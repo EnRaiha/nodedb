@@ -12,6 +12,14 @@ use crate::event::EventSource;
 use crate::types::{DatabaseId, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::MetaOp;
 
+/// Budget for one background COMPACT / REINDEX pass.
+///
+/// Deliberately not `tuning.network.default_deadline_secs`: that bounds a
+/// client statement, and a maintenance pass rewrites whole segments at
+/// `Priority::Background`. Bounding it by a query deadline would abandon the
+/// rewrite partway on every collection large enough to need it.
+const MAINTENANCE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Dispatch a maintenance operation (COMPACT/REINDEX) to all Data Plane cores.
 ///
 /// In single-node: dispatches to core 0 (the only core in most test configs).
@@ -28,7 +36,7 @@ pub fn dispatch_maintenance_to_all_cores(
         database_id,
         vshard_id: VShardId::new(0),
         plan: PhysicalPlan::Meta(op),
-        deadline: std::time::Instant::now() + std::time::Duration::from_secs(300),
+        deadline: std::time::Instant::now() + MAINTENANCE_DEADLINE,
         priority: Priority::Background,
         trace_id: TraceId::generate(),
         consistency: ReadConsistency::Strong,

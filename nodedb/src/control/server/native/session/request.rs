@@ -25,6 +25,16 @@ impl NativeSession {
         let seq = req.seq;
         let op = req.op;
 
+        // Pin this request's deadline before any work is planned or dispatched,
+        // the same way the pgwire statement entry points do. The native session
+        // store is keyed by peer address, and `SET statement_timeout` on this
+        // protocol writes into it, so the budget resolves identically. The
+        // guard restores the previous value on every exit path.
+        let _statement_scope = crate::control::server::shared::session::deadline::enter(
+            self.sessions.statement_timeout(self.peer_addr),
+            self.state.tuning.network.default_deadline_secs,
+        );
+
         // Auth handling.
         if op == OpCode::Auth {
             return SqlOutcome::Response(Box::new(self.handle_auth(seq, &req.fields).await));

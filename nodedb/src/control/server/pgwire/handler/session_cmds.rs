@@ -365,6 +365,19 @@ impl NodeDbPgHandler {
             ))));
         }
 
+        // `statement_timeout` bounds every later statement on this session, so
+        // an unparsable value must fail at SET. Storing it would leave the
+        // session believing it has a cap the dispatcher cannot read.
+        if key.eq_ignore_ascii_case("statement_timeout")
+            && let Err(e) = crate::control::server::shared::session::parse_statement_timeout(&value)
+        {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                nodedb_types::error::sqlstate::INVALID_PARAMETER_VALUE.to_owned(),
+                e.to_string(),
+            ))));
+        }
+
         self.sessions.set_parameter(session_id, key, value);
         Ok(vec![Response::Execution(Tag::new("SET"))])
     }

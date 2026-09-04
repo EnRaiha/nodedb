@@ -2,6 +2,7 @@
 
 //! Document read and scan handlers: Scan, PointGet, RangeScan, IndexLookup.
 
+mod audit_body;
 pub mod decode;
 pub mod emit;
 pub mod fetch;

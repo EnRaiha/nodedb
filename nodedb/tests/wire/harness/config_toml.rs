@@ -40,6 +40,9 @@ pub(super) struct TuningOverrides {
     /// Overrides `[tuning.maintenance] auto_analyze_min_mutations` so a test
     /// can trip auto-ANALYZE without issuing 1000 writes.
     pub(super) auto_analyze_min_mutations: Option<u64>,
+    /// Overrides `[tuning.query] stream_chunk_size` so a test can drive the
+    /// chunked-streaming scan path without seeding 1000 rows.
+    pub(super) stream_chunk_size: Option<usize>,
 }
 
 impl TuningOverrides {
@@ -60,6 +63,14 @@ impl TuningOverrides {
     pub(super) fn auto_analyze(min_mutations: u64) -> Self {
         Self {
             auto_analyze_min_mutations: Some(min_mutations),
+            ..Self::default()
+        }
+    }
+
+    /// Boot with a lowered scan streaming chunk size.
+    pub(super) fn stream_chunk(rows: usize) -> Self {
+        Self {
+            stream_chunk_size: Some(rows),
             ..Self::default()
         }
     }
@@ -96,6 +107,9 @@ pub(super) fn write_config(dir: &Path, auth_mode: AuthMode, tuning: TuningOverri
         toml.push_str(&format!(
             "\n[tuning.maintenance]\nauto_analyze_min_mutations = {min_mutations}\n"
         ));
+    }
+    if let Some(rows) = tuning.stream_chunk_size {
+        toml.push_str(&format!("\n[tuning.query]\nstream_chunk_size = {rows}\n"));
     }
     toml.push_str(&format!(
         "\n[backup_encryption]\nkey_path = {}\n",

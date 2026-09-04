@@ -7,6 +7,7 @@ pub(crate) mod checkpoint_outcome;
 pub(crate) mod columnar_checkpoint;
 pub mod core_loop;
 pub(crate) mod crdt_checkpoint;
+pub(crate) mod deadline;
 mod dispatch;
 pub(crate) mod doc_format;
 pub mod enforcement;

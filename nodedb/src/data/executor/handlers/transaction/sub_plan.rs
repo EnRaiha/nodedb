@@ -62,8 +62,14 @@ impl CoreLoop {
             return self.exec_tx_timeseries(parent, tid, plan, op, undo_log);
         }
 
-        let task =
-            Self::build_dummy_task_at(tid, parent.request.database_id, parent.request.vshard_id);
+        let task = Self::build_dummy_task_at(
+            tid,
+            parent.request.database_id,
+            parent.request.vshard_id,
+            // The sub-plan is part of the parent statement, so it runs on what
+            // is left of the parent's budget rather than a fresh one.
+            parent.request.deadline,
+        );
         self.execute_tx_sub_plan_with_task(&task, tid, plan, undo_log, crdt_deltas, user_roles)
     }
 
@@ -96,7 +102,9 @@ impl CoreLoop {
             | PhysicalPlan::Meta(_)
             | PhysicalPlan::Array(_)
             | PhysicalPlan::ClusterArray(_)
-            | PhysicalPlan::ClusterEvent(_) => self.exec_tx_passthrough(tid, plan),
+            | PhysicalPlan::ClusterEvent(_) => {
+                self.exec_tx_passthrough(tid, plan, dummy_task.request.deadline)
+            }
         }
     }
 
@@ -107,13 +115,21 @@ impl CoreLoop {
     /// only carries request metadata for response building.
     #[cfg(test)]
     pub(super) fn build_dummy_task(tid: u64) -> ExecutionTask {
-        Self::build_dummy_task_at(tid, DatabaseId::DEFAULT, crate::types::VShardId::new(0))
+        Self::build_dummy_task_at(
+            tid,
+            DatabaseId::DEFAULT,
+            crate::types::VShardId::new(0),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
     }
 
+    /// `deadline` is the enclosing statement's, copied from the parent task, so
+    /// every sub-plan this task carries stops when the statement does.
     fn build_dummy_task_at(
         tid: u64,
         database_id: DatabaseId,
         vshard_id: crate::types::VShardId,
+        deadline: std::time::Instant,
     ) -> ExecutionTask {
         ExecutionTask::new(crate::bridge::envelope::Request {
             request_id: crate::types::RequestId::new(0),
@@ -124,7 +140,7 @@ impl CoreLoop {
                 target_request_id: crate::types::RequestId::new(0),
             }),
             // no-determinism: ephemeral deadline is not written to Calvin state.
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            deadline,
             priority: crate::bridge::envelope::Priority::Normal,
             trace_id: TraceId::ZERO,
             consistency: crate::types::ReadConsistency::Strong,
@@ -229,7 +245,7 @@ impl CoreLoop {
                 undo_log,
             ),
 
-            _ => self.exec_tx_passthrough(tid, plan),
+            _ => self.exec_tx_passthrough(tid, plan, dummy_task.request.deadline),
         }
     }
 
@@ -276,7 +292,7 @@ impl CoreLoop {
                 undo_log,
             )),
 
-            _ => self.exec_tx_passthrough(tid, plan),
+            _ => self.exec_tx_passthrough(tid, plan, dummy_task.request.deadline),
         }
     }
 
@@ -377,7 +393,7 @@ impl CoreLoop {
                 Ok(response)
             }
 
-            _ => self.exec_tx_passthrough(tid, plan),
+            _ => self.exec_tx_passthrough(tid, plan, dummy_task.request.deadline),
         }
     }
 
@@ -387,7 +403,7 @@ impl CoreLoop {
     /// transaction-capable through their own staged handlers.
     fn exec_tx_crdt(
         &mut self,
-        _dummy_task: &ExecutionTask,
+        dummy_task: &ExecutionTask,
         tid: u64,
         plan: &PhysicalPlan,
         op: &CrdtOp,
@@ -399,7 +415,7 @@ impl CoreLoop {
                     detail: "CRDT Apply is not supported inside transaction batches".into(),
                 })
             }
-            _ => self.exec_tx_passthrough(tid, plan),
+            _ => self.exec_tx_passthrough(tid, plan, dummy_task.request.deadline),
         }
     }
 
@@ -437,7 +453,7 @@ impl CoreLoop {
                 undo_log,
             ),
 
-            _ => self.exec_tx_passthrough(tid, plan),
+            _ => self.exec_tx_passthrough(tid, plan, dummy_task.request.deadline),
         }
     }
 }

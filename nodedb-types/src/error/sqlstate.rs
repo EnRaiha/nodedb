@@ -56,6 +56,10 @@ pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 /// raised at runtime instead of evaluating to `NULL`)
 pub const DIVISION_BY_ZERO: &str = "22012";
 
+/// `22023` — `invalid_parameter_value` (a `SET` value the parameter's own
+/// grammar refuses, e.g. `SET statement_timeout = 'later'`)
+pub const INVALID_PARAMETER_VALUE: &str = "22023";
+
 // ── Class 23 — Integrity Constraint Violation ────────────────────────────────
 
 /// `23000` — `integrity_constraint_violation` (generic)

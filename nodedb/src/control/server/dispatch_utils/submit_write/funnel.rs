@@ -22,9 +22,10 @@
 //! qualify, the residual crash window it does not close, and the latency it
 //! costs a rejection.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::bridge::envelope::{Priority, Request, Status};
+use crate::control::server::shared::session::statement_deadline;
 use crate::control::server::wal_dispatch::{self, WalAppendRequest};
 use crate::control::state::SharedState;
 use crate::types::ReadConsistency;
@@ -54,6 +55,12 @@ pub(crate) async fn submit_write(
         ordering,
         change_feed,
     } = params;
+
+    // The running statement's deadline, pinned once at the session boundary and
+    // shared by every request the statement fans out into. Used for both the
+    // envelope the Data Plane enforces and the Control-Plane collect below, so
+    // the two halves cannot disagree about when this statement expires.
+    let deadline = statement_deadline(shared.tuning.network.default_deadline_secs);
 
     // Change metadata is derived from the plan HERE, before it is moved into
     // the request — the publish itself happens after apply, once the response
@@ -233,7 +240,7 @@ pub(crate) async fn submit_write(
         database_id,
         vshard_id,
         plan,
-        deadline: Instant::now() + Duration::from_secs(shared.tuning.network.default_deadline_secs),
+        deadline,
         priority: Priority::Normal,
         trace_id,
         consistency: ReadConsistency::Strong,
@@ -285,8 +292,11 @@ pub(crate) async fn submit_write(
     // `tuning.network.max_query_result_bytes` is cancelled with a typed
     // `ExecutionLimitExceeded` error.
     let max_result_bytes = shared.tuning.network.max_query_result_bytes as usize;
-    let response = match tokio::time::timeout(
-        Duration::from_secs(shared.tuning.network.default_deadline_secs),
+    // The same instant the envelope carries. The Data Plane normally answers
+    // with `DeadlineExceeded` first; this bounds the wait when it is inside a
+    // stage that carries no safe point yet.
+    let response = match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
         collect_bounded_response(&mut rx, max_result_bytes),
     )
     .await

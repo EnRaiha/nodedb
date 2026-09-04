@@ -9,5 +9,6 @@ pub mod doc_cache;
 pub mod fts_redb;
 pub mod gsi;
 pub mod inverted;
+pub mod scan_stop;
 pub mod sparse_vector;
 pub mod stats;

@@ -148,6 +148,10 @@ impl CoreLoop {
         // rows, so the predicate has already excluded out-of-range and
         // tombstoned rows before this bound is counted.
         let scan_limit = limit.max(1000);
+        // Safe point: the versioned scan consults this once per scanned
+        // version. A statement that goes over its deadline mid-scan stops here
+        // and the check below turns the short result into an error.
+        let deadline = crate::data::executor::deadline::DeadlineCheck::for_task(task);
         let mut scanned = match self.sparse.versioned_scan_as_of(
             crate::engine::sparse::btree_versioned::VersionedScanParams {
                 database_id: task.request.database_id.as_u64(),
@@ -158,6 +162,7 @@ impl CoreLoop {
                 limit: scan_limit,
             },
             &predicate,
+            &|| deadline.expired(),
         ) {
             Ok(rows) => rows,
             Err(e) => {
@@ -191,6 +196,13 @@ impl CoreLoop {
         // than quietly shrinking its answer.
         if let Some(e) = decode_err.take() {
             return self.response_error(task, e);
+        }
+
+        // A scan the deadline cut short holds an arbitrary prefix of the
+        // answer. Returning it would look like a complete result, so the
+        // statement fails instead.
+        if deadline.tripped() {
+            return self.response_error(task, ErrorCode::DeadlineExceeded);
         }
 
         // Normalize bodies to MessagePack so `sort_rows` (msgpack field

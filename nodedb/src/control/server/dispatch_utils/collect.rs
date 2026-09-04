@@ -3,7 +3,7 @@
 //! Bounded response collection for dispatched requests: draining a streamed
 //! response channel with a total-payload byte ceiling.
 
-use crate::bridge::envelope::{Payload, Response};
+use crate::bridge::envelope::{Payload, Response, Status};
 
 #[derive(Debug)]
 pub(crate) enum DispatchCollectError {
@@ -44,6 +44,16 @@ pub(crate) async fn collect_bounded_response(
             // Non-streaming fast path: a single terminal frame is returned
             // unmodified (writes, point reads, DDL, counts, single-chunk scans).
             return Ok(resp);
+        } else if resp.status == Status::Error {
+            // The producer ended the stream by failing — a deadline, a budget,
+            // a decode error. The chunks already collected are an arbitrary
+            // prefix of the answer, so they are dropped: an error response
+            // that carried rows would let a caller render a truncated result
+            // set as if the statement had completed.
+            return Ok(Response {
+                payload: Payload::empty(),
+                ..resp
+            });
         } else {
             total_bytes = total_bytes.saturating_add(resp.payload.len());
             if total_bytes > max_result_bytes {

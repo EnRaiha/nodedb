@@ -12,6 +12,7 @@ pub mod cursor_spill;
 pub mod ddl_buffer;
 mod ddl_flush;
 pub mod ddl_rollback;
+pub mod deadline;
 pub mod ephemeral_sequence;
 pub mod expander_stage;
 mod hot_key;
@@ -31,6 +32,7 @@ mod reservation_release;
 pub mod savepoint_ops;
 pub mod staging_gate;
 mod state;
+pub mod statement_timeout;
 mod store;
 pub mod temp_tables;
 mod transaction;
@@ -43,6 +45,7 @@ pub use self::connection::{
     ConnectionId, ConnectionIdError, ConnectionMetadata, ConnectionRegistrationError, SessionId,
 };
 pub use self::cross_shard_mode::{CrossShardTxnMode, parse_value as parse_cross_shard_value};
+pub use self::deadline::{statement_budget, statement_deadline, statement_deadline_ms};
 pub use self::outcome::{AbortReason, CommitOutcome, TxnDataPlane};
 pub use self::params::{
     is_known_pg_runtime_parameter, is_known_settable_runtime_parameter, parse_set_command,
@@ -61,6 +64,7 @@ pub(crate) use self::state::now_unix_ms;
 pub use self::state::{
     ConnSession, CursorState, PendingFieldInference, PendingOffsetCommit, TransactionState,
 };
+pub use self::statement_timeout::{InvalidStatementTimeout, parse_statement_timeout};
 pub use self::store::SessionStore;
 pub use self::temp_tables::TempTableEntry;
 pub use self::transaction::CommitDrain;

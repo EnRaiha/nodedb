@@ -332,10 +332,17 @@ impl CoreLoop {
     /// Execute a read-only / DDL sub-plan via the standard dispatch path.
     ///
     /// None of these variants mutate engine state, so no undo entry is needed.
+    ///
+    /// `deadline` is the enclosing statement's, copied from the parent task. A
+    /// sub-plan is part of the statement that spawned it, so it inherits that
+    /// statement's remaining budget; minting a fresh one here would let a
+    /// transaction outlive the `statement_timeout` its client set by one
+    /// sub-plan's worth of work per sub-plan.
     pub(super) fn exec_tx_passthrough(
         &mut self,
         tid: u64,
         plan: &PhysicalPlan,
+        deadline: std::time::Instant,
     ) -> Result<Response, ErrorCode> {
         let resp = self.execute(&ExecutionTask::new(crate::bridge::envelope::Request {
             request_id: crate::types::RequestId::new(0),
@@ -344,7 +351,7 @@ impl CoreLoop {
             vshard_id: crate::types::VShardId::new(0),
             plan: plan.clone(),
             // no-determinism: sub-plan deadline is ephemeral, not written to WAL
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            deadline,
             priority: crate::bridge::envelope::Priority::Normal,
             trace_id: TraceId::ZERO,
             consistency: crate::types::ReadConsistency::Strong,

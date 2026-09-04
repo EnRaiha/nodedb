@@ -87,6 +87,19 @@ impl TestServer {
         Self::connect_and_build(spawned, dir, AuthMode::Trust).await
     }
 
+    /// Spawn a single-core NodeDB server with a lowered scan streaming chunk
+    /// size so a test drives the chunked-streaming scan path on a small seed.
+    pub async fn start_with_stream_chunk_size(rows: usize) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spawned = process::spawn(
+            dir.path(),
+            AuthMode::Trust,
+            TuningOverrides::stream_chunk(rows),
+            1,
+        );
+        Self::connect_and_build(spawned, dir, AuthMode::Trust).await
+    }
+
     /// Open a server backed by an existing data directory, reopened in place
     /// so a previous server's data is visible after boot. `dir` is not
     /// consumed — ownership stays with the caller.

@@ -15,7 +15,7 @@ use crate::control::server::shared::clone_write::CloneCheckedTask;
 use nodedb_physical::physical_plan::PhysicalPlan;
 
 use super::core::{Gateway, QueryContext, authorized_plan_for_context};
-use super::dispatcher::{DispatchRouteStreamParams, default_deadline_ms, dispatch_route_stream};
+use super::dispatcher::{DispatchRouteStreamParams, dispatch_route_stream, statement_deadline_ms};
 use super::retry::retry_not_leader;
 use super::route::TaskRoute;
 use super::router::resolve_decision;
@@ -61,7 +61,7 @@ impl Gateway {
 
         let routes = self.compute_routes(plan, ctx)?;
 
-        let deadline_ms = default_deadline_ms(&shared);
+        let deadline_ms = statement_deadline_ms(&shared);
 
         let mut per_route: Vec<ResultStream> = Vec::with_capacity(routes.len());
         for route in routes {

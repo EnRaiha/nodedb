@@ -35,7 +35,7 @@
 
 use crate::bridge::envelope::{Payload, PhysicalPlan, Response};
 use crate::control::gateway::dispatcher::{
-    DispatchRouteParams, default_deadline_ms, dispatch_route,
+    DispatchRouteParams, dispatch_route, statement_deadline_ms,
 };
 use crate::control::gateway::{GatewayVersionSet, RouteDecision, TaskRoute};
 use crate::control::server::graph_dispatch::cluster_resolve::{gateway_shared, resolve_for_vshard};
@@ -98,7 +98,7 @@ pub(crate) async fn forward_to_leader(
         tenant_id: forward_task.tenant_id,
         database_id: forward_task.database_id,
         trace_id: TraceId::ZERO,
-        deadline_ms: default_deadline_ms(&shared),
+        deadline_ms: statement_deadline_ms(&shared),
         version_set: &version_set,
         // The leader's session-less staging handler reads THIS to key the
         // per-transaction overlay; forwarding it is the whole point.

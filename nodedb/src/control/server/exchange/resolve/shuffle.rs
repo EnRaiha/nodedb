@@ -216,14 +216,11 @@ pub async fn resolve_shuffle_join(
         detail: format!("shuffle join: encode probe scan: {e}"),
     })?;
 
-    // Deadline budget shared by produce + consume (no finer per-query deadline is
-    // reachable on this resolver path; use the configured network default).
-    let deadline_remaining_ms = state
-        .tuning
-        .network
-        .default_deadline_secs
-        .saturating_mul(1000)
-        .max(1);
+    // Deadline budget shared by produce + consume: what is left of the running
+    // statement's budget, so both shuffle sides stop when the statement does.
+    let deadline_remaining_ms = crate::control::server::shared::session::statement_deadline_ms(
+        state.tuning.network.default_deadline_secs,
+    );
     let num_parts_u32 = u32::try_from(effective_num_parts).map_err(|_| crate::Error::Internal {
         detail: format!("shuffle join: num_parts {effective_num_parts} exceeds u32"),
     })?;

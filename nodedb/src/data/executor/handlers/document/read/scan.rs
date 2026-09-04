@@ -140,6 +140,13 @@ impl CoreLoop {
 
         match fetched {
             Ok(fetched) => {
+                // Safe point: the storage scan stopped where its deadline
+                // passed, so these rows are a prefix of the answer. Emitting
+                // them would hand the client a truncated result set that looks
+                // complete.
+                if fetched.deadline_expired {
+                    return self.response_error(task, ErrorCode::DeadlineExceeded);
+                }
                 let mut filtered = fetched.rows;
                 let effective_schema = fetched.effective_schema;
                 // The encoding the rows arrive in from the fetch stage. It is
@@ -266,6 +273,14 @@ impl CoreLoop {
                         }
                     }
                 };
+
+                // Safe point: the sort is the one post-fetch stage whose cost
+                // grows with the row count, and it has just finished. Nothing
+                // has been emitted yet, so stopping here costs the client
+                // nothing but the error.
+                if crate::data::executor::deadline::DeadlineCheck::for_task(task).expired_now() {
+                    return self.response_error(task, ErrorCode::DeadlineExceeded);
+                }
 
                 let stream_chunk_size = self.query_tuning.stream_chunk_size;
 

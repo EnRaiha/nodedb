@@ -5,12 +5,11 @@
 //! single-blob merge path (`dispatch::single_blob_gather`, `snapshot`, `bsp`,
 //! `wcc`).
 
-use std::time::Duration;
-
 use futures::future::join_all;
 
 use crate::bridge::envelope::{Response, Status};
 use crate::control::server::exchange::gather::eager_dispatch_to_all_cores;
+use crate::control::server::shared::session::statement_deadline;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, TxnId};
 use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
@@ -32,7 +31,10 @@ pub(super) async fn gather_graph_op_all_cores(
     // Shared broadcast call counter (parity with gather_all_cores).
     crate::control::server::broadcast::broadcast_call_count_increment();
 
-    let deadline_secs = state.tuning.network.default_deadline_secs;
+    // The running statement's deadline — the same instant the per-core
+    // envelopes carry, so the Control-Plane wait and the Data-Plane execution
+    // expire together.
+    let deadline = statement_deadline(state.tuning.network.default_deadline_secs);
     let max_result_bytes = state.tuning.network.max_query_result_bytes as usize;
 
     let num_cores = state
@@ -97,10 +99,9 @@ pub(super) async fn gather_graph_op_all_cores(
             core_plan
         })?;
 
-    let deadline = Duration::from_secs(deadline_secs);
     let response_futures = receivers.into_iter().map(|(core_id, mut rx)| async move {
-        match tokio::time::timeout(
-            deadline,
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
             crate::control::server::dispatch_utils::collect_bounded_response(
                 &mut rx,
                 max_result_bytes,

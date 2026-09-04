@@ -143,6 +143,7 @@ mod serial_sequence_rollback_no_leak;
 mod session_handle_security;
 mod session_plan_cache_permission_tree_revoke;
 mod session_plan_cache_rls_revoke;
+mod session_statement_timeout;
 mod sorted_index_authorization;
 mod spatial_cp_dp_query;
 mod sql_aggregate_functions;

@@ -35,6 +35,9 @@ impl CoreLoop {
                 limit,
             },
             &|_| true,
+            // No task in scope: this helper serves callers that supply their
+            // own bound (an explicit `limit`), so no deadline cuts it short.
+            &crate::engine::sparse::scan_stop::never_stop,
         )?;
         let format = self.sparse_body_format(
             crate::types::DatabaseId::new(did),

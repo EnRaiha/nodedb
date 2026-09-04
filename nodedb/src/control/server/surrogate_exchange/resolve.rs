@@ -144,12 +144,11 @@ fn build_request(
         pk,
         trace_id,
     } = key;
-    let deadline_remaining_ms = state
-        .tuning
-        .network
-        .default_deadline_secs
-        .saturating_mul(1000)
-        .max(1);
+    // What is left of the running statement's budget: a surrogate assignment is
+    // work the statement waits on, so it stops when the statement does.
+    let deadline_remaining_ms = crate::control::server::shared::session::statement_deadline_ms(
+        state.tuning.network.default_deadline_secs,
+    );
     AssignSurrogateRequest {
         vshard_id: vshard.as_u32(),
         database_id: database_id.as_u64(),

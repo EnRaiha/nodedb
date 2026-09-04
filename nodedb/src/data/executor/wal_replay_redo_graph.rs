@@ -292,7 +292,8 @@ impl CoreLoop {
                 database_id,
                 vshard_id,
                 plan,
-                deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+                deadline: std::time::Instant::now()
+                    + crate::data::executor::deadline::REPLAY_DEADLINE,
                 priority: Priority::Normal,
                 trace_id: crate::types::TraceId::ZERO,
                 consistency: ReadConsistency::Strong,

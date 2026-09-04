@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response, Status};
 use crate::control::server::shared::clone_write::CloneCheckedTask;
+use crate::control::server::shared::session::statement_deadline;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
 
@@ -141,13 +142,20 @@ async fn dispatch_plan(
 ) -> crate::Result<Response> {
     let request_id = state.next_request_id();
 
+    // Whichever comes first: the running statement's deadline, or the caller's
+    // own timeout. A DDL statement a session bounded with `statement_timeout`
+    // stops with the statement; a background caller with no statement scope
+    // keeps exactly the timeout it asked for.
+    let deadline = statement_deadline(state.tuning.network.default_deadline_secs)
+        .min(Instant::now() + timeout);
+
     let request = Request {
         request_id,
         tenant_id,
         database_id,
         vshard_id,
         plan,
-        deadline: Instant::now() + timeout,
+        deadline,
         priority: Priority::Normal,
         trace_id: TraceId::generate(),
         consistency: ReadConsistency::Strong,
@@ -178,13 +186,16 @@ async fn dispatch_plan(
             })?,
     };
 
-    // Await with timeout — yields the thread so the response poller can run.
-    tokio::time::timeout(timeout, async { rx.recv().await.ok_or(()) })
-        .await
-        .map_err(|_| crate::Error::Internal {
-            detail: format!("dispatch timeout after {}ms", timeout.as_millis()),
-        })?
-        .map_err(|_| crate::Error::Internal {
-            detail: "response channel closed".into(),
-        })
+    // Await to the same instant the envelope carries — yields the thread so the
+    // response poller can run.
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+        rx.recv().await.ok_or(())
+    })
+    .await
+    .map_err(|_| crate::Error::Internal {
+        detail: format!("dispatch timeout after {}ms", timeout.as_millis()),
+    })?
+    .map_err(|_| crate::Error::Internal {
+        detail: "response channel closed".into(),
+    })
 }

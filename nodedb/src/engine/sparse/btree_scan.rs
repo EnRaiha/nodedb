@@ -279,6 +279,13 @@ impl SparseEngine {
     ///
     /// `predicate` receives the raw document bytes and returns true if the
     /// document should be included in results.
+    ///
+    /// `stop` is consulted once per scanned row, before the predicate. It ends
+    /// the scan where it stands, so the caller that owns the signal — a
+    /// statement deadline, today — decides whether the short result is an
+    /// answer or an error. Pass
+    /// [`never_stop`](crate::engine::sparse::scan_stop::never_stop) when
+    /// nothing can cut the scan short.
     pub fn scan_documents_filtered(
         &self,
         database_id: u64,
@@ -286,6 +293,7 @@ impl SparseEngine {
         collection: &str,
         limit: usize,
         predicate: &dyn Fn(&[u8]) -> bool,
+        stop: &dyn Fn() -> bool,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
         let prefix = coll_prefix(database_id, tenant_id, collection);
         let end = format!("{prefix}\u{ffff}");
@@ -302,6 +310,9 @@ impl SparseEngine {
         let mut results = Vec::with_capacity(limit.min(256));
         for entry in range {
             if results.len() >= limit {
+                break;
+            }
+            if stop() {
                 break;
             }
             let entry = entry.map_err(|e| redb_err("doc entry", e))?;
@@ -513,6 +524,61 @@ mod tests {
 
         assert_eq!(materialized.len(), 2);
         assert_eq!(materialized, streamed);
+    }
+
+    /// The stop signal ends the row loop where it stands. A caller that owns
+    /// the signal — a statement deadline — turns the short result into an error
+    /// rather than reporting it as the answer.
+    #[test]
+    fn filtered_scan_stops_on_the_stop_signal() {
+        let (engine, _dir) = open_temp();
+        for i in 0..8 {
+            engine
+                .put(0, 1, "users", &format!("u{i}"), b"body")
+                .unwrap();
+        }
+
+        // Stop after the third row is visited.
+        let visited = std::cell::Cell::new(0usize);
+        let rows = engine
+            .scan_documents_filtered(
+                0,
+                1,
+                "users",
+                usize::MAX,
+                &|_: &[u8]| {
+                    visited.set(visited.get() + 1);
+                    true
+                },
+                &|| visited.get() >= 3,
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 3, "the scan ends at the stop signal");
+        assert_eq!(visited.get(), 3, "no row past the signal is evaluated");
+    }
+
+    #[test]
+    fn filtered_scan_runs_to_completion_without_a_stop() {
+        let (engine, _dir) = open_temp();
+        for i in 0..8 {
+            engine
+                .put(0, 1, "users", &format!("u{i}"), b"body")
+                .unwrap();
+        }
+
+        let rows = engine
+            .scan_documents_filtered(
+                0,
+                1,
+                "users",
+                usize::MAX,
+                &|_: &[u8]| true,
+                &crate::engine::sparse::scan_stop::never_stop,
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 8, "never_stop must not cut the scan short");
     }
 
     #[test]

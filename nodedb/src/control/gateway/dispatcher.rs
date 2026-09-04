@@ -8,7 +8,6 @@
 //! Plane response bytes for the fuser to merge.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use nodedb_cluster::rpc_codec::TypedClusterError;
 
@@ -377,9 +376,16 @@ pub(super) fn map_typed_cluster_error(err: TypedClusterError, vshard_id: u64) ->
     }
 }
 
-/// Build the deadline_remaining_ms value from the server's default.
-pub fn default_deadline_ms(shared: &SharedState) -> u64 {
-    Duration::from_secs(shared.tuning.network.default_deadline_secs).as_millis() as u64
+/// Milliseconds left on the running statement, for a remote hop's
+/// `ExecuteRequest.deadline_remaining_ms`.
+///
+/// The session's `statement_timeout` when one is installed on this connection,
+/// else the node's configured default. A forwarded route must stop when the
+/// statement that spawned it does, not on a budget of its own.
+pub fn statement_deadline_ms(shared: &SharedState) -> u64 {
+    crate::control::server::shared::session::statement_deadline_ms(
+        shared.tuning.network.default_deadline_secs,
+    )
 }
 
 #[cfg(test)]

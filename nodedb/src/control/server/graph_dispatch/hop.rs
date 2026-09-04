@@ -36,7 +36,7 @@ use futures::future::join_all;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::gateway::dispatcher::{
-    DispatchRouteParams, default_deadline_ms, dispatch_route,
+    DispatchRouteParams, dispatch_route, statement_deadline_ms,
 };
 use crate::control::gateway::router::resolve_decision;
 use crate::control::gateway::version_set::GatewayVersionSet;
@@ -329,7 +329,7 @@ async fn expand_remote(
     // owning `SharedState`.
     let shared_arc = super::cluster_resolve::gateway_shared(shared)?;
 
-    let deadline_ms = default_deadline_ms(&shared_arc);
+    let deadline_ms = statement_deadline_ms(&shared_arc);
     // Graph structural ops touch no named collection, so the version set is
     // empty (descriptor-version checks do not apply to node-id-keyed edges).
     let version_set = GatewayVersionSet::from_pairs(Vec::new());

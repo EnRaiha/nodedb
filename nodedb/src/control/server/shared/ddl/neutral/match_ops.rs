@@ -200,7 +200,7 @@ pub async fn match_query(
     // LOCAL scatter/resume leg so this node's cores merge the transaction's
     // staged edge overlay (read-your-own-writes); remote legs read committed CSR
     // (multi-node overlay forwarding is a separate unit).
-    let deadline_ms = crate::control::gateway::dispatcher::default_deadline_ms(state);
+    let deadline_ms = crate::control::gateway::dispatcher::statement_deadline_ms(state);
     match graph_dispatch::scatter_match(
         state,
         tenant_id,

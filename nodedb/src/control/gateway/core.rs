@@ -31,7 +31,7 @@ use crate::control::trace_export::EmitSpanParams;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId, TxnId, VShardId};
 use nodedb_physical::physical_plan::PhysicalPlan;
 
-use super::dispatcher::{DispatchRouteParams, default_deadline_ms, dispatch_route};
+use super::dispatcher::{DispatchRouteParams, dispatch_route, statement_deadline_ms};
 use super::fuser::fuse_payloads;
 use super::key_extractor::UnwiredKeyExtractor;
 use super::plan_cache::PlanCache;
@@ -244,7 +244,7 @@ impl Gateway {
         let shared = self.shared()?;
         let routes = self.compute_routes(plan, ctx)?;
 
-        let deadline_ms = default_deadline_ms(&shared);
+        let deadline_ms = statement_deadline_ms(&shared);
         // Gateway-level byte ceiling: per-route `dispatch_to_data_plane`
         // already caps each shard's payload; this additionally caps the
         // scatter-gather *sum* so an N-shard fan-out can't accumulate

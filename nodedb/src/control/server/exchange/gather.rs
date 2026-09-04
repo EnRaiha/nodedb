@@ -16,13 +16,13 @@
 //! `Gather{as_aggregate: true}` plans.
 
 use futures::future::join_all;
-use std::time::{Duration, Instant};
 
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response, Status};
 use crate::control::arrow_convert;
 use crate::control::gateway::core::QueryContext;
 use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
 use crate::control::server::result_stream::ResultStream;
+use crate::control::server::shared::session::statement_deadline;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, ReadConsistency, TenantId, TraceId, TxnId, VShardId};
 
@@ -58,7 +58,10 @@ pub(crate) fn eager_dispatch_to_all_cores(
         tokio::sync::mpsc::Receiver<crate::bridge::envelope::Response>,
     )>,
 > {
-    let deadline_secs = state.tuning.network.default_deadline_secs;
+    // Every core in this fan-out belongs to ONE statement, so all of them
+    // carry that statement's deadline. Resolving per core would give each core
+    // its own budget and leave the statement unbounded in aggregate.
+    let deadline = statement_deadline(state.tuning.network.default_deadline_secs);
 
     let num_cores = state
         .dispatcher
@@ -76,7 +79,7 @@ pub(crate) fn eager_dispatch_to_all_cores(
             database_id,
             vshard_id,
             plan: plan_for_core(core_id),
-            deadline: Instant::now() + Duration::from_secs(deadline_secs),
+            deadline,
             priority: Priority::Normal,
             trace_id,
             consistency: ReadConsistency::Strong,
@@ -149,7 +152,7 @@ pub(crate) async fn gather_all_cores(
     // Track broadcast calls for observability (shared counter with broadcast.rs).
     crate::control::server::broadcast::broadcast_call_count_increment();
 
-    let deadline_secs = state.tuning.network.default_deadline_secs;
+    let deadline = statement_deadline(state.tuning.network.default_deadline_secs);
 
     // Issue all per-core sends and collect receiver channels before awaiting.
     // This ensures every core has the request in flight before we block on any
@@ -164,11 +167,10 @@ pub(crate) async fn gather_all_cores(
     // and concatenate the full bounded response per core — taking only the first
     // frame would silently truncate that core's contribution to `stream_chunk_size`
     // rows.
-    let deadline = Duration::from_secs(deadline_secs);
     let max_result_bytes = state.tuning.network.max_query_result_bytes as usize;
     let response_futures = receivers.into_iter().map(|(core_id, mut rx)| async move {
-        let result = match tokio::time::timeout(
-            deadline,
+        let result = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
             crate::control::server::dispatch_utils::collect_bounded_response(
                 &mut rx,
                 max_result_bytes,

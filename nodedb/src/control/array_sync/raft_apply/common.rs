@@ -249,7 +249,8 @@ pub(super) fn build_array_request(
         database_id,
         vshard_id,
         plan,
-        deadline: std::time::Instant::now() + Duration::from_secs(30),
+        deadline: std::time::Instant::now()
+            + Duration::from_secs(state.tuning.network.default_deadline_secs),
         priority: Priority::Normal,
         trace_id: TraceId::generate(),
         consistency: ReadConsistency::Strong,

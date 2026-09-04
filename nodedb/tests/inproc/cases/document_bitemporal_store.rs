@@ -100,6 +100,7 @@ fn non_bitemporal_collection_uses_legacy_storage() {
                 limit: 100,
             },
             &|_: &[u8]| true,
+            &nodedb::engine::sparse::scan_stop::never_stop,
         )
         .unwrap();
     assert!(

@@ -29,8 +29,6 @@
 //! This is MATCH-only: the generic gather primitives are left untouched for all
 //! other plan types.
 
-use std::time::Duration;
-
 use futures::future::join_all;
 
 use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
@@ -200,7 +198,12 @@ pub async fn broadcast_match_to_all_cores(
     // Shared broadcast call counter (parity with the generic gather path).
     crate::control::server::broadcast::broadcast_call_count_increment();
 
-    let deadline_secs = state.tuning.network.default_deadline_secs;
+    // The running statement's deadline — the same instant
+    // `eager_dispatch_to_all_cores` stamps on every per-core envelope below, so
+    // the Control-Plane wait and the Data-Plane execution expire together.
+    let deadline = crate::control::server::shared::session::statement_deadline(
+        state.tuning.network.default_deadline_secs,
+    );
 
     // Eager dispatch: register a tracker receiver and dispatch to each core
     // BEFORE awaiting any response, matching gather_all_cores' true-parallelism
@@ -216,11 +219,10 @@ pub async fn broadcast_match_to_all_cores(
     // Await all cores in parallel, draining the full bounded response per core
     // (a core's result may stream as several Partial frames before its terminal
     // frame).
-    let deadline = Duration::from_secs(deadline_secs);
     let max_result_bytes = state.tuning.network.max_query_result_bytes as usize;
     let response_futures = receivers.into_iter().map(|(core_id, mut rx)| async move {
-        match tokio::time::timeout(
-            deadline,
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
             crate::control::server::dispatch_utils::collect_bounded_response(
                 &mut rx,
                 max_result_bytes,

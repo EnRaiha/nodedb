@@ -8,11 +8,11 @@
 //! movement is handled by `exchange::gather::gather_all_cores`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use sonic_rs;
 
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response};
+use crate::control::server::shared::session::statement_deadline;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
 
@@ -137,8 +137,7 @@ pub async fn broadcast_count_to_all_cores(
             database_id,
             vshard_id,
             plan: plan.clone(),
-            deadline: Instant::now()
-                + Duration::from_secs(shared.tuning.network.default_deadline_secs),
+            deadline: statement_deadline(shared.tuning.network.default_deadline_secs),
             priority: Priority::Normal,
             trace_id,
             consistency: ReadConsistency::Strong,
@@ -168,8 +167,10 @@ pub async fn broadcast_count_to_all_cores(
     let mut error_msg = String::new();
 
     for mut rx in receivers {
-        let resp = tokio::time::timeout(
-            Duration::from_secs(shared.tuning.network.default_deadline_secs),
+        let resp = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(statement_deadline(
+                shared.tuning.network.default_deadline_secs,
+            )),
             async { rx.recv().await.ok_or(()) },
         )
         .await
@@ -254,8 +255,7 @@ pub async fn broadcast_register_to_all_cores(
             database_id,
             vshard_id,
             plan: plan.clone(),
-            deadline: Instant::now()
-                + Duration::from_secs(shared.tuning.network.default_deadline_secs),
+            deadline: statement_deadline(shared.tuning.network.default_deadline_secs),
             priority: Priority::Normal,
             trace_id,
             consistency: ReadConsistency::Strong,
@@ -280,8 +280,10 @@ pub async fn broadcast_register_to_all_cores(
     }
 
     for (core_id, mut rx) in receivers {
-        let resp = tokio::time::timeout(
-            Duration::from_secs(shared.tuning.network.default_deadline_secs),
+        let resp = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(statement_deadline(
+                shared.tuning.network.default_deadline_secs,
+            )),
             async { rx.recv().await.ok_or(()) },
         )
         .await

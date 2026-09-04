@@ -233,6 +233,12 @@ impl CoreLoop {
             false
         };
 
+        // Deadline safe points for this scan: the phase boundary below, every
+        // 1024th memtable row, and the stage boundary after the sort. The
+        // flushed-segment pass in phase 1 runs to completion once entered, so a
+        // statement is bounded to at most one such pass beyond its deadline.
+        let deadline = crate::data::executor::deadline::DeadlineCheck::for_task(task);
+
         // ── Phase 1: flushed segments ───────────────────────────────────────
         // Read rows that were drained from the memtable during prior flushes.
         // These rows are older than anything in the current memtable.
@@ -270,6 +276,12 @@ impl CoreLoop {
             // collapsing it to `Internal`/`XX000`, mirroring
             // `document/read/scan.rs`'s `Err(e) => self.response_error(task, e)`.
             return self.response_error(task, e);
+        }
+
+        // Safe point: phase 1 finished and nothing has been emitted, so the
+        // statement stops here rather than paying for phase 2 as well.
+        if deadline.expired_now() {
+            return self.response_error(task, ErrorCode::DeadlineExceeded);
         }
 
         // ── Phase 2: live memtable ──────────────────────────────────────────
@@ -341,6 +353,18 @@ impl CoreLoop {
                 if sort_keys.is_empty() && matched.len() >= limit {
                     break;
                 }
+                // Safe point: a row boundary. `expired` reads the clock once
+                // per 1024 rows, so the per-row cost is a decrement.
+                if deadline.expired() {
+                    break;
+                }
+            }
+            // The loop above stops mid-collection when the deadline passes, so
+            // `matched` is a prefix of the answer. Fail the statement rather
+            // than return a result set the client cannot tell from a complete
+            // one.
+            if deadline.tripped() {
+                return self.response_error(task, ErrorCode::DeadlineExceeded);
             }
         }
 
@@ -399,6 +423,12 @@ impl CoreLoop {
                 .map(|i| matched[i].clone())
                 .collect::<Vec<_>>();
             std::mem::swap(&mut matched, &mut reordered);
+            // Safe point: the sort is the one stage whose cost grows with the
+            // matched row count, and it has just finished. Nothing is emitted
+            // yet, so stopping here costs the client only the error.
+            if deadline.expired_now() {
+                return self.response_error(task, ErrorCode::DeadlineExceeded);
+            }
         } else if all_versions {
             // Audit-log order: ascending by system time. The hidden
             // `_ts_system` column index was resolved above.
@@ -678,6 +708,90 @@ mod tests {
 
         let rows = scan_with_prefilter(&mut core, coll, None);
         assert_eq!(ids(&rows), vec![1, 2, 3]);
+    }
+
+    /// Build a task whose deadline is already in the past.
+    fn expired_task() -> ExecutionTask {
+        let mut task = make_task();
+        task.request.deadline = Instant::now() - Duration::from_millis(1);
+        task
+    }
+
+    fn scan_response(
+        core: &mut CoreLoop,
+        collection: &str,
+        task: &ExecutionTask,
+    ) -> crate::bridge::envelope::Response {
+        core.execute_columnar_scan(
+            task,
+            ColumnarScanParams {
+                collection,
+                projection: &[],
+                limit: 0,
+                filters: &[],
+                rls_filters: &[],
+                sort_keys: &[],
+                system_time: nodedb_types::SystemTimeScope::Current,
+                valid_at_ms: None,
+                prefilter: None,
+                computed_columns: &[],
+                txn_id: None,
+            },
+        )
+    }
+
+    /// A statement over its deadline is stopped DURING execution, not merely
+    /// refused before it starts.
+    ///
+    /// This calls the handler directly, so the core loop's pre-execution
+    /// admission check never runs. The only code that can produce this response
+    /// is a safe point inside the scan itself.
+    #[test]
+    fn an_expired_deadline_stops_the_scan_inside_the_handler() {
+        let (mut core, _dir) = make_core();
+        let coll = "cf_deadline";
+        insert_and_flush(
+            &mut core,
+            coll,
+            &[(1, "a", Surrogate(501)), (2, "b", Surrogate(502))],
+        );
+
+        let resp = scan_response(&mut core, coll, &expired_task());
+
+        assert_eq!(
+            resp.status,
+            crate::bridge::envelope::Status::Error,
+            "an expired statement must not return rows"
+        );
+        assert_eq!(
+            resp.error_code.as_deref(),
+            Some(&crate::bridge::envelope::ErrorCode::DeadlineExceeded)
+        );
+        assert!(
+            resp.payload.is_empty(),
+            "a stopped scan carries no rows: a short result set is \
+             indistinguishable from a complete one at the client"
+        );
+    }
+
+    /// The companion negative: the same scan with a live deadline returns every
+    /// row, so the check above is not firing on every scan.
+    #[test]
+    fn a_live_deadline_leaves_the_scan_alone() {
+        let (mut core, _dir) = make_core();
+        let coll = "cf_deadline_live";
+        insert_and_flush(
+            &mut core,
+            coll,
+            &[(1, "a", Surrogate(601)), (2, "b", Surrogate(602))],
+        );
+
+        let resp = scan_response(&mut core, coll, &make_task());
+        assert_eq!(resp.status, crate::bridge::envelope::Status::Ok);
+        let decoded: Vec<nodedb_types::JsonValue> =
+            zerompk::from_msgpack(resp.payload.as_bytes()).expect("decode scan payload");
+        let rows: Vec<serde_json::Value> = decoded.into_iter().map(|j| j.0).collect();
+        assert_eq!(ids(&rows), vec![1, 2]);
     }
 
     /// Lockstep invariant: after a flush the two maps are equal-length per key

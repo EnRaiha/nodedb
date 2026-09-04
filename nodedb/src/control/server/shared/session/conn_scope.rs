@@ -8,8 +8,9 @@
 //! `.await` — tokio may poll a connection on a different worker after any of
 //! them. They share one task-local so the connection future gains one layer.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
+use std::time::Instant;
 
 use super::audit_context::AuditCtx;
 use super::ddl_buffer::DdlBuffer;
@@ -24,6 +25,10 @@ pub(super) struct ConnScope {
     /// SEQUENCE`, not yet visible in the shared registry. See
     /// `ephemeral_sequence` and `control::sequence::ddl_overlay`.
     pub(super) ephemeral_sequences: RefCell<EphemeralSequences>,
+    /// Absolute instant the statement now running on this connection must stop
+    /// at. `None` between statements, and on a connection future that has not
+    /// entered a statement scope. See [`super::deadline`].
+    pub(super) statement_deadline: Cell<Option<Instant>>,
 }
 
 impl ConnScope {
@@ -32,6 +37,7 @@ impl ConnScope {
             ddl_buffer: RefCell::new(None),
             audit: RefCell::new(None),
             ephemeral_sequences: RefCell::new(EphemeralSequences::new()),
+            statement_deadline: Cell::new(None),
         }
     }
 }
