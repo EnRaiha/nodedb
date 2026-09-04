@@ -120,13 +120,18 @@ impl CoreLoop {
                         "pressure Critical — lifting SPSC suspension"
                     );
                 }
-                let new_depth = (self.spsc_read_depth / 2).max(1);
-                if new_depth != self.spsc_read_depth {
-                    self.spsc_read_depth = new_depth;
+                // Throttle is ONE step from normal (64 -> 32), held while
+                // Critical persists. The old per-tick halving compounded
+                // (depth/2).max(1) every tick, collapsing 64 -> 1 after six
+                // Critical ticks — indistinguishable from an Emergency stall.
+                // Only the Emergency branch sets depth to 1.
+                let desired = SPSC_READ_DEPTH_NORMAL / 2;
+                if self.spsc_read_depth != desired {
+                    self.spsc_read_depth = desired;
                     warn!(
                         core = self.core_id,
-                        read_depth = new_depth,
-                        "Critical memory pressure — reduced SPSC read depth"
+                        read_depth = desired,
+                        "Critical memory pressure — throttled SPSC read depth"
                     );
                 }
             }
@@ -352,6 +357,23 @@ mod tests {
              cascade that turns transient or accounting-drift memory pressure \
              into permanent schema-register barrier timeouts and a server that \
              answers /healthz but fails every DDL"
+        );
+    }
+
+    #[test]
+    fn spsc_critical_ticks_do_not_collapse_to_one() {
+        // CLAIM D1: sustained Critical applies (depth/2).max(1) per tick,
+        // compounding 64 -> 1 instead of settling at NORMAL/2.
+        let (mut core, _tx, _rx, _dir) = make_core();
+        core.spsc_read_depth = SPSC_READ_DEPTH_NORMAL;
+        core.set_governor(make_governor_at(EngineId::Vector, 88));
+        for _ in 0..6 {
+            core.apply_spsc_pressure();
+        }
+        assert_eq!(
+            core.spsc_read_depth,
+            SPSC_READ_DEPTH_NORMAL / 2,
+            "D1: sustained Critical must settle at NORMAL/2, not compound to 1"
         );
     }
 
