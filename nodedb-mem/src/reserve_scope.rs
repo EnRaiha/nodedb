@@ -93,6 +93,16 @@ impl ReserveScope {
         }
     }
 
+    /// Credit the global ceiling unconditionally, ignoring the limit.
+    ///
+    /// The caller already holds this memory — a denial here would only
+    /// hide it from the ceiling, not free it. Always succeeds, even past
+    /// the ceiling.
+    pub(crate) fn credit_global_unchecked(&mut self) {
+        self.global.allocated.fetch_add(self.size, Ordering::AcqRel);
+        self.global_credited = true;
+    }
+
     /// Record an already-credited database counter so `Drop` releases it.
     pub(crate) fn credit_database(&mut self, counter: Arc<AtomicUsize>) {
         self.database = Some(counter);

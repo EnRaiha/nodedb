@@ -67,6 +67,22 @@ impl Budget {
         }
     }
 
+    /// Raise `peak` to `new_allocated` if it is a new high-water mark.
+    fn raise_peak(&self, new_allocated: usize) {
+        let mut peak = self.peak.load(Ordering::Relaxed);
+        while new_allocated > peak {
+            match self.peak.compare_exchange_weak(
+                peak,
+                new_allocated,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => peak = actual,
+            }
+        }
+    }
+
     /// Try to reserve `size` bytes from this budget.
     ///
     /// Returns `true` if the reservation succeeded, `false` if it would
@@ -89,20 +105,7 @@ impl Budget {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    // Update peak if necessary.
-                    let new_allocated = current + size;
-                    let mut peak = self.peak.load(Ordering::Relaxed);
-                    while new_allocated > peak {
-                        match self.peak.compare_exchange_weak(
-                            peak,
-                            new_allocated,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        ) {
-                            Ok(_) => break,
-                            Err(actual) => peak = actual,
-                        }
-                    }
+                    self.raise_peak(current + size);
                     return true;
                 }
                 Err(_) => continue, // Retry CAS.
@@ -120,6 +123,17 @@ impl Budget {
         } else {
             None
         }
+    }
+
+    /// Credit `size` bytes unconditionally, ignoring the limit.
+    ///
+    /// The caller already holds this memory — a denial here would only
+    /// hide it from the budget, not free it. Returns the shared `Arc` so
+    /// the caller can release it on drop, same as `try_reserve_arc`.
+    pub(crate) fn credit_arc(&self, size: usize) -> Arc<AtomicUsize> {
+        let new_allocated = self.allocated.fetch_add(size, Ordering::AcqRel) + size;
+        self.raise_peak(new_allocated);
+        Arc::clone(&self.allocated)
     }
 
     /// Current allocated bytes.

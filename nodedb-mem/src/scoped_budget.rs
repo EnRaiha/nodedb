@@ -57,6 +57,16 @@ impl ScopedBudget {
         }
     }
 
+    /// Credit `size` bytes unconditionally, ignoring the cap.
+    ///
+    /// The caller already holds this memory — a denial here would only
+    /// hide it from the scope, not free it. Returns the shared `Arc` so
+    /// the caller can release it on drop, same as `try_reserve`.
+    pub(crate) fn credit(&self, size: usize) -> Arc<AtomicUsize> {
+        self.allocated.fetch_add(size, Ordering::AcqRel);
+        Arc::clone(&self.allocated)
+    }
+
     /// Bytes left under the cap. `usize::MAX` when uncapped.
     pub(crate) fn available(&self) -> usize {
         match self.limit {
