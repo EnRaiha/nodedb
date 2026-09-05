@@ -43,6 +43,7 @@ pub mod governor;
 pub mod metrics;
 pub mod pressure;
 pub mod reservation_token;
+mod reserve_scope;
 mod scoped_budget;
 pub mod spill;
 

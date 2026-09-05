@@ -110,15 +110,15 @@ impl Drop for ReservationToken {
 
         // Release in reverse order: engine → tenant → database → global.
         //
-        // Each decrement saturates at zero. The legacy `MemoryGovernor::release`
-        // path touches the engine + global counters directly, so a counter can
-        // legitimately be below this token's `size` by the time the token drops
-        // (e.g. a timeseries flush released the memtable footprint while a
-        // per-batch token was still in scope). A plain `fetch_sub` would wrap
-        // such a counter to ~usize::MAX, which every utilization reader treats
-        // as 100 % → permanent Emergency pressure → suspended SPSC reads →
-        // schema-register barrier deadlock. Clamping keeps an over-release a
-        // harmless zero instead.
+        // Each decrement saturates at zero. A concurrent `BudgetGuard` on the
+        // same engine counter touches the engine + global counters directly,
+        // so a counter can legitimately be below this token's `size` by the
+        // time the token drops (e.g. a timeseries flush released the memtable
+        // footprint while a per-batch token was still in scope). A plain
+        // `fetch_sub` would wrap such a counter to ~usize::MAX, which every
+        // utilization reader treats as 100 % → permanent Emergency pressure →
+        // suspended SPSC reads → schema-register barrier deadlock. Clamping
+        // keeps an over-release a harmless zero instead.
         if let Some(ref counter) = self.engine_counter {
             crate::budget::atomic_saturating_sub(counter, size);
         }
@@ -221,15 +221,14 @@ mod tests {
 
     #[test]
     fn drop_does_not_underflow_a_counter_released_below_size() {
-        // The governor exposes two release paths: the RAII token (this
-        // type, four layers) and the legacy `MemoryGovernor::release`
-        // (engine + global only). When both touch the same engine budget
-        // — e.g. a timeseries flush calls `release(memtable_bytes)` while
-        // a live per-batch token still holds a small reservation — the
-        // budget can be driven to zero before the token drops. The
-        // token's `fetch_sub` on drop must NOT wrap that counter into the
-        // multi-exabyte range: a wrapped engine or tenant counter reads
-        // as 100% utilization (Emergency) forever, suspends the core's
+        // The governor exposes two RAII release paths: this token (four
+        // layers) and `BudgetGuard` (engine + global only). When both touch
+        // the same engine budget — e.g. a `BudgetGuard` for a timeseries
+        // flush drops while a live per-batch token still holds a small
+        // reservation — the budget can be driven to zero before the token
+        // drops. The token's `fetch_sub` on drop must NOT wrap that counter
+        // into the multi-exabyte range: a wrapped engine or tenant counter
+        // reads as 100% utilization (Emergency) forever, suspends the core's
         // SPSC reads, and deadlocks every subsequent DDL on the
         // schema-register barrier — the exact "healthy /healthz, every
         // query fails" failure mode. Drop must saturate at zero.
@@ -248,7 +247,7 @@ mod tests {
             engine: EngineId::Timeseries,
         });
 
-        // A concurrent legacy release drains the engine + global counters
+        // A concurrent `BudgetGuard` drop drains the engine + global counters
         // past what this token reserved (a flush releasing the full
         // memtable footprint while the small per-batch token is alive).
         engine_ctr.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -270,7 +269,7 @@ mod tests {
             glob, 0,
             "global counter underflowed to {glob} on token drop"
         );
-        // The tenant layer was not touched by the legacy release, so it
+        // The tenant layer was not touched by the concurrent drop, so it
         // returns to zero normally — proving the drop still works where
         // the counter is consistent.
         assert_eq!(tenant, 0, "tenant counter should release normally to 0");

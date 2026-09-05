@@ -108,13 +108,10 @@ impl CoreLoop {
         };
         let drain = mt.drain();
 
-        // The memtable is now empty — drop its memory reservation. The
-        // reservation tracked the full resident footprint (kept current by
-        // `recharge_ts_memtable_budget` after every ingest), so dropping the
-        // token here releases exactly what was reserved. This replaces the
-        // old `gov.release(Timeseries, memtable_bytes)` call, which released
-        // the memtable footprint against a budget that ingest had only ever
-        // charged a tiny per-batch estimate — an over-release on every flush.
+        // The memtable is empty, so drop its memory reservation. The
+        // reservation tracks the full resident footprint, kept current by
+        // `recharge_ts_memtable_budget` after every ingest, so dropping the
+        // token here releases exactly what was reserved.
         self.columnar_memtable_mem.remove(&key);
 
         tracing::info!(

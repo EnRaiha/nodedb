@@ -23,10 +23,13 @@
 //! that are the sole record of outstanding reservations.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
+use crate::budget::atomic_saturating_sub;
 use crate::engine::EngineId;
 use crate::error::{MemError, Result};
-use crate::governor::MemoryGovernor;
+use crate::governor::{GlobalCounter, MemoryGovernor};
+use crate::reserve_scope::ReserveScope;
 
 /// RAII guard that holds a byte reservation from the [`MemoryGovernor`].
 ///
@@ -39,16 +42,24 @@ use crate::governor::MemoryGovernor;
 #[must_use = "dropping a BudgetGuard immediately releases the reservation; bind it to a variable"]
 #[derive(Debug)]
 pub struct BudgetGuard {
-    governor: Arc<MemoryGovernor>,
+    global_counter: Arc<GlobalCounter>,
+    engine_counter: Arc<AtomicUsize>,
     engine: EngineId,
     bytes: usize,
 }
 
 impl BudgetGuard {
-    /// Internal constructor — called only by [`MemoryGovernor::reserve`].
-    pub(crate) fn new(governor: Arc<MemoryGovernor>, engine: EngineId, bytes: usize) -> Self {
+    /// Internal constructor — called only by [`MemoryGovernor::reserve`] with
+    /// the counters a committed [`ReserveScope`] credited.
+    pub(crate) fn new(
+        global_counter: Arc<GlobalCounter>,
+        engine_counter: Arc<AtomicUsize>,
+        engine: EngineId,
+        bytes: usize,
+    ) -> Self {
         Self {
-            governor,
+            global_counter,
+            engine_counter,
             engine,
             bytes,
         }
@@ -67,13 +78,22 @@ impl BudgetGuard {
 
 impl Drop for BudgetGuard {
     fn drop(&mut self) {
-        self.governor.release(self.engine, self.bytes);
+        if self.bytes == 0 {
+            return;
+        }
+        atomic_saturating_sub(&self.engine_counter, self.bytes);
+        atomic_saturating_sub(&self.global_counter.allocated, self.bytes);
     }
 }
 
 impl MemoryGovernor {
     /// Reserve `bytes` for `engine` and return a [`BudgetGuard`] that releases
     /// them on drop.
+    ///
+    /// Credits the global counter and the engine budget only — the same two
+    /// layers the guard releases on drop, so credit and release stay
+    /// symmetric. Callers that also need the database/tenant layers must use
+    /// [`MemoryGovernor::try_reserve`] and hold a `ReservationToken`.
     ///
     /// # Errors
     ///
@@ -83,28 +103,29 @@ impl MemoryGovernor {
     pub fn reserve(self: &Arc<Self>, engine: EngineId, bytes: usize) -> Result<BudgetGuard> {
         let budget = self.budget(engine).ok_or(MemError::UnknownEngine(engine))?;
 
-        // Global ceiling check.
-        let total_allocated = self.total_allocated();
-        let ceiling = self.global_ceiling();
-        if total_allocated + bytes > ceiling {
-            return Err(MemError::GlobalCeilingExceeded {
-                allocated: total_allocated,
-                ceiling,
-                requested: bytes,
-            });
-        }
+        let mut scope = ReserveScope::new(Arc::clone(&self.global_counter), bytes);
+        scope.try_credit_global()?;
 
-        // Per-engine check.
-        if !budget.try_reserve(bytes) {
-            return Err(MemError::BudgetExhausted {
-                engine,
-                requested: bytes,
-                available: budget.available(),
-                limit: budget.limit(),
-            });
-        }
+        let engine_counter = match budget.try_reserve_arc(bytes) {
+            Some(arc) => arc,
+            None => {
+                return Err(MemError::BudgetExhausted {
+                    engine,
+                    requested: bytes,
+                    available: budget.available(),
+                    limit: budget.limit(),
+                });
+            }
+        };
+        scope.credit_engine(Arc::clone(&engine_counter));
 
-        Ok(BudgetGuard::new(Arc::clone(self), engine, bytes))
+        let layers = scope.commit();
+        Ok(BudgetGuard::new(
+            layers.global,
+            engine_counter,
+            engine,
+            bytes,
+        ))
     }
 }
 
@@ -112,6 +133,7 @@ impl MemoryGovernor {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use super::*;
     use crate::error::MemError;
@@ -126,6 +148,26 @@ mod tests {
             })
             .expect("valid config"),
         )
+    }
+
+    #[test]
+    fn guard_reserve_and_drop_move_the_global_counter_symmetrically() {
+        let gov = make_governor(&[(EngineId::Vector, 4096)], 8192);
+
+        {
+            let _guard = gov.reserve(EngineId::Vector, 1000).expect("within budget");
+            assert_eq!(
+                gov.global_counter.allocated.load(Ordering::Relaxed),
+                1000,
+                "a guard reservation must increment the global counter it releases on drop"
+            );
+        }
+
+        assert_eq!(
+            gov.global_counter.allocated.load(Ordering::Relaxed),
+            0,
+            "dropping the guard must return the global counter to zero"
+        );
     }
 
     #[test]
