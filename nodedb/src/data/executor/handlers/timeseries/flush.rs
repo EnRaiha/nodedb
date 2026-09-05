@@ -238,18 +238,14 @@ impl CoreLoop {
         }
     }
 
-    /// Re-charge the engine memory budget for a timeseries memtable's
-    /// current resident footprint.
+    /// Charge the memtable's current resident footprint, replacing the
+    /// prior charge so the budget tracks `memory_bytes()`, not the sum of
+    /// every recharge.
     ///
-    /// Called after every ingest into `collection`'s memtable (ILP/JSON/
-    /// msgpack ingest and WAL replay). Drops the previous reservation — so
-    /// the budget tracks the memtable's net `memory_bytes()`, not the sum
-    /// of every recharge — then takes a fresh one. If the reservation
-    /// can't be granted (budget exhausted), the memtable runs un-accounted
-    /// until the next flush: an under-count, never an over-release. The
-    /// pre-flush-on-pressure check in the ingest path already tries to
-    /// drain before reaching here, and `flush_ts_collection` drops the
-    /// reservation when it drains the memtable.
+    /// Runs after every ingest and WAL replay. The bytes are already
+    /// resident, so the charge cannot be denied: hiding them would let
+    /// `worst_engine_pressure` under-report while the engine holds the most.
+    /// `flush_ts_collection` drops the charge when it drains the memtable.
     pub(in crate::data::executor) fn recharge_ts_memtable_budget(
         &mut self,
         tid: TenantId,
@@ -274,9 +270,8 @@ impl CoreLoop {
         if bytes == 0 {
             return;
         }
-        if let Ok(token) = gov.try_reserve(db_id, tid, nodedb_mem::EngineId::Timeseries, bytes) {
-            self.columnar_memtable_mem.insert(key, token);
-        }
+        let mem = nodedb_mem::ScopedMemory::new(gov, db_id, tid, nodedb_mem::EngineId::Timeseries);
+        self.columnar_memtable_mem.insert(key, mem.charge(bytes));
     }
 }
 
