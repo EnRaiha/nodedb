@@ -196,6 +196,7 @@ mod tests {
                 resp_tx,
                 dir,
                 Arc::new(nodedb_types::OrdinalClock::new()),
+                crate::data::executor::core_loop::test_governor(),
             )
             .expect("CoreLoop::open");
             Self {

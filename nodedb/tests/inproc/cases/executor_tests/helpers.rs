@@ -48,6 +48,7 @@ pub fn make_core_with_id(
         resp_tx,
         dir.path(),
         std::sync::Arc::new(nodedb_types::OrdinalClock::new()),
+        nodedb::data::executor::core_loop::test_governor(),
     )
     .unwrap();
     (core, req_tx, resp_rx, dir)

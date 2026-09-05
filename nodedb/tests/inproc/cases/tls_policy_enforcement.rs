@@ -151,6 +151,7 @@ fn open_state(
         &auth_config,
         nodedb_types::config::TuningConfig::default(),
         false,
+        nodedb::data::executor::core_loop::test_governor(),
     )
 }
 

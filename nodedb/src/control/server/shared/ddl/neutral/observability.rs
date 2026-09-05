@@ -221,35 +221,33 @@ pub fn show_memory(
     ];
 
     let mut rows = Vec::new();
-    if let Some(gov) = state.governor.as_ref() {
-        for snap in gov.snapshot() {
-            let mut row = Map::new();
-            row.insert(
-                "engine".to_string(),
-                JsonValue::String(format!("{:?}", snap.engine)),
-            );
-            row.insert(
-                "allocated_bytes".to_string(),
-                JsonValue::String((snap.allocated as i64).to_string()),
-            );
-            row.insert(
-                "limit_bytes".to_string(),
-                JsonValue::String((snap.limit as i64).to_string()),
-            );
-            row.insert(
-                "peak_bytes".to_string(),
-                JsonValue::String((snap.peak as i64).to_string()),
-            );
-            row.insert(
-                "rejections".to_string(),
-                JsonValue::String((snap.rejections as i64).to_string()),
-            );
-            row.insert(
-                "utilization_percent".to_string(),
-                JsonValue::String((snap.utilization_percent as i64).to_string()),
-            );
-            rows.push(row);
-        }
+    for snap in state.governor.snapshot() {
+        let mut row = Map::new();
+        row.insert(
+            "engine".to_string(),
+            JsonValue::String(format!("{:?}", snap.engine)),
+        );
+        row.insert(
+            "allocated_bytes".to_string(),
+            JsonValue::String((snap.allocated as i64).to_string()),
+        );
+        row.insert(
+            "limit_bytes".to_string(),
+            JsonValue::String((snap.limit as i64).to_string()),
+        );
+        row.insert(
+            "peak_bytes".to_string(),
+            JsonValue::String((snap.peak as i64).to_string()),
+        );
+        row.insert(
+            "rejections".to_string(),
+            JsonValue::String((snap.rejections as i64).to_string()),
+        );
+        row.insert(
+            "utilization_percent".to_string(),
+            JsonValue::String((snap.utilization_percent as i64).to_string()),
+        );
+        rows.push(row);
     }
 
     Ok(vec![DdlResult::Rows(ShapedRows {

@@ -72,6 +72,7 @@ pub fn spawn_core(
                 response_tx,
                 &data_dir,
                 hlc,
+                governor,
                 array_catalog,
             )
             .expect("failed to open CoreLoop engines");
@@ -79,7 +80,6 @@ pub fn spawn_core(
             wire_core_dependencies(
                 &mut core,
                 WiredDependencies {
-                    governor,
                     maintenance_budget,
                     system_metrics,
                     event_producer,
@@ -151,7 +151,6 @@ pub fn spawn_core(
 
 /// The shared handles a spawned core is wired with before it recovers.
 struct WiredDependencies {
-    governor: Arc<nodedb_mem::MemoryGovernor>,
     maintenance_budget: Arc<crate::control::maintenance::MaintenanceBudgetTracker>,
     system_metrics: Option<Arc<crate::control::metrics::SystemMetrics>>,
     event_producer: Option<crate::event::bus::EventProducer>,
@@ -164,7 +163,6 @@ struct WiredDependencies {
 /// recovery beyond running before it.
 fn wire_core_dependencies(core: &mut CoreLoop, deps: WiredDependencies) {
     let WiredDependencies {
-        governor,
         maintenance_budget,
         system_metrics,
         event_producer,
@@ -172,8 +170,6 @@ fn wire_core_dependencies(core: &mut CoreLoop, deps: WiredDependencies) {
         quarantine_registry,
     } = deps;
 
-    // 2b. Apply memory governor.
-    core.set_governor(governor);
     core.set_maintenance_budget(maintenance_budget);
 
     // 2b. Apply metrics reference.

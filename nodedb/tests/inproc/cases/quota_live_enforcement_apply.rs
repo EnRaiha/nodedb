@@ -107,11 +107,7 @@ async fn alter_tenant_quota_applies_connection_cap_and_memory_budget() {
     let db = DatabaseId::DEFAULT;
     let tenant = TenantId::new(TENANT);
     let registry = &server.shared.admission_registry;
-    let gov = server
-        .shared
-        .governor
-        .clone()
-        .expect("the harness wires a memory governor");
+    let gov = server.shared.governor.clone();
 
     assert_eq!(
         registry.tenant_live_connections(db, tenant),
@@ -202,11 +198,7 @@ async fn alter_tenant_string_form_applies_live_enforcement() {
     let server = start_with_tenant().await;
     let db = DatabaseId::DEFAULT;
     let tenant = TenantId::new(TENANT);
-    let gov = server
-        .shared
-        .governor
-        .clone()
-        .expect("the harness wires a memory governor");
+    let gov = server.shared.governor.clone();
 
     server
         .exec(&format!(

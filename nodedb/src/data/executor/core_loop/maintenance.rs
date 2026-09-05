@@ -48,11 +48,6 @@ impl CoreLoop {
         self.metrics.as_ref()
     }
 
-    /// Set memory governor for per-engine budget enforcement.
-    pub fn set_governor(&mut self, governor: Arc<nodedb_mem::MemoryGovernor>) {
-        self.governor = Some(governor);
-    }
-
     /// Set the shared per-database maintenance CPU budget tracker.
     pub fn set_maintenance_budget(
         &mut self,

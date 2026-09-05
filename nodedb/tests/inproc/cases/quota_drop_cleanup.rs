@@ -44,11 +44,7 @@ async fn drop_database_removes_quota_row_and_releases_caps() {
     let db = db_id(&server, "quota_drop_db");
     let tenant = TenantId::new(0);
     let registry = &server.shared.admission_registry;
-    let gov = server
-        .shared
-        .governor
-        .clone()
-        .expect("the harness wires a memory governor");
+    let gov = server.shared.governor.clone();
 
     server
         .exec(&format!(

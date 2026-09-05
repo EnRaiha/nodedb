@@ -77,6 +77,7 @@ async fn event_plane_watermarks_persisted_through_shutdown() {
             &AuthConfig::default(),
             Default::default(),
             false,
+            nodedb::data::executor::core_loop::test_governor(),
         )
         .expect("shared_state");
         let cdc_router = Arc::clone(&shared.cdc_router);

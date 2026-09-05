@@ -271,17 +271,13 @@ pub(super) fn apply_csr(
         }
     };
 
-    let rebuilt = if let Some(gov) = core.governor.clone() {
-        let memory = nodedb_mem::ScopedMemory::new(
-            gov,
-            *database_id,
-            *tenant_id,
-            nodedb_mem::EngineId::Graph,
-        );
-        rebuilt.with_memory_attached(memory)
-    } else {
-        rebuilt
-    };
+    let memory = nodedb_mem::ScopedMemory::new(
+        core.governor.clone(),
+        *database_id,
+        *tenant_id,
+        nodedb_mem::EngineId::Graph,
+    );
+    let rebuilt = rebuilt.with_memory_attached(memory);
 
     core.csr
         .install_partition(*database_id, *tenant_id, rebuilt);

@@ -45,8 +45,7 @@ impl CoreLoop {
         task: &ExecutionTask,
         engine: EngineId,
     ) -> Option<Response> {
-        let governor = self.governor.as_ref()?;
-        let pressure = governor.engine_pressure(engine);
+        let pressure = self.governor.engine_pressure(engine);
         match pressure {
             PressureLevel::Normal | PressureLevel::Warning => None,
             PressureLevel::Critical => {
@@ -79,12 +78,8 @@ impl CoreLoop {
     /// Called once per tick. Mutates `spsc_read_depth`, `pressure_suspend_reads`,
     /// and `pressure_normal_ticks`.
     pub fn apply_spsc_pressure(&mut self) {
-        let Some(ref governor) = self.governor else {
-            return;
-        };
-
         // Worst-case pressure across all engines that have a budget.
-        let worst = governor.worst_engine_pressure();
+        let worst = self.governor.worst_engine_pressure();
 
         match worst {
             PressureLevel::Normal | PressureLevel::Warning => {
@@ -176,6 +171,7 @@ mod tests {
             resp_tx,
             dir.path(),
             Arc::new(nodedb_types::OrdinalClock::new()),
+            make_governor_at(EngineId::Vector, 0),
         )
         .unwrap();
         (core, req_tx, resp_rx, dir)
@@ -237,20 +233,9 @@ mod tests {
     }
 
     #[test]
-    fn no_governor_always_allows() {
-        let (core, _tx, _rx, _dir) = make_core();
-        let task = make_task();
-        assert!(
-            core.check_engine_pressure(&task, EngineId::Vector)
-                .is_none(),
-            "no governor: must always allow"
-        );
-    }
-
-    #[test]
     fn normal_pressure_allows() {
         let (mut core, _tx, _rx, _dir) = make_core();
-        core.set_governor(make_governor_at(EngineId::Vector, 0));
+        core.governor = make_governor_at(EngineId::Vector, 0);
         let task = make_task();
         assert!(
             core.check_engine_pressure(&task, EngineId::Vector)
@@ -261,7 +246,7 @@ mod tests {
     #[test]
     fn warning_pressure_allows() {
         let (mut core, _tx, _rx, _dir) = make_core();
-        core.set_governor(make_governor_at(EngineId::Vector, 75));
+        core.governor = make_governor_at(EngineId::Vector, 75);
         let task = make_task();
         assert!(
             core.check_engine_pressure(&task, EngineId::Vector)
@@ -274,7 +259,7 @@ mod tests {
         let (mut core, _tx, _rx, _dir) = make_core();
         let metrics = Arc::new(crate::control::metrics::SystemMetrics::new());
         core.set_metrics(metrics.clone());
-        core.set_governor(make_governor_at(EngineId::Vector, 88));
+        core.governor = make_governor_at(EngineId::Vector, 88);
         let task = make_task();
         let result = core.check_engine_pressure(&task, EngineId::Vector);
         assert!(result.is_none(), "Critical must allow (None)");
@@ -287,7 +272,7 @@ mod tests {
         let (mut core, _tx, _rx, _dir) = make_core();
         let metrics = Arc::new(crate::control::metrics::SystemMetrics::new());
         core.set_metrics(metrics.clone());
-        core.set_governor(make_governor_at(EngineId::Vector, 97));
+        core.governor = make_governor_at(EngineId::Vector, 97);
         let task = make_task();
         let result = core.check_engine_pressure(&task, EngineId::Vector);
         assert!(result.is_some(), "Emergency must reject (Some)");
@@ -305,7 +290,7 @@ mod tests {
     fn spsc_emergency_sets_suspend_flag() {
         let (mut core, _tx, _rx, _dir) = make_core();
         // Fill Vector to Emergency; all other engines at 0 — worst = Emergency.
-        core.set_governor(make_governor_at(EngineId::Vector, 97));
+        core.governor = make_governor_at(EngineId::Vector, 97);
         core.apply_spsc_pressure();
         assert!(
             core.pressure_suspend_reads,
@@ -324,7 +309,7 @@ mod tests {
         // hysteresis gate; the suspend flag must be cleared once it
         // crosses the threshold.
         let (mut core, _tx, _rx, _dir) = make_core();
-        core.set_governor(make_governor_at(EngineId::Vector, 97));
+        core.governor = make_governor_at(EngineId::Vector, 97);
         core.apply_spsc_pressure();
         assert!(
             core.pressure_suspend_reads,
@@ -332,7 +317,7 @@ mod tests {
         );
 
         // Governor pressure returns to Normal (a fresh governor at 0%).
-        core.set_governor(make_governor_at(EngineId::Vector, 0));
+        core.governor = make_governor_at(EngineId::Vector, 0);
         for _ in 0..(PRESSURE_NORMAL_HYSTERESIS - 1) {
             core.apply_spsc_pressure();
         }
@@ -355,7 +340,7 @@ mod tests {
     fn spsc_critical_halves_depth() {
         let (mut core, _tx, _rx, _dir) = make_core();
         core.spsc_read_depth = SPSC_READ_DEPTH_NORMAL;
-        core.set_governor(make_governor_at(EngineId::Vector, 88));
+        core.governor = make_governor_at(EngineId::Vector, 88);
         core.apply_spsc_pressure();
         assert_eq!(
             core.spsc_read_depth,
@@ -370,7 +355,7 @@ mod tests {
         core.spsc_read_depth = SPSC_READ_DEPTH_NORMAL / 2;
         core.pressure_normal_ticks = 0;
         // Normal governor (0% on all engines).
-        core.set_governor(make_governor_at(EngineId::Vector, 0));
+        core.governor = make_governor_at(EngineId::Vector, 0);
         // 7 ticks — must NOT restore.
         for _ in 0..7 {
             core.apply_spsc_pressure();

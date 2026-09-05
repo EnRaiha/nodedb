@@ -71,11 +71,9 @@ pub struct CoreLoopSpawn {
     pub event_producer: EventProducer,
     /// Optional system metrics handle wired via `core.set_metrics`.
     pub core_metrics: Option<Arc<SystemMetrics>>,
-    /// Optional memory governor wired via `core.set_governor`. Production
-    /// (`data::runtime`) always wires this; without it the Data Plane's
-    /// per-engine budget accounting (and the pressure detector that reads
-    /// it) is a no-op, so memory-balance assertions in tests are vacuous.
-    pub governor: Option<Arc<MemoryGovernor>>,
+    /// Memory governor, supplied to `CoreLoop::open_with_array_catalog` at
+    /// construction. Production (`data::runtime`) always wires a real one.
+    pub governor: Arc<MemoryGovernor>,
     /// WAL replay payload, or `None` for fresh-start cores.
     pub replay: Option<WalReplay>,
     /// Graph engine tuning wired via `core.set_graph_tuning`. Production
@@ -135,6 +133,7 @@ pub fn spawn_core_loop(spawn: CoreLoopSpawn) -> tokio::task::JoinHandle<()> {
                     data_side.response_tx,
                     &core_dir,
                     Arc::new(OrdinalClock::new()),
+                    governor,
                     core_array_catalog,
                 )
                 .expect("CoreLoop::open_with_array_catalog");
@@ -143,9 +142,6 @@ pub fn spawn_core_loop(spawn: CoreLoopSpawn) -> tokio::task::JoinHandle<()> {
                 core.set_graph_tuning(graph_tuning);
                 if let Some(m) = core_metrics {
                     core.set_metrics(m);
-                }
-                if let Some(g) = governor {
-                    core.set_governor(g);
                 }
                 // Before replay, never after: replay is what consults
                 // `doc_configs`, and production seeds it in the same order

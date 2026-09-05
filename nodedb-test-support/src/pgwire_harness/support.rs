@@ -18,16 +18,12 @@ use nodedb::control::state::SharedState;
 ///
 /// An 8 GiB ceiling keeps even the smallest per-engine slice generous
 /// enough that integration workloads never trip engine-level pressure.
-/// Returns `None` only if `GovernorConfig` validation fails.
-///
-/// Without a wired governor any test that asserts on balanced
-/// acquire/release after a workload trips on `governor.is_none()`
-/// instead of the real accounting bug — every test entry point that
-/// hands out a `SharedState` must install one.
-pub(super) fn init_test_memory_governor() -> Option<Arc<nodedb_mem::MemoryGovernor>> {
+/// Panics if `GovernorConfig` validation fails — an 8 GiB uniform budget
+/// over the default `EngineConfig` never does.
+pub(super) fn init_test_memory_governor() -> Arc<nodedb_mem::MemoryGovernor> {
     let ceiling: usize = 8 * 1024 * 1024 * 1024; // 8 GiB
     let budgets = nodedb::config::EngineConfig::default().to_byte_budgets(ceiling);
-    nodedb::memory::init_governor(ceiling, &budgets).ok()
+    nodedb::memory::init_governor(ceiling, &budgets).expect("harness governor config is valid")
 }
 
 /// Bind a native (MessagePack) protocol listener on `127.0.0.1:0` and

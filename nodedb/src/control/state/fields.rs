@@ -316,7 +316,7 @@ pub struct SharedState {
     /// Live retention settings. RwLock-wrapped for runtime ALTER SYSTEM mutation.
     pub retention_settings: Arc<std::sync::RwLock<crate::config::server::RetentionSettings>>,
     /// Memory governor for per-engine budget enforcement.
-    pub governor: Option<Arc<nodedb_mem::MemoryGovernor>>,
+    pub governor: Arc<nodedb_mem::MemoryGovernor>,
     /// Per-database maintenance CPU budget tracker. Shared with every Data
     /// Plane `CoreLoop` so all cores draw from the same per-database window.
     /// Populated from `ALTER DATABASE … SET QUOTA (maintenance_cpu_pct = N)`.

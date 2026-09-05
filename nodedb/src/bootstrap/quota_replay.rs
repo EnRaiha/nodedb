@@ -128,7 +128,7 @@ mod tests {
         let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
         let mut shared = SharedState::new(dispatcher, wal).expect("shared state");
         let state = Arc::get_mut(&mut shared).expect("state is uniquely owned here");
-        state.governor = Some(make_governor());
+        state.governor = make_governor();
         (shared, dir)
     }
 
@@ -159,8 +159,9 @@ mod tests {
         tenant: TenantId,
         bytes: u64,
     ) -> bool {
-        let gov = shared.governor.clone().expect("governor");
-        gov.try_reserve(db, tenant, EngineId::DocumentSchemaless, bytes as usize)
+        shared
+            .governor
+            .try_reserve(db, tenant, EngineId::DocumentSchemaless, bytes as usize)
             .is_ok()
     }
 

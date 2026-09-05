@@ -431,7 +431,7 @@ impl SharedState {
             retention_settings: Arc::new(std::sync::RwLock::new(
                 crate::config::server::RetentionSettings::default(),
             )),
-            governor: None,
+            governor: crate::data::executor::core_loop::test_governor(),
             maintenance_budget: Arc::new(
                 crate::control::maintenance::MaintenanceBudgetTracker::new(),
             ),

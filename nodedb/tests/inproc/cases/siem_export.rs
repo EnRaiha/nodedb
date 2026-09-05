@@ -40,6 +40,7 @@ fn open_state(siem: Option<SiemConfig>) -> (Arc<SharedState>, tempfile::TempDir)
         &auth_config,
         nodedb_types::config::TuningConfig::default(),
         false,
+        nodedb::data::executor::core_loop::test_governor(),
     )
     .expect("shared state opens");
     (state, dir)

@@ -109,16 +109,15 @@ impl CoreLoop {
 
         let key = (task.request.database_id, tid, collection.to_string());
         if mode == TimeseriesApplyMode::CommitDeferred {
-            let governor_pressure = self.governor.as_ref().is_some_and(|governor| {
-                governor
-                    .try_reserve(
-                        task.request.database_id,
-                        tid,
-                        nodedb_mem::EngineId::Timeseries,
-                        0,
-                    )
-                    .is_err()
-            });
+            let governor_pressure = self
+                .governor
+                .try_reserve(
+                    task.request.database_id,
+                    tid,
+                    nodedb_mem::EngineId::Timeseries,
+                    0,
+                )
+                .is_err();
             let needs_flush = self.columnar_memtables.get(&key).is_some_and(|memtable| {
                 memtable.memory_bytes() >= self.ts_tuning.memtable_budget_bytes
                     || memtable.memory_bytes() >= self.ts_tuning.memtable_hard_limit_bytes

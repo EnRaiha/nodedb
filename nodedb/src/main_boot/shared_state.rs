@@ -76,6 +76,7 @@ pub(crate) async fn open_and_wire_state(
         &config.auth,
         config.tuning.clone(),
         is_cluster,
+        Arc::clone(&governor),
     )?;
 
     // Install startup gate, wire subsystems and cluster handles into SharedState.
@@ -86,7 +87,6 @@ pub(crate) async fn open_and_wire_state(
         cluster_handle,
         bootstrap::state_wiring::SharedStateComponents {
             quarantine_registry: Arc::clone(&quarantine_registry),
-            governor: Arc::clone(&governor),
             array_catalog: Arc::clone(&array_catalog),
             maintenance_budget: Arc::clone(&maintenance_budget),
         },

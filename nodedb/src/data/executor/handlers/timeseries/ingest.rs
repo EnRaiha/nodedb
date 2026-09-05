@@ -75,16 +75,15 @@ impl CoreLoop {
             });
         }
 
-        let governor_pressure = self.governor.as_ref().is_some_and(|governor| {
-            governor
-                .try_reserve(
-                    task.request.database_id,
-                    tid,
-                    nodedb_mem::EngineId::Timeseries,
-                    0,
-                )
-                .is_err()
-        });
+        let governor_pressure = self
+            .governor
+            .try_reserve(
+                task.request.database_id,
+                tid,
+                nodedb_mem::EngineId::Timeseries,
+                0,
+            )
+            .is_err();
         let resident = match live_resident {
             Some(live) => live.saturating_add(
                 simulation
@@ -219,15 +218,15 @@ impl CoreLoop {
 
         // The WAL has already committed this record, so the admission gate
         // resolves every possible mid-record stop before the first row lands.
-        let governor_pressure = self.governor.as_ref().is_some_and(|g| {
-            g.try_reserve(
+        let governor_pressure = self
+            .governor
+            .try_reserve(
                 task.request.database_id,
                 tid,
                 nodedb_mem::EngineId::Timeseries,
                 0,
             )
-            .is_err()
-        });
+            .is_err();
         let soft_limit = self.ts_tuning.memtable_budget_bytes;
         let hard_limit = self.ts_tuning.memtable_hard_limit_bytes;
         let max_tag_cardinality = self.ts_tuning.max_tag_cardinality;

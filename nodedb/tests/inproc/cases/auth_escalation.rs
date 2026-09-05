@@ -49,6 +49,7 @@ fn open_state(dir: &Path, escalation: Option<EscalationConfig>) -> Arc<SharedSta
         &auth_config,
         nodedb_types::config::TuningConfig::default(),
         false,
+        nodedb::data::executor::core_loop::test_governor(),
     )
     .expect("shared state opens")
 }

@@ -61,6 +61,7 @@ impl TestStack {
                 data_side.response_tx,
                 &core_dir,
                 std::sync::Arc::new(nodedb_types::OrdinalClock::new()),
+                nodedb::data::executor::core_loop::test_governor(),
             )
             .unwrap();
             loop {
@@ -533,6 +534,7 @@ fn startup_replay_recovers_all_wal_data() {
         resp_tx,
         &data_dir,
         std::sync::Arc::new(nodedb_types::OrdinalClock::new()),
+        nodedb::data::executor::core_loop::test_governor(),
     )
     .unwrap();
 

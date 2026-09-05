@@ -199,7 +199,10 @@ impl CoreLoop {
             }
         };
 
-        let governor = self.governor.as_ref();
+        // `CompactLevelParams::governor` is `Option<&Arc<MemoryGovernor>>` in
+        // nodedb-fts (a shared engine crate, out of scope for this change) —
+        // `CoreLoop` always holds a governor now, so this is always `Some`.
+        let governor = Some(&self.governor);
         let params = CompactLevelParams {
             backend: self.inverted.backend(),
             database_id,

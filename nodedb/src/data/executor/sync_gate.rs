@@ -243,7 +243,15 @@ mod tests {
         let (req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
         let (resp_tx, _resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
         drop(req_tx); // not needed in gate tests
-        let core = CoreLoop::open(0, req_rx, resp_tx, dir.path(), hlc).expect("CoreLoop::open");
+        let core = CoreLoop::open(
+            0,
+            req_rx,
+            resp_tx,
+            dir.path(),
+            hlc,
+            crate::data::executor::core_loop::test_governor(),
+        )
+        .expect("CoreLoop::open");
         (core, dir)
     }
 

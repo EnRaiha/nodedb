@@ -50,7 +50,7 @@ fn make_governor_at(engine: EngineId, utilization_percent: u8) -> Arc<MemoryGove
 #[test]
 fn normal_pressure_read_depth_unchanged_and_no_suspension() {
     let (mut core, _tx, _rx, _dir) = crate::cases::core_loop::helpers::make_core();
-    core.set_governor(make_governor_at(EngineId::Vector, 50));
+    core.set_governor_for_testing(make_governor_at(EngineId::Vector, 50));
     core.apply_spsc_pressure();
 
     assert_eq!(
@@ -70,7 +70,7 @@ fn normal_pressure_read_depth_unchanged_and_no_suspension() {
 #[test]
 fn warning_pressure_read_depth_unchanged_and_no_suspension() {
     let (mut core, _tx, _rx, _dir) = crate::cases::core_loop::helpers::make_core();
-    core.set_governor(make_governor_at(EngineId::Vector, 75));
+    core.set_governor_for_testing(make_governor_at(EngineId::Vector, 75));
     core.apply_spsc_pressure();
 
     assert_eq!(
@@ -91,7 +91,7 @@ fn critical_pressure_halves_read_depth_and_increments_metric() {
     let (mut core, _tx, _rx, _dir) = crate::cases::core_loop::helpers::make_core();
     let metrics = Arc::new(SystemMetrics::new());
     core.set_metrics(metrics.clone());
-    core.set_governor(make_governor_at(EngineId::Vector, 88));
+    core.set_governor_for_testing(make_governor_at(EngineId::Vector, 88));
 
     core.apply_spsc_pressure();
 
@@ -136,7 +136,7 @@ fn critical_check_engine_pressure_increments_metric() {
     let (mut core, _tx, _rx, _dir) = crate::cases::core_loop::helpers::make_core();
     let metrics = Arc::new(SystemMetrics::new());
     core.set_metrics(metrics.clone());
-    core.set_governor(make_governor_at(EngineId::Vector, 88));
+    core.set_governor_for_testing(make_governor_at(EngineId::Vector, 88));
 
     let task = ExecutionTask::new(Request {
         request_id: RequestId::new(1),
@@ -198,7 +198,7 @@ fn emergency_pressure_suspends_reads_and_increments_metric() {
     let (mut core, _tx, _rx, _dir) = crate::cases::core_loop::helpers::make_core();
     let metrics = Arc::new(SystemMetrics::new());
     core.set_metrics(metrics.clone());
-    core.set_governor(make_governor_at(EngineId::Vector, 96));
+    core.set_governor_for_testing(make_governor_at(EngineId::Vector, 96));
 
     // SPSC path: suspends reads.
     core.apply_spsc_pressure();
@@ -266,7 +266,7 @@ fn hysteresis_clears_suspension_and_restores_read_depth_after_n_ticks() {
     let (mut core, _tx, _rx, _dir) = crate::cases::core_loop::helpers::make_core();
 
     // Drive the core into Emergency to establish the suspended state.
-    core.set_governor(make_governor_at(EngineId::Vector, 96));
+    core.set_governor_for_testing(make_governor_at(EngineId::Vector, 96));
     core.apply_spsc_pressure();
     assert!(
         core.pressure_suspend_reads(),
@@ -274,7 +274,7 @@ fn hysteresis_clears_suspension_and_restores_read_depth_after_n_ticks() {
     );
 
     // Drop pressure to 60% (Normal — below all thresholds).
-    core.set_governor(make_governor_at(EngineId::Vector, 60));
+    core.set_governor_for_testing(make_governor_at(EngineId::Vector, 60));
 
     // Ticks 1–7: hysteresis counter not yet reached; suspension still lifted
     // (Critical branch lifts suspension immediately, Normal/Warning requires

@@ -463,6 +463,7 @@ mod tests {
             response_tx,
             dir.path(),
             Arc::new(nodedb_types::OrdinalClock::new()),
+            crate::data::executor::core_loop::test_governor(),
         )
         .expect("open CoreLoop");
         (core, dir)

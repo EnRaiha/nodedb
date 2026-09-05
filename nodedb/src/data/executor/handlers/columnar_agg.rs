@@ -42,7 +42,7 @@ pub(super) struct ColumnarAggParams<'a> {
     pub scan_limit: usize,
     pub spill_dir: &'a std::path::Path,
     pub spill_cap: usize,
-    pub governor: Option<std::sync::Arc<nodedb_mem::MemoryGovernor>>,
+    pub governor: std::sync::Arc<nodedb_mem::MemoryGovernor>,
     /// Database the query executes against, for memory governor scoping.
     pub db: crate::types::DatabaseId,
     /// Tenant the query executes on behalf of.
@@ -62,7 +62,6 @@ pub(super) fn try_columnar_aggregate(p: &ColumnarAggParams<'_>) -> Option<Column
     let (mt, group_by, aggregates, filters) = (p.mt, p.group_by, p.aggregates, p.filters);
     let (limit, scan_limit, spill_dir, spill_cap) =
         (p.limit, p.scan_limit, p.spill_dir, p.spill_cap);
-    let governor = p.governor.clone();
     let (db, tenant) = (p.db, p.tenant);
     let schema = mt.schema();
     let row_count = (mt.row_count() as usize).min(scan_limit);
@@ -196,7 +195,7 @@ pub(super) fn try_columnar_aggregate(p: &ColumnarAggParams<'_>) -> Option<Column
         let mut spiller = match ColumnarGroupBySpiller::new(
             spill_dir.to_path_buf(),
             spill_cap,
-            governor.clone(),
+            p.governor.clone(),
             db,
             tenant,
         ) {
@@ -503,7 +502,7 @@ mod tests {
             scan_limit: 100_000,
             spill_dir: &sd,
             spill_cap: 1_000_000,
-            governor: None,
+            governor: crate::data::executor::core_loop::test_governor(),
             db: crate::types::DatabaseId::DEFAULT,
             tenant: crate::types::TenantId::new(1),
         })
@@ -529,7 +528,7 @@ mod tests {
             scan_limit: 100_000,
             spill_dir: &sd,
             spill_cap: 1_000_000,
-            governor: None,
+            governor: crate::data::executor::core_loop::test_governor(),
             db: crate::types::DatabaseId::DEFAULT,
             tenant: crate::types::TenantId::new(1),
         })
@@ -558,7 +557,7 @@ mod tests {
             scan_limit: 100_000,
             spill_dir: &sd,
             spill_cap: 1_000_000,
-            governor: None,
+            governor: crate::data::executor::core_loop::test_governor(),
             db: crate::types::DatabaseId::DEFAULT,
             tenant: crate::types::TenantId::new(1),
         })
@@ -585,7 +584,7 @@ mod tests {
             scan_limit: 100_000,
             spill_dir: &sd,
             spill_cap: 1_000_000,
-            governor: None,
+            governor: crate::data::executor::core_loop::test_governor(),
             db: crate::types::DatabaseId::DEFAULT,
             tenant: crate::types::TenantId::new(1),
         })

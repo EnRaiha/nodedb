@@ -22,7 +22,7 @@ pub(in crate::data::executor::handlers) struct ColumnarGroupBySpiller {
     core: SpillCore<GroupKey, Vec<AggAccum>>,
     in_mem: HashMap<GroupKey, Vec<AggAccum>>,
     cap: usize,
-    governor: Option<Arc<nodedb_mem::MemoryGovernor>>,
+    governor: Arc<nodedb_mem::MemoryGovernor>,
     feed_counter: u64,
     /// Database this spiller is executing on behalf of.
     db: DatabaseId,
@@ -34,7 +34,7 @@ impl ColumnarGroupBySpiller {
     pub(in crate::data::executor::handlers) fn new(
         spill_dir: PathBuf,
         cap: usize,
-        governor: Option<Arc<nodedb_mem::MemoryGovernor>>,
+        governor: Arc<nodedb_mem::MemoryGovernor>,
         db: DatabaseId,
         tenant: TenantId,
     ) -> crate::Result<Self> {
@@ -60,15 +60,15 @@ impl ColumnarGroupBySpiller {
 
         if self.feed_counter.is_multiple_of(10_000) {
             let estimated_growth = std::mem::size_of::<AggAccum>() * num_aggs * 10_000;
-            if let Some(ref gov) = self.governor
-                && gov
-                    .try_reserve(
-                        self.db,
-                        self.tenant,
-                        nodedb_mem::EngineId::Query,
-                        estimated_growth,
-                    )
-                    .is_err()
+            if self
+                .governor
+                .try_reserve(
+                    self.db,
+                    self.tenant,
+                    nodedb_mem::EngineId::Query,
+                    estimated_growth,
+                )
+                .is_err()
             {
                 self.spill_current_run()?;
             }

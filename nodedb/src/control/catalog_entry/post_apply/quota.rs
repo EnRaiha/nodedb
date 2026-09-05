@@ -21,12 +21,12 @@ pub fn put_database(db_id: DatabaseId, record: &QuotaRecord, shared: &SharedStat
     shared
         .maintenance_budget
         .set_cap(db_id, record.maintenance_cpu_pct);
-    if let Some(ref governor) = shared.governor {
-        if record.max_memory_bytes > 0 {
-            governor.set_database_budget(db_id, record.max_memory_bytes as usize);
-        } else {
-            governor.clear_database_budget(db_id);
-        }
+    if record.max_memory_bytes > 0 {
+        shared
+            .governor
+            .set_database_budget(db_id, record.max_memory_bytes as usize);
+    } else {
+        shared.governor.clear_database_budget(db_id);
     }
     // `max_connections == 0` clears the cap inside the registry.
     shared
@@ -78,12 +78,12 @@ fn set_tenant_caps(
     shared
         .admission_registry
         .set_tenant_limit(db_id, tenant_id, record.max_connections);
-    if let Some(ref governor) = shared.governor {
-        if record.max_memory_bytes > 0 {
-            governor.set_tenant_budget(db_id, tenant_id, record.max_memory_bytes as usize);
-        } else {
-            governor.clear_tenant_budget(db_id, tenant_id);
-        }
+    if record.max_memory_bytes > 0 {
+        shared
+            .governor
+            .set_tenant_budget(db_id, tenant_id, record.max_memory_bytes as usize);
+    } else {
+        shared.governor.clear_tenant_budget(db_id, tenant_id);
     }
 }
 
@@ -92,18 +92,14 @@ fn set_tenant_caps(
 pub fn release_database_scope(db_id: DatabaseId, shared: &SharedState) {
     shared.maintenance_budget.set_cap(db_id, 0);
     shared.admission_registry.clear_database_scope(db_id);
-    if let Some(ref governor) = shared.governor {
-        governor.clear_database_scope(db_id);
-    }
+    shared.governor.clear_database_scope(db_id);
 }
 
 /// Release a dropped tenant's live caps in every database.
 /// Row deletion belongs to apply; this frees in-memory enforcement only.
 pub fn release_tenant_scope(tenant_id: TenantId, shared: &SharedState) {
     shared.admission_registry.clear_tenant_scope(tenant_id);
-    if let Some(ref governor) = shared.governor {
-        governor.clear_tenant_scope(tenant_id);
-    }
+    shared.governor.clear_tenant_scope(tenant_id);
 }
 
 #[cfg(test)]

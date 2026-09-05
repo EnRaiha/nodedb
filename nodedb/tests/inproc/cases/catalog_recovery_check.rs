@@ -681,6 +681,7 @@ async fn redaction_policy_survives_restart_via_boot_load() {
         &AuthConfig::default(),
         Default::default(),
         false,
+        nodedb::data::executor::core_loop::test_governor(),
     )
     .expect("shared_state reopen");
 

@@ -104,7 +104,15 @@ mod tests {
         let (req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
         let (resp_tx, _resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
         drop(req_tx); // no requests are dispatched in these tests
-        CoreLoop::open(0, req_rx, resp_tx, dir, hlc).expect("CoreLoop::open")
+        CoreLoop::open(
+            0,
+            req_rx,
+            resp_tx,
+            dir,
+            hlc,
+            crate::data::executor::core_loop::test_governor(),
+        )
+        .expect("CoreLoop::open")
     }
 
     /// The whole point of this checkpoint: after a restart whose WAL no longer

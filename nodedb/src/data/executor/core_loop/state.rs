@@ -362,7 +362,7 @@ pub struct CoreLoop {
     pub(in crate::data::executor) segment_keks: super::SegmentKeks,
 
     /// Memory governor for per-engine budget enforcement.
-    pub(in crate::data::executor) governor: Option<Arc<nodedb_mem::MemoryGovernor>>,
+    pub(in crate::data::executor) governor: Arc<nodedb_mem::MemoryGovernor>,
 
     /// Shared per-database maintenance CPU budget tracker.
     ///

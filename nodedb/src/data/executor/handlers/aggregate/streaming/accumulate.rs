@@ -110,10 +110,12 @@ impl CoreLoop {
             .join(format!("core-{}", self.core_id));
         let cap = self.query_tuning.groupby_max_groups_in_mem;
 
-        let memory = self
-            .governor
-            .clone()
-            .map(|gov| ScopedMemory::new(gov, database_id, tenant_id, EngineId::Query));
+        let memory = Some(ScopedMemory::new(
+            self.governor.clone(),
+            database_id,
+            tenant_id,
+            EngineId::Query,
+        ));
         let mut spiller = GroupBySpiller::new(spill_dir, cap, memory)?;
 
         // Accumulate matching documents. Spill errors are fatal and surfaced

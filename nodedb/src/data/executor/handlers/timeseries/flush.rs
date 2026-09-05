@@ -252,10 +252,7 @@ impl CoreLoop {
         db_id: DatabaseId,
         collection: &str,
     ) {
-        let gov = match &self.governor {
-            Some(g) => g.clone(),
-            None => return,
-        };
+        let gov = self.governor.clone();
         let key = (db_id, tid, collection.to_string());
         let bytes = match self.columnar_memtables.get(&key) {
             Some(mt) => mt.memory_bytes(),

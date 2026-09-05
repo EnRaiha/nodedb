@@ -58,6 +58,7 @@ fn make_core() -> (
         resp_tx,
         dir.path(),
         Arc::new(OrdinalClock::new()),
+        nodedb::data::executor::core_loop::test_governor(),
     )
     .unwrap();
     (core, req_tx, resp_rx, dir)

@@ -16,7 +16,6 @@ use crate::storage::quarantine::QuarantineRegistry;
 /// Optional subsystem components wired into [`SharedState`] by [`wire_state`].
 pub struct SharedStateComponents {
     pub quarantine_registry: Arc<QuarantineRegistry>,
-    pub governor: Arc<nodedb_mem::MemoryGovernor>,
     pub array_catalog: ArrayCatalogHandle,
     pub maintenance_budget: Arc<crate::control::maintenance::MaintenanceBudgetTracker>,
 }
@@ -24,8 +23,8 @@ pub struct SharedStateComponents {
 /// Wire all optional subsystems into SharedState after `SharedState::open`.
 ///
 /// This includes: startup gate, cluster handles, JWKS, cold storage, snapshot
-/// storage, quarantine storage, memory governor, backup KEK, OTLP exporter,
-/// gateway, and bitemporal retention registry.
+/// storage, quarantine storage, backup KEK, OTLP exporter, gateway, and
+/// bitemporal retention registry.
 ///
 /// Async because JWKS provider discovery fetches each provider's key set over
 /// the network. Bootstrap already runs inside the server's Tokio runtime, so
@@ -41,7 +40,6 @@ pub async fn wire_state(
 ) -> anyhow::Result<()> {
     let SharedStateComponents {
         quarantine_registry,
-        governor,
         array_catalog,
         maintenance_budget,
     } = components;
@@ -180,11 +178,6 @@ pub async fn wire_state(
                 std::process::exit(1);
             }
         }
-    }
-
-    // Wire memory governor.
-    if let Some(state) = Arc::get_mut(shared) {
-        state.governor = Some(Arc::clone(&governor));
     }
 
     // Wire maintenance budget tracker (shared with Data Plane cores so

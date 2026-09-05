@@ -93,6 +93,7 @@ impl NativeTestServer {
                 data_side.response_tx,
                 &core_dir,
                 std::sync::Arc::new(nodedb_types::OrdinalClock::new()),
+                nodedb::data::executor::core_loop::test_governor(),
                 core_array_catalog,
             )
             .expect("open core");

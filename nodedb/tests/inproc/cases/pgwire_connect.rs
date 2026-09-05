@@ -53,6 +53,7 @@ async fn pgwire_connect_and_query() {
             data_side.response_tx,
             &core_dir,
             std::sync::Arc::new(nodedb_types::OrdinalClock::new()),
+            nodedb::data::executor::core_loop::test_governor(),
         )
         .unwrap();
         while matches!(

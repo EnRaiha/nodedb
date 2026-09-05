@@ -397,7 +397,15 @@ mod tests {
         let (resp_tx, resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
         drop(req_tx);
         drop(resp_rx);
-        CoreLoop::open(0, req_rx, resp_tx, dir, hlc).expect("CoreLoop::open")
+        CoreLoop::open(
+            0,
+            req_rx,
+            resp_tx,
+            dir,
+            hlc,
+            crate::data::executor::core_loop::test_governor(),
+        )
+        .expect("CoreLoop::open")
     }
 
     /// A msgpack-encoded `TenantDataSnapshot` carrying one vector collection

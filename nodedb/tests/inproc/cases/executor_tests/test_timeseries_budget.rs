@@ -107,7 +107,7 @@ fn ingest_ilp(ctx: &mut TestCtx, collection: &str, payload: &str) -> serde_json:
 fn run_ts_flush_workload() -> (TestCtx, Arc<MemoryGovernor>) {
     let mut ctx = make_ctx();
     let gov = generous_governor();
-    ctx.core.set_governor(Arc::clone(&gov));
+    ctx.core.set_governor_for_testing(Arc::clone(&gov));
 
     let batch_size = 10_000usize;
     let num_batches = 300usize;

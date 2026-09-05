@@ -24,12 +24,7 @@ use nodedb_test_support::pgwire_harness::TestServer;
 /// allocated counter is stable for two consecutive observations, or
 /// the deadline expires. Returns the final settled value.
 async fn settle_allocated(srv: &TestServer, max_wait: Duration) -> usize {
-    let gov = srv
-        .shared
-        .governor
-        .as_ref()
-        .expect("test harness must wire the memory governor")
-        .clone();
+    let gov = srv.shared.governor.clone();
     let start = std::time::Instant::now();
     let mut prev = gov.total_allocated();
     loop {
@@ -109,12 +104,7 @@ async fn engine_memory_returns_to_baseline_after_create_insert_drop() {
     // in `allocated()`. Assert directly on the over-release event
     // counter exposed by `Budget` so any call-site that crosses the
     // wrong direction is caught here.
-    let gov = srv
-        .shared
-        .governor
-        .as_ref()
-        .expect("governor wired")
-        .clone();
+    let gov = srv.shared.governor.clone();
     let over_releases = gov.total_over_release_count();
     assert_eq!(
         over_releases, 0,
@@ -204,12 +194,7 @@ async fn wal_replay_restart_keeps_governor_accounting_sane() {
     assert_eq!(kv_rows.len(), 1, "replayed KV row must be queryable");
 
     let settled = settle_allocated(&srv2, Duration::from_secs(5)).await;
-    let gov = srv2
-        .shared
-        .governor
-        .as_ref()
-        .expect("governor wired into the restarted server")
-        .clone();
+    let gov = srv2.shared.governor.clone();
 
     let over_releases = gov.total_over_release_count();
     assert_eq!(

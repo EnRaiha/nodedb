@@ -409,6 +409,7 @@ mod txn_created_columnar_engine_tests {
             resp_tx,
             dir.path(),
             std::sync::Arc::new(nodedb_types::OrdinalClock::new()),
+            crate::data::executor::core_loop::test_governor(),
         )
         .expect("CoreLoop::open");
         (core, dir)

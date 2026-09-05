@@ -348,6 +348,7 @@ fn calvin_static_replay_sees_only_committed_data() {
             resp_tx,
             &data_path,
             Arc::new(OrdinalClock::new()),
+            nodedb::data::executor::core_loop::test_governor(),
         )
         .unwrap();
         (core, req_tx, resp_rx)
@@ -452,6 +453,7 @@ fn calvin_static_replay_sees_only_committed_data() {
             resp_tx,
             &data_path,
             Arc::new(OrdinalClock::new()),
+            nodedb::data::executor::core_loop::test_governor(),
         )
         .unwrap();
         (core, req_tx, resp_rx)

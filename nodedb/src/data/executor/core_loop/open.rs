@@ -34,6 +34,7 @@ impl CoreLoop {
         response_tx: Producer<BridgeResponse>,
         data_dir: &Path,
         hlc: Arc<OrdinalClock>,
+        governor: Arc<nodedb_mem::MemoryGovernor>,
     ) -> crate::Result<Self> {
         Self::open_with_array_catalog(
             core_id,
@@ -41,6 +42,7 @@ impl CoreLoop {
             response_tx,
             data_dir,
             hlc,
+            governor,
             crate::control::array_catalog::ArrayCatalog::handle(),
         )
     }
@@ -55,6 +57,7 @@ impl CoreLoop {
         response_tx: Producer<BridgeResponse>,
         data_dir: &Path,
         hlc: Arc<OrdinalClock>,
+        governor: Arc<nodedb_mem::MemoryGovernor>,
         array_catalog: ArrayCatalogHandle,
     ) -> crate::Result<Self> {
         let sparse_path = data_dir.join(format!("sparse/core-{core_id}.redb"));
@@ -174,7 +177,7 @@ impl CoreLoop {
                 array_segment_kek: None,
                 ts_segment_kek: None,
             },
-            governor: None,
+            governor,
             maintenance_budget: None,
             spsc_read_depth: SPSC_READ_DEPTH_NORMAL,
             pressure_suspend_reads: false,
