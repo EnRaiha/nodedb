@@ -119,6 +119,7 @@ impl CoreLoop {
             tid,
             DatabaseId::DEFAULT,
             crate::types::VShardId::new(0),
+            // no-determinism: test-only dummy deadline, never written to Calvin state
             std::time::Instant::now() + std::time::Duration::from_secs(60),
         )
     }
