@@ -98,10 +98,9 @@ impl MemoryGovernor {
     /// # Errors
     ///
     /// Returns [`MemError::BudgetExhausted`] or [`MemError::GlobalCeilingExceeded`]
-    /// if the reservation would exceed any configured limit.  Returns
-    /// [`MemError::UnknownEngine`] if `engine` is not registered.
+    /// if the reservation would exceed any configured limit.
     pub fn reserve(self: &Arc<Self>, engine: EngineId, bytes: usize) -> Result<BudgetGuard> {
-        let budget = self.budget(engine).ok_or(MemError::UnknownEngine(engine))?;
+        let budget = self.budget(engine);
 
         let mut scope = ReserveScope::new(Arc::clone(&self.global_counter), bytes);
         scope.try_credit_global()?;
@@ -131,16 +130,16 @@ impl MemoryGovernor {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
     use super::*;
+    use crate::engine_limits::EngineLimits;
     use crate::error::MemError;
     use crate::governor::GovernorConfig;
 
     fn make_governor(limits: &[(EngineId, usize)], ceiling: usize) -> Arc<MemoryGovernor> {
-        let engine_limits: HashMap<EngineId, usize> = limits.iter().copied().collect();
+        let engine_limits: EngineLimits = limits.iter().copied().collect();
         Arc::new(
             MemoryGovernor::new(GovernorConfig {
                 global_ceiling: ceiling,
@@ -176,14 +175,14 @@ mod tests {
 
         {
             let guard = gov.reserve(EngineId::Vector, 1000).expect("within budget");
-            assert_eq!(gov.budget(EngineId::Vector).unwrap().allocated(), 1000);
+            assert_eq!(gov.budget(EngineId::Vector).allocated(), 1000);
             assert_eq!(guard.bytes(), 1000);
             assert_eq!(guard.engine(), EngineId::Vector);
             // guard dropped here
         }
 
         assert_eq!(
-            gov.budget(EngineId::Vector).unwrap().allocated(),
+            gov.budget(EngineId::Vector).allocated(),
             0,
             "bytes must be returned on drop"
         );
@@ -199,7 +198,7 @@ mod tests {
             "expected BudgetExhausted, got {err:?}"
         );
         // No bytes charged.
-        assert_eq!(gov.budget(EngineId::Fts).unwrap().allocated(), 0);
+        assert_eq!(gov.budget(EngineId::Fts).allocated(), 0);
     }
 
     #[test]
@@ -217,19 +216,19 @@ mod tests {
         let g2 = gov.reserve(EngineId::Columnar, 2000).unwrap();
         let g3 = gov.reserve(EngineId::Graph, 3000).unwrap();
 
-        assert_eq!(gov.budget(EngineId::Vector).unwrap().allocated(), 1000);
-        assert_eq!(gov.budget(EngineId::Columnar).unwrap().allocated(), 2000);
-        assert_eq!(gov.budget(EngineId::Graph).unwrap().allocated(), 3000);
+        assert_eq!(gov.budget(EngineId::Vector).allocated(), 1000);
+        assert_eq!(gov.budget(EngineId::Columnar).allocated(), 2000);
+        assert_eq!(gov.budget(EngineId::Graph).allocated(), 3000);
 
         drop(g2); // release only Columnar
-        assert_eq!(gov.budget(EngineId::Vector).unwrap().allocated(), 1000);
-        assert_eq!(gov.budget(EngineId::Columnar).unwrap().allocated(), 0);
-        assert_eq!(gov.budget(EngineId::Graph).unwrap().allocated(), 3000);
+        assert_eq!(gov.budget(EngineId::Vector).allocated(), 1000);
+        assert_eq!(gov.budget(EngineId::Columnar).allocated(), 0);
+        assert_eq!(gov.budget(EngineId::Graph).allocated(), 3000);
 
         drop(g1);
         drop(g3);
-        assert_eq!(gov.budget(EngineId::Vector).unwrap().allocated(), 0);
-        assert_eq!(gov.budget(EngineId::Graph).unwrap().allocated(), 0);
+        assert_eq!(gov.budget(EngineId::Vector).allocated(), 0);
+        assert_eq!(gov.budget(EngineId::Graph).allocated(), 0);
     }
 
     /// Demonstrates that `mem::forget` prevents the release.
@@ -239,13 +238,13 @@ mod tests {
         let gov = make_governor(&[(EngineId::Kv, 4096)], 8192);
 
         let guard = gov.reserve(EngineId::Kv, 500).unwrap();
-        assert_eq!(gov.budget(EngineId::Kv).unwrap().allocated(), 500);
+        assert_eq!(gov.budget(EngineId::Kv).allocated(), 500);
 
         std::mem::forget(guard);
 
         // Bytes are NOT released — accounting drift matches the allocation.
         assert_eq!(
-            gov.budget(EngineId::Kv).unwrap().allocated(),
+            gov.budget(EngineId::Kv).allocated(),
             500,
             "mem::forget intentionally skips drop; bytes remain charged"
         );
@@ -259,7 +258,7 @@ mod tests {
             .expect("zero bytes always fits");
         assert_eq!(guard.bytes(), 0);
         drop(guard);
-        assert_eq!(gov.budget(EngineId::Query).unwrap().allocated(), 0);
+        assert_eq!(gov.budget(EngineId::Query).allocated(), 0);
     }
 
     #[test]

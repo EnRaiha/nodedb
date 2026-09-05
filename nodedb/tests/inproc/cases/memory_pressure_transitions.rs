@@ -6,12 +6,11 @@
 //! `make_governor_at` from `pressure.rs` is inlined here — it is trivial (four
 //! lines of book-keeping) and inlining avoids any production API surface change.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use nodedb::control::metrics::SystemMetrics;
 use nodedb::data::executor::core_loop::CoreLoop;
-use nodedb_mem::{EngineId, GovernorConfig, MemoryGovernor};
+use nodedb_mem::{EngineId, EngineLimits, GovernorConfig, MemoryGovernor};
 use nodedb_types::{DatabaseId, QualifiedCollection, TenantId};
 
 /// Baseline SPSC read depth, sourced from the `CoreLoop` public accessor so
@@ -27,10 +26,7 @@ fn normal_depth() -> usize {
 /// supplied utilization while every other engine stays at Normal.
 fn make_governor_at(engine: EngineId, utilization_percent: u8) -> Arc<MemoryGovernor> {
     let budget_bytes: usize = 10_000;
-    let mut engine_limits = HashMap::new();
-    for id in EngineId::ALL {
-        engine_limits.insert(*id, budget_bytes);
-    }
+    let engine_limits = EngineLimits::uniform(budget_bytes);
     let global_ceiling = budget_bytes * EngineId::ALL.len() * 2;
     let gov = MemoryGovernor::new(GovernorConfig {
         global_ceiling,

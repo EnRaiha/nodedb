@@ -55,10 +55,6 @@ pub enum MemError {
         limit: usize,
     },
 
-    /// Engine is not registered with the governor.
-    #[error("unknown engine: {0:?}")]
-    UnknownEngine(EngineId),
-
     /// jemalloc introspection error.
     #[error("jemalloc error: {0}")]
     Jemalloc(String),

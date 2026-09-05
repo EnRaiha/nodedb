@@ -191,11 +191,16 @@ impl Budget {
     /// to a DEGRADED core.
     pub fn utilization_percent(&self) -> u8 {
         let limit = self.limit();
+        let allocated = self.allocated();
         if limit == 0 {
-            return 100;
+            // A zero-limit engine holds nothing and can accept nothing, so it
+            // exerts no pressure. Reporting it full would drive
+            // `worst_engine_pressure` to Emergency and throttle every core.
+            // A non-zero count against a zero limit is an over-release, which
+            // does deserve the loudest level.
+            return if allocated == 0 { 0 } else { 100 };
         }
-        let allocated = self.allocated() as u128;
-        ((allocated * 100) / limit as u128).min(100) as u8
+        ((allocated as u128 * 100) / limit as u128).min(100) as u8
     }
 
     /// Peak allocation (high-water mark).

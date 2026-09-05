@@ -30,10 +30,9 @@
 //! (or the panic before it) marks the run red until ingest and flush
 //! agree on what the budget is tracking.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use nodedb_mem::{EngineId, GovernorConfig, MemoryGovernor};
+use nodedb_mem::{EngineId, EngineLimits, GovernorConfig, MemoryGovernor};
 use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
 use nodedb_types::{DatabaseId, QualifiedCollection};
 
@@ -44,10 +43,7 @@ use super::helpers::*;
 /// `over_release_count` moves is a genuine release-without-reserve.
 fn generous_governor() -> Arc<MemoryGovernor> {
     let per_engine: usize = 1 << 30; // 1 GiB
-    let mut engine_limits = HashMap::new();
-    for id in EngineId::ALL {
-        engine_limits.insert(*id, per_engine);
-    }
+    let engine_limits = EngineLimits::uniform(per_engine);
     let global_ceiling = per_engine * EngineId::ALL.len();
     Arc::new(
         MemoryGovernor::new(GovernorConfig {

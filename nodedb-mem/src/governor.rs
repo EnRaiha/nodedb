@@ -28,6 +28,7 @@ use nodedb_types::{DatabaseId, TenantId};
 
 use crate::budget::Budget;
 use crate::engine::EngineId;
+use crate::engine_limits::EngineLimits;
 use crate::error::{MemError, Result};
 use crate::pressure::{PressureLevel, PressureThresholds};
 use crate::reservation_token::ReservationToken;
@@ -59,14 +60,14 @@ pub struct GovernorConfig {
     /// must not exceed this.
     pub global_ceiling: usize,
 
-    /// Per-engine budget limits.
-    pub engine_limits: HashMap<EngineId, usize>,
+    /// Per-engine budget limits, one entry for every `EngineId`.
+    pub engine_limits: EngineLimits,
 }
 
 impl GovernorConfig {
     /// Validate that the sum of engine limits does not exceed the global ceiling.
     pub fn validate(&self) -> Result<()> {
-        let total: usize = self.engine_limits.values().sum();
+        let total = self.engine_limits.total();
         if total > self.global_ceiling {
             return Err(MemError::GlobalCeilingExceeded {
                 allocated: total,
@@ -85,8 +86,8 @@ impl GovernorConfig {
 /// lock, writes (rare — only when quotas change) take an exclusive lock.
 #[derive(Debug)]
 pub struct MemoryGovernor {
-    /// Per-engine budgets (original arity-2 tracking).
-    budgets: HashMap<EngineId, Budget>,
+    /// Per-engine budgets, one for every `EngineId`, indexed by `EngineId::index()`.
+    budgets: [Budget; EngineId::COUNT],
 
     /// Shared global counter. Held by both the governor and every live token.
     pub(crate) global_counter: Arc<GlobalCounter>,
@@ -111,10 +112,8 @@ impl MemoryGovernor {
     pub fn new(config: GovernorConfig) -> Result<Self> {
         config.validate()?;
 
-        let mut budgets = HashMap::new();
-        for (engine, limit) in &config.engine_limits {
-            budgets.insert(*engine, Budget::new(*limit));
-        }
+        let limits = config.engine_limits.as_array();
+        let budgets: [Budget; EngineId::COUNT] = std::array::from_fn(|i| Budget::new(limits[i]));
 
         let global_counter = Arc::new(GlobalCounter {
             allocated: AtomicUsize::new(0),
@@ -217,7 +216,8 @@ impl MemoryGovernor {
     /// implementation releases all four layers.
     ///
     /// Databases or tenants without a configured budget are skipped (uncapped).
-    /// Engines without a configured budget return [`MemError::UnknownEngine`].
+    /// Every `EngineId` carries a budget — a zero limit denies with
+    /// [`MemError::BudgetExhausted`] rather than a missing-engine error.
     pub fn try_reserve(
         &self,
         db: DatabaseId,
@@ -274,10 +274,7 @@ impl MemoryGovernor {
         }
 
         // ── Layer 4: per-engine budget ────────────────────────────────────────
-        let engine_budget = match self.budgets.get(&engine) {
-            Some(budget) => budget,
-            None => return Err(MemError::UnknownEngine(engine)),
-        };
+        let engine_budget = &self.budgets[engine.index()];
         let engine_counter = match engine_budget.try_reserve_arc(size) {
             Some(arc) => arc,
             None => {
@@ -307,8 +304,8 @@ impl MemoryGovernor {
     }
 
     /// Get the budget for a specific engine.
-    pub fn budget(&self, engine: EngineId) -> Option<&Budget> {
-        self.budgets.get(&engine)
+    pub fn budget(&self, engine: EngineId) -> &Budget {
+        &self.budgets[engine.index()]
     }
 
     /// Get the global ceiling.
@@ -316,9 +313,11 @@ impl MemoryGovernor {
         self.global_ceiling
     }
 
-    /// Total memory allocated across all engines (engine-layer sum).
+    /// Total memory allocated across all engines (engine-layer sum). A
+    /// separate aggregate from [`global_utilization_percent`](Self::global_utilization_percent),
+    /// which reads the global counter admission enforces the ceiling against.
     pub fn total_allocated(&self) -> usize {
-        self.budgets.values().map(|b| b.allocated()).sum()
+        self.budgets.iter().map(|b| b.allocated()).sum()
     }
 
     /// Total number of over-release events observed across all
@@ -328,24 +327,25 @@ impl MemoryGovernor {
     /// `allocated()` saturates to zero on over-release, so this
     /// counter is the only post-hoc observable for the bug.
     pub fn total_over_release_count(&self) -> usize {
-        self.budgets.values().map(|b| b.over_release_count()).sum()
+        self.budgets.iter().map(|b| b.over_release_count()).sum()
     }
 
-    /// Global utilization as a percentage (0-100). Computed in `u128` so a
-    /// corrupted engine-layer sum clamps to 100 % instead of overflowing.
+    /// Global utilization as a percentage (0-100). Reads the global counter
+    /// directly — the same quantity admission enforces the ceiling
+    /// against — computed in `u128` so a corrupted count clamps to 100 %
+    /// instead of overflowing.
     pub fn global_utilization_percent(&self) -> u8 {
+        let allocated = self.global_counter.allocated.load(Ordering::Relaxed);
         if self.global_ceiling == 0 {
-            return 100;
+            return if allocated == 0 { 0 } else { 100 };
         }
-        ((self.total_allocated() as u128 * 100) / self.global_ceiling as u128).min(100) as u8
+        ((allocated as u128 * 100) / self.global_ceiling as u128).min(100) as u8
     }
 
     /// Current pressure level for a specific engine.
     pub fn engine_pressure(&self, engine: EngineId) -> PressureLevel {
-        self.budgets
-            .get(&engine)
-            .map(|b| self.thresholds.level_for(b.utilization_percent()))
-            .unwrap_or(PressureLevel::Emergency)
+        self.thresholds
+            .level_for(self.budgets[engine.index()].utilization_percent())
     }
 
     /// Current global pressure level.
@@ -353,14 +353,13 @@ impl MemoryGovernor {
         self.thresholds.level_for(self.global_utilization_percent())
     }
 
-    /// Worst-case (highest) pressure level across every engine that has a
-    /// configured budget. Cheap: iterates the in-memory budget map and
-    /// allocates nothing — meant to be called once per Data-Plane core-loop
-    /// tick, unlike [`snapshot`](Self::snapshot) which materialises a `Vec`.
-    /// Returns `Normal` when no engine budgets are configured.
+    /// Worst-case (highest) pressure level across every engine. Cheap:
+    /// iterates the in-memory budget array and allocates nothing — meant to
+    /// be called once per Data-Plane core-loop tick, unlike
+    /// [`snapshot`](Self::snapshot) which materialises a `Vec`.
     pub fn worst_engine_pressure(&self) -> PressureLevel {
         self.budgets
-            .values()
+            .iter()
             .map(|b| self.thresholds.level_for(b.utilization_percent()))
             .max()
             .unwrap_or(PressureLevel::Normal)
@@ -373,10 +372,11 @@ impl MemoryGovernor {
 
     /// Snapshot of all engine budget states (for metrics/debugging).
     pub fn snapshot(&self) -> Vec<EngineSnapshot> {
-        self.budgets
+        EngineId::ALL
             .iter()
-            .map(|(engine, budget)| EngineSnapshot {
-                engine: *engine,
+            .zip(self.budgets.iter())
+            .map(|(&engine, budget)| EngineSnapshot {
+                engine,
                 allocated: budget.allocated(),
                 limit: budget.limit(),
                 peak: budget.peak(),
@@ -400,7 +400,6 @@ pub struct EngineSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::thread;
 
@@ -408,11 +407,15 @@ mod tests {
 
     use super::*;
 
+    /// Every engine other than the three under direct test keeps the zero
+    /// default: an unallocated zero-limit engine reports Normal pressure,
+    /// and any nonzero reservation against it (used by the denied-engine
+    /// tests below) still denies.
     fn test_config() -> GovernorConfig {
-        let mut engine_limits = HashMap::new();
-        engine_limits.insert(EngineId::Vector, 4096);
-        engine_limits.insert(EngineId::Query, 2048);
-        engine_limits.insert(EngineId::Timeseries, 1024);
+        let engine_limits = EngineLimits::zeroed()
+            .with(EngineId::Vector, 4096)
+            .with(EngineId::Query, 2048)
+            .with(EngineId::Timeseries, 1024);
 
         GovernorConfig {
             global_ceiling: 8192,
@@ -436,7 +439,7 @@ mod tests {
         let tok = gov
             .try_reserve(db(), tenant(), EngineId::Vector, 1000)
             .unwrap();
-        assert_eq!(gov.budget(EngineId::Vector).unwrap().allocated(), 1000);
+        assert_eq!(gov.budget(EngineId::Vector).allocated(), 1000);
         assert_eq!(tok.size(), 1000);
     }
 
@@ -482,12 +485,12 @@ mod tests {
             let tok = gov
                 .try_reserve(db(), tenant(), EngineId::Vector, 1000)
                 .unwrap();
-            assert_eq!(gov.budget(EngineId::Vector).unwrap().allocated(), 1000);
+            assert_eq!(gov.budget(EngineId::Vector).allocated(), 1000);
             assert_eq!(tok.size(), 1000);
         } // token dropped here
 
         assert_eq!(
-            gov.budget(EngineId::Vector).unwrap().allocated(),
+            gov.budget(EngineId::Vector).allocated(),
             0,
             "engine counter must be returned on drop"
         );
@@ -519,8 +522,7 @@ mod tests {
         // Global ceiling of 200. Engine limit also 200 (passes validation since
         // sum ≤ global). DB and tenant budgets are generous. Request 300 bytes —
         // global layer fires first and denies.
-        let mut engine_limits = HashMap::new();
-        engine_limits.insert(EngineId::Vector, 200);
+        let engine_limits = EngineLimits::zeroed().with(EngineId::Vector, 200);
         let gov = MemoryGovernor::new(GovernorConfig {
             global_ceiling: 200,
             engine_limits,
@@ -598,8 +600,7 @@ mod tests {
 
     #[test]
     fn concurrent_reserves_never_exceed_cap() {
-        let mut limits = HashMap::new();
-        limits.insert(EngineId::Vector, 10_000);
+        let limits = EngineLimits::zeroed().with(EngineId::Vector, 10_000);
         let gov = Arc::new(
             MemoryGovernor::new(GovernorConfig {
                 global_ceiling: 10_000,
@@ -636,7 +637,7 @@ mod tests {
             successful.len()
         );
 
-        let engine_alloc = gov.budget(EngineId::Vector).unwrap().allocated();
+        let engine_alloc = gov.budget(EngineId::Vector).allocated();
         assert!(
             engine_alloc <= 10_000,
             "engine total {engine_alloc} must not exceed cap 10000"
@@ -649,35 +650,30 @@ mod tests {
         );
     }
 
-    // ── Unknown-engine rejection and rollback ────────────────────────────────
+    // ── Denied engine budget rejection and rollback ──────────────────────────
+    //
+    // `EngineId::Crdt` keeps `test_config`'s default zero limit — it still
+    // carries a real `Budget` entry, so a 1000-byte reservation against it
+    // denies with `MemError::BudgetExhausted`, never a missing-engine error.
 
     #[test]
-    fn unknown_engine_rejected() {
-        let gov = MemoryGovernor::new(test_config()).unwrap();
-        let err = gov
-            .try_reserve(db(), tenant(), EngineId::Crdt, 100)
-            .unwrap_err();
-        assert!(matches!(err, MemError::UnknownEngine(EngineId::Crdt)));
-    }
-
-    #[test]
-    fn unregistered_engine_leaves_global_counter_untouched() {
+    fn denied_engine_budget_leaves_the_global_counter_untouched() {
         let gov = MemoryGovernor::new(test_config()).unwrap();
 
         let err = gov
             .try_reserve(db(), tenant(), EngineId::Crdt, 1000)
             .unwrap_err();
-        assert!(matches!(err, MemError::UnknownEngine(EngineId::Crdt)));
+        assert!(matches!(err, MemError::BudgetExhausted { .. }));
 
         assert_eq!(
             gov.global_counter.allocated.load(Ordering::Relaxed),
             0,
-            "global counter must be rolled back when the engine is unregistered"
+            "global counter must be rolled back when the engine budget denies"
         );
     }
 
     #[test]
-    fn unregistered_engine_leaves_database_counter_untouched() {
+    fn denied_engine_budget_leaves_the_database_counter_untouched() {
         let gov = MemoryGovernor::new(test_config()).unwrap();
         gov.set_database_budget(db(), 4096);
 
@@ -689,12 +685,12 @@ mod tests {
         assert_eq!(
             db_map[&db()].allocated.load(Ordering::Relaxed),
             0,
-            "database counter must be rolled back when the engine is unregistered"
+            "database counter must be rolled back when the engine budget denies"
         );
     }
 
     #[test]
-    fn unregistered_engine_leaves_tenant_counter_untouched() {
+    fn denied_engine_budget_leaves_the_tenant_counter_untouched() {
         let gov = MemoryGovernor::new(test_config()).unwrap();
         gov.set_database_budget(db(), 4096);
         gov.set_tenant_budget(db(), tenant(), 4096);
@@ -709,7 +705,7 @@ mod tests {
                 .allocated
                 .load(Ordering::Relaxed),
             0,
-            "tenant counter must be rolled back when the engine is unregistered"
+            "tenant counter must be rolled back when the engine budget denies"
         );
     }
 
@@ -717,7 +713,7 @@ mod tests {
     fn rejected_reservations_do_not_consume_the_global_ceiling() {
         let gov = MemoryGovernor::new(test_config()).unwrap();
 
-        // Nine rejected 1000-byte requests against an 8192-byte ceiling.
+        // Nine rejected 1000-byte requests against Crdt's zero-byte engine budget.
         for _ in 0..9 {
             let _ = gov
                 .try_reserve(db(), tenant(), EngineId::Crdt, 1000)
@@ -759,7 +755,7 @@ mod tests {
             .unwrap();
 
         let snap = gov.snapshot();
-        assert_eq!(snap.len(), 3);
+        assert_eq!(snap.len(), EngineId::COUNT);
 
         let vector_snap = snap.iter().find(|s| s.engine == EngineId::Vector).unwrap();
         assert_eq!(vector_snap.allocated, 2048);

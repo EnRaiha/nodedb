@@ -79,6 +79,19 @@ impl EngineId {
         EngineId::Wal,
         EngineId::Bridge,
     ];
+
+    /// Number of known engine identifiers.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Dense array index for this engine, for use with fixed-size
+    /// per-engine arrays sized `EngineId::COUNT`.
+    ///
+    /// `EngineId` is a fieldless enum, so the discriminant cast matches the
+    /// declaration position, and `ALL` lists variants in that same order —
+    /// the inline test below locks the two together.
+    pub const fn index(self) -> usize {
+        self as usize
+    }
 }
 
 impl std::fmt::Display for EngineId {
@@ -99,6 +112,19 @@ impl std::fmt::Display for EngineId {
             EngineId::Query => write!(f, "query"),
             EngineId::Wal => write!(f, "wal"),
             EngineId::Bridge => write!(f, "bridge"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_matches_all_declaration_order() {
+        assert_eq!(EngineId::ALL.len(), EngineId::COUNT);
+        for id in EngineId::ALL {
+            assert_eq!(EngineId::ALL[id.index()], *id);
         }
     }
 }

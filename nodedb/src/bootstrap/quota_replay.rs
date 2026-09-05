@@ -110,9 +110,7 @@ fn usable(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use nodedb_mem::{EngineId, GovernorConfig, MemoryGovernor};
+    use nodedb_mem::{EngineId, EngineLimits, GovernorConfig, MemoryGovernor};
     use nodedb_types::{DatabaseId, TenantId};
 
     use super::*;
@@ -137,10 +135,7 @@ mod tests {
     /// Governor with a generous global ceiling so only scope caps can deny.
     fn make_governor() -> Arc<MemoryGovernor> {
         let engine_bytes = 64 * MIB as usize;
-        let mut engine_limits = HashMap::new();
-        for id in EngineId::ALL {
-            engine_limits.insert(*id, engine_bytes);
-        }
+        let engine_limits = EngineLimits::uniform(engine_bytes);
         let gov = MemoryGovernor::new(GovernorConfig {
             global_ceiling: engine_bytes * EngineId::ALL.len(),
             engine_limits,

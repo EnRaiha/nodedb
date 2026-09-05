@@ -9,7 +9,10 @@ use std::sync::Arc;
 
 use nodedb::control::maintenance::MaintenanceBudgetTracker;
 use nodedb::control::metrics::DatabaseMetricsRegistry;
-use nodedb_mem::{MemoryGovernor, engine::EngineId, error::MemError, governor::GovernorConfig};
+use nodedb_mem::{
+    MemoryGovernor, engine::EngineId, engine_limits::EngineLimits, error::MemError,
+    governor::GovernorConfig,
+};
 use nodedb_types::{DatabaseId, TenantId};
 
 /// Helper: build a governor with explicit per-engine, per-database, and
@@ -20,9 +23,7 @@ fn make_governor(
     db_limit: usize,
     tenant_limit: usize,
 ) -> Arc<MemoryGovernor> {
-    use std::collections::HashMap;
-    let mut engine_limits = HashMap::new();
-    engine_limits.insert(EngineId::Vector, engine_limit);
+    let engine_limits = EngineLimits::zeroed().with(EngineId::Vector, engine_limit);
 
     let gov = MemoryGovernor::new(GovernorConfig {
         global_ceiling: global,
@@ -121,9 +122,7 @@ fn db_cap_denies_when_tenant_headroom_consumed() {
 #[test]
 fn second_db_unaffected_by_first_db_cap() {
     let global = 100 * 1024 * 1024usize;
-    use std::collections::HashMap;
-    let mut engine_limits = HashMap::new();
-    engine_limits.insert(EngineId::Vector, global / 2);
+    let engine_limits = EngineLimits::zeroed().with(EngineId::Vector, global / 2);
     let gov = Arc::new(
         MemoryGovernor::new(GovernorConfig {
             global_ceiling: global,

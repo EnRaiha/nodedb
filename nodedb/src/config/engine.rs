@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-use std::collections::HashMap;
-
-use nodedb_mem::EngineId;
+use nodedb_mem::{EngineId, EngineLimits};
 use serde::{Deserialize, Serialize};
 
 /// Per-engine memory budget allocation as fractions of the global ceiling.
@@ -11,9 +9,9 @@ use serde::{Deserialize, Serialize};
 /// Full-Text-Search overlays, the sparse/metadata store, the CRDT engine,
 /// query execution, the WAL, and the SPSC bridge — gets an explicit
 /// fraction. The memory governor maps these to per-engine byte budgets at
-/// startup; an engine without a budget is treated by the governor as being
-/// at *Emergency* pressure, which rejects its very first write with
-/// `resources exhausted`, so a complete mapping is mandatory.
+/// startup; a zero limit reports *Emergency* pressure and rejects the
+/// engine's very first write with `resources exhausted`, so every fraction
+/// must be strictly positive.
 ///
 /// Fractions must each be a positive, finite number and together sum to
 /// `<= 1.0`. Any remainder is unallocated headroom for transient
@@ -139,49 +137,48 @@ impl EngineConfig {
     /// given the global memory limit.
     pub fn to_byte_budgets(&self, global_limit: usize) -> EngineByteBudgets {
         let gl = global_limit as f64;
-        let per_engine = EngineId::ALL
+        let limits = EngineId::ALL
             .iter()
             .map(|&e| (e, (gl * self.fraction_for(e)) as usize))
             .collect();
-        EngineByteBudgets { per_engine }
+        EngineByteBudgets { limits }
     }
 }
 
 /// Absolute byte budgets for every `EngineId`, derived from fractional config.
 ///
-/// The map is always complete — it contains an entry for every member of
-/// `EngineId::ALL`.
+/// Wraps [`EngineLimits`], which is total by construction — every
+/// `EngineId::ALL` member always has an entry, so there is no runtime check
+/// to skip or forget.
 #[derive(Debug, Clone)]
 pub struct EngineByteBudgets {
-    per_engine: HashMap<EngineId, usize>,
+    limits: EngineLimits,
 }
 
 impl EngineByteBudgets {
-    /// Construct directly from an explicit per-engine map. The map MUST
-    /// contain an entry for every `EngineId::ALL` member.
-    pub fn from_map(per_engine: HashMap<EngineId, usize>) -> Self {
-        Self { per_engine }
+    /// Construct directly from an [`EngineLimits`] map.
+    pub fn from_limits(limits: EngineLimits) -> Self {
+        Self { limits }
     }
 
-    /// Byte budget for a single engine (0 if — contrary to the invariant —
-    /// it is absent).
+    /// Byte budget for a single engine.
     pub fn get(&self, engine: EngineId) -> usize {
-        self.per_engine.get(&engine).copied().unwrap_or(0)
+        self.limits.get(engine)
     }
 
     /// Sum of all engine byte budgets.
     pub fn total(&self) -> usize {
-        self.per_engine.values().copied().sum()
+        self.limits.total()
     }
 
-    /// The full per-engine map, ready to hand to `nodedb_mem::GovernorConfig`.
-    pub fn into_engine_limits(self) -> HashMap<EngineId, usize> {
-        self.per_engine
+    /// The underlying `EngineLimits`, ready to hand to `nodedb_mem::GovernorConfig`.
+    pub fn into_engine_limits(self) -> EngineLimits {
+        self.limits
     }
 
-    /// Borrow the per-engine map.
-    pub fn as_engine_limits(&self) -> &HashMap<EngineId, usize> {
-        &self.per_engine
+    /// Borrow the underlying `EngineLimits`.
+    pub fn as_engine_limits(&self) -> &EngineLimits {
+        &self.limits
     }
 }
 

@@ -147,12 +147,11 @@ impl CoreLoop {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use nodedb_bridge::buffer::RingBuffer;
-    use nodedb_mem::{EngineId, GovernorConfig, MemoryGovernor};
+    use nodedb_mem::{EngineId, EngineLimits, GovernorConfig, MemoryGovernor};
 
     use super::*;
     use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Priority, Request};
@@ -186,10 +185,7 @@ mod tests {
     /// pre-fill `engine` to `utilization_percent`.
     fn make_governor_at(engine: EngineId, utilization_percent: u8) -> Arc<MemoryGovernor> {
         let budget_bytes: usize = 10_000;
-        let mut engine_limits = HashMap::new();
-        for id in EngineId::ALL {
-            engine_limits.insert(*id, budget_bytes);
-        }
+        let engine_limits = EngineLimits::uniform(budget_bytes);
         let global_ceiling = budget_bytes * EngineId::ALL.len() * 2;
         let gov = MemoryGovernor::new(GovernorConfig {
             global_ceiling,

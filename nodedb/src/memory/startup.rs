@@ -14,12 +14,12 @@ use crate::config::engine::EngineByteBudgets;
 /// Called once at startup. The returned governor is shared (via `Arc`)
 /// across the Control Plane and all Data Plane cores.
 ///
-/// `budgets` carries a byte limit for **every** [`EngineId`]; the governor
-/// reports any engine without a budget as being at Emergency pressure,
-/// which rejects that engine's writes with `resources exhausted`, so the
-/// full map is mandatory. [`EngineByteBudgets`] is built by
+/// `budgets` carries a byte limit for every [`EngineId`] —
+/// [`nodedb_mem::EngineLimits`] is total by construction, so a partial
+/// registration cannot compile.
+/// [`EngineByteBudgets`] is built by
 /// [`crate::config::EngineConfig::to_byte_budgets`], which derives one
-/// entry per `EngineId::ALL` member.
+/// entry per `EngineId::ALL` member with a strictly-positive fraction.
 pub fn init_governor(
     global_ceiling: usize,
     budgets: &EngineByteBudgets,
@@ -56,9 +56,9 @@ mod tests {
         let budgets = cfg.to_byte_budgets(1024 * 1024 * 1024); // 1 GiB
         let gov = init_governor(1024 * 1024 * 1024, &budgets).unwrap();
 
-        assert!(gov.budget(EngineId::Vector).is_some());
-        assert!(gov.budget(EngineId::Query).is_some());
-        assert!(gov.budget(EngineId::Crdt).is_some());
+        assert!(gov.budget(EngineId::Vector).limit() > 0);
+        assert!(gov.budget(EngineId::Query).limit() > 0);
+        assert!(gov.budget(EngineId::Crdt).limit() > 0);
     }
 
     #[test]
@@ -80,12 +80,12 @@ mod tests {
         init_governor(global, &budgets).expect("default config must produce a governor")
     }
 
-    /// `MemoryGovernor::engine_pressure` returns `PressureLevel::Emergency`
-    /// for any engine that has no budget registered. The Data Plane calls
+    /// `MemoryGovernor::engine_pressure` reports `PressureLevel::Emergency`
+    /// for any engine with a zero limit. The Data Plane calls
     /// `check_engine_pressure` at the top of every write handler, so an
-    /// engine missing from the governor's map turns the very first write to
-    /// that engine on a fresh server into a client-facing `resources
-    /// exhausted` error — even though the box has gigabytes free.
+    /// engine with no positive share on a fresh server turns its very first
+    /// write into a client-facing `resources exhausted` error — even though
+    /// the box has gigabytes free.
     ///
     /// This is the reported `document_schemaless` symptom; the other
     /// assertions below cover the sibling engines that share the same
@@ -94,7 +94,7 @@ mod tests {
     fn document_schemaless_writes_not_starved_on_fresh_governor() {
         let gov = fresh_boot_governor();
         assert!(
-            gov.budget(EngineId::DocumentSchemaless).is_some(),
+            gov.budget(EngineId::DocumentSchemaless).limit() > 0,
             "document_schemaless has no memory budget on a fresh server"
         );
         assert_ne!(
@@ -109,7 +109,7 @@ mod tests {
     fn kv_writes_not_starved_on_fresh_governor() {
         let gov = fresh_boot_governor();
         assert!(
-            gov.budget(EngineId::Kv).is_some(),
+            gov.budget(EngineId::Kv).limit() > 0,
             "kv has no memory budget"
         );
         assert_ne!(
@@ -123,7 +123,7 @@ mod tests {
     fn columnar_writes_not_starved_on_fresh_governor() {
         let gov = fresh_boot_governor();
         assert!(
-            gov.budget(EngineId::Columnar).is_some(),
+            gov.budget(EngineId::Columnar).limit() > 0,
             "columnar has no memory budget"
         );
         assert_ne!(
@@ -137,7 +137,7 @@ mod tests {
     fn array_writes_not_starved_on_fresh_governor() {
         let gov = fresh_boot_governor();
         assert!(
-            gov.budget(EngineId::Array).is_some(),
+            gov.budget(EngineId::Array).limit() > 0,
             "array has no memory budget"
         );
         assert_ne!(
@@ -151,7 +151,7 @@ mod tests {
     fn graph_writes_not_starved_on_fresh_governor() {
         let gov = fresh_boot_governor();
         assert!(
-            gov.budget(EngineId::Graph).is_some(),
+            gov.budget(EngineId::Graph).limit() > 0,
             "graph has no memory budget"
         );
         assert_ne!(
@@ -167,7 +167,7 @@ mod tests {
         // because FTS indexing is a side effect of the write.
         let gov = fresh_boot_governor();
         assert!(
-            gov.budget(EngineId::Fts).is_some(),
+            gov.budget(EngineId::Fts).limit() > 0,
             "fts has no memory budget"
         );
         assert_ne!(
@@ -178,21 +178,21 @@ mod tests {
     }
 
     /// The root invariant: every engine identifier the rest of the system
-    /// can name must have a budget after `init_governor`. `engine_pressure`
-    /// fail-closes to `Emergency` for unknown engines and `try_reserve`
-    /// returns `UnknownEngine`, so a partial registration silently breaks
-    /// every code path keyed on the missing engine.
+    /// can name must have a strictly-positive budget after `init_governor`.
+    /// `EngineConfig::validate` enforces a positive fraction per engine and
+    /// `EngineLimits` is total by construction, so the only way this can
+    /// fail is a zero-fraction default slipping past validation.
     #[test]
     fn every_engine_has_a_budget_on_fresh_governor() {
         let gov = fresh_boot_governor();
-        let missing: Vec<_> = EngineId::ALL
+        let unfunded: Vec<_> = EngineId::ALL
             .iter()
-            .filter(|e| gov.budget(**e).is_none())
+            .filter(|&&e| gov.budget(e).limit() == 0)
             .map(|e| e.to_string())
             .collect();
         assert!(
-            missing.is_empty(),
-            "engines with no memory budget after init_governor: {missing:?}"
+            unfunded.is_empty(),
+            "engines with a zero memory budget after init_governor: {unfunded:?}"
         );
         for &engine in EngineId::ALL {
             assert_ne!(
