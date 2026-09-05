@@ -11,10 +11,13 @@
 
 use std::collections::HashMap;
 
+use nodedb_mem::{EngineId, ScopedMemory};
+
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::accum::GroupState;
 use crate::data::executor::handlers::spill::groupby::GroupBySpiller;
+use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec};
 use nodedb_query::msgpack_scan;
 
@@ -36,6 +39,10 @@ pub(in crate::data::executor) struct AccumulateGroupsParams<'a> {
     pub filters: &'a [u8],
     pub sub_group_by: &'a [String],
     pub sub_aggregates: &'a [AggregateSpec],
+    /// Database this accumulation charges memory reservations against.
+    pub database_id: DatabaseId,
+    /// Tenant this accumulation charges memory reservations against.
+    pub tenant_id: TenantId,
 }
 
 impl CoreLoop {
@@ -62,6 +69,8 @@ impl CoreLoop {
             filters,
             sub_group_by,
             sub_aggregates,
+            database_id,
+            tenant_id,
         } = params;
         let filter_predicates: Vec<ScanFilter> = if filters.is_empty() {
             Vec::new()
@@ -101,7 +110,11 @@ impl CoreLoop {
             .join(format!("core-{}", self.core_id));
         let cap = self.query_tuning.groupby_max_groups_in_mem;
 
-        let mut spiller = GroupBySpiller::new(spill_dir, cap, self.governor.clone())?;
+        let memory = self
+            .governor
+            .clone()
+            .map(|gov| ScopedMemory::new(gov, database_id, tenant_id, EngineId::Query));
+        let mut spiller = GroupBySpiller::new(spill_dir, cap, memory)?;
 
         // Accumulate matching documents. Spill errors are fatal and surfaced
         // once accumulation stops — the first error breaks out of both loops.

@@ -33,8 +33,8 @@ pub(crate) struct ReserveScope {
 }
 
 /// The counters a committed [`ReserveScope`] credited, handed to the caller
-/// so it can build its own RAII type (a `ReservationToken` or a
-/// `BudgetGuard`) on top of them.
+/// so it can build a [`crate::reservation_token::ReservationToken`] on top
+/// of them.
 pub(crate) struct ReservedLayers {
     pub global: Arc<GlobalCounter>,
     pub database: Option<Arc<AtomicUsize>>,

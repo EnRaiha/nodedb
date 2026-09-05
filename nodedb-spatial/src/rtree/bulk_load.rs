@@ -2,8 +2,7 @@
 
 //! Sort-Tile-Recursive (STR) bulk loading for R-tree.
 
-use nodedb_mem::{EngineId, MemoryGovernor};
-use std::sync::Arc;
+use nodedb_mem::ScopedMemory;
 
 use super::node::{ChildRef, INTERNAL_CAPACITY, LEAF_CAPACITY, Node, NodeKind, RTreeEntry};
 use super::tree::RTree;
@@ -17,22 +16,19 @@ impl RTree {
         Self::bulk_load_inner(entries, None)
     }
 
-    /// Bulk load with an optional governor for budget accounting.
+    /// Bulk load with scoped memory for budget accounting.
     ///
-    /// The governor is stored on the returned tree and used for subsequent
-    /// batch operations (full-scan, checkpoint serialization).
-    pub fn bulk_load_with_governor(
-        entries: Vec<RTreeEntry>,
-        governor: Arc<MemoryGovernor>,
-    ) -> Self {
-        Self::bulk_load_inner(entries, Some(governor))
+    /// The scoped memory handle is stored on the returned tree and used for
+    /// subsequent batch operations (full-scan, checkpoint serialization).
+    pub fn bulk_load_with_memory(entries: Vec<RTreeEntry>, memory: ScopedMemory) -> Self {
+        Self::bulk_load_inner(entries, Some(memory))
     }
 
-    fn bulk_load_inner(entries: Vec<RTreeEntry>, governor: Option<Arc<MemoryGovernor>>) -> Self {
+    fn bulk_load_inner(entries: Vec<RTreeEntry>, memory: Option<ScopedMemory>) -> Self {
         if entries.is_empty() {
             let mut tree = Self::new();
-            if let Some(gov) = governor {
-                tree.governor = Some(gov);
+            if let Some(mem) = memory {
+                tree.memory = Some(mem);
             }
             return tree;
         }
@@ -41,18 +37,18 @@ impl RTree {
         // Reserve budget for nodes vec (approximately len / LEAF_CAPACITY nodes,
         // each holding LEAF_CAPACITY RTreeEntry slots). Best-effort: budget
         // pressure is a backpressure signal, not a hard gate on bulk load.
-        let _guard = governor.as_ref().and_then(|gov| {
+        let _guard = memory.as_ref().and_then(|mem| {
             let node_count = len.div_ceil(LEAF_CAPACITY) * 2; // leaves + internals
             let bytes = node_count
                 * (std::mem::size_of::<Node>() + LEAF_CAPACITY * std::mem::size_of::<RTreeEntry>());
-            gov.reserve(EngineId::Spatial, bytes).ok()
+            mem.reserve(bytes).ok()
         });
 
         let mut tree = Self {
             nodes: Vec::new(),
             root: 0,
             len,
-            governor,
+            memory,
         };
         tree.root = str_pack(&mut tree.nodes, entries);
         tree

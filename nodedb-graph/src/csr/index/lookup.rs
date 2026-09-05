@@ -8,9 +8,8 @@
 //! ranges uses raw `u32` via `dense_out_edges` / `dense_in_edges`.
 
 use std::mem::size_of;
-use std::sync::Arc;
 
-use nodedb_mem::{EngineId, MemoryGovernor};
+use nodedb_mem::ScopedMemory;
 
 use super::types::{CsrIndex, Direction};
 use crate::GraphError;
@@ -185,20 +184,18 @@ impl CsrIndex {
     ///
     /// # Errors
     ///
-    /// Returns [`GraphError::MemoryBudget`] if `governor` is `Some` and the
+    /// Returns [`GraphError::MemoryBudget`] if `memory` is `Some` and the
     /// reservation for the three output arrays exceeds the `Graph` engine budget.
     pub(crate) fn build_dense(
         edges: &[Vec<(u32, u32)>],
         collections: &[Vec<u32>],
-        governor: Option<&Arc<MemoryGovernor>>,
+        memory: Option<&ScopedMemory>,
     ) -> Result<DenseAdjacency, GraphError> {
         let n = edges.len();
         let total: usize = edges.iter().map(|e| e.len()).sum();
         // Reserve budget for offsets (n+1 u32s), targets/labels/collections (total u32s each).
         let reserve_bytes = (n + 1 + 3 * total) * size_of::<u32>();
-        let _budget_guard = governor
-            .map(|g| g.reserve(EngineId::Graph, reserve_bytes))
-            .transpose()?;
+        let _budget_guard = memory.map(|mem| mem.reserve(reserve_bytes)).transpose()?;
         let mut offsets = Vec::with_capacity(n + 1);
         let mut targets = Vec::with_capacity(total);
         let mut labels = Vec::with_capacity(total);

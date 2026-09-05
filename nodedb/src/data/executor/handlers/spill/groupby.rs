@@ -19,7 +19,8 @@
 use std::collections::HashMap;
 use std::mem;
 use std::path::PathBuf;
-use std::sync::Arc;
+
+use nodedb_mem::ScopedMemory;
 
 use super::core::SpillCore;
 use crate::data::executor::handlers::accum::GroupState;
@@ -30,8 +31,14 @@ pub(in crate::data::executor::handlers) struct GroupBySpiller {
     core: SpillCore<String, GroupState>,
     in_mem: HashMap<String, GroupState>,
     cap: usize,
-    governor: Option<Arc<nodedb_mem::MemoryGovernor>>,
-    reservation: Option<nodedb_mem::BudgetGuard>,
+    memory: Option<ScopedMemory>,
+    /// One token per charged increment, all held for the run's lifetime. A
+    /// single token would cover only the newest slice, leaving the rest of
+    /// the map allocated but invisible to every budget layer.
+    reservations: Vec<nodedb_mem::ReservationToken>,
+    /// Bytes the tokens above hold, kept level with `bytes_estimate`.
+    reserved_bytes: usize,
+    /// Resident footprint of `in_mem`: one `GroupState` plus its key per group.
     bytes_estimate: usize,
     feed_counter: u64,
 }
@@ -40,14 +47,15 @@ impl GroupBySpiller {
     pub(in crate::data::executor::handlers) fn new(
         spill_dir: PathBuf,
         cap: usize,
-        governor: Option<Arc<nodedb_mem::MemoryGovernor>>,
+        memory: Option<ScopedMemory>,
     ) -> crate::Result<Self> {
         Ok(Self {
             core: SpillCore::new(spill_dir)?,
             in_mem: HashMap::new(),
             cap: cap.max(1),
-            governor,
-            reservation: None,
+            memory,
+            reservations: Vec::new(),
+            reserved_bytes: 0,
             bytes_estimate: 0,
             feed_counter: 0,
         })
@@ -71,18 +79,7 @@ impl GroupBySpiller {
         self.feed_counter += 1;
 
         if self.feed_counter.is_multiple_of(10_000) {
-            let estimated_growth = mem::size_of::<GroupState>() * 10_000;
-            if let Some(ref gov) = self.governor {
-                match gov.reserve(nodedb_mem::EngineId::Query, estimated_growth) {
-                    Ok(guard) => {
-                        self.bytes_estimate = self.bytes_estimate.saturating_add(estimated_growth);
-                        self.reservation = Some(guard);
-                    }
-                    Err(_) => {
-                        self.spill_current_run()?;
-                    }
-                }
-            }
+            self.charge_map_growth()?;
         }
 
         if let Some(state) = self.in_mem.get_mut(&key) {
@@ -103,13 +100,36 @@ impl GroupBySpiller {
         Ok(())
     }
 
+    /// Charge the bytes `in_mem` gained since the last charge.
+    ///
+    /// A denial means the budget is exhausted, so the run spills to disk and
+    /// the released tokens hand the bytes back.
+    fn charge_map_growth(&mut self) -> crate::Result<()> {
+        let shortfall = self.bytes_estimate.saturating_sub(self.reserved_bytes);
+        if shortfall == 0 {
+            return Ok(());
+        }
+        let Some(mem_scope) = self.memory.clone() else {
+            return Ok(());
+        };
+        match mem_scope.reserve(shortfall) {
+            Ok(token) => {
+                self.reservations.push(token);
+                self.reserved_bytes = self.reserved_bytes.saturating_add(shortfall);
+                Ok(())
+            }
+            Err(_) => self.spill_current_run(),
+        }
+    }
+
     fn spill_current_run(&mut self) -> crate::Result<()> {
         if self.in_mem.is_empty() {
             return Ok(());
         }
         self.core.flush_run(self.in_mem.drain())?;
         self.bytes_estimate = 0;
-        self.reservation = None;
+        self.reserved_bytes = 0;
+        self.reservations.clear();
         Ok(())
     }
 
@@ -183,6 +203,67 @@ mod tests {
             .into_iter()
             .map(|(k, s)| (k, s.finalize(specs).into_iter().map(|(_, v)| v).collect()))
             .collect()
+    }
+
+    #[test]
+    fn every_charged_increment_stays_reserved_for_the_run() {
+        // Holding one token covers only the newest increment. The rest of the
+        // map stays allocated while every budget layer reads it as released,
+        // so a long run charges the governor for a fraction of what it holds.
+        use std::sync::Arc;
+
+        use nodedb_mem::{EngineId, EngineLimits, GovernorConfig, MemoryGovernor, ScopedMemory};
+        use nodedb_types::{DatabaseId, TenantId};
+
+        // Per engine. The ceiling covers every engine at that limit, which is
+        // what the governor's own config check demands.
+        const AMPLE: usize = 64 * 1024 * 1024;
+
+        let governor = Arc::new(
+            MemoryGovernor::new(GovernorConfig {
+                global_ceiling: AMPLE * EngineId::ALL.len(),
+                engine_limits: EngineLimits::uniform(AMPLE),
+            })
+            .expect("governor"),
+        );
+        let memory = ScopedMemory::new(
+            Arc::clone(&governor),
+            DatabaseId::new(1),
+            TenantId::new(1),
+            EngineId::Query,
+        );
+
+        let specs = vec![make_spec("count", "*")];
+        let doc = make_doc_i64("v", 1);
+        // A cap this high keeps the run in memory, so only the charge path
+        // can release bytes.
+        let mut spiller = GroupBySpiller::new(
+            temp_spill_dir("charge_accumulates"),
+            1_000_000,
+            Some(memory),
+        )
+        .expect("spiller");
+
+        // Distinct keys grow the map every feed. Two charges land, at feed
+        // 10 000 and feed 20 000.
+        for i in 0..20_000u32 {
+            spiller.feed(format!("k{i}"), &specs, &doc).expect("feed");
+        }
+
+        assert_eq!(
+            spiller.reservations.len(),
+            2,
+            "each charge must add a token instead of replacing the last one"
+        );
+        assert_eq!(
+            governor.budget(EngineId::Query).allocated(),
+            spiller.reserved_bytes,
+            "the governor must hold every charged byte the map still owns"
+        );
+        assert!(
+            spiller.reserved_bytes >= spiller.bytes_estimate / 2,
+            "charges must track the map's footprint, not a fixed slice of it"
+        );
     }
 
     #[test]

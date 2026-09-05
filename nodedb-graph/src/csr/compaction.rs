@@ -133,9 +133,9 @@ impl CsrIndex {
         }
 
         // Build new dense arrays.
-        let governor = self.governor.as_ref();
-        let out = Self::build_dense(&new_out_edges, &new_out_collections, governor)?;
-        let in_ = Self::build_dense(&new_in_edges, &new_in_collections, governor)?;
+        let memory = self.memory.as_ref();
+        let out = Self::build_dense(&new_out_edges, &new_out_collections, memory)?;
+        let in_ = Self::build_dense(&new_in_edges, &new_in_collections, memory)?;
 
         self.out_offsets = out.offsets;
         self.out_targets = out.targets.into();

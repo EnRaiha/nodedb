@@ -99,6 +99,8 @@ impl CoreLoop {
                 filters,
                 sub_group_by: &[],
                 sub_aggregates: &[],
+                database_id: task.request.database_id,
+                tenant_id: task.request.tenant_id,
             }) {
                 Ok(g) => g,
                 Err(e) => {

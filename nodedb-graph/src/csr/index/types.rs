@@ -17,9 +17,8 @@
 //! `"weight"` edge property at insertion time. Unweighted edges default to 1.0.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
-use nodedb_mem::MemoryGovernor;
+use nodedb_mem::ScopedMemory;
 
 use crate::csr::dense_array::DenseArray;
 
@@ -142,14 +141,14 @@ pub struct CsrIndex {
     /// caught by comparing tags at API boundaries.
     pub(crate) partition_tag: u32,
 
-    /// Optional memory governor for budget tracking.
+    /// Optional memory scope for budget tracking.
     ///
     /// When `None`, all memory operations proceed without budget enforcement
     /// (the behavior for NodeDB-Lite / WASM deployments that have no governor).
     /// When `Some`, `compact()`, `checkpoint_to_bytes()`, and `compute_statistics()`
-    /// reserve bytes against `EngineId::Graph` before allocating and release them
-    /// on drop via `BudgetGuard`.
-    pub(crate) governor: Option<Arc<MemoryGovernor>>,
+    /// reserve bytes against the bound database, tenant, and `EngineId::Graph`
+    /// before allocating and release them on drop via `ReservationToken`.
+    pub(crate) memory: Option<ScopedMemory>,
 }
 
 impl Default for CsrIndex {
@@ -193,33 +192,33 @@ impl CsrIndex {
             access_counts: Vec::new(),
             query_epoch: 0,
             partition_tag: crate::csr::local_node_id::next_partition_tag(),
-            governor: None,
+            memory: None,
         }
     }
 
-    /// Create a new `CsrIndex` wired to a memory governor.
+    /// Create a new `CsrIndex` wired to a memory scope.
     ///
     /// Subsequent calls to `compact()`, `checkpoint_to_bytes()`, and
-    /// `compute_statistics()` will reserve bytes against `EngineId::Graph`
-    /// before allocating and return `Err(GraphError::MemoryBudget(_))` if
-    /// the budget is exhausted.
+    /// `compute_statistics()` will reserve bytes against the bound database,
+    /// tenant, and `EngineId::Graph` before allocating and return
+    /// `Err(GraphError::MemoryBudget(_))` if the budget is exhausted.
     ///
-    /// Use `CsrIndex::new()` when deploying without a governor (NodeDB-Lite,
+    /// Use `CsrIndex::new()` when deploying without a scope (NodeDB-Lite,
     /// WASM, or tests that do not need budget enforcement).
-    pub fn with_governor(governor: Arc<MemoryGovernor>) -> Self {
+    pub fn with_memory(memory: ScopedMemory) -> Self {
         Self {
-            governor: Some(governor),
+            memory: Some(memory),
             ..Self::new()
         }
     }
 
-    /// Attach a memory governor to an existing `CsrIndex`.
+    /// Attach a memory scope to an existing `CsrIndex`.
     ///
     /// Used by the REINDEX path: a partition is rebuilt on a background thread
-    /// (without a governor since `MemoryGovernor` is `Arc<...>` but the thread
-    /// is independent), and on cutover the Data Plane installs the governor.
-    pub fn with_governor_attached(mut self, governor: Arc<MemoryGovernor>) -> Self {
-        self.governor = Some(governor);
+    /// (without a scope since the governor lives behind an `Arc` the thread
+    /// does not hold), and on cutover the Data Plane installs the scope.
+    pub fn with_memory_attached(mut self, memory: ScopedMemory) -> Self {
+        self.memory = Some(memory);
         self
     }
 

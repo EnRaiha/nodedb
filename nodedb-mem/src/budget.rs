@@ -7,13 +7,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Decrement `counter` by `size`, clamping at zero.
 ///
-/// Plain `fetch_sub` wraps on underflow — a counter released past zero by a
-/// concurrent path (e.g. a `BudgetGuard` and a `ReservationToken` both
-/// crediting the same engine budget, one dropping while the other is still
-/// alive) would otherwise jump to ~`usize::MAX`, which every utilization
-/// reader then interprets as 100 % → permanent Emergency pressure. All
-/// release sites must go through this so an over-release is at worst a
-/// saturated zero, never a wrapped maximum.
+/// Plain `fetch_sub` wraps on underflow — a counter released past zero by
+/// two `ReservationToken`s crediting the same engine budget, one dropping
+/// while the other is still alive, would otherwise jump to ~`usize::MAX`,
+/// which every utilization reader then interprets as 100 % → permanent
+/// Emergency pressure. All release sites must go through this so an
+/// over-release is at worst a saturated zero, never a wrapped maximum.
 pub(crate) fn atomic_saturating_sub(counter: &AtomicUsize, size: usize) {
     if size == 0 {
         return;

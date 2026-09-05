@@ -10,7 +10,6 @@
 use std::collections::HashMap;
 use std::mem::size_of;
 
-use nodedb_mem::EngineId;
 use serde::{Deserialize, Serialize};
 
 use super::CsrIndex;
@@ -95,9 +94,9 @@ impl CsrIndex {
         // Reserve memory for the two degree-distribution scratch arrays.
         let degree_bytes = 2 * n * size_of::<usize>();
         let _degree_guard = self
-            .governor
+            .memory
             .as_ref()
-            .map(|g| g.reserve(EngineId::Graph, degree_bytes))
+            .map(|mem| mem.reserve(degree_bytes))
             .transpose()?;
 
         // Per-label counters.

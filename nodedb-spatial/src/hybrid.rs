@@ -19,12 +19,11 @@
 //! This is a unique NodeDB differentiator — PostGIS + pgvector can't do
 //! this in a single index scan.
 
-use nodedb_mem::{EngineId, MemoryGovernor};
+use nodedb_mem::ScopedMemory;
 #[cfg(test)]
 use nodedb_types::BoundingBox;
 use nodedb_types::geometry::Geometry;
 use nodedb_types::geometry_bbox;
-use std::sync::Arc;
 
 use crate::predicates;
 use crate::rtree::RTree;
@@ -52,15 +51,15 @@ pub struct SpatialPreFilterResult {
 /// The caller (vector engine) uses the candidate IDs to build a RoaringBitmap
 /// that restricts HNSW graph traversal.
 ///
-/// When `governor` is `Some`, the `candidate_ids` allocation is budgeted via
-/// [`MemoryGovernor::reserve`] before the `Vec::with_capacity`. Budget pressure
+/// When `memory` is `Some`, the `candidate_ids` allocation is budgeted via
+/// [`ScopedMemory::reserve`] before the `Vec::with_capacity`. Budget pressure
 /// is a backpressure signal; the allocation still proceeds on budget exhaustion.
 pub fn spatial_prefilter(
     rtree: &RTree,
     query_geometry: &Geometry,
     distance_meters: Option<f64>,
     exact_geometries: &dyn Fn(u64) -> Option<Geometry>,
-    governor: Option<&Arc<MemoryGovernor>>,
+    memory: Option<&ScopedMemory>,
 ) -> SpatialPreFilterResult {
     // Step 1: Compute search bbox.
     let search_bbox = if let Some(dist) = distance_meters {
@@ -74,9 +73,9 @@ pub fn spatial_prefilter(
     let rtree_candidates = rtree_results.len();
 
     // Step 3: Exact predicate refinement.
-    let _guard = governor.and_then(|gov| {
+    let _guard = memory.and_then(|mem| {
         let bytes = rtree_candidates * std::mem::size_of::<u64>();
-        gov.reserve(EngineId::Spatial, bytes).ok()
+        mem.reserve(bytes).ok()
     });
     let mut candidate_ids = Vec::with_capacity(rtree_candidates);
     for entry in &rtree_results {

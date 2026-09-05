@@ -3,11 +3,10 @@
 //! R*-tree public API and core structure.
 
 use nodedb_types::BoundingBox;
-use std::sync::Arc;
 
 use super::node::{Node, NodeKind, RTreeEntry};
 use super::search::NnResult;
-use nodedb_mem::MemoryGovernor;
+use nodedb_mem::ScopedMemory;
 
 /// R*-tree spatial index.
 ///
@@ -22,8 +21,8 @@ pub struct RTree {
     pub(crate) nodes: Vec<Node>,
     pub(crate) root: usize,
     pub(crate) len: usize,
-    /// Optional memory governor for budget enforcement (Origin only).
-    pub(crate) governor: Option<Arc<MemoryGovernor>>,
+    /// Optional scoped memory handle for budget enforcement (Origin only).
+    pub(crate) memory: Option<ScopedMemory>,
 }
 
 impl RTree {
@@ -32,21 +31,22 @@ impl RTree {
             nodes: vec![Node::new_leaf()],
             root: 0,
             len: 0,
-            governor: None,
+            memory: None,
         }
     }
 
-    /// Inject a [`MemoryGovernor`] to enforce per-engine memory budgets on
-    /// large batch allocations (bulk load, full-scan serialization, range
-    /// search result collection). When not set, allocations proceed without
-    /// budget enforcement — correct for NodeDB-Lite and WASM builds.
-    pub fn set_governor(&mut self, governor: Arc<MemoryGovernor>) {
-        self.governor = Some(governor);
+    /// Inject a [`ScopedMemory`] handle to enforce database, tenant, and
+    /// engine memory budgets on large batch allocations (bulk load,
+    /// full-scan serialization, range search result collection). When not
+    /// set, allocations proceed without budget enforcement — correct for
+    /// NodeDB-Lite and WASM builds.
+    pub fn set_memory(&mut self, memory: ScopedMemory) {
+        self.memory = Some(memory);
     }
 
-    /// Shared reference to the governor, if any.
-    pub(crate) fn governor(&self) -> Option<&Arc<MemoryGovernor>> {
-        self.governor.as_ref()
+    /// Shared reference to the scoped memory handle, if any.
+    pub(crate) fn memory(&self) -> Option<&ScopedMemory> {
+        self.memory.as_ref()
     }
 
     pub fn len(&self) -> usize {
@@ -83,9 +83,9 @@ impl RTree {
 
     /// Get all entries (for persistence serialization).
     pub fn entries(&self) -> Vec<&RTreeEntry> {
-        let _guard = self.governor().and_then(|gov| {
+        let _guard = self.memory().and_then(|mem| {
             let bytes = self.len * std::mem::size_of::<*const RTreeEntry>();
-            gov.reserve(nodedb_mem::EngineId::Spatial, bytes).ok()
+            mem.reserve(bytes).ok()
         });
         let mut result = Vec::with_capacity(self.len);
         collect_entries(&self.nodes, self.root, &mut result);

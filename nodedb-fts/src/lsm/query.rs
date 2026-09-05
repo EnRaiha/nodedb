@@ -14,7 +14,9 @@ use super::segment::reader::SegmentReader;
 
 use std::sync::Arc;
 
-use nodedb_mem::{EngineId, MemoryGovernor};
+use nodedb_mem::MemoryGovernor;
+
+use crate::mem_scope::fts_scope;
 
 /// Collect posting lists for a set of query tokens by merging across
 /// the active memtable and all immutable segments.
@@ -22,8 +24,8 @@ use nodedb_mem::{EngineId, MemoryGovernor};
 /// Returns per-term `TermBlocks` ready for BMW scoring.
 ///
 /// When `governor` is `Some`, the `Vec::with_capacity` for `term_blocks_list`
-/// is budgeted via [`MemoryGovernor::reserve`] before the allocation.
-/// If the budget is exhausted the allocation still proceeds — the governor
+/// is budgeted via [`nodedb_mem::ScopedMemory::reserve`] before the allocation.
+/// If the budget is exhausted the allocation still proceeds — the scope
 /// serves as an accounting and backpressure signal.
 pub fn collect_merged_term_blocks<B: FtsBackend>(
     backend: &B,
@@ -44,9 +46,9 @@ pub fn collect_merged_term_blocks<B: FtsBackend>(
         }
     }
 
-    let _term_blocks_guard = governor.and_then(|gov| {
+    let _term_blocks_guard = fts_scope(governor, database_id, tid).and_then(|mem| {
         let bytes = query_tokens.len() * std::mem::size_of::<TermBlocks>();
-        gov.reserve(EngineId::Fts, bytes).ok()
+        mem.reserve(bytes).ok()
     });
 
     let mut term_blocks_list = Vec::with_capacity(query_tokens.len());

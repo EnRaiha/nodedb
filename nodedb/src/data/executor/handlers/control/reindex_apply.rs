@@ -272,7 +272,13 @@ pub(super) fn apply_csr(
     };
 
     let rebuilt = if let Some(gov) = core.governor.clone() {
-        rebuilt.with_governor_attached(gov)
+        let memory = nodedb_mem::ScopedMemory::new(
+            gov,
+            *database_id,
+            *tenant_id,
+            nodedb_mem::EngineId::Graph,
+        );
+        rebuilt.with_memory_attached(memory)
     } else {
         rebuilt
     };

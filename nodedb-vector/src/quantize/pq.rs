@@ -15,16 +15,15 @@
 //! (8-16x total vs 4x for SQ8). Best for cost-sensitive large datasets.
 
 use std::mem::size_of;
-use std::sync::Arc;
 
-use nodedb_mem::{EngineId, MemoryGovernor};
+use nodedb_mem::{ReservationToken, ScopedMemory};
 use nodedb_types::decode_bounds::checked_decode_capacity;
 use serde::{Deserialize, Serialize};
 
 use crate::error::VectorError;
 
 /// Hard ceiling for a decoded PQ vector. This bounds corrupted persisted
-/// configuration even when the codec has no memory governor attached.
+/// configuration even when the codec has no scoped memory handle attached.
 const MAX_PQ_DECODE_DIM: usize = 1_048_576;
 const MAX_PQ_CODEBOOK_BYTES: usize = 64 * 1024 * 1024;
 // MessagePack stores each f32 as a marker plus four payload bytes and also
@@ -44,16 +43,16 @@ fn pq_codebook_allocation_bytes(m: usize, k: usize, sub_dim: usize) -> Option<us
         .checked_add(float_bytes)
 }
 
-/// Reserve `bytes` from `governor` for `EngineId::Vector`, or succeed silently
-/// when no governor is configured. The returned guard (if any) must be kept
-/// alive for the duration of the allocation it covers.
+/// Reserve `bytes` from `memory`, or succeed silently when no scoped memory
+/// handle is configured. The returned token (if any) must be kept alive for
+/// the duration of the allocation it covers.
 #[inline]
 fn try_reserve_or_skip(
-    governor: &Option<Arc<MemoryGovernor>>,
+    memory: &Option<ScopedMemory>,
     bytes: usize,
-) -> Result<Option<nodedb_mem::BudgetGuard>, VectorError> {
-    match governor {
-        Some(g) => Ok(Some(g.reserve(EngineId::Vector, bytes)?)),
+) -> Result<Option<ReservationToken>, VectorError> {
+    match memory {
+        Some(m) => Ok(Some(m.reserve(bytes)?)),
         None => Ok(None),
     }
 }
@@ -75,26 +74,25 @@ pub struct PqCodec {
     /// Total: M × K × sub_dim floats.
     codebooks: Vec<Vec<Vec<f32>>>,
 
-    /// Optional memory governor. Skipped during serialization — it is a
-    /// runtime concern only, not part of the on-disk format.
+    /// Optional scoped memory handle. Skipped during serialization — it is
+    /// a runtime concern only, not part of the on-disk format.
     #[serde(skip, default)]
     #[msgpack(ignore)]
-    governor: Option<Arc<MemoryGovernor>>,
+    memory: Option<ScopedMemory>,
 }
 
 impl PqCodec {
-    /// Attach a memory governor to this codec.
+    /// Attach a scoped memory handle to this codec.
     ///
     /// Once set, heap-significant operations (`train`, `encode_batch`,
-    /// `build_distance_table`, `decode`, `to_bytes`) will charge the
-    /// `EngineId::Vector` budget before allocating and release the reservation
-    /// when the returned value is dropped (RAII).  When no governor is set
-    /// those operations proceed unconditionally, preserving backward
-    /// compatibility with callers that do not use the memory governor.
+    /// `build_distance_table`, `decode`, `to_bytes`) charge the bound
+    /// database, tenant, and engine budget before allocating, and release
+    /// the reservation when the returned value drops (RAII). When no
+    /// scoped memory handle is set those operations proceed unconditionally.
     ///
-    /// The governor is a runtime concern only — it is **not** serialized.
-    pub fn with_governor(mut self, governor: Arc<MemoryGovernor>) -> Self {
-        self.governor = Some(governor);
+    /// The handle is a runtime concern only — it is **not** serialized.
+    pub fn with_memory(mut self, memory: ScopedMemory) -> Self {
+        self.memory = Some(memory);
         self
     }
 
@@ -141,7 +139,7 @@ impl PqCodec {
             k,
             sub_dim,
             codebooks,
-            governor: None,
+            memory: None,
         }
     }
 
@@ -165,12 +163,12 @@ impl PqCodec {
 
     /// Batch encode all vectors into a contiguous byte array.
     ///
-    /// Charges `m * vectors.len()` bytes to the governor budget (if set)
+    /// Charges `m * vectors.len()` bytes to the bound budget (if set)
     /// before allocating the output buffer.  The guard is released at
     /// the end of this call — the buffer itself remains alive.
     pub fn encode_batch(&self, vectors: &[&[f32]]) -> Result<Vec<u8>, VectorError> {
         let capacity = self.m * vectors.len();
-        let _g = try_reserve_or_skip(&self.governor, capacity * size_of::<u8>())?;
+        let _g = try_reserve_or_skip(&self.memory, capacity * size_of::<u8>())?;
         let mut out = Vec::with_capacity(capacity);
         for v in vectors {
             out.extend(self.encode(v));
@@ -184,12 +182,12 @@ impl PqCodec {
     /// to each centroid. Pre-computing this table makes distance evaluation
     /// O(M) per candidate instead of O(D).
     ///
-    /// Charges `m * k * size_of::<f32>()` bytes to the governor (if set)
+    /// Charges `m * k * size_of::<f32>()` bytes to the bound budget (if set)
     /// before allocating the table.
     pub fn build_distance_table(&self, query: &[f32]) -> Result<Vec<Vec<f32>>, VectorError> {
         debug_assert_eq!(query.len(), self.dim);
         let total_bytes = self.m * self.k * size_of::<f32>();
-        let _g = try_reserve_or_skip(&self.governor, total_bytes)?;
+        let _g = try_reserve_or_skip(&self.memory, total_bytes)?;
         let mut table = Vec::with_capacity(self.m);
         for sub in 0..self.m {
             let offset = sub * self.sub_dim;
@@ -219,7 +217,7 @@ impl PqCodec {
 
     /// Decode a PQ code back to an approximate FP32 vector.
     ///
-    /// Charges `dim * size_of::<f32>()` bytes to the governor (if set)
+    /// Charges `dim * size_of::<f32>()` bytes to the bound budget (if set)
     /// before allocating the output buffer.
     pub fn decode(&self, code: &[u8]) -> Result<Vec<f32>, VectorError> {
         self.validate_shape()?;
@@ -255,7 +253,7 @@ impl PqCodec {
             got: 0,
         })?;
         let allocation_bytes = output_capacity * size_of::<f32>();
-        let _g = try_reserve_or_skip(&self.governor, allocation_bytes)?;
+        let _g = try_reserve_or_skip(&self.memory, allocation_bytes)?;
         let mut out = Vec::with_capacity(output_capacity);
         for (sub, &c) in code.iter().enumerate() {
             out.extend_from_slice(&self.codebooks[sub][c as usize]);
@@ -267,7 +265,7 @@ impl PqCodec {
     ///
     /// Format: `[NDPQ\0\0 (6 bytes)][version: u8 = 1][msgpack payload]`
     ///
-    /// Charges the estimated serialized size to the governor (if set) before
+    /// Charges the estimated serialized size to the bound budget (if set) before
     /// allocating the output buffer.  The estimate is conservative:
     /// `m * k * sub_dim * size_of::<f32>() + 64` (header + framing overhead).
     pub fn to_bytes(&self) -> Result<Vec<u8>, VectorError> {
@@ -275,7 +273,7 @@ impl PqCodec {
         const MAGIC: &[u8; 6] = b"NDPQ\0\0";
         const VERSION: u8 = 1;
         let estimated = self.m * self.k * self.sub_dim * size_of::<f32>() + 64;
-        let _g = try_reserve_or_skip(&self.governor, estimated)?;
+        let _g = try_reserve_or_skip(&self.memory, estimated)?;
         let payload = zerompk::to_msgpack_vec(self).unwrap_or_default();
         let mut out = Vec::with_capacity(7 + payload.len());
         out.extend_from_slice(MAGIC);
@@ -533,7 +531,7 @@ mod tests {
             k: 1,
             sub_dim: MAX_PQ_DECODE_DIM + 1,
             codebooks: vec![vec![vec![]]],
-            governor: None,
+            memory: None,
         };
         assert!(codec.decode(&[0]).is_err());
     }
@@ -560,7 +558,7 @@ mod tests {
             k: 1,
             sub_dim: 2,
             codebooks: vec![vec![vec![0.0, 0.0]]],
-            governor: None,
+            memory: None,
         };
         let payload = zerompk::to_msgpack_vec(&malformed).unwrap();
         let mut bytes = b"NDPQ\0\0\x01".to_vec();
@@ -579,7 +577,7 @@ mod tests {
             k: 1,
             sub_dim: 1,
             codebooks: vec![vec![vec![0.0]]],
-            governor: None,
+            memory: None,
         };
         assert!(matches!(
             codec.decode(&[1]),

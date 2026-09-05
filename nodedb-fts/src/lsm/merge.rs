@@ -13,23 +13,21 @@ use crate::block::{CompactPosting, PostingBlock, into_blocks};
 
 use super::segment::reader::SegmentReader;
 
-use std::sync::Arc;
-
-use nodedb_mem::{EngineId, MemoryGovernor};
+use nodedb_mem::ScopedMemory;
 
 /// Merge multiple segments into a single set of per-term PostingBlocks.
 ///
 /// The result is a sorted list of `(term, blocks)` suitable for
 /// `segment::writer::build_from_blocks`.
 ///
-/// When `governor` is `Some`, the `Vec::with_capacity` for the result is
-/// budgeted via [`MemoryGovernor::reserve`] before the allocation.
-/// If the budget is exceeded the allocation still proceeds — the governor
+/// When `memory` is `Some`, the `Vec::with_capacity` for the result is
+/// budgeted via [`ScopedMemory::reserve`] before the allocation.
+/// If the budget is exceeded the allocation still proceeds — the scope
 /// serves as an accounting and backpressure signal; callers that need hard
 /// rejection should check pressure before dispatching the operation.
 pub fn merge_segments(
     segments: &[SegmentReader],
-    governor: Option<&Arc<MemoryGovernor>>,
+    memory: Option<&ScopedMemory>,
 ) -> Vec<(String, Vec<PostingBlock>)> {
     // Collect all unique terms across all segments.
     let mut all_terms = BTreeSet::new();
@@ -39,10 +37,10 @@ pub fn merge_segments(
         }
     }
 
-    let _result_guard = governor.and_then(|gov| {
+    let _result_guard = memory.and_then(|mem| {
         let bytes = all_terms.len()
             * (std::mem::size_of::<String>() + std::mem::size_of::<Vec<PostingBlock>>());
-        gov.reserve(EngineId::Fts, bytes).ok()
+        mem.reserve(bytes).ok()
     });
 
     let mut result = Vec::with_capacity(all_terms.len());

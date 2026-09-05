@@ -110,15 +110,15 @@ impl Drop for ReservationToken {
 
         // Release in reverse order: engine → tenant → database → global.
         //
-        // Each decrement saturates at zero. A concurrent `BudgetGuard` on the
-        // same engine counter touches the engine + global counters directly,
-        // so a counter can legitimately be below this token's `size` by the
-        // time the token drops (e.g. a timeseries flush released the memtable
-        // footprint while a per-batch token was still in scope). A plain
-        // `fetch_sub` would wrap such a counter to ~usize::MAX, which every
-        // utilization reader treats as 100 % → permanent Emergency pressure →
-        // suspended SPSC reads → schema-register barrier deadlock. Clamping
-        // keeps an over-release a harmless zero instead.
+        // Each decrement saturates at zero. A concurrent token on the same
+        // engine counter can legitimately drive it below this token's
+        // `size` by the time this token drops (e.g. a timeseries flush's
+        // token released the memtable footprint while a per-batch token
+        // was still in scope). A plain `fetch_sub` would wrap such a
+        // counter to ~usize::MAX, which every utilization reader treats
+        // as 100 % → permanent Emergency pressure → suspended SPSC reads
+        // → schema-register barrier deadlock. Clamping keeps an
+        // over-release a harmless zero instead.
         if let Some(ref counter) = self.engine_counter {
             crate::budget::atomic_saturating_sub(counter, size);
         }
@@ -221,15 +221,15 @@ mod tests {
 
     #[test]
     fn drop_does_not_underflow_a_counter_released_below_size() {
-        // The governor exposes two RAII release paths: this token (four
-        // layers) and `BudgetGuard` (engine + global only). When both touch
-        // the same engine budget — e.g. a `BudgetGuard` for a timeseries
-        // flush drops while a live per-batch token still holds a small
-        // reservation — the budget can be driven to zero before the token
-        // drops. The token's `fetch_sub` on drop must NOT wrap that counter
-        // into the multi-exabyte range: a wrapped engine or tenant counter
-        // reads as 100% utilization (Emergency) forever, suspends the core's
-        // SPSC reads, and deadlocks every subsequent DDL on the
+        // Two live tokens can credit the same engine budget. When one
+        // drops first — e.g. a timeseries flush's token releasing the
+        // full memtable footprint while a live per-batch token still
+        // holds a small reservation — the budget can be driven to zero
+        // before the second token drops. The second token's `fetch_sub`
+        // on drop must NOT wrap that counter into the multi-exabyte
+        // range: a wrapped engine or tenant counter reads as 100%
+        // utilization (Emergency) forever, suspends the core's SPSC
+        // reads, and deadlocks every subsequent DDL on the
         // schema-register barrier — the exact "healthy /healthz, every
         // query fails" failure mode. Drop must saturate at zero.
         let global = make_global(40);
@@ -247,7 +247,7 @@ mod tests {
             engine: EngineId::Timeseries,
         });
 
-        // A concurrent `BudgetGuard` drop drains the engine + global counters
+        // A concurrent token's drop drains the engine + global counters
         // past what this token reserved (a flush releasing the full
         // memtable footprint while the small per-batch token is alive).
         engine_ctr.store(0, std::sync::atomic::Ordering::Relaxed);

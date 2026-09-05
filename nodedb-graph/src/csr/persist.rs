@@ -9,8 +9,6 @@
 use std::collections::HashMap;
 use std::mem::size_of;
 
-use nodedb_mem::EngineId;
-
 use super::index::CsrIndex;
 use crate::GraphError;
 
@@ -113,9 +111,9 @@ impl CsrIndex {
             .expect("CSR rkyv serialization should not fail");
         let buf_capacity = RKYV_MAGIC.len() + 1 + rkyv_bytes.len();
         let _budget_guard = self
-            .governor
+            .memory
             .as_ref()
-            .map(|g| g.reserve(EngineId::Graph, buf_capacity * size_of::<u8>()))
+            .map(|mem| mem.reserve(buf_capacity * size_of::<u8>()))
             .transpose()?;
         let mut buf = Vec::with_capacity(buf_capacity);
         buf.extend_from_slice(RKYV_MAGIC);
@@ -292,8 +290,8 @@ impl CsrIndex {
             query_epoch: 0,
             partition_tag: crate::csr::local_node_id::next_partition_tag(),
             // Checkpoint restore creates an ungoverned index; callers that
-            // need budget enforcement should call `set_governor` afterwards.
-            governor: None,
+            // need budget enforcement call `with_memory_attached` afterwards.
+            memory: None,
         })
     }
 
@@ -397,7 +395,7 @@ impl CsrIndex {
             query_epoch: 0,
             partition_tag: crate::csr::local_node_id::next_partition_tag(),
             // Checkpoint restore creates an ungoverned index.
-            governor: None,
+            memory: None,
         }
     }
 }

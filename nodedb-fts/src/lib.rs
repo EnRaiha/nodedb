@@ -21,6 +21,7 @@ pub mod fuzzy;
 pub mod highlight;
 pub mod index;
 pub mod lsm;
+mod mem_scope;
 pub mod posting;
 pub mod search;
 

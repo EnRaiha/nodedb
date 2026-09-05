@@ -2,10 +2,8 @@
 
 //! Column block encoding: `encode_column_blocks` and the per-block dispatch logic.
 
-use std::sync::Arc;
-
 use nodedb_codec::{ColumnCodec, ResolvedColumnCodec};
-use nodedb_mem::{EngineId, MemoryGovernor};
+use nodedb_mem::ScopedMemory;
 use nodedb_types::columnar::ColumnType;
 
 use crate::error::ColumnarError;
@@ -25,16 +23,11 @@ pub(super) fn encode_column_blocks(
     col_type: &ColumnType,
     codec: ResolvedColumnCodec,
     row_count: usize,
-    governor: Option<&Arc<MemoryGovernor>>,
+    memory: Option<&ScopedMemory>,
 ) -> Result<Vec<BlockStats>, ColumnarError> {
     let num_blocks = row_count.div_ceil(BLOCK_SIZE);
-    let _stats_guard = governor
-        .map(|g| {
-            g.reserve(
-                EngineId::Columnar,
-                num_blocks * std::mem::size_of::<BlockStats>(),
-            )
-        })
+    let _stats_guard = memory
+        .map(|m| m.reserve(num_blocks * std::mem::size_of::<BlockStats>()))
         .transpose()?;
     let mut block_stats = Vec::with_capacity(num_blocks);
 
@@ -50,7 +43,7 @@ pub(super) fn encode_column_blocks(
             start,
             end,
             block_row_count,
-            governor,
+            memory,
         )?;
 
         // Write block: [compressed_len: u32 LE][compressed_data].
@@ -72,7 +65,7 @@ fn encode_single_block(
     start: usize,
     end: usize,
     block_row_count: usize,
-    governor: Option<&Arc<MemoryGovernor>>,
+    memory: Option<&ScopedMemory>,
 ) -> Result<(Vec<u8>, BlockStats), ColumnarError> {
     // Get validity slice — Cow::Owned(all-true) for non-nullable columns,
     // Cow::Borrowed for nullable columns. Generated once per flush block.
@@ -118,9 +111,7 @@ fn encode_single_block(
 
             let bool_slice = &values[start..end];
             let packed_len = bool_slice.len().div_ceil(8);
-            let _packed_guard = governor
-                .map(|g| g.reserve(EngineId::Columnar, packed_len))
-                .transpose()?;
+            let _packed_guard = memory.map(|m| m.reserve(packed_len)).transpose()?;
             let mut packed = Vec::with_capacity(packed_len);
             for chunk in bool_slice.chunks(8) {
                 let mut byte = 0u8;
@@ -205,9 +196,7 @@ fn encode_single_block(
 
             let slice = &values[start..end];
             let raw_len = slice.len() * 16;
-            let _raw_guard = governor
-                .map(|g| g.reserve(EngineId::Columnar, raw_len))
-                .transpose()?;
+            let _raw_guard = memory.map(|m| m.reserve(raw_len)).transpose()?;
             let mut raw = Vec::with_capacity(raw_len);
             for v in slice {
                 raw.extend_from_slice(v);
@@ -226,9 +215,7 @@ fn encode_single_block(
             let float_end = end * d;
             let float_slice = &data[float_start..float_end];
             let raw_len = float_slice.len() * 4;
-            let _raw_guard = governor
-                .map(|g| g.reserve(EngineId::Columnar, raw_len))
-                .transpose()?;
+            let _raw_guard = memory.map(|m| m.reserve(raw_len)).transpose()?;
             let mut raw = Vec::with_capacity(raw_len);
             for f in float_slice {
                 raw.extend_from_slice(&f.to_le_bytes());

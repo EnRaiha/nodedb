@@ -151,9 +151,7 @@ impl RTree {
 
         // Build inner plaintext: magic + version + rkyv payload.
         let inner_len = RTREE_RKYV_MAGIC.len() + 1 + rkyv_bytes.len();
-        let _guard = self
-            .governor()
-            .and_then(|gov| gov.reserve(nodedb_mem::EngineId::Spatial, inner_len).ok());
+        let _guard = self.memory().and_then(|mem| mem.reserve(inner_len).ok());
         let mut inner = Vec::with_capacity(inner_len);
         inner.extend_from_slice(RTREE_RKYV_MAGIC);
         inner.push(RTREE_FORMAT_VERSION);

@@ -13,7 +13,9 @@ use super::segment::{reader::SegmentReader, writer};
 
 use std::sync::Arc;
 
-use nodedb_mem::{EngineId, MemoryGovernor};
+use nodedb_mem::MemoryGovernor;
+
+use crate::mem_scope::fts_scope;
 
 /// Compaction configuration.
 #[derive(Debug, Clone, Copy)]
@@ -117,7 +119,7 @@ pub struct CompactLevelParams<'a, B: FtsBackend> {
 /// (which should be removed from storage after the new segment is written).
 ///
 /// When `governor` is `Some`, each `Vec::with_capacity` allocation is budgeted
-/// via [`MemoryGovernor::reserve`]. If the budget is exhausted the function
+/// via [`nodedb_mem::ScopedMemory::reserve`]. If the budget is exhausted the function
 /// returns [`CompactError::Budget`] before allocating.
 pub fn compact_level<B: FtsBackend>(
     params: CompactLevelParams<'_, B>,
@@ -136,17 +138,21 @@ pub fn compact_level<B: FtsBackend>(
         return Ok(None);
     }
 
-    let _readers_guard = governor
-        .map(|gov| {
-            gov.reserve(EngineId::Fts, to_merge.len() * size_of::<SegmentReader>())
+    let memory = fts_scope(governor, database_id, tid);
+
+    let _readers_guard = memory
+        .as_ref()
+        .map(|mem| {
+            mem.reserve(to_merge.len() * size_of::<SegmentReader>())
                 .map_err(CompactError::Budget)
         })
         .transpose()?;
     let mut readers = Vec::with_capacity(to_merge.len());
 
-    let _ids_guard = governor
-        .map(|gov| {
-            gov.reserve(EngineId::Fts, to_merge.len() * size_of::<String>())
+    let _ids_guard = memory
+        .as_ref()
+        .map(|mem| {
+            mem.reserve(to_merge.len() * size_of::<String>())
                 .map_err(CompactError::Budget)
         })
         .transpose()?;
@@ -167,7 +173,7 @@ pub fn compact_level<B: FtsBackend>(
         return Ok(None);
     }
 
-    let merged_term_blocks = merge::merge_segments(&readers, governor);
+    let merged_term_blocks = merge::merge_segments(&readers, memory.as_ref());
     let new_segment = writer::build_from_blocks(&merged_term_blocks)
         .expect("compaction produced a term longer than u16::MAX — data invariant violated");
 

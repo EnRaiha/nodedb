@@ -76,6 +76,8 @@ impl CoreLoop {
                 filters,
                 sub_group_by,
                 sub_aggregates,
+                database_id: task.request.database_id,
+                tenant_id: task.request.tenant_id,
             }) {
                 Ok(g) => g,
                 // Map through `From<crate::Error> for ErrorCode` rather than a

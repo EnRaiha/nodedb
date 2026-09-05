@@ -2,10 +2,8 @@
 
 //! `SegmentWriter` and codec selection for compressed columnar segments.
 
-use std::sync::Arc;
-
 use nodedb_codec::{ColumnCodec, ColumnTypeHint, ResolvedColumnCodec};
-use nodedb_mem::{EngineId, MemoryGovernor};
+use nodedb_mem::ScopedMemory;
 use nodedb_types::columnar::{ColumnType, ColumnarSchema};
 
 use crate::error::ColumnarError;
@@ -27,9 +25,9 @@ pub const PROFILE_SPATIAL: u8 = 2;
 /// any column without scanning the entire file.
 pub struct SegmentWriter {
     profile_tag: u8,
-    /// Optional memory governor for tracking working-buffer allocations.
+    /// Optional scoped memory handle for tracking working-buffer allocations.
     /// `None` in embedded (Lite) deployments that do not configure a governor.
-    governor: Option<Arc<MemoryGovernor>>,
+    memory: Option<ScopedMemory>,
 }
 
 impl SegmentWriter {
@@ -37,15 +35,15 @@ impl SegmentWriter {
     pub fn new(profile_tag: u8) -> Self {
         Self {
             profile_tag,
-            governor: None,
+            memory: None,
         }
     }
 
-    /// Create a writer for the given profile with a memory governor.
-    pub fn with_governor(profile_tag: u8, governor: Arc<MemoryGovernor>) -> Self {
+    /// Create a writer for the given profile with a scoped memory handle.
+    pub fn with_memory(profile_tag: u8, memory: ScopedMemory) -> Self {
         Self {
             profile_tag,
-            governor: Some(governor),
+            memory: Some(memory),
         }
     }
 
@@ -86,14 +84,9 @@ impl SegmentWriter {
 
         // 2. Encode each column's blocks.
         let _metas_guard = self
-            .governor
+            .memory
             .as_ref()
-            .map(|g| {
-                g.reserve(
-                    EngineId::Columnar,
-                    columns.len() * std::mem::size_of::<ColumnMeta>(),
-                )
-            })
+            .map(|m| m.reserve(columns.len() * std::mem::size_of::<ColumnMeta>()))
             .transpose()?;
         let mut column_metas = Vec::with_capacity(columns.len());
 
@@ -110,7 +103,7 @@ impl SegmentWriter {
                 &col_def.column_type,
                 codec,
                 row_count,
-                self.governor.as_ref(),
+                self.memory.as_ref(),
             )?;
 
             let col_end = buf.len() as u64;

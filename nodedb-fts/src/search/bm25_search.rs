@@ -210,11 +210,12 @@ impl<B: FtsBackend> FtsIndex<B> {
         }
 
         // Fallback: exhaustive BM25 scoring reading directly from the backend.
-        let _term_postings_guard = self.governor.as_ref().and_then(|gov| {
-            let bytes = num_query_terms
-                * (std::mem::size_of::<Vec<Posting>>() + std::mem::size_of::<bool>());
-            gov.reserve(nodedb_mem::EngineId::Fts, bytes).ok()
-        });
+        let _term_postings_guard =
+            crate::mem_scope::fts_scope(self.governor.as_ref(), database_id, tid).and_then(|mem| {
+                let bytes = num_query_terms
+                    * (std::mem::size_of::<Vec<Posting>>() + std::mem::size_of::<bool>());
+                mem.reserve(bytes).ok()
+            });
         let mut term_postings: Vec<(Vec<Posting>, bool)> = Vec::with_capacity(num_query_terms);
         for (i, token) in query_tokens.iter().enumerate() {
             let postings = self

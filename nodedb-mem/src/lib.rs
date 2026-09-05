@@ -35,7 +35,6 @@
 
 pub mod arena;
 pub mod budget;
-pub mod budget_guard;
 pub mod collection_arena;
 pub mod engine;
 pub mod engine_limits;
@@ -46,11 +45,11 @@ pub mod pressure;
 pub mod reservation_token;
 mod reserve_scope;
 mod scoped_budget;
+pub mod scoped_memory;
 pub mod spill;
 
 pub use arena::{bind_thread_to_local_numa, current_thread_arena, pin_thread_arena};
 pub use budget::Budget;
-pub use budget_guard::BudgetGuard;
 pub use collection_arena::{CollectionArenaHandle, CollectionArenaRegistry};
 pub use engine::EngineId;
 pub use engine_limits::EngineLimits;
@@ -58,4 +57,5 @@ pub use error::{MemError, Result};
 pub use governor::{GovernorConfig, MemoryGovernor};
 pub use pressure::{PressureLevel, PressureThresholds};
 pub use reservation_token::ReservationToken;
+pub use scoped_memory::ScopedMemory;
 pub use spill::{SpillAction, SpillConfig, SpillController};
