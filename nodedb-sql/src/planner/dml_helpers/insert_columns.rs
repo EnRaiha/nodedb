@@ -30,7 +30,7 @@ use crate::types::*;
 pub(crate) fn resolve_insert_columns(
     columns: Vec<String>,
     info: &CollectionInfo,
-    rows: &[Vec<ast::Expr>],
+    rows: &[ast::Parens<Vec<ast::Expr>>],
 ) -> Result<Vec<String>> {
     if !columns.is_empty() || info.columns.is_empty() {
         return Ok(columns);

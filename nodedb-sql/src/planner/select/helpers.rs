@@ -53,6 +53,20 @@ pub fn convert_projection(items: &[ast::SelectItem]) -> Result<Vec<Projection>> 
                     alias: normalize_ident(alias),
                 });
             }
+            // `expr AS (a, b)` binds one expression to several output names,
+            // which only has meaning for a dialect that expands a projection
+            // into multiple columns. `Projection` carries a single name, and
+            // NodeDB's PostgreSQL surface has no such expansion, so the
+            // statement is refused rather than silently taking one alias.
+            ast::SelectItem::ExprWithAliases { aliases, .. } => {
+                return Err(SqlError::Unsupported {
+                    detail: format!(
+                        "multi-alias projection ('AS' with {} names) is not supported; \
+                         give the expression a single alias",
+                        aliases.len()
+                    ),
+                });
+            }
             ast::SelectItem::Wildcard(_) => {
                 result.push(Projection::Star);
             }

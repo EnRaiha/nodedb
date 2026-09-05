@@ -29,7 +29,7 @@ use crate::types::*;
 pub(crate) fn build_kv_insert_plan(
     table_name: String,
     columns: &[String],
-    rows_ast: &[Vec<ast::Expr>],
+    rows_ast: &[ast::Parens<Vec<ast::Expr>>],
     intent: KvInsertIntent,
     mut on_conflict_updates: Vec<(String, SqlExpr)>,
     pk_col: Option<&str>,
@@ -277,7 +277,7 @@ mod kv_on_conflict_range_tests {
         build_kv_insert_plan(
             "t".to_string(),
             &["key".to_string()],
-            &[vec![key_value_expr("a")]],
+            &[ast::Parens::with_empty_span(vec![key_value_expr("a")])],
             KvInsertIntent::Put,
             updates,
             Some("key"),

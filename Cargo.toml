@@ -295,7 +295,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 rustls-pemfile = "2"
 
 # SQL parser
-sqlparser = { version = "0.61", features = ["visitor"] }
+sqlparser = { version = "0.62", features = ["visitor"] }
 
 # X.509 / PEM handling (TLS peer identity, certificate pinning)
 x509-parser = "0.18"

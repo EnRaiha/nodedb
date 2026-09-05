@@ -12,7 +12,7 @@ use super::dml_helpers::{
 };
 use crate::engine_rules::{self, InsertParams};
 use crate::error::{Result, SqlError};
-use crate::parser::normalize::{normalize_ident, normalize_object_name_checked};
+use crate::parser::normalize::{normalize_insert_column, normalize_object_name_checked};
 use crate::planner::declared_type_coerce::coerce_assignments_to_declared_types;
 use crate::resolver::expr::convert_expr;
 use crate::types::*;
@@ -80,6 +80,13 @@ pub fn plan_insert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
                 detail: "INSERT INTO table function not supported".into(),
             });
         }
+        // Oracle's `INSERT INTO (SELECT ...)`: the target is a subquery, so
+        // there is no collection to resolve or route to an engine.
+        ast::TableObject::TableQuery(_) => {
+            return Err(SqlError::Unsupported {
+                detail: "INSERT INTO a subquery target is not supported".into(),
+            });
+        }
     };
     let info = catalog
         .get_collection(DatabaseId::DEFAULT, &table_name)?
@@ -87,7 +94,11 @@ pub fn plan_insert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
             name: table_name.clone(),
         })?;
 
-    let columns: Vec<String> = ins.columns.iter().map(normalize_ident).collect();
+    let columns: Vec<String> = ins
+        .columns
+        .iter()
+        .map(normalize_insert_column)
+        .collect::<Result<_>>()?;
 
     // Check for INSERT...SELECT.
     if let Some(source) = &ins.source
@@ -191,6 +202,13 @@ pub fn plan_upsert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
                 detail: "UPSERT INTO table function not supported".into(),
             });
         }
+        // Oracle's `INSERT INTO (SELECT ...)`: the target is a subquery, so
+        // there is no collection to resolve or route to an engine.
+        ast::TableObject::TableQuery(_) => {
+            return Err(SqlError::Unsupported {
+                detail: "UPSERT INTO a subquery target is not supported".into(),
+            });
+        }
     };
     let info = catalog
         .get_collection(DatabaseId::DEFAULT, &table_name)?
@@ -198,7 +216,11 @@ pub fn plan_upsert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
             name: table_name.clone(),
         })?;
 
-    let columns: Vec<String> = ins.columns.iter().map(normalize_ident).collect();
+    let columns: Vec<String> = ins
+        .columns
+        .iter()
+        .map(normalize_insert_column)
+        .collect::<Result<_>>()?;
 
     let source = ins.source.as_ref().ok_or_else(|| SqlError::Parse {
         detail: "UPSERT requires VALUES".into(),
@@ -268,6 +290,13 @@ fn plan_upsert_with_on_conflict(
                 detail: "INSERT ... ON CONFLICT on a table function is not supported".into(),
             });
         }
+        // Oracle's `INSERT INTO (SELECT ...)`: the target is a subquery, so
+        // there is no collection to resolve or route to an engine.
+        ast::TableObject::TableQuery(_) => {
+            return Err(SqlError::Unsupported {
+                detail: "INSERT ... ON CONFLICT on a subquery target is not supported".into(),
+            });
+        }
     };
     let info = catalog
         .get_collection(DatabaseId::DEFAULT, &table_name)?
@@ -275,7 +304,11 @@ fn plan_upsert_with_on_conflict(
             name: table_name.clone(),
         })?;
 
-    let columns: Vec<String> = ins.columns.iter().map(normalize_ident).collect();
+    let columns: Vec<String> = ins
+        .columns
+        .iter()
+        .map(normalize_insert_column)
+        .collect::<Result<_>>()?;
 
     let source = ins.source.as_ref().ok_or_else(|| SqlError::Parse {
         detail: "INSERT ... ON CONFLICT requires VALUES".into(),

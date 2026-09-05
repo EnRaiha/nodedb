@@ -8,7 +8,7 @@
 
 use core::ops::ControlFlow;
 
-use sqlparser::ast::{Expr, LimitClause, Query, Statement, Value, Visitor};
+use sqlparser::ast::{Expr, LimitClause, Query, Statement, Value, ValueWithSpan, Visitor};
 
 use super::slots::{
     InferenceContext, InferredParamType, parse_placeholder_body, placeholder_index,
@@ -51,11 +51,11 @@ impl InferenceContext {
 impl Visitor for InferenceContext {
     type Break = ();
 
-    fn pre_visit_value(&mut self, value: &Value) -> ControlFlow<Self::Break> {
+    fn pre_visit_value(&mut self, value: &ValueWithSpan) -> ControlFlow<Self::Break> {
         // Every placeholder position sqlparser defines reaches this hook —
         // the same coverage `params::ParamBinder` relies on for binding — so
         // the result is sized by the highest index that actually exists.
-        if let Value::Placeholder(body) = value
+        if let Value::Placeholder(body) = &value.value
             && let Some(index) = parse_placeholder_body(body)
         {
             self.observe(index);

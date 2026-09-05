@@ -14,8 +14,8 @@
 //! rule of its own; guessing one is worse than the text-format fallback.
 
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, Insert, ObjectName, Query, SetExpr,
-    Statement, TableObject, Update, UpdateTableFromKind,
+    AssignmentTarget, BinaryOperator, Delete, Expr, FromTable, Insert, ObjectName, ObjectNamePart,
+    Query, SetExpr, Statement, TableObject, Update, UpdateTableFromKind,
 };
 
 use super::scope::{Scope, column_of, lookup_relation};
@@ -266,7 +266,13 @@ fn infer_insert(ctx: &mut InferenceContext, catalog: &dyn SqlCatalog, insert: &I
         info.columns.iter().collect()
     } else {
         let mut targets = Vec::with_capacity(insert.columns.len());
-        for ident in &insert.columns {
+        for name in &insert.columns {
+            // A target column is one plain identifier. A qualified or function
+            // form maps to no column here, and a partially built mapping is
+            // worse than none, so the whole pass backs out.
+            let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() else {
+                return;
+            };
             let Some(column) = column_of(&info, &ident.value) else {
                 // A named target the catalog does not declare makes the whole
                 // positional mapping untrustworthy, not just this one slot.

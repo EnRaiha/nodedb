@@ -69,7 +69,8 @@ fn extract_select_exprs_as_text(expr: &SetExpr) -> Option<Vec<String>> {
             .iter()
             .map(|item| match item {
                 ast::SelectItem::UnnamedExpr(e) => format!("{e}"),
-                ast::SelectItem::ExprWithAlias { expr: e, .. } => format!("{e}"),
+                ast::SelectItem::ExprWithAlias { expr: e, .. }
+                | ast::SelectItem::ExprWithAliases { expr: e, .. } => format!("{e}"),
                 ast::SelectItem::Wildcard(_) => "*".into(),
                 ast::SelectItem::QualifiedWildcard(name, _) => format!("{name}.*"),
             })
@@ -90,7 +91,8 @@ fn extract_step_exprs_and_condition(expr: &SetExpr) -> Option<(Vec<String>, Opti
         .iter()
         .map(|item| match item {
             ast::SelectItem::UnnamedExpr(e) => format!("{e}"),
-            ast::SelectItem::ExprWithAlias { expr: e, .. } => format!("{e}"),
+            ast::SelectItem::ExprWithAlias { expr: e, .. }
+            | ast::SelectItem::ExprWithAliases { expr: e, .. } => format!("{e}"),
             ast::SelectItem::Wildcard(_) => "*".into(),
             ast::SelectItem::QualifiedWildcard(name, _) => format!("{name}.*"),
         })

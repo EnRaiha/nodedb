@@ -57,6 +57,30 @@ pub fn normalize_object_name_checked(name: &sqlparser::ast::ObjectName) -> Resul
     }
 }
 
+/// Normalize a single entry of an `INSERT` column list.
+///
+/// The parser models these as `ObjectName`, but an `INSERT` target column is
+/// always one plain identifier: a qualified form like `t.col` names no column
+/// NodeDB can write to, and a function part is not a name at all. Both are
+/// typed errors — taking the last part of a qualified name would bind values
+/// to a column the statement did not ask for.
+pub fn normalize_insert_column(name: &sqlparser::ast::ObjectName) -> Result<String> {
+    if let [sqlparser::ast::ObjectNamePart::Identifier(ident)] = name.0.as_slice() {
+        return Ok(normalize_ident(ident));
+    }
+    if name.0.len() == 1 {
+        // The sole part is a function call, so there is no identifier to name.
+        return Err(SqlError::InvalidIdentifier {
+            name: String::new(),
+            reason: "an INSERT column list takes plain column names",
+        });
+    }
+    // Qualified or empty. `normalize_object_name_checked` owns both rejections
+    // and validates every component before reflecting it in the message; it
+    // cannot return `Ok` for either shape.
+    normalize_object_name_checked(name)
+}
+
 /// Normalize a table name, accepting the two system-schema qualifiers that name
 /// catalog relations (NodeDB has no user schemas, so any other qualifier is
 /// rejected by [`normalize_object_name_checked`]):
@@ -232,6 +256,43 @@ mod tests {
         let quote = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("a\"b"))]);
         assert!(matches!(
             normalize_object_name_checked(&quote),
+            Err(SqlError::InvalidIdentifier { .. })
+        ));
+    }
+
+    #[test]
+    fn insert_columns_take_plain_names_only() {
+        use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
+
+        let plain = ObjectName(vec![ObjectNamePart::Identifier(Ident::new("MiXeD"))]);
+        assert_eq!(
+            normalize_insert_column(&plain).expect("plain column"),
+            "mixed"
+        );
+
+        let mut quoted_ident = Ident::new("MiXeD");
+        quoted_ident.quote_style = Some('"');
+        let quoted = ObjectName(vec![ObjectNamePart::Identifier(quoted_ident)]);
+        assert_eq!(
+            normalize_insert_column(&quoted).expect("quoted column"),
+            "MiXeD"
+        );
+
+        // `INSERT INTO t (a.b) VALUES (1)` parses as a two-part name. Taking
+        // either part would bind the value to a column the statement did not
+        // name, so the whole statement is refused.
+        let qualified = ObjectName(vec![
+            ObjectNamePart::Identifier(Ident::new("a")),
+            ObjectNamePart::Identifier(Ident::new("b")),
+        ]);
+        assert!(matches!(
+            normalize_insert_column(&qualified),
+            Err(SqlError::Unsupported { .. })
+        ));
+
+        let empty = ObjectName(Vec::new());
+        assert!(matches!(
+            normalize_insert_column(&empty),
             Err(SqlError::InvalidIdentifier { .. })
         ));
     }

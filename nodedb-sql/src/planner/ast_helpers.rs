@@ -152,7 +152,9 @@ pub fn strip_single_table_qualifiers(
 
     for item in &mut out.projection {
         match item {
-            ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } => {
+            ast::SelectItem::UnnamedExpr(expr)
+            | ast::SelectItem::ExprWithAlias { expr, .. }
+            | ast::SelectItem::ExprWithAliases { expr, .. } => {
                 reject_foreign_qualifier(expr, valid_qualifiers)?;
                 *expr = strip_table_qualifiers(expr, valid_qualifiers);
             }

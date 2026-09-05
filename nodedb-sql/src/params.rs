@@ -21,7 +21,7 @@
 
 use core::ops::ControlFlow;
 
-use sqlparser::ast::{Statement, Value, VisitMut, VisitorMut};
+use sqlparser::ast::{Statement, Value, ValueWithSpan, VisitMut, VisitorMut};
 
 /// Parameter value for AST substitution.
 ///
@@ -62,11 +62,14 @@ struct ParamBinder<'a> {
 impl VisitorMut for ParamBinder<'_> {
     type Break = ();
 
-    fn pre_visit_value(&mut self, value: &mut Value) -> ControlFlow<Self::Break> {
-        if let Value::Placeholder(p) = value
+    fn pre_visit_value(&mut self, value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
+        // Only the literal is rewritten; `value.span` keeps pointing at the
+        // placeholder token, so a later diagnostic still names the source
+        // position the client wrote rather than a synthetic one.
+        if let Value::Placeholder(p) = &value.value
             && let Some(v) = placeholder_to_value(p, self.params)
         {
-            *value = v;
+            value.value = v;
         }
         ControlFlow::Continue(())
     }

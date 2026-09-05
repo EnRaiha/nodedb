@@ -15,7 +15,7 @@ use crate::types::*;
 
 pub(crate) fn convert_value_rows(
     columns: &[String],
-    rows: &[Vec<ast::Expr>],
+    rows: &[ast::Parens<Vec<ast::Expr>>],
 ) -> Result<Vec<Vec<(String, SqlValue)>>> {
     rows.iter()
         .map(|row| {
