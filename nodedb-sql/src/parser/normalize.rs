@@ -62,8 +62,8 @@ pub fn normalize_object_name_checked(name: &sqlparser::ast::ObjectName) -> Resul
 /// The parser models these as `ObjectName`, but an `INSERT` target column is
 /// always one plain identifier: a qualified form like `t.col` names no column
 /// NodeDB can write to, and a function part is not a name at all. Both are
-/// typed errors — taking the last part of a qualified name would bind values
-/// to a column the statement did not ask for.
+/// typed errors — taking the last part of a qualified name binds values to a
+/// column the statement never asked for.
 pub fn normalize_insert_column(name: &sqlparser::ast::ObjectName) -> Result<String> {
     if let [sqlparser::ast::ObjectNamePart::Identifier(ident)] = name.0.as_slice() {
         return Ok(normalize_ident(ident));

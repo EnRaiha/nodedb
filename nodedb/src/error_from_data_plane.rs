@@ -110,6 +110,9 @@ pub(crate) fn data_plane_code_to_public(code: ErrorCode) -> NodeDbError {
             "WITH RECURSIVE CTE '{cte_name}' exceeded max recursion depth {max_depth}; \
              add a stricter termination condition or raise max_recursion_depth"
         )),
+        ErrorCode::UndefinedColumn { column } => {
+            NodeDbError::bad_request(format!("column \"{column}\" does not exist"))
+        }
         ErrorCode::Unsupported { detail } => NodeDbError::bad_request(detail),
         ErrorCode::DivisionByZero => NodeDbError::division_by_zero(),
         ErrorCode::TxnOverlayMemoryExceeded { limit } => NodeDbError::bad_request(format!(

@@ -181,6 +181,16 @@ pub enum SqlError {
         declared_cols: usize,
     },
 
+    /// Two of the CTE's columns carry the same name, either from a repeated
+    /// entry in the declared column list or from two anchor items that infer
+    /// the same output name. Rows are keyed by column name, so a duplicate
+    /// drops one column's values instead of returning both.
+    #[error(
+        "WITH RECURSIVE CTE '{cte_name}': column '{column}' is declared or inferred \
+         more than once; give each column a distinct name"
+    )]
+    DuplicateRecursiveColumn { cte_name: String, column: String },
+
     /// The recursive CTE exceeded the configured `max_recursion_depth`.
     ///
     /// This is a runtime error produced by the executor, not the planner.

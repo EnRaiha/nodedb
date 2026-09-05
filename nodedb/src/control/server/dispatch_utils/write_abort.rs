@@ -144,7 +144,8 @@ pub(crate) fn write_definitely_not_applied(code: &ErrorCode) -> bool {
         // were discarded from the overlay and never installed.
         | ErrorCode::TxnOverlayMemoryExceeded { .. }
         // Expression evaluation failed before producing a value to write.
-        | ErrorCode::DivisionByZero => true,
+        | ErrorCode::DivisionByZero
+        | ErrorCode::UndefinedColumn { .. } => true,
 
         // NOT established — every one of these can be reported by a request
         // whose write reached, or may have reached, engine state. Emitting an

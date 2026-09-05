@@ -85,6 +85,13 @@ pub enum ErrorCode {
     /// The client should either add a stricter termination condition or
     /// increase `max_recursion_depth` in the server configuration.
     RecursionDepthExceeded { cte_name: String, max_depth: usize },
+    /// A column reference resolved against nothing in scope. Raised where the
+    /// Data Plane evaluates an expression whose column set is only known at
+    /// execution time (a value-generating `WITH RECURSIVE` step), so the
+    /// planner cannot catch it. Maps to `42703` (undefined_column), the same
+    /// SQLSTATE a planner-side `SqlError::UnknownColumn` produces — a missing
+    /// column reports identically wherever it is detected.
+    UndefinedColumn { column: String },
     /// Internal error (io_uring failure, corruption, etc.)
     Internal { detail: String },
     /// Operation is not supported on this engine, or not yet implemented for

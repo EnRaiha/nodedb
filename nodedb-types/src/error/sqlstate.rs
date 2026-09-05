@@ -132,6 +132,10 @@ pub const SYNTAX_ERROR: &str = "42601";
 /// carry, e.g. `SET nonsense = 1` or `SHOW nonsense`)
 pub const UNDEFINED_OBJECT: &str = "42704";
 
+/// `42703` — `undefined_column` (a column reference that resolves against no
+/// relation in scope)
+pub const UNDEFINED_COLUMN: &str = "42703";
+
 /// `42846` — `cannot_coerce`
 pub const CANNOT_COERCE: &str = "42846";
 
@@ -338,6 +342,7 @@ mod tests {
             SERIALIZATION_FAILURE,
             INSUFFICIENT_PRIVILEGE,
             SYNTAX_ERROR,
+            UNDEFINED_COLUMN,
             UNDEFINED_OBJECT,
             CANNOT_COERCE,
             UNDEFINED_TABLE,
@@ -392,6 +397,7 @@ mod tests {
     #[test]
     fn spot_check_well_known_codes() {
         assert_eq!(UNIQUE_VIOLATION, "23505");
+        assert_eq!(UNDEFINED_COLUMN, "42703");
         assert_eq!(UNDEFINED_TABLE, "42P01");
         assert_eq!(INSUFFICIENT_PRIVILEGE, "42501");
         assert_eq!(QUERY_CANCELED, "57014");

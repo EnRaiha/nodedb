@@ -92,6 +92,9 @@ pub enum DataPlaneErrorCode {
         cte_name: String,
         max_depth: u64,
     },
+    UndefinedColumn {
+        column: String,
+    },
     Internal {
         detail: String,
     },

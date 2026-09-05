@@ -8,7 +8,7 @@
 
 use crate::harness::TestServer;
 
-// ── Test 1: basic counter — value-generating CTE ──────────────────────────────
+// ── Value-generating counter ─────────────────────────────────────────────────
 
 /// `WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 5)`
 /// must produce exactly 5 rows with values 1..5.
@@ -45,7 +45,7 @@ async fn recursive_cte_generates_sequence() {
     );
 }
 
-// ── Test 2: UNION ALL preserves duplicates ────────────────────────────────────
+// ── UNION ALL vs UNION ───────────────────────────────────────────────────────
 
 /// A base case that itself contains duplicates (`SELECT 1 UNION ALL SELECT 1`)
 /// with no further recursion should yield exactly 2 rows when UNION ALL is used.
@@ -96,7 +96,7 @@ async fn recursive_cte_union_all_preserves_duplicates() {
     assert_eq!(nums, vec![10, 20, 30]);
 }
 
-// ── Test 3: graph-edge traversal ──────────────────────────────────────────────
+// ── Graph-edge traversal ─────────────────────────────────────────────────────
 
 /// Traverse a 3-level tree using a collection-backed recursive CTE with
 /// INNER JOIN on the CTE self-reference.
@@ -163,7 +163,7 @@ async fn recursive_cte_tree_traversal() {
     }
 }
 
-// ── Test 4: depth-limit overrun → typed error ─────────────────────────────────
+// ── Depth-limit overrun ──────────────────────────────────────────────────────
 
 /// A CTE with no termination condition must hit `max_recursion_depth` and
 /// return an error that mentions "recursion depth" or "max recursion".
@@ -206,7 +206,7 @@ async fn recursive_cte_depth_limit_overrun_is_typed_error() {
     }
 }
 
-// ── Test 5: INTERSECT in recursive term → typed error ────────────────────────
+// ── INTERSECT in the recursive term ──────────────────────────────────────────
 
 /// `WITH RECURSIVE … AS (base INTERSECT step)` must produce a typed error
 /// mentioning that INTERSECT is not permitted in the recursive term.
@@ -236,7 +236,7 @@ async fn recursive_cte_intersect_is_typed_error() {
     );
 }
 
-// ── Test 6: column-count mismatch → typed error ───────────────────────────────
+// ── Column-count mismatch ────────────────────────────────────────────────────
 
 /// Declaring `c(a, b)` but supplying only one column in the anchor must
 /// produce a typed error mentioning the column count.
@@ -266,7 +266,7 @@ async fn recursive_cte_column_count_mismatch_is_typed_error() {
     );
 }
 
-// ── Test 7: multi-column value-generating CTE ─────────────────────────────────
+// ── Multi-column value-generating CTE ────────────────────────────────────────
 
 /// A CTE with two columns `(n, sq)` accumulates `(n, n*n)` pairs.
 /// Verifies that column names are propagated correctly in the output.
@@ -312,7 +312,7 @@ async fn recursive_cte_multi_column_value_gen() {
     }
 }
 
-// ── Test 8: EXCEPT in recursive term → typed error ───────────────────────────
+// ── EXCEPT in the recursive term ─────────────────────────────────────────────
 
 /// `WITH RECURSIVE … AS (base EXCEPT step)` must also produce a typed error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -339,4 +339,119 @@ async fn recursive_cte_except_is_typed_error() {
             || lower.contains("set operator"),
         "error should mention EXCEPT or the UNION requirement: {msg}"
     );
+}
+
+// ── Anchor-derived column names ──────────────────────────────────────────────
+
+/// With no declared column list, a recursive CTE takes its column names from
+/// the anchor term, as PostgreSQL does. The recursive step resolves its own
+/// column references against those names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recursive_cte_without_column_list_takes_anchor_names() {
+    let server = TestServer::start().await;
+
+    let values = server
+        .query_text(
+            "WITH RECURSIVE c AS (\
+                SELECT 1 AS n \
+                UNION ALL \
+                SELECT n + 1 FROM c WHERE n < 5\
+             ) \
+             SELECT n FROM c",
+        )
+        .await
+        .expect("anchor alias should name the CTE column");
+
+    let mut nums: Vec<i64> = values
+        .iter()
+        .map(|v| v.trim().parse().expect("expected i64 row value"))
+        .collect();
+    nums.sort();
+    assert_eq!(nums, vec![1, 2, 3, 4, 5], "got {nums:?}");
+}
+
+/// An anchor item carrying no name of its own is addressable as `colN`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recursive_cte_unnamed_anchor_item_falls_back_to_positional_name() {
+    let server = TestServer::start().await;
+
+    let values = server
+        .query_text(
+            "WITH RECURSIVE c AS (\
+                SELECT 1 \
+                UNION ALL \
+                SELECT col0 + 1 FROM c WHERE col0 < 3\
+             ) \
+             SELECT col0 FROM c",
+        )
+        .await
+        .expect("unnamed anchor item should keep its positional name");
+
+    let mut nums: Vec<i64> = values
+        .iter()
+        .map(|v| v.trim().parse().expect("expected i64 row value"))
+        .collect();
+    nums.sort();
+    assert_eq!(nums, vec![1, 2, 3], "got {nums:?}");
+}
+
+// ── Undefined column in the recursive step ───────────────────────────────────
+
+/// A step column reference that resolves against nothing raises `42703`, the
+/// SQLSTATE the same reference reports in any other statement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recursive_cte_undefined_column_in_step_is_an_error() {
+    let server = TestServer::start().await;
+
+    let result = server
+        .query_text(
+            "WITH RECURSIVE c(n) AS (\
+                SELECT 1 \
+                UNION ALL \
+                SELECT zzz + 1 FROM c WHERE zzz < 3\
+             ) \
+             SELECT n FROM c",
+        )
+        .await;
+
+    let msg = result.expect_err("an undefined column in the step must be an error");
+    let lower = msg.to_lowercase();
+    assert!(
+        lower.contains("zzz") && lower.contains("does not exist"),
+        "error should name the missing column: {msg}"
+    );
+}
+
+// ── Duplicate column names ───────────────────────────────────────────────────
+
+/// Rows are keyed by column name, so two columns must not share one. Both the
+/// declared list and the anchor-derived names are checked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recursive_cte_duplicate_column_names_are_rejected() {
+    let server = TestServer::start().await;
+
+    for sql in [
+        "WITH RECURSIVE c(n, n) AS (\
+            SELECT 1, 2 \
+            UNION ALL \
+            SELECT n + 1, 2 FROM c WHERE n < 3\
+         ) \
+         SELECT n FROM c",
+        "WITH RECURSIVE c AS (\
+            SELECT 1 AS n, 2 AS n \
+            UNION ALL \
+            SELECT n + 1, 2 FROM c WHERE n < 3\
+         ) \
+         SELECT n FROM c",
+    ] {
+        let msg = server
+            .query_text(sql)
+            .await
+            .expect_err("duplicate CTE column names must be an error");
+        let lower = msg.to_lowercase();
+        assert!(
+            lower.contains("more than once") || lower.contains("distinct name"),
+            "error should explain the duplicate for `{sql}`: {msg}"
+        );
+    }
 }

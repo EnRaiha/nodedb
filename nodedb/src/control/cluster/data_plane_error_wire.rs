@@ -110,6 +110,7 @@ impl From<ErrorCode> for DataPlaneErrorCode {
                 cte_name,
                 max_depth: to_wire_count(max_depth),
             },
+            ErrorCode::UndefinedColumn { column } => Self::UndefinedColumn { column },
             ErrorCode::Internal { detail } => Self::Internal { detail },
             ErrorCode::Unsupported { detail } => Self::Unsupported { detail },
             ErrorCode::RollbackFailed {
@@ -197,6 +198,7 @@ impl From<DataPlaneErrorCode> for ErrorCode {
                 cte_name,
                 max_depth: from_wire_count(max_depth),
             },
+            DataPlaneErrorCode::UndefinedColumn { column } => Self::UndefinedColumn { column },
             DataPlaneErrorCode::Internal { detail } => Self::Internal { detail },
             DataPlaneErrorCode::Unsupported { detail } => Self::Unsupported { detail },
             DataPlaneErrorCode::RollbackFailed {

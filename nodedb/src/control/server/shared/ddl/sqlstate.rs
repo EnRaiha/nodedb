@@ -155,6 +155,11 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
                  add a stricter termination condition or raise max_recursion_depth"
             ),
         ),
+        ErrorCode::UndefinedColumn { column } => (
+            "ERROR",
+            sqlstate::UNDEFINED_COLUMN,
+            format!("column \"{column}\" does not exist"),
+        ),
         ErrorCode::Internal { detail } => ("ERROR", sqlstate::INTERNAL_ERROR, detail.clone()),
         // Division/modulo by zero.
         ErrorCode::DivisionByZero => (
