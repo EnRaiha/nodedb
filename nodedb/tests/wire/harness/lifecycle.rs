@@ -48,6 +48,7 @@ impl TestServer {
     /// `nodedb` binary under test was itself built with `--features
     /// failpoints` — a plain build ignores the variable and the fail point
     /// never fires, since `fail_point_err!` compiles to nothing without it.
+    #[cfg(feature = "failpoints")]
     pub async fn start_with_failpoints(spec: &str) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let spawned = process::spawn_with_failpoints(
