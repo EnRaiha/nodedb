@@ -331,7 +331,7 @@ impl PqCodec {
                 book.len() == self.k && book.iter().all(|centroid| centroid.len() == self.sub_dim)
             });
         if !valid_scalar_shape
-            || !codebook_bytes.is_some_and(|bytes| bytes <= MAX_PQ_CODEBOOK_BYTES)
+            || codebook_bytes.is_none_or(|bytes| bytes > MAX_PQ_CODEBOOK_BYTES)
             || !valid_codebooks
         {
             return Err(VectorError::DeserializationFailed(
