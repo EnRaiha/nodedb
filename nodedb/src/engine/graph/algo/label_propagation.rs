@@ -122,18 +122,20 @@ fn shuffle_deterministic(order: &mut [usize], seed: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::graph::test_support::test_scoped_memory;
 
     #[test]
     fn label_prop_triangle() {
         // Fully connected triangle — all should be same community.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
         csr.add_edge("c", "L", "a").unwrap();
         csr.add_edge("b", "L", "a").unwrap();
         csr.add_edge("c", "L", "b").unwrap();
         csr.add_edge("a", "L", "c").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr, &AlgoParams::default());
         assert_eq!(batch.len(), 3);
@@ -155,7 +157,7 @@ mod tests {
         // Clique 1: a-b-c (fully connected)
         // Clique 2: d-e-f (fully connected)
         // Bridge: c-d
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         for (s, d) in &[
             ("a", "b"),
             ("b", "a"),
@@ -174,7 +176,8 @@ mod tests {
         ] {
             csr.add_edge(s, "L", d).unwrap();
         }
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(
             &csr,
@@ -204,10 +207,11 @@ mod tests {
 
     #[test]
     fn label_prop_isolated_node() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_node("isolated").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr, &AlgoParams::default());
         assert_eq!(batch.len(), 3);
@@ -215,7 +219,7 @@ mod tests {
 
     #[test]
     fn label_prop_empty_graph() {
-        let csr = CsrIndex::new();
+        let csr = CsrIndex::new(test_scoped_memory());
         let batch = run(&csr, &AlgoParams::default());
         assert!(batch.is_empty());
     }
@@ -223,11 +227,12 @@ mod tests {
     #[test]
     fn label_prop_deterministic() {
         // Same graph, same params → same result.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
         csr.add_edge("c", "L", "a").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let params = AlgoParams::default();
         let r1 = run(&csr, &params).to_json().unwrap();

@@ -15,6 +15,8 @@ use nodedb_vector::DistanceMetric;
 use nodedb_vector::collection::VectorCollection;
 use nodedb_vector::hnsw::{HnswIndex, HnswParams};
 
+use crate::support::test_memory;
+
 fn params() -> HnswParams {
     HnswParams {
         m: 16,
@@ -45,7 +47,7 @@ fn make_built_collection_with_pq_config() -> VectorCollection {
     for v in &req.vectors {
         idx.insert(v.clone()).unwrap();
     }
-    coll.complete_build(req.segment_id, idx);
+    coll.complete_build(req.segment_id, idx, test_memory());
     coll
 }
 
@@ -77,7 +79,7 @@ fn hnsw_pq_config_stats_index_type_reports_hnsw_pq() {
 fn hnsw_pq_config_survives_checkpoint_roundtrip() {
     let coll = make_built_collection_with_pq_config();
     let bytes = coll.checkpoint_to_bytes(None).unwrap();
-    let restored = VectorCollection::from_checkpoint(&bytes, None)
+    let restored = VectorCollection::from_checkpoint(&bytes, None, test_memory())
         .expect("checkpoint must deserialize for PQ-configured collection");
     let stats = restored.stats();
     assert_eq!(

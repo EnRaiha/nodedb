@@ -137,16 +137,18 @@ fn brandes_from_source(csr: &CsrIndex, s: usize, n: usize, cb: &mut [f64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::graph::test_support::test_scoped_memory;
 
     #[test]
     fn betweenness_path_graph() {
         // a -> b -> c -> d (linear path)
         // b and c are on all shortest paths between endpoints.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
         csr.add_edge("c", "L", "d").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr, &AlgoParams::default());
         let json = batch.to_json().unwrap();
@@ -172,7 +174,7 @@ mod tests {
     #[test]
     fn betweenness_triangle() {
         // Fully connected triangle: all betweenness = 0.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         for (s, d) in &[
             ("a", "b"),
             ("b", "a"),
@@ -183,7 +185,8 @@ mod tests {
         ] {
             csr.add_edge(s, "L", d).unwrap();
         }
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr, &AlgoParams::default());
         let json = batch.to_json().unwrap();
@@ -201,11 +204,12 @@ mod tests {
     #[test]
     fn betweenness_star() {
         // Hub a connects to b, c, d. All shortest paths b-c, b-d, c-d go through a.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("a", "L", "c").unwrap();
         csr.add_edge("a", "L", "d").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr, &AlgoParams::default());
         let json = batch.to_json().unwrap();
@@ -226,12 +230,13 @@ mod tests {
 
     #[test]
     fn betweenness_with_sampling() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         for i in 0..20 {
             csr.add_edge(&format!("n{i}"), "L", &format!("n{}", i + 1))
                 .unwrap();
         }
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let params = AlgoParams {
             sample_size: Some(5),
@@ -243,7 +248,7 @@ mod tests {
 
     #[test]
     fn betweenness_empty() {
-        let csr = CsrIndex::new();
+        let csr = CsrIndex::new(test_scoped_memory());
         assert!(run(&csr, &AlgoParams::default()).is_empty());
     }
 

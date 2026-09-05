@@ -136,6 +136,12 @@ impl CoreLoop {
         );
 
         let database_id = task.request.database_id.as_u64();
+        let memory = nodedb_mem::ScopedMemory::new(
+            self.governor.clone(),
+            task.request.database_id,
+            crate::types::TenantId::new(tid),
+            nodedb_mem::EngineId::Graph,
+        );
 
         // Build a collection-scoped CSR — same call as execute_graph_algo — so
         // distributed WCC runs over exactly the same (collection, edge_label)
@@ -147,6 +153,7 @@ impl CoreLoop {
             &params.collection,
             params.edge_label.as_deref(),
             None,
+            memory,
         ) {
             Ok(c) => c,
             Err(e) => return self.response_error(task, ErrorCode::from(e)),
@@ -220,7 +227,13 @@ mod tests {
 
     /// Build a small CSR with a chain a->b->c and a separate z node/edge z->w.
     fn two_component_csr() -> CsrIndex {
-        let mut csr = CsrIndex::new();
+        let memory = nodedb_mem::ScopedMemory::new(
+            crate::data::executor::core_loop::test_governor(),
+            nodedb_types::DatabaseId::DEFAULT,
+            crate::types::TenantId::new(0),
+            nodedb_mem::EngineId::Graph,
+        );
+        let mut csr = CsrIndex::new(memory);
         csr.add_edge("a", "e", "b").unwrap();
         csr.add_edge("b", "e", "c").unwrap();
         csr.add_edge("z", "e", "w").unwrap();

@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use nodedb_mem::ScopedMemory;
 use nodedb_types::VectorQuantization;
 
 use crate::error::VectorError;
@@ -38,6 +39,7 @@ pub(crate) fn build_sidecar(
     quantization: VectorQuantization,
     dim: usize,
     samples: &[(u32, Vec<f32>)],
+    memory: ScopedMemory,
 ) -> Result<Option<CodecSidecar>, VectorError> {
     if samples.is_empty() {
         // Nothing to train on or encode — return an empty sidecar for non-None quantizations
@@ -71,7 +73,7 @@ pub(crate) fn build_sidecar(
         }
 
         VectorQuantization::Pq => {
-            let mut codec = PqRerank::new(dim, 8, 256);
+            let mut codec = PqRerank::new(dim, 8, 256, memory);
             if !samples.is_empty() {
                 let vecs: Vec<&[f32]> = samples
                     .iter()

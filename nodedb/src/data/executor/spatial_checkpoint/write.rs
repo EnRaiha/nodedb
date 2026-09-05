@@ -204,9 +204,18 @@ mod tests {
         )
     }
 
+    fn test_rtree_memory(db: DatabaseId, tid: TenantId) -> nodedb_mem::ScopedMemory {
+        nodedb_mem::ScopedMemory::new(
+            crate::data::executor::core_loop::test_governor(),
+            db,
+            tid,
+            nodedb_mem::EngineId::Spatial,
+        )
+    }
+
     fn seed_one_entry(core: &mut CoreLoop) {
         let (db, tid, coll, field) = key();
-        let mut rtree = RTree::new();
+        let mut rtree = RTree::new(test_rtree_memory(db, tid));
         rtree.insert(RTreeEntry {
             id: 1,
             bbox: BoundingBox::new(0.0, 0.0, 1.0, 1.0),
@@ -302,7 +311,8 @@ mod tests {
         let mut core = open_core_at(dir.path());
         // Geometry with no doc_map entries at all: the shape a columnar-family
         // index takes before any document row maps into it.
-        let mut rtree = RTree::new();
+        let (db, tid, _, _) = key();
+        let mut rtree = RTree::new(test_rtree_memory(db, tid));
         rtree.insert(RTreeEntry {
             id: 1,
             bbox: BoundingBox::new(0.0, 0.0, 1.0, 1.0),

@@ -133,10 +133,11 @@ impl CsrIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_memory;
 
     #[test]
     fn access_tracking() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
 
@@ -157,10 +158,10 @@ mod tests {
 
     #[test]
     fn memory_estimation_includes_weights() {
-        let mut unweighted = CsrIndex::new();
+        let mut unweighted = CsrIndex::new(test_memory());
         unweighted.add_edge("a", "L", "b").unwrap();
 
-        let mut weighted = CsrIndex::new();
+        let mut weighted = CsrIndex::new(test_memory());
         weighted.add_edge_weighted("a", "L", "b", 5.0).unwrap();
 
         // Weighted graph uses more memory.
@@ -169,7 +170,7 @@ mod tests {
 
     #[test]
     fn evaluate_memory_pressure_hysteresis() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "L", "b").unwrap();
 
         // Above spill threshold.

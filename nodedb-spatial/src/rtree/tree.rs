@@ -21,32 +21,24 @@ pub struct RTree {
     pub(crate) nodes: Vec<Node>,
     pub(crate) root: usize,
     pub(crate) len: usize,
-    /// Optional scoped memory handle for budget enforcement (Origin only).
-    pub(crate) memory: Option<ScopedMemory>,
+    /// Enforces database, tenant, and engine memory budgets on large batch
+    /// allocations (bulk load, full-scan serialization, range search results).
+    pub(crate) memory: ScopedMemory,
 }
 
 impl RTree {
-    pub fn new() -> Self {
+    pub fn new(memory: ScopedMemory) -> Self {
         Self {
             nodes: vec![Node::new_leaf()],
             root: 0,
             len: 0,
-            memory: None,
+            memory,
         }
     }
 
-    /// Inject a [`ScopedMemory`] handle to enforce database, tenant, and
-    /// engine memory budgets on large batch allocations (bulk load,
-    /// full-scan serialization, range search result collection). When not
-    /// set, allocations proceed without budget enforcement — correct for
-    /// NodeDB-Lite and WASM builds.
-    pub fn set_memory(&mut self, memory: ScopedMemory) {
-        self.memory = Some(memory);
-    }
-
-    /// Shared reference to the scoped memory handle, if any.
-    pub(crate) fn memory(&self) -> Option<&ScopedMemory> {
-        self.memory.as_ref()
+    /// Shared reference to the scoped memory handle.
+    pub(crate) fn memory(&self) -> &ScopedMemory {
+        &self.memory
     }
 
     pub fn len(&self) -> usize {
@@ -83,10 +75,8 @@ impl RTree {
 
     /// Get all entries (for persistence serialization).
     pub fn entries(&self) -> Vec<&RTreeEntry> {
-        let _guard = self.memory().and_then(|mem| {
-            let bytes = self.len * std::mem::size_of::<*const RTreeEntry>();
-            mem.reserve(bytes).ok()
-        });
+        let bytes = self.len * std::mem::size_of::<*const RTreeEntry>();
+        let _guard = self.memory().reserve(bytes).ok();
         let mut result = Vec::with_capacity(self.len);
         collect_entries(&self.nodes, self.root, &mut result);
         result
@@ -117,12 +107,6 @@ impl RTree {
     }
 }
 
-impl Default for RTree {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 fn collect_entries<'a>(nodes: &'a [Node], node_idx: usize, result: &mut Vec<&'a RTreeEntry>) {
     match &nodes[node_idx].kind {
         NodeKind::Leaf { entries } => result.extend(entries.iter()),
@@ -149,6 +133,7 @@ pub(crate) fn collect_entries_owned(nodes: &[Node], node_idx: usize, result: &mu
 mod tests {
     use super::super::node::LEAF_CAPACITY;
     use super::*;
+    use crate::test_support::test_memory;
 
     fn make_entry(id: u64, lng: f64, lat: f64) -> RTreeEntry {
         RTreeEntry {
@@ -166,7 +151,7 @@ mod tests {
 
     #[test]
     fn empty_tree() {
-        let tree = RTree::new();
+        let tree = RTree::new(test_memory());
         assert!(tree.is_empty());
         assert!(
             tree.search(&BoundingBox::new(-180.0, -90.0, 180.0, 90.0))
@@ -176,7 +161,7 @@ mod tests {
 
     #[test]
     fn insert_and_search_single() {
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         tree.insert(make_entry(1, 10.0, 20.0));
         assert_eq!(tree.len(), 1);
         assert_eq!(
@@ -191,7 +176,7 @@ mod tests {
 
     #[test]
     fn insert_many_and_search() {
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         for i in 0..200 {
             tree.insert(make_entry(
                 i,
@@ -206,7 +191,7 @@ mod tests {
 
     #[test]
     fn delete_entry() {
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         for i in 0..50 {
             tree.insert(make_entry(i, i as f64, i as f64));
         }
@@ -219,7 +204,7 @@ mod tests {
 
     #[test]
     fn nearest_neighbor() {
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         tree.insert(make_entry(1, 0.0, 0.0));
         tree.insert(make_entry(2, 10.0, 10.0));
         tree.insert(make_entry(3, 5.0, 5.0));
@@ -231,12 +216,12 @@ mod tests {
 
     #[test]
     fn nearest_empty() {
-        assert!(RTree::new().nearest(0.0, 0.0, 5).is_empty());
+        assert!(RTree::new(test_memory()).nearest(0.0, 0.0, 5).is_empty());
     }
 
     #[test]
     fn rect_overlap_search() {
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         tree.insert(make_rect(1, 0.0, 0.0, 10.0, 10.0));
         tree.insert(make_rect(2, 5.0, 5.0, 15.0, 15.0));
         tree.insert(make_rect(3, 20.0, 20.0, 30.0, 30.0));
@@ -246,7 +231,7 @@ mod tests {
 
     #[test]
     fn stress_insert_delete() {
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         for i in 0..100_u64 {
             tree.insert(make_entry(i, (i as f64) * 0.5, (i as f64) * 0.3));
         }
@@ -260,7 +245,7 @@ mod tests {
 
     #[test]
     fn triggers_node_split() {
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         let count = LEAF_CAPACITY * 3;
         for i in 0..count as u64 {
             tree.insert(make_entry(i, (i as f64) * 0.1, (i as f64) * 0.1));
@@ -272,7 +257,7 @@ mod tests {
 
     #[test]
     fn entries_enumeration() {
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         for i in 0..10 {
             tree.insert(make_entry(i, i as f64, i as f64));
         }

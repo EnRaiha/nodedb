@@ -46,7 +46,7 @@ pub fn bmw_search<B: FtsBackend>(
         collection,
         index.memtable(),
         p.query_tokens,
-        index.governor.as_ref(),
+        &index.governor,
     )?;
 
     let all_empty = lsm_term_blocks.iter().all(|tb| tb.df == 0);
@@ -157,6 +157,7 @@ mod tests {
     use super::*;
     use crate::backend::memory::MemoryBackend;
     use crate::index::FtsIndex;
+    use crate::test_support::test_governor;
 
     const DB: u64 = 0;
     const T: u64 = 1;
@@ -186,7 +187,7 @@ mod tests {
 
     #[test]
     fn bmw_query_basic() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(
             DB,
             T,
@@ -212,7 +213,7 @@ mod tests {
 
     #[test]
     fn bmw_query_empty_collection() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         let tokens = crate::analyze("hello");
         let bm25 = Bm25Params::default();
         let p = make_params(&tokens, 0, 1.0, 10, false, &bm25);
@@ -223,7 +224,7 @@ mod tests {
 
     #[test]
     fn bmw_query_respects_top_k() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         for i in 1..=50u32 {
             idx.index_document(DB, T, "docs", Surrogate(i), &format!("common term word{i}"))
                 .unwrap();
@@ -240,7 +241,7 @@ mod tests {
 
     #[test]
     fn bmw_query_with_fuzzy() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "docs", D1, "distributed database systems")
             .unwrap();
 
@@ -269,7 +270,7 @@ mod tests {
 
     #[test]
     fn bmw_query_uses_memtable() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "docs", D1, "hello world greeting")
             .unwrap();
 

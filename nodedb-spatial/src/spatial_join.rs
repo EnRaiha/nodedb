@@ -13,6 +13,7 @@
 //! This module provides the join logic; the planner decides which side
 //! to index based on collection cardinality.
 
+use nodedb_mem::ScopedMemory;
 use nodedb_types::geometry::Geometry;
 use nodedb_types::{BoundingBox, geometry_bbox};
 
@@ -89,7 +90,7 @@ pub fn spatial_join(
 }
 
 /// Build an R-tree from a list of (entry_id, geometry) pairs for join.
-pub fn build_join_index(entries: &[(u64, Geometry)]) -> RTree {
+pub fn build_join_index(entries: &[(u64, Geometry)], memory: ScopedMemory) -> RTree {
     let rtree_entries: Vec<RTreeEntry> = entries
         .iter()
         .map(|(id, geom)| RTreeEntry {
@@ -97,7 +98,7 @@ pub fn build_join_index(entries: &[(u64, Geometry)]) -> RTree {
             bbox: geometry_bbox(geom),
         })
         .collect();
-    RTree::bulk_load(rtree_entries)
+    RTree::bulk_load(rtree_entries, memory)
 }
 
 /// Which spatial predicate to use for the join.
@@ -113,6 +114,7 @@ pub enum SpatialJoinPredicate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_memory;
 
     #[test]
     fn join_overlapping_squares() {
@@ -151,7 +153,7 @@ mod tests {
             .collect();
 
         // Build index on left side.
-        let index = build_join_index(&left);
+        let index = build_join_index(&left, test_memory());
 
         // Probe with right side.
         let probe_entries: Vec<(u64, BoundingBox)> = right
@@ -198,7 +200,7 @@ mod tests {
             ]]),
         )];
 
-        let index = build_join_index(&left);
+        let index = build_join_index(&left, test_memory());
         let probes: Vec<(u64, BoundingBox)> = right
             .iter()
             .map(|(id, g)| (*id, geometry_bbox(g)))
@@ -223,7 +225,7 @@ mod tests {
         let left = vec![(1u64, Geometry::point(0.0, 0.0))];
         let right = vec![(100u64, Geometry::point(0.001, 0.0))]; // ~111m away
 
-        let index = build_join_index(&left);
+        let index = build_join_index(&left, test_memory());
         let probes: Vec<(u64, BoundingBox)> = right
             .iter()
             .map(|(id, g)| {

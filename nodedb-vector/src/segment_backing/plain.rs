@@ -99,6 +99,7 @@ mod tests {
 
     use super::*;
     use crate::mmap_segment::MmapVectorSegment;
+    use crate::test_support::test_memory;
 
     fn make_backing(dim: usize, vecs: &[Vec<f32>]) -> PlainMmapBacking {
         let dir = tempdir().unwrap();
@@ -112,6 +113,7 @@ mod tests {
             dim,
             &refs,
             &surrogates,
+            &test_memory(),
         )
         .unwrap();
 
@@ -162,8 +164,14 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>(_: &T) {}
 
         let dir = tempdir().unwrap();
-        let seg =
-            MmapVectorSegment::create(dir.path(), "check.ndvs", 2, &[&[1.0_f32, 2.0]]).unwrap();
+        let seg = MmapVectorSegment::create(
+            dir.path(),
+            "check.ndvs",
+            2,
+            &[&[1.0_f32, 2.0]],
+            &test_memory(),
+        )
+        .unwrap();
         let backing = PlainMmapBacking::new(seg);
 
         assert_send_sync(&backing);
@@ -188,7 +196,8 @@ mod tests {
     #[test]
     fn plain_backing_empty_segment() {
         let dir = tempdir().unwrap();
-        let seg = MmapVectorSegment::create(dir.path(), "empty.ndvs", 4, &[]).unwrap();
+        let seg =
+            MmapVectorSegment::create(dir.path(), "empty.ndvs", 4, &[], &test_memory()).unwrap();
         let backing = PlainMmapBacking::new(seg);
 
         assert_eq!(backing.len(), 0);

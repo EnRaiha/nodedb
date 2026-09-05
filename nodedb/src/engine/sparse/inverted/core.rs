@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use redb::Database;
 
+use nodedb_mem::MemoryGovernor;
 use nodedb_types::TenantId;
 
 use super::errors::into_result_err;
@@ -20,11 +21,12 @@ pub struct InvertedIndex {
 }
 
 impl InvertedIndex {
-    /// Open or create an inverted index at the given redb database.
-    pub fn open(db: Arc<Database>) -> crate::Result<Self> {
+    /// Open or create an inverted index at the given redb database, with
+    /// FTS memory budgeted against `governor`.
+    pub fn open(db: Arc<Database>, governor: Arc<MemoryGovernor>) -> crate::Result<Self> {
         let backend = RedbFtsBackend::open(db)?;
         Ok(Self {
-            inner: nodedb_fts::index::FtsIndex::new(backend),
+            inner: nodedb_fts::index::FtsIndex::new(backend, governor),
         })
     }
 
@@ -85,7 +87,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test-inverted.redb");
         let db = Arc::new(Database::create(&path).unwrap());
-        let idx = InvertedIndex::open(db).unwrap();
+        let idx =
+            InvertedIndex::open(db, crate::data::executor::core_loop::test_governor()).unwrap();
         (idx, dir)
     }
 

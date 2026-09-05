@@ -147,14 +147,16 @@ fn build_personalization(csr: &CsrIndex, params: &AlgoParams, n: usize) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::graph::test_support::test_scoped_memory;
 
     fn triangle_csr() -> CsrIndex {
         // a -> b -> c -> a (cycle)
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
         csr.add_edge("c", "L", "a").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
         csr
     }
 
@@ -176,11 +178,12 @@ mod tests {
 
     #[test]
     fn pagerank_star_topology() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("a", "L", "c").unwrap();
         csr.add_edge("a", "L", "d").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let params = AlgoParams {
             max_iterations: Some(50),
@@ -205,16 +208,17 @@ mod tests {
 
     #[test]
     fn pagerank_empty_graph() {
-        let csr = CsrIndex::new();
+        let csr = CsrIndex::new(test_scoped_memory());
         let batch = run(&csr, &AlgoParams::default());
         assert!(batch.is_empty());
     }
 
     #[test]
     fn pagerank_single_node() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_node("lonely").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr, &AlgoParams::default());
         assert_eq!(batch.len(), 1);
@@ -222,10 +226,11 @@ mod tests {
 
     #[test]
     fn pagerank_dangling_nodes() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_node("c").unwrap(); // dangling
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr, &AlgoParams::default());
         assert_eq!(batch.len(), 3);

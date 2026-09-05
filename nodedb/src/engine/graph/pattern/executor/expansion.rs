@@ -477,6 +477,7 @@ mod tests {
     use super::*;
     use crate::engine::graph::csr::CsrIndex;
     use crate::engine::graph::edge_store::Direction;
+    use crate::engine::graph::test_support::test_scoped_memory;
 
     /// Spec: variable-length expansion MUST apply global per-node dedup.
     ///
@@ -494,7 +495,7 @@ mod tests {
         // node, 30 edges). With max_hops = 8 and no dedup the BFS explores
         // 5^8 = 390,625 distinct paths. With dedup it explores ≤ 6 nodes
         // per depth level, i.e. ≤ 48 results over 8 hops.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         let nodes = ["a", "b", "c", "d", "e", "f"];
         for &src in &nodes {
             for &dst in &nodes {
@@ -549,7 +550,7 @@ mod tests {
     /// the source even when `min_hops == 0`.
     #[test]
     fn variable_length_expansion_includes_source_at_zero_hops() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "l", "b").unwrap();
         csr.add_edge("b", "l", "c").unwrap();
 
@@ -582,7 +583,7 @@ mod tests {
     /// remain correct once global dedup prunes shorter paths.
     #[test]
     fn variable_length_expansion_exact_length_returns_only_that_depth() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         // Chain a → b → c → d. At exactly 2 hops from `a` only `c` is
         // reachable, not `b` (1 hop) or `d` (3 hops).
         csr.add_edge("a", "l", "b").unwrap();
@@ -627,7 +628,7 @@ mod tests {
     /// size is bounded.
     #[test]
     fn variable_length_expansion_caps_frontier_per_hop() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         const LEAVES: usize = 5_000;
         for i in 0..LEAVES {
             csr.add_edge("root", "l", &format!("leaf_{i}")).unwrap();
@@ -661,7 +662,7 @@ mod tests {
 
     /// Build a simple directed chain `n0 -l-> n1 -l-> ... -l-> n{len}`.
     fn make_chain(len: usize) -> CsrIndex {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         for i in 0..len {
             csr.add_edge(&format!("n{i}"), "l", &format!("n{}", i + 1))
                 .unwrap();

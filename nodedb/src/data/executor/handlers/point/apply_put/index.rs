@@ -85,7 +85,16 @@ impl CoreLoop {
                     let tid_id = crate::types::TenantId::new(tid);
                     let spatial_key = (db_id, tid_id, collection.to_string(), field_name.clone());
                     let entry_id = crate::util::fnv1a_hash(document_id.as_bytes());
-                    let rtree = self.spatial_indexes.entry(spatial_key.clone()).or_default();
+                    let memory = nodedb_mem::ScopedMemory::new(
+                        self.governor.clone(),
+                        db_id,
+                        tid_id,
+                        nodedb_mem::EngineId::Spatial,
+                    );
+                    let rtree = self
+                        .spatial_indexes
+                        .entry(spatial_key.clone())
+                        .or_insert_with(|| crate::engine::spatial::RTree::new(memory));
                     rtree.insert(crate::engine::spatial::RTreeEntry { id: entry_id, bbox });
                     // Maintain reverse map: entry_id → document_id.
                     self.spatial_doc_map.insert(

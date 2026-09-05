@@ -259,8 +259,18 @@ fn temporal_algorithm_rebuild_matches_expected_topology_at_cutoff() {
     put(&store, "a", "R", "c", 200);
     put(&store, "b", "R", "c", 300);
 
-    let at_150 = rebuild_sharded_from_store_as_of(&store, Some(ms_to_ordinal_upper(150))).unwrap();
-    let at_250 = rebuild_sharded_from_store_as_of(&store, Some(ms_to_ordinal_upper(250))).unwrap();
+    let at_150 = rebuild_sharded_from_store_as_of(
+        &store,
+        Some(ms_to_ordinal_upper(150)),
+        nodedb::data::executor::core_loop::test_governor(),
+    )
+    .unwrap();
+    let at_250 = rebuild_sharded_from_store_as_of(
+        &store,
+        Some(ms_to_ordinal_upper(250)),
+        nodedb::data::executor::core_loop::test_governor(),
+    )
+    .unwrap();
 
     let p150 = at_150.partition(DB, T).unwrap();
     let p250 = at_250.partition(DB, T).unwrap();
@@ -281,8 +291,18 @@ fn temporal_algorithm_direction_matters_across_cutoffs() {
     // Flip: later make sink→source dominant.
     put(&store, "sink", "R", "source", 300);
 
-    let at_150 = rebuild_sharded_from_store_as_of(&store, Some(ms_to_ordinal_upper(150))).unwrap();
-    let at_400 = rebuild_sharded_from_store_as_of(&store, Some(ms_to_ordinal_upper(400))).unwrap();
+    let at_150 = rebuild_sharded_from_store_as_of(
+        &store,
+        Some(ms_to_ordinal_upper(150)),
+        nodedb::data::executor::core_loop::test_governor(),
+    )
+    .unwrap();
+    let at_400 = rebuild_sharded_from_store_as_of(
+        &store,
+        Some(ms_to_ordinal_upper(400)),
+        nodedb::data::executor::core_loop::test_governor(),
+    )
+    .unwrap();
 
     // Verify direction of the 1-hop neighbor set.
     let src_out_150 = store

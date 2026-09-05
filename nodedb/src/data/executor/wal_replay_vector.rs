@@ -616,7 +616,14 @@ mod tests {
         // checkpoint (the gate is set only by load/save, never by a live
         // `note_checkpoint_lsn`, which feeds the separate applied watermark).
         let bytes = coll.checkpoint_to_bytes(None).unwrap();
-        let coll = VectorCollection::from_checkpoint(&bytes, None).expect("decode checkpoint");
+        let memory = nodedb_mem::ScopedMemory::new(
+            core.governor.clone(),
+            nodedb_types::DatabaseId::new(0),
+            crate::types::TenantId::new(tenant_id),
+            nodedb_mem::EngineId::Vector,
+        );
+        let coll =
+            VectorCollection::from_checkpoint(&bytes, None, memory).expect("decode checkpoint");
         let key = CoreLoop::vector_index_key(0, tenant_id, collection, "");
         core.vector_collections.insert(key, coll);
     }

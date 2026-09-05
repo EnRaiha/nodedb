@@ -18,7 +18,6 @@ use std::mem::size_of;
 
 use nodedb_mem::{ReservationToken, ScopedMemory};
 use nodedb_types::decode_bounds::checked_decode_capacity;
-use serde::{Deserialize, Serialize};
 
 use crate::error::VectorError;
 
@@ -43,24 +42,29 @@ fn pq_codebook_allocation_bytes(m: usize, k: usize, sub_dim: usize) -> Option<us
         .checked_add(float_bytes)
 }
 
-/// Reserve `bytes` from `memory`, or succeed silently when no scoped memory
-/// handle is configured. The returned token (if any) must be kept alive for
+/// Reserve `bytes` from `memory`. The returned token must be kept alive for
 /// the duration of the allocation it covers.
 #[inline]
 fn try_reserve_or_skip(
-    memory: &Option<ScopedMemory>,
+    memory: &ScopedMemory,
     bytes: usize,
-) -> Result<Option<ReservationToken>, VectorError> {
-    match memory {
-        Some(m) => Ok(Some(m.reserve(bytes)?)),
-        None => Ok(None),
-    }
+) -> Result<ReservationToken, VectorError> {
+    Ok(memory.reserve(bytes)?)
+}
+
+/// The on-disk shape of a [`PqCodec`] — everything except the runtime
+/// memory scope, which is never serialized.
+#[derive(Clone, Debug, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+struct PqCodecData {
+    dim: usize,
+    m: usize,
+    k: usize,
+    sub_dim: usize,
+    codebooks: Vec<Vec<Vec<f32>>>,
 }
 
 /// PQ codec with trained codebooks.
-#[derive(
-    Clone, Debug, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
-)]
+#[derive(Clone, Debug)]
 pub struct PqCodec {
     /// Original vector dimensionality.
     pub dim: usize,
@@ -74,34 +78,28 @@ pub struct PqCodec {
     /// Total: M × K × sub_dim floats.
     codebooks: Vec<Vec<Vec<f32>>>,
 
-    /// Optional scoped memory handle. Skipped during serialization — it is
-    /// a runtime concern only, not part of the on-disk format.
-    #[serde(skip, default)]
-    #[msgpack(ignore)]
-    memory: Option<ScopedMemory>,
+    /// Charges heap-significant operations (`train`, `encode_batch`,
+    /// `build_distance_table`, `decode`, `to_bytes`) against the bound
+    /// database, tenant, and engine budget before allocating, releasing
+    /// the reservation when the returned value drops (RAII). A runtime
+    /// concern only — it is never serialized.
+    memory: ScopedMemory,
 }
 
 impl PqCodec {
-    /// Attach a scoped memory handle to this codec.
-    ///
-    /// Once set, heap-significant operations (`train`, `encode_batch`,
-    /// `build_distance_table`, `decode`, `to_bytes`) charge the bound
-    /// database, tenant, and engine budget before allocating, and release
-    /// the reservation when the returned value drops (RAII). When no
-    /// scoped memory handle is set those operations proceed unconditionally.
-    ///
-    /// The handle is a runtime concern only — it is **not** serialized.
-    pub fn with_memory(mut self, memory: ScopedMemory) -> Self {
-        self.memory = Some(memory);
-        self
-    }
-
     /// Train PQ codebooks from a set of training vectors via k-means.
     ///
     /// `m` = number of subvectors (must divide `dim` evenly).
     /// `k` = centroids per subvector (typically 256).
     /// `max_iter` = k-means iterations (20 is usually sufficient).
-    pub fn train(vectors: &[&[f32]], dim: usize, m: usize, k: usize, max_iter: usize) -> Self {
+    pub fn train(
+        vectors: &[&[f32]],
+        dim: usize,
+        m: usize,
+        k: usize,
+        max_iter: usize,
+        memory: ScopedMemory,
+    ) -> Self {
         assert!(!vectors.is_empty());
         assert!(
             dim > 0
@@ -139,7 +137,7 @@ impl PqCodec {
             k,
             sub_dim,
             codebooks,
-            memory: None,
+            memory,
         }
     }
 
@@ -274,7 +272,14 @@ impl PqCodec {
         const VERSION: u8 = 1;
         let estimated = self.m * self.k * self.sub_dim * size_of::<f32>() + 64;
         let _g = try_reserve_or_skip(&self.memory, estimated)?;
-        let payload = zerompk::to_msgpack_vec(self).unwrap_or_default();
+        let data = PqCodecData {
+            dim: self.dim,
+            m: self.m,
+            k: self.k,
+            sub_dim: self.sub_dim,
+            codebooks: self.codebooks.clone(),
+        };
+        let payload = zerompk::to_msgpack_vec(&data).unwrap_or_default();
         let mut out = Vec::with_capacity(7 + payload.len());
         out.extend_from_slice(MAGIC);
         out.push(VERSION);
@@ -286,7 +291,7 @@ impl PqCodec {
     ///
     /// Returns `VectorError::InvalidMagic` if the header does not match
     /// `NDPQ\0\0`, and `VectorError::UnsupportedVersion` for unknown versions.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, VectorError> {
+    pub fn from_bytes(bytes: &[u8], memory: ScopedMemory) -> Result<Self, VectorError> {
         const MAGIC: &[u8; 6] = b"NDPQ\0\0";
         const PQ_FORMAT_VERSION: u8 = 1;
 
@@ -307,8 +312,16 @@ impl PqCodec {
             ));
         }
         super::pq_decode::preflight_pq_payload(payload, MAX_PQ_DECODE_DIM, MAX_PQ_CODEBOOK_BYTES)?;
-        let codec = zerompk::from_msgpack::<Self>(payload)
+        let data = zerompk::from_msgpack::<PqCodecData>(payload)
             .map_err(|e| VectorError::DeserializationFailed(e.to_string()))?;
+        let codec = Self {
+            dim: data.dim,
+            m: data.m,
+            k: data.k,
+            sub_dim: data.sub_dim,
+            codebooks: data.codebooks,
+            memory,
+        };
         codec.validate_shape()?;
         Ok(codec)
     }
@@ -468,6 +481,7 @@ fn kmeans(data: &[&[f32]], dim: usize, k: usize, max_iter: usize) -> Vec<Vec<f32
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_memory;
 
     fn make_clustered_data() -> Vec<Vec<f32>> {
         // 4 clusters in 4D space, 50 points each.
@@ -490,7 +504,7 @@ mod tests {
     #[should_panic]
     fn train_rejects_dimension_above_decode_limit() {
         let vector = [0.0];
-        PqCodec::train(&[&vector], MAX_PQ_DECODE_DIM + 1, 1, 1, 1);
+        PqCodec::train(&[&vector], MAX_PQ_DECODE_DIM + 1, 1, 1, 1, test_memory());
     }
 
     #[test]
@@ -498,7 +512,7 @@ mod tests {
     fn train_rejects_raw_64_mib_codebook_once_container_overhead_is_counted() {
         let vector = [0.0];
         let vectors = vec![vector.as_slice(); 256];
-        PqCodec::train(&vectors, 65_536, 1, 256, 1);
+        PqCodec::train(&vectors, 65_536, 1, 256, 1, test_memory());
     }
 
     #[test]
@@ -506,21 +520,21 @@ mod tests {
     fn train_rejects_codebook_above_decode_limit() {
         let vector = [0.0];
         let vectors = vec![vector.as_slice(); 17];
-        PqCodec::train(&vectors, MAX_PQ_DECODE_DIM, 1, 17, 1);
+        PqCodec::train(&vectors, MAX_PQ_DECODE_DIM, 1, 17, 1, test_memory());
     }
 
     #[test]
     #[should_panic]
     fn train_rejects_more_centroids_than_training_vectors() {
         let vector = [0.0];
-        PqCodec::train(&[&vector], 1, 1, 2, 1);
+        PqCodec::train(&[&vector], 1, 1, 2, 1, test_memory());
     }
 
     #[test]
     #[should_panic]
     fn train_rejects_centroid_count_above_u8_encoding_range() {
         let vector = [0.0];
-        PqCodec::train(&[&vector], 1, 1, 257, 1);
+        PqCodec::train(&[&vector], 1, 1, 257, 1, test_memory());
     }
 
     #[test]
@@ -531,7 +545,7 @@ mod tests {
             k: 1,
             sub_dim: MAX_PQ_DECODE_DIM + 1,
             codebooks: vec![vec![vec![]]],
-            memory: None,
+            memory: test_memory(),
         };
         assert!(codec.decode(&[0]).is_err());
     }
@@ -545,26 +559,25 @@ mod tests {
         let mut bytes = b"NDPQ\0\0\x01".to_vec();
         bytes.extend_from_slice(&payload);
         assert!(matches!(
-            PqCodec::from_bytes(&bytes),
+            PqCodec::from_bytes(&bytes, test_memory()),
             Err(VectorError::DeserializationFailed(_))
         ));
     }
 
     #[test]
     fn from_bytes_rejects_malformed_codebook_shape() {
-        let malformed = PqCodec {
+        let malformed = PqCodecData {
             dim: 4,
             m: 2,
             k: 1,
             sub_dim: 2,
             codebooks: vec![vec![vec![0.0, 0.0]]],
-            memory: None,
         };
         let payload = zerompk::to_msgpack_vec(&malformed).unwrap();
         let mut bytes = b"NDPQ\0\0\x01".to_vec();
         bytes.extend_from_slice(&payload);
         assert!(matches!(
-            PqCodec::from_bytes(&bytes),
+            PqCodec::from_bytes(&bytes, test_memory()),
             Err(VectorError::DeserializationFailed(_))
         ));
     }
@@ -577,7 +590,7 @@ mod tests {
             k: 1,
             sub_dim: 1,
             codebooks: vec![vec![vec![0.0]]],
-            memory: None,
+            memory: test_memory(),
         };
         assert!(matches!(
             codec.decode(&[1]),
@@ -589,7 +602,7 @@ mod tests {
     fn encode_decode_roundtrip() {
         let vecs = make_clustered_data();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let codec = PqCodec::train(&refs, 4, 2, 16, 10);
+        let codec = PqCodec::train(&refs, 4, 2, 16, 10, test_memory());
 
         for v in &vecs {
             let code = codec.encode(v);
@@ -603,7 +616,7 @@ mod tests {
     fn distance_table_gives_correct_ordering() {
         let vecs = make_clustered_data();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let codec = PqCodec::train(&refs, 4, 2, 16, 10);
+        let codec = PqCodec::train(&refs, 4, 2, 16, 10, test_memory());
 
         let codes: Vec<Vec<u8>> = vecs.iter().map(|v| codec.encode(v)).collect();
         let query = &[5.0, 5.0, 5.0, 5.0];
@@ -637,7 +650,7 @@ mod tests {
     fn batch_encode() {
         let vecs = make_clustered_data();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let codec = PqCodec::train(&refs, 4, 2, 16, 10);
+        let codec = PqCodec::train(&refs, 4, 2, 16, 10, test_memory());
 
         let batch = codec.encode_batch(&refs).unwrap();
         assert_eq!(batch.len(), 2 * 200); // M=2, N=200
@@ -648,7 +661,7 @@ mod tests {
     fn pq_codec_golden_format() {
         let vecs = make_clustered_data();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let codec = PqCodec::train(&refs, 4, 2, 16, 10);
+        let codec = PqCodec::train(&refs, 4, 2, 16, 10, test_memory());
 
         let bytes = codec.to_bytes().unwrap();
 
@@ -657,7 +670,8 @@ mod tests {
         // Version byte.
         assert_eq!(bytes[6], 1u8, "version must be 1");
         // The complete persisted envelope must pass bounded preflight and decode.
-        let restored = PqCodec::from_bytes(&bytes).expect("persisted PQ codec must decode");
+        let restored =
+            PqCodec::from_bytes(&bytes, test_memory()).expect("persisted PQ codec must decode");
         assert_eq!(restored.dim, codec.dim);
         assert_eq!(restored.m, codec.m);
     }
@@ -669,7 +683,7 @@ mod tests {
         crafted.push(0u8); // wrong version
         crafted.extend_from_slice(b"\x80"); // minimal valid msgpack map
 
-        let err = PqCodec::from_bytes(&crafted).unwrap_err();
+        let err = PqCodec::from_bytes(&crafted, test_memory()).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -685,7 +699,7 @@ mod tests {
     #[test]
     fn pq_invalid_magic_returns_error() {
         let bad: &[u8] = b"JUNK\0\0\x01some-payload";
-        let err = PqCodec::from_bytes(bad).unwrap_err();
+        let err = PqCodec::from_bytes(bad, test_memory()).unwrap_err();
         assert!(
             matches!(err, VectorError::InvalidMagic),
             "expected InvalidMagic, got: {err:?}"

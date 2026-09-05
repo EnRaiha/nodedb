@@ -187,18 +187,20 @@ fn has_undirected_edge(csr: &CsrIndex, u: u32, w: u32, _neighbor_set: &HashSet<u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::graph::test_support::test_scoped_memory;
 
     #[test]
     fn lcc_triangle() {
         // Fully connected triangle: each node has LCC = 1.0.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
         csr.add_edge("c", "L", "a").unwrap();
         csr.add_edge("b", "L", "a").unwrap();
         csr.add_edge("c", "L", "b").unwrap();
         csr.add_edge("a", "L", "c").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr, DEFAULT_HIGH_DEGREE_THRESHOLD, DEFAULT_SAMPLE_PAIRS);
         assert_eq!(batch.len(), 3);
@@ -220,11 +222,12 @@ mod tests {
         // Star topology: center a connects to b, c, d. No edges between b, c, d.
         // a has LCC = 0.0 (3 neighbors, 0 edges between them → 0/3).
         // b, c, d have LCC = 0.0 (degree 1 < 2).
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("a", "L", "c").unwrap();
         csr.add_edge("a", "L", "d").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr, DEFAULT_HIGH_DEGREE_THRESHOLD, DEFAULT_SAMPLE_PAIRS);
         let json = batch.to_json().unwrap();
@@ -242,10 +245,11 @@ mod tests {
     #[test]
     fn lcc_path() {
         // Path: a -> b -> c. Only b has 2 neighbors. No edge a-c → LCC(b) = 0.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr, DEFAULT_HIGH_DEGREE_THRESHOLD, DEFAULT_SAMPLE_PAIRS);
         let json = batch.to_json().unwrap();
@@ -267,16 +271,17 @@ mod tests {
 
     #[test]
     fn lcc_empty_graph() {
-        let csr = CsrIndex::new();
+        let csr = CsrIndex::new(test_scoped_memory());
         let batch = run(&csr, DEFAULT_HIGH_DEGREE_THRESHOLD, DEFAULT_SAMPLE_PAIRS);
         assert!(batch.is_empty());
     }
 
     #[test]
     fn lcc_single_node() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_node("lonely").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr, DEFAULT_HIGH_DEGREE_THRESHOLD, DEFAULT_SAMPLE_PAIRS);
         assert_eq!(batch.len(), 1);
@@ -289,13 +294,14 @@ mod tests {
     fn lcc_partial_connectivity() {
         // Diamond: a-b, a-c, b-d, c-d, b-c.
         // Node a: neighbors {b, c}. Edge b-c exists → 1 triangle / 1 pair = 1.0.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("a", "L", "c").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
         csr.add_edge("b", "L", "d").unwrap();
         csr.add_edge("c", "L", "d").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr, DEFAULT_HIGH_DEGREE_THRESHOLD, DEFAULT_SAMPLE_PAIRS);
         let json = batch.to_json().unwrap();

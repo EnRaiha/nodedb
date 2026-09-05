@@ -104,9 +104,9 @@ pub(super) async fn reissue_columnar_snapshots(
     entries: Vec<(String, Vec<u8>)>,
 ) -> Result<usize, Error> {
     // Columnar segment KEK == the WAL encryption key (segments are written via
-    // `SegmentWriter::plain().write_segment(..., kek)` with this key). Absent
-    // when at-rest encryption is not configured, in which case segments are
-    // plaintext NDBS and decode with `kek = None`.
+    // `SegmentWriter::new(profile, memory).write_segment(..., kek)` with this
+    // key). Absent when at-rest encryption is not configured, in which case
+    // segments are plaintext NDBS and decode with `kek = None`.
     let kek = state.wal.encryption_key().cloned();
     let database_id = crate::types::DatabaseId::DEFAULT;
 

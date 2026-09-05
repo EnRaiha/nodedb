@@ -81,14 +81,16 @@ fn bfs_distances(csr: &CsrIndex, source: u32, n: usize) -> (f64, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::graph::test_support::test_scoped_memory;
 
     #[test]
     fn closeness_path() {
         // a - b - c (path). Middle node b should have highest closeness.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr);
         let json = batch.to_json().unwrap();
@@ -110,7 +112,7 @@ mod tests {
     #[test]
     fn closeness_complete_graph() {
         // Fully connected: all nodes equidistant → equal closeness.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         for (s, d) in &[
             ("a", "b"),
             ("b", "a"),
@@ -121,7 +123,8 @@ mod tests {
         ] {
             csr.add_edge(s, "L", d).unwrap();
         }
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr);
         let json = batch.to_json().unwrap();
@@ -139,10 +142,11 @@ mod tests {
     #[test]
     fn closeness_disconnected() {
         // a-b connected, c isolated. Wasserman-Faust gives c = 0.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_node("c").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr);
         let json = batch.to_json().unwrap();
@@ -163,7 +167,7 @@ mod tests {
 
     #[test]
     fn closeness_empty() {
-        let csr = CsrIndex::new();
+        let csr = CsrIndex::new(test_scoped_memory());
         assert!(run(&csr).is_empty());
     }
 

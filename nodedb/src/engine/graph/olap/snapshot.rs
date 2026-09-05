@@ -16,11 +16,13 @@
 //! delta during OLTP mutations on the live CSR.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::engine::graph::csr::CsrIndex;
 use crate::engine::graph::edge_store::EdgeStore;
 use nodedb_graph::LocalNodeId;
 use nodedb_graph::csr::weights::extract_weight_from_properties;
+use nodedb_mem::{EngineId, MemoryGovernor, ScopedMemory};
 use nodedb_types::{DatabaseId, TenantId};
 
 /// Immutable graph snapshot for analytical workloads.
@@ -60,7 +62,8 @@ impl CsrSnapshot {
     /// **Important**: This compacts the live CSR first to merge all buffer
     /// edges into the dense arrays. The snapshot only contains dense data.
     pub fn from_csr(csr: &mut CsrIndex) -> Self {
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
         Self::snapshot_dense(csr)
     }
 
@@ -87,8 +90,9 @@ impl CsrSnapshot {
         db: DatabaseId,
         tid: TenantId,
         system_as_of: Option<i64>,
+        governor: Arc<MemoryGovernor>,
     ) -> crate::Result<Self> {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(ScopedMemory::new(governor, db, tid, EngineId::Graph));
         let records = edge_store.scan_all_edges_decoded(system_as_of)?;
 
         // First pass: intern every endpoint so isolated vertices still land
@@ -121,7 +125,8 @@ impl CsrSnapshot {
             })?;
         }
 
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
         Ok(Self::snapshot_dense(&csr))
     }
 
@@ -326,9 +331,10 @@ impl CsrSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::graph::test_support::test_scoped_memory;
 
     fn make_csr() -> CsrIndex {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
         csr.add_edge("b", "KNOWS", "c").unwrap();
         csr.add_edge("a", "LIKES", "c").unwrap();
@@ -393,7 +399,7 @@ mod tests {
 
     #[test]
     fn snapshot_weighted() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge_weighted("a", "R", "b", 2.5).unwrap();
         csr.add_edge_weighted("b", "R", "c", 7.0).unwrap();
         let snap = CsrSnapshot::from_csr(&mut csr);
@@ -413,7 +419,7 @@ mod tests {
 
     #[test]
     fn no_compact_snapshot() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         // Don't compact — buffer edges only.
         let snap = CsrSnapshot::from_csr_no_compact(&csr);

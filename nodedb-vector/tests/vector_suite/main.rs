@@ -11,3 +11,4 @@
 //! `cases::<file>::<test>` and names never collide across files.
 
 mod cases;
+mod support;

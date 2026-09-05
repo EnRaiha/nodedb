@@ -25,6 +25,8 @@ pub mod matryoshka;
 pub mod multivec;
 pub mod quantize;
 pub mod rerank;
+#[cfg(test)]
+mod test_support;
 pub mod vamana;
 
 pub use distance::DistanceMetric;

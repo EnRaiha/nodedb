@@ -342,9 +342,16 @@ mod tests {
             let (seg_schema, columns, row_count) = engine.memtable_mut().drain_optimized();
             // Capture surrogates BEFORE `on_memtable_flushed` clears them.
             let flushed_surrogates: Vec<Option<Surrogate>> = engine.memtable_surrogates().to_vec();
-            let bytes = nodedb_columnar::SegmentWriter::plain()
-                .write_segment(&seg_schema, &columns, row_count, None)
-                .expect("write_segment");
+            let memory = nodedb_mem::ScopedMemory::new(
+                core.governor.clone(),
+                key.0,
+                key.1,
+                nodedb_mem::EngineId::Columnar,
+            );
+            let bytes =
+                nodedb_columnar::SegmentWriter::new(nodedb_columnar::writer::PROFILE_PLAIN, memory)
+                    .write_segment(&seg_schema, &columns, row_count, None)
+                    .expect("write_segment");
             core.columnar_flushed_segments
                 .entry(key.clone())
                 .or_default()
@@ -537,9 +544,16 @@ mod tests {
             let new_segment_id = engine.next_segment_id();
             let (seg_schema, columns, row_count) = engine.memtable_mut().drain_optimized();
             let surrogates: Vec<Option<Surrogate>> = engine.memtable_surrogates().to_vec();
-            let bytes = nodedb_columnar::SegmentWriter::plain()
-                .write_segment(&seg_schema, &columns, row_count, None)
-                .expect("write_segment");
+            let memory = nodedb_mem::ScopedMemory::new(
+                core.governor.clone(),
+                key.0,
+                key.1,
+                nodedb_mem::EngineId::Columnar,
+            );
+            let bytes =
+                nodedb_columnar::SegmentWriter::new(nodedb_columnar::writer::PROFILE_PLAIN, memory)
+                    .write_segment(&seg_schema, &columns, row_count, None)
+                    .expect("write_segment");
             engine
                 .on_memtable_flushed(new_segment_id)
                 .expect("on_memtable_flushed");

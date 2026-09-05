@@ -115,7 +115,13 @@ impl CoreLoop {
             // been truncated.
             let bytes = nodedb_wal::segment::read_checkpoint_framed(&path)?;
             let kek = self.segment_keks.vector_checkpoint_kek.as_ref();
-            let collection = VectorCollection::from_checkpoint(&bytes, kek)?;
+            let memory = nodedb_mem::ScopedMemory::new(
+                self.governor.clone(),
+                key.0,
+                key.1,
+                nodedb_mem::EngineId::Vector,
+            );
+            let collection = VectorCollection::from_checkpoint(&bytes, kek, memory)?;
             decoded.insert(key, collection);
         }
         Ok(decoded)

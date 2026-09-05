@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use nodedb_graph::CsrIndex;
+use nodedb_mem::{EngineId, ScopedMemory};
 use nodedb_types::DatabaseId;
 
 use crate::types::TenantId;
@@ -32,8 +33,10 @@ impl CoreLoop {
         database_id: u64,
         tid: u64,
     ) -> &mut CsrIndex {
-        self.csr
-            .get_or_create(DatabaseId::new(database_id), TenantId::new(tid))
+        let db = DatabaseId::new(database_id);
+        let tenant = TenantId::new(tid);
+        let memory = ScopedMemory::new(self.governor.clone(), db, tenant, EngineId::Graph);
+        self.csr.get_or_create(db, tenant, memory)
     }
 
     /// Mark `node_id` as deleted within the caller's `(database, tenant)`.

@@ -18,8 +18,9 @@ use nodedb::control::state::SharedState;
 ///
 /// An 8 GiB ceiling keeps even the smallest per-engine slice generous
 /// enough that integration workloads never trip engine-level pressure.
-/// Panics if `GovernorConfig` validation fails — an 8 GiB uniform budget
-/// over the default `EngineConfig` never does.
+/// Panics if `GovernorConfig` validation fails. Validation rejects a config
+/// whose per-engine limits outgrow the ceiling. `EngineConfig::default()`
+/// fractions sum below 1.0, so the derived budgets fit at any ceiling.
 pub(super) fn init_test_memory_governor() -> Arc<nodedb_mem::MemoryGovernor> {
     let ceiling: usize = 8 * 1024 * 1024 * 1024; // 8 GiB
     let budgets = nodedb::config::EngineConfig::default().to_byte_budgets(ceiling);

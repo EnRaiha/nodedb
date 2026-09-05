@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 
+use nodedb_mem::ScopedMemory;
 use nodedb_types::{Surrogate, VectorQuantization};
 
 use crate::flat::FlatIndex;
@@ -252,7 +253,7 @@ impl VectorCollection {
     /// codec-dispatch index when `self.quantization` is `RaBitQ` or `Bbq`.
     /// The rebuild trains over all vectors so the codec index always covers
     /// every sealed segment.
-    pub fn complete_build(&mut self, segment_id: u32, index: HnswIndex) {
+    pub fn complete_build(&mut self, segment_id: u32, index: HnswIndex, memory: ScopedMemory) {
         if let Some(pos) = self
             .building
             .iter()
@@ -269,13 +270,13 @@ impl VectorCollection {
             } else if use_pq {
                 (
                     None,
-                    Self::build_pq_for_index(&index, self.index_config.pq_m),
+                    Self::build_pq_for_index(&index, self.index_config.pq_m, memory.clone()),
                 )
             } else {
                 (Self::build_sq8_for_index(&index), None)
             };
             let (tier, mmap_vectors) =
-                self.resolve_tier_for_build(segment_id, building.base_id, &index);
+                self.resolve_tier_for_build(segment_id, building.base_id, &index, &memory);
 
             self.sealed.push(SealedSegment {
                 index,

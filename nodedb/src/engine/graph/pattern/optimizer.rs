@@ -145,9 +145,10 @@ mod tests {
     use super::*;
     use crate::engine::graph::pattern::ast::*;
     use crate::engine::graph::pattern::compiler;
+    use crate::engine::graph::test_support::test_scoped_memory;
 
     fn social_graph() -> CsrIndex {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         // KNOWS: 100 edges (dense), CREATED: 5 edges (sparse)
         for i in 0..100 {
             csr.add_edge(&format!("p{i}"), "KNOWS", &format!("p{}", (i + 1) % 100))
@@ -157,7 +158,8 @@ mod tests {
             csr.add_edge(&format!("p{i}"), "CREATED", &format!("doc{i}"))
                 .unwrap();
         }
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
         csr
     }
 

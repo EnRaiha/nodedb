@@ -174,12 +174,19 @@ fn csr_rebuild_as_of_omits_post_cutoff_writes() {
         .unwrap();
 
     // Current-state rebuild sees both edges.
-    let csr_now = rebuild_sharded_from_store(&store).unwrap();
+    let csr_now =
+        rebuild_sharded_from_store(&store, nodedb::data::executor::core_loop::test_governor())
+            .unwrap();
     let part_now = csr_now.partition(DB, T).expect("partition exists");
     assert_eq!(part_now.node_count(), 3);
 
     // AS OF ordinal 150 only sees the first edge.
-    let sharded = rebuild_sharded_from_store_as_of(&store, Some(150)).unwrap();
+    let sharded = rebuild_sharded_from_store_as_of(
+        &store,
+        Some(150),
+        nodedb::data::executor::core_loop::test_governor(),
+    )
+    .unwrap();
     let part = sharded.partition(DB, T).expect("partition exists");
     assert_eq!(part.node_count(), 2, "only a + b at ordinal 150");
 }

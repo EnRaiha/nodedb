@@ -79,8 +79,11 @@ pub(super) fn rebuild_fts_thread(input: FtsRebuild) -> crate::Result<RebuildOutp
     }))
 }
 
-pub(super) fn rebuild_csr_thread(snapshot_bytes: Vec<u8>) -> crate::Result<RebuildOutput> {
-    let restored = nodedb_graph::CsrIndex::from_checkpoint(&snapshot_bytes)
+pub(super) fn rebuild_csr_thread(
+    snapshot_bytes: Vec<u8>,
+    memory: nodedb_mem::ScopedMemory,
+) -> crate::Result<RebuildOutput> {
+    let restored = nodedb_graph::CsrIndex::from_checkpoint(&snapshot_bytes, memory)
         .map_err(|e| crate::Error::Storage {
             engine: "graph".to_string(),
             detail: format!("CSR restore: {e}"),
@@ -250,7 +253,13 @@ pub(super) fn apply_csr(
     collection_key: &str,
     bytes: Vec<u8>,
 ) {
-    let rebuilt = match nodedb_graph::CsrIndex::from_checkpoint(&bytes) {
+    let memory = nodedb_mem::ScopedMemory::new(
+        core.governor.clone(),
+        *database_id,
+        *tenant_id,
+        nodedb_mem::EngineId::Graph,
+    );
+    let rebuilt = match nodedb_graph::CsrIndex::from_checkpoint(&bytes, memory) {
         Ok(Some(r)) => r,
         Ok(None) => {
             warn!(
@@ -270,14 +279,6 @@ pub(super) fn apply_csr(
             return;
         }
     };
-
-    let memory = nodedb_mem::ScopedMemory::new(
-        core.governor.clone(),
-        *database_id,
-        *tenant_id,
-        nodedb_mem::EngineId::Graph,
-    );
-    let rebuilt = rebuilt.with_memory_attached(memory);
 
     core.csr
         .install_partition(*database_id, *tenant_id, rebuilt);

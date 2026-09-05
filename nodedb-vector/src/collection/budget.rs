@@ -2,6 +2,8 @@
 
 //! RAM budget enforcement and mmap spillover for `VectorCollection`.
 
+use nodedb_mem::ScopedMemory;
+
 use crate::collection::tier::StorageTier;
 use crate::hnsw::HnswIndex;
 use crate::mmap_segment::MmapVectorSegment;
@@ -62,6 +64,7 @@ impl VectorCollection {
         segment_id: u32,
         base_id: u32,
         index: &HnswIndex,
+        memory: &ScopedMemory,
     ) -> (StorageTier, Option<MmapVectorSegment>) {
         if !self.is_budget_exceeded() {
             return (StorageTier::L0Ram, None);
@@ -97,6 +100,7 @@ impl VectorCollection {
             self.dim,
             &ref_slices,
             &surrogate_ids,
+            memory,
         ) {
             Ok(mmap) => {
                 self.mmap_fallback_count += 1;

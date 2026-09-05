@@ -117,15 +117,17 @@ impl Ord for OrdF64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::graph::test_support::test_scoped_memory;
 
     fn weighted_graph() -> CsrIndex {
         // a --(2.0)--> b --(3.0)--> c
         // a --(10.0)-> c  (direct but longer)
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge_weighted("a", "R", "b", 2.0).unwrap();
         csr.add_edge_weighted("b", "R", "c", 3.0).unwrap();
         csr.add_edge_weighted("a", "R", "c", 10.0).unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
         csr
     }
 
@@ -160,10 +162,11 @@ mod tests {
 
     #[test]
     fn sssp_unreachable_node() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge_weighted("a", "R", "b", 1.0).unwrap();
         csr.add_node("island").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let params = AlgoParams {
             source_node: Some("a".into()),
@@ -180,11 +183,12 @@ mod tests {
     #[test]
     fn sssp_unweighted_defaults_to_one() {
         // Unweighted edges default to 1.0.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
         csr.add_edge("c", "L", "d").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let params = AlgoParams {
             source_node: Some("a".into()),
@@ -201,7 +205,7 @@ mod tests {
 
     #[test]
     fn sssp_missing_source() {
-        let csr = CsrIndex::new();
+        let csr = CsrIndex::new(test_scoped_memory());
         let params = AlgoParams {
             source_node: Some("nonexistent".into()),
             ..Default::default()
@@ -213,9 +217,10 @@ mod tests {
 
     #[test]
     fn sssp_missing_source_in_nonempty_graph() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let params = AlgoParams {
             source_node: Some("nonexistent".into()),
@@ -227,9 +232,10 @@ mod tests {
 
     #[test]
     fn sssp_no_source_param() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let params = AlgoParams::default();
         let result = run(&csr, &params);
@@ -238,9 +244,10 @@ mod tests {
 
     #[test]
     fn sssp_single_node() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_node("solo").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let params = AlgoParams {
             source_node: Some("solo".into()),
@@ -269,12 +276,13 @@ mod tests {
     fn sssp_diamond_graph() {
         // Diamond: a -> b (1), a -> c (4), b -> d (2), c -> d (1)
         // Shortest a->d: a->b->d = 3 (not a->c->d = 5)
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge_weighted("a", "R", "b", 1.0).unwrap();
         csr.add_edge_weighted("a", "R", "c", 4.0).unwrap();
         csr.add_edge_weighted("b", "R", "d", 2.0).unwrap();
         csr.add_edge_weighted("c", "R", "d", 1.0).unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let params = AlgoParams {
             source_node: Some("a".into()),
@@ -291,9 +299,10 @@ mod tests {
 
     #[test]
     fn sssp_rejects_negative_weights() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge_weighted("a", "R", "b", -1.0).unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let params = AlgoParams {
             source_node: Some("a".into()),

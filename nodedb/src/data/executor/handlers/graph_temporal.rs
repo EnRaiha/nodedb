@@ -132,6 +132,12 @@ impl CoreLoop {
         );
         let cutoff_ordinal = system_as_of_ms.map(ms_to_ordinal_upper);
         let database_id = task.request.database_id.as_u64();
+        let memory = nodedb_mem::ScopedMemory::new(
+            self.governor.clone(),
+            task.request.database_id,
+            crate::types::TenantId::new(tid),
+            nodedb_mem::EngineId::Graph,
+        );
 
         let scoped_csr = match super::graph_algo::build_csr_for_collection(
             &self.edge_store,
@@ -140,6 +146,7 @@ impl CoreLoop {
             &params.collection,
             params.edge_label.as_deref(),
             cutoff_ordinal,
+            memory,
         ) {
             Ok(c) => c,
             Err(e) => return self.response_error(task, ErrorCode::from(e)),

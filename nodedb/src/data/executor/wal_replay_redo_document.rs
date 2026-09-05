@@ -674,9 +674,16 @@ mod tests {
             .expect("collection present after first replay")
             .checkpoint_to_bytes(None)
             .unwrap();
-        let restored =
-            crate::engine::vector::collection::VectorCollection::from_checkpoint(&bytes, None)
-                .expect("decode checkpoint");
+        let memory = nodedb_mem::ScopedMemory::new(
+            h.core.governor.clone(),
+            nodedb_types::DatabaseId::new(0),
+            crate::types::TenantId::new(7),
+            nodedb_mem::EngineId::Vector,
+        );
+        let restored = crate::engine::vector::collection::VectorCollection::from_checkpoint(
+            &bytes, None, memory,
+        )
+        .expect("decode checkpoint");
         h.core.vector_collections.insert(key.clone(), restored);
 
         h.core

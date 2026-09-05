@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::mem::size_of;
 
+use nodedb_mem::ScopedMemory;
+
 use super::index::CsrIndex;
 use crate::GraphError;
 
@@ -110,11 +112,7 @@ impl CsrIndex {
         let rkyv_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&snapshot)
             .expect("CSR rkyv serialization should not fail");
         let buf_capacity = RKYV_MAGIC.len() + 1 + rkyv_bytes.len();
-        let _budget_guard = self
-            .memory
-            .as_ref()
-            .map(|mem| mem.reserve(buf_capacity * size_of::<u8>()))
-            .transpose()?;
+        let _budget_guard = self.memory.reserve(buf_capacity * size_of::<u8>())?;
         let mut buf = Vec::with_capacity(buf_capacity);
         buf.extend_from_slice(RKYV_MAGIC);
         buf.push(CSR_FORMAT_VERSION);
@@ -130,7 +128,10 @@ impl CsrIndex {
     ///   format exists for CSR; callers should treat this as an invalid buffer).
     /// - `Err(CsrCheckpointError::UnsupportedVersion)` — magic matches but the
     ///   version byte is not `CSR_FORMAT_VERSION`.
-    pub fn from_checkpoint(bytes: &[u8]) -> Result<Option<Self>, CsrCheckpointError> {
+    pub fn from_checkpoint(
+        bytes: &[u8],
+        memory: ScopedMemory,
+    ) -> Result<Option<Self>, CsrCheckpointError> {
         let header_len = RKYV_MAGIC.len() + 1; // magic + version byte
         if bytes.len() > header_len && &bytes[..RKYV_MAGIC.len()] == RKYV_MAGIC {
             let version = bytes[RKYV_MAGIC.len()];
@@ -140,7 +141,7 @@ impl CsrIndex {
                     expected: CSR_FORMAT_VERSION,
                 });
             }
-            return Ok(Self::from_rkyv_checkpoint(&bytes[header_len..]));
+            return Ok(Self::from_rkyv_checkpoint(&bytes[header_len..], memory));
         }
         Ok(None)
     }
@@ -151,19 +152,19 @@ impl CsrIndex {
     /// weights) are zero-copy: DenseArray points directly into the archived
     /// buffer with no per-element parsing. On big-endian, falls back to full
     /// deserialization.
-    fn from_rkyv_checkpoint(bytes: &[u8]) -> Option<Self> {
+    fn from_rkyv_checkpoint(bytes: &[u8], memory: ScopedMemory) -> Option<Self> {
         let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
         aligned.extend_from_slice(bytes);
 
         #[cfg(target_endian = "little")]
         {
-            Self::from_rkyv_zero_copy(aligned)
+            Self::from_rkyv_zero_copy(aligned, memory)
         }
         #[cfg(not(target_endian = "little"))]
         {
             let snap: CsrSnapshotRkyv =
                 rkyv::from_bytes::<CsrSnapshotRkyv, rkyv::rancor::Error>(&aligned).ok()?;
-            Some(Self::from_snapshot_fields(snap))
+            Some(Self::from_snapshot_fields(snap, memory))
         }
     }
 
@@ -174,7 +175,7 @@ impl CsrIndex {
     /// casts are sound because `ArchivedVec<T>` stores contiguous `T_le`
     /// values, and the `Arc<AlignedVec>` keeps the buffer alive.
     #[cfg(target_endian = "little")]
-    fn from_rkyv_zero_copy(aligned: rkyv::util::AlignedVec) -> Option<Self> {
+    fn from_rkyv_zero_copy(aligned: rkyv::util::AlignedVec, memory: ScopedMemory) -> Option<Self> {
         use super::dense_array::DenseArray;
 
         let backing = std::sync::Arc::new(aligned);
@@ -289,9 +290,7 @@ impl CsrIndex {
             access_counts,
             query_epoch: 0,
             partition_tag: crate::csr::local_node_id::next_partition_tag(),
-            // Checkpoint restore creates an ungoverned index; callers that
-            // need budget enforcement call `with_memory_attached` afterwards.
-            memory: None,
+            memory,
         })
     }
 
@@ -315,7 +314,7 @@ impl CsrIndex {
 
     /// Reconstruct CsrIndex from deserialized snapshot fields.
     #[cfg(not(target_endian = "little"))]
-    fn from_snapshot_fields(snap: CsrSnapshotRkyv) -> Self {
+    fn from_snapshot_fields(snap: CsrSnapshotRkyv, memory: ScopedMemory) -> Self {
         let node_to_id: HashMap<String, u32> = snap
             .nodes
             .iter()
@@ -394,8 +393,7 @@ impl CsrIndex {
             access_counts,
             query_epoch: 0,
             partition_tag: crate::csr::local_node_id::next_partition_tag(),
-            // Checkpoint restore creates an ungoverned index.
-            memory: None,
+            memory,
         }
     }
 }
@@ -404,16 +402,20 @@ impl CsrIndex {
 mod tests {
     use super::*;
     use crate::csr::index::Direction;
+    use crate::test_support::test_memory;
 
     #[test]
     fn checkpoint_roundtrip_unweighted() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
         csr.add_edge("b", "KNOWS", "c").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
-        let bytes = csr.checkpoint_to_bytes().expect("no governor, cannot fail");
-        let restored = CsrIndex::from_checkpoint(&bytes)
+        let bytes = csr
+            .checkpoint_to_bytes()
+            .expect("test governor ceiling covers this reservation");
+        let restored = CsrIndex::from_checkpoint(&bytes, test_memory())
             .expect("roundtrip")
             .unwrap();
         assert_eq!(restored.node_count(), 3);
@@ -427,14 +429,17 @@ mod tests {
 
     #[test]
     fn checkpoint_roundtrip_weighted() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge_weighted("a", "R", "b", 2.5).unwrap();
         csr.add_edge_weighted("b", "R", "c", 7.0).unwrap();
         csr.add_edge("c", "R", "d").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
-        let bytes = csr.checkpoint_to_bytes().expect("no governor, cannot fail");
-        let restored = CsrIndex::from_checkpoint(&bytes)
+        let bytes = csr
+            .checkpoint_to_bytes()
+            .expect("test governor ceiling covers this reservation");
+        let restored = CsrIndex::from_checkpoint(&bytes, test_memory())
             .expect("roundtrip")
             .unwrap();
         assert!(restored.has_weights());
@@ -445,11 +450,13 @@ mod tests {
 
     #[test]
     fn checkpoint_roundtrip_with_buffer() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "L", "b").unwrap();
         // Don't compact — edges in buffer.
-        let bytes = csr.checkpoint_to_bytes().expect("no governor, cannot fail");
-        let restored = CsrIndex::from_checkpoint(&bytes)
+        let bytes = csr
+            .checkpoint_to_bytes()
+            .expect("test governor ceiling covers this reservation");
+        let restored = CsrIndex::from_checkpoint(&bytes, test_memory())
             .expect("roundtrip")
             .unwrap();
         assert_eq!(restored.edge_count(), 1);
@@ -457,9 +464,11 @@ mod tests {
 
     #[test]
     fn golden_header_layout() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
-        let bytes = csr.checkpoint_to_bytes().expect("no governor, cannot fail");
+        let bytes = csr
+            .checkpoint_to_bytes()
+            .expect("test governor ceiling covers this reservation");
         // Magic at bytes[0..6].
         assert_eq!(&bytes[0..6], b"RKCS2\0");
         // Version byte at bytes[6].
@@ -470,12 +479,14 @@ mod tests {
 
     #[test]
     fn version_mismatch_returns_error() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
-        let mut bytes = csr.checkpoint_to_bytes().expect("no governor, cannot fail");
+        let mut bytes = csr
+            .checkpoint_to_bytes()
+            .expect("test governor ceiling covers this reservation");
         // Corrupt the version byte to an unsupported value.
         bytes[6] = 0;
-        match CsrIndex::from_checkpoint(&bytes) {
+        match CsrIndex::from_checkpoint(&bytes, test_memory()) {
             Err(CsrCheckpointError::UnsupportedVersion { found, expected }) => {
                 assert_eq!(found, 0);
                 assert_eq!(expected, super::CSR_FORMAT_VERSION);

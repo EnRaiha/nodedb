@@ -151,6 +151,7 @@ impl VectorCodec for PqCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_memory;
 
     fn make_codec() -> PqCodec {
         let vecs: Vec<Vec<f32>> = (0..80)
@@ -165,7 +166,7 @@ mod tests {
             })
             .collect();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        PqCodec::train(&refs, 4, 2, 8, 10)
+        PqCodec::train(&refs, 4, 2, 8, 10, test_memory())
     }
 
     /// `encode` round-trip: packed_bits in the UQV must match the raw

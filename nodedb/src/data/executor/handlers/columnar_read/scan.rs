@@ -579,9 +579,16 @@ mod tests {
             flushed_surrogates.len(),
             "drained row_count must equal captured surrogate count"
         );
-        let bytes = nodedb_columnar::SegmentWriter::plain()
-            .write_segment(&seg_schema, &columns, row_count, None)
-            .expect("write_segment");
+        let memory = nodedb_mem::ScopedMemory::new(
+            core.governor.clone(),
+            key.0,
+            key.1,
+            nodedb_mem::EngineId::Columnar,
+        );
+        let bytes =
+            nodedb_columnar::SegmentWriter::new(nodedb_columnar::writer::PROFILE_PLAIN, memory)
+                .write_segment(&seg_schema, &columns, row_count, None)
+                .expect("write_segment");
         // Lockstep push: both maps, same key, same order.
         core.columnar_flushed_segments
             .entry(key.clone())

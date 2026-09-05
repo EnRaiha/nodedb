@@ -87,7 +87,16 @@ impl CoreLoop {
                 let bbox = nodedb_types::bbox::geometry_bbox(&geom);
                 let index_key = (db_id, tid, collection.to_string(), col_def.name.clone());
                 let entry_id = crate::util::fnv1a_hash(doc_id.as_bytes());
-                let rtree = self.spatial_indexes.entry(index_key.clone()).or_default();
+                let memory = nodedb_mem::ScopedMemory::new(
+                    self.governor.clone(),
+                    db_id,
+                    tid,
+                    nodedb_mem::EngineId::Spatial,
+                );
+                let rtree = self
+                    .spatial_indexes
+                    .entry(index_key.clone())
+                    .or_insert_with(|| crate::engine::spatial::RTree::new(memory));
                 rtree.insert(crate::engine::spatial::RTreeEntry { id: entry_id, bbox });
                 self.spatial_doc_map.insert(
                     (

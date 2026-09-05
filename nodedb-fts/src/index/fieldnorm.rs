@@ -66,13 +66,14 @@ mod tests {
     use crate::backend::memory::MemoryBackend;
     use crate::codec::smallfloat;
     use crate::index::FtsIndex;
+    use crate::test_support::test_governor;
 
     const DB: u64 = 0;
     const T: u64 = 1;
 
     #[test]
     fn fieldnorm_roundtrip() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.write_fieldnorm(DB, T, "col", Surrogate(0), 100)
             .unwrap();
         idx.write_fieldnorm(DB, T, "col", Surrogate(5), 50).unwrap();
@@ -94,7 +95,7 @@ mod tests {
 
     #[test]
     fn fieldnorm_missing_doc() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         assert_eq!(
             idx.read_fieldnorm(DB, T, "col", Surrogate(99)).unwrap(),
             None
@@ -103,7 +104,7 @@ mod tests {
 
     #[test]
     fn fieldnorm_overwrite() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.write_fieldnorm(DB, T, "col", Surrogate(0), 100)
             .unwrap();
         idx.write_fieldnorm(DB, T, "col", Surrogate(0), 200)

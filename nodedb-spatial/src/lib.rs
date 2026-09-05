@@ -21,6 +21,8 @@ pub mod persist;
 pub mod predicates;
 pub mod rtree;
 pub mod spatial_join;
+#[cfg(test)]
+mod test_support;
 pub mod validate;
 pub mod wkb;
 pub mod wkt;

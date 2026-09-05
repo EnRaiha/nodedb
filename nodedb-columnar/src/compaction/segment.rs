@@ -35,15 +35,14 @@ pub struct CompactionResult {
 /// SEGC envelope. The input segment must be plaintext (the caller is
 /// responsible for decrypting before passing to this function).
 ///
-/// `memory` is optional: when `Some`, working-buffer allocations are
-/// tracked against the bound database, tenant, and engine budget. Pass
-/// `None` in embedded (Lite) deployments where no governor is configured.
+/// `memory` tracks working-buffer allocations against the bound database,
+/// tenant, and engine budget.
 pub fn compact_segment(
     segment_data: &[u8],
     deletes: &DeleteBitmap,
     schema: &ColumnarSchema,
     profile_tag: u8,
-    memory: Option<&ScopedMemory>,
+    memory: &ScopedMemory,
     kek: Option<&nodedb_wal::crypto::WalEncryptionKey>,
 ) -> Result<CompactionResult, ColumnarError> {
     let reader = SegmentReader::open(segment_data)?;
@@ -62,9 +61,7 @@ pub fn compact_segment(
     // Read all columns without delete masking — we'll filter manually.
     let col_count = reader.column_count();
     // Reserve budget for the decoded-column pointer vec (each entry is a fat pointer).
-    let _cols_guard = memory
-        .map(|m| m.reserve(col_count * std::mem::size_of::<usize>() * 3))
-        .transpose()?;
+    let _cols_guard = memory.reserve(col_count * std::mem::size_of::<usize>() * 3)?;
     let mut decoded_cols = Vec::with_capacity(col_count);
     for i in 0..col_count {
         decoded_cols.push(reader.read_column(i)?);
@@ -73,9 +70,7 @@ pub fn compact_segment(
     // Build a new memtable with only live rows.
     let mut memtable = ColumnarMemtable::new(schema);
     let col_len = schema.columns.len();
-    let _row_guard = memory
-        .map(|m| m.reserve(col_len * std::mem::size_of::<usize>() * 3))
-        .transpose()?;
+    let _row_guard = memory.reserve(col_len * std::mem::size_of::<usize>() * 3)?;
     let mut row_values = Vec::with_capacity(col_len);
 
     for row_idx in 0..total_rows {
@@ -94,10 +89,7 @@ pub fn compact_segment(
     }
 
     let (schema, columns, row_count) = memtable.drain();
-    let writer = match memory {
-        Some(m) => SegmentWriter::with_memory(profile_tag, m.clone()),
-        None => SegmentWriter::new(profile_tag),
-    };
+    let writer = SegmentWriter::new(profile_tag, memory.clone());
     let new_segment = writer.write_segment(&schema, &columns, row_count, kek)?;
 
     Ok(CompactionResult {
@@ -115,6 +107,7 @@ mod tests {
     use crate::delete_bitmap::DeleteBitmap;
     use crate::memtable::ColumnarMemtable;
     use crate::reader::{DecodedColumn, SegmentReader};
+    use crate::test_support::test_memory;
     use crate::writer::SegmentWriter;
 
     use super::compact_segment;
@@ -144,7 +137,7 @@ mod tests {
             .expect("append");
         }
         let (schema, columns, row_count) = mt.drain();
-        SegmentWriter::plain()
+        SegmentWriter::new(crate::writer::PROFILE_PLAIN, test_memory())
             .write_segment(&schema, &columns, row_count, None)
             .expect("write")
     }
@@ -159,8 +152,8 @@ mod tests {
             deletes.mark_deleted(i);
         }
 
-        let result =
-            compact_segment(&segment, &deletes, &test_schema(), 0, None, None).expect("compact");
+        let result = compact_segment(&segment, &deletes, &test_schema(), 0, &test_memory(), None)
+            .expect("compact");
 
         assert_eq!(result.live_rows, 90);
         assert_eq!(result.removed_rows, 10);
@@ -193,8 +186,8 @@ mod tests {
             deletes.mark_deleted(i);
         }
 
-        let result =
-            compact_segment(&segment, &deletes, &test_schema(), 0, None, None).expect("compact");
+        let result = compact_segment(&segment, &deletes, &test_schema(), 0, &test_memory(), None)
+            .expect("compact");
 
         assert_eq!(result.live_rows, 0);
         assert_eq!(result.removed_rows, 10);
@@ -206,8 +199,8 @@ mod tests {
         let segment = write_segment(50);
         let deletes = DeleteBitmap::new();
 
-        let result =
-            compact_segment(&segment, &deletes, &test_schema(), 0, None, None).expect("compact");
+        let result = compact_segment(&segment, &deletes, &test_schema(), 0, &test_memory(), None)
+            .expect("compact");
 
         assert_eq!(result.live_rows, 50);
         assert_eq!(result.removed_rows, 0);
@@ -220,8 +213,8 @@ mod tests {
         let mut deletes = DeleteBitmap::new();
         deletes.mark_deleted(0); // Delete first row.
 
-        let result =
-            compact_segment(&segment, &deletes, &test_schema(), 0, None, None).expect("compact");
+        let result = compact_segment(&segment, &deletes, &test_schema(), 0, &test_memory(), None)
+            .expect("compact");
         let new_seg = result.segment.as_ref().expect("segment");
         let reader = SegmentReader::open(new_seg).expect("open");
 

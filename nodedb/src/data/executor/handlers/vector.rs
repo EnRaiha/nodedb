@@ -285,7 +285,13 @@ impl CoreLoop {
         // IVF-PQ requires training before the first insert.
         if ivf.n_cells() == 0 {
             let refs: Vec<&[f32]> = vec![vector];
-            ivf.train(&refs);
+            let memory = nodedb_mem::ScopedMemory::new(
+                self.governor.clone(),
+                index_key.0,
+                index_key.1,
+                nodedb_mem::EngineId::Vector,
+            );
+            ivf.train(&refs, memory);
         }
 
         let vector_id = ivf.add(vector);

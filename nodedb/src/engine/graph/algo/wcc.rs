@@ -99,15 +99,17 @@ impl UnionFind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::graph::test_support::test_scoped_memory;
 
     #[test]
     fn wcc_single_component() {
         // a -> b -> c -> a (cycle — all connected)
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
         csr.add_edge("c", "L", "a").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr);
         assert_eq!(batch.len(), 3);
@@ -128,10 +130,11 @@ mod tests {
     fn wcc_two_components() {
         // Component 1: a -> b
         // Component 2: c -> d
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("c", "L", "d").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr);
         assert_eq!(batch.len(), 4);
@@ -156,9 +159,10 @@ mod tests {
     #[test]
     fn wcc_directed_edges_treated_as_undirected() {
         // a -> b (only outbound). WCC should still put them in same component.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr);
         let json = batch.to_json().unwrap();
@@ -178,10 +182,11 @@ mod tests {
 
     #[test]
     fn wcc_isolated_nodes() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_node("isolated").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr);
         assert_eq!(batch.len(), 3);
@@ -204,7 +209,7 @@ mod tests {
 
     #[test]
     fn wcc_empty_graph() {
-        let csr = CsrIndex::new();
+        let csr = CsrIndex::new(test_scoped_memory());
         let batch = run(&csr);
         assert!(batch.is_empty());
     }
@@ -212,12 +217,13 @@ mod tests {
     #[test]
     fn wcc_chain_graph() {
         // a -> b -> c -> d -> e (single chain = single component)
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
         csr.add_edge("c", "L", "d").unwrap();
         csr.add_edge("d", "L", "e").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr);
         let json = batch.to_json().unwrap();

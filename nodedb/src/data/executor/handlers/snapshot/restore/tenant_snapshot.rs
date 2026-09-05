@@ -3,6 +3,8 @@
 //! Single dispatch entry point for a full-tenant snapshot restore, orchestrating
 //! the per-engine install helpers in `engines.rs` across every engine.
 
+use std::sync::Arc;
+
 use tracing::{info, warn};
 
 use crate::bridge::envelope::{ErrorCode, Response};
@@ -118,6 +120,7 @@ impl CoreLoop {
             if edges_written > 0 {
                 match crate::engine::graph::csr::rebuild::rebuild_sharded_from_store(
                     &self.edge_store,
+                    Arc::clone(&self.governor),
                 ) {
                     Ok(rebuilt) => self.csr = rebuilt,
                     Err(e) => {

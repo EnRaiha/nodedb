@@ -51,15 +51,17 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> AlgoResultBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::graph::test_support::test_scoped_memory;
 
     #[test]
     fn degree_star_topology() {
         // Hub a connects to b, c, d.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("a", "L", "c").unwrap();
         csr.add_edge("a", "L", "d").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr, &AlgoParams::default());
         let json = batch.to_json().unwrap();
@@ -82,10 +84,11 @@ mod tests {
 
     #[test]
     fn degree_out_direction() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("a", "L", "c").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let params = AlgoParams {
             direction: Some("OUT".into()),
@@ -110,15 +113,16 @@ mod tests {
 
     #[test]
     fn degree_empty_graph() {
-        let csr = CsrIndex::new();
+        let csr = CsrIndex::new(test_scoped_memory());
         assert!(run(&csr, &AlgoParams::default()).is_empty());
     }
 
     #[test]
     fn degree_single_node() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_node("solo").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
         let batch = run(&csr, &AlgoParams::default());
         assert_eq!(batch.len(), 1);
     }

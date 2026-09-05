@@ -24,7 +24,8 @@ use nodedb::storage::quarantine::{
         open_segment_with_quarantine,
     },
 };
-use nodedb_columnar::{ColumnarMemtable, SegmentWriter};
+use nodedb_columnar::{ColumnarMemtable, SegmentWriter, writer::PROFILE_PLAIN};
+use nodedb_mem::EngineId;
 use nodedb_raft::snapshot_framing::{SnapshotEngineId, encode_snapshot_chunk};
 use nodedb_types::columnar::{ColumnDef, ColumnType, ColumnarSchema};
 use nodedb_types::value::Value;
@@ -42,9 +43,12 @@ fn write_columnar_segment() -> Vec<u8> {
     let mut mem = ColumnarMemtable::new(&schema);
     mem.append_row(&[Value::Integer(42)]).expect("append row");
 
-    SegmentWriter::plain()
-        .write_segment(&schema, mem.columns(), mem.row_count(), None)
-        .expect("write segment")
+    SegmentWriter::new(
+        PROFILE_PLAIN,
+        super::support::memory::test_scoped_memory(EngineId::Columnar),
+    )
+    .write_segment(&schema, mem.columns(), mem.row_count(), None)
+    .expect("write segment")
 }
 
 /// Produce a valid FTS segment with one term.

@@ -722,7 +722,13 @@ mod tests {
 
     /// Put one un-flushed entry in an R-tree so the flush has state to lose.
     fn spatial_index_with_a_pending_entry(core: &mut CoreLoop) {
-        let mut rtree = crate::engine::spatial::RTree::new();
+        let memory = nodedb_mem::ScopedMemory::new(
+            core.governor.clone(),
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(1),
+            nodedb_mem::EngineId::Spatial,
+        );
+        let mut rtree = crate::engine::spatial::RTree::new(memory);
         rtree.insert(crate::engine::spatial::RTreeEntry {
             id: 1,
             bbox: nodedb_types::BoundingBox::new(0.0, 0.0, 1.0, 1.0),

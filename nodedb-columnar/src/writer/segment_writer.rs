@@ -25,31 +25,17 @@ pub const PROFILE_SPATIAL: u8 = 2;
 /// any column without scanning the entire file.
 pub struct SegmentWriter {
     profile_tag: u8,
-    /// Optional scoped memory handle for tracking working-buffer allocations.
-    /// `None` in embedded (Lite) deployments that do not configure a governor.
-    memory: Option<ScopedMemory>,
+    /// Tracks working-buffer allocations against the bound database, tenant, and engine budget.
+    memory: ScopedMemory,
 }
 
 impl SegmentWriter {
-    /// Create a writer for the given profile without a memory governor.
-    pub fn new(profile_tag: u8) -> Self {
+    /// Create a writer for the given profile, tracking allocations against `memory`.
+    pub fn new(profile_tag: u8, memory: ScopedMemory) -> Self {
         Self {
             profile_tag,
-            memory: None,
+            memory,
         }
-    }
-
-    /// Create a writer for the given profile with a scoped memory handle.
-    pub fn with_memory(profile_tag: u8, memory: ScopedMemory) -> Self {
-        Self {
-            profile_tag,
-            memory: Some(memory),
-        }
-    }
-
-    /// Create a writer for the plain (default) profile.
-    pub fn plain() -> Self {
-        Self::new(PROFILE_PLAIN)
     }
 
     /// Encode a drained memtable into a segment byte buffer.
@@ -85,9 +71,7 @@ impl SegmentWriter {
         // 2. Encode each column's blocks.
         let _metas_guard = self
             .memory
-            .as_ref()
-            .map(|m| m.reserve(columns.len() * std::mem::size_of::<ColumnMeta>()))
-            .transpose()?;
+            .reserve(columns.len() * std::mem::size_of::<ColumnMeta>())?;
         let mut column_metas = Vec::with_capacity(columns.len());
 
         for (i, (col_def, col_data)) in schema.columns.iter().zip(columns.iter()).enumerate() {
@@ -103,7 +87,7 @@ impl SegmentWriter {
                 &col_def.column_type,
                 codec,
                 row_count,
-                self.memory.as_ref(),
+                &self.memory,
             )?;
 
             let col_end = buf.len() as u64;
@@ -230,6 +214,7 @@ mod tests {
     use super::*;
     use crate::format::{SegmentFooter, SegmentHeader};
     use crate::memtable::ColumnarMemtable;
+    use crate::test_support::test_memory;
 
     fn analytics_schema() -> ColumnarSchema {
         ColumnarSchema::new(vec![
@@ -263,7 +248,7 @@ mod tests {
             .expect("append");
         }
         let (schema, columns, row_count) = mt.drain();
-        let writer = SegmentWriter::plain();
+        let writer = SegmentWriter::new(PROFILE_PLAIN, test_memory());
         let segment = writer
             .write_segment(&schema, &columns, row_count, None)
             .expect("write must succeed");
@@ -303,7 +288,7 @@ mod tests {
             mt.append_row(&[Value::Integer(i)]).expect("append");
         }
         let (schema, columns, row_count) = mt.drain();
-        let writer = SegmentWriter::plain();
+        let writer = SegmentWriter::new(PROFILE_PLAIN, test_memory());
         let segment = writer
             .write_segment(&schema, &columns, row_count, None)
             .expect("write");
@@ -337,7 +322,7 @@ mod tests {
         }
 
         let (schema, columns, row_count) = mt.drain();
-        let writer = SegmentWriter::plain();
+        let writer = SegmentWriter::new(PROFILE_PLAIN, test_memory());
         let segment = writer
             .write_segment(&schema, &columns, row_count, None)
             .expect("write");
@@ -383,7 +368,7 @@ mod tests {
         }
 
         let (schema, columns, row_count) = mt.drain();
-        let writer = SegmentWriter::plain();
+        let writer = SegmentWriter::new(PROFILE_PLAIN, test_memory());
         let segment = writer
             .write_segment(&schema, &columns, row_count, None)
             .expect("write");
@@ -413,7 +398,7 @@ mod tests {
             let mut m = mt;
             m.drain()
         };
-        let writer = SegmentWriter::plain();
+        let writer = SegmentWriter::new(PROFILE_PLAIN, test_memory());
         assert!(matches!(
             writer.write_segment(&schema, &columns, row_count, None),
             Err(ColumnarError::EmptyMemtable)
@@ -435,7 +420,7 @@ mod tests {
         }
 
         let (schema, columns, row_count) = mt.drain();
-        let writer = SegmentWriter::plain();
+        let writer = SegmentWriter::new(PROFILE_PLAIN, test_memory());
         let segment = writer
             .write_segment(&schema, &columns, row_count, None)
             .expect("write");
@@ -473,7 +458,7 @@ mod tests {
             .expect("append");
 
         let (schema, columns, row_count) = mt.drain();
-        let writer = SegmentWriter::plain();
+        let writer = SegmentWriter::new(PROFILE_PLAIN, test_memory());
         let segment = writer
             .write_segment(&schema, &columns, row_count, None)
             .expect("write");
@@ -531,7 +516,7 @@ mod tests {
         }
 
         let (schema, columns, row_count) = mt.drain();
-        let segment = SegmentWriter::plain()
+        let segment = SegmentWriter::new(PROFILE_PLAIN, test_memory())
             .write_segment(&schema, &columns, row_count, None)
             .expect("write");
         let footer = SegmentFooter::from_segment_tail(&segment).expect("footer");
@@ -587,7 +572,7 @@ mod tests {
         }
 
         let (schema, columns, row_count) = mt.drain();
-        let segment = SegmentWriter::plain()
+        let segment = SegmentWriter::new(PROFILE_PLAIN, test_memory())
             .write_segment(&schema, &columns, row_count, None)
             .expect("write");
         let footer = SegmentFooter::from_segment_tail(&segment).expect("footer");
@@ -624,7 +609,7 @@ mod tests {
             .expect("append");
 
         let (schema, columns, row_count) = mt.drain();
-        let segment = SegmentWriter::plain()
+        let segment = SegmentWriter::new(PROFILE_PLAIN, test_memory())
             .write_segment(&schema, &columns, row_count, None)
             .expect("write");
         let footer = SegmentFooter::from_segment_tail(&segment).expect("footer");

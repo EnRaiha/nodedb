@@ -446,6 +446,7 @@ mod tests {
     use crate::collection::segment::DEFAULT_SEAL_THRESHOLD;
     use crate::distance::DistanceMetric;
     use crate::hnsw::{HnswIndex, HnswParams};
+    use crate::test_support::test_memory;
 
     fn make_collection() -> VectorCollection {
         VectorCollection::new(
@@ -498,7 +499,7 @@ mod tests {
         for v in &req.vectors {
             index.insert(v.clone()).unwrap();
         }
-        coll.complete_build(req.segment_id, index);
+        coll.complete_build(req.segment_id, index, test_memory());
 
         assert_eq!(coll.building.len(), 0);
         assert_eq!(coll.sealed.len(), 1);
@@ -525,7 +526,7 @@ mod tests {
         for v in &req.vectors {
             idx.insert(v.clone()).unwrap();
         }
-        coll.complete_build(req.segment_id, idx);
+        coll.complete_build(req.segment_id, idx, test_memory());
 
         for i in 100..200 {
             coll.insert(vec![i as f32, 0.0]);
@@ -567,7 +568,7 @@ mod tests {
         for v in &req.vectors {
             idx.insert(v.clone()).unwrap();
         }
-        coll.complete_build(req.segment_id, idx);
+        coll.complete_build(req.segment_id, idx, test_memory());
         coll
     }
 

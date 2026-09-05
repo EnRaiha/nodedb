@@ -32,6 +32,7 @@ impl<B: FtsBackend> FtsIndex<B> {
 mod tests {
     use crate::backend::memory::MemoryBackend;
     use crate::index::FtsIndex;
+    use crate::test_support::test_governor;
     use nodedb_types::Surrogate;
 
     const DB: u64 = 0;
@@ -39,7 +40,7 @@ mod tests {
 
     #[test]
     fn empty_collection_stats() {
-        let idx: FtsIndex<MemoryBackend> = FtsIndex::new(MemoryBackend::new());
+        let idx: FtsIndex<MemoryBackend> = FtsIndex::new(MemoryBackend::new(), test_governor());
         let (count, avg) = idx.index_stats(DB, T, "empty").unwrap();
         assert_eq!(count, 0);
         assert!((avg - 1.0).abs() < f32::EPSILON);
@@ -47,7 +48,7 @@ mod tests {
 
     #[test]
     fn stats_after_indexing() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "docs", Surrogate(1), "hello world greeting")
             .unwrap();
         idx.index_document(DB, T, "docs", Surrogate(2), "hello rust")

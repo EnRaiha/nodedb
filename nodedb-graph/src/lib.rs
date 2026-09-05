@@ -18,6 +18,8 @@ pub mod params;
 pub mod path_overlay;
 pub mod path_params;
 pub mod sharded;
+#[cfg(test)]
+mod test_support;
 pub mod traversal;
 pub mod traversal_options;
 pub mod traversal_overlay;

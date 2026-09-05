@@ -32,7 +32,13 @@ impl CoreLoop {
                 continue;
             };
             if let Some(coll) = self.vector_collections.get_mut(&tuple_key) {
-                coll.complete_build(complete.segment_id, complete.index);
+                let memory = nodedb_mem::ScopedMemory::new(
+                    self.governor.clone(),
+                    tuple_key.0,
+                    tuple_key.1,
+                    nodedb_mem::EngineId::Vector,
+                );
+                coll.complete_build(complete.segment_id, complete.index, memory);
                 tracing::info!(
                     core = self.core_id,
                     key = %complete.key,

@@ -22,6 +22,7 @@
 //! - `{collection}\x00{field}\x00rtree` → serialized R-tree entries
 //! - `{collection}\x00{field}\x00meta`  → SpatialIndexMeta
 
+use nodedb_mem::ScopedMemory;
 use nodedb_types::BoundingBox;
 use serde::{Deserialize, Serialize};
 use zerompk::{FromMessagePack, ToMessagePack};
@@ -151,7 +152,7 @@ impl RTree {
 
         // Build inner plaintext: magic + version + rkyv payload.
         let inner_len = RTREE_RKYV_MAGIC.len() + 1 + rkyv_bytes.len();
-        let _guard = self.memory().and_then(|mem| mem.reserve(inner_len).ok());
+        let _guard = self.memory().reserve(inner_len).ok();
         let mut inner = Vec::with_capacity(inner_len);
         inner.extend_from_slice(RTREE_RKYV_MAGIC);
         inner.push(RTREE_FORMAT_VERSION);
@@ -174,6 +175,7 @@ impl RTree {
     pub fn from_checkpoint(
         bytes: &[u8],
         kek: Option<&nodedb_wal::crypto::WalEncryptionKey>,
+        memory: ScopedMemory,
     ) -> Result<Self, RTreeCheckpointError> {
         let is_encrypted = bytes.len() >= 4 && bytes[0..4] == SEGV_MAGIC;
 
@@ -193,10 +195,13 @@ impl RTree {
             inner_ref = bytes;
         }
 
-        Self::decode_plaintext_inner(inner_ref)
+        Self::decode_plaintext_inner(inner_ref, memory)
     }
 
-    fn decode_plaintext_inner(bytes: &[u8]) -> Result<Self, RTreeCheckpointError> {
+    fn decode_plaintext_inner(
+        bytes: &[u8],
+        memory: ScopedMemory,
+    ) -> Result<Self, RTreeCheckpointError> {
         let header_len = RTREE_RKYV_MAGIC.len() + 1; // magic + version byte
         if bytes.len() <= header_len || &bytes[..RTREE_RKYV_MAGIC.len()] != RTREE_RKYV_MAGIC {
             return Err(RTreeCheckpointError::UnrecognizedFormat);
@@ -214,7 +219,7 @@ impl RTree {
         let snapshot: RTreeSnapshotRkyv =
             rkyv::from_bytes::<RTreeSnapshotRkyv, rkyv::rancor::Error>(&aligned)
                 .map_err(|e| RTreeCheckpointError::RkyvDeserialize(e.to_string()))?;
-        Ok(RTree::bulk_load(snapshot.entries))
+        Ok(RTree::bulk_load(snapshot.entries, memory))
     }
 }
 
@@ -299,6 +304,7 @@ pub enum RTreeCheckpointError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_memory;
 
     fn make_entry(id: u64, lng: f64, lat: f64) -> RTreeEntry {
         RTreeEntry {
@@ -309,22 +315,22 @@ mod tests {
 
     #[test]
     fn checkpoint_roundtrip_empty() {
-        let tree = RTree::new();
+        let tree = RTree::new(test_memory());
         let bytes = tree.checkpoint_to_bytes(None).unwrap();
-        let restored = RTree::from_checkpoint(&bytes, None).unwrap();
+        let restored = RTree::from_checkpoint(&bytes, None, test_memory()).unwrap();
         assert_eq!(restored.len(), 0);
     }
 
     #[test]
     fn checkpoint_roundtrip_entries() {
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         for i in 0..100 {
             tree.insert(make_entry(i, (i as f64) * 0.5, (i as f64) * 0.3));
         }
         assert_eq!(tree.len(), 100);
 
         let bytes = tree.checkpoint_to_bytes(None).unwrap();
-        let restored = RTree::from_checkpoint(&bytes, None).unwrap();
+        let restored = RTree::from_checkpoint(&bytes, None, test_memory()).unwrap();
         assert_eq!(restored.len(), 100);
 
         // All entries should be searchable.
@@ -334,12 +340,12 @@ mod tests {
 
     #[test]
     fn checkpoint_preserves_ids() {
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         tree.insert(make_entry(42, 10.0, 20.0));
         tree.insert(make_entry(99, 30.0, 40.0));
 
         let bytes = tree.checkpoint_to_bytes(None).unwrap();
-        let restored = RTree::from_checkpoint(&bytes, None).unwrap();
+        let restored = RTree::from_checkpoint(&bytes, None, test_memory()).unwrap();
 
         let results = restored.search(&BoundingBox::new(5.0, 15.0, 15.0, 25.0));
         assert_eq!(results.len(), 1);
@@ -349,7 +355,7 @@ mod tests {
     #[test]
     fn corrupted_bytes_returns_error() {
         assert!(matches!(
-            RTree::from_checkpoint(&[0xFF, 0xFF, 0xFF], None),
+            RTree::from_checkpoint(&[0xFF, 0xFF, 0xFF], None, test_memory()),
             Err(RTreeCheckpointError::UnrecognizedFormat)
         ));
     }
@@ -381,7 +387,7 @@ mod tests {
 
     #[test]
     fn checkpoint_size_reasonable() {
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         for i in 0..1000 {
             tree.insert(make_entry(i, (i as f64) * 0.01, (i as f64) * 0.01));
         }
@@ -402,7 +408,7 @@ mod tests {
 
     #[test]
     fn golden_header_layout() {
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         tree.insert(make_entry(1, 10.0, 20.0));
         let bytes = tree.checkpoint_to_bytes(None).unwrap();
         // Magic at bytes[0..6].
@@ -415,12 +421,12 @@ mod tests {
 
     #[test]
     fn version_mismatch_returns_error() {
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         tree.insert(make_entry(1, 10.0, 20.0));
         let mut bytes = tree.checkpoint_to_bytes(None).unwrap();
         // Corrupt the version byte to an unsupported value.
         bytes[6] = 0;
-        match RTree::from_checkpoint(&bytes, None) {
+        match RTree::from_checkpoint(&bytes, None, test_memory()) {
             Err(RTreeCheckpointError::UnsupportedVersion { found, expected }) => {
                 assert_eq!(found, 0);
                 assert_eq!(expected, super::RTREE_FORMAT_VERSION);
@@ -437,7 +443,7 @@ mod tests {
     #[test]
     fn spatial_rtree_checkpoint_encrypted_at_rest() {
         let kek = make_test_kek();
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         for i in 0..50 {
             tree.insert(make_entry(i, i as f64, i as f64 * 0.5));
         }
@@ -448,7 +454,7 @@ mod tests {
         assert_eq!(&enc_bytes[0..4], b"SEGV");
 
         // Round-trip: decrypt and verify all entries survive.
-        let restored = RTree::from_checkpoint(&enc_bytes, Some(&kek)).unwrap();
+        let restored = RTree::from_checkpoint(&enc_bytes, Some(&kek), test_memory()).unwrap();
         assert_eq!(restored.len(), 50);
         let all = restored.search(&BoundingBox::new(-180.0, -90.0, 180.0, 90.0));
         assert_eq!(all.len(), 50);
@@ -457,7 +463,7 @@ mod tests {
     #[test]
     fn spatial_rtree_refuses_plaintext_when_kek_required() {
         let kek = make_test_kek();
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         tree.insert(make_entry(1, 10.0, 20.0));
 
         // Write plaintext checkpoint.
@@ -465,7 +471,7 @@ mod tests {
 
         // Attempting to load with a KEK must be refused.
         assert!(matches!(
-            RTree::from_checkpoint(&plain_bytes, Some(&kek)),
+            RTree::from_checkpoint(&plain_bytes, Some(&kek), test_memory()),
             Err(RTreeCheckpointError::KekRequired)
         ));
     }
@@ -473,14 +479,14 @@ mod tests {
     #[test]
     fn spatial_rtree_refuses_encrypted_without_kek() {
         let kek = make_test_kek();
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         tree.insert(make_entry(1, 10.0, 20.0));
 
         let enc_bytes = tree.checkpoint_to_bytes(Some(&kek)).unwrap();
 
         // Loading without a key must be refused.
         assert!(matches!(
-            RTree::from_checkpoint(&enc_bytes, None),
+            RTree::from_checkpoint(&enc_bytes, None, test_memory()),
             Err(RTreeCheckpointError::MissingKek)
         ));
     }
@@ -488,7 +494,7 @@ mod tests {
     #[test]
     fn spatial_rtree_tampered_ciphertext_rejected() {
         let kek = make_test_kek();
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         tree.insert(make_entry(1, 10.0, 20.0));
 
         let mut enc_bytes = tree.checkpoint_to_bytes(Some(&kek)).unwrap();
@@ -496,7 +502,7 @@ mod tests {
         enc_bytes[nodedb_wal::crypto::SEGMENT_ENVELOPE_PREAMBLE_SIZE + 2] ^= 0xFF;
 
         assert!(matches!(
-            RTree::from_checkpoint(&enc_bytes, Some(&kek)),
+            RTree::from_checkpoint(&enc_bytes, Some(&kek), test_memory()),
             Err(RTreeCheckpointError::DecryptionFailed(_))
         ));
     }

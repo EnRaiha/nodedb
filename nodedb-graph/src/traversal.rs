@@ -431,9 +431,10 @@ impl CsrIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_memory;
 
     fn make_csr() -> CsrIndex {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
         csr.add_edge("b", "KNOWS", "c").unwrap();
         csr.add_edge("c", "KNOWS", "d").unwrap();
@@ -479,7 +480,7 @@ mod tests {
 
     #[test]
     fn bfs_cycle() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
         csr.add_edge("c", "L", "a").unwrap();
@@ -576,12 +577,13 @@ mod tests {
 
     #[test]
     fn large_graph_bfs() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         for i in 0..999 {
             csr.add_edge(&format!("n{i}"), "NEXT", &format!("n{}", i + 1))
                 .unwrap();
         }
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let result = csr.traverse_bfs(
             BfsParams {

@@ -41,7 +41,16 @@ impl CoreLoop {
                 // Reverse a forward spatial removal: re-insert the entry with
                 // its captured bbox and re-populate the reverse map, matching
                 // the forward `apply_point_put_spatial` insert shape.
-                let rtree = self.spatial_indexes.entry(key.clone()).or_default();
+                let memory = nodedb_mem::ScopedMemory::new(
+                    self.governor.clone(),
+                    key.0,
+                    key.1,
+                    nodedb_mem::EngineId::Spatial,
+                );
+                let rtree = self
+                    .spatial_indexes
+                    .entry(key.clone())
+                    .or_insert_with(|| crate::engine::spatial::RTree::new(memory));
                 rtree.insert(crate::engine::spatial::RTreeEntry { id: entry_id, bbox });
                 self.spatial_doc_map
                     .insert((key.0, key.1, key.2, key.3, entry_id), document_id);
@@ -87,7 +96,16 @@ mod tests {
         let bbox = nodedb_types::BoundingBox::new(0.0, 0.0, 1.0, 1.0);
 
         // Seed as though a forward spatial insert had run.
-        let rtree = core.spatial_indexes.entry(key.clone()).or_default();
+        let memory = nodedb_mem::ScopedMemory::new(
+            core.governor.clone(),
+            key.0,
+            key.1,
+            nodedb_mem::EngineId::Spatial,
+        );
+        let rtree = core
+            .spatial_indexes
+            .entry(key.clone())
+            .or_insert_with(|| crate::engine::spatial::RTree::new(memory));
         rtree.insert(crate::engine::spatial::RTreeEntry { id: entry_id, bbox });
         core.spatial_doc_map.insert(
             (key.0, key.1, key.2.clone(), key.3.clone(), entry_id),

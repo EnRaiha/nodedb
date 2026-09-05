@@ -6,22 +6,34 @@
 use nodedb_graph::CsrIndex;
 use nodedb_graph::ShardedCsrIndex;
 use nodedb_graph::csr::weights::extract_weight_from_properties;
+use nodedb_mem::EngineId;
+use nodedb_mem::MemoryGovernor;
+use nodedb_mem::ScopedMemory;
 #[cfg(test)]
 use nodedb_types::{DatabaseId, TenantId};
+use std::sync::Arc;
 
 use crate::engine::graph::edge_store::EdgeStore;
 
 /// Rebuild the sharded CSR index from an EdgeStore at `system_as_of` (None =
 /// current state).
-pub fn rebuild_sharded_from_store(store: &EdgeStore) -> crate::Result<ShardedCsrIndex> {
-    rebuild_sharded_from_store_as_of(store, None)
+pub fn rebuild_sharded_from_store(
+    store: &EdgeStore,
+    governor: Arc<MemoryGovernor>,
+) -> crate::Result<ShardedCsrIndex> {
+    rebuild_sharded_from_store_as_of(store, None, governor)
 }
 
 /// Rebuild the sharded CSR index from an EdgeStore using a specific
 /// bitemporal cutoff.
+///
+/// `governor` scopes every rebuilt partition's memory to its own
+/// `(DatabaseId, TenantId, EngineId::Graph)` — a rebuild spans many
+/// tenants, so no single scope covers the whole sharded index.
 pub fn rebuild_sharded_from_store_as_of(
     store: &EdgeStore,
     system_as_of: Option<i64>,
+    governor: Arc<MemoryGovernor>,
 ) -> crate::Result<ShardedCsrIndex> {
     let mut sharded = ShardedCsrIndex::new();
     let all_edges = store.scan_all_edges_decoded(system_as_of)?;
@@ -30,7 +42,8 @@ pub fn rebuild_sharded_from_store_as_of(
     // endpoints get stable node ids before edge insertion.
     // EdgeRecord is (DatabaseId, TenantId, collection, src, label, dst, props).
     for (db, tid, _collection, src, _label, dst, _props) in &all_edges {
-        let partition = sharded.get_or_create(*db, *tid);
+        let memory = ScopedMemory::new(Arc::clone(&governor), *db, *tid, EngineId::Graph);
+        let partition = sharded.get_or_create(*db, *tid, memory);
         partition
             .add_node(src)
             .map_err(|e| crate::Error::Internal {
@@ -49,7 +62,8 @@ pub fn rebuild_sharded_from_store_as_of(
     // collection id so collection-scoped MATCH / RAG reads never cross
     // collection boundaries.
     for (db, tid, collection, src, label, dst, props) in &all_edges {
-        let partition = sharded.get_or_create(*db, *tid);
+        let memory = ScopedMemory::new(Arc::clone(&governor), *db, *tid, EngineId::Graph);
+        let partition = sharded.get_or_create(*db, *tid, memory);
         let weight = extract_weight_from_properties(props);
         let res = if weight != 1.0 {
             partition.add_edge_weighted_in_collection(src, label, dst, collection, weight)
@@ -91,7 +105,8 @@ pub fn rebuild_sharded_from_store_as_of(
 pub fn rebuild_from_store(store: &EdgeStore) -> crate::Result<CsrIndex> {
     use std::collections::hash_map::Entry;
 
-    let mut sharded = rebuild_sharded_from_store_as_of(store, None)?;
+    let governor = crate::data::executor::core_loop::test_governor();
+    let mut sharded = rebuild_sharded_from_store_as_of(store, None, governor.clone())?;
     let (db, tid) = sharded
         .iter()
         .map(|(key, _)| *key)
@@ -99,7 +114,12 @@ pub fn rebuild_from_store(store: &EdgeStore) -> crate::Result<CsrIndex> {
         .unwrap_or((DatabaseId::DEFAULT, TenantId::new(0)));
     match sharded.entry(db, tid) {
         Entry::Occupied(entry) => Ok(entry.remove()),
-        Entry::Vacant(_) => Ok(CsrIndex::new()),
+        Entry::Vacant(_) => Ok(CsrIndex::new(ScopedMemory::new(
+            governor,
+            db,
+            tid,
+            EngineId::Graph,
+        ))),
     }
 }
 

@@ -21,6 +21,8 @@
 
 use nodedb_vector::quantize::pq::PqCodec;
 
+use crate::support::test_memory;
+
 /// Training set of 200 vectors: 190 near-duplicates at the origin plus
 /// 10 outliers scattered across a single subspace. A correct k-means++
 /// spreads centroids across both clusters; the current farthest-point-
@@ -62,7 +64,7 @@ fn unique_centroid_count(codec: &PqCodec, vectors: &[Vec<f32>]) -> usize {
 fn pq_kmeans_produces_diverse_centroids_on_duplicate_heavy_data() {
     let vecs = clustered_with_duplicates();
     let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-    let codec = PqCodec::train(&refs, 4, 2, 16, 20);
+    let codec = PqCodec::train(&refs, 4, 2, 16, 20, test_memory());
 
     let unique = unique_centroid_count(&codec, &vecs);
     assert!(
@@ -81,7 +83,7 @@ fn pq_distance_table_separates_duplicates_from_outliers() {
     // codebook entries alias to one point so all distances look similar.
     let vecs = clustered_with_duplicates();
     let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-    let codec = PqCodec::train(&refs, 4, 2, 16, 20);
+    let codec = PqCodec::train(&refs, 4, 2, 16, 20, test_memory());
 
     let query = [0.0f32, 0.0, 0.0, 0.0];
     let table = codec
@@ -119,7 +121,7 @@ fn ivf_pq_training_does_not_collapse_on_duplicate_heavy_data() {
             metric: DistanceMetric::L2,
         },
     );
-    idx.train(&refs);
+    idx.train(&refs, test_memory());
     for v in &vecs {
         idx.add(v);
     }

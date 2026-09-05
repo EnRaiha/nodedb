@@ -581,7 +581,14 @@ mod tests {
         // feeds the applied watermark, which save folds into the gate and load
         // restores — the faithful shape of a restored checkpoint.
         let bytes = coll.checkpoint_to_bytes(None).unwrap();
-        let coll = VectorCollection::from_checkpoint(&bytes, None).expect("decode checkpoint");
+        let memory = nodedb_mem::ScopedMemory::new(
+            h.core.governor.clone(),
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            nodedb_mem::EngineId::Vector,
+        );
+        let coll =
+            VectorCollection::from_checkpoint(&bytes, None, memory).expect("decode checkpoint");
         h.core.vector_collections.insert(du_index_key(), coll);
 
         h.core

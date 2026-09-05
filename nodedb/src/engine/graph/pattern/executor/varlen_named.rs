@@ -372,6 +372,7 @@ pub(super) fn record_boundary_resumes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::graph::test_support::test_scoped_memory;
 
     fn pattern(label: &str, min: usize, max: usize) -> VarLenPattern<'_> {
         VarLenPattern {
@@ -398,7 +399,7 @@ mod tests {
     /// staged-only node (no durable CSR id) that the durable BFS could not.
     #[test]
     fn staged_edge_traversed_by_name() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "R", "b").unwrap();
         let mut ov = GraphOverlayDelta::new();
         // b -> c staged: c has no durable id.
@@ -427,7 +428,7 @@ mod tests {
     /// cursor recovers exactly the missing destinations.
     #[test]
     fn named_resume_union_equals_uncapped() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         for i in 0..3 {
             csr.add_edge(&format!("n{i}"), "R", &format!("n{}", i + 1))
                 .unwrap();
@@ -473,7 +474,7 @@ mod tests {
     fn named_resume_foreign_core_skips_unowned() {
         // This core owns nothing referenced by the cursor: empty CSR, and the
         // only staged endpoints belong to an unrelated local edge.
-        let csr = CsrIndex::new();
+        let csr = CsrIndex::new(test_scoped_memory());
         let mut ov = GraphOverlayDelta::new();
         ov.stage_edge("local_only", "R", "x");
 
@@ -504,7 +505,7 @@ mod tests {
     /// surfaces as a resume via [`record_boundary_resumes`].
     #[test]
     fn boundary_node_captured_and_recorded() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "R", "b").unwrap();
         // Non-empty overlay (forces the name-keyed path) that does NOT give `b`
         // any out-edge, so `b` is a genuine zero-out-degree boundary node.
@@ -535,7 +536,7 @@ mod tests {
     /// merged out-degree is non-zero, so the BFS continues locally.
     #[test]
     fn boundary_not_captured_with_staged_out_edge() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "R", "b").unwrap();
         let mut ov = GraphOverlayDelta::new();
         // b has a staged out-edge, so it is NOT a boundary node.
@@ -556,7 +557,7 @@ mod tests {
     /// sources each expand their own staged tails without cross-contamination.
     #[test]
     fn two_anchor_named_expansion() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "R", "b").unwrap();
         csr.add_edge("p", "R", "q").unwrap();
         let mut ov = GraphOverlayDelta::new();

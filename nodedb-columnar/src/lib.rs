@@ -27,6 +27,8 @@ pub mod mutation;
 pub mod pk_index;
 pub mod predicate;
 pub mod reader;
+#[cfg(test)]
+mod test_support;
 pub mod wal_record;
 pub mod writer;
 

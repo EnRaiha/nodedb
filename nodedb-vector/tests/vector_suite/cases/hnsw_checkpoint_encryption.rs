@@ -10,6 +10,8 @@
 use nodedb_vector::{VectorCollection, distance::DistanceMetric, hnsw::HnswParams};
 use nodedb_wal::crypto::WalEncryptionKey;
 
+use crate::support::test_memory;
+
 const KEK_BYTES: [u8; 32] = [0x42u8; 32];
 const DIM: usize = 4;
 
@@ -59,7 +61,7 @@ fn hnsw_checkpoint_encrypted_at_rest() {
     );
 
     // Restore must recover the same vectors.
-    let restored = VectorCollection::from_checkpoint(&blob, Some(&key))
+    let restored = VectorCollection::from_checkpoint(&blob, Some(&key), test_memory())
         .expect("decryption must succeed with correct key");
 
     assert_eq!(
@@ -98,7 +100,7 @@ fn hnsw_refuses_plaintext_when_kek_required() {
 
     // Attempt to load with a KEK — must return a typed error, not succeed.
     let key = make_key();
-    let result = VectorCollection::from_checkpoint(&plaintext_blob, Some(&key));
+    let result = VectorCollection::from_checkpoint(&plaintext_blob, Some(&key), test_memory());
     assert!(
         result.is_err(),
         "loading a plaintext checkpoint with a KEK configured must return Err"

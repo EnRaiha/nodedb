@@ -181,13 +181,14 @@ fn resolve_analyzer(name: &str) -> Box<dyn TextAnalyzer> {
 mod tests {
     use crate::backend::memory::MemoryBackend;
     use crate::index::FtsIndex;
+    use crate::test_support::test_governor;
 
     const DB: u64 = 0;
     const T: u64 = 1;
 
     #[test]
     fn default_analyzer() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         let tokens = idx
             .analyze_for_collection(DB, T, "col", "The quick brown fox")
             .unwrap();
@@ -197,7 +198,7 @@ mod tests {
 
     #[test]
     fn configured_german_analyzer() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.set_collection_analyzer(DB, T, "col", "german").unwrap();
 
         let tokens = idx
@@ -209,7 +210,7 @@ mod tests {
 
     #[test]
     fn configured_hindi_no_stem() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.set_collection_analyzer(DB, T, "col", "hindi").unwrap();
 
         let tokens = idx
@@ -220,7 +221,7 @@ mod tests {
 
     #[test]
     fn analyzer_persists() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.set_collection_analyzer(DB, T, "col", "french").unwrap();
         idx.set_collection_language(DB, T, "col", "fr").unwrap();
 

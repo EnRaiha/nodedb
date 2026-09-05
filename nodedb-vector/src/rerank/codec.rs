@@ -79,6 +79,7 @@ pub trait RerankCodec: Send + Sync {
 pub fn rerank_codec_from_bytes(
     name: CodecName,
     bytes: &[u8],
+    memory: nodedb_mem::ScopedMemory,
 ) -> Result<Arc<dyn RerankCodec>, RerankError> {
     use crate::quantize::pq::PqCodec;
     use crate::quantize::sq8::Sq8Codec;
@@ -105,9 +106,9 @@ pub fn rerank_codec_from_bytes(
             Ok(Arc::new(BinaryRerank::new(dim)))
         }
         CodecName::Pq => {
-            let inner = PqCodec::from_bytes(bytes)
+            let inner = PqCodec::from_bytes(bytes, memory.clone())
                 .map_err(|e| RerankError::BadInput(format!("pq from_bytes: {e}")))?;
-            Ok(Arc::new(PqRerank::from_codec(inner)))
+            Ok(Arc::new(PqRerank::from_codec(inner, memory)))
         }
         CodecName::RaBitQ => {
             let inner = RaBitQCodec::from_bytes(bytes)

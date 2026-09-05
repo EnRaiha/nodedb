@@ -51,15 +51,15 @@ pub struct SpatialPreFilterResult {
 /// The caller (vector engine) uses the candidate IDs to build a RoaringBitmap
 /// that restricts HNSW graph traversal.
 ///
-/// When `memory` is `Some`, the `candidate_ids` allocation is budgeted via
-/// [`ScopedMemory::reserve`] before the `Vec::with_capacity`. Budget pressure
-/// is a backpressure signal; the allocation still proceeds on budget exhaustion.
+/// The `candidate_ids` allocation is budgeted via [`ScopedMemory::reserve`]
+/// before the `Vec::with_capacity`. Budget pressure is a backpressure
+/// signal; the allocation still proceeds on budget exhaustion.
 pub fn spatial_prefilter(
     rtree: &RTree,
     query_geometry: &Geometry,
     distance_meters: Option<f64>,
     exact_geometries: &dyn Fn(u64) -> Option<Geometry>,
-    memory: Option<&ScopedMemory>,
+    memory: &ScopedMemory,
 ) -> SpatialPreFilterResult {
     // Step 1: Compute search bbox.
     let search_bbox = if let Some(dist) = distance_meters {
@@ -73,10 +73,8 @@ pub fn spatial_prefilter(
     let rtree_candidates = rtree_results.len();
 
     // Step 3: Exact predicate refinement.
-    let _guard = memory.and_then(|mem| {
-        let bytes = rtree_candidates * std::mem::size_of::<u64>();
-        mem.reserve(bytes).ok()
-    });
+    let bytes = rtree_candidates * std::mem::size_of::<u64>();
+    let _guard = memory.reserve(bytes).ok();
     let mut candidate_ids = Vec::with_capacity(rtree_candidates);
     for entry in &rtree_results {
         if let Some(doc_geom) = exact_geometries(entry.id) {
@@ -134,9 +132,10 @@ pub fn bitmap_contains(bitmap: &[u8], id: u64) -> bool {
 mod tests {
     use super::*;
     use crate::rtree::RTreeEntry;
+    use crate::test_support::test_memory;
 
     fn make_tree() -> RTree {
-        let mut tree = RTree::new();
+        let mut tree = RTree::new(test_memory());
         // 10 points in a grid from (0,0) to (9,9).
         for i in 0..10 {
             tree.insert(RTreeEntry {
@@ -162,7 +161,7 @@ mod tests {
         };
 
         // 200km radius should capture several nearby points.
-        let result = spatial_prefilter(&tree, &query, Some(200_000.0), &get_geom, None);
+        let result = spatial_prefilter(&tree, &query, Some(200_000.0), &get_geom, &test_memory());
         assert!(!result.candidate_ids.is_empty());
         // Point (5,5) should definitely be in results (distance = 0).
         assert!(result.candidate_ids.contains(&5));
@@ -188,7 +187,7 @@ mod tests {
             }
         };
 
-        let result = spatial_prefilter(&tree, &query, None, &get_geom, None);
+        let result = spatial_prefilter(&tree, &query, None, &get_geom, &test_memory());
         // Points 4, 5, 6 should be inside (3 is on edge → not contained by intersects returns true).
         assert!(result.candidate_ids.contains(&4));
         assert!(result.candidate_ids.contains(&5));

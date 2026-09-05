@@ -7,14 +7,36 @@
 //! the predicate value must NOT be skipped when the predicate value actually
 //! falls within the exact i64 range.
 
+use std::sync::Arc;
+
 use nodedb_columnar::{
     SegmentReader, SegmentWriter, memtable::ColumnarMemtable, predicate::ScanPredicate,
     reader::DecodedColumn,
 };
+use nodedb_mem::{EngineId, EngineLimits, GovernorConfig, MemoryGovernor, ScopedMemory};
 use nodedb_types::{
+    DatabaseId, TenantId,
     columnar::{ColumnDef, ColumnType, ColumnarSchema},
     value::Value,
 };
+
+/// A scope backed by a governor whose ceiling covers every engine's limit.
+fn test_memory() -> ScopedMemory {
+    let per_engine = usize::MAX / EngineId::ALL.len();
+    let governor = Arc::new(
+        MemoryGovernor::new(GovernorConfig {
+            global_ceiling: per_engine * EngineId::ALL.len(),
+            engine_limits: EngineLimits::uniform(per_engine),
+        })
+        .expect("test governor"),
+    );
+    ScopedMemory::new(
+        governor,
+        DatabaseId::DEFAULT,
+        TenantId::new(0),
+        EngineId::Columnar,
+    )
+}
 
 /// Target value: outside ±2^53, well below i64::MAX.
 /// 9_223_372_036_854_775_000 rounds to the same f64 as values nearby,
@@ -69,7 +91,7 @@ fn write_two_block_segment() -> Vec<u8> {
     }
 
     let (schema, columns, row_count) = mt.drain();
-    SegmentWriter::plain()
+    SegmentWriter::new(nodedb_columnar::writer::PROFILE_PLAIN, test_memory())
         .write_segment(&schema, &columns, row_count, None)
         .expect("write segment")
 }

@@ -109,8 +109,8 @@ pub struct CompactLevelParams<'a, B: FtsBackend> {
     pub segments: &'a [SegmentMeta],
     /// Level whose segments are merged into `level + 1`.
     pub level: u32,
-    /// Optional memory governor budgeting each `Vec::with_capacity`.
-    pub governor: Option<&'a Arc<MemoryGovernor>>,
+    /// Memory governor budgeting each `Vec::with_capacity`.
+    pub governor: &'a Arc<MemoryGovernor>,
 }
 
 /// Perform compaction: merge all segments at `level` into one segment at `level + 1`.
@@ -118,9 +118,9 @@ pub struct CompactLevelParams<'a, B: FtsBackend> {
 /// Returns the merged segment bytes and the ids of segments that were merged
 /// (which should be removed from storage after the new segment is written).
 ///
-/// When `governor` is `Some`, each `Vec::with_capacity` allocation is budgeted
-/// via [`nodedb_mem::ScopedMemory::reserve`]. If the budget is exhausted the function
-/// returns [`CompactError::Budget`] before allocating.
+/// Each `Vec::with_capacity` allocation is budgeted via
+/// [`nodedb_mem::ScopedMemory::reserve`]. If the budget is exhausted the
+/// function returns [`CompactError::Budget`] before allocating.
 pub fn compact_level<B: FtsBackend>(
     params: CompactLevelParams<'_, B>,
 ) -> Result<Option<CompactionResult>, CompactError<B::Error>> {
@@ -141,21 +141,13 @@ pub fn compact_level<B: FtsBackend>(
     let memory = fts_scope(governor, database_id, tid);
 
     let _readers_guard = memory
-        .as_ref()
-        .map(|mem| {
-            mem.reserve(to_merge.len() * size_of::<SegmentReader>())
-                .map_err(CompactError::Budget)
-        })
-        .transpose()?;
+        .reserve(to_merge.len() * size_of::<SegmentReader>())
+        .map_err(CompactError::Budget)?;
     let mut readers = Vec::with_capacity(to_merge.len());
 
     let _ids_guard = memory
-        .as_ref()
-        .map(|mem| {
-            mem.reserve(to_merge.len() * size_of::<String>())
-                .map_err(CompactError::Budget)
-        })
-        .transpose()?;
+        .reserve(to_merge.len() * size_of::<String>())
+        .map_err(CompactError::Budget)?;
     let mut merged_ids = Vec::with_capacity(to_merge.len());
 
     for meta in &to_merge {
@@ -173,7 +165,7 @@ pub fn compact_level<B: FtsBackend>(
         return Ok(None);
     }
 
-    let merged_term_blocks = merge::merge_segments(&readers, memory.as_ref());
+    let merged_term_blocks = merge::merge_segments(&readers, &memory);
     let new_segment = writer::build_from_blocks(&merged_term_blocks)
         .expect("compaction produced a term longer than u16::MAX — data invariant violated");
 

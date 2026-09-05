@@ -8,41 +8,23 @@ use super::node::{ChildRef, INTERNAL_CAPACITY, LEAF_CAPACITY, Node, NodeKind, RT
 use super::tree::RTree;
 
 impl RTree {
-    /// Bulk load entries using Sort-Tile-Recursive packing.
+    /// Bulk load entries using Sort-Tile-Recursive packing, tracked against `memory`.
     ///
     /// More efficient than repeated single inserts for large datasets.
     /// Produces better packing (less overlap between nodes).
-    pub fn bulk_load(entries: Vec<RTreeEntry>) -> Self {
-        Self::bulk_load_inner(entries, None)
-    }
-
-    /// Bulk load with scoped memory for budget accounting.
-    ///
-    /// The scoped memory handle is stored on the returned tree and used for
-    /// subsequent batch operations (full-scan, checkpoint serialization).
-    pub fn bulk_load_with_memory(entries: Vec<RTreeEntry>, memory: ScopedMemory) -> Self {
-        Self::bulk_load_inner(entries, Some(memory))
-    }
-
-    fn bulk_load_inner(entries: Vec<RTreeEntry>, memory: Option<ScopedMemory>) -> Self {
+    pub fn bulk_load(entries: Vec<RTreeEntry>, memory: ScopedMemory) -> Self {
         if entries.is_empty() {
-            let mut tree = Self::new();
-            if let Some(mem) = memory {
-                tree.memory = Some(mem);
-            }
-            return tree;
+            return Self::new(memory);
         }
         let len = entries.len();
 
         // Reserve budget for nodes vec (approximately len / LEAF_CAPACITY nodes,
         // each holding LEAF_CAPACITY RTreeEntry slots). Best-effort: budget
         // pressure is a backpressure signal, not a hard gate on bulk load.
-        let _guard = memory.as_ref().and_then(|mem| {
-            let node_count = len.div_ceil(LEAF_CAPACITY) * 2; // leaves + internals
-            let bytes = node_count
-                * (std::mem::size_of::<Node>() + LEAF_CAPACITY * std::mem::size_of::<RTreeEntry>());
-            mem.reserve(bytes).ok()
-        });
+        let node_count = len.div_ceil(LEAF_CAPACITY) * 2; // leaves + internals
+        let bytes = node_count
+            * (std::mem::size_of::<Node>() + LEAF_CAPACITY * std::mem::size_of::<RTreeEntry>());
+        let _guard = memory.reserve(bytes).ok();
 
         let mut tree = Self {
             nodes: Vec::new(),
@@ -145,6 +127,7 @@ fn pack_internal(nodes: &mut Vec<Node>, child_indices: Vec<usize>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_memory;
     use nodedb_types::BoundingBox;
 
     fn make_entry(id: u64, lng: f64, lat: f64) -> RTreeEntry {
@@ -159,7 +142,7 @@ mod tests {
         let entries: Vec<RTreeEntry> = (0..500)
             .map(|i| make_entry(i, (i as f64) * 0.1 - 25.0, (i as f64) * 0.06 - 15.0))
             .collect();
-        let tree = RTree::bulk_load(entries);
+        let tree = RTree::bulk_load(entries, test_memory());
         assert_eq!(tree.len(), 500);
 
         let all = tree.search(&BoundingBox::new(-180.0, -90.0, 180.0, 90.0));
@@ -172,13 +155,13 @@ mod tests {
     #[test]
     fn bulk_load_small() {
         let entries = vec![make_entry(1, 0.0, 0.0), make_entry(2, 1.0, 1.0)];
-        let tree = RTree::bulk_load(entries);
+        let tree = RTree::bulk_load(entries, test_memory());
         assert_eq!(tree.len(), 2);
     }
 
     #[test]
     fn bulk_load_empty() {
-        let tree = RTree::bulk_load(Vec::new());
+        let tree = RTree::bulk_load(Vec::new(), test_memory());
         assert!(tree.is_empty());
     }
 }

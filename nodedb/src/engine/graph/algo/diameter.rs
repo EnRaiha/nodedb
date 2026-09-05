@@ -152,15 +152,17 @@ use super::util::undirected_neighbors;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::graph::test_support::test_scoped_memory;
 
     #[test]
     fn diameter_path() {
         // a - b - c - d (path of length 3).
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
         csr.add_edge("c", "L", "d").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(
             &csr,
@@ -178,11 +180,12 @@ mod tests {
 
     #[test]
     fn diameter_triangle() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         for (s, d) in &[("a", "b"), ("b", "c"), ("c", "a")] {
             csr.add_edge(s, "L", d).unwrap();
         }
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(
             &csr,
@@ -202,12 +205,13 @@ mod tests {
 
     #[test]
     fn diameter_approximate() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
         csr.add_edge("c", "L", "d").unwrap();
         csr.add_edge("d", "L", "e").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         // Approximate should give a reasonable result.
         let batch = run(&csr, &AlgoParams::default());
@@ -221,15 +225,16 @@ mod tests {
 
     #[test]
     fn diameter_empty() {
-        let csr = CsrIndex::new();
+        let csr = CsrIndex::new(test_scoped_memory());
         assert!(run(&csr, &AlgoParams::default()).is_empty());
     }
 
     #[test]
     fn diameter_single_node() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_node("solo").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(
             &csr,

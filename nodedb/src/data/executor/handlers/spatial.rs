@@ -551,7 +551,16 @@ mod tests {
         let tid_id = TenantId::new(tid);
         let spatial_key = (db_id, tid_id, collection.to_string(), field.to_string());
         let entry_id = fnv1a_hash(doc_id.as_bytes());
-        let rtree = core.spatial_indexes.entry(spatial_key.clone()).or_default();
+        let memory = nodedb_mem::ScopedMemory::new(
+            core.governor.clone(),
+            db_id,
+            tid_id,
+            nodedb_mem::EngineId::Spatial,
+        );
+        let rtree = core
+            .spatial_indexes
+            .entry(spatial_key.clone())
+            .or_insert_with(|| crate::engine::spatial::RTree::new(memory));
         rtree.insert(RTreeEntry { id: entry_id, bbox });
         core.spatial_doc_map.insert(
             (

@@ -212,6 +212,7 @@ impl<B: FtsBackend> FtsIndex<B> {
 mod tests {
     use crate::backend::memory::MemoryBackend;
     use crate::index::writer::FtsIndex;
+    use crate::test_support::test_governor;
 
     use super::SynonymGroupRecord;
 
@@ -219,7 +220,7 @@ mod tests {
     const T: u64 = 1;
 
     fn idx() -> FtsIndex<MemoryBackend> {
-        FtsIndex::new(MemoryBackend::new())
+        FtsIndex::new(MemoryBackend::new(), test_governor())
     }
 
     fn rec(name: &str, terms: &[&str]) -> SynonymGroupRecord {

@@ -38,7 +38,7 @@ pub struct MmapVectorSegment {
     madvise_state: Option<libc::c_int>,
     /// RAII reservation token for the mmap region.  Held for the lifetime
     /// of the mapping; released automatically on `Drop` alongside `munmap`.
-    _reservation: Option<ReservationToken>,
+    _reservation: ReservationToken,
 }
 
 // SAFETY: `MmapVectorSegment` holds a `*const u8` (`base`) into a read-only
@@ -52,89 +52,60 @@ impl MmapVectorSegment {
     // ── Constructors ──────────────────────────────────────────────────────────
 
     /// Create the segment file `name` inside `dir` (surrogates default to 0)
-    /// and open it.
-    pub fn create(dir: &Path, name: &str, dim: usize, vectors: &[&[f32]]) -> std::io::Result<Self> {
+    /// and open it, tracked against `memory`.
+    pub fn create(
+        dir: &Path,
+        name: &str,
+        dim: usize,
+        vectors: &[&[f32]],
+        memory: &ScopedMemory,
+    ) -> Result<Self, VectorError> {
         write_segment(dir, name, dim, vectors, &[])?;
-        Self::open_with_policy(&dir.join(name), VectorSegmentDropPolicy::default())
+        Self::open_with_policy(&dir.join(name), memory, VectorSegmentDropPolicy::default())
     }
 
     /// Create the segment file `name` inside `dir` with explicit surrogate IDs
-    /// and open it.
+    /// and open it, tracked against `memory`.
     pub fn create_with_surrogates(
         dir: &Path,
         name: &str,
         dim: usize,
         vectors: &[&[f32]],
         surrogate_ids: &[u64],
-    ) -> std::io::Result<Self> {
+        memory: &ScopedMemory,
+    ) -> Result<Self, VectorError> {
         write_segment(dir, name, dim, vectors, surrogate_ids)?;
-        Self::open_with_policy(&dir.join(name), VectorSegmentDropPolicy::default())
+        Self::open_with_policy(&dir.join(name), memory, VectorSegmentDropPolicy::default())
     }
 
     /// Create the segment file `name` inside `dir` with an explicit drop
-    /// policy.
+    /// policy, tracked against `memory`.
     pub fn create_with_policy(
         dir: &Path,
         name: &str,
         dim: usize,
         vectors: &[&[f32]],
         policy: VectorSegmentDropPolicy,
-    ) -> std::io::Result<Self> {
+        memory: &ScopedMemory,
+    ) -> Result<Self, VectorError> {
         write_segment(dir, name, dim, vectors, &[])?;
-        Self::open_with_policy(&dir.join(name), policy)
+        Self::open_with_policy(&dir.join(name), memory, policy)
     }
 
     /// Open an existing segment file and memory-map it.
-    pub fn open(path: &Path) -> std::io::Result<Self> {
-        Self::open_with_policy(path, VectorSegmentDropPolicy::default())
-    }
-
-    /// Open an existing segment with an explicit drop policy.
-    pub fn open_with_policy(path: &Path, policy: VectorSegmentDropPolicy) -> std::io::Result<Self> {
-        let fd = std::fs::OpenOptions::new().read(true).open(path)?;
-        let file_size = fd.metadata()?.len() as usize;
-
-        let min_size = HEADER_SIZE + FOOTER_SIZE;
-        if file_size < min_size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("segment file too small: {file_size} < {min_size} bytes"),
-            ));
-        }
-
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                file_size,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE,
-                fd.as_raw_fd(),
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error());
-        }
-        let base = base as *const u8;
-
-        Self::validate_and_build(fd, base, file_size, path, policy, None).inspect_err(|_e| {
-            unsafe { libc::munmap(base as *mut libc::c_void, file_size) };
-        })
-    }
-
-    /// Open an existing segment with scoped memory.
     ///
     /// Reserves `file_size` bytes against the bound database, tenant, and
     /// engine budget before mapping the file.  Returns
     /// `VectorError::BudgetExhausted` if the reservation is rejected.  The
     /// reservation is released automatically when the segment is dropped
     /// (RAII via `ReservationToken`).
-    pub fn open_with_memory(path: &Path, memory: &ScopedMemory) -> Result<Self, VectorError> {
-        Self::open_with_memory_and_policy(path, memory, VectorSegmentDropPolicy::default())
+    pub fn open(path: &Path, memory: &ScopedMemory) -> Result<Self, VectorError> {
+        Self::open_with_policy(path, memory, VectorSegmentDropPolicy::default())
     }
 
-    /// Open an existing segment with scoped memory and an explicit drop policy.
-    pub fn open_with_memory_and_policy(
+    /// Open an existing segment with an explicit drop policy, tracked
+    /// against `memory`.
+    pub fn open_with_policy(
         path: &Path,
         memory: &ScopedMemory,
         policy: VectorSegmentDropPolicy,
@@ -170,7 +141,7 @@ impl MmapVectorSegment {
         }
         let base = base as *const u8;
 
-        Self::validate_and_build(fd, base, file_size, path, policy, Some(reservation))
+        Self::validate_and_build(fd, base, file_size, path, policy, reservation)
             .map_err(VectorError::from)
             .inspect_err(|_| {
                 unsafe { libc::munmap(base as *mut libc::c_void, file_size) };
@@ -185,7 +156,7 @@ impl MmapVectorSegment {
         file_size: usize,
         path: &Path,
         policy: VectorSegmentDropPolicy,
-        reservation: Option<ReservationToken>,
+        reservation: ReservationToken,
     ) -> std::io::Result<Self> {
         // Validate magic + format version.
         let header = unsafe { std::slice::from_raw_parts(base, HEADER_SIZE) };
@@ -488,6 +459,15 @@ impl Drop for MmapVectorSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_memory;
+
+    /// Unwrap the `std::io::Error` inside a `VectorError::SegmentIo`.
+    fn io_err(err: VectorError) -> std::io::Error {
+        match err {
+            VectorError::SegmentIo(e) => e,
+            other => panic!("expected VectorError::SegmentIo, got: {other:?}"),
+        }
+    }
 
     #[test]
     fn create_and_read() {
@@ -504,6 +484,7 @@ mod tests {
             3,
             &[&v0, &v1, &v2],
             &surrogates,
+            &test_memory(),
         )
         .unwrap();
 
@@ -533,6 +514,7 @@ mod tests {
             3,
             &[&v0, &v1],
             &sids,
+            &test_memory(),
         )
         .unwrap();
 
@@ -551,10 +533,17 @@ mod tests {
         let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
         let sids: Vec<u64> = (0u64..100).collect();
 
-        MmapVectorSegment::create_with_surrogates(dir.path(), "reopen.vseg", 3, &refs, &sids)
-            .unwrap();
+        MmapVectorSegment::create_with_surrogates(
+            dir.path(),
+            "reopen.vseg",
+            3,
+            &refs,
+            &sids,
+            &test_memory(),
+        )
+        .unwrap();
 
-        let seg = MmapVectorSegment::open(&path).unwrap();
+        let seg = MmapVectorSegment::open(&path, &test_memory()).unwrap();
         assert_eq!(seg.count(), 100);
         for (i, v) in vectors.iter().enumerate() {
             assert_eq!(seg.get_vector(i as u32).unwrap(), v.as_slice());
@@ -567,7 +556,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let v = vec![1.0f32, 2.0];
-        let seg = MmapVectorSegment::create(dir.path(), "nosid.vseg", 2, &[&v]).unwrap();
+        let seg =
+            MmapVectorSegment::create(dir.path(), "nosid.vseg", 2, &[&v], &test_memory()).unwrap();
         assert_eq!(seg.get_surrogate_id(0).unwrap(), 0);
     }
 
@@ -576,7 +566,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let v = vec![1.0f32; 768];
-        let seg = MmapVectorSegment::create(dir.path(), "prefetch.vseg", 768, &[&v]).unwrap();
+        let seg =
+            MmapVectorSegment::create(dir.path(), "prefetch.vseg", 768, &[&v], &test_memory())
+                .unwrap();
         seg.prefetch(0);
         seg.prefetch(999);
     }
@@ -585,7 +577,8 @@ mod tests {
     fn empty_segment() {
         let dir = tempfile::tempdir().unwrap();
 
-        let seg = MmapVectorSegment::create(dir.path(), "empty.vseg", 3, &[]).unwrap();
+        let seg =
+            MmapVectorSegment::create(dir.path(), "empty.vseg", 3, &[], &test_memory()).unwrap();
         assert_eq!(seg.count(), 0);
         assert!(seg.get_vector(0).is_none());
         assert_eq!(seg.all_vectors_flat().len(), 0);
@@ -638,13 +631,14 @@ mod tests {
         data[last - 1] = 0xef;
         std::fs::write(&path, &data).unwrap();
 
-        let result = MmapVectorSegment::open(&path);
+        let result = MmapVectorSegment::open(&path, &test_memory());
         assert!(result.is_err(), "expected trailing magic error");
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let err_string = err.to_string();
+        assert_eq!(io_err(err).kind(), std::io::ErrorKind::InvalidData);
         assert!(
-            err.to_string().contains("trailing magic"),
-            "expected trailing magic message, got: {err}"
+            err_string.contains("trailing magic"),
+            "expected trailing magic message, got: {err_string}"
         );
     }
 
@@ -663,9 +657,12 @@ mod tests {
         data[footer_start + 1] = fv_bytes[1];
         std::fs::write(&path, &data).unwrap();
 
-        let result = MmapVectorSegment::open(&path);
+        let result = MmapVectorSegment::open(&path, &test_memory());
         assert!(result.is_err(), "expected footer version mismatch error");
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            io_err(result.unwrap_err()).kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -680,9 +677,12 @@ mod tests {
         data[HEADER_SIZE] ^= 0xff;
         std::fs::write(&path, &data).unwrap();
 
-        let result = MmapVectorSegment::open(&path);
+        let result = MmapVectorSegment::open(&path, &test_memory());
         assert!(result.is_err(), "expected CRC error");
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            io_err(result.unwrap_err()).kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -697,9 +697,12 @@ mod tests {
         data[0] = b'X';
         std::fs::write(&path, &data).unwrap();
 
-        let result = MmapVectorSegment::open(&path);
+        let result = MmapVectorSegment::open(&path, &test_memory());
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            io_err(result.unwrap_err()).kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -721,7 +724,7 @@ mod tests {
         buf.extend_from_slice(&[0u8; 6]); // reserved
         std::fs::write(&path, &buf).unwrap();
 
-        let result = MmapVectorSegment::open(&path);
+        let result = MmapVectorSegment::open(&path, &test_memory());
         assert!(
             result.is_err(),
             "expected Err for overflow-inducing dim/count"
@@ -748,7 +751,7 @@ mod tests {
         buf.extend_from_slice(&[0u8; 64]);
         std::fs::write(&path, &buf).unwrap();
 
-        let result = MmapVectorSegment::open(&path);
+        let result = MmapVectorSegment::open(&path, &test_memory());
         assert!(result.is_err(), "expected Err for dim=0 with nonzero count");
     }
 }

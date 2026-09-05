@@ -122,10 +122,11 @@ impl<'a> Iterator for WordBoundaryIter<'a> {
 mod tests {
     use crate::backend::memory::MemoryBackend;
     use crate::index::FtsIndex;
+    use crate::test_support::test_governor;
 
     #[test]
     fn highlight_basic() {
-        let idx: FtsIndex<MemoryBackend> = FtsIndex::new(MemoryBackend::new());
+        let idx: FtsIndex<MemoryBackend> = FtsIndex::new(MemoryBackend::new(), test_governor());
         let result = idx.highlight(
             "The quick brown fox jumps over the lazy dog",
             "brown fox",
@@ -138,7 +139,7 @@ mod tests {
 
     #[test]
     fn highlight_no_match() {
-        let idx: FtsIndex<MemoryBackend> = FtsIndex::new(MemoryBackend::new());
+        let idx: FtsIndex<MemoryBackend> = FtsIndex::new(MemoryBackend::new(), test_governor());
         let text = "hello world";
         let result = idx.highlight(text, "xyz", "<b>", "</b>");
         assert_eq!(result, text);
@@ -146,7 +147,7 @@ mod tests {
 
     #[test]
     fn offsets_basic() {
-        let idx: FtsIndex<MemoryBackend> = FtsIndex::new(MemoryBackend::new());
+        let idx: FtsIndex<MemoryBackend> = FtsIndex::new(MemoryBackend::new(), test_governor());
         let offsets = idx.offsets("The quick brown fox", "brown");
         assert_eq!(offsets.len(), 1);
         assert_eq!(offsets[0].start, 10);

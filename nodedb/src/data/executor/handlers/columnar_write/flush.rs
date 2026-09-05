@@ -42,8 +42,17 @@ impl CoreLoop {
                 engine.memtable_surrogates().to_vec();
             if row_count > 0 {
                 let kek = self.segment_keks.columnar_segment_kek.as_ref();
-                match nodedb_columnar::SegmentWriter::plain()
-                    .write_segment(&schema, &columns, row_count, kek)
+                let memory = nodedb_mem::ScopedMemory::new(
+                    self.governor.clone(),
+                    engine_key.0,
+                    engine_key.1,
+                    nodedb_mem::EngineId::Columnar,
+                );
+                match nodedb_columnar::SegmentWriter::new(
+                    nodedb_columnar::writer::PROFILE_PLAIN,
+                    memory,
+                )
+                .write_segment(&schema, &columns, row_count, kek)
                 {
                     Ok(bytes) => {
                         // Lockstep invariant: push to BOTH maps for the same key in

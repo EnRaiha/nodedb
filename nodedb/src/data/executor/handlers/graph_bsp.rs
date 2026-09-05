@@ -299,6 +299,12 @@ impl CoreLoop {
         }
 
         let database_id = task.request.database_id.as_u64();
+        let memory = nodedb_mem::ScopedMemory::new(
+            self.governor.clone(),
+            task.request.database_id,
+            crate::types::TenantId::new(tid),
+            nodedb_mem::EngineId::Graph,
+        );
 
         // Build a collection-scoped CSR — same call as execute_graph_algo — so
         // distributed PageRank runs over exactly the same (collection, edge_label)
@@ -310,6 +316,7 @@ impl CoreLoop {
             &args.params.collection,
             args.params.edge_label.as_deref(),
             None,
+            memory,
         ) {
             Ok(c) => c,
             Err(e) => return self.response_error(task, ErrorCode::from(e)),
@@ -345,7 +352,13 @@ mod tests {
 
     /// Build a small CSR with a known triangle topology: a→b, b→c, c→a.
     fn triangle_csr() -> CsrIndex {
-        let mut csr = CsrIndex::new();
+        let memory = nodedb_mem::ScopedMemory::new(
+            crate::data::executor::core_loop::test_governor(),
+            nodedb_types::DatabaseId::DEFAULT,
+            crate::types::TenantId::new(0),
+            nodedb_mem::EngineId::Graph,
+        );
+        let mut csr = CsrIndex::new(memory);
         for n in ["a", "b", "c"] {
             csr.add_node(n).unwrap();
         }

@@ -23,10 +23,10 @@ use crate::mem_scope::fts_scope;
 ///
 /// Returns per-term `TermBlocks` ready for BMW scoring.
 ///
-/// When `governor` is `Some`, the `Vec::with_capacity` for `term_blocks_list`
-/// is budgeted via [`nodedb_mem::ScopedMemory::reserve`] before the allocation.
-/// If the budget is exhausted the allocation still proceeds — the scope
-/// serves as an accounting and backpressure signal.
+/// The `Vec::with_capacity` for `term_blocks_list` is budgeted via
+/// [`nodedb_mem::ScopedMemory::reserve`] before the allocation. If the
+/// budget is exhausted the allocation still proceeds — the scope serves
+/// as an accounting and backpressure signal.
 pub fn collect_merged_term_blocks<B: FtsBackend>(
     backend: &B,
     database_id: u64,
@@ -34,7 +34,7 @@ pub fn collect_merged_term_blocks<B: FtsBackend>(
     collection: &str,
     memtable: &Memtable,
     query_tokens: &[String],
-    governor: Option<&Arc<MemoryGovernor>>,
+    governor: &Arc<MemoryGovernor>,
 ) -> Result<Vec<TermBlocks>, B::Error> {
     let seg_ids = backend.list_segments(database_id, tid, collection)?;
     let mut readers: Vec<SegmentReader> = Vec::new();
@@ -46,10 +46,9 @@ pub fn collect_merged_term_blocks<B: FtsBackend>(
         }
     }
 
-    let _term_blocks_guard = fts_scope(governor, database_id, tid).and_then(|mem| {
-        let bytes = query_tokens.len() * std::mem::size_of::<TermBlocks>();
-        mem.reserve(bytes).ok()
-    });
+    let memory = fts_scope(governor, database_id, tid);
+    let bytes = query_tokens.len() * std::mem::size_of::<TermBlocks>();
+    let _term_blocks_guard = memory.reserve(bytes).ok();
 
     let mut term_blocks_list = Vec::with_capacity(query_tokens.len());
 
@@ -145,6 +144,7 @@ mod tests {
     use crate::codec::smallfloat;
     use crate::lsm::memtable::{Memtable, MemtableConfig};
     use crate::lsm::segment::writer;
+    use crate::test_support::test_governor;
     use std::collections::HashMap;
 
     const DB: u64 = 0;
@@ -168,7 +168,8 @@ mod tests {
 
         let tokens = vec!["hello".to_string()];
         let term_blocks =
-            collect_merged_term_blocks(&backend, DB, T, "col", &mt, &tokens, None).unwrap();
+            collect_merged_term_blocks(&backend, DB, T, "col", &mt, &tokens, &test_governor())
+                .unwrap();
 
         assert_eq!(term_blocks.len(), 1);
         assert_eq!(term_blocks[0].df, 2);
@@ -187,7 +188,8 @@ mod tests {
         let mt = Memtable::new(MemtableConfig::default());
         let tokens = vec!["hello".to_string()];
         let term_blocks =
-            collect_merged_term_blocks(&backend, DB, T, "col", &mt, &tokens, None).unwrap();
+            collect_merged_term_blocks(&backend, DB, T, "col", &mt, &tokens, &test_governor())
+                .unwrap();
 
         assert_eq!(term_blocks.len(), 1);
         assert_eq!(term_blocks[0].df, 2);
@@ -210,7 +212,8 @@ mod tests {
 
         let tokens = vec!["hello".to_string()];
         let term_blocks =
-            collect_merged_term_blocks(&backend, DB, T, "col", &mt, &tokens, None).unwrap();
+            collect_merged_term_blocks(&backend, DB, T, "col", &mt, &tokens, &test_governor())
+                .unwrap();
 
         assert_eq!(term_blocks.len(), 1);
         assert_eq!(term_blocks[0].df, 3);
@@ -223,7 +226,8 @@ mod tests {
 
         let tokens = vec!["nonexistent".to_string()];
         let term_blocks =
-            collect_merged_term_blocks(&backend, DB, T, "col", &mt, &tokens, None).unwrap();
+            collect_merged_term_blocks(&backend, DB, T, "col", &mt, &tokens, &test_governor())
+                .unwrap();
 
         assert_eq!(term_blocks.len(), 1);
         assert_eq!(term_blocks[0].df, 0);

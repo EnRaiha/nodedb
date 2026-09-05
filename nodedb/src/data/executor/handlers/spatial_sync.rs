@@ -32,7 +32,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::sync_gate::{SyncAdmit, ack_status_from_admit};
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
-use crate::engine::spatial::RTreeEntry;
+use crate::engine::spatial::{RTree, RTreeEntry};
 use crate::types::TenantId;
 use crate::util::fnv1a_hash;
 use nodedb_types::Surrogate;
@@ -179,7 +179,16 @@ impl CoreLoop {
         }
 
         let bbox = geometry_bbox(geometry);
-        let rtree = self.spatial_indexes.entry(spatial_key).or_default();
+        let memory = nodedb_mem::ScopedMemory::new(
+            self.governor.clone(),
+            db_id,
+            tenant_id,
+            nodedb_mem::EngineId::Spatial,
+        );
+        let rtree = self
+            .spatial_indexes
+            .entry(spatial_key)
+            .or_insert_with(|| RTree::new(memory));
         rtree.insert(RTreeEntry { id: entry_id, bbox });
         self.spatial_doc_map.insert(doc_map_key, doc_id);
 

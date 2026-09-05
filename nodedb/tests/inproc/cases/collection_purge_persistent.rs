@@ -152,7 +152,11 @@ fn kv_engine_cross_tenant_isolation() {
 #[test]
 fn inverted_index_purge_is_scoped_to_collection() {
     let (_tmp, sparse) = open_sparse();
-    let inverted = InvertedIndex::open(sparse.db().clone()).unwrap();
+    let inverted = InvertedIndex::open(
+        sparse.db().clone(),
+        nodedb::data::executor::core_loop::test_governor(),
+    )
+    .unwrap();
     let tid = TenantId::new(TENANT);
 
     inverted

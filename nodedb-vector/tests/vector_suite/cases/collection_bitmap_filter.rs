@@ -15,6 +15,8 @@ use nodedb_vector::collection::VectorCollection;
 use nodedb_vector::hnsw::{HnswIndex, HnswParams};
 use roaring::RoaringBitmap;
 
+use crate::support::test_memory;
+
 fn params() -> HnswParams {
     HnswParams {
         metric: DistanceMetric::L2,
@@ -33,7 +35,7 @@ fn seal_one(coll: &mut VectorCollection, count: usize) {
     for v in &req.vectors {
         idx.insert(v.clone()).unwrap();
     }
-    coll.complete_build(req.segment_id, idx);
+    coll.complete_build(req.segment_id, idx, test_memory());
 }
 
 fn bitmap_bytes(ids: impl IntoIterator<Item = u32>) -> Vec<u8> {

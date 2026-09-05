@@ -210,12 +210,10 @@ impl<B: FtsBackend> FtsIndex<B> {
         }
 
         // Fallback: exhaustive BM25 scoring reading directly from the backend.
-        let _term_postings_guard =
-            crate::mem_scope::fts_scope(self.governor.as_ref(), database_id, tid).and_then(|mem| {
-                let bytes = num_query_terms
-                    * (std::mem::size_of::<Vec<Posting>>() + std::mem::size_of::<bool>());
-                mem.reserve(bytes).ok()
-            });
+        let term_postings_memory = crate::mem_scope::fts_scope(&self.governor, database_id, tid);
+        let term_postings_bytes =
+            num_query_terms * (std::mem::size_of::<Vec<Posting>>() + std::mem::size_of::<bool>());
+        let _term_postings_guard = term_postings_memory.reserve(term_postings_bytes).ok();
         let mut term_postings: Vec<(Vec<Posting>, bool)> = Vec::with_capacity(num_query_terms);
         for (i, token) in query_tokens.iter().enumerate() {
             let postings = self
@@ -363,7 +361,7 @@ impl<B: FtsBackend> FtsIndex<B> {
             collection,
             self.memtable(),
             &neg_tokens,
-            self.governor.as_ref(),
+            &self.governor,
         )
         .map_err(FtsIndexError::backend)?;
 
@@ -408,7 +406,7 @@ impl<B: FtsBackend> FtsIndex<B> {
             collection,
             self.memtable(),
             query_tokens,
-            self.governor.as_ref(),
+            &self.governor,
         )?;
 
         let mut results = Vec::new();
@@ -440,7 +438,7 @@ impl<B: FtsBackend> FtsIndex<B> {
             collection,
             self.memtable(),
             query_tokens,
-            self.governor.as_ref(),
+            &self.governor,
         ) {
             Ok(tb) => tb,
             Err(_) => return 0,
@@ -483,6 +481,7 @@ mod tests {
     use crate::index::error::FtsIndexError;
     use crate::posting::QueryMode;
     use crate::search::query_parser::InvalidQuery;
+    use crate::test_support::test_governor;
 
     const DB: u64 = 0;
     const T: u64 = 1;
@@ -491,7 +490,7 @@ mod tests {
     const D3: Surrogate = Surrogate(3);
 
     fn make_index() -> FtsIndex<MemoryBackend> {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(
             DB,
             T,
@@ -530,7 +529,7 @@ mod tests {
 
     #[test]
     fn search_with_stemming() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "docs", D1, "running distributed databases")
             .unwrap();
         idx.index_document(DB, T, "docs", D2, "the cat sat on a mat")
@@ -576,7 +575,7 @@ mod tests {
 
     #[test]
     fn and_mode_filters() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "docs", D1, "Rust programming language")
             .unwrap();
         idx.index_document(DB, T, "docs", D2, "Python programming language")
@@ -602,7 +601,7 @@ mod tests {
 
     #[test]
     fn and_fallback_to_or() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "docs", D1, "rust programming language")
             .unwrap();
         idx.index_document(DB, T, "docs", D2, "python programming language")
@@ -630,7 +629,7 @@ mod tests {
 
     #[test]
     fn and_no_fallback_when_results_exist() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "docs", D1, "rust programming language")
             .unwrap();
         idx.index_document(DB, T, "docs", D2, "python programming language")
@@ -676,7 +675,7 @@ mod tests {
 
     #[test]
     fn collections_isolated() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "col_a", D1, "alpha bravo charlie")
             .unwrap();
         idx.index_document(DB, T, "col_b", D1, "delta echo foxtrot")
@@ -719,7 +718,7 @@ mod tests {
 
     #[test]
     fn fuzzy_search() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "docs", D1, "distributed database systems")
             .unwrap();
 
@@ -743,7 +742,7 @@ mod tests {
 
     #[test]
     fn phrase_boost_consecutive() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "docs", D1, "the quick brown fox jumped")
             .unwrap();
         idx.index_document(DB, T, "docs", D2, "a brown dog chased a fox")
@@ -769,7 +768,7 @@ mod tests {
 
     #[test]
     fn phrase_boost_no_effect_single_term() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "docs", D1, "hello world")
             .unwrap();
 
@@ -792,7 +791,7 @@ mod tests {
 
     #[test]
     fn tenants_isolated() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, 1, "docs", D1, "alpha bravo")
             .unwrap();
         idx.index_document(DB, 2, "docs", D1, "charlie delta")
@@ -832,7 +831,7 @@ mod tests {
 
     #[test]
     fn prefilter_excludes_non_member_surrogates() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
 
         idx.index_document(DB, T, "docs", D1, "rust language system")
             .unwrap();
@@ -933,7 +932,7 @@ mod tests {
 
     #[test]
     fn not_keyword_excludes_documents() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         // D1: rust + python, D2: rust + ruby, D3: python + ruby
         idx.index_document(DB, T, "docs", D1, "rust python programming")
             .unwrap();
@@ -969,7 +968,7 @@ mod tests {
 
     #[test]
     fn dash_prefix_excludes_documents() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "docs", D1, "rust python programming")
             .unwrap();
         idx.index_document(DB, T, "docs", D2, "rust ruby programming")
@@ -997,7 +996,7 @@ mod tests {
 
     #[test]
     fn multiple_not_excludes_all_negated() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "docs", D1, "rust python programming")
             .unwrap();
         idx.index_document(DB, T, "docs", D2, "rust ruby programming")
@@ -1027,7 +1026,7 @@ mod tests {
 
     #[test]
     fn not_nonexistent_term_returns_all_positives() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "docs", D1, "rust programming")
             .unwrap();
         idx.index_document(DB, T, "docs", D2, "rust systems")
@@ -1074,7 +1073,7 @@ mod tests {
 
     #[test]
     fn negative_only_returns_invalid_query_error() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "docs", D1, "python programming")
             .unwrap();
 
@@ -1100,7 +1099,7 @@ mod tests {
 
     #[test]
     fn parentheses_after_not_returns_invalid_query_error() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "docs", D1, "rust programming")
             .unwrap();
 

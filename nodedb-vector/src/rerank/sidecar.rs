@@ -85,7 +85,7 @@ impl CodecSidecar {
     }
 
     /// Deserialize a sidecar from bytes produced by [`Self::to_bytes`].
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RerankError> {
+    pub fn from_bytes(bytes: &[u8], memory: nodedb_mem::ScopedMemory) -> Result<Self, RerankError> {
         if bytes.len() < 5 {
             return Err(RerankError::BadInput(
                 "sidecar from_bytes: too short".into(),
@@ -121,7 +121,8 @@ impl CodecSidecar {
                 payload.codec_name
             ))
         })?;
-        let codec = super::codec::rerank_codec_from_bytes(codec_name, &payload.codec_bytes)?;
+        let codec =
+            super::codec::rerank_codec_from_bytes(codec_name, &payload.codec_bytes, memory)?;
         let encoded = payload.encoded.into_iter().collect();
         Ok(CodecSidecar { codec, encoded })
     }
@@ -170,6 +171,7 @@ fn codec_name_from_u8(b: u8) -> Option<CodecName> {
 mod tests {
     use super::*;
     use crate::rerank::codec::CodecName;
+    use crate::test_support::test_memory;
 
     struct StubCodec;
 
@@ -303,7 +305,7 @@ mod tests {
             s.encode_and_insert(i, &det_vec(i as usize, dim)).unwrap();
         }
         let bytes = s.to_bytes().expect("to_bytes");
-        let s2 = CodecSidecar::from_bytes(&bytes).expect("from_bytes");
+        let s2 = CodecSidecar::from_bytes(&bytes, test_memory()).expect("from_bytes");
         assert_eq!(s2.codec_name(), CodecName::Sq8);
         for i in 0..5u32 {
             assert_eq!(s.get(i), s2.get(i), "encoded bytes differ for id {i}");
@@ -319,7 +321,7 @@ mod tests {
             s.encode_and_insert(i, &det_vec(i as usize, dim)).unwrap();
         }
         let bytes = s.to_bytes().expect("to_bytes");
-        let s2 = CodecSidecar::from_bytes(&bytes).expect("from_bytes");
+        let s2 = CodecSidecar::from_bytes(&bytes, test_memory()).expect("from_bytes");
         assert_eq!(s2.codec_name(), CodecName::Binary);
         for i in 0..5u32 {
             assert_eq!(s.get(i), s2.get(i), "encoded bytes differ for id {i}");
@@ -332,7 +334,7 @@ mod tests {
         let dim = 16;
         let m = 4;
         let k = 8;
-        let mut codec = PqRerank::new(dim, m, k);
+        let mut codec = PqRerank::new(dim, m, k, test_memory());
         let samples: Vec<Vec<f32>> = (0..32).map(|i| det_vec(i, dim)).collect();
         let refs: Vec<&[f32]> = samples.iter().map(|v| v.as_slice()).collect();
         codec.train(&refs).unwrap();
@@ -342,7 +344,7 @@ mod tests {
             s.encode_and_insert(i, &det_vec(i as usize, dim)).unwrap();
         }
         let bytes = s.to_bytes().expect("to_bytes");
-        let s2 = CodecSidecar::from_bytes(&bytes).expect("from_bytes");
+        let s2 = CodecSidecar::from_bytes(&bytes, test_memory()).expect("from_bytes");
         assert_eq!(s2.codec_name(), CodecName::Pq);
         for i in 0..5u32 {
             assert_eq!(s.get(i), s2.get(i), "encoded bytes differ for id {i}");
@@ -363,7 +365,7 @@ mod tests {
             s.encode_and_insert(i, &det_vec(i as usize, dim)).unwrap();
         }
         let bytes = s.to_bytes().expect("to_bytes");
-        let s2 = CodecSidecar::from_bytes(&bytes).expect("from_bytes");
+        let s2 = CodecSidecar::from_bytes(&bytes, test_memory()).expect("from_bytes");
         assert_eq!(s2.codec_name(), CodecName::RaBitQ);
         for i in 0..5u32 {
             assert_eq!(s.get(i), s2.get(i), "encoded bytes differ for id {i}");
@@ -384,7 +386,7 @@ mod tests {
             s.encode_and_insert(i, &det_vec(i as usize, dim)).unwrap();
         }
         let bytes = s.to_bytes().expect("to_bytes");
-        let s2 = CodecSidecar::from_bytes(&bytes).expect("from_bytes");
+        let s2 = CodecSidecar::from_bytes(&bytes, test_memory()).expect("from_bytes");
         assert_eq!(s2.codec_name(), CodecName::Bbq);
         for i in 0..5u32 {
             assert_eq!(s.get(i), s2.get(i), "encoded bytes differ for id {i}");
@@ -397,7 +399,7 @@ mod tests {
         let s = CodecSidecar::new(Arc::new(BinaryRerank::new(4)));
         let mut bytes = s.to_bytes().unwrap();
         bytes[0] = b'X';
-        assert!(CodecSidecar::from_bytes(&bytes).is_err());
+        assert!(CodecSidecar::from_bytes(&bytes, test_memory()).is_err());
     }
 
     #[test]
@@ -406,7 +408,7 @@ mod tests {
         let s = CodecSidecar::new(Arc::new(BinaryRerank::new(4)));
         let mut bytes = s.to_bytes().unwrap();
         bytes[4] = 99;
-        assert!(CodecSidecar::from_bytes(&bytes).is_err());
+        assert!(CodecSidecar::from_bytes(&bytes, test_memory()).is_err());
     }
 
     #[test]
@@ -425,7 +427,7 @@ mod tests {
         let d_orig = s.distance_prepared(&prepared_orig, 1).unwrap().unwrap();
 
         let bytes = s.to_bytes().unwrap();
-        let s2 = CodecSidecar::from_bytes(&bytes).unwrap();
+        let s2 = CodecSidecar::from_bytes(&bytes, test_memory()).unwrap();
         let prepared_rest = s2.prepare_query(&query_vec).unwrap();
         let d_rest = s2.distance_prepared(&prepared_rest, 1).unwrap().unwrap();
 

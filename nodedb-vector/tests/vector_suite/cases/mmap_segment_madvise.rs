@@ -13,10 +13,12 @@
 use nodedb_vector::mmap_segment::MmapVectorSegment;
 use tempfile::tempdir;
 
+use crate::support::test_memory;
+
 fn make_segment(dir: &std::path::Path, name: &str, dim: usize, n: usize) -> MmapVectorSegment {
     let vecs: Vec<Vec<f32>> = (0..n).map(|i| vec![i as f32; dim]).collect();
     let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-    MmapVectorSegment::create(dir, name, dim, &refs).unwrap()
+    MmapVectorSegment::create(dir, name, dim, &refs, &test_memory()).unwrap()
 }
 
 #[test]
@@ -40,7 +42,7 @@ fn reopen_also_advises_random() {
     let path = dir.path().join("reopen.vseg");
     make_segment(dir.path(), "reopen.vseg", 16, 8);
 
-    let seg = MmapVectorSegment::open(&path).unwrap();
+    let seg = MmapVectorSegment::open(&path, &test_memory()).unwrap();
     assert_eq!(seg.madvise_state(), Some(libc::MADV_RANDOM));
 }
 
@@ -83,6 +85,7 @@ fn drop_skips_release_when_disabled() {
             8,
             &refs,
             VectorSegmentDropPolicy::keep_resident(),
+            &test_memory(),
         )
         .unwrap();
     }
@@ -99,7 +102,7 @@ fn empty_segment_does_not_advise() {
 
     // Zero data bytes — advising a header-only region is a noop at best,
     // EINVAL at worst on some kernels. The open path must handle this.
-    let seg = MmapVectorSegment::create(dir.path(), "empty.vseg", 3, &[]).unwrap();
+    let seg = MmapVectorSegment::create(dir.path(), "empty.vseg", 3, &[], &test_memory()).unwrap();
     assert_eq!(seg.count(), 0);
     // Either None (skipped advise on zero-data) or MADV_RANDOM (advised header
     // page only) are acceptable; a panic or error is not.

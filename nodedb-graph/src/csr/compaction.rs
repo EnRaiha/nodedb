@@ -133,7 +133,7 @@ impl CsrIndex {
         }
 
         // Build new dense arrays.
-        let memory = self.memory.as_ref();
+        let memory = &self.memory;
         let out = Self::build_dense(&new_out_edges, &new_out_collections, memory)?;
         let in_ = Self::build_dense(&new_in_edges, &new_in_collections, memory)?;
 

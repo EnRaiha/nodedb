@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use nodedb_mem::ScopedMemory;
 use nodedb_types::Surrogate;
 
 use crate::block::CompactPosting;
@@ -59,7 +60,7 @@ impl Default for WorkerResult {
 ///
 /// This is the "leader" step: takes the flushed segments from all workers
 /// and performs N-way merge into one final segment.
-pub fn merge_worker_segments(worker_segments: Vec<Vec<u8>>) -> Vec<u8> {
+pub fn merge_worker_segments(worker_segments: Vec<Vec<u8>>, memory: &ScopedMemory) -> Vec<u8> {
     let readers: Vec<SegmentReader> = worker_segments
         .into_iter()
         .filter_map(|data| SegmentReader::open(data).ok())
@@ -70,7 +71,7 @@ pub fn merge_worker_segments(worker_segments: Vec<Vec<u8>>) -> Vec<u8> {
             .expect("build_from_blocks on empty input must not fail");
     }
 
-    let merged_term_blocks = merge::merge_segments(&readers, None);
+    let merged_term_blocks = merge::merge_segments(&readers, memory);
     writer::build_from_blocks(&merged_term_blocks)
         .expect("merge produced a term exceeding u16::MAX bytes — data invariant violated")
 }
@@ -114,6 +115,7 @@ pub fn make_compact_posting(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_memory;
 
     #[test]
     fn partition_even() {
@@ -157,7 +159,7 @@ mod tests {
         let seg2 = w2.flush_to_segment();
 
         // Leader merge.
-        let merged = merge_worker_segments(vec![seg1, seg2]);
+        let merged = merge_worker_segments(vec![seg1, seg2], &test_memory());
 
         // Verify merged segment.
         let reader = SegmentReader::open(merged).expect("merged segment must be valid");
@@ -169,7 +171,7 @@ mod tests {
 
     #[test]
     fn merge_empty_workers() {
-        let merged = merge_worker_segments(Vec::new());
+        let merged = merge_worker_segments(Vec::new(), &test_memory());
         let reader = SegmentReader::open(merged).expect("merged segment must be valid");
         assert_eq!(reader.num_terms(), 0);
     }

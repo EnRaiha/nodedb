@@ -34,6 +34,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::{Entry, Iter, IterMut};
 
+use nodedb_mem::ScopedMemory;
 use nodedb_types::{DatabaseId, TenantId};
 
 use crate::GraphError;
@@ -73,14 +74,21 @@ impl ShardedCsrIndex {
     }
 
     /// Mutable access to a tenant's partition, creating an empty one
-    /// on first use.
+    /// bound to `memory` on first use.
     ///
     /// This is the canonical write-path entry point: insertion handlers
     /// call this once to resolve the partition, then operate on the
     /// returned `&mut CsrIndex` exactly as they would on a standalone
     /// instance.
-    pub fn get_or_create(&mut self, db: DatabaseId, tid: TenantId) -> &mut CsrIndex {
-        self.partitions.entry((db, tid)).or_default()
+    pub fn get_or_create(
+        &mut self,
+        db: DatabaseId,
+        tid: TenantId,
+        memory: ScopedMemory,
+    ) -> &mut CsrIndex {
+        self.partitions
+            .entry((db, tid))
+            .or_insert_with(|| CsrIndex::new(memory))
     }
 
     /// Drop a tenant's entire graph state.
@@ -175,6 +183,7 @@ impl Default for ShardedCsrIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_memory;
 
     fn tid(n: u64) -> TenantId {
         TenantId::new(n)
@@ -193,7 +202,7 @@ mod tests {
     #[test]
     fn get_or_create_installs_empty_partition() {
         let mut sharded = ShardedCsrIndex::new();
-        let part = sharded.get_or_create(DB, tid(7));
+        let part = sharded.get_or_create(DB, tid(7), test_memory());
         assert_eq!(part.node_count(), 0);
         assert!(sharded.contains_partition(DB, tid(7)));
         assert_eq!(sharded.partition_count(), 1);
@@ -208,11 +217,11 @@ mod tests {
         let mut sharded = ShardedCsrIndex::new();
 
         sharded
-            .get_or_create(DB, tid(1))
+            .get_or_create(DB, tid(1), test_memory())
             .add_edge("alice", "knows", "bob")
             .unwrap();
         sharded
-            .get_or_create(DB, tid(2))
+            .get_or_create(DB, tid(2), test_memory())
             .add_edge("alice", "knows", "carol")
             .unwrap();
 
@@ -237,13 +246,13 @@ mod tests {
     fn node_names_are_unprefixed() {
         let mut sharded = ShardedCsrIndex::new();
         sharded
-            .get_or_create(DB, tid(42))
+            .get_or_create(DB, tid(42), test_memory())
             .add_edge("alice", "knows", "bob")
             .unwrap();
         sharded
-            .get_or_create(DB, tid(42))
+            .get_or_create(DB, tid(42), test_memory())
             .compact()
-            .expect("no governor, cannot fail");
+            .expect("test governor ceiling covers this reservation");
 
         let part = sharded.partition(DB, tid(42)).unwrap();
         let alice_id = part.node_id("alice").expect("alice must be present");
@@ -257,7 +266,7 @@ mod tests {
     fn drop_partition_removes_tenant_state() {
         let mut sharded = ShardedCsrIndex::new();
         sharded
-            .get_or_create(DB, tid(1))
+            .get_or_create(DB, tid(1), test_memory())
             .add_edge("a", "l", "b")
             .unwrap();
         assert!(sharded.contains_partition(DB, tid(1)));
@@ -274,11 +283,11 @@ mod tests {
     fn drop_partition_does_not_touch_other_tenants() {
         let mut sharded = ShardedCsrIndex::new();
         sharded
-            .get_or_create(DB, tid(1))
+            .get_or_create(DB, tid(1), test_memory())
             .add_edge("a", "l", "b")
             .unwrap();
         sharded
-            .get_or_create(DB, tid(2))
+            .get_or_create(DB, tid(2), test_memory())
             .add_edge("c", "l", "d")
             .unwrap();
 
@@ -292,11 +301,11 @@ mod tests {
     fn install_partition_replaces_existing() {
         let mut sharded = ShardedCsrIndex::new();
         sharded
-            .get_or_create(DB, tid(1))
+            .get_or_create(DB, tid(1), test_memory())
             .add_edge("old", "l", "value")
             .unwrap();
 
-        let mut replacement = CsrIndex::new();
+        let mut replacement = CsrIndex::new(test_memory());
         replacement.add_edge("new", "l", "value").unwrap();
         sharded.install_partition(DB, tid(1), replacement);
 
@@ -310,13 +319,15 @@ mod tests {
         let mut sharded = ShardedCsrIndex::new();
         for t in 1..=3 {
             sharded
-                .get_or_create(DB, tid(t))
+                .get_or_create(DB, tid(t), test_memory())
                 .add_edge("a", "l", "b")
                 .unwrap();
         }
         // Pre-compact: edges live in the write buffer. `compact_all`
         // merges them into the dense CSR arrays for every partition.
-        sharded.compact_all().expect("no governor, cannot fail");
+        sharded
+            .compact_all()
+            .expect("test governor ceiling covers this reservation");
         for t in 1..=3 {
             let part = sharded.partition(DB, tid(t)).unwrap();
             assert_eq!(part.edge_count(), 1);

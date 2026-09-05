@@ -9,20 +9,15 @@ use nodedb_mem::{EngineId, MemoryGovernor, ScopedMemory};
 use nodedb_types::{DatabaseId, TenantId};
 
 /// Bind `governor` to `(database_id, tid, EngineId::Fts)`.
-///
-/// Returns `None` when `governor` is `None` — the embedded (Lite) case
-/// where no governor is configured and reservations are skipped.
 pub(crate) fn fts_scope(
-    governor: Option<&Arc<MemoryGovernor>>,
+    governor: &Arc<MemoryGovernor>,
     database_id: u64,
     tid: u64,
-) -> Option<ScopedMemory> {
-    governor.map(|gov| {
-        ScopedMemory::new(
-            Arc::clone(gov),
-            DatabaseId::new(database_id),
-            TenantId::new(tid),
-            EngineId::Fts,
-        )
-    })
+) -> ScopedMemory {
+    ScopedMemory::new(
+        Arc::clone(governor),
+        DatabaseId::new(database_id),
+        TenantId::new(tid),
+        EngineId::Fts,
+    )
 }

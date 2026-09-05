@@ -222,6 +222,7 @@ pub(super) fn bind_name(row: &mut BindingRow, binding: &NodeBinding, name: &str)
 mod tests {
     use super::*;
     use crate::engine::graph::pattern::ast::{EdgeBinding, EdgeDirection};
+    use crate::engine::graph::test_support::test_scoped_memory;
 
     fn triple(src: Option<&str>, label: &str, dst: Option<&str>) -> PatternTriple {
         PatternTriple {
@@ -251,7 +252,7 @@ mod tests {
     /// a durable `a->b` edge and a staged `a->c` edge yields both destinations.
     #[test]
     fn staged_put_unions_with_durable_neighbours() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
         let mut ov = GraphOverlayDelta::new();
         ov.stage_edge("a", "KNOWS", "c");
@@ -282,7 +283,7 @@ mod tests {
     /// A staged tombstone hides a durable edge.
     #[test]
     fn staged_tombstone_hides_durable_edge() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
         let mut ov = GraphOverlayDelta::new();
         ov.stage_tombstone("a", "KNOWS", "b");
@@ -306,7 +307,7 @@ mod tests {
     /// expand its own staged edge.
     #[test]
     fn staged_only_node_expands_as_source() {
-        let csr = CsrIndex::new(); // no durable nodes at all
+        let csr = CsrIndex::new(test_scoped_memory()); // no durable nodes at all
         let mut ov = GraphOverlayDelta::new();
         ov.stage_edge("x", "KNOWS", "y");
 

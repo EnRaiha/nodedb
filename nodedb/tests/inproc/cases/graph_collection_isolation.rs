@@ -23,6 +23,7 @@
 //! collection B's edges.
 
 use nodedb::engine::graph::csr::{CsrIndex, Direction};
+use nodedb_mem::EngineId;
 
 const COLL_A: &str = "collection_a";
 const COLL_B: &str = "collection_b";
@@ -35,7 +36,7 @@ const COLL_B: &str = "collection_b";
 /// `alice` is shared across both collections (nodes are shared) but its
 /// out-edges belong to different collections.
 fn build_two_collection_csr() -> CsrIndex {
-    let mut csr = CsrIndex::new();
+    let mut csr = CsrIndex::new(super::support::memory::test_scoped_memory(EngineId::Graph));
     csr.add_edge_in_collection("alice", "KNOWS", "bob", COLL_A)
         .unwrap();
     csr.add_edge_in_collection("bob", "KNOWS", "carol", COLL_A)
@@ -149,7 +150,7 @@ fn unscoped_neighbors_see_the_merged_graph() {
 /// read MISSED the shared triple (a false negative).
 #[test]
 fn shared_triple_is_visible_in_both_collections() {
-    let mut csr = CsrIndex::new();
+    let mut csr = CsrIndex::new(super::support::memory::test_scoped_memory(EngineId::Graph));
     csr.add_edge_in_collection("x", "KNOWS", "y", COLL_A)
         .unwrap();
     csr.add_edge_in_collection("x", "KNOWS", "y", COLL_B)
@@ -172,7 +173,7 @@ fn shared_triple_is_visible_in_both_collections() {
 /// identity, so it never over-deletes the other collection's edge.
 #[test]
 fn scoped_removal_of_shared_triple_leaves_other_collection_intact() {
-    let mut csr = CsrIndex::new();
+    let mut csr = CsrIndex::new(super::support::memory::test_scoped_memory(EngineId::Graph));
     csr.add_edge_in_collection("x", "KNOWS", "y", COLL_A)
         .unwrap();
     csr.add_edge_in_collection("x", "KNOWS", "y", COLL_B)
@@ -205,8 +206,8 @@ fn scoped_removal_of_shared_triple_leaves_other_collection_intact() {
 /// (`test_tenant_isolation_graph`) covers the end-to-end path.
 #[test]
 fn distinct_partitions_do_not_share_edges() {
-    let mut tenant_a = CsrIndex::new();
-    let tenant_b = CsrIndex::new();
+    let mut tenant_a = CsrIndex::new(super::support::memory::test_scoped_memory(EngineId::Graph));
+    let tenant_b = CsrIndex::new(super::support::memory::test_scoped_memory(EngineId::Graph));
     tenant_a
         .add_edge_in_collection("alice", "KNOWS", "bob", COLL_A)
         .unwrap();

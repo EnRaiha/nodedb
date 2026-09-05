@@ -209,11 +209,12 @@ fn compute_modularity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::graph::test_support::test_scoped_memory;
 
     #[test]
     fn louvain_two_cliques() {
         // Two cliques connected by a single bridge.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         for (s, d) in &[
             ("a", "b"),
             ("b", "a"),
@@ -232,7 +233,8 @@ mod tests {
         ] {
             csr.add_edge(s, "L", d).unwrap();
         }
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr, &AlgoParams::default());
         assert_eq!(batch.len(), 6);
@@ -258,7 +260,7 @@ mod tests {
 
     #[test]
     fn louvain_positive_modularity() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         for (s, d) in &[
             ("a", "b"),
             ("b", "a"),
@@ -269,7 +271,8 @@ mod tests {
         ] {
             csr.add_edge(s, "L", d).unwrap();
         }
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr, &AlgoParams::default());
         let json = batch.to_json().unwrap();
@@ -283,15 +286,16 @@ mod tests {
 
     #[test]
     fn louvain_empty() {
-        let csr = CsrIndex::new();
+        let csr = CsrIndex::new(test_scoped_memory());
         assert!(run(&csr, &AlgoParams::default()).is_empty());
     }
 
     #[test]
     fn louvain_single_node() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_node("solo").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
         let batch = run(&csr, &AlgoParams::default());
         assert_eq!(batch.len(), 1);
     }

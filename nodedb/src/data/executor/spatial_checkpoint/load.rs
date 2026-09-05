@@ -114,7 +114,13 @@ impl CoreLoop {
 
             let bytes = nodedb_wal::segment::read_checkpoint_framed(&path)?;
             let kek = self.segment_keks.spatial_checkpoint_kek.as_ref();
-            let rtree = RTree::from_checkpoint(&bytes, kek)?;
+            let memory = nodedb_mem::ScopedMemory::new(
+                self.governor.clone(),
+                key.0,
+                key.1,
+                nodedb_mem::EngineId::Spatial,
+            );
+            let rtree = RTree::from_checkpoint(&bytes, kek, memory)?;
 
             // The doc_map is not optional company for the R-tree: the write
             // path always publishes both into the same generation, so a missing
@@ -161,10 +167,19 @@ mod tests {
     }
 
     fn one_entry_rtree_bytes() -> Vec<u8> {
-        let rtree = RTree::bulk_load(vec![RTreeEntry {
-            id: 1,
-            bbox: BoundingBox::new(0.0, 0.0, 1.0, 1.0),
-        }]);
+        let memory = nodedb_mem::ScopedMemory::new(
+            crate::data::executor::core_loop::test_governor(),
+            DatabaseId::new(0),
+            TenantId::new(7),
+            nodedb_mem::EngineId::Spatial,
+        );
+        let rtree = RTree::bulk_load(
+            vec![RTreeEntry {
+                id: 1,
+                bbox: BoundingBox::new(0.0, 0.0, 1.0, 1.0),
+            }],
+            memory,
+        );
         rtree.checkpoint_to_bytes(None).expect("encode R-tree")
     }
 

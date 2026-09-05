@@ -30,52 +30,40 @@ use nodedb_mem::MemoryGovernor;
 /// stored via the backend. Queries merge the active memtable with
 /// all persisted segments.
 ///
-/// An optional [`MemoryGovernor`] can be injected via [`FtsIndex::set_governor`]
-/// to enforce per-engine memory budgets on large allocations (compaction,
-/// segment merge, query term collection). When no governor is set, allocations
-/// proceed without budget enforcement — which is the correct behaviour for
-/// NodeDB-Lite and WASM deployments where `nodedb-mem` is not available.
+/// [`MemoryGovernor`] enforces per-engine memory budgets on large
+/// allocations (compaction, segment merge, query term collection).
 pub struct FtsIndex<B: FtsBackend> {
     pub(crate) backend: B,
     pub(crate) bm25_params: Bm25Params,
     pub(crate) memtable: Memtable,
     /// Monotonic segment ID counter.
     next_segment_id: AtomicU64,
-    /// Optional memory governor for budget enforcement (Origin only).
-    pub(crate) governor: Option<Arc<MemoryGovernor>>,
+    /// Memory governor for budget enforcement.
+    pub(crate) governor: Arc<MemoryGovernor>,
 }
 
 impl<B: FtsBackend> FtsIndex<B> {
-    /// Create a new FTS index with the given backend and default BM25 params.
-    pub fn new(backend: B) -> Self {
+    /// Create a new FTS index with the given backend, default BM25 params,
+    /// and a memory governor.
+    pub fn new(backend: B, governor: Arc<MemoryGovernor>) -> Self {
         Self {
             backend,
             bm25_params: Bm25Params::default(),
             memtable: Memtable::new(MemtableConfig::default()),
             next_segment_id: AtomicU64::new(1),
-            governor: None,
+            governor,
         }
     }
 
-    /// Create a new FTS index with custom BM25 parameters.
-    pub fn with_params(backend: B, params: Bm25Params) -> Self {
+    /// Create a new FTS index with custom BM25 parameters and a memory governor.
+    pub fn with_params(backend: B, params: Bm25Params, governor: Arc<MemoryGovernor>) -> Self {
         Self {
             backend,
             bm25_params: params,
             memtable: Memtable::new(MemtableConfig::default()),
             next_segment_id: AtomicU64::new(1),
-            governor: None,
+            governor,
         }
-    }
-
-    /// Inject a [`MemoryGovernor`] to enforce per-engine memory budgets on
-    /// large allocations (compaction, merge, query). When not set, all
-    /// allocations proceed without budget enforcement.
-    ///
-    /// This is the correct pattern for Origin deployments. NodeDB-Lite and
-    /// WASM builds should leave the governor unset (no `nodedb-mem` dependency).
-    pub fn set_governor(&mut self, governor: Arc<MemoryGovernor>) {
-        self.governor = Some(governor);
     }
 
     /// Access the underlying backend.
@@ -257,6 +245,7 @@ mod tests {
     use nodedb_types::Surrogate;
 
     use crate::backend::memory::MemoryBackend;
+    use crate::test_support::test_governor;
 
     use super::*;
 
@@ -264,7 +253,7 @@ mod tests {
     const T: u64 = 1;
 
     fn make_index() -> FtsIndex<MemoryBackend> {
-        FtsIndex::new(MemoryBackend::new())
+        FtsIndex::new(MemoryBackend::new(), test_governor())
     }
 
     #[test]
@@ -278,7 +267,7 @@ mod tests {
                 max_terms: 1,
             }),
             next_segment_id: AtomicU64::new(1),
-            governor: None,
+            governor: test_governor(),
         };
 
         // Insert a single posting under a term whose byte length exceeds the
@@ -331,7 +320,7 @@ mod tests {
                 max_terms: 100,
             }),
             next_segment_id: AtomicU64::new(1),
-            governor: None,
+            governor: test_governor(),
         };
 
         idx.index_document(

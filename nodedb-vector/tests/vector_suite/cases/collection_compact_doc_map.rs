@@ -17,6 +17,8 @@ use nodedb_vector::Surrogate;
 use nodedb_vector::collection::VectorCollection;
 use nodedb_vector::hnsw::{HnswIndex, HnswParams};
 
+use crate::support::test_memory;
+
 fn params() -> HnswParams {
     HnswParams {
         metric: DistanceMetric::L2,
@@ -35,7 +37,7 @@ fn build_collection_with_docs() -> VectorCollection {
     for v in &req.vectors {
         idx.insert(v.clone()).unwrap();
     }
-    coll.complete_build(req.segment_id, idx);
+    coll.complete_build(req.segment_id, idx, test_memory());
     coll
 }
 
@@ -92,7 +94,7 @@ fn multi_doc_map_stays_correct_after_compact() {
     for v in &req.vectors {
         idx.insert(v.clone()).unwrap();
     }
-    coll.complete_build(req.segment_id, idx);
+    coll.complete_build(req.segment_id, idx, test_memory());
 
     assert!(coll.delete(1));
     assert!(coll.delete(4));

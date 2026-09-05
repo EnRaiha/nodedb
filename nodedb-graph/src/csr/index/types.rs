@@ -141,24 +141,22 @@ pub struct CsrIndex {
     /// caught by comparing tags at API boundaries.
     pub(crate) partition_tag: u32,
 
-    /// Optional memory scope for budget tracking.
+    /// Memory scope for budget tracking.
     ///
-    /// When `None`, all memory operations proceed without budget enforcement
-    /// (the behavior for NodeDB-Lite / WASM deployments that have no governor).
-    /// When `Some`, `compact()`, `checkpoint_to_bytes()`, and `compute_statistics()`
+    /// `compact()`, `checkpoint_to_bytes()`, and `compute_statistics()`
     /// reserve bytes against the bound database, tenant, and `EngineId::Graph`
     /// before allocating and release them on drop via `ReservationToken`.
-    pub(crate) memory: Option<ScopedMemory>,
-}
-
-impl Default for CsrIndex {
-    fn default() -> Self {
-        Self::new()
-    }
+    pub(crate) memory: ScopedMemory,
 }
 
 impl CsrIndex {
-    pub fn new() -> Self {
+    /// Create a new `CsrIndex` wired to `memory`.
+    ///
+    /// Subsequent calls to `compact()`, `checkpoint_to_bytes()`, and
+    /// `compute_statistics()` reserve bytes against the bound database,
+    /// tenant, and `EngineId::Graph` before allocating and return
+    /// `Err(GraphError::MemoryBudget(_))` if the budget is exhausted.
+    pub fn new(memory: ScopedMemory) -> Self {
         Self {
             node_to_id: HashMap::new(),
             id_to_node: Vec::new(),
@@ -192,34 +190,8 @@ impl CsrIndex {
             access_counts: Vec::new(),
             query_epoch: 0,
             partition_tag: crate::csr::local_node_id::next_partition_tag(),
-            memory: None,
+            memory,
         }
-    }
-
-    /// Create a new `CsrIndex` wired to a memory scope.
-    ///
-    /// Subsequent calls to `compact()`, `checkpoint_to_bytes()`, and
-    /// `compute_statistics()` will reserve bytes against the bound database,
-    /// tenant, and `EngineId::Graph` before allocating and return
-    /// `Err(GraphError::MemoryBudget(_))` if the budget is exhausted.
-    ///
-    /// Use `CsrIndex::new()` when deploying without a scope (NodeDB-Lite,
-    /// WASM, or tests that do not need budget enforcement).
-    pub fn with_memory(memory: ScopedMemory) -> Self {
-        Self {
-            memory: Some(memory),
-            ..Self::new()
-        }
-    }
-
-    /// Attach a memory scope to an existing `CsrIndex`.
-    ///
-    /// Used by the REINDEX path: a partition is rebuilt on a background thread
-    /// (without a scope since the governor lives behind an `Arc` the thread
-    /// does not hold), and on cutover the Data Plane installs the scope.
-    pub fn with_memory_attached(mut self, memory: ScopedMemory) -> Self {
-        self.memory = Some(memory);
-        self
     }
 
     /// Whether any edge in this index has a non-default (1.0) weight.
@@ -232,9 +204,10 @@ impl CsrIndex {
 #[cfg(test)]
 mod tests {
     use super::{CsrIndex, Direction};
+    use crate::test_support::test_memory;
 
     fn make_csr() -> CsrIndex {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
         csr.add_edge("b", "KNOWS", "c").unwrap();
         csr.add_edge("c", "KNOWS", "d").unwrap();
@@ -278,7 +251,7 @@ mod tests {
 
     #[test]
     fn duplicate_add_is_idempotent() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("a", "L", "b").unwrap();
         assert_eq!(csr.neighbors("a", None, Direction::Out).len(), 1);
@@ -286,12 +259,13 @@ mod tests {
 
     #[test]
     fn compact_merges_buffer_into_dense() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
         assert_eq!(csr.neighbors("a", None, Direction::Out).len(), 1);
 
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
         assert!(csr.buffer_out.iter().all(|b| b.is_empty()));
         assert_eq!(csr.neighbors("a", None, Direction::Out).len(), 1);
         assert_eq!(csr.neighbors("b", None, Direction::Out).len(), 1);
@@ -299,22 +273,24 @@ mod tests {
 
     #[test]
     fn compact_handles_deletes() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("a", "L", "c").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         csr.remove_edge("a", "L", "b");
         assert_eq!(csr.neighbors("a", None, Direction::Out).len(), 1);
 
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
         assert_eq!(csr.neighbors("a", None, Direction::Out).len(), 1);
         assert_eq!(csr.neighbors("a", None, Direction::Out)[0].1, "c");
     }
 
     #[test]
     fn label_interning_reduces_memory() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         for i in 0..100 {
             csr.add_edge(&format!("n{i}"), "FOLLOWS", &format!("n{}", i + 1))
                 .unwrap();
@@ -332,12 +308,15 @@ mod tests {
     #[test]
     fn checkpoint_roundtrip() {
         let mut csr = make_csr();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
-        let bytes = csr.checkpoint_to_bytes().expect("no governor, cannot fail");
+        let bytes = csr
+            .checkpoint_to_bytes()
+            .expect("test governor ceiling covers this reservation");
         assert!(!bytes.is_empty());
 
-        let restored = CsrIndex::from_checkpoint(&bytes)
+        let restored = CsrIndex::from_checkpoint(&bytes, test_memory())
             .expect("roundtrip")
             .unwrap();
         assert_eq!(restored.node_count(), csr.node_count());
@@ -357,7 +336,7 @@ mod tests {
 
     #[test]
     fn out_degree_and_in_degree() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("a", "L", "c").unwrap();
         csr.add_edge("d", "L", "b").unwrap();
@@ -371,7 +350,7 @@ mod tests {
 
     #[test]
     fn remove_node_edges_all() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("a", "L", "c").unwrap();
         csr.add_edge("d", "L", "a").unwrap();
@@ -385,7 +364,7 @@ mod tests {
     #[test]
     fn surrogate_reverse_lookup_resolves_node_name() {
         use nodedb_types::Surrogate;
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("alice", "KNOWS", "bob").unwrap();
         csr.add_edge("alice", "KNOWS", "carol").unwrap();
         csr.set_node_surrogate("alice", Surrogate(101));
@@ -401,7 +380,7 @@ mod tests {
 
     #[test]
     fn add_node_idempotent() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         let id1 = csr.add_node("x").unwrap();
         let id2 = csr.add_node("x").unwrap();
         assert_eq!(id1, id2);
@@ -410,7 +389,7 @@ mod tests {
 
     #[test]
     fn node_labels_bitset() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("alice", "KNOWS", "bob").unwrap();
         csr.add_edge("acme", "EMPLOYS", "alice").unwrap();
 
@@ -448,7 +427,7 @@ mod tests {
     /// whose labels no edge-store rebuild could ever bring back.
     #[test]
     fn labeled_nodes_exports_every_labeled_node_by_name() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("alice", "KNOWS", "bob").unwrap();
         csr.add_node_label("alice", "Person").unwrap();
         csr.add_node_label("alice", "Employee").unwrap();
@@ -475,7 +454,7 @@ mod tests {
     /// resurrect a label the user deleted.
     #[test]
     fn labeled_nodes_omits_a_node_whose_labels_were_all_removed() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_node_label("alice", "Person").unwrap();
         csr.remove_node_label("alice", "Person");
         assert!(csr.labeled_nodes().is_empty());
@@ -494,7 +473,7 @@ mod tests {
     /// `label_name(id) == label`. Aliasing would break the round-trip.
     #[test]
     fn edge_label_interning_does_not_alias_past_u16_max() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
 
         // Push past the u16 boundary. 65_537 distinct labels forces the bug:
         // label 65_536 receives id = (65_536 as u16) = 0, aliasing id 0.
@@ -548,7 +527,7 @@ mod tests {
     /// returns `NodeOverflow { used }` rather than silently wrapping.
     #[test]
     fn node_overflow_guard_fires_on_fresh_node() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         // Two real nodes so node_to_id has "a" → 0 and "b" → 1.
         csr.add_edge("a", "L", "b").unwrap();
         assert_eq!(csr.node_count(), 2);
@@ -626,7 +605,7 @@ mod tests {
     /// (u16 → u32) MUST preserve this across the compaction path.
     #[test]
     fn edge_label_ids_survive_compaction() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         // Spread a moderate number of labels across many edges so
         // compaction actually touches the label table.
         const N: usize = 512;
@@ -639,7 +618,8 @@ mod tests {
             .map(|i| csr.label_id(&format!("L_{i}")).expect("label present"))
             .collect();
 
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         for (i, &id) in before.iter().enumerate() {
             let after_id = csr

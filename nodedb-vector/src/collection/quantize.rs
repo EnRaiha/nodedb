@@ -5,6 +5,8 @@
 //! All methods here are `impl VectorCollection` blocks — Rust allows a
 //! type's impl to be split across files.
 
+use nodedb_mem::ScopedMemory;
+
 use crate::hnsw::{HnswIndex, HnswParams};
 use crate::index_config::{IndexConfig, IndexType};
 use crate::quantize::pq::PqCodec;
@@ -82,8 +84,13 @@ impl VectorCollection {
         Some((codec, data))
     }
 
-    /// Train a PQ codec from a built HNSW index's live vectors.
-    pub fn build_pq_for_index(index: &HnswIndex, pq_m: usize) -> Option<(PqCodec, Vec<u8>)> {
+    /// Train a PQ codec from a built HNSW index's live vectors, tracking
+    /// codebook allocations against `memory`.
+    pub fn build_pq_for_index(
+        index: &HnswIndex,
+        pq_m: usize,
+        memory: ScopedMemory,
+    ) -> Option<(PqCodec, Vec<u8>)> {
         let dim = index.dim();
         if pq_m == 0 || !dim.is_multiple_of(pq_m) {
             return None;
@@ -102,7 +109,7 @@ impl VectorCollection {
         }
         let refs_slices: Vec<&[f32]> = refs.iter().map(|v| v.as_slice()).collect();
         let k = 256usize.min(refs.len());
-        let codec = PqCodec::train(&refs_slices, dim, pq_m, k, 20);
+        let codec = PqCodec::train(&refs_slices, dim, pq_m, k, 20, memory);
         let codes = codec.encode_batch(&refs_slices).ok()?;
         Some((codec, codes))
     }

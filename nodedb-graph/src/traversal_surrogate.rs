@@ -200,11 +200,12 @@ impl CsrIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_memory;
 
     /// `a -knows-> b -knows-> c` in `people`, plus `a -knows-> x` in `other`.
     /// Every node gets a surrogate except `x`, which deliberately has none.
     fn seeded_csr() -> CsrIndex {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         for (src, dst, coll) in [
             ("a", "b", "people"),
             ("b", "c", "people"),

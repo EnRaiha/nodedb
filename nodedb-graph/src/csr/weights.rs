@@ -221,10 +221,11 @@ pub fn extract_weight_from_properties(properties: &[u8]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_memory;
 
     #[test]
     fn unweighted_graph_has_no_weight_arrays() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "L", "b").unwrap();
         assert!(!csr.has_weights());
         assert!(csr.out_weights.is_none());
@@ -233,7 +234,7 @@ mod tests {
 
     #[test]
     fn weighted_edge_basic() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge_weighted("a", "ROAD", "b", 5.0).unwrap();
         csr.add_edge_weighted("b", "ROAD", "c", 3.0).unwrap();
         csr.add_edge("c", "ROAD", "d").unwrap(); // unweighted → 1.0
@@ -247,12 +248,13 @@ mod tests {
 
     #[test]
     fn weighted_edges_survive_compaction() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge_weighted("a", "R", "b", 2.5).unwrap();
         csr.add_edge_weighted("b", "R", "c", 7.0).unwrap();
         csr.add_edge("c", "R", "d").unwrap();
 
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         assert!(csr.has_weights());
         assert_eq!(csr.edge_weight("a", "R", "b"), Some(2.5));
@@ -262,7 +264,7 @@ mod tests {
 
     #[test]
     fn weighted_edge_remove_keeps_weights_consistent() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge_weighted("a", "R", "b", 2.0).unwrap();
         csr.add_edge_weighted("a", "R", "c", 3.0).unwrap();
         csr.add_edge_weighted("a", "R", "d", 4.0).unwrap();
@@ -276,10 +278,11 @@ mod tests {
 
     #[test]
     fn iter_out_edges_weighted_returns_weights() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge_weighted("a", "R", "b", 2.5).unwrap();
         csr.add_edge_weighted("a", "R", "c", 7.0).unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let edges: Vec<(u32, LocalNodeId, f64)> =
             csr.iter_out_edges_weighted(csr.local(0)).collect();
@@ -292,7 +295,7 @@ mod tests {
 
     #[test]
     fn mixed_weighted_unweighted_backfill() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
         assert!(!csr.has_weights());

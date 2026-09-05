@@ -15,6 +15,7 @@ use nodedb_columnar::memtable::ColumnData as SharedColumnData;
 use nodedb_columnar::predicate::ScanPredicate;
 use nodedb_columnar::reader::{DecodedColumn, SegmentReader};
 use nodedb_columnar::writer::SegmentWriter;
+use nodedb_mem::ScopedMemory;
 use nodedb_types::columnar::{ColumnDef, ColumnType as SharedColumnType, ColumnarSchema};
 
 use super::columnar_memtable::{
@@ -115,11 +116,12 @@ fn ts_column_to_shared(
 pub fn write_ts_drain_as_segment(
     drain: &ColumnarDrainResult,
     kek: Option<&nodedb_wal::crypto::WalEncryptionKey>,
+    memory: ScopedMemory,
 ) -> Result<Vec<u8>, nodedb_columnar::ColumnarError> {
     let shared_schema = ts_schema_to_shared(&drain.schema);
     let (shared_columns, row_count) = ts_drain_to_shared_columns(drain);
 
-    let writer = SegmentWriter::new(nodedb_columnar::writer::PROFILE_TIMESERIES);
+    let writer = SegmentWriter::new(nodedb_columnar::writer::PROFILE_TIMESERIES, memory);
     writer.write_segment(&shared_schema, &shared_columns, row_count, kek)
 }
 
@@ -272,6 +274,17 @@ mod tests {
     use super::super::columnar_memtable::{ColumnarMemtable, ColumnarMemtableConfig};
     use super::*;
 
+    /// `ScopedMemory` bound to the timeseries engine, backed by a real
+    /// governor with ample per-engine limits.
+    fn test_memory() -> ScopedMemory {
+        ScopedMemory::new(
+            crate::data::executor::core_loop::test_governor(),
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::TenantId::new(0),
+            nodedb_mem::EngineId::Timeseries,
+        )
+    }
+
     fn default_config() -> ColumnarMemtableConfig {
         ColumnarMemtableConfig {
             max_memory_bytes: crate::engine::timeseries::memtable::DEFAULT_MEMTABLE_BUDGET_BYTES,
@@ -319,7 +332,8 @@ mod tests {
         assert_eq!(drain.row_count, 100);
 
         // Write as shared segment.
-        let segment = write_ts_drain_as_segment(&drain, None).expect("write segment");
+        let segment =
+            write_ts_drain_as_segment(&drain, None, test_memory()).expect("write segment");
 
         // Read back and verify.
         let reader = nodedb_columnar::reader::SegmentReader::open(&segment).expect("open");
@@ -360,7 +374,7 @@ mod tests {
         }
 
         let drain = mt.drain();
-        let segment = write_ts_drain_as_segment(&drain, None).expect("write");
+        let segment = write_ts_drain_as_segment(&drain, None, test_memory()).expect("write");
         let stats = extract_timestamp_block_stats(&segment).expect("stats");
 
         assert_eq!(stats.len(), 1); // 50 rows < 1024 block size = 1 block.
@@ -383,7 +397,7 @@ mod tests {
             );
         }
         let drain = mt.drain();
-        write_ts_drain_as_segment(&drain, None).expect("write")
+        write_ts_drain_as_segment(&drain, None, test_memory()).expect("write")
     }
 
     #[test]
@@ -482,7 +496,7 @@ mod tests {
             assert_ne!(result, nodedb_types::timeseries::IngestResult::Rejected);
         }
         let drain = mt.drain();
-        write_ts_drain_as_segment(&drain, None).expect("write large-ts segment")
+        write_ts_drain_as_segment(&drain, None, test_memory()).expect("write large-ts segment")
     }
 
     /// end-to-end block skip with timestamps outside ±2^53.

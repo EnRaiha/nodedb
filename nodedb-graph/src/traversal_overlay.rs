@@ -247,10 +247,11 @@ mod tests {
     use crate::bfs_params::BfsParams;
     use crate::csr::{CsrIndex, Direction};
     use crate::overlay_delta::GraphOverlayDelta;
+    use crate::test_support::test_memory;
     use crate::traversal::DEFAULT_MAX_VISITED;
 
     fn base() -> CsrIndex {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
         csr
     }
@@ -303,7 +304,7 @@ mod tests {
     #[test]
     fn subgraph_includes_staged_and_skips_tombstone() {
         // Durable a->b (tombstoned) + a->c. Staged a->x.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
         csr.add_edge("a", "KNOWS", "c").unwrap();
         let mut ov = GraphOverlayDelta::new();

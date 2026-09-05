@@ -403,9 +403,15 @@ impl CoreLoop {
                     detail: format!("CSR serialize: {e}"),
                 })?;
 
+        let memory = nodedb_mem::ScopedMemory::new(
+            self.governor.clone(),
+            database_id,
+            tenant_id,
+            nodedb_mem::EngineId::Graph,
+        );
         let (tx, rx) = mpsc::sync_channel::<crate::Result<RebuildOutput>>(1);
         std::thread::spawn(move || {
-            let _ = tx.send(rebuild_csr_thread(snapshot_bytes));
+            let _ = tx.send(rebuild_csr_thread(snapshot_bytes, memory));
         });
 
         self.pending_reindex.push(PendingReindex {

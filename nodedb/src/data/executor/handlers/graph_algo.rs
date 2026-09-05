@@ -47,6 +47,12 @@ impl CoreLoop {
         }
 
         let database_id = task.request.database_id.as_u64();
+        let memory = nodedb_mem::ScopedMemory::new(
+            self.governor.clone(),
+            task.request.database_id,
+            TenantId::new(tid),
+            nodedb_mem::EngineId::Graph,
+        );
         let scoped_csr = match build_csr_for_collection(
             &self.edge_store,
             database_id,
@@ -54,6 +60,7 @@ impl CoreLoop {
             &params.collection,
             params.edge_label.as_deref(),
             None,
+            memory,
         ) {
             Ok(c) => c,
             Err(e) => return self.response_error(task, ErrorCode::from(e)),
@@ -90,12 +97,13 @@ pub(super) fn build_csr_for_collection(
     collection: &str,
     edge_label: Option<&str>,
     system_as_of: Option<i64>,
+    memory: nodedb_mem::ScopedMemory,
 ) -> crate::Result<CsrIndex> {
     let records = edge_store.scan_all_edges_decoded(system_as_of)?;
     let target_db = DatabaseId::new(database_id);
     let target_tid = TenantId::new(tid);
 
-    let mut csr = CsrIndex::new();
+    let mut csr = CsrIndex::new(memory);
 
     // Pass 1: intern endpoint nodes.
     for (rec_db, rec_tid, coll, src, label, dst, _props) in &records {

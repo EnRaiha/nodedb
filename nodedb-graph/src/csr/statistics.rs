@@ -93,11 +93,7 @@ impl CsrIndex {
 
         // Reserve memory for the two degree-distribution scratch arrays.
         let degree_bytes = 2 * n * size_of::<usize>();
-        let _degree_guard = self
-            .memory
-            .as_ref()
-            .map(|mem| mem.reserve(degree_bytes))
-            .transpose()?;
+        let _degree_guard = self.memory.reserve(degree_bytes)?;
 
         // Per-label counters.
         let mut label_edge_count: HashMap<u32, usize> = HashMap::new();
@@ -224,10 +220,11 @@ fn compute_histogram(degrees: &[usize]) -> DegreeHistogram {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_memory;
 
     #[test]
     fn statistics_empty_graph() {
-        let csr = CsrIndex::new();
+        let csr = CsrIndex::new(test_memory());
         let stats = csr.compute_statistics().unwrap();
         assert_eq!(stats.node_count, 0);
         assert_eq!(stats.edge_count, 0);
@@ -236,11 +233,12 @@ mod tests {
 
     #[test]
     fn statistics_basic() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
         csr.add_edge("b", "KNOWS", "c").unwrap();
         csr.add_edge("a", "LIKES", "c").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let stats = csr.compute_statistics().unwrap();
         assert_eq!(stats.node_count, 3);
@@ -258,12 +256,13 @@ mod tests {
 
     #[test]
     fn degree_histogram_values() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("a", "L", "c").unwrap();
         csr.add_edge("a", "L", "d").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let stats = csr.compute_statistics().unwrap();
         assert_eq!(stats.out_degree_histogram.min, 0);
@@ -273,11 +272,12 @@ mod tests {
 
     #[test]
     fn label_edge_count_direct() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
         csr.add_edge("b", "KNOWS", "c").unwrap();
         csr.add_edge("a", "LIKES", "c").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         assert_eq!(csr.label_edge_count("KNOWS"), 2);
         assert_eq!(csr.label_edge_count("LIKES"), 1);
@@ -286,11 +286,12 @@ mod tests {
 
     #[test]
     fn label_selectivity_values() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
         csr.add_edge("b", "KNOWS", "c").unwrap();
         csr.add_edge("a", "LIKES", "c").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let sel_knows = csr.label_selectivity("KNOWS");
         let sel_likes = csr.label_selectivity("LIKES");
@@ -302,9 +303,10 @@ mod tests {
 
     #[test]
     fn statistics_serde_roundtrip() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let stats = csr.compute_statistics().unwrap();
         let json = sonic_rs::to_string(&stats).unwrap();
@@ -315,7 +317,7 @@ mod tests {
 
     #[test]
     fn statistics_with_buffer_edges() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
         // Don't compact — edges in buffer.
         let stats = csr.compute_statistics().unwrap();

@@ -5,6 +5,8 @@
 //! Inverted File with Product Quantization: partition vectors into Voronoi
 //! cells using k-means centroids, PQ-compress within cells.
 
+use nodedb_mem::ScopedMemory;
+
 use crate::distance::{DistanceMetric, distance};
 use crate::hnsw::SearchResult;
 use crate::quantize::pq::PqCodec;
@@ -63,8 +65,9 @@ impl IvfPqIndex {
         }
     }
 
-    /// Train the index from a set of vectors.
-    pub fn train(&mut self, vectors: &[&[f32]]) {
+    /// Train the index from a set of vectors, tracking PQ codebook
+    /// allocations against `memory`.
+    pub fn train(&mut self, vectors: &[&[f32]], memory: ScopedMemory) {
         assert!(!vectors.is_empty());
         assert!(self.dim > 0);
         assert!(
@@ -95,6 +98,7 @@ impl IvfPqIndex {
             self.params.pq_m,
             self.params.pq_k,
             20,
+            memory,
         ));
     }
 
@@ -308,6 +312,7 @@ fn kmeans_centroids(data: &[&[f32]], dim: usize, k: usize, max_iter: usize) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_memory;
 
     fn make_vectors(n: usize, dim: usize) -> Vec<Vec<f32>> {
         (0..n)
@@ -330,7 +335,7 @@ mod tests {
                 metric: DistanceMetric::L2,
             },
         );
-        idx.train(&refs);
+        idx.train(&refs, test_memory());
         idx.add_batch(&refs);
 
         assert_eq!(idx.len(), 1000);

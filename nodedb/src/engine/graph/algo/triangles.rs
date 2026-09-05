@@ -123,9 +123,10 @@ fn tail_after(sorted: &[u32], val: u32) -> &[u32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::graph::test_support::test_scoped_memory;
 
     fn fully_connected_triangle() -> CsrIndex {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         for (s, d) in &[
             ("a", "b"),
             ("b", "a"),
@@ -136,7 +137,8 @@ mod tests {
         ] {
             csr.add_edge(s, "L", d).unwrap();
         }
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
         csr
     }
 
@@ -171,10 +173,11 @@ mod tests {
 
     #[test]
     fn triangle_no_triangles() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("b", "L", "c").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(
             &csr,
@@ -190,7 +193,7 @@ mod tests {
 
     #[test]
     fn triangle_two_triangles() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         for (s, d) in &[
             ("a", "b"),
             ("b", "a"),
@@ -205,7 +208,8 @@ mod tests {
         ] {
             csr.add_edge(s, "L", d).unwrap();
         }
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(
             &csr,
@@ -221,7 +225,7 @@ mod tests {
 
     #[test]
     fn triangle_empty() {
-        let csr = CsrIndex::new();
+        let csr = CsrIndex::new(test_scoped_memory());
         assert!(run(&csr, &AlgoParams::default()).is_empty());
     }
 

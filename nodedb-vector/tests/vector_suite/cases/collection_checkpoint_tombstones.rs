@@ -21,6 +21,8 @@ use nodedb_vector::DistanceMetric;
 use nodedb_vector::collection::VectorCollection;
 use nodedb_vector::hnsw::HnswParams;
 
+use crate::support::test_memory;
+
 fn params() -> HnswParams {
     HnswParams {
         metric: DistanceMetric::L2,
@@ -40,8 +42,8 @@ fn growing_segment_tombstones_survive_checkpoint_roundtrip() {
     assert_eq!(live_before, 8);
 
     let bytes = coll.checkpoint_to_bytes(None).unwrap();
-    let restored =
-        VectorCollection::from_checkpoint(&bytes, None).expect("checkpoint deserializes");
+    let restored = VectorCollection::from_checkpoint(&bytes, None, test_memory())
+        .expect("checkpoint deserializes");
 
     assert_eq!(
         restored.live_count(),
@@ -78,8 +80,8 @@ fn building_segment_tombstones_survive_checkpoint_roundtrip() {
     assert_eq!(live_before, 18);
 
     let bytes = coll.checkpoint_to_bytes(None).unwrap();
-    let restored =
-        VectorCollection::from_checkpoint(&bytes, None).expect("checkpoint deserializes");
+    let restored = VectorCollection::from_checkpoint(&bytes, None, test_memory())
+        .expect("checkpoint deserializes");
 
     assert_eq!(
         restored.live_count(),

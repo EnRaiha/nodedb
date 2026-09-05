@@ -24,6 +24,8 @@ pub mod lsm;
 mod mem_scope;
 pub mod posting;
 pub mod search;
+#[cfg(test)]
+mod test_support;
 
 pub use analyzer::{
     AnalyzerRegistry, EdgeNgramAnalyzer, KeywordAnalyzer, LanguageAnalyzer, NgramAnalyzer,

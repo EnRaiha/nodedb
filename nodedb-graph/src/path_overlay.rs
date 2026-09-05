@@ -257,6 +257,7 @@ mod tests {
     use crate::csr::CsrIndex;
     use crate::overlay_delta::GraphOverlayDelta;
     use crate::path_params::ShortestPathParams;
+    use crate::test_support::test_memory;
     use crate::traversal::DEFAULT_MAX_VISITED;
 
     fn params<'a>(
@@ -279,7 +280,7 @@ mod tests {
     /// staged B->C, so A->B->C must be found only with the overlay.
     #[test]
     fn staged_edge_completes_path() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
         let mut ov = GraphOverlayDelta::new();
         ov.stage_edge("b", "KNOWS", "c");
@@ -301,7 +302,7 @@ mod tests {
     /// participate as the meeting point.
     #[test]
     fn path_through_staged_only_node() {
-        let csr = CsrIndex::new();
+        let csr = CsrIndex::new(test_memory());
         let mut ov = GraphOverlayDelta::new();
         ov.stage_edge("a", "KNOWS", "x");
         ov.stage_edge("x", "KNOWS", "d");
@@ -317,7 +318,7 @@ mod tests {
     #[test]
     fn tombstone_forces_detour() {
         // Durable: a->d (direct), a->b, b->d. Tombstone a->d. Detour a->b->d.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "d").unwrap();
         csr.add_edge("a", "KNOWS", "b").unwrap();
         csr.add_edge("b", "KNOWS", "d").unwrap();
@@ -333,7 +334,7 @@ mod tests {
     /// A staged tombstone that removes the only path yields None.
     #[test]
     fn tombstone_removes_only_path() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "d").unwrap();
         let mut ov = GraphOverlayDelta::new();
         ov.stage_tombstone("a", "KNOWS", "d");
@@ -348,7 +349,7 @@ mod tests {
     /// small fixed graph (parity check).
     #[test]
     fn empty_overlay_matches_dense() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
         csr.add_edge("b", "KNOWS", "c").unwrap();
         csr.add_edge("c", "KNOWS", "d").unwrap();
@@ -365,7 +366,7 @@ mod tests {
 
     #[test]
     fn src_equals_dst() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
         let mut ov = GraphOverlayDelta::new();
         ov.stage_edge("a", "KNOWS", "x");
@@ -377,7 +378,7 @@ mod tests {
 
     #[test]
     fn unreachable_is_none() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_memory());
         csr.add_edge("a", "KNOWS", "b").unwrap();
         let mut ov = GraphOverlayDelta::new();
         ov.stage_edge("m", "KNOWS", "n");

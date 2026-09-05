@@ -259,6 +259,7 @@ impl VectorCollection {
     pub fn from_checkpoint(
         bytes: &[u8],
         kek: Option<&nodedb_wal::crypto::WalEncryptionKey>,
+        memory: nodedb_mem::ScopedMemory,
     ) -> Result<Self, VectorError> {
         let is_encrypted = bytes.len() >= 4 && bytes[0..4] == SEGV_MAGIC;
 
@@ -329,7 +330,7 @@ impl VectorCollection {
             })?;
             let pq = match (&ss.pq_bytes, &ss.pq_codes) {
                 (Some(bytes), Some(codes)) => Some((
-                    PqCodec::from_bytes(bytes).map_err(|e| {
+                    PqCodec::from_bytes(bytes, memory.clone()).map_err(|e| {
                         VectorError::CheckpointDeserializationError {
                             detail: format!("PQ codec decode: {e}"),
                         }
@@ -478,6 +479,7 @@ mod tests {
     use crate::collection::lifecycle::VectorCollection;
     use crate::distance::DistanceMetric;
     use crate::hnsw::HnswParams;
+    use crate::test_support::test_memory;
 
     /// SQ8 calibration data must survive a checkpoint round-trip without
     /// being recomputed. Verifies that the O(N*dim) rebuild-on-restart bug
@@ -508,7 +510,7 @@ mod tests {
         for v in &req.vectors {
             idx.insert(v.clone()).unwrap();
         }
-        coll.complete_build(req.segment_id, idx);
+        coll.complete_build(req.segment_id, idx, test_memory());
 
         let sealed = coll.sealed_segments();
         assert!(!sealed.is_empty(), "expected at least one sealed segment");
@@ -521,7 +523,7 @@ mod tests {
         let orig_bytes = orig_sq8.0.to_bytes();
 
         let checkpoint = coll.checkpoint_to_bytes(None).unwrap();
-        let restored = VectorCollection::from_checkpoint(&checkpoint, None).unwrap();
+        let restored = VectorCollection::from_checkpoint(&checkpoint, None, test_memory()).unwrap();
 
         let restored_sealed = restored.sealed_segments();
         assert!(!restored_sealed.is_empty());
@@ -552,7 +554,7 @@ mod tests {
             coll.insert(vec![i as f32, 0.0, 0.0]);
         }
         let bytes = coll.checkpoint_to_bytes(None).unwrap();
-        let restored = VectorCollection::from_checkpoint(&bytes, None).unwrap();
+        let restored = VectorCollection::from_checkpoint(&bytes, None, test_memory()).unwrap();
         assert_eq!(restored.len(), 50);
         assert_eq!(restored.dim(), 3);
 
@@ -587,7 +589,7 @@ mod tests {
         );
 
         let bytes = coll.checkpoint_to_bytes(None).unwrap();
-        let restored = VectorCollection::from_checkpoint(&bytes, None).unwrap();
+        let restored = VectorCollection::from_checkpoint(&bytes, None, test_memory()).unwrap();
         assert_eq!(
             restored.checkpoint_wal_lsn(),
             42,
@@ -640,7 +642,7 @@ mod tests {
         }
 
         let bytes = coll.checkpoint_to_bytes(None).unwrap();
-        let restored = VectorCollection::from_checkpoint(&bytes, None).unwrap();
+        let restored = VectorCollection::from_checkpoint(&bytes, None, test_memory()).unwrap();
 
         let pred = FilterPredicate::Eq {
             field: "category".to_string(),

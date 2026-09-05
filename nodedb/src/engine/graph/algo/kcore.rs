@@ -105,11 +105,12 @@ pub fn run(csr: &CsrIndex) -> AlgoResultBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::graph::test_support::test_scoped_memory;
 
     #[test]
     fn kcore_triangle() {
         // Fully connected triangle: each node has degree 2 → all in 2-core.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         for (s, d) in &[
             ("a", "b"),
             ("b", "a"),
@@ -120,7 +121,8 @@ mod tests {
         ] {
             csr.add_edge(s, "L", d).unwrap();
         }
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr);
         let json = batch.to_json().unwrap();
@@ -135,11 +137,12 @@ mod tests {
     fn kcore_star() {
         // Hub a connects to b, c, d. a has degree 3, leaves have degree 1.
         // 1-core includes all. 2-core: none (removing leaves drops a to 0).
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_edge("a", "L", "c").unwrap();
         csr.add_edge("a", "L", "d").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr);
         let json = batch.to_json().unwrap();
@@ -163,7 +166,7 @@ mod tests {
     fn kcore_with_dense_subgraph() {
         // K4 (a,b,c,d fully connected) + pendant e connected only to a.
         // K4 nodes: coreness 3. e: coreness 1.
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         let k4 = ["a", "b", "c", "d"];
         for i in 0..4 {
             for j in 0..4 {
@@ -174,7 +177,8 @@ mod tests {
         }
         csr.add_edge("a", "L", "e").unwrap();
         csr.add_edge("e", "L", "a").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr);
         let json = batch.to_json().unwrap();
@@ -198,10 +202,11 @@ mod tests {
 
     #[test]
     fn kcore_isolated_node() {
-        let mut csr = CsrIndex::new();
+        let mut csr = CsrIndex::new(test_scoped_memory());
         csr.add_edge("a", "L", "b").unwrap();
         csr.add_node("isolated").unwrap();
-        csr.compact().expect("no governor, cannot fail");
+        csr.compact()
+            .expect("test governor ceiling covers this reservation");
 
         let batch = run(&csr);
         let json = batch.to_json().unwrap();
@@ -222,7 +227,7 @@ mod tests {
 
     #[test]
     fn kcore_empty() {
-        let csr = CsrIndex::new();
+        let csr = CsrIndex::new(test_scoped_memory());
         assert!(run(&csr).is_empty());
     }
 }

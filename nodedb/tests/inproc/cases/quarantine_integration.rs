@@ -223,15 +223,20 @@ fn quarantine_fts_corrupt_segment_two_strike_quarantine() {
 
 #[test]
 fn quarantine_vector_corrupt_crc_quarantines_and_renames_file() {
-    use nodedb::storage::quarantine::engines::open_vector_segment_with_quarantine;
+    use nodedb::storage::quarantine::engines::{
+        VectorQuarantineOpen, open_vector_segment_with_quarantine,
+    };
+    use nodedb_mem::EngineId;
+    use nodedb_vector::error::VectorError;
     use nodedb_vector::mmap_segment::{MmapVectorSegment, VectorSegmentDropPolicy};
 
     let tmp = tempfile::tempdir().unwrap();
     let good_path = tmp.path().join("good.seg");
     let corrupt_path = tmp.path().join("corrupt.seg");
+    let memory = super::support::memory::test_scoped_memory(EngineId::Vector);
 
     let v = vec![1.0f32, 2.0, 3.0];
-    MmapVectorSegment::create(tmp.path(), "good.seg", 3, &[&v]).unwrap();
+    MmapVectorSegment::create(tmp.path(), "good.seg", 3, &[&v], &memory).unwrap();
 
     // Corrupt the CRC in the footer (FOOTER_SIZE=46, CRC at bytes [34..38] from footer start).
     let mut bytes = std::fs::read(&good_path).unwrap();
@@ -244,15 +249,29 @@ fn quarantine_vector_corrupt_crc_quarantines_and_renames_file() {
 
     assert!(
         matches!(
-            open_vector_segment_with_quarantine(&reg, &corrupt_path, policy, "vecdb", "s1"),
-            Err(VectorOrQuarantine::Io(_))
+            open_vector_segment_with_quarantine(VectorQuarantineOpen {
+                registry: &reg,
+                path: &corrupt_path,
+                policy,
+                collection: "vecdb",
+                segment_id: "s1",
+                memory: &memory,
+            }),
+            Err(VectorOrQuarantine::Vector(VectorError::SegmentIo(_)))
         ),
-        "first strike must be IoError"
+        "first strike must be a SegmentIo VectorError"
     );
 
     assert!(
         matches!(
-            open_vector_segment_with_quarantine(&reg, &corrupt_path, policy, "vecdb", "s1"),
+            open_vector_segment_with_quarantine(VectorQuarantineOpen {
+                registry: &reg,
+                path: &corrupt_path,
+                policy,
+                collection: "vecdb",
+                segment_id: "s1",
+                memory: &memory,
+            }),
             Err(VectorOrQuarantine::Quarantined(_))
         ),
         "second strike must be Quarantined"
@@ -268,7 +287,15 @@ fn quarantine_vector_corrupt_crc_quarantines_and_renames_file() {
 
     // Good segment still readable (is_ok checked by verifying no err).
     assert!(
-        open_vector_segment_with_quarantine(&reg, &good_path, policy, "vecdb", "s2").is_ok(),
+        open_vector_segment_with_quarantine(VectorQuarantineOpen {
+            registry: &reg,
+            path: &good_path,
+            policy,
+            collection: "vecdb",
+            segment_id: "s2",
+            memory: &memory,
+        })
+        .is_ok(),
         "good segment must remain readable"
     );
 }

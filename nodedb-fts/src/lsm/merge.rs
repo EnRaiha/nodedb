@@ -20,14 +20,14 @@ use nodedb_mem::ScopedMemory;
 /// The result is a sorted list of `(term, blocks)` suitable for
 /// `segment::writer::build_from_blocks`.
 ///
-/// When `memory` is `Some`, the `Vec::with_capacity` for the result is
-/// budgeted via [`ScopedMemory::reserve`] before the allocation.
-/// If the budget is exceeded the allocation still proceeds — the scope
-/// serves as an accounting and backpressure signal; callers that need hard
-/// rejection should check pressure before dispatching the operation.
+/// The `Vec::with_capacity` for the result is budgeted via
+/// [`ScopedMemory::reserve`] before the allocation. If the budget is
+/// exceeded the allocation still proceeds — the scope serves as an
+/// accounting and backpressure signal; callers that need hard rejection
+/// check pressure before dispatching the operation.
 pub fn merge_segments(
     segments: &[SegmentReader],
-    memory: Option<&ScopedMemory>,
+    memory: &ScopedMemory,
 ) -> Vec<(String, Vec<PostingBlock>)> {
     // Collect all unique terms across all segments.
     let mut all_terms = BTreeSet::new();
@@ -37,11 +37,9 @@ pub fn merge_segments(
         }
     }
 
-    let _result_guard = memory.and_then(|mem| {
-        let bytes = all_terms.len()
-            * (std::mem::size_of::<String>() + std::mem::size_of::<Vec<PostingBlock>>());
-        mem.reserve(bytes).ok()
-    });
+    let bytes = all_terms.len()
+        * (std::mem::size_of::<String>() + std::mem::size_of::<Vec<PostingBlock>>());
+    let _result_guard = memory.reserve(bytes).ok();
 
     let mut result = Vec::with_capacity(all_terms.len());
 
@@ -122,6 +120,7 @@ mod tests {
     use super::*;
     use crate::codec::smallfloat;
     use crate::lsm::segment::writer;
+    use crate::test_support::test_memory;
 
     fn cp(doc_id: u32, tf: u32) -> CompactPosting {
         CompactPosting {
@@ -150,7 +149,7 @@ mod tests {
         let r1 = SegmentReader::open(seg1).expect("seg1 must be valid");
         let r2 = SegmentReader::open(seg2).expect("seg2 must be valid");
 
-        let merged = merge_segments(&[r1, r2], None);
+        let merged = merge_segments(&[r1, r2], &test_memory());
         let terms: Vec<&str> = merged.iter().map(|(t, _)| t.as_str()).collect();
         assert!(terms.contains(&"hello"));
         assert!(terms.contains(&"world"));

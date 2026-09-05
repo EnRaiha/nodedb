@@ -52,7 +52,7 @@ impl<B: FtsBackend> FtsIndex<B> {
                 collection,
                 self.memtable(),
                 &tokens,
-                self.governor.as_ref(),
+                &self.governor,
             )?;
             if !term_blocks.is_empty() && term_blocks[0].df > 0 {
                 let mut postings = Vec::new();
@@ -79,6 +79,7 @@ impl<B: FtsBackend> FtsIndex<B> {
 mod tests {
     use crate::backend::memory::MemoryBackend;
     use crate::index::FtsIndex;
+    use crate::test_support::test_governor;
     use nodedb_types::Surrogate;
 
     const DB: u64 = 0;
@@ -86,7 +87,7 @@ mod tests {
 
     #[test]
     fn fuzzy_lookup_finds_close_term() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "docs", Surrogate(1), "distributed database systems")
             .unwrap();
 
@@ -97,7 +98,7 @@ mod tests {
 
     #[test]
     fn fuzzy_lookup_no_match() {
-        let idx = FtsIndex::new(MemoryBackend::new());
+        let idx = FtsIndex::new(MemoryBackend::new(), test_governor());
         idx.index_document(DB, T, "docs", Surrogate(1), "hello world")
             .unwrap();
 

@@ -344,7 +344,8 @@ mod tests {
     use super::super::types::DecodedColumn;
     use crate::memtable::ColumnarMemtable;
     use crate::predicate::ScanPredicate;
-    use crate::writer::SegmentWriter;
+    use crate::test_support::test_memory;
+    use crate::writer::{PROFILE_PLAIN, SegmentWriter};
 
     #[test]
     fn varlen_offset_table_range_must_fit_payload() {
@@ -392,7 +393,7 @@ mod tests {
         }
 
         let (schema, columns, row_count) = mt.drain();
-        SegmentWriter::plain()
+        SegmentWriter::new(PROFILE_PLAIN, test_memory())
             .write_segment(&schema, &columns, row_count, None)
             .expect("write")
     }
@@ -626,7 +627,7 @@ mod tests {
         }
 
         let (schema, columns, row_count) = mt.drain();
-        let segment = crate::writer::SegmentWriter::plain()
+        let segment = crate::writer::SegmentWriter::new(PROFILE_PLAIN, test_memory())
             .write_segment(&schema, &columns, row_count, None)
             .expect("write");
 
@@ -689,7 +690,7 @@ mod tests {
         assert!(matches!(mt.columns()[1], ColumnData::DictEncoded { .. }));
 
         let (schema, columns, row_count) = mt.drain();
-        let segment = SegmentWriter::plain()
+        let segment = SegmentWriter::new(PROFILE_PLAIN, test_memory())
             .write_segment(&schema, &columns, row_count, None)
             .expect("write segment");
 
@@ -748,7 +749,7 @@ mod tests {
         mt.try_dict_encode_columns(DICT_ENCODE_MAX_CARDINALITY);
 
         let (schema, columns, row_count) = mt.drain();
-        let segment = SegmentWriter::plain()
+        let segment = SegmentWriter::new(PROFILE_PLAIN, test_memory())
             .write_segment(&schema, &columns, row_count, None)
             .expect("write");
 

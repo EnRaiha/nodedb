@@ -331,7 +331,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test-inverted.redb");
         let db = Arc::new(Database::create(&path).unwrap());
-        let idx = InvertedIndex::open(db).unwrap();
+        let idx =
+            InvertedIndex::open(db, crate::data::executor::core_loop::test_governor()).unwrap();
         (idx, dir)
     }
 

@@ -14,6 +14,7 @@
 //! table (`lut[sub][centroid]`).
 
 use nodedb_codec::vector_quant::layout::UnifiedQuantizedVectorRef;
+use nodedb_mem::ScopedMemory;
 
 use crate::{
     quantize::pq::PqCodec,
@@ -45,6 +46,9 @@ pub struct PqRerank {
     m: usize,
     k: usize,
     max_iter: usize,
+    /// Charges the codebooks a future `train()` call learns against the
+    /// bound database, tenant, and engine budget.
+    memory: ScopedMemory,
 }
 
 impl PqRerank {
@@ -54,18 +58,19 @@ impl PqRerank {
     /// Defaults used by higher-level callers: `m = 8`, `k = 256`.
     /// `encode` / `distance_prepared` return `RerankError::NotTrained` until
     /// `train()` has been called.
-    pub fn new(dim: usize, m: usize, k: usize) -> Self {
+    pub fn new(dim: usize, m: usize, k: usize, memory: ScopedMemory) -> Self {
         Self {
             codec: None,
             dim,
             m,
             k,
             max_iter: 25,
+            memory,
         }
     }
 
     /// Construct from a pre-trained codec (used when restoring from snapshot).
-    pub fn from_codec(codec: PqCodec) -> Self {
+    pub fn from_codec(codec: PqCodec, memory: ScopedMemory) -> Self {
         let dim = codec.dim;
         let m = codec.m;
         let k = codec.k;
@@ -75,6 +80,7 @@ impl PqRerank {
             m,
             k,
             max_iter: 25,
+            memory,
         }
     }
 }
@@ -214,7 +220,14 @@ impl RerankCodec for PqRerank {
                 samples.len()
             )));
         }
-        let codec = PqCodec::train(samples, self.dim, self.m, self.k, self.max_iter);
+        let codec = PqCodec::train(
+            samples,
+            self.dim,
+            self.m,
+            self.k,
+            self.max_iter,
+            self.memory.clone(),
+        );
         self.codec = Some(codec);
         Ok(())
     }
@@ -225,6 +238,7 @@ impl RerankCodec for PqRerank {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_memory;
 
     const DIM: usize = 32;
     const M: usize = 4;
@@ -240,7 +254,7 @@ mod tests {
     fn trained() -> PqRerank {
         let vecs: Vec<Vec<f32>> = (0..N).map(|i| det_vec(i, DIM)).collect();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let mut codec = PqRerank::new(DIM, M, K);
+        let mut codec = PqRerank::new(DIM, M, K, test_memory());
         codec.train(&refs).expect("train must succeed");
         codec
     }
@@ -260,7 +274,7 @@ mod tests {
 
     #[test]
     fn encode_before_train_returns_not_trained() {
-        let codec = PqRerank::new(DIM, M, K);
+        let codec = PqRerank::new(DIM, M, K, test_memory());
         let v = det_vec(0, DIM);
         let err = codec.encode(&v).unwrap_err();
         let msg = format!("{err}");
@@ -276,7 +290,7 @@ mod tests {
         let mut refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
         let bad = det_vec(0, DIM + 4);
         refs.push(bad.as_slice());
-        let mut codec = PqRerank::new(DIM, M, K);
+        let mut codec = PqRerank::new(DIM, M, K, test_memory());
         let err = codec.train(&refs).unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -290,7 +304,7 @@ mod tests {
         // dim=33, m=4: 33 % 4 != 0
         let vecs: Vec<Vec<f32>> = (0..16).map(|i| det_vec(i, 33)).collect();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let mut codec = PqRerank::new(33, 4, 8);
+        let mut codec = PqRerank::new(33, 4, 8, test_memory());
         let err = codec.train(&refs).unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -304,7 +318,7 @@ mod tests {
         // k=8 but only 4 samples
         let vecs: Vec<Vec<f32>> = (0..4).map(|i| det_vec(i, DIM)).collect();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
-        let mut codec = PqRerank::new(DIM, M, 8);
+        let mut codec = PqRerank::new(DIM, M, 8, test_memory());
         let err = codec.train(&refs).unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -315,7 +329,7 @@ mod tests {
 
     #[test]
     fn name_is_pq() {
-        let codec = PqRerank::new(DIM, M, K);
+        let codec = PqRerank::new(DIM, M, K, test_memory());
         assert_eq!(codec.name(), CodecName::Pq);
     }
 }
