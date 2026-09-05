@@ -84,9 +84,9 @@ for rel in "${scan_paths[@]}"; do
         esac
 
         # Skip if inside a #[cfg(test)] mod tests { ... } block.
-        last_cfg=$(awk -v n="$lineno" 'NR<=n && /^#\[cfg\(test\)\]/ {x=NR} END{print x+0}' "$file")
+        last_cfg=$(awk -v n="$lineno" 'NR<=n && /^[[:space:]]*#\[cfg\(test\)\]/ {x=NR} END{print x+0}' "$file")
         if [ "$last_cfg" -gt 0 ]; then
-            close_after=$(awk -v a="$last_cfg" -v b="$lineno" 'NR>a && NR<b && /^}/ {x=NR} END{print x+0}' "$file")
+            close_after=$(awk -v a="$last_cfg" -v b="$lineno" 'NR>a && NR<b && /^[[:space:]]*}/ {x=NR} END{print x+0}' "$file")
             [ "$close_after" -eq 0 ] && continue
         fi
 
