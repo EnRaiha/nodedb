@@ -30,6 +30,7 @@ use crate::budget::Budget;
 use crate::engine::EngineId;
 use crate::engine_limits::EngineLimits;
 use crate::error::{MemError, Result};
+use crate::over_release::OverRelease;
 use crate::pressure::{PressureLevel, PressureThresholds};
 use crate::reservation_token::ReservationToken;
 use crate::reserve_scope::ReserveScope;
@@ -42,6 +43,21 @@ use crate::scoped_budget::{ScopedBudget, clear_scoped_limit, set_scoped_limit};
 pub struct GlobalCounter {
     pub(crate) allocated: AtomicUsize,
     pub(crate) ceiling: usize,
+    /// Per-layer over-release counters. Every releaser already holds this
+    /// `Arc<GlobalCounter>`, so no new plumbing is needed to reach it from
+    /// `ReservationToken::drop` or `ReserveScope::drop`.
+    pub(crate) over_release: OverRelease,
+}
+
+impl GlobalCounter {
+    /// Build a fresh counter for a governor with the given ceiling.
+    pub(crate) fn new(ceiling: usize) -> Self {
+        Self {
+            allocated: AtomicUsize::new(0),
+            ceiling,
+            over_release: OverRelease::new(),
+        }
+    }
 }
 
 impl std::fmt::Debug for GlobalCounter {
@@ -49,6 +65,7 @@ impl std::fmt::Debug for GlobalCounter {
         f.debug_struct("GlobalCounter")
             .field("allocated", &self.allocated.load(Ordering::Relaxed))
             .field("ceiling", &self.ceiling)
+            .field("over_release", &self.over_release)
             .finish()
     }
 }
@@ -115,10 +132,7 @@ impl MemoryGovernor {
         let limits = config.engine_limits.as_array();
         let budgets: [Budget; EngineId::COUNT] = std::array::from_fn(|i| Budget::new(limits[i]));
 
-        let global_counter = Arc::new(GlobalCounter {
-            allocated: AtomicUsize::new(0),
-            ceiling: config.global_ceiling,
-        });
+        let global_counter = Arc::new(GlobalCounter::new(config.global_ceiling));
 
         Ok(Self {
             budgets,
@@ -225,7 +239,8 @@ impl MemoryGovernor {
         engine: EngineId,
         size: usize,
     ) -> Result<ReservationToken> {
-        let mut scope = ReserveScope::new(Arc::clone(&self.global_counter), size);
+        let identity = crate::over_release::ReleaseIdentity { db, tenant, engine };
+        let mut scope = ReserveScope::new(Arc::clone(&self.global_counter), size, identity);
 
         // ── Layer 1: global ceiling ───────────────────────────────────────────
         scope.try_credit_global()?;
@@ -320,14 +335,34 @@ impl MemoryGovernor {
         self.budgets.iter().map(|b| b.allocated()).sum()
     }
 
-    /// Total number of over-release events observed across all
-    /// per-engine budgets. A non-zero value signals at least one
-    /// call-site is releasing more bytes than it reserved — the
-    /// "memory release exceeds allocation" warning class. Per-engine
-    /// `allocated()` saturates to zero on over-release, so this
-    /// counter is the only post-hoc observable for the bug.
+    /// Total number of over-release events observed across every layer
+    /// (global, database, tenant, engine). A non-zero value signals at
+    /// least one call site is releasing more bytes than it reserved — the
+    /// "memory release exceeds allocation" warning class. A saturating
+    /// release clamps the affected counter to zero, so this is the only
+    /// post-hoc observable for the bug.
     pub fn total_over_release_count(&self) -> usize {
-        self.budgets.iter().map(|b| b.over_release_count()).sum()
+        self.global_counter.over_release.total()
+    }
+
+    /// Over-release events recorded against the global ceiling counter.
+    pub fn global_over_release_count(&self) -> usize {
+        self.global_counter.over_release.global()
+    }
+
+    /// Over-release events recorded against any per-database counter.
+    pub fn database_over_release_count(&self) -> usize {
+        self.global_counter.over_release.database()
+    }
+
+    /// Over-release events recorded against any per-tenant counter.
+    pub fn tenant_over_release_count(&self) -> usize {
+        self.global_counter.over_release.tenant()
+    }
+
+    /// Over-release events recorded against any per-engine counter.
+    pub fn engine_over_release_count(&self) -> usize {
+        self.global_counter.over_release.engine()
     }
 
     /// Global utilization as a percentage (0-100). Reads the global counter

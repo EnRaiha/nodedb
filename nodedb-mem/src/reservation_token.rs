@@ -12,7 +12,8 @@
 //!
 //! # Panic safety
 //!
-//! `Drop` uses atomic operations only and never panics.
+//! `Drop` uses atomic operations and a `tracing::warn!` on over-release.
+//! Neither path panics.
 //!
 //! # `mem::forget`
 //!
@@ -26,6 +27,7 @@ use nodedb_types::{DatabaseId, TenantId};
 
 use crate::engine::EngineId;
 use crate::governor::GlobalCounter;
+use crate::over_release::{Layer, ReleaseIdentity, release_layer};
 
 /// Holds a memory reservation across the four budget layers.
 ///
@@ -118,17 +120,31 @@ impl Drop for ReservationToken {
         // counter to ~usize::MAX, which every utilization reader treats
         // as 100 % → permanent Emergency pressure → suspended SPSC reads
         // → schema-register barrier deadlock. Clamping keeps an
-        // over-release a harmless zero instead.
+        // over-release a harmless zero instead, and the shortfall the
+        // clamp would otherwise hide is counted against the matching
+        // layer on `self.global_counter.over_release`.
+        let identity = ReleaseIdentity {
+            db: self.db,
+            tenant: self.tenant,
+            engine: self.engine,
+        };
+        let over_release = &self.global_counter.over_release;
         if let Some(ref counter) = self.engine_counter {
-            crate::budget::atomic_saturating_sub(counter, size);
+            release_layer(counter, size, Layer::Engine, over_release, identity);
         }
         if let Some(ref counter) = self.tenant_counter {
-            crate::budget::atomic_saturating_sub(counter, size);
+            release_layer(counter, size, Layer::Tenant, over_release, identity);
         }
         if let Some(ref counter) = self.database_counter {
-            crate::budget::atomic_saturating_sub(counter, size);
+            release_layer(counter, size, Layer::Database, over_release, identity);
         }
-        crate::budget::atomic_saturating_sub(&self.global_counter.allocated, size);
+        release_layer(
+            &self.global_counter.allocated,
+            size,
+            Layer::Global,
+            over_release,
+            identity,
+        );
     }
 }
 
@@ -159,10 +175,11 @@ mod tests {
     }
 
     fn make_global(val: usize) -> Arc<GlobalCounter> {
-        Arc::new(GlobalCounter {
-            allocated: AtomicUsize::new(val),
-            ceiling: 1024 * 1024,
-        })
+        let global = GlobalCounter::new(1024 * 1024);
+        global
+            .allocated
+            .store(val, std::sync::atomic::Ordering::Relaxed);
+        Arc::new(global)
     }
 
     #[test]
@@ -273,6 +290,136 @@ mod tests {
         // returns to zero normally — proving the drop still works where
         // the counter is consistent.
         assert_eq!(tenant, 0, "tenant counter should release normally to 0");
+    }
+
+    /// Build a governor whose global ceiling covers every engine's uniform
+    /// per-engine limit — the shape the governor's config check demands
+    /// (`EngineLimits::total() <= global_ceiling`).
+    fn generous_governor(per_engine: usize) -> crate::governor::MemoryGovernor {
+        crate::governor::MemoryGovernor::new(crate::governor::GovernorConfig {
+            global_ceiling: per_engine * EngineId::ALL.len(),
+            engine_limits: crate::engine_limits::EngineLimits::uniform(per_engine),
+        })
+        .expect("uniform limits always satisfy the global-ceiling check")
+    }
+
+    #[test]
+    fn second_drop_over_the_same_engine_counter_is_counted() {
+        // Two tokens share one engine counter that was only ever credited
+        // once (100 bytes) — the shape of a double-release: the first
+        // token's drop is the legitimate release, so by the time the
+        // second token drops, the bytes it asks to release are already
+        // gone. The live release path must count that, not silently clamp
+        // it away.
+        let global = make_global(100);
+        let engine_ctr = make_counter(100);
+
+        let first = ReservationToken::new(ReservationParams {
+            global_counter: Arc::clone(&global),
+            database_counter: None,
+            tenant_counter: None,
+            engine_counter: Some(Arc::clone(&engine_ctr)),
+            size: 100,
+            db: DatabaseId::DEFAULT,
+            tenant: TenantId::new(1),
+            engine: EngineId::Vector,
+        });
+        let second = ReservationToken::new(ReservationParams {
+            global_counter: Arc::clone(&global),
+            database_counter: None,
+            tenant_counter: None,
+            engine_counter: Some(Arc::clone(&engine_ctr)),
+            size: 100,
+            db: DatabaseId::DEFAULT,
+            tenant: TenantId::new(1),
+            engine: EngineId::Vector,
+        });
+
+        drop(first);
+        assert_eq!(
+            global.over_release.total(),
+            0,
+            "the first drop is a clean release of the only 100 bytes credited"
+        );
+
+        drop(second);
+        assert!(
+            global.over_release.engine() > 0,
+            "the second drop releases 100 bytes the engine counter no \
+             longer holds — the live-path over-release the detector exists \
+             to catch"
+        );
+        assert_eq!(
+            global.over_release.global(),
+            1,
+            "the global counter is credited once and released twice, so it \
+             over-releases alongside the engine layer"
+        );
+        assert_eq!(
+            global.over_release.total(),
+            2,
+            "total() sums the layers, and this drop drifts both the engine \
+             and the global counter"
+        );
+        assert_eq!(
+            global.over_release.database(),
+            0,
+            "a token with no database counter cannot drift that layer"
+        );
+        assert_eq!(global.over_release.tenant(), 0);
+    }
+
+    #[test]
+    fn clean_reserve_and_drop_leaves_every_over_release_counter_at_zero() {
+        let gov = generous_governor(1024);
+        let token = gov
+            .try_reserve(DatabaseId::DEFAULT, TenantId::new(1), EngineId::Vector, 100)
+            .unwrap();
+        drop(token);
+
+        assert_eq!(gov.total_over_release_count(), 0);
+        assert_eq!(gov.global_over_release_count(), 0);
+        assert_eq!(gov.database_over_release_count(), 0);
+        assert_eq!(gov.tenant_over_release_count(), 0);
+        assert_eq!(gov.engine_over_release_count(), 0);
+    }
+
+    #[test]
+    fn over_release_still_clamps_the_counter_to_zero_never_wrapping() {
+        // The detector counts the event; it must not change the clamp
+        // behaviour the counter itself relies on to avoid reading as a
+        // wrapped-to-usize::MAX 100% utilization.
+        let global = make_global(100);
+        let engine_ctr = make_counter(100);
+
+        let first = ReservationToken::new(ReservationParams {
+            global_counter: Arc::clone(&global),
+            database_counter: None,
+            tenant_counter: None,
+            engine_counter: Some(Arc::clone(&engine_ctr)),
+            size: 100,
+            db: DatabaseId::DEFAULT,
+            tenant: TenantId::new(1),
+            engine: EngineId::Vector,
+        });
+        let second = ReservationToken::new(ReservationParams {
+            global_counter: Arc::clone(&global),
+            database_counter: None,
+            tenant_counter: None,
+            engine_counter: Some(Arc::clone(&engine_ctr)),
+            size: 100,
+            db: DatabaseId::DEFAULT,
+            tenant: TenantId::new(1),
+            engine: EngineId::Vector,
+        });
+        drop(first);
+        drop(second);
+
+        assert_eq!(
+            engine_ctr.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "an over-release must saturate at zero, never wrap toward usize::MAX"
+        );
     }
 
     #[test]

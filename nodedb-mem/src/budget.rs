@@ -13,16 +13,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// which every utilization reader then interprets as 100 % → permanent
 /// Emergency pressure. All release sites must go through this so an
 /// over-release is at worst a saturated zero, never a wrapped maximum.
-pub(crate) fn atomic_saturating_sub(counter: &AtomicUsize, size: usize) {
+///
+/// Returns the shortfall: `size.saturating_sub(current)` at the CAS that
+/// succeeds. Zero means the release was clean. A nonzero shortfall is the
+/// number of bytes the caller released that this counter never held — the
+/// caller records it against the matching `Layer` on `OverRelease`.
+pub(crate) fn atomic_saturating_sub(counter: &AtomicUsize, size: usize) -> usize {
     if size == 0 {
-        return;
+        return 0;
     }
     let mut current = counter.load(Ordering::Acquire);
     loop {
         let new_val = current.saturating_sub(size);
         match counter.compare_exchange_weak(current, new_val, Ordering::Release, Ordering::Relaxed)
         {
-            Ok(_) => return,
+            Ok(_) => return size.saturating_sub(current),
             Err(actual) => current = actual,
         }
     }
@@ -49,13 +54,6 @@ pub struct Budget {
 
     /// Number of times an allocation was rejected due to budget exhaustion.
     rejection_count: AtomicUsize,
-
-    /// Number of `release(size)` calls where `size > current` — the
-    /// accounting-drift symptom. Saturating the per-engine counter
-    /// to zero hides the drift from `allocated()`, so this counter
-    /// is the only observable signal that the call-site is
-    /// over-releasing.
-    over_release_count: AtomicUsize,
 }
 
 impl Budget {
@@ -66,7 +64,6 @@ impl Budget {
             allocated: Arc::new(AtomicUsize::new(0)),
             peak: AtomicUsize::new(0),
             rejection_count: AtomicUsize::new(0),
-            over_release_count: AtomicUsize::new(0),
         }
     }
 
@@ -125,36 +122,6 @@ impl Budget {
         }
     }
 
-    /// Release `size` bytes back to the budget.
-    ///
-    /// Saturates to zero if `size` exceeds the current allocation (which can
-    /// happen when data is replayed from WAL without a matching reservation).
-    pub fn release(&self, size: usize) {
-        loop {
-            let current = self.allocated.load(Ordering::Acquire);
-            let new_val = current.saturating_sub(size);
-            match self.allocated.compare_exchange_weak(
-                current,
-                new_val,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    if size > current {
-                        self.over_release_count.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(
-                            released = size,
-                            allocated = current,
-                            "memory release exceeds allocation (WAL replay or accounting drift)"
-                        );
-                    }
-                    return;
-                }
-                Err(_) => continue,
-            }
-        }
-    }
-
     /// Current allocated bytes.
     pub fn allocated(&self) -> usize {
         self.allocated.load(Ordering::Relaxed)
@@ -163,15 +130,6 @@ impl Budget {
     /// Hard limit in bytes.
     pub fn limit(&self) -> usize {
         self.limit.load(Ordering::Relaxed)
-    }
-
-    /// Number of over-release events observed on this budget. A
-    /// non-zero value is the smoking-gun signal that some call-site
-    /// is releasing more bytes than it reserved. Per-engine
-    /// `allocated()` saturates to zero on over-release, so this
-    /// counter is the only post-hoc observable.
-    pub fn over_release_count(&self) -> usize {
-        self.over_release_count.load(Ordering::Relaxed)
     }
 
     /// Remaining bytes available.
@@ -292,12 +250,20 @@ mod tests {
 
     #[test]
     fn release_frees_capacity() {
+        // `Budget::release` is gone — the live release path is the shared
+        // `allocated` counter handed out by `try_reserve_arc`, decremented
+        // through `atomic_saturating_sub` the way `ReservationToken::drop`
+        // does it.
         let budget = Budget::new(1024);
         assert!(budget.try_reserve(512));
-        assert!(budget.try_reserve(512));
+        let arc = budget.try_reserve_arc(512).expect("within budget");
         assert!(!budget.try_reserve(1));
 
-        budget.release(256);
+        let shortfall = atomic_saturating_sub(&arc, 256);
+        assert_eq!(
+            shortfall, 0,
+            "releasing less than held is never a shortfall"
+        );
         assert!(budget.try_reserve(256));
     }
 
@@ -305,7 +271,10 @@ mod tests {
     fn peak_tracks_high_water_mark() {
         let budget = Budget::new(1024);
         budget.try_reserve(800);
-        budget.release(500);
+        let arc = budget
+            .try_reserve_arc(0)
+            .expect("zero-size reserve always succeeds");
+        atomic_saturating_sub(&arc, 500);
         budget.try_reserve(100);
 
         assert_eq!(budget.peak(), 800);

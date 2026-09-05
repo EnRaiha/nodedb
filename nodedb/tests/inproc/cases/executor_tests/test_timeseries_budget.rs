@@ -10,13 +10,13 @@
 //! before it returns, while `flush_ts_collection` releases the
 //! *resident memtable footprint* (`memory_bytes()`, up to the 64 MiB
 //! soft limit). The two sides of the same `EngineId::Timeseries`
-//! budget therefore track different quantities: every flush calls
-//! `Budget::release(memtable_bytes)` against an `allocated` counter
-//! that only ever saw the small estimate, so it saturates to zero and
-//! bumps `over_release_count` — the production "memory release exceeds
-//! allocation (WAL replay or accounting drift)" warning — and the
-//! engine's reported allocation no longer reflects the memory it is
-//! actually holding.
+//! budget therefore track different quantities: every flush drops a
+//! `ReservationToken` sized to `memtable_bytes` against an `allocated`
+//! counter that only ever saw the small estimate, so it saturates to
+//! zero and bumps the governor's per-engine over-release count — the
+//! production "memory release exceeds allocation (WAL replay or
+//! accounting drift)" warning — and the engine's reported allocation
+//! no longer reflects the memory it is actually holding.
 //!
 //! Worse: the over-release saturates the per-engine `Budget` to zero
 //! while the still-alive per-batch `ReservationToken` is holding a
@@ -135,11 +135,12 @@ fn run_ts_flush_workload() -> (TestCtx, Arc<MemoryGovernor>) {
 ///
 /// `flush_ts_collection` releases `memtable_bytes`; ingest only ever
 /// reserved a tiny per-batch estimate (and dropped it). The release
-/// therefore over-releases on every flush — the per-engine `Budget`
-/// saturates to zero and increments `over_release_count`, which is the
-/// production "memory release exceeds allocation" warning. WAL replay
-/// re-ingest drives the same `flush_ts_collection`, so this is the
-/// drift that detaches a recovered node's governor view from reality.
+/// therefore over-releases on every flush — the per-engine counter
+/// saturates to zero and the governor's engine-layer over-release count
+/// increments, which is the production "memory release exceeds
+/// allocation" warning. WAL replay re-ingest drives the same
+/// `flush_ts_collection`, so this is the drift that detaches a
+/// recovered node's governor view from reality.
 #[test]
 fn timeseries_flush_does_not_over_release_engine_budget() {
     let (_ctx, gov) = run_ts_flush_workload();

@@ -12,9 +12,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::budget::atomic_saturating_sub;
 use crate::error::{MemError, Result};
 use crate::governor::GlobalCounter;
+use crate::over_release::{Layer, ReleaseIdentity, release_layer};
 
 /// Owns the unwind for a reservation across the global, database, tenant,
 /// and engine counters.
@@ -30,6 +30,8 @@ pub(crate) struct ReserveScope {
     engine: Option<Arc<AtomicUsize>>,
     size: usize,
     committed: bool,
+    /// Names the reservation in an unwind-time over-release warning.
+    identity: ReleaseIdentity,
 }
 
 /// The counters a committed [`ReserveScope`] credited, handed to the caller
@@ -44,7 +46,7 @@ pub(crate) struct ReservedLayers {
 
 impl ReserveScope {
     /// Start a scope for a `size`-byte reservation. Credits nothing yet.
-    pub(crate) fn new(global: Arc<GlobalCounter>, size: usize) -> Self {
+    pub(crate) fn new(global: Arc<GlobalCounter>, size: usize, identity: ReleaseIdentity) -> Self {
         Self {
             global,
             global_credited: false,
@@ -53,6 +55,7 @@ impl ReserveScope {
             engine: None,
             size,
             committed: false,
+            identity,
         }
     }
 
@@ -128,17 +131,46 @@ impl Drop for ReserveScope {
             return;
         }
         // Release in reverse order: engine → tenant → database → global.
+        // A shortfall here means an earlier layer's rollback unwound a
+        // counter this scope never actually credited that much of — the
+        // same clamp-hides-drift case `ReservationToken::drop` guards
+        // against. `release_layer` counts and warns for both paths, so an
+        // unwind-time drift is as visible as a drop-time one.
         if let Some(ref counter) = self.engine {
-            atomic_saturating_sub(counter, self.size);
+            release_layer(
+                counter,
+                self.size,
+                Layer::Engine,
+                &self.global.over_release,
+                self.identity,
+            );
         }
         if let Some(ref counter) = self.tenant {
-            atomic_saturating_sub(counter, self.size);
+            release_layer(
+                counter,
+                self.size,
+                Layer::Tenant,
+                &self.global.over_release,
+                self.identity,
+            );
         }
         if let Some(ref counter) = self.database {
-            atomic_saturating_sub(counter, self.size);
+            release_layer(
+                counter,
+                self.size,
+                Layer::Database,
+                &self.global.over_release,
+                self.identity,
+            );
         }
         if self.global_credited {
-            atomic_saturating_sub(&self.global.allocated, self.size);
+            release_layer(
+                &self.global.allocated,
+                self.size,
+                Layer::Global,
+                &self.global.over_release,
+                self.identity,
+            );
         }
     }
 }

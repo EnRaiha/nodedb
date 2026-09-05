@@ -3,11 +3,11 @@
 //! Engine memory accounting must remain balanced across a full
 //! lifecycle of `CREATE → INSERT → DROP`.
 //!
-//! `Budget::release()` saturates to zero on over-release and emits a
-//! `tracing::warn!` — silent in test output, but the real symptom on
-//! origin deployments is a continuous "memory release exceeds
-//! allocation" log every ~40 s. The dual call-site bug — releasing the
-//! wrong size or skipping `acquire` — surfaces as drift in the global
+//! `ReservationToken::drop` saturates each layer's counter to zero on
+//! over-release and emits a `tracing::warn!` — silent in test output, but
+//! the real symptom on origin deployments is a continuous "memory release
+//! exceeds allocation" log every ~40 s. The dual call-site bug — releasing
+//! the wrong size or skipping `acquire` — surfaces as drift in the global
 //! `total_allocated()` counter once a workload's resources are fully
 //! released.
 //!
