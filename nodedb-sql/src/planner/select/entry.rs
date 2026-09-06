@@ -117,6 +117,7 @@ pub fn plan_query(
             let tail = QueryTail {
                 order_by: query.order_by.as_ref(),
                 limit_clause: &query.limit_clause,
+                fetch: query.fetch.as_ref(),
             };
             let mut plan = plan_select(select, catalog, functions, temporal, &tail)?;
             // Snapshot the projection before ORDER BY transforms the plan,

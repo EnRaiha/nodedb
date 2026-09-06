@@ -2,25 +2,23 @@
 
 //! A row bound the planner cannot resolve must be rejected, never dropped.
 //!
-//! `LIMIT` and `OFFSET` values reach the planner as
-//! `sqlparser::ast::Expr`. The extractor behind them
-//! (`crate::coerce::expr_as_usize_literal`) answers `Option<usize>`, which
-//! collapses three distinct inputs into one `None`:
+//! `LIMIT` and `OFFSET` values reach the planner as `sqlparser::ast::Expr`.
+//! `crate::coerce::checked_row_bound` resolves each one to a
+//! `crate::coerce::RowBound`: `Rows(n)` for a literal in
+//! `[0, usize::MAX]`, `Unbounded` for `NULL` or `ALL` (PostgreSQL reads
+//! both as no bound at all), or `Err` for anything else — negative,
+//! fractional, wider than `usize`, or non-numeric text. `Err` fails the
+//! statement with SQLSTATE `2201W` (`invalid_limit_value`), matching
+//! PostgreSQL.
 //!
-//! - no clause at all,
-//! - a clause whose value is not a literal the planner can read,
-//! - a clause whose value IS readable and is out of the `usize` domain
-//!   (negative, fractional, wider than `usize`, non-numeric text).
-//!
-//! Every consumer maps that `None` onto a permissive default — `None` limit
-//! means unbounded, `unwrap_or(0)` offset means skip nothing. So an invalid
-//! bound widens the query instead of failing it: `LIMIT -1` scans the whole
-//! collection. PostgreSQL rejects the same input with SQLSTATE `2201W`
-//! (`invalid_limit_value`).
-//!
-//! Each test asserts the rejection AND that no plan came back carrying the
-//! permissive default, so a regression to any silent-widening shape fails
-//! here rather than returning a plan that quietly reads everything.
+//! Each rejection test asserts the failure AND that no plan came back
+//! carrying a permissive default, so a regression to silent widening
+//! fails here rather than returning a plan that quietly reads everything.
+//! The unbounded tests pin the `NULL` / `ALL` reading against the same
+//! regression from the other direction: rejecting them outright breaks
+//! a prepared `LIMIT $1`, whose Parse-time schema inference plans
+//! `LIMIT NULL` to derive the row description (see
+//! `fn prepared_limit_placeholder_null_plans_cleanly` below).
 
 use nodedb_sql::types::{CollectionInfo, EngineType, SqlPlan};
 use nodedb_sql::{SqlCatalog, SqlCatalogError, plan_sql};
@@ -135,8 +133,7 @@ fn overflowing_limit_is_rejected() {
 // OFFSET
 // ---------------------------------------------------------------------------
 
-/// A negative OFFSET currently collapses to `unwrap_or(0)` — the rows the
-/// query asked to skip are returned instead.
+/// A negative OFFSET is out of the `usize` domain and fails the statement.
 #[test]
 fn negative_offset_is_rejected() {
     expect_rejected("SELECT * FROM articles OFFSET -2");
@@ -222,4 +219,134 @@ fn absent_limit_stays_unbounded() {
         }
         other => panic!("expected a Scan, got: {other:?}"),
     }
+}
+
+/// `LIMIT NULL` is PostgreSQL's other spelling of "no LIMIT clause" and
+/// must plan the same as an absent clause, not fail.
+#[test]
+fn null_limit_stays_unbounded() {
+    match plan_one("SELECT * FROM articles LIMIT NULL") {
+        SqlPlan::Scan { limit, .. } => assert_eq!(limit, None),
+        other => panic!("expected a Scan, got: {other:?}"),
+    }
+}
+
+/// `OFFSET NULL` is the same as omitting OFFSET — skip nothing.
+#[test]
+fn null_offset_stays_unbounded() {
+    match plan_one("SELECT * FROM articles OFFSET NULL") {
+        SqlPlan::Scan { offset, .. } => assert_eq!(offset, 0),
+        other => panic!("expected a Scan, got: {other:?}"),
+    }
+}
+
+/// `LIMIT NULL` combined with a real OFFSET applies the OFFSET and leaves
+/// LIMIT unbounded — the two clauses resolve independently.
+#[test]
+fn null_limit_with_offset_is_honored() {
+    match plan_one("SELECT * FROM articles LIMIT NULL OFFSET 2") {
+        SqlPlan::Scan { limit, offset, .. } => {
+            assert_eq!(limit, None);
+            assert_eq!(offset, 2);
+        }
+        other => panic!("expected a Scan, got: {other:?}"),
+    }
+}
+
+/// The exact shape `substitute_placeholders_with_null` produces for a
+/// prepared `SELECT id FROM t ORDER BY id LIMIT $1`: the pgwire Parse-time
+/// schema inference path rewrites `$1` to the literal `NULL` before
+/// planning, to derive the row description ahead of Bind/Execute. Rejecting
+/// `LIMIT NULL` breaks every prepared statement with a LIMIT placeholder —
+/// describe fails, the client gets an empty column list, and Execute then
+/// dies with a field-count mismatch. This test is the only coverage of
+/// that path in `nodedb-sql`; deleting it removes the only signal that a
+/// future change to `checked_row_bound` regresses prepared LIMIT again.
+#[test]
+fn prepared_limit_placeholder_null_plans_cleanly() {
+    let _ = plan_one("SELECT id FROM articles ORDER BY id LIMIT NULL");
+}
+
+// ---------------------------------------------------------------------------
+// FETCH FIRST / NEXT — a LIMIT synonym, honored the same way
+// ---------------------------------------------------------------------------
+
+/// `FETCH FIRST n ROWS ONLY` is a LIMIT synonym and must bound the scan.
+#[test]
+fn fetch_first_n_rows_only_is_honored() {
+    match plan_one("SELECT * FROM articles FETCH FIRST 2 ROWS ONLY") {
+        SqlPlan::Scan { limit, .. } => assert_eq!(limit, Some(2)),
+        other => panic!("expected a Scan, got: {other:?}"),
+    }
+}
+
+/// `FETCH FIRST ROW ONLY` with no count means one row (standard SQL).
+#[test]
+fn fetch_first_row_only_with_no_count_is_one_row() {
+    match plan_one("SELECT * FROM articles FETCH FIRST ROW ONLY") {
+        SqlPlan::Scan { limit, .. } => assert_eq!(limit, Some(1)),
+        other => panic!("expected a Scan, got: {other:?}"),
+    }
+}
+
+/// `OFFSET ... FETCH FIRST ... ROWS ONLY` applies both bounds.
+#[test]
+fn offset_and_fetch_first_are_both_honored() {
+    match plan_one("SELECT * FROM articles OFFSET 2 FETCH FIRST 2 ROWS ONLY") {
+        SqlPlan::Scan { limit, offset, .. } => {
+            assert_eq!(limit, Some(2));
+            assert_eq!(offset, 2);
+        }
+        other => panic!("expected a Scan, got: {other:?}"),
+    }
+}
+
+/// Non-numeric text in a FETCH FIRST count is not a bound at all.
+#[test]
+fn non_numeric_fetch_first_is_rejected() {
+    expect_rejected("SELECT * FROM articles FETCH FIRST 'abc' ROWS ONLY");
+}
+
+/// `WITH TIES` needs a plan primitive `SqlPlan` does not have — reject
+/// rather than silently drop the modifier and apply a plain LIMIT.
+#[test]
+fn fetch_first_with_ties_is_rejected() {
+    expect_rejected("SELECT * FROM articles ORDER BY id FETCH FIRST 2 ROWS WITH TIES");
+}
+
+/// PostgreSQL accepts only one spelling of the row-bound clause; a query
+/// with both is rejected rather than silently picking one.
+#[test]
+fn limit_combined_with_fetch_first_is_rejected() {
+    expect_rejected("SELECT * FROM articles LIMIT 2 FETCH FIRST 2 ROWS ONLY");
+}
+
+// ---------------------------------------------------------------------------
+// UPDATE / DELETE ... LIMIT — a MySQL extension PostgreSQL does not have
+// ---------------------------------------------------------------------------
+
+/// `UPDATE ... LIMIT` is a MySQL extension with no PostgreSQL equivalent.
+/// Honoring it needs a new cross-engine capability; reject instead.
+#[test]
+fn update_limit_is_rejected() {
+    expect_rejected("UPDATE articles SET name = 'x' WHERE id = '1' LIMIT 1");
+}
+
+/// `DELETE ... LIMIT` is the same MySQL extension on the DELETE side.
+#[test]
+fn delete_limit_is_rejected() {
+    expect_rejected("DELETE FROM articles WHERE id = '1' LIMIT 1");
+}
+
+/// Control: `UPDATE` without a LIMIT still plans — the guard rejects only
+/// the LIMIT clause, not every UPDATE.
+#[test]
+fn update_without_limit_plans() {
+    let _ = plan_one("UPDATE articles SET name = 'x' WHERE id = '1'");
+}
+
+/// Control: `DELETE` without a LIMIT still plans.
+#[test]
+fn delete_without_limit_plans() {
+    let _ = plan_one("DELETE FROM articles WHERE id = '1'");
 }

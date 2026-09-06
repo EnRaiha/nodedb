@@ -27,7 +27,7 @@ pub(in crate::planner::select) fn apply_limit(
     mut plan: SqlPlan,
     tail: &QueryTail<'_>,
 ) -> Result<SqlPlan> {
-    let (limit_val, offset_val) = tail.limit_offset();
+    let (limit_val, offset_val) = tail.limit_offset()?;
 
     // The LIMIT belongs to the query reading the CTE, not to the CTE body, so
     // it lands on the outer plan — without this a derived table like
@@ -245,6 +245,7 @@ mod tests {
         QueryTail {
             order_by: None,
             limit_clause,
+            fetch: None,
         }
     }
 

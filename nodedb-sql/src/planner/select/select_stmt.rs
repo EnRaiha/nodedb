@@ -288,7 +288,7 @@ pub(super) fn plan_select(
     // answer the query from the wrong rows. Those clauses land on the join
     // itself downstream — the same reason `scan_projection` is empty here.
     let (sort_keys, limit, offset) = if subquery_joins.is_empty() {
-        let (limit, offset) = tail.limit_offset();
+        let (limit, offset) = tail.limit_offset()?;
         (tail.sort_keys()?, limit, offset)
     } else {
         (Vec::new(), None, 0)

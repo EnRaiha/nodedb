@@ -3,8 +3,8 @@
 //! Postgres-semantic value coercion for planner use-sites.
 //!
 //! The planner matches `sqlparser::ast::Value` in numeric contexts
-//! (LIMIT, OFFSET, fusion weights, …). When a parameter was sent over
-//! the pgwire Parse message with `Type::UNKNOWN` — the default for
+//! (LIMIT, OFFSET, FETCH, fusion weights, …). When a parameter was sent
+//! over the pgwire Parse message with `Type::UNKNOWN` — the default for
 //! drivers that don't pre-fetch OIDs, e.g. `postgres-js` with
 //! `fetch_types: false` — our bind layer emits it as
 //! `Value::SingleQuotedString` (we have no type information to do
@@ -18,10 +18,62 @@
 //! numeric use-site must route through here — a raw
 //! `match Value::Number` ignores UNKNOWN-coerced literals and
 //! re-introduces the silent match-failure bug class.
+//!
+//! Row-bound extraction (LIMIT / OFFSET / FETCH) returns
+//! `Result<RowBound, _>`. `RowBound` has two states: `Rows(n)` for a
+//! literal in `[0, usize::MAX]`, and `Unbounded` for a `NULL` argument
+//! — PostgreSQL treats `NULL` as no bound at all, the same as an absent
+//! clause. `LIMIT ALL` is PostgreSQL's other unbounded spelling, but
+//! `sqlparser` parses it as an absent LIMIT expression, so it never
+//! reaches `checked_row_bound` at all — callers see it as `None` before
+//! this module runs. A malformed literal (negative, fractional,
+//! non-numeric, overflowing `usize`) is a third case: the statement
+//! fails. `checked_row_bound` is the chokepoint every
+//! LIMIT/OFFSET/FETCH site calls.
 
 use sqlparser::ast;
 
-/// Resolve a `Value` into a `usize` if numeric-shaped.
+/// A row bound the planner resolved.
+#[derive(Debug, PartialEq)]
+pub enum RowBound {
+    /// A literal count the planner applies.
+    Rows(usize),
+    /// `NULL`. PostgreSQL reads it as no bound at all, the same as an
+    /// absent clause or `LIMIT ALL` (which never reaches this type —
+    /// see the module doc).
+    Unbounded,
+}
+
+impl RowBound {
+    /// The LIMIT this bound names. `Rows(n)` maps to `Some(n)`.
+    /// `Unbounded` maps to `None` — no limit applies.
+    pub fn limit(self) -> Option<usize> {
+        match self {
+            RowBound::Rows(n) => Some(n),
+            RowBound::Unbounded => None,
+        }
+    }
+
+    /// The OFFSET this bound names. `Rows(n)` maps to `n`.
+    /// `Unbounded` maps to `0` — no rows skip.
+    pub fn offset(self) -> usize {
+        match self {
+            RowBound::Rows(n) => n,
+            RowBound::Unbounded => 0,
+        }
+    }
+}
+
+/// A row-bound literal that did not resolve to `[0, usize::MAX]`.
+///
+/// Carries the value as written so the caller names it without
+/// re-deriving text from the AST.
+#[derive(Debug, PartialEq)]
+pub struct InvalidRowBoundLiteral {
+    pub raw: String,
+}
+
+/// Resolve a `Value` into a `usize` row bound.
 ///
 /// Accepts:
 /// - `Value::Number(n, _)` — the typed-parameter and explicit-literal path.
@@ -36,31 +88,58 @@ use sqlparser::ast;
 /// # Bounds
 ///
 /// Valid outputs are `[0, usize::MAX]` (64-bit on typical targets).
-/// Inputs that don't fit — negative numbers, fractional values,
-/// values exceeding `usize::MAX`, non-numeric text — return `None`.
-/// The caller decides the semantic: a LIMIT site treats `None` as
-/// "no limit applied" (pre-existing behavior); stricter sites should
-/// surface a planner error.
+/// A negative number, a fractional value, a value exceeding `usize::MAX`,
+/// or non-numeric text returns `Err(InvalidRowBoundLiteral)` carrying the
+/// value as written.
 ///
 /// Does not perform saturating or wrapping coercion — values that
 /// overflow `usize` are rejected, not silently truncated.
-pub fn as_usize_literal(value: &ast::Value) -> Option<usize> {
+pub fn as_usize_literal(value: &ast::Value) -> Result<usize, InvalidRowBoundLiteral> {
     match value {
-        ast::Value::Number(n, _) => n.parse::<usize>().ok(),
-        ast::Value::SingleQuotedString(s) => s.parse::<usize>().ok(),
-        _ => None,
+        ast::Value::Number(n, _) => n
+            .parse::<usize>()
+            .map_err(|_| InvalidRowBoundLiteral { raw: n.clone() }),
+        ast::Value::SingleQuotedString(s) => s
+            .parse::<usize>()
+            .map_err(|_| InvalidRowBoundLiteral { raw: s.clone() }),
+        other => Err(InvalidRowBoundLiteral {
+            raw: other.to_string(),
+        }),
     }
 }
 
-/// Resolve an `Expr::Value` into a `usize` if numeric-shaped. Thin
-/// wrapper that unpacks the `Expr` → `Value` layer so callers reading
-/// LIMIT/OFFSET clauses don't each re-write the unpack.
-pub fn expr_as_usize_literal(expr: &ast::Expr) -> Option<usize> {
-    if let ast::Expr::Value(v) = expr {
-        as_usize_literal(&v.value)
-    } else {
-        None
+/// Resolve an `Expr::Value` into a `usize` row bound. Thin wrapper that
+/// unpacks the `Expr` → `Value` layer so callers reading LIMIT/OFFSET/FETCH
+/// clauses don't each re-write the unpack. A non-`Expr::Value` expression
+/// (a column reference, a function call, an arithmetic expression) is not
+/// a literal the planner can read — it fails with the expression's
+/// `Display` text as `raw`.
+pub fn expr_as_usize_literal(expr: &ast::Expr) -> Result<usize, InvalidRowBoundLiteral> {
+    match expr {
+        ast::Expr::Value(v) => as_usize_literal(&v.value),
+        other => Err(InvalidRowBoundLiteral {
+            raw: other.to_string(),
+        }),
     }
+}
+
+/// Resolve a LIMIT/OFFSET/FETCH bound. Names `clause` and the value as
+/// written on failure. Every row-bound site routes through here.
+///
+/// `Expr::Value(Value::Null)` resolves to `RowBound::Unbounded` —
+/// PostgreSQL treats a `NULL` LIMIT/OFFSET/FETCH argument as no bound
+/// at all. A prepared `LIMIT $1` reaches this shape at Parse-time
+/// schema inference, before the real bound is bound at Execute time.
+pub fn checked_row_bound(clause: &'static str, expr: &ast::Expr) -> crate::error::Result<RowBound> {
+    if matches!(expr, ast::Expr::Value(v) if matches!(v.value, ast::Value::Null)) {
+        return Ok(RowBound::Unbounded);
+    }
+    expr_as_usize_literal(expr)
+        .map(RowBound::Rows)
+        .map_err(|e| crate::error::SqlError::InvalidLimitValue {
+            clause,
+            value: e.raw,
+        })
 }
 
 /// Resolve a `Value` into an `f64` if numeric-shaped.
@@ -92,7 +171,7 @@ mod tests {
     fn usize_from_number() {
         assert_eq!(
             as_usize_literal(&ast::Value::Number("42".into(), false)),
-            Some(42)
+            Ok(42)
         );
     }
 
@@ -102,7 +181,7 @@ mod tests {
     fn usize_from_unknown_param_text() {
         assert_eq!(
             as_usize_literal(&ast::Value::SingleQuotedString("42".into())),
-            Some(42)
+            Ok(42)
         );
     }
 
@@ -110,7 +189,7 @@ mod tests {
     fn usize_rejects_non_numeric_text() {
         assert_eq!(
             as_usize_literal(&ast::Value::SingleQuotedString("abc".into())),
-            None
+            Err(InvalidRowBoundLiteral { raw: "abc".into() })
         );
     }
 
@@ -118,7 +197,7 @@ mod tests {
     fn usize_rejects_negative() {
         assert_eq!(
             as_usize_literal(&ast::Value::SingleQuotedString("-1".into())),
-            None
+            Err(InvalidRowBoundLiteral { raw: "-1".into() })
         );
     }
 
@@ -139,15 +218,18 @@ mod tests {
     #[test]
     fn usize_rejects_overflow_number() {
         let huge = format!("{}0", usize::MAX);
-        assert_eq!(as_usize_literal(&ast::Value::Number(huge, false)), None);
+        assert_eq!(
+            as_usize_literal(&ast::Value::Number(huge.clone(), false)),
+            Err(InvalidRowBoundLiteral { raw: huge })
+        );
     }
 
     #[test]
     fn usize_rejects_overflow_text() {
         let huge = format!("{}0", usize::MAX);
         assert_eq!(
-            as_usize_literal(&ast::Value::SingleQuotedString(huge)),
-            None
+            as_usize_literal(&ast::Value::SingleQuotedString(huge.clone())),
+            Err(InvalidRowBoundLiteral { raw: huge })
         );
     }
 
@@ -155,7 +237,7 @@ mod tests {
     fn usize_rejects_fractional_number() {
         assert_eq!(
             as_usize_literal(&ast::Value::Number("1.5".into(), false)),
-            None
+            Err(InvalidRowBoundLiteral { raw: "1.5".into() })
         );
     }
 
@@ -163,7 +245,7 @@ mod tests {
     fn usize_rejects_fractional_text() {
         assert_eq!(
             as_usize_literal(&ast::Value::SingleQuotedString("1.5".into())),
-            None
+            Err(InvalidRowBoundLiteral { raw: "1.5".into() })
         );
     }
 
@@ -172,7 +254,7 @@ mod tests {
         // `1e3` is not a usize literal — Postgres treats it as a float.
         assert_eq!(
             as_usize_literal(&ast::Value::Number("1e3".into(), false)),
-            None
+            Err(InvalidRowBoundLiteral { raw: "1e3".into() })
         );
     }
 
@@ -180,7 +262,7 @@ mod tests {
     fn usize_accepts_zero() {
         assert_eq!(
             as_usize_literal(&ast::Value::Number("0".into(), false)),
-            Some(0)
+            Ok(0)
         );
     }
 
@@ -189,7 +271,7 @@ mod tests {
         let max_str = usize::MAX.to_string();
         assert_eq!(
             as_usize_literal(&ast::Value::Number(max_str, false)),
-            Some(usize::MAX)
+            Ok(usize::MAX)
         );
     }
 

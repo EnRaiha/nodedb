@@ -6,7 +6,6 @@
 use sqlparser::ast;
 
 use super::correlation::analyse_lateral_where;
-use crate::coerce::expr_as_usize_literal;
 use crate::error::{Result, SqlError};
 use crate::parser::normalize::normalize_ident;
 use crate::reserved::check_ast_identifier;
@@ -69,7 +68,7 @@ pub fn plan_lateral_join(args: LateralJoinArgs<'_>) -> Result<SqlPlan> {
     //   - A LIMIT k on the subquery.
     //   - No non-equi correlations (those require LateralLoop).
     let has_equi = !analysis.equi_keys.is_empty();
-    let inner_limit = limit_from_query(subquery);
+    let inner_limit = limit_from_query(subquery)?;
     let is_top_k = has_equi && inner_limit.is_some() && analysis.non_equi.is_empty();
 
     if is_top_k {
@@ -353,16 +352,18 @@ fn refs_outer(expr: &ast::Expr, outer_alias: &str) -> bool {
     }
 }
 
-/// Extract the LIMIT value from a query.
-fn limit_from_query(query: &ast::Query) -> Option<usize> {
+/// Extract the LIMIT value from a query, or fail on a bound that does not
+/// resolve to `[0, usize::MAX]`. `LIMIT NULL` / `LIMIT ALL` and an absent
+/// clause all mean no bound, so both map to `None`.
+fn limit_from_query(query: &ast::Query) -> Result<Option<usize>> {
     match &query.limit_clause {
-        Some(ast::LimitClause::LimitOffset { limit, .. }) => {
-            limit.as_ref().and_then(expr_as_usize_literal)
+        Some(ast::LimitClause::LimitOffset {
+            limit: Some(limit), ..
+        })
+        | Some(ast::LimitClause::OffsetCommaLimit { limit, .. }) => {
+            Ok(crate::coerce::checked_row_bound("LIMIT", limit)?.limit())
         }
-        Some(ast::LimitClause::OffsetCommaLimit { limit, .. }) => {
-            Some(expr_as_usize_literal(limit).unwrap_or(0))
-        }
-        None => None,
+        Some(ast::LimitClause::LimitOffset { limit: None, .. }) | None => Ok(None),
     }
 }
 

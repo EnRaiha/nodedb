@@ -29,6 +29,12 @@ pub fn plan_update(stmt: &ast::Statement, catalog: &dyn SqlCatalog) -> Result<Ve
         });
     };
 
+    if update.limit.is_some() {
+        return Err(SqlError::Unsupported {
+            detail: "UPDATE ... LIMIT is not supported".into(),
+        });
+    }
+
     // Delegate to the UPDATE...FROM path when a FROM clause is present.
     if update.from.is_some() {
         return plan_update_from(update, catalog);
@@ -326,6 +332,17 @@ pub fn plan_delete(stmt: &ast::Statement, catalog: &dyn SqlCatalog) -> Result<Ve
             detail: "expected DELETE statement".into(),
         });
     };
+
+    if delete.limit.is_some() {
+        return Err(SqlError::Unsupported {
+            detail: "DELETE ... LIMIT is not supported".into(),
+        });
+    }
+    if !delete.order_by.is_empty() {
+        return Err(SqlError::Unsupported {
+            detail: "DELETE ... ORDER BY is not supported".into(),
+        });
+    }
 
     let from_tables = match &delete.from {
         ast::FromTable::WithFromKeyword(tables) | ast::FromTable::WithoutKeyword(tables) => tables,
