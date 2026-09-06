@@ -69,6 +69,7 @@ pub fn plan_lateral_join(args: LateralJoinArgs<'_>) -> Result<SqlPlan> {
     //   - No non-equi correlations (those require LateralLoop).
     let has_equi = !analysis.equi_keys.is_empty();
     let inner_limit = limit_from_query(subquery)?;
+    reject_lateral_offset(subquery)?;
     let is_top_k = has_equi && inner_limit.is_some() && analysis.non_equi.is_empty();
 
     if is_top_k {
@@ -365,6 +366,35 @@ fn limit_from_query(query: &ast::Query) -> Result<Option<usize>> {
         }
         Some(ast::LimitClause::LimitOffset { limit: None, .. }) | None => Ok(None),
     }
+}
+
+/// Reject an inner OFFSET on a LATERAL subquery.
+///
+/// `SqlPlan::LateralTopK` carries no offset field and `SqlPlan::LateralLoop`
+/// carries neither limit nor offset. A per-outer-row OFFSET needs a new plan
+/// field plus Data Plane execution that skips rows per outer row, so this
+/// rejects rather than silently drops the clause. `OFFSET 0` and `OFFSET
+/// NULL` skip nothing and plan cleanly; a resolved offset above zero fails
+/// with `SqlError::Unsupported`. An offset literal outside `[0, usize::MAX]`
+/// fails first, inside `checked_row_bound`, with `SqlError::InvalidLimitValue`.
+fn reject_lateral_offset(query: &ast::Query) -> Result<()> {
+    let offset_expr = match &query.limit_clause {
+        Some(ast::LimitClause::LimitOffset {
+            offset: Some(offset),
+            ..
+        }) => Some(&offset.value),
+        Some(ast::LimitClause::OffsetCommaLimit { offset, .. }) => Some(offset),
+        Some(ast::LimitClause::LimitOffset { offset: None, .. }) | None => None,
+    };
+    let Some(expr) = offset_expr else {
+        return Ok(());
+    };
+    if crate::coerce::checked_row_bound("OFFSET", expr)?.offset() > 0 {
+        return Err(SqlError::Unsupported {
+            detail: "OFFSET inside a LATERAL subquery is not supported".into(),
+        });
+    }
+    Ok(())
 }
 
 /// Extract and validate a LATERAL alias from a `TableFactor::Derived`.

@@ -183,6 +183,61 @@ fn negative_limit_in_lateral_subquery_is_rejected() {
     );
 }
 
+/// `SqlPlan::LateralTopK` carries no offset field, so a nonzero inner
+/// OFFSET has nowhere to plan to. Reject rather than drop it.
+#[test]
+fn nonzero_offset_in_lateral_subquery_with_limit_is_rejected() {
+    expect_rejected(
+        "SELECT a.id, e.id FROM authors a \
+         JOIN LATERAL (SELECT id FROM articles WHERE articles.id = a.id \
+         ORDER BY id LIMIT 3 OFFSET 2) e ON true",
+    );
+}
+
+/// An inner OFFSET with no LIMIT takes the equi-hash-join branch of
+/// `plan_lateral_join`, not the top-k branch. The same rejection applies.
+#[test]
+fn nonzero_offset_in_lateral_subquery_without_limit_is_rejected() {
+    expect_rejected(
+        "SELECT a.id, e.id FROM authors a \
+         JOIN LATERAL (SELECT id FROM articles WHERE articles.id = a.id OFFSET 2) e ON true",
+    );
+}
+
+/// A negative inner OFFSET fails inside `checked_row_bound`, the same as a
+/// negative OFFSET anywhere else, before the LATERAL-specific check runs.
+#[test]
+fn negative_offset_in_lateral_subquery_is_rejected() {
+    expect_rejected(
+        "SELECT a.id, e.id FROM authors a \
+         JOIN LATERAL (SELECT id FROM articles WHERE articles.id = a.id \
+         ORDER BY id LIMIT 3 OFFSET -2) e ON true",
+    );
+}
+
+/// `OFFSET 0` skips nothing. It is satisfiable and must still plan — the
+/// control proving the check reads the resolved value, not the clause's
+/// presence.
+#[test]
+fn zero_offset_in_lateral_subquery_plans_cleanly() {
+    let _ = plan_one(
+        "SELECT a.id, e.id FROM authors a \
+         JOIN LATERAL (SELECT id FROM articles WHERE articles.id = a.id \
+         ORDER BY id LIMIT 3 OFFSET 0) e ON true",
+    );
+}
+
+/// A LATERAL subquery with LIMIT and no OFFSET plans cleanly — the control
+/// showing the rejection targets OFFSET, not LIMIT.
+#[test]
+fn lateral_subquery_with_limit_and_no_offset_plans_cleanly() {
+    let _ = plan_one(
+        "SELECT a.id, e.id FROM authors a \
+         JOIN LATERAL (SELECT id FROM articles WHERE articles.id = a.id \
+         ORDER BY id LIMIT 3) e ON true",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Controls — valid bounds keep working
 // ---------------------------------------------------------------------------
