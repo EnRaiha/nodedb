@@ -135,6 +135,10 @@ impl<'a> FromMessagePack<'a> for ErrorDetails {
                 skip_fields(reader, field_count)?;
                 Ok(ErrorDetails::DivisionByZero)
             }
+            TAG_INVALID_LIMIT_VALUE => {
+                let (clause, value) = read2_str(reader, field_count)?;
+                Ok(ErrorDetails::InvalidLimitValue { clause, value })
+            }
             TAG_AUTHORIZATION_DENIED => {
                 let (resource,) = read1_str(reader, field_count)?;
                 Ok(ErrorDetails::AuthorizationDenied { resource })

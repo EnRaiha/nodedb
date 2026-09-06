@@ -56,6 +56,10 @@ pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 /// raised at runtime instead of evaluating to `NULL`)
 pub const DIVISION_BY_ZERO: &str = "22012";
 
+/// `2201W` — `invalid_limit_value` (a LIMIT/OFFSET/FETCH bound that is
+/// negative, fractional, non-numeric, or wider than `usize`)
+pub const INVALID_LIMIT_VALUE: &str = "2201W";
+
 /// `22023` — `invalid_parameter_value` (a `SET` value the parameter's own
 /// grammar refuses, e.g. `SET statement_timeout = 'later'`)
 pub const INVALID_PARAMETER_VALUE: &str = "22023";
@@ -325,6 +329,7 @@ mod tests {
             FEATURE_NOT_SUPPORTED,
             NUMERIC_VALUE_OUT_OF_RANGE,
             DIVISION_BY_ZERO,
+            INVALID_LIMIT_VALUE,
             INTEGRITY_CONSTRAINT_VIOLATION,
             NOT_NULL_VIOLATION,
             FOREIGN_KEY_VIOLATION,

@@ -287,6 +287,11 @@ pub enum Error {
     #[error("division by zero")]
     DivisionByZero,
 
+    /// A LIMIT/OFFSET/FETCH bound did not resolve to `[0, usize::MAX]`.
+    /// The pgwire layer renders it as SQLSTATE `2201W`.
+    #[error("invalid {clause} value: {value}")]
+    InvalidLimitValue { clause: &'static str, value: String },
+
     /// Descriptor lease conflict; pgwire retries within `PLAN_RETRY_BUDGET`.
     #[error("retryable schema change on {descriptor}")]
     RetryableSchemaChanged { descriptor: String },

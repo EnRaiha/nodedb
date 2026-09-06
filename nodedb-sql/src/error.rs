@@ -34,6 +34,12 @@ pub enum SqlError {
     #[error("division by zero")]
     DivisionByZero,
 
+    /// A LIMIT, OFFSET, or FETCH FIRST clause resolved to a value outside
+    /// `[0, usize::MAX]`, or to an expression the planner cannot read as a
+    /// literal. PostgreSQL rejects the same input with SQLSTATE `2201W`.
+    #[error("invalid {clause} value: {value}")]
+    InvalidLimitValue { clause: &'static str, value: String },
+
     /// A constant expression overflowed at plan time. Same distinction as
     /// [`SqlError::DivisionByZero`].
     #[error("arithmetic overflow evaluating a constant expression: {detail}")]

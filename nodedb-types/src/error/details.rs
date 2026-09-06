@@ -104,6 +104,9 @@ pub enum ErrorDetails {
     /// Expression evaluation divided or took a modulus by zero.
     #[serde(rename = "division_by_zero")]
     DivisionByZero,
+    /// A LIMIT/OFFSET/FETCH bound resolved outside `[0, usize::MAX]`.
+    #[serde(rename = "invalid_limit_value")]
+    InvalidLimitValue { clause: String, value: String },
 
     // Auth
     #[serde(rename = "authorization_denied")]

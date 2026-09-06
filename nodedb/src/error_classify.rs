@@ -149,6 +149,9 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         Error::PlanError { detail } => NodeDbError::plan_error(detail),
         Error::UndefinedFunction { name } => NodeDbError::undefined_function(name.clone()),
         Error::DivisionByZero => NodeDbError::division_by_zero(),
+        Error::InvalidLimitValue { clause, value } => {
+            NodeDbError::invalid_limit_value(*clause, value.clone())
+        }
         Error::RetryableSchemaChanged { descriptor } => {
             NodeDbError::plan_error(format!("retryable schema change on {descriptor}"))
         }

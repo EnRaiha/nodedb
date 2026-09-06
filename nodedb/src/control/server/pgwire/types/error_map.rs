@@ -51,6 +51,9 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
             format!("function {name}(...) does not exist"),
         ),
         crate::Error::DivisionByZero => ("ERROR", sqlstate::DIVISION_BY_ZERO, err.to_string()),
+        crate::Error::InvalidLimitValue { .. } => {
+            ("ERROR", sqlstate::INVALID_LIMIT_VALUE, err.to_string())
+        }
         crate::Error::DocumentNotFound {
             collection,
             document_id,
@@ -183,6 +186,8 @@ pub(crate) fn numeric_code_to_sqlstate(code: nodedb_types::error::ErrorCode) -> 
         Ec::UNDEFINED_FUNCTION => sqlstate::UNDEFINED_FUNCTION,
         // Mirrors the `DivisionByZero` arm.
         Ec::DIVISION_BY_ZERO => sqlstate::DIVISION_BY_ZERO,
+        // Mirrors the `InvalidLimitValue` arm.
+        Ec::INVALID_LIMIT_VALUE => sqlstate::INVALID_LIMIT_VALUE,
         // Mirrors the `FanOutExceeded` arm.
         Ec::FAN_OUT_EXCEEDED => sqlstate::STATEMENT_TOO_COMPLEX,
         // Mirrors the `RejectedAuthz` arm.

@@ -147,6 +147,20 @@ impl NodeDbError {
         }
     }
 
+    /// A LIMIT/OFFSET/FETCH bound did not resolve to `[0, usize::MAX]`.
+    /// Distinct from `plan_error` so clients match the code, SQLSTATE
+    /// `2201W`, instead of parsing the message.
+    pub fn invalid_limit_value(clause: impl Into<String>, value: impl Into<String>) -> Self {
+        let clause = clause.into();
+        let value = value.into();
+        Self {
+            code: ErrorCode::INVALID_LIMIT_VALUE,
+            message: format!("invalid {clause} value: {value}"),
+            details: ErrorDetails::InvalidLimitValue { clause, value },
+            cause: None,
+        }
+    }
+
     pub fn authorization_denied(resource: impl Into<String>) -> Self {
         let resource = resource.into();
         Self {

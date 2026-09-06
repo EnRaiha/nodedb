@@ -160,6 +160,9 @@ impl ToMessagePack for ErrorDetails {
                 write1(writer, TAG_UNDEFINED_FUNCTION, name)
             }
             ErrorDetails::DivisionByZero => write_unit(writer, TAG_DIVISION_BY_ZERO),
+            ErrorDetails::InvalidLimitValue { clause, value } => {
+                write2(writer, TAG_INVALID_LIMIT_VALUE, clause, value)
+            }
             ErrorDetails::AuthorizationDenied { resource } => {
                 write1(writer, TAG_AUTHORIZATION_DENIED, resource)
             }

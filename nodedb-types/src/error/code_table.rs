@@ -88,6 +88,7 @@ error_code_table! {
     SQL_NOT_ENABLED => SqlNotEnabled,
     UNDEFINED_FUNCTION => UndefinedFunction { name: String::new() },
     DIVISION_BY_ZERO => DivisionByZero,
+    INVALID_LIMIT_VALUE => InvalidLimitValue { clause: "remote".into(), value: message.to_owned() },
 
     // Auth / tenant quota.
     AUTHORIZATION_DENIED => AuthorizationDenied { resource: String::new() },

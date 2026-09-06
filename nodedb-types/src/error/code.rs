@@ -57,6 +57,8 @@ impl ErrorCode {
     pub const UNDEFINED_FUNCTION: Self = Self(1203);
     /// Expression evaluation divided or took a modulus by zero.
     pub const DIVISION_BY_ZERO: Self = Self(1204);
+    /// A LIMIT/OFFSET/FETCH bound resolved outside `[0, usize::MAX]`.
+    pub const INVALID_LIMIT_VALUE: Self = Self(1205);
 
     // Engine ops (1300–1399)
     pub const ARRAY: Self = Self(1300);
