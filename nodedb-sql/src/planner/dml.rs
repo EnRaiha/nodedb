@@ -97,6 +97,74 @@ fn classify_on_conflict(ins: &ast::Insert, scope: &TableScope) -> Result<OnConfl
     }
 }
 
+/// PRIMARY KEY implies NOT NULL on every engine.
+///
+/// A row that omits the declared primary-key column or binds it to NULL
+/// must raise `23502` (not_null_violation) rather than commit. On the
+/// document path such a row used to fall through to "fresh surrogate" —
+/// silently minting a new identity for what the caller declared as the row's
+/// key, so several NULL-key rows coexisted and readback of them disagreed
+/// between scan and aggregate paths. Collections whose key is synthetic
+/// (`_rowid`, or a schemaless collection carrying only the auto-injected PK
+/// column) legitimately mint fresh identities and are exempt.
+fn enforce_pk_not_null(
+    engine: EngineType,
+    collection: &str,
+    primary_key: Option<&str>,
+    columns: &[ColumnInfo],
+    rows: &[Vec<(String, SqlValue)>],
+) -> Result<()> {
+    let Some(pk) = primary_key else {
+        return Ok(());
+    };
+    if pk == "_rowid" {
+        return Ok(());
+    }
+    // Closed to the engines #293 names: document_strict and kv reject NULL
+    // keys today, and a declared schemaless column list closes the document
+    // engine. columnar/timeseries/spatial are deliberately NOT gated: their
+    // identity contract mints a surrogate for an omitted key (SERIAL-style
+    // auto identity), so a missing key is legitimate there, not a violation.
+    // Closed to the engines #293 names: document_strict and kv reject NULL
+    // keys today; a schemaless document collection closes exactly when the
+    // user DECLARED its primary key (the auto-injected `id` is synthesized,
+    // `raw_type: None`, and omitting it legitimately mints an auto identity
+    // even when other fields are declared — upstream exercises that with
+    // `CREATE COLLECTION ... FIELDS (...)`). columnar/timeseries/spatial are
+    // deliberately NOT gated: their identity contract and the Data Plane
+    // handle NULL keys themselves.
+    let closed = match engine {
+        EngineType::DocumentSchemaless => columns
+            .iter()
+            .any(|c| c.is_primary_key && c.raw_type.is_some()),
+        EngineType::KeyValue | EngineType::DocumentStrict => true,
+        EngineType::Columnar | EngineType::Timeseries | EngineType::Spatial | EngineType::Array => {
+            false
+        }
+    };
+    if !closed {
+        return Ok(());
+    }
+    let pk_has_default = columns.iter().any(|c| c.name == pk && c.default.is_some());
+    for row in rows {
+        let cell = row.iter().find(|(name, _)| name == pk).map(|(_, v)| v);
+        let missing = cell.is_none();
+        let null = matches!(cell, Some(SqlValue::Null));
+        // A declared DEFAULT materializes at conversion; only absence is
+        // exempt, an explicit NULL still violates the constraint.
+        if missing && pk_has_default {
+            continue;
+        }
+        if missing || null {
+            return Err(SqlError::NotNullViolation {
+                table: collection.to_string(),
+                column: pk.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Plan an INSERT statement.
 pub fn plan_insert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<SqlPlan>> {
     let table_name = match &ins.table {
@@ -215,6 +283,13 @@ pub fn plan_insert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
         .iter()
         .filter_map(|c| c.raw_type.as_ref().map(|t| (c.name.clone(), t.clone())))
         .collect();
+    enforce_pk_not_null(
+        info.engine,
+        &table_name,
+        info.primary_key.as_deref(),
+        &info.columns,
+        &rows,
+    )?;
     let rules = engine_rules::resolve_engine_rules(info.engine);
     rules.plan_insert(InsertParams {
         collection: table_name,
@@ -297,6 +372,13 @@ pub fn plan_upsert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
         .iter()
         .filter_map(|c| c.raw_type.as_ref().map(|t| (c.name.clone(), t.clone())))
         .collect();
+    enforce_pk_not_null(
+        info.engine,
+        &table_name,
+        info.primary_key.as_deref(),
+        &info.columns,
+        &rows,
+    )?;
     let rules = engine_rules::resolve_engine_rules(info.engine);
     rules.plan_upsert(engine_rules::UpsertParams {
         collection: table_name,
@@ -391,6 +473,13 @@ fn plan_upsert_with_on_conflict(
         .iter()
         .filter_map(|c| c.raw_type.as_ref().map(|t| (c.name.clone(), t.clone())))
         .collect();
+    enforce_pk_not_null(
+        info.engine,
+        &table_name,
+        info.primary_key.as_deref(),
+        &info.columns,
+        &rows,
+    )?;
     let rules = engine_rules::resolve_engine_rules(info.engine);
     rules.plan_upsert(engine_rules::UpsertParams {
         collection: table_name,

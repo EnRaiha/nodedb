@@ -91,6 +91,7 @@ error_code_table! {
     AMBIGUOUS_COLUMN => AmbiguousColumn { column: String::new() },
     DIVISION_BY_ZERO => DivisionByZero,
     INVALID_LIMIT_VALUE => InvalidLimitValue { clause: "remote".into(), value: message.to_owned() },
+    NOT_NULL_VIOLATION => NotNullViolation { table: "remote".into(), column: message.to_owned() },
 
     // Auth / tenant quota.
     AUTHORIZATION_DENIED => AuthorizationDenied { resource: String::new() },

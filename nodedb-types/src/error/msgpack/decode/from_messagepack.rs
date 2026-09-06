@@ -139,6 +139,10 @@ impl<'a> FromMessagePack<'a> for ErrorDetails {
                 let (column,) = read1_str(reader, field_count)?;
                 Ok(ErrorDetails::AmbiguousColumn { column })
             }
+            TAG_NOT_NULL_VIOLATION => {
+                let (table, column) = read2_str(reader, field_count)?;
+                Ok(ErrorDetails::NotNullViolation { table, column })
+            }
             TAG_DIVISION_BY_ZERO => {
                 skip_fields(reader, field_count)?;
                 Ok(ErrorDetails::DivisionByZero)

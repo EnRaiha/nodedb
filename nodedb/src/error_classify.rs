@@ -151,6 +151,10 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         Error::UndefinedColumn { column } => NodeDbError::undefined_column(column.clone()),
         Error::AmbiguousColumn { column } => NodeDbError::ambiguous_column(column.clone()),
         Error::UnknownStrictField { column, .. } => NodeDbError::undefined_column(column.clone()),
+
+        Error::NotNullViolation { table, column } => {
+            NodeDbError::not_null_violation(table.clone(), column.clone())
+        }
         Error::DivisionByZero => NodeDbError::division_by_zero(),
         Error::InvalidLimitValue { clause, value } => {
             NodeDbError::invalid_limit_value(*clause, value.clone())

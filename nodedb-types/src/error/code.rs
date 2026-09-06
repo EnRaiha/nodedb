@@ -63,6 +63,8 @@ impl ErrorCode {
     pub const UNDEFINED_COLUMN: Self = Self(1206);
     /// A bare column name resolves against more than one relation in scope.
     pub const AMBIGUOUS_COLUMN: Self = Self(1207);
+    /// A NOT NULL column received an explicit NULL or no value at all.
+    pub const NOT_NULL_VIOLATION: Self = Self(1208);
 
     // Engine ops (1300–1399)
     pub const ARRAY: Self = Self(1300);

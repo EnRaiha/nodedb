@@ -61,13 +61,27 @@ pub(super) fn convert_collection_type(
                 .declared_primary_key
                 .clone()
                 .unwrap_or_else(|| "id".to_string());
+            // `raw_type: None` is the documented marker for a synthesized
+            // (auto-injected) primary key. A key the DDL actually declared
+            // carries its declared type token here instead, so the planner
+            // can tell "user-declared identity" from "auto id" — the NULL-pk
+            // write gate (#293) closes only the former.
+            let pk_declared_type = stored
+                .fields
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&pk_name))
+                .and_then(|(_, ts)| {
+                    ts.split_whitespace()
+                        .next()
+                        .map(|t| t.trim_end_matches(',').to_string())
+                });
             let mut columns = vec![ColumnInfo {
                 name: pk_name.clone(),
                 data_type: SqlDataType::String,
                 nullable: false,
                 is_primary_key: true,
                 default: None,
-                raw_type: None,
+                raw_type: pk_declared_type,
                 int_width: None,
                 float_width: None,
             }];

@@ -63,6 +63,14 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::UnknownStrictField { .. } => {
             ("ERROR", sqlstate::UNDEFINED_COLUMN, err.to_string())
         }
+
+        crate::Error::NotNullViolation { table, column } => (
+            "ERROR",
+            sqlstate::NOT_NULL_VIOLATION,
+            format!(
+                "null value in column '{column}' violates not-null constraint in table '{table}'"
+            ),
+        ),
         crate::Error::DivisionByZero => ("ERROR", sqlstate::DIVISION_BY_ZERO, err.to_string()),
         crate::Error::InvalidLimitValue { .. } => {
             ("ERROR", sqlstate::INVALID_LIMIT_VALUE, err.to_string())
