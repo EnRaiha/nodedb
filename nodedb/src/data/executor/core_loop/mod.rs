@@ -14,7 +14,7 @@ mod graph_partition;
 pub(in crate::data::executor) mod index_value_versions;
 pub(in crate::data::executor) mod maintenance;
 mod open;
-pub(in crate::data::executor) mod pressure;
+pub mod pressure;
 pub(in crate::data::executor) mod priority_queues;
 mod response;
 mod segment_keks;

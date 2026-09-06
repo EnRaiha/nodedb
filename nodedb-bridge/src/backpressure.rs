@@ -2,7 +2,8 @@
 
 //! Adaptive backpressure controller.
 //!
-//! Monitors SPSC queue utilization and drives state transitions:
+//! Tracks one SPSC ring's utilization and drives state transitions. The
+//! ring's writer owns the controller and decides what each state means for it.
 //!
 //! ```text
 //! ┌──────────┐   >85%   ┌──────────────┐  >95%  ┌───────────┐
@@ -12,9 +13,9 @@
 //!      └────────────────────  └───────────────────────┘
 //! ```
 //!
-//! - **Normal**: Data Plane processes all I/O at full speed.
-//! - **Throttled**: Data Plane reduces read depth (fewer concurrent io_uring reads).
-//! - **Suspended**: Data Plane suspends new read submissions (except replay-critical I/O).
+//! - **Normal**: the writer proceeds at full speed.
+//! - **Throttled**: the writer slows down, so the reader can catch up.
+//! - **Suspended**: the writer stops adding load until the ring drains.
 //!
 //! Hysteresis (10% gap) prevents oscillation at threshold boundaries.
 
@@ -50,9 +51,9 @@ impl Default for BackpressureConfig {
 pub enum PressureState {
     /// Full speed — all I/O permitted.
     Normal = 0,
-    /// Reduced read depth — Data Plane should limit concurrent io_uring reads.
+    /// Reduced rate — the writer limits how much new load it adds.
     Throttled = 1,
-    /// New reads suspended — only replay-critical I/O permitted.
+    /// No new load — the writer waits for the ring to drain.
     Suspended = 2,
 }
 
@@ -68,8 +69,8 @@ impl PressureState {
 
 /// Tracks backpressure state and transition counts.
 ///
-/// Called by the bridge on every push/pop to update state. The Data Plane
-/// reads the current state to decide its I/O behavior.
+/// Called by the ring's writer to update state. The writer reads the current
+/// state to decide how much new load to add.
 pub struct BackpressureController {
     config: BackpressureConfig,
 

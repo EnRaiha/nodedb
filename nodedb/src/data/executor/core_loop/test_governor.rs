@@ -19,7 +19,7 @@ const TEST_ENGINE_BUDGET_BYTES: usize = 1 << 30;
 /// `CoreLoop` and `SharedState` no longer accept a missing governor, so
 /// every construction site needs one. A test that exercises specific
 /// pressure levels builds its own governor instead — see
-/// `core_loop::pressure::tests::make_governor_at`.
+/// `core_loop::pressure::fixtures::make_governor_at`.
 ///
 /// Public (not `#[cfg(test)]`) because `nodedb/tests/inproc` links this
 /// crate as an external dependency and cannot see `cfg(test)` items.

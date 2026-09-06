@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 use super::super::histogram::{AtomicHistogram, WAL_FSYNC_BUCKETS_US};
 use super::super::purge::PurgeMetrics;
 use super::heartbeat::CoreHeartbeats;
+use crate::data::executor::core_loop::pressure::ThrottleMetrics;
 use crate::data::io::IoMetrics;
 
 /// Core metrics collected across the system.
@@ -201,6 +202,15 @@ pub struct SystemMetrics {
     /// Plane can update counters without crossing the plane boundary.
     /// The Prometheus handler reads from here.
     pub io_metrics: Arc<IoMetrics>,
+
+    // ── SPSC intake throttle ──
+    /// Per-level core counts and transition counters for the Data Plane's
+    /// request-intake throttle.
+    ///
+    /// Shared `Arc` is cloned into each `CoreLoop` at startup so a core
+    /// records its own transitions without crossing the plane boundary.
+    /// The Prometheus handler reads from here.
+    pub spsc_throttle: Arc<ThrottleMetrics>,
 
     // ── Data Plane core liveness ──
     /// One counter per Data Plane core, bumped at the top of every event-loop

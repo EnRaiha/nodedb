@@ -119,27 +119,27 @@ impl CoreLoop {
         self.segment_keks.array_segment_kek = Some(kek);
     }
 
-    /// Returns the current SPSC drain batch size.
-    ///
-    /// Useful for observability and integration-level pressure tests that
-    /// verify the governor correctly throttles the read depth.
+    /// Current SPSC drain batch size, derived from the intake throttle level.
     pub fn spsc_read_depth(&self) -> usize {
-        self.spsc_read_depth
+        self.throttle.read_depth()
     }
 
-    /// Returns whether new SPSC reads are suspended due to Emergency pressure.
-    ///
-    /// Useful for observability and integration-level pressure tests that
-    /// verify the governor correctly gates the drain path.
+    /// Whether the core is taking in no new SPSC requests this tick.
     pub fn pressure_suspend_reads(&self) -> bool {
-        self.pressure_suspend_reads
+        self.throttle.suspends_reads()
     }
 
-    /// Returns the configured baseline SPSC drain depth (the value restored
-    /// after pressure normalizes).  Exposed so integration tests can assert
-    /// throttled depths relative to the baseline without hard-coding the value.
+    /// Current intake throttle level. Read depth and the suspend decision
+    /// both derive from it.
+    pub fn throttle_level(&self) -> super::pressure::ThrottleLevel {
+        self.throttle.level()
+    }
+
+    /// Baseline SPSC drain depth — the value restored once pressure clears.
+    /// Exposed so callers assert throttled depths relative to the baseline
+    /// instead of hard-coding it.
     pub fn spsc_read_depth_normal() -> usize {
-        crate::data::executor::core_loop::pressure::SPSC_READ_DEPTH_NORMAL
+        super::pressure::SPSC_READ_DEPTH_NORMAL
     }
 
     /// Install the encryption key for timeseries columnar segment files.

@@ -28,7 +28,7 @@ NodeDB splits work across three planes connected by lock-free ring buffers. This
 
 **Event Plane** — Runs on Tokio. Consumes the event stream from the Data Plane and handles all asynchronous, event-driven work: AFTER trigger dispatch, CDC change stream delivery, cron job evaluation, durable pub/sub topics, and webhook HTTP delivery. Side effects (trigger bodies, scheduled SQL) are dispatched back through the normal Control Plane → Data Plane path — the Event Plane handles routing and delivery, not compute. WAL-backed crash recovery ensures no events are lost across restarts.
 
-**SPSC Bridge** — Bounded lock-free ring buffers are the only communication path between the planes. Backpressure is automatic: at 85% queue utilization the Data Plane reduces read depth, at 95% it suspends new reads.
+**SPSC Bridge** — Bounded lock-free ring buffers are the only communication path between the planes. Each plane throttles on the ring it writes to: the Control Plane stages requests in a weighted-fair queue, the Data Plane halves its read depth above 85% response-ring occupancy and takes in nothing above 95%. Engine memory pressure drives the same two steps; a core runs at whichever level is stricter.
 
 ### Plane Boundaries
 

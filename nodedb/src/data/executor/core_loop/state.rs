@@ -372,21 +372,10 @@ pub struct CoreLoop {
     pub(in crate::data::executor) maintenance_budget:
         Option<Arc<crate::control::maintenance::MaintenanceBudgetTracker>>,
 
-    /// Current SPSC drain batch size, adjusted by memory pressure.
-    ///
-    /// Normal: 64.  Critical: halved (floor 1).  Emergency: 0 (new reads
-    /// suspended until pressure clears).  Restored with hysteresis after
-    /// `PRESSURE_NORMAL_HYSTERESIS` consecutive Normal/Warning iterations.
-    pub(crate) spsc_read_depth: usize,
-
-    /// When `true` the core loop does not drain new SPSC requests.
-    /// Set on Emergency pressure; cleared when pressure drops to Critical
-    /// or below (then normal hysteresis restores `spsc_read_depth`).
-    pub(crate) pressure_suspend_reads: bool,
-
-    /// Consecutive ticks at Normal/Warning pressure since last Critical/Emergency
-    /// transition. Used for hysteresis before restoring `spsc_read_depth`.
-    pub(crate) pressure_normal_ticks: u32,
+    /// Request intake level for this tick, folded from engine memory
+    /// pressure and response-ring utilization. Drain depth and the suspend
+    /// decision both read off it.
+    pub(crate) throttle: super::pressure::SpscThrottle,
 
     /// Per-collection jemalloc arena registry.
     ///

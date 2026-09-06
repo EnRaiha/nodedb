@@ -17,11 +17,12 @@ impl CoreLoop {
     /// Emergency. Each request is routed to the Critical, High, or Low tier
     /// based on `Request.priority`.
     pub fn drain_requests(&mut self) {
-        if self.pressure_suspend_reads {
-            // Emergency pressure: do not accept new requests.
+        if self.throttle.suspends_reads() {
+            // Intake suspended. In-flight tasks still answer, so the
+            // response ring drains and the condition clears itself.
             return;
         }
-        let depth = self.spsc_read_depth.max(1);
+        let depth = self.throttle.read_depth();
         let mut batch = Vec::new();
         // A disconnected producer here means the Control Plane is gone, which
         // only happens as the process itself terminates: a core thread has no

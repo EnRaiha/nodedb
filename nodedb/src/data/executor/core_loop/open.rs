@@ -19,7 +19,6 @@ use crate::engine::sparse::inverted::InvertedIndex;
 use crate::types::Lsn;
 use nodedb_types::OrdinalClock;
 
-use super::pressure::SPSC_READ_DEPTH_NORMAL;
 use super::priority_queues::PriorityQueues;
 use super::state::CoreLoop;
 
@@ -182,9 +181,7 @@ impl CoreLoop {
             },
             governor,
             maintenance_budget: None,
-            spsc_read_depth: SPSC_READ_DEPTH_NORMAL,
-            pressure_suspend_reads: false,
-            pressure_normal_ticks: 0,
+            throttle: super::pressure::SpscThrottle::new(),
             collection_arena_registry: None,
             metrics: None,
             event_producer: None,
