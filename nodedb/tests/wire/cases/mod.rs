@@ -184,6 +184,7 @@ mod sql_join_correctness;
 mod sql_join_row_level_security;
 mod sql_json_path_ops;
 mod sql_lateral;
+mod sql_limit_offset_bounds;
 mod sql_maintenance;
 mod sql_materialized_view_refresh;
 mod sql_merge;
