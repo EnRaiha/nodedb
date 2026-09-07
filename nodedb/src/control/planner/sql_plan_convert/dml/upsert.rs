@@ -76,8 +76,14 @@ pub(in super::super) fn convert_upsert(
     for row in rows {
         match engine {
             EngineType::DocumentSchemaless | EngineType::DocumentStrict => {
-                let value_bytes = row_to_msgpack(row)?;
-                let (doc_id, surrogate) = resolve_doc_identity(ctx, collection, primary_key, row)?;
+                // Defaults (incl. sequence-backed) materialize before
+                // encoding and before identity resolution: a column the
+                // statement omitted may still carry a DEFAULT, and a
+                // sequence-defaulted primary key must not be mistaken for a
+                // NULL/omitted key by the NOT NULL enforcement below.
+                let expanded = super::super::value::expand_row_defaults(ctx, row, column_defaults)?;
+                let value_bytes = row_to_msgpack(&expanded)?;
+                let (doc_id, surrogate) = resolve_doc_identity(ctx, collection, primary_key, &expanded)?;
                 let plan = if is_crdt {
                     PhysicalPlan::Crdt(CrdtOp::DocUpsert {
                         collection: qualified_collection.clone(),
@@ -128,7 +134,7 @@ pub(in super::super) fn convert_upsert(
     }
 
     if !columnar_rows.is_empty() {
-        let payload = rows_to_msgpack_array(&columnar_rows, column_defaults)?;
+        let payload = rows_to_msgpack_array(&columnar_rows, column_defaults, ctx)?;
         let surrogates = columnar_row_surrogates(ctx, collection, &columnar_rows, primary_key)?;
         let schema_bytes = build_schema_bytes(column_schema);
         tasks.push(PhysicalTask {

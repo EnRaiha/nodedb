@@ -73,6 +73,7 @@ pub trait PlanVisitor {
     fn insert(&mut self, args: InsertVisitArgs<'_>) -> Result<Self::Output, Self::Error>;
 
     /// Handle [`SqlPlan::KvInsert`].
+    #[allow(clippy::too_many_arguments)]
     fn kv_insert(
         &mut self,
         collection: &str,
@@ -80,6 +81,8 @@ pub trait PlanVisitor {
         ttl_secs: u64,
         intent: KvInsertIntent,
         on_conflict_updates: &[(String, SqlExpr)],
+        key_column: &str,
+        sequence_defaults: &[(String, String)],
     ) -> Result<Self::Output, Self::Error>;
 
     /// Handle [`SqlPlan::Upsert`].

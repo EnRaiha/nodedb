@@ -113,7 +113,17 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             ttl_secs,
             intent,
             on_conflict_updates,
-        } => visitor.kv_insert(collection, entries, *ttl_secs, *intent, on_conflict_updates),
+            key_column,
+            sequence_defaults,
+        } => visitor.kv_insert(
+            collection,
+            entries,
+            *ttl_secs,
+            *intent,
+            on_conflict_updates,
+            key_column,
+            sequence_defaults,
+        ),
         SqlPlan::Upsert {
             collection,
             engine,

@@ -40,6 +40,11 @@ pub struct QueryContext {
     /// `QueryContext::new()` test fixtures that never lower to
     /// surrogate-bearing variants.
     pub(super) surrogate_assigner: Option<Arc<crate::control::surrogate::SurrogateAssigner>>,
+    /// Sequence registry — `Some` when the planner has access to
+    /// `SharedState` (production path). SQL sequence accessors
+    /// (`nextval`/`currval`/`setval`) and sequence-backed DEFAULT
+    /// expressions evaluate through this; `None` for sub-planners.
+    pub(super) sequence_registry: Option<Arc<crate::control::sequence::SequenceRegistry>>,
     /// Cluster mode flag — `true` when the node has a live cluster
     /// topology. Passed into `ConvertContext` so array converters can
     /// emit `ClusterArray` variants instead of local `Array` variants.
@@ -109,6 +114,7 @@ impl QueryContext {
             array_catalog: None,
             wal: None,
             surrogate_assigner: None,
+            sequence_registry: None,
             cluster_enabled: false,
             bitemporal_retention_registry: None,
             max_vector_dim: std::sync::atomic::AtomicU32::new(0),
@@ -140,6 +146,7 @@ impl QueryContext {
             Some(Arc::clone(&state.retention_policy_registry)),
         );
         ctx.surrogate_assigner = Some(Arc::clone(&state.surrogate_assigner));
+        ctx.sequence_registry = Some(Arc::clone(&state.sequence_registry));
         ctx.cluster_enabled = state.cluster_topology.is_some();
         ctx.bitemporal_retention_registry = Some(Arc::clone(&state.bitemporal_retention_registry));
         // max_vector_dim starts at 0 (unlimited); connection handlers call
@@ -174,6 +181,7 @@ impl QueryContext {
             array_catalog: Some(state.array_catalog.clone()),
             wal: Some(Arc::clone(&state.wal)),
             surrogate_assigner: Some(Arc::clone(&state.surrogate_assigner)),
+            sequence_registry: Some(Arc::clone(&state.sequence_registry)),
             cluster_enabled: state.cluster_topology.is_some(),
             bitemporal_retention_registry: Some(Arc::clone(&state.bitemporal_retention_registry)),
             // max_vector_dim is tenant-specific; callers supply it via
@@ -215,6 +223,7 @@ impl QueryContext {
             array_catalog: None,
             wal: None,
             surrogate_assigner: None,
+            sequence_registry: None,
             cluster_enabled: false,
             bitemporal_retention_registry: None,
             max_vector_dim: std::sync::atomic::AtomicU32::new(0),

@@ -144,6 +144,7 @@ mod tests {
             credentials: None,
             wal: None,
             surrogate_assigner: None,
+            sequence_registry: None,
             cluster_enabled,
             bitemporal_retention_registry: None,
             max_vector_dim: 0,

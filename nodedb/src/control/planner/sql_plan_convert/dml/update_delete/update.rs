@@ -377,6 +377,7 @@ mod tests {
             credentials: Some(Arc::new(store)),
             wal: None,
             surrogate_assigner: None,
+            sequence_registry: None,
             cluster_enabled: false,
             bitemporal_retention_registry: None,
             max_vector_dim: 0,

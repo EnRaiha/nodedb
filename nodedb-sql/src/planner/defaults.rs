@@ -120,3 +120,61 @@ fn sql_value_to_ndb(v: crate::types::SqlValue) -> nodedb_types::Value {
         SqlValue::Timestamptz(dt) => nodedb_types::Value::DateTime(dt),
     }
 }
+
+/// A sequence accessor appearing in a DEFAULT expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceAccessor {
+    Nextval,
+    Currval,
+    Setval,
+}
+
+/// Whether a DEFAULT expression *starts like* a sequence accessor
+/// (`nextval(`/`currval(`/`setval(` … `)`) even when the body does not parse.
+/// Malformed accessor-looking defaults must raise loudly — never fall back
+/// to the pure evaluator and silently vanish (#294 class).
+pub fn looks_like_sequence_accessor(expr: &str) -> bool {
+    let t = expr.trim();
+    let bytes = t.as_bytes();
+    if bytes.len() < 8 || !t.ends_with(')') {
+        return false;
+    }
+    let head = |n: usize, name: &[u8]| bytes[..n].eq_ignore_ascii_case(name) && bytes[n] == b'(';
+    head(7, b"nextval") || head(7, b"currval") || head(6, b"setval")
+}
+
+/// One canonical sequence-accessor recognizer for DEFAULT expressions,
+/// shared by the SQL planner (which must skip these — the pure evaluator
+/// cannot run them) and the convert layer (which advances the CP-side
+/// registry). Matched on the ORIGINAL bytes, ASCII case-insensitive — never
+/// by slicing the original with a length taken from a case-folded copy.
+pub fn sequence_accessor(expr: &str) -> Option<(SequenceAccessor, String)> {
+    let t = expr.trim();
+    let bytes = t.as_bytes();
+    if bytes.len() < 8 || !t.ends_with(')') {
+        return None;
+    }
+    let (accessor, prefix_len) = if bytes[..7].eq_ignore_ascii_case(b"nextval") {
+        (SequenceAccessor::Nextval, 7)
+    } else if bytes[..7].eq_ignore_ascii_case(b"currval") {
+        (SequenceAccessor::Currval, 7)
+    } else if bytes[..6].eq_ignore_ascii_case(b"setval") {
+        (SequenceAccessor::Setval, 6)
+    } else {
+        return None;
+    };
+    if bytes[prefix_len] != b'(' {
+        return None;
+    }
+    let inner = &t[prefix_len + 1..t.len() - 1];
+    let inner = inner.trim();
+    let name = inner
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .or_else(|| inner.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        .unwrap_or(inner);
+    if name.is_empty() {
+        return None;
+    }
+    Some((accessor, name.to_string()))
+}

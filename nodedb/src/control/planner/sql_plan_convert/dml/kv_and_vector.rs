@@ -14,12 +14,15 @@ use super::super::value::{
 use super::insert::assign_for_pk;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
+#[allow(clippy::too_many_arguments)]
 pub(in super::super) fn convert_kv_insert(
     collection: &str,
     entries: &[(SqlValue, Vec<(String, SqlValue)>)],
     ttl_secs: u64,
     intent: KvInsertIntent,
     on_conflict_updates: &[(String, SqlExpr)],
+    key_column: &str,
+    sequence_defaults: &[(String, String)],
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
@@ -35,9 +38,34 @@ pub(in super::super) fn convert_kv_insert(
     let ttl_ms = ttl_secs * 1000;
     let mut tasks = Vec::with_capacity(entries.len());
     for (key_val, value_cols) in entries {
-        // A declared PRIMARY KEY implies NOT NULL. The planner substitutes
-        // `SqlValue::Null` for a column the statement omitted, so this also
-        // catches an omitted key, not only an explicit `NULL` literal.
+        // Sequence-backed defaults (key or value column) advance the CP-side
+        // registry here — the planner cannot run them. The planner
+        // substitutes `SqlValue::Null` for a column the statement omitted,
+        // so a NULL key either names a declared sequence default (filled
+        // below) or violates the PRIMARY KEY's NOT NULL (#310) and is
+        // rejected.
+        let mut key_val = key_val.clone();
+        let mut value_cols = value_cols.clone();
+        if matches!(key_val, SqlValue::Null)
+            && let Some((_, expr)) = sequence_defaults
+                .iter()
+                .find(|(name, _)| name == key_column)
+        {
+            key_val = sequence_default_value(ctx, expr)?;
+            // Named primary-key columns are mirrored into the value map
+            // so scans can project/filter them (see the builder's
+            // exclusion rule); a defaulted key must mirror too, or the
+            // row reads back with a blank key column.
+            if key_column != "key" && !value_cols.iter().any(|(c, _)| c == key_column) {
+                value_cols.push((key_column.to_string(), key_val.clone()));
+            }
+        }
+        for (name, expr) in sequence_defaults {
+            if name != key_column && !value_cols.iter().any(|(c, _)| c == name) {
+                let val = sequence_default_value(ctx, expr)?;
+                value_cols.push((name.clone(), val));
+            }
+        }
         if matches!(key_val, SqlValue::Null) {
             return Err(crate::Error::RejectedConstraint {
                 collection: collection.to_string(),
@@ -45,13 +73,13 @@ pub(in super::super) fn convert_kv_insert(
                 detail: "primary key cannot be NULL or omitted".to_string(),
             });
         }
-        let key = sql_value_to_bytes(key_val);
+        let key = sql_value_to_bytes(&key_val);
         let value = if value_cols.len() == 1 && value_cols[0].0 == "value" {
             sql_value_to_bytes(&value_cols[0].1)
         } else {
             let mut buf = Vec::with_capacity(value_cols.len() * 32);
             write_msgpack_map_header(&mut buf, value_cols.len());
-            for (col, val) in value_cols {
+            for (col, val) in &value_cols {
                 write_msgpack_str(&mut buf, col);
                 write_msgpack_value(&mut buf, val);
             }
@@ -200,6 +228,23 @@ pub(in super::super) fn convert_vector_primary_insert(
     Ok(tasks)
 }
 
+fn sequence_default_value(ctx: &ConvertContext, expr: &str) -> crate::Result<SqlValue> {
+    let Some(registry) = &ctx.sequence_registry else {
+        return Err(crate::Error::PlanError {
+            detail: format!("sequence default '{expr}' requires sequence registry access"),
+        });
+    };
+    let name = super::super::value::sequence_name(expr).ok_or_else(|| crate::Error::PlanError {
+        detail: format!("unrecognized sequence default expression: '{expr}'"),
+    })?;
+    let value = registry
+        .nextval(ctx.database_id.as_u64(), ctx.tenant_id.as_u64(), &name)
+        .map_err(|e| crate::Error::PlanError {
+            detail: format!("nextval('{name}'): {e}"),
+        })?;
+    Ok(SqlValue::Int(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::convert::ConvertContext;
@@ -214,6 +259,7 @@ mod tests {
             credentials: None,
             wal: None,
             surrogate_assigner: None,
+            sequence_registry: None,
             cluster_enabled: false,
             bitemporal_retention_registry: None,
             max_vector_dim,

@@ -61,12 +61,24 @@ pub(super) fn convert_collection_type(
                 .declared_primary_key
                 .clone()
                 .unwrap_or_else(|| "id".to_string());
+            // The stored field entry keeps the FULL DDL constraint text
+            // (`"BIGINT DEFAULT nextval('s') PRIMARY KEY"`), so the DEFAULT
+            // expression is recoverable even though the schemaless type
+            // system records no per-column default slot of its own. Dropping
+            // it here is what made `DEFAULT uuid_v7()` / `DEFAULT
+            // nextval('s')` silently commit NULL on the document engine
+            // (#294): the DDL accepted the expression, the catalog forgot it.
+            let pk_default = stored
+                .fields
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&pk_name))
+                .and_then(|(_, ts)| doc_default_expr(ts));
             let mut columns = vec![ColumnInfo {
                 name: pk_name.clone(),
                 data_type: SqlDataType::String,
                 nullable: false,
                 is_primary_key: true,
-                default: None,
+                default: pk_default,
                 raw_type: None,
                 int_width: None,
                 float_width: None,
@@ -81,7 +93,7 @@ pub(super) fn convert_collection_type(
                     data_type: parse_type_str(type_str),
                     nullable: true,
                     is_primary_key: false,
-                    default: None,
+                    default: doc_default_expr(type_str),
                     raw_type: None,
                     int_width: IntWidth::from_declared_type(type_str),
                     float_width: FloatWidth::from_declared_type(type_str),
@@ -287,6 +299,12 @@ fn parse_type_str(s: &str) -> SqlDataType {
         "TIMESTAMP" | "TIMESTAMPTZ" => SqlDataType::Timestamp,
         _ => SqlDataType::String,
     }
+}
+
+fn doc_default_expr(type_str: &str) -> Option<String> {
+    let (_, _, _, default_expr) =
+        nodedb_sql::ddl_ast::collection_type::parse_column_type_str_full(type_str);
+    default_expr
 }
 
 #[cfg(test)]

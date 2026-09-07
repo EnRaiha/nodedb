@@ -138,6 +138,12 @@ pub enum SqlPlan {
         /// Empty for plain UPSERT (whole-value overwrite) and for INSERT
         /// variants.
         on_conflict_updates: Vec<(String, SqlExpr)>,
+        /// The collection's primary-key column name (the KV key slot).
+        key_column: String,
+        /// Column defaults that are sequence accessors (`nextval(...)`) —
+        /// the pure planner evaluator cannot run them; the converter
+        /// advances the CP-side registry per row instead.
+        sequence_defaults: Vec<(String, String)>,
     },
     /// UPSERT: insert or merge if document exists.
     Upsert {

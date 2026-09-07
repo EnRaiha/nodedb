@@ -75,6 +75,7 @@ fn sql_to_physical(sql: &str) -> PhysicalPlan {
         credentials: None,
         wal: None,
         surrogate_assigner: None,
+        sequence_registry: None,
         cluster_enabled: false,
         bitemporal_retention_registry: None,
         max_vector_dim: 0,
