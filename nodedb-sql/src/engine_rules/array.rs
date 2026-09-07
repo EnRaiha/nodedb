@@ -74,6 +74,11 @@ impl EngineRules for ArrayRules {
             "use INSERT INTO ARRAY / DELETE FROM ARRAY for array engine mutations",
         ))
     }
+
+    /// Columns are the array's declared dims and attrs.
+    fn accepts_undeclared_columns(&self) -> bool {
+        false
+    }
 }
 
 fn unsupported(op: &str, hint: &str) -> SqlError {

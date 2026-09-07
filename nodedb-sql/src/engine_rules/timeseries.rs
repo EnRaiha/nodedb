@@ -128,6 +128,11 @@ impl EngineRules for TimeseriesRules {
             ),
         })
     }
+
+    /// Every column is declared at creation and encoded per column.
+    fn accepts_undeclared_columns(&self) -> bool {
+        false
+    }
 }
 
 /// Default time range bounds for the SqlPlan IR.

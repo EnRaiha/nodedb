@@ -33,6 +33,21 @@ pub struct CollectionInfo {
     /// Authoritative per-collection partition metadata. Future routing layers
     /// read this instead of inferring distribution from engine type.
     pub partition_strategy: nodedb_types::PartitionStrategy,
+    /// Whether a name outside `columns` resolves in this relation.
+    ///
+    /// A stored collection derives it from its engine. A synthesized relation
+    /// sets it independently: a derived, LATERAL, or CTE alias is closed when
+    /// its projection list is inferable, open only when it is `*` over an open
+    /// source. `pg_catalog` relations are open because NodeDB models a subset
+    /// of the columns clients ask for.
+    pub open_schema: bool,
+}
+
+impl CollectionInfo {
+    /// The openness a stored collection on `engine` carries.
+    pub fn open_schema_for(engine: EngineType) -> bool {
+        crate::engine_rules::resolve_engine_rules(engine).accepts_undeclared_columns()
+    }
 }
 
 /// Secondary index metadata surfaced to the SQL planner.

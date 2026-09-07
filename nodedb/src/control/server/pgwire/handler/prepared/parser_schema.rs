@@ -154,6 +154,7 @@ pub(super) fn result_fields_for_returning(
             SqlDataType::Uuid => Type::TEXT,
             SqlDataType::Vector(_) => Type::BYTEA,
             SqlDataType::Geometry => Type::BYTEA,
+            SqlDataType::Unknown => Type::TEXT,
         }
     }
 

@@ -166,6 +166,7 @@ impl SqlCatalog for OriginCatalog {
             primary: stored.primary,
             vector_primary: stored.vector_primary,
             partition_strategy: stored.partition_strategy,
+            open_schema: CollectionInfo::open_schema_for(engine),
         }))
     }
 

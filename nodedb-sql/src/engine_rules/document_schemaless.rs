@@ -146,4 +146,10 @@ impl EngineRules for SchemalessRules {
             sort_keys: Vec::new(),
         })
     }
+
+    /// Schemaless documents store fields the schema never declares, so an
+    /// undeclared name is a valid read.
+    fn accepts_undeclared_columns(&self) -> bool {
+        true
+    }
 }

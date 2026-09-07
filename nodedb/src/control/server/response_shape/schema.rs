@@ -60,6 +60,8 @@ pub fn sql_data_type_to_ddl_col_type(
         SqlDataType::Vector(_) => DdlColType::Text,
         // No dedicated wire type yet; falls back to Text (no regression).
         SqlDataType::Geometry => DdlColType::Text,
+        // No declared type at all; the column resolves by name only.
+        SqlDataType::Unknown => DdlColType::Text,
     }
 }
 

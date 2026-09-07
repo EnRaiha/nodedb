@@ -150,4 +150,5 @@ pub enum SqlDataType {
     Uuid,
     Vector(usize),
     Geometry,
+    Unknown,
 }

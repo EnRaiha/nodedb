@@ -154,7 +154,8 @@ fn coerce_value(column: &str, value: SqlValue, declared: &SqlDataType) -> Result
         | SqlDataType::Decimal
         | SqlDataType::Uuid
         | SqlDataType::Vector(_)
-        | SqlDataType::Geometry => Ok(value),
+        | SqlDataType::Geometry
+        | SqlDataType::Unknown => Ok(value),
     }
 }
 

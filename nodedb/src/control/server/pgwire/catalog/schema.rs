@@ -235,5 +235,7 @@ pub fn catalog_collection_info(name: &str) -> Option<CollectionInfo> {
         vector_primary: None,
         // Catalog relations are synthetic, read-only, and never sharded.
         partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
+        // NodeDB models a subset of the columns clients ask for.
+        open_schema: true,
     })
 }

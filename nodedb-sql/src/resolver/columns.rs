@@ -7,11 +7,13 @@ use std::collections::HashMap;
 use nodedb_types::DatabaseId;
 
 use crate::error::{Result, SqlError};
-use crate::parser::normalize::{normalize_object_name_checked, table_name_from_factor};
-use crate::types::{
-    ArrayCatalogView, CollectionInfo, ColumnInfo, EngineType, SqlCatalog, SqlDataType,
-};
-use crate::types_array::{ArrayAttrType, ArrayDimType};
+use crate::parser::normalize::table_name_from_factor;
+use crate::types::{CollectionInfo, ColumnInfo, SqlCatalog};
+
+/// Synthetic temporal columns an audit read injects into every version row.
+/// They are not declared columns, so a bitemporal relation resolves them by
+/// name.
+const BITEMPORAL_AUDIT_COLUMNS: [&str; 3] = ["_ts_system", "_ts_valid_from", "_ts_valid_until"];
 
 /// Resolved table reference: name, alias, and catalog info.
 #[derive(Debug, Clone)]
@@ -29,12 +31,26 @@ impl ResolvedTable {
 }
 
 /// Context built during FROM clause resolution.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct TableScope {
     /// Tables by reference name (alias or table name).
     pub tables: HashMap<String, ResolvedTable>,
     /// Insertion order for unambiguous column resolution.
     order: Vec<String>,
+    /// Names resolvable here that belong to no relation: SELECT output
+    /// aliases visible to ORDER BY, GROUP BY, and HAVING, plus the output
+    /// names substituted for aggregate calls.
+    output_names: Vec<String>,
+    /// The enclosing query's scope, for a correlated subquery. A qualifier
+    /// naming no relation here resolves there instead. Boxed rather than
+    /// borrowed: a lifetime on `TableScope` would ripple through every
+    /// planner signature that stores or returns one.
+    outer: Option<Box<TableScope>>,
+    /// Relations a bare column name never resolves against, reachable only
+    /// through their qualifier. A MERGE source and the `excluded` relation of
+    /// `ON CONFLICT DO UPDATE` are both qualified-only, so a bare name in a
+    /// WHEN or SET clause names the target column.
+    qualified_only: Vec<String>,
 }
 
 impl TableScope {
@@ -55,74 +71,33 @@ impl TableScope {
         Ok(())
     }
 
-    /// Resolve a column name, optionally qualified with a table reference.
+    /// Add a relation that only a qualified reference reaches.
     ///
-    /// For schemaless collections, any column is accepted (dynamic fields).
-    /// For typed collections, the column must exist in the schema.
-    pub fn resolve_column(
-        &self,
-        table_ref: Option<&str>,
-        column: &str,
-    ) -> Result<(String, String)> {
-        let col = column.to_lowercase();
-
-        if let Some(tref) = table_ref {
-            let tref_lower = tref.to_lowercase();
-            let table = self
-                .tables
-                .get(&tref_lower)
-                .ok_or_else(|| SqlError::UnknownTable {
-                    name: tref_lower.clone(),
-                })?;
-            self.validate_column(table, &col)?;
-            return Ok((table.name.clone(), col));
-        }
-
-        // Unqualified: search all tables.
-        let mut matches = Vec::new();
-        for key in &self.order {
-            let table = &self.tables[key];
-            if self.column_exists(table, &col) {
-                matches.push(table.name.clone());
-            }
-        }
-
-        match matches.len() {
-            0 => {
-                // For single-table queries with schemaless, accept anything.
-                if self.tables.len() == 1 {
-                    let table = self
-                        .tables
-                        .values()
-                        .next()
-                        .expect("invariant: self.tables.len() == 1 checked immediately above");
-                    if table.info.engine == EngineType::DocumentSchemaless {
-                        return Ok((table.name.clone(), col));
-                    }
-                }
-                Err(SqlError::UnknownColumn {
-                    table: self
-                        .order
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "<unknown>".into()),
-                    column: col,
-                })
-            }
-            1 => Ok((
-                matches
-                    .into_iter()
-                    .next()
-                    .expect("invariant: matches.len() == 1 guaranteed by this match arm"),
-                col,
-            )),
-            _ => Err(SqlError::AmbiguousColumn { column: col }),
-        }
+    /// A bare column name skips it, so a name both this relation and a
+    /// bare-resolvable one declare is not ambiguous.
+    pub fn add_qualified_only(&mut self, table: ResolvedTable) -> Result<()> {
+        let key = table.ref_name().to_string();
+        self.add(table)?;
+        self.qualified_only.push(key);
+        Ok(())
     }
 
     fn column_exists(&self, table: &ResolvedTable, column: &str) -> bool {
-        // Schemaless accepts any column.
-        if table.info.engine == EngineType::DocumentSchemaless {
+        if table.info.open_schema {
+            return true;
+        }
+        if table.info.bitemporal && BITEMPORAL_AUDIT_COLUMNS.contains(&column) {
+            return true;
+        }
+        let rules = crate::engine_rules::resolve_engine_rules(table.info.engine);
+        if rules.implicit_columns().contains(&column) {
+            return true;
+        }
+        // A key-only collection on an engine with a free value-column name
+        // has not fixed that name yet, so any name resolves.
+        if rules.value_column_name_is_free()
+            && !table.info.columns.iter().any(|c| !c.is_primary_key)
+        {
             return true;
         }
         table.info.columns.iter().any(|c| c.name == column)
@@ -145,6 +120,116 @@ impl TableScope {
             self.tables.values().next()
         } else {
             Option::None
+        }
+    }
+
+    /// A copy of this scope nested inside `outer`, for planning a correlated
+    /// subquery body.
+    pub fn nested_in(mut self, outer: TableScope) -> Self {
+        self.outer = Some(Box::new(outer));
+        self
+    }
+
+    /// A copy of this scope widened with output column names.
+    ///
+    /// An ORDER BY, GROUP BY, or HAVING identifier resolves against input
+    /// columns first and output names second, so this only widens: a name
+    /// that already resolves to a column keeps resolving to it.
+    pub fn with_output_names(&self, names: impl IntoIterator<Item = String>) -> Self {
+        let mut out = self.clone();
+        out.output_names.extend(names);
+        out
+    }
+
+    /// A single-relation scope, for the DML planners that resolve one
+    /// collection and build no FROM clause.
+    pub fn single(table: ResolvedTable) -> Result<Self> {
+        let mut scope = Self::new();
+        scope.add(table)?;
+        Ok(scope)
+    }
+
+    /// Reject a column reference that names nothing in scope.
+    pub fn check_name(&self, table_ref: Option<&str>, column: &str) -> Result<()> {
+        let col = column.to_lowercase();
+
+        if let Some(tref) = table_ref {
+            let tref_lower = tref.to_lowercase();
+            return match self.tables.get(&tref_lower) {
+                Some(table) => self.validate_column(table, &col),
+                // A qualifier naming no relation here belongs to the outer
+                // query of a correlated subquery. With no outer scope it is
+                // an unknown relation, not an unknown column.
+                None => match &self.outer {
+                    Some(outer) => outer.check_name(Some(&tref_lower), &col),
+                    None => Err(SqlError::UnknownTable { name: tref_lower }),
+                },
+            };
+        }
+
+        if self.output_names.iter().any(|n| n == &col) {
+            return Ok(());
+        }
+
+        // A relation that declares the column wins over one that merely
+        // accepts any name. An open-schema relation alongside a closed one
+        // that declares the column is not an ambiguity.
+        let bare: Vec<&ResolvedTable> = self
+            .order
+            .iter()
+            .filter(|key| !self.qualified_only.contains(*key))
+            .map(|key| &self.tables[key])
+            .collect();
+        let declared = bare
+            .iter()
+            .filter(|table| table.info.columns.iter().any(|c| c.name == col))
+            .count();
+        // An open-schema relation contributes a maybe, never a yes. With no
+        // relation declaring the column, one that accepts any name resolves
+        // it: neither ambiguity nor absence is provable.
+        if declared == 0 && bare.iter().any(|table| self.column_exists(table, &col)) {
+            return Ok(());
+        }
+        match declared {
+            0 => match &self.outer {
+                Some(outer) => outer.check_name(None, &col),
+                None => Err(SqlError::UnknownColumn {
+                    table: self
+                        .order
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "<unknown>".into()),
+                    column: col,
+                }),
+            },
+            1 => Ok(()),
+            _ => Err(SqlError::AmbiguousColumn { column: col }),
+        }
+    }
+
+    /// The resolved tables, in the order the FROM clause introduced them.
+    pub fn tables_in_order(&self) -> impl Iterator<Item = &ResolvedTable> {
+        self.order.iter().map(|key| &self.tables[key])
+    }
+
+    /// The relation registered under `ref_name`, alias or table name.
+    pub fn table_by_ref(&self, ref_name: &str) -> Option<&ResolvedTable> {
+        self.tables.get(&ref_name.to_lowercase())
+    }
+
+    /// The declared column a reference names, when the relation declares it.
+    pub fn declared_column(&self, table_ref: Option<&str>, column: &str) -> Option<&ColumnInfo> {
+        let col = column.to_lowercase();
+        match table_ref {
+            Some(tref) => self
+                .table_by_ref(tref)?
+                .info
+                .columns
+                .iter()
+                .find(|c| c.name == col),
+            None => self
+                .tables_in_order()
+                .find_map(|t| t.info.columns.iter().find(|c| c.name == col)),
         }
     }
 
@@ -171,35 +256,32 @@ impl TableScope {
         // ARRAY_*(...) table-valued function: synthesize a ResolvedTable
         // from the array's dim+attr schema so equi-join keys against the
         // TVF's output rows resolve.
-        if let Some(resolved) = resolve_array_tvf(catalog, factor)? {
+        if let Some(resolved) = crate::resolver::array_tvf::resolve_array_tvf(catalog, factor)? {
             self.add(resolved)?;
             return Ok(());
         }
-        // LATERAL derived subquery: register the alias as a schemaless
-        // collection so qualified column references (`alias.col`) resolve
-        // without a catalog lookup. The actual inner plan is built separately.
+        // Derived subquery, LATERAL or not: register the alias as the relation
+        // its projection list exposes, so a column reference on the alias
+        // resolves without a catalog lookup. The inner plan is built
+        // separately.
         if let sqlparser::ast::TableFactor::Derived {
-            lateral: true,
+            subquery,
             alias: Some(alias),
             ..
         } = factor
         {
             let alias_str = crate::reserved::check_ast_identifier(&alias.name)?;
+            let declared: Vec<String> = alias
+                .columns
+                .iter()
+                .map(|column| crate::reserved::check_ast_identifier(&column.name))
+                .collect::<Result<_>>()?;
+            let info =
+                crate::resolver::derived::infer_subquery_relation(catalog, &alias_str, subquery)?;
             self.add(ResolvedTable {
                 name: alias_str.clone(),
-                alias: Some(alias_str.clone()),
-                info: CollectionInfo {
-                    name: alias_str,
-                    engine: EngineType::DocumentSchemaless,
-                    columns: Vec::new(),
-                    primary_key: None,
-                    has_auto_tier: false,
-                    indexes: Vec::new(),
-                    bitemporal: false,
-                    primary: nodedb_types::PrimaryEngine::Document,
-                    vector_primary: None,
-                    partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
-                },
+                alias: Some(alias_str),
+                info: crate::resolver::derived::rename_output_columns(info, &declared),
             })?;
             return Ok(());
         }
@@ -213,136 +295,39 @@ impl TableScope {
     }
 }
 
-/// If `factor` is `ARRAY_*(name, ...)`, look up the array via the
-/// catalog and build a `ResolvedTable` whose columns mirror the array's
-/// dims + attrs. Returns `Ok(None)` for any non-array-TVF factor.
-fn resolve_array_tvf(
-    catalog: &dyn SqlCatalog,
-    factor: &sqlparser::ast::TableFactor,
-) -> Result<Option<ResolvedTable>> {
-    let (fn_name, args, alias) = match factor {
-        sqlparser::ast::TableFactor::Table {
-            name,
-            args: Some(args),
-            alias,
-            ..
-        } => (
-            normalize_object_name_checked(name)?,
-            args,
-            alias
-                .as_ref()
-                .map(|alias| crate::reserved::check_ast_identifier(&alias.name))
-                .transpose()?,
-        ),
-        _ => return Ok(None),
-    };
-    if !matches!(
-        fn_name.as_str(),
-        "array_slice" | "array_project" | "array_agg" | "array_elementwise"
-    ) {
-        return Ok(None);
-    }
+/// Scope builders shared by the planner unit tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{ResolvedTable, TableScope};
+    use crate::types::{CollectionInfo, EngineType};
 
-    // First positional arg is the array name as a string literal.
-    let first = args.args.first().ok_or_else(|| SqlError::Unsupported {
-        detail: format!("{fn_name}: missing array-name argument"),
-    })?;
-    let array_name = extract_string_literal_arg(first).ok_or_else(|| SqlError::Unsupported {
-        detail: format!("{fn_name}: array-name argument must be a string literal"),
-    })?;
-    let view = catalog
-        .lookup_array(&array_name)
-        .ok_or_else(|| SqlError::UnknownTable {
-            name: array_name.clone(),
-        })?;
-
-    let info = CollectionInfo {
-        name: view.name.clone(),
-        engine: EngineType::Array,
-        columns: array_columns(&view),
-        primary_key: None,
-        has_auto_tier: false,
-        indexes: Vec::new(),
-        bitemporal: false,
-        primary: nodedb_types::PrimaryEngine::Document,
-        vector_primary: None,
-        partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
-    };
-    Ok(Some(ResolvedTable {
-        name: view.name,
-        alias,
-        info,
-    }))
-}
-
-fn array_columns(view: &ArrayCatalogView) -> Vec<ColumnInfo> {
-    let mut cols = Vec::with_capacity(view.dims.len() + view.attrs.len());
-    for d in &view.dims {
-        cols.push(ColumnInfo {
-            name: d.name.clone(),
-            data_type: dim_type_to_sql(d.dtype),
-            nullable: false,
-            is_primary_key: false,
-            default: None,
-            raw_type: None,
-            int_width: None,
-            float_width: None,
-        });
-    }
-    for a in &view.attrs {
-        cols.push(ColumnInfo {
-            name: a.name.clone(),
-            data_type: attr_type_to_sql(a.dtype),
-            nullable: a.nullable,
-            is_primary_key: false,
-            default: None,
-            raw_type: None,
-            int_width: None,
-            float_width: None,
-        });
-    }
-    cols
-}
-
-fn dim_type_to_sql(t: ArrayDimType) -> SqlDataType {
-    match t {
-        ArrayDimType::Int64 => SqlDataType::Int64,
-        ArrayDimType::Float64 => SqlDataType::Float64,
-        ArrayDimType::TimestampMs => SqlDataType::Timestamp,
-        ArrayDimType::String => SqlDataType::String,
-    }
-}
-
-fn attr_type_to_sql(t: ArrayAttrType) -> SqlDataType {
-    match t {
-        ArrayAttrType::Int64 => SqlDataType::Int64,
-        ArrayAttrType::Float64 => SqlDataType::Float64,
-        ArrayAttrType::String => SqlDataType::String,
-        ArrayAttrType::Bytes => SqlDataType::Bytes,
-    }
-}
-
-fn extract_string_literal_arg(arg: &sqlparser::ast::FunctionArg) -> Option<String> {
-    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Value};
-    let expr = match arg {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
-        FunctionArg::Named {
-            arg: FunctionArgExpr::Expr(e),
-            ..
-        } => e,
-        _ => return None,
-    };
-    match expr {
-        Expr::Value(v) => match &v.value {
-            Value::SingleQuotedString(s) => Some(s.clone()),
-            _ => None,
-        },
-        _ => None,
+    /// A one-relation scope over `collection` that accepts any column name.
+    pub(crate) fn open_scope(collection: &str) -> TableScope {
+        let info = CollectionInfo {
+            name: collection.into(),
+            engine: EngineType::DocumentSchemaless,
+            columns: Vec::new(),
+            primary_key: None,
+            has_auto_tier: false,
+            indexes: Vec::new(),
+            bitemporal: false,
+            primary: nodedb_types::PrimaryEngine::Document,
+            vector_primary: None,
+            partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
+            open_schema: CollectionInfo::open_schema_for(EngineType::DocumentSchemaless),
+        };
+        TableScope::single(ResolvedTable {
+            name: info.name.clone(),
+            alias: None,
+            info,
+        })
+        .expect("single-relation scope")
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::open_scope;
     use super::*;
     use crate::types::{CollectionInfo, ColumnInfo, EngineType, SqlDataType};
     use nodedb_types::PrimaryEngine;
@@ -371,21 +356,7 @@ mod tests {
             primary: PrimaryEngine::Document,
             vector_primary: None,
             partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
-        }
-    }
-
-    fn schemaless_collection(name: &str) -> CollectionInfo {
-        CollectionInfo {
-            name: name.into(),
-            engine: EngineType::DocumentSchemaless,
-            columns: Vec::new(),
-            primary_key: None,
-            has_auto_tier: false,
-            indexes: Vec::new(),
-            bitemporal: false,
-            primary: PrimaryEngine::Document,
-            vector_primary: None,
-            partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
+            open_schema: CollectionInfo::open_schema_for(EngineType::DocumentStrict),
         }
     }
 
@@ -401,39 +372,36 @@ mod tests {
         scope
     }
 
-    /// A double-quoted identifier resolves as a column name (case-preserved).
+    /// A double-quoted identifier resolves as a column name.
     /// `"userId"` is parsed by the SQL layer as `Expr::Identifier` with
-    /// `quote_style = Some('"')` and `value = "userId"`.  At the
-    /// `TableScope` level the column name arrives lowercase (strict schema
-    /// columns are stored lowercase), so the resolved name is `"userid"`.
+    /// `quote_style = Some('"')` and `value = "userId"`. At the `TableScope`
+    /// level the column name arrives lowercase, because strict schema columns
+    /// are stored lowercase.
     ///
-    /// This test confirms the resolution path, not just `convert_expr`.
+    /// This test covers the resolution path, not just `convert_expr`.
     #[test]
     fn quoted_identifier_resolves_as_column() {
         let scope = scope_with(strict_collection("users", vec!["userid", "email"]));
-        let (table, col) = scope
-            .resolve_column(None, "userid")
-            .expect("should resolve");
-        assert_eq!(table, "users");
-        assert_eq!(col, "userid");
+        scope.check_name(None, "userid").expect("must resolve");
     }
 
-    /// An unrecognized column in a strict collection must yield
-    /// `SqlError::UnknownColumn`, NOT `SqlError::Unsupported`.
-    /// This verifies that a double-quoted identifier like `"ghost_col"`
-    /// that maps to `SqlExpr::Column { name: "ghost_col" }` surfaces the
-    /// right error variant when resolved against a strict schema.
+    /// An unrecognized column in a strict collection yields
+    /// `SqlError::UnknownColumn`, never `SqlError::Unsupported`.
+    ///
+    /// A double-quoted identifier like `"ghost_col"` maps to
+    /// `SqlExpr::Column { name: "ghost_col" }`. Resolving it against a strict
+    /// schema must name the missing column.
     #[test]
     fn unknown_column_in_strict_collection_yields_unknown_column_error() {
         let scope = scope_with(strict_collection("users", vec!["id", "email"]));
         let err = scope
-            .resolve_column(None, "ghost_col")
-            .expect_err("should fail for unknown column");
+            .check_name(None, "ghost_col")
+            .expect_err("must reject an unknown column");
         assert!(
             matches!(err, SqlError::UnknownColumn { ref column, .. } if column == "ghost_col"),
             "expected UnknownColumn(ghost_col), got {err:?}"
         );
-        // Must NOT be Unsupported — that would be the wrong error variant.
+        // Unsupported is the wrong error variant here.
         assert!(
             !matches!(err, SqlError::Unsupported { .. }),
             "must not surface Unsupported for a missing column"
@@ -444,23 +412,19 @@ mod tests {
     /// like they could be misidentified double-quoted identifiers.
     #[test]
     fn any_column_accepted_in_schemaless_collection() {
-        let scope = scope_with(schemaless_collection("events"));
-        let (table, col) = scope
-            .resolve_column(None, "ghost_col")
-            .expect("schemaless should accept any column");
-        assert_eq!(table, "events");
-        assert_eq!(col, "ghost_col");
+        let scope = open_scope("events");
+        scope
+            .check_name(None, "ghost_col")
+            .expect("a schemaless relation must accept any column");
     }
 
     /// Qualified column reference: `"t"."col"` → table `t`, column `col`.
     #[test]
     fn qualified_column_resolves_correctly() {
         let scope = scope_with(strict_collection("t", vec!["col", "other"]));
-        let (table, col) = scope
-            .resolve_column(Some("t"), "col")
-            .expect("qualified column should resolve");
-        assert_eq!(table, "t");
-        assert_eq!(col, "col");
+        scope
+            .check_name(Some("t"), "col")
+            .expect("a qualified column must resolve");
     }
 
     /// Qualified reference to an unknown column in a strict collection must
@@ -469,8 +433,8 @@ mod tests {
     fn qualified_unknown_column_in_strict_collection() {
         let scope = scope_with(strict_collection("t", vec!["id"]));
         let err = scope
-            .resolve_column(Some("t"), "missing")
-            .expect_err("should fail");
+            .check_name(Some("t"), "missing")
+            .expect_err("must reject an unknown column");
         assert!(
             matches!(err, SqlError::UnknownColumn { .. }),
             "expected UnknownColumn, got {err:?}"

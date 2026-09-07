@@ -45,4 +45,19 @@ pub trait EngineRules {
     /// MERGE semantics (everything except `document_schemaless` and
     /// `document_strict`).
     fn plan_merge(&self, params: MergeParams) -> Result<Vec<SqlPlan>>;
+    /// True when the engine accepts fields the schema never declares, so a
+    /// read of an undeclared name resolves to NULL instead of raising
+    /// `SqlError::UnknownColumn`.
+    fn accepts_undeclared_columns(&self) -> bool;
+    /// Columns every collection on this engine carries whether or not the
+    /// DDL declares them. A reference to one resolves like a declared column.
+    fn implicit_columns(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// True when the engine stores one value whose column name the statement
+    /// picks. Such a collection resolves any name while it declares no value
+    /// column, and closes to the declared set once it names one.
+    fn value_column_name_is_free(&self) -> bool {
+        false
+    }
 }

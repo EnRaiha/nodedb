@@ -132,4 +132,19 @@ impl EngineRules for KvRules {
             ),
         })
     }
+
+    /// The key/value/ttl shape is fixed.
+    fn accepts_undeclared_columns(&self) -> bool {
+        false
+    }
+
+    /// The key/value/ttl triple is the engine's fixed shape, so a collection
+    /// carries all three even when the DDL names only the key.
+    fn implicit_columns(&self) -> &'static [&'static str] {
+        &["key", "value", "ttl"]
+    }
+
+    fn value_column_name_is_free(&self) -> bool {
+        true
+    }
 }
