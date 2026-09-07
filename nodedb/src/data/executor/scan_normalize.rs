@@ -37,13 +37,27 @@ impl CoreLoop {
         rls_filters: &[u8],
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
         let docs = self.scan_collection(did, tid, collection, limit)?;
-        if rls_filters.is_empty() {
+        self.retain_rows_matching(docs, rls_filters, "RLS filter (join side)")
+    }
+
+    /// Keep the rows matching a MessagePack `Vec<ScanFilter>`.
+    ///
+    /// Empty `filter_bytes` keeps every row. A set that fails to deserialize is
+    /// an error, never an empty set: `context` names which set failed so the
+    /// caller's error says whether a policy or a query predicate was dropped.
+    pub(in crate::data::executor) fn retain_rows_matching(
+        &self,
+        docs: Vec<(String, Vec<u8>)>,
+        filter_bytes: &[u8],
+        context: &str,
+    ) -> crate::Result<Vec<(String, Vec<u8>)>> {
+        if filter_bytes.is_empty() {
             return Ok(docs);
         }
 
         let filters: Vec<crate::bridge::scan_filter::ScanFilter> =
-            zerompk::from_msgpack(rls_filters).map_err(|e| crate::Error::PlanError {
-                detail: format!("RLS filter deserialization failed (join side): {e}"),
+            zerompk::from_msgpack(filter_bytes).map_err(|e| crate::Error::PlanError {
+                detail: format!("{context} deserialization failed: {e}"),
             })?;
 
         let mut kept = Vec::with_capacity(docs.len());

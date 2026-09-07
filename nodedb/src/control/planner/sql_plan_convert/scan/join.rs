@@ -15,6 +15,7 @@ use super::super::aggregate::{
 };
 use super::super::convert::convert_one;
 use super::super::filter::{expr_filter_qualified, serialize_join_post_filters};
+use super::super::filter_scan_side::serialize_scan_side_filters;
 use super::super::scan_params::JoinPlanParams;
 use super::super::value::sql_value_to_string;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -47,6 +48,19 @@ fn shuffle_supports_join_tail(
         && computed_projection.is_empty()
         && join_filters.is_empty()
         && post_filters.is_empty()
+}
+
+/// Serialize a join side's own `WHERE` predicates when that side is scanned by
+/// name. A side lowered to a child plan carries its predicates inside that
+/// plan, so its slot stays empty.
+fn side_scan_filters(plan: &SqlPlan, has_input: bool) -> crate::Result<Vec<u8>> {
+    if has_input {
+        return Ok(Vec::new());
+    }
+    match plan {
+        SqlPlan::Scan { filters, .. } => serialize_scan_side_filters(filters),
+        _ => Ok(Vec::new()),
+    }
 }
 
 /// Build a `PhysicalPlan` bitmap-producer sub-plan from a `BitmapHint`.
@@ -129,6 +143,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
     };
     let right_input = super::super::aggregate::inline_join_side(right, tenant_id, ctx)?;
 
+    let mut left_scan_filters = side_scan_filters(left, left_input.is_some())?;
+    let mut right_scan_filters = side_scan_filters(right, right_input.is_some())?;
+
     // RIGHT JOIN → swap sides and convert to LEFT JOIN.
     let mut on_keys = on.to_vec();
     let mut left_input = left_input;
@@ -138,6 +155,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
         std::mem::swap(&mut left_raw, &mut right_raw);
         std::mem::swap(&mut left_alias, &mut right_alias);
         std::mem::swap(&mut left_input, &mut right_input);
+        std::mem::swap(&mut left_scan_filters, &mut right_scan_filters);
         on_keys = on_keys.into_iter().map(|(l, r)| (r, l)).collect();
         "left".to_string()
     } else {
@@ -225,6 +243,8 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
         // when that side is scanned locally (`*_input` is `None`).
         left_rls_filters: Vec::new(),
         right_rls_filters: Vec::new(),
+        left_scan_filters,
+        right_scan_filters,
     });
 
     let plan = if shuffle_eligible {

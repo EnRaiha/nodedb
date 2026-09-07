@@ -9,6 +9,50 @@ use nodedb_query::msgpack_scan;
 use super::hash::{HashIndex, ProbeParams, probe_hash_index};
 use super::params::HashJoinParams;
 
+/// One locally-scanned join side: the collection to read and the two predicate
+/// sets its rows must pass before the join sees them.
+pub(super) struct JoinSideScan<'a> {
+    pub(super) database_id: u64,
+    pub(super) tenant_id: u64,
+    pub(super) collection: &'a str,
+    pub(super) limit: usize,
+    /// Row-level-security filters the planner injected for this side.
+    pub(super) rls_filters: &'a [u8],
+    /// This side's own `WHERE` predicates.
+    pub(super) scan_filters: &'a [u8],
+}
+
+impl CoreLoop {
+    /// Scan one join side locally, keeping only the rows that pass BOTH the
+    /// side's policy filters and its own `WHERE` predicates.
+    ///
+    /// Both apply per side before the join: an excluded row must neither match
+    /// a partner nor produce a null-extended outer row, and a post-join filter
+    /// can do neither.
+    fn scan_join_side(&self, side: JoinSideScan<'_>) -> crate::Result<Vec<(String, Vec<u8>)>> {
+        let docs = self.scan_collection_with_rls(
+            side.database_id,
+            side.tenant_id,
+            side.collection,
+            side.limit,
+            side.rls_filters,
+        )?;
+        self.retain_rows_matching(docs, side.scan_filters, "join side predicate")
+    }
+
+    /// Apply a join side's policy filters and its own `WHERE` predicates to
+    /// rows a sub-plan already produced.
+    fn retain_join_side_rows(
+        &self,
+        docs: Vec<(String, Vec<u8>)>,
+        rls_filters: &[u8],
+        scan_filters: &[u8],
+    ) -> crate::Result<Vec<(String, Vec<u8>)>> {
+        let kept = self.retain_rows_matching(docs, rls_filters, "RLS filter (join side)")?;
+        self.retain_rows_matching(kept, scan_filters, "join side predicate")
+    }
+}
+
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_hash_join(
         &mut self,
@@ -27,6 +71,8 @@ impl CoreLoop {
             right_bitmap,
             left_rls_filters,
             right_rls_filters,
+            left_scan_filters,
+            right_scan_filters,
         } = p;
 
         debug!(
@@ -120,6 +166,8 @@ impl CoreLoop {
                     right_alias,
                     left_rls_filters,
                     right_rls_filters,
+                    left_scan_filters,
+                    right_scan_filters,
                 },
                 budget,
             )
@@ -193,12 +241,33 @@ impl CoreLoop {
                     // Forward a failing sub-plan response (e.g. ResourcesExhausted
                     // from the bitmap scan) instead of swallowing it to an empty
                     // Vec, which would silently return a zero-row join.
-                    match crate::data::executor::response_codec::decode_response_to_docs(&resp) {
-                        Some(d) => d,
-                        None => return resp,
+                    // The prefiltered scan carries no predicate slot of its own,
+                    // so both of this side's filter sets apply to its rows here.
+                    let rows =
+                        match crate::data::executor::response_codec::decode_response_to_docs(&resp) {
+                            Some(d) => d,
+                            None => return resp,
+                        };
+                    match self.retain_join_side_rows(rows, left_rls_filters, left_scan_filters) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            return self.response_error(
+                                join.task,
+                                ErrorCode::Internal {
+                                    detail: e.to_string(),
+                                },
+                            );
+                        }
                     }
                 }
-                None => match self.scan_collection_with_rls(join.task.request.database_id.as_u64(), tid, left_collection, scan_limit, left_rls_filters) {
+                None => match self.scan_join_side(JoinSideScan {
+                    database_id: join.task.request.database_id.as_u64(),
+                    tenant_id: tid,
+                    collection: left_collection,
+                    limit: scan_limit,
+                    rls_filters: left_rls_filters,
+                    scan_filters: left_scan_filters,
+                }) {
                     Ok(d) => d,
                     Err(e) => {
                         return self.response_error(
@@ -213,13 +282,14 @@ impl CoreLoop {
             let keys = join.on.iter().map(|(l, _)| l.clone()).collect();
             (docs, keys)
         } else {
-            let docs = match self.scan_collection_with_rls(
-                join.task.request.database_id.as_u64(),
-                tid,
-                left_collection,
-                scan_limit,
-                left_rls_filters,
-            ) {
+            let docs = match self.scan_join_side(JoinSideScan {
+                database_id: join.task.request.database_id.as_u64(),
+                tenant_id: tid,
+                collection: left_collection,
+                limit: scan_limit,
+                rls_filters: left_rls_filters,
+                scan_filters: left_scan_filters,
+            }) {
                 Ok(d) => d,
                 Err(e) => {
                     return self.response_error(
@@ -263,18 +333,34 @@ impl CoreLoop {
                     // Forward a failing sub-plan response (e.g. ResourcesExhausted
                     // from the bitmap scan) instead of swallowing it to an empty
                     // Vec, which would silently return a zero-row join.
-                    match crate::data::executor::response_codec::decode_response_to_docs(&resp) {
-                        Some(d) => d,
-                        None => return resp,
+                    // The prefiltered scan carries no predicate slot of its own,
+                    // so both of this side's filter sets apply to its rows here.
+                    let rows =
+                        match crate::data::executor::response_codec::decode_response_to_docs(&resp)
+                        {
+                            Some(d) => d,
+                            None => return resp,
+                        };
+                    match self.retain_join_side_rows(rows, right_rls_filters, right_scan_filters) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            return self.response_error(
+                                join.task,
+                                ErrorCode::Internal {
+                                    detail: e.to_string(),
+                                },
+                            );
+                        }
                     }
                 }
-                None => match self.scan_collection_with_rls(
-                    join.task.request.database_id.as_u64(),
-                    tid,
-                    right_collection,
-                    scan_limit,
-                    right_rls_filters,
-                ) {
+                None => match self.scan_join_side(JoinSideScan {
+                    database_id: join.task.request.database_id.as_u64(),
+                    tenant_id: tid,
+                    collection: right_collection,
+                    limit: scan_limit,
+                    rls_filters: right_rls_filters,
+                    scan_filters: right_scan_filters,
+                }) {
                     Ok(d) => d,
                     Err(e) => {
                         return self.response_error(
@@ -287,13 +373,14 @@ impl CoreLoop {
                 },
             }
         } else {
-            match self.scan_collection_with_rls(
-                join.task.request.database_id.as_u64(),
-                tid,
-                right_collection,
-                scan_limit,
-                right_rls_filters,
-            ) {
+            match self.scan_join_side(JoinSideScan {
+                database_id: join.task.request.database_id.as_u64(),
+                tenant_id: tid,
+                collection: right_collection,
+                limit: scan_limit,
+                rls_filters: right_rls_filters,
+                scan_filters: right_scan_filters,
+            }) {
                 Ok(d) => d,
                 Err(e) => {
                     return self.response_error(

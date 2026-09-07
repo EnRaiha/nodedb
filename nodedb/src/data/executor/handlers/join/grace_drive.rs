@@ -102,6 +102,10 @@ pub(super) struct LocalJoinSides<'a> {
     pub(super) left_rls_filters: &'a [u8],
     /// Row-level-security filters for the build (right) side.
     pub(super) right_rls_filters: &'a [u8],
+    /// The probe (left) side's own `WHERE` predicates.
+    pub(super) left_scan_filters: &'a [u8],
+    /// The build (right) side's own `WHERE` predicates.
+    pub(super) right_scan_filters: &'a [u8],
 }
 
 /// Per-side streaming accumulation state. Starts `Buffering`; transitions to
@@ -149,6 +153,8 @@ impl CoreLoop {
             right_alias,
             left_rls_filters,
             right_rls_filters,
+            left_scan_filters,
+            right_scan_filters,
         } = sides;
         let probe_collection = left_alias.unwrap_or(left_collection);
         let index_collection = right_alias.unwrap_or(right_collection);
@@ -177,12 +183,14 @@ impl CoreLoop {
                 tenant_id: tid,
                 collection: right_collection.to_string(),
                 rls_filters: right_rls_filters.to_vec(),
+                scan_filters: right_scan_filters.to_vec(),
             },
             probe: RowSource::LocalScan {
                 database_id: did,
                 tenant_id: tid,
                 collection: left_collection.to_string(),
                 rls_filters: left_rls_filters.to_vec(),
+                scan_filters: left_scan_filters.to_vec(),
             },
         };
 

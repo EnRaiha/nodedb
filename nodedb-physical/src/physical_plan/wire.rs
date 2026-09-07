@@ -130,6 +130,8 @@ mod tests {
             right_input: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
             left_bitmap: None,
             right_bitmap: None,
         });

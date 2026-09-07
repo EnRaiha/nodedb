@@ -45,7 +45,7 @@ pub(super) fn serialize_join_post_filters(filters: &[Filter]) -> crate::Result<V
     encode_scan_filters(&scan_filters)
 }
 
-fn encode_scan_filters(
+pub(super) fn encode_scan_filters(
     filters: &Vec<nodedb_query::scan_filter::ScanFilter>,
 ) -> crate::Result<Vec<u8>> {
     if filters.is_empty() {
@@ -80,7 +80,9 @@ fn filter_to_join_scan_filters(expr: &FilterExpr) -> Vec<nodedb_query::scan_filt
     }
 }
 
-fn filter_to_scan_filters(expr: &FilterExpr) -> Vec<nodedb_query::scan_filter::ScanFilter> {
+pub(super) fn filter_to_scan_filters(
+    expr: &FilterExpr,
+) -> Vec<nodedb_query::scan_filter::ScanFilter> {
     use nodedb_query::scan_filter::{FilterOp, ScanFilter};
 
     match expr {

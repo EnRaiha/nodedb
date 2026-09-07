@@ -333,3 +333,34 @@ async fn lateral_loop_outer_row_cap_returns_error() {
         "small LateralLoop should succeed with 1 outer row, got {rows:?}"
     );
 }
+
+/// The equi-correlated LATERAL branch lowers to a join. Its inner `WHERE`
+/// carries the correlation predicate plus local predicates on the inner
+/// relation. Both must survive: dropping the local ones returns every inner
+/// row, silently widening the result.
+///
+/// `u1` has scores 10, 30, 20 and `u2` has 50, 40, so `score > 25` matches one
+/// `u1` row and two `u2` rows. Without the local predicate the count is 5.
+#[tokio::test]
+async fn lateral_equi_correlated_keeps_local_inner_predicate() {
+    let server = TestServer::start().await;
+    setup_users_events(&server).await;
+
+    let rows = server
+        .query_text(
+            "SELECT u.id \
+             FROM lat_users u, \
+             LATERAL (\
+                 SELECT e.id FROM lat_events e \
+                 WHERE e.user_id = u.id AND e.score > 25\
+             ) x",
+        )
+        .await
+        .expect("equi-correlated LATERAL with a local predicate must plan");
+
+    assert_eq!(
+        rows.len(),
+        3,
+        "expected one u1 row and two u2 rows, got {rows:?}"
+    );
+}

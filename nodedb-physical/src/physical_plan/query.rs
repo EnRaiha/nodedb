@@ -261,6 +261,15 @@ pub enum QueryOp {
         /// Row-level-security filters for rows scanned from
         /// `right_collection` locally. Same semantics as `left_rls_filters`.
         right_rls_filters: Vec<u8>,
+        /// Predicates from the left side's own `WHERE`, applied to rows
+        /// scanned from `left_collection` locally. Empty when `left_input` is
+        /// `Some`, because the child plan then carries its own predicates.
+        /// Applied per side before the join, for the same reason as
+        /// `left_rls_filters`.
+        left_scan_filters: Vec<u8>,
+        /// Predicates from the right side's own `WHERE`. Same semantics as
+        /// `left_scan_filters`.
+        right_scan_filters: Vec<u8>,
     },
 
     /// Cross-node shuffle-join CONSUMER (E4b): run the node-local grace-hash

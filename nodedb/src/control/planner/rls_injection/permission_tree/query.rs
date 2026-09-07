@@ -245,6 +245,8 @@ mod tests {
             right_bitmap: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
         });
         assert_refused(apply(&mut plan, &cache), "users");
     }

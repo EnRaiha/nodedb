@@ -110,6 +110,8 @@ fn cross_join_uses_inline_right_scalar_aggregate_for_post_filter() {
             right_bitmap: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
         }),
     );
 
@@ -227,6 +229,8 @@ fn cross_join_uses_unaliased_scalar_aggregate_key_for_post_filter() {
             right_bitmap: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
         }),
     );
 
@@ -394,11 +398,15 @@ fn semi_join_uses_nested_scalar_subquery_result_as_inline_right() {
                 right_bitmap: None,
                 left_rls_filters: Vec::new(),
                 right_rls_filters: Vec::new(),
+                left_scan_filters: Vec::new(),
+                right_scan_filters: Vec::new(),
             }))),
             left_bitmap: None,
             right_bitmap: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
         }),
     );
 

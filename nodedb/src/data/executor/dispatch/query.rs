@@ -107,6 +107,8 @@ impl CoreLoop {
                 right_bitmap,
                 left_rls_filters,
                 right_rls_filters,
+                left_scan_filters,
+                right_scan_filters,
                 ..
             } => self.execute_hash_join(HashJoinParams {
                 join: JoinParams {
@@ -130,6 +132,8 @@ impl CoreLoop {
                 right_bitmap: right_bitmap.as_deref(),
                 left_rls_filters,
                 right_rls_filters,
+                left_scan_filters,
+                right_scan_filters,
             }),
 
             QueryOp::ShuffleJoinConsume {
