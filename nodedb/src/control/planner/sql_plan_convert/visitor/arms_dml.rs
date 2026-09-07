@@ -66,6 +66,8 @@ macro_rules! impl_dml_arms_for_convert_visitor {
             ttl_secs: u64,
             intent: nodedb_sql::types::plan::KvInsertIntent,
             on_conflict_updates: &[(String, nodedb_sql::types_expr::SqlExpr)],
+            key_column: &str,
+            sequence_defaults: &[(String, String)],
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
             super::super::dml::convert_kv_insert(
                 collection,
@@ -73,6 +75,8 @@ macro_rules! impl_dml_arms_for_convert_visitor {
                 ttl_secs,
                 intent,
                 on_conflict_updates,
+                key_column,
+                sequence_defaults,
                 self.tenant_id,
                 self.ctx,
             )

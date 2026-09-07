@@ -85,6 +85,17 @@ pub(crate) fn sql_value_to_msgpack(v: &SqlValue) -> Vec<u8> {
     buf
 }
 
+pub(crate) fn nodedb_value_to_sql(val: nodedb_types::Value) -> SqlValue {
+    match val {
+        nodedb_types::Value::Integer(n) => SqlValue::Int(n),
+        nodedb_types::Value::Float(f) => SqlValue::Float(f),
+        nodedb_types::Value::String(s) => SqlValue::String(s),
+        nodedb_types::Value::Bool(b) => SqlValue::Bool(b),
+        nodedb_types::Value::Null => SqlValue::Null,
+        other => SqlValue::String(other.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

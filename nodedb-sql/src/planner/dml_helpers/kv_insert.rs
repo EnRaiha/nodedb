@@ -108,7 +108,10 @@ pub(crate) fn build_kv_insert_plan(
         // position in the statement's column list.
         let key_val = match row.iter().find(|(name, _)| name == key_col_name) {
             Some((_, value)) => value.clone(),
-            None => SqlValue::String(String::new()),
+            // NULL marks "key column absent from this row" — the converter
+            // fills a sequence default there, or stores the legacy empty key
+            // when none is declared.
+            None => SqlValue::Null,
         };
         if let Some((_, value)) = row.iter().find(|(name, _)| name == "ttl") {
             match value {
@@ -124,12 +127,23 @@ pub(crate) fn build_kv_insert_plan(
             .collect();
         entries.push((key_val, value_cols));
     }
+    let sequence_defaults: Vec<(String, String)> = declared_columns
+        .iter()
+        .filter_map(|c| {
+            c.default
+                .as_ref()
+                .filter(|d| crate::planner::defaults::looks_like_sequence_accessor(d))
+                .map(|d| (c.name.clone(), d.clone()))
+        })
+        .collect();
     Ok(vec![SqlPlan::KvInsert {
         collection: table_name,
         entries,
         ttl_secs,
         intent,
         on_conflict_updates,
+        key_column: key_col_name.to_string(),
+        sequence_defaults,
     }])
 }
 
@@ -160,6 +174,12 @@ fn materialize_declared_defaults(
             continue;
         };
         if row.iter().any(|(name, _)| name == &column.name) {
+            continue;
+        }
+        // Sequence accessors cannot run in the pure planner evaluator; the
+        // converter advances the CP-side registry instead (the column is
+        // carried on the plan as a sequence default and stays absent here).
+        if crate::planner::defaults::looks_like_sequence_accessor(default_expr) {
             continue;
         }
         let evaluated =

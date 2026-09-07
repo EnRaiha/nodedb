@@ -143,17 +143,6 @@ pub(super) fn columnar_row_surrogates(
     Ok(out)
 }
 
-pub(in super::super) fn nodedb_value_to_sql(val: nodedb_types::Value) -> SqlValue {
-    match val {
-        nodedb_types::Value::Integer(n) => SqlValue::Int(n),
-        nodedb_types::Value::Float(f) => SqlValue::Float(f),
-        nodedb_types::Value::String(s) => SqlValue::String(s),
-        nodedb_types::Value::Bool(b) => SqlValue::Bool(b),
-        nodedb_types::Value::Null => SqlValue::Null,
-        _ => SqlValue::String(format!("{val:?}")),
-    }
-}
-
 /// Bundled arguments for [`convert_insert`].
 pub(in super::super) struct ConvertInsertArgs<'a> {
     pub collection: &'a str,
@@ -231,17 +220,7 @@ pub(in super::super) fn convert_insert(
             expanded_rows.push(row.clone());
             continue;
         }
-        let mut expanded = row.clone();
-        for (col_name, default_expr) in column_defaults {
-            if !expanded.iter().any(|(k, _)| k == col_name)
-                && let Some(val) = super::super::value::evaluate_default_expr(default_expr)
-                    .map_err(|e| crate::Error::PlanError {
-                        detail: format!("default for column '{col_name}': {e}"),
-                    })?
-            {
-                expanded.push((col_name.clone(), nodedb_value_to_sql(val)));
-            }
-        }
+        let expanded = super::super::value::expand_row_defaults(ctx, row, column_defaults)?;
         expanded_rows.push(expanded);
     }
 
@@ -262,7 +241,10 @@ pub(in super::super) fn convert_insert(
                 });
             }
             EngineType::Columnar | EngineType::Spatial => {
-                columnar_rows.push(&rows[i]);
+                // `expanded_rows[i]` carries the materialized defaults; the
+                // raw `rows[i]` may still be missing the column (sequence and
+                // stateless defaults would silently vanish otherwise).
+                columnar_rows.push(&expanded_rows[i]);
             }
             EngineType::DocumentSchemaless | EngineType::DocumentStrict => {
                 let value_bytes = row_to_msgpack(row)?;
@@ -352,7 +334,7 @@ pub(in super::super) fn convert_insert(
     }
 
     if !columnar_rows.is_empty() {
-        let payload = rows_to_msgpack_array(&columnar_rows, column_defaults)?;
+        let payload = rows_to_msgpack_array(&columnar_rows, column_defaults, ctx)?;
         let intent = if if_absent {
             ColumnarInsertIntent::InsertIfAbsent
         } else {
@@ -433,6 +415,7 @@ mod tests {
             credentials: Some(Arc::new(store)),
             wal: None,
             surrogate_assigner: None,
+            sequence_registry: None,
             cluster_enabled: false,
             bitemporal_retention_registry: None,
             max_vector_dim: 0,

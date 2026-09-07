@@ -62,6 +62,9 @@ pub struct ConvertContext {
     pub credentials: Option<Arc<CredentialStore>>,
     /// LSN allocator for array Put/Delete dispatches.
     pub wal: Option<Arc<WalManager>>,
+    /// Sequence registry for SQL sequence accessors and sequence-backed
+    /// DEFAULT expressions. `None` for sub-planner contexts.
+    pub sequence_registry: Option<Arc<crate::control::sequence::SequenceRegistry>>,
     /// CP-side surrogate assigner — bound to the same `Arc` held on
     /// `SharedState`. Threaded into INSERT/UPSERT/KV-INSERT converters
     /// to bind `(collection, pk_bytes)` → `Surrogate` before the op
@@ -281,6 +284,7 @@ mod tests {
             credentials: None,
             wal: None,
             surrogate_assigner: Some(assigner),
+            sequence_registry: None,
             cluster_enabled: false,
             bitemporal_retention_registry: None,
             max_vector_dim: 0,

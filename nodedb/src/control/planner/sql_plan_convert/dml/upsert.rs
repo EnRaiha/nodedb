@@ -81,7 +81,11 @@ pub(in super::super) fn convert_upsert(
 
         match engine {
             EngineType::DocumentSchemaless | EngineType::DocumentStrict => {
-                let value_bytes = row_to_msgpack(row)?;
+                // Defaults (incl. sequence-backed) materialize before
+                // encoding, same as the INSERT path — an UPSERT omitting a
+                // defaulted column must not silently drop the default (#294).
+                let expanded = super::super::value::expand_row_defaults(ctx, row, column_defaults)?;
+                let value_bytes = row_to_msgpack(&expanded)?;
                 // A row with no primary-key value (auto-`_rowid` collection or
                 // an upsert that omitted the pk column) has no identity to match
                 // on, so the upsert degenerates to an insert with a fresh
@@ -145,7 +149,7 @@ pub(in super::super) fn convert_upsert(
     }
 
     if !columnar_rows.is_empty() {
-        let payload = rows_to_msgpack_array(&columnar_rows, column_defaults)?;
+        let payload = rows_to_msgpack_array(&columnar_rows, column_defaults, ctx)?;
         let surrogates = columnar_row_surrogates(ctx, collection, &columnar_rows, primary_key)?;
         let schema_bytes = build_schema_bytes(column_schema);
         tasks.push(PhysicalTask {

@@ -22,4 +22,7 @@ pub(super) use msgpack_write::{
     write_msgpack_value,
 };
 pub(super) use nodedb_sql::planner::defaults::evaluate_default_expr;
+pub(super) use sequence_default::{expand_row_defaults, sequence_name};
+
+mod sequence_default;
 pub(super) use rows::rows_to_msgpack_array;

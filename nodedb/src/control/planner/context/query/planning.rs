@@ -156,6 +156,7 @@ impl QueryContext {
                 .map(|i| Arc::clone(&i.credentials)),
             wal: self.wal.clone(),
             surrogate_assigner: self.surrogate_assigner.clone(),
+            sequence_registry: self.sequence_registry.clone(),
             cluster_enabled: self.cluster_enabled,
             bitemporal_retention_registry: self.bitemporal_retention_registry.clone(),
             max_vector_dim: self
@@ -421,6 +422,7 @@ impl QueryContext {
                 .map(|i| Arc::clone(&i.credentials)),
             wal: self.wal.clone(),
             surrogate_assigner: self.surrogate_assigner.clone(),
+            sequence_registry: self.sequence_registry.clone(),
             cluster_enabled: self.cluster_enabled,
             bitemporal_retention_registry: self.bitemporal_retention_registry.clone(),
             max_vector_dim: self
