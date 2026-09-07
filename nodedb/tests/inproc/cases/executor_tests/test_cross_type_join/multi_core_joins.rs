@@ -139,6 +139,8 @@ fn multi_core_broadcast_inner_join() {
             right_bitmap: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
         }),
     );
 
@@ -284,6 +286,8 @@ fn multi_core_broadcast_left_join() {
             right_bitmap: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
         }),
     );
 
@@ -469,6 +473,8 @@ fn multi_core_broadcast_merge_simulation() {
             right_bitmap: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
         })
     };
 

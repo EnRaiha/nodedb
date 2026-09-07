@@ -18,6 +18,8 @@ use crate::parser::normalize::{
     SCHEMA_QUALIFIED_MSG, normalize_ident, normalize_object_name_checked,
 };
 use crate::planner::declared_type_coerce::coerce_assignments_to_declared_types;
+use crate::resolver::ColumnScope;
+use crate::resolver::columns::{ResolvedTable, TableScope};
 use crate::resolver::expr::convert_expr;
 use crate::types::*;
 
@@ -50,7 +52,13 @@ pub fn plan_update(stmt: &ast::Statement, catalog: &dyn SqlCatalog) -> Result<Ve
             name: table_name.clone(),
         })?;
 
-    let mut assigns = convert_assignments(&update.assignments)?;
+    let target_scope = TableScope::single(ResolvedTable {
+        name: table_name.clone(),
+        alias: None,
+        info: info.clone(),
+    })?;
+
+    let mut assigns = convert_assignments(&update.assignments, &target_scope, &target_scope)?;
     // Re-type each literal assignment to its declared column type before the
     // range check reads it — the same order, and for the same reason, as the
     // INSERT path's `coerce_and_check_rows`. Engines with a typed write path
@@ -63,7 +71,7 @@ pub fn plan_update(stmt: &ast::Statement, catalog: &dyn SqlCatalog) -> Result<Ve
     check_declared_float_ranges_in_assignments(&info.columns, &assigns)?;
 
     let filters = match &update.selection {
-        Some(expr) => super::super::select::convert_where_to_filters(expr)?,
+        Some(expr) => super::super::select::convert_where_to_filters(expr, &target_scope)?,
         None => Vec::new(),
     };
 
@@ -159,7 +167,26 @@ fn plan_update_from(update: &ast::Update, catalog: &dyn SqlCatalog) -> Result<Ve
             name: source_name.clone(),
         })?;
 
-    let assigns = convert_assignments(&update.assignments)?;
+    // The SET target belongs to the update target; its right-hand side can
+    // read either relation.
+    let target_scope = TableScope::single(ResolvedTable {
+        name: target_name.clone(),
+        alias: target_alias.clone(),
+        info: target_info.clone(),
+    })?;
+    let mut join_scope = TableScope::new();
+    join_scope.add(ResolvedTable {
+        name: target_name.clone(),
+        alias: target_alias.clone(),
+        info: target_info.clone(),
+    })?;
+    join_scope.add(ResolvedTable {
+        name: source_name.clone(),
+        alias: source_alias.clone(),
+        info: source_info.clone(),
+    })?;
+
+    let assigns = convert_assignments(&update.assignments, &target_scope, &join_scope)?;
 
     // Split the WHERE clause into:
     //   - one equi-join predicate linking target and source (required)
@@ -172,7 +199,7 @@ fn plan_update_from(update: &ast::Update, catalog: &dyn SqlCatalog) -> Result<Ve
                     .into(),
             });
         }
-        Some(expr) => extract_join_predicate(expr, target_ref, source_ref)?,
+        Some(expr) => extract_join_predicate(expr, target_ref, source_ref, &join_scope)?,
     };
 
     // Plan the source as a simple scan (no filters — all filtering is via join key).
@@ -213,6 +240,7 @@ fn extract_join_predicate(
     expr: &ast::Expr,
     target_ref: &str,
     source_ref: &str,
+    scope: &TableScope,
 ) -> Result<(String, String, Vec<Filter>)> {
     // Flatten the top-level AND chain.
     let mut conjuncts: Vec<ast::Expr> = Vec::new();
@@ -225,6 +253,8 @@ fn extract_join_predicate(
 
     for (i, conjunct) in conjuncts.iter().enumerate() {
         if let Some((tc, sc)) = try_equijoin_pair(conjunct, target_ref, source_ref) {
+            scope.check_name(Some(target_ref), &tc)?;
+            scope.check_name(Some(source_ref), &sc)?;
             target_col = tc;
             source_col = sc;
             join_idx = Some(i);
@@ -243,7 +273,7 @@ fn extract_join_predicate(
 
     // Remaining conjuncts become target_filters. Strip table qualifier so
     // `uf_target.score` becomes `score` — documents store bare field names.
-    let target_filters = strip_and_convert_filters(conjuncts, target_ref)?;
+    let target_filters = strip_and_convert_filters(conjuncts, target_ref, scope)?;
 
     Ok((target_col, source_col, target_filters))
 }
@@ -298,7 +328,11 @@ fn try_equijoin_pair(
 }
 
 /// Convert `update.assignments` into `Vec<(col, SqlExpr)>`.
-fn convert_assignments(assignments: &[ast::Assignment]) -> Result<Vec<(String, SqlExpr)>> {
+fn convert_assignments(
+    assignments: &[ast::Assignment],
+    target_scope: &TableScope,
+    value_scope: &TableScope,
+) -> Result<Vec<(String, SqlExpr)>> {
     assignments
         .iter()
         .map(|a| {
@@ -319,7 +353,10 @@ fn convert_assignments(assignments: &[ast::Assignment]) -> Result<Vec<(String, S
                     .collect::<Result<Vec<_>>>()?
                     .join(","),
             };
-            let val = convert_expr(&a.value)?;
+            for name in col.split(',') {
+                target_scope.check_name(None, name)?;
+            }
+            let val = convert_expr(&a.value, &ColumnScope::Relations(value_scope))?;
             Ok((col, val))
         })
         .collect()
@@ -358,8 +395,14 @@ pub fn plan_delete(stmt: &ast::Statement, catalog: &dyn SqlCatalog) -> Result<Ve
             name: table_name.clone(),
         })?;
 
+    let target_scope = TableScope::single(ResolvedTable {
+        name: table_name.clone(),
+        alias: None,
+        info: info.clone(),
+    })?;
+
     let filters = match &delete.selection {
-        Some(expr) => super::super::select::convert_where_to_filters(expr)?,
+        Some(expr) => super::super::select::convert_where_to_filters(expr, &target_scope)?,
         None => Vec::new(),
     };
 

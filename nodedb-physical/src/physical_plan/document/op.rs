@@ -337,6 +337,10 @@ pub enum DocumentOp {
         source_collection: QualifiedCollection,
         source_filters: Vec<u8>,
         source_limit: usize,
+        /// zerompk-encoded `Vec<ComputedColumn>`: one entry per target column,
+        /// its `alias` the target column name and its `expr` the source-row
+        /// expression. Empty means copy each source row unchanged.
+        column_map: Vec<u8>,
     },
 
     /// Upsert: insert or merge. When `on_conflict_updates` is non-empty,

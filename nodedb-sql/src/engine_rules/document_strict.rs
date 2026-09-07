@@ -146,4 +146,10 @@ impl EngineRules for StrictRules {
             sort_keys: Vec::new(),
         })
     }
+
+    /// A Binary Tuple is positional over the declared schema, so an
+    /// undeclared field cannot exist.
+    fn accepts_undeclared_columns(&self) -> bool {
+        false
+    }
 }

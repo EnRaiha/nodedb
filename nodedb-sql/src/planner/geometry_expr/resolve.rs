@@ -63,7 +63,8 @@ pub(crate) fn resolve_geometry_expr(expr: &ast::Expr) -> Result<Geometry> {
 /// `Ok(None)` means the expression folded but is not a geometry, or could not
 /// be folded at plan time at all.
 fn resolve(expr: &ast::Expr) -> Result<Option<Geometry>> {
-    let sql_expr = crate::resolver::expr::convert_expr(expr)?;
+    let sql_expr =
+        crate::resolver::expr::convert_expr(expr, &crate::resolver::ColumnScope::Unchecked)?;
     let Some(value) = crate::planner::const_fold::fold_constant_default(&sql_expr)? else {
         return Ok(None);
     };

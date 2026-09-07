@@ -27,6 +27,7 @@
 use nodedb_physical::physical_plan::{ColumnarOp, DocumentOp, KvOp, PhysicalPlan, TimeseriesOp};
 use nodedb_types::{CollectionType, ColumnarProfile, DocumentMode, SystemTimeScope};
 
+use crate::bridge::scan_filter::decode_scan_filters;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
 
@@ -39,23 +40,27 @@ use crate::types::{DatabaseId, TenantId};
 /// overflowing.
 const COMPLETE_SCAN: usize = usize::MAX;
 
-/// A collection to scan, paired with the row-level-security filters that apply
-/// to it for the requesting identity. The pairing is the point: no caller can
-/// scan one join side's rows under the other side's policy, whichever side the
+/// A collection to scan, paired with the predicates that apply to it: the
+/// row-level-security filters for the requesting identity and the side's own
+/// `WHERE` predicates. The pairing is the point: no caller can scan one join
+/// side's rows under the other side's policy or predicate, whichever side the
 /// planner drives from.
 pub struct ScanSide<'a> {
     collection: &'a str,
     rls_filters: &'a [u8],
+    scan_filters: &'a [u8],
 }
 
 impl<'a> ScanSide<'a> {
     /// One side of a join, under the compiled read filters the RLS pass
-    /// injected into that side's slot. Empty means no policy restricts this
-    /// identity on the collection.
-    pub fn join_side(collection: &'a str, rls_filters: &'a [u8]) -> Self {
+    /// injected into that side's slot plus that side's own `WHERE` predicates.
+    /// Empty `rls_filters` means no policy restricts this identity on the
+    /// collection; empty `scan_filters` means the side has no local predicate.
+    pub fn join_side(collection: &'a str, rls_filters: &'a [u8], scan_filters: &'a [u8]) -> Self {
         Self {
             collection,
             rls_filters,
+            scan_filters,
         }
     }
 
@@ -66,6 +71,7 @@ impl<'a> ScanSide<'a> {
         Self {
             collection,
             rls_filters: &[],
+            scan_filters: &[],
         }
     }
 
@@ -73,6 +79,26 @@ impl<'a> ScanSide<'a> {
     pub fn collection(&self) -> &'a str {
         self.collection
     }
+}
+
+/// AND the two predicate sets a scanned join side carries into one
+/// MessagePack `Vec<ScanFilter>`.
+///
+/// A set that fails to decode is an error, never an empty set: dropping either
+/// returns rows the caller excluded.
+fn combine_side_filters(rls_filters: &[u8], scan_filters: &[u8]) -> crate::Result<Vec<u8>> {
+    if scan_filters.is_empty() {
+        return Ok(rls_filters.to_vec());
+    }
+    if rls_filters.is_empty() {
+        return Ok(scan_filters.to_vec());
+    }
+    let mut combined = decode_scan_filters(rls_filters, "join side filter")?;
+    combined.extend(decode_scan_filters(scan_filters, "join side filter")?);
+    zerompk::to_msgpack_vec(&combined).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("join side filter serialization: {e}"),
+    })
 }
 
 /// Build a full-collection scan plan for `side`, or `Ok(None)` when the
@@ -89,7 +115,10 @@ pub fn full_scan_plan_for_collection(
     side: ScanSide<'_>,
 ) -> crate::Result<Option<PhysicalPlan>> {
     let collection = side.collection;
-    let rls_filters = side.rls_filters;
+    // Both predicate sets travel in the slot the RLS filters already use: that
+    // slot is evaluated per row before any join match, which is what a local
+    // `WHERE` predicate needs too.
+    let side_filters = combine_side_filters(side.rls_filters, side.scan_filters)?;
     let catalog = state.credentials.catalog();
     let stored = match catalog.get_collection(database_id, tenant_id.as_u64(), collection)? {
         Some(s) => s,
@@ -103,7 +132,7 @@ pub fn full_scan_plan_for_collection(
                 collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
                 limit: COMPLETE_SCAN,
                 offset: 0,
-                filters: rls_filters.to_vec(),
+                filters: side_filters,
                 sort_keys: Vec::new(),
                 distinct: false,
                 projection: Vec::new(),
@@ -118,7 +147,7 @@ pub fn full_scan_plan_for_collection(
             collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
             cursor: Vec::new(),
             count: COMPLETE_SCAN,
-            filters: rls_filters.to_vec(),
+            filters: side_filters,
             sort_keys: Vec::new(),
             match_pattern: None,
             surrogate_ceiling: None,
@@ -131,7 +160,7 @@ pub fn full_scan_plan_for_collection(
                 limit: COMPLETE_SCAN,
                 filters: Vec::new(),
                 sort_keys: Vec::new(),
-                rls_filters: rls_filters.to_vec(),
+                rls_filters: side_filters,
                 system_time: SystemTimeScope::Current,
                 valid_at_ms: None,
                 prefilter: None,
@@ -152,7 +181,7 @@ pub fn full_scan_plan_for_collection(
                 aggregates: Vec::new(),
                 gap_fill: String::new(),
                 computed_columns: Vec::new(),
-                rls_filters: rls_filters.to_vec(),
+                rls_filters: side_filters,
                 system_time: SystemTimeScope::Current,
                 valid_at_ms: None,
             })

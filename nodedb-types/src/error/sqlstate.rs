@@ -140,6 +140,10 @@ pub const UNDEFINED_OBJECT: &str = "42704";
 /// relation in scope)
 pub const UNDEFINED_COLUMN: &str = "42703";
 
+/// `42702` — `ambiguous_column`: a bare column name that resolves against
+/// more than one relation in scope.
+pub const AMBIGUOUS_COLUMN: &str = "42702";
+
 /// `42846` — `cannot_coerce`
 pub const CANNOT_COERCE: &str = "42846";
 
@@ -348,6 +352,7 @@ mod tests {
             INSUFFICIENT_PRIVILEGE,
             SYNTAX_ERROR,
             UNDEFINED_COLUMN,
+            AMBIGUOUS_COLUMN,
             UNDEFINED_OBJECT,
             CANNOT_COERCE,
             UNDEFINED_TABLE,
@@ -403,6 +408,7 @@ mod tests {
     fn spot_check_well_known_codes() {
         assert_eq!(UNIQUE_VIOLATION, "23505");
         assert_eq!(UNDEFINED_COLUMN, "42703");
+        assert_eq!(AMBIGUOUS_COLUMN, "42702");
         assert_eq!(UNDEFINED_TABLE, "42P01");
         assert_eq!(INSUFFICIENT_PRIVILEGE, "42501");
         assert_eq!(QUERY_CANCELED, "57014");

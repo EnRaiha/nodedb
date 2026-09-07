@@ -596,6 +596,7 @@ mod tests {
                 source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
                 source_filters: Vec::new(),
                 source_limit: 0,
+                column_map: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::Upsert {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
@@ -1563,6 +1564,8 @@ mod tests {
                 right_bitmap: None,
                 left_rls_filters: Vec::new(),
                 right_rls_filters: Vec::new(),
+                left_scan_filters: Vec::new(),
+                right_scan_filters: Vec::new(),
             }),
             PhysicalPlan::Query(QueryOp::ShuffleJoinConsume {
                 build_path: String::new(),

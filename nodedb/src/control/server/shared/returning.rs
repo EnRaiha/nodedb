@@ -375,6 +375,7 @@ mod tests {
             source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "src"),
             source_filters: Vec::new(),
             source_limit: 0,
+            column_map: Vec::new(),
         });
         let detail = refuse_unprojectable_insert_returning(&plan)
             .expect_err("an INSERT ... SELECT cannot carry the clause")

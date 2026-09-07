@@ -8,12 +8,14 @@
 
 use sqlparser::ast;
 
-use super::aliases::resolve_order_by_target;
+use super::aliases::{resolve_order_by_target, select_output_aliases};
 use super::triggers::try_extract_sort_search;
 use crate::error::Result;
 use crate::functions::registry::FunctionRegistry;
 use crate::planner::agg_bind::{BindName, bind_aggregate_calls};
 use crate::planner::select::post_process::post_process;
+use crate::resolver::ColumnScope;
+use crate::resolver::columns::TableScope;
 use crate::resolver::expr::convert_expr;
 use crate::types::*;
 
@@ -31,6 +33,7 @@ pub(in crate::planner::select) fn apply_order_by(
     order_by: &ast::OrderBy,
     functions: &FunctionRegistry,
     select_items: &[ast::SelectItem],
+    scope: &TableScope,
 ) -> Result<SqlPlan> {
     let exprs = match &order_by.kind {
         ast::OrderByKind::Expressions(exprs) => exprs,
@@ -61,20 +64,35 @@ pub(in crate::planner::select) fn apply_order_by(
     let mut bound_aggregates: Option<Vec<AggregateExpr>> = None;
     let sort_keys: Vec<SortKey> = if let SqlPlan::Aggregate { aggregates, .. } = plan {
         let mut extended = aggregates.clone();
-        let keys = exprs
+        // ORDER BY sorts after aggregates are renamed to their user aliases,
+        // so each key must address the output name. Binding runs to
+        // completion first: a sort-only aggregate appends to `extended`, and
+        // the name it lands in has to be in scope when the key converts.
+        let bound: Vec<ast::Expr> = exprs
             .iter()
             .map(|o| {
-                // ORDER BY sorts after aggregates are renamed to their user
-                // aliases, so the key must address the output name.
-                let bound = bind_aggregate_calls(
+                bind_aggregate_calls(
                     &o.expr,
                     select_items,
                     &mut extended,
                     functions,
                     BindName::Output,
-                )?;
+                    scope,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let sort_scope = scope.with_output_names(
+            extended
+                .iter()
+                .map(|a| a.alias.clone())
+                .chain(select_output_aliases(select_items)),
+        );
+        let keys = exprs
+            .iter()
+            .zip(&bound)
+            .map(|(o, expr)| {
                 Ok(SortKey {
-                    expr: convert_expr(&bound)?,
+                    expr: convert_expr(expr, &ColumnScope::Relations(&sort_scope))?,
                     ascending: o.options.asc.unwrap_or(true),
                     nulls_first: o
                         .options
@@ -86,11 +104,12 @@ pub(in crate::planner::select) fn apply_order_by(
         bound_aggregates = Some(extended);
         keys
     } else {
+        let sort_scope = scope.with_output_names(select_output_aliases(select_items));
         exprs
             .iter()
             .map(|o| {
                 Ok(SortKey {
-                    expr: convert_expr(&o.expr)?,
+                    expr: convert_expr(&o.expr, &ColumnScope::Relations(&sort_scope))?,
                     ascending: o.options.asc.unwrap_or(true),
                     nulls_first: o
                         .options
@@ -191,7 +210,13 @@ pub(in crate::planner::select) fn apply_order_by(
         // with the inner subquery plan; the sort_keys ride along.
         SqlPlan::Cte { definitions, outer } => Ok(SqlPlan::Cte {
             definitions: definitions.clone(),
-            outer: Box::new(apply_order_by(outer, order_by, functions, select_items)?),
+            outer: Box::new(apply_order_by(
+                outer,
+                order_by,
+                functions,
+                select_items,
+                scope,
+            )?),
         }),
         // The clause is non-empty here (`exprs` was checked above), so these
         // keys were asked for. A variant with no slot to hold them must not

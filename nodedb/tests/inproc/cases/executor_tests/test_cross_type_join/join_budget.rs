@@ -127,6 +127,8 @@ fn hash_join_completeness_past_50k_cap() {
             right_bitmap: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
         }),
     );
 
@@ -327,6 +329,8 @@ fn hash_join_left_side_over_budget_streams_and_completes() {
             right_bitmap: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
         }),
     );
 
@@ -397,6 +401,8 @@ fn hash_join_right_side_over_budget_spills_and_completes() {
             right_bitmap: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
         }),
     );
 
@@ -466,6 +472,8 @@ fn hash_join_build_side_spill_returns_all_matches_across_partitions() {
             right_bitmap: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
         }),
     );
 
@@ -545,6 +553,8 @@ fn hash_join_probe_side_spill_returns_all_matches() {
             right_bitmap: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
         }),
     );
 
@@ -848,6 +858,8 @@ fn no_limit_join_within_budget_returns_all_rows_past_10k() {
             right_bitmap: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
         }),
     );
 
@@ -912,6 +924,8 @@ fn explicit_limit_join_caps_at_k_regardless_of_budget() {
             right_bitmap: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
         }),
     );
 
@@ -972,6 +986,8 @@ fn join_budget_zero_is_unlimited() {
             right_bitmap: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
         }),
     );
 }

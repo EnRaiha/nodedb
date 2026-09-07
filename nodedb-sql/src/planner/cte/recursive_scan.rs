@@ -103,6 +103,7 @@ pub fn plan_recursive_cte(
             declared_columns: &declared_columns,
             distinct,
         },
+        catalog,
     )
 }
 
@@ -170,6 +171,7 @@ fn plan_recursive_scan_from_parts(
     cte_name: &str,
     base: &SqlPlan,
     parts: &RecursiveParts<'_>,
+    catalog: &dyn SqlCatalog,
 ) -> Result<SqlPlan> {
     let RecursiveParts {
         left,
@@ -195,7 +197,8 @@ fn plan_recursive_scan_from_parts(
     // intentionally absent from the ordinary catalog. Parse that supported
     // shape directly instead of attempting ordinary planning and swallowing
     // whichever error happens to occur first.
-    let (recursive_filters, join_link) = super::join_link::extract_recursive_info(right, cte_name)?;
+    let (recursive_filters, join_link) =
+        super::join_link::extract_recursive_info(right, cte_name, catalog)?;
 
     // The anchor plan carries the CTE's resolved output columns; propagate
     // them so the recursive scan self-describes its output schema.

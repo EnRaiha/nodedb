@@ -127,3 +127,47 @@ impl DomainContext for BatchInsertWithoutSurrogates<'_> {
         })
     }
 }
+
+/// A stored Binary Tuple that does not decode against its collection's
+/// strict schema. The bytes on disk are wrong, so the statement that read
+/// them is refused rather than applied over a partial row set.
+pub(in crate::diag) struct StrictRowUndecodable<'a> {
+    /// Collection whose stored row did not decode.
+    pub collection: &'a str,
+    /// Storage key of the row that did not decode.
+    pub doc_id: &'a str,
+    /// Detection site inside the UPDATE path.
+    pub site: &'static str,
+}
+
+impl DomainContext for StrictRowUndecodable<'_> {
+    fn domain_kind(&self) -> &'static str {
+        "nodedb.strict_row_undecodable"
+    }
+
+    fn grouping_key(&self) -> String {
+        // Collection names the root cause: one schema, one stored form. The
+        // row id is the occurrence, so a scan over many bad rows files one
+        // report with a rising count.
+        format!("collection={}", self.collection)
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "collection": self.collection,
+            "doc_id": self.doc_id,
+            "site": self.site,
+            "why_fatal": "the row is stored state that no longer matches the schema this \
+                          build decodes it with, so every statement reading it is refused \
+                          from here on. The bytes are already on disk, so the damage \
+                          outlives the statement and outlives the process — a restart \
+                          re-reads the same row and fails the same way",
+            "operator_action": "read the named row of the named collection directly: a \
+                                 single bad row points at a truncated or partially written \
+                                 body, while every row failing points at a schema whose \
+                                 stored column layout no longer matches the catalog. \
+                                 Restore the collection from a snapshot or rewrite the \
+                                 named row",
+        })
+    }
+}

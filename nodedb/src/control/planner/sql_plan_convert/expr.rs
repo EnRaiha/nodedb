@@ -494,10 +494,12 @@ pub(super) fn inline_cte(plan: &SqlPlan, cte_name: &str, cte_plan: &SqlPlan) -> 
             target,
             source,
             limit,
+            column_map,
         } => SqlPlan::InsertSelect {
             target: target.clone(),
             source: Box::new(inline_cte(source, cte_name, cte_plan)),
             limit: *limit,
+            column_map: column_map.clone(),
         },
 
         // A post-processor produced by an earlier CTE definition: recurse into

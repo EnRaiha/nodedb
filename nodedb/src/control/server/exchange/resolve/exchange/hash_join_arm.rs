@@ -37,6 +37,8 @@ pub(super) struct HashJoinFields {
     pub right_bitmap: Option<Box<PhysicalPlan>>,
     pub left_rls_filters: Vec<u8>,
     pub right_rls_filters: Vec<u8>,
+    pub left_scan_filters: Vec<u8>,
+    pub right_scan_filters: Vec<u8>,
 }
 
 /// Resolve a `QueryOp::HashJoin` node: resolve `Broadcast` children embedded
@@ -73,6 +75,8 @@ pub(super) async fn resolve_hash_join(
         right_bitmap,
         left_rls_filters,
         right_rls_filters,
+        left_scan_filters,
+        right_scan_filters,
     } = fields;
 
     let left_input = resolve_join_input(
@@ -122,7 +126,7 @@ pub(super) async fn resolve_hash_join(
             // The side's own collection and its own injected policy,
             // taken as one value: a planner that swaps build and probe
             // swaps both together, never one without the other.
-            ScanSide::join_side(&right_collection, &right_rls_filters),
+            ScanSide::join_side(&right_collection, &right_rls_filters, &right_scan_filters),
             trace_id,
             txn_id,
             captures,
@@ -151,6 +155,8 @@ pub(super) async fn resolve_hash_join(
             right_bitmap,
             left_rls_filters,
             right_rls_filters,
+            left_scan_filters,
+            right_scan_filters,
         },
     ))))
 }

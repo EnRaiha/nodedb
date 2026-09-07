@@ -160,6 +160,8 @@ pub fn code_for_sqlstate(sqlstate_str: &str) -> ErrorCode {
         sqlstate::INVALID_CATALOG_NAME => ErrorCode::DATABASE_NOT_FOUND,
         sqlstate::INSUFFICIENT_PRIVILEGE => ErrorCode::AUTHORIZATION_DENIED,
         sqlstate::UNDEFINED_FUNCTION => ErrorCode::UNDEFINED_FUNCTION,
+        sqlstate::UNDEFINED_COLUMN => ErrorCode::UNDEFINED_COLUMN,
+        sqlstate::AMBIGUOUS_COLUMN => ErrorCode::AMBIGUOUS_COLUMN,
         // A malformed request and a plan that cannot be built both render as
         // `42601`; both are non-retriable client errors, so one code covers
         // both without losing anything a client acts on.

@@ -23,6 +23,7 @@ use crate::error::{Result, SqlError};
 use crate::functions::registry::{FunctionCategory, FunctionRegistry};
 use crate::parser::normalize::normalize_ident;
 use crate::planner::agg_naming::aggregate_output_key;
+use crate::resolver::columns::TableScope;
 use crate::types::AggregateExpr;
 
 /// Which name an aggregate call is rewritten to.
@@ -36,15 +37,19 @@ pub enum BindName {
 
 /// Rewrite every aggregate call in `expr` to a reference to its computed
 /// column, registering aggregates the projection did not already request.
+///
+/// `scope` carries the input relations each aggregate argument resolves
+/// against.
 pub fn bind_aggregate_calls(
     expr: &ast::Expr,
     projection: &[ast::SelectItem],
     aggregates: &mut Vec<AggregateExpr>,
     functions: &FunctionRegistry,
     name: BindName,
+    scope: &TableScope,
 ) -> Result<ast::Expr> {
     let resolved = resolve_select_aliases(expr, projection);
-    bind(&resolved, aggregates, functions, name)
+    bind(&resolved, aggregates, functions, name, scope)
 }
 
 /// Substitute SELECT-list output aliases referenced by the expression.
@@ -90,29 +95,30 @@ fn bind(
     aggregates: &mut Vec<AggregateExpr>,
     functions: &FunctionRegistry,
     name: BindName,
+    scope: &TableScope,
 ) -> Result<ast::Expr> {
     match expr {
         ast::Expr::Function(func) if is_aggregate_call(func, functions) => {
-            let column = register_aggregate(expr, aggregates, functions, name)?;
+            let column = register_aggregate(expr, aggregates, functions, name, scope)?;
             Ok(ast::Expr::Identifier(ast::Ident::new(column)))
         }
         ast::Expr::BinaryOp { left, op, right } => Ok(ast::Expr::BinaryOp {
-            left: Box::new(bind(left, aggregates, functions, name)?),
+            left: Box::new(bind(left, aggregates, functions, name, scope)?),
             op: op.clone(),
-            right: Box::new(bind(right, aggregates, functions, name)?),
+            right: Box::new(bind(right, aggregates, functions, name, scope)?),
         }),
         ast::Expr::UnaryOp { op, expr } => Ok(ast::Expr::UnaryOp {
             op: *op,
-            expr: Box::new(bind(expr, aggregates, functions, name)?),
+            expr: Box::new(bind(expr, aggregates, functions, name, scope)?),
         }),
         ast::Expr::Nested(inner) => Ok(ast::Expr::Nested(Box::new(bind(
-            inner, aggregates, functions, name,
+            inner, aggregates, functions, name, scope,
         )?))),
         ast::Expr::IsNull(inner) => Ok(ast::Expr::IsNull(Box::new(bind(
-            inner, aggregates, functions, name,
+            inner, aggregates, functions, name, scope,
         )?))),
         ast::Expr::IsNotNull(inner) => Ok(ast::Expr::IsNotNull(Box::new(bind(
-            inner, aggregates, functions, name,
+            inner, aggregates, functions, name, scope,
         )?))),
         ast::Expr::Between {
             expr,
@@ -120,10 +126,10 @@ fn bind(
             low,
             high,
         } => Ok(ast::Expr::Between {
-            expr: Box::new(bind(expr, aggregates, functions, name)?),
+            expr: Box::new(bind(expr, aggregates, functions, name, scope)?),
             negated: *negated,
-            low: Box::new(bind(low, aggregates, functions, name)?),
-            high: Box::new(bind(high, aggregates, functions, name)?),
+            low: Box::new(bind(low, aggregates, functions, name, scope)?),
+            high: Box::new(bind(high, aggregates, functions, name, scope)?),
         }),
         other => Ok(other.clone()),
     }
@@ -153,10 +159,11 @@ fn register_aggregate(
     aggregates: &mut Vec<AggregateExpr>,
     functions: &FunctionRegistry,
     name: BindName,
+    scope: &TableScope,
 ) -> Result<String> {
     // The alias is replaced below for a newly registered aggregate, so the
     // placeholder is never observable.
-    let mut extracted = extract_aggregates(expr, "", functions)?;
+    let mut extracted = extract_aggregates(expr, "", functions, scope)?;
     let Some(mut agg) = extracted.pop() else {
         return Err(SqlError::Unsupported {
             detail: format!("aggregate `{expr}` could not be extracted"),

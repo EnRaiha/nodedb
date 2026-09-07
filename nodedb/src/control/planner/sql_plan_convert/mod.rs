@@ -8,6 +8,7 @@ pub mod convert;
 pub mod dml;
 pub mod expr;
 pub mod filter;
+pub mod filter_scan_side;
 pub mod group_key_name;
 pub mod lateral;
 pub mod output_schema;

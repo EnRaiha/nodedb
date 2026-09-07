@@ -134,6 +134,32 @@ impl NodeDbError {
         }
     }
 
+    /// A column reference names no column of any relation in scope. Distinct
+    /// from `plan_error` so clients match on the code rather than parsing the
+    /// message.
+    pub fn undefined_column(column: impl Into<String>) -> Self {
+        let column = column.into();
+        Self {
+            code: ErrorCode::UNDEFINED_COLUMN,
+            message: format!("column \"{column}\" does not exist"),
+            details: ErrorDetails::UndefinedColumn { column },
+            cause: None,
+        }
+    }
+
+    /// A bare column name resolves against more than one relation in scope.
+    /// Distinct from `plan_error` so clients match on the code rather than
+    /// parsing the message.
+    pub fn ambiguous_column(column: impl Into<String>) -> Self {
+        let column = column.into();
+        Self {
+            code: ErrorCode::AMBIGUOUS_COLUMN,
+            message: format!("column reference \"{column}\" is ambiguous"),
+            details: ErrorDetails::AmbiguousColumn { column },
+            cause: None,
+        }
+    }
+
     /// Expression evaluation divided or took a modulus by zero. Distinct
     /// from `plan_error` so clients can match on the specific code
     /// (SQLSTATE `22012`, `division_by_zero`) rather than parsing the

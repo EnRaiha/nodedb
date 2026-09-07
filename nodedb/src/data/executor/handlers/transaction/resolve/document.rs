@@ -180,7 +180,7 @@ mod tests {
         let mut obj = std::collections::HashMap::new();
         obj.insert("_rowid".to_string(), Value::Integer(rowid));
         obj.insert("body".to_string(), Value::String(body.to_string()));
-        strict_format::value_to_binary_tuple(&Value::Object(obj), &strict_schema())
+        strict_format::value_to_binary_tuple(&Value::Object(obj), &strict_schema(), "docs")
             .expect("encode binary tuple")
     }
 

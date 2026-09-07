@@ -282,6 +282,25 @@ pub enum Error {
     #[error("function {name}(...) does not exist")]
     UndefinedFunction { name: String },
 
+    /// A column reference resolved against no relation, output alias, or
+    /// synthetic column in scope. Propagated from `SqlError::UnknownColumn`;
+    /// the pgwire layer renders it as SQLSTATE `42703` (undefined_column).
+    #[error("column \"{column}\" does not exist")]
+    UndefinedColumn { column: String },
+
+    /// A bare column name resolved against more than one relation in scope.
+    /// Propagated from `SqlError::AmbiguousColumn`; the pgwire layer renders
+    /// it as SQLSTATE `42702` (ambiguous_column).
+    #[error("column reference \"{column}\" is ambiguous")]
+    AmbiguousColumn { column: String },
+
+    /// A write body carried a field the collection's strict schema does not
+    /// declare. The same condition the planner reports as an unknown column,
+    /// detected at encode time for the transports that bypass the planner:
+    /// the native client, `COPY FROM`, and CRDT delta merge.
+    #[error("column \"{column}\" of collection \"{collection}\" does not exist")]
+    UnknownStrictField { collection: String, column: String },
+
     /// Expression evaluation divided or took a modulus by zero. Rendered as
     /// SQLSTATE `22012` (division_by_zero) at the pgwire layer.
     #[error("division by zero")]

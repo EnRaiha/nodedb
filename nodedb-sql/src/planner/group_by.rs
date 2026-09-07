@@ -10,12 +10,14 @@ use sqlparser::ast::{self, GroupByExpr};
 
 use crate::error::Result;
 use crate::parser::normalize::normalize_ident;
+use crate::resolver::ColumnScope;
+use crate::resolver::columns::TableScope;
 use crate::resolver::expr::convert_expr;
 use crate::types::{ColumnInfo, SqlExpr};
 
 /// Convert GROUP BY clause to SqlExpr list.
-pub fn convert_group_by(group_by: &GroupByExpr) -> Result<Vec<SqlExpr>> {
-    convert_group_by_with_projection(group_by, &[], &[])
+pub fn convert_group_by(group_by: &GroupByExpr, scope: &TableScope) -> Result<Vec<SqlExpr>> {
+    convert_group_by_with_projection(group_by, &[], &[], scope)
 }
 
 /// Convert a GROUP BY clause, resolving SELECT-list output aliases.
@@ -36,15 +38,21 @@ pub fn convert_group_by_with_projection(
     group_by: &GroupByExpr,
     projection: &[ast::SelectItem],
     table_columns: &[ColumnInfo],
+    scope: &TableScope,
 ) -> Result<Vec<SqlExpr>> {
+    // A key written as an output alias is substituted for its SELECT-list
+    // expression above, so only the remaining names need the alias widening.
+    let key_scope =
+        scope.with_output_names(crate::planner::select::select_output_aliases(projection));
+    let key_scope = ColumnScope::Relations(&key_scope);
     match group_by {
         GroupByExpr::All(_) => Ok(Vec::new()),
         GroupByExpr::Expressions(exprs, _) => exprs
             .iter()
             .map(
                 |e| match resolve_output_alias(e, projection, table_columns) {
-                    Some(aliased) => convert_expr(aliased),
-                    None => convert_expr(e),
+                    Some(aliased) => convert_expr(aliased, &key_scope),
+                    None => convert_expr(e, &key_scope),
                 },
             )
             .collect(),

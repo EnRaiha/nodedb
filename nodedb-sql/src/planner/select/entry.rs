@@ -7,6 +7,7 @@
 use nodedb_types::DatabaseId;
 use sqlparser::ast::{Query, SetExpr};
 
+use super::cte_catalog::CteCatalog;
 use super::limit::apply_limit;
 use super::order_by::{apply_order_by, try_hybrid_from_projection};
 use super::query_tail::QueryTail;
@@ -14,6 +15,7 @@ use super::select_stmt::plan_select;
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
 use crate::reserved::check_ast_identifier;
+use crate::resolver::derived::{infer_subquery_relation, rename_output_columns};
 use crate::temporal::TemporalScope;
 use crate::types::{Projection, SqlExpr, *};
 
@@ -82,23 +84,27 @@ pub fn plan_query(
             pipe_operators: query.pipe_operators.clone(),
         };
 
-        // Plan each CTE subquery.
+        // Plan each CTE subquery and infer the relation it exposes.
         let mut definitions = Vec::new();
-        let mut cte_names = Vec::new();
+        let mut relations = Vec::new();
         for cte in &with.cte_tables {
             let name = check_ast_identifier(&cte.alias.name)?;
-            for column in &cte.alias.columns {
-                check_ast_identifier(&column.name)?;
-            }
+            let declared: Vec<String> = cte
+                .alias
+                .columns
+                .iter()
+                .map(|column| check_ast_identifier(&column.name))
+                .collect::<Result<_>>()?;
             let cte_plan = plan_query(&cte.query, catalog, functions, temporal)?;
+            let info = infer_subquery_relation(catalog, &name, &cte.query)?;
             definitions.push((name.clone(), cte_plan));
-            cte_names.push(name);
+            relations.push((name, rename_output_columns(info, &declared)));
         }
 
         // Build CTE-aware catalog so the outer query can reference CTE names.
         let cte_catalog = CteCatalog {
             inner: catalog,
-            cte_names,
+            relations,
         };
         let outer = plan_query(&inner_query, &cte_catalog, functions, temporal)?;
 
@@ -119,7 +125,9 @@ pub fn plan_query(
                 limit_clause: &query.limit_clause,
                 fetch: query.fetch.as_ref(),
             };
-            let mut plan = plan_select(select, catalog, functions, temporal, &tail)?;
+            let planned = plan_select(select, catalog, functions, temporal, &tail)?;
+            let scope = planned.scope;
+            let mut plan = planned.plan;
             // Snapshot the projection before ORDER BY transforms the plan,
             // in case `apply_order_by` converts a Scan into VectorSearch.
             let pre_order_by_projection: Option<Vec<Projection>> = match &plan {
@@ -131,7 +139,7 @@ pub fn plan_query(
                 _ => None,
             };
             if let Some(order_by) = &query.order_by {
-                plan = apply_order_by(&plan, order_by, functions, &select.projection)?;
+                plan = apply_order_by(&plan, order_by, functions, &select.projection, &scope)?;
             }
             // Fall back to a SELECT-projection scan for hybrid-search and
             // text-search triggers. The `SELECT id, rrf_score(...) AS score
@@ -371,37 +379,6 @@ pub fn plan_query(
     }
 }
 
-/// Catalog wrapper that resolves CTE names as schemaless document collections.
-pub(crate) struct CteCatalog<'a> {
-    pub(crate) inner: &'a dyn SqlCatalog,
-    pub(crate) cte_names: Vec<String>,
-}
-
-impl SqlCatalog for CteCatalog<'_> {
-    fn get_collection(
-        &self,
-        database_id: DatabaseId,
-        name: &str,
-    ) -> std::result::Result<Option<CollectionInfo>, SqlCatalogError> {
-        // Check CTE names first.
-        if self.cte_names.iter().any(|n| n == name) {
-            return Ok(Some(CollectionInfo {
-                name: name.into(),
-                engine: EngineType::DocumentSchemaless,
-                columns: Vec::new(),
-                primary_key: Some("id".into()),
-                has_auto_tier: false,
-                indexes: Vec::new(),
-                bitemporal: false,
-                primary: nodedb_types::PrimaryEngine::Document,
-                vector_primary: None,
-                partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
-            }));
-        }
-        self.inner.get_collection(database_id, name)
-    }
-}
-
 /// Unit tests for SELECT query planning.
 #[cfg(test)]
 mod tests {
@@ -430,6 +407,7 @@ mod tests {
                     primary: nodedb_types::PrimaryEngine::Document,
                     vector_primary: None,
                     partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
+                    open_schema: CollectionInfo::open_schema_for(EngineType::DocumentSchemaless),
                 }),
                 "users" => Some(CollectionInfo {
                     name: "users".into(),
@@ -442,6 +420,7 @@ mod tests {
                     primary: nodedb_types::PrimaryEngine::Document,
                     vector_primary: None,
                     partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
+                    open_schema: CollectionInfo::open_schema_for(EngineType::DocumentSchemaless),
                 }),
                 "orders" => Some(CollectionInfo {
                     name: "orders".into(),
@@ -454,6 +433,7 @@ mod tests {
                     primary: nodedb_types::PrimaryEngine::Document,
                     vector_primary: None,
                     partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
+                    open_schema: CollectionInfo::open_schema_for(EngineType::DocumentSchemaless),
                 }),
                 "docs" => Some(CollectionInfo {
                     name: "docs".into(),
@@ -466,6 +446,7 @@ mod tests {
                     primary: nodedb_types::PrimaryEngine::Document,
                     vector_primary: None,
                     partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
+                    open_schema: CollectionInfo::open_schema_for(EngineType::DocumentSchemaless),
                 }),
                 "tags" => Some(CollectionInfo {
                     name: "tags".into(),
@@ -478,6 +459,7 @@ mod tests {
                     primary: nodedb_types::PrimaryEngine::Document,
                     vector_primary: None,
                     partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
+                    open_schema: CollectionInfo::open_schema_for(EngineType::DocumentSchemaless),
                 }),
                 "user_prefs" => Some(CollectionInfo {
                     name: "user_prefs".into(),
@@ -490,6 +472,7 @@ mod tests {
                     primary: nodedb_types::PrimaryEngine::Document,
                     vector_primary: None,
                     partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
+                    open_schema: CollectionInfo::open_schema_for(EngineType::KeyValue),
                 }),
                 "embeddings" => Some(CollectionInfo {
                     name: "embeddings".into(),
@@ -502,6 +485,7 @@ mod tests {
                     primary: nodedb_types::PrimaryEngine::Document,
                     vector_primary: None,
                     partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
+                    open_schema: CollectionInfo::open_schema_for(EngineType::DocumentSchemaless),
                 }),
                 _ => None,
             };

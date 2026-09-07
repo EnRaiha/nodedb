@@ -30,6 +30,8 @@ use sqlparser::ast::{self, Expr, Visit, Visitor};
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
 use crate::parser::normalize::normalize_ident;
+use crate::resolver::ColumnScope;
+use crate::resolver::columns::TableScope;
 use crate::resolver::expr::convert_expr;
 use crate::types::{AggregateExpr, SqlExpr};
 
@@ -48,14 +50,19 @@ pub fn contains_aggregate(expr: &Expr, functions: &FunctionRegistry) -> bool {
 /// the given output `alias`. Nested aggregates (e.g. `SUM(AVG(x))`,
 /// which is illegal SQL in Postgres and most other systems) are
 /// reported as a planner error rather than silently double-extracted.
+///
+/// `scope` carries the relations the arguments resolve against, so a
+/// column no relation declares is rejected at plan time.
 pub fn extract_aggregates(
     expr: &Expr,
     alias: &str,
     functions: &FunctionRegistry,
+    scope: &TableScope,
 ) -> Result<Vec<AggregateExpr>> {
     let mut extractor = AggregateExtractor {
         functions,
         alias,
+        scope,
         inside_aggregate: 0,
         out: Vec::new(),
         error: None,
@@ -97,6 +104,7 @@ impl Visitor for AggregateDetector<'_> {
 struct AggregateExtractor<'a> {
     functions: &'a FunctionRegistry,
     alias: &'a str,
+    scope: &'a TableScope,
     /// Depth counter: >0 means we're currently inside the argument
     /// subtree of an already-extracted aggregate. A second aggregate
     /// found in that subtree is an illegal nested aggregate.
@@ -132,7 +140,13 @@ impl Visitor for AggregateExtractor<'_> {
                 });
                 return ControlFlow::Break(());
             }
-            let (args, distinct) = function_args_and_distinct(f);
+            let (args, distinct) = match function_args_and_distinct(f, self.scope) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    self.error = Some(e);
+                    return ControlFlow::Break(());
+                }
+            };
             self.out.push(AggregateExpr {
                 function: function_name(f),
                 args,
@@ -193,30 +207,44 @@ fn function_name(f: &ast::Function) -> String {
         .join(".")
 }
 
-fn function_args_and_distinct(f: &ast::Function) -> (Vec<SqlExpr>, bool) {
+/// Convert an aggregate call's argument list against `scope`.
+///
+/// An argument the converter rejects is an error, never a dropped argument:
+/// discarding one silently changes the aggregate's arity and hides an unknown
+/// column behind a query that reports success.
+fn function_args_and_distinct(
+    f: &ast::Function,
+    scope: &TableScope,
+) -> Result<(Vec<SqlExpr>, bool)> {
     let ast::FunctionArguments::List(args) = &f.args else {
-        return (Vec::new(), false);
+        return Ok((Vec::new(), false));
     };
-    let parsed = args
-        .args
-        .iter()
-        .filter_map(|a| match a {
-            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => convert_expr(e).ok(),
-            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard) => Some(SqlExpr::Wildcard),
-            _ => None,
-        })
-        .collect();
+    let mut parsed = Vec::with_capacity(args.args.len());
+    for a in &args.args {
+        match a {
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
+                parsed.push(convert_expr(e, &ColumnScope::Relations(scope))?);
+            }
+            // `COUNT(*)` carries no column to resolve.
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard) => {
+                parsed.push(SqlExpr::Wildcard);
+            }
+            _ => {}
+        }
+    }
     let distinct = matches!(
         args.duplicate_treatment,
         Some(ast::DuplicateTreatment::Distinct)
     );
-    (parsed, distinct)
+    Ok((parsed, distinct))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser::statement::parse_sql;
+    use crate::resolver::columns::ResolvedTable;
+    use crate::types::{CollectionInfo, EngineType};
 
     fn first_select_projection(sql: &str) -> Vec<ast::SelectItem> {
         let stmts = parse_sql(sql).unwrap();
@@ -238,6 +266,29 @@ mod tests {
 
     fn functions() -> FunctionRegistry {
         FunctionRegistry::new()
+    }
+
+    /// A one-relation scope that accepts any column name.
+    fn open_scope() -> TableScope {
+        let info = CollectionInfo {
+            name: "t".into(),
+            engine: EngineType::DocumentSchemaless,
+            columns: Vec::new(),
+            primary_key: None,
+            has_auto_tier: false,
+            indexes: Vec::new(),
+            bitemporal: false,
+            primary: nodedb_types::PrimaryEngine::Document,
+            vector_primary: None,
+            partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
+            open_schema: CollectionInfo::open_schema_for(EngineType::DocumentSchemaless),
+        };
+        TableScope::single(ResolvedTable {
+            name: info.name.clone(),
+            alias: None,
+            info,
+        })
+        .expect("single-relation scope")
     }
 
     // ── detection ──
@@ -318,8 +369,13 @@ mod tests {
 
     #[test]
     fn extract_plain_aggregate() {
-        let aggs =
-            extract_aggregates(&first_expr("SELECT SUM(x) FROM t"), "total", &functions()).unwrap();
+        let aggs = extract_aggregates(
+            &first_expr("SELECT SUM(x) FROM t"),
+            "total",
+            &functions(),
+            &open_scope(),
+        )
+        .unwrap();
         assert_eq!(aggs.len(), 1);
         assert_eq!(aggs[0].function, "sum");
         assert_eq!(aggs[0].alias, "total");
@@ -331,6 +387,7 @@ mod tests {
             &first_expr("SELECT CAST(SUM(x) AS TEXT) AS n FROM t"),
             "n",
             &functions(),
+            &open_scope(),
         )
         .unwrap();
         assert_eq!(aggs.len(), 1);
@@ -343,6 +400,7 @@ mod tests {
             &first_expr("SELECT CASE WHEN x > 0 THEN SUM(y) ELSE 0 END FROM t"),
             "r",
             &functions(),
+            &open_scope(),
         )
         .unwrap();
         assert_eq!(aggs.len(), 1);
@@ -355,6 +413,7 @@ mod tests {
             &first_expr("SELECT COALESCE(SUM(x), 0) FROM t"),
             "r",
             &functions(),
+            &open_scope(),
         )
         .unwrap();
         assert_eq!(aggs.len(), 1);
@@ -367,6 +426,7 @@ mod tests {
             &first_expr("SELECT SUM(x) + COUNT(y) AS total FROM t"),
             "total",
             &functions(),
+            &open_scope(),
         )
         .unwrap();
         assert_eq!(aggs.len(), 2);
@@ -377,8 +437,13 @@ mod tests {
 
     #[test]
     fn nested_aggregate_directly_inside_aggregate_rejected() {
-        let err = extract_aggregates(&first_expr("SELECT SUM(AVG(x)) FROM t"), "r", &functions())
-            .unwrap_err();
+        let err = extract_aggregates(
+            &first_expr("SELECT SUM(AVG(x)) FROM t"),
+            "r",
+            &functions(),
+            &open_scope(),
+        )
+        .unwrap_err();
         let msg = format!("{err:?}");
         assert!(
             msg.to_lowercase().contains("nested aggregate"),
@@ -396,6 +461,7 @@ mod tests {
             &first_expr("SELECT SUM(CAST(AVG(x) AS BIGINT)) FROM t"),
             "r",
             &functions(),
+            &open_scope(),
         )
         .unwrap_err();
         assert!(
@@ -414,6 +480,7 @@ mod tests {
             &first_expr("SELECT CAST(SUM(x) AS TEXT) || CAST(COUNT(y) AS TEXT) FROM t"),
             "r",
             &functions(),
+            &open_scope(),
         )
         .unwrap();
         assert_eq!(aggs.len(), 2);
@@ -425,6 +492,7 @@ mod tests {
             &first_expr("SELECT COUNT(DISTINCT x) FROM t"),
             "c",
             &functions(),
+            &open_scope(),
         )
         .unwrap();
         assert_eq!(aggs.len(), 1);

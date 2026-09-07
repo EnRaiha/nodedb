@@ -13,6 +13,8 @@ use crate::planner::aggregate::{
     extract_aggregates_from_projection, function_args_exprs, normalize_function_name,
 };
 use crate::planner::group_by::{expr_column_name, key_column_name};
+use crate::resolver::ColumnScope;
+use crate::resolver::columns::TableScope;
 use crate::resolver::expr::convert_expr;
 use crate::types::query::AggOutputSlot;
 use crate::types_expr::SqlExpr;
@@ -31,8 +33,9 @@ pub fn compute_output_order(
     projection: &[ast::SelectItem],
     group_by: &[SqlExpr],
     functions: &FunctionRegistry,
+    scope: &TableScope,
 ) -> Result<Vec<AggOutputSlot>> {
-    let real_agg_count = extract_aggregates_from_projection(projection, functions)?.len();
+    let real_agg_count = extract_aggregates_from_projection(projection, functions, scope)?.len();
     let mut order = Vec::new();
     let mut agg_cursor = 0usize;
     let mut grouping_cursor = 0usize;
@@ -59,7 +62,7 @@ pub fn compute_output_order(
         // rendering — both the projection expr and the GROUP BY key pass
         // through the same `convert_expr`, so equal expressions render
         // identically.
-        if let Ok(converted) = convert_expr(expr) {
+        if let Ok(converted) = convert_expr(expr, &ColumnScope::Relations(scope)) {
             let rendered = format!("{converted:?}");
             if let Some(index) = group_by
                 .iter()
@@ -87,7 +90,7 @@ pub fn compute_output_order(
                 _ => format!("{expr}").to_lowercase(),
             };
             let produced =
-                crate::aggregate_walk::extract_aggregates(expr, &alias, functions)?.len();
+                crate::aggregate_walk::extract_aggregates(expr, &alias, functions, scope)?.len();
             for _ in 0..produced {
                 order.push(AggOutputSlot::Aggregate(agg_cursor));
                 agg_cursor += 1;

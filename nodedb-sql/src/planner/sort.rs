@@ -7,16 +7,22 @@
 //! sort key extraction utilities.
 
 use crate::error::Result;
+use crate::resolver::ColumnScope;
+use crate::resolver::columns::TableScope;
 use crate::resolver::expr::convert_expr;
 use crate::types::SortKey;
 
 /// Convert sqlparser OrderByExpr list to SortKey list.
-pub fn convert_sort_keys(exprs: &[sqlparser::ast::OrderByExpr]) -> Result<Vec<SortKey>> {
+pub fn convert_sort_keys(
+    exprs: &[sqlparser::ast::OrderByExpr],
+    scope: &TableScope,
+) -> Result<Vec<SortKey>> {
+    let scope = ColumnScope::Relations(scope);
     exprs
         .iter()
         .map(|o| {
             Ok(SortKey {
-                expr: convert_expr(&o.expr)?,
+                expr: convert_expr(&o.expr, &scope)?,
                 ascending: o.options.asc.unwrap_or(true),
                 nulls_first: o
                     .options

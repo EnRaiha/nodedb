@@ -54,6 +54,11 @@ pub(crate) struct HashJoinParams<'a> {
     pub left_rls_filters: &'a [u8],
     /// Row-level-security filters for the right side. Same semantics.
     pub right_rls_filters: &'a [u8],
+    /// The left side's own `WHERE` predicates when it is scanned locally.
+    /// Applied with `left_rls_filters` before the join: both must pass.
+    pub left_scan_filters: &'a [u8],
+    /// The right side's own `WHERE` predicates. Same semantics.
+    pub right_scan_filters: &'a [u8],
 }
 
 /// Nested-loop join: O(N×M) fallback for non-equi, theta, and cross joins.

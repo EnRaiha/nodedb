@@ -194,11 +194,13 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             source_collection,
             source_filters,
             source_limit,
+            column_map,
         } => Ok(document::insert_select(
             target_collection,
             source_collection,
             source_filters,
             *source_limit,
+            column_map,
         )),
         ReplicatedWrite::ApplyBalanceDelta {
             collection,

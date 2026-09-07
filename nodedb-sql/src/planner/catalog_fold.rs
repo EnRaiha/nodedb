@@ -244,10 +244,12 @@ fn walk_plan(
             target,
             source,
             limit,
+            column_map,
         } => SqlPlan::InsertSelect {
             target,
             source: Box::new(walk_plan(*source, catalog, database_id, tenant_id)),
             limit,
+            column_map,
         },
 
         SqlPlan::Aggregate {

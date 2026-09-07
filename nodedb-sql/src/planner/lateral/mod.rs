@@ -8,5 +8,6 @@
 
 pub mod correlation;
 pub mod plan;
+pub mod subquery;
 
 pub use plan::plan_lateral_join;

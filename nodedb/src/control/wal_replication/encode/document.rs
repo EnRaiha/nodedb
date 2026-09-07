@@ -249,12 +249,14 @@ pub(super) fn insert_select(
     source_collection: &str,
     source_filters: &[u8],
     source_limit: usize,
+    column_map: &[u8],
 ) -> ReplicatedWrite {
     ReplicatedWrite::InsertSelect {
         target_collection: target_collection.to_owned(),
         source_collection: source_collection.to_owned(),
         source_filters: source_filters.to_vec(),
         source_limit,
+        column_map: column_map.to_vec(),
     }
 }
 

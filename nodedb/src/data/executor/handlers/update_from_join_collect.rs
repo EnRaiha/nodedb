@@ -100,15 +100,23 @@ impl CoreLoop {
 
         let mut rows: Vec<ResolvedUpdateRow> = Vec::new();
         for (doc_id, current_bytes) in target_rows {
+            // A row the statement matched but cannot decode fails the
+            // statement. Skipping it leaves the row untouched under a smaller
+            // affected count that reports success.
             let mut target_doc = if let Some(schema) = strict_schema {
-                match super::super::strict_format::binary_tuple_to_json(&current_bytes, schema) {
-                    Some(v) => v,
-                    None => continue,
-                }
+                super::super::strict_format::binary_tuple_to_json(&current_bytes, schema)
+                    .ok_or_else(|| {
+                        crate::diag::strict_row_undecodable(
+                            target_collection,
+                            &doc_id,
+                            "update_from_join_collect",
+                        );
+                        super::super::strict_format::undecodable_strict_row(
+                            target_collection,
+                            &doc_id,
+                        )
+                    })?
             } else {
-                // A target row skipped here is one the UPDATE silently leaves
-                // untouched while reporting a smaller affected count as the
-                // truth.
                 doc_format::decode_document(&current_bytes)?
             };
 
@@ -140,16 +148,15 @@ impl CoreLoop {
             if let Some(target_obj) = target_doc.as_object_mut() {
                 for (field, update_val) in updates {
                     let val: serde_json::Value = match update_val {
-                        UpdateValue::Literal(bytes) => match nodedb_types::json_from_msgpack(bytes)
-                        {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        },
-                        // Division/modulo by zero fails the statement, same
-                        // as the literal decode-failure arm above would if
-                        // it propagated instead of skipping (kept as-is;
-                        // only the newly-fallible expr path is threaded
-                        // here).
+                        UpdateValue::Literal(bytes) => nodedb_types::json_from_msgpack(bytes)
+                            .map_err(|e| crate::Error::Serialization {
+                                format: "msgpack".into(),
+                                detail: format!(
+                                    "literal assigned to \"{field}\" for document \"{doc_id}\" \
+                                     of collection \"{target_collection}\" does not decode: {e}"
+                                ),
+                            })?,
+                        // Division or modulo by zero fails the statement.
                         UpdateValue::Expr(expr) => {
                             expr.eval(&merged_ndb).map_err(crate::Error::from)?.into()
                         }
@@ -158,40 +165,32 @@ impl CoreLoop {
                 }
             }
 
-            // Recompute generated columns if any dependency changed.
+            // Recompute generated columns if any dependency changed. A column
+            // the engine cannot recompute fails the statement.
             if let Some(config) = self.doc_configs.get(config_key)
                 && !config.enforcement.generated_columns.is_empty()
                 && super::generated::needs_recomputation(
                     updates,
                     &config.enforcement.generated_columns,
                 )
-                && let Err(e) = super::generated::evaluate_generated_columns(
+            {
+                super::generated::evaluate_generated_columns(
                     &mut target_doc,
                     &config.enforcement.generated_columns,
                 )
-            {
-                tracing::warn!(
-                    %doc_id,
-                    error = ?e,
-                    "generated column recomputation failed during UpdateFromJoin, skipping"
-                );
-                continue;
+                .map_err(crate::Error::DataPlane)?;
             }
 
             // Re-encode the post-image (strict Binary Tuple or MessagePack).
+            // An encode error carries its own typed cause, such as a field the
+            // strict schema does not declare.
             let updated_bytes = if let Some(schema) = strict_schema {
                 let ndb_val: nodedb_types::Value = target_doc.clone().into();
-                match super::super::strict_format::value_to_binary_tuple(&ndb_val, schema) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        tracing::warn!(
-                            %doc_id,
-                            error = %e,
-                            "strict re-encode failed during UpdateFromJoin, skipping"
-                        );
-                        continue;
-                    }
-                }
+                super::super::strict_format::value_to_binary_tuple(
+                    &ndb_val,
+                    schema,
+                    target_collection,
+                )?
             } else {
                 doc_format::encode_to_msgpack(&target_doc)
             };
@@ -256,18 +255,32 @@ impl CoreLoop {
             for entry in range.flatten() {
                 let key = entry.0.value();
                 let value_bytes = entry.1.value();
+                let Some(doc_id) = key.strip_prefix(&prefix) else {
+                    continue;
+                };
+                // A stored row that does not decode fails the statement.
+                // Treating it as a non-match drops it from the update set
+                // while the statement reports success.
                 let matches = if let Some(schema) = strict_schema {
-                    match super::super::strict_format::binary_tuple_to_json(value_bytes, schema) {
-                        Some(doc) => {
-                            let msgpack = doc_format::encode_to_msgpack(&doc);
-                            ScanFilter::all_match_binary(target_filters, &msgpack)?
-                        }
-                        None => false,
-                    }
+                    let doc =
+                        super::super::strict_format::binary_tuple_to_json(value_bytes, schema)
+                            .ok_or_else(|| {
+                                crate::diag::strict_row_undecodable(
+                                    target_collection,
+                                    doc_id,
+                                    "update_from_join_scan",
+                                );
+                                super::super::strict_format::undecodable_strict_row(
+                                    target_collection,
+                                    doc_id,
+                                )
+                            })?;
+                    let msgpack = doc_format::encode_to_msgpack(&doc);
+                    ScanFilter::all_match_binary(target_filters, &msgpack)?
                 } else {
                     ScanFilter::all_match_binary(target_filters, value_bytes)?
                 };
-                if matches && let Some(doc_id) = key.strip_prefix(&prefix) {
+                if matches {
                     rows.push((doc_id.to_string(), value_bytes.to_vec()));
                 }
             }

@@ -114,6 +114,8 @@ fn inline_hash_join_honors_qualified_left_keys() {
             right_bitmap: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
         }),
     );
 
@@ -188,6 +190,8 @@ fn inline_hash_join_honors_qualified_left_keys() {
             right_bitmap: None,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_scan_filters: Vec::new(),
+            right_scan_filters: Vec::new(),
         }),
     );
 

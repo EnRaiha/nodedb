@@ -361,6 +361,7 @@ pub(super) fn insert_select(
     source_collection: &str,
     source_filters: &[u8],
     source_limit: usize,
+    column_map: &[u8],
 ) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::InsertSelect {
         target_collection: nodedb_types::QualifiedCollection::from_stored(
@@ -371,6 +372,7 @@ pub(super) fn insert_select(
         ),
         source_filters: source_filters.to_vec(),
         source_limit,
+        column_map: column_map.to_vec(),
     })
 }
 

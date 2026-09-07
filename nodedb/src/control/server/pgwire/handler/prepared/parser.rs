@@ -98,7 +98,8 @@ fn inferred_param_type(inferred: &nodedb_sql::InferredParamType) -> Option<Type>
         SqlDataType::Decimal
         | SqlDataType::Uuid
         | SqlDataType::Vector(_)
-        | SqlDataType::Geometry => None,
+        | SqlDataType::Geometry
+        | SqlDataType::Unknown => None,
     }
 }
 

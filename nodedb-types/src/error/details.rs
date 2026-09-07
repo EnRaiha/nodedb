@@ -101,6 +101,12 @@ pub enum ErrorDetails {
     /// A function call names no registered scalar/aggregate/window function.
     #[serde(rename = "undefined_function")]
     UndefinedFunction { name: String },
+    /// A column reference names no column of any relation in scope.
+    #[serde(rename = "undefined_column")]
+    UndefinedColumn { column: String },
+    /// A bare column name resolves against more than one relation in scope.
+    #[serde(rename = "ambiguous_column")]
+    AmbiguousColumn { column: String },
     /// Expression evaluation divided or took a modulus by zero.
     #[serde(rename = "division_by_zero")]
     DivisionByZero,

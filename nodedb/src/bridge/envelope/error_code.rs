@@ -202,6 +202,11 @@ impl From<crate::Error> for ErrorCode {
                 Self::TxnOverlayMemoryExceeded { limit }
             }
             crate::Error::DivisionByZero => Self::DivisionByZero,
+            crate::Error::UndefinedColumn { column } => Self::UndefinedColumn { column },
+            // Same condition an undefined column reports at plan time, raised
+            // here by the strict encoder for a transport the planner never
+            // sees (native client, `COPY FROM`, CRDT delta merge).
+            crate::Error::UnknownStrictField { column, .. } => Self::UndefinedColumn { column },
             // Already a Data-Plane verdict: hand back the same code rather
             // than re-wrapping it as `Internal` and losing its SQLSTATE.
             crate::Error::DataPlane(code) => code,

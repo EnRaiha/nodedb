@@ -11,17 +11,29 @@ use super::coerce::coerce_value;
 ///
 /// Accepts zerompk bytes (from planner) and decodes them internally.
 /// Missing nullable columns become NULL; missing non-nullable columns error.
-pub fn bytes_to_binary_tuple(bytes: &[u8], schema: &StrictSchema) -> crate::Result<Vec<u8>> {
+/// `collection` names the target in an unknown-field error and carries no
+/// other meaning.
+pub fn bytes_to_binary_tuple(
+    bytes: &[u8],
+    schema: &StrictSchema,
+    collection: &str,
+) -> crate::Result<Vec<u8>> {
     let value =
         nodedb_types::value_from_msgpack(bytes).map_err(|e| crate::Error::Serialization {
             format: "msgpack".to_string(),
             detail: format!("zerompk decode: {e}"),
         })?;
-    value_to_binary_tuple(&value, schema)
+    value_to_binary_tuple(&value, schema, collection)
 }
 
 /// Encode a `nodedb_types::Value` as a Binary Tuple according to the schema.
-pub fn value_to_binary_tuple(value: &Value, schema: &StrictSchema) -> crate::Result<Vec<u8>> {
+/// `collection` names the target in an unknown-field error and carries no
+/// other meaning.
+pub fn value_to_binary_tuple(
+    value: &Value,
+    schema: &StrictSchema,
+    collection: &str,
+) -> crate::Result<Vec<u8>> {
     let map = match value {
         Value::Object(m) => m,
         _ => {
@@ -34,8 +46,9 @@ pub fn value_to_binary_tuple(value: &Value, schema: &StrictSchema) -> crate::Res
     let schema_columns: std::collections::HashSet<&str> =
         schema.columns.iter().map(|c| c.name.as_str()).collect();
     if let Some(unknown) = map.keys().find(|k| !schema_columns.contains(k.as_str())) {
-        return Err(crate::Error::BadRequest {
-            detail: format!("unknown field '{unknown}' not present in strict schema"),
+        return Err(crate::Error::UnknownStrictField {
+            collection: collection.to_string(),
+            column: unknown.clone(),
         });
     }
 
@@ -67,12 +80,15 @@ pub fn value_to_binary_tuple(value: &Value, schema: &StrictSchema) -> crate::Res
 
 /// Bitemporal variant: decode msgpack to `Value`, then encode as a Binary
 /// Tuple with reserved slots 0/1/2 populated from the supplied timestamps.
+/// `collection` names the target in an unknown-field error and carries no
+/// other meaning.
 pub fn bytes_to_binary_tuple_bitemporal(
     bytes: &[u8],
     schema: &StrictSchema,
     system_from_ms: i64,
     valid_from_ms: i64,
     valid_until_ms: i64,
+    collection: &str,
 ) -> crate::Result<Vec<u8>> {
     let value =
         nodedb_types::value_from_msgpack(bytes).map_err(|e| crate::Error::Serialization {
@@ -85,17 +101,20 @@ pub fn bytes_to_binary_tuple_bitemporal(
         system_from_ms,
         valid_from_ms,
         valid_until_ms,
+        collection,
     )
 }
 
 /// Bitemporal variant: encode a user-supplied `Value::Object` together
-/// with the three reserved bitemporal timestamps.
+/// with the three reserved bitemporal timestamps. `collection` names the
+/// target in an unknown-field error and carries no other meaning.
 pub fn value_to_binary_tuple_bitemporal(
     value: &Value,
     schema: &StrictSchema,
     system_from_ms: i64,
     valid_from_ms: i64,
     valid_until_ms: i64,
+    collection: &str,
 ) -> crate::Result<Vec<u8>> {
     if !schema.bitemporal {
         return Err(crate::Error::BadRequest {
@@ -133,8 +152,9 @@ pub fn value_to_binary_tuple_bitemporal(
         !user_names.contains(k.as_str())
             && !nodedb_types::columnar::BITEMPORAL_RESERVED_COLUMNS.contains(&k.as_str())
     }) {
-        return Err(crate::Error::BadRequest {
-            detail: format!("unknown field '{unknown}' not present in strict schema"),
+        return Err(crate::Error::UnknownStrictField {
+            collection: collection.to_string(),
+            column: unknown.clone(),
         });
     }
 

@@ -42,6 +42,7 @@ pub(crate) async fn resolve_and_emit_insert_select_ops(
         source_collection,
         source_filters,
         source_limit,
+        column_map,
     }) = &task.plan
     else {
         // Callers only pass an `InsertSelect` task; a mismatch is a bug.
@@ -61,6 +62,7 @@ pub(crate) async fn resolve_and_emit_insert_select_ops(
             source_collection: source_collection.as_str(),
             source_filters,
             source_limit: *source_limit,
+            column_map,
             txn_id: task.txn_id,
         },
     )
@@ -121,6 +123,7 @@ struct MaterializeCopy<'a> {
     source_collection: &'a str,
     source_filters: &'a [u8],
     source_limit: usize,
+    column_map: &'a [u8],
     txn_id: Option<TxnId>,
 }
 
@@ -140,6 +143,7 @@ async fn materialize_copy(
         source_collection,
         source_filters,
         source_limit,
+        column_map,
         txn_id,
     } = args;
     let spec = resolve_copy_spec(
@@ -148,6 +152,7 @@ async fn materialize_copy(
         database_id,
         target_collection,
         source_filters,
+        column_map,
     )?;
 
     let mut cursor: Vec<u8> = Vec::new();

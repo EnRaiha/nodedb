@@ -24,6 +24,7 @@
 use std::path::PathBuf;
 
 use super::grace_repartition::FrameStreamReader;
+use crate::bridge::scan_filter::decode_scan_filters;
 use crate::data::executor::core_loop::CoreLoop;
 
 /// One side of a join consumed through a uniform interface.
@@ -53,6 +54,11 @@ pub(super) enum RowSource {
         /// through — a filter applied anywhere else would be one strategy's
         /// filter, not the join's.
         rls_filters: Vec<u8>,
+        /// This side's own `WHERE` predicates, as the MessagePack
+        /// `Vec<ScanFilter>` the planner serialized. Empty = no local
+        /// predicate. Applied at the same seam as `rls_filters`, and a row must
+        /// pass both.
+        scan_filters: Vec<u8>,
     },
     /// Stream rows from a LOCAL staged shuffle file written by a cross-node
     /// exchange. The file is a sequence of `[u32 LE len][row-bytes]` frames,
@@ -88,17 +94,16 @@ impl RowSource {
                 tenant_id,
                 collection,
                 rls_filters,
+                scan_filters,
             } => {
-                if rls_filters.is_empty() {
+                if rls_filters.is_empty() && scan_filters.is_empty() {
                     return core.scan_collection_for_each(*database_id, *tenant_id, collection, f);
                 }
-                // Deserialize once, outside the per-row closure. A filter that
+                // Deserialize once, outside the per-row closure. A set that
                 // fails to decode is an error, never an empty filter set:
                 // dropping it would stream the unfiltered side into the join.
-                let filters: Vec<crate::bridge::scan_filter::ScanFilter> =
-                    zerompk::from_msgpack(rls_filters).map_err(|e| crate::Error::PlanError {
-                        detail: format!("RLS filter deserialization failed (join side): {e}"),
-                    })?;
+                let mut filters = decode_scan_filters(rls_filters, "RLS filter (join side)")?;
+                filters.extend(decode_scan_filters(scan_filters, "join side predicate")?);
                 core.scan_collection_for_each(*database_id, *tenant_id, collection, |id, bytes| {
                     if crate::bridge::scan_filter::ScanFilter::all_match_binary(&filters, bytes)? {
                         f(id, bytes)?;

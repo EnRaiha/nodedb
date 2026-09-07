@@ -170,13 +170,17 @@ impl CoreLoop {
                     sys_from_ms,
                     i64::MIN,
                     i64::MAX,
+                    ctx.collection,
                 )
             } else {
-                strict_format::value_to_binary_tuple(&merged, schema)
+                strict_format::value_to_binary_tuple(&merged, schema, ctx.collection)
             };
-            result.map_err(|e| crate::Error::Serialization {
-                format: "binary_tuple".into(),
-                detail: e.to_string(),
+            result.map_err(|e| match e {
+                crate::Error::UnknownStrictField { .. } => e,
+                other => crate::Error::Serialization {
+                    format: "binary_tuple".into(),
+                    detail: other.to_string(),
+                },
             })
         } else {
             nodedb_types::value_to_msgpack(&merged).map_err(|e| crate::Error::Serialization {

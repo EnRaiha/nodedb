@@ -80,6 +80,8 @@ pub async fn resolve_shuffle_join(
         right_input,
         left_rls_filters,
         right_rls_filters,
+        left_scan_filters,
+        right_scan_filters,
         ..
     }) = child
     else {
@@ -201,13 +203,21 @@ pub async fn resolve_shuffle_join(
         state,
         database_id,
         tenant_id,
-        ScanSide::join_side(right_collection.as_str(), &right_rls_filters),
+        ScanSide::join_side(
+            right_collection.as_str(),
+            &right_rls_filters,
+            &right_scan_filters,
+        ),
     )?;
     let probe_scan = require_scan_plan(
         state,
         database_id,
         tenant_id,
-        ScanSide::join_side(left_collection.as_str(), &left_rls_filters),
+        ScanSide::join_side(
+            left_collection.as_str(),
+            &left_rls_filters,
+            &left_scan_filters,
+        ),
     )?;
     let build_plan_bytes = plan_wire::encode(&build_scan).map_err(|e| crate::Error::Internal {
         detail: format!("shuffle join: encode build scan: {e}"),

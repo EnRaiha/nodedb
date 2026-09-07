@@ -114,6 +114,8 @@ pub(super) async fn resolve_exchange(
             right_bitmap,
             left_rls_filters,
             right_rls_filters,
+            left_scan_filters,
+            right_scan_filters,
         }) => {
             hash_join_arm::resolve_hash_join(
                 state,
@@ -139,6 +141,8 @@ pub(super) async fn resolve_exchange(
                     right_bitmap,
                     left_rls_filters,
                     right_rls_filters,
+                    left_scan_filters,
+                    right_scan_filters,
                 },
             )
             .await

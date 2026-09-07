@@ -160,9 +160,15 @@ fn dispatch_trigger(
     }
 }
 
-fn extra_filter_to_filters(extra: Option<&ast::Expr>) -> Result<Vec<Filter>> {
+fn extra_filter_to_filters(
+    extra: Option<&ast::Expr>,
+    table: &crate::resolver::columns::ResolvedTable,
+) -> Result<Vec<Filter>> {
     match extra {
-        Some(e) => convert_where_to_filters(e),
+        Some(e) => {
+            let scope = crate::resolver::columns::TableScope::single(table.clone())?;
+            convert_where_to_filters(e, &scope)
+        }
         None => Ok(Vec::new()),
     }
 }
@@ -208,7 +214,7 @@ fn plan_text_from_where(
         collection: table.name.clone(),
         query: fts_query,
         top_k: 1000,
-        filters: extra_filter_to_filters(extra_filter)?,
+        filters: extra_filter_to_filters(extra_filter, table)?,
         score_alias: None,
         projection: projection.to_vec(),
     }))
@@ -244,7 +250,7 @@ fn plan_vector_from_where(
         top_k: DEFAULT_TOP_K,
         ef_search,
         metric: metric_from_func_name(name),
-        filters: extra_filter_to_filters(extra_filter)?,
+        filters: extra_filter_to_filters(extra_filter, table)?,
         array_prefilter: None,
         ann_options,
         // Vector-primary skip-payload-fetch and payload-filter peeling are
@@ -340,7 +346,7 @@ fn plan_spatial_from_where(
         predicate,
         query_geometry: geometry,
         distance_meters: distance,
-        attribute_filters: extra_filter_to_filters(extra_filter)?,
+        attribute_filters: extra_filter_to_filters(extra_filter, table)?,
         limit: 1000,
         projection: projection.to_vec(),
     }))

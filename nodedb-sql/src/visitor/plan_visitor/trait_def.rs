@@ -91,6 +91,7 @@ pub trait PlanVisitor {
         target: &str,
         source: &SqlPlan,
         limit: usize,
+        column_map: &[(String, SqlExpr)],
     ) -> Result<Self::Output, Self::Error>;
 
     /// Handle [`SqlPlan::Update`].

@@ -8,6 +8,8 @@ use sqlparser::ast;
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
 use crate::parser::normalize::{SCHEMA_QUALIFIED_MSG, normalize_ident};
+use crate::resolver::ColumnScope;
+use crate::resolver::columns::TableScope;
 use crate::resolver::expr::convert_expr;
 use crate::types::*;
 
@@ -25,12 +27,16 @@ pub(super) fn source_projection(plan: &SqlPlan) -> Vec<Projection> {
 }
 
 /// Convert SELECT projection items.
-pub fn convert_projection(items: &[ast::SelectItem]) -> Result<Vec<Projection>> {
+pub fn convert_projection(
+    items: &[ast::SelectItem],
+    scope: &TableScope,
+) -> Result<Vec<Projection>> {
+    let scope = ColumnScope::Relations(scope);
     let mut result = Vec::new();
     for item in items {
         match item {
             ast::SelectItem::UnnamedExpr(expr) => {
-                let sql_expr = convert_expr(expr)?;
+                let sql_expr = convert_expr(expr, &scope)?;
                 match &sql_expr {
                     SqlExpr::Column { table, name } => {
                         result.push(Projection::Column(qualified_name(table.as_deref(), name)));
@@ -47,7 +53,7 @@ pub fn convert_projection(items: &[ast::SelectItem]) -> Result<Vec<Projection>> 
                 }
             }
             ast::SelectItem::ExprWithAlias { expr, alias } => {
-                let sql_expr = convert_expr(expr)?;
+                let sql_expr = convert_expr(expr, &scope)?;
                 result.push(Projection::Computed {
                     expr: sql_expr,
                     alias: normalize_ident(alias),
@@ -90,8 +96,8 @@ pub fn qualified_name(table: Option<&str>, name: &str) -> String {
 }
 
 /// Convert a WHERE expression into a list of Filter.
-pub fn convert_where_to_filters(expr: &ast::Expr) -> Result<Vec<Filter>> {
-    let sql_expr = canonicalize_predicate(convert_expr(expr)?);
+pub fn convert_where_to_filters(expr: &ast::Expr, scope: &TableScope) -> Result<Vec<Filter>> {
+    let sql_expr = canonicalize_predicate(convert_expr(expr, &ColumnScope::Relations(scope))?);
     Ok(vec![Filter {
         expr: FilterExpr::Expr(sql_expr),
     }])

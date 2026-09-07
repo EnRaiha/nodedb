@@ -1,0 +1,48 @@
+# Replays reviewed CodeQL dismissals that GitHub drops when line numbers shift.
+#
+# GitHub fingerprints an alert partly by location, so editing a file re-raises
+# every already-dismissed finding in it as a new alert. Rust has no inline
+# `// codeql[rule]` suppression to pin them with, so the dismissal is replayed
+# here from .github/codeql/suppressions.json, anchored to the sink text.
+#
+# Runs after CodeQL finishes on main, so the replay lands on the alerts that
+# run just created. Alerts that match no entry are left open and listed in the
+# step summary.
+
+name: CodeQL suppression replay
+
+on:
+  workflow_run:
+    workflows: ["CodeQL"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Report what would be dismissed without dismissing it"
+        type: boolean
+        default: true
+
+concurrency:
+  group: codeql-suppress
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  replay:
+    name: Replay reviewed dismissals
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+      - name: Replay
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TARGET_REF: refs/heads/main
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: python3 .github/scripts/codeql_suppress.py

@@ -1,0 +1,44 @@
+{
+  "note": [
+    "Reviewed CodeQL findings that are false positives and are re-raised every time",
+    "the surrounding file is edited, because a shifted line number gives the alert a",
+    "new fingerprint and GitHub does not carry the dismissal across.",
+    "",
+    "Rust has no inline `// codeql[rule]` suppression: the AlertSuppression.ql query",
+    "that implements it exists for C/C++, C#, Go, Java, JS, Python, Ruby and Swift,",
+    "but not Rust. codeql-config.yml cannot help either \u2014 `paths-ignore` would drop",
+    "every rule on the file, and `query-filters` would drop the rule on every file.",
+    "So the dismissal is replayed by .github/workflows/codeql-suppress.yml instead.",
+    "",
+    "An entry is anchored to the SINK TEXT, never to a line number: `sink` must match",
+    "the source line the alert points at. A rule firing on a different expression in",
+    "the same file stays open and needs its own review. Keep `reason` under 280 chars",
+    "\u2014 that is the GitHub API's hard cap on a dismissal comment."
+  ],
+  "suppressions": [
+    {
+      "rule": "rust/path-injection",
+      "path": "nodedb-wal/src/segment/atomic_io.rs",
+      "sink": "^\\s*(let mut f = fs::File::create\\(&tmp\\)|fs::rename\\(&(tmp, &dst|live, &backup|staged, &live)\\))",
+      "reason": "checked_name() runs is_plain_path_component on every name at the top of the function, before any path is built: rejects / \\ : NUL . .. leading/trailing dot-space and control chars, returning InvalidInput before any filesystem call. Both paths join the same caller dir."
+    },
+    {
+      "rule": "rust/path-injection",
+      "path": "nodedb/src/control/server/shared/ddl/neutral/timeseries/rewrite.rs",
+      "sink": "^\\s*let _ = std::fs::remove_dir_all\\(ts_base\\.join\\(&backup_name\\)\\);",
+      "reason": "dir_name is validated with is_plain_path_component immediately above this join (rejects / \\ : NUL . .. leading/trailing dot-space and control chars); a failing name is skipped with a warning before any path is built. backup_name only appends .old to that validated component."
+    },
+    {
+      "rule": "rust/path-injection",
+      "path": "nodedb-wal/src/segment/atomic_io.rs",
+      "sink": "^\\s*let dir_file = fs::File::open\\(dir\\)",
+      "reason": "fsync_directory opens the caller's own directory read-only and calls sync_all on the fd. It appends nothing to the path, so it reaches no resource the caller did not already hold. Every name joined onto that directory is validated by checked_name at its own entry point."
+    },
+    {
+      "rule": "rust/path-injection",
+      "path": "nodedb/src/control/server/shared/ddl/neutral/timeseries/rewrite.rs",
+      "sink": "^\\s*let partition_dir = ts_base\\.join\\(dir_name\\);",
+      "reason": "dir_name is validated with is_plain_path_component immediately above this join (rejects / \\ : NUL . .. leading/trailing dot-space and control chars); a failing name is skipped with a warning before any path is built, so the join stays one level under ts_base."
+    }
+  ]
+}

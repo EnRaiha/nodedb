@@ -7,6 +7,7 @@ use sqlparser::ast;
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
 use crate::parser::normalize::{SCHEMA_QUALIFIED_MSG, normalize_ident};
+use crate::resolver::ColumnScope;
 use crate::types::*;
 
 use super::convert::convert_expr_depth;
@@ -19,7 +20,11 @@ use super::convert::convert_expr_depth;
 /// `planner::const_fold::DEFAULT_REGISTRY`.
 static FUNCTION_REGISTRY: LazyLock<FunctionRegistry> = LazyLock::new(FunctionRegistry::new);
 
-pub(super) fn convert_function_depth(func: &ast::Function, depth: &mut usize) -> Result<SqlExpr> {
+pub(super) fn convert_function_depth(
+    func: &ast::Function,
+    depth: &mut usize,
+    scope: &ColumnScope<'_>,
+) -> Result<SqlExpr> {
     // Intercept PG FTS surface functions and lower them to pg_* internal names
     // before the generic path runs.
     if func.name.0.len() == 1 {
@@ -27,7 +32,7 @@ pub(super) fn convert_function_depth(func: &ast::Function, depth: &mut usize) ->
             ast::ObjectNamePart::Identifier(ident) => ident.value.to_ascii_lowercase(),
             _ => String::new(),
         };
-        if let Some(expr) = intercept_fts_function(&raw_name, func, depth)? {
+        if let Some(expr) = intercept_fts_function(&raw_name, func, depth, scope)? {
             return Ok(expr);
         }
     }
@@ -62,7 +67,7 @@ pub(super) fn convert_function_depth(func: &ast::Function, depth: &mut usize) ->
     // Fold to a literal array at parse time so `= ANY(current_schemas(...))` works
     // without threading session context into the data-plane evaluator.
     if (name == "current_schemas" || name == "current_schema")
-        && let Some(expr) = intercept_catalog_function(&name, func, depth)?
+        && let Some(expr) = intercept_catalog_function(&name, func, depth, scope)?
     {
         return Ok(expr);
     }
@@ -81,31 +86,7 @@ pub(super) fn convert_function_depth(func: &ast::Function, depth: &mut usize) ->
         return Err(SqlError::UndefinedFunction { name });
     }
 
-    let args = match &func.args {
-        ast::FunctionArguments::None => Vec::new(),
-        ast::FunctionArguments::Subquery(_) => {
-            return Err(SqlError::Unsupported {
-                detail: "subquery in function args".into(),
-            });
-        }
-        ast::FunctionArguments::List(arg_list) => arg_list
-            .args
-            .iter()
-            .filter_map(|a| match a {
-                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
-                    Some(convert_expr_depth(e, depth))
-                }
-                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard) => {
-                    Some(Ok(SqlExpr::Wildcard))
-                }
-                ast::FunctionArg::Named {
-                    arg: ast::FunctionArgExpr::Expr(e),
-                    ..
-                } => Some(convert_expr_depth(e, depth)),
-                _ => None,
-            })
-            .collect::<Result<Vec<_>>>()?,
-    };
+    let args = collect_function_args(func, depth, scope)?;
 
     let distinct = match &func.args {
         ast::FunctionArguments::List(arg_list) => {
@@ -133,10 +114,24 @@ fn intercept_fts_function(
     name: &str,
     func: &ast::Function,
     depth: &mut usize,
+    scope: &ColumnScope<'_>,
 ) -> Result<Option<SqlExpr>> {
     use crate::functions::fts_ops::pg_fts_funcs;
 
-    let args = collect_function_args(func, depth)?;
+    if !matches!(
+        name,
+        "to_tsvector"
+            | "to_tsquery"
+            | "plainto_tsquery"
+            | "phraseto_tsquery"
+            | "websearch_to_tsquery"
+            | "ts_rank"
+            | "ts_rank_cd"
+            | "ts_headline"
+    ) {
+        return Ok(None);
+    }
+    let args = collect_function_args(func, depth, scope)?;
     match name {
         "to_tsvector" => Ok(Some(SqlExpr::Function {
             name: "pg_to_tsvector".into(),
@@ -175,8 +170,9 @@ fn intercept_catalog_function(
     name: &str,
     func: &ast::Function,
     depth: &mut usize,
+    scope: &ColumnScope<'_>,
 ) -> Result<Option<SqlExpr>> {
-    let args = collect_function_args(func, depth)?;
+    let args = collect_function_args(func, depth, scope)?;
     match name {
         "current_schemas" => {
             // Determine whether to include implicit schemas (pg_catalog).
@@ -198,7 +194,11 @@ fn intercept_catalog_function(
 }
 
 /// Collect function call arguments, converting each `Expr` to `SqlExpr`.
-fn collect_function_args(func: &ast::Function, depth: &mut usize) -> Result<Vec<SqlExpr>> {
+fn collect_function_args(
+    func: &ast::Function,
+    depth: &mut usize,
+    scope: &ColumnScope<'_>,
+) -> Result<Vec<SqlExpr>> {
     match &func.args {
         ast::FunctionArguments::None => Ok(Vec::new()),
         ast::FunctionArguments::Subquery(_) => Err(SqlError::Unsupported {
@@ -209,7 +209,7 @@ fn collect_function_args(func: &ast::Function, depth: &mut usize) -> Result<Vec<
             .iter()
             .filter_map(|a| match a {
                 ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
-                    Some(convert_expr_depth(e, depth))
+                    Some(convert_expr_depth(e, depth, scope))
                 }
                 ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard) => {
                     Some(Ok(SqlExpr::Wildcard))
@@ -217,7 +217,7 @@ fn collect_function_args(func: &ast::Function, depth: &mut usize) -> Result<Vec<
                 ast::FunctionArg::Named {
                     arg: ast::FunctionArgExpr::Expr(e),
                     ..
-                } => Some(convert_expr_depth(e, depth)),
+                } => Some(convert_expr_depth(e, depth, scope)),
                 _ => None,
             })
             .collect::<Result<Vec<_>>>(),
@@ -259,7 +259,7 @@ mod tests {
     fn unknown_function_name_is_rejected() {
         let func = function_ast("SELECT totally_bogus_fn(1, 2)");
         let mut depth = 0;
-        let err = convert_function_depth(&func, &mut depth).unwrap_err();
+        let err = convert_function_depth(&func, &mut depth, &ColumnScope::Unchecked).unwrap_err();
         match err {
             SqlError::UndefinedFunction { name } => assert_eq!(name, "totally_bogus_fn"),
             other => panic!("expected SqlError::UndefinedFunction, got {other:?}"),
@@ -270,7 +270,7 @@ mod tests {
     fn known_scalar_function_name_resolves() {
         let func = function_ast("SELECT upper('x')");
         let mut depth = 0;
-        let expr = convert_function_depth(&func, &mut depth).unwrap();
+        let expr = convert_function_depth(&func, &mut depth, &ColumnScope::Unchecked).unwrap();
         match expr {
             SqlExpr::Function { name, .. } => assert_eq!(name, "upper"),
             other => panic!("expected SqlExpr::Function, got {other:?}"),
@@ -289,11 +289,11 @@ mod tests {
         let lower = function_ast("SELECT upper('x')");
         let upper_quoted = function_ast(r#"SELECT "UPPER"('x')"#);
         assert!(
-            convert_function_depth(&lower, &mut depth).is_ok(),
+            convert_function_depth(&lower, &mut depth, &ColumnScope::Unchecked).is_ok(),
             "lowercase 'upper' must resolve"
         );
         assert!(
-            convert_function_depth(&upper_quoted, &mut depth).is_ok(),
+            convert_function_depth(&upper_quoted, &mut depth, &ColumnScope::Unchecked).is_ok(),
             "quoted 'UPPER' must still resolve via case-insensitive registry lookup"
         );
     }

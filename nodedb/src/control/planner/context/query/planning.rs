@@ -48,6 +48,15 @@ fn map_plan_error(error: nodedb_sql::SqlError, tenant_id: crate::types::TenantId
         nodedb_sql::SqlError::InvalidLimitValue { clause, value } => {
             crate::Error::InvalidLimitValue { clause, value }
         }
+        nodedb_sql::SqlError::UnknownColumn { column, .. } => {
+            crate::Error::UndefinedColumn { column }
+        }
+        nodedb_sql::SqlError::AmbiguousColumn { column } => {
+            crate::Error::AmbiguousColumn { column }
+        }
+        // A target/expression count mismatch is a syntax error in PostgreSQL,
+        // so it renders 42601 through `BadRequest`.
+        nodedb_sql::SqlError::Arity { detail } => crate::Error::BadRequest { detail },
         other => crate::Error::PlanError {
             detail: other.to_string(),
         },

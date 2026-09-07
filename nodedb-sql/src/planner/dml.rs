@@ -6,7 +6,7 @@ use nodedb_types::DatabaseId;
 use sqlparser::ast::{self};
 
 use super::dml_helpers::{
-    build_kv_insert_plan, build_vector_primary_insert_plan,
+    bind_insert_select_columns, build_kv_insert_plan, build_vector_primary_insert_plan,
     check_declared_float_ranges_in_assignments, check_declared_int_ranges_in_assignments,
     coerce_and_check_rows, convert_value_rows, resolve_insert_columns,
 };
@@ -14,6 +14,8 @@ use crate::engine_rules::{self, InsertParams};
 use crate::error::{Result, SqlError};
 use crate::parser::normalize::{normalize_insert_column, normalize_object_name_checked};
 use crate::planner::declared_type_coerce::coerce_assignments_to_declared_types;
+use crate::resolver::ColumnScope;
+use crate::resolver::columns::{ResolvedTable, TableScope};
 use crate::resolver::expr::convert_expr;
 use crate::types::*;
 
@@ -21,6 +23,39 @@ pub use dml_update_delete::{plan_delete, plan_truncate_stmt, plan_update};
 
 #[path = "dml_update_delete.rs"]
 mod dml_update_delete;
+
+/// The column namespace of an INSERT target.
+fn target_scope(table_name: &str, info: &CollectionInfo) -> Result<TableScope> {
+    let mut scope = TableScope::single(ResolvedTable {
+        name: table_name.to_string(),
+        alias: None,
+        info: info.clone(),
+    })?;
+    // `ON CONFLICT DO UPDATE` addresses the proposed row as `excluded`. It
+    // carries the target's columns and is qualified-only, so a bare name in
+    // the SET clause names the stored row.
+    scope.add_qualified_only(ResolvedTable {
+        name: EXCLUDED_RELATION.to_string(),
+        alias: None,
+        info: info.clone(),
+    })?;
+    Ok(scope)
+}
+
+/// The pseudo-relation `ON CONFLICT DO UPDATE` uses for the proposed row.
+const EXCLUDED_RELATION: &str = "excluded";
+
+/// Normalize an INSERT column list and reject a name the target does not have.
+fn insert_columns(columns: &[ast::ObjectName], scope: &TableScope) -> Result<Vec<String>> {
+    columns
+        .iter()
+        .map(|c| {
+            let col = normalize_insert_column(c)?;
+            scope.check_name(None, &col)?;
+            Ok(col)
+        })
+        .collect()
+}
 
 /// Classification of an `ON CONFLICT` clause attached to an INSERT.
 enum OnConflict {
@@ -33,7 +68,7 @@ enum OnConflict {
     DoUpdate(Vec<(String, SqlExpr)>),
 }
 
-fn classify_on_conflict(ins: &ast::Insert) -> Result<OnConflict> {
+fn classify_on_conflict(ins: &ast::Insert, scope: &TableScope) -> Result<OnConflict> {
     let Some(on) = ins.on.as_ref() else {
         return Ok(OnConflict::None);
     };
@@ -53,7 +88,8 @@ fn classify_on_conflict(ins: &ast::Insert) -> Result<OnConflict> {
                         });
                     }
                 };
-                let expr = convert_expr(&a.value)?;
+                scope.check_name(None, &name)?;
+                let expr = convert_expr(&a.value, &ColumnScope::Relations(scope))?;
                 pairs.push((name, expr));
             }
             Ok(OnConflict::DoUpdate(pairs))
@@ -63,16 +99,6 @@ fn classify_on_conflict(ins: &ast::Insert) -> Result<OnConflict> {
 
 /// Plan an INSERT statement.
 pub fn plan_insert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<SqlPlan>> {
-    // `INSERT ... ON CONFLICT DO UPDATE SET` reroutes to the upsert path
-    // with the assignments carried through. `DO NOTHING` stays on the
-    // INSERT path with `if_absent=true`.
-    let if_absent = match classify_on_conflict(ins)? {
-        OnConflict::None => false,
-        OnConflict::DoNothing => true,
-        OnConflict::DoUpdate(updates) => {
-            return plan_upsert_with_on_conflict(ins, catalog, updates);
-        }
-    };
     let table_name = match &ins.table {
         ast::TableObject::TableName(name) => normalize_object_name_checked(name)?,
         ast::TableObject::TableFunction(_) => {
@@ -93,17 +119,26 @@ pub fn plan_insert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
         .ok_or_else(|| SqlError::UnknownTable {
             name: table_name.clone(),
         })?;
+    let target_scope = target_scope(&table_name, &info)?;
 
-    let columns: Vec<String> = ins
-        .columns
-        .iter()
-        .map(normalize_insert_column)
-        .collect::<Result<_>>()?;
+    // `INSERT ... ON CONFLICT DO UPDATE SET` reroutes to the upsert path
+    // with the assignments carried through. `DO NOTHING` stays on the
+    // INSERT path with `if_absent=true`.
+    let if_absent = match classify_on_conflict(ins, &target_scope)? {
+        OnConflict::None => false,
+        OnConflict::DoNothing => true,
+        OnConflict::DoUpdate(updates) => {
+            return plan_upsert_with_on_conflict(ins, catalog, updates);
+        }
+    };
+
+    let columns = insert_columns(&ins.columns, &target_scope)?;
 
     // Check for INSERT...SELECT.
     if let Some(source) = &ins.source
-        && let ast::SetExpr::Select(_select) = &*source.body
+        && let ast::SetExpr::Select(select) = &*source.body
     {
+        let column_map = bind_insert_select_columns(catalog, &columns, select, &info)?;
         let source_plan = super::select::plan_query(
             source,
             catalog,
@@ -114,6 +149,7 @@ pub fn plan_insert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
             target: table_name,
             source: Box::new(source_plan),
             limit: 0,
+            column_map,
         }]);
     }
 
@@ -216,11 +252,7 @@ pub fn plan_upsert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
             name: table_name.clone(),
         })?;
 
-    let columns: Vec<String> = ins
-        .columns
-        .iter()
-        .map(normalize_insert_column)
-        .collect::<Result<_>>()?;
+    let columns = insert_columns(&ins.columns, &target_scope(&table_name, &info)?)?;
 
     let source = ins.source.as_ref().ok_or_else(|| SqlError::Parse {
         detail: "UPSERT requires VALUES".into(),
@@ -304,11 +336,7 @@ fn plan_upsert_with_on_conflict(
             name: table_name.clone(),
         })?;
 
-    let columns: Vec<String> = ins
-        .columns
-        .iter()
-        .map(normalize_insert_column)
-        .collect::<Result<_>>()?;
+    let columns = insert_columns(&ins.columns, &target_scope(&table_name, &info)?)?;
 
     let source = ins.source.as_ref().ok_or_else(|| SqlError::Parse {
         detail: "INSERT ... ON CONFLICT requires VALUES".into(),
