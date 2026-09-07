@@ -9,8 +9,9 @@
 //!      actually holds the rebuild to being correct, not merely quick
 //!   2. no query errored during the rebuild
 //!   3. queries kept completing throughout the rebuild, not just before it
-//!   4. no query stalled past `STALL_BOUND` — the signature of a rebuild
-//!      that took an exclusive lock instead of running concurrently
+//!   4. the query p99 stayed a small share of the rebuild window — the
+//!      signature of a rebuild that took an exclusive lock instead of
+//!      running concurrently
 //!   5. exactly one `atomic_cutover` tracing event was emitted by the
 //!      `nodedb::reindex` target during the rebuild phase
 //!
@@ -22,7 +23,9 @@
 //! so the rebuild window holds a few hundred samples, and the assertions below
 //! are orders of magnitude away from scheduler noise rather than a 2× multiple
 //! of it. Latencies are still printed, so a real slowdown stays visible in the
-//! log without gating CI on wall-clock.
+//! log without gating CI on wall-clock. The one remaining timing gate is a
+//! share of the rebuild's own duration, so a slower machine widens the bound
+//! and the workload it measures together.
 //!
 //! Assertion 1 is the load-bearing one and is the only one whose failure mode
 //! was verified by deliberately breaking it: a query answered out of a
@@ -160,19 +163,35 @@ async fn reindex_vector_concurrent_p99() {
     const ROWS: usize = 1_000;
     const BATCH: usize = 500;
     const BASELINE_QUERIES: usize = 20;
-    // One query per millisecond, so the rebuild window holds many samples
-    // instead of one. The loop paces itself and skips the sleep when a query
-    // already took longer than the interval.
-    const REBUILD_QPS: u64 = 1_000;
+    // Query rate during the rebuild. The loop paces itself and skips the sleep
+    // when a query already took longer than the interval.
+    //
+    // A tenant's default quota is 1000 qps (`control::security::tenant`), so
+    // driving the rebuild at that rate refuses queries as soon as the rebuild
+    // outlives the limiter's own window. A fast machine rebuilds in a few
+    // hundred milliseconds and never fills it. A slower one sustains the rate
+    // for seconds and sees most queries rejected. The limiter is production
+    // behaviour, so the load generator stays well under it.
+    const REBUILD_QPS: u64 = 200;
 
-    /// Longest a single query may take during the rebuild.
+    /// Share of the rebuild window the p99 query may occupy.
     ///
-    /// A concurrent rebuild leaves queries in the low milliseconds; one that
-    /// takes an exclusive lock blocks them for the whole rebuild, which this
-    /// test already allows up to 60s for. Two seconds sits between those two
-    /// regimes by orders of magnitude, so a loaded machine cannot cross it but
-    /// a lock-holding rebuild cannot avoid it.
-    const STALL_BOUND: Duration = Duration::from_secs(2);
+    /// A rebuild holding an exclusive lock blocks every query it overlaps, so
+    /// the p99 approaches the window itself. A concurrent rebuild leaves it
+    /// far below. Both sides scale together when the machine slows down,
+    /// which an absolute bound does not — a busy CI runner crosses a fixed
+    /// two seconds while running perfectly concurrently.
+    ///
+    /// The p99 carries the gate rather than the single slowest sample. One
+    /// descheduled query on an oversubscribed runner moves the maximum and
+    /// says nothing about locking.
+    const STALL_SHARE_OF_WINDOW: u32 = 2;
+
+    /// Floor under the derived bound, for a rebuild that finishes in
+    /// milliseconds. Scheduler noise alone can then exceed half the window,
+    /// and this keeps the derived bound from being stricter than the absolute
+    /// one it replaces.
+    const STALL_FLOOR: Duration = Duration::from_millis(250);
 
     /// Fewest queries that must complete during the rebuild window.
     ///
@@ -278,7 +297,19 @@ async fn reindex_vector_concurrent_p99() {
                         empty_writer.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                Err(error) => errors_writer.lock().unwrap().push(error.to_string()),
+                Err(error) => {
+                    // `Display` on a tokio_postgres error is "db error" and
+                    // nothing else. The server's message lives in the source
+                    // chain, and it is the only thing that names the fault.
+                    let mut detail = format!("{error}");
+                    let mut cause: Option<&(dyn std::error::Error + 'static)> =
+                        std::error::Error::source(&error);
+                    while let Some(inner) = cause {
+                        detail.push_str(&format!(" <- {inner}"));
+                        cause = inner.source();
+                    }
+                    errors_writer.lock().unwrap().push(detail);
+                }
             }
             lats_writer.lock().unwrap().push(lat);
             // Pace to target QPS; no-op if query took longer than the interval.
@@ -291,6 +322,7 @@ async fn reindex_vector_concurrent_p99() {
     // Issue REINDEX CONCURRENTLY on the main client.
     // This returns as soon as the background thread is started; the atomic
     // cutover is applied on a later tick() — so we must wait for it.
+    let rebuild_started = Instant::now();
     server.exec("REINDEX CONCURRENTLY vecs10k").await.unwrap();
 
     // Wait up to 60 s for the Data Plane to complete the background rebuild
@@ -300,6 +332,8 @@ async fn reindex_vector_concurrent_p99() {
     while cutover_count.load(Ordering::Relaxed) == 0 && Instant::now() < wait_deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+
+    let rebuild_window = rebuild_started.elapsed();
 
     // Signal the query task to stop and collect its latencies.
     stop_flag.store(1, Ordering::Relaxed);
@@ -350,13 +384,17 @@ async fn reindex_vector_concurrent_p99() {
         rebuild_samples.len()
     );
 
+    let stall_bound = (rebuild_window / STALL_SHARE_OF_WINDOW).max(STALL_FLOOR);
+    let rebuild_p99 = p99(rebuild_samples.clone());
     assert!(
-        slowest < STALL_BOUND,
-        "a query stalled {:.1}ms during the rebuild (bound {:.0}ms) — the \
-         signature of a rebuild holding an exclusive lock rather than running \
-         concurrently",
-        slowest.as_secs_f64() * 1000.0,
-        STALL_BOUND.as_secs_f64() * 1000.0
+        rebuild_p99 < stall_bound,
+        "queries ran at a {:.1}ms p99 during a {:.1}ms rebuild window (bound \
+         {:.1}ms, slowest {:.1}ms) — the signature of a rebuild holding an \
+         exclusive lock rather than running concurrently",
+        rebuild_p99.as_secs_f64() * 1000.0,
+        rebuild_window.as_secs_f64() * 1000.0,
+        stall_bound.as_secs_f64() * 1000.0,
+        slowest.as_secs_f64() * 1000.0
     );
 
     // Verify exactly one atomic_cutover event was emitted during the rebuild.

@@ -104,13 +104,36 @@ fn ingest_ilp(ctx: &mut TestCtx, collection: &str, payload: &str) -> serde_json:
 /// `count_star_sees_flushed_partitions` uses the same 3 M-row volume to
 /// guarantee ≥ 2 flushes; we reuse that so these tests fail for the
 /// accounting bug and not because nothing flushed.
+/// Memtable budget for the flush workload, well under the shipped default.
+///
+/// At roughly 56 bytes per wide row this flushes every ~18 K rows, so the
+/// 100 K-row workload below crosses several cycles and still leaves a
+/// resident memtable for the governor to account for.
+const FLUSH_BUDGET_BYTES: usize = 1024 * 1024;
+
+/// Hard limit for the same workload. It sits above the budget so the
+/// pre-flush always runs before admission control rejects a row.
+const FLUSH_HARD_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+
 fn run_ts_flush_workload() -> (TestCtx, Arc<MemoryGovernor>) {
     let mut ctx = make_ctx();
     let gov = generous_governor();
     ctx.core.set_governor_for_testing(Arc::clone(&gov));
 
+    // Shrink the memtable budget rather than ingesting past the shipped
+    // 64 MiB one. The flush path reads `memtable_budget_bytes`, so a small
+    // budget crosses the same cycles on a fraction of the rows. Sizing the
+    // workload to the default instead costs three million rows, which a
+    // loaded CI runner cannot finish inside the harness timeout.
+    ctx.core
+        .set_timeseries_tuning(nodedb_types::config::tuning::TimeseriesToning {
+            memtable_budget_bytes: FLUSH_BUDGET_BYTES,
+            memtable_hard_limit_bytes: FLUSH_HARD_LIMIT_BYTES,
+            ..Default::default()
+        });
+
     let batch_size = 10_000usize;
-    let num_batches = 300usize;
+    let num_batches = 10usize;
     let mut accepted: u64 = 0;
     let mut rejected: u64 = 0;
     for b in 0..num_batches {

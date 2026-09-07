@@ -148,12 +148,21 @@ fn ts_scan_filtered(
 fn count_star_sees_flushed_partitions() {
     let mut ctx = make_ctx();
 
-    // Ingest enough wide rows to force multiple memtable flushes.
-    // Each row is ~7 columns × ~8 bytes = ~56 bytes of column data.
-    // 64MB / 56 = ~1.2M rows per flush. We send 3M rows to guarantee
-    // at least 2 flush cycles. Each batch is 10K rows.
+    // Shrink the memtable budget, then ingest enough wide rows to force
+    // several flushes. Each row is ~7 columns x ~8 bytes = ~56 bytes, so a
+    // 1 MiB budget flushes every ~18 K rows and 100 K rows cross several
+    // cycles. Sizing the workload to the shipped 64 MiB budget instead costs
+    // three million rows, which a loaded CI runner cannot finish inside the
+    // harness timeout.
+    ctx.core
+        .set_timeseries_tuning(nodedb_types::config::tuning::TimeseriesToning {
+            memtable_budget_bytes: 1024 * 1024,
+            memtable_hard_limit_bytes: 4 * 1024 * 1024,
+            ..Default::default()
+        });
+
     let batch_size = 10_000;
-    let num_batches = 300;
+    let num_batches = 10;
     let mut total_accepted: u64 = 0;
     let mut total_rejected: u64 = 0;
 

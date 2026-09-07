@@ -288,8 +288,13 @@ impl TestServer {
         let shared_poller = Arc::clone(&shared);
         let (poller_shutdown_tx, mut poller_shutdown_rx) = tokio::sync::watch::channel(false);
         let poller_handle = tokio::spawn(async move {
+            let mut last_rate_reset = std::time::Instant::now();
             loop {
                 shared_poller.poll_and_route_responses();
+                super::support::reset_tenant_rate_counters_each_second(
+                    &shared_poller,
+                    &mut last_rate_reset,
+                );
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(1)) => {}
                     _ = poller_shutdown_rx.changed() => break,

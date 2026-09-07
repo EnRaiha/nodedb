@@ -87,3 +87,20 @@ pub(super) async fn bind_http_listener(
     });
     (port, handle)
 }
+
+/// Runs the tenant rate-counter reset the server drives from
+/// `spawn_background_loops`, which this harness does not start.
+///
+/// `requests_this_second` only means "this second" while something clears it.
+/// Without this it is a running total, so a tenant is refused for good once a
+/// test issues more requests than its quota, and the error names a rate the
+/// test never reached.
+pub(super) fn reset_tenant_rate_counters_each_second(
+    shared: &SharedState,
+    last_reset: &mut std::time::Instant,
+) {
+    if last_reset.elapsed() >= std::time::Duration::from_secs(1) {
+        shared.reset_tenant_rate_counters();
+        *last_reset = std::time::Instant::now();
+    }
+}
