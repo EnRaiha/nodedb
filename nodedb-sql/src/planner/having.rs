@@ -22,6 +22,9 @@ use crate::aggregate_walk::contains_aggregate;
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
 use crate::planner::agg_bind::{BindName, bind_aggregate_calls};
+use crate::planner::agg_naming::aggregate_output_key;
+use crate::planner::select::select_output_aliases;
+use crate::resolver::columns::TableScope;
 use crate::types::{AggregateExpr, Filter};
 
 /// Convert a HAVING clause into filters over finalized group rows.
@@ -33,6 +36,7 @@ pub fn plan_having(
     projection: &[ast::SelectItem],
     aggregates: &mut Vec<AggregateExpr>,
     functions: &FunctionRegistry,
+    scope: &TableScope,
 ) -> Result<Vec<Filter>> {
     let rewritten = bind_aggregate_calls(
         having,
@@ -40,6 +44,7 @@ pub fn plan_having(
         aggregates,
         functions,
         BindName::Canonical,
+        scope,
     )?;
 
     // Any aggregate call still standing is one this rewrite did not reach.
@@ -54,5 +59,14 @@ pub fn plan_having(
         });
     }
 
-    crate::planner::select::convert_where_to_filters(&rewritten)
+    // The rewritten predicate addresses computed group columns: an
+    // aggregate's canonical key, its output alias, or a SELECT-list alias.
+    let having_scope = scope.with_output_names(
+        aggregates
+            .iter()
+            .map(aggregate_output_key)
+            .chain(aggregates.iter().map(|a| a.alias.clone()))
+            .chain(select_output_aliases(projection)),
+    );
+    crate::planner::select::convert_where_to_filters(&rewritten, &having_scope)
 }

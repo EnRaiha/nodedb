@@ -82,6 +82,8 @@
 // |  76 | NotFound                  |
 // |  77 | CannotDropDefaultDatabase |
 // |  78 | InvalidLimitValue         |
+// |  79 | UndefinedColumn           |
+// |  80 | AmbiguousColumn           |
 
 pub(super) const TAG_CONSTRAINT_VIOLATION: u16 = 1;
 pub(super) const TAG_WRITE_CONFLICT: u16 = 2;
@@ -161,3 +163,5 @@ pub(super) const TAG_OBJECT_NOT_READY: u16 = 75;
 pub(super) const TAG_NOT_FOUND: u16 = 76;
 pub(super) const TAG_CANNOT_DROP_DEFAULT_DATABASE: u16 = 77;
 pub(super) const TAG_INVALID_LIMIT_VALUE: u16 = 78;
+pub(super) const TAG_UNDEFINED_COLUMN: u16 = 79;
+pub(super) const TAG_AMBIGUOUS_COLUMN: u16 = 80;

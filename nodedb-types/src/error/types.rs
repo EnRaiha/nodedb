@@ -99,6 +99,8 @@ impl NodeDbError {
                 | ErrorDetails::Config
                 | ErrorDetails::SqlNotEnabled
                 | ErrorDetails::UndefinedFunction { .. }
+                | ErrorDetails::UndefinedColumn { .. }
+                | ErrorDetails::AmbiguousColumn { .. }
                 | ErrorDetails::DivisionByZero
                 | ErrorDetails::InvalidLimitValue { .. }
                 | ErrorDetails::BackupTenantMismatch { .. }

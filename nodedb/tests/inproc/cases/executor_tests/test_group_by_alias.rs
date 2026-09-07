@@ -29,7 +29,16 @@ impl SqlCatalog for TimeseriesCatalog {
             "dns_bench" => Some(CollectionInfo {
                 name: "dns_bench".into(),
                 engine: EngineType::Timeseries,
-                columns: Vec::new(),
+                columns: vec![nodedb_sql::types::ColumnInfo {
+                    name: "timestamp".into(),
+                    data_type: nodedb_sql::types::SqlDataType::Timestamp,
+                    nullable: false,
+                    is_primary_key: false,
+                    default: None,
+                    raw_type: None,
+                    int_width: None,
+                    float_width: None,
+                }],
                 primary_key: None,
                 has_auto_tier: false,
                 indexes: Vec::new(),
@@ -37,6 +46,7 @@ impl SqlCatalog for TimeseriesCatalog {
                 primary: nodedb_types::PrimaryEngine::Document,
                 vector_primary: None,
                 partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
+                open_schema: CollectionInfo::open_schema_for(EngineType::Timeseries),
             }),
             _ => None,
         };

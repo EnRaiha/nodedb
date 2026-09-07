@@ -10,7 +10,8 @@ use crate::functions::registry::{FunctionRegistry, SearchTrigger};
 use crate::parser::normalize::normalize_ident;
 use crate::planner::group_by::{convert_group_by_with_projection, group_by_output_aliases};
 use crate::planner::grouping_sets::expand_group_by;
-use crate::resolver::columns::ResolvedTable;
+use crate::resolver::ColumnScope;
+use crate::resolver::columns::{ResolvedTable, TableScope};
 use crate::resolver::expr::convert_expr;
 use crate::temporal::TemporalScope;
 use crate::types::*;
@@ -20,12 +21,12 @@ pub fn plan_aggregate(
     select: &ast::Select,
     table: &ResolvedTable,
     filters: &[Filter],
-    _scope: &crate::resolver::columns::TableScope,
+    scope: &TableScope,
     functions: &FunctionRegistry,
     temporal: &TemporalScope,
 ) -> Result<SqlPlan> {
     // Detect ROLLUP / CUBE / GROUPING SETS before falling through to plain convert.
-    let grouping_expansion = expand_group_by(&select.group_by)?;
+    let grouping_expansion = expand_group_by(&select.group_by, scope)?;
 
     let (group_by_exprs, grouping_sets) = if let Some(exp) = grouping_expansion {
         (exp.canonical_keys, Some(exp.grouping_sets))
@@ -35,18 +36,19 @@ pub fn plan_aggregate(
                 &select.group_by,
                 &select.projection,
                 &table.info.columns,
+                scope,
             )?,
             None,
         )
     };
 
-    let mut aggregates = extract_aggregates_from_projection(&select.projection, functions)?;
+    let mut aggregates = extract_aggregates_from_projection(&select.projection, functions, scope)?;
     // HAVING is bound to the aggregates' computed output columns, and any
     // aggregate it alone introduces is added to `aggregates` so it is actually
     // computed.
     let having = match &select.having {
         Some(expr) => {
-            super::having::plan_having(expr, &select.projection, &mut aggregates, functions)?
+            super::having::plan_having(expr, &select.projection, &mut aggregates, functions, scope)?
         }
         None => Vec::new(),
     };
@@ -54,7 +56,7 @@ pub fn plan_aggregate(
     // When grouping sets are present, detect GROUPING(col) in the projection and
     // synthesize AggregateExpr entries so the executor can compute them per-set.
     if grouping_sets.is_some() {
-        let grouping_aggs = extract_grouping_calls(&select.projection, &group_by_exprs)?;
+        let grouping_aggs = extract_grouping_calls(&select.projection, &group_by_exprs, scope)?;
         aggregates.extend(grouping_aggs);
     }
 
@@ -66,6 +68,7 @@ pub fn plan_aggregate(
         &select.projection,
         &group_by_exprs,
         functions,
+        scope,
     )?;
 
     // Extract timeseries-specific params (bucket interval, group columns) if applicable.
@@ -310,6 +313,7 @@ fn parse_interval_to_ms(s: &str) -> i64 {
 fn extract_grouping_calls(
     items: &[ast::SelectItem],
     canonical_keys: &[SqlExpr],
+    scope: &TableScope,
 ) -> Result<Vec<AggregateExpr>> {
     let mut out = Vec::new();
     for item in items {
@@ -318,7 +322,7 @@ fn extract_grouping_calls(
             ast::SelectItem::ExprWithAlias { expr, alias } => (expr, normalize_ident(alias)),
             _ => continue,
         };
-        collect_grouping_from_expr(expr, &alias, canonical_keys, &mut out)?;
+        collect_grouping_from_expr(expr, &alias, canonical_keys, &mut out, scope)?;
     }
     Ok(out)
 }
@@ -329,6 +333,7 @@ fn collect_grouping_from_expr(
     alias: &str,
     canonical_keys: &[SqlExpr],
     out: &mut Vec<AggregateExpr>,
+    scope: &TableScope,
 ) -> Result<()> {
     match expr {
         ast::Expr::Function(f) => {
@@ -344,7 +349,7 @@ fn collect_grouping_from_expr(
                     // Encode index in the field name; alias is user-visible output name.
                     out.push(AggregateExpr {
                         function: "grouping".into(),
-                        args: vec![convert_expr(col_expr)?],
+                        args: vec![convert_expr(col_expr, &ColumnScope::Relations(scope))?],
                         alias: alias.to_string(),
                         distinct: false,
                         grouping_col_index: Some(canonical_idx),
@@ -354,8 +359,8 @@ fn collect_grouping_from_expr(
         }
         // Recurse into binary ops and other wrappers.
         ast::Expr::BinaryOp { left, right, .. } => {
-            collect_grouping_from_expr(left, alias, canonical_keys, out)?;
-            collect_grouping_from_expr(right, alias, canonical_keys, out)?;
+            collect_grouping_from_expr(left, alias, canonical_keys, out, scope)?;
+            collect_grouping_from_expr(right, alias, canonical_keys, out, scope)?;
         }
         _ => {}
     }
@@ -390,9 +395,13 @@ pub(super) fn normalize_function_name(f: &ast::Function) -> String {
 }
 
 /// Extract aggregate expressions from SELECT projection.
+///
+/// `scope` gates each aggregate argument, so a column no relation declares
+/// raises an undefined-column error instead of planning.
 pub fn extract_aggregates_from_projection(
     items: &[ast::SelectItem],
     functions: &FunctionRegistry,
+    scope: &TableScope,
 ) -> Result<Vec<AggregateExpr>> {
     let mut aggregates = Vec::new();
     for item in items {
@@ -409,7 +418,8 @@ pub fn extract_aggregates_from_projection(
             ast::SelectItem::ExprWithAlias { expr, alias } => (expr, normalize_ident(alias)),
             _ => continue,
         };
-        let mut extracted = crate::aggregate_walk::extract_aggregates(expr, &alias, functions)?;
+        let mut extracted =
+            crate::aggregate_walk::extract_aggregates(expr, &alias, functions, scope)?;
         aggregates.append(&mut extracted);
     }
     Ok(aggregates)

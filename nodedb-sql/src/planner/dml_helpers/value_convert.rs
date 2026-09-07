@@ -63,7 +63,8 @@ pub(crate) fn expr_to_sql_value(expr: &ast::Expr) -> Result<SqlValue> {
 }
 
 fn fold_constant_value(expr: &ast::Expr) -> Result<SqlValue> {
-    let sql_expr = crate::resolver::expr::convert_expr(expr)?;
+    let sql_expr =
+        crate::resolver::expr::convert_expr(expr, &crate::resolver::ColumnScope::Unchecked)?;
     crate::planner::const_fold::fold_constant_default(&sql_expr)?.ok_or_else(|| {
         SqlError::Unsupported {
             detail: format!("value expression: {expr}"),

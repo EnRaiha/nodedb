@@ -62,7 +62,7 @@ pub fn parse_expr_string(expr_text: &str) -> Result<SqlExpr> {
             detail: e.to_string(),
         })?;
 
-    resolver::expr::convert_expr(&ast_expr)
+    resolver::expr::convert_expr(&ast_expr, &resolver::ColumnScope::Unchecked)
 }
 
 use functions::registry::FunctionRegistry;

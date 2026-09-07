@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn table_aliases_enforce_ast_identifier_rules() {
-        use crate::planner::lateral::plan::lateral_alias_from_factor;
+        use crate::planner::lateral::subquery::lateral_alias_from_factor;
 
         let quoted = parse_table_factor("SELECT * FROM users AS \"MiXeD 雪\"");
         assert_eq!(

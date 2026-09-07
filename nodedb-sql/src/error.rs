@@ -28,6 +28,12 @@ pub enum SqlError {
     #[error("type mismatch: {detail}")]
     TypeMismatch { detail: String },
 
+    /// A statement lists a different number of targets than expressions, such
+    /// as an `INSERT` whose target column list does not match its `SELECT`
+    /// list.
+    #[error("{detail}")]
+    Arity { detail: String },
+
     /// A constant expression divided by zero at plan time. Distinct from the
     /// folder declining to fold: the expression *was* constant and evaluating
     /// it failed, so the statement must raise rather than yield NULL.

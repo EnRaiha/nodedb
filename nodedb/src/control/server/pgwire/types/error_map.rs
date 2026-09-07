@@ -50,6 +50,19 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
             sqlstate::UNDEFINED_FUNCTION,
             format!("function {name}(...) does not exist"),
         ),
+        crate::Error::UndefinedColumn { column } => (
+            "ERROR",
+            sqlstate::UNDEFINED_COLUMN,
+            format!("column \"{column}\" does not exist"),
+        ),
+        crate::Error::AmbiguousColumn { column } => (
+            "ERROR",
+            sqlstate::AMBIGUOUS_COLUMN,
+            format!("column reference \"{column}\" is ambiguous"),
+        ),
+        crate::Error::UnknownStrictField { .. } => {
+            ("ERROR", sqlstate::UNDEFINED_COLUMN, err.to_string())
+        }
         crate::Error::DivisionByZero => ("ERROR", sqlstate::DIVISION_BY_ZERO, err.to_string()),
         crate::Error::InvalidLimitValue { .. } => {
             ("ERROR", sqlstate::INVALID_LIMIT_VALUE, err.to_string())
@@ -184,6 +197,10 @@ pub(crate) fn numeric_code_to_sqlstate(code: nodedb_types::error::ErrorCode) -> 
         Ec::BAD_REQUEST | Ec::PLAN_ERROR => sqlstate::SYNTAX_ERROR,
         // Mirrors the `UndefinedFunction` arm.
         Ec::UNDEFINED_FUNCTION => sqlstate::UNDEFINED_FUNCTION,
+        // Mirrors the `UndefinedColumn` arm.
+        Ec::UNDEFINED_COLUMN => sqlstate::UNDEFINED_COLUMN,
+        // Mirrors the `AmbiguousColumn` arm.
+        Ec::AMBIGUOUS_COLUMN => sqlstate::AMBIGUOUS_COLUMN,
         // Mirrors the `DivisionByZero` arm.
         Ec::DIVISION_BY_ZERO => sqlstate::DIVISION_BY_ZERO,
         // Mirrors the `InvalidLimitValue` arm.

@@ -13,6 +13,7 @@
 use sqlparser::ast;
 
 use crate::error::{Result, SqlError};
+use crate::resolver::columns::TableScope;
 use crate::types::SortKey;
 
 /// The trailing clauses of the enclosing `Query`.
@@ -31,10 +32,10 @@ impl QueryTail<'_> {
     /// This is the same conversion `apply_order_by` performs on the plan it
     /// receives, so a scan that already carries these keys is overwritten
     /// downstream with an identical list, never an appended one.
-    pub(in crate::planner::select) fn sort_keys(&self) -> Result<Vec<SortKey>> {
+    pub(in crate::planner::select) fn sort_keys(&self, scope: &TableScope) -> Result<Vec<SortKey>> {
         match self.order_by.map(|o| &o.kind) {
             Some(ast::OrderByKind::Expressions(exprs)) => {
-                crate::planner::sort::convert_sort_keys(exprs)
+                crate::planner::sort::convert_sort_keys(exprs, scope)
             }
             Some(ast::OrderByKind::All(_)) | None => Ok(Vec::new()),
         }

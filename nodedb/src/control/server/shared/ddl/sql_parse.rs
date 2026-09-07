@@ -137,7 +137,10 @@ fn try_eval_scalar_function(s: &str) -> Option<nodedb_types::Value> {
         | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => e,
         _ => return None,
     };
-    let sql_expr = nodedb_sql::resolver::expr::convert_expr(&ast_expr).ok()?;
+    // A DDL constant expression has no FROM clause, so no identifier is
+    // checkable against a relation here.
+    let scope = nodedb_sql::resolver::ColumnScope::Unchecked;
+    let sql_expr = nodedb_sql::resolver::expr::convert_expr(&ast_expr, &scope).ok()?;
     let folded = nodedb_sql::planner::const_fold::fold_constant_default(&sql_expr).ok()??;
     Some(sql_value_to_ndb_value(folded))
 }

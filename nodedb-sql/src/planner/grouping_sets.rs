@@ -16,6 +16,8 @@ use sqlparser::ast::{self, GroupByExpr};
 
 use crate::error::{Result, SqlError};
 use crate::parser::normalize::normalize_ident;
+use crate::resolver::ColumnScope;
+use crate::resolver::columns::TableScope;
 use crate::resolver::expr::convert_expr;
 use crate::types::SqlExpr;
 
@@ -33,7 +35,11 @@ pub struct GroupingSetsExpansion {
 ///
 /// Returns `None` when the GROUP BY is a plain expression list with no
 /// extensions — callers fall back to the existing single-set path.
-pub fn expand_group_by(group_by: &GroupByExpr) -> Result<Option<GroupingSetsExpansion>> {
+pub fn expand_group_by(
+    group_by: &GroupByExpr,
+    scope: &TableScope,
+) -> Result<Option<GroupingSetsExpansion>> {
+    let scope = ColumnScope::Relations(scope);
     let exprs = match group_by {
         GroupByExpr::All(_) => return Ok(None),
         GroupByExpr::Expressions(exprs, _) => exprs,
@@ -101,7 +107,7 @@ pub fn expand_group_by(group_by: &GroupByExpr) -> Result<Option<GroupingSetsExpa
         }
         let idx = canonical_names.len();
         canonical_names.push(display);
-        canonical_exprs.push(convert_expr(e)?);
+        canonical_exprs.push(convert_expr(e, &scope)?);
         Ok(idx)
     };
 
@@ -214,6 +220,7 @@ pub fn resolve_grouping_col(col_expr: &ast::Expr, canonical_keys: &[SqlExpr]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resolver::columns::test_support::open_scope;
 
     fn parse_group_by(sql: &str) -> GroupByExpr {
         use sqlparser::dialect::GenericDialect;
@@ -233,7 +240,9 @@ mod tests {
         let gb = parse_group_by(
             "SELECT region, country, SUM(sales) FROM orders GROUP BY ROLLUP (region, country)",
         );
-        let result = expand_group_by(&gb).unwrap().unwrap();
+        let result = expand_group_by(&gb, &open_scope("orders"))
+            .unwrap()
+            .unwrap();
         // ROLLUP(region, country) → [[0,1], [0], []]
         assert_eq!(result.canonical_keys.len(), 2);
         assert_eq!(result.grouping_sets.len(), 3);
@@ -247,7 +256,9 @@ mod tests {
         let gb = parse_group_by(
             "SELECT region, country, SUM(sales) FROM orders GROUP BY CUBE (region, country)",
         );
-        let result = expand_group_by(&gb).unwrap().unwrap();
+        let result = expand_group_by(&gb, &open_scope("orders"))
+            .unwrap()
+            .unwrap();
         // CUBE(region, country) → [[0,1], [0], [1], []]
         assert_eq!(result.canonical_keys.len(), 2);
         assert_eq!(result.grouping_sets.len(), 4);
@@ -264,7 +275,9 @@ mod tests {
             "SELECT region, country, SUM(sales) FROM orders \
              GROUP BY GROUPING SETS ((region, country), (region), ())",
         );
-        let result = expand_group_by(&gb).unwrap().unwrap();
+        let result = expand_group_by(&gb, &open_scope("orders"))
+            .unwrap()
+            .unwrap();
         assert_eq!(result.canonical_keys.len(), 2);
         assert_eq!(result.grouping_sets.len(), 3);
         assert_eq!(result.grouping_sets[0], vec![0, 1]);
@@ -275,14 +288,16 @@ mod tests {
     #[test]
     fn plain_group_by_returns_none() {
         let gb = parse_group_by("SELECT region, COUNT(*) FROM orders GROUP BY region");
-        let result = expand_group_by(&gb).unwrap();
+        let result = expand_group_by(&gb, &open_scope("orders")).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn mixed_plain_and_rollup() {
         let gb = parse_group_by("SELECT a, b, c, SUM(x) FROM t GROUP BY a, ROLLUP (b, c)");
-        let result = expand_group_by(&gb).unwrap().unwrap();
+        let result = expand_group_by(&gb, &open_scope("orders"))
+            .unwrap()
+            .unwrap();
         // Canonical: a(0), b(1), c(2).
         // Extension sets (from ROLLUP(b,c)): [[b,c], [b], []].
         // Cross-product with plain [a]:
@@ -299,7 +314,9 @@ mod tests {
     #[test]
     fn rollup_three_cols() {
         let gb = parse_group_by("SELECT a, b, c, SUM(x) FROM t GROUP BY ROLLUP (a, b, c)");
-        let result = expand_group_by(&gb).unwrap().unwrap();
+        let result = expand_group_by(&gb, &open_scope("orders"))
+            .unwrap()
+            .unwrap();
         assert_eq!(result.grouping_sets.len(), 4); // (a,b,c),(a,b),(a),()
     }
 }

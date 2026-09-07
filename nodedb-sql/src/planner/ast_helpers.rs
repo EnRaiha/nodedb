@@ -191,6 +191,7 @@ pub fn strip_single_table_qualifiers(
 pub fn strip_and_convert_filters(
     conjuncts: Vec<ast::Expr>,
     qualifier: &str,
+    scope: &crate::resolver::columns::TableScope,
 ) -> Result<Vec<Filter>> {
     if conjuncts.is_empty() {
         return Ok(Vec::new());
@@ -200,5 +201,5 @@ pub fn strip_and_convert_filters(
         .map(|c| strip_table_qualifier(&c, qualifier))
         .collect();
     let rebuilt = rebuild_and_expr(stripped);
-    convert_where_to_filters(&rebuilt)
+    convert_where_to_filters(&rebuilt, scope)
 }

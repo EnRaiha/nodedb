@@ -16,6 +16,20 @@ use sqlparser::ast;
 
 use crate::parser::normalize::normalize_ident;
 
+/// The output names a SELECT list introduces via explicit `AS`.
+pub(crate) fn select_output_aliases(items: &[ast::SelectItem]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            ast::SelectItem::ExprWithAlias { alias, .. } => Some(normalize_ident(alias)),
+            ast::SelectItem::UnnamedExpr(_)
+            | ast::SelectItem::ExprWithAliases { .. }
+            | ast::SelectItem::QualifiedWildcard(..)
+            | ast::SelectItem::Wildcard(_) => None,
+        })
+        .collect()
+}
+
 /// Resolve a possibly-aliased ORDER BY expression against the SELECT list.
 ///
 /// Returns the expression to inspect for search-trigger detection plus the

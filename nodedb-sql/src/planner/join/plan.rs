@@ -9,9 +9,9 @@ use super::array_arm;
 use super::constraint::extract_join_spec;
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
-use crate::planner::lateral::plan::{
-    LateralJoinArgs, is_lateral_derived, lateral_alias_from_factor, plan_lateral_join,
-    subquery_from_factor,
+use crate::planner::lateral::plan::{LateralJoinArgs, plan_lateral_join};
+use crate::planner::lateral::subquery::{
+    is_lateral_derived, lateral_alias_from_factor, subquery_from_factor,
 };
 use crate::resolver::columns::TableScope;
 use crate::types::*;
@@ -50,7 +50,7 @@ pub fn plan_join_from_select(
             let subquery = subquery_from_factor(&join_item.relation)
                 .expect("is_lateral_derived guarantees Derived variant");
             let left_join = is_left_join_operator(&join_item.join_operator);
-            let projection = super::super::select::convert_projection(&select.projection)?;
+            let projection = super::super::select::convert_projection(&select.projection, scope)?;
             return Ok(Some(plan_lateral_join(LateralJoinArgs {
                 outer_plan: current_plan,
                 outer_alias,
@@ -58,6 +58,7 @@ pub fn plan_join_from_select(
                 lateral_alias: &lateral_alias,
                 left_join,
                 outer_projection: projection,
+                outer_scope: scope,
                 catalog,
                 temporal,
             })?));
@@ -72,7 +73,8 @@ pub fn plan_join_from_select(
             scan_for_relation(&join_item.relation, scope)?
         };
 
-        let (join_type, mut on_keys, condition) = extract_join_spec(&join_item.join_operator)?;
+        let (join_type, mut on_keys, condition) =
+            extract_join_spec(&join_item.join_operator, scope)?;
 
         // Orient equi-keys to FROM order: `on.0` must reference the left input
         // and `on.1` the right input. The ON clause may write the operands in
@@ -96,15 +98,15 @@ pub fn plan_join_from_select(
 
     let (subquery_joins, effective_where) = if let Some(expr) = &select.selection {
         let extraction =
-            super::super::subquery::extract_subqueries(expr, catalog, functions, temporal)?;
+            super::super::subquery::extract_subqueries(expr, scope, catalog, functions, temporal)?;
         (extraction.joins, extraction.remaining_where)
     } else {
         (Vec::new(), None)
     };
 
-    let projection = super::super::select::convert_projection(&select.projection)?;
+    let projection = super::super::select::convert_projection(&select.projection, scope)?;
     let filters = match &effective_where {
-        Some(expr) => super::super::select::convert_where_to_filters(expr)?,
+        Some(expr) => super::super::select::convert_where_to_filters(expr, scope)?,
         None => Vec::new(),
     };
 
@@ -112,7 +114,7 @@ pub fn plan_join_from_select(
         current_plan = SqlPlan::Join {
             left: Box::new(current_plan),
             right: Box::new(sq.inner_plan),
-            on: vec![(sq.outer_column, sq.inner_column)],
+            on: sq.on,
             join_type: sq.join_type,
             condition: None,
             limit: None,
@@ -125,21 +127,31 @@ pub fn plan_join_from_select(
         ast::GroupByExpr::All(_) => true,
         ast::GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
     };
-    if super::super::select::convert_projection(&select.projection).is_ok() && group_by_non_empty {
+    if group_by_non_empty {
         let aggregates = super::super::aggregate::extract_aggregates_from_projection(
             &select.projection,
             functions,
+            scope,
         )?;
-        let group_by = super::super::group_by::convert_group_by(&select.group_by)?;
+        let group_by = super::super::group_by::convert_group_by(&select.group_by, scope)?;
         let group_by_aliases =
             super::super::group_by::group_by_output_aliases(&select.projection, &group_by);
         let output_order = super::super::aggregate_order::compute_output_order(
             &select.projection,
             &group_by,
             functions,
+            scope,
         )?;
         let having = match &select.having {
-            Some(expr) => super::super::select::convert_where_to_filters(expr)?,
+            Some(expr) => {
+                // A HAVING term addresses a computed group column, so the
+                // aggregate output names join the input columns here.
+                let having_scope =
+                    scope.with_output_names(aggregates.iter().map(|a| a.alias.clone()).chain(
+                        super::super::select::select_output_aliases(&select.projection),
+                    ));
+                super::super::select::convert_where_to_filters(expr, &having_scope)?
+            }
             None => Vec::new(),
         };
         return Ok(Some(SqlPlan::Aggregate {

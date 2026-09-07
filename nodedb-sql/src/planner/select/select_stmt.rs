@@ -2,9 +2,9 @@
 
 //! Single SELECT statement planning (no UNION, no CTE wrapper).
 
-use nodedb_types::DatabaseId;
 use sqlparser::ast::{self, Select};
 
+use super::comma_lateral::try_plan_comma_lateral;
 use super::derived_from::try_plan_derived_from;
 use super::helpers::{convert_projection, convert_where_to_filters};
 use super::query_tail::QueryTail;
@@ -12,13 +12,15 @@ use super::where_search::try_extract_where_search;
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
 use crate::planner::ast_helpers::strip_single_table_qualifiers;
-use crate::planner::lateral::plan::{
-    LateralJoinArgs, is_lateral_derived, lateral_alias_from_factor, plan_lateral_join,
-    subquery_from_factor,
-};
 use crate::resolver::columns::TableScope;
 use crate::temporal::TemporalScope;
 use crate::types::*;
+
+/// A planned SELECT body and the column namespace it resolved against.
+pub(in crate::planner::select) struct PlannedSelect {
+    pub plan: SqlPlan,
+    pub scope: TableScope,
+}
 
 /// Plan a single SELECT statement (no UNION, no CTE wrapper).
 ///
@@ -31,13 +33,18 @@ pub(super) fn plan_select(
     functions: &FunctionRegistry,
     temporal: TemporalScope,
     tail: &QueryTail<'_>,
-) -> Result<SqlPlan> {
+) -> Result<PlannedSelect> {
     // 0. Intercept array table-valued functions before catalog resolution
     //    so a name like `ARRAY_SLICE` is not looked up as a collection.
     if let Some(plan) =
         crate::planner::array_fn::try_plan_array_table_fn(&select.from, catalog, temporal)?
     {
-        return Ok(plan);
+        // `resolve_from` synthesizes a relation from the array's dims and
+        // attrs, so ORDER BY and the tail clauses resolve its columns.
+        return Ok(PlannedSelect {
+            plan,
+            scope: TableScope::resolve_from(catalog, &select.from)?,
+        });
     }
 
     // 0.5. Derived FROM subquery: `FROM (SELECT ...) AS t`.
@@ -49,8 +56,8 @@ pub(super) fn plan_select(
     // dropped non-LATERAL derived factors silently, the scope ended
     // up empty, and the planner errored with "multi-table FROM
     // without JOIN".
-    if let Some(plan) = try_plan_derived_from(select, catalog, functions, temporal, tail)? {
-        return Ok(plan);
+    if let Some(planned) = try_plan_derived_from(select, catalog, functions, temporal, tail)? {
+        return Ok(planned);
     }
 
     // 1. Resolve FROM tables.
@@ -63,9 +70,9 @@ pub(super) fn plan_select(
         if let Some(plan) =
             crate::planner::array_fn::try_plan_array_maint_fn(&select.projection, catalog)?
         {
-            return Ok(plan);
+            return Ok(PlannedSelect { plan, scope });
         }
-        let projection = convert_projection(&select.projection)?;
+        let projection = convert_projection(&select.projection, &scope)?;
         let mut columns = Vec::new();
         let mut values = Vec::new();
         for (i, proj) in projection.iter().enumerate() {
@@ -86,73 +93,32 @@ pub(super) fn plan_select(
                 }
             }
         }
-        return Ok(SqlPlan::ConstantResult { columns, values });
+        return Ok(PlannedSelect {
+            plan: SqlPlan::ConstantResult { columns, values },
+            scope,
+        });
     }
 
     // 3. Check for JOINs (including LATERAL).
     if let Some(plan) = try_plan_join(select, &scope, catalog, functions, temporal)? {
-        return Ok(plan);
+        return Ok(PlannedSelect { plan, scope });
     }
 
     // 3b. Comma-LATERAL syntax: `FROM t, LATERAL (SELECT ...) x`.
-    // sqlparser represents this as two TableWithJoins elements in `select.from`,
-    // where the second has an empty joins list and its relation is Derived{lateral:true}.
-    if select.from.len() == 2 && is_lateral_derived(&select.from[1].relation) {
-        let outer_twj = &select.from[0];
-        let lateral_twj = &select.from[1];
-
-        // Build outer scan plan.
-        let outer_alias = extract_table_alias_from_twj(outer_twj)?;
-        let outer_collection =
-            crate::parser::normalize::table_name_from_factor(&outer_twj.relation)?
-                .map(|(n, _)| n)
-                .ok_or_else(|| SqlError::Unsupported {
-                    detail: "LATERAL: outer side must be a plain table".into(),
-                })?;
-        let outer_info = catalog
-            .resolve_relation(DatabaseId::DEFAULT, &outer_collection)?
-            .ok_or_else(|| SqlError::UnknownTable {
-                name: outer_collection.clone(),
-            })?;
-        let outer_scan = SqlPlan::Scan {
-            collection: outer_collection,
-            alias: outer_alias.clone(),
-            engine: outer_info.engine,
-            filters: Vec::new(),
-            projection: Vec::new(),
-            sort_keys: Vec::new(),
-            limit: None,
-            offset: 0,
-            distinct: false,
-            window_functions: Vec::new(),
-            temporal,
-        };
-
-        let lateral_alias = lateral_alias_from_factor(&lateral_twj.relation)?.ok_or_else(|| {
-            SqlError::Unsupported {
-                detail: "LATERAL subquery requires an alias (e.g. LATERAL (...) AS x)".into(),
-            }
-        })?;
-        let subquery = subquery_from_factor(&lateral_twj.relation)
-            .expect("is_lateral_derived guarantees Derived variant");
-        let projection = convert_projection(&select.projection)?;
-        return plan_lateral_join(LateralJoinArgs {
-            outer_plan: outer_scan,
-            outer_alias,
-            subquery,
-            lateral_alias: &lateral_alias,
-            left_join: false, // comma-LATERAL is INNER (no LEFT semantics)
-            outer_projection: projection,
-            catalog,
-            temporal,
-        })
-        .map(Ok)?;
+    if let Some(plan) = try_plan_comma_lateral(select, &scope, catalog, temporal)? {
+        return Ok(PlannedSelect { plan, scope });
     }
 
     // 4. Single-table query.
-    let table = scope.single_table().ok_or_else(|| SqlError::Unsupported {
-        detail: "multi-table FROM without JOIN".into(),
-    })?;
+    // Cloned rather than borrowed: `scope` moves into the returned
+    // `PlannedSelect` while this relation is still in use.
+    let single = scope
+        .single_table()
+        .cloned()
+        .ok_or_else(|| SqlError::Unsupported {
+            detail: "multi-table FROM without JOIN".into(),
+        })?;
+    let table = &single;
 
     // For a single table the column qualifier (`t.` or its alias) is always
     // redundant, so strip it from the projection, WHERE, and GROUP BY here —
@@ -175,8 +141,9 @@ pub(super) fn plan_select(
 
     // 4. Extract subqueries from WHERE and rewrite as semi/anti joins.
     let (subquery_joins, effective_where) = if let Some(expr) = &select.selection {
-        let extraction =
-            crate::planner::subquery::extract_subqueries(expr, catalog, functions, temporal)?;
+        let extraction = crate::planner::subquery::extract_subqueries(
+            expr, &scope, catalog, functions, temporal,
+        )?;
         (extraction.joins, extraction.remaining_where)
     } else {
         (Vec::new(), None)
@@ -194,13 +161,13 @@ pub(super) fn plan_select(
             // Check for search-triggering functions in WHERE. The resolved
             // SELECT target list is threaded through so the search plan
             // self-describes its output columns.
-            let where_projection = convert_projection(&select.projection)?;
+            let where_projection = convert_projection(&select.projection, &scope)?;
             if let Some(plan) = try_extract_where_search(expr, table, functions, &where_projection)?
             {
-                return Ok(plan);
+                return Ok(PlannedSelect { plan, scope });
             }
             cached_projection = Some(where_projection);
-            convert_where_to_filters(expr)?
+            convert_where_to_filters(expr, &scope)?
         }
         None => Vec::new(),
     };
@@ -230,7 +197,7 @@ pub(super) fn plan_select(
                 base_input = Box::new(SqlPlan::Join {
                     left: base_input,
                     right: Box::new(sq.inner_plan.clone()),
-                    on: vec![(sq.outer_column.clone(), sq.inner_column.clone())],
+                    on: sq.on.clone(),
                     join_type: sq.join_type,
                     condition: None,
                     limit: None,
@@ -248,7 +215,7 @@ pub(super) fn plan_select(
             plan = SqlPlan::Join {
                 left: Box::new(plan),
                 right: Box::new(sq.inner_plan),
-                on: vec![(sq.outer_column, sq.inner_column)],
+                on: sq.on,
                 join_type: sq.join_type,
                 condition: None,
                 limit: None,
@@ -256,18 +223,19 @@ pub(super) fn plan_select(
                 filters: Vec::new(),
             };
         }
-        return Ok(plan);
+        return Ok(PlannedSelect { plan, scope });
     }
 
     // 7. Convert projection (reuse the WHERE-search conversion if we already
     // did it in step 5, to avoid converting the same projection twice).
     let projection = match cached_projection {
         Some(p) => p,
-        None => convert_projection(&select.projection)?,
+        None => convert_projection(&select.projection, &scope)?,
     };
 
     // 8. Convert window functions (SELECT with OVER).
-    let window_functions = crate::planner::window::extract_window_functions(select, functions)?;
+    let window_functions =
+        crate::planner::window::extract_window_functions(select, functions, &scope)?;
 
     // 9. Build base scan plan.
     let scan_projection = if subquery_joins.is_empty() {
@@ -289,7 +257,10 @@ pub(super) fn plan_select(
     // itself downstream — the same reason `scan_projection` is empty here.
     let (sort_keys, limit, offset) = if subquery_joins.is_empty() {
         let (limit, offset) = tail.limit_offset()?;
-        (tail.sort_keys()?, limit, offset)
+        // ORDER BY resolves against the output names the SELECT list
+        // introduces as well as the input columns.
+        let order_scope = scope.with_output_names(super::select_output_aliases(&select.projection));
+        (tail.sort_keys(&order_scope)?, limit, offset)
     } else {
         (Vec::new(), None, 0)
     };
@@ -342,7 +313,7 @@ pub(super) fn plan_select(
         plan = SqlPlan::Join {
             left: Box::new(plan),
             right: Box::new(sq.inner_plan),
-            on: vec![(sq.outer_column, sq.inner_column)],
+            on: sq.on,
             join_type: sq.join_type,
             condition: None,
             limit: None,
@@ -359,7 +330,7 @@ pub(super) fn plan_select(
         *join_projection = projection;
     }
 
-    Ok(plan)
+    Ok(PlannedSelect { plan, scope })
 }
 
 /// Check if a filter expression contains a column-vs-column comparison
@@ -386,12 +357,6 @@ fn has_column_comparison(expr: &SqlExpr) -> bool {
         }
         _ => false,
     }
-}
-
-/// Extract the alias from the first table in a `TableWithJoins`.
-fn extract_table_alias_from_twj(twj: &sqlparser::ast::TableWithJoins) -> Result<Option<String>> {
-    crate::parser::normalize::table_name_from_factor(&twj.relation)
-        .map(|relation| relation.map(|(name, alias)| alias.unwrap_or(name)))
 }
 
 /// Check if a SELECT has aggregation (GROUP BY or aggregate functions in projection).

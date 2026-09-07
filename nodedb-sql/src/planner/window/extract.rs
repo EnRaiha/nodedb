@@ -17,6 +17,8 @@ use sqlparser::ast;
 use crate::error::{Result, SqlError};
 use crate::functions::registry::{FunctionCategory, FunctionRegistry};
 use crate::parser::normalize::{SCHEMA_QUALIFIED_MSG, normalize_ident};
+use crate::resolver::ColumnScope;
+use crate::resolver::columns::TableScope;
 use crate::resolver::expr::convert_expr;
 use crate::types::{SortKey, SqlExpr, WindowSpec};
 use nodedb_query::{FrameBound, WindowFrame};
@@ -28,6 +30,7 @@ use super::named::{collect_named_windows, flatten_window_spec, resolve_named_def
 pub fn extract_window_functions(
     select: &ast::Select,
     functions: &FunctionRegistry,
+    scope: &TableScope,
 ) -> Result<Vec<WindowSpec>> {
     let named = collect_named_windows(&select.named_window)?;
     let mut specs = Vec::new();
@@ -40,7 +43,7 @@ pub fn extract_window_functions(
         if let ast::Expr::Function(func) = expr
             && func.over.is_some()
         {
-            specs.push(convert_window_spec(func, &alias, functions, &named)?);
+            specs.push(convert_window_spec(func, &alias, functions, &named, scope)?);
         }
     }
     Ok(specs)
@@ -51,6 +54,7 @@ fn convert_window_spec(
     alias: &str,
     functions: &FunctionRegistry,
     named: &HashMap<String, &ast::NamedWindowExpr>,
+    scope: &TableScope,
 ) -> Result<WindowSpec> {
     if func.name.0.len() > 1 {
         let qualified: String = func
@@ -99,7 +103,7 @@ fn convert_window_spec(
         }
     }
 
-    let args = convert_window_args(func, &name)?;
+    let args = convert_window_args(func, &name, scope)?;
     validate_constant_args(&name, &args)?;
 
     // Resolve the OVER target into a flattened partition/order/frame.
@@ -121,14 +125,14 @@ fn convert_window_spec(
             let pb = flat
                 .partition_by
                 .iter()
-                .map(convert_expr)
+                .map(|e| convert_expr(e, &ColumnScope::Relations(scope)))
                 .collect::<Result<Vec<_>>>()?;
             let ob = flat
                 .order_by
                 .iter()
                 .map(|o| {
                     Ok(SortKey {
-                        expr: convert_expr(&o.expr)?,
+                        expr: convert_expr(&o.expr, &ColumnScope::Relations(scope))?,
                         ascending: o.options.asc.unwrap_or(true),
                         nulls_first: o
                             .options
@@ -185,7 +189,11 @@ fn convert_window_spec(
 /// An argument the converter cannot represent is an error, never a dropped
 /// argument: discarding one silently turns `SUM(price * qty) OVER (...)` into
 /// a windowed column of NULLs that still reports success.
-fn convert_window_args(func: &ast::Function, name: &str) -> Result<Vec<SqlExpr>> {
+fn convert_window_args(
+    func: &ast::Function,
+    name: &str,
+    scope: &TableScope,
+) -> Result<Vec<SqlExpr>> {
     let ast::FunctionArguments::List(list) = &func.args else {
         return Ok(Vec::new());
     };
@@ -193,7 +201,9 @@ fn convert_window_args(func: &ast::Function, name: &str) -> Result<Vec<SqlExpr>>
     let mut args = Vec::with_capacity(list.args.len());
     for arg in &list.args {
         match arg {
-            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => args.push(convert_expr(e)?),
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
+                args.push(convert_expr(e, &ColumnScope::Relations(scope))?)
+            }
             // `COUNT(*) OVER (...)` — a wildcard carries no value to evaluate.
             // The evaluator counts frame rows when no argument is present.
             ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard) => {}
@@ -242,6 +252,7 @@ mod tests {
     use super::*;
     use crate::functions::registry::FunctionRegistry;
     use crate::parser::statement::parse_sql;
+    use crate::resolver::columns::test_support::open_scope;
 
     fn select_of(sql: &str) -> Box<ast::Select> {
         match parse_sql(sql).unwrap().into_iter().next().unwrap() {
@@ -261,7 +272,7 @@ mod tests {
              FROM ticks
              WINDOW w AS (PARTITION BY bucket ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
         );
-        let specs = extract_window_functions(&select, &reg).unwrap();
+        let specs = extract_window_functions(&select, &reg, &open_scope("ticks")).unwrap();
         assert_eq!(specs.len(), 3);
         for s in &specs {
             assert_eq!(
@@ -284,7 +295,7 @@ mod tests {
     fn undefined_named_window_is_rejected() {
         let reg = FunctionRegistry::new();
         let select = select_of("SELECT row_number() OVER missing AS r FROM t");
-        let err = extract_window_functions(&select, &reg).unwrap_err();
+        let err = extract_window_functions(&select, &reg, &open_scope("ticks")).unwrap_err();
         assert!(
             format!("{err}").contains("missing"),
             "error must name the missing window: {err}"
@@ -297,7 +308,7 @@ mod tests {
         let select = select_of(
             "SELECT sum(x) OVER w2 AS s FROM t WINDOW w1 AS (PARTITION BY a), w2 AS (w1 ORDER BY ts)",
         );
-        let specs = extract_window_functions(&select, &reg).unwrap();
+        let specs = extract_window_functions(&select, &reg, &open_scope("ticks")).unwrap();
         assert_eq!(specs.len(), 1);
         assert_eq!(
             specs[0].partition_by.len(),
@@ -311,7 +322,7 @@ mod tests {
     fn circular_named_window_is_rejected() {
         let reg = FunctionRegistry::new();
         let select = select_of("SELECT sum(x) OVER w1 AS s FROM t WINDOW w1 AS (w2), w2 AS (w1)");
-        let err = extract_window_functions(&select, &reg).unwrap_err();
+        let err = extract_window_functions(&select, &reg, &open_scope("ticks")).unwrap_err();
         assert!(
             format!("{err}").to_lowercase().contains("circular"),
             "got: {err}"
@@ -331,7 +342,7 @@ mod tests {
              WINDOW w     AS (PARTITION BY time_bucket('1m', ts), symbol),
                     w_ord AS (w ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
         );
-        let specs = extract_window_functions(&select, &reg).unwrap();
+        let specs = extract_window_functions(&select, &reg, &open_scope("ticks")).unwrap();
         assert_eq!(specs.len(), 5);
         for s in &specs {
             assert_eq!(
@@ -365,7 +376,7 @@ mod tests {
         let select = select_of(
             "SELECT sum(x) OVER (w ORDER BY ts) AS s FROM t WINDOW w AS (PARTITION BY a)",
         );
-        let specs = extract_window_functions(&select, &reg).unwrap();
+        let specs = extract_window_functions(&select, &reg, &open_scope("ticks")).unwrap();
         assert_eq!(specs[0].partition_by.len(), 1);
         assert_eq!(specs[0].order_by.len(), 1);
     }

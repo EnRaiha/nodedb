@@ -66,6 +66,8 @@ pub(crate) fn ndb_code_for_sqlstate(sqlstate_str: &str) -> u16 {
         sqlstate::INVALID_CATALOG_NAME => ErrorCode::DATABASE_NOT_FOUND,
         sqlstate::INSUFFICIENT_PRIVILEGE => ErrorCode::AUTHORIZATION_DENIED,
         sqlstate::UNDEFINED_FUNCTION => ErrorCode::UNDEFINED_FUNCTION,
+        sqlstate::UNDEFINED_COLUMN => ErrorCode::UNDEFINED_COLUMN,
+        sqlstate::AMBIGUOUS_COLUMN => ErrorCode::AMBIGUOUS_COLUMN,
         // Both a malformed request and a plan that cannot be built render as
         // `42601`, so this cannot say which. It does not have to: the two
         // differ in which side wrote the bad statement, not in how a client

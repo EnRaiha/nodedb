@@ -13,6 +13,8 @@ use super::ast_helpers::{qualified_ident_pair, strip_and_convert_filters};
 use crate::engine_rules::{self, MergeParams, ScanParams};
 use crate::error::{Result, SqlError};
 use crate::parser::normalize::{normalize_ident, normalize_object_name_checked};
+use crate::resolver::ColumnScope;
+use crate::resolver::columns::{ResolvedTable, TableScope};
 use crate::resolver::expr::convert_expr;
 use crate::temporal::TemporalScope;
 use crate::types::*;
@@ -46,12 +48,35 @@ pub fn plan_merge(stmt: &ast::Statement, catalog: &dyn SqlCatalog) -> Result<Vec
     let source_plan = plan_merge_source(&merge.source, catalog)?;
     let source_alias = merge_source_alias(&merge.source, &source_plan)?;
 
+    // ── Column namespace: target and source are both addressable ──
+    let target_table = ResolvedTable {
+        name: target_name.clone(),
+        alias: target_alias.clone(),
+        info: target_info.clone(),
+    };
+    let target_scope = TableScope::single(target_table.clone())?;
+    let mut scope = TableScope::new();
+    scope.add(target_table)?;
+    // The source is qualified-only: a bare name in an ON or WHEN clause
+    // resolves to the target column, matching the engine's MERGE semantics.
+    scope.add_qualified_only(merge_source_relation(
+        &merge.source,
+        &source_alias,
+        catalog,
+    )?)?;
+
     // ── Parse ON clause into equi-join columns ──
     let (target_join_col, source_join_col) =
-        extract_merge_equijoin(&merge.on, target_ref, &source_alias)?;
+        extract_merge_equijoin(&merge.on, target_ref, &source_alias, &scope)?;
 
     // ── Convert WHEN clauses ──
-    let clauses = convert_merge_clauses(&merge.clauses, target_ref, &source_alias)?;
+    let clauses = convert_merge_clauses(
+        &merge.clauses,
+        target_ref,
+        &source_alias,
+        &scope,
+        &target_scope,
+    )?;
 
     // ── Dispatch to engine rules ──
     let rules = engine_rules::resolve_engine_rules(target_info.engine);
@@ -140,6 +165,48 @@ fn plan_merge_source(factor: &ast::TableFactor, catalog: &dyn SqlCatalog) -> Res
     }
 }
 
+/// The source relation as it appears in the MERGE column namespace.
+///
+/// A named table resolves through the catalog. A derived subquery or VALUES
+/// constructor has no declared schema, so it exposes whatever it projects.
+fn merge_source_relation(
+    factor: &ast::TableFactor,
+    source_alias: &str,
+    catalog: &dyn SqlCatalog,
+) -> Result<ResolvedTable> {
+    if let ast::TableFactor::Table { name, .. } = factor {
+        let source_name = normalize_object_name_checked(name)?;
+        let info = catalog
+            .get_collection(DatabaseId::DEFAULT, &source_name)?
+            .ok_or_else(|| SqlError::UnknownTable {
+                name: source_name.clone(),
+            })?;
+        return Ok(ResolvedTable {
+            name: source_name,
+            alias: Some(source_alias.to_string()),
+            info,
+        });
+    }
+    Ok(ResolvedTable {
+        name: source_alias.to_string(),
+        alias: None,
+        info: CollectionInfo {
+            name: source_alias.to_string(),
+            engine: EngineType::DocumentSchemaless,
+            columns: Vec::new(),
+            primary_key: None,
+            has_auto_tier: false,
+            indexes: Vec::new(),
+            bitemporal: false,
+            primary: nodedb_types::PrimaryEngine::Document,
+            vector_primary: None,
+            partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
+            // The alias exposes whatever the subquery projects.
+            open_schema: true,
+        },
+    })
+}
+
 /// Determine the alias used to qualify source-column references in WHEN arms.
 fn merge_source_alias(factor: &ast::TableFactor, source_plan: &SqlPlan) -> Result<String> {
     match factor {
@@ -175,6 +242,7 @@ fn extract_merge_equijoin(
     on: &ast::Expr,
     target_ref: &str,
     source_ref: &str,
+    scope: &TableScope,
 ) -> Result<(String, String)> {
     if let ast::Expr::BinaryOp {
         left,
@@ -187,9 +255,13 @@ fn extract_merge_equijoin(
         match (lhs, rhs) {
             (Some((lt, lc)), Some((rt, rc))) => {
                 if lt == target_ref && rt == source_ref {
+                    scope.check_name(Some(&lt), &lc)?;
+                    scope.check_name(Some(&rt), &rc)?;
                     return Ok((lc, rc));
                 }
                 if lt == source_ref && rt == target_ref {
+                    scope.check_name(Some(&lt), &lc)?;
+                    scope.check_name(Some(&rt), &rc)?;
                     return Ok((rc, lc));
                 }
             }
@@ -197,12 +269,18 @@ fn extract_merge_equijoin(
             // pattern when one side is unqualified.
             (Some((t, c)), None) if t == source_ref => {
                 if let ast::Expr::Identifier(ident) = right.as_ref() {
-                    return Ok((normalize_ident(ident), c));
+                    let target_col = normalize_ident(ident);
+                    scope.check_name(Some(&t), &c)?;
+                    scope.check_name(Some(target_ref), &target_col)?;
+                    return Ok((target_col, c));
                 }
             }
             (None, Some((t, c))) if t == source_ref => {
                 if let ast::Expr::Identifier(ident) = left.as_ref() {
-                    return Ok((normalize_ident(ident), c));
+                    let target_col = normalize_ident(ident);
+                    scope.check_name(Some(&t), &c)?;
+                    scope.check_name(Some(target_ref), &target_col)?;
+                    return Ok((target_col, c));
                 }
             }
             _ => {}
@@ -223,10 +301,12 @@ fn convert_merge_clauses(
     clauses: &[ast::MergeClause],
     target_ref: &str,
     source_ref: &str,
+    scope: &TableScope,
+    target_scope: &TableScope,
 ) -> Result<Vec<MergePlanClause>> {
     clauses
         .iter()
-        .map(|c| convert_one_clause(c, target_ref, source_ref))
+        .map(|c| convert_one_clause(c, target_ref, source_ref, scope, target_scope))
         .collect()
 }
 
@@ -234,6 +314,8 @@ fn convert_one_clause(
     clause: &ast::MergeClause,
     target_ref: &str,
     source_ref: &str,
+    scope: &TableScope,
+    target_scope: &TableScope,
 ) -> Result<MergePlanClause> {
     let kind = match clause.clause_kind {
         AstMergeClauseKind::Matched => MergeClauseKind::Matched,
@@ -244,11 +326,11 @@ fn convert_one_clause(
     };
 
     let extra_predicate = match &clause.predicate {
-        Some(expr) => strip_and_convert_filters(vec![expr.clone()], target_ref)?,
+        Some(expr) => strip_and_convert_filters(vec![expr.clone()], target_ref, scope)?,
         None => Vec::new(),
     };
 
-    let action = convert_merge_action(&clause.action, source_ref)?;
+    let action = convert_merge_action(&clause.action, source_ref, scope, target_scope)?;
 
     Ok(MergePlanClause {
         kind,
@@ -257,7 +339,12 @@ fn convert_one_clause(
     })
 }
 
-fn convert_merge_action(action: &MergeAction, source_ref: &str) -> Result<MergePlanAction> {
+fn convert_merge_action(
+    action: &MergeAction,
+    source_ref: &str,
+    scope: &TableScope,
+    target_scope: &TableScope,
+) -> Result<MergePlanAction> {
     match action {
         MergeAction::Update(update_expr) => {
             let assignments = update_expr
@@ -273,7 +360,8 @@ fn convert_merge_action(action: &MergeAction, source_ref: &str) -> Result<MergeP
                                 .into(),
                         }),
                     }?;
-                    let val = convert_expr(&a.value)?;
+                    target_scope.check_name(None, &col)?;
+                    let val = convert_expr(&a.value, &ColumnScope::Relations(scope))?;
                     Ok((col, val))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -284,7 +372,11 @@ fn convert_merge_action(action: &MergeAction, source_ref: &str) -> Result<MergeP
             let columns: Vec<String> = insert_expr
                 .columns
                 .iter()
-                .map(normalize_object_name_checked)
+                .map(|c| {
+                    let col = normalize_object_name_checked(c)?;
+                    target_scope.check_name(None, &col)?;
+                    Ok(col)
+                })
                 .collect::<Result<Vec<_>>>()?;
 
             let values: Vec<crate::types_expr::SqlExpr> = match &insert_expr.kind {
@@ -299,7 +391,7 @@ fn convert_merge_action(action: &MergeAction, source_ref: &str) -> Result<MergeP
                     }
                     vals.rows[0]
                         .iter()
-                        .map(convert_expr)
+                        .map(|e| convert_expr(e, &ColumnScope::Relations(scope)))
                         .collect::<Result<Vec<_>>>()?
                 }
                 MergeInsertKind::Row => {

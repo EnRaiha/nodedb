@@ -24,6 +24,20 @@ use nodedb_sql::types::{CollectionInfo, EngineType, SqlPlan};
 use nodedb_sql::{SqlCatalog, SqlCatalogError, plan_sql};
 use nodedb_types::DatabaseId;
 
+/// A declared TEXT column, for the stub catalog below.
+fn text_column(name: &str, is_primary_key: bool) -> nodedb_sql::types::ColumnInfo {
+    nodedb_sql::types::ColumnInfo {
+        name: name.into(),
+        data_type: nodedb_sql::types::SqlDataType::String,
+        nullable: !is_primary_key,
+        is_primary_key,
+        default: None,
+        raw_type: None,
+        int_width: None,
+        float_width: None,
+    }
+}
+
 struct Catalog;
 
 impl SqlCatalog for Catalog {
@@ -36,7 +50,7 @@ impl SqlCatalog for Catalog {
             "articles" | "authors" => Some(CollectionInfo {
                 name: name.into(),
                 engine: EngineType::DocumentStrict,
-                columns: Vec::new(),
+                columns: vec![text_column("id", true), text_column("name", false)],
                 primary_key: Some("id".into()),
                 has_auto_tier: false,
                 indexes: Vec::new(),
@@ -44,6 +58,7 @@ impl SqlCatalog for Catalog {
                 primary: nodedb_types::PrimaryEngine::Document,
                 vector_primary: None,
                 partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
+                open_schema: CollectionInfo::open_schema_for(EngineType::DocumentStrict),
             }),
             _ => None,
         };
