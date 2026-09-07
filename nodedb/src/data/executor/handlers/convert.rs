@@ -138,7 +138,8 @@ impl CoreLoop {
         let mut errors = 0u64;
 
         for (doc_id, doc_bytes) in &docs {
-            match super::super::strict_format::bytes_to_binary_tuple(doc_bytes, &schema) {
+            match super::super::strict_format::bytes_to_binary_tuple(doc_bytes, &schema, collection)
+            {
                 Ok(tuple_bytes) => {
                     if let Err(e) =
                         self.sparse

@@ -71,6 +71,15 @@ pub fn binary_tuple_to_msgpack(tuple_bytes: &[u8], schema: &StrictSchema) -> Opt
     nodedb_types::value_to_msgpack(&val).ok()
 }
 
+/// The error for a stored Binary Tuple that does not decode against the
+/// collection's strict schema. Names the row so an operator can find it.
+pub fn undecodable_strict_row(collection: &str, doc_id: &str) -> crate::Error {
+    crate::Error::Serialization {
+        format: "binary_tuple".into(),
+        detail: format!("document \"{doc_id}\" of collection \"{collection}\" does not decode"),
+    }
+}
+
 /// Decode a Binary Tuple to a JSON object using the schema (for pgwire output).
 pub fn binary_tuple_to_json(
     tuple_bytes: &[u8],

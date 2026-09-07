@@ -43,9 +43,9 @@ pub(in crate::data::executor) struct ProjectUpdateRows<'a> {
 }
 
 impl CoreLoop {
-    /// Compute the post-image of every matched row. A row that is gone or
-    /// cannot decode/re-encode is skipped, same as the apply loop. A failure
-    /// that means the statement itself is wrong is an error, not a skip.
+    /// Compute the post-image of every matched row. A row deleted between the
+    /// match and this pass is skipped — it is no longer in the update set. A
+    /// row the engine cannot decode, re-encode, or evaluate is an error.
     pub(in crate::data::executor) fn project_bulk_update_rows(
         &self,
         p: ProjectUpdateRows<'_>,
@@ -70,18 +70,18 @@ impl CoreLoop {
                 continue;
             };
 
-            // Decode current value — format depends on storage mode.
+            // Decode current value — format depends on storage mode. A row the
+            // statement matched but cannot decode fails the statement rather
+            // than under-reporting the affected count.
             let mut doc = match strict_schema {
-                Some(schema) => {
-                    match crate::data::executor::strict_format::binary_tuple_to_json(
-                        &current_bytes,
-                        schema,
-                    ) {
-                        Some(v) => v,
-                        None => continue,
-                    }
-                }
-                // Fails the statement rather than silently under-reporting affected.
+                Some(schema) => crate::data::executor::strict_format::binary_tuple_to_json(
+                    &current_bytes,
+                    schema,
+                )
+                .ok_or_else(|| {
+                    crate::diag::strict_row_undecodable(collection, doc_id, "bulk_update_project");
+                    crate::data::executor::strict_format::undecodable_strict_row(collection, doc_id)
+                })?,
                 None => doc_format::decode_document(&current_bytes)?,
             };
 
@@ -93,14 +93,16 @@ impl CoreLoop {
             if let Some(obj) = doc.as_object_mut() {
                 for (field, update_val) in updates {
                     let val: serde_json::Value = match update_val {
-                        UpdateValue::Literal(bytes) => match nodedb_types::json_from_msgpack(bytes)
-                        {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        },
+                        UpdateValue::Literal(bytes) => nodedb_types::json_from_msgpack(bytes)
+                            .map_err(|e| crate::Error::Serialization {
+                                format: "msgpack".into(),
+                                detail: format!(
+                                    "literal assigned to \"{field}\" for document \"{doc_id}\" \
+                                     of collection \"{collection}\" does not decode: {e}"
+                                ),
+                            })?,
+                        // Division or modulo by zero fails the statement.
                         UpdateValue::Expr(expr) => {
-                            // Unlike the literal-decode skip above, a division/
-                            // modulo-by-zero here fails the whole statement.
                             let result: nodedb_types::Value = expr.eval(&eval_doc)?;
                             result.into()
                         }
@@ -109,43 +111,31 @@ impl CoreLoop {
                 }
             }
 
-            // Recompute generated columns if any dependency changed.
+            // Recompute generated columns if any dependency changed. A column
+            // the engine cannot recompute fails the statement.
             if let Some(config) = self.doc_configs.get(&config_key)
                 && !config.enforcement.generated_columns.is_empty()
                 && super::super::generated::needs_recomputation(
                     updates,
                     &config.enforcement.generated_columns,
                 )
-                && let Err(e) = super::super::generated::evaluate_generated_columns(
+            {
+                super::super::generated::evaluate_generated_columns(
                     &mut doc,
                     &config.enforcement.generated_columns,
                 )
-            {
-                tracing::warn!(
-                    %doc_id,
-                    error = ?e,
-                    "generated column recomputation failed, skipping document"
-                );
-                continue;
+                .map_err(crate::Error::DataPlane)?;
             }
 
-            // Re-encode — format depends on storage mode.
+            // Re-encode — format depends on storage mode. An encode error
+            // carries its own typed cause, such as a field the strict schema
+            // does not declare.
             let updated_bytes = match strict_schema {
                 Some(schema) => {
                     let ndb_val: nodedb_types::Value = doc.clone().into();
-                    match crate::data::executor::strict_format::value_to_binary_tuple(
-                        &ndb_val, schema,
-                    ) {
-                        Ok(bytes) => bytes,
-                        Err(e) => {
-                            tracing::warn!(
-                                %doc_id,
-                                error = %e,
-                                "strict re-encode failed, skipping document"
-                            );
-                            continue;
-                        }
-                    }
+                    crate::data::executor::strict_format::value_to_binary_tuple(
+                        &ndb_val, schema, collection,
+                    )?
                 }
                 None => doc_format::encode_to_msgpack(&doc),
             };

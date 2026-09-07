@@ -118,3 +118,21 @@ pub fn wal_archival_failed_truncation_held(
         None => capture.emit(),
     };
 }
+
+/// Report a stored Binary Tuple that does not decode against its
+/// collection's strict schema. Called from each UPDATE site that detects
+/// the row, alongside the error it returns; `site` names that site.
+pub fn strict_row_undecodable(collection: &str, doc_id: &str, site: &'static str) {
+    let ctx = context::StrictRowUndecodable {
+        collection,
+        doc_id,
+        site,
+    };
+    let _ = Capture::new(
+        EventKind::Corruption,
+        "stored strict row did not decode, so the statement reading it is refused",
+    )
+    .domain(&ctx)
+    .with_backtrace()
+    .emit();
+}

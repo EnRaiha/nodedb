@@ -1320,8 +1320,12 @@ mod tests {
             "body".to_string(),
             nodedb_types::Value::String(body.to_string()),
         );
-        strict_format::value_to_binary_tuple(&nodedb_types::Value::Object(obj), &strict_schema())
-            .expect("encode binary tuple")
+        strict_format::value_to_binary_tuple(
+            &nodedb_types::Value::Object(obj),
+            &strict_schema(),
+            "docs",
+        )
+        .expect("encode binary tuple")
     }
 
     /// A schemaless document body in canonical storage encoding, not the raw

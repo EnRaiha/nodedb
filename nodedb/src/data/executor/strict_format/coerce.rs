@@ -318,7 +318,8 @@ mod tests {
         map.insert("age".into(), Value::Integer(30));
 
         let tuple_bytes =
-            super::super::encode::value_to_binary_tuple(&Value::Object(map), &schema).unwrap();
+            super::super::encode::value_to_binary_tuple(&Value::Object(map), &schema, "docs")
+                .unwrap();
         let decoded = super::super::decode::binary_tuple_to_json(&tuple_bytes, &schema).unwrap();
         assert_eq!(decoded["id"], "u1");
         assert_eq!(decoded["name"], "Alice");
@@ -333,7 +334,8 @@ mod tests {
         map.insert("name".into(), Value::String("Bob".into()));
 
         let tuple_bytes =
-            super::super::encode::value_to_binary_tuple(&Value::Object(map), &schema).unwrap();
+            super::super::encode::value_to_binary_tuple(&Value::Object(map), &schema, "docs")
+                .unwrap();
         let decoded = super::super::decode::binary_tuple_to_json(&tuple_bytes, &schema).unwrap();
         assert_eq!(decoded["id"], "u2");
         assert!(decoded["age"].is_null());
@@ -345,7 +347,8 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert("id".into(), Value::String("u3".into()));
 
-        let result = super::super::encode::value_to_binary_tuple(&Value::Object(map), &schema);
+        let result =
+            super::super::encode::value_to_binary_tuple(&Value::Object(map), &schema, "docs");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("NOT NULL"));
     }
@@ -367,6 +370,7 @@ mod tests {
             1_700_000_000_000,
             0,
             i64::MAX,
+            "docs",
         )
         .unwrap();
 
@@ -391,6 +395,7 @@ mod tests {
             0,
             0,
             0,
+            "docs",
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not bitemporal"));
@@ -404,13 +409,10 @@ mod tests {
         map.insert("name".into(), Value::String("Eve".into()));
         map.insert("extra".into(), Value::String("boom".into()));
 
-        let result = super::super::encode::value_to_binary_tuple(&Value::Object(map), &schema);
+        let result =
+            super::super::encode::value_to_binary_tuple(&Value::Object(map), &schema, "docs");
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("unknown field 'extra'")
-        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("\"extra\"") && msg.contains("does not exist"));
     }
 }

@@ -113,6 +113,7 @@ impl CoreLoop {
         };
         let value = value_with_rowid.unwrap_or(value);
 
+        let collection = &config_key.2;
         let stored = if bitemporal && schema.bitemporal {
             strict_format::bytes_to_binary_tuple_bitemporal(
                 &value,
@@ -120,13 +121,17 @@ impl CoreLoop {
                 sys_from_ms,
                 valid_from_ms,
                 valid_until_ms,
+                collection,
             )
         } else {
-            strict_format::bytes_to_binary_tuple(&value, schema)
+            strict_format::bytes_to_binary_tuple(&value, schema, collection)
         }
-        .map_err(|e| crate::Error::Serialization {
-            format: "binary_tuple".into(),
-            detail: e.to_string(),
+        .map_err(|e| match e {
+            crate::Error::UnknownStrictField { .. } => e,
+            other => crate::Error::Serialization {
+                format: "binary_tuple".into(),
+                detail: other.to_string(),
+            },
         })?;
 
         Ok(StoredBody { value, stored })

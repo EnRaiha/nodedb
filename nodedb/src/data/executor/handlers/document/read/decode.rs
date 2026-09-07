@@ -104,7 +104,7 @@ mod tests {
         map.insert("name".into(), Value::String("Ada".into()));
         map.insert("age".into(), Value::Integer(42));
 
-        let tuple = strict_format::value_to_binary_tuple(&Value::Object(map), &schema)
+        let tuple = strict_format::value_to_binary_tuple(&Value::Object(map), &schema, "docs")
             .expect("encode strict tuple");
 
         let decoded = decode_scanned_document(&tuple, SparseBodyFormatRef::Strict(&schema))
@@ -230,7 +230,7 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert("id".into(), Value::String("u1".into()));
         map.insert("name".into(), Value::String("Ada".into()));
-        let tuple = strict_format::value_to_binary_tuple(&Value::Object(map), &schema)
+        let tuple = strict_format::value_to_binary_tuple(&Value::Object(map), &schema, "docs")
             .expect("encode strict tuple");
 
         let image = crate::data::executor::scan_normalize::sparse_body_to_msgpack(

@@ -97,13 +97,17 @@ impl CoreLoop {
                     sys_from_ms,
                     i64::MIN,
                     i64::MAX,
+                    collection,
                 )
             } else {
-                strict_format::bytes_to_binary_tuple(&encoded_input, schema)
+                strict_format::bytes_to_binary_tuple(&encoded_input, schema, collection)
             }
-            .map_err(|e| crate::Error::Serialization {
-                format: "binary_tuple".into(),
-                detail: e.to_string(),
+            .map_err(|e| match e {
+                crate::Error::UnknownStrictField { .. } => e,
+                other => crate::Error::Serialization {
+                    format: "binary_tuple".into(),
+                    detail: other.to_string(),
+                },
             })?;
             Ok(stored)
         } else {
@@ -204,13 +208,17 @@ impl CoreLoop {
                         sys_from_ms,
                         i64::MIN,
                         i64::MAX,
+                        collection,
                     )
                 } else {
-                    strict_format::value_to_binary_tuple(&ndb_val, schema)
+                    strict_format::value_to_binary_tuple(&ndb_val, schema, collection)
                 }
-                .map_err(|e| crate::Error::Serialization {
-                    format: "binary_tuple".into(),
-                    detail: e.to_string(),
+                .map_err(|e| match e {
+                    crate::Error::UnknownStrictField { .. } => e,
+                    other => crate::Error::Serialization {
+                        format: "binary_tuple".into(),
+                        detail: other.to_string(),
+                    },
                 })?;
                 Ok(bytes)
             }

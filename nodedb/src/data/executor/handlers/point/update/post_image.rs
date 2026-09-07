@@ -84,6 +84,7 @@ impl CoreLoop {
             });
         };
         let ndb_val: nodedb_types::Value = doc.clone().into();
+        let collection = &config_key.2;
         let result = if bitemporal && schema.bitemporal {
             strict_format::value_to_binary_tuple_bitemporal(
                 &ndb_val,
@@ -91,12 +92,18 @@ impl CoreLoop {
                 sys_from_ms,
                 i64::MIN,
                 i64::MAX,
+                collection,
             )
         } else {
-            strict_format::value_to_binary_tuple(&ndb_val, schema)
+            strict_format::value_to_binary_tuple(&ndb_val, schema, collection)
         };
-        result.map_err(|e| ErrorCode::Internal {
-            detail: format!("strict re-encode: {e}"),
+        result.map_err(|e| match e {
+            crate::Error::UnknownStrictField { column, .. } => {
+                ErrorCode::UndefinedColumn { column }
+            }
+            other => ErrorCode::Internal {
+                detail: format!("strict re-encode: {other}"),
+            },
         })
     }
 

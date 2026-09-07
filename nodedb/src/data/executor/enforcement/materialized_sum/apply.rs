@@ -445,7 +445,7 @@ mod tests {
         row.insert("id".to_string(), Value::String(ACCOUNT.into()));
         row.insert("owner".to_string(), Value::String("alice".into()));
         row.insert("balance".to_string(), Value::String("100".into()));
-        let tuple = strict_format::value_to_binary_tuple(&Value::Object(row), &schema)
+        let tuple = strict_format::value_to_binary_tuple(&Value::Object(row), &schema, TARGET)
             .expect("encode seed tuple");
         let target_key = surrogate_to_doc_id(TARGET_SURROGATE);
         core.sparse
