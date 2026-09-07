@@ -443,6 +443,9 @@ pub(crate) fn build_insert_select(
         source_collection: QualifiedCollection::new(ctx.database_id(), &source),
         source_filters: filters,
         source_limit: limit,
+        // The native text-field form names no projection, so every source row
+        // copies unchanged.
+        column_map: Vec::new(),
     }))
 }
 

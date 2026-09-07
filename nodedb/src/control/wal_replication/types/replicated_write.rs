@@ -578,6 +578,9 @@ pub enum ReplicatedWrite {
         source_collection: String,
         source_filters: Vec<u8>,
         source_limit: usize,
+        /// See `DocumentOp::InsertSelect::column_map`. Each replica shapes the
+        /// rows it copies with the same bindings the leader used.
+        column_map: Vec<u8>,
     },
     CrdtImportCollection {
         tenant_id: u64,

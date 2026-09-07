@@ -89,9 +89,39 @@ pub(in crate::control::planner::sql_plan_convert) fn serialize_join_computed_pro
         .ok_or_else(|| crate::Error::BadRequest {
             detail: "wildcard join projection reached computed-expression lowering".into(),
         })?;
+    encode_computed_columns(computed, "join computed projection")
+}
+
+/// Encode a `(target_column, source_expression)` binding as the same
+/// `Vec<ComputedColumn>` payload [`serialize_join_computed_projection`]
+/// produces. Every pair is kept: a bare column binding still names the target
+/// column it writes. Column references stay unqualified — the rows this map
+/// shapes come from one collection, so their fields carry bare names.
+pub(in crate::control::planner::sql_plan_convert) fn serialize_column_map(
+    column_map: &[(String, SqlExpr)],
+) -> crate::Result<Vec<u8>> {
+    if column_map.is_empty() {
+        return Ok(Vec::new());
+    }
+    let computed: Vec<crate::bridge::expr_eval::ComputedColumn> = column_map
+        .iter()
+        .map(|(name, expr)| crate::bridge::expr_eval::ComputedColumn {
+            alias: name.clone(),
+            expr: sql_expr_to_bridge_expr(expr),
+        })
+        .collect();
+    encode_computed_columns(computed, "insert-select column map")
+}
+
+/// Encode a computed-column list as its MessagePack payload. `context` names
+/// the caller, so an encode error says which payload failed.
+fn encode_computed_columns(
+    computed: Vec<crate::bridge::expr_eval::ComputedColumn>,
+    context: &str,
+) -> crate::Result<Vec<u8>> {
     zerompk::to_msgpack_vec(&computed).map_err(|e| crate::Error::Serialization {
         format: "msgpack".into(),
-        detail: format!("join computed projection: {e}"),
+        detail: format!("{context}: {e}"),
     })
 }
 

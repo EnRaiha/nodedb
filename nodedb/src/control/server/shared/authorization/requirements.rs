@@ -55,6 +55,7 @@ mod tests {
             source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "source"),
             source_filters: Vec::new(),
             source_limit: 0,
+            column_map: Vec::new(),
         });
 
         assert_eq!(

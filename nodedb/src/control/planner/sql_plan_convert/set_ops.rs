@@ -2,7 +2,7 @@
 
 //! Set operations and miscellaneous plan conversions (UNION, INTERSECT, EXCEPT, CTE, etc.).
 
-use nodedb_sql::types::{Projection, SortKey, SqlPlan, SqlValue};
+use nodedb_sql::types::{Projection, SortKey, SqlExpr, SqlPlan, SqlValue};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{TenantId, VShardId};
@@ -146,6 +146,7 @@ pub(super) fn convert_except(
 pub(super) fn convert_insert_select(
     target: &str,
     source: &SqlPlan,
+    column_map: &[(String, SqlExpr)],
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
@@ -155,7 +156,6 @@ pub(super) fn convert_insert_select(
     let SqlPlan::Scan {
         collection,
         filters,
-        projection,
         sort_keys,
         limit,
         offset,
@@ -169,18 +169,9 @@ pub(super) fn convert_insert_select(
         });
     };
 
-    let projection_is_passthrough = projection.is_empty()
-        || projection.iter().all(|p| {
-            matches!(p, Projection::Star)
-                || matches!(p, Projection::QualifiedStar(name) if name == collection)
-        });
-
-    if !projection_is_passthrough
-        || !sort_keys.is_empty()
-        || *offset != 0
-        || *distinct
-        || !window_functions.is_empty()
-    {
+    // Ordering, offset, distinct, and window functions each need an ordered
+    // materialization the page-at-a-time copy does not provide.
+    if !sort_keys.is_empty() || *offset != 0 || *distinct || !window_functions.is_empty() {
         return Err(crate::Error::PlanError {
             detail: "INSERT ... SELECT currently supports only SELECT * with optional WHERE/LIMIT"
                 .into(),
@@ -188,6 +179,7 @@ pub(super) fn convert_insert_select(
     }
 
     let filter_bytes = super::filter::serialize_filters(filters)?;
+    let column_map_bytes = super::aggregate::serialize_column_map(column_map)?;
     let vshard = VShardId::from_collection_in_database(ctx.database_id, target);
     let qualified_source = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
 
@@ -200,6 +192,7 @@ pub(super) fn convert_insert_select(
             source_collection: qualified_source,
             source_filters: filter_bytes,
             source_limit: limit.unwrap_or(10_000),
+            column_map: column_map_bytes,
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,
@@ -384,6 +377,7 @@ mod tests {
         let tasks = convert_insert_select(
             "batch_copy",
             &source,
+            &[],
             TenantId::new(1),
             &ConvertContext {
                 purpose: crate::control::planner::sql_plan_convert::PlanningPurpose::Execute,
@@ -442,6 +436,7 @@ mod tests {
         let tasks = convert_insert_select(
             "batch_copy",
             &source,
+            &[],
             TenantId::new(1),
             &ConvertContext {
                 purpose: crate::control::planner::sql_plan_convert::PlanningPurpose::Execute,

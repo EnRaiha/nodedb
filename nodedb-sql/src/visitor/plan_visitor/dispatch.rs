@@ -135,7 +135,8 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             target,
             source,
             limit,
-        } => visitor.insert_select(target, source, *limit),
+            column_map,
+        } => visitor.insert_select(target, source, *limit, column_map),
         SqlPlan::Update {
             collection,
             engine,

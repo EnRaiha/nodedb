@@ -160,6 +160,12 @@ pub enum SqlPlan {
         target: String,
         source: Box<SqlPlan>,
         limit: usize,
+        /// `(target_column, source_expression)`, in target-column order.
+        ///
+        /// Empty means passthrough: `INSERT INTO t SELECT * FROM s` copies
+        /// each source row unchanged. Non-empty means every target column is
+        /// materialized from the paired expression over the source row.
+        column_map: Vec<(String, SqlExpr)>,
     },
     Update {
         collection: String,

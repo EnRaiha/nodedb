@@ -175,11 +175,13 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             source_collection,
             source_filters,
             source_limit,
+            column_map,
         } => document::insert_select(
             target_collection.as_str(),
             source_collection.as_str(),
             source_filters,
             *source_limit,
+            column_map,
         ),
 
         DocumentOp::BatchInsert {

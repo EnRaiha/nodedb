@@ -12,6 +12,7 @@
 
 use nodedb_types::{DatabaseId, Surrogate, TenantId};
 
+use crate::bridge::expr_eval::ComputedColumn;
 use crate::bridge::scan_filter::ScanFilter;
 use crate::control::state::SharedState;
 use crate::control::target_identity::{
@@ -25,6 +26,9 @@ pub(crate) struct CopySpec {
     pub target_pk: TargetPk,
     /// Residual source `WHERE` predicate (deserialized `Vec<ScanFilter>`).
     pub filters: Vec<ScanFilter>,
+    /// One entry per target column, its `alias` the target column name and its
+    /// `expr` the source-row expression. Empty copies each row unchanged.
+    pub column_map: Vec<ComputedColumn>,
 }
 
 /// Resolve the target PK and the residual source `WHERE` filter for one
@@ -38,6 +42,7 @@ pub(crate) fn resolve_copy_spec(
     database_id: DatabaseId,
     target_collection: &str,
     source_filters: &[u8],
+    column_map: &[u8],
 ) -> crate::Result<CopySpec> {
     let catalog = state.credentials.catalog();
 
@@ -62,7 +67,20 @@ pub(crate) fn resolve_copy_spec(
         })?
     };
 
-    Ok(CopySpec { target_pk, filters })
+    let column_map: Vec<ComputedColumn> = if column_map.is_empty() {
+        Vec::new()
+    } else {
+        zerompk::from_msgpack(column_map).map_err(|e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("insert-select column map: {e}"),
+        })?
+    };
+
+    Ok(CopySpec {
+        target_pk,
+        filters,
+        column_map,
+    })
 }
 
 /// Filter and assign fresh surrogates for one scanned source page.
@@ -91,6 +109,13 @@ pub(crate) fn assign_page_rows(
         {
             continue;
         }
+        // Shape the source row into the target's column set. An empty map is
+        // passthrough — the source body is already the target body.
+        let value = if spec.column_map.is_empty() {
+            value
+        } else {
+            shape_row(&value, &spec.column_map)?
+        };
         let surrogate = assign_target_surrogate(
             state,
             database_id,
@@ -103,4 +128,27 @@ pub(crate) fn assign_page_rows(
         *remaining -= 1;
     }
     Ok(out)
+}
+
+/// Evaluate each `(target_column, expression)` pair against the source row and
+/// re-encode as the target body. A source column absent from the row yields
+/// SQL NULL, matching every other projection path.
+fn shape_row(source: &[u8], column_map: &[ComputedColumn]) -> crate::Result<Vec<u8>> {
+    let row =
+        nodedb_types::value_from_msgpack(source).map_err(|e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("insert-select source row: {e}"),
+        })?;
+    let mut shaped = std::collections::HashMap::with_capacity(column_map.len());
+    for column in column_map {
+        // A division/modulo-by-zero in a bound expression fails the statement
+        // instead of silently writing NULL into the target.
+        shaped.insert(column.alias.clone(), column.expr.eval(&row)?);
+    }
+    nodedb_types::value_to_msgpack(&nodedb_types::Value::Object(shaped)).map_err(|e| {
+        crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("insert-select target row: {e}"),
+        }
+    })
 }

@@ -34,6 +34,7 @@ pub async fn run_authorized_insert_select(
         source_collection,
         source_filters,
         source_limit,
+        column_map,
     }) = task.plan
     else {
         return Err(crate::Error::BadRequest {
@@ -44,20 +45,35 @@ pub async fn run_authorized_insert_select(
         state,
         task.tenant_id,
         task.database_id,
-        target_collection.as_str(),
-        source_collection.as_str(),
-        &source_filters,
-        source_limit,
+        &CopyRequest {
+            target_collection: target_collection.as_str(),
+            source_collection: source_collection.as_str(),
+            source_filters: &source_filters,
+            source_limit,
+            column_map: &column_map,
+        },
     )
     .await
 }
 
+/// The plan-derived operands of one `INSERT ... SELECT` copy.
+pub(crate) struct CopyRequest<'a> {
+    pub target_collection: &'a str,
+    pub source_collection: &'a str,
+    /// Serialized `Vec<ScanFilter>` residual `WHERE` predicate.
+    pub source_filters: &'a [u8],
+    /// Bounds how many source rows are copied.
+    pub source_limit: usize,
+    /// Serialized `Vec<ComputedColumn>` shaping each copied row. Empty for a
+    /// plain copy.
+    pub column_map: &'a [u8],
+}
+
 /// Drive an `INSERT ... SELECT` from `source_collection` into `target_collection`.
 ///
-/// `target_collection` / `source_collection` are the (db-qualified) collection
-/// names as they appear in the `DocumentOp::InsertSelect` plan. `source_filters`
-/// is the serialized `Vec<ScanFilter>` residual `WHERE` predicate; `source_limit`
-/// bounds how many source rows are copied.
+/// The copy operands travel in `CopyRequest`: `target_collection` /
+/// `source_collection` are the (db-qualified) collection names as they
+/// appear in the `DocumentOp::InsertSelect` plan.
 ///
 /// Returns a `{"inserted": N}` response mirroring the shape the autocommit
 /// dispatch loops shape as an `INSERT` command tag.
@@ -65,21 +81,19 @@ pub(crate) async fn run_insert_select(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
-    target_collection: &str,
-    source_collection: &str,
-    source_filters: &[u8],
-    source_limit: usize,
+    req: &CopyRequest<'_>,
 ) -> crate::Result<Response> {
     let spec = resolve_copy_spec(
         state,
         tenant_id,
         database_id,
-        target_collection,
-        source_filters,
+        req.target_collection,
+        req.source_filters,
+        req.column_map,
     )?;
 
     let mut cursor: Vec<u8> = Vec::new();
-    let mut remaining = source_limit;
+    let mut remaining = req.source_limit;
     let mut total_inserted: usize = 0;
     let mut max_lsn = Lsn::ZERO;
 
@@ -89,7 +103,7 @@ pub(crate) async fn run_insert_select(
             state,
             tenant_id,
             database_id,
-            source_collection,
+            req.source_collection,
             &cursor,
             None,
             None,
@@ -102,7 +116,7 @@ pub(crate) async fn run_insert_select(
             state,
             tenant_id,
             database_id,
-            target_collection,
+            req.target_collection,
             &spec,
             entries,
             &mut remaining,
@@ -127,7 +141,7 @@ pub(crate) async fn run_insert_select(
                 crate::control::planner::materialized_sum::resolve_sum_targets_for_bodies(
                     state,
                     &page_bodies,
-                    target_collection,
+                    req.target_collection,
                     tenant_id,
                     database_id,
                     crate::types::TraceId::ZERO,
@@ -136,7 +150,7 @@ pub(crate) async fn run_insert_select(
 
             let plan = PhysicalPlan::Document(DocumentOp::BatchInsert {
                 collection: nodedb_types::QualifiedCollection::from_stored(
-                    target_collection.to_string(),
+                    req.target_collection.to_string(),
                 ),
                 documents,
                 surrogates,
@@ -151,8 +165,15 @@ pub(crate) async fn run_insert_select(
                 // deferred to a sibling task.
                 deferred_sum_targets: Vec::new(),
             });
-            let resp = dispatch_local(state, tenant_id, database_id, target_collection, plan, None)
-                .await?;
+            let resp = dispatch_local(
+                state,
+                tenant_id,
+                database_id,
+                req.target_collection,
+                plan,
+                None,
+            )
+            .await?;
             if resp.status != Status::Ok {
                 // Atomic page failure (e.g. constraint violation): the page's
                 // rows did not land. Surface the DP error verbatim.
@@ -166,7 +187,7 @@ pub(crate) async fn run_insert_select(
                 &state.wal,
                 tenant_id,
                 database_id,
-                target_collection,
+                req.target_collection,
                 &resp,
             )?;
             total_inserted += decode_inserted(&resp.payload).unwrap_or(page_len);

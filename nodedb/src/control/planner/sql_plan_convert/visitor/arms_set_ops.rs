@@ -61,8 +61,15 @@ macro_rules! impl_set_ops_arms_for_convert_visitor {
             target: &str,
             source: &nodedb_sql::types::SqlPlan,
             _limit: usize,
+            column_map: &[(String, nodedb_sql::types::SqlExpr)],
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
-            super::super::set_ops::convert_insert_select(target, source, self.tenant_id, self.ctx)
+            super::super::set_ops::convert_insert_select(
+                target,
+                source,
+                column_map,
+                self.tenant_id,
+                self.ctx,
+            )
         }
 
         fn cte(
