@@ -21,5 +21,6 @@ mod projection;
 mod triggers;
 mod vector_join;
 
+pub(crate) use aliases::select_output_aliases;
 pub(super) use apply::apply_order_by;
 pub(super) use projection::try_hybrid_from_projection;
