@@ -42,7 +42,7 @@ pub(super) fn apply_set_ops(
                     crate::control::server::pgwire::types::error_map::numeric_code_to_sqlstate(
                         e.code(),
                     );
-                sqlstate_error(code, &e.message())
+                sqlstate_error(code, e.message())
             })? {
             ShapeOutcome::Rows(shaped) => {
                 shape_encode::shaped_query_response(shaped, result_formats)

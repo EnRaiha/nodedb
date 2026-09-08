@@ -534,7 +534,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn sequence_hook_folds_accessor_and_marks_guard_used() {
         let registry = FunctionRegistry::new();
         let expr = SqlExpr::Function {
@@ -587,6 +586,7 @@ mod tests {
         ));
     }
 
+    #[test]
     fn fold_unknown_function_returns_none() {
         let registry = FunctionRegistry::new();
         let expr = SqlExpr::Function {

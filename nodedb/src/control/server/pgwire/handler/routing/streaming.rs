@@ -144,7 +144,7 @@ impl NodeDbPgHandler {
                         .map_err(|e| {
     println!("RTMAP {:?} -> {:?}", e.code(), e.message());
     let code = crate::control::server::pgwire::types::error_map::numeric_code_to_sqlstate(e.code());
-    sqlstate_error(code, &e.message())
+    sqlstate_error(code, e.message())
 })?
                         {
                             ShapeOutcome::Rows(shaped) => {
