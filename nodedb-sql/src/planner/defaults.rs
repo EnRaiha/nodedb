@@ -178,3 +178,93 @@ pub fn sequence_accessor(expr: &str) -> Option<(SequenceAccessor, String)> {
     }
     Some((accessor, name.to_string()))
 }
+
+#[cfg(test)]
+mod sequence_accessor_corpus {
+    use super::{SequenceAccessor, looks_like_sequence_accessor, sequence_accessor};
+
+    fn name(expr: &str) -> Option<String> {
+        sequence_accessor(expr).map(|(_, n)| n)
+    }
+
+    fn acc(expr: &str) -> Option<SequenceAccessor> {
+        sequence_accessor(expr).map(|(a, _)| a)
+    }
+
+    #[test]
+    fn canonical_forms() {
+        assert_eq!(name("nextval('sq')").as_deref(), Some("sq"));
+        assert_eq!(acc("nextval('sq')"), Some(SequenceAccessor::Nextval));
+        assert_eq!(acc("currval('sq')"), Some(SequenceAccessor::Currval));
+        assert_eq!(acc("setval('sq')"), Some(SequenceAccessor::Setval));
+    }
+
+    #[test]
+    fn case_and_quote_variants() {
+        // ASCII case-insensitive on the accessor; name bytes preserved.
+        assert_eq!(name("NEXTVAL('MySeq')").as_deref(), Some("MySeq"));
+        assert_eq!(name("Currval('c')").as_deref(), Some("c"));
+        // Double-quoted names are recognized too.
+        assert_eq!(name("nextval(\"dq\")").as_deref(), Some("dq"));
+        // Whitespace inside the parens is tolerated.
+        assert_eq!(name("nextval( 'padded' )").as_deref(), Some("padded"));
+    }
+
+    #[test]
+    fn tolerant_raw_name_handling() {
+        // Embedded quotes are preserved raw (byte-safe) — never sliced
+        // against a case-folded copy, never panicked.
+        assert_eq!(name("nextval('a''b')").as_deref(), Some("a''b"));
+        // Unicode names survive untouched.
+        assert_eq!(
+            name("nextval('sekuensi\u{1F600}')").as_deref(),
+            Some("sekuensi\u{1F600}")
+        );
+        // Bare identifier (unquoted) is tolerated by the recognizer; the
+        // registry/convert layers decide loudness afterwards.
+        assert_eq!(name("nextval(sq)").as_deref(), Some("sq"));
+    }
+
+    #[test]
+    fn non_accessor_shapes_are_rejected() {
+        assert_eq!(name("nextval('')"), None, "empty name is malformed");
+        // Tolerant by design: extra args ride along in the raw name and the
+        // convert layer raises on registry lookup — still loud, never
+        // silent. (Byte-safe: no slice against a case-folded copy.)
+        assert_eq!(
+            acc("nextval('s', 'x')"),
+            Some(SequenceAccessor::Nextval),
+            "two-arg form is tolerated and resolved loud later"
+        );
+        assert_eq!(
+            name("nextval('s')::text"),
+            None,
+            "cast wrapper is not raw accessor"
+        );
+        assert_eq!(acc("lastval('s')"), None);
+        assert_eq!(acc("nextvalx('s')"), None);
+        assert_eq!(acc("xnextval('s')"), None);
+        assert_eq!(
+            acc("nextval ('s')"),
+            None,
+            "space before paren is not a call"
+        );
+        assert_eq!(acc("nextval"), None);
+        assert_eq!(acc(""), None);
+        assert_eq!(
+            acc("'nextval('s')'"),
+            None,
+            "quoted string literal is not a call"
+        );
+    }
+
+    #[test]
+    fn looks_like_matches_only_call_prefix() {
+        assert!(looks_like_sequence_accessor("nextval('x')"));
+        assert!(looks_like_sequence_accessor("SETVAL( 'x' )"));
+        assert!(!looks_like_sequence_accessor("nextvalx('x')"));
+        assert!(!looks_like_sequence_accessor("xnextval('x')"));
+        assert!(!looks_like_sequence_accessor("nextval ('x')"));
+        assert!(!looks_like_sequence_accessor("nextval"));
+    }
+}
