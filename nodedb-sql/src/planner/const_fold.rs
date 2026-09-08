@@ -388,11 +388,11 @@ pub fn fold_function_call(name: &str, args: &[SqlExpr], registry: &FunctionRegis
     // through to the loud 0A000 classification below.
     let lowered = name.to_lowercase();
     if matches!(lowered.as_str(), "nextval" | "currval" | "setval") {
-        let hook_result: Option<SequenceConstEvalResult> =
-            SEQUENCE_CONST_EVAL.with(|slot| match slot.borrow_mut().as_mut() {
-                Some(hook) => Some(hook(&lowered, &folded_args)),
-                None => None,
-            });
+        let hook_result: Option<SequenceConstEvalResult> = SEQUENCE_CONST_EVAL.with(|slot| {
+            slot.borrow_mut()
+                .as_mut()
+                .map(|hook| hook(&lowered, &folded_args))
+        });
         match hook_result {
             Some(Ok(Some(value))) => return Ok(Some(ndb_to_sql_value(value))),
             Some(Ok(None)) => {}
