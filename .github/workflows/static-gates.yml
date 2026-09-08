@@ -55,3 +55,5 @@ jobs:
         run: |
           python3 scripts/ci/check_advisory_ignores.py --self-test
           python3 scripts/ci/check_advisory_ignores.py
+      - name: Sequence-plane gate
+        run: python3 scripts/ci/check_sequence_plane.py
