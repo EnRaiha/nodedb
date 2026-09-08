@@ -9,7 +9,9 @@
 //! Registered (A1) + dispatch guard (A3) + fold classification (A5) make
 //! every escape loud:
 //!
-//! - FROM-less `SELECT nextval('s')` — folded at plan time → classified.
+//! - Constant contexts (`SELECT nextval('s')` without a FROM clause,
+//!   VALUES cells) evaluate through the CP registry (sequence_const_select);
+//!   a missing sequence raises a plan error naming it.
 //! - SELECT list / WHERE / ORDER BY over a table — row-scope eval.
 //! - VALUES / INSERT..SELECT — expression eval on the write path.
 //! - Derived-table constant expressions — same row-scope evaluator
@@ -33,9 +35,13 @@ async fn setup_kv(server: &TestServer) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fromless_select_nextval_raises_0a000() {
+async fn fromless_missing_sequence_raises_plan_error() {
+    // Constant contexts (no FROM clause) gain real registry evaluation
+    // (see sequence_const_select): nextval('existing') advances and a
+    // missing sequence raises the registry-miss plan error naming it —
+    // never a silent NULL. 0A000 remains reserved for row-scope contexts.
     let server = TestServer::start().await;
-    server.expect_error("SELECT nextval('nope')", "0A000").await;
+    server.expect_error("SELECT nextval('nope')", "42601").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -91,11 +97,11 @@ async fn order_by_nextval_raises_0a000() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn values_nextval_raises_0a000() {
+async fn values_missing_sequence_raises_plan_error() {
     let server = TestServer::start().await;
     setup_kv(&server).await;
     server
-        .expect_error("INSERT INTO seqctx (id) VALUES (nextval('nope'))", "0A000")
+        .expect_error("INSERT INTO seqctx (id) VALUES (nextval('nope'))", "42601")
         .await;
 }
 
@@ -126,8 +132,11 @@ async fn derived_constant_errors_stay_loud() {
     server
         .expect_error("SELECT * FROM (SELECT mod(5, 0) AS v) d", "22012")
         .await;
+    // A derived-table constant cell is a constant context too: the accessor
+    // now evaluates through the CP registry, so a missing sequence raises
+    // the registry-miss plan error instead of 0A000.
     server
-        .expect_error("SELECT * FROM (SELECT nextval('nope') AS v) d", "0A000")
+        .expect_error("SELECT * FROM (SELECT nextval('nope') AS v) d", "42601")
         .await;
 }
 

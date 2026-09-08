@@ -47,6 +47,48 @@ pub fn default_registry() -> &'static FunctionRegistry {
 }
 
 /// Convenience wrapper around [`fold_constant`] using the default registry.
+/// CP-side sequence evaluator for constant (row-less) contexts.
+///
+/// `SELECT nextval('s')` without a FROM clause, an explicit
+/// `VALUES (nextval('s'))` cell, or any other accessor whose arguments all
+/// folded resolves HERE, at plan time — there is no row scope downstream
+/// that could evaluate it. `nodedb-sql` stays registry-free: the control
+/// plane installs a closure over its `SequenceRegistry` for the duration of
+/// one planning call via [`install_sequence_const_eval`], and uninstalls it
+/// immediately after. Absent a hook, accessors in constant contexts raise
+/// the existing loud `FeatureNotSupported` (0A000) instead of silently
+/// folding to NULL.
+use std::cell::RefCell;
+
+thread_local! {
+    static SEQUENCE_CONST_EVAL: RefCell<Option<SequenceConstEvalFn>> =
+        const { RefCell::new(None) };
+}
+
+/// Result of one accessor evaluation inside a constant context.
+/// `Ok(None)` means "not handled — keep the loud default path".
+pub type SequenceConstEvalResult = Result<Option<Value>, String>;
+
+/// Closure installed by the control plane: `(accessor, folded_args) -> result`.
+pub type SequenceConstEvalFn = Box<dyn FnMut(&str, &[Value]) -> SequenceConstEvalResult>;
+
+/// Restores the previous hook on drop (nesting-safe).
+pub struct SequenceConstEvalGuard {
+    previous: Option<SequenceConstEvalFn>,
+}
+
+impl Drop for SequenceConstEvalGuard {
+    fn drop(&mut self) {
+        SEQUENCE_CONST_EVAL.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
+
+/// Install a sequence evaluator for the rest of this planning call.
+pub fn install_sequence_const_eval(f: SequenceConstEvalFn) -> SequenceConstEvalGuard {
+    let previous = SEQUENCE_CONST_EVAL.with(|slot| slot.borrow_mut().replace(f));
+    SequenceConstEvalGuard { previous }
+}
+
 pub fn fold_constant_default(expr: &SqlExpr) -> FoldResult {
     fold_constant(expr, default_registry())
 }
@@ -339,7 +381,26 @@ pub fn fold_function_call(name: &str, args: &[SqlExpr], registry: &FunctionRegis
     // clause; `SELECT mod(5, 0)` has no row scope and became NULL.
     // Exhaustive on purpose: a new `EvalError` variant must be classified
     // here rather than defaulting to "defer to a runtime that may not exist".
-    match nodedb_query::functions::eval_function(&name.to_lowercase(), &folded_args) {
+    //
+    // Sequence accessors are the one exception: they are stateful (CP
+    // registry), so when the control plane installed a constant-context
+    // evaluator we hand the folded call to it first. `Ok(None)` falls
+    // through to the loud 0A000 classification below.
+    let lowered = name.to_lowercase();
+    if matches!(lowered.as_str(), "nextval" | "currval" | "setval") {
+        let hook_result: Option<SequenceConstEvalResult> =
+            SEQUENCE_CONST_EVAL.with(|slot| match slot.borrow_mut().as_mut() {
+                Some(hook) => Some(hook(&lowered, &folded_args)),
+                None => None,
+            });
+        match hook_result {
+            Some(Ok(Some(value))) => return Ok(Some(ndb_to_sql_value(value))),
+            Some(Ok(None)) => {}
+            Some(Err(detail)) => return Err(SqlError::Unsupported { detail }),
+            None => {}
+        }
+    }
+    match nodedb_query::functions::eval_function(&lowered, &folded_args) {
         Ok(result) => Ok(Some(ndb_to_sql_value(result))),
         Err(nodedb_query::EvalError::DivisionByZero) => Err(SqlError::DivisionByZero),
         Err(nodedb_query::EvalError::FeatureNotSupported { name }) => {

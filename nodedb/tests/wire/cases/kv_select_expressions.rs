@@ -17,9 +17,7 @@ use crate::harness::TestServer;
 
 async fn setup(server: &TestServer) {
     server
-        .exec(
-            "CREATE COLLECTION kvsel (id BIGINT PRIMARY KEY, v TEXT) WITH (engine = 'kv')",
-        )
+        .exec("CREATE COLLECTION kvsel (id BIGINT PRIMARY KEY, v TEXT) WITH (engine = 'kv')")
         .await
         .unwrap();
     server
@@ -38,9 +36,15 @@ async fn scalar_expressions_evaluate_per_row() {
         .await
         .expect("rows");
     assert_eq!(rows.len(), 2, "{rows:?}");
-    let u: Vec<_> = rows.iter().map(|r| r.get("u").map(|s| s.as_str())).collect();
+    let u: Vec<_> = rows
+        .iter()
+        .map(|r| r.get("u").map(|s| s.as_str()))
+        .collect();
     assert_eq!(u, vec![Some("HELLO"), Some("WORLD")], "{rows:?}");
-    let s: Vec<_> = rows.iter().map(|r| r.get("s").map(|s| s.as_str())).collect();
+    let s: Vec<_> = rows
+        .iter()
+        .map(|r| r.get("s").map(|s| s.as_str()))
+        .collect();
     assert_eq!(s, vec![Some("2"), Some("2")], "{rows:?}");
 }
 
@@ -66,7 +70,9 @@ async fn plain_projection_still_returns_stored_columns() {
         .expect("rows");
     assert_eq!(rows.len(), 2, "{rows:?}");
     assert_eq!(
-        rows.iter().map(|r| r.get("v").map(|s| s.as_str())).collect::<Vec<_>>(),
+        rows.iter()
+            .map(|r| r.get("v").map(|s| s.as_str()))
+            .collect::<Vec<_>>(),
         vec![Some("hello"), Some("world")]
     );
 }

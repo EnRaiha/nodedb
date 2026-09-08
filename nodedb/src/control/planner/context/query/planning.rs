@@ -75,6 +75,59 @@ pub struct PlanSqlWithRlsParams<'a> {
 }
 
 impl QueryContext {
+    /// Install the CP-side sequence evaluator for one planning call, when a
+    /// sequence registry is available. Constant contexts (`SELECT nextval('s')`
+    /// without a FROM clause, explicit `VALUES (nextval('s'))` cells) fold at
+    /// plan time inside `nodedb-sql`, which has no registry of its own — this
+    /// hook hands those folded calls back to the control-plane registry so the
+    /// accessor advances exactly once per constant evaluation. Guard drops at
+    /// the end of the enclosing planning call; absent a registry the hook is
+    /// simply not installed and accessors keep their loud 0A000 behaviour.
+    fn sequence_const_eval_guard(
+        &self,
+        database_id: crate::types::DatabaseId,
+        tenant_id: crate::types::TenantId,
+    ) -> Option<nodedb_sql::planner::const_fold::SequenceConstEvalGuard> {
+        self.sequence_registry.as_ref().map(|registry| {
+            let registry = Arc::clone(registry);
+            let db = database_id.as_u64();
+            let tenant = tenant_id.as_u64();
+            nodedb_sql::planner::const_fold::install_sequence_const_eval(Box::new(
+                move |accessor: &str, args: &[nodedb_types::Value]| {
+                    let name = match args.first() {
+                        Some(nodedb_types::Value::String(s)) => s.clone(),
+                        _ => {
+                            return Err(format!(
+                                "{accessor}() in a constant context expects a sequence name literal"
+                            ));
+                        }
+                    };
+                    let value = match accessor {
+                        "nextval" => registry.nextval(db, tenant, &name),
+                        "currval" => registry.currval(db, tenant, &name),
+                        "setval" => {
+                            let v = match args.get(1) {
+                                Some(nodedb_types::Value::Integer(i)) => *i,
+                                _ => {
+                                    return Err(
+                                        "setval() in a constant context expects (name, value)"
+                                            .into(),
+                                    );
+                                }
+                            };
+                            registry.setval(db, tenant, &name, v)
+                        }
+                        _ => return Ok(None),
+                    };
+                    match value {
+                        Ok(i) => Ok(Some(nodedb_types::Value::Integer(i))),
+                        Err(e) => Err(format!("{accessor}('{name}'): {e}")),
+                    }
+                },
+            ))
+        })
+    }
+
     /// Core planning via nodedb-sql: parse → plan → optimize → convert.
     ///
     /// PRIVATE, and it stays private. Its result is a task set with no policy
@@ -131,6 +184,7 @@ impl QueryContext {
         } else {
             inputs.build_adapter(tenant_id.as_u64(), database_id)
         };
+        let _sequence_guard = self.sequence_const_eval_guard(database_id, tenant_id);
         let plans =
             nodedb_sql::plan_sql(sql, &catalog).map_err(|e| map_plan_error(e, tenant_id))?;
         // Fold catalog-dependent cast expressions (::regclass, ::regtype) to
@@ -401,6 +455,7 @@ impl QueryContext {
         // `plan_with_nodedb_sql_for_purpose`. Its recorded version set is returned to the
         // caller so parameterized plans participate in descriptor admission.
         let catalog = inputs.build_adapter(tenant_id.as_u64(), database_id);
+        let _sequence_guard = self.sequence_const_eval_guard(database_id, tenant_id);
         let raw_plans = nodedb_sql::plan_sql_with_params(sql, params, &catalog)
             .map_err(|error| map_plan_error(error, tenant_id))?;
         let plans: Vec<_> = raw_plans
