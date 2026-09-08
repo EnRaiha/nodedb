@@ -184,7 +184,7 @@ impl QueryContext {
         } else {
             inputs.build_adapter(tenant_id.as_u64(), database_id)
         };
-        let _sequence_guard = self.sequence_const_eval_guard(database_id, tenant_id);
+        let sequence_guard = self.sequence_const_eval_guard(database_id, tenant_id);
         let plans =
             nodedb_sql::plan_sql(sql, &catalog).map_err(|e| map_plan_error(e, tenant_id))?;
         // Fold catalog-dependent cast expressions (::regclass, ::regtype) to
@@ -254,6 +254,13 @@ impl QueryContext {
             nodedb_sql::types::PlanCacheEligibility::Cacheable
         } else {
             nodedb_sql::types::PlanCacheEligibility::DataDependent
+        };
+        // A plan that folded a stateful sequence accessor must never be
+        // cached: the folded literal would replay the same value forever.
+        let cache_eligibility = if sequence_guard.as_ref().is_some_and(|g| g.used()) {
+            nodedb_sql::types::PlanCacheEligibility::DataDependent
+        } else {
+            cache_eligibility
         };
         let tasks = crate::control::planner::sql_plan_convert::convert(&plans, tenant_id, &ctx)?;
         Ok((tasks, output_schema, version_set, cache_eligibility))
@@ -455,7 +462,7 @@ impl QueryContext {
         // `plan_with_nodedb_sql_for_purpose`. Its recorded version set is returned to the
         // caller so parameterized plans participate in descriptor admission.
         let catalog = inputs.build_adapter(tenant_id.as_u64(), database_id);
-        let _sequence_guard = self.sequence_const_eval_guard(database_id, tenant_id);
+        let sequence_guard = self.sequence_const_eval_guard(database_id, tenant_id);
         let raw_plans = nodedb_sql::plan_sql_with_params(sql, params, &catalog)
             .map_err(|error| map_plan_error(error, tenant_id))?;
         let plans: Vec<_> = raw_plans

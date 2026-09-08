@@ -57,6 +57,31 @@ async fn values_cells_advance_per_row() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multiple_accessors_in_one_statement_advance_in_order() {
+    let server = TestServer::start().await;
+    server.exec("CREATE SEQUENCE csel_mseq").await.unwrap();
+    let rows = server
+        .query_named_rows("SELECT nextval('csel_mseq') AS a, nextval('csel_mseq') AS b")
+        .await
+        .expect("rows");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].get("a").map(|s| s.as_str()), Some("1"), "{rows:?}");
+    assert_eq!(rows[0].get("b").map(|s| s.as_str()), Some("2"), "{rows:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nextval_continues_after_setval() {
+    let server = TestServer::start().await;
+    server.exec("CREATE SEQUENCE csel_cseq").await.unwrap();
+    server.exec("SELECT setval('csel_cseq', 41)").await.unwrap();
+    let rows = server
+        .query_named_rows("SELECT nextval('csel_cseq') AS n")
+        .await
+        .expect("rows");
+    assert_eq!(rows[0].get("n").map(|s| s.as_str()), Some("42"), "{rows:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn setval_const_expr_returns_value() {
     let server = TestServer::start().await;
     server.exec("CREATE SEQUENCE csel_sseq").await.unwrap();

@@ -61,7 +61,7 @@ pub fn default_registry() -> &'static FunctionRegistry {
 use std::cell::RefCell;
 
 thread_local! {
-    static SEQUENCE_CONST_EVAL: RefCell<Option<SequenceConstEvalFn>> =
+    static SEQUENCE_CONST_EVAL: RefCell<Option<SequenceConstEvalSlot>> =
         const { RefCell::new(None) };
 }
 
@@ -72,9 +72,27 @@ pub type SequenceConstEvalResult = Result<Option<Value>, String>;
 /// Closure installed by the control plane: `(accessor, folded_args) -> result`.
 pub type SequenceConstEvalFn = Box<dyn FnMut(&str, &[Value]) -> SequenceConstEvalResult>;
 
+struct SequenceConstEvalSlot {
+    hook: SequenceConstEvalFn,
+    /// Set when the hook actually produced a value. Planning must not cache
+    /// a plan that folded a stateful accessor: the cached literal would
+    /// replay the same sequence value for every subsequent execution.
+    used: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
 /// Restores the previous hook on drop (nesting-safe).
 pub struct SequenceConstEvalGuard {
-    previous: Option<SequenceConstEvalFn>,
+    previous: Option<SequenceConstEvalSlot>,
+    used: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl SequenceConstEvalGuard {
+    /// Whether the installed evaluator produced at least one value during
+    /// the guarded planning call. Callers must force the plan
+    /// non-cacheable in that case.
+    pub fn used(&self) -> bool {
+        self.used.get()
+    }
 }
 
 impl Drop for SequenceConstEvalGuard {
@@ -85,8 +103,14 @@ impl Drop for SequenceConstEvalGuard {
 
 /// Install a sequence evaluator for the rest of this planning call.
 pub fn install_sequence_const_eval(f: SequenceConstEvalFn) -> SequenceConstEvalGuard {
-    let previous = SEQUENCE_CONST_EVAL.with(|slot| slot.borrow_mut().replace(f));
-    SequenceConstEvalGuard { previous }
+    let used = std::rc::Rc::new(std::cell::Cell::new(false));
+    let previous = SEQUENCE_CONST_EVAL.with(|slot| {
+        slot.borrow_mut().replace(SequenceConstEvalSlot {
+            hook: f,
+            used: std::rc::Rc::clone(&used),
+        })
+    });
+    SequenceConstEvalGuard { previous, used }
 }
 
 pub fn fold_constant_default(expr: &SqlExpr) -> FoldResult {
@@ -389,9 +413,17 @@ pub fn fold_function_call(name: &str, args: &[SqlExpr], registry: &FunctionRegis
     let lowered = name.to_lowercase();
     if matches!(lowered.as_str(), "nextval" | "currval" | "setval") {
         let hook_result: Option<SequenceConstEvalResult> = SEQUENCE_CONST_EVAL.with(|slot| {
-            slot.borrow_mut()
-                .as_mut()
-                .map(|hook| hook(&lowered, &folded_args))
+            let mut slot = slot.borrow_mut();
+            match slot.as_mut() {
+                Some(s) => {
+                    let result = (s.hook)(&lowered, &folded_args);
+                    if matches!(result, Ok(Some(_))) {
+                        s.used.set(true);
+                    }
+                    Some(result)
+                }
+                None => None,
+            }
         });
         match hook_result {
             Some(Ok(Some(value))) => return Ok(Some(ndb_to_sql_value(value))),
@@ -502,6 +534,59 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn sequence_hook_folds_accessor_and_marks_guard_used() {
+        let registry = FunctionRegistry::new();
+        let expr = SqlExpr::Function {
+            name: "nextval".into(),
+            args: vec![SqlExpr::Literal(SqlValue::String("s".into()))],
+            distinct: false,
+        };
+        // No hook: loud 0A000 classification (existing contract).
+        assert!(matches!(
+            fold_constant(&expr, &registry),
+            Err(SqlError::FeatureNotSupported { .. })
+        ));
+        // Hook installed: value produced, guard reports use (plan must not
+        // be admitted to the physical-plan cache).
+        let guard = install_sequence_const_eval(Box::new(|name, args| {
+            assert_eq!(name, "nextval");
+            let [Value::String(s)] = args else {
+                panic!("expected one string arg, got {args:?}");
+            };
+            assert_eq!(s, "s");
+            Ok(Some(Value::Integer(7)))
+        }));
+        assert_eq!(
+            fold_constant(&expr, &registry).unwrap(),
+            Some(SqlValue::Int(7))
+        );
+        assert!(guard.used());
+        drop(guard);
+        // Guard dropped: loud classification again.
+        assert!(matches!(
+            fold_constant(&expr, &registry),
+            Err(SqlError::FeatureNotSupported { .. })
+        ));
+    }
+
+    #[test]
+    fn sequence_hook_errors_surface_as_unsupported() {
+        let registry = FunctionRegistry::new();
+        let expr = SqlExpr::Function {
+            name: "nextval".into(),
+            args: vec![SqlExpr::Literal(SqlValue::String("missing".into()))],
+            distinct: false,
+        };
+        let _guard = install_sequence_const_eval(Box::new(|_name, _args| {
+            Err("sequence \"missing\" does not exist".into())
+        }));
+        assert!(matches!(
+            fold_constant(&expr, &registry),
+            Err(SqlError::Unsupported { detail }) if detail.contains("missing")
+        ));
+    }
+
     fn fold_unknown_function_returns_none() {
         let registry = FunctionRegistry::new();
         let expr = SqlExpr::Function {
