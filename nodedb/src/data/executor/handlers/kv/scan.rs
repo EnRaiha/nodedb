@@ -22,6 +22,8 @@ pub(in crate::data::executor) struct KvScanHandlerParams<'a> {
     pub filters: &'a [u8],
     pub sort_keys: &'a [nodedb_physical::physical_plan::SortKeySpec],
     pub surrogate_ceiling: Option<u32>,
+    pub projection: &'a [String],
+    pub computed_columns: &'a [u8],
 }
 
 impl CoreLoop {
@@ -40,6 +42,8 @@ impl CoreLoop {
             filters,
             sort_keys,
             surrogate_ceiling,
+            projection,
+            computed_columns,
         } = params;
 
         debug!(core = self.core_id, %collection, count, "kv scan");
@@ -153,6 +157,30 @@ impl CoreLoop {
                 super::super::sort_utils::sort_msgpack_rows(&mut result_entries, sort_keys)
         {
             return self.response_error(task, crate::Error::from(e));
+        }
+
+        // Projection + computed-column parity with the document scan path
+        // (same wire format, same evaluator). Without this, SELECT-list
+        // expressions over kv collections surfaced as NULL at response
+        // shaping (`SELECT 1 + 1 FROM kv` returned an empty column), and
+        // sequence accessors could not raise their typed 0A000 here.
+        if !projection.is_empty() || !computed_columns.is_empty() {
+            let computed_cols: Vec<crate::bridge::expr_eval::ComputedColumn> =
+                if computed_columns.is_empty() {
+                    Vec::new()
+                } else {
+                    zerompk::from_msgpack(computed_columns).unwrap_or_default()
+                };
+            for entry in result_entries.iter_mut() {
+                match crate::data::executor::handlers::document::read::projection::
+                    apply_projection_msgpack(entry, &computed_cols, projection)
+                {
+                    Ok(out) => *entry = out,
+                    Err(e) => {
+                        return self.response_error(task, crate::Error::from(e));
+                    }
+                }
+            }
         }
 
         // Build response as flat msgpack array — same format as document/columnar scan.

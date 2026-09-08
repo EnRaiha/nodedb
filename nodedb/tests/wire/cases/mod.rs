@@ -139,6 +139,7 @@ mod schema_visibility_barrier;
 mod schemaless_bitemporal_audit_query;
 mod scope_grant_conditions;
 mod scope_quota_enforcement;
+mod kv_select_expressions;
 mod sequence_default_all_engines;
 mod sequence_default_typed;
 mod sequence_expression_contexts;
