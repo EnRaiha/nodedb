@@ -37,8 +37,13 @@ pub(super) fn apply_set_ops(
     };
     Ok(
         match compose::shape_payload_no_plan(&merged, PlanKind::MultiRow, projection, redaction)
-            .map_err(|e| sqlstate_error("XX000", e.message()))?
-        {
+            .map_err(|e| {
+                let code =
+                    crate::control::server::pgwire::types::error_map::numeric_code_to_sqlstate(
+                        e.code(),
+                    );
+                sqlstate_error(code, &e.message())
+            })? {
             ShapeOutcome::Rows(shaped) => {
                 shape_encode::shaped_query_response(shaped, result_formats)
             }

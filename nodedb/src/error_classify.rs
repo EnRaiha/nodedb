@@ -152,7 +152,10 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         Error::AmbiguousColumn { column } => NodeDbError::ambiguous_column(column.clone()),
         Error::UnknownStrictField { column, .. } => NodeDbError::undefined_column(column.clone()),
         Error::DivisionByZero => NodeDbError::division_by_zero(),
-        Error::FeatureNotSupported { name } => NodeDbError::feature_not_supported(name.clone()),
+        Error::FeatureNotSupported { name } => {
+            println!("CLASSIFY feature {name}");
+            NodeDbError::feature_not_supported(name.clone())
+        }
         Error::InvalidLimitValue { clause, value } => {
             NodeDbError::invalid_limit_value(*clause, value.clone())
         }

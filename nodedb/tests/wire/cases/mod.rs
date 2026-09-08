@@ -144,6 +144,7 @@ mod sequence_const_select;
 mod sequence_default_all_engines;
 mod sequence_default_typed;
 mod sequence_expression_contexts;
+mod sequence_matrix;
 mod serial_sequence_rollback_no_leak;
 mod session_handle_security;
 mod session_plan_cache_permission_tree_revoke;

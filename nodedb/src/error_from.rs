@@ -202,6 +202,7 @@ impl From<nodedb_cluster::rpc_codec::TypedClusterError> for Error {
             TypedClusterError::DataPlane { code } => Error::DataPlane(code.into()),
             TypedClusterError::Internal { code, message } => {
                 // Legacy or unknown codes retain their message without panicking.
+                println!("TCINTERNAL code={code} msg={message}");
                 match u16::try_from(code) {
                     Ok(code_u16) if code_u16 != 0 => Error::RemoteTyped {
                         code: nodedb_types::error::ErrorCode(code_u16),

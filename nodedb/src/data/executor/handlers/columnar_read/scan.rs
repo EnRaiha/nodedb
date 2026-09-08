@@ -326,8 +326,9 @@ impl CoreLoop {
                         // `stage_columnar_dml.rs`'s identical call site,
                         // which hardcodes the same typed code rather than
                         // collapsing to `Internal`/`XX000`.
-                        Err(_e) => {
-                            return self.response_error(task, ErrorCode::DivisionByZero);
+                        Err(e) => {
+                            return self
+                                .response_error(task, ErrorCode::from(crate::Error::from(e)));
                         }
                     }
                 }

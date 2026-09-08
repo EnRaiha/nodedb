@@ -171,15 +171,16 @@ pub(super) fn execute_grouping_sets(
 
             let group_key = match msgpack_scan::build_group_key(raw, &active_specs) {
                 Ok(k) => k,
-                Err(_e) => return core.response_error(task, ErrorCode::DivisionByZero),
+                Err(e) => {
+                    return core.response_error(task, ErrorCode::from(crate::Error::from(e)));
+                }
             };
-            if groups
+            if let Err(e) = groups
                 .entry(group_key)
                 .or_insert_with(|| GroupState::new(&real_agg_slice))
                 .feed(&real_agg_slice, raw)
-                .is_err()
             {
-                return core.response_error(task, ErrorCode::DivisionByZero);
+                return core.response_error(task, ErrorCode::from(crate::Error::from(e)));
             }
         }
 
@@ -190,8 +191,9 @@ pub(super) fn execute_grouping_sets(
             for raw in &owned_docs {
                 match ScanFilter::all_match_binary(&filter_predicates, raw) {
                     Ok(true) => {
-                        if grand.feed(&real_agg_slice, raw).is_err() {
-                            return core.response_error(task, ErrorCode::DivisionByZero);
+                        if let Err(e) = grand.feed(&real_agg_slice, raw) {
+                            return core
+                                .response_error(task, ErrorCode::from(crate::Error::from(e)));
                         }
                     }
                     Ok(false) => {}
