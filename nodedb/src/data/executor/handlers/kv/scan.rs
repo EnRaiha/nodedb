@@ -139,8 +139,8 @@ impl CoreLoop {
                 ) {
                     Ok(true) => {}
                     Ok(false) => continue,
-                    Err(_e) => {
-                        return self.response_error(task, ErrorCode::DivisionByZero);
+                    Err(e) => {
+                        return self.response_error(task, ErrorCode::from(crate::Error::from(e)));
                     }
                 }
             }

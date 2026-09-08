@@ -65,7 +65,7 @@ impl CoreLoop {
                     match ScanFilter::all_match_binary(&predicates, &row) {
                         Ok(true) => {}
                         Ok(false) => continue,
-                        Err(_e) => return Err(ErrorCode::DivisionByZero),
+                        Err(e) => return Err(ErrorCode::from(crate::Error::from(e))),
                     }
                 }
                 matched.push((key, value));

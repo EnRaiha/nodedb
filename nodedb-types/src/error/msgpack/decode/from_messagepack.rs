@@ -143,6 +143,10 @@ impl<'a> FromMessagePack<'a> for ErrorDetails {
                 skip_fields(reader, field_count)?;
                 Ok(ErrorDetails::DivisionByZero)
             }
+            TAG_FEATURE_NOT_SUPPORTED => {
+                let (name,) = read1_str(reader, field_count)?;
+                Ok(ErrorDetails::FeatureNotSupported { name })
+            }
             TAG_INVALID_LIMIT_VALUE => {
                 let (clause, value) = read2_str(reader, field_count)?;
                 Ok(ErrorDetails::InvalidLimitValue { clause, value })

@@ -342,6 +342,11 @@ pub fn fold_function_call(name: &str, args: &[SqlExpr], registry: &FunctionRegis
     match nodedb_query::functions::eval_function(&name.to_lowercase(), &folded_args) {
         Ok(result) => Ok(Some(ndb_to_sql_value(result))),
         Err(nodedb_query::EvalError::DivisionByZero) => Err(SqlError::DivisionByZero),
+        Err(nodedb_query::EvalError::FeatureNotSupported { name }) => {
+            Err(SqlError::FeatureNotSupported {
+                name: name.to_string(),
+            })
+        }
     }
 }
 

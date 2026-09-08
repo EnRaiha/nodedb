@@ -19,5 +19,6 @@ pub mod mirror;
 pub mod move_tenant;
 pub mod read_query_auth;
 pub mod remote_code;
+pub mod sequence_accessor;
 pub mod sync_infra;
 pub mod write_path;

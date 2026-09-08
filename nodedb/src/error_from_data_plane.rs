@@ -113,6 +113,7 @@ pub(crate) fn data_plane_code_to_public(code: ErrorCode) -> NodeDbError {
         ErrorCode::UndefinedColumn { column } => NodeDbError::undefined_column(column),
         ErrorCode::Unsupported { detail } => NodeDbError::bad_request(detail),
         ErrorCode::DivisionByZero => NodeDbError::division_by_zero(),
+        ErrorCode::FeatureNotSupported { name } => NodeDbError::feature_not_supported(name),
         ErrorCode::TxnOverlayMemoryExceeded { limit } => NodeDbError::bad_request(format!(
             "transaction staging overlay exceeded its {limit}-byte per-core budget; \
              split the transaction into smaller batches"

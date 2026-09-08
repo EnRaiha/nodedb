@@ -57,6 +57,9 @@ impl ErrorCode {
     pub const UNDEFINED_FUNCTION: Self = Self(1203);
     /// Expression evaluation divided or took a modulus by zero.
     pub const DIVISION_BY_ZERO: Self = Self(1204);
+    /// A registered sequence accessor was evaluated in a SQL expression
+    /// context (stateful accessors are DEFAULT-scoped only). SQLSTATE 0A000.
+    pub const FEATURE_NOT_SUPPORTED: Self = Self(1208);
     /// A LIMIT/OFFSET/FETCH bound resolved outside `[0, usize::MAX]`.
     pub const INVALID_LIMIT_VALUE: Self = Self(1205);
     /// A column reference names no column of any relation in scope.

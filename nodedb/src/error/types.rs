@@ -306,6 +306,16 @@ pub enum Error {
     #[error("division by zero")]
     DivisionByZero,
 
+    /// A registered sequence accessor (`nextval`/`currval`/`setval`) was
+    /// evaluated in a SQL expression context (fold or row scope).
+    /// Accessors are stateful and CP-side only — valid as column DEFAULTs.
+    /// Rendered as SQLSTATE `0A000` (feature_not_supported) at the pgwire
+    /// layer.
+    #[error(
+        "sequence accessors are supported as column DEFAULTs          (DEFAULT nextval('s')); SELECT-time evaluation is not yet wired"
+    )]
+    FeatureNotSupported { name: String },
+
     /// A LIMIT/OFFSET/FETCH bound did not resolve to `[0, usize::MAX]`.
     /// The pgwire layer renders it as SQLSTATE `2201W`.
     #[error("invalid {clause} value: {value}")]

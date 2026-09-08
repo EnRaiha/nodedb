@@ -24,6 +24,9 @@ impl From<nodedb_query::EvalError> for Error {
     fn from(e: nodedb_query::EvalError) -> Self {
         match e {
             nodedb_query::EvalError::DivisionByZero => Self::DivisionByZero,
+            nodedb_query::EvalError::FeatureNotSupported { name } => Self::FeatureNotSupported {
+                name: name.to_string(),
+            },
         }
     }
 }

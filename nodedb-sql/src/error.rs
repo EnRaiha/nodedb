@@ -19,6 +19,15 @@ pub enum SqlError {
     #[error("function {name}(...) does not exist")]
     UndefinedFunction { name: String },
 
+    /// A registered sequence accessor (`nextval`/`currval`/`setval`) was
+    /// const-folded or row-evaluated. Accessors are stateful and CP-side
+    /// only — valid as column DEFAULTs, invalid in any SQL expression
+    /// context. Maps to SQLSTATE 0A000 (feature not supported).
+    #[error(
+        "sequence accessors are supported as column DEFAULTs          (DEFAULT nextval('s')); SELECT-time evaluation is not yet wired"
+    )]
+    FeatureNotSupported { name: String },
+
     #[error("unknown column '{column}' in table '{table}'")]
     UnknownColumn { table: String, column: String },
 

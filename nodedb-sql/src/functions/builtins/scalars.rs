@@ -12,6 +12,7 @@ mod math;
 mod misc;
 mod pg_fts;
 mod pg_json;
+mod sequence;
 mod spatial;
 mod string;
 mod vector;
@@ -22,6 +23,7 @@ pub(super) fn scalar_functions() -> Vec<FunctionMeta> {
     let mut fns = Vec::new();
     fns.extend(vector::vector_functions());
     fns.extend(spatial::spatial_functions());
+    fns.extend(sequence::sequence_functions());
     fns.extend(datetime::datetime_functions());
     fns.extend(doc::doc_functions());
     fns.extend(string::string_functions());
