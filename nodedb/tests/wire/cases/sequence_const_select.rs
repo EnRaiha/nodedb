@@ -57,6 +57,49 @@ async fn values_cells_advance_per_row() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn update_set_accessor_raises_0a000() {
+    // Row-scope DML expression: accessors must stay loud (0A000), never a
+    // once-folded value silently applied to every row.
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE COLLECTION upst (id BIGINT PRIMARY KEY, v TEXT) WITH (engine = 'document_schemaless')")
+        .await
+        .unwrap();
+    server
+        .exec("INSERT INTO upst (id, v) VALUES (1, 'a')")
+        .await
+        .unwrap();
+    server
+        .expect_error("UPDATE upst SET v = nextval('upst_missing')", "0A000")
+        .await;
+    server
+        .expect_error(
+            "INSERT INTO upst (id, v) VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET v = nextval('upst_missing')",
+            "0A000",
+        )
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explain_plans_without_advancing_the_sequence() {
+    let server = TestServer::start().await;
+    server.exec("CREATE SEQUENCE csel_eseq").await.unwrap();
+    server
+        .exec("EXPLAIN SELECT nextval('csel_eseq')")
+        .await
+        .expect("EXPLAIN must plan the accessor without executing it");
+    let rows = server
+        .query_named_rows("SELECT nextval('csel_eseq') AS n")
+        .await
+        .expect("rows");
+    assert_eq!(
+        rows[0].get("n").map(|s| s.as_str()),
+        Some("1"),
+        "EXPLAIN must not advance the sequence: {rows:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multiple_accessors_in_one_statement_advance_in_order() {
     let server = TestServer::start().await;
     server.exec("CREATE SEQUENCE csel_mseq").await.unwrap();

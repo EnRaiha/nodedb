@@ -87,7 +87,20 @@ impl QueryContext {
         &self,
         database_id: crate::types::DatabaseId,
         tenant_id: crate::types::TenantId,
+        purpose: PlanningPurpose,
     ) -> Option<nodedb_sql::planner::const_fold::SequenceConstEvalGuard> {
+        // Metadata-purpose planning (EXPLAIN, catalog inspection) must not
+        // advance the registry: PostgreSQL plans EXPLAIN without executing,
+        // so the folded accessor stands in as a dummy literal here.
+        if purpose == PlanningPurpose::Metadata {
+            return Some(
+                nodedb_sql::planner::const_fold::install_sequence_const_eval(Box::new(
+                    |_accessor: &str, _args: &[nodedb_types::Value]| {
+                        Ok(Some(nodedb_types::Value::Integer(0)))
+                    },
+                )),
+            );
+        }
         self.sequence_registry.as_ref().map(|registry| {
             let registry = Arc::clone(registry);
             let db = database_id.as_u64();
@@ -184,7 +197,7 @@ impl QueryContext {
         } else {
             inputs.build_adapter(tenant_id.as_u64(), database_id)
         };
-        let sequence_guard = self.sequence_const_eval_guard(database_id, tenant_id);
+        let sequence_guard = self.sequence_const_eval_guard(database_id, tenant_id, purpose);
         let plans =
             nodedb_sql::plan_sql(sql, &catalog).map_err(|e| map_plan_error(e, tenant_id))?;
         // Fold catalog-dependent cast expressions (::regclass, ::regtype) to
@@ -466,7 +479,8 @@ impl QueryContext {
         // cache (only the four-tuple planning path does, and it applies the
         // used-guard override), so the guard here only needs to stay alive
         // for the duration of planning.
-        let _sequence_guard = self.sequence_const_eval_guard(database_id, tenant_id);
+        let _sequence_guard =
+            self.sequence_const_eval_guard(database_id, tenant_id, PlanningPurpose::Execute);
         let raw_plans = nodedb_sql::plan_sql_with_params(sql, params, &catalog)
             .map_err(|error| map_plan_error(error, tenant_id))?;
         let plans: Vec<_> = raw_plans
