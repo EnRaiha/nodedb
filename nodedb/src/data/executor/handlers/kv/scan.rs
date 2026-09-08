@@ -177,7 +177,7 @@ impl CoreLoop {
                 {
                     Ok(out) => *entry = out,
                     Err(e) => {
-                        return self.response_error(task, crate::Error::from(e));
+                        return self.response_error(task, e);
                     }
                 }
             }

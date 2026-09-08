@@ -462,7 +462,11 @@ impl QueryContext {
         // `plan_with_nodedb_sql_for_purpose`. Its recorded version set is returned to the
         // caller so parameterized plans participate in descriptor admission.
         let catalog = inputs.build_adapter(tenant_id.as_u64(), database_id);
-        let sequence_guard = self.sequence_const_eval_guard(database_id, tenant_id);
+        // The parameterized path never admits plans to the physical-plan
+        // cache (only the four-tuple planning path does, and it applies the
+        // used-guard override), so the guard here only needs to stay alive
+        // for the duration of planning.
+        let _sequence_guard = self.sequence_const_eval_guard(database_id, tenant_id);
         let raw_plans = nodedb_sql::plan_sql_with_params(sql, params, &catalog)
             .map_err(|error| map_plan_error(error, tenant_id))?;
         let plans: Vec<_> = raw_plans
