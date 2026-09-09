@@ -124,6 +124,22 @@ impl NodeDbError {
     /// window function. Distinct from `plan_error` so clients can match on
     /// the specific code (SQLSTATE `42883`, `undefined_function`) rather
     /// than parsing the message.
+    /// A DEFAULT expression names a sequence that does not exist. Distinct
+    /// from `plan_error` so clients can match on the specific code
+    /// (SQLSTATE `42704`, `undefined_object`) rather than parsing the
+    /// message — the same class PostgreSQL gives `nextval('missing')`.
+    pub fn undefined_sequence(name: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            code: ErrorCode::UNDEFINED_OBJECT,
+            message: format!("sequence \"{name}\" does not exist"),
+            details: ErrorDetails::UndefinedObject {
+                object: format!("sequence {name}"),
+            },
+            cause: None,
+        }
+    }
+
     pub fn undefined_function(name: impl Into<String>) -> Self {
         let name = name.into();
         Self {

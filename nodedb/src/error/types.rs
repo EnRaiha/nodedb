@@ -282,6 +282,12 @@ pub enum Error {
     #[error("function {name}(...) does not exist")]
     UndefinedFunction { name: String },
 
+    /// A DEFAULT expression names a sequence the registry does not hold.
+    /// Rendered as SQLSTATE `42704` (undefined_object), matching
+    /// PostgreSQL's `nextval('missing')`.
+    #[error("sequence \"{name}\" does not exist")]
+    UndefinedSequence { name: String },
+
     /// A column reference resolved against no relation, output alias, or
     /// synthetic column in scope. Propagated from `SqlError::UnknownColumn`;
     /// the pgwire layer renders it as SQLSTATE `42703` (undefined_column).

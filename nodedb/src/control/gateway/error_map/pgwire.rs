@@ -55,6 +55,7 @@ impl GatewayErrorMap {
             // directly). They must keep their typed SQLSTATEs here too.
             Error::DivisionByZero => (sqlstate::DIVISION_BY_ZERO, err.to_string()),
             Error::FeatureNotSupported { .. } => (sqlstate::FEATURE_NOT_SUPPORTED, err.to_string()),
+            Error::UndefinedSequence { .. } => (sqlstate::UNDEFINED_OBJECT, err.to_string()),
             _ => (sqlstate::INTERNAL_ERROR, err.to_string()),
         }
     }

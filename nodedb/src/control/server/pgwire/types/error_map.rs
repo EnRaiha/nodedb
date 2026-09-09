@@ -67,6 +67,9 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::FeatureNotSupported { .. } => {
             ("ERROR", sqlstate::FEATURE_NOT_SUPPORTED, err.to_string())
         }
+        crate::Error::UndefinedSequence { .. } => {
+            ("ERROR", sqlstate::UNDEFINED_OBJECT, err.to_string())
+        }
         crate::Error::InvalidLimitValue { .. } => {
             ("ERROR", sqlstate::INVALID_LIMIT_VALUE, err.to_string())
         }

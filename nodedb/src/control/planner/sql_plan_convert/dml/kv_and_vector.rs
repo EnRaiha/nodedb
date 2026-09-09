@@ -237,11 +237,17 @@ fn sequence_default_value(ctx: &ConvertContext, expr: &str) -> crate::Result<Sql
     let name = super::super::value::sequence_name(expr).ok_or_else(|| crate::Error::PlanError {
         detail: format!("unrecognized sequence default expression: '{expr}'"),
     })?;
-    let value = registry
-        .nextval(ctx.database_id.as_u64(), ctx.tenant_id.as_u64(), &name)
-        .map_err(|e| crate::Error::PlanError {
-            detail: format!("nextval('{name}'): {e}"),
-        })?;
+    let value = match registry.nextval(ctx.database_id.as_u64(), ctx.tenant_id.as_u64(), &name) {
+        Ok(v) => v,
+        Err(crate::control::sequence::SequenceError::NotFound { .. }) => {
+            return Err(crate::Error::UndefinedSequence { name });
+        }
+        Err(e) => {
+            return Err(crate::Error::PlanError {
+                detail: format!("nextval('{name}'): {e}"),
+            });
+        }
+    };
     Ok(SqlValue::Int(value))
 }
 

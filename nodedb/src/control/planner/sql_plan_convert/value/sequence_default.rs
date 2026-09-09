@@ -39,6 +39,9 @@ fn evaluate_sequence_default(ctx: &ConvertContext, expr: &str) -> crate::Result<
             };
             match registry.nextval(ctx.database_id.as_u64(), ctx.tenant_id.as_u64(), &name) {
                 Ok(value) => Value::Integer(value),
+                Err(crate::control::sequence::SequenceError::NotFound { .. }) => {
+                    return Err(crate::Error::UndefinedSequence { name });
+                }
                 Err(e) => {
                     return Err(crate::Error::PlanError {
                         detail: format!("nextval('{name}'): {e}"),

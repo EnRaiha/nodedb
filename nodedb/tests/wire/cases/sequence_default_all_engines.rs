@@ -98,6 +98,10 @@ async fn kv_default_unknown_sequence_raises() {
         .await
         .unwrap_err();
     assert!(
+        err.contains("42704"),
+        "unknown-sequence DEFAULT must raise 42704 (undefined_object): {err}"
+    );
+    assert!(
         err.contains("no_kv_seq"),
         "error must name the missing sequence: {err}"
     );
