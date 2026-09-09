@@ -40,6 +40,9 @@ pub(in crate::data::executor) struct ProjectUpdateRows<'a> {
     pub(in crate::data::executor) updates: &'a [(String, UpdateValue)],
     /// `Some` for a strict collection, whose bodies are Binary Tuples.
     pub(in crate::data::executor) strict_schema: Option<&'a StrictSchema>,
+    /// Declared `PRIMARY KEY` column of a schemaless collection, `None`
+    /// otherwise. `Some` makes the post-image guard below run.
+    pub(in crate::data::executor) declared_primary_key: Option<&'a str>,
 }
 
 impl CoreLoop {
@@ -57,6 +60,7 @@ impl CoreLoop {
             doc_ids,
             updates,
             strict_schema,
+            declared_primary_key,
         } = p;
         let config_key = (
             DatabaseId::new(database_id),
@@ -70,9 +74,12 @@ impl CoreLoop {
                 continue;
             };
 
-            // Decode current value — format depends on storage mode. A row the
-            // statement matched but cannot decode fails the statement rather
-            // than under-reporting the affected count.
+            // Decode current value — format depends on storage mode, with the
+            // storage key attached as `id` for a schemaless row whose body
+            // carries none, so this image matches the one DELETE's
+            // write-gate judges. A row the statement matched but cannot
+            // decode fails the statement rather than under-reporting the
+            // affected count.
             let mut doc = match strict_schema {
                 Some(schema) => crate::data::executor::strict_format::binary_tuple_to_json(
                     &current_bytes,
@@ -82,7 +89,11 @@ impl CoreLoop {
                     crate::diag::strict_row_undecodable(collection, doc_id, "bulk_update_project");
                     crate::data::executor::strict_format::undecodable_strict_row(collection, doc_id)
                 })?,
-                None => doc_format::decode_document(&current_bytes)?,
+                None => crate::data::executor::handlers::returning_doc::from_stored(
+                    &current_bytes,
+                    doc_id,
+                    None,
+                )?,
             };
 
             // Feeds the secondary-index SET diff for values the UPDATE drops.
@@ -109,6 +120,17 @@ impl CoreLoop {
                     };
                     obj.insert(field.clone(), val);
                 }
+            }
+
+            // Only schemaless needs this check, and only here does a computed
+            // RHS resolve to NULL — a strict collection already refuses one
+            // at encode time.
+            if strict_schema.is_none() {
+                super::super::merge_helpers::check_declared_pk_not_null(
+                    collection,
+                    &doc,
+                    declared_primary_key,
+                )?;
             }
 
             // Recompute generated columns if any dependency changed. A column

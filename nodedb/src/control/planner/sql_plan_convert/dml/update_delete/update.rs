@@ -54,6 +54,21 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
     let filter_bytes = serialize_filters(filters)?;
     let updates = assignments_to_update_values(assignments)?;
 
+    // A declared PRIMARY KEY implies NOT NULL. Check before any engine
+    // dispatch so every engine is covered by one gate.
+    let declared_primary_key = super::super::declared_primary_key_name(ctx, collection)?;
+    if let Some(declared) = declared_primary_key.as_deref()
+        && assignments.iter().any(|(field, expr)| {
+            field == declared && matches!(expr, SqlExpr::Literal(SqlValue::Null))
+        })
+    {
+        return Err(crate::Error::RejectedConstraint {
+            collection: collection.to_string(),
+            constraint: "not_null".to_string(),
+            detail: format!("primary key '{declared}' cannot be set to NULL"),
+        });
+    }
+
     if matches!(engine, EngineType::KeyValue) {
         if let Some((field, _)) = assignments
             .iter()
@@ -227,6 +242,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 // Filled in by the materialized-sum resolution pass.
                 resolved_sum_targets: Vec::new(),
+                declared_primary_key,
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,
@@ -267,6 +283,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                     rls_filters: Vec::new(),
                     rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                     resolved_sum_targets: Vec::new(),
+                    declared_primary_key: declared_primary_key.clone(),
                 })
             };
             tasks.push(PhysicalTask {
@@ -310,6 +327,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 // Filled in by the materialized-sum resolution pass.
                 resolved_sum_targets: Vec::new(),
+                declared_primary_key,
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,

@@ -18,6 +18,7 @@ use nodedb_types::columnar::StrictSchema;
 
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::filter_match::matches_with_resolved_schema;
 use crate::data::executor::doc_format;
 use crate::data::executor::handlers::update_from_join_source_map::json_value_to_string;
 use crate::data::executor::task::ExecutionTask;
@@ -39,6 +40,9 @@ pub(in crate::data::executor) struct CollectUpdateRows<'a> {
     pub target_filters: &'a [ScanFilter],
     pub strict_schema: Option<&'a StrictSchema>,
     pub config_key: &'a (DatabaseId, TenantId, String),
+    /// Declared `PRIMARY KEY` column of a schemaless target, `None`
+    /// otherwise. `Some` makes the post-image guard below run.
+    pub declared_primary_key: Option<&'a str>,
 }
 
 /// Borrowed inputs for [`CoreLoop::scan_target_rows`], bundled to keep the
@@ -71,6 +75,7 @@ impl CoreLoop {
             target_filters,
             strict_schema,
             config_key,
+            declared_primary_key,
         } = ctx;
         let database_id = task.request.database_id.as_u64();
         // Read the TARGET as the transaction's CURRENT view = base ∪ overlay:
@@ -163,6 +168,17 @@ impl CoreLoop {
                     };
                     target_obj.insert(field.clone(), val);
                 }
+            }
+
+            // Only schemaless needs this check, and only here does a computed
+            // RHS resolve to NULL — a strict collection already refuses one
+            // at encode time.
+            if strict_schema.is_none() {
+                super::merge_helpers::check_declared_pk_not_null(
+                    target_collection,
+                    &target_doc,
+                    declared_primary_key,
+                )?;
             }
 
             // Recompute generated columns if any dependency changed. A column
@@ -258,28 +274,16 @@ impl CoreLoop {
                 let Some(doc_id) = key.strip_prefix(&prefix) else {
                     continue;
                 };
-                // A stored row that does not decode fails the statement.
-                // Treating it as a non-match drops it from the update set
-                // while the statement reports success.
-                let matches = if let Some(schema) = strict_schema {
-                    let doc =
-                        super::super::strict_format::binary_tuple_to_json(value_bytes, schema)
-                            .ok_or_else(|| {
-                                crate::diag::strict_row_undecodable(
-                                    target_collection,
-                                    doc_id,
-                                    "update_from_join_scan",
-                                );
-                                super::super::strict_format::undecodable_strict_row(
-                                    target_collection,
-                                    doc_id,
-                                )
-                            })?;
-                    let msgpack = doc_format::encode_to_msgpack(&doc);
-                    ScanFilter::all_match_binary(target_filters, &msgpack)?
-                } else {
-                    ScanFilter::all_match_binary(target_filters, value_bytes)?
-                };
+                // Goes through the same primitive the overlay half below uses,
+                // so a schemaless row with no `id` field matches `WHERE id
+                // ...` here exactly as it does once staged.
+                let matches = matches_with_resolved_schema(
+                    strict_schema,
+                    target_filters,
+                    doc_id,
+                    value_bytes,
+                )
+                .map_err(crate::Error::from)?;
                 if matches {
                     rows.push((doc_id.to_string(), value_bytes.to_vec()));
                 }
@@ -294,14 +298,14 @@ impl CoreLoop {
         // dropped, exactly as for a base row.
         if let Some(txn_id) = txn_id {
             // `merge_overlay_into_scan` takes an infallible
-            // `Fn(&[u8]) -> bool` predicate, so a division/modulo-by-zero
-            // is captured via this `Cell` side-channel and checked once the
-            // merge returns.
+            // `Fn(&str, &[u8]) -> bool` predicate, so a division/modulo-by-
+            // zero is captured via this `Cell` side-channel and checked once
+            // the merge returns.
             let raw_matches =
                 self.strict_aware_matcher(database_id, tid, target_collection, target_filters);
             let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
                 std::cell::Cell::new(None);
-            let matches = |body: &[u8]| match raw_matches(body) {
+            let matches = |doc_id: &str, body: &[u8]| match raw_matches(doc_id, body) {
                 Ok(b) => b,
                 Err(e) => {
                     predicate_err.set(Some(e));

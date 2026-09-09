@@ -4,6 +4,8 @@
 
 use nodedb_physical::physical_plan::DocumentOp;
 
+use crate::engine::document::store::surrogate_to_doc_id;
+
 use super::context::RlsCtx;
 
 /// Exhaustive over [`DocumentOp`] so a new document operation forces a
@@ -112,15 +114,18 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
             collection,
             value,
             rls_filters,
+            surrogate,
             ..
         }
         | DocumentOp::PointInsert {
             collection,
             value,
             rls_filters,
+            surrogate,
             ..
         } => {
-            ctx.admit_write_image(collection, value)?;
+            let row_key = surrogate_to_doc_id(*surrogate);
+            ctx.admit_document_write_image(collection, &row_key, value)?;
             ctx.set_post_filters(collection, rls_filters)
         }
 
@@ -128,10 +133,17 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
             collection,
             documents,
             rls_filters,
+            surrogates,
             ..
         } => {
-            for (_, value) in documents.iter() {
-                ctx.admit_write_image(collection, value)?;
+            // Every row is gated. A row whose surrogate is not yet assigned
+            // falls back to its document id, which a declared key already
+            // carries in the body.
+            for (index, (document_id, value)) in documents.iter().enumerate() {
+                let row_key = surrogates
+                    .get(index)
+                    .map_or_else(|| document_id.clone(), |s| surrogate_to_doc_id(*s));
+                ctx.admit_document_write_image(collection, &row_key, value)?;
             }
             ctx.set_post_filters(collection, rls_filters)
         }
@@ -236,6 +248,7 @@ mod tests {
             rls_filters: Vec::new(),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             resolved_sum_targets: Vec::new(),
+            declared_primary_key: None,
         })
     }
 
@@ -376,6 +389,7 @@ mod tests {
             rls_filters: Vec::new(),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             resolved_sum_targets: Vec::new(),
+            declared_primary_key: None,
         });
         assert!(inject(&mut plan, &store).is_ok());
         assert!(write_check(&plan).has_predicate());
@@ -590,6 +604,7 @@ mod tests {
             rls_filters: Vec::new(),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             resolved_sum_targets: Vec::new(),
+            declared_primary_key: None,
         });
         assert!(inject(&mut plan, &store).is_ok());
         match &plan {
@@ -635,6 +650,7 @@ mod tests {
             rls_filters: Vec::new(),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             resolved_sum_targets: Vec::new(),
+            declared_primary_key: None,
         });
         assert!(inject(&mut plan, &store).is_ok());
         match &plan {

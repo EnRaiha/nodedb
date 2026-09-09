@@ -3,8 +3,8 @@
 //! `UPSERT` / `INSERT ... ON CONFLICT DO UPDATE` lowering.
 //!
 //! Split from `insert.rs`, which lowers plain `INSERT`. The two share the row
-//! identity helpers there (`extract_doc_id`, `assign_for_pk`, `assign_fresh`)
-//! so a row's surrogate is derived identically whichever statement wrote it.
+//! identity helper there (`resolve_doc_identity`) so a row's surrogate is
+//! derived identically whichever statement wrote it.
 
 use nodedb_sql::types::{EngineType, SqlExpr, SqlValue};
 
@@ -15,10 +15,7 @@ use nodedb_physical::physical_plan::*;
 
 use super::super::convert::ConvertContext;
 use super::super::value::{assignments_to_update_values, row_to_msgpack, rows_to_msgpack_array};
-use super::insert::{
-    assign_for_pk, assign_fresh, build_schema_bytes, columnar_row_surrogates, extract_doc_id,
-    is_auto_rowid_pk,
-};
+use super::insert::{build_schema_bytes, columnar_row_surrogates, resolve_doc_identity};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 /// Bundled arguments for [`convert_upsert`].
@@ -77,24 +74,10 @@ pub(in super::super) fn convert_upsert(
     let mut columnar_rows: Vec<&Vec<(String, SqlValue)>> = Vec::new();
 
     for row in rows {
-        let doc_id = extract_doc_id(row, primary_key);
-
         match engine {
             EngineType::DocumentSchemaless | EngineType::DocumentStrict => {
                 let value_bytes = row_to_msgpack(row)?;
-                // A row with no primary-key value (auto-`_rowid` collection or
-                // an upsert that omitted the pk column) has no identity to match
-                // on, so the upsert degenerates to an insert with a fresh
-                // surrogate; the on-conflict clause can never match a prior row.
-                // Content-addressing the empty pk would instead collapse every
-                // id-less row onto one document.
-                let (doc_id, surrogate) = if is_auto_rowid_pk(primary_key) || doc_id.is_empty() {
-                    let s = assign_fresh(ctx, collection)?;
-                    (s.as_u32().to_string(), s)
-                } else {
-                    let s = assign_for_pk(ctx, collection, doc_id.as_bytes())?;
-                    (doc_id, s)
-                };
+                let (doc_id, surrogate) = resolve_doc_identity(ctx, collection, primary_key, row)?;
                 let plan = if is_crdt {
                     PhysicalPlan::Crdt(CrdtOp::DocUpsert {
                         collection: qualified_collection.clone(),
