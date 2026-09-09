@@ -111,3 +111,6 @@ dmypy.json
 .cargo/
 .claude/prep/
 .pi-subagents
+
+# local search tool index
+.tgrep/

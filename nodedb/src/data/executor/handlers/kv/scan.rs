@@ -159,12 +159,18 @@ impl CoreLoop {
             return self.response_error(task, crate::Error::from(e));
         }
 
-        // Projection + computed-column parity with the document scan path
-        // (same wire format, same evaluator). Without this, SELECT-list
-        // expressions over kv collections surfaced as NULL at response
-        // shaping (`SELECT 1 + 1 FROM kv` returned an empty column), and
-        // sequence accessors could not raise their typed 0A000 here.
-        if !projection.is_empty() || !computed_columns.is_empty() {
+        // Computed-column parity with the document scan path (same wire
+        // format, same evaluator). Without this, SELECT-list expressions
+        // over kv collections surfaced as NULL at response shaping
+        // (`SELECT 1 + 1 FROM kv` returned an empty column), and sequence
+        // accessors could not raise their typed 0A000 here.
+        //
+        // Plain projections (no computed columns) deliberately stay
+        // full-row: clone-source delegation merges rows by primary key at
+        // the control plane, then the response shape extracts columns —
+        // projecting here would strip the keys and break tombstone
+        // suppression (clone_write_suppresses_source_row).
+        if !computed_columns.is_empty() {
             let computed_cols: Vec<crate::bridge::expr_eval::ComputedColumn> =
                 if computed_columns.is_empty() {
                     Vec::new()
