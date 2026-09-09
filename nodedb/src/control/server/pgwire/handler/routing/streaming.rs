@@ -141,7 +141,11 @@ impl NodeDbPgHandler {
                             shaping.projection,
                             Some(redaction.ctx(&state.redaction)),
                         )
-                        .map_err(|e| sqlstate_error("XX000", e.message()))?
+                        .map_err(|e| {
+    println!("RTMAP {:?} -> {:?}", e.code(), e.message());
+    let code = crate::control::server::pgwire::types::error_map::numeric_code_to_sqlstate(e.code());
+    sqlstate_error(code, e.message())
+})?
                         {
                             ShapeOutcome::Rows(shaped) => {
                                 let (response, _notice) = crate::control::server::pgwire::handler::shape_encode::shaped_query_response(

@@ -125,6 +125,7 @@ impl ErrorHandler for WireSafeErrorHandler {
         // are rendered from its own `Display` impls, which emit no control
         // bytes.
         if let PgWireError::UserError(info) = error {
+            println!("WIRESAFE code={} msg={}", info.code, info.message);
             sanitize_error_info(info);
         }
     }

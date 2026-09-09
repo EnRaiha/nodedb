@@ -83,7 +83,8 @@ pub(in super::super) fn convert_upsert(
                 // NULL/omitted key by the NOT NULL enforcement below.
                 let expanded = super::super::value::expand_row_defaults(ctx, row, column_defaults)?;
                 let value_bytes = row_to_msgpack(&expanded)?;
-                let (doc_id, surrogate) = resolve_doc_identity(ctx, collection, primary_key, &expanded)?;
+                let (doc_id, surrogate) =
+                    resolve_doc_identity(ctx, collection, primary_key, &expanded)?;
                 let plan = if is_crdt {
                     PhysicalPlan::Crdt(CrdtOp::DocUpsert {
                         collection: qualified_collection.clone(),

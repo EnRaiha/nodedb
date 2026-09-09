@@ -121,12 +121,10 @@ impl CoreLoop {
                 }
                 self.response_with_payload(task, payload)
             }
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            // Typed propagation: a HAVING/group-key evaluation error keeps
+            // its originating code (division -> 22012, accessors -> 0A000)
+            // instead of collapsing to the generic XX000 Internal.
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }

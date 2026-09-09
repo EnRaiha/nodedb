@@ -37,6 +37,8 @@ Welcome to the NodeDB docs. These guides explain what each engine does, when to 
 
 ## Cross-Engine Features
 
+- [Sequences](sequences.md) — CP-side counters, DEFAULT nextval on every engine, constant-context accessors, typed row-scope errors
+
 - [Bitemporal Queries](bitemporal.md) — System time and valid time, audit trails, corrections, compliance
 - [Cross-Engine Identity](architecture.md#cross-engine-identity) — Surrogate bitmaps for fused multi-engine queries
 

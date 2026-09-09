@@ -47,6 +47,72 @@ pub fn default_registry() -> &'static FunctionRegistry {
 }
 
 /// Convenience wrapper around [`fold_constant`] using the default registry.
+/// CP-side sequence evaluator for constant (row-less) contexts.
+///
+/// `SELECT nextval('s')` without a FROM clause, an explicit
+/// `VALUES (nextval('s'))` cell, or any other accessor whose arguments all
+/// folded resolves HERE, at plan time — there is no row scope downstream
+/// that could evaluate it. `nodedb-sql` stays registry-free: the control
+/// plane installs a closure over its `SequenceRegistry` for the duration of
+/// one planning call via [`install_sequence_const_eval`], and uninstalls it
+/// immediately after. Absent a hook, accessors in constant contexts raise
+/// the existing loud `FeatureNotSupported` (0A000) instead of silently
+/// folding to NULL.
+use std::cell::RefCell;
+
+thread_local! {
+    static SEQUENCE_CONST_EVAL: RefCell<Option<SequenceConstEvalSlot>> =
+        const { RefCell::new(None) };
+}
+
+/// Result of one accessor evaluation inside a constant context.
+/// `Ok(None)` means "not handled — keep the loud default path".
+pub type SequenceConstEvalResult = Result<Option<Value>, String>;
+
+/// Closure installed by the control plane: `(accessor, folded_args) -> result`.
+pub type SequenceConstEvalFn = Box<dyn FnMut(&str, &[Value]) -> SequenceConstEvalResult>;
+
+struct SequenceConstEvalSlot {
+    hook: SequenceConstEvalFn,
+    /// Set when the hook actually produced a value. Planning must not cache
+    /// a plan that folded a stateful accessor: the cached literal would
+    /// replay the same sequence value for every subsequent execution.
+    used: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+/// Restores the previous hook on drop (nesting-safe).
+pub struct SequenceConstEvalGuard {
+    previous: Option<SequenceConstEvalSlot>,
+    used: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl SequenceConstEvalGuard {
+    /// Whether the installed evaluator produced at least one value during
+    /// the guarded planning call. Callers must force the plan
+    /// non-cacheable in that case.
+    pub fn used(&self) -> bool {
+        self.used.get()
+    }
+}
+
+impl Drop for SequenceConstEvalGuard {
+    fn drop(&mut self) {
+        SEQUENCE_CONST_EVAL.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
+
+/// Install a sequence evaluator for the rest of this planning call.
+pub fn install_sequence_const_eval(f: SequenceConstEvalFn) -> SequenceConstEvalGuard {
+    let used = std::rc::Rc::new(std::cell::Cell::new(false));
+    let previous = SEQUENCE_CONST_EVAL.with(|slot| {
+        slot.borrow_mut().replace(SequenceConstEvalSlot {
+            hook: f,
+            used: std::rc::Rc::clone(&used),
+        })
+    });
+    SequenceConstEvalGuard { previous, used }
+}
+
 pub fn fold_constant_default(expr: &SqlExpr) -> FoldResult {
     fold_constant(expr, default_registry())
 }
@@ -339,7 +405,34 @@ pub fn fold_function_call(name: &str, args: &[SqlExpr], registry: &FunctionRegis
     // clause; `SELECT mod(5, 0)` has no row scope and became NULL.
     // Exhaustive on purpose: a new `EvalError` variant must be classified
     // here rather than defaulting to "defer to a runtime that may not exist".
-    match nodedb_query::functions::eval_function(&name.to_lowercase(), &folded_args) {
+    //
+    // Sequence accessors are the one exception: they are stateful (CP
+    // registry), so when the control plane installed a constant-context
+    // evaluator we hand the folded call to it first. `Ok(None)` falls
+    // through to the loud 0A000 classification below.
+    let lowered = name.to_lowercase();
+    if matches!(lowered.as_str(), "nextval" | "currval" | "setval") {
+        let hook_result: Option<SequenceConstEvalResult> = SEQUENCE_CONST_EVAL.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match slot.as_mut() {
+                Some(s) => {
+                    let result = (s.hook)(&lowered, &folded_args);
+                    if matches!(result, Ok(Some(_))) {
+                        s.used.set(true);
+                    }
+                    Some(result)
+                }
+                None => None,
+            }
+        });
+        match hook_result {
+            Some(Ok(Some(value))) => return Ok(Some(ndb_to_sql_value(value))),
+            Some(Ok(None)) => {}
+            Some(Err(detail)) => return Err(SqlError::Unsupported { detail }),
+            None => {}
+        }
+    }
+    match nodedb_query::functions::eval_function(&lowered, &folded_args) {
         Ok(result) => Ok(Some(ndb_to_sql_value(result))),
         Err(nodedb_query::EvalError::DivisionByZero) => Err(SqlError::DivisionByZero),
         Err(nodedb_query::EvalError::FeatureNotSupported { name }) => {
@@ -437,6 +530,59 @@ mod tests {
         assert!(matches!(
             fold_constant(&expr, &registry),
             Ok(Some(SqlValue::Timestamptz(_)))
+        ));
+    }
+
+    #[test]
+    fn sequence_hook_folds_accessor_and_marks_guard_used() {
+        let registry = FunctionRegistry::new();
+        let expr = SqlExpr::Function {
+            name: "nextval".into(),
+            args: vec![SqlExpr::Literal(SqlValue::String("s".into()))],
+            distinct: false,
+        };
+        // No hook: loud 0A000 classification (existing contract).
+        assert!(matches!(
+            fold_constant(&expr, &registry),
+            Err(SqlError::FeatureNotSupported { .. })
+        ));
+        // Hook installed: value produced, guard reports use (plan must not
+        // be admitted to the physical-plan cache).
+        let guard = install_sequence_const_eval(Box::new(|name, args| {
+            assert_eq!(name, "nextval");
+            let [Value::String(s)] = args else {
+                panic!("expected one string arg, got {args:?}");
+            };
+            assert_eq!(s, "s");
+            Ok(Some(Value::Integer(7)))
+        }));
+        assert_eq!(
+            fold_constant(&expr, &registry).unwrap(),
+            Some(SqlValue::Int(7))
+        );
+        assert!(guard.used());
+        drop(guard);
+        // Guard dropped: loud classification again.
+        assert!(matches!(
+            fold_constant(&expr, &registry),
+            Err(SqlError::FeatureNotSupported { .. })
+        ));
+    }
+
+    #[test]
+    fn sequence_hook_errors_surface_as_unsupported() {
+        let registry = FunctionRegistry::new();
+        let expr = SqlExpr::Function {
+            name: "nextval".into(),
+            args: vec![SqlExpr::Literal(SqlValue::String("missing".into()))],
+            distinct: false,
+        };
+        let _guard = install_sequence_const_eval(Box::new(|_name, _args| {
+            Err("sequence \"missing\" does not exist".into())
+        }));
+        assert!(matches!(
+            fold_constant(&expr, &registry),
+            Err(SqlError::Unsupported { detail }) if detail.contains("missing")
         ));
     }
 

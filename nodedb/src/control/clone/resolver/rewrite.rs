@@ -249,6 +249,8 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> crate::Res
             // (clones-of-clones still funnel through here per-level);
             // the resolver overrides it for source delegation below.
             surrogate_ceiling: _,
+            projection,
+            computed_columns,
         }) if collection == &target_qualified => {
             Ok(SourceRewrite::task(PhysicalPlan::Kv(KvOp::Scan {
                 collection: source_qualified,
@@ -258,6 +260,8 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> crate::Res
                 match_pattern: match_pattern.clone(),
                 sort_keys: sort_keys.clone(),
                 surrogate_ceiling: kv_surrogate_ceiling,
+                projection: projection.clone(),
+                computed_columns: computed_columns.clone(),
             })))
         }
 

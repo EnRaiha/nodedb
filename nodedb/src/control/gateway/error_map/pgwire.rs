@@ -50,6 +50,11 @@ impl GatewayErrorMap {
                     crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(code);
                 (state, message)
             }
+            // Expression evaluation errors can also arrive as typed errors
+            // (streaming aggregate finalization returns crate::Error
+            // directly). They must keep their typed SQLSTATEs here too.
+            Error::DivisionByZero => (sqlstate::DIVISION_BY_ZERO, err.to_string()),
+            Error::FeatureNotSupported { .. } => (sqlstate::FEATURE_NOT_SUPPORTED, err.to_string()),
             _ => (sqlstate::INTERNAL_ERROR, err.to_string()),
         }
     }

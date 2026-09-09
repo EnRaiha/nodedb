@@ -402,8 +402,14 @@ impl NodeDbPgHandler {
                     tenant_id,
                     redaction: Some(redaction.ctx(&self.state.redaction)),
                 })
-                .map_err(|e| sqlstate_error("XX000", e.message()))?
-                {
+                .map_err(|e| {
+                    println!("DLMAP {:?} {:?}", e.code(), e.message());
+                    let code =
+                        crate::control::server::pgwire::types::error_map::numeric_code_to_sqlstate(
+                            e.code(),
+                        );
+                    sqlstate_error(code, e.message())
+                })? {
                     ShapeOutcome::Rows(shaped) => {
                         task_rows = Some(shaped.rows.len() as u64);
                         if matches!(plan_kind, PlanKind::ReturningRows) {

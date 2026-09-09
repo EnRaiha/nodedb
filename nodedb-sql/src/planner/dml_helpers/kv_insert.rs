@@ -124,12 +124,27 @@ pub(crate) fn build_kv_insert_plan(
             .collect();
         entries.push((key_val, value_cols));
     }
+    // Sequence accessors (nextval) cannot run in the pure planner evaluator;
+    // they ride on the plan so the converter advances the CP-side registry
+    // per row. Anything else shaped like an accessor but malformed is left
+    // for the converter to reject loudly rather than silently NULLing.
+    let sequence_defaults: Vec<(String, String)> = declared_columns
+        .iter()
+        .filter_map(|c| {
+            c.default
+                .as_ref()
+                .filter(|d| crate::planner::defaults::looks_like_sequence_accessor(d))
+                .map(|d| (c.name.clone(), d.clone()))
+        })
+        .collect();
     Ok(vec![SqlPlan::KvInsert {
         collection: table_name,
         entries,
         ttl_secs,
         intent,
         on_conflict_updates,
+        key_column: key_col_name.to_string(),
+        sequence_defaults,
     }])
 }
 
