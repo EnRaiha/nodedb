@@ -27,6 +27,16 @@ use super::types::SqlExpr;
 pub enum EvalError {
     #[error("division by zero")]
     DivisionByZero,
+    /// Sequence accessors (`nextval`/`currval`/`setval`) are stateful and
+    /// CP-side only. They are evaluated as column DEFAULTs by the plan
+    /// converter, never by the row-scope scalar evaluator. Reaching this
+    /// error means an accessor escaped the DEFAULT path (e.g. a bare
+    /// `SELECT nextval('s')`), which must surface loudly as 0A000 — never as
+    /// a silent `Null`.
+    #[error(
+        "sequence accessors are supported as column DEFAULTs          (DEFAULT nextval('s')); SELECT-time evaluation is not yet wired"
+    )]
+    FeatureNotSupported { name: &'static str },
 }
 
 /// Row scope for `SqlExpr::eval_scope`: how `Column(..)` and `OldColumn(..)`

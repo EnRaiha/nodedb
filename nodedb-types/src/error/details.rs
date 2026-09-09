@@ -117,6 +117,10 @@ pub enum ErrorDetails {
     /// Expression evaluation divided or took a modulus by zero.
     #[serde(rename = "division_by_zero")]
     DivisionByZero,
+    /// A registered sequence accessor escaped the DEFAULT path and was
+    /// evaluated as a SQL-expression scalar (SQLSTATE 0A000).
+    #[serde(rename = "feature_not_supported")]
+    FeatureNotSupported { name: String },
     /// A LIMIT/OFFSET/FETCH bound resolved outside `[0, usize::MAX]`.
     #[serde(rename = "invalid_limit_value")]
     InvalidLimitValue { clause: String, value: String },

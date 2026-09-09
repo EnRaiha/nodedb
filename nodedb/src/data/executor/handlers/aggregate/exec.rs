@@ -273,8 +273,9 @@ impl CoreLoop {
                                 }
                             }
                         });
-                        if predicate_err.take().is_some() {
-                            return self.response_error(task, ErrorCode::DivisionByZero);
+                        if let Some(e) = predicate_err.take() {
+                            return self
+                                .response_error(task, ErrorCode::from(crate::Error::from(e)));
                         }
                     }
                 }

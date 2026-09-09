@@ -165,9 +165,9 @@ pub fn read_parquet_filtered(
     // `crate::Error::DivisionByZero` the pre-fix `ArrowError` conversion
     // above lost.
     if let Ok(mut slot) = predicate_err.lock()
-        && slot.take().is_some()
+        && let Some(e) = slot.take()
     {
-        return Err(crate::Error::DivisionByZero);
+        return Err(crate::Error::from(e));
     }
 
     Ok(batches)

@@ -152,16 +152,18 @@ pub(super) fn execute_grouping_sets(
                     match ScanFilter::all_match_binary_indexed(&filter_predicates, raw, &idx) {
                         Ok(true) => {}
                         Ok(false) => continue,
-                        Err(_e) => {
-                            return core.response_error(task, ErrorCode::DivisionByZero);
+                        Err(e) => {
+                            return core
+                                .response_error(task, ErrorCode::from(crate::Error::from(e)));
                         }
                     }
                 } else {
                     match ScanFilter::all_match_binary(&filter_predicates, raw) {
                         Ok(true) => {}
                         Ok(false) => continue,
-                        Err(_e) => {
-                            return core.response_error(task, ErrorCode::DivisionByZero);
+                        Err(e) => {
+                            return core
+                                .response_error(task, ErrorCode::from(crate::Error::from(e)));
                         }
                     }
                 }
@@ -193,8 +195,8 @@ pub(super) fn execute_grouping_sets(
                         }
                     }
                     Ok(false) => {}
-                    Err(_e) => {
-                        return core.response_error(task, ErrorCode::DivisionByZero);
+                    Err(e) => {
+                        return core.response_error(task, ErrorCode::from(crate::Error::from(e)));
                     }
                 }
             }

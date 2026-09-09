@@ -145,7 +145,10 @@ pub(crate) fn write_definitely_not_applied(code: &ErrorCode) -> bool {
         | ErrorCode::TxnOverlayMemoryExceeded { .. }
         // Expression evaluation failed before producing a value to write.
         | ErrorCode::DivisionByZero
-        | ErrorCode::UndefinedColumn { .. } => true,
+        | ErrorCode::UndefinedColumn { .. }
+        // Sequence accessor evaluated as an expression (0A000) — the row
+        // produced no value, so the write was refused, not applied.
+        | ErrorCode::FeatureNotSupported { .. } => true,
 
         // NOT established — every one of these can be reported by a request
         // whose write reached, or may have reached, engine state. Emitting an

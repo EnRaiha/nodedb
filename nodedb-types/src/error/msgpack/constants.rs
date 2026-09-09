@@ -165,3 +165,4 @@ pub(super) const TAG_CANNOT_DROP_DEFAULT_DATABASE: u16 = 77;
 pub(super) const TAG_INVALID_LIMIT_VALUE: u16 = 78;
 pub(super) const TAG_UNDEFINED_COLUMN: u16 = 79;
 pub(super) const TAG_AMBIGUOUS_COLUMN: u16 = 80;
+pub(super) const TAG_FEATURE_NOT_SUPPORTED: u16 = 81;

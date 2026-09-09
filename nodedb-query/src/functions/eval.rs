@@ -20,6 +20,19 @@ use super::{array, conditional, datetime, fts, id, json, math, string, system, t
 /// fallible arm doesn't force every scalar-function module to carry a
 /// `Result` it can never actually produce.
 pub fn eval_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    // Sequence accessors are stateful (CP-side, DEFAULT-scoped). They are
+    // never scalar-evaluable: if one reaches this dispatcher, it escaped the
+    // DEFAULT path and must raise 0A000 instead of falling through to the
+    // geo fallback's silent `Null`.
+    let canonical = match name.to_ascii_lowercase().as_str() {
+        "nextval" => Some("nextval"),
+        "currval" => Some("currval"),
+        "setval" => Some("setval"),
+        _ => None,
+    };
+    if let Some(cname) = canonical {
+        return Err(EvalError::FeatureNotSupported { name: cname });
+    }
     if let Some(v) = string::try_eval(name, args) {
         return Ok(v);
     }
@@ -61,6 +74,29 @@ mod tests {
 
     fn eval_fn(name: &str, args: Vec<Value>) -> Value {
         eval_function(name, &args).unwrap()
+    }
+
+    #[test]
+    fn sequence_accessors_are_loud_not_null() {
+        // Regression: accessors used to fall through to the geo fallback and
+        // return Ok(Null). They must error as FeatureNotSupported (0A000).
+        for name in ["nextval", "currval", "setval", "NEXTVAL"] {
+            let err = eval_function(name, &[Value::String("s".into())]).unwrap_err();
+            assert!(
+                matches!(err, crate::expr::EvalError::FeatureNotSupported { .. }),
+                "{name} must raise FeatureNotSupported, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_sequence_unknown_still_nulls() {
+        // The guard is scoped: unknown non-sequence names keep the legacy
+        // geo-fallback behaviour (Ok(Null)), not an error.
+        assert_eq!(
+            eval_function("definitely_not_a_fn", &[]).unwrap(),
+            Value::Null
+        );
     }
 
     #[test]

@@ -112,4 +112,8 @@ pub enum DataPlaneErrorCode {
         limit: u64,
     },
     DivisionByZero,
+    /// Registered sequence accessor reached expression evaluation (0A000).
+    FeatureNotSupported {
+        name: String,
+    },
 }

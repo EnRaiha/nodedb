@@ -174,6 +174,13 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
             sqlstate::DIVISION_BY_ZERO,
             "division by zero".into(),
         ),
+        ErrorCode::FeatureNotSupported { name } => (
+            "ERROR",
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            format!(
+                "sequence accessors are supported as column DEFAULTs                  (DEFAULT nextval('s')); SELECT-time evaluation is not yet wired                  ({name})"
+            ),
+        ),
         ErrorCode::Unsupported { detail } => {
             ("ERROR", sqlstate::FEATURE_NOT_SUPPORTED, detail.clone())
         }

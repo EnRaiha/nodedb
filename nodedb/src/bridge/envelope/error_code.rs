@@ -123,6 +123,10 @@ pub enum ErrorCode {
     /// special-cases `NotFound`) and reaches the client as SQLSTATE `22012`
     /// rather than the generic `XX000` every `Internal` maps to.
     DivisionByZero,
+    /// A registered sequence accessor escaped the DEFAULT path and reached
+    /// expression evaluation. Crosses the Data Plane → pgwire boundary as
+    /// SQLSTATE `0A000` (`feature_not_supported`), never `XX000`.
+    FeatureNotSupported { name: String },
 }
 
 impl From<crate::Error> for ErrorCode {
@@ -202,6 +206,7 @@ impl From<crate::Error> for ErrorCode {
                 Self::TxnOverlayMemoryExceeded { limit }
             }
             crate::Error::DivisionByZero => Self::DivisionByZero,
+            crate::Error::FeatureNotSupported { name } => Self::FeatureNotSupported { name },
             crate::Error::UndefinedColumn { column } => Self::UndefinedColumn { column },
             // Same condition an undefined column reports at plan time, raised
             // here by the strict encoder for a transport the planner never

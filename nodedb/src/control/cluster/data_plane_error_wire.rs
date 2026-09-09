@@ -137,6 +137,7 @@ impl From<ErrorCode> for DataPlaneErrorCode {
                 limit: to_wire_count(limit),
             },
             ErrorCode::DivisionByZero => Self::DivisionByZero,
+            ErrorCode::FeatureNotSupported { name } => Self::FeatureNotSupported { name },
         }
     }
 }
@@ -227,6 +228,7 @@ impl From<DataPlaneErrorCode> for ErrorCode {
                 }
             }
             DataPlaneErrorCode::DivisionByZero => Self::DivisionByZero,
+            DataPlaneErrorCode::FeatureNotSupported { name } => Self::FeatureNotSupported { name },
         }
     }
 }
