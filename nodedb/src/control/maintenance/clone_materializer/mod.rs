@@ -19,3 +19,4 @@ pub use walker::{
 // local-dispatch primitive and source-scan cursor decode.
 pub(crate) use dispatch::{dispatch_local, dispatch_local_on_vshard};
 pub(crate) use document::{read_all_source_rows, scan_source_page};
+pub(crate) use kv::scan_kv_source_page;

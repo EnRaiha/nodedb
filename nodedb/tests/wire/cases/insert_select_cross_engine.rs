@@ -307,3 +307,69 @@ async fn insert_select_from_strict_source_normalizes_and_resolves() {
         "vector search must resolve the copied strict-source 'alpha'; got {near_e1:?}"
     );
 }
+
+/// An autocommit `INSERT ... SELECT` whose SOURCE is a KV collection must copy
+/// rows instead of silently answering `INSERT 0 0`. The pre-fix orchestrator
+/// scanned every source with the DOCUMENT materialize scan, which reads the
+/// sparse store — a KV collection has no rows there, so a non-empty source
+/// copied zero rows. Expression projections from the source row (e.g.
+/// `upper(v)`) must evaluate against the KV row's fields.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insert_select_from_kv_source_copies_rows() {
+    let server = TestServer::start().await;
+
+    server
+        .exec(
+            "CREATE COLLECTION isk_src \
+             (id BIGINT PRIMARY KEY, v TEXT) WITH (engine='kv')",
+        )
+        .await
+        .unwrap();
+    server
+        .exec("INSERT INTO isk_src (id, v) VALUES (1, 'hello')")
+        .await
+        .unwrap();
+    server
+        .exec("INSERT INTO isk_src (id, v) VALUES (2, 'world')")
+        .await
+        .unwrap();
+    server
+        .exec("CREATE COLLECTION isk_tgt (id BIGINT PRIMARY KEY, v TEXT)")
+        .await
+        .unwrap();
+
+    server
+        .exec("INSERT INTO isk_tgt (id, v) SELECT id, upper(v) FROM isk_src")
+        .await
+        .unwrap();
+
+    // Both rows landed with the expression evaluated per row.
+    let scan = server
+        .query_text("SELECT v FROM isk_tgt ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        scan,
+        vec!["HELLO".to_string(), "WORLD".to_string()],
+        "kv-source copy must persist both rows with per-row expressions; got {scan:?}"
+    );
+
+    // The plain-passthrough copy (no explicit column list) works too.
+    server
+        .exec("CREATE COLLECTION isk_tgt2 (id BIGINT PRIMARY KEY, v TEXT)")
+        .await
+        .unwrap();
+    server
+        .exec("INSERT INTO isk_tgt2 SELECT * FROM isk_src")
+        .await
+        .unwrap();
+    let copied = server
+        .query_text("SELECT count(*) FROM isk_tgt2")
+        .await
+        .unwrap();
+    assert_eq!(
+        copied,
+        vec!["2".to_string()],
+        "kv-source SELECT * copy must copy both rows; got {copied:?}"
+    );
+}

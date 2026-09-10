@@ -20,6 +20,18 @@ use crate::control::target_identity::{
     TargetPk, assign_target_surrogate, bare_collection_name, resolve_target_pk,
 };
 use crate::engine::document::store::surrogate_to_doc_id;
+use crate::types::TxnId;
+
+/// Which source scan a copy request must use, derived from the source
+/// collection's engine at [`resolve_copy_spec`] time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SourceScanKind {
+    /// Sparse-store document read (`DocumentOp::MaterializeScan`).
+    Document,
+    /// KV engine cursor read (`KvOp::MaterializeScan`) shaped per row
+    /// with the shared KV → doc rule.
+    KeyValue,
+}
 
 /// Resolved, per-statement copy context shared across every scanned page.
 pub(crate) struct CopySpec {
@@ -30,18 +42,21 @@ pub(crate) struct CopySpec {
     /// One entry per target column, its `alias` the target column name and its
     /// `expr` the source-row expression. Empty copies each row unchanged.
     pub column_map: Vec<ComputedColumn>,
+    /// The engine-appropriate source scan for this statement's source.
+    pub source_kind: SourceScanKind,
 }
 
-/// Resolve the target PK and the residual source `WHERE` filter for one
-/// `INSERT ... SELECT` statement.
+/// Resolve the target PK, the residual source `WHERE` filter, and the source
+/// scan kind for one `INSERT ... SELECT` statement.
 ///
-/// `target_collection` is the db-qualified name as it appears in the
-/// `DocumentOp::InsertSelect` plan.
+/// `target_collection` and `source_collection` are the db-qualified names as
+/// they appear in the `DocumentOp::InsertSelect` plan.
 pub(crate) fn resolve_copy_spec(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     target_collection: &str,
+    source_collection: &str,
     source_filters: &[u8],
     column_map: &[u8],
 ) -> crate::Result<CopySpec> {
@@ -58,6 +73,34 @@ pub(crate) fn resolve_copy_spec(
             collection: target_collection.to_string(),
         })?;
     let target_pk = resolve_target_pk(&target, "INSERT ... SELECT")?;
+
+    // Engine-blind source scans silently copy ZERO rows when the source is a
+    // KV collection (DocumentOp::MaterializeScan reads the sparse store, which
+    // holds no KV rows). Resolve the source engine so the caller picks the
+    // matching scan, and refuse engines no scan path supports yet instead of
+    // answering `INSERT 0 0` on a non-empty source.
+    let source = catalog
+        .get_collection(
+            database_id,
+            tenant_id.as_u64(),
+            &bare_collection_name(database_id, source_collection),
+        )?
+        .ok_or_else(|| crate::Error::CollectionNotFound {
+            tenant_id,
+            collection: source_collection.to_string(),
+        })?;
+    let source_kind = match source.collection_type {
+        nodedb_types::CollectionType::KeyValue(_) => SourceScanKind::KeyValue,
+        nodedb_types::CollectionType::Document(_) => SourceScanKind::Document,
+        nodedb_types::CollectionType::Columnar(_) => {
+            return Err(crate::Error::PlanError {
+                detail: format!(
+                    "INSERT ... SELECT from a columnar source is not supported yet \
+                     (source '{source_collection}')"
+                ),
+            });
+        }
+    };
 
     let filters: Vec<ScanFilter> = if source_filters.is_empty() {
         Vec::new()
@@ -81,7 +124,51 @@ pub(crate) fn resolve_copy_spec(
         target_pk,
         filters,
         column_map,
+        source_kind,
     })
+}
+
+/// Scan one source page with the engine-appropriate `MaterializeScan`.
+///
+/// Both copy orchestrators (autocommit and staged) route through here so the
+/// source engine is resolved exactly once, in [`resolve_copy_spec`]. Each
+/// entry is a document-shaped `(doc_id, surrogate, msgpack)` triple: the
+/// source surrogate is discarded by [`assign_page_rows`], which assigns a
+/// fresh target-keyed surrogate per copied row.
+pub(crate) async fn scan_copy_source_page(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    source_collection: &str,
+    source_kind: SourceScanKind,
+    cursor: &[u8],
+    txn_id: Option<TxnId>,
+) -> crate::Result<(Vec<(String, u32, Vec<u8>)>, Vec<u8>)> {
+    match source_kind {
+        SourceScanKind::KeyValue => {
+            crate::control::maintenance::clone_materializer::scan_kv_source_page(
+                state,
+                tenant_id,
+                database_id,
+                source_collection,
+                cursor,
+                txn_id,
+            )
+            .await
+        }
+        SourceScanKind::Document => {
+            crate::control::maintenance::clone_materializer::scan_source_page(
+                state,
+                tenant_id,
+                database_id,
+                source_collection,
+                cursor,
+                None,
+                txn_id,
+            )
+            .await
+        }
+    }
 }
 
 /// Filter and assign fresh surrogates for one scanned source page.

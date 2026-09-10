@@ -242,3 +242,140 @@ async fn strict_insert_select_sees_source_rows_staged_earlier_in_txn() {
     )
     .await;
 }
+
+/// KV-source variants: source is a KV collection (scanned via
+/// `KvOp::MaterializeScan`), target a document collection written through the
+/// plain overlay path. Pre-fix the copy scored ZERO source rows — the
+/// document materialize scan reads the sparse store, which holds no KV rows —
+/// so these would report `INSERT 0 0` and stage nothing.
+async fn kv_setup(server: &TestServer, src: &str, tgt: &str) {
+    server
+        .exec(&format!(
+            "CREATE COLLECTION {src} \
+             (id STRING NOT NULL PRIMARY KEY, n INT) WITH (engine='kv')"
+        ))
+        .await
+        .unwrap();
+    server
+        .exec(&format!(
+            "CREATE COLLECTION {tgt} (id STRING NOT NULL PRIMARY KEY, n INT)"
+        ))
+        .await
+        .unwrap();
+    for (id, n) in [("a", 1), ("b", 1), ("c", 2), ("unrelated", 100)] {
+        server
+            .exec(&format!("INSERT INTO {src} (id, n) VALUES ('{id}', {n})"))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kv_insert_select_stages_and_is_visible() {
+    let server = TestServer::start().await;
+    kv_setup(&server, "is_kv_src", "is_kv_tgt").await;
+
+    server.exec("BEGIN").await.unwrap();
+    let msgs = server
+        .client
+        .simple_query("INSERT INTO is_kv_tgt SELECT * FROM is_kv_src WHERE n = 1")
+        .await
+        .expect("in-tx kv insert-select should succeed at the statement");
+    assert_eq!(
+        command_count(&msgs),
+        Some(2),
+        "kv: INSERT ... SELECT must report the real copied-row count, not 0"
+    );
+    let seen = scan_ints(&server, "SELECT n FROM is_kv_tgt").await;
+    assert_eq!(
+        seen,
+        vec![1, 1],
+        "kv: in-tx scan of target must observe the staged copy"
+    );
+
+    server.client.simple_query("COMMIT").await.unwrap();
+    let after = scan_ints(&server, "SELECT n FROM is_kv_tgt").await;
+    assert_eq!(
+        after,
+        vec![1, 1],
+        "kv: committed insert-select must persist"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kv_insert_select_rollback_discards_staged_copy() {
+    let server = TestServer::start().await;
+    kv_setup(&server, "is_kv_rb_src", "is_kv_rb_tgt").await;
+
+    server.exec("BEGIN").await.unwrap();
+    server
+        .exec("INSERT INTO is_kv_rb_tgt SELECT * FROM is_kv_rb_src WHERE n = 1")
+        .await
+        .unwrap();
+    let staged = scan_ints(&server, "SELECT n FROM is_kv_rb_tgt").await;
+    assert_eq!(
+        staged,
+        vec![1, 1],
+        "kv: staged copy must be visible pre-rollback"
+    );
+
+    server.client.simple_query("ROLLBACK").await.unwrap();
+    let after = scan_ints(&server, "SELECT n FROM is_kv_rb_tgt").await;
+    assert!(
+        after.is_empty(),
+        "kv: ROLLBACK must discard the staged copy, got {after:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kv_insert_select_respects_limit() {
+    let server = TestServer::start().await;
+    kv_setup(&server, "is_kv_lim_src", "is_kv_lim_tgt").await;
+
+    server.exec("BEGIN").await.unwrap();
+    let msgs = server
+        .client
+        .simple_query("INSERT INTO is_kv_lim_tgt SELECT * FROM is_kv_lim_src WHERE n = 1 LIMIT 1")
+        .await
+        .expect("in-tx kv insert-select with LIMIT should succeed");
+    assert_eq!(
+        command_count(&msgs),
+        Some(1),
+        "kv: LIMIT must cap the staged count"
+    );
+    let seen = scan_ints(&server, "SELECT n FROM is_kv_lim_tgt").await;
+    assert_eq!(seen, vec![1], "kv: target must show only the LIMIT-ed copy");
+
+    server.client.simple_query("ROLLBACK").await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kv_insert_select_sees_source_rows_staged_earlier_in_txn() {
+    let server = TestServer::start().await;
+    kv_setup(&server, "is_kv_ov_src", "is_kv_ov_tgt").await;
+
+    server.exec("BEGIN").await.unwrap();
+    server
+        .exec("INSERT INTO is_kv_ov_src (id, n) VALUES ('fresh', 1)")
+        .await
+        .unwrap();
+
+    let msgs = server
+        .client
+        .simple_query("INSERT INTO is_kv_ov_tgt SELECT * FROM is_kv_ov_src WHERE n = 1")
+        .await
+        .expect("in-tx kv insert-select should succeed at the statement");
+    assert_eq!(
+        command_count(&msgs),
+        Some(3),
+        "kv: copy must include the source row staged earlier in this txn"
+    );
+    let seen = scan_ints(&server, "SELECT n FROM is_kv_ov_tgt").await;
+    assert_eq!(
+        seen,
+        vec![1, 1, 1],
+        "kv: target must contain the copy of the staged source row"
+    );
+
+    server.client.simple_query("ROLLBACK").await.unwrap();
+}

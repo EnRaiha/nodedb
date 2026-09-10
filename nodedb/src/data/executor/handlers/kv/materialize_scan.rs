@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Cursor-paginated raw KV scan used by the clone materializer.
+//! Cursor-paginated raw KV scan used by the clone materializer and the
+//! `INSERT ... SELECT` copy pipeline.
 //!
 //! Returns the engine's `(key, value)` pairs verbatim (no map wrapping or
 //! key-injection — the materializer needs the raw stored value bytes to
-//! re-`Put` them on target) plus the next-cursor in a single response so the
+//! re-`Put` them on target; the copy pipeline shapes them itself) plus the
+//! next-cursor in a single response so the
 //! caller can drive the scan to completion in O(N / count) round-trips.
 
 use crate::bridge::envelope::Response;
@@ -31,18 +33,35 @@ impl CoreLoop {
         };
 
         let now_ms = current_ms();
-        let (entries, next_cursor) = self.kv_engine.scan(KvScanParams {
+        let txn_id = task.request.txn_id;
+        let (mut entries, mut next_cursor) = self.kv_engine.scan(KvScanParams {
             database_id: did,
             tenant_id: tid,
             collection,
             cursor,
-            count,
+            // In-transaction callers need base ∪ overlay. The overlay can
+            // tombstone/supersede rows spanning pages, so collect the whole
+            // base set (ignoring the page cap, like the document scan) and
+            // return it un-paginated; the capacity hint stays bounded by the
+            // engine's own slot count.
+            count: if txn_id.is_some() { usize::MAX } else { count },
             now_ms,
             match_pattern: None,
             filter_field: None,
             filter_value: None,
             surrogate_ceiling: None,
         });
+
+        if let Some(txn_id) = txn_id {
+            let coll_key = (
+                crate::types::DatabaseId::new(did),
+                crate::types::TenantId::new(tid),
+                collection.to_string(),
+            );
+            self.merge_kv_overlay_into_scan(txn_id, &coll_key, &mut entries, &|_| true);
+            // Single un-paginated response: the scan is complete in one round-trip.
+            next_cursor = Vec::new();
+        }
 
         // Encode response payload as msgpack:
         //   [next_cursor: bytes, entries: [[key, value], ...]]

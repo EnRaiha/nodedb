@@ -18,8 +18,9 @@
 use nodedb_types::{DatabaseId, Surrogate, TenantId};
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::insert_select::copy_rows::{assign_page_rows, resolve_copy_spec};
-use crate::control::maintenance::clone_materializer::scan_source_page;
+use crate::control::insert_select::copy_rows::{
+    assign_page_rows, resolve_copy_spec, scan_copy_source_page,
+};
 use crate::control::state::SharedState;
 use crate::types::{TxnId, VShardId};
 use nodedb_physical::physical_plan::DocumentOp;
@@ -151,6 +152,7 @@ async fn materialize_copy(
         tenant_id,
         database_id,
         target_collection,
+        source_collection,
         source_filters,
         column_map,
     )?;
@@ -160,13 +162,13 @@ async fn materialize_copy(
     let mut rows: Vec<(String, Vec<u8>, Surrogate)> = Vec::new();
 
     while remaining > 0 {
-        let (entries, next_cursor) = scan_source_page(
+        let (entries, next_cursor) = scan_copy_source_page(
             state,
             tenant_id,
             database_id,
             source_collection,
+            spec.source_kind,
             &cursor,
-            None,
             txn_id,
         )
         .await?;

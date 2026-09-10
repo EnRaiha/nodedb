@@ -23,6 +23,7 @@ use crate::control::metadata_proposer::propose_catalog_entry;
 use crate::control::planner::sql_plan_convert::convert::db_qualified;
 use crate::control::security::catalog::{StoredCollection, SystemCatalog};
 use crate::control::state::SharedState;
+use crate::types::TxnId;
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
 
 use super::dispatch::dispatch_local;
@@ -79,6 +80,7 @@ pub(super) async fn materialize_kv_collection(
             origin.source_database,
             &source_qualified,
             &cursor,
+            None,
         )
         .await?;
 
@@ -188,20 +190,30 @@ fn checkpoint_progress(
 
 /// Run one source-side `MaterializeScan` round-trip. Returns the entries in
 /// this page (raw `(key, value)` byte pairs) plus the next-cursor; the
-/// cursor is empty when the scan is complete.
-async fn scan_source_page(
+/// cursor is empty when the scan is complete. `txn_id`, when set, makes the
+/// handler fold the transaction's staging overlay into the page.
+pub(crate) async fn scan_source_page(
     state: &SharedState,
     tenant_id: TenantId,
     source_db_id: DatabaseId,
     source_qualified: &str,
     cursor: &[u8],
+    txn_id: Option<TxnId>,
 ) -> crate::Result<ScanPage> {
     let plan = PhysicalPlan::Kv(KvOp::MaterializeScan {
         collection: nodedb_types::QualifiedCollection::from_stored(source_qualified.to_string()),
         cursor: cursor.to_vec(),
         count: SCAN_PAGE,
     });
-    let resp = dispatch_local(state, tenant_id, source_db_id, source_qualified, plan, None).await?;
+    let resp = dispatch_local(
+        state,
+        tenant_id,
+        source_db_id,
+        source_qualified,
+        plan,
+        txn_id,
+    )
+    .await?;
     if resp.status != Status::Ok {
         return Err(crate::Error::Storage {
             engine: "clone_materializer".into(),
@@ -212,6 +224,43 @@ async fn scan_source_page(
         });
     }
     parse_materialize_scan_payload(resp.payload.as_ref())
+}
+
+/// One KV source page shaped as document rows for the `INSERT ... SELECT`
+/// copy pipeline: each `(key, value)` pair becomes `(key, 0, {key, value…}
+/// msgpack)` via the shared KV → doc rule ([`msgpack_scan::kv_row_msgpack`]).
+///
+/// The surrogate slot is a placeholder — the copy pipeline discards the
+/// source surrogate and assigns a fresh target-keyed one.
+pub(crate) async fn scan_kv_source_page(
+    state: &SharedState,
+    tenant_id: TenantId,
+    source_db_id: DatabaseId,
+    source_qualified: &str,
+    cursor: &[u8],
+    txn_id: Option<TxnId>,
+) -> crate::Result<(Vec<(String, u32, Vec<u8>)>, Vec<u8>)> {
+    let (entries, next_cursor) = scan_source_page(
+        state,
+        tenant_id,
+        source_db_id,
+        source_qualified,
+        cursor,
+        txn_id,
+    )
+    .await?;
+    let rows = entries
+        .into_iter()
+        .map(|(key, value)| {
+            let key_str = String::from_utf8_lossy(&key).into_owned();
+            (
+                key_str.clone(),
+                0u32,
+                nodedb_query::msgpack_scan::kv_row_msgpack(&key_str, &value),
+            )
+        })
+        .collect();
+    Ok((rows, next_cursor))
 }
 
 /// `(key, value)` pairs returned by one materialize-scan page.

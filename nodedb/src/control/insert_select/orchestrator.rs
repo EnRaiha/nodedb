@@ -18,8 +18,10 @@
 use nodedb_types::{DatabaseId, Lsn, Surrogate, TenantId};
 
 use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
-use crate::control::insert_select::copy_rows::{assign_page_rows, resolve_copy_spec};
-use crate::control::maintenance::clone_materializer::{dispatch_local, scan_source_page};
+use crate::control::insert_select::copy_rows::{
+    assign_page_rows, resolve_copy_spec, scan_copy_source_page,
+};
+use crate::control::maintenance::clone_materializer::dispatch_local;
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::DocumentOp;
 
@@ -88,6 +90,7 @@ pub(crate) async fn run_insert_select(
         tenant_id,
         database_id,
         req.target_collection,
+        req.source_collection,
         req.source_filters,
         req.column_map,
     )?;
@@ -98,14 +101,15 @@ pub(crate) async fn run_insert_select(
     let mut max_lsn = Lsn::ZERO;
 
     while remaining > 0 {
-        // Phase 1: scan one source page (point-in-time snapshot).
-        let (entries, next_cursor) = scan_source_page(
+        // Phase 1: scan one source page (point-in-time snapshot) with the
+        // engine-appropriate materialize scan.
+        let (entries, next_cursor) = scan_copy_source_page(
             state,
             tenant_id,
             database_id,
             req.source_collection,
+            spec.source_kind,
             &cursor,
-            None,
             None,
         )
         .await?;
