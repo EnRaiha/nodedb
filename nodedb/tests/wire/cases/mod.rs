@@ -141,6 +141,7 @@ mod schemaless_bitemporal_audit_query;
 mod scope_grant_conditions;
 mod scope_quota_enforcement;
 mod sequence_const_select;
+mod derived_expression_errors;
 mod sequence_default_all_engines;
 mod sequence_default_typed;
 mod sequence_expression_contexts;
