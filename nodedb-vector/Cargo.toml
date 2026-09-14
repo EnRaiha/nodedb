@@ -44,3 +44,13 @@ rand = { workspace = true }
 tempfile = { workspace = true }
 libc = { workspace = true }
 nodedb-wal = { workspace = true }
+
+# `fluxbench` pulls `tokio`, which does not build for wasm32. Keeping it out of
+# the wasm dev-dependency set is what lets the crate's own wasm tests build and
+# run under a wasm runner, instead of only being compile-checked.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+fluxbench = { workspace = true }
+
+[[bench]]
+name = "bbq_kernel"
+harness = false

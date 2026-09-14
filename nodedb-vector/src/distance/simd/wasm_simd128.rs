@@ -17,6 +17,7 @@
 //! explicit `unsafe {}` blocks even within `unsafe fn` bodies, as required by
 //! the `unsafe_op_in_unsafe_fn` lint default in edition 2024.
 
+use super::bbq::{assert_payload_shapes, l2_scalar_from_bytes, recon_scale};
 use std::arch::wasm32::*;
 
 /// L2-squared distance between two F32 slices using WASM SIMD128.
@@ -127,6 +128,63 @@ unsafe fn ip_impl(a: &[f32], b: &[f32]) -> f32 {
         dot += a[i] * b[i];
     }
     -dot
+}
+
+/// Lane masks for every packed byte, MSB-first: `MASKS[byte][0]` covers dims
+/// 0..4 of the byte, `MASKS[byte][1]` covers dims 4..8. `u32::MAX` marks a set
+/// sign bit, so `v128_bitselect` takes `+scale` for that lane.
+static MASKS: [[[u32; 4]; 2]; 256] = build_masks();
+
+const fn build_masks() -> [[[u32; 4]; 2]; 256] {
+    let mut table = [[[0u32; 4]; 2]; 256];
+    let mut byte = 0usize;
+    while byte < 256 {
+        let mut half = 0usize;
+        while half < 2 {
+            let mut lane = 0usize;
+            while lane < 4 {
+                let bit = (byte >> (7 - (half * 4 + lane))) & 1;
+                table[byte][half][lane] = if bit == 1 { u32::MAX } else { 0 };
+                lane += 1;
+            }
+            half += 1;
+        }
+        byte += 1;
+    }
+    table
+}
+
+/// 4-lane tier (`simd128`): `v128_bitselect` between `+scale` and `-scale`.
+/// Safe entry for `SimdRuntime`; the feature gate is this module's `#![cfg]`.
+pub fn l2_bbq(centered: &[u8], packed: &[u8], residual_norm: f32, dim: usize) -> f32 {
+    assert_payload_shapes(centered, packed, dim);
+
+    let scale = recon_scale(residual_norm, dim);
+    let pos = f32x4_splat(scale);
+    let neg = f32x4_splat(-scale);
+    let mut acc = f32x4_splat(0.0);
+
+    let mut i = 0;
+    while i + 4 <= dim {
+        // `i` advances by 4, so `i % 8` is 0 or 4 and one byte holds all four
+        // dims of this step.
+        let lanes = MASKS[packed[i / 8] as usize][(i % 8) / 4];
+        let mask = u32x4(lanes[0], lanes[1], lanes[2], lanes[3]);
+        // SAFETY: `i + 4 <= dim`, and `assert_payload_shapes` checked
+        // `centered.len() >= dim * 4`.
+        let q = unsafe { v128_load(centered.as_ptr().add(i * 4).cast()) };
+        let recon = v128_bitselect(pos, neg, mask);
+        let d = f32x4_sub(q, recon);
+        acc = f32x4_add(acc, f32x4_mul(d, d));
+        i += 4;
+    }
+
+    let sum = f32x4_extract_lane::<0>(acc)
+        + f32x4_extract_lane::<1>(acc)
+        + f32x4_extract_lane::<2>(acc)
+        + f32x4_extract_lane::<3>(acc)
+        + l2_scalar_from_bytes(centered, packed, scale, i, dim);
+    sum.sqrt()
 }
 
 #[cfg(target_arch = "wasm32")]

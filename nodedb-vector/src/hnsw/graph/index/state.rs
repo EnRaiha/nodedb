@@ -128,6 +128,8 @@ impl HnswIndex {
 
 #[cfg(test)]
 mod tests {
+    // Only the backing test uses this, and that test is gated off on wasm32.
+    #[cfg(not(target_arch = "wasm32"))]
     use std::sync::Arc;
 
     use super::{HnswIndex, HnswParams};
@@ -255,6 +257,9 @@ mod tests {
     /// Rerank must see the vector for a narrow dtype too. Before the `Cow` return
     /// this yielded `None` for F16/BF16, which made the FP32 rerank path fail with
     /// "fetch_vector returned None" for every candidate in the collection.
+    ///
+    /// `get_vector_or_backing` is gated off on wasm32, so the test is too.
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn get_vector_or_backing_serves_narrow_dtypes() {
         for dtype in [VectorStorageDtype::F16, VectorStorageDtype::BF16] {
@@ -307,6 +312,9 @@ mod tests {
     /// backing is the worst case: the graph looks healthy, so search proceeds and
     /// then scores a node that has no vector — which is what made one poisoned
     /// segment panic the daemon on every query.
+    ///
+    /// `segment_backing` is gated off on wasm32, so the test is too.
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn with_backing_refuses_a_backing_that_cannot_serve_the_index() {
         use crate::segment_backing::VectorSegmentBacking;
