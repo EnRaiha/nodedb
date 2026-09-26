@@ -13,6 +13,7 @@ pub mod index_registry_seed;
 pub mod listeners;
 pub mod panic_hook;
 pub mod permission_tree_load;
+pub mod poll_pacer;
 pub mod quota_replay;
 pub mod schema_rehydrate;
 pub mod signal;
