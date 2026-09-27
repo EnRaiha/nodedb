@@ -12,6 +12,26 @@
 
 use std::time::Duration;
 
+/// A reading of `Date.now()`, in milliseconds, as an elapsed `Duration`.
+///
+/// `None` when the reading is negative, i.e. the clock stands before the Unix
+/// epoch. Both arms agree on that contract, which is the whole point: callers
+/// map the absence to an error, so a target that answered `Some(0)` instead
+/// would store a plausible zero timestamp and lose the failure.
+///
+/// `Date.now()` returns an `f64`, and `as u64` **saturates** a negative value to
+/// `0` rather than wrapping, so the guard has to come before the conversion —
+/// converting first is exactly the bug this exists to prevent. Declared for
+/// every target so the guard itself is testable on the host, where the
+/// `js_sys` arm never compiles and could otherwise only be reviewed by eye.
+#[cfg_attr(not(test), allow(dead_code))]
+fn duration_from_epoch_millis(millis: f64) -> Option<Duration> {
+    if millis < 0.0 {
+        return None;
+    }
+    Some(Duration::from_millis(millis as u64))
+}
+
 /// Time elapsed since the Unix epoch.
 ///
 /// `None` when the system clock reads earlier than the epoch. On
@@ -19,17 +39,7 @@ use std::time::Duration;
 /// has millisecond resolution.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub fn since_epoch() -> Option<Duration> {
-    let millis = js_sys::Date::now();
-    // `Date.now()` returns a negative `f64` for a pre-epoch clock, and `as u64`
-    // saturates that to `0` rather than wrapping. Converting first would report
-    // `Some(0)` — a plausible-looking zero timestamp — where the std arm below
-    // reports `None`, so the two targets would disagree on a case callers map to
-    // an error. `Duration::from_millis` takes a `u64`, so the guard has to come
-    // before the conversion, not after.
-    if millis < 0.0 {
-        return None;
-    }
-    Some(Duration::from_millis(millis as u64))
+    duration_from_epoch_millis(js_sys::Date::now())
 }
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -41,7 +51,8 @@ pub fn since_epoch() -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
-    use super::since_epoch;
+    use super::{duration_from_epoch_millis, since_epoch};
+    use std::time::Duration;
 
     /// The helper exists so callers never reach `SystemTime::now()` on a
     /// target that has no clock. It must answer on every target it builds for.
@@ -61,5 +72,35 @@ mod tests {
         let first = since_epoch().expect("clock");
         let second = since_epoch().expect("clock");
         assert!(second >= first, "{second:?} is before {first:?}");
+    }
+
+    /// A clock standing before the Unix epoch must read as absent, on every
+    /// target.
+    ///
+    /// This is the arm `wasm32-unknown-unknown` reaches, and it cannot be
+    /// exercised by running that target here — hence the guard living in a
+    /// function the host can call. Without it `f64 as u64` saturates a negative
+    /// reading to `0`, so the browser arm would answer `Some(0)` where the std
+    /// arm answers `None`, and a caller mapping absence to an error would store
+    /// a zero timestamp instead of reporting the fault.
+    #[test]
+    fn a_pre_epoch_reading_is_absent_not_zero() {
+        assert_eq!(duration_from_epoch_millis(-1.0), None);
+        assert_eq!(duration_from_epoch_millis(-1_700_000_000_000.0), None);
+        assert_eq!(
+            duration_from_epoch_millis(-0.5),
+            None,
+            "a sub-millisecond pre-epoch reading is still before the epoch"
+        );
+    }
+
+    /// The epoch itself and anything after it are elapsed time, unchanged.
+    #[test]
+    fn a_post_epoch_reading_is_the_elapsed_time() {
+        assert_eq!(duration_from_epoch_millis(0.0), Some(Duration::ZERO));
+        assert_eq!(
+            duration_from_epoch_millis(1_700_000_000_000.0),
+            Some(Duration::from_millis(1_700_000_000_000))
+        );
     }
 }
