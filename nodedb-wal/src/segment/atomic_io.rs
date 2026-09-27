@@ -48,6 +48,12 @@ use crate::error::{Result, WalError};
 /// before the directory entry is persisted causes the file to "disappear"
 /// on reboot. Calling fsync on the directory fd ensures the metadata
 /// (filename, inode pointer) is on stable storage.
+///
+/// The exception is `wasm32-wasip1`: wasi preview1 has no directory fsync, so on
+/// that target this is a documented no-op and the durability guarantee above
+/// does not hold there. The alternative was failing every caller that renames
+/// and fsyncs on that target, which turns a weaker guarantee into an unusable
+/// one.
 pub fn fsync_directory(dir: &Path) -> Result<()> {
     // Crash injection: the directory entry never reaches stable storage.
     // Every caller must treat this as a durability failure, not a warning.
@@ -55,9 +61,23 @@ pub fn fsync_directory(dir: &Path) -> Result<()> {
         std::io::Error::other(format!("failpoint wal::fsync_directory: {detail}"))
     ));
 
-    let dir_file = fs::File::open(dir).map_err(WalError::Io)?;
-    dir_file.sync_all().map_err(WalError::Io)?;
-    Ok(())
+    #[cfg(target_arch = "wasm32")]
+    {
+        // `File::sync_all` on a directory is not implemented by wasi preview1
+        // and there is no weaker syscall with the same guarantee. The rename
+        // itself still succeeds; what is lost on this target is the assurance
+        // that the rename survives a host crash. The failpoint above still
+        // fires here, so crash injection keeps working.
+        let _ = dir;
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let dir_file = fs::File::open(dir).map_err(WalError::Io)?;
+        dir_file.sync_all().map_err(WalError::Io)?;
+        Ok(())
+    }
 }
 
 fn invalid_input(detail: String) -> WalError {
@@ -102,6 +122,10 @@ fn tmp_name(name: &str) -> String {
 /// 3. `rename(tmp, dst)` — atomic on POSIX filesystems.
 /// 4. `fsync_directory(dir)` — forces the directory entry durable so the new
 ///    name survives power loss.
+///
+/// Step 4 is a no-op on `wasm32-wasip1`, which has no directory fsync: there the
+/// rename is atomic with respect to the process but its durability across a host
+/// crash is not assured. Steps 1-3 are unchanged on every target.
 ///
 /// `name` must be one plain path component; anything else returns
 /// `InvalidInput` before a byte is written. Both paths are built here from

@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::error::Result;
-// Only the unix `pwrite` path constructs an error value directly; elsewhere
-// failures propagate as `Result` from calls that build their own.
-#[cfg(unix)]
+// The unix `pwrite` arm and the wasm seek+write arm both construct an error
+// value directly; elsewhere failures propagate as `Result` from calls that
+// build their own.
+#[cfg(any(unix, target_arch = "wasm32"))]
 use crate::error::WalError;
 
 use super::core::WalWriter;
+
+// The write arms below cover unix and wasm32. A target in neither family would
+// compile no arm at all and reinstate the silent success this file's wasi arm
+// exists to prevent, so fail the build instead of writing nothing.
+#[cfg(not(any(unix, target_arch = "wasm32")))]
+compile_error!("nodedb-wal has no WAL write arm for this target family");
 
 impl WalWriter {
     /// Flush the aligned buffer to the file.
@@ -42,8 +49,12 @@ impl WalWriter {
             self.buffer.as_slice()
         };
 
-        // Use pwrite to write at the exact offset, retrying on short writes.
-        #[cfg(unix)]
+        // Write at the exact offset. The unix path uses `pwrite` and retries
+        // short writes. `cfg(unix)` is false on `wasm32-wasip1` — its
+        // `target_family` is `wasm`, not `unix` — so wasi needs its own arm:
+        // without one this function advanced `file_offset`, cleared the buffer
+        // and reported the flush with nothing written at all.
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
         {
             use std::os::unix::io::AsRawFd;
             let fd = self.file.as_raw_fd();
@@ -59,7 +70,8 @@ impl WalWriter {
                     )
                 };
                 if written < 0 {
-                    return Err(write_error(
+                    return Err(classify_write_error(
+                        std::io::Error::last_os_error(),
                         "WAL segment append",
                         write_offset,
                         remaining.len() as u64,
@@ -79,6 +91,43 @@ impl WalWriter {
             }
         }
 
+        // This arm covers every wasm32 target, including
+        // `wasm32-unknown-unknown`, where libc defines no `pwrite` at all, and
+        // std's wasi positional API (`std::os::wasi::fs`) is still unstable.
+        // The segment is only ever appended to, so seeking to `file_offset` and
+        // writing is equivalent to a positional write. An error returns before
+        // the shared bookkeeping below, so a failed flush leaves the buffer and
+        // `file_offset` untouched for a retry — the same property the `pwrite`
+        // arm has.
+        #[cfg(target_arch = "wasm32")]
+        {
+            use std::io::{Seek as _, SeekFrom, Write as _};
+            self.file
+                .seek(SeekFrom::Start(self.file_offset))
+                .map_err(WalError::Io)?;
+            // Crash injection: this arm's write fails with a full device. It
+            // sits inside the arm, so a test that arms it proves the arm is what
+            // ran — and it is classified exactly as the real failure below is,
+            // by the same call, which is the only way to reach that classifier
+            // on a runtime whose writes cannot be made to fail on demand.
+            nodedb_types::fail_point_err!("wal::wasm_flush_write", |_detail: String| {
+                classify_write_error(
+                    std::io::Error::new(std::io::ErrorKind::StorageFull, "device full"),
+                    "WAL segment append",
+                    self.file_offset,
+                    data.len() as u64,
+                )
+            });
+            self.file.write_all(data).map_err(|err| {
+                classify_write_error(
+                    err,
+                    "WAL segment append",
+                    self.file_offset,
+                    data.len() as u64,
+                )
+            })?;
+        }
+
         self.file_offset += data.len() as u64;
         self.buffer.clear();
 
@@ -90,7 +139,7 @@ impl WalWriter {
     }
 }
 
-/// Classify the current `errno` from a failed WAL write.
+/// Classify a failed WAL write.
 ///
 /// A full device is called out separately from generic I/O failure: it is not
 /// transient, retrying cannot succeed, and the caller must stop acknowledging
@@ -98,14 +147,22 @@ impl WalWriter {
 /// where the batch stalled and how much of it never reached the file, which is
 /// what a report needs to describe the write that could not complete.
 ///
-/// Gated to match its only call site: the `pwrite` loop is unix-only, so on
-/// other targets (wasm32) this would be dead code and a `-D warnings` build
-/// would reject it.
-#[cfg(unix)]
-fn write_error(context: &'static str, offset: u64, pending: u64) -> WalError {
-    let err = std::io::Error::last_os_error();
-    #[cfg(unix)]
-    if err.raw_os_error() == Some(libc::ENOSPC) {
+/// Takes the error rather than reading `errno` again: the wasm arm is handed a
+/// real `io::Error` by `write_all`, and re-deriving it from the thread's errno
+/// would classify whatever happened to be there last.
+///
+/// Keyed on `ErrorKind::StorageFull` rather than on `libc::ENOSPC`: std maps the
+/// full-device errno to that kind on every target that has a filesystem, and
+/// `libc` defines no constants at all for `wasm32-unknown-unknown`, which this
+/// crate is also compiled for.
+#[cfg(any(unix, target_arch = "wasm32"))]
+fn classify_write_error(
+    err: std::io::Error,
+    context: &'static str,
+    offset: u64,
+    pending: u64,
+) -> WalError {
+    if err.kind() == std::io::ErrorKind::StorageFull {
         let out_of_space = WalError::OutOfSpace { context };
         crate::diag::out_of_space(&out_of_space, context, offset, pending);
         return out_of_space;
