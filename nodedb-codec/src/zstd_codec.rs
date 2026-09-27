@@ -303,17 +303,16 @@ fn decompress_native(frame: &[u8], expected_size: usize) -> Result<Vec<u8>, Code
     Ok(output)
 }
 
-// WASM: use ruzstd for decompression. Compression on WASM uses a simple
-// fallback (ruzstd is decode-only; if full Zstd encoding is needed on WASM,
-// we'd need the zstd crate compiled to WASM via C-to-WASM toolchain).
-// For Pattern C (Lite-local), cold compression happens infrequently, so
-// we fall back to LZ4 encoding on WASM and only support Zstd decoding.
+// WASM: decoding uses ruzstd. Encoding returns `CompressFailed`: the C library is
+// not built for this target and ruzstd's encoder is not adopted here, so a wasm
+// caller that needs compression picks another codec. Adopting `ruzstd::encoding`
+// is a change of its own; getting the C library there would need a C-to-WASM
+// toolchain.
 
 #[cfg(target_arch = "wasm32")]
 fn compress_native(_data: &[u8], _level: i32) -> Result<Vec<u8>, CodecError> {
-    // ruzstd is decode-only. On WASM, we encode using a minimal Zstd frame.
-    // For production WASM builds that need Zstd encoding, compile the C zstd
-    // library to WASM. For now, return an error directing callers to use LZ4.
+    // No encoder is wired up here. This is a stub, not a fallback: it encodes
+    // nothing, and the error below is what every caller sees.
     Err(CodecError::CompressFailed {
         detail: "Zstd encoding not available on WASM — use LZ4 codec instead".into(),
     })
@@ -431,7 +430,16 @@ impl ZstdDecoder {
 mod tests {
     use super::*;
 
+    // The eight encoder tests are ignored on `wasm32` rather than removed:
+    // `compress_native` returns `CompressFailed` there by design, so `encode`
+    // cannot succeed. `cfg_attr(ignore)` keeps them running natively and visible
+    // in `--list` on wasm; the tests that do not encode stay live on both.
+
     #[test]
+    #[cfg_attr(
+        target_arch = "wasm32",
+        ignore = "nodedb-codec has no wasm encoder: encode() returns CompressFailed"
+    )]
     fn empty_data() {
         let encoded = encode(&[]).unwrap();
         let decoded = decode(&encoded).unwrap();
@@ -439,6 +447,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_arch = "wasm32",
+        ignore = "nodedb-codec has no wasm encoder: encode() returns CompressFailed"
+    )]
     fn small_data_roundtrip() {
         let data = b"hello world, zstd compression test";
         let encoded = encode(data).unwrap();
@@ -447,6 +459,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_arch = "wasm32",
+        ignore = "nodedb-codec has no wasm encoder: encode() returns CompressFailed"
+    )]
     fn large_data_roundtrip() {
         let line = "2024-01-15 ERROR database connection timeout host=db-prod-01 retry=3\n";
         let data: Vec<u8> = line.as_bytes().repeat(1000);
@@ -462,6 +478,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_arch = "wasm32",
+        ignore = "nodedb-codec has no wasm encoder: encode() returns CompressFailed"
+    )]
     fn high_compression_level() {
         let data: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
         let default_encoded = encode(&data).unwrap();
@@ -476,6 +496,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_arch = "wasm32",
+        ignore = "nodedb-codec has no wasm encoder: encode() returns CompressFailed"
+    )]
     fn header_metadata() {
         let data = vec![42u8; 1000];
         let encoded = encode_with_level(&data, 7).unwrap();
@@ -485,6 +509,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_arch = "wasm32",
+        ignore = "nodedb-codec has no wasm encoder: encode() returns CompressFailed"
+    )]
     fn better_ratio_than_lz4() {
         // Structured data where Zstd should beat LZ4.
         let mut data = Vec::new();
@@ -552,6 +580,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_arch = "wasm32",
+        ignore = "nodedb-codec has no wasm encoder: encode() returns CompressFailed"
+    )]
     fn streaming_encoder() {
         let parts: Vec<&[u8]> = vec![b"part one ", b"part two ", b"part three"];
         let full: Vec<u8> = parts.iter().flat_map(|p| p.iter().copied()).collect();
@@ -585,6 +617,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_arch = "wasm32",
+        ignore = "nodedb-codec has no wasm encoder: encode() returns CompressFailed"
+    )]
     fn level_clamping() {
         let data = b"test data for clamping";
         // Level 0 → clamped to 1, level 99 → clamped to 22.
