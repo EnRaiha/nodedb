@@ -108,6 +108,10 @@ getrandom = { version = "0.4", features = ["std"] }
 # all three generations at once.
 getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+# The browser clock and timer bindings, reached only from
+# `wasm32-unknown-unknown`; declared here so a crate depends on it the same way
+# it depends on every other shared dependency.
+js-sys = "0.3"
 aes-gcm = "0.10"
 argon2 = "0.5"
 rsa = "0.9"

@@ -41,3 +41,9 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 toml = { workspace = true }
+
+# The browser clock, reached only by `clock::since_epoch`'s
+# `wasm32-unknown-unknown` arm. Every other target, `wasm32-wasip1` included,
+# reads the clock through std.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+js-sys = { workspace = true }
