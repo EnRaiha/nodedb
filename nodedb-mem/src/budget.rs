@@ -320,6 +320,9 @@ mod tests {
         assert_eq!(budget.allocated(), 0);
     }
 
+    // Drives the reserve path from real threads; `wasm32-wasip1` has none.
+
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn concurrent_reserves() {
         use std::sync::Arc;

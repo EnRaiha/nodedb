@@ -35,5 +35,15 @@ zerompk = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
 
-[dev-dependencies]
+# The optional `tokio` above is the crate's own dependency and stays as it is;
+# these are the dev-dependencies. Native needs nothing new, but the workspace
+# entry cannot be used in both: workspace features are additive, so
+# `{ workspace = true }` always carries the workspace's `features = ["full"]`,
+# and tokio refuses to build on wasm with anything beyond
+# `sync,macros,io-util,rt,time`. The wasm entry therefore names the version and
+# the features directly, which is what keeps the test targets buildable on both.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time"] }

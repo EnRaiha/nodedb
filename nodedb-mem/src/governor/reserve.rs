@@ -167,11 +167,7 @@ impl MemoryGovernor {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
-    use std::thread;
-
-    use nodedb_types::{DatabaseId, TenantId};
 
     use super::*;
     use crate::engine_limits::EngineLimits;
@@ -345,8 +341,16 @@ mod tests {
 
     // ── Concurrent reserves ───────────────────────────────────────────────────
 
+    // Drives the reserve path from real threads; `wasm32-wasip1` has none.
+
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn concurrent_reserves_never_exceed_cap() {
+        use std::sync::Arc;
+        use std::thread;
+
+        use nodedb_types::{DatabaseId, TenantId};
+
         let limits = EngineLimits::zeroed().with(EngineId::Vector, 10_000);
         let gov = Arc::new(
             MemoryGovernor::new(GovernorConfig {

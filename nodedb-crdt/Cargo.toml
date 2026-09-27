@@ -27,5 +27,12 @@ subtle = { workspace = true }
 getrandom = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
 serde_json = { workspace = true }
+
+# Native-only dev-dependencies. `tokio = { workspace = true }` inherits
+# `features = ["full"]`, and tokio refuses fs/io-std/net/process/
+# rt-multi-thread/signal on wasm; Cargo unifies dev-dependency features across
+# the whole `cargo test` invocation, so it breaks every wasm test target in the
+# build. No test or bench in this crate calls tokio.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true }
