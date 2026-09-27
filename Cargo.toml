@@ -102,7 +102,7 @@ hmac = "0.12"
 hkdf = "0.12"
 subtle = "2"
 base64 = "0.23"
-getrandom = { version = "0.4", features = ["std"] }
+getrandom = { version = "0.4", features = ["std", "wasm_js"] }
 # wasm builds pin the older generations: `getrandom` 0.3 needs `wasm_js` and 0.2
 # needs `js` to reach the browser CSPRNG. Both are aliased so one crate can hold
 # all three generations at once.

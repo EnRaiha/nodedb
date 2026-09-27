@@ -47,3 +47,8 @@ toml = { workspace = true }
 # reads the clock through std.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 js-sys = { workspace = true }
+# `getrandom` reaches this crate transitively through `aes-gcm`, and 0.3 refuses
+# `wasm32-unknown-unknown` unless `wasm_js` is on and the matching cfg is set.
+# Naming it here is what puts the feature in this crate's resolution.
+getrandom_02 = { workspace = true }
+getrandom_03 = { workspace = true }
