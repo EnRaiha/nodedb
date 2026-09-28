@@ -498,4 +498,111 @@ mod tests {
             }) if bytes.is_empty()
         ));
     }
+
+    /// A row whose payload carries no key column still mints an identity, and
+    /// that identity must also appear under the key column. A later point read
+    /// finds the row by `pk_bytes` regardless, so an omitted column leaves the
+    /// key value absent from the sidecar and from any payload index on it.
+    #[test]
+    fn missing_key_column_carries_the_minted_identity() {
+        let ctx = make_ctx(0);
+        let rows = vec![VectorPrimaryRow {
+            surrogate: nodedb_types::Surrogate::ZERO,
+            vector: vec![0.0f32; 3],
+            payload_fields: std::collections::HashMap::new(),
+        }];
+        let tasks = convert(&ctx, &rows, VectorPrimaryInsertIntent::Insert).expect("convert");
+        let (pk_bytes, carried) = carried_key_column(&tasks[0]);
+        assert_eq!(
+            carried,
+            String::from_utf8(pk_bytes).expect("identity is utf8"),
+            "the payload's key column must equal the identity the point read resolves"
+        );
+    }
+
+    /// An explicit NULL key column takes the same path as an absent one: both
+    /// mint, and both must be replaced in the payload.
+    #[test]
+    fn null_key_column_carries_the_minted_identity() {
+        let ctx = make_ctx(0);
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("id".to_string(), SqlValue::Null);
+        let rows = vec![VectorPrimaryRow {
+            surrogate: nodedb_types::Surrogate::ZERO,
+            vector: vec![0.0f32; 3],
+            payload_fields: fields,
+        }];
+        let tasks = convert(&ctx, &rows, VectorPrimaryInsertIntent::Insert).expect("convert");
+        let (pk_bytes, carried) = carried_key_column(&tasks[0]);
+        assert_eq!(
+            carried,
+            String::from_utf8(pk_bytes).expect("identity is utf8"),
+            "a NULL key column must be filled, not kept"
+        );
+    }
+
+    /// The fill path fills an absent key and a NULL key. A present value stays
+    /// as the row carries it: `pk_bytes` already holds that value's string
+    /// form, and the column keeps the value. An overwrite replaces a typed
+    /// column with its string form, so `Int(7)` lands in the payload as `"7"`.
+    #[test]
+    fn present_key_column_is_left_alone() {
+        let ctx = make_ctx(0);
+        let rows = vec![row(3, "r1")];
+        let tasks = convert(&ctx, &rows, VectorPrimaryInsertIntent::Insert).expect("convert");
+        let (_, carried) = carried_key_column(&tasks[0]);
+        assert_eq!(carried, "r1", "a present key column must survive untouched");
+    }
+
+    /// An empty key column is a present key, not a missing one. The identity
+    /// extractor reads `""` as `Present("")` and returns `""` as the identity,
+    /// so `pk_bytes` stays empty. The guard writes `doc_id` when it fills, and
+    /// `doc_id` already equals `""` here, so a fill changes nothing. An
+    /// extractor that reads `""` as missing mints a fresh identity, and this
+    /// assertion fails on `pk_bytes`.
+    #[test]
+    fn empty_key_column_is_left_alone() {
+        let ctx = make_ctx(0);
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("id".to_string(), SqlValue::String(String::new()));
+        let rows = vec![VectorPrimaryRow {
+            surrogate: nodedb_types::Surrogate::ZERO,
+            vector: vec![0.0f32; 3],
+            payload_fields: fields,
+        }];
+        let tasks = convert(&ctx, &rows, VectorPrimaryInsertIntent::Insert).expect("convert");
+        let (pk_bytes, carried) = carried_key_column(&tasks[0]);
+        assert!(
+            carried.is_empty(),
+            "an empty key column must not be replaced by a minted identity"
+        );
+        assert!(
+            pk_bytes.is_empty(),
+            "the identity must stay the empty key the row already carries"
+        );
+    }
+
+    /// Read the key column back out of the payload a `DirectInsert` carries.
+    fn carried_key_column(task: &PhysicalTask) -> (Vec<u8>, String) {
+        let (pk_bytes, payload) = match &task.plan {
+            PhysicalPlan::Vector(VectorOp::DirectInsert {
+                pk_bytes, payload, ..
+            }) => (pk_bytes.clone(), payload.clone()),
+            other => panic!("expected DirectInsert, got {other:?}"),
+        };
+        // Name the cause here: a guard that fills nothing leaves the payload
+        // empty, and a bare decode error reports a codec failure rather than
+        // the missing key column this assertion is about.
+        assert!(
+            !payload.is_empty(),
+            "the payload carries no key column, so the guard did not fill it: expected {}",
+            String::from_utf8_lossy(&pk_bytes)
+        );
+        let decoded: std::collections::HashMap<String, nodedb_types::Value> =
+            zerompk::from_msgpack(&payload).expect("payload decodes");
+        match decoded.get("id") {
+            Some(nodedb_types::Value::String(id)) => (pk_bytes, id.clone()),
+            other => panic!("expected a string key column in the payload, got {other:?}"),
+        }
+    }
 }
