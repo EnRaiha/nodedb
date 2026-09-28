@@ -40,7 +40,7 @@ pub(super) enum DdlCommitPlan<'a> {
     /// Buffered DDL already reserved via `DdlPendingPropose`. The caller
     /// must call [`finalize_pending`] on this handle before dispatching any
     /// buffered DML, then, on any dispatch failure, propose compensation
-    /// for `handle.objects()` via [`compensate_finalized`].
+    /// for `handle.objects()` via `ddl_compensate::compensate_finalized`.
     Pending(PendingDdlHandle<'a>),
 }
 
@@ -156,7 +156,7 @@ fn local_apply_error(
 /// node-local pending record is gone, or via an internal `?` on failure —
 /// so the lease releases at exactly that moment either way. `objects` is
 /// cloned out before that move so a dispatch failure that follows can still
-/// build compensation via [`compensate_finalized`].
+/// build compensation via `ddl_compensate::compensate_finalized`.
 pub(super) struct PendingDdlHandle<'a> {
     token: u64,
     log_index: u64,
@@ -186,7 +186,7 @@ impl PendingDdlHandle<'_> {
 
 /// Propose `entry` to the metadata group and block until this node's applied
 /// watermark reaches its log index.
-fn propose_and_await(
+pub(super) fn propose_and_await(
     state: &SharedState,
     handle: &dyn MetadataRaftHandle,
     entry: &MetadataEntry,
@@ -308,7 +308,7 @@ fn propose_pending_buffered<'a>(
         .cluster_version_view()
         .can_activate_feature(crate::control::rolling_upgrade::DESCRIPTOR_VERSIONING_VERSION)
     {
-        catalog_entry::descriptor_stamp::stamp_batch(entries, &state.hlc_clock, catalog)
+        catalog_entry::descriptor_stamp::stamp_batch(entries, &state.hlc_clock, catalog)?
     } else {
         entries
     };
@@ -389,86 +389,51 @@ pub(super) fn finalize_pending(
     Ok(())
 }
 
-/// Undo every object `finalize_pending` already applied to the catalog,
-/// after a buffered-DML dispatch failure. Proposed as one fenced batch, so
-/// the compensation itself is atomic: a fresh `Create` is purged/deleted, an
-/// `Alter` is restored from its captured `before_image`. A failure here is
-/// returned, never swallowed — the caller surfaces it alongside the original
-/// dispatch failure rather than logging and continuing.
-pub(super) fn compensate_finalized(
-    state: &SharedState,
-    objects: &[PendingDdlObject],
-) -> crate::Result<()> {
-    let Some(handle) = state.metadata_raft.get() else {
-        return Err(crate::Error::Internal {
-            detail: "compensate_finalized: no metadata raft group installed".into(),
-        });
-    };
-    let mut entries = Vec::with_capacity(objects.len());
-    for object in objects {
-        let payload = match object {
-            PendingDdlObject::Alter { before_image, .. } => before_image.clone(),
-            PendingDdlObject::Create { entry } => {
-                let created = catalog_entry::decode(wire_payload(entry)?)?;
-                catalog_entry::encode(&reverse_create(&created)?)?
-            }
-        };
-        entries.push(MetadataEntry::CatalogDdl { payload });
-    }
-    let log_index = propose_and_await(state, handle.as_ref(), &MetadataEntry::Batch { entries })?;
-    // The compensation restores prior authorization state, which binds every
-    // node like any other authorization change.
-    if super::ddl_authorization::objects_bear_authorization(objects)? {
-        super::ddl_authorization::barrier_at(state, log_index)?;
-    }
-    Ok(())
-}
-
-/// The opaque catalog payload `entry` carries, regardless of audit wrapping.
-fn wire_payload(entry: &MetadataEntry) -> crate::Result<&[u8]> {
-    match entry {
-        MetadataEntry::CatalogDdl { payload }
-        | MetadataEntry::CatalogDdlAudited { payload, .. } => Ok(payload),
-        other => Err(crate::Error::Internal {
-            detail: format!(
-                "commit compensation: pending DDL wire shape is not CatalogDdl: {other:?}"
-            ),
-        }),
-    }
-}
-
 /// The catalog entry that undoes `entry` after `finalize_pending` has
 /// already applied it as a fresh `PendingDdlObject::Create`. Covers the
 /// object kinds transactional DDL can buffer as a create; anything else
 /// reports a typed error instead of silently doing nothing.
-fn reverse_create(entry: &CatalogEntry) -> crate::Result<CatalogEntry> {
+///
+/// The reversal is proposed without a stamp, so each delete targets the exact
+/// incarnation the create wrote.
+pub(super) fn reverse_create(entry: &CatalogEntry) -> crate::Result<CatalogEntry> {
     match entry {
         CatalogEntry::PutCollection(stored) | CatalogEntry::PutCollectionIfAbsent(stored) => {
             Ok(CatalogEntry::PurgeCollection {
                 database_id: stored.database_id.as_u64(),
                 tenant_id: stored.tenant_id,
                 name: stored.name.clone(),
+                target_descriptor_version: stored.descriptor_version,
+                target_hlc: stored.modification_hlc,
             })
         }
         CatalogEntry::PutSequence(stored) => Ok(CatalogEntry::DeleteSequence {
             database_id: stored.database_id,
             tenant_id: stored.tenant_id,
             name: stored.name.clone(),
+            target_descriptor_version: stored.descriptor_version,
+            target_hlc: stored.modification_hlc,
         }),
         CatalogEntry::PutFunction(stored) => Ok(CatalogEntry::DeleteFunction {
             database_id: stored.database_id,
             tenant_id: stored.tenant_id,
             name: stored.name.clone(),
+            target_descriptor_version: stored.descriptor_version,
+            target_hlc: stored.modification_hlc,
         }),
         CatalogEntry::PutTrigger(stored) => Ok(CatalogEntry::DeleteTrigger {
             database_id: stored.database_id,
             tenant_id: stored.tenant_id,
             name: stored.name.clone(),
+            target_descriptor_version: stored.descriptor_version,
+            target_hlc: stored.modification_hlc,
         }),
         CatalogEntry::PutProcedure(stored) => Ok(CatalogEntry::DeleteProcedure {
             database_id: stored.database_id,
             tenant_id: stored.tenant_id,
             name: stored.name.clone(),
+            target_descriptor_version: stored.descriptor_version,
+            target_hlc: stored.modification_hlc,
         }),
         CatalogEntry::PutIndexRecord(stored) => Ok(CatalogEntry::DeleteIndexRecord {
             database_id: stored.database_id,
@@ -480,6 +445,8 @@ fn reverse_create(entry: &CatalogEntry) -> crate::Result<CatalogEntry> {
             database_id: stored.database_id,
             tenant_id: stored.tenant_id,
             name: stored.name.clone(),
+            target_descriptor_version: stored.descriptor_version,
+            target_hlc: stored.modification_hlc,
         }),
         other => Err(crate::Error::Internal {
             detail: format!(
@@ -501,12 +468,12 @@ mod tests {
     use crate::wal::WalManager;
 
     use super::super::connection::{ConnectionId, SessionId};
+    use super::super::ddl_compensate::compensate_finalized;
     use super::super::store::SessionStore;
     use super::super::{conn_scope, ddl_buffer};
     use super::{
         DdlCommitPlan, MetadataEntry, PendingDdlHandle, PendingDdlObject, SharedState,
-        begin_commit, compensate_finalized, finalize_pending, flush_local, local_apply_error,
-        reverse_create,
+        begin_commit, finalize_pending, flush_local, local_apply_error, reverse_create,
     };
 
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -603,9 +570,30 @@ mod tests {
                 } => {
                     shared.pending_ddl.insert(token, objects, proposed_at);
                 }
-                MetadataEntry::DdlPendingFinalize { token }
-                | MetadataEntry::DdlPendingCancel { token } => {
+                MetadataEntry::DdlPendingFinalize { token } => {
+                    if let Some(record) = shared.pending_ddl.take(token) {
+                        for object in &record.objects {
+                            let (PendingDdlObject::Create { entry }
+                            | PendingDdlObject::Alter { entry, .. }) = object;
+                            apply_catalog(&shared, entry)?;
+                        }
+                    }
+                }
+                MetadataEntry::DdlPendingCancel { token } => {
                     shared.pending_ddl.take(token);
+                }
+                MetadataEntry::DdlPrepared { token, entry } => {
+                    let owns_lease = shared
+                        .metadata_ddl_owner
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .is_some_and(|(current, _)| current == token);
+                    if owns_lease {
+                        apply_catalog(&shared, &entry)?;
+                        shared
+                            .metadata_ddl_applied_token
+                            .store(token, Ordering::Release);
+                    }
                 }
                 _ => {}
             }
@@ -615,6 +603,29 @@ mod tests {
                 .bump(index);
             Ok(index)
         }
+    }
+
+    /// Apply a catalog-bearing entry the way the metadata applier does:
+    /// validate, then write, descending into batches.
+    fn apply_catalog(shared: &SharedState, entry: &MetadataEntry) -> crate::Result<()> {
+        use crate::control::catalog_entry::descriptor_validate::{ValidationOutcome, validate};
+        match entry {
+            MetadataEntry::Batch { entries } => {
+                for sub in entries {
+                    apply_catalog(shared, sub)?;
+                }
+            }
+            MetadataEntry::CatalogDdl { payload }
+            | MetadataEntry::CatalogDdlAudited { payload, .. } => {
+                let decoded = crate::control::catalog_entry::decode(payload)?;
+                let catalog = shared.credentials.catalog();
+                if validate(&decoded, catalog)? == ValidationOutcome::Apply {
+                    crate::control::catalog_entry::apply::apply_to(&decoded, catalog)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// A `SharedState` with a fake metadata raft group installed, so
@@ -837,7 +848,8 @@ mod tests {
             CatalogEntry::DeleteSequence {
                 database_id: 0,
                 tenant_id: 7,
-                name
+                name,
+                ..
             } if name == "orders_seq"
         ));
     }
@@ -848,6 +860,8 @@ mod tests {
             database_id: 0,
             tenant_id: 7,
             name: "orders_seq".into(),
+            target_descriptor_version: 0,
+            target_hlc: nodedb_types::Hlc::ZERO,
         });
         assert!(
             err.is_err(),
@@ -864,6 +878,46 @@ mod tests {
 
         compensate_finalized(&state, &objects)
             .expect("compensate_finalized must propose a reversal batch for the finalized create");
+        assert!(
+            state
+                .credentials
+                .catalog()
+                .get_sequence(0, 7, "orders_seq")
+                .expect("read sequence")
+                .is_none(),
+            "the reversal must delete the sequence the transaction created"
+        );
+    }
+
+    /// A DDL that lands between the finalize and the compensation owns the
+    /// descriptor. The reversal is refused, and the later row survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn compensate_finalized_refuses_a_descriptor_changed_after_finalize() {
+        let (state, _dir) = replicated_state();
+        let handle = propose_one_sequence(&state, "orders_seq").await;
+        let objects: Vec<PendingDdlObject> = handle.objects().to_vec();
+        finalize_pending(&state, handle).expect("finalize_pending must succeed");
+
+        let catalog = state.credentials.catalog();
+        let mut later = catalog
+            .get_sequence(0, 7, "orders_seq")
+            .expect("read sequence")
+            .expect("finalize created the sequence");
+        later.descriptor_version += 1;
+        later.modification_hlc = state.hlc_clock.now();
+        catalog
+            .put_sequence(&later)
+            .expect("write later incarnation");
+
+        assert!(
+            compensate_finalized(&state, &objects).is_err(),
+            "a reversal over a later DDL must fail, never report success"
+        );
+        let surviving = catalog
+            .get_sequence(0, 7, "orders_seq")
+            .expect("read sequence")
+            .expect("the later incarnation must survive");
+        assert_eq!(surviving.modification_hlc, later.modification_hlc);
     }
 
     /// A local apply that fails at COMMIT reports the apply error's own

@@ -47,6 +47,8 @@ pub async fn drop_synonym_group(
         database_id: database_id_u64,
         tenant_id: tenant_id_u64,
         name: name.to_string(),
+        // Frozen by the proposer's stamp.
+        target_hlc: nodedb_types::Hlc::ZERO,
     };
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;

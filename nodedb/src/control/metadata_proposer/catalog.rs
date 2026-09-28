@@ -144,7 +144,7 @@ fn propose_and_apply_locally(
             entry.clone(),
             &shared.hlc_clock,
             shared.credentials.catalog(),
-        );
+        )?;
         &stamped_owned
     } else {
         entry

@@ -131,7 +131,9 @@ mod tests {
             CatalogEntry::DeleteSequence {
                 database_id: 0,
                 tenant_id: 1,
-                name: "c".into()
+                name: "c".into(),
+                target_descriptor_version: 0,
+                target_hlc: nodedb_types::Hlc::ZERO,
             }
             .kind(),
             "delete_sequence"

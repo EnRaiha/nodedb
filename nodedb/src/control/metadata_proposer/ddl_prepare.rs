@@ -175,7 +175,7 @@ pub(crate) fn acquire_ddl_prepare_lease<'a>(
 /// callers, blocking-pool threads) and panics on the current-thread runtime,
 /// so it is applied only where it is both legal and meaningful — mirroring
 /// `lease::drain_propose::poll_leases_drained`.
-pub(super) fn lock_ddl_preparation(
+pub(crate) fn lock_ddl_preparation(
     shared: &SharedState,
 ) -> Result<std::sync::MutexGuard<'_, ()>, Error> {
     let acquire = || {

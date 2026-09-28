@@ -180,7 +180,8 @@ mod tests {
             },
             &clock,
             catalog,
-        );
+        )
+        .expect("stamp deactivate_collection");
         apply_to(&deactivate, catalog).expect("apply deactivate_collection");
 
         let dropped = catalog

@@ -421,7 +421,7 @@ fn find_topic_definition(
     Ok(Some(def))
 }
 
-fn validate_topic_identity(
+pub(super) fn validate_topic_identity(
     def: &TopicDef,
     database_id: DatabaseId,
     tenant_id: u64,
@@ -525,7 +525,7 @@ fn scoped_message_keys(
     Ok(keys)
 }
 
-fn topic_key(database_id: DatabaseId, tenant_id: u64, name: &str) -> String {
+pub(super) fn topic_key(database_id: DatabaseId, tenant_id: u64, name: &str) -> String {
     let mut encoded = String::with_capacity(name.len() * 2);
     for byte in name.as_bytes() {
         use std::fmt::Write;
@@ -626,11 +626,12 @@ impl From<LegacyTopicDef> for TopicDef {
             database_id: DatabaseId::DEFAULT,
             last_sequence: 0,
             last_lsn: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 }
 
-fn decode_topic(bytes: &[u8]) -> crate::Result<TopicDef> {
+pub(super) fn decode_topic(bytes: &[u8]) -> crate::Result<TopicDef> {
     zerompk::from_msgpack(bytes)
         .or_else(|_| zerompk::from_msgpack::<LegacyTopicDef>(bytes).map(TopicDef::from))
         .map_err(|e| catalog_err("decode topic", e))
@@ -663,6 +664,7 @@ mod tests {
             created_at: 0,
             last_sequence: 0,
             last_lsn: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 

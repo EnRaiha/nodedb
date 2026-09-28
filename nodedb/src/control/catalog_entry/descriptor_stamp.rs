@@ -20,9 +20,14 @@
 //! Variants without descriptor fields pass through unchanged: `PutUser`,
 //! `PutRole`, `PutPermission`, `PutOwner`, `PutTenant`, `PutApiKey`,
 //! `PutAuthUser`, `PutRlsPolicy`, `PutSchedule`, `PutChangeStream`,
-//! `PutSequenceState`, and every `Delete*` / `Purge*` variant.
+//! `PutSequenceState`, and every unfenced `Delete*` variant.
 //! `DeactivateCollection` does carry them: a soft delete rewrites the row, so it
 //! consumes a version like any other mutation.
+//!
+//! A fenced delete (`PurgeCollection` and the `Delete*` of every stored type
+//! with an incarnation clock) freezes the target row's incarnation instead.
+//! `PutSynonymGroup`, `PutVectorIndexParams`, and `CreateTopicIfAbsent` stamp
+//! only `modification_hlc`. See [`super::incarnation`].
 //! The match is exhaustive on [`CatalogEntry`], so a new variant is a compile
 //! error here. Deciding whether it needs a stamp is deliberate.
 
@@ -38,10 +43,7 @@ fn next_collection_stamp(
     clock: &HlcClock,
     hlc: Hlc,
 ) -> (u64, Hlc) {
-    let hlc = match prior.map(|c| c.modification_hlc) {
-        Some(prior_hlc) if prior_hlc >= hlc => clock.update(prior_hlc),
-        _ => hlc,
-    };
+    let hlc = super::incarnation::stamp::after(prior.map(|c| c.modification_hlc), clock, hlc);
     let prior_descriptor = prior.map(|c| c.descriptor_version).unwrap_or(0);
     (prior_descriptor.saturating_add(1), hlc)
 }
@@ -49,17 +51,22 @@ fn next_collection_stamp(
 /// Read the prior persisted descriptor, assign `descriptor_version = prior + 1`
 /// (or `1` on create), stamp `modification_hlc = clock.now()`, return the entry.
 ///
-/// Infallible by design: a failed redb read stamps as if the record was absent
-/// (version `1`). Version `0` is never emitted — it is strictly the
-/// pre-stamping compat-mode sentinel.
-pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> CatalogEntry {
+/// A failed catalog read fails the stamp: a guessed prior would emit a
+/// version-1 put or an unfenced delete. Version `0` is never emitted — it is
+/// strictly the pre-stamping compat-mode sentinel.
+pub fn stamp(
+    entry: CatalogEntry,
+    clock: &HlcClock,
+    catalog: &SystemCatalog,
+) -> crate::Result<CatalogEntry> {
     let mut hlc = clock.now();
-    match entry {
+    Ok(match entry {
         CatalogEntry::PutCollection(mut stored) => {
-            let prior = catalog
-                .get_committed_collection(stored.database_id, stored.tenant_id, &stored.name)
-                .ok()
-                .flatten();
+            let prior = catalog.get_committed_collection(
+                stored.database_id,
+                stored.tenant_id,
+                &stored.name,
+            )?;
             let (descriptor_version, stamped_hlc) =
                 next_collection_stamp(prior.as_ref(), clock, hlc);
             stored.descriptor_version = descriptor_version;
@@ -83,14 +90,15 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
             CatalogEntry::PutCollection(stored)
         }
         CatalogEntry::PutCollectionIfAbsent(mut stored) => {
-            let prior = catalog
-                .get_committed_collection(stored.database_id, stored.tenant_id, &stored.name)
-                .ok()
-                .flatten();
+            let prior = catalog.get_committed_collection(
+                stored.database_id,
+                stored.tenant_id,
+                &stored.name,
+            )?;
             // Existing is a semantic no-op: freeze the exact persisted record, so
             // replay stays payload-identical and later batch entries see the prior.
             if let Some(prior) = prior {
-                return CatalogEntry::PutCollectionIfAbsent(Box::new(prior));
+                return Ok(CatalogEntry::PutCollectionIfAbsent(Box::new(prior)));
             }
             stored.descriptor_version = 1;
             let new_set = crate::control::security::catalog::collection_constraints(&stored);
@@ -100,9 +108,11 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         }
         CatalogEntry::PutMaterializedView(mut stored) => {
             let prior = catalog
-                .get_committed_materialized_view(stored.database_id, stored.tenant_id, &stored.name)
-                .ok()
-                .flatten()
+                .get_committed_materialized_view(
+                    stored.database_id,
+                    stored.tenant_id,
+                    &stored.name,
+                )?
                 .map(|v| v.descriptor_version)
                 .unwrap_or(0);
             stored.descriptor_version = prior.saturating_add(1);
@@ -115,9 +125,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
                     stored.database_id,
                     stored.tenant_id,
                     &stored.name,
-                )
-                .ok()
-                .flatten()
+                )?
                 .map(|f| f.descriptor_version)
                 .unwrap_or(0);
             stored.descriptor_version = prior.saturating_add(1);
@@ -130,9 +138,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
                     stored.database_id,
                     stored.tenant_id,
                     &stored.name,
-                )
-                .ok()
-                .flatten()
+                )?
                 .map(|p| p.descriptor_version)
                 .unwrap_or(0);
             stored.descriptor_version = prior.saturating_add(1);
@@ -145,9 +151,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
                     stored.database_id,
                     stored.tenant_id,
                     &stored.name,
-                )
-                .ok()
-                .flatten()
+                )?
                 .map(|t| t.descriptor_version)
                 .unwrap_or(0);
             stored.descriptor_version = prior.saturating_add(1);
@@ -156,9 +160,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         }
         CatalogEntry::PutSequence(mut stored) => {
             let prior = catalog
-                .get_sequence(stored.database_id, stored.tenant_id, &stored.name)
-                .ok()
-                .flatten()
+                .get_sequence(stored.database_id, stored.tenant_id, &stored.name)?
                 .map(|s| s.descriptor_version)
                 .unwrap_or(0);
             stored.descriptor_version = prior.saturating_add(1);
@@ -167,9 +169,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         }
         CatalogEntry::PutContinuousAggregate(mut stored) => {
             let prior = catalog
-                .get_continuous_aggregate(stored.database_id, stored.tenant_id, &stored.name)
-                .ok()
-                .flatten()
+                .get_continuous_aggregate(stored.database_id, stored.tenant_id, &stored.name)?
                 .map(|c| c.descriptor_version)
                 .unwrap_or(0);
             stored.descriptor_version = prior.saturating_add(1);
@@ -184,14 +184,11 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         } => {
             // A soft delete rewrites the row, advancing the same ordering
             // metadata a `PutCollection` would.
-            let prior = catalog
-                .get_committed_collection(
-                    crate::types::DatabaseId::new(database_id),
-                    tenant_id,
-                    &name,
-                )
-                .ok()
-                .flatten();
+            let prior = catalog.get_committed_collection(
+                crate::types::DatabaseId::new(database_id),
+                tenant_id,
+                &name,
+            )?;
             let (descriptor_version, stamped_hlc) =
                 next_collection_stamp(prior.as_ref(), clock, hlc);
             CatalogEntry::DeactivateCollection {
@@ -202,16 +199,26 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
                 modification_hlc: stamped_hlc,
             }
         }
-        // Variants without descriptor versioning pass through unchanged.
         entry @ (CatalogEntry::PurgeCollection { .. }
+        | CatalogEntry::DeleteSequence { .. }
+        | CatalogEntry::DeleteTrigger { .. }
         | CatalogEntry::DeleteFunction { .. }
         | CatalogEntry::DeleteProcedure { .. }
-        | CatalogEntry::DeleteTrigger { .. }
         | CatalogEntry::DeleteMaterializedView { .. }
-        | CatalogEntry::PutStreamingMaterializedView(_)
-        | CatalogEntry::DeleteStreamingMaterializedView { .. }
         | CatalogEntry::DeleteContinuousAggregate { .. }
-        | CatalogEntry::DeleteSequence { .. }
+        | CatalogEntry::DeleteSynonymGroup { .. }
+        | CatalogEntry::DeleteTopicWithConsumerGroups { .. }
+        | CatalogEntry::DeleteVectorIndexParams { .. }) => {
+            super::incarnation::stamp::stamp_delete(entry, catalog)?
+        }
+        entry @ (CatalogEntry::PutSynonymGroup(_)
+        | CatalogEntry::PutVectorIndexParams(_)
+        | CatalogEntry::CreateTopicIfAbsent(_)) => {
+            super::incarnation::stamp::stamp_put(entry, clock, catalog, hlc)?
+        }
+        // Variants without descriptor versioning pass through unchanged.
+        entry @ (CatalogEntry::PutStreamingMaterializedView(_)
+        | CatalogEntry::DeleteStreamingMaterializedView { .. }
         | CatalogEntry::PutSequenceState(_)
         | CatalogEntry::PutSchedule(_)
         | CatalogEntry::DeleteSchedule { .. }
@@ -239,8 +246,6 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::DeleteIndexRecord { .. }
         | CatalogEntry::PutOwner(_)
         | CatalogEntry::DeleteOwner { .. }
-        | CatalogEntry::PutSynonymGroup(_)
-        | CatalogEntry::DeleteSynonymGroup { .. }
         | CatalogEntry::PutCustomType(_)
         | CatalogEntry::DeleteCustomType { .. }
         | CatalogEntry::PutDatabase(_)
@@ -261,8 +266,6 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::DeleteRetentionPolicy { .. }
         | CatalogEntry::PutAlertRule(_)
         | CatalogEntry::DeleteAlertRule { .. }
-        | CatalogEntry::CreateTopicIfAbsent(_)
-        | CatalogEntry::DeleteTopicWithConsumerGroups { .. }
         | CatalogEntry::PutConsumerGroupIfAbsent(_)
         | CatalogEntry::DeleteConsumerGroup { .. }
         | CatalogEntry::MigrateConsumerGroupStream { .. }
@@ -271,11 +274,9 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::CompactHistory { .. }
         | CatalogEntry::PutVectorModel(_)
         | CatalogEntry::DeleteVectorModel { .. }
-        | CatalogEntry::PutVectorIndexParams(_)
-        | CatalogEntry::DeleteVectorIndexParams { .. }
         | CatalogEntry::PutColumnStats(_)
         | CatalogEntry::MoveTenantCutover { .. }) => entry,
-    }
+    })
 }
 
 /// Stamp a transactional DDL batch in statement order. Persisted catalog state
@@ -284,10 +285,10 @@ pub fn stamp_batch(
     entries: Vec<CatalogEntry>,
     clock: &HlcClock,
     catalog: &SystemCatalog,
-) -> Vec<CatalogEntry> {
+) -> crate::Result<Vec<CatalogEntry>> {
     let mut stamped_entries = Vec::with_capacity(entries.len());
     for entry in entries {
-        let mut stamped = stamp(entry, clock, catalog);
+        let mut stamped = stamp(entry, clock, catalog)?;
         if let Some(prior) = stamped_entries
             .iter()
             .rev()
@@ -295,9 +296,10 @@ pub fn stamp_batch(
         {
             stamped = advance_after(prior, stamped);
         }
+        let stamped = super::incarnation::stamp::retarget_in_batch(&stamped_entries, stamped);
         stamped_entries.push(stamped);
     }
-    stamped_entries
+    Ok(stamped_entries)
 }
 
 /// The `(database, tenant, name)` a versioned collection entry mutates. A soft
@@ -495,7 +497,7 @@ mod tests {
         let stored = StoredCollection::new(1, "orders", "tester");
         let entry = CatalogEntry::PutCollection(Box::new(stored));
 
-        let stamped = stamp(entry, &clock, catalog);
+        let stamped = stamp(entry, &clock, catalog).expect("stamp");
         let CatalogEntry::PutCollection(boxed) = stamped else {
             panic!("expected PutCollection");
         };
@@ -513,7 +515,7 @@ mod tests {
         for expected in 1u64..=5 {
             let stored = StoredCollection::new(1, "orders", "tester");
             let entry = CatalogEntry::PutCollection(Box::new(stored));
-            let stamped = stamp(entry, &clock, catalog);
+            let stamped = stamp(entry, &clock, catalog).expect("stamp");
             let CatalogEntry::PutCollection(boxed) = stamped else {
                 panic!("expected PutCollection");
             };
@@ -535,7 +537,7 @@ mod tests {
             CatalogEntry::PutCollection(Box::new(StoredCollection::new(1, "orders", "tester"))),
             CatalogEntry::PutCollection(Box::new(StoredCollection::new(1, "orders", "tester"))),
         ];
-        let stamped = stamp_batch(entries, &clock, store.catalog());
+        let stamped = stamp_batch(entries, &clock, store.catalog()).expect("stamp batch");
         let CatalogEntry::PutCollection(first) = &stamped[0] else {
             panic!("expected first collection");
         };
@@ -666,7 +668,8 @@ mod tests {
             ],
             &clock,
             store.catalog(),
-        );
+        )
+        .expect("stamp batch");
         let CatalogEntry::PutCollectionIfAbsent(noop) = &stamped[0] else {
             panic!("expected create-only entry");
         };
@@ -690,7 +693,8 @@ mod tests {
             ],
             &clock,
             store.catalog(),
-        );
+        )
+        .expect("stamp batch");
         let CatalogEntry::PutSequence(first) = &stamped[0] else {
             panic!("expected first sequence");
         };
@@ -717,7 +721,8 @@ mod tests {
             CatalogEntry::PutCollection(Box::new(stored)),
             &clock,
             catalog,
-        );
+        )
+        .expect("stamp");
         let CatalogEntry::PutCollection(created) = &create else {
             panic!("expected PutCollection");
         };
@@ -737,7 +742,8 @@ mod tests {
             },
             &clock,
             catalog,
-        );
+        )
+        .expect("stamp");
         let CatalogEntry::DeactivateCollection {
             descriptor_version,
             modification_hlc,

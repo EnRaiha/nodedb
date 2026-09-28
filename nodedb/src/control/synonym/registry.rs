@@ -100,6 +100,7 @@ mod tests {
             name: name.into(),
             terms: vec![term.into()],
             created_at: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 

@@ -70,6 +70,7 @@ mod tests {
             created_at: 1_000,
             last_sequence: 0,
             last_lsn: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 
@@ -78,6 +79,7 @@ mod tests {
             database_id: DB,
             tenant_id: TENANT,
             name: NAME.to_string(),
+            target_hlc: nodedb_types::Hlc::new(7, 1),
         }
     }
 
@@ -106,7 +108,9 @@ mod tests {
                 database_id,
                 tenant_id,
                 name,
+                target_hlc,
             } => {
+                assert_eq!(target_hlc, nodedb_types::Hlc::new(7, 1));
                 assert_eq!(database_id, DB);
                 assert_eq!(tenant_id, TENANT);
                 assert_eq!(name, NAME);

@@ -96,6 +96,8 @@ pub(crate) fn propose_delete_params(
         tenant_id,
         collection: collection.to_string(),
         field_name: field_name.to_string(),
+        // Frozen by the proposer's stamp.
+        target_hlc: nodedb_types::Hlc::ZERO,
     };
     propose_and_apply_outcome(state, &entry, || {
         apply::delete_params(

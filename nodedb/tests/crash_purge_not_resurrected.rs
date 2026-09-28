@@ -134,6 +134,93 @@ async fn run(case: Case) {
     );
 }
 
+/// CREATE, DROP ... PURGE, and CREATE again on the same name, all before the
+/// crash. The purge's tombstone must fence only the first incarnation; the
+/// second incarnation's rows, inserted after the recreate, must survive boot
+/// replay of the same log.
+async fn run_recreated(case: Case) {
+    let name = format!("{}_recreated", case.prefix);
+    let database = case.database.unwrap_or("default");
+
+    let mut h = harness(case.standalone);
+    h.spawn();
+    h.wait_ready();
+
+    if let Some(db) = case.database {
+        h.exec(&format!("CREATE DATABASE {db}")).await;
+    }
+
+    h.exec_in(database, &case.engine.create(&name)).await;
+    for i in 0..ROWS {
+        h.exec_in(database, &case.engine.insert(&name, i)).await;
+    }
+    assert_eq!(
+        count(&h, database, &name).await,
+        vec![ROWS.to_string()],
+        "test setup: {database}.{name} must hold its {ROWS} rows before the purge"
+    );
+
+    h.exec_in(database, &format!("DROP COLLECTION {name} PURGE"))
+        .await;
+
+    // Second incarnation: created and populated before the crash, so the
+    // WAL tail carries both the tombstone and the new rows in one replay.
+    h.exec_in(database, &case.engine.create(&name)).await;
+    for i in 0..ROWS {
+        h.exec_in(database, &case.engine.insert(&name, i)).await;
+    }
+    assert_eq!(
+        count(&h, database, &name).await,
+        vec![ROWS.to_string()],
+        "test setup: the recreated {database}.{name} must hold its {ROWS} rows before \
+         the crash"
+    );
+
+    h.kill_9();
+    h.reopen();
+
+    assert_eq!(
+        count(&h, database, &name).await,
+        vec![ROWS.to_string()],
+        "boot replay must fence the purge to the first incarnation of {database}.{name}; \
+         a replay that ignores incarnation identity reclaims the second incarnation and \
+         its rows vanish"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recreated_document_survives_replayed_purge() {
+    run_recreated(Case {
+        engine: Engine::Document,
+        database: Some("recreate_doc_db"),
+        standalone: false,
+        prefix: "rdoc",
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recreated_kv_survives_replayed_purge() {
+    run_recreated(Case {
+        engine: Engine::Kv,
+        database: Some("recreate_kv_db"),
+        standalone: false,
+        prefix: "rkv",
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recreated_columnar_survives_replayed_purge() {
+    run_recreated(Case {
+        engine: Engine::Columnar,
+        database: Some("recreate_col_db"),
+        standalone: false,
+        prefix: "rcol",
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn purged_document_rows_stay_gone_in_a_named_database() {
     run(Case {

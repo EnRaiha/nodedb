@@ -70,6 +70,10 @@ pub enum CatalogEntry {
         database_id: u64,
         tenant_id: u64,
         name: String,
+        /// Incarnation this delete targets, frozen at propose time from the
+        /// stored row. `Hlc::ZERO` applies unfenced.
+        target_descriptor_version: u64,
+        target_hlc: nodedb_types::Hlc,
     },
 
     // ── Sequence ───────────────────────────────────────────────────
@@ -81,6 +85,10 @@ pub enum CatalogEntry {
         database_id: u64,
         tenant_id: u64,
         name: String,
+        /// Incarnation this delete targets, frozen at propose time from the
+        /// stored row. `Hlc::ZERO` applies unfenced.
+        target_descriptor_version: u64,
+        target_hlc: nodedb_types::Hlc,
     },
     /// Runtime state (current value, is_called, epoch, period_key). Used by
     /// ALTER SEQUENCE RESTART to propagate the new counter across nodes.
@@ -93,6 +101,10 @@ pub enum CatalogEntry {
         database_id: DatabaseId,
         tenant_id: u64,
         name: String,
+        /// Incarnation this delete targets, frozen at propose time from the
+        /// stored row. `Hlc::ZERO` applies unfenced.
+        target_descriptor_version: u64,
+        target_hlc: nodedb_types::Hlc,
     },
 
     // ── Function ───────────────────────────────────────────────────
@@ -103,6 +115,10 @@ pub enum CatalogEntry {
         database_id: DatabaseId,
         tenant_id: u64,
         name: String,
+        /// Incarnation this delete targets, frozen at propose time from the
+        /// stored row. `Hlc::ZERO` applies unfenced.
+        target_descriptor_version: u64,
+        target_hlc: nodedb_types::Hlc,
     },
 
     // ── Procedure ──────────────────────────────────────────────────
@@ -113,6 +129,10 @@ pub enum CatalogEntry {
         database_id: DatabaseId,
         tenant_id: u64,
         name: String,
+        /// Incarnation this delete targets, frozen at propose time from the
+        /// stored row. `Hlc::ZERO` applies unfenced.
+        target_descriptor_version: u64,
+        target_hlc: nodedb_types::Hlc,
     },
 
     // ── Schedule ───────────────────────────────────────────────────
@@ -133,6 +153,9 @@ pub enum CatalogEntry {
         database_id: u64,
         tenant_id: u64,
         name: String,
+        /// Incarnation this delete targets, frozen at propose time from the
+        /// stored row. `Hlc::ZERO` applies unfenced.
+        target_hlc: nodedb_types::Hlc,
     },
 
     // ── Custom type ────────────────────────────────────────────────
@@ -203,6 +226,10 @@ pub enum CatalogEntry {
         database_id: u64,
         tenant_id: u64,
         name: String,
+        /// Incarnation this delete targets, frozen at propose time from the
+        /// stored row. `Hlc::ZERO` applies unfenced.
+        target_descriptor_version: u64,
+        target_hlc: nodedb_types::Hlc,
     },
     // ── Continuous Aggregate ───────────────────────────────────────
     /// Writes the catalog row plus the owner row. Post-apply re-dispatches
@@ -214,6 +241,10 @@ pub enum CatalogEntry {
         database_id: u64,
         tenant_id: u64,
         name: String,
+        /// Incarnation this delete targets, frozen at propose time from the
+        /// stored row. `Hlc::ZERO` applies unfenced.
+        target_descriptor_version: u64,
+        target_hlc: nodedb_types::Hlc,
     },
 
     // ── Tenant ─────────────────────────────────────────────────────
@@ -460,6 +491,9 @@ pub enum CatalogEntry {
         database_id: u64,
         tenant_id: u64,
         name: String,
+        /// Incarnation this delete targets, frozen at propose time from the
+        /// stored row. `Hlc::ZERO` applies unfenced.
+        target_hlc: nodedb_types::Hlc,
     },
 
     // ── Consumer group ─────────────────────────────────────────────
@@ -537,6 +571,9 @@ pub enum CatalogEntry {
         tenant_id: u64,
         collection: String,
         field_name: String,
+        /// Incarnation this delete targets, frozen at propose time from the
+        /// stored row. `Hlc::ZERO` applies unfenced.
+        target_hlc: nodedb_types::Hlc,
     },
 
     // ── Column statistics ──────────────────────────────────────────

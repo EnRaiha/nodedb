@@ -462,7 +462,8 @@ mod tests {
             CatalogEntry::PutCollection(Box::new(stored)),
             &clock,
             catalog,
-        );
+        )
+        .expect("stamp");
         let CatalogEntry::PutCollection(created) = &create else {
             panic!("expected PutCollection");
         };
@@ -480,7 +481,8 @@ mod tests {
             },
             &clock,
             catalog,
-        );
+        )
+        .expect("stamp");
         apply_to(&deactivate, catalog).expect("apply deactivate_collection");
 
         let loaded = catalog
@@ -514,7 +516,8 @@ mod tests {
             CatalogEntry::PutCollection(Box::new(stored)),
             &clock,
             catalog,
-        );
+        )
+        .expect("stamp");
         apply_to(&create, catalog).expect("apply put_collection");
 
         let deactivate = stamp(
@@ -527,7 +530,8 @@ mod tests {
             },
             &clock,
             catalog,
-        );
+        )
+        .expect("stamp");
         apply_to(&deactivate, catalog).expect("apply deactivate_collection");
 
         let loaded = catalog
@@ -563,6 +567,8 @@ mod tests {
                 database_id: 9,
                 tenant_id: 1,
                 name: "shared".into(),
+                target_descriptor_version: 0,
+                target_hlc: nodedb_types::Hlc::ZERO,
             },
             catalog,
         )

@@ -39,6 +39,11 @@ pub struct StoredVectorIndexParams {
     pub ivf_cells: usize,
     /// IVF nprobe (0 = unused).
     pub ivf_nprobe: usize,
+    /// Stamped at propose time on every put; fences a replayed delete to
+    /// the incarnation it targeted.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub modification_hlc: crate::hlc::Hlc,
 }
 
 #[cfg(test)]
@@ -60,6 +65,7 @@ mod tests {
             pq_m: 0,
             ivf_cells: 0,
             ivf_nprobe: 0,
+            modification_hlc: crate::hlc::Hlc::ZERO,
         };
         let bytes = zerompk::to_msgpack_vec(&e).unwrap();
         let back: StoredVectorIndexParams = zerompk::from_msgpack(&bytes).unwrap();

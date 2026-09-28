@@ -48,6 +48,8 @@ pub async fn create_synonym_group(
         name: name.to_string(),
         terms: terms.to_vec(),
         created_at,
+        // Frozen by the proposer's stamp.
+        modification_hlc: nodedb_types::Hlc::ZERO,
     };
 
     let catalog = state.credentials.catalog();

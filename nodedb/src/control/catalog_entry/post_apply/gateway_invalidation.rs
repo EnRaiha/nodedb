@@ -530,6 +530,8 @@ mod tests {
                 database_id: 0,
                 tenant_id: 1,
                 name: "seq".into(),
+                target_descriptor_version: 0,
+                target_hlc: nodedb_types::Hlc::ZERO,
             },
             "DeleteSequence",
         );
@@ -559,6 +561,8 @@ mod tests {
                 database_id: crate::types::DatabaseId::DEFAULT,
                 tenant_id: 1,
                 name: "trig".into(),
+                target_descriptor_version: 0,
+                target_hlc: nodedb_types::Hlc::ZERO,
             },
             "DeleteTrigger",
         );
@@ -571,6 +575,8 @@ mod tests {
                 database_id: crate::types::DatabaseId::DEFAULT,
                 tenant_id: 1,
                 name: "fn_".into(),
+                target_descriptor_version: 0,
+                target_hlc: nodedb_types::Hlc::ZERO,
             },
             "DeleteFunction",
         );
@@ -583,6 +589,8 @@ mod tests {
                 database_id: crate::types::DatabaseId::DEFAULT,
                 tenant_id: 1,
                 name: "proc".into(),
+                target_descriptor_version: 0,
+                target_hlc: nodedb_types::Hlc::ZERO,
             },
             "DeleteProcedure",
         );
@@ -649,6 +657,8 @@ mod tests {
                 database_id: 2,
                 tenant_id: 1,
                 name: "mv_orders".into(),
+                target_descriptor_version: 0,
+                target_hlc: nodedb_types::Hlc::ZERO,
             },
             "DeleteMaterializedView",
         );

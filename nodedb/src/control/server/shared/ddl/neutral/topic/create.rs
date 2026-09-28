@@ -80,6 +80,8 @@ pub async fn create_topic(
         created_at: now,
         last_sequence: 0,
         last_lsn: 0,
+        // Frozen by the proposer's stamp.
+        modification_hlc: nodedb_types::Hlc::ZERO,
     };
 
     if state

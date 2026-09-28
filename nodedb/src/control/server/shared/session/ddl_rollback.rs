@@ -96,6 +96,7 @@ fn target_of(entry: &CatalogEntry) -> Option<Target> {
             database_id,
             tenant_id,
             name,
+            ..
         } => Some((DatabaseId::new(*database_id), *tenant_id, name.clone())),
         _ => None,
     }
@@ -128,6 +129,8 @@ mod tests {
             database_id: DatabaseId::DEFAULT.as_u64(),
             tenant_id: TENANT,
             name: name.to_owned(),
+            target_descriptor_version: 0,
+            target_hlc: nodedb_types::Hlc::ZERO,
         })
     }
 
@@ -152,6 +155,8 @@ mod tests {
             database_id: 0,
             tenant_id: TENANT,
             name: "orders_seq".to_owned(),
+            target_descriptor_version: 0,
+            target_hlc: nodedb_types::Hlc::ZERO,
         })];
         assert!(targets(&batch).is_empty());
     }

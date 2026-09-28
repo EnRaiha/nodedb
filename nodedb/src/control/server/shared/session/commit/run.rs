@@ -16,6 +16,7 @@ use super::super::commit_calvin;
 use super::super::commit_fence;
 use super::super::connection::SessionId;
 use super::super::ddl_buffer::DdlBuffer;
+use super::super::ddl_compensate;
 use super::super::ddl_flush::{self, DdlCommitPlan};
 use super::super::outcome::{AbortReason, CommitOutcome, TxnDataPlane};
 use super::super::overlay_drop::drop_txn_overlay;
@@ -35,7 +36,7 @@ fn compensate_finalized_ddl(state: &SharedState, compensation: &Option<Vec<Pendi
     let Some(objects) = compensation else {
         return;
     };
-    if let Err(error) = ddl_flush::compensate_finalized(state, objects) {
+    if let Err(error) = ddl_compensate::compensate_finalized(state, objects) {
         tracing::error!(
             %error,
             "commit compensation failed: this transaction's finalized DDL may still be \

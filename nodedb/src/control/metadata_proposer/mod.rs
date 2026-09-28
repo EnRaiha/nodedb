@@ -29,7 +29,7 @@ pub mod replicated_entries;
 pub mod timeouts;
 
 pub use catalog::{propose_catalog_entry, propose_catalog_entry_with_timeout};
-pub(crate) use ddl_prepare::{DdlPrepareGuard, acquire_ddl_prepare_lease};
+pub(crate) use ddl_prepare::{DdlPrepareGuard, acquire_ddl_prepare_lease, lock_ddl_preparation};
 pub use handle::{MetadataRaftHandle, RaftLoopProposerHandle};
 pub use replicated_entries::{
     propose_surrogate_hwm, propose_surrogate_reserve, propose_sync_peer_bind,

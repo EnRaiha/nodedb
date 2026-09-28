@@ -29,6 +29,7 @@ fn topic_registry_crud() {
         created_at: 1000,
         last_sequence: 0,
         last_lsn: 0,
+        modification_hlc: nodedb_types::Hlc::ZERO,
     };
     registry.register(def);
 
@@ -131,6 +132,7 @@ fn topic_list_all() {
             created_at: 0,
             last_sequence: 0,
             last_lsn: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         });
     }
 

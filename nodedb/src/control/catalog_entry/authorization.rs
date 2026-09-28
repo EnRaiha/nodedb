@@ -117,6 +117,8 @@ mod tests {
                 database_id: 0,
                 tenant_id: 1,
                 name: "c".into(),
+                target_descriptor_version: 0,
+                target_hlc: nodedb_types::Hlc::ZERO,
             }
             .bears_authorization()
         );

@@ -12,6 +12,7 @@ mod cursor;
 pub mod cursor_spill;
 mod ddl_authorization;
 pub mod ddl_buffer;
+mod ddl_compensate;
 pub mod ddl_effect;
 mod ddl_flush;
 pub mod ddl_rollback;

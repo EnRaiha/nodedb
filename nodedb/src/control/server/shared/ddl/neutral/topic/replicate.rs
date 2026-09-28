@@ -44,6 +44,8 @@ pub(super) fn propose_delete(
         database_id,
         tenant_id,
         name: name.to_string(),
+        // Frozen by the proposer's stamp.
+        target_hlc: nodedb_types::Hlc::ZERO,
     };
     propose_and_apply(state, &entry, || {
         apply::delete_with_consumer_groups(

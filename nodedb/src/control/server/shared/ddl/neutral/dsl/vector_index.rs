@@ -227,6 +227,8 @@ pub async fn create_vector_index(
         pq_m: params.pq_m,
         ivf_cells: params.ivf_cells,
         ivf_nprobe: params.ivf_nprobe,
+        // Frozen by the proposer's stamp.
+        modification_hlc: nodedb_types::Hlc::ZERO,
     };
     let outcome = super::super::vector_replicate::propose_put_params(state, &stored)?;
 

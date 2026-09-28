@@ -194,6 +194,9 @@ pub async fn sweep_once(shared: &SharedState, retention: Duration) -> crate::Res
                     database_id: coll.database_id.as_u64(),
                     tenant_id: coll.tenant_id,
                     name: coll.name.clone(),
+                    // Frozen by the proposer's stamp.
+                    target_descriptor_version: 0,
+                    target_hlc: nodedb_types::Hlc::ZERO,
                 };
                 match crate::control::metadata_proposer::propose_catalog_entry(shared, &entry) {
                     Ok(outcome) => {

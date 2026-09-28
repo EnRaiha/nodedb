@@ -317,6 +317,7 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
             database_id,
             tenant_id,
             name,
+            ..
         } => (
             format!("topic:{database_id}:{tenant_id}:{name}"),
             0,
@@ -422,6 +423,7 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
             tenant_id,
             collection,
             field_name,
+            ..
         } => (
             format!("vector_index_params:{database_id}:{tenant_id}:{collection}:{field_name}"),
             0,

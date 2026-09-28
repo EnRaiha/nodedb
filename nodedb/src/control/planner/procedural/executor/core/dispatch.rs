@@ -488,6 +488,7 @@ mod cross_shard_origination_tests {
             database_id,
             last_sequence: 0,
             last_lsn: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         };
         // A topic exists only once it is durable: PUBLISH revalidates the
         // catalog row under the lifecycle lock before it accepts a message,

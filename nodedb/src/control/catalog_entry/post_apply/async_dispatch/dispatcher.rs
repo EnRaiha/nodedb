@@ -124,6 +124,7 @@ pub fn spawn_post_apply_async_side_effects(entry: CatalogEntry, shared: Arc<Shar
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             let purge_lsn = shared.wal.next_lsn().as_u64();
             let result = tokio::task::block_in_place(|| {
@@ -153,6 +154,7 @@ pub fn spawn_post_apply_async_side_effects(entry: CatalogEntry, shared: Arc<Shar
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             let purge_lsn = shared.wal.next_lsn().as_u64();
             let result = tokio::task::block_in_place(|| {
@@ -199,6 +201,7 @@ pub fn spawn_post_apply_async_side_effects(entry: CatalogEntry, shared: Arc<Shar
             tenant_id,
             collection,
             field_name,
+            ..
         } => {
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async move {
@@ -240,6 +243,7 @@ pub fn spawn_post_apply_async_side_effects(entry: CatalogEntry, shared: Arc<Shar
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             tokio::spawn(async move {
                 super::continuous_aggregate::delete_async(database_id, tenant_id, name, shared)
@@ -262,6 +266,7 @@ pub fn spawn_post_apply_async_side_effects(entry: CatalogEntry, shared: Arc<Shar
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async move {

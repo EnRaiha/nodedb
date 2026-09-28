@@ -42,6 +42,7 @@ fn buffered_def(database_id: u64, tenant_id: u64, name: &str) -> Option<StoredSe
                     database_id: entry_database,
                     tenant_id: entry_tenant,
                     name: entry_name,
+                    ..
                 } if *entry_database == database_id
                     && *entry_tenant == tenant_id
                     && entry_name == name =>
@@ -93,6 +94,8 @@ mod tests {
             database_id,
             tenant_id,
             name: name.to_owned(),
+            target_descriptor_version: 0,
+            target_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 

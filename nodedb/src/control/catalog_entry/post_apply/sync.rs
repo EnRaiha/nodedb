@@ -78,6 +78,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             collection::purge_sync(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
             collection::queue_tree_def_removal_sync(*database_id, *tenant_id, name, shared);
@@ -89,6 +90,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             sequence::delete(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
         }
@@ -102,6 +104,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             trigger::delete(*database_id, *tenant_id, name.clone(), shared);
         }
@@ -112,6 +115,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             function::delete(*database_id, *tenant_id, name.clone(), shared);
         }
@@ -122,6 +126,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             procedure::delete(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
         }
@@ -177,6 +182,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             materialized_view::delete(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
         }
@@ -202,6 +208,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             continuous_aggregate::delete(
                 *database_id,
@@ -308,6 +315,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             synonym_group::delete(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
         }
@@ -411,6 +419,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             topic::delete_with_consumer_groups(*database_id, *tenant_id, name, shared);
         }

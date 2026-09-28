@@ -311,6 +311,9 @@ pub fn drop_sequence(
         database_id: db,
         tenant_id,
         name: name.to_string(),
+        // Frozen by the proposer's stamp.
+        target_descriptor_version: 0,
+        target_hlc: nodedb_types::Hlc::ZERO,
     };
     let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
         .map_err(|e| DdlError::from_error(&e))?;

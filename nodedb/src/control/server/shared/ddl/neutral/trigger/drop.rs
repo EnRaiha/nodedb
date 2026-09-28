@@ -67,6 +67,9 @@ pub fn drop_trigger(
         database_id,
         tenant_id,
         name: name.clone(),
+        // Frozen by the proposer's stamp.
+        target_descriptor_version: 0,
+        target_hlc: nodedb_types::Hlc::ZERO,
     };
     let outcome = propose_and_apply(state, &entry)?;
     if outcome.needs_local_apply() {

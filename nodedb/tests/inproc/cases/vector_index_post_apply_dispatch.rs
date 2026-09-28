@@ -38,6 +38,7 @@ fn params() -> StoredVectorIndexParams {
         pq_m: 0,
         ivf_cells: 0,
         ivf_nprobe: 0,
+        modification_hlc: nodedb_types::Hlc::ZERO,
     }
 }
 
@@ -123,6 +124,7 @@ async fn post_apply_drops_the_index_on_this_node() {
             tenant_id: TENANT,
             collection: COLLECTION.to_string(),
             field_name: FIELD.to_string(),
+            target_hlc: nodedb_types::Hlc::ZERO,
         },
     );
 

@@ -119,6 +119,9 @@ pub fn drop_materialized_view(
         database_id: database_id.as_u64(),
         tenant_id: tenant_id.as_u64(),
         name: name.clone(),
+        // Frozen by the proposer's stamp.
+        target_descriptor_version: 0,
+        target_hlc: nodedb_types::Hlc::ZERO,
     };
     let mut local_lifecycle = if state.metadata_raft.get().is_none() {
         Some(

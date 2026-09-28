@@ -23,6 +23,10 @@ pub struct StoredSynonymGroup {
     pub name: String,
     pub terms: Vec<String>,
     pub created_at: u64,
+    /// Stamped at propose time on every put; fences a replayed delete to
+    /// the incarnation it targeted.
+    #[serde(default)]
+    pub modification_hlc: nodedb_types::Hlc,
 }
 
 impl SystemCatalog {
@@ -211,6 +215,7 @@ mod tests {
             name: name.into(),
             terms: terms.iter().map(|t| (*t).to_string()).collect(),
             created_at: 1000,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 

@@ -397,6 +397,7 @@ mod tests {
             pq_m: 8,
             ivf_cells: 64,
             ivf_nprobe: 16,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 

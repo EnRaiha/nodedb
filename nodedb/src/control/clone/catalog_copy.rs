@@ -428,6 +428,7 @@ mod tests {
                 pq_m: 0,
                 ivf_cells: 0,
                 ivf_nprobe: 0,
+                modification_hlc: nodedb_types::Hlc::ZERO,
             })
             .expect("seed vector index params");
 
@@ -796,6 +797,7 @@ mod tests {
                 name: "db_terms".into(),
                 terms: vec!["database".into(), "db".into()],
                 created_at: 5,
+                modification_hlc: nodedb_types::Hlc::ZERO,
             })
             .expect("seed synonym group");
         catalog

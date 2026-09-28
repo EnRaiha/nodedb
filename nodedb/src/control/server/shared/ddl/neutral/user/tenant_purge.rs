@@ -190,6 +190,7 @@ fn purge_collection_redaction_policies(
     Ok(())
 }
 
+/// Fenced deletes carry an unstamped target. The proposer freezes it.
 fn teardown_delete_entry(kind: OwnerKind, tenant: TenantId, owner: &StoredOwner) -> CatalogEntry {
     let tenant_id = tenant.as_u64();
     let name = owner.object_name.clone();
@@ -198,26 +199,36 @@ fn teardown_delete_entry(kind: OwnerKind, tenant: TenantId, owner: &StoredOwner)
             database_id: owner.database_id,
             tenant_id,
             name,
+            target_descriptor_version: 0,
+            target_hlc: nodedb_types::Hlc::ZERO,
         },
         OwnerKind::Function => CatalogEntry::DeleteFunction {
             database_id: crate::types::DatabaseId::new(owner.database_id),
             tenant_id,
             name,
+            target_descriptor_version: 0,
+            target_hlc: nodedb_types::Hlc::ZERO,
         },
         OwnerKind::Procedure => CatalogEntry::DeleteProcedure {
             database_id: crate::types::DatabaseId::new(owner.database_id),
             tenant_id,
             name,
+            target_descriptor_version: 0,
+            target_hlc: nodedb_types::Hlc::ZERO,
         },
         OwnerKind::Trigger => CatalogEntry::DeleteTrigger {
             database_id: crate::types::DatabaseId::new(owner.database_id),
             tenant_id,
             name,
+            target_descriptor_version: 0,
+            target_hlc: nodedb_types::Hlc::ZERO,
         },
         OwnerKind::MaterializedView => CatalogEntry::DeleteMaterializedView {
             database_id: owner.database_id,
             tenant_id,
             name,
+            target_descriptor_version: 0,
+            target_hlc: nodedb_types::Hlc::ZERO,
         },
         OwnerKind::StreamingMaterializedView => CatalogEntry::DeleteStreamingMaterializedView {
             database_id: owner.database_id,
@@ -228,6 +239,8 @@ fn teardown_delete_entry(kind: OwnerKind, tenant: TenantId, owner: &StoredOwner)
             database_id: owner.database_id,
             tenant_id,
             name,
+            target_descriptor_version: 0,
+            target_hlc: nodedb_types::Hlc::ZERO,
         },
         OwnerKind::Schedule => CatalogEntry::DeleteSchedule {
             database_id: crate::types::DatabaseId::new(owner.database_id),
@@ -243,6 +256,8 @@ fn teardown_delete_entry(kind: OwnerKind, tenant: TenantId, owner: &StoredOwner)
             database_id: owner.database_id,
             tenant_id,
             name,
+            target_descriptor_version: 0,
+            target_hlc: nodedb_types::Hlc::ZERO,
         },
         OwnerKind::Index => CatalogEntry::DeleteOwner {
             object_type: owner.object_type.clone(),

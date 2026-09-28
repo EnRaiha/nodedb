@@ -68,6 +68,7 @@ pub mod tables;
 pub mod tenant_group_marks;
 pub mod tenant_id_hwm;
 pub mod tenant_quotas;
+pub mod topic_lookup;
 pub mod topics;
 pub mod trigger_types;
 pub mod triggers;

@@ -103,6 +103,7 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             // Preserve an inactive row until post-apply storage reclaim
             // succeeds — the restart-durable same-name lifecycle barrier.
@@ -126,6 +127,7 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             database_id,
             tenant_id,
             name,
+            ..
         } => sequence::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutSequenceState(state) => sequence::put_state(state, catalog),
         CatalogEntry::PutTrigger(stored) => trigger::put(stored, catalog),
@@ -133,18 +135,21 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             database_id,
             tenant_id,
             name,
+            ..
         } => trigger::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutFunction(stored) => function::put(stored, catalog),
         CatalogEntry::DeleteFunction {
             database_id,
             tenant_id,
             name,
+            ..
         } => function::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutProcedure(stored) => procedure::put(stored, catalog),
         CatalogEntry::DeleteProcedure {
             database_id,
             tenant_id,
             name,
+            ..
         } => procedure::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutSchedule(stored) => schedule::put(stored, catalog),
         CatalogEntry::DeleteSchedule {
@@ -173,6 +178,7 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             database_id,
             tenant_id,
             name,
+            ..
         } => match materialized_view::delete(*database_id, *tenant_id, name, catalog) {
             Ok(()) => Ok(()),
             Err(error) => panic!("materialized-view catalog deletion failed: {error}"),
@@ -193,6 +199,7 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             database_id,
             tenant_id,
             name,
+            ..
         } => continuous_aggregate::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutTenant(stored) => tenant::put(stored, catalog),
         // Applied by `apply_to` so its commit outcome can suppress post-apply.
@@ -241,6 +248,7 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             database_id,
             tenant_id,
             name,
+            ..
         } => synonym_group::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutCustomType(stored) => custom_type::put(stored, catalog),
         CatalogEntry::DeleteCustomType {
@@ -304,6 +312,7 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             database_id,
             tenant_id,
             name,
+            ..
         } => topic::delete_with_consumer_groups(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutConsumerGroupIfAbsent(def) => consumer_group::put_if_absent(def, catalog),
         CatalogEntry::DeleteConsumerGroup {
@@ -354,6 +363,7 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             tenant_id,
             collection,
             field_name,
+            ..
         } => vector::delete_params(*database_id, *tenant_id, collection, field_name, catalog),
         CatalogEntry::PutColumnStats(rows) => column_stats::put_rows(rows, catalog),
         CatalogEntry::MoveTenantCutover {

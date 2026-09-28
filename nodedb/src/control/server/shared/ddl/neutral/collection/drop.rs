@@ -246,6 +246,9 @@ pub fn drop_collection(
             database_id: database_id.as_u64(),
             tenant_id: tenant_id.as_u64(),
             name: name.to_string(),
+            // Frozen by the proposer's stamp.
+            target_descriptor_version: 0,
+            target_hlc: nodedb_types::Hlc::ZERO,
         }
     } else {
         crate::control::catalog_entry::CatalogEntry::DeactivateCollection {

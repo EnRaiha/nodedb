@@ -53,6 +53,10 @@ pub struct TopicDef {
     /// Last LSN durably assigned to this topic.
     #[msgpack(default)]
     pub last_lsn: u64,
+    /// Stamped at propose time on create; fences a replayed delete to the
+    /// incarnation it targeted.
+    #[msgpack(default)]
+    pub modification_hlc: nodedb_types::Hlc,
 }
 
 /// A durably retained topic publication.

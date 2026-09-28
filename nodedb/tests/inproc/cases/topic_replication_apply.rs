@@ -44,6 +44,7 @@ fn topic() -> TopicDef {
         created_at: 1_000,
         last_sequence: 0,
         last_lsn: 0,
+        modification_hlc: nodedb_types::Hlc::ZERO,
     }
 }
 
@@ -67,6 +68,7 @@ fn delete_topic_entry() -> CatalogEntry {
         database_id: DB,
         tenant_id: TENANT,
         name: TOPIC.to_string(),
+        target_hlc: nodedb_types::Hlc::ZERO,
     }
 }
 

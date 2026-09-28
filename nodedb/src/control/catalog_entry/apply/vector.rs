@@ -133,6 +133,7 @@ mod tests {
             pq_m: 0,
             ivf_cells: 0,
             ivf_nprobe: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 
@@ -180,6 +181,7 @@ mod tests {
             tenant_id: TENANT,
             collection: COLLECTION.to_string(),
             field_name: FIELD.to_string(),
+            target_hlc: nodedb_types::Hlc::new(7, 1),
         };
         match decode(&encode(&entry).unwrap()).unwrap() {
             CatalogEntry::DeleteVectorIndexParams {
@@ -187,7 +189,9 @@ mod tests {
                 tenant_id,
                 collection,
                 field_name,
+                target_hlc,
             } => {
+                assert_eq!(target_hlc, nodedb_types::Hlc::new(7, 1));
                 assert_eq!(database_id, DATABASE);
                 assert_eq!(tenant_id, TENANT);
                 assert_eq!(collection, COLLECTION);
@@ -305,6 +309,7 @@ mod tests {
                 tenant_id: TENANT,
                 collection: COLLECTION.to_string(),
                 field_name: FIELD.to_string(),
+                target_hlc: nodedb_types::Hlc::ZERO,
             },
             &catalog,
         )
