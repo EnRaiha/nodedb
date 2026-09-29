@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nodedb_bridge::backpressure::{BackpressureConfig, BackpressureController, PressureState};
 use nodedb_bridge::buffer::RingBuffer;
@@ -243,4 +244,30 @@ impl Dispatcher {
     pub fn router(&self) -> &VShardRouter {
         &self.router
     }
+}
+
+/// Dispatches refused because a capacity limit had no room, since process
+/// start.
+///
+/// Every capacity refusal carries [`crate::Error::DispatchCapacity`], which
+/// classifies as `server_overload` and reaches a pgwire client as `57P03`. The
+/// count is process-wide because the condition is the same one whichever core,
+/// database, or tenant hit its limit.
+///
+/// Rendered as `nodedb_dispatch_capacity_busy_total` on `/metrics` and as the
+/// `dispatch_capacity_busy_total` row of `SHOW STATS`.
+static DISPATCH_CAPACITY_BUSY_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Count one dispatch refused on a capacity limit.
+///
+/// Called only from the dispatch paths that raise
+/// [`crate::Error::DispatchCapacity`], so the operator-visible counter and the
+/// client-visible class cannot drift apart.
+pub(crate) fn note_capacity_busy() {
+    DISPATCH_CAPACITY_BUSY_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Dispatches refused on a capacity limit since process start.
+pub fn dispatch_capacity_busy_total() -> u64 {
+    DISPATCH_CAPACITY_BUSY_TOTAL.load(Ordering::Relaxed)
 }

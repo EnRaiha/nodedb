@@ -15,7 +15,7 @@ mod test_requests;
 pub use core_channel::{CoreChannel, CoreChannelDataSide};
 pub use dispatcher::{
     BridgeRequest, BridgeResponse, DATA_PLANE_QUEUE_CAPACITY, DatabasePriorityResolver,
-    DefaultPriorityResolver, Dispatcher,
+    DefaultPriorityResolver, Dispatcher, dispatch_capacity_busy_total,
 };
 pub use drain::CorePending;
 pub use outcome_floor::{OutcomeFloor, ResendRefusal, StuckFloor, WriteWindow};

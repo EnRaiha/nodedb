@@ -204,6 +204,8 @@ Admission ordering for requests:
 
 Memory reservation flips the order (largest scope first to fail fast): global → database → tenant → engine. Failure at any layer aborts before the next is consulted.
 
+A dispatch refused by the bridge — a full per-core weighted-fair queue, a per-database virtual queue at its fair share, or a tenant at its in-flight cap — surfaces as `SERVER_OVERLOAD` (`57P03`). That class is retryable: the client waits for capacity and resends the same request. `nodedb_dispatch_capacity_busy_total` counts every such refusal.
+
 ### Memory Governor
 
 Located in `nodedb-mem/src/governor.rs`, the `MemoryGovernor` enforces hierarchical memory reservations:
@@ -342,6 +344,7 @@ Counters are incremented at the sites where resources are consumed:
 - **WAL latency**: Group commit fsync completion
 - **Maintenance CPU**: Lease acquisition / release
 - **Replication lag**: Raft follower log application
+- **Dispatch capacity refusals**: bridge dispatcher, at every refusal — WFQ full, per-database suspension, tenant in-flight cap (`nodedb_dispatch_capacity_busy_total`, also the `dispatch_capacity_busy_total` row of `SHOW STATS`)
 
 All metrics are dimensionalized by database and tenant to enable per-customer tracking and alerting.
 

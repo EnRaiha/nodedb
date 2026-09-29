@@ -18,6 +18,18 @@ use crate::types::Lsn;
 use super::dispatcher::Dispatcher;
 use super::refusal::DispatchRefusal;
 
+/// Refuse a dispatch on a capacity limit, counting it once.
+///
+/// Every capacity refusal goes through here, so the counter the operator reads
+/// and the `57P03` class the client receives always describe the same event.
+fn capacity_refusal(
+    scope: DispatchCapacityScope,
+    request: envelope::Request,
+) -> Box<DispatchRefusal> {
+    super::dispatcher::note_capacity_busy();
+    DispatchRefusal::boxed(crate::Error::DispatchCapacity { scope }, request)
+}
+
 impl Dispatcher {
     /// Dispatch a request to the correct Data Plane core.
     ///
@@ -54,10 +66,7 @@ impl Dispatcher {
                     inflight,
                     cap: self.max_per_tenant_inflight,
                 };
-                return Err(DispatchRefusal::boxed(
-                    crate::Error::DispatchCapacity { scope },
-                    request,
-                ));
+                return Err(capacity_refusal(scope, request));
             }
         }
 
@@ -80,10 +89,7 @@ impl Dispatcher {
                 database_id: request.database_id,
                 core_id,
             };
-            return Err(DispatchRefusal::boxed(
-                crate::Error::DispatchCapacity { scope },
-                request,
-            ));
+            return Err(capacity_refusal(scope, request));
         }
 
         // Enqueue into the WFQ. A full queue hands the request back.
@@ -92,10 +98,7 @@ impl Dispatcher {
                 core_id,
                 capacity: self.per_core_capacity,
             };
-            return Err(DispatchRefusal::boxed(
-                crate::Error::DispatchCapacity { scope },
-                request,
-            ));
+            return Err(capacity_refusal(scope, request));
         }
 
         self.commit_enqueued(core_id, database_id, tenant_id, req_id, wal_lsn);
@@ -129,14 +132,13 @@ impl Dispatcher {
         let cls = self.priority_resolver.priority_for(database_id);
         channel.wfq.set_priority(database_id, cls);
 
-        channel.wfq.try_enqueue(database_id, request).map_err(|_| {
-            crate::Error::DispatchCapacity {
-                scope: DispatchCapacityScope::QueueFull {
-                    core_id,
-                    capacity: self.per_core_capacity,
-                },
-            }
-        })?;
+        if let Err(request) = channel.wfq.try_enqueue(database_id, request) {
+            let scope = DispatchCapacityScope::QueueFull {
+                core_id,
+                capacity: self.per_core_capacity,
+            };
+            return Err(capacity_refusal(scope, request));
+        }
 
         self.commit_enqueued(core_id, database_id, tenant_id, req_id, wal_lsn);
         Ok(())
@@ -364,5 +366,77 @@ mod tests {
         // The test confirms per-DB pressure is being tracked without panic.
         let _ = dispatcher.db_pressure_on_core(0, 1);
         let _ = dispatcher.db_pressure_on_core(0, 2);
+    }
+
+    /// A capacity refusal counts, whichever limit refused it.
+    ///
+    /// The counter is process-wide, so the assertion is a lower bound: a test
+    /// running beside this one in the same binary may refuse too.
+    #[test]
+    fn capacity_refusals_are_counted_once_each() {
+        let before = crate::bridge::dispatch::dispatch_capacity_busy_total();
+
+        // A full weighted-fair queue. Distinct tenants and databases keep the
+        // tenant cap and the per-database suspension out of play.
+        let (mut dispatcher, _) = Dispatcher::new(1, 4);
+        let mut queue_full = false;
+        for i in 1..=64u64 {
+            let mut request = make_request_for_db(0, i, i);
+            request.tenant_id = TenantId::new(i);
+            match dispatcher.dispatch(request) {
+                Ok(()) => continue,
+                Err(crate::Error::DispatchCapacity {
+                    scope: DispatchCapacityScope::QueueFull { .. },
+                }) => {
+                    queue_full = true;
+                    break;
+                }
+                Err(other) => panic!("expected a queue-full refusal, got: {other}"),
+            }
+        }
+        assert!(
+            queue_full,
+            "a one-core queue of four must fill within 64 distinct requests"
+        );
+
+        // The per-tenant in-flight cap.
+        let (mut dispatcher, _) = Dispatcher::new(1, 4);
+        for i in 0..4u64 {
+            dispatcher
+                .dispatch(make_request_for_db(0, i + 1, i + 1))
+                .unwrap();
+        }
+        let refusal = dispatcher
+            .try_dispatch(make_request_for_db(0, 99, 99))
+            .expect_err("the fifth request exceeds the tenant cap");
+        assert!(
+            matches!(
+                refusal.error,
+                crate::Error::DispatchCapacity {
+                    scope: DispatchCapacityScope::TenantInflight { .. }
+                }
+            ),
+            "the second refusal must be the tenant cap, got: {}",
+            refusal.error
+        );
+
+        let after = crate::bridge::dispatch::dispatch_capacity_busy_total();
+        assert!(
+            after >= before + 2,
+            "two capacity refusals must count at least twice: {before} → {after}"
+        );
+    }
+
+    /// A terminal refusal is not a capacity refusal, so it carries no scope.
+    #[test]
+    fn terminal_refusal_is_not_a_capacity_refusal() {
+        let (mut dispatcher, _) = Dispatcher::new(1, 4);
+        let error = dispatcher
+            .dispatch_to_core(7, make_request(0))
+            .expect_err("core 7 does not exist on a one-core dispatcher");
+        assert!(
+            matches!(error, crate::Error::Dispatch { .. }),
+            "an out-of-range core is a terminal dispatch error, got: {error}"
+        );
     }
 }

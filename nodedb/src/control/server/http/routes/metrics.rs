@@ -50,6 +50,19 @@ pub async fn metrics(
     output.push_str("# TYPE nodedb_wal_next_lsn gauge\n");
     output.push_str(&format!("nodedb_wal_next_lsn {wal_lsn}\n\n"));
 
+    // Dispatches refused because a capacity limit had no room. The same refusal
+    // reaches the client as the retryable `57P03` class, so a non-zero counter
+    // tells an operator that bulk writers are backing off rather than failing.
+    output.push_str(
+        "# HELP nodedb_dispatch_capacity_busy_total \
+         Dispatches refused because a dispatch capacity limit had no room.\n",
+    );
+    output.push_str("# TYPE nodedb_dispatch_capacity_busy_total counter\n");
+    output.push_str(&format!(
+        "nodedb_dispatch_capacity_busy_total {}\n\n",
+        crate::bridge::dispatch::dispatch_capacity_busy_total()
+    ));
+
     // Outcome floor: every engine watermark and WAL truncation stays at or
     // below it.
     let outcome_floor = &state.shared.outcome_floor;

@@ -141,6 +141,13 @@ fn server_stats_rows(state: &SharedState) -> Vec<(String, String)> {
         ));
     }
 
+    // Not a `SystemMetrics` counter: the dispatcher counts its own refusals,
+    // and the row keeps the SQL surface in step with `/metrics`.
+    rows.push((
+        "dispatch_capacity_busy_total".into(),
+        crate::bridge::dispatch::dispatch_capacity_busy_total().to_string(),
+    ));
+
     rows
 }
 
