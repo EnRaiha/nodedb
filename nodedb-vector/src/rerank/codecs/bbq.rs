@@ -17,7 +17,7 @@
 
 use nodedb_codec::vector_quant::bbq::BbqCodec;
 use nodedb_codec::vector_quant::codec::VectorCodec as _;
-use nodedb_codec::vector_quant::layout::UnifiedQuantizedVectorRef;
+use nodedb_codec::vector_quant::layout::{QuantMode, UnifiedQuantizedVectorRef};
 
 use crate::{
     rerank::codec::{CodecName, PreparedQuery, RerankCodec},
@@ -36,50 +36,10 @@ fn encode_payload(query_norm: f32, centered: &[f32]) -> Vec<u8> {
     buf
 }
 
-fn decode_payload(payload: &[u8], dim: usize) -> Result<(f32, Vec<f32>), RerankError> {
-    let expected = 4 + dim * 4;
-    if payload.len() != expected {
-        return Err(RerankError::BadInput(format!(
-            "bbq distance: payload len {} != expected {} for dim {}",
-            payload.len(),
-            expected,
-            dim
-        )));
-    }
-    let query_norm = f32::from_le_bytes(
-        payload[..4]
-            .try_into()
-            .expect("slice of 4 bytes always converts to [u8;4]"),
-    );
-    let centered: Vec<f32> = payload[4..]
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| f32::from_le_bytes(*b))
-        .collect();
-    Ok((query_norm, centered))
-}
-
-// ── Inline dequantize (mirrors BbqCodec::dequantize, which is private) ────────
-
-/// Reconstruct an approximate FP32 vector from BBQ sign bits and residual norm.
-///
-/// Each dimension is approximated as ±residual_norm / √dim, with the sign
-/// taken from the packed bit (MSB-first within each byte, same as BBQ's
-/// `pack_signs`).
-#[inline]
-fn bbq_dequantize(packed: &[u8], residual_norm: f32, dim: usize) -> Vec<f32> {
-    let scale = if dim > 0 {
-        residual_norm / (dim as f32).sqrt()
-    } else {
-        0.0
-    };
-    (0..dim)
-        .map(|i| {
-            let bit = (packed[i / 8] >> (7 - (i % 8))) & 1;
-            if bit != 0 { scale } else { -scale }
-        })
-        .collect()
+/// Byte length of a prepared BBQ payload for `dim`: alpha + centered f32s.
+/// `None` when `dim` is large enough that the length itself overflows.
+fn payload_len(dim: usize) -> Option<usize> {
+    dim.checked_mul(4)?.checked_add(4)
 }
 
 // ── BbqRerank ─────────────────────────────────────────────────────────────────
@@ -197,22 +157,54 @@ impl RerankCodec for BbqRerank {
             }
         };
 
-        let (_query_norm, centered) = decode_payload(payload, self.dim)?;
+        let Some(expected) = payload_len(self.dim) else {
+            return Err(RerankError::BadInput(format!(
+                "bbq distance: dim {} overflows the prepared payload length",
+                self.dim
+            )));
+        };
+        if payload.len() != expected {
+            return Err(RerankError::BadInput(format!(
+                "bbq distance: payload len {} != expected {} for dim {}",
+                payload.len(),
+                expected,
+                self.dim
+            )));
+        }
 
         let packed_len = self.dim.div_ceil(8);
         let uqv_ref = UnifiedQuantizedVectorRef::from_bytes(encoded, packed_len).map_err(|e| {
             RerankError::BadInput(format!("bbq distance: failed to parse encoded bytes: {e}"))
         })?;
 
+        // The header decides how the candidate is reconstructed, so a candidate
+        // encoded for another dimension or another quantizer must be rejected
+        // rather than scored: `from_bytes` only proves the buffer is long enough
+        // to parse, not that it belongs to this codec.
         let header = uqv_ref.header();
-        let recon = bbq_dequantize(uqv_ref.packed_bits(), header.residual_norm, self.dim);
-        let dist = centered
-            .iter()
-            .zip(recon.iter())
-            .map(|(&a, &b)| (a - b) * (a - b))
-            .sum::<f32>()
-            .sqrt();
-        Ok(dist)
+        if usize::from(header.dim) != self.dim {
+            return Err(RerankError::BadInput(format!(
+                "bbq distance: candidate dim {} != codec dim {}",
+                header.dim, self.dim
+            )));
+        }
+        if header.quant_mode != QuantMode::Bbq as u16 {
+            return Err(RerankError::BadInput(format!(
+                "bbq distance: candidate quant mode {} is not BBQ ({})",
+                header.quant_mode,
+                QuantMode::Bbq as u16
+            )));
+        }
+
+        // Fused and allocation-free: the kernel reads the centered query
+        // straight from the prepared payload bytes, so a rerank pass pays one
+        // pass and no allocation per candidate (nor per query).
+        Ok((crate::distance::simd::runtime().l2_bbq)(
+            &payload[4..],
+            uqv_ref.packed_bits(),
+            header.residual_norm,
+            self.dim,
+        ))
     }
 
     fn name(&self) -> CodecName {
@@ -291,6 +283,62 @@ mod tests {
         assert!(dist >= 0.0, "distance must be non-negative, got {dist}");
     }
 
+    /// Pins the value `distance_prepared` returns: the asymmetric L2 between the
+    /// exact centred query and the `±residual_norm/√dim` reconstruction, computed
+    /// here in f64 by plain indexing. The fused kernel sits behind this seam, so
+    /// the reference is built from the wire layout rather than from the kernel.
+    #[test]
+    fn distance_prepared_matches_the_unfused_l2() {
+        let codec = trained();
+        let v = det_vec(7, DIM);
+        let enc = codec.encode(&v).expect("encode");
+        let prep = codec.prepare_query(&v).expect("prepare_query");
+        let got = codec.distance_prepared(&prep, &enc).expect("distance");
+
+        let PreparedQuery::Bytes(payload) = &prep else {
+            panic!("prepare_query must yield PreparedQuery::Bytes");
+        };
+
+        // Wire layout: 32-byte `QuantHeader` (residual_norm at bytes 8..12),
+        // then `dim.div_ceil(8)` sign-packed bytes; the prepared payload is the
+        // 4-byte alpha followed by `dim` centred f32s. The offsets are pinned on
+        // purpose: a change on either side of the seam must fail this test.
+        let residual_norm = f32::from_le_bytes([enc[8], enc[9], enc[10], enc[11]]);
+        let packed = &enc[32..32 + DIM.div_ceil(8)];
+        let centered: Vec<f64> = payload[4..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b) as f64)
+            .collect();
+        assert_eq!(centered.len(), DIM, "centred query must carry `dim` lanes");
+
+        let scale = residual_norm as f64 / (DIM as f64).sqrt();
+        let expected = centered
+            .iter()
+            .enumerate()
+            .map(|(i, q)| {
+                let bit = (packed[i / 8] >> (7 - (i % 8))) & 1;
+                let recon = if bit != 0 { scale } else { -scale };
+                (q - recon).powi(2)
+            })
+            .sum::<f64>()
+            .sqrt();
+
+        // A degenerate reference would make the comparison vacuous.
+        assert!(
+            expected > 1e-3,
+            "reference distance collapsed to {expected}"
+        );
+
+        let rel = 1e-4f64;
+        let abs = 1e-6f64;
+        assert!(
+            ((got as f64) - expected).abs() <= abs.max(rel * expected.abs()),
+            "distance_prepared = {got}, unfused L2 = {expected}"
+        );
+    }
+
     #[test]
     fn encode_before_train_returns_not_trained() {
         let codec = BbqRerank::new(DIM, DEFAULT_OVERSAMPLE);
@@ -326,6 +374,49 @@ mod tests {
         assert!(
             msg.contains("bad input") || msg.contains("dim"),
             "expected bad input error, got: {msg}"
+        );
+    }
+
+    /// A candidate encoded by a codec of another dimension parses against this
+    /// codec's packed length when its buffer is long enough, so only the header
+    /// check can reject it. Scoring it would silently return a wrong distance.
+    #[test]
+    fn candidate_encoded_for_another_dim_is_rejected() {
+        let codec = trained();
+        let prep = codec
+            .prepare_query(&det_vec(0, DIM))
+            .expect("prepare_query");
+
+        let other_dim = DIM * 2;
+        let vecs: Vec<Vec<f32>> = (0..N).map(|i| det_vec(i, other_dim)).collect();
+        let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
+        let mut other = BbqRerank::new(other_dim, DEFAULT_OVERSAMPLE);
+        other.train(&refs).expect("train must succeed");
+        let enc = other.encode(&det_vec(0, other_dim)).expect("encode");
+
+        let err = codec.distance_prepared(&prep, &enc).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("candidate dim"),
+            "expected a dimension mismatch, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn candidate_with_another_quant_mode_is_rejected() {
+        let codec = trained();
+        let v = det_vec(0, DIM);
+        let prep = codec.prepare_query(&v).expect("prepare_query");
+        let mut enc = codec.encode(&v).expect("encode");
+
+        // Header bytes 0..2 carry the quant mode; Sq8 has the same header size.
+        enc[0..2].copy_from_slice(&(QuantMode::Sq8 as u16).to_le_bytes());
+
+        let err = codec.distance_prepared(&prep, &enc).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("quant mode"),
+            "expected a quant-mode mismatch, got: {msg}"
         );
     }
 

@@ -58,3 +58,29 @@ fn l2_rejects_swapped_mismatch() {
         "distance() must reject length mismatch in either argument order"
     );
 }
+
+/// The BBQ fused kernel is the same contract on byte slices: it reads the
+/// centered query straight out of the prepared payload, so `centered` must
+/// carry `dim * 4` bytes and `packed` must carry `dim.div_ceil(8)` sign bytes.
+/// Every tier's safe entry validates both before any vector load, so an
+/// external safe caller gets a panic — never a read past the slice.
+#[test]
+fn bbq_rejects_short_slices() {
+    let kernel = nodedb_vector::distance::simd::runtime::runtime();
+    let dim = 16usize;
+
+    let short_centered = std::panic::catch_unwind(|| (kernel.l2_bbq)(&[], &[], 1.0, dim));
+    assert!(
+        short_centered.is_err(),
+        "dispatched bbq kernel ({}) must reject empty slices",
+        kernel.name
+    );
+
+    let centered = vec![0u8; dim * 4];
+    let short_packed = std::panic::catch_unwind(|| (kernel.l2_bbq)(&centered, &[], 1.0, dim));
+    assert!(
+        short_packed.is_err(),
+        "dispatched bbq kernel ({}) must reject a short packed slice",
+        kernel.name
+    );
+}

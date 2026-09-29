@@ -4,6 +4,8 @@
 
 #![cfg(target_arch = "x86_64")]
 
+use super::bbq::{assert_payload_shapes, l2_scalar_from_bytes, recon_scale};
+
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "avx512 l2: length mismatch");
     unsafe { l2_impl(a, b) }
@@ -98,4 +100,40 @@ unsafe fn ip_impl(a: &[f32], b: &[f32]) -> f32 {
         }
         -dot
     }
+}
+
+/// Safe entry for `SimdRuntime`; the feature guard lives in `SimdRuntime::detect`.
+pub fn l2_bbq(centered: &[u8], packed: &[u8], residual_norm: f32, dim: usize) -> f32 {
+    assert_payload_shapes(centered, packed, dim);
+    // SAFETY: selected only when `detect()` observed this tier's features, and
+    // both slices were just checked against `dim`.
+    unsafe { l2_bbq_impl(centered, packed, residual_norm, dim) }
+}
+
+#[target_feature(enable = "avx512f")]
+unsafe fn l2_bbq_impl(centered: &[u8], packed: &[u8], residual_norm: f32, dim: usize) -> f32 {
+    use std::arch::x86_64::*;
+
+    let scale = recon_scale(residual_norm, dim);
+    let pos = _mm512_set1_ps(scale);
+    let neg = _mm512_set1_ps(-scale);
+    let mut acc = _mm512_setzero_ps();
+
+    let mut i = 0;
+    while i + 16 <= dim {
+        // SAFETY: `i + 16 <= dim`, and `l2_bbq` asserted
+        // `centered.len() >= dim * 4`; two packed bytes are in range because
+        // 16 dims consume exactly two bytes.
+        let q = unsafe { _mm512_loadu_ps(centered.as_ptr().add(i * 4).cast::<f32>()) };
+        let b0 = unsafe { *packed.get_unchecked(i / 8) };
+        let b1 = unsafe { *packed.get_unchecked(i / 8 + 1) };
+        let mask: __mmask16 = (b0.reverse_bits() as u16) | ((b1.reverse_bits() as u16) << 8);
+        let recon = _mm512_mask_blend_ps(mask, neg, pos);
+        let d = _mm512_sub_ps(q, recon);
+        acc = _mm512_fmadd_ps(d, d, acc);
+        i += 16;
+    }
+
+    let sum = _mm512_reduce_add_ps(acc) + l2_scalar_from_bytes(centered, packed, scale, i, dim);
+    sum.sqrt()
 }
