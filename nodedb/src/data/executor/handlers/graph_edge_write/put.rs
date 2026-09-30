@@ -33,7 +33,7 @@ impl CoreLoop {
     ///
     /// A put writes a new edge-store version and makes the CSR edge live with
     /// the weight in `properties`, so a successful put always reports exactly
-    /// one edge affected.
+    /// one edge affected and records exactly one edge version written.
     pub(in crate::data::executor) fn execute_edge_put_with_undo(
         &mut self,
         task: &ExecutionTask,
@@ -140,6 +140,9 @@ impl CoreLoop {
                                 properties: Some(properties),
                             },
                         );
+                        if let Some(metrics) = &self.metrics {
+                            metrics.record_graph_edge_written();
+                        }
                         self.response_affected(task, 1)
                     }
                     Err(e) => self.response_error(
@@ -162,6 +165,8 @@ impl CoreLoop {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::*;
     use crate::bridge::envelope::Status;
     use crate::event::WriteOp;
@@ -170,6 +175,85 @@ mod tests {
     use nodedb_types::Surrogate;
 
     use super::super::shared::test_support::{affected_count, make_core, make_task_with_lsn};
+
+    /// A put records one edge version written, even when it rewrites an edge
+    /// that is already live: the gauge of live edges stays flat, so the write
+    /// count is the only place the second put shows up.
+    #[test]
+    fn a_put_counts_one_edge_version_per_write() {
+        use std::sync::Arc;
+
+        use crate::control::metrics::SystemMetrics;
+
+        let mut h = make_core();
+        let metrics = Arc::new(SystemMetrics::new());
+        h.core.set_metrics(Arc::clone(&metrics));
+        let task = make_task_with_lsn(5);
+        let params = || EdgePutParams {
+            tid: 1,
+            collection: "knows",
+            src_id: "a",
+            label: "KNOWS",
+            dst_id: "b",
+            properties: b"w=1",
+            src_surrogate: Surrogate::new(1),
+            dst_surrogate: Surrogate::new(2),
+        };
+
+        assert_eq!(
+            metrics.graph_edges_written.load(Ordering::Relaxed),
+            0,
+            "the core starts with a clean counter"
+        );
+
+        let first = h.core.execute_edge_put(&task, params());
+        assert_eq!(first.status, Status::Ok);
+        assert_eq!(metrics.graph_edges_written.load(Ordering::Relaxed), 1);
+
+        // The same edge again: a new version, still one write.
+        let second = h.core.execute_edge_put(&task, params());
+        assert_eq!(second.status, Status::Ok);
+        assert_eq!(
+            metrics.graph_edges_written.load(Ordering::Relaxed),
+            2,
+            "a rewrite is a write even though no new live edge appears"
+        );
+    }
+
+    /// A put refused before any version is written must not count.
+    #[test]
+    fn a_refused_put_counts_no_write() {
+        use std::sync::Arc;
+
+        use crate::control::metrics::SystemMetrics;
+
+        let mut h = make_core();
+        let metrics = Arc::new(SystemMetrics::new());
+        h.core.set_metrics(Arc::clone(&metrics));
+        h.core
+            .mark_node_deleted(crate::types::DatabaseId::DEFAULT.as_u64(), 1, "gone");
+
+        let resp = h.core.execute_edge_put(
+            &make_task_with_lsn(6),
+            EdgePutParams {
+                tid: 1,
+                collection: "knows",
+                src_id: "a",
+                label: "KNOWS",
+                dst_id: "gone",
+                properties: b"w=1",
+                src_surrogate: Surrogate::new(1),
+                dst_surrogate: Surrogate::new(2),
+            },
+        );
+
+        assert_eq!(resp.status, Status::Error);
+        assert_eq!(
+            metrics.graph_edges_written.load(Ordering::Relaxed),
+            0,
+            "a refusal applies nothing, so it counts nothing"
+        );
+    }
 
     #[test]
     fn edge_put_emits_cdc_insert_on_its_collection() {

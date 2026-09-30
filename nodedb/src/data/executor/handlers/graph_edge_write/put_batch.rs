@@ -74,6 +74,12 @@ impl CoreLoop {
                     }
                     partition.set_node_surrogate(&edge.src_id, edge.src_surrogate);
                     partition.set_node_surrogate(&edge.dst_id, edge.dst_surrogate);
+                    // Counted per edge as it is applied, not once for the
+                    // batch: edges before a mid-batch failure are still
+                    // written and must show up in the counter.
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_graph_edge_written();
+                    }
                 }
                 Err(e) => {
                     return self.response_error(
@@ -119,7 +125,11 @@ impl CoreLoop {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
     use crate::bridge::envelope::{ErrorCode, Status};
+    use crate::control::metrics::SystemMetrics;
     use crate::types::TenantId;
     use nodedb_physical::physical_plan::BatchEdge;
     use nodedb_types::{DatabaseId, QualifiedCollection, Surrogate};
@@ -135,6 +145,43 @@ mod tests {
             src_surrogate: Surrogate::new(1),
             dst_surrogate: Surrogate::new(2),
         }
+    }
+
+    /// Every applied edge of a batch is one write, not one write for the
+    /// batch: the counter has to describe the edges that reached storage.
+    #[test]
+    fn a_batch_counts_one_write_per_applied_edge() {
+        let mut h = make_core();
+        let metrics = Arc::new(SystemMetrics::new());
+        h.core.set_metrics(Arc::clone(&metrics));
+        let edges = vec![edge("a", "b"), edge("c", "d"), edge("e", "f")];
+
+        let resp = h
+            .core
+            .execute_edge_put_batch(&make_task_with_lsn(11), 1, &edges);
+
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(metrics.graph_edges_written.load(Ordering::Relaxed), 3);
+    }
+
+    /// A dangling endpoint refuses the whole batch before any edge is applied,
+    /// so no write is counted — the counter and the affected count agree.
+    #[test]
+    fn a_refused_batch_counts_no_write() {
+        let mut h = make_core();
+        let metrics = Arc::new(SystemMetrics::new());
+        h.core.set_metrics(Arc::clone(&metrics));
+        h.core
+            .mark_node_deleted(DatabaseId::DEFAULT.as_u64(), 1, "gone");
+
+        let resp = h.core.execute_edge_put_batch(
+            &make_task_with_lsn(12),
+            1,
+            &[edge("a", "b"), edge("c", "gone")],
+        );
+
+        assert_eq!(resp.status, Status::Error);
+        assert_eq!(metrics.graph_edges_written.load(Ordering::Relaxed), 0);
     }
 
     /// The funnel cancels the batch's record on a dangling refusal, so the

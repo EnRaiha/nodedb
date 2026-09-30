@@ -86,6 +86,18 @@ impl SystemMetrics {
             "Graph edges stored",
             self.graph_edges.load(Ordering::Relaxed),
         );
+        counter(
+            out,
+            "nodedb_graph_edges_written_total",
+            "Edge versions applied by a graph edge write",
+            self.graph_edges_written.load(Ordering::Relaxed),
+        );
+        counter(
+            out,
+            "nodedb_graph_edges_deleted_total",
+            "Live edges tombstoned by a graph edge delete",
+            self.graph_edges_deleted.load(Ordering::Relaxed),
+        );
 
         // ── Document engine ──
         counter(

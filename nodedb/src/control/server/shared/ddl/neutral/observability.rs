@@ -124,6 +124,14 @@ fn server_stats_rows(state: &SharedState) -> Vec<(String, String)> {
             sys.queries_graph.load(Ordering::Relaxed).to_string(),
         ));
         rows.push((
+            "graph_edges_written_total".into(),
+            sys.graph_edges_written.load(Ordering::Relaxed).to_string(),
+        ));
+        rows.push((
+            "graph_edges_deleted_total".into(),
+            sys.graph_edges_deleted.load(Ordering::Relaxed).to_string(),
+        ));
+        rows.push((
             "queries_document".into(),
             sys.queries_document.load(Ordering::Relaxed).to_string(),
         ));
@@ -253,4 +261,80 @@ pub fn show_memory(
         column_types,
         rows,
     ))])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::metrics::SystemMetrics;
+    use std::sync::Arc;
+
+    /// Read one `(name, value)` row from a rendered row set.
+    fn row_value(rows: &[(String, String)], name: &str) -> Option<String> {
+        rows.iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    }
+
+    /// The graph write counters render on the Prometheus surface as counters
+    /// with their own help text, next to the live-edge gauge they must not be
+    /// confused with.
+    #[test]
+    fn the_graph_write_counters_render_on_the_prometheus_surface() {
+        let metrics = SystemMetrics::new();
+        metrics.record_graph_edge_written();
+        metrics.record_graph_edge_deleted();
+        let output = metrics.to_prometheus();
+
+        assert!(
+            output.contains("# TYPE nodedb_graph_edges_written_total counter"),
+            "the write counter renders as a counter: {output}"
+        );
+        assert!(
+            output.contains("nodedb_graph_edges_written_total 1"),
+            "the write counter carries its value: {output}"
+        );
+        assert!(
+            output.contains("# TYPE nodedb_graph_edges_deleted_total counter"),
+            "the delete counter renders as a counter: {output}"
+        );
+        assert!(
+            output.contains("nodedb_graph_edges_deleted_total 1"),
+            "the delete counter carries its value: {output}"
+        );
+    }
+
+    /// The row builder reads the counters off `SystemMetrics`, the same
+    /// instance the Data Plane records through, so `SHOW STATS` cannot drift
+    /// from `/metrics`. Rows carry the value as decimal text like every other
+    /// counter in the set.
+    #[test]
+    fn the_stats_rows_read_the_graph_write_counters_from_metrics() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let wal = Arc::new(
+            crate::wal::WalManager::open_for_testing(&directory.path().join("obs-stats.wal"))
+                .expect("open WAL"),
+        );
+        let (dispatcher, _data_sides) = crate::bridge::dispatch::Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).expect("shared state");
+        let metrics = state
+            .system_metrics
+            .as_ref()
+            .expect("system metrics are wired")
+            .clone();
+        metrics.record_graph_edge_written();
+        metrics.record_graph_edge_written();
+        metrics.record_graph_edge_deleted();
+
+        let rows = server_stats_rows(&state);
+
+        assert_eq!(
+            row_value(&rows, "graph_edges_written_total").as_deref(),
+            Some("2"),
+        );
+        assert_eq!(
+            row_value(&rows, "graph_edges_deleted_total").as_deref(),
+            Some("1"),
+        );
+    }
 }

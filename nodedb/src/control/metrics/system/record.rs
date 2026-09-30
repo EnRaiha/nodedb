@@ -217,6 +217,23 @@ impl SystemMetrics {
         self.graph_edges.store(edges, Ordering::Relaxed);
     }
 
+    /// One edge version was applied by a graph edge write.
+    ///
+    /// Batch handlers call this once per edge as it is applied, never once per
+    /// batch: a batch that fails midway has already applied the edges before
+    /// the failure, and those writes are counted.
+    pub fn record_graph_edge_written(&self) {
+        self.graph_edges_written.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One live edge was tombstoned by a graph edge delete.
+    ///
+    /// Callers pass the pre-image result: a delete whose pre-image was absent
+    /// removes no live edge, so it does not count.
+    pub fn record_graph_edge_deleted(&self) {
+        self.graph_edges_deleted.fetch_add(1, Ordering::Relaxed);
+    }
+
     // ── Document engine ──
 
     pub fn record_document_insert(&self) {

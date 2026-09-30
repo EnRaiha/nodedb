@@ -81,6 +81,11 @@ impl CoreLoop {
                 &edge.dst_id,
                 edge.collection.as_str(),
             );
+            // Counted per edge as it is tombstoned, never once for the batch:
+            // edges before a mid-batch failure are already removed.
+            if existed && let Some(metrics) = &self.metrics {
+                metrics.record_graph_edge_deleted();
+            }
         }
         if !edges.is_empty() {
             self.checkpoint_coordinator
@@ -109,5 +114,72 @@ impl CoreLoop {
             );
         }
         self.response_affected(task, removed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use crate::bridge::envelope::Status;
+    use crate::control::metrics::SystemMetrics;
+    use crate::data::executor::handlers::graph::graph_edge_write::shared::EdgePutParams;
+    use crate::data::executor::handlers::graph::graph_edge_write::shared::test_support::{
+        affected_count, make_core, make_task_with_lsn,
+    };
+    use nodedb_physical::physical_plan::BatchEdge;
+    use nodedb_types::{DatabaseId, QualifiedCollection, Surrogate};
+
+    fn edge(src: &str, dst: &str) -> BatchEdge {
+        BatchEdge {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "knows"),
+            src_id: src.to_string(),
+            label: "KNOWS".to_string(),
+            dst_id: dst.to_string(),
+            src_surrogate: Surrogate::new(1),
+            dst_surrogate: Surrogate::new(2),
+        }
+    }
+
+    fn put(core: &mut crate::data::executor::core_loop::CoreLoop, src: &str, dst: &str, lsn: u64) {
+        assert_eq!(
+            core.execute_edge_put(
+                &make_task_with_lsn(lsn),
+                EdgePutParams {
+                    tid: 1,
+                    collection: "knows",
+                    src_id: src,
+                    label: "KNOWS",
+                    dst_id: dst,
+                    properties: b"w=1",
+                    src_surrogate: Surrogate::new(1),
+                    dst_surrogate: Surrogate::new(2),
+                },
+            )
+            .status,
+            Status::Ok
+        );
+    }
+
+    /// The batch counts the edges it actually removed: two live edges count
+    /// two, the absent third counts nothing, and the counter matches the
+    /// affected count the response carries.
+    #[test]
+    fn a_delete_batch_counts_only_the_live_edges() {
+        let mut h = make_core();
+        let metrics = Arc::new(SystemMetrics::new());
+        h.core.set_metrics(Arc::clone(&metrics));
+        put(&mut h.core, "a", "b", 40);
+        put(&mut h.core, "c", "d", 41);
+
+        let batch = vec![edge("a", "b"), edge("c", "d"), edge("e", "f")];
+        let resp = h
+            .core
+            .execute_edge_delete_batch(&make_task_with_lsn(42), 1, &batch);
+
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(affected_count(&resp), 2);
+        assert_eq!(metrics.graph_edges_deleted.load(Ordering::Relaxed), 2);
     }
 }

@@ -77,6 +77,14 @@ pub struct SystemMetrics {
     pub graph_traversals: AtomicU64,
     pub graph_nodes: AtomicU64,
     pub graph_edges: AtomicU64,
+    /// Edge versions applied by a graph edge write (single and batch puts).
+    /// Distinct from [`Self::graph_edges`], a gauge of live edges: a put that
+    /// rewrites an edge leaves the gauge flat and still counts here.
+    pub graph_edges_written: AtomicU64,
+    /// Live edges tombstoned by a graph edge delete (single and batch deletes).
+    /// A delete of an edge that was already absent writes a tombstone but
+    /// removes no live edge, so it does not count.
+    pub graph_edges_deleted: AtomicU64,
 
     pub document_inserts: AtomicU64,
     pub document_reads: AtomicU64,

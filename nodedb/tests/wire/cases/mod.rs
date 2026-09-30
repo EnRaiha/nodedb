@@ -86,6 +86,7 @@ mod graph_drop_hides_edges;
 mod graph_dsl_algo;
 mod graph_dsl_argument_validation;
 mod graph_dsl_handlers;
+mod graph_edge_write_counters;
 mod graph_match_authorization;
 mod graph_rag_fusion;
 mod graph_timeseries_rls_probe;

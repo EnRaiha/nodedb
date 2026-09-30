@@ -129,6 +129,12 @@ impl CoreLoop {
                         properties: None,
                     },
                 );
+                // Only a live edge counts as deleted: the tombstone is
+                // written either way, but a delete of an absent edge removes
+                // nothing, matching the affected count below.
+                if existed && let Some(metrics) = &self.metrics {
+                    metrics.record_graph_edge_deleted();
+                }
                 self.response_affected(task, u64::from(existed))
             }
             Err(e) => self.response_error(
@@ -143,14 +149,76 @@ impl CoreLoop {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
     use super::*;
     use crate::bridge::envelope::Status;
+    use crate::control::metrics::SystemMetrics;
     use crate::event::WriteOp;
     use crate::event::bus::create_event_bus_with_capacity;
     use nodedb_types::{RlsWriteCheck, Surrogate};
 
     use super::super::shared::EdgePutParams;
     use super::super::shared::test_support::{affected_count, make_core, make_task_with_lsn};
+
+    /// A delete of a live edge counts one; a delete of an edge that was never
+    /// there writes a tombstone but removes nothing, so it counts zero — the
+    /// counter and the reported affected count stay in step.
+    #[test]
+    fn a_delete_counts_only_a_live_edge() {
+        let mut h = make_core();
+        let metrics = Arc::new(SystemMetrics::new());
+        h.core.set_metrics(Arc::clone(&metrics));
+        let delete = |core: &mut super::CoreLoop, lsn: u64| {
+            let task = make_task_with_lsn(lsn);
+            core.execute_edge_delete(
+                &task,
+                EdgeDeleteParams {
+                    tid: 1,
+                    collection: "knows",
+                    src_id: "a",
+                    label: "KNOWS",
+                    dst_id: "b",
+                    rls_write_check: &RlsWriteCheck::NoPolicyApplies,
+                },
+            )
+        };
+
+        let absent = delete(&mut h.core, 30);
+        assert_eq!(absent.status, Status::Ok);
+        assert_eq!(affected_count(&absent), 0);
+        assert_eq!(
+            metrics.graph_edges_deleted.load(Ordering::Relaxed),
+            0,
+            "an absent edge is nothing to remove"
+        );
+
+        let put_task = make_task_with_lsn(31);
+        assert_eq!(
+            h.core
+                .execute_edge_put(
+                    &put_task,
+                    EdgePutParams {
+                        tid: 1,
+                        collection: "knows",
+                        src_id: "a",
+                        label: "KNOWS",
+                        dst_id: "b",
+                        properties: b"w=1",
+                        src_surrogate: Surrogate::new(1),
+                        dst_surrogate: Surrogate::new(2),
+                    },
+                )
+                .status,
+            Status::Ok
+        );
+
+        let live = delete(&mut h.core, 32);
+        assert_eq!(live.status, Status::Ok);
+        assert_eq!(affected_count(&live), 1);
+        assert_eq!(metrics.graph_edges_deleted.load(Ordering::Relaxed), 1);
+    }
 
     /// Compiled filters equivalent to a `FOR WRITE` policy on `owner`.
     fn owner_write_check(owner: &str) -> Vec<u8> {

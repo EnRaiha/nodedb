@@ -342,6 +342,10 @@ Counters are incremented at the sites where resources are consumed:
 - **WAL latency**: Group commit fsync completion
 - **Maintenance CPU**: Lease acquisition / release
 - **Replication lag**: Raft follower log application
+- **Graph edge writes**: graph edge put handler, per applied edge in a single put or a batch put (`nodedb_graph_edges_written_total`, also the `graph_edges_written_total` row of `SHOW STATS`)
+- **Graph edge deletes**: graph edge delete handler, per live edge tombstoned in a single delete or a batch delete (`nodedb_graph_edges_deleted_total`, also the `graph_edges_deleted_total` row of `SHOW STATS`)
+
+`nodedb_graph_edges_written_total` counts applied edge versions, so a put that rewrites a live edge increments it while the `nodedb_graph_edges` gauge stays flat. `nodedb_graph_edges_deleted_total` counts live edges removed, so a delete of an edge that was already absent writes a tombstone and increments neither counter — matching the affected count that statement reports.
 
 All metrics are dimensionalized by database and tenant to enable per-customer tracking and alerting.
 
