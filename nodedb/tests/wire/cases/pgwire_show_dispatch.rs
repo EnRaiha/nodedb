@@ -460,3 +460,69 @@ async fn show_session_set_parameter_round_trips() {
         .expect("SHOW application_name must succeed");
     assert_eq!(rows, vec!["mae8_bootstrap".to_string()]);
 }
+
+// ── Dispatch capacity counter ────────────────────────────────────────
+
+/// Fetch the raw Prometheus text body from `/metrics`.
+async fn fetch_metrics(http_port: u16) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", http_port))
+        .await
+        .expect("connect to /metrics");
+    let req = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    stream.write_all(req).await.expect("write metrics request");
+    let mut body = String::new();
+    stream
+        .read_to_string(&mut body)
+        .await
+        .expect("read metrics response");
+    body
+}
+
+/// The dispatcher's refusal counter must be readable from SQL, so an operator
+/// without HTTP access can still see dispatch pressure. A refusal reaches the
+/// client as `57P03`, and this row is the operator's view of the same event.
+#[tokio::test]
+async fn show_stats_carries_the_dispatch_capacity_counter() {
+    let server = TestServer::start().await;
+    let rows = server
+        .query_named_rows("SHOW STATS")
+        .await
+        .expect("SHOW STATS must succeed");
+
+    let row = rows
+        .iter()
+        .find(|r| {
+            r.get("name")
+                .map(|name| name == "dispatch_capacity_busy_total")
+                .unwrap_or(false)
+        })
+        .unwrap_or_else(|| {
+            panic!("SHOW STATS must carry dispatch_capacity_busy_total; got {rows:?}")
+        });
+
+    let value = row.get("value").expect("the counter row carries a value");
+    value.parse::<u64>().unwrap_or_else(|_| {
+        panic!("dispatch_capacity_busy_total must be a decimal integer, got {value:?}")
+    });
+}
+
+/// `/metrics` must declare the counter and export it. The declaration is what
+/// a Prometheus scrape uses to read it as a monotonic counter rather than a
+/// gauge.
+#[tokio::test]
+async fn metrics_exposes_the_dispatch_capacity_counter() {
+    let server = TestServer::start().await;
+    let body = fetch_metrics(server.http_port).await;
+
+    assert!(
+        body.contains("# TYPE nodedb_dispatch_capacity_busy_total counter"),
+        "/metrics must declare nodedb_dispatch_capacity_busy_total as a counter"
+    );
+    assert!(
+        body.lines()
+            .any(|line| line.starts_with("nodedb_dispatch_capacity_busy_total ")),
+        "/metrics must export a nodedb_dispatch_capacity_busy_total sample"
+    );
+}
