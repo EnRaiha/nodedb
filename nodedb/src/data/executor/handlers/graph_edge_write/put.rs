@@ -140,7 +140,13 @@ impl CoreLoop {
                                 properties: Some(properties),
                             },
                         );
-                        if let Some(metrics) = &self.metrics {
+                        // A cross-vShard edge is dual-homed: the put runs on
+                        // both endpoint homes and only the source home owns
+                        // the logical edge, so only that home counts it.
+                        if !self.boot_replaying_wal()
+                            && owns_logical_edge_stats(task, src_id)
+                            && let Some(metrics) = &self.metrics
+                        {
                             metrics.record_graph_edge_written();
                         }
                         self.response_affected(task, 1)
@@ -174,7 +180,9 @@ mod tests {
     use crate::types::Lsn;
     use nodedb_types::Surrogate;
 
-    use super::super::shared::test_support::{affected_count, make_core, make_task_with_lsn};
+    use super::super::shared::test_support::{
+        affected_count, make_core, make_task_at_source, make_task_with_lsn,
+    };
 
     /// A put records one edge version written, even when it rewrites an edge
     /// that is already live: the gauge of live edges stays flat, so the write
@@ -188,7 +196,7 @@ mod tests {
         let mut h = make_core();
         let metrics = Arc::new(SystemMetrics::new());
         h.core.set_metrics(Arc::clone(&metrics));
-        let task = make_task_with_lsn(5);
+        let task = make_task_at_source(5, "a");
         let params = || EdgePutParams {
             tid: 1,
             collection: "knows",
@@ -234,7 +242,7 @@ mod tests {
             .mark_node_deleted(crate::types::DatabaseId::DEFAULT.as_u64(), 1, "gone");
 
         let resp = h.core.execute_edge_put(
-            &make_task_with_lsn(6),
+            &make_task_at_source(6, "a"),
             EdgePutParams {
                 tid: 1,
                 collection: "knows",
@@ -252,6 +260,79 @@ mod tests {
             metrics.graph_edges_written.load(Ordering::Relaxed),
             0,
             "a refusal applies nothing, so it counts nothing"
+        );
+    }
+
+    /// A single put running on the destination home applies its replica of a
+    /// dual-homed edge without counting it. This is the single-edge form of
+    /// the double count the wire test caught, so it fails if the ownership
+    /// gate is dropped from `execute_edge_put`.
+    #[test]
+    fn a_put_on_a_foreign_home_counts_no_write() {
+        use std::sync::Arc;
+
+        use crate::control::metrics::SystemMetrics;
+
+        let mut h = make_core();
+        let metrics = Arc::new(SystemMetrics::new());
+        h.core.set_metrics(Arc::clone(&metrics));
+
+        // The task is homed on "b"; the put writes an edge whose source is
+        // "a", so this core is the destination home.
+        let resp = h.core.execute_edge_put(
+            &make_task_at_source(7, "b"),
+            EdgePutParams {
+                tid: 1,
+                collection: "knows",
+                src_id: "a",
+                label: "KNOWS",
+                dst_id: "b",
+                properties: b"w=1",
+                src_surrogate: Surrogate::new(1),
+                dst_surrogate: Surrogate::new(2),
+            },
+        );
+
+        assert_eq!(resp.status, Status::Ok, "the replica is still applied");
+        assert_eq!(
+            metrics.graph_edges_written.load(Ordering::Relaxed),
+            0,
+            "the destination home does not own the logical edge"
+        );
+    }
+
+    /// Replay re-enters this handler for edges a client wrote before the
+    /// restart, so it must not count them as new writes.
+    #[test]
+    fn a_replayed_put_counts_no_write() {
+        use std::sync::Arc;
+
+        use crate::control::metrics::SystemMetrics;
+
+        let mut h = make_core();
+        let metrics = Arc::new(SystemMetrics::new());
+        h.core.set_metrics(Arc::clone(&metrics));
+        h.core.boot_replaying_wal = true;
+
+        let resp = h.core.execute_edge_put(
+            &make_task_at_source(8, "a"),
+            EdgePutParams {
+                tid: 1,
+                collection: "knows",
+                src_id: "a",
+                label: "KNOWS",
+                dst_id: "b",
+                properties: b"w=1",
+                src_surrogate: Surrogate::new(1),
+                dst_surrogate: Surrogate::new(2),
+            },
+        );
+
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(
+            metrics.graph_edges_written.load(Ordering::Relaxed),
+            0,
+            "a replayed write happened before the restart"
         );
     }
 

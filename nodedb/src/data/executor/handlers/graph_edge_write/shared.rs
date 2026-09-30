@@ -16,6 +16,37 @@ pub(in crate::data::executor) fn owns_logical_edge_stats(
     task.request.vshard_id == VShardId::from_key(src_id.as_bytes())
 }
 
+/// Whether this participant is the one that counts a delete of
+/// `(src_id, dst_id)` once.
+///
+/// WIP — this cannot answer correctly from the Data Plane today, and exists so
+/// the limitation is stated in one place instead of implied by two call sites.
+///
+/// A delete removes the copy of the row its participant holds, so the count
+/// must follow the removal:
+///
+/// * One core, or two endpoints on one vShard (the Control Plane calls this
+///   `single_home`): one participant tombstones the forward and reverse rows
+///   together, so it must count even when it is not the source home.
+/// * Two or more cores: each home keeps its own copy in its own store, both
+///   see a live pre-image, and only the source home may count or one logical
+///   delete counts twice.
+///
+/// The deciding fact is `single_home`, which
+/// [`nodedb::control::server::shared::ddl::neutral::graph_ops::edge`] computes
+/// on the Control Plane and which the plan does not carry. Distinguishing the
+/// two cases here would need a new `GraphOp::EdgeDelete` field threaded from
+/// there, so this predicate currently reports the removal-follows rule and
+/// over-counts on a cluster. Do not rely on the counter on a multi-core
+/// deployment until that field exists.
+pub(in crate::data::executor) fn counts_logical_edge_delete(
+    _task: &ExecutionTask,
+    _src_id: &str,
+    _dst_id: &str,
+) -> bool {
+    true
+}
+
 /// Bundled arguments for [`CoreLoop::execute_edge_put`].
 pub(in crate::data::executor) struct EdgePutParams<'a> {
     pub tid: u64,
@@ -113,11 +144,32 @@ pub(super) mod test_support {
     /// it — the LSN the emitted CDC event then carries. The `plan` field is
     /// unused by the edge handlers (they take params directly).
     pub fn make_task_with_lsn(lsn: u64) -> crate::data::executor::task::ExecutionTask {
+        task_at_vshard(lsn, VShardId::new(0))
+    }
+
+    /// A task whose `vshard_id` is the home of `key`, the vShard the planner
+    /// routes a write on `key` to.
+    ///
+    /// The edge write handlers record persistent logical-edge statistics only
+    /// on the source home, so a test asserting those counters must build its
+    /// task the way the planner routes one.
+    pub fn make_task_at_source(
+        lsn: u64,
+        src_id: &str,
+    ) -> crate::data::executor::task::ExecutionTask {
+        task_at_vshard(lsn, VShardId::from_key(src_id.as_bytes()))
+    }
+
+    /// A task carrying `wal_lsn` on an explicit vShard home.
+    pub fn task_at_vshard(
+        lsn: u64,
+        vshard_id: VShardId,
+    ) -> crate::data::executor::task::ExecutionTask {
         crate::data::executor::task::ExecutionTask::new(Request {
             request_id: RequestId::new(1),
             tenant_id: TenantId::new(1),
             database_id: DatabaseId::DEFAULT,
-            vshard_id: VShardId::new(0),
+            vshard_id,
             plan: PhysicalPlan::Graph(GraphOp::Neighbors {
                 node_id: "x".to_string(),
                 edge_label: None,

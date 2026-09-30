@@ -491,4 +491,9 @@ pub struct CoreLoop {
         crate::data::executor::handlers::transaction::redo_apply::RedoApplyState,
     /// Set once this core's state is unknown. It then refuses every request.
     pub(in crate::data::executor) fail_stop: super::fail_stop::CoreFailStop,
+
+    /// True while this core rebuilds engine state from the WAL at boot.
+    /// Boot replay re-enters the write handlers, so a handler that counts
+    /// client activity asks this first. See [`Self::boot_replaying_wal`].
+    pub(in crate::data::executor) boot_replaying_wal: bool,
 }

@@ -197,6 +197,7 @@ impl CoreLoop {
             redo_apply:
                 crate::data::executor::handlers::transaction::redo_apply::RedoApplyState::new(),
             fail_stop: super::fail_stop::CoreFailStop::default(),
+            boot_replaying_wal: false,
         })
     }
 }

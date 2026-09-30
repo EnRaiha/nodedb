@@ -41,6 +41,13 @@ impl CoreLoop {
         }
         let core_id = self.core_id;
 
+        // Boot replay re-enters the ordinary write handlers to rebuild engine
+        // state, and the metrics are attached before recovery runs. Every edge
+        // re-applied here was written by a client before the restart, so the
+        // write counters must not see it: the flag is held across the whole
+        // pass and cleared on every exit below.
+        self.boot_replaying_wal = true;
+
         // Replay decides every record handed to it before this core serves a
         // request or writes a checkpoint: it applies the record, or a stamp,
         // a tombstone or an abort marker says it must not. Every one of them
@@ -101,6 +108,10 @@ impl CoreLoop {
                 std::process::exit(1);
             }
         }
+
+        // Replay is over: this core is about to serve, so client writes must
+        // count again.
+        self.boot_replaying_wal = false;
     }
 }
 

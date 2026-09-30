@@ -95,7 +95,9 @@ impl SystemMetrics {
         counter(
             out,
             "nodedb_graph_edges_deleted_total",
-            "Live edges tombstoned by a graph edge delete",
+            "Live edges tombstoned by a graph edge delete (WIP: counted per \
+             endpoint home, so a cross-shard delete on a multi-core cluster \
+             reports one logical removal per home)",
             self.graph_edges_deleted.load(Ordering::Relaxed),
         );
 

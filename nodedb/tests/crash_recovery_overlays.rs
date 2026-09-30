@@ -51,6 +51,83 @@ async fn graph_edges_survive_kill_9() {
     );
 }
 
+/// The graph write counters describe client activity, so a restart that
+/// re-applies an edge from the WAL must not report that edge as a new write.
+///
+/// Boot replay re-enters the same put/delete handlers, and the metrics are
+/// attached before recovery runs, so without a boot-replay guard the counters
+/// count every replayed edge again on every restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn replay_does_not_count_graph_edges_as_new_writes() {
+    let mut h = CrashHarness::new();
+    h.spawn();
+    h.wait_ready();
+
+    h.exec("CREATE COLLECTION crash_counter_edges").await;
+    h.exec("GRAPH INSERT EDGE IN 'crash_counter_edges' FROM 'a' TO 'b' TYPE 'knows'")
+        .await;
+    h.exec("GRAPH INSERT EDGE IN 'crash_counter_edges' FROM 'a' TO 'c' TYPE 'knows'")
+        .await;
+
+    let written = counter_value(&h, "graph_edges_written_total").await;
+    assert!(
+        written >= 2,
+        "two client inserts must be counted before the crash, saw {written}"
+    );
+
+    h.kill_9();
+    h.reopen();
+
+    // The counters are per-process, so a restart begins at zero. What matters
+    // is that recovery's re-application of both edges, which re-enters the
+    // same put handler, does not count as client work: without the boot-replay
+    // guard this reads 2 (or 4, one per home) with no client write at all.
+    let after_replay = counter_value(&h, "graph_edges_written_total").await;
+    assert_eq!(
+        after_replay, 0,
+        "boot replay must not count a re-applied edge as a new write"
+    );
+
+    let recovered = h
+        .query_col(
+            "MATCH (x)-[:knows]->(y) IN 'crash_counter_edges' RETURN x, y",
+            "y",
+        )
+        .await;
+    assert_eq!(
+        recovered.len(),
+        2,
+        "both edges must still be present after recovery: {recovered:?}"
+    );
+
+    // A write issued after recovery is still counted normally.
+    h.exec("GRAPH INSERT EDGE IN 'crash_counter_edges' FROM 'a' TO 'd' TYPE 'knows'")
+        .await;
+    assert_eq!(
+        counter_value(&h, "graph_edges_written_total").await,
+        1,
+        "a live write after recovery is counted exactly once"
+    );
+}
+
+/// Read one `(name, value)` counter out of `SHOW STATS`.
+async fn counter_value(h: &CrashHarness, name: &str) -> u64 {
+    let names = h.query_col_idx("SHOW STATS", 0).await;
+    let values = h.query_col_idx("SHOW STATS", 1).await;
+    assert_eq!(
+        names.len(),
+        values.len(),
+        "SHOW STATS must return the same number of names and values"
+    );
+    let index = names
+        .iter()
+        .position(|n| n == name)
+        .unwrap_or_else(|| panic!("SHOW STATS must carry {name}, got {names:?}"));
+    values[index]
+        .parse::<u64>()
+        .unwrap_or_else(|_| panic!("{name} must be a decimal integer, got {:?}", values[index]))
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_node_labels_survive_kill_9() {
     let mut h = CrashHarness::new();

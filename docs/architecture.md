@@ -343,9 +343,15 @@ Counters are incremented at the sites where resources are consumed:
 - **Maintenance CPU**: Lease acquisition / release
 - **Replication lag**: Raft follower log application
 - **Graph edge writes**: graph edge put handler, per applied edge in a single put or a batch put (`nodedb_graph_edges_written_total`, also the `graph_edges_written_total` row of `SHOW STATS`)
-- **Graph edge deletes**: graph edge delete handler, per live edge tombstoned in a single delete or a batch delete (`nodedb_graph_edges_deleted_total`, also the `graph_edges_deleted_total` row of `SHOW STATS`)
+- **Graph edge deletes**: graph edge delete handler, per live edge tombstoned in a single delete or a batch delete (`nodedb_graph_edges_deleted_total`, also the `graph_edges_deleted_total` row of `SHOW STATS`) — WIP, see below
 
 `nodedb_graph_edges_written_total` counts applied edge versions, so a put that rewrites a live edge increments it while the `nodedb_graph_edges` gauge stays flat. `nodedb_graph_edges_deleted_total` counts live edges removed, so a delete of an edge that was already absent writes a tombstone and increments neither counter — matching the affected count that statement reports.
+
+A cross-vShard edge is dual-homed: the same `EdgePut` or `EdgeDelete` runs on both endpoint homes. The write counter is recorded under `owns_logical_edge_stats` — the same ownership boundary `SHOW GRAPH STATS` counts logical edges with — so the source home counts the edge version once and the destination home adds nothing.
+
+`nodedb_graph_edges_deleted_total` is **WIP and over-reports on a multi-core cluster**. It counts each endpoint home that removes a live row. On one core the two dual-home participants share a store, so only the first finds the edge and the counter reads one; on two or more cores each home keeps its own copy, both find a live row, and one logical delete reads as two. Counting only the source home instead reads zero on one core, because the destination home performs the removal there. The deciding fact is the Control Plane's `single_home`, which the plan does not carry; distinguishing the cases needs a new `GraphOp::EdgeDelete` field threaded from `graph_ops/edge.rs`. Do not rely on this counter on a multi-core deployment until that lands.
+
+Both counters record client activity, so neither counts a WAL-replayed edge. Boot replay re-enters the same handlers to rebuild engine state, and the metrics are attached before replay runs; counting there would report pre-restart writes as new work on every restart. The handlers skip both counters while `CoreLoop::boot_replaying_wal()` holds, which covers the whole boot pass and is never set on a serving core. An online committed-redo apply reaches the same handlers and does count, because it is a real write.
 
 All metrics are dimensionalized by database and tenant to enable per-customer tracking and alerting.
 

@@ -12,7 +12,7 @@ use crate::types::TenantId;
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use crate::data::executor::handlers::transaction::undo::edge_write::EdgeTarget;
 
-use super::shared::{EdgeDeleteParams, owns_logical_edge_stats};
+use super::shared::{EdgeDeleteParams, counts_logical_edge_delete, owns_logical_edge_stats};
 
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_edge_delete(
@@ -131,8 +131,20 @@ impl CoreLoop {
                 );
                 // Only a live edge counts as deleted: the tombstone is
                 // written either way, but a delete of an absent edge removes
-                // nothing, matching the affected count below.
-                if existed && let Some(metrics) = &self.metrics {
+                // nothing.
+                //
+                // WIP, not yet correct on a multi-core cluster. See
+                // `counts_logical_edge_delete` in `shared.rs`: on one core the
+                // two dual-home participants share a store and only the
+                // removal is observable, while on two or more cores each home
+                // holds its own copy and both see a live pre-image. No
+                // predicate available to this handler distinguishes the two,
+                // so this over-reports one logical delete as two on a cluster.
+                if existed
+                    && !self.boot_replaying_wal()
+                    && counts_logical_edge_delete(task, src_id, dst_id)
+                    && let Some(metrics) = &self.metrics
+                {
                     metrics.record_graph_edge_deleted();
                 }
                 self.response_affected(task, u64::from(existed))
@@ -160,7 +172,9 @@ mod tests {
     use nodedb_types::{RlsWriteCheck, Surrogate};
 
     use super::super::shared::EdgePutParams;
-    use super::super::shared::test_support::{affected_count, make_core, make_task_with_lsn};
+    use super::super::shared::test_support::{
+        affected_count, make_core, make_task_at_source, make_task_with_lsn,
+    };
 
     /// A delete of a live edge counts one; a delete of an edge that was never
     /// there writes a tombstone but removes nothing, so it counts zero — the
@@ -171,7 +185,7 @@ mod tests {
         let metrics = Arc::new(SystemMetrics::new());
         h.core.set_metrics(Arc::clone(&metrics));
         let delete = |core: &mut super::CoreLoop, lsn: u64| {
-            let task = make_task_with_lsn(lsn);
+            let task = make_task_at_source(lsn, "a");
             core.execute_edge_delete(
                 &task,
                 EdgeDeleteParams {
@@ -194,7 +208,7 @@ mod tests {
             "an absent edge is nothing to remove"
         );
 
-        let put_task = make_task_with_lsn(31);
+        let put_task = make_task_at_source(31, "a");
         assert_eq!(
             h.core
                 .execute_edge_put(
@@ -218,6 +232,131 @@ mod tests {
         assert_eq!(live.status, Status::Ok);
         assert_eq!(affected_count(&live), 1);
         assert_eq!(metrics.graph_edges_deleted.load(Ordering::Relaxed), 1);
+    }
+
+    /// A dual-homed delete is counted by the home that holds the live row,
+    /// whichever that is. This home is not the edge's source, and it still
+    /// counts the removal it performed; the other home then finds the edge
+    /// absent and counts nothing, so the pair counts one.
+    #[test]
+    fn a_delete_on_any_home_counts_the_live_row_it_removes() {
+        let mut h = make_core();
+        let metrics = Arc::new(SystemMetrics::new());
+        h.core.set_metrics(Arc::clone(&metrics));
+
+        // Seed the edge through its source home so it is live here too.
+        let put_task = make_task_at_source(33, "a");
+        assert_eq!(
+            h.core
+                .execute_edge_put(
+                    &put_task,
+                    EdgePutParams {
+                        tid: 1,
+                        collection: "knows",
+                        src_id: "a",
+                        label: "KNOWS",
+                        dst_id: "b",
+                        properties: b"w=1",
+                        src_surrogate: Surrogate::new(1),
+                        dst_surrogate: Surrogate::new(2),
+                    },
+                )
+                .status,
+            Status::Ok
+        );
+
+        // The task is homed on "b", the edge's destination home.
+        let task = make_task_at_source(34, "b");
+        let resp = h.core.execute_edge_delete(
+            &task,
+            EdgeDeleteParams {
+                tid: 1,
+                collection: "knows",
+                src_id: "a",
+                label: "KNOWS",
+                dst_id: "b",
+                rls_write_check: &RlsWriteCheck::NoPolicyApplies,
+            },
+        );
+
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(affected_count(&resp), 1, "a live row was removed");
+        assert_eq!(
+            metrics.graph_edges_deleted.load(Ordering::Relaxed),
+            1,
+            "the home that held the live row counts the removal"
+        );
+
+        // The other home, which now finds the edge absent, adds nothing.
+        let other = make_task_at_source(35, "a");
+        let resp = h.core.execute_edge_delete(
+            &other,
+            EdgeDeleteParams {
+                tid: 1,
+                collection: "knows",
+                src_id: "a",
+                label: "KNOWS",
+                dst_id: "b",
+                rls_write_check: &RlsWriteCheck::NoPolicyApplies,
+            },
+        );
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(affected_count(&resp), 0);
+        assert_eq!(
+            metrics.graph_edges_deleted.load(Ordering::Relaxed),
+            1,
+            "the second home removes nothing, so the logical edge counts once"
+        );
+    }
+
+    /// Replay re-enters this handler for edges a client removed before the
+    /// restart, so it must not count them as new removals.
+    #[test]
+    fn a_replayed_delete_counts_no_delete() {
+        let mut h = make_core();
+        let metrics = Arc::new(SystemMetrics::new());
+        h.core.set_metrics(Arc::clone(&metrics));
+
+        let put_task = make_task_at_source(35, "a");
+        assert_eq!(
+            h.core
+                .execute_edge_put(
+                    &put_task,
+                    EdgePutParams {
+                        tid: 1,
+                        collection: "knows",
+                        src_id: "a",
+                        label: "KNOWS",
+                        dst_id: "b",
+                        properties: b"w=1",
+                        src_surrogate: Surrogate::new(1),
+                        dst_surrogate: Surrogate::new(2),
+                    },
+                )
+                .status,
+            Status::Ok
+        );
+
+        h.core.boot_replaying_wal = true;
+        let task = make_task_at_source(36, "a");
+        let resp = h.core.execute_edge_delete(
+            &task,
+            EdgeDeleteParams {
+                tid: 1,
+                collection: "knows",
+                src_id: "a",
+                label: "KNOWS",
+                dst_id: "b",
+                rls_write_check: &RlsWriteCheck::NoPolicyApplies,
+            },
+        );
+
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(
+            metrics.graph_edges_deleted.load(Ordering::Relaxed),
+            0,
+            "a replayed removal happened before the restart"
+        );
     }
 
     /// Compiled filters equivalent to a `FOR WRITE` policy on `owner`.

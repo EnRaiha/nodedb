@@ -57,6 +57,20 @@ use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use crate::data::executor::replay_abort::abort_replay;
 
 impl CoreLoop {
+    /// Whether this core is rebuilding engine state from the WAL at boot.
+    ///
+    /// Boot replay re-enters the ordinary write handlers, so a handler that
+    /// records client activity asks this first: every edge boot replay
+    /// re-applies was written by a client before the restart, and counting it
+    /// again reports the restart as new work. The flag covers the whole boot
+    /// pass and is never set on a serving core.
+    ///
+    /// An online committed-redo apply reaches the same handlers, but it does
+    /// not come through the boot entry, so it counts as the real write it is.
+    pub(in crate::data::executor) fn boot_replaying_wal(&self) -> bool {
+        self.boot_replaying_wal
+    }
+
     /// Whether a committed-redo apply is driving the replay arms.
     pub(in crate::data::executor) fn applying_committed_redo(&self) -> bool {
         self.redo_apply.scope.is_some()

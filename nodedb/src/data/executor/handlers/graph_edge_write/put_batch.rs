@@ -76,8 +76,12 @@ impl CoreLoop {
                     partition.set_node_surrogate(&edge.dst_id, edge.dst_surrogate);
                     // Counted per edge as it is applied, not once for the
                     // batch: edges before a mid-batch failure are still
-                    // written and must show up in the counter.
-                    if let Some(metrics) = &self.metrics {
+                    // written and must show up in the counter. A dual-homed
+                    // edge is counted by its source home only.
+                    if !self.boot_replaying_wal()
+                        && owns_logical_edge_stats(task, &edge.src_id)
+                        && let Some(metrics) = &self.metrics
+                    {
                         metrics.record_graph_edge_written();
                     }
                 }
@@ -134,7 +138,7 @@ mod tests {
     use nodedb_physical::physical_plan::BatchEdge;
     use nodedb_types::{DatabaseId, QualifiedCollection, Surrogate};
 
-    use super::super::shared::test_support::{make_core, make_task_with_lsn};
+    use super::super::shared::test_support::{make_core, make_task_at_source, make_task_with_lsn};
 
     fn edge(src: &str, dst: &str) -> BatchEdge {
         BatchEdge {
@@ -154,14 +158,63 @@ mod tests {
         let mut h = make_core();
         let metrics = Arc::new(SystemMetrics::new());
         h.core.set_metrics(Arc::clone(&metrics));
-        let edges = vec![edge("a", "b"), edge("c", "d"), edge("e", "f")];
+        // One source home owns every edge of the batch, so each applied edge
+        // is one counted write.
+        let edges = vec![edge("owner", "b"), edge("owner", "d"), edge("owner", "f")];
 
         let resp = h
             .core
-            .execute_edge_put_batch(&make_task_with_lsn(11), 1, &edges);
+            .execute_edge_put_batch(&make_task_at_source(11, "owner"), 1, &edges);
 
         assert_eq!(resp.status, Status::Ok);
         assert_eq!(metrics.graph_edges_written.load(Ordering::Relaxed), 3);
+    }
+
+    /// A dual-homed edge runs on both endpoint homes. Only the source home
+    /// owns the logical edge, so a batch running on a foreign home applies the
+    /// edge without counting it — otherwise one cross-shard insert would count
+    /// twice.
+    #[test]
+    fn a_batch_on_a_foreign_home_counts_no_write() {
+        let mut h = make_core();
+        let metrics = Arc::new(SystemMetrics::new());
+        h.core.set_metrics(Arc::clone(&metrics));
+
+        // The task is homed on "b", the batch writes an edge whose source is
+        // "a" — the destination-home replica of a dual-homed edge.
+        let resp =
+            h.core
+                .execute_edge_put_batch(&make_task_at_source(13, "b"), 1, &[edge("a", "b")]);
+
+        assert_eq!(resp.status, Status::Ok, "the replica is still applied");
+        assert_eq!(
+            metrics.graph_edges_written.load(Ordering::Relaxed),
+            0,
+            "the destination home does not own the logical edge"
+        );
+    }
+
+    /// Replay re-enters this handler for batches a client ran before the
+    /// restart, so it must not count them as new writes.
+    #[test]
+    fn a_replayed_batch_counts_no_write() {
+        let mut h = make_core();
+        let metrics = Arc::new(SystemMetrics::new());
+        h.core.set_metrics(Arc::clone(&metrics));
+        h.core.boot_replaying_wal = true;
+
+        let resp = h.core.execute_edge_put_batch(
+            &make_task_at_source(14, "owner"),
+            1,
+            &[edge("owner", "b")],
+        );
+
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(
+            metrics.graph_edges_written.load(Ordering::Relaxed),
+            0,
+            "a replayed write happened before the restart"
+        );
     }
 
     /// A dangling endpoint refuses the whole batch before any edge is applied,
