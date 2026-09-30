@@ -132,12 +132,15 @@ impl Dispatcher {
         let cls = self.priority_resolver.priority_for(database_id);
         channel.wfq.set_priority(database_id, cls);
 
-        if let Err(request) = channel.wfq.try_enqueue(database_id, request) {
+        if let Err(_request) = channel.wfq.try_enqueue(database_id, request) {
             let scope = DispatchCapacityScope::QueueFull {
                 core_id,
                 capacity: self.per_core_capacity,
             };
-            return Err(capacity_refusal(scope, request));
+            // This path reports a flat `Error` rather than a boxed refusal
+            // that hands the request back, so the count is noted directly.
+            super::dispatcher::note_capacity_busy();
+            return Err(crate::Error::DispatchCapacity { scope });
         }
 
         self.commit_enqueued(core_id, database_id, tenant_id, req_id, wal_lsn);
