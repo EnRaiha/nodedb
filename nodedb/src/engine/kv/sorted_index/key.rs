@@ -126,7 +126,7 @@ impl SortKeyEncoder {
         };
 
         let (lower_source, upper_source) = if descending { (max, min) } else { (min, max) };
-        let lower = lower_source.map(&framed);
+        let lower = lower_source.map(framed);
         let upper = upper_source.map(|value| {
             let mut bound = framed(value);
             bound.extend_from_slice(&[0xFF; 4]);

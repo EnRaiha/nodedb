@@ -38,7 +38,7 @@ impl ConnectionIdAllocator {
     pub(crate) fn allocate(&self) -> Result<ConnectionId, ConnectionAllocationError> {
         let id = self
             .next
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| ConnectionAllocationError::Exhausted)?;

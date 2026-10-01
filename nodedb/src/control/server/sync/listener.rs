@@ -124,7 +124,7 @@ impl SyncSessionGuard {
     fn open(state: Arc<SyncListenerState>) -> Option<Self> {
         let sequence = state
             .connections_accepted
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .ok()?

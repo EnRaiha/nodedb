@@ -142,7 +142,7 @@ impl Listener {
                             };
 
                             let Some(raw_connection_id) = next_connection_id
-                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                                     current.checked_add(1)
                                 })
                                 .ok()
