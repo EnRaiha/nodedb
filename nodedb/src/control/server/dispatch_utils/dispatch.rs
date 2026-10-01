@@ -811,7 +811,7 @@ mod tests {
 
         assert!(
             matches!(result, Err(crate::Error::Internal { .. })),
-            "{result:?}"
+            "a row write the caller journalled must be refused with an internal error"
         );
         assert!(!replayed(&state).contains(&lsn.as_u64()));
         assert_eq!(state.outcome_floor.leaked_windows(), 0);
