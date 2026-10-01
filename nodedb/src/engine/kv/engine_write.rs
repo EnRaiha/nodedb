@@ -179,27 +179,14 @@ impl KvEngine {
         } = params;
 
         let tkey = table_key(database_id, tenant_id, collection);
-        let present = self
-            .tables
-            .get(&tkey)
-            .is_some_and(|t| t.get_entry_meta(key).is_some());
-        if matches!(identity, RowIdentity::KeepExisting) && !present {
+        // One probe serves both the rewrite's presence check and the old expiry.
+        let old_meta = self.tables.get(&tkey).and_then(|t| t.get_entry_meta(key));
+        if matches!(identity, RowIdentity::KeepExisting) && old_meta.is_none() {
             return None;
         }
 
-        // Single-pass: check indexes + get old entry meta in one HashMap lookup.
         let has_indexes = self.indexes.get(&tkey).is_some_and(|idx| !idx.is_empty());
-        let old_expire = self
-            .tables
-            .get(&tkey)
-            .and_then(|t| t.get_entry_meta(key))
-            .and_then(|m| {
-                if m.has_ttl {
-                    Some(m.expire_at_ms)
-                } else {
-                    None
-                }
-            });
+        let old_expire = old_meta.and_then(|m| m.has_ttl.then_some(m.expire_at_ms));
 
         // Cancel old expiry (before mutating the table).
         if let Some(old_ms) = old_expire {
