@@ -135,7 +135,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 sha2 = { version = "0.10", features = ["oid"] }
 
 # WASM runtime
-wasmtime = { version = "48", default-features = false, features = [
+wasmtime = { version = "49", default-features = false, features = [
   "cranelift",
   "runtime",
 ] }
