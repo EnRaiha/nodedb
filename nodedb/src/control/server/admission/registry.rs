@@ -139,7 +139,7 @@ impl LimitEntry {
         let owed = u32::try_from(owed).unwrap_or(u32::MAX);
         let _ = self
             .pending_shrink
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_add(owed))
             });
     }
