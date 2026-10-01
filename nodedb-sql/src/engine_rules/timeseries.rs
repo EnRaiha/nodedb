@@ -111,6 +111,21 @@ impl EngineRules for TimeseriesRules {
                 ),
             });
         }
+        // A native `TimeseriesScan` carries no `having` slot, so a predicate
+        // reaching here would be dropped and the statement would answer groups
+        // the user filtered out. Refuse it instead. Every other engine forwards
+        // `having`; this one cannot, and a refusal tells the user that where a
+        // silent widening of the result set does not.
+        if !p.having.is_empty() {
+            return Err(SqlError::Unsupported {
+                detail: format!(
+                    "HAVING is not supported on timeseries collection '{}'; \
+                     the native time-series aggregate cannot express a predicate \
+                     over the aggregate result. Filter the input with WHERE instead",
+                    p.collection
+                ),
+            });
+        }
         Ok(SqlPlan::TimeseriesScan {
             collection: p.collection,
             time_range: default_time_range(),

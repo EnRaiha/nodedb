@@ -378,11 +378,20 @@ fn has_column_comparison(expr: &SqlExpr) -> bool {
     }
 }
 
-/// Check if a SELECT has aggregation (GROUP BY or aggregate functions in projection).
+/// Check if a SELECT has aggregation (GROUP BY, aggregate functions in
+/// projection, or a HAVING clause).
 pub(in crate::planner::select) fn has_aggregation(
     select: &Select,
     functions: &FunctionRegistry,
 ) -> bool {
+    // A HAVING clause is a statement about group results, so it needs the
+    // aggregate path even when the projection happens to name no aggregate:
+    // `SELECT host FROM ts HAVING COUNT(*) > 1` is an aggregate statement whose
+    // predicate the non-aggregate path never reads. Leaving it out dropped the
+    // predicate and answered every row.
+    if select.having.is_some() {
+        return true;
+    }
     let group_by_non_empty = match &select.group_by {
         ast::GroupByExpr::All(_) => true,
         ast::GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
