@@ -241,6 +241,53 @@ where
     }))
 }
 
+/// Run `op` until it succeeds or fails terminally, or until `budget` elapses.
+///
+/// This is for a caller whose client cannot retry, such as an ILP stream that
+/// sends no acks. Such a caller waits out a drain for as long as the drain
+/// itself can last. Each wait ends early when a drain ends on this node. The
+/// last retryable error is returned once `budget` elapses.
+pub async fn retry_through_drain<F, Fut, T, E>(
+    drains: &DescriptorDrainTracker,
+    budget: Duration,
+    mut op: F,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: RetryableSchemaChange,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    let ceiling = BACKOFFS[BACKOFFS.len() - 1];
+    let mut attempt = 0usize;
+    loop {
+        // Enabled before the attempt, so a drain that ends while the attempt
+        // runs still wakes the wait after it.
+        let drain_ended = drains.drain_ended();
+        tokio::pin!(drain_ended);
+        drain_ended.as_mut().enable();
+        let error = match op().await {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let Some(descriptor) = error.retryable_descriptor() else {
+            return Err(error);
+        };
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(error);
+        }
+        tracing::debug!(attempt, descriptor, "waiting out a descriptor drain");
+        let backoff = BACKOFFS.get(attempt).copied().unwrap_or(ceiling);
+        let wake = (now + backoff).min(deadline);
+        tokio::select! {
+            _ = drain_ended.as_mut() => {}
+            _ = tokio::time::sleep_until(wake) => {}
+        }
+        attempt += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +436,66 @@ mod tests {
             }
         })
         .await;
+        assert!(matches!(result, Err(Error::PlanError { .. })));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A drain that outlasts the statement budget is still waited out when
+    /// the caller's budget covers it.
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_longer_than_the_statement_budget_is_waited_out() {
+        let calls = AtomicUsize::new(0);
+        let drains = DescriptorDrainTracker::new();
+        let refusals = MAX_ATTEMPTS * 3;
+        let result: Result<(), Error> =
+            retry_through_drain(&drains, Duration::from_secs(35), || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n < refusals {
+                        Err(Error::RetryableSchemaChanged {
+                            descriptor: "orders".into(),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+        result.expect("the attempt after the drain succeeds");
+        assert_eq!(calls.load(Ordering::SeqCst), refusals + 1);
+    }
+
+    /// A drain that never ends returns its error once the budget elapses.
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_past_the_budget_surfaces_its_error_at_the_deadline() {
+        let drains = DescriptorDrainTracker::new();
+        let budget = Duration::from_secs(2);
+        let started = tokio::time::Instant::now();
+        let result: Result<(), Error> = retry_through_drain(&drains, budget, || async {
+            Err(Error::RetryableSchemaChanged {
+                descriptor: "orders".into(),
+            })
+        })
+        .await;
+        assert!(matches!(result, Err(Error::RetryableSchemaChanged { .. })));
+        assert!(started.elapsed() >= budget);
+        assert!(started.elapsed() < budget + BACKOFFS[BACKOFFS.len() - 1]);
+    }
+
+    #[tokio::test]
+    async fn retry_through_drain_surfaces_a_terminal_error_at_once() {
+        let calls = AtomicUsize::new(0);
+        let drains = DescriptorDrainTracker::new();
+        let result: Result<(), Error> =
+            retry_through_drain(&drains, Duration::from_secs(35), || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    Err(Error::PlanError {
+                        detail: "syntax error".into(),
+                    })
+                }
+            })
+            .await;
         assert!(matches!(result, Err(Error::PlanError { .. })));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
