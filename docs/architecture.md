@@ -162,7 +162,7 @@ SET cross_shard_txn = 'best_effort_non_atomic';
 
 (Bare `best_effort` is deliberately rejected; invalid values return SQLSTATE `22023`.)
 
-**Single-node deployments run Calvin by default** (`[server] single_node_calvin = true`): a standalone node synthesizes a one-node sequencer group so transactions spanning multiple cores (vShards) commit atomically instead of being rejected. Set it `false` to force the legacy fast path. Uncontended single-shard point writes bypass the sequencer entirely and go directly through the relevant data-group Raft; contended or predicate/bulk writes route through the deterministic scheduler.
+**Single-node deployments always run Calvin.** A node with no `[cluster]` section synthesizes a one-node cluster with its own sequencer group, so transactions spanning multiple cores (vShards) commit atomically. Uncontended single-shard point writes bypass the sequencer entirely and go directly through the relevant data-group Raft; contended or predicate/bulk writes route through the deterministic scheduler.
 
 **Overlay hygiene.** Per-transaction staging overlays are kept alive by every staged write/read; overlays orphaned by vanished clients are reaped after a 6-hour lease. The `nodedb_active_txn_overlays` Prometheus gauge tracks live overlays. Data-Plane resource rejection surfaces as SQLSTATE `53200` (backpressure — retry when pressure subsides).
 

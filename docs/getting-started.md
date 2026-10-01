@@ -295,12 +295,252 @@ listener is already plaintext.
 | -------------------------------- | ---------------------------------- | ------- |
 | `checkpoint.interval_secs`       | `NODEDB_CHECKPOINT_INTERVAL_SECS`  | `300`   |
 | `checkpoint.wal_segment_target_mb` | `NODEDB_WAL_SEGMENT_TARGET_MB`   | `64`    |
+| `checkpoint.wal_archive_interval_secs` | none                         | `10`    |
 | `tuning.wal.direct_io`           | `NODEDB_WAL_DIRECT_IO`             | `true`  |
 | `tuning.wal.write_buffer_size`   | `NODEDB_WAL_WRITE_BUFFER_SIZE`     | `2MiB`  |
 
-Both intervals must be positive. `write_buffer_size` accepts a memory size and
-must be at least `64KiB`. Turn `direct_io` off only on a filesystem that
-rejects `O_DIRECT`.
+All intervals must be positive. A zero interval stops startup.
+`write_buffer_size` accepts a memory size and must be at least `64KiB`. Turn
+`direct_io` off only on a filesystem that rejects `O_DIRECT`.
+
+`wal_archive_interval_secs` applies only when `[cold_storage]` is configured.
+Each interval, every sealed WAL segment the archive does not hold is uploaded
+to cold storage. A sealed segment therefore reaches the archive within one
+interval. The segment still being written is uploaded once it is sealed.
+Checkpoints never delete a WAL segment the archive does not hold.
+
+**Point-in-time recovery:**
+
+| Config field                       | Environment variable | Default |
+| ---------------------------------- | -------------------- | ------- |
+| `pitr.enabled`                     | none                 | `false` |
+| `pitr.base_snapshot_interval_secs` | none                 | `86400` |
+| `pitr.base_snapshot_retention`     | none                 | `7`     |
+| `pitr.restore_point_interval_secs` | none                 | `0`     |
+
+```toml
+[pitr]
+enabled = true
+base_snapshot_interval_secs = 86400
+base_snapshot_retention = 7
+restore_point_interval_secs = 3600
+
+[cold_storage]
+bucket = "my-nodedb-cold"
+
+[encryption]
+key_path = "/etc/nodedb/keys/wal.key"
+```
+
+With `pitr.enabled = true`, startup stops unless `[cold_storage]` is
+configured and opens, and unless `[encryption]` is configured. The WAL archive
+is the only copy of a segment once a checkpoint deletes it locally. Base
+snapshots are encrypted with the WAL key. With `pitr.enabled = false` and no
+`[cold_storage]`, checkpoints delete WAL segments without archiving them.
+
+Archived segments are stored under `{prefix}wal/{node_id}/{incarnation}/`.
+The incarnation is a random id stored in the data directory. A node whose
+data directory is wiped gets a new incarnation, so it never mixes its
+segments with those of its earlier life.
+
+Each `base_snapshot_interval_secs`, the node takes a base snapshot of every
+Data Plane core and of its catalogs. Bases are stored in `[snapshot_storage]`
+under `{node_id}/{incarnation}/`. The first base is taken once startup
+completes when the node has none. A base must finish within one interval.
+
+Bases are incremental. Each image is cut into chunks of 256 KiB to 4 MiB at
+content-defined boundaries. A chunk is stored once, under `chunks/{id}` in
+the same directory. The id is an HMAC of the chunk content under a key
+derived from the WAL key, so it reveals nothing about the content. A new base
+uploads only the chunks the store lacks. Every base manifest still lists
+every chunk it needs, so a restore reads one base and never its parent.
+
+After each base, the node keeps the newest `base_snapshot_retention` bases
+and deletes older ones. It never deletes the base it just took. It then
+deletes archived WAL segments whose records all lie below the oldest kept
+base, so every kept base can replay forward. The segment holding that base's
+start is always kept. It also deletes every chunk no kept base lists. A chunk
+a base still being written relies on is never deleted. Both values must be
+positive. A zero value stops startup.
+
+A failed run is retried at the next interval. These metrics report the task:
+
+- `nodedb_pitr_base_last_success_timestamp_seconds`
+- `nodedb_pitr_base_snapshots`
+- `nodedb_pitr_base_last_failure_timestamp_seconds`
+- `nodedb_pitr_base_failures_total`
+- `nodedb_pitr_wal_segments_collected_total`
+- `nodedb_pitr_base_chunks_uploaded_total`
+- `nodedb_pitr_base_chunk_bytes_uploaded_total`
+- `nodedb_pitr_base_chunks_reused_total`
+- `nodedb_pitr_base_chunks_collected_total`
+
+**Restoring one node:**
+
+```bash
+nodedb restore --config /etc/nodedb/nodedb.toml --target-time 2026-09-01T12:00:00Z --dry-run
+nodedb restore --config /etc/nodedb/nodedb.toml --target-lsn 48213
+```
+
+The restore runs offline, with the server stopped. It writes the newest base
+at or below the target, plus the archived WAL cut at the target, into the
+data directory of the config. The data directory must be empty. A time
+target is RFC 3339 or epoch seconds, milliseconds or microseconds.
+`--dry-run` prints the plan and writes nothing. `--incarnation` picks the
+node life when several hold bases. Start the server afterwards. It needs no
+flag.
+
+**Cluster restore points:**
+
+A cluster rewinds only to a restore point: one instant every Raft group of
+the cluster agrees on.
+
+```sql
+CREATE RESTORE POINT;
+SHOW RESTORE POINTS;
+```
+
+- `CREATE RESTORE POINT` takes a point now and returns its row.
+- `SHOW RESTORE POINTS` lists every point, oldest first.
+- Both are superuser only, and both refuse on a node outside a cluster.
+- A row holds `id`, `hlc` (the point's watermark, HLC nanoseconds) and
+  `created_at_ms`.
+
+With `restore_point_interval_secs` above `0`, the cluster also takes a point
+each interval. A point cuts every data group and the Calvin sequencer at its
+watermark. Each node records every group's place at the point in its WAL.
+Every write a group's log places after its cut records a commit time above
+the watermark, on every replica.
+
+Each node also copies the metadata group's committed log to
+`{prefix}raft/{node_id}/{incarnation}/` in cold storage. The metadata log
+never compacts past the entries that copy holds.
+
+**Restoring a cluster:**
+
+1. Pick the point with `SHOW RESTORE POINTS`.
+2. Stop every node of the cluster.
+3. On every node, empty the data directory except `tls/`.
+4. On every node, run the restore:
+
+   ```bash
+   nodedb restore --config /etc/nodedb/nodedb.toml --cluster --restore-point 5812
+   ```
+
+5. Start every node.
+
+The restore needs the point in the node's archived WAL. After a node records
+a point, it seals the WAL segment that holds the records, so they reach the
+archive within one `wal_archive_interval_secs`. A point taken less than one
+interval before the stop can be missing from the archive. The restore then
+refuses and names the node and the point.
+
+Each node's restore writes:
+
+- The newest base holding nothing the restore drops, in data or metadata.
+- The archived WAL through its last kept record. Each record is kept or
+  dropped by one rule:
+  - A write keeps its commit HLC. It is kept when that HLC is below the
+    watermark, wherever the WAL placed it.
+  - A record that a metadata entry's apply appended carries the entry's
+    stamp, and follows the entry.
+  - Any other record (a checkpoint, a tombstone) carries no clock. It is
+    kept when it lies before this node's cut of its vShard's group in the
+    WAL, or before the metadata group's cut when no group homes the vShard.
+- Each data group and the sequencer, started at its place at the point. The
+  sequencer resumes at the first epoch after the point.
+- The metadata group, started at the base's catalogs, with the archived
+  metadata log entries after the base, through the point. The first boot
+  applies them. A range this node's archive lacks is read from another
+  node's archive.
+
+Every metadata entry a node proposes carries the node's HLC. The restore
+keeps an entry only when that stamp is below the watermark, so the catalog
+matches the data exactly. A DDL issued after the watermark is dropped even
+when it applied before the point's entry, and so is every write that
+depends on it. A dropped entry keeps its index as an empty entry.
+
+The restore also sets two counters at the point:
+
+- The surrogate high-water mark rises to the highest surrogate any node
+  ever reserved, after the point too. No surrogate is issued twice.
+- Each tenant write mark is the newest kept write. A mark the base holds at
+  or above the watermark stops just below it.
+
+The generation claim needs a cold store with conditional create (put if
+absent). A store without one refuses the restore and names the store.
+
+Every group of every node starts at one new term, and the cluster epoch
+starts at the same value. The value comes from a generation the restore
+claims in cold storage under `{prefix}raft/restore/`. Every node restoring
+the same point before the cluster starts takes the same generation. Each
+node's first boot seals the generation, and the next restore takes a newer
+one. A node the restore missed holds lower terms and a lower epoch. Raft
+refuses its log, and the epoch fence stands it down. A restored data
+directory holds the file `restore_generation` until its first boot. That
+boot needs `[cold_storage]` to seal the generation.
+
+A restore that fails empties the data directory except `tls/`. Run it
+again. A group a node hosts that recorded no place at the point starts with
+no log and catches up from its leader. The report lists such groups.
+
+**Scheduled backups:**
+
+| Config field               | Environment variable | Default |
+| -------------------------- | -------------------- | ------- |
+| `backup.schedule.database` | none                 | none    |
+| `backup.schedule.target`   | none                 | none    |
+| `backup.schedule.cron`     | none                 | none    |
+| `backup.schedule.keep`     | none                 | none    |
+
+```toml
+[[backup.schedule]]
+database = "sales"
+target = "s3://my-backups/nightly/sales"
+cron = "0 3 * * *"
+keep = 7
+
+[backup_encryption]
+key_path = "/etc/nodedb/keys/backup.key"
+```
+
+Each `[[backup.schedule]]` entry runs `BACKUP DATABASE <database>` on its
+cron schedule. The cron is 5-field and uses `scheduler.cron_timezone`. A run
+writes one envelope named `<database>-<unix_ms>.ndbb` under `target`.
+`<unix_ms>` is the scheduled minute, not the time the run started. The run
+then deletes the oldest envelopes of that database under `target` beyond
+`keep`. Other objects under `target` are never deleted.
+
+- `target` is `s3://<bucket>/<prefix>` or `file:///<dir>`. It resolves
+  against `[backup_storage]`, like a `BACKUP DATABASE ... TO` URI.
+- A `file://` target must name a directory inside `[backup_storage]
+  local_root`.
+- Every field is required. `keep` must be positive.
+- Two entries with the same `database` and `target` stop startup.
+- A schedule needs `[backup_encryption]`. Without it, startup stops.
+
+In a cluster, only the leader of vShard 0 runs scheduled backups, and only
+while its leader lease is valid. A leader cut off from its peers stops once
+its lease lapses, before another node can take over. The lease is checked
+again before the envelope write and before the record below. After each
+completed run, the leader records the scheduled minute through the metadata
+group, so every node holds the same record. A node reads that record only
+after it has applied the metadata group through a read index its leader
+confirmed. When that read cannot be confirmed, the tick is skipped. A new
+leader of vShard 0 runs any due minute with no completed record. A minute that runs twice across a leader
+change writes the same envelope again. Several missed minutes fire one run.
+A new entry, or an entry whose `database`, `target`, or `cron` changes,
+starts fresh from the current minute. A failed run retries after 60 seconds.
+A run never overlaps an earlier run of the same entry. Each run is recorded
+in the job history under `backup:<database>:<target>`. These metrics report
+the runs:
+
+- `nodedb_backup_schedule_runs_total`
+- `nodedb_backup_schedule_failures_total`
+- `nodedb_backup_schedule_last_success_timestamp_seconds`
+- `nodedb_backup_schedule_last_failure_timestamp_seconds`
+- `nodedb_backup_schedule_envelopes_deleted_total`
+- `nodedb_backup_schedule_ticks_skipped_total`
 
 **Timeseries memtable settings:**
 
@@ -319,16 +559,24 @@ between flushes.
 
 **Cluster settings** (each needs a `[cluster]` section in the config file):
 
-| Config field                          | Environment variable                 | Default |
-| ------------------------------------- | ------------------------------------ | ------- |
-| `cluster.node_id`                     | `NODEDB_NODE_ID`                     | none    |
-| `cluster.seed_nodes`                  | `NODEDB_SEED_NODES`                  | none    |
-| `cluster.join_retry_max_attempts`     | `NODEDB_JOIN_RETRY_MAX_ATTEMPTS`     | `8`     |
-| `cluster.join_retry_max_backoff_secs` | `NODEDB_JOIN_RETRY_MAX_BACKOFF_SECS` | `32`    |
+| Config field                          | Environment variable                 | Default                     |
+| ------------------------------------- | ------------------------------------ | --------------------------- |
+| `cluster.node_id`                     | `NODEDB_NODE_ID`                     | none                        |
+| `cluster.seed_nodes`                  | `NODEDB_SEED_NODES`                  | none                        |
+| `cluster.swim_listen`                 | `NODEDB_SWIM_LISTEN`                 | `cluster.listen` port + 1   |
+| `cluster.join_retry_max_attempts`     | `NODEDB_JOIN_RETRY_MAX_ATTEMPTS`     | `8`                         |
+| `cluster.join_retry_max_backoff_secs` | `NODEDB_JOIN_RETRY_MAX_BACKOFF_SECS` | `32`                        |
 
 `NODEDB_SEED_NODES` takes a comma-separated `host:port` list. Both join-retry
 values must be positive. Setting any of these without a `[cluster]` section
 stops startup.
+
+`cluster.swim_listen` is the UDP `host:port` of the SWIM failure detector.
+By default it uses the `cluster.listen` IP, one port above the `cluster.listen`
+port. Each node advertises its bound address to its peers, so nodes can set it
+independently. Startup fails if the address cannot be bound. Open this UDP port
+between every pair of nodes. Without it, nodes cannot detect a failed peer, and
+a crashed node's descriptor leases block DDL until they expire.
 
 **Maintenance loop settings:**
 

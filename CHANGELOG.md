@@ -14,6 +14,7 @@ NodeDB uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Native-protocol `SELECT` returns nested objects and arrays as structured values, not JSON text. `nodedb_types::conversion::json_to_value_display` is replaced by `json_to_value_ref`.
 - JWT `metadata` claims keep their JSON type instead of being coerced to strings.
 - `document_get` for a missing id returns `Ok(None)` instead of a serialization error.
+- **`[server] single_node_calvin` is removed.** A server without a `[cluster]` section always runs the single-node Calvin sequencer, so cross-core (cross-vShard) transactions always commit atomically. A config that still sets the key fails to load as an unknown field. Remove the line.
 
 ### Added
 

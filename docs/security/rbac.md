@@ -135,8 +135,8 @@ Who can execute cluster and database-scoped DDL:
 | `MIRROR DATABASE`                     | Superuser                                       |
 | `ALTER DATABASE ... PROMOTE`          | Superuser (irreversible; requires vault access) |
 | `MOVE TENANT`                         | Superuser                                       |
-| `BACKUP DATABASE`                     | Superuser, ClusterAdmin, or DatabaseOwner       |
-| `RESTORE DATABASE`                    | Superuser                                       |
+| `BACKUP DATABASE`                     | Superuser or DatabaseOwner                      |
+| `RESTORE DATABASE`                    | Superuser or DatabaseOwner; Superuser for a database that does not exist |
 | `KILL SESSION`                        | Superuser, ClusterAdmin, or session owner       |
 | `CREATE/ALTER/DROP OIDC PROVIDER`     | Superuser or ClusterAdmin                       |
 
