@@ -152,7 +152,7 @@ pub fn run_release_savepoint(
 /// Truncates the write buffer to the saved position and rewinds the
 /// value/TTL, graph, and array overlays on every vShard the transaction has
 /// staged to. Iterates the CURRENT staged set (a superset of the savepoint's,
-/// since writes may have staged to NEW vShards after the savepoint): a vShard
+/// since writes can have staged to NEW vShards after the savepoint): a vShard
 /// with a saved marker rewinds to it; a vShard first staged AFTER the savepoint
 /// has no saved marker and rewinds to all-zero markers, dropping ALL of its
 /// staged writes.
@@ -194,7 +194,7 @@ pub async fn run_rollback_to_savepoint(
 
 /// A parsed deferred COMMIT OFFSET / COMMIT OFFSETS command.
 pub enum DeferredOffsetCmd {
-    /// `COMMIT OFFSET PARTITION <p> AT <lsn>:<sequence> ON <stream> CONSUMER GROUP <name>`.
+    /// `COMMIT OFFSET PARTITION <p> AT <epoch>:<index>:<sequence> ON <stream> CONSUMER GROUP <name>`.
     Single {
         stream: String,
         group: String,
@@ -206,18 +206,38 @@ pub enum DeferredOffsetCmd {
     Batch { stream: String, group: String },
 }
 
+/// A `COMMIT OFFSET` statement whose partition or offset does not parse.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DeferredOffsetError {
+    #[error("invalid partition: '{0}'")]
+    InvalidPartition(String),
+    #[error(transparent)]
+    InvalidOffset(#[from] crate::event::cdc::offset::ParseCdcOffsetError),
+}
+
+impl From<DeferredOffsetError> for crate::Error {
+    fn from(error: DeferredOffsetError) -> Self {
+        Self::BadRequest {
+            detail: error.to_string(),
+        }
+    }
+}
+
 /// Parse a `COMMIT OFFSET` / `COMMIT OFFSETS` statement into a neutral command.
 ///
 /// Returns `Ok(None)` when `sql` is not a deferred-offset commit. `upper` is
 /// the caller's uppercased form of `sql`, passed in to avoid re-allocating it.
-/// A bare LSN uses the documented legacy whole-LSN acknowledgement semantics.
-pub fn parse_deferred_offset(sql: &str, upper: &str) -> Result<Option<DeferredOffsetCmd>, String> {
+/// An `<epoch>:<index>` token acknowledges every event of that write.
+pub fn parse_deferred_offset(
+    sql: &str,
+    upper: &str,
+) -> Result<Option<DeferredOffsetCmd>, DeferredOffsetError> {
     if !(upper.starts_with("COMMIT OFFSET ") || upper.starts_with("COMMIT OFFSETS ")) {
         return Ok(None);
     }
     let parts: Vec<&str> = sql.split_whitespace().collect();
 
-    // Single-partition: COMMIT OFFSET PARTITION <p> AT <lsn> ON <stream> CONSUMER GROUP <name>
+    // Single-partition: COMMIT OFFSET PARTITION <p> AT <offset> ON <stream> CONSUMER GROUP <name>
     if parts.len() >= 11
         && parts[2].eq_ignore_ascii_case("PARTITION")
         && parts[4].eq_ignore_ascii_case("AT")
@@ -225,10 +245,8 @@ pub fn parse_deferred_offset(sql: &str, upper: &str) -> Result<Option<DeferredOf
     {
         let partition_id: u32 = parts[3]
             .parse()
-            .map_err(|_| format!("invalid partition: '{}'", parts[3]))?;
-        let offset: CdcOffset = parts[5]
-            .parse()
-            .map_err(|error: crate::event::cdc::offset::ParseCdcOffsetError| error.to_string())?;
+            .map_err(|_| DeferredOffsetError::InvalidPartition(parts[3].to_owned()))?;
+        let offset: CdcOffset = parts[5].parse()?;
         return Ok(Some(DeferredOffsetCmd::Single {
             stream: parts[7].to_lowercase(),
             group: parts[10].to_lowercase(),
@@ -392,10 +410,10 @@ mod tests {
     }
 
     #[test]
-    fn deferred_commit_offset_accepts_emitted_and_legacy_tokens() {
+    fn deferred_commit_offset_accepts_event_and_whole_write_tokens() {
         let canonical = parse_deferred_offset(
-            "COMMIT OFFSET PARTITION 2 AT 42:7 ON orders CONSUMER GROUP analytics",
-            "COMMIT OFFSET PARTITION 2 AT 42:7 ON ORDERS CONSUMER GROUP ANALYTICS",
+            "COMMIT OFFSET PARTITION 2 AT 0:42:7 ON orders CONSUMER GROUP analytics",
+            "COMMIT OFFSET PARTITION 2 AT 0:42:7 ON ORDERS CONSUMER GROUP ANALYTICS",
         )
         .unwrap()
         .unwrap();
@@ -404,15 +422,39 @@ mod tests {
         };
         assert_eq!(offset, CdcOffset::new(42, 7));
 
-        let legacy = parse_deferred_offset(
-            "COMMIT OFFSET PARTITION 2 AT 42 ON orders CONSUMER GROUP analytics",
-            "COMMIT OFFSET PARTITION 2 AT 42 ON ORDERS CONSUMER GROUP ANALYTICS",
+        let whole_write = parse_deferred_offset(
+            "COMMIT OFFSET PARTITION 2 AT 0:42 ON orders CONSUMER GROUP analytics",
+            "COMMIT OFFSET PARTITION 2 AT 0:42 ON ORDERS CONSUMER GROUP ANALYTICS",
         )
         .unwrap()
         .unwrap();
-        let DeferredOffsetCmd::Single { offset, .. } = legacy else {
+        let DeferredOffsetCmd::Single { offset, .. } = whole_write else {
             panic!("expected single offset commit");
         };
-        assert_eq!(offset, CdcOffset::legacy_lsn(42));
+        assert_eq!(offset, CdcOffset::whole_index(42));
+    }
+
+    #[test]
+    fn deferred_commit_offset_refuses_a_bad_partition_or_offset_with_a_typed_error() {
+        let bad_partition = parse_deferred_offset(
+            "COMMIT OFFSET PARTITION x AT 0:1 ON s CONSUMER GROUP g",
+            "COMMIT OFFSET PARTITION X AT 0:1 ON S CONSUMER GROUP G",
+        );
+        assert!(matches!(
+            bad_partition,
+            Err(DeferredOffsetError::InvalidPartition(ref p)) if p == "x"
+        ));
+        let bad_offset = parse_deferred_offset(
+            "COMMIT OFFSET PARTITION 1 AT 42 ON s CONSUMER GROUP g",
+            "COMMIT OFFSET PARTITION 1 AT 42 ON S CONSUMER GROUP G",
+        );
+        let Err(error) = bad_offset else {
+            panic!("a one-part offset must be refused");
+        };
+        assert!(matches!(error, DeferredOffsetError::InvalidOffset(_)));
+        assert!(matches!(
+            crate::Error::from(error),
+            crate::Error::BadRequest { .. }
+        ));
     }
 }

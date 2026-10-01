@@ -25,6 +25,8 @@
 //!   counts as the entry's outcome.
 //! - An apply that writes no record of its own (a `wal=false` timeseries
 //!   ingest) appends a payload-free `ProposalApplied` record in its place.
+//! - A snapshot install appends a `ProposalApplied` record per key the
+//!   snapshot carried: those entries never apply on this node.
 //!
 //! A duplicate delivered after a restart is recognised as long as the WAL
 //! still retains a record of its original.

@@ -8,4 +8,5 @@ mod bulk;
 mod context;
 pub(in crate::data::executor) mod dispatch;
 mod point;
+mod txn_rows;
 mod upsert;

@@ -12,8 +12,6 @@
 //! ILP lines are newline-delimited raw text written directly to the stream:
 //! no further framing, and no per-line acknowledgement.
 
-#![allow(dead_code)] // Not every test binary exercises every helper.
-
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
@@ -45,6 +43,37 @@ pub async fn connect_and_auth_from(
     username: &str,
     password: &str,
 ) -> TcpStream {
+    connect_with(
+        source,
+        addr,
+        AuthMethod::Password {
+            username: username.into(),
+            password: password.into(),
+        },
+    )
+    .await
+}
+
+/// Like [`connect_and_auth`], against a server in trust mode: the Auth frame
+/// names `username` and carries no password.
+pub async fn connect_trust(addr: std::net::SocketAddr, username: &str) -> TcpStream {
+    connect_with(
+        None,
+        addr,
+        AuthMethod::Trust {
+            username: username.into(),
+        },
+    )
+    .await
+}
+
+/// Complete the Hello + Auth prelude with `auth` and return the stream ready
+/// for raw ILP lines.
+async fn connect_with(
+    source: Option<std::net::SocketAddr>,
+    addr: std::net::SocketAddr,
+    auth: AuthMethod,
+) -> TcpStream {
     let (mut stream, _ack) = do_handshake_from(source, addr, &HelloFrame::current())
         .await
         .expect("ILP native Hello handshake");
@@ -54,10 +83,7 @@ pub async fn connect_and_auth_from(
         1,
         OpCode::Auth,
         TextFields {
-            auth: Some(AuthMethod::Password {
-                username: username.into(),
-                password: password.into(),
-            }),
+            auth: Some(auth),
             ..Default::default()
         },
     )

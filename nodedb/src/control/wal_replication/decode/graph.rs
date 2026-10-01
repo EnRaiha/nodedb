@@ -164,9 +164,9 @@ mod tests {
         }
 
         // Verify the decoded PhysicalPlan uses the carried (authoritative) surrogates.
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Graph(GraphOp::EdgePut {
                 src_surrogate,
@@ -186,5 +186,50 @@ mod tests {
             }
             other => panic!("expected Graph(EdgePut), got {other:?}"),
         }
+    }
+
+    /// The propose seams hand every edge write, single or batched, to its
+    /// Calvin transaction as the plan it carries, and keep a label write on
+    /// the data group.
+    #[test]
+    fn every_edge_write_entry_yields_its_plan_for_calvin() {
+        let tenant = TenantId::new(1);
+        let vshard = VShardId::new(0);
+        let edge = BatchEdge {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "graph"),
+            src_id: "alice".into(),
+            label: "knows".into(),
+            dst_id: "bob".into(),
+            src_surrogate: nodedb_types::Surrogate::new(11),
+            dst_surrogate: nodedb_types::Surrogate::new(22),
+        };
+        for plan in [
+            PhysicalPlan::Graph(GraphOp::EdgePutBatch {
+                edges: vec![edge.clone()],
+            }),
+            PhysicalPlan::Graph(GraphOp::EdgeDeleteBatch {
+                edges: vec![edge.clone()],
+            }),
+        ] {
+            let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+                .expect("encode")
+                .expect("an edge batch has a replicated form");
+            let carried = decode::edge_write_plan(&entry.write)
+                .expect("decode")
+                .expect("an edge batch runs as a Calvin transaction");
+            assert_eq!(carried, plan);
+        }
+        let labels = PhysicalPlan::Graph(GraphOp::SetNodeLabels {
+            node_id: "alice".into(),
+            labels: vec!["person".into()],
+        });
+        let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &labels)
+            .expect("encode")
+            .expect("a label write has a replicated form");
+        assert!(
+            decode::edge_write_plan(&entry.write)
+                .expect("decode")
+                .is_none()
+        );
     }
 }

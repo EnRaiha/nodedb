@@ -301,6 +301,8 @@ impl SessionStore {
             debug_assert_eq!(session.tx_buffer.len(), session.tx_lease_scopes.len());
             session.tx_buffer.clear();
             session.tx_lease_scopes.clear();
+            session.tx_body_tasks.clear();
+            session.tx_ts_preview_rejected.clear();
             session.tx_snapshot_lsn = None;
             session.tx_snapshot_epoch = None;
             session.tx_id = None;
@@ -312,11 +314,12 @@ impl SessionStore {
             session.pending_offset_commits.clear();
             session.pending_field_inference.clear();
             session.pending_notifies.clear();
-            // Cursors may retain rows from the previous database, including
+            session.pending_publishes.clear();
+            // Cursors can retain rows from the previous database, including
             // WITH HOLD cursors, so no cursor can survive a database switch.
             session.cursors.clear();
             // LIVE subscriptions are bound to the database selected when they
-            // are created. Retaining them across USE DATABASE would deliver
+            // are created. Retaining them across USE DATABASE will deliver
             // events from the previous database on the new session binding.
             session.live_subscriptions.clear();
             session.prepared_stmts.clear();

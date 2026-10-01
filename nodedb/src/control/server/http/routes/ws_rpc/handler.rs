@@ -28,6 +28,7 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
+use futures::future::BoxFuture;
 use futures::{SinkExt, StreamExt};
 use tracing::{debug, warn};
 
@@ -145,7 +146,29 @@ impl Drop for AbortOnDropJoinHandle {
 }
 
 /// Handle a single WebSocket connection.
-async fn handle_ws_connection(
+///
+/// The connection future is boxed, once per connection. Every request path
+/// nests inside it, and unboxed it can overflow the compiler's layout depth
+/// limit in the upgrade task.
+fn handle_ws_connection(
+    socket: WebSocket,
+    state: AppState,
+    identity: crate::control::security::identity::AuthenticatedIdentity,
+    database_id: DatabaseId,
+    trace_id: nodedb_types::TraceId,
+    peer_addr: String,
+) -> BoxFuture<'static, ()> {
+    Box::pin(serve_ws_connection(
+        socket,
+        state,
+        identity,
+        database_id,
+        trace_id,
+        peer_addr,
+    ))
+}
+
+async fn serve_ws_connection(
     socket: WebSocket,
     state: AppState,
     identity: crate::control::security::identity::AuthenticatedIdentity,

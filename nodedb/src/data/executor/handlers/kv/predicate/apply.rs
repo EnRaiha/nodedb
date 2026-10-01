@@ -6,7 +6,7 @@
 //! would drift from the keyed one.
 
 use nodedb_physical::physical_plan::ReturningSpec;
-use nodedb_types::{RlsWriteCheck, Surrogate};
+use nodedb_types::RlsWriteCheck;
 use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
@@ -17,7 +17,8 @@ use crate::data::executor::handlers::kv::rls::admit_kv_row;
 use crate::data::executor::handlers::returning_rows::KvStoredRow;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
-use crate::engine::kv::{KvPutParams, current_ms};
+use crate::engine::kv::entry::NO_EXPIRY;
+use crate::engine::kv::{KvRewriteParams, current_ms};
 
 /// Routing and policy inputs shared by both predicate handlers.
 pub(in crate::data::executor) struct KvPredicateCtx<'a> {
@@ -76,19 +77,21 @@ impl CoreLoop {
         }
 
         for (key, old_body, new_value) in &writes {
-            // `Surrogate::ZERO` leaves the row's existing bound identity alone.
-            self.kv_engine.put(KvPutParams {
-                database_id: did,
-                tenant_id: tid,
-                collection,
-                key,
-                value: new_value,
-                // Mirrors `execute_kv_field_set`, whose keyed merge this is the
-                // predicate form of: the merge writes no TTL of its own.
-                ttl_ms: 0,
-                now_ms,
-                surrogate: Surrogate::ZERO,
-            });
+            // The matched row exists and keeps its bound identity.
+            self.kv_engine.rewrite_with_absolute_expiry(
+                KvRewriteParams {
+                    database_id: did,
+                    tenant_id: tid,
+                    collection,
+                    key,
+                    value: new_value,
+                    // Mirrors `execute_kv_field_set`, whose keyed merge this is
+                    // the predicate form of: the merge writes no TTL of its own.
+                    ttl_ms: 0,
+                    now_ms,
+                },
+                NO_EXPIRY,
+            );
             if let Some(ref m) = self.metrics {
                 m.record_kv_put();
             }

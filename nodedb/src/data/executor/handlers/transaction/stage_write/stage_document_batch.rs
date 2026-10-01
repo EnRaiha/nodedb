@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Staging for the two document writes only a Calvin transaction stages:
-//! `BatchInsert` and `ApplyBalanceDelta`.
+//! Staging for `BatchInsert`, which only a Calvin transaction stages, and
+//! `ApplyBalanceDelta`, which a Calvin transaction and an in-transaction
+//! `StageWrite` both stage.
 //!
 //! A multi-shard statement commits through Calvin. Calvin stages every plan
 //! into the transaction overlay, and the flush installs the redo record that
@@ -92,6 +93,16 @@ impl CoreLoop {
                     ),
                 },
             );
+        }
+        // One unbound row refuses the whole batch before any row is staged.
+        for surrogate in surrogates {
+            if let Some(refusal) =
+                crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+                    "document", collection, *surrogate,
+                )
+            {
+                return self.response_error(task, refusal);
+            }
         }
         for ((document_id, value), surrogate) in documents.iter().zip(surrogates) {
             let ctx = StageCtx::new(
@@ -237,7 +248,7 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), Value::String((*v).to_string())))
             .collect();
-        zerompk::to_msgpack_vec(&Value::Object(map)).expect("encode object")
+        nodedb_types::value_to_msgpack(&Value::Object(map)).expect("encode object")
     }
 
     fn seed(core: &mut CoreLoop, collection: &str, surrogate: u32, fields: &[(&str, &str)]) {
@@ -306,6 +317,33 @@ mod tests {
             field(&core, "accounts", 9, "balance"),
             Some(Value::String("12.5".into())),
             "both moves land, the second on the first's staged row"
+        );
+    }
+
+    /// A session transaction stages a balance move through `StageWrite`, and
+    /// its redo record installs the moved balance.
+    #[test]
+    fn a_session_balance_delta_commits_through_the_redo_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        seed(
+            &mut core,
+            "accounts",
+            9,
+            &[("id", "acc1"), ("balance", "10")],
+        );
+
+        let response = core.commit_plans_for_test(
+            &make_default_task(),
+            TID,
+            &[balance_delta("5"), balance_delta("-2.5")],
+            100,
+        );
+
+        assert_eq!(response.status, Status::Ok, "{:?}", response.error_code);
+        assert_eq!(
+            field(&core, "accounts", 9, "balance"),
+            Some(Value::String("12.5".into()))
         );
     }
 

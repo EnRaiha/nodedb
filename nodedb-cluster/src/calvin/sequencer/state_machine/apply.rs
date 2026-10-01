@@ -12,14 +12,14 @@
 
 use std::sync::atomic::Ordering;
 
-use tokio::sync::mpsc;
 use tracing::{error, warn};
 
 use crate::calvin::sequencer::entry::SequencerEntry;
 use crate::calvin::sequencer::epoch_guard::{EpochCheck, SequencerHalt, classify};
-use crate::calvin::types::SchedulerInput;
+use crate::calvin::types::{EpochBatch, SchedulerInput, TxnIdWire};
+use crate::calvin::{ParticipantVote, TxnId, VerdictOutcome};
 
-use super::core::SequencerStateMachine;
+use super::core::{Delivery, SequencerStateMachine};
 
 impl SequencerStateMachine {
     /// Apply a committed Raft log entry.
@@ -85,228 +85,25 @@ impl SequencerStateMachine {
         };
 
         match entry {
-            SequencerEntry::EpochBatch { mut batch } => {
-                // Re-derive the participating_vshards field which is skipped
-                // during serialization (it is computed from write_set collection names).
-                // A class whose participants cannot be derived makes the entry
-                // as unusable as one that fails to decode, so it is skipped the
-                // same way.
-                for txn in &mut batch.txns {
-                    if let Err(err) = txn.tx_class.restore_derived() {
-                        error!(
-                            epoch = batch.epoch,
-                            raft_index = index,
-                            error = %err,
-                            "sequencer state machine: epoch batch carries a transaction \
-                             with underivable participants; skipping entry"
-                        );
-                        crate::diag::sequencer_participants_underivable(
-                            batch.epoch,
-                            index,
-                            &err.to_string(),
-                        );
-                        return;
-                    }
-                }
-
-                // A halted state machine has already diverged from the log;
-                // resuming fan-out mid-divergence is how a detected fault turns
-                // into corrupted lock-table and completion state.
-                if self.halted {
-                    error!(
-                        epoch = batch.epoch,
-                        raft_index = index,
-                        "sequencer state machine is halted on an epoch regression; \
-                         refusing to apply further epoch batches"
-                    );
-                    return;
-                }
-
-                let expected = self.next_epoch();
-                let check = classify(expected, batch.epoch);
-                match check {
-                    EpochCheck::InOrder => {}
-                    // Entries are missing on THIS replica, but the batch in
-                    // hand is intact and self-describing. Dropping it would
-                    // add fresh data loss on top of the entries already
-                    // missed, so it is fanned out and the hole is reported —
-                    // the scheduler recovers the missed range by replaying the
-                    // sequencer Raft log.
-                    EpochCheck::Ahead => {
-                        error!(
-                            epoch = batch.epoch,
-                            expected,
-                            raft_index = index,
-                            "sequencer state machine: epoch gap detected; this node missed \
-                             entries. Fanning out the batch in hand; the skipped epochs must \
-                             be recovered by log replay."
-                        );
-                        self.metrics
-                            .epochs_skipped_gap
-                            .fetch_add(1, Ordering::Relaxed);
-                        crate::diag::sequencer_epoch_gap(
-                            expected,
-                            batch.epoch,
-                            check.direction(),
-                            batch.txns.len(),
-                            index,
-                        );
-                    }
-                    // A NEW log entry (an index never applied here — the
-                    // re-delivery guard at the top of `apply` already returned
-                    // for the ones that were) carrying an already-consumed
-                    // epoch. Every `(epoch, position)` in this batch aliases one
-                    // that has already run here, so fanning it out would collide
-                    // with live lock-table and completion entries — and dropping
-                    // it would silently discard committed writes. Neither is
-                    // acceptable: halt and escalate.
-                    EpochCheck::Behind => {
-                        error!(
-                            epoch = batch.epoch,
-                            expected,
-                            raft_index = index,
-                            txns = batch.txns.len(),
-                            "sequencer state machine: epoch regression; a committed epoch was \
-                             proposed a second time. Halting the sequencer state machine \
-                             rather than aliasing committed transaction identities."
-                        );
-                        self.metrics
-                            .epochs_refused_regression
-                            .fetch_add(1, Ordering::Relaxed);
-                        crate::diag::sequencer_epoch_gap(
-                            expected,
-                            batch.epoch,
-                            check.direction(),
-                            batch.txns.len(),
-                            index,
-                        );
-                        self.halted = true;
-                        if let Some(hook) = self.unrecoverable_hook.as_ref() {
-                            hook(SequencerHalt {
-                                expected_epoch: expected,
-                                found_epoch: batch.epoch,
-                                txns_in_batch: batch.txns.len(),
-                                raft_index: index,
-                            });
-                        }
-                        return;
-                    }
-                }
-
-                let mut fanned_out = 0u64;
-                let mut dropped = 0u64;
-                // Collected for a single end-of-call diagnostics report,
-                // never emitted per-txn — a sustained backpressure storm can
-                // drop many positions in one apply() call and per-txn
-                // emission would report-storm.
-                let mut drop_pairs: Vec<(u32, &'static str)> = Vec::new();
-
-                // Per-vShard count of how many of this epoch's positions target
-                // each vShard. Delivered to each scheduler so it knows how many
-                // positions of the epoch it must apply before the epoch is fully
-                // applied on its vShard — the input to its per-`(epoch, position)`
-                // applied gate and fully-applied watermark. Every position of an
-                // epoch targeting a given vShard is stamped with the same count.
-                // Shared with the replay path via `compute_vshard_txn_counts` so
-                // the two paths can never drift.
-                let vshard_txn_counts =
-                    crate::calvin::sequencer::replay::compute_vshard_txn_counts(&batch);
-                for txn in &batch.txns {
-                    // Seed the expected vote-participant count deterministically on
-                    // EVERY replica (not just the epoch's originating leader), so a
-                    // post-failover sequencer leader can still detect vote
-                    // completeness and aggregate the verdict.
-                    self.completion_registry.seed_expected(
-                        crate::calvin::TxnId::new(batch.epoch, txn.position),
-                        txn.tx_class.participating_vshards().len(),
-                    );
-                }
-
-                for txn in &batch.txns {
-                    // Build a per-shard copy with epoch_system_ms stamped from
-                    // the batch. This is the deterministic time anchor that engine
-                    // handlers use instead of reading the wall clock themselves.
-                    let mut txn_with_ts = txn.clone();
-                    txn_with_ts.epoch_system_ms = batch.epoch_system_ms;
-
-                    // Fan out only to vshards that participate in this txn.
-                    let vshards = txn.tx_class.participating_vshards();
-                    for vshard_id in vshards {
-                        let vshard = vshard_id.as_u32();
-                        if let Some(sender) = self.vshard_senders.get(&vshard) {
-                            // Stamp the per-vShard position count for the vShard
-                            // this copy is delivered to.
-                            let mut per_vshard = txn_with_ts.clone();
-                            per_vshard.epoch_vshard_txn_count =
-                                vshard_txn_counts.get(&vshard).copied().unwrap_or(0);
-                            match sender.try_send(SchedulerInput::Txn(per_vshard)) {
-                                Ok(()) => {
-                                    fanned_out += 1;
-                                }
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    warn!(
-                                        epoch = batch.epoch,
-                                        position = txn.position,
-                                        vshard,
-                                        "sequencer apply: vshard channel full (backpressure); \
-                                         dropping txn. Scheduler will catch up via log replay."
-                                    );
-                                    self.record_catch_up(vshard, index);
-                                    dropped += 1;
-                                    drop_pairs.push((vshard, "full"));
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    warn!(
-                                        vshard,
-                                        epoch = batch.epoch,
-                                        "sequencer apply: vshard sender gone; \
-                                         scheduler may have exited"
-                                    );
-                                    self.record_catch_up(vshard, index);
-                                    dropped += 1;
-                                    drop_pairs.push((vshard, "closed"));
-                                }
-                            }
-                        }
-                        // If no sender registered for this vshard, silently skip —
-                        // this node may not host that vshard.
-                    }
-                }
-
-                if dropped > 0 {
-                    crate::diag::sequencer_backpressure_drop(batch.epoch, dropped, &drop_pairs);
-                }
-
-                self.metrics
-                    .txns_fanned_out
-                    .fetch_add(fanned_out, Ordering::Relaxed);
-                self.metrics
-                    .txns_dropped_backpressure
-                    .fetch_add(dropped, Ordering::Relaxed);
-                self.metrics.epochs_applied.fetch_add(1, Ordering::Relaxed);
-                self.last_applied_epoch = batch.epoch;
-            }
+            SequencerEntry::EpochBatch { batch } => self.apply_epoch_batch(index, batch),
             SequencerEntry::CompletionAck {
                 epoch,
                 position,
                 vshard_id,
-            } => {
-                let txn = crate::calvin::TxnId::new(epoch, position);
-                self.completion_registry.note_completion_ack(txn, vshard_id);
-                self.completion_registry
-                    .applied_acks
-                    .record(crate::calvin::AppliedCompletionAck {
-                        index,
-                        txn,
-                        vshard_id,
-                    });
-            }
+                result,
+                from_node,
+            } => self.apply_completion_ack(
+                index,
+                TxnId::new(epoch, position),
+                vshard_id,
+                from_node,
+                result,
+            ),
             // Broadcast the OLLP predicate-mismatch signal to ALL replicas so the
             // coordinator's registry fires wherever it lives (including remote nodes).
-            SequencerEntry::OllpMismatch { epoch, position } => {
-                self.completion_registry
-                    .note_ollp_mismatch(crate::calvin::TxnId::new(epoch, position));
-            }
+            SequencerEntry::OllpMismatch { epoch, position } => self
+                .completion_registry
+                .note_ollp_mismatch(TxnId::new(epoch, position)),
             // Broadcast the terminal routing-failure signal to ALL replicas so
             // the coordinator's registry fires wherever it lives (including
             // remote nodes), mirroring `OllpMismatch`.
@@ -314,168 +111,388 @@ impl SequencerStateMachine {
                 epoch,
                 position,
                 detail,
-            } => {
-                self.completion_registry
-                    .note_routing_failed(crate::calvin::TxnId::new(epoch, position), detail);
-            }
-            // Durable per-participant commit vote for a staged cross-shard txn.
-            // The registry tallies votes per vshard; once every participant has
-            // voted the leader aggregates them into the global verdict that gates
-            // the cross-shard commit barrier (flush on commit, drop on abort).
+            } => self
+                .completion_registry
+                .note_routing_failed(TxnId::new(epoch, position), detail),
+            // Durable per-participant votes for a staged cross-shard txn. The
+            // registry tallies them per vshard. Once every participant voted,
+            // the leader aggregates them into the global verdict that gates the
+            // cross-shard commit barrier (flush on commit, drop on abort).
             SequencerEntry::Vote {
                 epoch,
                 position,
                 vshard,
-                commit,
-            } => {
-                self.completion_registry.note_vote(
-                    crate::calvin::TxnId::new(epoch, position),
-                    vshard,
-                    if commit {
-                        crate::calvin::ParticipantVote::Commit
-                    } else {
-                        // A pre-existing abort vote records no reason.
-                        crate::calvin::ParticipantVote::Abort(None)
-                    },
-                );
-            }
-            // Durable per-participant ABORT vote carrying its cause. Split from
-            // `Vote` so the reason reaches the coordinator without changing
-            // `Vote`'s wire shape.
+            } => self.completion_registry.note_vote(
+                TxnId::new(epoch, position),
+                vshard,
+                ParticipantVote::Commit,
+            ),
             SequencerEntry::AbortVote {
                 epoch,
                 position,
                 vshard,
                 reason,
-            } => {
-                self.completion_registry.note_vote(
-                    crate::calvin::TxnId::new(epoch, position),
-                    vshard,
-                    crate::calvin::ParticipantVote::Abort(Some(reason)),
-                );
-            }
-            // Authoritative commit/abort verdict for a staged cross-shard txn,
-            // proposed by the leader once every participant voted. Applied on
-            // ALL replicas to store the durable decision, which releases every
-            // participant parked at the cross-shard commit barrier into its
-            // flush (commit) or drop (abort).
-            SequencerEntry::Verdict {
-                epoch,
-                position,
-                commit,
-            } => {
-                // A pre-existing abort verdict records no reason; `Abort(None)`
-                // is exactly that unknown cause.
-                let outcome = if commit {
-                    crate::calvin::VerdictOutcome::Commit
-                } else {
-                    crate::calvin::VerdictOutcome::Abort(None)
-                };
-                self.completion_registry
-                    .note_verdict(crate::calvin::TxnId::new(epoch, position), outcome);
-            }
-            // Authoritative ABORT verdict carrying the winning participant
-            // reason. Split from `Verdict` for the same wire-shape reason as
-            // `AbortVote`.
+            } => self.completion_registry.note_vote(
+                TxnId::new(epoch, position),
+                vshard,
+                ParticipantVote::Abort(reason),
+            ),
+            // Authoritative verdict for a staged cross-shard txn, proposed by
+            // the leader once every participant voted. Applied on ALL replicas
+            // to store the durable decision, which releases every participant
+            // parked at the cross-shard commit barrier into its flush (commit)
+            // or drop (abort).
+            SequencerEntry::Verdict { epoch, position } => self
+                .completion_registry
+                .note_verdict(TxnId::new(epoch, position), VerdictOutcome::Commit),
             SequencerEntry::AbortVerdict {
                 epoch,
                 position,
                 reason,
-            } => {
-                self.completion_registry.note_verdict(
-                    crate::calvin::TxnId::new(epoch, position),
-                    crate::calvin::VerdictOutcome::Abort(Some(reason)),
-                );
-            }
-            // Fan a hot-key read reservation out to its owning vShard's scheduler,
-            // which installs the SHARED lock. Same `try_send` backpressure
-            // discipline as the epoch-batch fan-out: a full/closed channel logs
-            // and drops (this node may not host the vShard, in which case there is
-            // simply no sender registered).
-            SequencerEntry::ReserveRead { owner, vshard, key } => {
-                if let Some(sender) = self.vshard_senders.get(&vshard) {
-                    match sender.try_send(SchedulerInput::Reserve { owner, key }) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            warn!(
-                                vshard,
-                                owner_epoch = owner.epoch,
-                                owner_position = owner.position,
-                                "sequencer apply: vshard channel full (backpressure); \
-                                 dropping read reservation"
-                            );
-                            self.record_catch_up(vshard, index);
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            warn!(
-                                vshard,
-                                "sequencer apply: vshard sender gone; \
-                                 scheduler may have exited (reservation)"
-                            );
-                            self.record_catch_up(vshard, index);
-                        }
-                    }
-                }
-            }
-            // Fan a backup's cut marker out to every vShard scheduler this
-            // node hosts. Same `try_send` discipline as `ReserveRead`: a
-            // dropped marker is recovered by the scheduler's catch-up drain,
-            // which replays it in log order.
-            SequencerEntry::CutMarker { hlc } => {
-                for (&vshard, sender) in &self.vshard_senders {
-                    match sender.try_send(SchedulerInput::CutMarker { hlc }) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            warn!(
-                                vshard,
-                                hlc,
-                                "sequencer apply: vshard channel full (backpressure); \
-                                 dropping cut marker"
-                            );
-                            self.record_catch_up(vshard, index);
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            warn!(
-                                vshard,
-                                "sequencer apply: vshard sender gone; \
-                                 scheduler may have exited (cut marker)"
-                            );
-                            self.record_catch_up(vshard, index);
-                        }
-                    }
-                }
-            }
-            // Fan a reservation release out to its owning vShard's scheduler.
-            // Same `try_send` discipline as `ReserveRead`.
+            } => self
+                .completion_registry
+                .note_verdict(TxnId::new(epoch, position), VerdictOutcome::Abort(reason)),
+            // The owning vShard's scheduler installs the SHARED lock.
+            SequencerEntry::ReserveRead { owner, vshard, key } => self.forward_reservation(
+                index,
+                vshard,
+                owner,
+                SchedulerInput::Reserve { owner, key },
+                "read reservation",
+            ),
+            // The owning vShard's scheduler releases every shared lock of `owner`.
             SequencerEntry::ReleaseReservation {
                 owner,
                 vshard,
                 reason,
-            } => {
-                if let Some(sender) = self.vshard_senders.get(&vshard) {
-                    match sender.try_send(SchedulerInput::Release { owner, reason }) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            warn!(
-                                vshard,
-                                owner_epoch = owner.epoch,
-                                owner_position = owner.position,
-                                "sequencer apply: vshard channel full (backpressure); \
-                                 dropping reservation release"
-                            );
-                            self.record_catch_up(vshard, index);
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            warn!(
-                                vshard,
-                                "sequencer apply: vshard sender gone; \
-                                 scheduler may have exited (reservation release)"
-                            );
-                            self.record_catch_up(vshard, index);
-                        }
+            } => self.forward_reservation(
+                index,
+                vshard,
+                owner,
+                SchedulerInput::Release { owner, reason },
+                "reservation release",
+            ),
+            SequencerEntry::EpochFloor {
+                next_epoch,
+                epoch_system_ms,
+            } => self.apply_epoch_floor(next_epoch, epoch_system_ms),
+            SequencerEntry::CutMarker { hlc, restore_point } => {
+                self.apply_cut_marker(index, hlc, restore_point)
+            }
+            SequencerEntry::TxnPart {
+                epoch,
+                position,
+                index: part,
+                first_task,
+                targets,
+                plans,
+                chunk,
+            } => self.apply_txn_part(
+                index,
+                TxnId::new(epoch, position),
+                super::parts::PartEntry {
+                    index: part,
+                    first_task,
+                    targets,
+                    plans,
+                    chunk,
+                },
+            ),
+            SequencerEntry::TxnPartsAbandoned { epoch, position } => {
+                self.apply_parts_abandoned(index, TxnId::new(epoch, position))
+            }
+        }
+    }
+
+    /// Apply a committed epoch batch: re-derive each txn's participants,
+    /// check the epoch order, then fan the batch out.
+    fn apply_epoch_batch(&mut self, index: u64, mut batch: EpochBatch) {
+        // Re-derive the participating_vshards field which is skipped
+        // during serialization (it is computed from write_set collection names).
+        // A class whose participants cannot be derived makes the entry
+        // as unusable as one that fails to decode, so it is skipped the
+        // same way.
+        for txn in &mut batch.txns {
+            if let Err(err) = txn.tx_class.restore_derived() {
+                error!(
+                    epoch = batch.epoch,
+                    raft_index = index,
+                    error = %err,
+                    "sequencer state machine: epoch batch carries a transaction \
+                     with underivable participants; skipping entry"
+                );
+                crate::diag::sequencer_participants_underivable(
+                    batch.epoch,
+                    index,
+                    &err.to_string(),
+                );
+                return;
+            }
+        }
+        if self.epoch_in_order(index, &batch) {
+            self.last_epoch_system_ms = Some(
+                self.last_epoch_system_ms
+                    .map_or(batch.epoch_system_ms, |seen| {
+                        seen.max(batch.epoch_system_ms)
+                    }),
+            );
+            self.open_multi_parts(index, &batch);
+            self.fan_out_epoch_batch(index, batch);
+        }
+    }
+
+    /// Whether `batch` may be fanned out. `false` when the state machine is
+    /// halted or the batch re-mints a consumed epoch. A forward gap is
+    /// reported and still returns `true`.
+    fn epoch_in_order(&mut self, index: u64, batch: &EpochBatch) -> bool {
+        // A halted state machine has already diverged from the log;
+        // resuming fan-out mid-divergence is how a detected fault turns
+        // into corrupted lock-table and completion state.
+        if self.halted {
+            error!(
+                epoch = batch.epoch,
+                raft_index = index,
+                "sequencer state machine is halted on an epoch regression; \
+                         refusing to apply further epoch batches"
+            );
+            return false;
+        }
+
+        let expected = self.next_epoch();
+        let check = classify(expected, batch.epoch);
+        match check {
+            EpochCheck::InOrder => {}
+            // Entries are missing on THIS replica, but the batch in
+            // hand is intact and self-describing. Dropping it would
+            // add fresh data loss on top of the entries already
+            // missed, so it is fanned out and the hole is reported —
+            // the scheduler recovers the missed range by replaying the
+            // sequencer Raft log.
+            EpochCheck::Ahead => {
+                error!(
+                    epoch = batch.epoch,
+                    expected,
+                    raft_index = index,
+                    "sequencer state machine: epoch gap detected; this node missed \
+                             entries. Fanning out the batch in hand; the skipped epochs must \
+                             be recovered by log replay."
+                );
+                self.metrics
+                    .epochs_skipped_gap
+                    .fetch_add(1, Ordering::Relaxed);
+                crate::diag::sequencer_epoch_gap(
+                    expected,
+                    batch.epoch,
+                    check.direction(),
+                    batch.txns.len(),
+                    index,
+                );
+            }
+            // A NEW log entry (an index never applied here — the
+            // re-delivery guard at the top of `apply` already returned
+            // for the ones that were) carrying an already-consumed
+            // epoch. Every `(epoch, position)` in this batch aliases one
+            // that has already run here, so fanning it out would collide
+            // with live lock-table and completion entries — and dropping
+            // it would silently discard committed writes. Neither is
+            // acceptable: halt and escalate.
+            EpochCheck::Behind => {
+                error!(
+                    epoch = batch.epoch,
+                    expected,
+                    raft_index = index,
+                    txns = batch.txns.len(),
+                    "sequencer state machine: epoch regression; a committed epoch was \
+                             proposed a second time. Halting the sequencer state machine \
+                             rather than aliasing committed transaction identities."
+                );
+                self.metrics
+                    .epochs_refused_regression
+                    .fetch_add(1, Ordering::Relaxed);
+                crate::diag::sequencer_epoch_gap(
+                    expected,
+                    batch.epoch,
+                    check.direction(),
+                    batch.txns.len(),
+                    index,
+                );
+                self.halted = true;
+                if let Some(hook) = self.unrecoverable_hook.as_ref() {
+                    hook(SequencerHalt {
+                        expected_epoch: expected,
+                        found_epoch: batch.epoch,
+                        txns_in_batch: batch.txns.len(),
+                        raft_index: index,
+                    });
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Fan each txn of `batch` out to the scheduler of every participating
+    /// vShard this node hosts, then advance the applied epoch.
+    fn fan_out_epoch_batch(&mut self, index: u64, mut batch: EpochBatch) {
+        let mut fanned_out = 0u64;
+        let mut dropped = 0u64;
+        // Collected for a single end-of-call diagnostics report,
+        // never emitted per-txn — a sustained backpressure storm can
+        // drop many positions in one apply() call and per-txn
+        // emission would report-storm.
+        let mut drop_pairs: Vec<(u32, &'static str)> = Vec::new();
+
+        // Per-vShard count of how many of this epoch's positions target
+        // each vShard. Delivered to each scheduler so it knows how many
+        // positions of the epoch it must apply before the epoch is fully
+        // applied on its vShard — the input to its per-`(epoch, position)`
+        // applied gate and fully-applied watermark. Every position of an
+        // epoch targeting a given vShard is stamped with the same count.
+        // Shared with the replay path via `compute_vshard_txn_counts` so
+        // the two paths can never drift.
+        let vshard_txn_counts = crate::calvin::sequencer::replay::compute_vshard_txn_counts(&batch);
+        for txn in &batch.txns {
+            // Seed the expected vote-participant count deterministically on
+            // EVERY replica (not just the epoch's originating leader), so a
+            // post-failover sequencer leader can still detect vote
+            // completeness and aggregate the verdict.
+            self.completion_registry.seed_expected(
+                crate::calvin::TxnId::new(batch.epoch, txn.position),
+                txn.tx_class.participating_vshards().len(),
+            );
+        }
+
+        let epoch_system_ms = batch.epoch_system_ms;
+        for txn in &mut batch.txns {
+            // Stamp epoch_system_ms from the batch. This is the
+            // deterministic time anchor that engine handlers use
+            // instead of reading the wall clock themselves.
+            txn.epoch_system_ms = epoch_system_ms;
+
+            // Fan out only to vshards that participate in this txn.
+            let vshards = txn.tx_class.participating_vshards();
+            for vshard_id in vshards {
+                let vshard = vshard_id.as_u32();
+                // This node may not host the vShard: then nothing is sent.
+                if !self.vshard_senders.contains_key(&vshard) {
+                    continue;
+                }
+                // Stamp the per-vShard position count for the vShard this
+                // copy is delivered to.
+                let mut per_vshard = txn.clone();
+                per_vshard.epoch_vshard_txn_count =
+                    vshard_txn_counts.get(&vshard).copied().unwrap_or(0);
+                match self.deliver(index, vshard, SchedulerInput::Txn(Box::new(per_vshard))) {
+                    Delivery::NotHosted => {}
+                    Delivery::Sent => {
+                        fanned_out += 1;
+                        self.undurable
+                            .note(index, vshard, batch.epoch, txn.position);
+                    }
+                    // The armed catch-up replays it in log order.
+                    Delivery::Deferred => {
+                        dropped += 1;
+                        drop_pairs.push((vshard, "catch_up"));
+                    }
+                    Delivery::DroppedFull => {
+                        warn!(
+                            epoch = batch.epoch,
+                            position = txn.position,
+                            vshard,
+                            "sequencer apply: vshard channel full (backpressure); \
+                             txn left to the catch-up replay"
+                        );
+                        dropped += 1;
+                        drop_pairs.push((vshard, "full"));
+                    }
+                    Delivery::DroppedClosed => {
+                        warn!(
+                            vshard,
+                            epoch = batch.epoch,
+                            "sequencer apply: vshard sender gone; scheduler may have exited"
+                        );
+                        dropped += 1;
+                        drop_pairs.push((vshard, "closed"));
                     }
                 }
             }
+        }
+
+        if dropped > 0 {
+            crate::diag::sequencer_backpressure_drop(batch.epoch, dropped, &drop_pairs);
+        }
+
+        self.metrics
+            .txns_fanned_out
+            .fetch_add(fanned_out, Ordering::Relaxed);
+        self.metrics
+            .txns_dropped_backpressure
+            .fetch_add(dropped, Ordering::Relaxed);
+        self.metrics.epochs_applied.fetch_add(1, Ordering::Relaxed);
+        self.last_applied_epoch = batch.epoch;
+    }
+
+    /// Record `vshard_id`'s completion ack for `txn`, with its apply result,
+    /// and log the ack at its Raft `index`.
+    ///
+    /// The first ack of a vShard in log order answers for it, on every node
+    /// alike: the result depends on the log alone. Only the vShard's
+    /// data-group leader proposes an ack, so a node that left the group adds
+    /// none. `from_node` names the proposer for tracing.
+    fn apply_completion_ack(
+        &self,
+        index: u64,
+        txn: TxnId,
+        vshard_id: u32,
+        from_node: u64,
+        result: Vec<u8>,
+    ) {
+        tracing::trace!(
+            epoch = txn.epoch,
+            position = txn.position,
+            vshard_id,
+            from_node,
+            "sequencer apply: completion ack"
+        );
+        self.completion_registry
+            .note_completion_ack_with(txn, vshard_id, result);
+        self.completion_registry
+            .applied_acks
+            .record(crate::calvin::AppliedCompletionAck {
+                index,
+                txn,
+                vshard_id,
+            });
+    }
+
+    /// Send a reservation `input` for `owner` to `vshard`'s scheduler.
+    ///
+    /// Same delivery as the epoch-batch fan-out: an armed vShard, or a full
+    /// or closed channel, leaves the input to the catch-up replay. This node
+    /// may not host the vShard. Then nothing is sent. `what` names the input
+    /// in the warnings.
+    fn forward_reservation(
+        &self,
+        index: u64,
+        vshard: u32,
+        owner: TxnIdWire,
+        input: SchedulerInput,
+        what: &'static str,
+    ) {
+        match self.deliver(index, vshard, input) {
+            Delivery::NotHosted | Delivery::Sent | Delivery::Deferred => {}
+            Delivery::DroppedFull => warn!(
+                vshard,
+                owner_epoch = owner.epoch,
+                owner_position = owner.position,
+                what,
+                "sequencer apply: vshard channel full (backpressure); \
+                 reservation input left to the catch-up replay"
+            ),
+            Delivery::DroppedClosed => warn!(
+                vshard,
+                what, "sequencer apply: vshard sender gone; scheduler may have exited"
+            ),
         }
     }
 }
@@ -484,6 +501,8 @@ impl SequencerStateMachine {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    use tokio::sync::mpsc;
 
     use super::*;
     use crate::calvin::CalvinCompletionRegistry;
@@ -883,7 +902,7 @@ mod tests {
         let (tx_b, _rx_b) = mpsc::channel(1);
         // Pre-fill channel A so it is full.
         let pre_fill: SequencedTxn = batch.txns[0].clone();
-        let _ = tx_a.try_send(SchedulerInput::Txn(pre_fill));
+        let _ = tx_a.try_send(SchedulerInput::Txn(Box::new(pre_fill)));
         let mut senders = HashMap::new();
         senders.insert(va, tx_a);
         senders.insert(vb, tx_b);
@@ -956,7 +975,6 @@ mod tests {
         let data = encode_entry(&SequencerEntry::Verdict {
             epoch: 9,
             position: 4,
-            commit: true,
         });
         sm.apply(1, &data);
 
@@ -988,7 +1006,7 @@ mod tests {
         assert_eq!(
             rx.await.expect("completion fires"),
             crate::calvin::AttemptOutcome::Aborted {
-                reason: Some(crate::calvin::AbortReason::ParticipantError)
+                reason: crate::calvin::AbortReason::ParticipantError
             }
         );
         assert_eq!(sm.last_applied_epoch(), None);
@@ -1011,16 +1029,14 @@ mod tests {
 
         assert_eq!(
             registry.vote_tally(txn).and_then(|t| t.get(&3).copied()),
-            Some(crate::calvin::ParticipantVote::Abort(Some(
+            Some(crate::calvin::ParticipantVote::Abort(
                 crate::calvin::AbortReason::ParticipantError
-            )))
+            ))
         );
     }
 
     #[tokio::test]
-    async fn apply_legacy_abort_vote_tallies_without_a_reason() {
-        // A `Vote { commit: false }` durable before abort reasons existed must
-        // still decode and tally — with an unknown cause, never an invented one.
+    async fn apply_vote_tallies_a_commit_vote() {
         let registry = CalvinCompletionRegistry::new_detached();
         let mut sm = SequencerStateMachine::new(HashMap::new(), Arc::clone(&registry));
         let txn = crate::calvin::TxnId::new(9, 7);
@@ -1029,14 +1045,67 @@ mod tests {
             epoch: 9,
             position: 7,
             vshard: 3,
-            commit: false,
         });
         sm.apply(1, &data);
 
         assert_eq!(
             registry.vote_tally(txn).and_then(|t| t.get(&3).copied()),
-            Some(crate::calvin::ParticipantVote::Abort(None))
+            Some(crate::calvin::ParticipantVote::Commit)
         );
+    }
+
+    /// Every txn a replica fans out carries the batch's `epoch_system_ms`,
+    /// whatever value the proposer left on the txn itself.
+    #[test]
+    fn fanned_out_txns_carry_the_batch_epoch_system_ms() {
+        let (mut batch, va, vb) = make_batch_with_two_vshards();
+        batch.epoch_system_ms = 1_800_000_000_000;
+        for txn in &mut batch.txns {
+            txn.epoch_system_ms = 0;
+        }
+        let (tx_a, mut rx_a) = mpsc::channel(64);
+        let (tx_b, mut rx_b) = mpsc::channel(64);
+        let mut senders = HashMap::new();
+        senders.insert(va, tx_a);
+        senders.insert(vb, tx_b);
+        let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new_detached());
+
+        sm.apply(1, &encode_entry(&SequencerEntry::EpochBatch { batch }));
+
+        for rx in [&mut rx_a, &mut rx_b] {
+            match rx.try_recv() {
+                Ok(SchedulerInput::Txn(txn)) => {
+                    assert_eq!(txn.epoch_system_ms, 1_800_000_000_000);
+                    assert_eq!(txn.epoch_vshard_txn_count, 1);
+                }
+                _ => panic!("each participating vShard receives the txn"),
+            }
+        }
+    }
+
+    /// The state machine keeps the highest epoch instant it applied, the
+    /// floor a leader seeded from it mints above.
+    #[test]
+    fn applied_epoch_instant_is_the_highest_applied() {
+        let mut sm =
+            SequencerStateMachine::new(HashMap::new(), CalvinCompletionRegistry::new_detached());
+        assert_eq!(sm.last_epoch_system_ms(), None);
+        for (index, (epoch, ms)) in [(0u64, 5_000i64), (1, 4_000), (2, 6_000)]
+            .into_iter()
+            .enumerate()
+        {
+            let (mut batch, _, _) = make_batch_with_two_vshards();
+            batch.epoch = epoch;
+            for txn in &mut batch.txns {
+                txn.epoch = epoch;
+            }
+            batch.epoch_system_ms = ms;
+            sm.apply(
+                index as u64 + 1,
+                &encode_entry(&SequencerEntry::EpochBatch { batch }),
+            );
+        }
+        assert_eq!(sm.last_epoch_system_ms(), Some(6_000));
     }
 
     #[test]
@@ -1046,7 +1115,7 @@ mod tests {
         let (tx_a, _rx_a) = mpsc::channel(1);
         // vshard B has room and a live receiver → never drops.
         let (tx_b, _rx_b) = mpsc::channel(64);
-        let _ = tx_a.try_send(SchedulerInput::Txn(batch.txns[0].clone()));
+        let _ = tx_a.try_send(SchedulerInput::Txn(Box::new(batch.txns[0].clone())));
         let mut senders = HashMap::new();
         senders.insert(va, tx_a);
         senders.insert(vb, tx_b);
@@ -1079,6 +1148,45 @@ mod tests {
         assert_eq!(sm.take_catch_up_from(va), None);
     }
 
+    /// An armed vShard takes no live input, even with room on its channel:
+    /// a later input overtaking an earlier dropped one would reach the
+    /// scheduler out of log order. The replay delivers both.
+    #[test]
+    fn an_armed_vshard_defers_every_later_input_to_the_replay() {
+        let (batch, va, _vb) = make_batch_with_two_vshards();
+        let (tx_a, mut rx_a) = mpsc::channel(1);
+        let _ = tx_a.try_send(SchedulerInput::Txn(Box::new(batch.txns[0].clone())));
+        let mut senders = HashMap::new();
+        senders.insert(va, tx_a);
+        let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new_detached());
+
+        sm.apply(
+            4,
+            &encode_entry(&SequencerEntry::EpochBatch {
+                batch: batch.clone(),
+            }),
+        );
+        // The scheduler reads the pre-filled input: the channel has room.
+        assert!(rx_a.try_recv().is_ok());
+        let mut later = batch;
+        later.epoch = 1;
+        for txn in &mut later.txns {
+            txn.epoch = 1;
+        }
+        sm.apply(
+            7,
+            &encode_entry(&SequencerEntry::EpochBatch { batch: later }),
+        );
+
+        assert!(rx_a.try_recv().is_err(), "the later input is not sent live");
+        assert_eq!(sm.peek_catch_up_from(va), Some(4));
+        // A replay through 5 leaves index 7 owed: still armed, from 6.
+        sm.clear_catch_up_up_to(va, 5);
+        assert_eq!(sm.peek_catch_up_from(va), Some(6));
+        sm.clear_catch_up_up_to(va, 7);
+        assert_eq!(sm.peek_catch_up_from(va), None);
+    }
+
     /// PEEK must not consume: the scheduler drain reads the armed index, and
     /// only clears it after a confirmed replay. A take-then-early-return (the
     /// old shape) silently lost the miss when the replay could not complete.
@@ -1086,7 +1194,7 @@ mod tests {
     fn peek_catch_up_from_does_not_consume() {
         let (batch, va, _vb) = make_batch_with_two_vshards();
         let (tx_a, _rx_a) = mpsc::channel(1);
-        let _ = tx_a.try_send(SchedulerInput::Txn(batch.txns[0].clone()));
+        let _ = tx_a.try_send(SchedulerInput::Txn(Box::new(batch.txns[0].clone())));
         let mut senders = HashMap::new();
         senders.insert(va, tx_a);
         let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new_detached());
@@ -1169,7 +1277,6 @@ mod tests {
         let data = encode_entry(&SequencerEntry::Verdict {
             epoch: 1,
             position: 0,
-            commit: true,
         });
         sm.apply(42, &data);
         assert_eq!(sm.current_committed_index(), Some(42));

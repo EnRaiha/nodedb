@@ -31,13 +31,15 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::server::dispatch_utils::{MintedRecords, RecordOwner};
+use crate::control::server::dispatch_utils::{MintedRecords, RecordOwner, SentRecords};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, TenantId};
 use nodedb_physical::physical_plan::VectorOp;
 use nodedb_types::StoredVectorIndexParams;
 
-use super::core_fanout::{CoreFanout, DISPATCH_TIMEOUT, FanoutAnswers, fan_out};
+use super::core_fanout::{
+    CoreFanout, DISPATCH_TIMEOUT, FanoutAnswers, fan_out, send_to_every_core,
+};
 
 /// The longest a parameter install waits for its cores to answer: the
 /// `SetParams` dispatch deadline, then the reshape's. Its record's window
@@ -162,9 +164,11 @@ async fn install_params(
         report(&error, "set_params_wal_append", &target);
     }
 
-    // The cores hold the record from here. It closes from their answers.
-    minted.mark_sent();
-    let set_params = fan_out(&shared, &fanout(&target), &plan).await;
+    // The cores hold the record from the enqueue. It closes from their
+    // answers, and an aborted task holds it.
+    let sent = send_to_every_core(&shared, &fanout(&target), &plan);
+    let minted = SentRecords::sent(minted);
+    let set_params = sent.answers(&fanout(&target)).await;
     let stage = if set_params.pending.is_empty() {
         let refused = set_params.refused;
         if refused.is_empty() {
@@ -197,7 +201,7 @@ async fn finish_put(
     shared: &SharedState,
     entry: &StoredVectorIndexParams,
     stage: PutStage,
-    minted: MintedRecords,
+    minted: SentRecords,
 ) {
     let target = IndexTarget::of(entry);
     let (refused, rebuild) = match stage {
@@ -222,7 +226,7 @@ fn close_put(
     target: &IndexTarget<'_>,
     refused: Vec<usize>,
     reshaped: Vec<usize>,
-    minted: MintedRecords,
+    minted: SentRecords,
 ) {
     let missed: Vec<usize> = refused
         .into_iter()
@@ -306,9 +310,11 @@ async fn drop_index(name: IndexName, shared: Arc<SharedState>, ready: oneshot::S
         Err(error) => report(&error, "drop_index_wal_append", &target),
     }
 
-    // The cores hold the record from here. It closes from their answers.
-    minted.mark_sent();
-    let answers = fan_out(&shared, &fanout(&target), &plan).await;
+    // The cores hold the record from the enqueue. It closes from their
+    // answers, and an aborted task holds it.
+    let sent = send_to_every_core(&shared, &fanout(&target), &plan);
+    let minted = SentRecords::sent(minted);
+    let answers = sent.answers(&fanout(&target)).await;
     // Cores still working past the deadline answer later. The caller moves
     // on while this task waits for their final answers.
     let _ = ready.send(());
@@ -317,7 +323,7 @@ async fn drop_index(name: IndexName, shared: Arc<SharedState>, ready: oneshot::S
 }
 
 /// Close a drop's window from the cores that did not drop the index.
-fn close_drop(target: &IndexTarget<'_>, refused: Vec<usize>, minted: MintedRecords) {
+fn close_drop(target: &IndexTarget<'_>, refused: Vec<usize>, minted: SentRecords) {
     if refused.is_empty() {
         minted.settle();
         return;

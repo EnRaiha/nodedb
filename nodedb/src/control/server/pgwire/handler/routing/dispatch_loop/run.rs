@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! The per-task dispatch loop for non-Calvin pgwire queries: tenant check,
-//! in-transaction routing, streaming fast path, pre-dispatch hooks, dispatch,
-//! read tracking, AFTER triggers, and metering. Shaping one task's response
+//! in-transaction routing (`txn_route`: triggers, clone copy-on-write,
+//! staging), streaming fast path, pre-dispatch hooks, dispatch, read tracking
+//! (`tracking.rs`), auto-analyze, and metering. Shaping one task's response
 //! lives in `task.rs`; the statement's tail (folded RETURNING rows, the
 //! set-op merge, and the one folded command tag) lives in `finish.rs`.
 //!
-//! Split out of `execute.rs`, which keeps the plan/authorize/admit entry
-//! points and hands the admitted task list here.
+//! `execute.rs` holds the plan/authorize/admit entry points and hands the
+//! admitted task list here.
 
 use std::sync::Arc;
 
@@ -24,12 +25,14 @@ use crate::control::server::response_shape::types::{ShapedRows, StatementTag};
 use crate::control::server::shared::ddl::neutral::maintenance::auto_analyze;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
-use crate::control::server::shared::session::SessionId;
+use crate::control::server::shared::session::{DmlTxnCtx, SessionId};
+use crate::control::server::shared::write_admission::plan_is_write;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::super::super::super::types::{
-    dml_fold_error_to_pg, error_to_sqlstate, response_status_to_sqlstate, sqlstate_error,
+    dml_fold_error_to_pg, error_to_pg, error_to_sqlstate, response_status_to_sqlstate,
+    sqlstate_error,
 };
 use super::super::super::core::NodeDbPgHandler;
 use super::super::super::plan::{PlanKind, describe_plan};
@@ -39,6 +42,9 @@ use super::super::result_shaping::ResultShaping;
 use super::super::streaming::StreamSelectContext;
 use super::finish::StatementTail;
 use super::task::ShapeTaskParams;
+use super::tracking::DispatchedTask;
+use super::txn_task::StatementTxnOutcome;
+use crate::control::server::shared::txn_route::{StatementEvents, TxnTaskContext};
 
 pub(crate) struct DispatchTaskContext<'a> {
     pub(crate) plan_lease_scope: Arc<crate::control::lease::QueryLeaseScope>,
@@ -47,14 +53,23 @@ pub(crate) struct DispatchTaskContext<'a> {
     pub(crate) auth_ctx: &'a crate::control::security::auth_context::AuthContext,
     pub(crate) session_id: SessionId,
     pub(crate) shaping: ResultShaping<'a>,
+    /// The row images the statement's cross-shard balances were settled
+    /// from. A statement in a transaction adds them to its read set, so
+    /// COMMIT's conflict check covers them.
+    pub(crate) sum_target_reads:
+        Vec<crate::control::server::shared::session::read_set::ReadSetEntry>,
 }
 
 impl NodeDbPgHandler {
-    /// Execute the per-task dispatch loop for non-Calvin queries.
-    pub(crate) async fn dispatch_task_loop(
+    /// Execute the per-task dispatch loop for non-Calvin queries. `txn` is
+    /// the statement's transaction: the client's block, or the implicit
+    /// transaction a statement whose write fires a synchronous trigger body
+    /// runs in (see `txn_task`). `None` for an autocommit statement.
+    pub(super) async fn dispatch_task_loop_in(
         &self,
         tasks: Vec<PhysicalTask>,
         context: DispatchTaskContext<'_>,
+        txn: Option<&DmlTxnCtx<'_>>,
     ) -> PgWireResult<Vec<Response>> {
         let DispatchTaskContext {
             plan_lease_scope,
@@ -63,7 +78,14 @@ impl NodeDbPgHandler {
             auth_ctx,
             session_id,
             shaping,
+            sum_target_reads,
         } = context;
+        if let Some(txn) = txn
+            && !sum_target_reads.is_empty()
+        {
+            txn.sessions
+                .record_read_entries(txn.session_id, sum_target_reads);
+        }
         let projection = shaping.projection;
         let result_formats = shaping.formats;
         let needs_set_op = tasks.iter().any(|t| t.post_set_op != PostSetOp::None);
@@ -98,6 +120,21 @@ impl NodeDbPgHandler {
         // A derived implicit-edge write beside the user's own never answers
         // the statement, exactly as Calvin's deposit rule has it.
         let has_user_write = plans_have_user_write(tasks.iter().map(|t| &t.plan));
+        // A strong session reads linearizably, in and out of a transaction.
+        let strong_reads = self.sessions.read_consistency(session_id).requires_leader();
+
+        // A statement in a transaction routes each task through the shared
+        // `txn_route`, and fires its SYNC AFTER STATEMENT bodies once after
+        // its last task.
+        let route_ctx = txn.map(|txn| TxnTaskContext {
+            state: &self.state,
+            identity,
+            auth: auth_ctx,
+            txn,
+            lease_scope: &plan_lease_scope,
+            fire_triggers: true,
+        });
+        let mut statement_events = StatementEvents::default();
 
         for mut task in tasks {
             if task.tenant_id != tenant_id {
@@ -113,38 +150,62 @@ impl NodeDbPgHandler {
                 ))));
             }
 
-            // Whether this task would answer with rows, read BEFORE the
-            // routing gate consumes the task: a buffered or staged write
-            // reports only a command tag, and a statement that asked for rows
-            // must be told so rather than handed that tag.
-            let returns_rows = matches!(describe_plan(&task.plan), PlanKind::ReturningRows);
-
-            // In-transaction write-routing gate: protocol-neutral decision of
-            // read / buffer-for-COMMIT / stage-now-and-buffer, shared with
-            // every other dispatch loop (native, DSL/UPSERT). Moved to
-            // `execute_dml_hooks.rs` to keep this file under the size limit;
-            // behavior is unchanged.
-            match self
-                .route_task_in_txn(session_id, identity, task, Arc::clone(&plan_lease_scope))
-                .await?
-            {
-                execute_dml_hooks::TxnRouteOutcome::Proceed(routed_task) => {
-                    task = *routed_task;
-                }
-                execute_dml_hooks::TxnRouteOutcome::Handled(handled) => {
-                    if returns_rows {
-                        let (severity, code, message) = error_to_sqlstate(
-                            &crate::control::server::shared::returning::
-                                in_transaction_returning_unsupported(),
-                        );
-                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                            severity.to_owned(),
-                            code.to_owned(),
-                            message,
-                        ))));
+            // In a transaction: read, buffer for COMMIT, or stage now, with
+            // the write's synchronous trigger bodies joining the same
+            // transaction. A staged write that answers `RETURNING` folds its
+            // rows into the statement's one result set.
+            if let Some(route) = route_ctx.as_ref() {
+                let plan = task.plan.clone();
+                let task_database_id = task.database_id;
+                let hooks = execute_dml_hooks::PreDispatchContext {
+                    identity,
+                    auth: auth_ctx,
+                    tenant_id,
+                    session_id,
+                    plan_kind: describe_plan(&plan),
+                    projection,
+                };
+                match self
+                    .route_statement_txn_task(route, task, &mut statement_events)
+                    .await?
+                {
+                    StatementTxnOutcome::Dispatch(routed_task) => task = *routed_task,
+                    StatementTxnOutcome::Write(handled) => {
+                        handled.fold_into(&mut statement_tag)?;
+                        continue;
                     }
-                    handled.fold_into(&mut statement_tag)?;
-                    continue;
+                    StatementTxnOutcome::Returning(returning) => {
+                        for rows in returning {
+                            self.shape_task_response(
+                                ShapeTaskParams {
+                                    response: &staged_rows_response(rows),
+                                    plan: &plan,
+                                    plan_kind: PlanKind::ReturningRows,
+                                    counts_toward_tag: false,
+                                    projection,
+                                    result_formats,
+                                    session_id,
+                                    tenant_id,
+                                    database_id: task_database_id,
+                                    auth_ctx,
+                                    session_sequences: session_sequences.clone(),
+                                },
+                                &mut responses,
+                                &mut returning_rows,
+                                &mut statement_tag,
+                            )?;
+                        }
+                        continue;
+                    }
+                    StatementTxnOutcome::Clone(resp) => {
+                        match self.clone_write_answer(hooks, &plan, &resp)? {
+                            PreDispatchHandled::Rows(response) => responses.push(response),
+                            PreDispatchHandled::Write(handled) => {
+                                handled.fold_into(&mut statement_tag)?;
+                            }
+                        }
+                        continue;
+                    }
                 }
             }
 
@@ -222,9 +283,7 @@ impl NodeDbPgHandler {
             // the request and the data plane merges the transaction's own staged
             // writes into the scan (read-your-own-writes); the streaming path
             // builds per-core requests without the transaction id.
-            let in_transaction = self.sessions.transaction_state(session_id)
-                == crate::control::server::shared::session::TransactionState::InBlock;
-            if !in_transaction
+            if txn.is_none()
                 && let Some(stream_response) = self
                     .maybe_stream_select(
                         &task,
@@ -246,10 +305,9 @@ impl NodeDbPgHandler {
                 continue;
             }
 
-            // --- Pre-dispatch hooks: trigger interception + clone write-path
-            // interception (moved to execute_dml_hooks.rs to keep this file
-            // under the size limit; behavior is unchanged).
-            let (dml_info, old_row, truncate_restart_collection) = match self
+            // --- Pre-dispatch hooks: truncate restart-identity extraction and
+            // clone write-path interception (`execute_dml_hooks.rs`).
+            let (dml_info, truncate_restart_collection) = match self
                 .run_pre_dispatch_hooks(
                     execute_dml_hooks::PreDispatchContext {
                         identity,
@@ -279,19 +337,19 @@ impl NodeDbPgHandler {
                     let execute_dml_hooks::PreDispatchProceed {
                         task: proceeding_task,
                         dml_info,
-                        old_row,
                         truncate_restart_collection,
                     } = *proceed;
                     task = proceeding_task;
-                    (dml_info, old_row, truncate_restart_collection)
+                    (dml_info, truncate_restart_collection)
                 }
             };
 
             // --- Normal dispatch ---
             let user_id: Option<std::sync::Arc<str>> =
                 Some(std::sync::Arc::from(identity.username.as_str()));
+            let linearizable = strong_reads && !plan_is_write(&task.plan);
             let (resp, shard_watermarks, distributed_reads) = self
-                .dispatch_authorized_task_with_watermarks(task, user_id, identity)
+                .dispatch_authorized_task_with_watermarks(task, user_id, identity, linearizable)
                 .await
                 .map_err(|e| {
                     let (severity, code, message) = error_to_sqlstate(&e);
@@ -302,68 +360,20 @@ impl NodeDbPgHandler {
                     )))
                 })?;
 
-            // Track reads for snapshot-isolation / cross-shard conflict detection
-            // at the protocol-neutral layer. Recorded BEFORE the error
-            // short-circuit so an absent-key point read (a `NotFound` from the
-            // Data Plane) is still captured — a "not found" is a validatable
-            // phantom observation, not a no-op. Only successful reads and
-            // not-found reads record; a genuine dispatch failure does not.
-            let records_read = resp.status == crate::bridge::envelope::Status::Ok
-                || resp.error_code.as_deref()
-                    == Some(&crate::bridge::envelope::ErrorCode::NotFound);
-            if records_read
-                && self.sessions.transaction_state(session_id)
-                    == crate::control::server::shared::session::TransactionState::InBlock
-            {
-                let watermarks = if shard_watermarks.is_empty() {
-                    vec![(task_vshard, resp.watermark_lsn)]
-                } else {
-                    shard_watermarks
-                };
-                crate::control::server::shared::session::record_reads_for_response(
-                    &self.state,
-                    &self.sessions,
-                    session_id,
-                    identity.tenant_id,
-                    crate::control::server::shared::session::ResponseReads {
-                        plan: &plan_for_response,
-                        watermarks: &watermarks,
-                        read_version_lsn: resp.read_version_lsn,
-                        found: resp.status == crate::bridge::envelope::Status::Ok,
-                        distributed_reads: &distributed_reads,
-                        read_lsn_vshard: task_vshard,
-                    },
-                )
-                .await;
-            }
-
-            // Record the session's OWN committed write-version so a later
-            // transaction's read-set capture can be floored at it
-            // (read-your-writes floor for cross-shard OCC). A prior autocommit
-            // write must still floor a later transaction's read, so this records
-            // regardless of transaction state — the version is the write's
-            // committed per-collection `coll_write_lsn`, carried on
-            // `read_version_lsn` by the replicated-write dispatch path. Only
-            // successful writes with a non-zero version are recorded.
-            if resp.status == crate::bridge::envelope::Status::Ok
-                && resp.read_version_lsn > crate::types::Lsn::ZERO
-                && matches!(
-                    crate::control::security::identity::required_permission(&plan_for_response),
-                    crate::control::security::identity::Permission::Write
-                )
-                && let Some(collection) =
-                    crate::control::server::shared::plan_util::extract_collection(
-                        &plan_for_response,
-                    )
-            {
-                self.sessions.note_own_write(
-                    session_id,
-                    task_database_id,
-                    identity.tenant_id,
-                    collection,
-                    resp.read_version_lsn,
-                );
-            }
+            self.track_dispatched_task(
+                DispatchedTask {
+                    identity,
+                    client_session: session_id,
+                    txn,
+                    plan: &plan_for_response,
+                    vshard: task_vshard,
+                    database_id: task_database_id,
+                },
+                &resp,
+                shard_watermarks,
+                &distributed_reads,
+            )
+            .await;
 
             if let Some((severity, code, message)) =
                 response_status_to_sqlstate(resp.status, resp.error_code.as_deref())
@@ -386,29 +396,9 @@ impl NodeDbPgHandler {
                     );
             }
 
-            // --- AFTER triggers ---
+            // An autocommit write reaching here fires no synchronous trigger
+            // body: one that does runs in an implicit transaction (`txn`).
             if let Some(ref info) = dml_info {
-                crate::control::trigger::dml_hook_fire::fire_post_dispatch_triggers(
-                    crate::control::trigger::dml_hook_fire::DispatchTriggerParams {
-                        state: &self.state,
-                        identity,
-                        database_id: task_database_id,
-                        tenant_id,
-                        info,
-                        old_row: &old_row,
-                        cascade_depth: 0,
-                    },
-                )
-                .await
-                .map_err(|e| {
-                    let (severity, code, message) = error_to_sqlstate(&e);
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        severity.to_owned(),
-                        code.to_owned(),
-                        message,
-                    )))
-                })?;
-
                 auto_analyze::record_and_maybe_analyze(
                     &self.state,
                     identity,
@@ -459,6 +449,13 @@ impl NodeDbPgHandler {
             }
         }
 
+        if let Some(route) = route_ctx.as_ref() {
+            statement_events
+                .fire(route)
+                .await
+                .map_err(|error| error_to_pg(&error))?;
+        }
+
         self.finish_statement(
             &mut responses,
             StatementTail {
@@ -477,5 +474,21 @@ impl NodeDbPgHandler {
         )?;
 
         Ok(responses)
+    }
+}
+
+/// A staged write's `RETURNING` rows as the response the shaper reads.
+fn staged_rows_response(rows: Vec<u8>) -> crate::bridge::envelope::Response {
+    crate::bridge::envelope::Response {
+        request_id: crate::types::RequestId::new(0),
+        status: crate::bridge::envelope::Status::Ok,
+        attempt: 0,
+        partial: false,
+        payload: crate::bridge::envelope::Payload::from_vec(rows),
+        watermark_lsn: crate::types::Lsn::ZERO,
+        error_code: None,
+        read_set_valid: None,
+        read_version_lsn: crate::types::Lsn::ZERO,
+        write_set: Vec::new(),
     }
 }

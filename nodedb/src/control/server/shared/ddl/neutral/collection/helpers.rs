@@ -2,8 +2,7 @@
 
 //! Shared parsing helpers used across collection DDL sub-modules.
 //!
-//! Relocated verbatim from the pgwire `ddl::collection::helpers` module (now
-//! deleted): its sole external caller was already `neutral::collection::alter::add_column`.
+//! Its sole external caller is `neutral::collection::alter::add_column`.
 
 use nodedb_sql::parser::preprocess::lex::{
     find_ascii_case_insensitive, find_ascii_case_insensitive_from,

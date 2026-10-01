@@ -9,13 +9,12 @@
 //! VERIFY AUDIT CHAIN
 //! ```
 //!
-//! Ported from the pgwire `ddl::session_ddl` handlers. All four read or
+//! All four handlers read or
 //! mutate the GLOBAL `state.session_registry` / `state.audit` — not any
 //! per-connection session state — so they carry no per-connection state. The
 //! superuser / cluster_admin / database_owner gates, the race-condition
 //! handling in `kill_session` (the disappeared-session audit branch), and the
-//! audit records are preserved verbatim; only the result construction changed
-//! from pgwire `Response` / `PgWireError` to the protocol-neutral
+//! audit records run here. The result is the protocol-neutral
 //! [`DdlResult`] / [`DdlError`].
 //!
 //! Named `session_admin` (not `session`) to avoid collision with the

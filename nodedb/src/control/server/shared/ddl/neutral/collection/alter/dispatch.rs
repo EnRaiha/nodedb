@@ -4,10 +4,9 @@
 //! protocol-neutral handler.
 //!
 //! This is the total match over `AlterCollectionOp` — no `_ =>` fallthrough —
-//! so the neutral router owns every `ALTER COLLECTION` sub-command. Ported from
-//! the pgwire `router::ast::alter::dispatch_alter_collection`; the ADD COLUMN
-//! `col_def` string assembly (`<name> <type> [NOT NULL] [DEFAULT ...]`) is
-//! preserved verbatim. `SetOnConflict` continues to route to the
+//! so the neutral router owns every `ALTER COLLECTION` sub-command. The ADD
+//! COLUMN `col_def` string assembly is `<name> <type> [NOT NULL] [DEFAULT ...]`.
+//! `SetOnConflict` continues to route to the
 //! `conflict_policy` family; every other variant routes to its sibling handler
 //! in this directory.
 
@@ -83,6 +82,7 @@ pub async fn dispatch_alter_collection(
 
         AlterCollectionOp::OwnerTo { new_owner } => {
             super::ownership::alter_collection_owner(state, identity, database_id, name, new_owner)
+                .await
         }
 
         AlterCollectionOp::SetRetention { value } => {
@@ -93,10 +93,12 @@ pub async fn dispatch_alter_collection(
                 name,
                 value,
             )
+            .await
         }
 
         AlterCollectionOp::SetAppendOnly => {
             super::enforcement::alter_collection_set_append_only(state, identity, database_id, name)
+                .await
         }
 
         AlterCollectionOp::SetLastValueCache { enabled } => {
@@ -107,6 +109,7 @@ pub async fn dispatch_alter_collection(
                 name,
                 *enabled,
             )
+            .await
         }
 
         AlterCollectionOp::SetLegalHold { enabled, tag } => {
@@ -118,6 +121,7 @@ pub async fn dispatch_alter_collection(
                 *enabled,
                 tag,
             )
+            .await
         }
 
         AlterCollectionOp::AddMaterializedSum {

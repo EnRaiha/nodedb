@@ -1,48 +1,37 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Database hwm persistence trait + concrete `SystemCatalog`-backed impl.
+//! Database hwm persistence trait and its `SystemCatalog` impl.
 //!
-//! Mirrors `nodedb::control::surrogate::persist` for the database
-//! allocator. The trait separates the registry's allocation logic from
-//! the storage layer so tests can substitute an in-memory impl.
-
-use std::sync::Arc;
+//! The trait separates the registry's allocation logic from the storage
+//! layer so tests can substitute an in-memory impl.
 
 use crate::control::security::catalog::SystemCatalog;
 
-/// Pluggable persistence boundary for `DatabaseRegistry`.
-/// Tests substitute an in-memory store; production wires
-/// [`SystemCatalogDatabaseHwm`].
+/// Pluggable persistence boundary for `DatabaseRegistry`. Production uses
+/// the `SystemCatalog` impl over `_system.database_hwm`.
 pub trait DatabaseHwmPersist: Send + Sync {
-    /// Persist the current high-watermark. Called by
-    /// `DatabaseRegistry::flush` whenever periodic-flush thresholds
-    /// (64 ops or 200 ms) are tripped.
-    fn checkpoint(&self, hwm: u64) -> crate::Result<()>;
+    /// Persist the hwm and the log index of the reservation that produced
+    /// it, atomically.
+    fn checkpoint_reserve(&self, hwm: u64, reserve_index: u64) -> crate::Result<()>;
 
-    /// Load the persisted high-watermark, or `0` if none recorded yet
-    /// (fresh database).
+    /// Load the persisted hwm, or `0` on a fresh catalog.
     fn load(&self) -> crate::Result<u64>;
+
+    /// Load the applied-reservation cursor, or `0` on a fresh catalog.
+    fn load_reserve_index(&self) -> crate::Result<u64>;
 }
 
-/// `SystemCatalog`-backed persistence — delegates to
-/// `put_database_hwm` / `get_database_hwm`.
-pub struct SystemCatalogDatabaseHwm {
-    catalog: Arc<SystemCatalog>,
-}
-
-impl SystemCatalogDatabaseHwm {
-    pub fn new(catalog: Arc<SystemCatalog>) -> Self {
-        Self { catalog }
-    }
-}
-
-impl DatabaseHwmPersist for SystemCatalogDatabaseHwm {
-    fn checkpoint(&self, hwm: u64) -> crate::Result<()> {
-        self.catalog.put_database_hwm(hwm)
+impl DatabaseHwmPersist for SystemCatalog {
+    fn checkpoint_reserve(&self, hwm: u64, reserve_index: u64) -> crate::Result<()> {
+        self.put_database_reserve_state(hwm, reserve_index)
     }
 
     fn load(&self) -> crate::Result<u64> {
-        self.catalog.get_database_hwm()
+        self.get_database_hwm()
+    }
+
+    fn load_reserve_index(&self) -> crate::Result<u64> {
+        self.get_database_reserve_index()
     }
 }
 
@@ -51,12 +40,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn handle_roundtrip_via_catalog() {
+    fn roundtrip_via_catalog() {
         let dir = tempfile::tempdir().unwrap();
-        let catalog = Arc::new(SystemCatalog::open(&dir.path().join("system.redb")).unwrap());
-        let p = SystemCatalogDatabaseHwm::new(catalog);
-        assert_eq!(p.load().unwrap(), 0);
-        p.checkpoint(1024).unwrap();
-        assert_eq!(p.load().unwrap(), 1024);
+        let catalog = SystemCatalog::open(&dir.path().join("system.redb")).unwrap();
+        assert_eq!(catalog.load().unwrap(), 0);
+        catalog.checkpoint_reserve(1025, 9).unwrap();
+        assert_eq!(catalog.load().unwrap(), 1025);
+        assert_eq!(catalog.load_reserve_index().unwrap(), 9);
     }
 }

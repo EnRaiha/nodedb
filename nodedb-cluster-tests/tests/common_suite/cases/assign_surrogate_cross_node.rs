@@ -54,36 +54,33 @@ async fn assign_remote_surrogate_is_authoritative_and_idempotent() {
     )
     .await;
 
-    // Find a (coordinator, pk) pair where the pk's home vShard (`VShardId::from_key`)
-    // leader is a DIFFERENT node than the coordinator, so the routed assign actually
-    // crosses to a remote leader (not a local short circuit). This must work under
-    // ANY leadership distribution — including this harness's single-data-leader
-    // topology where ONE node leads every data vShard: from that node's own snapshot
-    // every key is local, but from a FOLLOWER's snapshot the leader resolves to a
-    // remote node. So we try each node as the candidate coordinator and pick the
-    // first whose snapshot yields a remote-led key. The owner is resolved exactly
-    // like the production helper: `leader_for_vshard` on the coordinator's snapshot.
-    let mut picked: Option<(u64, String, String, VShardId, u64)> = None;
-    'outer: for cand in &cluster.nodes {
+    // A key's home is its collection's home vShard (`VShardId::from_collection`).
+    // Find a coordinator whose snapshot names a DIFFERENT node as that vShard's
+    // leader, so the routed assign crosses to a remote leader (not a local short
+    // circuit). The leader node's own snapshot sees the home as local, so each
+    // node is tried as the coordinator and the first follower is picked. The
+    // owner is resolved exactly like the production helper: `leader_for_vshard`
+    // on the coordinator's snapshot.
+    let collection = "people".to_string();
+    let home = VShardId::from_collection(nodedb_types::CollectionKey::from_bare(DB, &collection));
+    let pk = "person:0".to_string();
+    let mut picked: Option<(u64, u64)> = None;
+    for cand in &cluster.nodes {
         let cand_id = cand.shared.node_id;
         let Some(routing) = cand.shared.cluster_routing.as_ref() else {
             continue;
         };
         let guard = routing.read().unwrap_or_else(|p| p.into_inner());
-        for i in 0..10_000u32 {
-            let pk = format!("person:{i}");
-            let vshard = VShardId::from_key(pk.as_bytes());
-            if let Ok(leader) = guard.leader_for_vshard(vshard.as_u32())
-                && leader != 0
-                && leader != cand_id
-            {
-                picked = Some((cand_id, "people".to_string(), pk, vshard, leader));
-                break 'outer;
-            }
+        if let Ok(leader) = guard.leader_for_vshard(home.as_u32())
+            && leader != 0
+            && leader != cand_id
+        {
+            picked = Some((cand_id, leader));
+            break;
         }
     }
-    let (coordinator_id, collection, pk, vshard, owner) =
-        picked.expect("some node's snapshot resolves a pk to a remote-led home vShard");
+    let (coordinator_id, owner) =
+        picked.expect("some node's snapshot names a remote leader for the collection's home");
 
     let coordinator = cluster
         .nodes
@@ -100,7 +97,6 @@ async fn assign_remote_surrogate_is_authoritative_and_idempotent() {
     // authoritative surrogate.
     let s1 = assign_surrogate_routed(
         &coordinator.shared,
-        vshard,
         nodedb_types::CollectionKey::from_bare(DB, &collection),
         TENANT,
         pk.as_bytes(),
@@ -119,7 +115,6 @@ async fn assign_remote_surrogate_is_authoritative_and_idempotent() {
     // source, so a repeat resolves the already-bound value.
     let s2 = assign_surrogate_routed(
         &coordinator.shared,
-        vshard,
         nodedb_types::CollectionKey::from_bare(DB, &collection),
         TENANT,
         pk.as_bytes(),

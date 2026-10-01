@@ -28,8 +28,15 @@ pub struct CdcEvent {
     /// Wall-clock time of the event (epoch milliseconds).
     /// Used for time-bucket grouping; ordering uses LSN, not wall-clock.
     pub event_time: u64,
-    /// WAL LSN for this event. Used for offset tracking and ordering.
+    /// Local WAL LSN of the write. Differs between replicas.
     pub lsn: u64,
+    /// Position index of the write: the data-group Raft log index in a
+    /// cluster, equal on every replica. See [`super::offset`].
+    #[serde(default)]
+    pub index: u64,
+    /// Position epoch of the partition. See [`super::offset`].
+    #[serde(default)]
+    pub epoch: u64,
     /// Database that owns the collection. Missing legacy payloads decode to
     /// the built-in default database.
     #[serde(default)]
@@ -69,10 +76,11 @@ pub struct CdcEvent {
 impl CdcEvent {
     /// Lossless offset for this event.
     pub const fn position(&self) -> super::offset::CdcOffset {
-        super::offset::CdcOffset::new(self.lsn, self.sequence)
+        super::offset::CdcOffset::at(self.epoch, self.index, self.sequence)
     }
 
-    /// Canonical `<lsn>:<sequence>` token accepted by `COMMIT OFFSET`.
+    /// Canonical `<epoch>:<index>:<sequence>` token accepted by
+    /// `COMMIT OFFSET`.
     pub fn offset_token(&self) -> String {
         self.position().token()
     }
@@ -89,14 +97,15 @@ impl CdcEvent {
 }
 
 /// JSON consumers receive the canonical offset alongside the position fields.
-/// The token is derived at serialization time so it cannot drift from `lsn` or
-/// `sequence` in memory or over the cluster MessagePack payload.
+/// The token is derived at serialization time so it cannot drift from
+/// `epoch`, `index` or `sequence` in memory or over the cluster MessagePack
+/// payload.
 impl Serialize for CdcEvent {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        let field_count = 12
+        let field_count = 14
             + usize::from(self.new_value.is_some())
             + usize::from(self.old_value.is_some())
             + usize::from(self.field_diffs.is_some())
@@ -110,6 +119,8 @@ impl Serialize for CdcEvent {
         state.serialize_field("row_id", &self.row_id)?;
         state.serialize_field("event_time", &self.event_time)?;
         state.serialize_field("lsn", &self.lsn)?;
+        state.serialize_field("index", &self.index)?;
+        state.serialize_field("epoch", &self.epoch)?;
         state.serialize_field("offset", &self.offset_token())?;
         state.serialize_field("database_id", &self.database_id)?;
         state.serialize_field("tenant_id", &self.tenant_id)?;
@@ -138,7 +149,7 @@ impl Serialize for CdcEvent {
 
 impl zerompk::ToMessagePack for CdcEvent {
     fn write<W: zerompk::Write>(&self, writer: &mut W) -> zerompk::Result<()> {
-        let field_count = 11
+        let field_count = 13
             + usize::from(self.new_value.is_some())
             + usize::from(self.old_value.is_some())
             + usize::from(self.field_diffs.is_some())
@@ -159,6 +170,10 @@ impl zerompk::ToMessagePack for CdcEvent {
         writer.write_u64(self.event_time)?;
         writer.write_string("lsn")?;
         writer.write_u64(self.lsn)?;
+        writer.write_string("index")?;
+        writer.write_u64(self.index)?;
+        writer.write_string("epoch")?;
+        writer.write_u64(self.epoch)?;
         writer.write_string("tenant_id")?;
         writer.write_u64(self.tenant_id)?;
         writer.write_string("database_id")?;
@@ -201,6 +216,8 @@ impl<'a> zerompk::FromMessagePack<'a> for CdcEvent {
         let mut row_id = String::new();
         let mut event_time: u64 = 0;
         let mut lsn: u64 = 0;
+        let mut index: u64 = 0;
+        let mut epoch: u64 = 0;
         let mut tenant_id: u64 = 0;
         let mut database_id = DatabaseId::DEFAULT;
         let mut source: Option<crate::event::EventSource> = None;
@@ -220,6 +237,8 @@ impl<'a> zerompk::FromMessagePack<'a> for CdcEvent {
                 "row_id" => row_id = reader.read_string()?.into_owned(),
                 "event_time" => event_time = reader.read_u64()?,
                 "lsn" => lsn = reader.read_u64()?,
+                "index" => index = reader.read_u64()?,
+                "epoch" => epoch = reader.read_u64()?,
                 "tenant_id" => tenant_id = reader.read_u64()?,
                 "database_id" => database_id = DatabaseId::new(reader.read_u64()?),
                 "source" => {
@@ -253,6 +272,8 @@ impl<'a> zerompk::FromMessagePack<'a> for CdcEvent {
             row_id,
             event_time,
             lsn,
+            index,
+            epoch,
             tenant_id,
             source,
             database_id,
@@ -280,6 +301,8 @@ mod tests {
             row_id: "order-1".into(),
             event_time: 1700000000000,
             lsn: 100,
+            index: 100,
+            epoch: 0,
             tenant_id: 1,
             source: crate::event::EventSource::User,
             database_id: DatabaseId::DEFAULT,
@@ -295,9 +318,9 @@ mod tests {
         let parsed: CdcEvent = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.collection, "orders");
         assert_eq!(parsed.sequence, 1);
-        assert_eq!(event.offset_token(), "100:1");
+        assert_eq!(event.offset_token(), "0:100:1");
         let json: serde_json::Value = sonic_rs::from_slice(&bytes).unwrap();
-        assert_eq!(json["offset"], "100:1");
+        assert_eq!(json["offset"], "0:100:1");
         assert!(parsed.old_value.is_none());
     }
 
@@ -311,6 +334,8 @@ mod tests {
             row_id: "user-5".into(),
             event_time: 1700000001000,
             lsn: 200,
+            index: 200,
+            epoch: 4,
             tenant_id: 1,
             source: crate::event::EventSource::User,
             database_id: DatabaseId::DEFAULT,
@@ -327,7 +352,7 @@ mod tests {
         assert_eq!(parsed.op, "UPDATE");
         assert_eq!(
             parsed.position(),
-            super::super::offset::CdcOffset::new(200, 2)
+            super::super::offset::CdcOffset::at(4, 200, 2)
         );
         assert!(parsed.old_value.is_some());
     }
@@ -342,6 +367,8 @@ mod tests {
             row_id: "u-1".into(),
             event_time: 1700000002000,
             lsn: 300,
+            index: 300,
+            epoch: 0,
             tenant_id: 1,
             source: crate::event::EventSource::User,
             database_id: DatabaseId::DEFAULT,
@@ -374,6 +401,8 @@ mod tests {
             row_id: "u-2".into(),
             event_time: 1700000003000,
             lsn: 400,
+            index: 400,
+            epoch: 0,
             tenant_id: 1,
             source: crate::event::EventSource::Restore,
             database_id: DatabaseId::DEFAULT,

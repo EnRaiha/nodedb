@@ -33,7 +33,91 @@ pub(crate) fn plan_lock_keys(plan: &PhysicalPlan) -> Option<(VShardId, BTreeSet<
     let key = point_lock_key(plan)?;
     let mut keys = BTreeSet::new();
     keys.insert(key);
+    keys.extend(graph_node_lock_keys(plan));
+    keys.extend(document_row_id_key(plan));
     Some((vshard, keys))
+}
+
+/// The one key that names the row a single-row point write stores: the key
+/// two writes of that row both hold. `None` for a plan that is not a point
+/// write. The write-order fence and the keyed order lock serialize on it.
+pub(crate) fn plan_row_key(plan: &PhysicalPlan) -> Option<LockKey> {
+    point_lock_key(plan)
+}
+
+/// The row id key a document point write holds besides its surrogate key,
+/// the same key the Calvin tx-class builder locks. A delete or update planned
+/// while the row's key was unbound locks only this key and the collection
+/// key, so it orders against a fast-path insert of the same id.
+fn document_row_id_key(plan: &PhysicalPlan) -> Option<LockKey> {
+    use crate::control::planner::calvin::tx_class::write_keys::row_id_key;
+    match plan {
+        PhysicalPlan::Document(
+            DocumentOp::PointPut {
+                collection,
+                document_id,
+                ..
+            }
+            | DocumentOp::PointInsert {
+                collection,
+                document_id,
+                ..
+            }
+            | DocumentOp::Upsert {
+                collection,
+                document_id,
+                ..
+            }
+            | DocumentOp::PointDelete {
+                collection,
+                document_id,
+                ..
+            }
+            | DocumentOp::PointUpdate {
+                collection,
+                document_id,
+                ..
+            },
+        ) => Some(LockKey::Kv {
+            collection: Arc::from(collection.as_str()),
+            key: Arc::from(row_id_key(document_id).as_slice()),
+        }),
+        _ => None,
+    }
+}
+
+/// The node lock keys an edge write holds besides its own edge key: one per
+/// endpoint, the same pairs the Calvin tx-class builder locks, so a node
+/// delete's guard and every write of an edge on its node run in order.
+fn graph_node_lock_keys(plan: &PhysicalPlan) -> Vec<LockKey> {
+    use crate::control::planner::calvin::tx_class::shared::node_lock_pair;
+    match plan {
+        PhysicalPlan::Graph(
+            GraphOp::EdgePut {
+                collection,
+                src_id,
+                dst_id,
+                ..
+            }
+            | GraphOp::EdgeDelete {
+                collection,
+                src_id,
+                dst_id,
+                ..
+            },
+        ) => [src_id, dst_id]
+            .into_iter()
+            .map(|node| {
+                let (src, dst) = node_lock_pair(node);
+                LockKey::Edge {
+                    collection: Arc::from(collection.as_str()),
+                    src,
+                    dst,
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// The single deterministic lock key identifying a point write, or `None`.
@@ -74,7 +158,16 @@ fn document_point_key(op: &DocumentOp) -> Option<LockKey> {
             surrogate,
             ..
         }
-        | DocumentOp::PointDelete {
+        | DocumentOp::Upsert {
+            collection,
+            surrogate,
+            ..
+        } => Some(LockKey::Surrogate {
+            collection: Arc::from(collection.as_str()),
+            surrogate: surrogate.as_u32(),
+        }),
+        // A key unbound in its database names no row to lock.
+        DocumentOp::PointDelete {
             collection,
             surrogate,
             ..
@@ -83,14 +176,9 @@ fn document_point_key(op: &DocumentOp) -> Option<LockKey> {
             collection,
             surrogate,
             ..
-        }
-        | DocumentOp::Upsert {
-            collection,
-            surrogate,
-            ..
-        } => Some(LockKey::Surrogate {
+        } => surrogate.map(|s| LockKey::Surrogate {
             collection: Arc::from(collection.as_str()),
-            surrogate: surrogate.as_u32(),
+            surrogate: s.as_u32(),
         }),
         // Multi-row and cross-collection writes have no single point identity.
         DocumentOp::BatchInsert { .. }
@@ -174,12 +262,16 @@ fn kv_point_key(op: &KvOp) -> Option<LockKey> {
 /// sparse and multi-vector writes lack a single stable surrogate identity.
 fn vector_point_key(op: &VectorOp) -> Option<LockKey> {
     match op {
-        VectorOp::Insert {
+        // A delete of a key its home never bound names no row to key.
+        VectorOp::DeleteBySurrogate {
             collection,
             surrogate,
             ..
-        }
-        | VectorOp::DeleteBySurrogate {
+        } => surrogate.map(|s| LockKey::Surrogate {
+            collection: Arc::from(collection.as_str()),
+            surrogate: s.as_u32(),
+        }),
+        VectorOp::Insert {
             collection,
             surrogate,
             ..

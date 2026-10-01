@@ -5,7 +5,9 @@
 
 use nodedb::control::planner::procedural::ast::*;
 use nodedb::control::planner::procedural::executor::exception::exception_matches;
-use nodedb::control::planner::procedural::executor::transaction::ProcedureTransactionCtx;
+use nodedb::control::planner::procedural::executor::transaction::{
+    ProcedureTransactionCtx, RemoteWrite,
+};
 use nodedb::control::planner::procedural::parse_block;
 use nodedb::control::security::catalog::procedure_types::*;
 
@@ -141,95 +143,70 @@ fn parse_no_exception_block() {
 }
 
 // ---------------------------------------------------------------------------
-// Transaction context: buffer + savepoint + rollback
+// Transaction context: post-commit effects + savepoint + rollback
 // ---------------------------------------------------------------------------
 
-fn dummy_task(id: &str) -> nodedb_physical::physical_task::PhysicalTask {
-    use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
-    use nodedb_physical::physical_task::PostSetOp;
-
-    nodedb_physical::physical_task::PhysicalTask {
-        tenant_id: nodedb::types::TenantId::new(1),
-        vshard_id: nodedb::types::VShardId::new(0),
-        database_id: nodedb::types::DatabaseId::DEFAULT,
-        plan: PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: nodedb_types::QualifiedCollection::new(
-                nodedb::types::DatabaseId::DEFAULT,
-                "test",
-            ),
-            document_id: id.into(),
-            value: vec![],
-            surrogate: nodedb_types::Surrogate::ZERO,
-            pk_bytes: Vec::new(),
-            returning: None,
-            rls_filters: Vec::new(),
-            resolved_sum_targets: Vec::new(),
-        }),
-        post_set_op: PostSetOp::None,
-        txn_id: None,
+fn remote(sql: &str) -> RemoteWrite {
+    RemoteWrite {
+        target_vshard: 1,
+        sql: sql.into(),
     }
 }
 
 #[test]
-fn tx_ctx_buffer_and_commit() {
+fn tx_ctx_take_empties_the_held_effects() {
     let mut ctx = ProcedureTransactionCtx::new();
-    ctx.buffer_task(dummy_task("a"));
-    ctx.buffer_task(dummy_task("b"));
-    ctx.buffer_task(dummy_task("c"));
-    let tasks = ctx.take_buffered_tasks();
-    assert_eq!(tasks.len(), 3);
-    assert!(ctx.take_buffered_tasks().is_empty()); // Empty after take
+    ctx.buffer_remote(remote("a")).unwrap();
+    ctx.buffer_remote(remote("b")).unwrap();
+    ctx.buffer_remote(remote("c")).unwrap();
+    assert_eq!(ctx.take_effects().remote.len(), 3);
+    assert!(ctx.take_effects().is_empty());
 }
 
 #[test]
 fn tx_ctx_rollback_discards_all() {
     let mut ctx = ProcedureTransactionCtx::new();
-    ctx.buffer_task(dummy_task("a"));
-    ctx.buffer_task(dummy_task("b"));
+    ctx.buffer_remote(remote("a")).unwrap();
+    ctx.buffer_remote(remote("b")).unwrap();
     ctx.rollback();
-    assert!(ctx.take_buffered_tasks().is_empty());
+    assert!(ctx.take_effects().is_empty());
 }
 
 #[test]
 fn tx_ctx_savepoint_rollback_to() {
     let mut ctx = ProcedureTransactionCtx::new();
-    ctx.buffer_task(dummy_task("a"));
+    ctx.buffer_remote(remote("a")).unwrap();
     ctx.savepoint("sp1");
-    ctx.buffer_task(dummy_task("b"));
-    ctx.buffer_task(dummy_task("c"));
+    ctx.buffer_remote(remote("b")).unwrap();
+    ctx.buffer_remote(remote("c")).unwrap();
     ctx.rollback_to("sp1").unwrap();
-
-    let tasks = ctx.take_buffered_tasks();
-    assert_eq!(tasks.len(), 1); // Only "a"
+    assert_eq!(ctx.take_effects().remote, vec![remote("a")]);
 }
 
 #[test]
 fn tx_ctx_nested_savepoints() {
     let mut ctx = ProcedureTransactionCtx::new();
-    ctx.buffer_task(dummy_task("a"));
+    ctx.buffer_remote(remote("a")).unwrap();
     ctx.savepoint("sp1");
-    ctx.buffer_task(dummy_task("b"));
+    ctx.buffer_remote(remote("b")).unwrap();
     ctx.savepoint("sp2");
-    ctx.buffer_task(dummy_task("c"));
-    ctx.buffer_task(dummy_task("d"));
+    ctx.buffer_remote(remote("c")).unwrap();
+    ctx.buffer_remote(remote("d")).unwrap();
 
     ctx.rollback_to("sp2").unwrap();
-    // a + b remain (sp2 was after b)
-    assert_eq!(ctx.take_buffered_tasks().len(), 2);
+    assert_eq!(ctx.take_effects().remote.len(), 2);
 }
 
 #[test]
 fn tx_ctx_release_savepoint() {
     let mut ctx = ProcedureTransactionCtx::new();
-    ctx.buffer_task(dummy_task("a"));
+    ctx.buffer_remote(remote("a")).unwrap();
     ctx.savepoint("sp1");
-    ctx.buffer_task(dummy_task("b"));
+    ctx.buffer_remote(remote("b")).unwrap();
     ctx.release_savepoint("sp1").unwrap();
 
-    // Released savepoint can't be rolled back to.
     assert!(ctx.rollback_to("sp1").is_err());
-    // But data is still there.
-    assert_eq!(ctx.take_buffered_tasks().len(), 2);
+    assert_eq!(ctx.take_effects().remote.len(), 2);
 }
 
 #[test]

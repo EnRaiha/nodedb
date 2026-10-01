@@ -28,7 +28,7 @@ fn kv_put_get_delete() {
             key: b"key1".to_vec(),
             value: b"value1".to_vec(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"key1".as_ref()),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -106,7 +106,7 @@ fn kv_overwrite_returns_ok() {
             key: b"k".to_vec(),
             value: b"v1".to_vec(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"k".as_ref()),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -126,7 +126,7 @@ fn kv_overwrite_returns_ok() {
             key: b"k".to_vec(),
             value: b"v2".to_vec(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"k".as_ref()),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -159,7 +159,10 @@ fn kv_batch_put_and_get() {
     let (mut core, mut tx, mut rx, _dir) = make_core();
 
     let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..5u8).map(|i| (vec![i], vec![i * 10])).collect();
-    let surrogates = vec![nodedb_types::Surrogate::ZERO; entries.len()];
+    let surrogates = entries
+        .iter()
+        .map(|(key, _)| nodedb_test_support::kv_rows::kv_row_surrogate(key))
+        .collect();
 
     let payload = send_ok(
         &mut core,
@@ -218,7 +221,9 @@ fn kv_scan_returns_entries() {
                 key: format!("key{i}").into_bytes(),
                 value: format!("val{i}").into_bytes(),
                 ttl_ms: 0,
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(
+                    &format!("key{i}").into_bytes(),
+                ),
                 returning: None,
                 rls_filters: Vec::new(),
                 provenance: None,
@@ -269,7 +274,9 @@ fn kv_scan_with_match_pattern() {
                     key: format!("{prefix}{i}").into_bytes(),
                     value: b"data".to_vec(),
                     ttl_ms: 0,
-                    surrogate: nodedb_types::Surrogate::ZERO,
+                    surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(
+                        &format!("{prefix}{i}").into_bytes(),
+                    ),
                     returning: None,
                     rls_filters: Vec::new(),
                     provenance: None,
@@ -325,7 +332,7 @@ fn kv_expire_and_persist() {
             key: b"k".to_vec(),
             value: b"v".to_vec(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"k".as_ref()),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -413,7 +420,7 @@ fn kv_register_index_and_lookup() {
             key: b"s1".to_vec(),
             value: doc1,
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"s1".as_ref()),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -431,7 +438,7 @@ fn kv_register_index_and_lookup() {
             key: b"s2".to_vec(),
             value: doc2,
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"s2".as_ref()),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -491,7 +498,7 @@ fn kv_drop_index() {
             key: b"k1".to_vec(),
             value: doc,
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"k1".as_ref()),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -534,7 +541,7 @@ fn kv_tenant_isolation() {
             key: b"k".to_vec(),
             value: b"tenant1".to_vec(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"k".as_ref()),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -557,7 +564,7 @@ fn kv_tenant_isolation() {
             key: b"k".to_vec(),
             value: b"tenant2".to_vec(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"k".as_ref()),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,

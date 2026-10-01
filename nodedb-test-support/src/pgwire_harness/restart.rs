@@ -18,7 +18,6 @@ use nodedb::wal::WalManager;
 use super::support::{bind_http_listener, bind_native_listener, init_test_memory_governor};
 use super::types::{TestClient, TestDataDir, TestServer};
 
-#[allow(dead_code)]
 impl TestServer {
     /// Consume the server, send shutdown signals, and await all core threads.
     ///
@@ -103,6 +102,25 @@ impl TestServer {
             .loop_registry
             .shutdown_all(std::time::Duration::from_secs(5))
             .await;
+        // The lease loop, the cluster subsystems and the transport. The Raft
+        // loops saw the shutdown signal the bus sent above.
+        if let Some(mut raft) = self.raft.take() {
+            raft.shutdown(&self.shared).await;
+        }
+        // Every Raft task holds an `Arc<SharedState>` until it observes the
+        // signal. The catalog redb stays locked until the last clone drops,
+        // so wait for this handle to be the only one left.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&self.shared) > 1 {
+            if tokio::time::Instant::now() >= deadline {
+                eprintln!(
+                    "pgwire_harness: SharedState still has {} strong refs after 5s",
+                    Arc::strong_count(&self.shared)
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         // conn_handle, shared, _dir all drop here, releasing the remaining
         // Arc<SharedState> and CredentialStore redb handle.
     }
@@ -195,33 +213,25 @@ impl TestServer {
         let mut shared =
             SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials, false)
                 .expect("build shared state");
-        if let Some(s) = Arc::get_mut(&mut shared) {
+        // The directory's cluster catalog restarts the same one-node cluster.
+        let cluster = crate::single_node::init(dir_path)
+            .await
+            .expect("restart the one-node cluster");
+        {
+            let s = Arc::get_mut(&mut shared).expect("shared state is not cloned yet");
+            crate::single_node::wire(s, &cluster, dir_path).expect("wire the one-node cluster");
             s.backup_kek = Some(Arc::new([0x42u8; 32]));
             s.governor = init_test_memory_governor();
         }
         let shared = shared;
         // The same gateway install production boot runs, after every
         // `Arc::get_mut` above.
-        nodedb::bootstrap::state_wiring::install_gateway(&shared);
+        nodedb::bootstrap::state_wiring::install_gateway(&shared).expect("install gateway");
         nodedb::bootstrap::credentials::replay_surrogate_wal(
             &shared,
             &wal_records,
             &replay_tombstones,
         );
-        // Restore in-memory synonym registry from the persisted catalog.
-        let catalog = shared.credentials.catalog();
-        if let Err(e) = shared.synonym_registry.reload_from_catalog(catalog) {
-            eprintln!("pgwire_harness: failed to reload synonym groups: {e}");
-        }
-        let catalog = shared.credentials.catalog();
-        if let Ok(entries) = catalog.load_all_arrays()
-            && let Ok(mut guard) = shared.array_catalog.write()
-        {
-            for entry in entries {
-                let _ = guard.register(entry);
-            }
-        }
-
         let mut core_stop_txs = Vec::new();
         let mut core_handles = Vec::new();
         for (idx, (data_side, event_producer)) in
@@ -254,6 +264,7 @@ impl TestServer {
                         }
                         qt
                     },
+                    timeseries_tuning: nodedb_types::config::tuning::TimeseriesToning::default(),
                     // Seeded from the SAME durable catalog production reads, so a
                     // harness restart reconstructs cores the way a real one does.
                     // An empty catalog yields an empty seed, which is exactly what
@@ -261,6 +272,7 @@ impl TestServer {
                     doc_config_seed: nodedb::bootstrap::data_plane::load_doc_config_registry_from(
                         shared.credentials.catalog(),
                     ),
+                    event_interest: crate::core_loop_runner::event_interest_for(&shared),
                     stop_rx: core_stop_rx,
                 });
             core_stop_txs.push(core_stop_tx);
@@ -284,26 +296,6 @@ impl TestServer {
             }
         });
 
-        nodedb::bootstrap::schema_rehydrate::rehydrate_schema_registry(&shared)
-            .await
-            .expect("schema rehydration on restart");
-
-        // Re-register every persisted continuous aggregate on the local
-        // Data Plane manager: the registry is per-core in-memory state
-        // and is otherwise lost across restart.
-        nodedb::control::server::shared::ddl::neutral::continuous_agg::register_persisted_continuous_aggregates(
-            &shared,
-        )
-        .await;
-
-        // Rehydrate the AFTER-trigger registry from the catalog before the
-        // Event Plane starts — it is per-process in-memory state and is
-        // otherwise empty after a restart, so replayed/live events would match
-        // no trigger. Mirrors the production boot sequence.
-        shared
-            .trigger_registry
-            .load_all(shared.credentials.catalog());
-
         let watermark_store =
             Arc::new(nodedb::event::watermark::WatermarkStore::open(dir_path).unwrap());
         let trigger_dlq = Arc::new(std::sync::Mutex::new(
@@ -322,11 +314,13 @@ impl TestServer {
             shutdown_bus: shutdown_bus.clone(),
         });
 
-        // Load grants and hierarchy edges before the listener opens, as the
-        // production boot does once the data groups replayed.
-        nodedb::bootstrap::permission_tree_load::load_permission_trees(&shared)
+        // Raft replays the metadata and data groups. The readiness wait then
+        // rehydrates the schema registry and the continuous aggregates and
+        // loads the permission trees, as production boot does before it
+        // opens a listener.
+        let raft = crate::single_node::start(&cluster, &shared, dir_path)
             .await
-            .expect("permission tree load on restart");
+            .expect("restart the one-node cluster's Raft");
 
         let pg_listener = PgListener::bind("127.0.0.1:0".parse().unwrap())
             .await
@@ -400,6 +394,7 @@ impl TestServer {
             poller_handle: Some(poller_handle),
             core_handles: Some(core_handles),
             event_plane: Some(event_plane),
+            raft: Some(raft),
             _dir: placeholder_dir,
         }
     }

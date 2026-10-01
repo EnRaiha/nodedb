@@ -21,3 +21,4 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 sonic-rs = { workspace = true }
 rust_decimal = { workspace = true }
+hex = { workspace = true }

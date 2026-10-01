@@ -4,8 +4,8 @@
 //! [`super::registry::SequenceRegistry`] map.
 //!
 //! `CREATE SEQUENCE` inside an open transaction is buffered and only reaches
-//! the shared registry at COMMIT (`post_apply` runs only for
-//! `ProposeOutcome::needs_local_apply()`, which `Buffered` never satisfies).
+//! the shared registry at COMMIT (`post_apply` never runs for a
+//! `ProposeOutcome::Buffered` entry).
 //! Without this fallback, `NEXTVAL` / `CURRVAL` / `SETVAL` on a sequence
 //! created earlier in the same transaction resolve as missing.
 //!

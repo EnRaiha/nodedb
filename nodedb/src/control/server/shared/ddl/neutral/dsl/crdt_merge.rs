@@ -84,6 +84,9 @@ pub async fn crdt_merge(
             // Admitted at this request's own transport entry; this handler
             // has no session or peer information of its own.
             admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
+            // No session reaches this handler, so its read takes the strong
+            // default (see `DmlTxnCtx::linearizable_reads`).
+            linearizable: true,
         },
     )
     .await
@@ -95,14 +98,15 @@ pub async fn crdt_merge(
         ));
     }
 
-    let target_surrogate = state
-        .surrogate_assigner
-        .assign(
-            nodedb_types::CollectionKey::from_bare(database_id, collection),
-            tenant_id,
-            target_id.as_bytes(),
-        )
-        .map_err(|e| DdlError::from_error(&e))?;
+    let target_surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
+        state,
+        nodedb_types::CollectionKey::from_bare(database_id, collection),
+        tenant_id,
+        target_id.as_bytes(),
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| DdlError::from_error(&e))?;
 
     let apply_plan = PhysicalPlan::Crdt(CrdtOp::Apply {
         collection: nodedb_types::QualifiedCollection::new(database_id, collection),

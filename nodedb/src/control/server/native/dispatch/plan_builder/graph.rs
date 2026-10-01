@@ -29,7 +29,7 @@ fn clamped_depth(value: Option<u32>, default: usize, field: &str) -> crate::Resu
     Ok(v)
 }
 
-pub(crate) fn build_rag_fusion(
+pub(crate) async fn build_rag_fusion(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -57,10 +57,14 @@ pub(crate) fn build_rag_fusion(
         options: Default::default(),
         bm25_query: None,
         bm25_field: None,
+        stage: nodedb_physical::physical_plan::RagStage::Local,
     }))
 }
 
-pub(crate) fn build_hop(ctx: &DispatchCtx<'_>, fields: &TextFields) -> crate::Result<PhysicalPlan> {
+pub(crate) async fn build_hop(
+    ctx: &DispatchCtx<'_>,
+    fields: &TextFields,
+) -> crate::Result<PhysicalPlan> {
     let start = fields
         .start_node
         .as_ref()
@@ -82,7 +86,7 @@ pub(crate) fn build_hop(ctx: &DispatchCtx<'_>, fields: &TextFields) -> crate::Re
     }))
 }
 
-pub(crate) fn build_neighbors(
+pub(crate) async fn build_neighbors(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
 ) -> crate::Result<PhysicalPlan> {
@@ -104,7 +108,7 @@ pub(crate) fn build_neighbors(
     }))
 }
 
-pub(crate) fn build_path(
+pub(crate) async fn build_path(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
 ) -> crate::Result<PhysicalPlan> {
@@ -135,7 +139,7 @@ pub(crate) fn build_path(
     }))
 }
 
-pub(crate) fn build_subgraph(
+pub(crate) async fn build_subgraph(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
 ) -> crate::Result<PhysicalPlan> {
@@ -158,7 +162,7 @@ pub(crate) fn build_subgraph(
     }))
 }
 
-pub(crate) fn build_edge_put(
+pub(crate) async fn build_edge_put(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -192,16 +196,9 @@ pub(crate) fn build_edge_put(
         })?,
         None => String::new(),
     };
-    let src_surrogate = ctx.state.surrogate_assigner.assign(
-        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-        ctx.tenant_id(),
-        src.as_bytes(),
-    )?;
-    let dst_surrogate = ctx.state.surrogate_assigner.assign(
-        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-        ctx.tenant_id(),
-        dst.as_bytes(),
-    )?;
+    // The endpoint surrogates come from the collection home, the one place a
+    // key's surrogate is minted (`surrogate_exchange::authority`).
+    let [src_surrogate, dst_surrogate] = endpoint_surrogates(ctx, collection, src, dst).await?;
     Ok(PhysicalPlan::Graph(GraphOp::EdgePut {
         collection: QualifiedCollection::new(ctx.database_id(), collection),
         src_id: src.clone(),
@@ -213,7 +210,7 @@ pub(crate) fn build_edge_put(
     }))
 }
 
-pub(crate) fn build_edge_delete(
+pub(crate) async fn build_edge_delete(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -241,19 +238,10 @@ pub(crate) fn build_edge_delete(
         .ok_or_else(|| crate::Error::BadRequest {
             detail: "missing 'edge_type'".to_string(),
         })?;
-    // Resolve endpoint surrogates exactly as `build_edge_put` does (get-or-assign
-    // returns the existing node identities) so a cross-shard delete dual-homes
-    // and locks against a concurrent insert of the same edge.
-    let src_surrogate = ctx.state.surrogate_assigner.assign(
-        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-        ctx.tenant_id(),
-        src.as_bytes(),
-    )?;
-    let dst_surrogate = ctx.state.surrogate_assigner.assign(
-        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-        ctx.tenant_id(),
-        dst.as_bytes(),
-    )?;
+    // The endpoint surrogates come from the collection home, as for
+    // `build_edge_put`, so a cross-shard delete dual-homes and locks against a
+    // concurrent insert of the same edge.
+    let [src_surrogate, dst_surrogate] = endpoint_surrogates(ctx, collection, src, dst).await?;
     Ok(PhysicalPlan::Graph(GraphOp::EdgeDelete {
         collection: QualifiedCollection::new(ctx.database_id(), collection),
         src_id: src.clone(),
@@ -267,7 +255,10 @@ pub(crate) fn build_edge_delete(
     }))
 }
 
-pub(crate) fn build_algo(fields: &TextFields, collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) async fn build_algo(
+    fields: &TextFields,
+    collection: &str,
+) -> crate::Result<PhysicalPlan> {
     let algo_name = fields
         .algorithm
         .as_deref()
@@ -312,7 +303,13 @@ pub(crate) fn build_algo(fields: &TextFields, collection: &str) -> crate::Result
         personalization_vector,
     };
 
-    Ok(PhysicalPlan::Graph(GraphOp::Algo { algorithm, params }))
+    // The native dispatch runs the algorithm over every partition
+    // (`graph_owner`); the stage it builds from is chosen there.
+    Ok(PhysicalPlan::Graph(GraphOp::Algo {
+        algorithm,
+        params,
+        stage: nodedb_physical::physical_plan::AlgoStage::Local,
+    }))
 }
 
 /// Extract the Personalized PageRank seed map from the raw-protocol
@@ -347,7 +344,10 @@ fn parse_algo_personalization(
     Ok(Some(map))
 }
 
-pub(crate) fn build_match(fields: &TextFields, _collection: &str) -> crate::Result<PhysicalPlan> {
+pub(crate) async fn build_match(
+    fields: &TextFields,
+    _collection: &str,
+) -> crate::Result<PhysicalPlan> {
     let query_str = fields
         .match_query
         .as_ref()
@@ -370,6 +370,27 @@ pub(crate) fn build_match(fields: &TextFields, _collection: &str) -> crate::Resu
     }))
 }
 
+/// Both endpoints' surrogates, in one batch at the collection's home.
+async fn endpoint_surrogates(
+    ctx: &DispatchCtx<'_>,
+    collection: &str,
+    src: &str,
+    dst: &str,
+) -> crate::Result<[nodedb_types::Surrogate; 2]> {
+    let bound =
+        super::helpers::assign_surrogates(ctx, collection, &[src.as_bytes(), dst.as_bytes()])
+            .await?;
+    match bound.as_slice() {
+        [src_surrogate, dst_surrogate] => Ok([*src_surrogate, *dst_surrogate]),
+        _ => Err(crate::Error::Internal {
+            detail: format!(
+                "edge write in '{collection}': the home answered {} endpoint surrogates",
+                bound.len()
+            ),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,45 +411,45 @@ mod tests {
         params
     }
 
-    #[test]
-    fn build_algo_parses_personalization_from_algo_params() {
+    #[tokio::test]
+    async fn build_algo_parses_personalization_from_algo_params() {
         let fields = algo_fields(Some(json!({
             "personalization_vector": { "alice": 1.0, "bob": 0.5 }
         })));
-        let pv = params_of(build_algo(&fields, "social").unwrap())
+        let pv = params_of(build_algo(&fields, "social").await.unwrap())
             .personalization_vector
             .expect("personalization present");
         assert_eq!(pv.get("alice"), Some(&1.0));
         assert_eq!(pv.get("bob"), Some(&0.5));
     }
 
-    #[test]
-    fn build_algo_without_personalization_is_none() {
+    #[tokio::test]
+    async fn build_algo_without_personalization_is_none() {
         assert!(
-            params_of(build_algo(&algo_fields(None), "social").unwrap())
+            params_of(build_algo(&algo_fields(None), "social").await.unwrap())
                 .personalization_vector
                 .is_none()
         );
         // An algo_params object that omits the key is also None.
         let fields = algo_fields(Some(json!({ "other": 1 })));
         assert!(
-            params_of(build_algo(&fields, "social").unwrap())
+            params_of(build_algo(&fields, "social").await.unwrap())
                 .personalization_vector
                 .is_none()
         );
     }
 
-    #[test]
-    fn build_algo_rejects_non_numeric_weight() {
+    #[tokio::test]
+    async fn build_algo_rejects_non_numeric_weight() {
         let fields = algo_fields(Some(
             json!({ "personalization_vector": { "alice": "high" } }),
         ));
-        assert!(build_algo(&fields, "social").is_err());
+        assert!(build_algo(&fields, "social").await.is_err());
     }
 
-    #[test]
-    fn build_algo_rejects_non_object_personalization() {
+    #[tokio::test]
+    async fn build_algo_rejects_non_object_personalization() {
         let fields = algo_fields(Some(json!({ "personalization_vector": [1, 2, 3] })));
-        assert!(build_algo(&fields, "social").is_err());
+        assert!(build_algo(&fields, "social").await.is_err());
     }
 }

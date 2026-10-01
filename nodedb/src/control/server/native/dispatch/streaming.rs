@@ -18,7 +18,6 @@ use nodedb_physical::physical_task::PostSetOp;
 use nodedb_types::protocol::NativeResponse;
 
 use crate::control::gateway::core::QueryContext;
-use crate::control::server::exchange::gather::gather_all_cores_stream_authorized;
 use crate::control::server::exchange::streamable::streamable_gather_child;
 use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::response_shape::schema::OutputSchema;
@@ -71,8 +70,8 @@ pub(crate) struct SqlStream {
     /// projection; no `apply_kv_wrap` / `translate_search_response` applies here.
     pub projection: Option<OutputSchema>,
     /// The statement's column-level redaction inputs, resolved ONCE here.
-    /// Re-resolving them per batch would risk an early batch shipping rows a
-    /// later one would have redacted.
+    /// Re-resolving them per batch will risk an early batch shipping rows a
+    /// later one will redact.
     pub redaction: Option<QueryRedaction>,
     /// Descriptor leases acquired after planning. The session loop owns this
     /// stream, so retaining the scope here holds leases until final emission
@@ -109,7 +108,7 @@ impl SqlStream {
 ///     streamable unordered scan (via [`streamable_gather_child`]).
 ///
 /// Returns `Ok(Some(stream))` when eligible, `Ok(None)` to fall back to the
-/// materialized path, or `Err` if the stream could not be opened.
+/// materialized path, or `Err` if the stream cannot be opened.
 pub(crate) async fn try_open_sql_stream(
     ctx: &DispatchCtx<'_>,
     seq: u64,
@@ -162,22 +161,15 @@ pub(crate) async fn try_open_sql_stream(
         }
     };
 
-    let gateway = ctx.state.gateway.get();
-    let stream = if let Some(gw) = gateway {
-        let gw_ctx = QueryContext {
-            tenant_id: task.tenant_id,
-            trace_id: crate::types::TraceId::ZERO,
-            database_id,
-            txn_id: task.txn_id,
-        };
-        gw.execute_stream(&gw_ctx, checked_child).await?
-    } else {
-        gather_all_cores_stream_authorized(
-            ctx.state,
-            checked_child.into_authorized(),
-            crate::types::TraceId::ZERO,
-        )?
+    let gateway = ctx.state.installed_gateway()?;
+    let gw_ctx = QueryContext {
+        tenant_id: task.tenant_id,
+        trace_id: crate::types::TraceId::ZERO,
+        database_id,
+        txn_id: task.txn_id,
+        linearizable: true,
     };
+    let stream = gateway.execute_stream(&gw_ctx, checked_child).await?;
 
     Ok(Some(SqlStream {
         seq,

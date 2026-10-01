@@ -105,15 +105,27 @@ impl SimpleQueryHandler for NodeDbPgHandler {
         let result = self.execute_sql(&identity, session_id, query).await;
 
         // Drain queued NOTICE messages emitted by response shapers (e.g.
-        // `truncated_before_horizon` on array slices) and send them before
+        // `truncated_before_horizon` on array slices) and raised below them
+        // (`session::statement_notice`), and send them before
         // the query result so the client associates the warning with the
         // current statement.
-        for message in self.sessions.drain_notices(session_id) {
+        for message in self
+            .sessions
+            .drain_notices(session_id)
+            .into_iter()
+            .chain(crate::control::server::shared::session::statement_notice::take())
+        {
             let notice = super::super::super::types::notice_warning(&message);
             let _ = client
                 .send(PgWireBackendMessage::NoticeResponse(notice))
                 .await;
         }
+        // Cross-shard graph reads the query made join the transaction's
+        // read-set.
+        crate::control::server::shared::session::graph_reads::record_pending(
+            &self.sessions,
+            session_id,
+        );
 
         // Drain pending LIVE SELECT notifications and send as pgwire
         // async NotificationResponse messages. This is the standard

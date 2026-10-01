@@ -2,9 +2,7 @@
 
 //! Parsing helpers for TYPEGUARD DDL field definitions.
 //!
-//! Ported verbatim from the pgwire `ddl::typeguard::parse` helpers; only the
-//! error construction changed from pgwire `PgWireError` to the protocol-neutral
-//! [`DdlError`].
+//! Parse errors are the protocol-neutral [`DdlError`].
 
 use nodedb_sql::parser::preprocess::lex::{
     find_ascii_case_insensitive, find_ascii_case_insensitive_from,

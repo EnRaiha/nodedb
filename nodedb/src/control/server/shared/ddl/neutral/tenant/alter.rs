@@ -27,10 +27,10 @@ use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::super::replicate::propose_and_apply;
+use super::super::replicate::propose_and_apply_async;
 use super::support::{ddl_err, resolve_tenant_ref, status, tenant_exists};
 
-pub fn alter_tenant(
+pub async fn alter_tenant(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -121,26 +121,15 @@ pub fn alter_tenant(
 
     // Replicated: every node writes the row and installs the cap in its live
     // enforcement components via post-apply.
-    propose_and_apply(
+    propose_and_apply_async(
         state,
         &CatalogEntry::PutTenantQuota {
             db_id: database_id.as_u64(),
             tenant_id: tenant_id.as_u64(),
             record: Box::new(record.clone()),
         },
-        || {
-            catalog
-                .write_tenant_quota(database_id, tenant_id, &record)
-                .map_err(|e| DdlError::from_error(&e))?;
-            crate::control::catalog_entry::post_apply::quota::put_tenant(
-                database_id,
-                tenant_id,
-                &record,
-                state,
-            );
-            Ok(())
-        },
-    )?;
+    )
+    .await?;
 
     state.audit_record(
         AuditEvent::AdminAction,

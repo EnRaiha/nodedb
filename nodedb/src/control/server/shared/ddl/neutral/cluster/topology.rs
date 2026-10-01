@@ -3,11 +3,9 @@
 //! Protocol-neutral cluster topology DDL commands: SHOW NODES, SHOW NODE,
 //! REMOVE NODE, SHOW CLUSTER.
 //!
-//! Ported from the pgwire `ddl::cluster::topology` handlers. The topology /
-//! routing / raft-status reads and the `REMOVE NODE` `set_state` side-effect
-//! are preserved verbatim; only the result construction changed from pgwire
-//! `Response` / `QueryResponse` to the protocol-neutral `DdlResult` over
-//! `ShapedRows`.
+//! The topology / routing / raft-status reads and the `REMOVE NODE`
+//! `set_state` side-effect run here. The result is the protocol-neutral
+//! `DdlResult` over `ShapedRows`.
 
 use serde_json::{Map, Value as JsonValue};
 
@@ -16,7 +14,7 @@ use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::support::{ddl_err, node_state_str};
+use super::support::{cluster_not_started, ddl_err, node_state_str};
 
 /// SHOW NODES — list all cluster members with state.
 ///
@@ -75,21 +73,7 @@ pub fn show_nodes(
                 rows.push(row);
             }
         }
-        None => {
-            // Single-node mode: show this node as the only member.
-            let mut row = Map::new();
-            row.insert(
-                "node_id".to_string(),
-                JsonValue::String((state.node_id as i64).to_string()),
-            );
-            row.insert(
-                "address".to_string(),
-                JsonValue::String("local".to_string()),
-            );
-            row.insert("state".to_string(), JsonValue::String("active".to_string()));
-            row.insert("raft_groups".to_string(), JsonValue::String(String::new()));
-            rows.push(row);
-        }
+        None => return Err(cluster_not_started("cluster topology")),
     }
 
     Ok(vec![DdlResult::Rows(ShapedRows::from_json_rows(
@@ -150,26 +134,7 @@ pub fn show_node(
                 ),
             ]
         }
-        None => {
-            // Single-node mode: show self info if node_id matches.
-            if node_id != state.node_id {
-                return Err(ddl_err(
-                    "42704",
-                    format!(
-                        "node {node_id} not found (single-node instance, this node is {})",
-                        state.node_id
-                    ),
-                ));
-            }
-            let wal_lsn = state.wal.next_lsn().as_u64().saturating_sub(1);
-            vec![
-                ("node_id".to_string(), state.node_id.to_string()),
-                ("address".to_string(), "local".to_string()),
-                ("state".to_string(), "active".to_string()),
-                ("mode".to_string(), "single-node".to_string()),
-                ("wal_lsn".to_string(), wal_lsn.to_string()),
-            ]
-        }
+        None => return Err(cluster_not_started("cluster topology")),
     };
 
     let mut rows = Vec::new();
@@ -208,12 +173,7 @@ pub fn remove_node(
 
     let topo = match &state.cluster_topology {
         Some(t) => t,
-        None => {
-            return Err(ddl_err(
-                "55000",
-                "cluster mode not enabled (single-node instance)",
-            ));
-        }
+        None => return Err(cluster_not_started("cluster topology")),
     };
 
     let mut topo = topo.write().unwrap_or_else(|p| p.into_inner());
@@ -251,13 +211,14 @@ pub fn show_cluster(
 
     let mut props = vec![("node_id", state.node_id.to_string())];
 
-    if let Some(topo) = &state.cluster_topology {
+    let Some(topo) = &state.cluster_topology else {
+        return Err(cluster_not_started("cluster topology"));
+    };
+    {
         let topo = topo.read().unwrap_or_else(|p| p.into_inner());
         props.push(("nodes_total", topo.node_count().to_string()));
         props.push(("nodes_active", topo.active_nodes().len().to_string()));
         props.push(("topology_version", topo.version().to_string()));
-    } else {
-        props.push(("mode", "single-node".to_string()));
     }
 
     if let Some(routing) = &state.cluster_routing {

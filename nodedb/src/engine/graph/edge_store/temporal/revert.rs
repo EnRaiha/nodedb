@@ -16,6 +16,7 @@ use crate::engine::graph::edge_store::store::{
 };
 
 use super::keys::{EdgeRef, versioned_edge_key};
+use super::visibility::EDGE_APPLIED;
 
 /// How one write changed the edge counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,12 +36,19 @@ pub struct EdgeVersionWrite {
     pub prior_forward: Option<Vec<u8>>,
     /// The reverse value the key held before the write, `None` when absent.
     pub prior_reverse: Option<Vec<u8>>,
+    /// The applied ordinal the key recorded before the write, `None` when it
+    /// recorded none.
+    pub prior_applied: Option<i64>,
     /// The counter change the write made, `None` when it made none.
     pub counted: Option<EdgeCountChange>,
     /// Whether the write created the collection's zero summary row.
     pub summary_created: bool,
     /// Every endpoint binding the write set, with the binding it held before.
     pub prior_bindings: Vec<(String, Option<u32>)>,
+    /// The properties the edge resolves to after the write, `None` when it
+    /// is not live. The CSR mirrors it: a version below the newest one, or
+    /// one a TRUNCATE hides, leaves the edge as it was.
+    pub current: Option<Vec<u8>>,
 }
 
 impl EdgeVersionWrite {
@@ -50,9 +58,11 @@ impl EdgeVersionWrite {
             system_from,
             prior_forward: None,
             prior_reverse: None,
+            prior_applied: None,
             counted: None,
             summary_created: false,
             prior_bindings: Vec::new(),
+            current: None,
         }
     }
 }
@@ -103,6 +113,16 @@ impl EdgeStore {
             restored.map_err(|e| redb_err("remove reverse edge version", e))?;
             drop(reverse);
 
+            let mut applied = write_txn
+                .open_table(EDGE_APPLIED)
+                .map_err(|e| redb_err("open edge_applied", e))?;
+            let restored = match written.prior_applied {
+                Some(prior) => applied.insert((d, t, fwd.as_str()), prior).map(drop),
+                None => applied.remove((d, t, fwd.as_str())).map(drop),
+            };
+            restored.map_err(|e| redb_err("restore edge applied ordinal", e))?;
+            drop(applied);
+
             let key = EdgeStatsKey {
                 db: d,
                 tid: t,
@@ -151,6 +171,7 @@ mod tests {
 
     use super::*;
     use crate::engine::graph::edge_store::stats::table::CollectionStats;
+    use crate::engine::graph::edge_store::temporal::write::VersionStamp;
 
     const T: TenantId = TenantId::new(1);
     const DB: DatabaseId = DatabaseId::DEFAULT;
@@ -194,7 +215,7 @@ mod tests {
             .put_edge_version_recorded(
                 e("a", "b").with_surrogates(Surrogate::new(7), Surrogate::new(8)),
                 b"v2",
-                200,
+                VersionStamp::at(200),
                 200,
                 i64::MAX,
                 true,
@@ -233,7 +254,7 @@ mod tests {
         let before = stats(&store);
 
         let written = store
-            .soft_delete_edge_recorded(e("a", "b"), 200, true)
+            .soft_delete_edge_recorded(e("a", "b"), VersionStamp::at(200), true)
             .expect("tombstone");
         assert_eq!(written.counted, Some(EdgeCountChange::Removed));
         store
@@ -254,7 +275,14 @@ mod tests {
     fn removing_a_first_insert_uncounts_the_edge() {
         let (store, _dir) = make_store();
         let written = store
-            .put_edge_version_recorded(e("a", "b"), b"v1", 100, 100, i64::MAX, true)
+            .put_edge_version_recorded(
+                e("a", "b"),
+                b"v1",
+                VersionStamp::at(100),
+                100,
+                i64::MAX,
+                true,
+            )
             .expect("write");
         assert_eq!(written.counted, Some(EdgeCountChange::Added));
         store
@@ -275,7 +303,14 @@ mod tests {
             .put_edge_versioned(e("a", "b"), b"v1", 100, 100, i64::MAX)
             .expect("seed");
         let written = store
-            .put_edge_version_recorded(e("a", "b"), b"v2", 100, 100, i64::MAX, true)
+            .put_edge_version_recorded(
+                e("a", "b"),
+                b"v2",
+                VersionStamp::at(100),
+                100,
+                i64::MAX,
+                true,
+            )
             .expect("overwrite");
         store
             .remove_edge_version(e("a", "b"), &written)
@@ -305,7 +340,7 @@ mod tests {
             .put_edge_version_recorded(
                 e("a", "c").with_surrogates(Surrogate::new(9), Surrogate::new(3)),
                 b"v1",
-                200,
+                VersionStamp::at(200),
                 200,
                 i64::MAX,
                 true,
@@ -329,7 +364,14 @@ mod tests {
     fn removing_a_destination_replica_write_drops_the_zero_summary_it_created() {
         let (store, _dir) = make_store();
         let written = store
-            .put_edge_version_recorded(e("a", "b"), b"v1", 100, 100, i64::MAX, false)
+            .put_edge_version_recorded(
+                e("a", "b"),
+                b"v1",
+                VersionStamp::at(100),
+                100,
+                i64::MAX,
+                false,
+            )
             .expect("write");
         assert!(written.summary_created);
         store

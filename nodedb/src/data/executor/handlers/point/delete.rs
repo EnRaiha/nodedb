@@ -5,9 +5,11 @@
 
 use tracing::debug;
 
-use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::redo_image::versioned_point_images;
 use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
+use crate::data::executor::handlers::partial_refusal::refusal_after_partial_apply;
 use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
 use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
@@ -22,7 +24,9 @@ pub(in crate::data::executor) struct PointDeleteExec<'a> {
     pub tid: u64,
     pub collection: &'a str,
     pub document_id: &'a str,
-    pub surrogate: Surrogate,
+    /// `None` when the key is unbound in this database: the delete matches
+    /// no row.
+    pub surrogate: Option<Surrogate>,
     pub returning: Option<&'a ReturningSpec>,
     /// Compiled RLS read policy gating the `RETURNING` rows. Empty = no policy.
     pub rls_filters: &'a [u8],
@@ -53,6 +57,10 @@ impl CoreLoop {
             resolved_sum_targets,
         } = args;
         debug!(core = self.core_id, %collection, %document_id, "point delete");
+        // A key unbound in this database names no row here.
+        let Some(surrogate) = surrogate else {
+            return self.point_delete_matched_nothing(task, returning, rls_filters);
+        };
 
         let database_id = task.request.database_id.as_u64();
         let hook_ctx = HookCtx {
@@ -176,6 +184,18 @@ impl CoreLoop {
         // no-op and emits nothing.
         let document_identity =
             crate::engine::document::store::RowIdentity::from_user_key(document_id);
+        // A versioned removal's tombstone key was decided here, so its stamped
+        // entry replaces the unstamped pre-dispatch record. Then one entry per
+        // target row this delete debited: the statement's own record names
+        // only the removed row.
+        let mut write_set = match (prior.is_some(), outcome.bitemporal_sys_from_ms) {
+            (true, Some(sys_from_ms)) => versioned_point_images(
+                WriteSetEntry::delete(surrogate.as_u32(), document_identity.clone()),
+                sys_from_ms,
+            ),
+            _ => Vec::new(),
+        };
+        write_set.extend(target_write_set);
         if let Some(prior_bytes) = prior.as_deref() {
             let old_converted = self.resolve_event_payload(
                 task.request.database_id.as_u64(),
@@ -216,28 +236,29 @@ impl CoreLoop {
             };
             let doc = match doc {
                 Ok(doc) => doc,
-                Err(e) => return self.response_error(task, e),
+                // The removal committed: the refusal keeps its record and
+                // carries its entries.
+                Err(e) => {
+                    let code = refusal_after_partial_apply(e.into());
+                    return self.refusal_with_landed_rows(task, code, write_set);
+                }
             };
             match returning_rows::build_rows_payload(spec, rls_filters, &[doc]) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("RETURNING encode: {e}"),
-                    },
-                ),
+                // The removal committed: the refusal carries its entries.
+                Err(e) => {
+                    return self.refusal_with_landed_rows(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("RETURNING encode: {e}"),
+                        },
+                        write_set,
+                    );
+                }
             }
-        } else if let Some(spec) = returning {
+        } else if returning.is_some() {
             // Row did not exist — return empty rows payload.
-            match returning_rows::build_rows_payload(spec, rls_filters, &[]) {
-                Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("RETURNING encode: {e}"),
-                    },
-                ),
-            }
+            self.point_delete_matched_nothing(task, returning, rls_filters)
         } else {
             // No RETURNING: report the count the doc-store write actually
             // produced. `prior` is `None` when the row was already gone, which
@@ -246,14 +267,30 @@ impl CoreLoop {
             // so the surrogate is no evidence a row was there to remove.
             self.response_affected(task, u64::from(prior.is_some()))
         };
-        // Redo entries for the target rows this delete debited: the statement's
-        // own redo names only the removed row, so without these a WAL-only
-        // restart replays the removal and leaves every total still carrying the
-        // contribution of a row that is gone.
-        if !target_write_set.is_empty() {
-            response.write_set = target_write_set;
-        }
+        response.write_set = write_set;
         response
+    }
+
+    /// The answer of a point delete that removed no row: an empty `RETURNING`
+    /// row set, or zero rows affected.
+    pub(in crate::data::executor) fn point_delete_matched_nothing(
+        &mut self,
+        task: &ExecutionTask,
+        returning: Option<&ReturningSpec>,
+        rls_filters: &[u8],
+    ) -> Response {
+        let Some(spec) = returning else {
+            return self.response_affected(task, 0);
+        };
+        match returning_rows::build_rows_payload(spec, rls_filters, &[]) {
+            Ok(payload) => self.response_with_payload(task, payload),
+            Err(e) => self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("RETURNING encode: {e}"),
+                },
+            ),
+        }
     }
 
     /// Decide a single row's removal against the compiled write policy.
@@ -457,7 +494,7 @@ mod tests {
                 tid: TID,
                 collection: SOURCE,
                 document_id: "e31",
-                surrogate: Surrogate(31),
+                surrogate: Some(Surrogate(31)),
                 returning: None,
                 rls_filters: &[],
                 rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
@@ -500,8 +537,8 @@ mod tests {
         .status
     }
 
-    /// Removing a link makes `verify_chain` report the row AFTER it as broken, so
-    /// the delete is refused rather than allowed to accuse an untampered row.
+    /// A removed row reads as tampering to `VERIFY_HASH_CHAIN`, so the delete is
+    /// refused.
     #[test]
     fn a_delete_on_a_hash_chained_collection_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -515,7 +552,7 @@ mod tests {
                 tid: TID,
                 collection: SOURCE,
                 document_id: "e1",
-                surrogate: Surrogate(91),
+                surrogate: Some(Surrogate(91)),
                 returning: None,
                 rls_filters: &[],
                 rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,

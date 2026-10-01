@@ -113,6 +113,8 @@ impl SessionStore {
             debug_assert_eq!(session.tx_buffer.len(), session.tx_lease_scopes.len());
             let buffer = std::mem::take(&mut session.tx_buffer);
             let lease_scopes = std::mem::take(&mut session.tx_lease_scopes);
+            session.tx_body_tasks.clear();
+            session.tx_ts_preview_rejected.clear();
             session.tx_state = TransactionState::Idle;
             session.tx_snapshot_lsn = None;
             session.tx_snapshot_epoch = None;
@@ -141,6 +143,9 @@ impl SessionStore {
                 debug_assert_eq!(session.tx_buffer.len(), session.tx_lease_scopes.len());
                 session.tx_buffer.clear();
                 session.tx_lease_scopes.clear();
+                session.tx_body_tasks.clear();
+                session.tx_ts_preview_rejected.clear();
+                session.pending_publishes.clear();
                 session.tx_state = TransactionState::Idle;
                 session.tx_snapshot_lsn = None;
                 session.tx_snapshot_epoch = None;

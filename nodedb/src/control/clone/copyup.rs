@@ -6,19 +6,27 @@
 //! `Shadowed` clone, this module performs the copy-up:
 //!
 //! 1. Allocate a fresh target surrogate.
-//! 2. Write the source row to target with the fresh surrogate.
-//! 3. Record `(target_collection, source_surrogate) → target_surrogate`
-//!    in the `clone_copyups` catalog table.
+//! 2. Write the source row to the target shard's owner, through its
+//!    replicated write path, so every replica holds it.
+//! 3. Record `(target_collection, source_surrogate) → target_surrogate` in
+//!    the `clone_copyups` table of every node, through the metadata log.
 //!
-//! Steps 2-3 are performed inside the existing WAL group-commit boundary.
-
-use std::time::Duration;
+//! The target row goes first. A clone read suppresses every source row that
+//! has a mapping, so a mapping without its target row hides the row
+//! entirely. A failure after the target write instead leaves an exact copy of
+//! the source row with no mapping. A clone read also suppresses a source row
+//! whose primary key the target holds, so the row still reads once, from the
+//! target. A retry of the statement assigns the same target surrogate,
+//! rewrites the same row, and then writes the mapping, so it converges. The
+//! materializer's insert-if-absent skips the existing target row, and
+//! materialization then drops the source side.
 
 use nodedb_types::{DatabaseId, Surrogate, TenantId};
 
-use crate::bridge::envelope::{Priority, Request, Status};
+use crate::control::catalog_entry::CatalogEntry;
+use crate::control::maintenance::clone_materializer::dispatch_to_owner;
+use crate::control::planner::sql_plan_convert::convert::db_qualified;
 use crate::control::state::SharedState;
-use crate::types::{ReadConsistency, RequestId, TraceId};
 use nodedb_physical::physical_plan::{DocumentOp, KvOp, PhysicalPlan};
 
 /// Parameters for a KV copy-up operation.
@@ -34,9 +42,14 @@ pub struct KvCopyUpParams<'a> {
     pub source_value_bytes: Vec<u8>,
 }
 
-/// Perform a KV copy-up: write `source_value_bytes` into target KV storage
-/// under `kv_key`, making the row available for subsequent FieldSet or Delete
-/// operations in the clone.
+/// Perform a KV copy-up: write `source_value_bytes` into the target shard
+/// under `kv_key` on every replica, making the row available for subsequent
+/// FieldSet or Delete operations in the clone.
+///
+/// A KV copy-up records no mapping: a clone read hides a source key the
+/// target holds, and the caller's tombstone follows. A failure before the
+/// tombstone leaves a target row that already shadows the source, and a retry
+/// rewrites it.
 pub async fn perform_kv_clone_copyup(params: KvCopyUpParams<'_>) -> crate::Result<()> {
     let KvCopyUpParams {
         state,
@@ -48,15 +61,18 @@ pub async fn perform_kv_clone_copyup(params: KvCopyUpParams<'_>) -> crate::Resul
     } = params;
 
     let target_key = nodedb_types::CollectionKey::from_bare(target_db_id, target_collection);
-
-    // Allocate a surrogate for the target KV row.
-    let surrogate = state
-        .surrogate_assigner
-        .assign(target_key, tenant_id, &kv_key)
-        .map_err(|e| crate::Error::Storage {
-            engine: "clone_kv_copyup".into(),
-            detail: format!("surrogate alloc failed: {e}"),
-        })?;
+    let surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
+        state,
+        target_key,
+        tenant_id,
+        &kv_key,
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| crate::Error::Storage {
+        engine: "clone_kv_copyup".into(),
+        detail: format!("surrogate alloc failed: {e}"),
+    })?;
 
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
         collection: nodedb_types::QualifiedCollection::new(target_db_id, target_collection),
@@ -68,59 +84,18 @@ pub async fn perform_kv_clone_copyup(params: KvCopyUpParams<'_>) -> crate::Resul
         rls_filters: Vec::new(),
         provenance: None,
     });
-
-    let vshard_id = target_key.vshard();
-    let req_id = RequestId::new(
-        state
-            .request_id_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-    );
-
-    let deadline_secs = state.tuning.network.default_deadline_secs;
-    let deadline_dur = Duration::from_secs(deadline_secs);
-    let req = Request {
-        request_id: req_id,
+    dispatch_to_owner(
+        state,
         tenant_id,
-        vshard_id,
-        database_id: target_db_id,
-        plan: put_plan,
-        deadline: std::time::Instant::now() + deadline_dur,
-        priority: Priority::Normal,
-        trace_id: TraceId::ZERO,
-        consistency: ReadConsistency::Strong,
-        idempotency_key: None,
-        event_source: crate::event::EventSource::User,
-        user_roles: Vec::new(),
-        user_id: None,
-        statement_digest: None,
-        txn_id: None,
-        wal_lsn: None,
-        resolved_now_ms: None,
-        admission: crate::bridge::envelope::Admission::Exempt(
-            crate::bridge::envelope::ExemptReason::AlreadyOrdered,
-        ),
-    };
-
-    let mut rx = state.tracker.register(req_id);
-    match state.dispatcher.lock() {
-        Ok(mut d) => d.dispatch(req)?,
-        Err(p) => p.into_inner().dispatch(req)?,
-    };
-
-    let resp = tokio::time::timeout(deadline_dur, rx.recv())
-        .await
-        .map_err(|_| crate::Error::DeadlineExceeded { request_id: req_id })?
-        .ok_or(crate::Error::Dispatch {
-            detail: "clone_kv_copyup: response channel closed".into(),
-        })?;
-
-    if resp.status != Status::Ok {
-        return Err(crate::Error::Storage {
-            engine: "clone_kv_copyup".into(),
-            detail: format!("Data Plane returned error status {:?}", resp.status),
-        });
-    }
-
+        target_db_id,
+        &db_qualified(target_db_id, target_collection),
+        put_plan,
+    )
+    .await
+    .map_err(|e| crate::Error::Storage {
+        engine: "clone_kv_copyup".into(),
+        detail: format!("target write failed: {e}"),
+    })?;
     Ok(())
 }
 
@@ -139,8 +114,9 @@ pub struct CopyUpParams<'a> {
     pub source_row_bytes: Vec<u8>,
 }
 
-/// Perform a copy-up: write `source_row_bytes` into target storage with a
-/// fresh surrogate and record the mapping in `clone_copyups`.
+/// Perform a copy-up: write `source_row_bytes` into the target shard with a
+/// fresh surrogate on every replica, then record the mapping in
+/// `clone_copyups` on every node.
 ///
 /// Returns the fresh target surrogate so the caller can apply the pending
 /// UPDATE to it.
@@ -157,60 +133,31 @@ pub async fn perform_clone_copyup(params: CopyUpParams<'_>) -> crate::Result<Sur
 
     // Allocate a fresh target surrogate using the (collection, doc_id) key.
     let target_key = nodedb_types::CollectionKey::from_bare(target_db_id, target_collection);
-    let target_coll_qualified = crate::control::planner::sql_plan_convert::convert::db_qualified(
+    let target_surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
+        state,
+        target_key,
+        tenant_id,
+        source_doc_id.as_bytes(),
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| crate::Error::Storage {
+        engine: "clone_copyup".into(),
+        detail: format!("surrogate alloc failed: {e}"),
+    })?;
+
+    let value = match state.credentials.catalog().get_collection(
         target_db_id,
+        tenant_id.as_u64(),
         target_collection,
-    );
-    let target_surrogate = state
-        .surrogate_assigner
-        .assign(target_key, tenant_id, source_doc_id.as_bytes())
-        .map_err(|e| crate::Error::Storage {
-            engine: "clone_copyup".into(),
-            detail: format!("surrogate alloc failed: {e}"),
-        })?;
-
-    // Recorded BEFORE the KV put so the catalog is never less informed than
-    // target storage; a failed put compensates by removing the mapping,
-    // avoiding an orphaned target row that would cause duplicate surrogates.
-    let catalog = state.credentials.catalog();
-
-    // Keyed by the TARGET collection: every reader looks the mapping up
-    // under the clone it belongs to.
-    catalog
-        .put_clone_copyup(
-            &target_coll_qualified,
-            source_surrogate.as_u32(),
-            target_surrogate.as_u32(),
-        )
-        .map_err(|e| crate::Error::Storage {
-            engine: "clone_copyup".into(),
-            detail: format!("put_clone_copyup catalog write failed: {e}"),
-        })?;
-
-    // Rolls the catalog mapping back if a subsequent step fails. A failed
-    // rollback is logged, not fatal: the read path treats a missing target
-    // row as "fall through to source", same as no mapping at all.
-    let rollback_mapping = |reason: &str| {
-        if let Err(e) =
-            catalog.delete_clone_copyup(&target_coll_qualified, source_surrogate.as_u32())
-        {
-            tracing::error!(
-                target_collection = %target_coll_qualified,
-                source_surrogate = source_surrogate.as_u32(),
-                target_surrogate = target_surrogate.as_u32(),
-                rollback_error = %e,
-                trigger = reason,
-                "clone_copyup: catalog rollback after put failure also failed; \
-                 mapping will be reaped at next materialization sweep"
-            );
-        }
+    )? {
+        Some(coll) => super::identity::carry_identity(&coll, source_row_bytes, &source_doc_id),
+        None => source_row_bytes,
     };
-
-    // Write the source row into target storage using PointPut.
     let put_plan = PhysicalPlan::Document(DocumentOp::PointPut {
         collection: nodedb_types::QualifiedCollection::new(target_db_id, target_collection),
         document_id: source_doc_id.clone(),
-        value: source_row_bytes.clone(),
+        value,
         surrogate: target_surrogate,
         pk_bytes: source_doc_id.as_bytes().to_vec(),
         // A copy-up is internal plumbing behind the caller's own statement; it
@@ -219,70 +166,54 @@ pub async fn perform_clone_copyup(params: CopyUpParams<'_>) -> crate::Result<Sur
         rls_filters: Vec::new(),
         resolved_sum_targets: Vec::new(),
     });
-
-    let vshard_id = target_key.vshard();
-    let req_id = RequestId::new(
-        state
-            .request_id_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-    );
-
-    let deadline_secs = state.tuning.network.default_deadline_secs;
-    let deadline_dur = Duration::from_secs(deadline_secs);
-    let req = Request {
-        request_id: req_id,
+    dispatch_to_owner(
+        state,
         tenant_id,
-        vshard_id,
-        database_id: target_db_id,
-        plan: put_plan,
-        deadline: std::time::Instant::now() + deadline_dur,
-        priority: Priority::Normal,
-        trace_id: TraceId::ZERO,
-        consistency: ReadConsistency::Strong,
-        idempotency_key: None,
-        event_source: crate::event::EventSource::User,
-        user_roles: Vec::new(),
-        user_id: None,
-        statement_digest: None,
-        txn_id: None,
-        wal_lsn: None,
-        resolved_now_ms: None,
-        admission: crate::bridge::envelope::Admission::Exempt(
-            crate::bridge::envelope::ExemptReason::AlreadyOrdered,
-        ),
-    };
+        target_db_id,
+        &db_qualified(target_db_id, target_collection),
+        put_plan,
+    )
+    .await
+    .map_err(|e| crate::Error::Storage {
+        engine: "clone_copyup".into(),
+        detail: format!("target write of document '{source_doc_id}' failed: {e}"),
+    })?;
 
-    let mut rx = state.tracker.register(req_id);
-    let dispatch_outcome = match state.dispatcher.lock() {
-        Ok(mut d) => d.dispatch(req),
-        Err(p) => p.into_inner().dispatch(req),
+    // Keyed by the TARGET collection: every reader looks the mapping up
+    // under the clone it belongs to.
+    let row = CopyupRow {
+        database_id: target_db_id.as_u64(),
+        tenant_id: tenant_id.as_u64(),
+        collection: target_collection.to_string(),
+        source_surrogate: source_surrogate.as_u32(),
     };
-    if let Err(e) = dispatch_outcome {
-        rollback_mapping("dispatch failed");
-        return Err(e);
-    }
-
-    let resp = match tokio::time::timeout(deadline_dur, rx.recv()).await {
-        Err(_) => {
-            rollback_mapping("deadline exceeded");
-            return Err(crate::Error::DeadlineExceeded { request_id: req_id });
-        }
-        Ok(None) => {
-            rollback_mapping("response channel closed");
-            return Err(crate::Error::Dispatch {
-                detail: "clone_copyup: response channel closed".into(),
-            });
-        }
-        Ok(Some(r)) => r,
-    };
-
-    if resp.status != Status::Ok {
-        rollback_mapping("data plane returned non-Ok status");
-        return Err(crate::Error::Storage {
+    super::cow_entry::replicate_async(state, &row.put(target_surrogate))
+        .await
+        .map_err(|e| crate::Error::Storage {
             engine: "clone_copyup".into(),
-            detail: format!("Data Plane returned error status {:?}", resp.status),
-        });
-    }
-
+            detail: format!(
+                "mapping of document '{source_doc_id}' failed after its target write: {e}"
+            ),
+        })?;
     Ok(target_surrogate)
+}
+
+/// One copy-up mapping row, before it becomes a catalog entry.
+struct CopyupRow {
+    database_id: u64,
+    tenant_id: u64,
+    collection: String,
+    source_surrogate: u32,
+}
+
+impl CopyupRow {
+    fn put(self, target_surrogate: Surrogate) -> CatalogEntry {
+        CatalogEntry::PutCloneCopyup {
+            database_id: self.database_id,
+            tenant_id: self.tenant_id,
+            collection: self.collection,
+            source_surrogate: self.source_surrogate,
+            target_surrogate: target_surrogate.as_u32(),
+        }
+    }
 }

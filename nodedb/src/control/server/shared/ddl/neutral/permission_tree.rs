@@ -10,28 +10,24 @@
 //! }';
 //!
 //! ALTER COLLECTION documents DROP PERMISSION_TREE;
-//!
-//! SELECT RESOLVE_PERMISSION('user-42', 'doc-123', 'documents');
 //! ```
 //!
-//! Ported from the pgwire `ddl::permission_tree` handlers. The JSON parse /
-//! validate, catalog get/put, in-memory permission-cache update, and audit
-//! side effects are preserved verbatim; only the result construction changed
-//! from pgwire `Response` / `Tag` to the protocol-neutral [`DdlResult`].
+//! Both statements act on the named collection of the session's database.
+//! The permission table resolves in that same database.
 
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 use nodedb_types::DatabaseId;
 
 use crate::control::catalog_entry::persist_collection_replicated;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::permission_tree::TreeKey;
 use crate::control::security::permission_tree::types::PermissionTreeDef;
 use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
 use super::super::result::{DdlError, DdlResult};
 
-/// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
-/// the pgwire handlers produced.
+/// Construct a [`DdlError`] from a SQLSTATE code and a message.
 fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
 }
@@ -48,6 +44,7 @@ fn status(command: impl Into<String>) -> Vec<DdlResult> {
 pub async fn set_permission_tree(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     // Extract collection name: between "ALTER COLLECTION " and " SET PERMISSION_TREE".
@@ -78,7 +75,7 @@ pub async fn set_permission_tree(
     // Verify collection exists.
     let catalog = state.credentials.catalog();
     let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
+        .get_collection(database_id, tenant_id.as_u64(), &collection)
         .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", format!("collection '{collection}' does not exist")))?;
 
@@ -93,17 +90,22 @@ pub async fn set_permission_tree(
     let def_json = sonic_rs::to_string(&def)
         .map_err(|e| DdlError::internal(format!("serialize PERMISSION_TREE: {e}")))?;
     coll.permission_tree_def = Some(def_json);
-    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, &coll)
+        .await
         .map_err(|e| DdlError::from_error(&e))?;
 
-    let sources = [collection.clone(), def.permission_table.clone()];
+    let key = TreeKey::new(database_id, tenant_id.as_u64(), collection.clone());
+    let sources = [
+        key.clone(),
+        key.scope.collection(def.permission_table.clone()),
+    ];
 
     // Update in-memory cache.
     state
         .permission_cache
         .write()
         .await
-        .register_tree_def(tenant_id.as_u64(), &collection, def);
+        .register_tree_def(key, def);
 
     // Rows already in the sources are grants and edges too. Hold the
     // acknowledgement until every lease holder covers each source group
@@ -128,16 +130,15 @@ pub async fn set_permission_tree(
 }
 
 /// Barrier on every Raft group homing one of `sources`, at a read index
-/// taken now. A single node has no groups; its planning reloads the cache.
-async fn source_group_barrier(state: &SharedState, sources: &[String]) -> crate::Result<()> {
-    let Some(timing) = state.authorization_fence.timing() else {
-        return Ok(());
-    };
+/// taken now.
+async fn source_group_barrier(state: &SharedState, sources: &[TreeKey]) -> crate::Result<()> {
+    let timing = crate::control::security::auth_lease::barrier::lease_timing(state)?;
     let mut targets: Vec<nodedb_cluster::GroupCoverage> = Vec::new();
     for source in sources {
-        let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, source).vshard();
-        let group_id =
-            crate::control::security::auth_fence::cluster::group_of_vshard(state, vshard.as_u32())?;
+        let group_id = crate::control::security::auth_fence::cluster::group_of_vshard(
+            state,
+            source.vshard().as_u32(),
+        )?;
         if targets.iter().any(|target| target.group_id == group_id) {
             continue;
         }
@@ -156,6 +157,7 @@ async fn source_group_barrier(state: &SharedState, sources: &[String]) -> crate:
 pub async fn drop_permission_tree(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let start = "ALTER COLLECTION ".len();
@@ -167,12 +169,13 @@ pub async fn drop_permission_tree(
 
     let catalog = state.credentials.catalog();
     let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
+        .get_collection(database_id, tenant_id.as_u64(), &collection)
         .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", format!("collection '{collection}' does not exist")))?;
 
     coll.permission_tree_def = None;
-    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, &coll)
+        .await
         .map_err(|e| DdlError::from_error(&e))?;
 
     // Update in-memory cache.
@@ -180,7 +183,11 @@ pub async fn drop_permission_tree(
         .permission_cache
         .write()
         .await
-        .unregister_tree_def(tenant_id.as_u64(), &collection);
+        .unregister_tree_def(&TreeKey::new(
+            database_id,
+            tenant_id.as_u64(),
+            collection.clone(),
+        ));
 
     state
         .audit

@@ -8,8 +8,10 @@
 
 use std::sync::Arc;
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
+
+use crate::engine::durability_gate::GatedDatabase;
 
 /// Redb table for column statistics.
 /// Key: "{database_id}:{tenant}:{collection}:{field}" → Value: serialized ColumnStats.
@@ -161,12 +163,13 @@ impl Default for ColumnStats {
 
 /// Column statistics store backed by redb.
 pub struct StatsStore {
-    db: Arc<Database>,
+    /// The sparse engine's gated database, shared.
+    db: Arc<GatedDatabase>,
 }
 
 impl StatsStore {
     /// Open or create the stats store sharing a redb database.
-    pub fn open(db: Arc<Database>) -> crate::Result<Self> {
+    pub fn open(db: Arc<GatedDatabase>) -> crate::Result<Self> {
         // Ensure the table exists.
         let write_txn = db.begin_write().map_err(|e| crate::Error::Storage {
             engine: "stats".into(),
@@ -400,6 +403,8 @@ impl StatsStore {
 
 #[cfg(test)]
 mod tests {
+    use redb::Database;
+
     use super::*;
 
     #[test]
@@ -457,7 +462,9 @@ mod tests {
     #[test]
     fn stats_store_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(Database::create(dir.path().join("stats.redb")).unwrap());
+        let db = Arc::new(GatedDatabase::new(
+            Database::create(dir.path().join("stats.redb")).unwrap(),
+        ));
         let store = StatsStore::open(db).unwrap();
 
         let mut stats = ColumnStats::new();

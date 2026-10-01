@@ -44,17 +44,41 @@ impl CoreLoop {
         tenant_id: u64,
         coll_key: &str,
         vectors: Vec<(u32, Vec<f32>, Option<nodedb_types::Surrogate>)>,
+        multi_documents: &std::collections::HashSet<nodedb_types::Surrogate>,
         replace_mode: bool,
     ) -> crate::Result<()> {
-        if vectors.is_empty() {
+        let Some(dim) = vectors.first().map(|(_, data, _)| data.len()) else {
             return Ok(());
-        }
-        let dim = vectors[0].1.len();
+        };
         let map_key = (
             nodedb_types::DatabaseId::new(database_id),
             crate::types::TenantId::new(tenant_id),
             coll_key.to_string(),
         );
+        // A multi-vector document installs as one multi-vector insert, so its
+        // membership survives even with one vector. Every other row installs
+        // as a single-vector row.
+        let mut documents: std::collections::HashMap<nodedb_types::Surrogate, Vec<Vec<f32>>> =
+            std::collections::HashMap::new();
+        let mut data = Vec::new();
+        let mut surrogates = Vec::new();
+        for (vector_id, vector, surrogate) in vectors {
+            // Every stored vector is bound: a vector insert refuses an unbound
+            // row. A snapshot vector without a surrogate fails the restore
+            // before the local collection changes.
+            let surrogate = surrogate.ok_or(crate::Error::Internal {
+                detail: format!(
+                    "restore: vector {vector_id} of '{coll_key}' carries no surrogate; every \
+                     stored vector is bound"
+                ),
+            })?;
+            if multi_documents.contains(&surrogate) {
+                documents.entry(surrogate).or_default().push(vector);
+            } else {
+                data.push(vector);
+                surrogates.push(surrogate);
+            }
+        }
         // Raft InstallSnapshot apply (`replace_mode`) must REPLACE the local
         // collection so the snapshot's vectors are not appended on top of stale
         // entries. User RESTORE (`!replace_mode`) keeps the prior insert-into-
@@ -63,11 +87,14 @@ impl CoreLoop {
             self.vector_collections.remove(&map_key);
         }
         let coll = self.ensure_vector_collection(&map_key, &map_key, dim)?;
-        let (data, surrogates): (Vec<Vec<f32>>, Vec<nodedb_types::Surrogate>) = vectors
-            .into_iter()
-            .map(|(_, data, surrogate)| (data, surrogate.unwrap_or(nodedb_types::Surrogate::ZERO)))
-            .unzip();
         coll.insert_batch_with_surrogates(&data, &surrogates)?;
+        for (document, group) in documents {
+            // Replaces the document's earlier vectors on a restore into an
+            // existing collection.
+            coll.delete_multi_vector(document);
+            let slices: Vec<&[f32]> = group.iter().map(Vec::as_slice).collect();
+            coll.insert_multi_vector(&slices, document)?;
+        }
         self.train_ivf_if_ready(&map_key);
         Ok(())
     }
@@ -79,10 +106,14 @@ impl CoreLoop {
     /// database and tenant its key names, so a merged multi-tenant snapshot
     /// keeps every table with its owner. A key whose database disagrees with
     /// its qualified collection name fails the restore.
+    ///
+    /// Each row installs under the surrogate the snapshot carries. A Raft
+    /// snapshot install restores the same cluster, so that surrogate is the
+    /// row's bound identity. A row carrying `0` fails the restore.
     pub(super) fn restore_kv_table(
         &mut self,
         snapshot_key: &str,
-        entries: Vec<(Vec<u8>, Vec<u8>, u64)>,
+        entries: Vec<crate::engine::kv::hash_table::KvSnapshotRow>,
     ) -> crate::Result<()> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -100,7 +131,7 @@ impl CoreLoop {
                 ),
             });
         }
-        for (key, value, expire_at) in entries {
+        for (key, value, expire_at, surrogate) in entries {
             let ttl_ms = if expire_at > now_ms {
                 expire_at - now_ms
             } else if expire_at == 0 {
@@ -116,8 +147,8 @@ impl CoreLoop {
                 value: &value,
                 ttl_ms,
                 now_ms,
-                surrogate: nodedb_types::Surrogate::ZERO,
-            });
+                surrogate: nodedb_types::Surrogate::new(surrogate),
+            })?;
         }
         Ok(())
     }
@@ -190,7 +221,11 @@ impl CoreLoop {
         let tid = crate::types::TenantId::new(tenant_id);
         let db_id = nodedb_types::DatabaseId::new(database_id);
         let map_key = (db_id, tid, collection.clone());
-        self.columnar_memtables.insert(map_key, mt);
+        self.columnar_memtables.insert(map_key.clone(), mt);
+        // The leader's schema at the snapshot's position, as its next log
+        // entry meets it. The flush below skips an empty memtable, so the
+        // schema is written here and survives a restart either way.
+        self.persist_ts_schema(&map_key)?;
 
         // Persist the restored memtable to an on-disk segment immediately so
         // timeseries data is durable across restart. Uses a wall-clock timestamp

@@ -81,7 +81,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
         } => document::point_delete(
             collection.as_str(),
             document_id,
-            surrogate.as_u32(),
+            surrogate.map(|s| s.as_u32()),
             resolved_sum_targets,
             encode_returning(returning),
             rls_filters,
@@ -106,7 +106,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             collection.as_str(),
             document_id,
             updates,
-            surrogate.as_u32(),
+            surrogate.map(|s| s.as_u32()),
             resolved_sum_targets,
             WireReturning {
                 returning: encode_returning(returning),

@@ -84,7 +84,8 @@ pub async fn create_consumer_group(
         tenant_id,
         &stream_name,
         &group_name,
-    )?;
+    )
+    .await?;
 
     if state
         .group_registry
@@ -109,9 +110,10 @@ pub async fn create_consumer_group(
         stream_name: stream_name.clone(),
         owner: identity.username.clone(),
         created_at: now,
+        modification_hlc: nodedb_types::Hlc::ZERO,
     };
 
-    super::replicate::propose_create(state, &def)?;
+    super::replicate::propose_create(state, &def).await?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

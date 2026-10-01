@@ -79,9 +79,7 @@ impl GatewayErrorMap {
             | Error::NotInTransactionBlock { .. }
             | Error::CrdtAdmissionTimeout { .. }
             | Error::NoLeader { .. }
-            | Error::FanOutExceeded { .. }
             | Error::CrossCollectionNotColocated { .. }
-            | Error::SourceFrozen { .. }
             | Error::CloneWriteRequiresMaterialize { .. }
             | Error::BackupTenantMismatch { .. }
             | Error::BackupKeyMismatch
@@ -97,10 +95,14 @@ impl GatewayErrorMap {
             | Error::DataException { .. }
             | Error::InvalidLimitValue { .. }
             | Error::RetryableLeaderChange { .. }
+            | Error::CommittedResultUnavailable { .. }
+            | Error::ProposalOutcomeUnknown { .. }
             | Error::GroupQuorumUnavailable { .. }
             | Error::GroupMarksUnavailable { .. }
+            | Error::BackupCaptureMoved { .. }
             | Error::MetadataLeaderUnavailable
             | Error::AuthorizationStateBehind { .. }
+            | Error::LinearizableReadRefused { .. }
             | Error::ExecutionLimitExceeded { .. }
             | Error::LimitExceeded { .. }
             | Error::Wal(_)
@@ -118,11 +120,14 @@ impl GatewayErrorMap {
             | Error::Encryption { .. }
             | Error::Bridge { .. }
             | Error::VersionCompat { .. }
+            | Error::RestoreTargetNotEmpty { .. }
+            | Error::RestoreVerificationFailed { .. }
             | Error::Internal { .. }
             | Error::Shaping(_)
             | Error::Ddl(_)
             | Error::DescriptorVersionAnomaly { .. }
             | Error::CollectionPurgeRowMissing { .. }
+            | Error::CollectionUnstamped { .. }
             | Error::CatalogIntegrityViolation { .. }
             | Error::Promql(_)
             | Error::DependentObjectsExist { .. }

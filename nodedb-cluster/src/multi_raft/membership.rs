@@ -15,7 +15,9 @@
 //!   RaftNode state, used by the join flow to decide redirect vs admit.
 //! - `group_role_is_leader(group)`: cheap leader-check helper.
 
-use nodedb_raft::NodeRole;
+use nodedb_raft::{NodeRole, RaftNode};
+
+use crate::group_disk::StagedLogStorage;
 
 use crate::error::{ClusterError, Result};
 
@@ -62,12 +64,48 @@ impl MultiRaft {
             .unwrap_or(0)
     }
 
+    /// The leader of `group_id` this node knows, and this node's term for
+    /// the group: `(leader, term)`. `(0, 0)` when the group is not hosted
+    /// here. The leader is `0` while none is known.
+    pub fn group_leader_at_term(&self, group_id: u64) -> (u64, u64) {
+        self.groups
+            .get(&group_id)
+            .map_or((0, 0), |n| (n.leader_id(), n.current_term()))
+    }
+
     /// Whether this node is currently the leader of `group_id`.
     pub fn group_role_is_leader(&self, group_id: u64) -> bool {
         self.groups
             .get(&group_id)
             .map(|n| n.role() == NodeRole::Leader)
             .unwrap_or(false)
+    }
+
+    /// `AppendEntries` responses this leader counted from `peer` in
+    /// `group_id` in the current term. `None` when this node does not lead
+    /// the group.
+    pub fn peer_ack_count(&self, group_id: u64, peer: u64) -> Option<u64> {
+        self.groups.get(&group_id)?.peer_ack_count(peer)
+    }
+
+    /// Whether this node leads `group_id` by an election against other
+    /// voters that no leadership transfer started.
+    pub fn leads_by_contested_election(&self, group_id: u64) -> bool {
+        self.groups
+            .get(&group_id)
+            .is_some_and(|node| node.leads_by_contested_election())
+    }
+
+    /// Whether `peer` holds every entry this leader has committed in
+    /// `group_id`, and did not ask for a snapshot last. `false` when this
+    /// node does not lead the group.
+    pub fn peer_caught_up(&self, group_id: u64, peer: u64) -> bool {
+        let Some(node) = self.groups.get(&group_id) else {
+            return false;
+        };
+        node.role() == NodeRole::Leader
+            && node.match_index_for(peer).unwrap_or(0) >= node.commit_index()
+            && !node.peer_awaits_snapshot(peer)
     }
 
     /// Initiate a leadership transfer for `group_id` to `target`.
@@ -82,6 +120,35 @@ impl MultiRaft {
             .get_mut(&group_id)
             .ok_or(ClusterError::GroupNotFound { group_id })?;
         node.transfer_leadership(target).map_err(ClusterError::Raft)
+    }
+
+    /// Hand this node's leadership of `group_id` to another voter that holds
+    /// every committed entry and did not ask for a snapshot last. Returns the
+    /// target. `None` when this node does not lead the group, no voter
+    /// qualifies, or the transfer did not start.
+    pub fn hand_off_leadership(&mut self, group_id: u64) -> Option<u64> {
+        let membership = self.group_membership(group_id)?;
+        if membership.leader_id != self.node_id {
+            return None;
+        }
+        let target = membership
+            .voters
+            .iter()
+            .copied()
+            .find(|&voter| voter != self.node_id && self.peer_caught_up(group_id, voter))?;
+        self.transfer_leadership(group_id, target).ok()?;
+        Some(target)
+    }
+
+    /// Stop hosting `group_id`: take its replica out, and return it.
+    ///
+    /// Dropping the returned replica closes its log, which can write to
+    /// disk, so the caller drops it off the async threads. The log file stays
+    /// on disk with the applied index the Data Plane state matches, so a
+    /// later mount of the group resumes from it. The group's apply gate stays
+    /// too. `None` when the group is not hosted here.
+    pub fn unmount_group(&mut self, group_id: u64) -> Option<RaftNode<StagedLogStorage>> {
+        self.groups.remove(&group_id)
     }
 }
 

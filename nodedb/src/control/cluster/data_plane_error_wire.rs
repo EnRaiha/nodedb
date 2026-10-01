@@ -21,17 +21,26 @@ use crate::bridge::envelope::{CounterFault, ErrorCode, SyncHold};
 /// the coordinator rebuilds `Error::DataPlane(code)` and renders the SQLSTATE
 /// single-node execution renders. Every other error keeps its own numeric
 /// classification from `NodeDbError::from(err).code()` — never a hardcoded
-/// plan-decode code, which would misname what failed.
+/// plan-decode code, which will misname what failed.
 pub(crate) fn execution_error_to_typed(err: crate::Error) -> TypedClusterError {
     match err {
         crate::Error::DataPlane(code) => TypedClusterError::DataPlane { code: code.into() },
         // A statement that ran out of time keeps the wire's own deadline
         // variant, which the coordinator rebuilds as `Error::DeadlineExceeded`.
-        // Folding it into `Internal` would report a client's own timeout as an
+        // Folding it into `Internal` will report a client's own timeout as an
         // internal failure once it crossed a node boundary.
         crate::Error::DeadlineExceeded { .. } => {
             TypedClusterError::DeadlineExceeded { elapsed_ms: 0 }
         }
+        // A redirect crosses as the wire's own redirect, with the leader and
+        // the term this node knows it at, so the coordinator moves its
+        // routing hint and retries against that leader.
+        not_leader @ crate::Error::NotLeader { .. } => TypedClusterError::from(not_leader),
+        // A Calvin abort keeps its verdict and a schema change stays
+        // retryable, so a routed submit answers as a local one does.
+        typed @ (crate::Error::CalvinSerializationConflict
+        | crate::Error::CalvinParticipantError
+        | crate::Error::RetryableSchemaChanged { .. }) => TypedClusterError::from(typed),
         // A Control-Plane constraint refusal crosses verbatim, same as a
         // Data-Plane verdict, so the coordinator answers 23502 vs 23505
         // instead of flattening both into one numeric class.
@@ -57,8 +66,6 @@ pub(crate) fn execution_error_to_typed(err: crate::Error) -> TypedClusterError {
         | crate::Error::RejectedAuthz { .. }
         | crate::Error::OffsetRegression { .. }
         | crate::Error::ConflictRetry { .. }
-        | crate::Error::CalvinSerializationConflict
-        | crate::Error::CalvinParticipantError
         | crate::Error::RejectedPrevalidation { .. }
         | crate::Error::RetryableRefusal { .. }
         | crate::Error::AppendOnlyViolation { .. }
@@ -87,10 +94,7 @@ pub(crate) fn execution_error_to_typed(err: crate::Error) -> TypedClusterError {
         | crate::Error::NotInTransactionBlock { .. }
         | crate::Error::CrdtAdmissionTimeout { .. }
         | crate::Error::NoLeader { .. }
-        | crate::Error::NotLeader { .. }
-        | crate::Error::FanOutExceeded { .. }
         | crate::Error::CrossCollectionNotColocated { .. }
-        | crate::Error::SourceFrozen { .. }
         | crate::Error::CloneWriteRequiresMaterialize { .. }
         | crate::Error::BadRequest { .. }
         | crate::Error::BackupTenantMismatch { .. }
@@ -107,12 +111,15 @@ pub(crate) fn execution_error_to_typed(err: crate::Error) -> TypedClusterError {
         | crate::Error::DivisionByZero
         | crate::Error::DataException { .. }
         | crate::Error::InvalidLimitValue { .. }
-        | crate::Error::RetryableSchemaChanged { .. }
         | crate::Error::RetryableLeaderChange { .. }
+        | crate::Error::CommittedResultUnavailable { .. }
+        | crate::Error::ProposalOutcomeUnknown { .. }
         | crate::Error::GroupQuorumUnavailable { .. }
         | crate::Error::GroupMarksUnavailable { .. }
+        | crate::Error::BackupCaptureMoved { .. }
         | crate::Error::MetadataLeaderUnavailable
         | crate::Error::AuthorizationStateBehind { .. }
+        | crate::Error::LinearizableReadRefused { .. }
         | crate::Error::ExecutionLimitExceeded { .. }
         | crate::Error::LimitExceeded { .. }
         | crate::Error::Wal(_)
@@ -130,12 +137,15 @@ pub(crate) fn execution_error_to_typed(err: crate::Error) -> TypedClusterError {
         | crate::Error::Encryption { .. }
         | crate::Error::Bridge { .. }
         | crate::Error::VersionCompat { .. }
+        | crate::Error::RestoreTargetNotEmpty { .. }
+        | crate::Error::RestoreVerificationFailed { .. }
         | crate::Error::Internal { .. }
         | crate::Error::Shaping(_)
         | crate::Error::RemoteTyped { .. }
         | crate::Error::Ddl(_)
         | crate::Error::DescriptorVersionAnomaly { .. }
         | crate::Error::CollectionPurgeRowMissing { .. }
+        | crate::Error::CollectionUnstamped { .. }
         | crate::Error::CatalogIntegrityViolation { .. }
         | crate::Error::Promql(_)
         | crate::Error::DependentObjectsExist { .. }
@@ -213,7 +223,6 @@ impl From<ErrorCode> for DataPlaneErrorCode {
             ErrorCode::CrdtFrontierMismatch { expected, actual } => {
                 Self::CrdtFrontierMismatch { expected, actual }
             }
-            ErrorCode::FanOutExceeded => Self::FanOutExceeded,
             ErrorCode::ResourcesExhausted => Self::ResourcesExhausted,
             ErrorCode::RejectedDanglingEdge { missing_node } => {
                 Self::RejectedDanglingEdge { missing_node }
@@ -340,7 +349,6 @@ impl From<DataPlaneErrorCode> for ErrorCode {
             DataPlaneErrorCode::CrdtFrontierMismatch { expected, actual } => {
                 Self::CrdtFrontierMismatch { expected, actual }
             }
-            DataPlaneErrorCode::FanOutExceeded => Self::FanOutExceeded,
             DataPlaneErrorCode::ResourcesExhausted => Self::ResourcesExhausted,
             DataPlaneErrorCode::RejectedDanglingEdge { missing_node } => {
                 Self::RejectedDanglingEdge { missing_node }

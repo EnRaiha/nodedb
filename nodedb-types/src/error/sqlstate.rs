@@ -220,7 +220,7 @@ pub const CONFIGURATION_LIMIT_EXCEEDED: &str = "53400";
 /// `54000` — `program_limit_exceeded` (generic over-cap)
 pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
 
-/// `54001` — `statement_too_complex` (fan-out / rate limit exceeded)
+/// `54001` — `statement_too_complex`
 pub const STATEMENT_TOO_COMPLEX: &str = "54001";
 
 // ── Class 55 — Object Not In Prerequisite State ──────────────────────────────

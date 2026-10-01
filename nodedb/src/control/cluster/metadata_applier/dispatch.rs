@@ -5,9 +5,16 @@
 
 use tracing::{debug, error, warn};
 
-use nodedb_cluster::{MetadataApplier, MetadataEntry, RoutingChange, TopologyChange, decode_entry};
+use nodedb_cluster::{
+    CommittedMetadata, MetadataApplier, MetadataEntry, MetadataPayload, RoutingChange,
+    TopologyChange,
+};
 
 use super::types::{CatalogChangeEvent, MetadataCommitApplier};
+
+/// The future of one entry's host-side effects.
+pub(super) type HostEffects<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::Error>> + Send + 'a>>;
 
 impl MetadataCommitApplier {
     /// Apply a single decoded `MetadataEntry`'s host-side effects.
@@ -28,69 +35,76 @@ impl MetadataCommitApplier {
     /// failure clears on retry; a persistent one leaves the watermark loudly
     /// stuck (proposer waiters time out) rather than silently diverging from the
     /// quorum with a false-success ACK.
-    pub(super) fn apply_host_side_effects(
+    ///
+    /// The future is boxed: a prepared DDL and a batch apply their inner
+    /// entries through this function again.
+    pub(super) fn apply_host_side_effects<'a>(
+        &'a self,
+        entry: &'a MetadataEntry,
+        raft_index: u64,
+    ) -> HostEffects<'a> {
+        Box::pin(async move {
+            let result = self.apply_host_side_effects_inner(entry, raft_index).await;
+            // A drain this entry ended wakes the statements waiting it out,
+            // now that every effect of the entry is visible to their re-plan.
+            if let Ok(shared) = self.shared_state() {
+                shared.lease_drain.settle();
+            }
+            result
+        })
+    }
+
+    async fn apply_host_side_effects_inner(
         &self,
         entry: &MetadataEntry,
         raft_index: u64,
     ) -> Result<(), crate::Error> {
-        // A prepared DDL is conditionally applied under the replicated owner
-        // token. A superseded proposal is a deterministic no-op: rejecting a
-        // committed stale token would wedge the Raft apply watermark forever.
-        if let MetadataEntry::DdlPrepared { token, entry } = entry {
-            let Some(shared) = self.shared.get().and_then(std::sync::Weak::upgrade) else {
-                return Ok(());
-            };
-            let owns_lease = shared
-                .metadata_ddl_owner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_some_and(|(current, _)| current == *token);
-            if !owns_lease {
-                debug!(token, raft_index, "skipping superseded prepared DDL");
-                return Ok(());
-            }
-            self.apply_host_side_effects(entry.as_ref(), raft_index)?;
-            shared
-                .metadata_ddl_applied_token
-                .store(*token, std::sync::atomic::Ordering::Release);
-            return Ok(());
-        }
-
-        // Atomic batches unpack one level: the sub-entries are
-        // applied individually so each gets its own audit record
-        // stamped with the same raft_index (they committed at the
-        // same log position).
-        if let MetadataEntry::Batch { entries } = entry {
-            for sub in entries {
-                self.apply_host_side_effects(sub, raft_index)?;
-            }
-            return Ok(());
-        }
-
         // Handle non-CatalogDdl variants that still have host-side
         // effects. Drain start/end land on `shared.lease_drain` on
         // every node so the next `force_refresh_lease` check sees
         // the replicated drain state.
         match entry {
+            MetadataEntry::DdlPrepared { token, entry } => {
+                return self.apply_prepared_ddl(*token, entry, raft_index).await;
+            }
+            MetadataEntry::Batch { entries } => {
+                return self.apply_batch(entries, raft_index).await;
+            }
             MetadataEntry::DescriptorDrainStart {
                 descriptor_id,
                 up_to_version,
                 expires_at,
-            } => return self.apply_drain_start(descriptor_id, *up_to_version, *expires_at),
-            MetadataEntry::DescriptorDrainEnd { descriptor_id } => {
-                return self.apply_drain_end(descriptor_id);
+                proposer_node_id,
+                owner,
+            } => {
+                return self.apply_drain_start(
+                    descriptor_id,
+                    owner,
+                    *up_to_version,
+                    *expires_at,
+                    *proposer_node_id,
+                );
             }
-            MetadataEntry::DdlPrepareAcquire { token } => {
-                if let Some(shared) = self.shared.get().and_then(std::sync::Weak::upgrade) {
-                    let mut owner = shared
-                        .metadata_ddl_owner
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if owner.is_none() || owner.is_some_and(|(current, _)| current == *token) {
-                        *owner = Some((*token, std::time::Instant::now()));
-                    }
-                }
-                return Ok(());
+            MetadataEntry::DescriptorDrainEnd {
+                descriptor_id,
+                owner,
+            } => {
+                return self.apply_drain_end(descriptor_id, owner);
+            }
+            MetadataEntry::DescriptorLeaseRelease {
+                node_id,
+                descriptor_ids,
+            } => {
+                return self.apply_lease_release(*node_id, descriptor_ids);
+            }
+            MetadataEntry::DdlPrepareAcquire { token, node_id } => {
+                return self.apply_ddl_prepare_acquire(*token, *node_id);
+            }
+            MetadataEntry::DescriptorLeaseGrant(lease) => {
+                return self.apply_lease_grant(lease);
+            }
+            MetadataEntry::ClusterVersionBump { to, .. } => {
+                return self.apply_cluster_version(*to);
             }
             MetadataEntry::DdlPendingPropose {
                 token,
@@ -100,22 +114,13 @@ impl MetadataCommitApplier {
                 return self.apply_ddl_pending_propose(*token, objects, *proposed_at);
             }
             MetadataEntry::DdlPendingFinalize { token } => {
-                return self.apply_ddl_pending_finalize(*token, raft_index);
+                return self.apply_ddl_pending_finalize(*token, raft_index).await;
             }
             MetadataEntry::DdlPendingCancel { token } => {
                 return self.apply_ddl_pending_cancel(*token);
             }
             MetadataEntry::DdlPrepareRelease { token } => {
-                if let Some(shared) = self.shared.get().and_then(std::sync::Weak::upgrade) {
-                    let mut owner = shared
-                        .metadata_ddl_owner
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if owner.is_some_and(|(current, _)| current == *token) {
-                        *owner = None;
-                    }
-                }
-                return Ok(());
+                return self.apply_ddl_prepare_release(*token);
             }
             MetadataEntry::CaTrustChange {
                 add_ca_cert,
@@ -129,6 +134,15 @@ impl MetadataCommitApplier {
             }
             MetadataEntry::SurrogateAlloc { hwm } => {
                 return self.apply_surrogate_alloc(*hwm, raft_index);
+            }
+            MetadataEntry::DatabaseIdReserve {
+                node_id,
+                request_id,
+            } => {
+                return self.apply_database_id_reserve(*node_id, *request_id, raft_index);
+            }
+            MetadataEntry::RestorePoint { hlc, created_at_ms } => {
+                return self.apply_restore_point(*hlc, *created_at_ms, raft_index);
             }
             MetadataEntry::SurrogateReserve {
                 node_id,
@@ -190,75 +204,19 @@ impl MetadataCommitApplier {
                 transition,
                 ts_ms,
             } => {
-                nodedb_cluster::apply_token_transition_to_mirror(
-                    &self.token_state,
-                    *token_hash,
-                    transition,
-                    *ts_ms,
-                );
-                let state = self
-                    .token_state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .get(token_hash)
-                    .cloned();
-                if let Some(state) = state {
-                    self.credentials.catalog().put_join_token_state(&state)?;
-                }
-                return Ok(());
+                return self.apply_join_token_transition(token_hash, transition, *ts_ms);
             }
             MetadataEntry::EnrollmentPreauthorization {
                 spki,
                 expires_at_ms,
             } => {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|duration| duration.as_millis() as u64)
-                    .unwrap_or(u64::MAX);
-                if *expires_at_ms <= now_ms {
-                    return Ok(());
-                }
-                self.credentials
-                    .catalog()
-                    .put_enrollment_preauthorization(spki, *expires_at_ms)?;
-                let ttl = std::time::Duration::from_millis(expires_at_ms - now_ms);
-                let transport = self.transport.get().ok_or_else(|| crate::Error::Internal {
-                    detail: "metadata enrollment apply has no cluster transport".into(),
-                })?;
-                if !transport.preauthorize_peer_identity(*spki, ttl) {
-                    // Admission remains fail-closed, but replicated metadata
-                    // application must never wedge on a bounded runtime cache.
-                    // The issuer reserves capacity before proposing, so this is
-                    // only a defensive path for stale/corrupt excess entries.
-                    tracing::error!(
-                        ?spki,
-                        "metadata enrollment preauthorization capacity exhausted; entry persisted but not admitted"
-                    );
-                }
-                return Ok(());
+                return self.apply_enrollment_preauthorization(spki, *expires_at_ms);
             }
             MetadataEntry::EnrollmentPreauthorizationRevoke {
                 spki,
                 expires_at_ms,
             } => {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|duration| duration.as_millis() as u64)
-                    .unwrap_or(u64::MAX);
-                if *expires_at_ms <= now_ms {
-                    return Ok(());
-                }
-                self.credentials
-                    .catalog()
-                    .remove_enrollment_preauthorization(spki)?;
-                let transport = self.transport.get().ok_or_else(|| crate::Error::Internal {
-                    detail: "metadata enrollment revoke has no cluster transport".into(),
-                })?;
-                transport.revoke_peer_preauthorization(
-                    spki,
-                    std::time::Duration::from_millis(expires_at_ms - now_ms),
-                );
-                return Ok(());
+                return self.apply_enrollment_revoke(spki, *expires_at_ms);
             }
             MetadataEntry::RoutingChange(RoutingChange::SetPlacement {
                 group_id,
@@ -266,35 +224,66 @@ impl MetadataCommitApplier {
             }) => {
                 return self.apply_set_placement(*group_id, placement, raft_index);
             }
+            MetadataEntry::RoutingChange(RoutingChange::ReassignVShard {
+                vshard_id,
+                new_group_id,
+                new_leaseholder_node_id,
+            }) => {
+                return self.apply_reassign_vshard(
+                    *vshard_id,
+                    *new_group_id,
+                    *new_leaseholder_node_id,
+                    raft_index,
+                );
+            }
             MetadataEntry::TopologyChange(TopologyChange::Leave { node_id }) => {
-                // Lease GC: a node that left the topology can never release
-                // its own leases. Spawn (do NOT propose-and-wait inline —
-                // apply runs on the raft loop task; blocking here would
-                // deadlock the applied-index watcher).
-                if let Some(shared) = self.shared.get().and_then(std::sync::Weak::upgrade) {
-                    let shared = std::sync::Arc::clone(&shared);
-                    let left_node_id = *node_id;
-                    tokio::spawn(async move {
-                        if !shared.is_singleton_worker() {
-                            return;
-                        }
-                        if let Err(e) =
-                            crate::control::lease::gc::gc_leases_for_node(&shared, left_node_id)
-                        {
-                            tracing::warn!(
-                                node_id = left_node_id,
-                                error = %e,
-                                "lease GC after Leave failed; periodic sweep will retry"
-                            );
-                        }
-                    });
-                }
-                return Ok(());
+                return self.apply_node_leave(*node_id, raft_index);
             }
             _ => {}
         }
 
-        self.apply_catalog_ddl(entry, raft_index)
+        self.apply_catalog_ddl(entry, raft_index).await
+    }
+
+    /// Apply a prepared DDL under the replicated owner token. A superseded
+    /// proposal is a deterministic no-op: rejecting a committed stale token
+    /// will wedge the Raft apply watermark forever.
+    async fn apply_prepared_ddl(
+        &self,
+        token: u64,
+        entry: &MetadataEntry,
+        raft_index: u64,
+    ) -> Result<(), crate::Error> {
+        let shared = self.shared_state()?;
+        if !crate::control::metadata_proposer::ddl_owner::owns_ddl_lease(&shared, token) {
+            debug!(token, raft_index, "skipping superseded prepared DDL");
+            return Ok(());
+        }
+        self.apply_host_side_effects(entry, raft_index).await?;
+        shared
+            .metadata_ddl_applied_token
+            .store(token, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Apply an atomic batch one level deep. Each sub-entry applies on its
+    /// own, so each gets its own audit record stamped with the same
+    /// `raft_index` (they committed at the same log position).
+    async fn apply_batch(
+        &self,
+        entries: &[MetadataEntry],
+        raft_index: u64,
+    ) -> Result<(), crate::Error> {
+        let shared = self.shared.get().and_then(std::sync::Weak::upgrade);
+        for sub in entries {
+            self.apply_host_side_effects(sub, raft_index).await?;
+            if let Some(shared) = &shared {
+                shared
+                    .metadata_apply_progress
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+        }
+        Ok(())
     }
 
     /// Publish a permanent apply failure on the node-wide readiness marker.
@@ -325,47 +314,90 @@ impl MetadataCommitApplier {
     }
 }
 
+/// The fail point that holds back node `node_id`'s whole metadata apply.
+pub fn metadata_apply_hold_point(node_id: u64) -> String {
+    format!("metadata_apply::hold::node{node_id}")
+}
+
+#[async_trait::async_trait]
 impl MetadataApplier for MetadataCommitApplier {
-    fn apply(&self, entries: &[(u64, Vec<u8>)]) -> u64 {
+    async fn apply_decoded(&self, entries: &[CommittedMetadata<'_>]) -> u64 {
+        let shared = self.shared.get().and_then(std::sync::Weak::upgrade);
+        // Holds back this node's whole metadata apply, so a test can make
+        // its catalog lag the metadata group. Nothing applies and Raft
+        // re-delivers the batch once the hold is released.
+        #[cfg(feature = "failpoints")]
+        if let Some(shared) = &shared
+            && crate::control::fail_gate::holds_metadata_apply(shared.node_id)
+        {
+            return 0;
+        }
+        // Before any entry mutates a registry or the catalog, declare the
+        // batch's end. A reader that sees an effect of this batch then stamps
+        // a floor at or above the entry that made it visible.
+        if let (Some(batch_end), Some(shared)) = (entries.last(), &shared) {
+            shared
+                .applied_index_watcher(nodedb_cluster::METADATA_GROUP_ID)
+                .begin_batch(batch_end.index);
+        }
         // `last` is the highest index whose state is GUARANTEED visible. We
         // only advance it past an entry that fully applied — a durable apply
         // failure stops the batch here so Raft re-delivers the entry and the
         // apply is retried (never a silent divergence with a false-success ACK).
         let mut last = 0u64;
-        for (index, data) in entries {
-            if data.is_empty() {
-                // Raft no-op: nothing to apply, but advance the cache watermark
-                // in lockstep with the Raft applied index the tick loop reports
-                // from our return value. Skipping this leaves `cache.applied_index`
-                // behind the watcher and the startup applied-index sanity check
-                // fails the boot with a spurious gap (every group's first
-                // committed entry on a fresh start is an election no-op).
-                self.cache
-                    .write()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .advance_applied_index(*index);
-                last = *index;
-                continue;
-            }
-            let entry = match decode_entry(data) {
-                Ok(e) => e,
-                Err(e) => {
+        for committed in entries {
+            let index = &committed.index;
+            let data = committed.data;
+            let entry = match &committed.payload {
+                MetadataPayload::Empty => {
+                    // Raft no-op: nothing to apply, but advance the cache
+                    // watermark in lockstep with the Raft applied index the
+                    // tick loop reports from our return value. Skipping this
+                    // leaves `cache.applied_index` behind the watcher and the
+                    // startup applied-index sanity check fails the boot with a
+                    // spurious gap (every group's first committed entry on a
+                    // fresh start is an election no-op).
+                    self.cache
+                        .write()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .advance_applied_index(*index);
+                    last = *index;
+                    continue;
+                }
+                MetadataPayload::Undecodable(e) => {
                     // Undecodable committed entry: deterministic poison, won't
                     // decode on retry — skip (advance) rather than wedge.
                     warn!(index = *index, error = %e, "metadata decode failed");
                     last = *index;
                     continue;
                 }
+                MetadataPayload::Decoded(entry) => entry,
             };
+            if let Err(e) = self.observe_stamp(data) {
+                error!(
+                    index = *index,
+                    last_applied = last,
+                    error = %e,
+                    "metadata apply: recording the entry stamp failed; not advancing \
+                     watermark — Raft will re-deliver and retry"
+                );
+                break;
+            }
             // 1. Cluster-owned cache state (topology, routing,
             //    leases, catalog_entries_applied counter).
             {
                 let mut guard = self.cache.write().unwrap_or_else(|p| p.into_inner());
-                guard.apply(*index, &entry);
+                guard.apply(*index, entry);
             }
-            // 2. Host side effects (redb writeback + async post-apply). A
+            // 2. Host side effects (redb writeback + awaited post-apply). A
             //    durable failure halts the watermark at the last good index.
-            if let Err(e) = self.apply_host_side_effects(&entry, *index) {
+            // Every WAL record the effects append carries the entry's stamp.
+            let applied = crate::wal::manager::effect_stamp::with_effect_stamp(
+                nodedb_cluster::entry_stamp(data),
+                self.apply_host_side_effects(entry, *index),
+            )
+            .await;
+            if let Err(e) = applied {
                 // Both classes stop the batch — skipping a committed metadata
                 // entry is silent divergence from the quorum and is strictly
                 // worse than halting. What differs is whether waiting for a
@@ -373,14 +405,14 @@ impl MetadataApplier for MetadataCommitApplier {
                 let class = super::wedge::classify(&e);
                 // A deterministic failure here re-fails on every re-delivery and
                 // wedges this node's applier forever while /healthz stays green,
-                // so it is filed as a structured report — not just a log line —
+                // so it is filed as a structured report — not only a log line —
                 // at the one site that detects it.
-                crate::diag::metadata_apply_wedged(&e, &entry, *index, last, class.is_permanent());
+                crate::diag::metadata_apply_wedged(&e, entry, *index, last, class.is_permanent());
                 if class.is_permanent() {
                     // Retrying cannot help, so the node must stop advertising
                     // readiness rather than serve queries that will all die on
                     // an unrelated-looking descriptor-lease timeout.
-                    self.record_permanent_wedge(&e, &entry, *index, last);
+                    self.record_permanent_wedge(&e, entry, *index, last);
                     error!(
                         index = *index,
                         last_applied = last,
@@ -415,6 +447,12 @@ impl MetadataApplier for MetadataCommitApplier {
             );
         }
         last
+    }
+
+    /// Host effects land in redb, or in state boot rebuilds from redb, before
+    /// `apply` returns an index.
+    fn durable_effects(&self) -> bool {
+        true
     }
 }
 
@@ -454,7 +492,7 @@ mod tests {
     }
 
     fn put_collection_entry(name: &str) -> MetadataEntry {
-        let stored = StoredCollection::new(7, name, "tester");
+        let stored = StoredCollection::stamped_for_test(7, name, "tester");
         let catalog_entry = CatalogEntry::PutCollection(Box::new(stored));
         MetadataEntry::CatalogDdl {
             payload: catalog_entry::encode(&catalog_entry).unwrap(),
@@ -467,23 +505,121 @@ mod tests {
         }
     }
 
-    /// An applier wired to a real `SharedState` (weak handle installed), the
-    /// only shape under which `DdlPendingPropose` / `DdlPendingFinalize` /
-    /// `DdlPendingCancel` do anything — they are no-ops without it, matching
-    /// every other `self.shared`-gated apply path in this module.
+    /// Install `token` as the DDL preparation owner, as an applied
+    /// `DdlPrepareAcquire` does. A pending propose and finalize apply only
+    /// under the owner's token.
+    fn own_ddl_lease(state: &SharedState, token: u64) {
+        *state.metadata_ddl_owner.lock().unwrap() =
+            Some(crate::control::metadata_proposer::DdlPrepareOwner {
+                token,
+                node_id: state.node_id,
+                acquired_at: std::time::Instant::now(),
+            });
+    }
+
+    /// A reclaimed owner's late propose and finalize apply nothing on any
+    /// replica, and a prepared entry under its token is skipped too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reclaimed_owners_late_entries_apply_nothing() {
+        let (applier, state, _core, _tmp) = make_applier_with_acknowledging_core();
+        let dead = 21;
+        let acquire =
+            |token: u64, node_id: u64| MetadataEntry::DdlPrepareAcquire { token, node_id };
+        let entries = [
+            acquire(dead, 2),
+            // The metadata leader reclaims the dead owner's lease.
+            MetadataEntry::DdlPrepareRelease { token: dead },
+            acquire(22, 3),
+            MetadataEntry::DdlPendingPropose {
+                token: dead,
+                objects: vec![pending_create_object("late_pending")],
+                proposed_at: Hlc::default(),
+            },
+            MetadataEntry::DdlPendingFinalize { token: dead },
+            MetadataEntry::DdlPrepared {
+                token: dead,
+                entry: Box::new(put_collection_entry("late_prepared")),
+            },
+        ];
+        let batch: Vec<_> = entries
+            .iter()
+            .zip(1u64..)
+            .map(|(entry, index)| (index, encode_entry(entry).unwrap()))
+            .collect();
+        assert_eq!(applier.apply(&batch).await, 6, "no late entry wedges apply");
+
+        assert!(
+            !state.pending_ddl.contains(dead),
+            "the late propose reserved nothing"
+        );
+        let catalog = state.credentials.catalog();
+        for name in ["late_pending", "late_prepared"] {
+            assert!(
+                catalog
+                    .get_collection(DatabaseId::DEFAULT, 7, name)
+                    .unwrap()
+                    .is_none(),
+                "{name} must not apply under a reclaimed token"
+            );
+        }
+        assert_ne!(
+            state
+                .metadata_ddl_applied_token
+                .load(std::sync::atomic::Ordering::Acquire),
+            dead,
+            "the dead owner's proposer must see its entries superseded"
+        );
+        assert_eq!(catalog.load_ddl_owner().unwrap(), Some((22, 3)));
+    }
+
+    /// An applier wired to a real `SharedState` (weak handle installed). Every
+    /// entry with host effects needs it: without it the apply returns a
+    /// transient error and the watermark stays put.
     fn make_applier_with_shared() -> (MetadataCommitApplier, Arc<SharedState>, tempfile::TempDir) {
+        let (applier, state, _data_sides, tmp) = applier_over_shared_state();
+        // `_data_sides` drops here, so no Data Plane request is ever answered.
+        (applier, state, tmp)
+    }
+
+    /// [`make_applier_with_shared`] with one Data Plane core that
+    /// acknowledges every request. A create's post-apply clears the name's
+    /// storage on every core before it registers, so an applied create needs
+    /// the answer. Runs inside a multi-thread tokio runtime: the core is a
+    /// spawned task, and the applier blocks its own worker for the post-apply.
+    fn make_applier_with_acknowledging_core() -> (
+        MetadataCommitApplier,
+        Arc<SharedState>,
+        tokio::task::JoinHandle<()>,
+        tempfile::TempDir,
+    ) {
+        let (applier, state, mut data_sides, tmp) = applier_over_shared_state();
+        let side = data_sides.pop().expect("one data side");
+        let core = tokio::spawn(crate::control::state::test_core::acknowledge_every_request(
+            Arc::clone(&state),
+            side,
+        ));
+        (applier, state, core, tmp)
+    }
+
+    /// An applier over a one-core `SharedState`, and that core's data side.
+    fn applier_over_shared_state() -> (
+        MetadataCommitApplier,
+        Arc<SharedState>,
+        Vec<crate::bridge::dispatch::CoreChannelDataSide>,
+        tempfile::TempDir,
+    ) {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let wal =
             Arc::new(WalManager::open_for_testing(&tmp.path().join("test.wal")).expect("open wal"));
         let credentials =
             Arc::new(CredentialStore::open(&tmp.path().join("system.redb")).expect("open catalog"));
-        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let (dispatcher, data_sides) = Dispatcher::new(1, 64);
         let mut state = SharedState::new_with_credentials(dispatcher, wal, credentials, false)
             .expect("construct shared state");
-        // `_data_sides` is dropped with this fixture, so the schema-register
-        // barrier can never be answered. Keep its deadline short: the test
-        // covers finalize semantics, not the production deadline. Sole
-        // reference here, so `get_mut` always succeeds.
+        // A fixture whose data side drops never answers a Data Plane request.
+        // Keep the request deadline short: the tests cover apply semantics,
+        // not the production deadline. Sole reference here, so `get_mut`
+        // always succeeds.
         Arc::get_mut(&mut state)
             .expect("sole reference to the fixture's SharedState")
             .tuning
@@ -498,19 +634,23 @@ mod tests {
             token_state,
         );
         applier.install_shared(Arc::downgrade(&state));
-        (applier, state, tmp)
+        (applier, state, data_sides, tmp)
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn propose_then_finalize_applies_and_clears_the_record() {
-        let (applier, state, _tmp) = make_applier_with_shared();
+        let (applier, state, _core, _tmp) = make_applier_with_acknowledging_core();
         let token = 1;
+        own_ddl_lease(&state, token);
         let propose = MetadataEntry::DdlPendingPropose {
             token,
             objects: vec![pending_create_object("pending_orders")],
             proposed_at: Hlc::default(),
         };
-        assert_eq!(applier.apply(&[(1, encode_entry(&propose).unwrap())]), 1);
+        assert_eq!(
+            applier.apply(&[(1, encode_entry(&propose).unwrap())]).await,
+            1
+        );
         assert!(
             state.pending_ddl.contains(token),
             "propose reserves the record"
@@ -526,7 +666,12 @@ mod tests {
         );
 
         let finalize = MetadataEntry::DdlPendingFinalize { token };
-        assert_eq!(applier.apply(&[(2, encode_entry(&finalize).unwrap())]), 2);
+        assert_eq!(
+            applier
+                .apply(&[(2, encode_entry(&finalize).unwrap())])
+                .await,
+            2
+        );
         assert!(
             !state.pending_ddl.contains(token),
             "finalize clears the record"
@@ -543,7 +688,12 @@ mod tests {
 
         // Double-apply (Raft re-delivery): no record left, so this must be a
         // silent no-op rather than an error or a repeat write.
-        assert_eq!(applier.apply(&[(3, encode_entry(&finalize).unwrap())]), 3);
+        assert_eq!(
+            applier
+                .apply(&[(3, encode_entry(&finalize).unwrap())])
+                .await,
+            3
+        );
         assert!(!state.pending_ddl.contains(token));
     }
 
@@ -551,19 +701,39 @@ mod tests {
     async fn propose_then_cancel_clears_without_touching_the_catalog() {
         let (applier, state, _tmp) = make_applier_with_shared();
         let token = 2;
+        own_ddl_lease(&state, token);
         let propose = MetadataEntry::DdlPendingPropose {
             token,
             objects: vec![pending_create_object("pending_widgets")],
             proposed_at: Hlc::default(),
         };
-        assert_eq!(applier.apply(&[(1, encode_entry(&propose).unwrap())]), 1);
+        assert_eq!(
+            applier.apply(&[(1, encode_entry(&propose).unwrap())]).await,
+            1
+        );
         assert!(state.pending_ddl.contains(token));
 
         let cancel = MetadataEntry::DdlPendingCancel { token };
-        assert_eq!(applier.apply(&[(2, encode_entry(&cancel).unwrap())]), 2);
+        assert_eq!(
+            applier.apply(&[(2, encode_entry(&cancel).unwrap())]).await,
+            2
+        );
         assert!(
             !state.pending_ddl.contains(token),
             "cancel clears the record"
+        );
+        // The fixture's Data Plane never answers, so the spawned teardown
+        // cannot succeed and remove the row: it was queued before the spawn.
+        let queued = state
+            .credentials
+            .catalog()
+            .load_pending_reclaim_queue()
+            .unwrap();
+        assert!(
+            queued
+                .iter()
+                .any(|entry| entry.tenant_id == 7 && entry.name == "pending_widgets"),
+            "cancel queues a durable reclaim for the teardown: {queued:?}"
         );
         assert!(
             state
@@ -576,8 +746,66 @@ mod tests {
         );
 
         // Double-apply (Raft re-delivery): no record left, must stay a no-op.
-        assert_eq!(applier.apply(&[(3, encode_entry(&cancel).unwrap())]), 3);
+        assert_eq!(
+            applier.apply(&[(3, encode_entry(&cancel).unwrap())]).await,
+            3
+        );
         assert!(!state.pending_ddl.contains(token));
+    }
+
+    /// A reclaim that fails before any durable retry is queued stops the
+    /// batch at its entry. The re-delivered entry runs the reclaim again.
+    #[cfg(feature = "failpoints")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reclaim_with_no_retry_queued_stops_the_batch_and_redelivery_retries_it() {
+        let (applier, state, _tmp) = make_applier_with_shared();
+        let purge = MetadataEntry::CatalogDdl {
+            payload: catalog_entry::encode(&CatalogEntry::PurgeCollection {
+                database_id: DatabaseId::DEFAULT.as_u64(),
+                tenant_id: 7,
+                name: "orders".to_string(),
+                target_descriptor_version: 0,
+                target_hlc: Hlc::ZERO,
+            })
+            .unwrap(),
+        };
+        let batch = [(1, encode_entry(&purge).unwrap()), (2, Vec::new())];
+
+        {
+            let _fail = nodedb_types::fail_point::FailGuard::fail(
+                "collection_reclaim::before_tombstone",
+                "injected tombstone write error",
+            );
+            assert_eq!(
+                applier.apply(&batch).await,
+                0,
+                "the failed reclaim stops the batch before its entry"
+            );
+        }
+        assert!(
+            state
+                .credentials
+                .catalog()
+                .load_pending_reclaim_queue()
+                .unwrap()
+                .is_empty(),
+            "the injected error precedes every durable reclaim step"
+        );
+
+        // Re-delivery: the reclaim runs again. The fixture's Data Plane never
+        // answers, so it ends with a queued durable retry, which counts as done.
+        assert_eq!(applier.apply(&batch).await, 2);
+        let queued = state
+            .credentials
+            .catalog()
+            .load_pending_reclaim_queue()
+            .unwrap();
+        assert!(
+            queued
+                .iter()
+                .any(|entry| entry.tenant_id == 7 && entry.name == "orders"),
+            "the re-delivered purge ran its reclaim: {queued:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -585,36 +813,41 @@ mod tests {
         let (applier, state, _tmp) = make_applier_with_shared();
         let unknown = 999;
         assert_eq!(
-            applier.apply(&[(
-                1,
-                encode_entry(&MetadataEntry::DdlPendingFinalize { token: unknown }).unwrap()
-            )]),
+            applier
+                .apply(&[(
+                    1,
+                    encode_entry(&MetadataEntry::DdlPendingFinalize { token: unknown }).unwrap()
+                )])
+                .await,
             1,
             "finalize with no matching propose must not wedge the watermark"
         );
         assert_eq!(
-            applier.apply(&[(
-                2,
-                encode_entry(&MetadataEntry::DdlPendingCancel { token: unknown }).unwrap()
-            )]),
+            applier
+                .apply(&[(
+                    2,
+                    encode_entry(&MetadataEntry::DdlPendingCancel { token: unknown }).unwrap()
+                )])
+                .await,
             2,
             "cancel with no matching propose must not wedge the watermark"
         );
         assert!(!state.pending_ddl.contains(unknown));
     }
 
-    #[test]
-    fn apply_put_collection_writes_through_to_redb() {
-        let (applier, cache, credentials, _tmp) = make_applier();
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apply_put_collection_writes_through_to_redb() {
+        let (applier, state, _core, _tmp) = make_applier_with_acknowledging_core();
         let bytes = encode_entry(&put_collection_entry("orders")).unwrap();
-        assert_eq!(applier.apply(&[(11, bytes)]), 11);
+        assert_eq!(applier.apply(&[(11, bytes)]).await, 11);
 
-        let cache_guard = cache.read().unwrap();
+        let cache_guard = state.metadata_cache.read().unwrap();
         assert_eq!(cache_guard.applied_index, 11);
         assert_eq!(cache_guard.catalog_entries_applied, 1);
         drop(cache_guard);
 
-        let loaded = credentials
+        let loaded = state
+            .credentials
             .catalog()
             .get_collection(DatabaseId::DEFAULT, 7, "orders")
             .unwrap()
@@ -623,12 +856,18 @@ mod tests {
         assert_eq!(loaded.owner, "tester");
     }
 
-    #[test]
-    fn apply_deactivate_preserves_record() {
-        let (applier, _cache, credentials, _tmp) = make_applier();
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apply_deactivate_preserves_record() {
+        let (applier, state, _core, _tmp) = make_applier_with_acknowledging_core();
 
         // Seed.
-        applier.apply(&[(1, encode_entry(&put_collection_entry("archived")).unwrap())]);
+        assert_eq!(
+            applier
+                .apply(&[(1, encode_entry(&put_collection_entry("archived")).unwrap())])
+                .await,
+            1,
+            "the seeding create applies"
+        );
 
         let drop_entry = MetadataEntry::CatalogDdl {
             payload: catalog_entry::encode(&CatalogEntry::DeactivateCollection {
@@ -640,9 +879,12 @@ mod tests {
             })
             .unwrap(),
         };
-        applier.apply(&[(2, encode_entry(&drop_entry).unwrap())]);
+        applier
+            .apply(&[(2, encode_entry(&drop_entry).unwrap())])
+            .await;
 
-        let loaded = credentials
+        let loaded = state
+            .credentials
             .catalog()
             .get_collection(DatabaseId::DEFAULT, 7, "archived")
             .unwrap()
@@ -650,8 +892,8 @@ mod tests {
         assert!(!loaded.is_active);
     }
 
-    #[test]
-    fn join_token_transition_updates_and_persists_shared_mirror() {
+    #[tokio::test]
+    async fn join_token_transition_updates_and_persists_shared_mirror() {
         let (applier, _cache, credentials, _tmp) = make_applier();
         let hash = [0x44; 32];
         let entries = [
@@ -683,7 +925,9 @@ mod tests {
         for (offset, entry) in entries.iter().enumerate() {
             let index = offset as u64 + 1;
             assert_eq!(
-                applier.apply(&[(index, encode_entry(entry).expect("encode"))]),
+                applier
+                    .apply(&[(index, encode_entry(entry).expect("encode"))])
+                    .await,
                 index
             );
         }
@@ -700,21 +944,37 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn apply_empty_batch_is_noop() {
-        let (applier, _cache, _credentials, _tmp) = make_applier();
-        assert_eq!(applier.apply(&[]), 0);
+    /// Without `SharedState` a catalog DDL cannot land its host effects, so
+    /// the watermark stays below the entry and Raft re-delivers it.
+    #[tokio::test]
+    async fn catalog_ddl_without_shared_state_is_not_applied() {
+        let (applier, _cache, credentials, _tmp) = make_applier();
+        let bytes = encode_entry(&put_collection_entry("orders")).unwrap();
+        assert_eq!(applier.apply(&[(4, bytes)]).await, 0);
+        assert!(
+            credentials
+                .catalog()
+                .get_collection(DatabaseId::DEFAULT, 7, "orders")
+                .unwrap()
+                .is_none()
+        );
     }
 
-    #[test]
-    fn apply_noop_entry_advances_cache_watermark() {
+    #[tokio::test]
+    async fn apply_empty_batch_is_noop() {
+        let (applier, _cache, _credentials, _tmp) = make_applier();
+        assert_eq!(applier.apply(&[]).await, 0);
+    }
+
+    #[tokio::test]
+    async fn apply_noop_entry_advances_cache_watermark() {
         let (applier, cache, _credentials, _tmp) = make_applier();
         // A committed Raft no-op (empty payload) at index 1 — the shape of every
         // group's first entry on a fresh single-node start. It mutates nothing, but
         // the cache watermark must advance in lockstep with the Raft applied index
         // the tick loop takes from the return value; otherwise the startup
         // applied-index sanity check reads a spurious gap and fails the boot.
-        assert_eq!(applier.apply(&[(1, Vec::new())]), 1);
+        assert_eq!(applier.apply(&[(1, Vec::new())]).await, 1);
         assert_eq!(cache.read().unwrap().applied_index, 1);
         assert_eq!(
             cache.read().unwrap().catalog_entries_applied,
@@ -738,12 +998,16 @@ mod tests {
     async fn a_proposers_hlc_advances_the_local_clock() {
         let (applier, state, _tmp) = make_applier_with_shared();
         let ahead = Hlc::new(now_ns() + 500_000_000, 0);
+        own_ddl_lease(&state, 9);
         let propose = MetadataEntry::DdlPendingPropose {
             token: 9,
             objects: vec![pending_create_object("hlc_fold")],
             proposed_at: ahead,
         };
-        assert_eq!(applier.apply(&[(1, encode_entry(&propose).unwrap())]), 1);
+        assert_eq!(
+            applier.apply(&[(1, encode_entry(&propose).unwrap())]).await,
+            1
+        );
         assert!(
             state.hlc_clock.peek() >= ahead,
             "the local clock must absorb a proposer's observation"
@@ -756,12 +1020,16 @@ mod tests {
     async fn a_far_future_proposer_hlc_is_refused_but_the_entry_still_applies() {
         let (applier, state, _tmp) = make_applier_with_shared();
         let far = Hlc::new(now_ns() + nodedb_types::MAX_CLOCK_SKEW_NS * 10, 0);
+        own_ddl_lease(&state, 11);
         let propose = MetadataEntry::DdlPendingPropose {
             token: 11,
             objects: vec![pending_create_object("hlc_skew")],
             proposed_at: far,
         };
-        assert_eq!(applier.apply(&[(1, encode_entry(&propose).unwrap())]), 1);
+        assert_eq!(
+            applier.apply(&[(1, encode_entry(&propose).unwrap())]).await,
+            1
+        );
         assert!(
             state.hlc_clock.peek() < far,
             "a skewed proposer must never move this node's clock"
@@ -770,6 +1038,48 @@ mod tests {
             state.pending_ddl.contains(11),
             "the committed entry must still apply — refusing the fold is the \
              protection, wedging the state machine is not"
+        );
+    }
+
+    /// A topic the batch in progress creates is visible before the applied
+    /// watermark reaches its entry. The floor a reader stamps once it sees
+    /// the topic is at or above the entry that created it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_object_visible_mid_batch_yields_a_floor_at_its_entry() {
+        let (applier, state, _tmp) = make_applier_with_shared();
+        let topic = crate::event::topic::TopicDef {
+            database_id: DatabaseId::DEFAULT,
+            tenant_id: 1,
+            name: "floor_feed".into(),
+            retention: crate::event::cdc::stream_def::RetentionConfig::default(),
+            owner: "tester".into(),
+            created_at: 0,
+            last_sequence: 0,
+            last_lsn: 0,
+            last_epoch: 0,
+            modification_hlc: Hlc::ZERO,
+        };
+        let create = MetadataEntry::CatalogDdl {
+            payload: catalog_entry::encode(&CatalogEntry::CreateTopicIfAbsent(Box::new(topic)))
+                .unwrap(),
+        };
+        let watcher = state.applied_index_watcher(nodedb_cluster::METADATA_GROUP_ID);
+        // The entry creating the topic sits inside a batch that ends later.
+        let batch = [(7, encode_entry(&create).unwrap()), (8, Vec::new())];
+        assert_eq!(applier.apply(&batch).await, 8);
+
+        // The Raft loop bumps the applied watermark only after the batch
+        // returns, so the topic is visible with `applied` still below it.
+        assert!(
+            state
+                .ep_topic_registry
+                .get(DatabaseId::DEFAULT, 1, "floor_feed")
+                .is_some()
+        );
+        assert!(watcher.current() < 7);
+        assert!(
+            watcher.floor() >= 7,
+            "a reader that sees the topic stamps a floor at or above its creation"
         );
     }
 }

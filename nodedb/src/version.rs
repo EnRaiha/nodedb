@@ -28,6 +28,11 @@ pub const RUST_VERSION: &str = env!("NODEDB_RUST_VERSION");
 /// Readers MUST reject messages with wire_version != their own.
 pub use nodedb_types::wire_version::{MIN_WIRE_FORMAT_VERSION, WIRE_FORMAT_VERSION};
 
+/// This build's exact identity. Re-exported from `nodedb_types::wire_version`
+/// so `nodedb` and `nodedb-cluster` read the identical value — never a
+/// crate-local recomputation that drifts.
+pub use nodedb_types::wire_version::WIRE_BUILD_ID;
+
 /// Returns a comma-separated list of always-on observability capabilities
 /// compiled into this build.
 pub fn features_str() -> &'static str {

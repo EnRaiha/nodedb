@@ -24,7 +24,9 @@ use nodedb::config::auth::JwtAuthConfig;
 use nodedb::control::security::jwks::registry::JwksRegistry;
 use nodedb::control::security::oidc::verify_bearer_token;
 use nodedb::control::security::request_scope::RequestAuthScope;
-use nodedb_test_support::pgwire_auth_helpers::{ddl_ok, make_state_with_catalog, superuser};
+use nodedb_test_support::pgwire_auth_helpers::{
+    ddl_ok, make_state_with_catalog_configured, superuser,
+};
 
 async fn spawn_static_jwks(body: String) -> String {
     let listener = tokio::net::TcpListener::bind("[::]:0")
@@ -101,12 +103,23 @@ async fn verify_via_catalog_provider(
     jwks: String,
     token: &str,
 ) -> (
-    Arc<nodedb::control::state::SharedState>,
+    nodedb_test_support::pgwire_auth_helpers::BootedState,
     nodedb::control::security::identity::AuthenticatedIdentity,
     nodedb::control::security::jwks::registry::VerifiedJwtClaims,
 ) {
     let jwks_uri = spawn_static_jwks(jwks).await;
-    let mut state = make_state_with_catalog();
+    // The registry is set before the gateway install, as production boot
+    // sets it.
+    let registry = JwksRegistry::init(JwtAuthConfig {
+        allow_http_jwks: true,
+        allow_jwks_hosts: vec!["localhost".into()],
+        allow_jwks_cidrs: vec!["127.0.0.0/8".into(), "::1/128".into()],
+        ..JwtAuthConfig::default()
+    })
+    .await
+    .expect("test JWKS registry must initialize");
+    let state =
+        make_state_with_catalog_configured(|state| state.jwks_registry = Some(Arc::new(registry)));
     let su = superuser();
 
     ddl_ok(&state, &su, "CREATE TENANT native_claims_tenant ID 999").await;
@@ -123,18 +136,6 @@ async fn verify_via_catalog_provider(
         ),
     )
     .await;
-
-    let registry = JwksRegistry::init(JwtAuthConfig {
-        allow_http_jwks: true,
-        allow_jwks_hosts: vec!["localhost".into()],
-        allow_jwks_cidrs: vec!["127.0.0.0/8".into(), "::1/128".into()],
-        ..JwtAuthConfig::default()
-    })
-    .await
-    .expect("test JWKS registry must initialize");
-    Arc::get_mut(&mut state)
-        .expect("test state must remain uniquely owned")
-        .jwks_registry = Some(Arc::new(registry));
 
     let (identity, claims) = verify_bearer_token(&state, token)
         .await

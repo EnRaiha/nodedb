@@ -18,7 +18,6 @@ use crate::tile::cell_payload::CellPayload;
 use crate::tile::sparse_tile::{RowKind, SparseRow, SparseTile, SparseTileBuilder};
 use crate::types::TileId;
 use crate::types::coord::value::CoordValue;
-use nodedb_types::{OPEN_UPPER, Surrogate};
 
 // ── Result type ─────────────────────────────────────────────────────────────
 
@@ -119,7 +118,7 @@ pub fn decode_sparse_rows(tile: &SparseTile) -> ArrayResult<Vec<DecodedRow>> {
                     })
                     .collect::<ArrayResult<Vec<_>>>()?;
 
-                let surrogate = tile.surrogates.get(row).copied().unwrap_or(Surrogate::ZERO);
+                let surrogate = tile.live_surrogate(row)?;
                 let valid_from_ms = tile.valid_from_ms.get(row).copied().ok_or_else(|| {
                     ArrayError::SegmentCorruption {
                         detail: format!("decode_sparse_rows: valid_from_ms row {row} out of range"),
@@ -272,28 +271,20 @@ pub fn merge_for_retention(
                 // Drop entirely — GDPR erasure removes the cell from the ceiling.
             }
             RowKind::Tombstone => {
-                builder.push_row(SparseRow {
-                    coord: &coord,
-                    attrs: &[],
-                    surrogate: Surrogate::ZERO,
-                    valid_from_ms: 0,
-                    valid_until_ms: OPEN_UPPER,
-                    kind: RowKind::Tombstone,
-                })?;
+                builder.push_row(SparseRow::sentinel(&coord, RowKind::Tombstone))?;
                 cells_carried_forward += 1;
             }
             RowKind::Live => {
                 let p = payload.ok_or_else(|| ArrayError::SegmentCorruption {
                     detail: "Live row in ceiling has no CellPayload".into(),
                 })?;
-                builder.push_row(SparseRow {
-                    coord: &coord,
-                    attrs: &p.attrs,
-                    surrogate: p.surrogate,
-                    valid_from_ms: p.valid_from_ms,
-                    valid_until_ms: p.valid_until_ms,
-                    kind: RowKind::Live,
-                })?;
+                builder.push_row(SparseRow::live(
+                    &coord,
+                    &p.attrs,
+                    p.surrogate,
+                    p.valid_from_ms,
+                    p.valid_until_ms,
+                ))?;
                 cells_carried_forward += 1;
             }
         }
@@ -338,6 +329,7 @@ mod tests {
     use crate::types::cell_value::value::CellValue;
     use crate::types::coord::value::CoordValue;
     use crate::types::domain::{Domain, DomainBound};
+    use nodedb_types::{OPEN_UPPER, Surrogate};
 
     fn schema() -> ArraySchema {
         ArraySchemaBuilder::new("t")
@@ -368,7 +360,7 @@ mod tests {
         b.push_row(SparseRow {
             coord: &[CoordValue::Int64(x)],
             attrs: &[CellValue::Int64(v)],
-            surrogate: Surrogate::ZERO,
+            surrogate: Some(Surrogate::new(x as u32 + 1)),
             valid_from_ms: 0,
             valid_until_ms: OPEN_UPPER,
             kind: RowKind::Live,
@@ -383,7 +375,7 @@ mod tests {
         b.push_row(SparseRow {
             coord: &[CoordValue::Int64(x)],
             attrs: &[],
-            surrogate: Surrogate::ZERO,
+            surrogate: None,
             valid_from_ms: 0,
             valid_until_ms: OPEN_UPPER,
             kind: RowKind::Tombstone,
@@ -398,7 +390,7 @@ mod tests {
         b.push_row(SparseRow {
             coord: &[CoordValue::Int64(x)],
             attrs: &[],
-            surrogate: Surrogate::ZERO,
+            surrogate: None,
             valid_from_ms: 0,
             valid_until_ms: OPEN_UPPER,
             kind: RowKind::GdprErased,

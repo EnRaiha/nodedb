@@ -10,6 +10,7 @@ pub(super) fn not_leader() -> Error {
         vshard_id: VShardId::new(1),
         leader_node: 2,
         leader_addr: "10.0.0.1:9000".into(),
+        leader_term: 3,
     }
 }
 

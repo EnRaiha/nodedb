@@ -30,6 +30,9 @@ pub(super) struct ServerPorts {
     pub(super) native: u16,
     pub(super) sync: u16,
     pub(super) resp: u16,
+    /// The ILP listener. The server leaves ILP off unless its port is set, so
+    /// the harness always sets one, as `crash_harness` does.
+    pub(super) ilp: u16,
 }
 
 impl ServerPorts {
@@ -40,6 +43,7 @@ impl ServerPorts {
             native: free_port(),
             sync: free_port(),
             resp: free_port(),
+            ilp: free_port(),
         }
     }
 }
@@ -182,6 +186,7 @@ fn try_spawn(
         .env("NODEDB_PORT_NATIVE", ports.native.to_string())
         .env("NODEDB_PORT_SYNC", ports.sync.to_string())
         .env("NODEDB_PORT_RESP", ports.resp.to_string())
+        .env("NODEDB_PORT_ILP", ports.ilp.to_string())
         // Pinned so the harness client can authenticate in password mode;
         // trust mode ignores it. Same value on every spawn (including a
         // restart against the same data directory).

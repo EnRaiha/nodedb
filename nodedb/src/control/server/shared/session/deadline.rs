@@ -19,7 +19,7 @@
 //! `Request::deadline`, the same field and the same contract as before.
 //!
 //! [`Instant`] is monotonic. A wall clock can step backwards under NTP and
-//! would stretch or shrink a running statement's budget.
+//! will stretch or shrink a running statement's budget.
 
 use std::time::{Duration, Instant};
 
@@ -57,7 +57,8 @@ impl Drop for StatementScope {
     }
 }
 
-/// Pin the deadline for the statement about to run.
+/// Pin the deadline for the statement about to run, and start the
+/// statement's served-read notes empty.
 ///
 /// The instant is fixed ONCE here, so every request the statement fans out into
 /// shares it and the statement is bounded end to end rather than per hop.
@@ -66,6 +67,8 @@ impl Drop for StatementScope {
 /// store is a no-op and every envelope site falls back to the node default, so
 /// installing the guard is always safe.
 pub fn enter(statement_timeout: Option<Duration>, default_deadline_secs: u64) -> StatementScope {
+    // A statement starts with no reads served (`served_reads`).
+    super::served_reads::clear();
     let previous = current();
     store(Some(
         Instant::now() + statement_budget(statement_timeout, default_deadline_secs),
@@ -92,7 +95,7 @@ pub fn statement_deadline(default_deadline_secs: u64) -> Instant {
 /// `ExecuteRequest.deadline_remaining_ms` field.
 ///
 /// Saturates at 1: a hop dispatched with `0` is refused up front by the
-/// receiver's deadline check, which would report a deadline the local half has
+/// receiver's deadline check, which will report a deadline the local half has
 /// not actually reached yet.
 pub fn statement_deadline_ms(default_deadline_secs: u64) -> u64 {
     let remaining =
@@ -122,7 +125,7 @@ mod tests {
     #[test]
     fn a_changed_default_changes_the_budget() {
         // Pins the derivation, not the number: a literal in the dispatch path
-        // would not move when the configured value does.
+        // will not move when the configured value does.
         assert_eq!(statement_budget(None, 7), Duration::from_secs(7));
         assert_eq!(statement_budget(None, 120), Duration::from_secs(120));
     }

@@ -5,10 +5,10 @@
 //!
 //! The `GRAPH INSERT EDGE` / `GRAPH DELETE EDGE` handlers dispatch a single
 //! `GraphOp::EdgePut` / `EdgeDelete` directly to the Data Plane in autocommit.
-//! Inside an explicit `BEGIN..COMMIT` block that direct dispatch would apply
+//! Inside an explicit `BEGIN..COMMIT` block that direct dispatch will apply
 //! the write DURABLY at statement time, so an in-transaction `MATCH` / `GRAPH
-//! NEIGHBORS` would not observe it as staged (breaking read-your-own-writes)
-//! and a ROLLBACK could not undo it. These helpers instead route the write
+//! NEIGHBORS` will not observe it as staged (breaking read-your-own-writes)
+//! and a ROLLBACK cannot undo it. These helpers instead route the write
 //! through the protocol-neutral staging gate
 //! ([`route_in_tx_write`](crate::control::server::shared::session::staging_gate::route_in_tx_write)),
 //! exactly like every other in-transaction point write: the Data Plane stages
@@ -16,7 +16,7 @@
 //! Hop for RYOW), the plan is buffered for COMMIT's durable replay, and
 //! ROLLBACK drops the overlay.
 //!
-//! A SINGLE-HOME edge (both endpoints on one vShard, or single-node) stages
+//! A SINGLE-HOME edge (both endpoints on one vShard) stages
 //! once into `vsrc`. A cross-shard (dual-home) edge is reachable from BOTH
 //! endpoints, and each core merges only its OWN overlay on a read, so
 //! [`stage_edge_dual_home`] stages the same edge into both the `vsrc` and `vdst`
@@ -41,10 +41,10 @@ use super::support::ddl_err;
 /// Stage a graph-edge write into the active transaction's overlay on EVERY
 /// vShard the edge homes to.
 ///
-/// A single-home edge (both endpoints on one vShard, or single-node) stages
+/// A single-home edge (both endpoints on one vShard) stages
 /// once, into `vsrc`. A cross-shard (dual-home) edge is reachable from BOTH
 /// endpoints, and each Data-Plane core merges only its OWN transaction overlay
-/// on a read — so a reverse/IN traversal that scatters to `from_key(dst)` would
+/// on a read — so a reverse/IN traversal that scatters to `from_key(dst)` will
 /// never observe an edge staged only on `vsrc`. The dual-home case therefore
 /// stages the SAME `GraphOp` into both the `vsrc` and `vdst` overlays, giving
 /// read-your-own-writes from either endpoint. Each stage buffers its task, so

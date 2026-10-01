@@ -27,6 +27,9 @@ pub struct RecordTarget {
     /// The event source code of the row write the record carries.
     /// [`NO_EVENT_SOURCE`] for a record that carries no row write.
     pub event_source: u8,
+    /// HLC wall time, in nanoseconds, the record's write committed at. See
+    /// [`RecordHeader::commit_hlc`].
+    pub commit_hlc: u64,
 }
 
 /// The header fields that tie a record to the write that appended it.
@@ -37,13 +40,17 @@ pub struct RecordStamp {
     pub apply_key: u64,
     /// The event source code of the row write the record carries.
     pub event_source: u8,
+    /// HLC wall time, in nanoseconds, the record's write committed at. See
+    /// [`RecordHeader::commit_hlc`].
+    pub commit_hlc: u64,
 }
 
 impl RecordStamp {
-    /// No proposal key and no row write.
+    /// No proposal key, no row write, and no commit HLC.
     pub const NONE: Self = Self {
         apply_key: 0,
         event_source: NO_EVENT_SOURCE,
+        commit_hlc: 0,
     };
 }
 
@@ -71,20 +78,19 @@ impl WalRecord {
     /// the ciphertext to its segment (preamble-swap defense). Pass `None`
     /// for unencrypted records (the argument is ignored in that case).
     ///
-    /// `database_id` is stored in header bytes 34-41 (previously reserved,
-    /// zero-filled). Pre-existing records with zeros decode to `DatabaseId(0)`
-    /// (the default database), preserving backward compatibility.
+    /// `database_id` is stored in header bytes 34-41.
     pub fn new(args: WalRecordArgs<'_>) -> Result<Self> {
         Self::new_stamped(args, RecordStamp::NONE)
     }
 
-    /// [`Self::new`] with the proposal key and event source of `stamp`. Both
-    /// ride the header, inside the CRC and the encryption AAD, so the record
-    /// and its stamp are durable together.
+    /// [`Self::new`] with the proposal key, event source and commit HLC of
+    /// `stamp`. They ride the header, inside the CRC and the encryption AAD,
+    /// so the record and its stamp are durable together.
     pub fn new_stamped(args: WalRecordArgs<'_>, stamp: RecordStamp) -> Result<Self> {
         let RecordStamp {
             apply_key,
             event_source,
+            commit_hlc,
         } = stamp;
         let WalRecordArgs {
             record_type,
@@ -115,6 +121,7 @@ impl WalRecord {
                 database_id,
                 apply_key,
                 event_source,
+                commit_hlc,
                 crc32c: 0,
             };
             let header_bytes = temp_header.to_bytes();
@@ -144,6 +151,7 @@ impl WalRecord {
             database_id,
             apply_key,
             event_source,
+            commit_hlc,
             crc32c: 0,
         };
 
@@ -299,7 +307,7 @@ impl WalRecord {
 
 /// Build the AAD buffer: `preamble_bytes || header_bytes`.
 ///
-/// When `preamble_bytes` is `None` (no encryption or legacy path), the AAD
+/// When `preamble_bytes` is `None` (no encryption), the AAD
 /// is just the header bytes. When present, the preamble is prepended.
 pub(crate) fn build_aad(
     preamble_bytes: Option<&[u8; PREAMBLE_SIZE]>,
@@ -379,10 +387,10 @@ mod tests {
 
     #[test]
     fn anchor_payload_in_record() {
-        use super::super::anchor::LsnMsAnchorPayload;
-        let anchor = LsnMsAnchorPayload::new(42, 1_700_000_000_000);
+        use super::super::anchor::TimeAnchorPayload;
+        let anchor = TimeAnchorPayload::new(1_700_000_000_000_000_000);
         let record = WalRecord::new(WalRecordArgs {
-            record_type: RecordType::LsnMsAnchor as u32,
+            record_type: RecordType::TimeAnchor as u32,
             lsn: 42,
             tenant_id: 0,
             vshard_id: 0,
@@ -393,8 +401,8 @@ mod tests {
         })
         .unwrap();
         record.verify_checksum().unwrap();
-        assert_eq!(record.logical_record_type(), RecordType::LsnMsAnchor as u32);
-        let decoded = LsnMsAnchorPayload::from_bytes(&record.payload).unwrap();
+        assert_eq!(record.logical_record_type(), RecordType::TimeAnchor as u32);
+        let decoded = TimeAnchorPayload::from_bytes(&record.payload).unwrap();
         assert_eq!(decoded, anchor);
     }
 
@@ -415,6 +423,7 @@ mod tests {
                 RecordStamp {
                     apply_key: 7,
                     event_source: code,
+                    commit_hlc: 11,
                 },
             )
             .expect("record");
@@ -425,6 +434,7 @@ mod tests {
                 .expect("checksum covers the source");
             let decoded = RecordHeader::from_bytes(&record.header.to_bytes());
             assert_eq!(decoded.event_source, code);
+            assert_eq!(decoded.commit_hlc, 11);
         }
     }
 }

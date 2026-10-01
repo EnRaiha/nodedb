@@ -9,8 +9,6 @@
 
 use tracing::warn;
 
-use nodedb_types::Surrogate;
-
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::crdt_rejection;
@@ -75,6 +73,11 @@ impl CoreLoop {
                 },
             );
         }
+        if let Some(refusal) = crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+            "crdt", collection, surrogate,
+        ) {
+            return self.response_error(task, refusal);
+        }
 
         // Borrow the engine in a nested block so the &mut borrow is dropped
         // before the sparse write below takes &self. On a Clean apply we read
@@ -97,18 +100,16 @@ impl CoreLoop {
             let outcome = engine.apply_committed_delta_validated(
                 collection,
                 delta,
-                surrogate,
-                document_id,
+                crate::engine::crdt::tenant_state::ApplyTarget::Document {
+                    document_id,
+                    surrogate,
+                },
                 peer_id,
             );
             match outcome {
                 ValidatedApplyOutcome::Clean { .. } => {
                     imported_authoritative = true;
-                    if surrogate != Surrogate::ZERO {
-                        Ok(Self::encode_crdt_row(engine, collection, document_id))
-                    } else {
-                        Ok(None)
-                    }
+                    Ok(Self::encode_crdt_row(engine, collection, document_id))
                 }
                 ValidatedApplyOutcome::Rejected(vt) => Err(LocalRefusal::Constraint(vt)),
                 ValidatedApplyOutcome::Malformed => Err(LocalRefusal::Malformed),
@@ -222,6 +223,15 @@ pub(in crate::data::executor::handlers::control::crdt_apply) mod tests {
     use crate::bridge::envelope::Status;
     use crate::data::executor::core_loop::tests::{make_core_with_dir, make_default_task};
 
+    /// A distinct bound surrogate per document id, so two documents never
+    /// project onto one sparse row.
+    fn document_surrogate(document_id: &str) -> Surrogate {
+        let sum = document_id.bytes().fold(1u32, |acc, byte| {
+            acc.wrapping_mul(31).wrapping_add(u32::from(byte))
+        });
+        Surrogate::new(sum.max(1))
+    }
+
     pub(in crate::data::executor::handlers::control::crdt_apply) fn params<'a>(
         document_id: &'a str,
         delta: &'a [u8],
@@ -230,7 +240,7 @@ pub(in crate::data::executor::handlers::control::crdt_apply) mod tests {
             collection: "docs",
             document_id,
             delta,
-            surrogate: Surrogate::ZERO,
+            surrogate: document_surrogate(document_id),
             peer_id: 7,
             provenance: None,
             constraint_version_required: 0,
@@ -251,6 +261,42 @@ pub(in crate::data::executor::handlers::control::crdt_apply) mod tests {
                 .expect("source write");
         }
         source.export_snapshot().expect("source snapshot")
+    }
+
+    /// A delta whose document carries no surrogate is refused before the
+    /// import, so no row exists afterwards.
+    #[test]
+    fn a_delta_without_a_surrogate_imports_no_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _request_tx, _response_rx) = make_core_with_dir(dir.path());
+        let task = make_default_task();
+        let source = nodedb_crdt::CrdtState::new(42).expect("source state");
+        source
+            .upsert("docs", "one", &[("value", LoroValue::String("one".into()))])
+            .expect("source write");
+        let delta = source.export_snapshot().expect("source snapshot");
+        let unbound = CrdtApplyParams {
+            surrogate: Surrogate::ZERO,
+            ..params("one", &delta)
+        };
+
+        let response = core.apply_crdt_local(&task, unbound);
+
+        assert_eq!(response.status, Status::Error);
+        assert!(
+            matches!(
+                response.error_code.as_deref(),
+                Some(ErrorCode::RejectedPrevalidation { .. })
+            ),
+            "got {:?}",
+            response.error_code
+        );
+        let key = (task.request.database_id, task.request.tenant_id);
+        let imported = core
+            .crdt_engines
+            .get(&key)
+            .is_some_and(|engine| engine.row_exists("docs", "one"));
+        assert!(!imported, "an unbound delta must not reach the CRDT state");
     }
 
     /// A delta with no named target is refused before the import. The

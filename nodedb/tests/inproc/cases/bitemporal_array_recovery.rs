@@ -63,7 +63,7 @@ fn put_cell(x: i64, v: i64, system_from_ms: i64, valid_from_ms: i64) -> ArrayPut
     ArrayPutCell {
         coord: vec![CoordValue::Int64(x)],
         attrs: vec![CellValue::Int64(v)],
-        surrogate: Surrogate::ZERO,
+        surrogate: Surrogate::new(x as u32 + 1),
         system_from_ms,
         valid_from_ms,
         valid_until_ms: i64::MAX,

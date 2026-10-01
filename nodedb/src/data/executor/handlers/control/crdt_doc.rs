@@ -41,7 +41,8 @@ pub(in crate::data::executor) struct CrdtDocUpsert<'a> {
 pub(in crate::data::executor) struct CrdtDocDelete<'a> {
     pub collection: &'a str,
     pub document_id: &'a str,
-    pub surrogate: Surrogate,
+    /// `None`: the key is unbound, so no row matches.
+    pub surrogate: Option<Surrogate>,
     pub returning: Option<&'a ReturningSpec>,
     /// Compiled RLS read policy gating the `RETURNING` rows. Empty = no policy.
     pub rls_filters: &'a [u8],
@@ -65,6 +66,11 @@ impl CoreLoop {
             rls_filters,
         } = args;
         debug!(core = self.core_id, %collection, %document_id, partial, "crdt doc upsert");
+        if let Some(refusal) = crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+            "crdt", collection, surrogate,
+        ) {
+            return self.response_error(task, refusal);
+        }
         let tenant_id = task.request.tenant_id;
         let Ok(json_map) =
             sonic_rs::from_str::<serde_json::Map<String, serde_json::Value>>(fields_json)
@@ -106,11 +112,7 @@ impl CoreLoop {
                     },
                 );
             }
-            if surrogate != Surrogate::ZERO {
-                Self::encode_crdt_row(engine, collection, document_id)
-            } else {
-                None
-            }
+            Self::encode_crdt_row(engine, collection, document_id)
         };
 
         let response = if let Some(bytes) = materialized {
@@ -191,6 +193,15 @@ impl CoreLoop {
             rls_filters,
         } = args;
         debug!(core = self.core_id, %collection, %document_id, "crdt doc delete");
+        // An unbound key names no stored row: the delete matches nothing.
+        let Some(surrogate) = surrogate else {
+            return self.point_delete_matched_nothing(task, returning, rls_filters);
+        };
+        if let Some(refusal) = crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+            "crdt", collection, surrogate,
+        ) {
+            return self.response_error(task, refusal);
+        }
         let tenant_id = task.request.tenant_id;
         {
             let engine = match self.get_crdt_engine(task.request.database_id, tenant_id) {
@@ -236,7 +247,6 @@ impl CoreLoop {
                 database_id: task.request.database_id.as_u64(),
                 tid,
                 collection,
-                // The graph cascade keys nodes by the client key.
                 document_id,
                 surrogate,
                 user_roles: &task.request.user_roles,

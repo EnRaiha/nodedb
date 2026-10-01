@@ -73,7 +73,8 @@ pub async fn handle_subscribe(
 
     // Exact subscriptions use only their topic buses, so unrelated topic,
     // tenant, and database traffic cannot create lag or be observed here.
-    let mut subscriptions: Vec<_> = channels
+    // A topic dropped after the check above has no bus to subscribe to.
+    let Some(mut subscriptions) = channels
         .iter()
         .map(|channel| {
             state
@@ -81,7 +82,13 @@ pub async fn handle_subscribe(
                 .subscribe(DatabaseId::DEFAULT, tenant_id, channel)
         })
         .collect::<Option<Vec<_>>>()
-        .expect("topics were validated before subscribing");
+    else {
+        return write_rejection(
+            stream,
+            RespValue::err("ERR a subscribed topic was dropped; retry the SUBSCRIBE"),
+        )
+        .await;
+    };
 
     for (i, channel) in channels.iter().enumerate() {
         let confirm = RespValue::array(vec![
@@ -258,25 +265,10 @@ pub async fn handle_publish(
         // Durable topics do not track live RESP subscribers. `1` means the
         // Event Plane accepted the message into the topic's durable buffer.
         Ok(_) => RespValue::integer(1),
-        Err(PublishError::RemoteHome { leader_node, .. }) => {
-            match crate::event::topic::publish::publish_remote(
-                state,
-                DatabaseId::DEFAULT,
-                identity.tenant_id.as_u64(),
-                &channel,
-                message,
-                leader_node,
-            )
-            .await
-            {
-                Ok(_) => RespValue::integer(1),
-                Err(error) => RespValue::err(format!("ERR publish failed: {error}")),
-            }
-        }
         Err(PublishError::TopicNotFound(topic)) => {
             RespValue::err(format!("ERR no such topic '{topic}'"))
         }
-        Err(PublishError::Persistence(error)) | Err(PublishError::RemoteError(error)) => {
+        Err(PublishError::Persistence(error)) => {
             RespValue::err(format!("ERR publish failed: {error}"))
         }
     }
@@ -391,15 +383,12 @@ async fn write_value(stream: &mut ConnStream, response: RespValue) -> crate::Res
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use crate::control::security::identity::{AuthMethod, DatabaseSet};
     use crate::control::security::permission::{PermissionStore, collection_target};
     use crate::control::security::role::RoleStore;
     use crate::event::cdc::stream_def::RetentionConfig;
     use crate::event::topic::TopicDef;
     use crate::types::TenantId;
-    use crate::wal::WalManager;
 
     use super::*;
 
@@ -448,6 +437,7 @@ mod tests {
             sequence: 7,
             event_time: 1,
             lsn: 7,
+            epoch: 0,
             payload: "{\"id\":7,\"unchanged\":true}".into(),
         };
         let channels = ["orders.created".to_string()];
@@ -498,14 +488,11 @@ mod tests {
         assert_eq!(registry.receiver_count(), before);
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn publish_authorizes_then_appends_to_durable_topic_buffer() {
-        let directory = tempfile::tempdir().expect("temporary test directory");
-        let wal_directory = directory.path().join("wal");
-        std::fs::create_dir_all(&wal_directory).expect("create WAL directory");
-        let wal = Arc::new(WalManager::open_for_testing(&wal_directory).expect("test WAL"));
-        let (dispatcher, _) = crate::bridge::dispatch::Dispatcher::new(1, 16);
-        let state = SharedState::new(dispatcher, wal).expect("test shared state");
+        // A publication proposes through the topic's data group.
+        let cluster = crate::control::cluster::test_one_node::boot().await;
+        let state = &cluster.state;
         let identity = identity();
         let retention = RetentionConfig {
             max_events: 10,
@@ -520,6 +507,7 @@ mod tests {
             created_at: 0,
             last_sequence: 0,
             last_lsn: 0,
+            last_epoch: 0,
             modification_hlc: nodedb_types::Hlc::ZERO,
         };
         state
@@ -544,7 +532,7 @@ mod tests {
         };
 
         assert_eq!(
-            handle_publish(&command, &session, &state).await,
+            handle_publish(&command, &session, state).await,
             RespValue::err("NOPERM this user has no permissions to access this channel")
         );
         assert_eq!(buffer.total_pushed(), 0);
@@ -552,7 +540,7 @@ mod tests {
         state
             .permissions
             .grant(
-                &collection_target(identity.tenant_id, "topic:orders"),
+                &collection_target(DatabaseId::DEFAULT, identity.tenant_id, "topic:orders"),
                 "user:alice",
                 Permission::Write,
                 "test",
@@ -560,7 +548,7 @@ mod tests {
             )
             .expect("in-memory grant");
         assert_eq!(
-            handle_publish(&command, &session, &state).await,
+            handle_publish(&command, &session, state).await,
             RespValue::integer(1)
         );
         assert_eq!(buffer.total_pushed(), 1);
@@ -568,7 +556,7 @@ mod tests {
         state
             .permissions
             .grant(
-                &collection_target(identity.tenant_id, "topic:missing"),
+                &collection_target(DatabaseId::DEFAULT, identity.tenant_id, "topic:missing"),
                 "user:alice",
                 Permission::Write,
                 "test",
@@ -580,8 +568,9 @@ mod tests {
             args: vec![b"missing".to_vec(), b"accepted".to_vec()],
         };
         assert_eq!(
-            handle_publish(&missing_topic, &session, &state).await,
+            handle_publish(&missing_topic, &session, state).await,
             RespValue::err("ERR no such topic 'missing'")
         );
+        cluster.shutdown().await;
     }
 }

@@ -24,6 +24,9 @@ impl WalAppender<'_> {
         self.append_record(RecordType::Checkpoint, tid, vs, db, &payload)
     }
 
+    /// Append a timeseries or columnar batch. It is a row-write record: WAL
+    /// replay rebuilds a timeseries ingest's events from it, so it carries
+    /// the event source its write ran with.
     pub fn append_timeseries_batch(
         &self,
         tid: TenantId,
@@ -31,7 +34,7 @@ impl WalAppender<'_> {
         db: DatabaseId,
         p: &[u8],
     ) -> crate::Result<Lsn> {
-        self.append_record(RecordType::TimeseriesBatch, tid, vs, db, p)
+        self.append_row_record(RecordType::TimeseriesBatch, tid, vs, db, p)
     }
 
     pub fn append_log_batch(

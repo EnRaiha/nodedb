@@ -5,6 +5,10 @@
 //!
 //! Each batch edge appends as its own single-edge `Put`/`Delete` record. Batch
 //! `properties` is always empty, matching what `execute_edge_put_batch` applies.
+//!
+//! An edge record is an [`EdgePutRedo`] or [`EdgeDeleteRedo`], the same payload
+//! a transaction's redo carries. It carries both endpoint surrogates. A write
+//! whose endpoint surrogate is `Surrogate::ZERO` is refused before any append.
 
 #![deny(clippy::wildcard_enum_match_arm)]
 
@@ -12,6 +16,7 @@ use nodedb_physical::physical_plan::{BatchEdge, GraphOp};
 
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use crate::wal::manager::WalAppender;
+use crate::wal::{EdgeDeleteRedo, EdgePutRedo};
 
 /// Append the WAL record for a single `GraphOp`, returning the allocated LSN
 /// for edge/node-label writes or `None` for traversal/algorithm/read variants.
@@ -30,13 +35,19 @@ pub(super) fn wal_append_graph_op(
             label,
             dst_id,
             properties,
-            src_surrogate: _,
-            dst_surrogate: _,
+            src_surrogate,
+            dst_surrogate,
         } => {
-            let entry = zerompk::to_msgpack_vec(&(collection, src_id, label, dst_id, properties))
-                .map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("wal edge put: {e}"),
+            let entry = encode_edge_put(EdgePutRedo {
+                collection: collection.to_string(),
+                src_id: src_id.clone(),
+                label: label.clone(),
+                dst_id: dst_id.clone(),
+                properties: properties.clone(),
+                src_surrogate: src_surrogate.as_u32(),
+                dst_surrogate: dst_surrogate.as_u32(),
+                system_from: None,
+                applied: None,
             })?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
@@ -46,17 +57,20 @@ pub(super) fn wal_append_graph_op(
             src_id,
             label,
             dst_id,
-            src_surrogate: _,
-            dst_surrogate: _,
+            src_surrogate,
+            dst_surrogate,
             rls_write_check: _,
         } => {
-            let entry =
-                zerompk::to_msgpack_vec(&(collection, src_id, label, dst_id)).map_err(|e| {
-                    crate::Error::Serialization {
-                        format: "msgpack".into(),
-                        detail: format!("wal edge delete: {e}"),
-                    }
-                })?;
+            let entry = encode_edge_delete(EdgeDeleteRedo {
+                collection: collection.to_string(),
+                src_id: src_id.clone(),
+                label: label.clone(),
+                dst_id: dst_id.clone(),
+                src_surrogate: src_surrogate.as_u32(),
+                dst_surrogate: dst_surrogate.as_u32(),
+                system_from: None,
+                applied: None,
+            })?;
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
         GraphOp::SetNodeLabels { node_id, labels } => {
@@ -91,7 +105,14 @@ pub(super) fn wal_append_graph_op(
         | GraphOp::WccSuperstep(_)
         | GraphOp::TemporalNeighbors { .. }
         | GraphOp::TemporalAlgorithm { .. }
-        | GraphOp::Stats { .. } => None,
+        | GraphOp::Stats { .. }
+        | GraphOp::NodePresenceRead { .. } => None,
+        // A node delete's guard writes nothing. A TRUNCATE's edge share runs
+        // only inside a Calvin transaction, whose resolved redo journals its
+        // tombstones.
+        GraphOp::NodeEdgeGuard { .. }
+        | GraphOp::NodePresenceGuard { .. }
+        | GraphOp::TruncateEdges { .. } => None,
     };
     Ok(appended)
 }
@@ -105,20 +126,24 @@ pub(crate) fn wal_append_graph_edge_put_batch(
     database_id: DatabaseId,
     edges: &[BatchEdge],
 ) -> crate::Result<Option<Lsn>> {
+    let entries = edges
+        .iter()
+        .map(|edge| {
+            encode_edge_put(EdgePutRedo {
+                collection: edge.collection.to_string(),
+                src_id: edge.src_id.clone(),
+                label: edge.label.clone(),
+                dst_id: edge.dst_id.clone(),
+                properties: Vec::new(),
+                src_surrogate: edge.src_surrogate.as_u32(),
+                dst_surrogate: edge.dst_surrogate.as_u32(),
+                system_from: None,
+                applied: None,
+            })
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
     let mut last_lsn = None;
-    for edge in edges {
-        let properties: Vec<u8> = Vec::new();
-        let entry = zerompk::to_msgpack_vec(&(
-            &edge.collection,
-            &edge.src_id,
-            &edge.label,
-            &edge.dst_id,
-            &properties,
-        ))
-        .map_err(|e| crate::Error::Serialization {
-            format: "msgpack".into(),
-            detail: format!("wal edge put batch: {e}"),
-        })?;
+    for entry in entries {
         last_lsn = Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?);
     }
     Ok(last_lsn)
@@ -133,17 +158,68 @@ pub(crate) fn wal_append_graph_edge_delete_batch(
     database_id: DatabaseId,
     edges: &[BatchEdge],
 ) -> crate::Result<Option<Lsn>> {
+    let entries = edges
+        .iter()
+        .map(|edge| {
+            encode_edge_delete(EdgeDeleteRedo {
+                collection: edge.collection.to_string(),
+                src_id: edge.src_id.clone(),
+                label: edge.label.clone(),
+                dst_id: edge.dst_id.clone(),
+                src_surrogate: edge.src_surrogate.as_u32(),
+                dst_surrogate: edge.dst_surrogate.as_u32(),
+                system_from: None,
+                applied: None,
+            })
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
     let mut last_lsn = None;
-    for edge in edges {
-        let entry =
-            zerompk::to_msgpack_vec(&(&edge.collection, &edge.src_id, &edge.label, &edge.dst_id))
-                .map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("wal edge delete batch: {e}"),
-            })?;
+    for entry in entries {
         last_lsn = Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?);
     }
     Ok(last_lsn)
+}
+
+/// The refusal for an edge record whose endpoint surrogate is unbound.
+fn unbound_edge(collection: &str, src_id: &str, label: &str, dst_id: &str) -> crate::Error {
+    crate::Error::Internal {
+        detail: format!(
+            "edge '{src_id}'-'{label}'->'{dst_id}' in '{collection}' carries an unbound \
+             endpoint surrogate; every edge write carries both endpoint identities"
+        ),
+    }
+}
+
+/// Encode an edge put record. Refuses an unbound endpoint surrogate.
+pub(super) fn encode_edge_put(record: EdgePutRedo) -> crate::Result<Vec<u8>> {
+    if record.endpoints().is_none() {
+        return Err(unbound_edge(
+            &record.collection,
+            &record.src_id,
+            &record.label,
+            &record.dst_id,
+        ));
+    }
+    zerompk::to_msgpack_vec(&record).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("wal edge put: {e}"),
+    })
+}
+
+/// Encode an edge delete record. Refuses an unbound endpoint surrogate.
+pub(super) fn encode_edge_delete(record: EdgeDeleteRedo) -> crate::Result<Vec<u8>> {
+    if record.endpoints().is_none() {
+        return Err(unbound_edge(
+            &record.collection,
+            &record.src_id,
+            &record.label,
+            &record.dst_id,
+        ));
+    }
+    zerompk::to_msgpack_vec(&record).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("wal edge delete: {e}"),
+    })
 }
 
 #[cfg(test)]
@@ -199,14 +275,18 @@ mod tests {
             .collect();
         assert_eq!(puts.len(), 3, "one Put record per edge");
 
-        let (collection, src_id, label, dst_id, properties) =
-            zerompk::from_msgpack::<(String, String, String, String, Vec<u8>)>(&puts[0].payload)
-                .expect("decode edge put payload");
-        assert_eq!(collection, "knows");
-        assert_eq!(src_id, "a");
-        assert_eq!(label, "KNOWS");
-        assert_eq!(dst_id, "b");
-        assert!(properties.is_empty(), "batch edges carry no properties");
+        let put = zerompk::from_msgpack::<EdgePutRedo>(&puts[0].payload)
+            .expect("decode edge put payload");
+        assert_eq!(put.collection, "knows");
+        assert_eq!(put.src_id, "a");
+        assert_eq!(put.label, "KNOWS");
+        assert_eq!(put.dst_id, "b");
+        assert!(put.properties.is_empty(), "batch edges carry no properties");
+        assert_eq!(
+            put.endpoints(),
+            Some((Surrogate::new(1), Surrogate::new(2))),
+            "each batch edge record carries both endpoint surrogates"
+        );
 
         assert_eq!(
             lsn.as_u64(),
@@ -246,13 +326,17 @@ mod tests {
             .collect();
         assert_eq!(deletes.len(), 2, "one Delete record per edge");
 
-        let (collection, src_id, label, dst_id) =
-            zerompk::from_msgpack::<(String, String, String, String)>(&deletes[0].payload)
-                .expect("decode edge delete payload");
-        assert_eq!(collection, "knows");
-        assert_eq!(src_id, "a");
-        assert_eq!(label, "KNOWS");
-        assert_eq!(dst_id, "b");
+        let delete = zerompk::from_msgpack::<EdgeDeleteRedo>(&deletes[0].payload)
+            .expect("decode edge delete payload");
+        assert_eq!(delete.collection, "knows");
+        assert_eq!(delete.src_id, "a");
+        assert_eq!(delete.label, "KNOWS");
+        assert_eq!(delete.dst_id, "b");
+        assert_eq!(
+            delete.endpoints(),
+            Some((Surrogate::new(1), Surrogate::new(2))),
+            "each batch edge delete record carries both endpoint surrogates"
+        );
 
         assert_eq!(
             lsn.as_u64(),
@@ -331,6 +415,66 @@ mod tests {
             &wal,
             nodedb_wal::record::RecordType::Put
         ));
+    }
+
+    /// The autocommit edge records carry both endpoint surrogates, and an edge
+    /// write with an unbound endpoint is refused before any append.
+    #[test]
+    fn edge_records_carry_endpoint_identity_and_refuse_unbound() {
+        use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = open_wal(dir.path());
+        let append = |plan: &PhysicalPlan| {
+            super::super::wal_append_if_write(
+                &wal,
+                TenantId::new(7),
+                VShardId::new(0),
+                DatabaseId::DEFAULT,
+                plan,
+            )
+        };
+        let collection = nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "knows");
+        let put = |src: Surrogate| {
+            PhysicalPlan::Graph(GraphOp::EdgePut {
+                collection: collection.clone(),
+                src_id: "a".to_string(),
+                label: "KNOWS".to_string(),
+                dst_id: "b".to_string(),
+                properties: vec![],
+                src_surrogate: src,
+                dst_surrogate: Surrogate::new(6),
+            })
+        };
+        let delete = |dst: Surrogate| {
+            PhysicalPlan::Graph(GraphOp::EdgeDelete {
+                collection: collection.clone(),
+                src_id: "a".to_string(),
+                label: "KNOWS".to_string(),
+                dst_id: "b".to_string(),
+                src_surrogate: Surrogate::new(5),
+                dst_surrogate: dst,
+                rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+            })
+        };
+        assert!(
+            append(&put(Surrogate::ZERO)).is_err(),
+            "unbound put refused"
+        );
+        assert!(
+            append(&delete(Surrogate::ZERO)).is_err(),
+            "unbound delete refused"
+        );
+        append(&put(Surrogate::new(5))).expect("bound put");
+        append(&delete(Surrogate::new(6))).expect("bound delete");
+
+        wal.sync().expect("sync wal");
+        let records = wal.replay().expect("read wal");
+        assert_eq!(records.len(), 2, "only the bound writes append");
+        let put = zerompk::from_msgpack::<EdgePutRedo>(&records[0].payload).expect("put");
+        let delete = zerompk::from_msgpack::<EdgeDeleteRedo>(&records[1].payload).expect("delete");
+        let bound = Some((Surrogate::new(5), Surrogate::new(6)));
+        assert_eq!(put.endpoints(), bound);
+        assert_eq!(delete.endpoints(), bound);
     }
 
     #[test]

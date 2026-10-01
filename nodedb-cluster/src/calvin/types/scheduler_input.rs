@@ -11,7 +11,10 @@
 //!
 //! [`SequencerEntry`]: super::super::sequencer::entry::SequencerEntry
 
+use std::sync::Arc;
+
 use super::lock_wire::{LockKeyWire, ReleaseReason, TxnIdWire};
+use super::multi_part::TaskChunk;
 use super::sequencer::SequencedTxn;
 
 /// One item in a per-vShard scheduler input stream.
@@ -20,8 +23,9 @@ use super::sequencer::SequencedTxn;
 /// form is the replicated `SequencerEntry`, decoded and fanned out into these.
 #[derive(Debug)]
 pub enum SchedulerInput {
-    /// A sequenced transaction to process (lock-acquire + dispatch).
-    Txn(SequencedTxn),
+    /// A sequenced transaction to process (lock-acquire + dispatch). Boxed
+    /// so the other, small variants do not carry its size.
+    Txn(Box<SequencedTxn>),
     /// Install a SHARED reservation on `key` for interactive txn `owner`.
     Reserve { owner: TxnIdWire, key: LockKeyWire },
     /// Release ALL of `owner`'s shared reservations on this vShard.
@@ -33,4 +37,17 @@ pub enum SchedulerInput {
     /// transaction delivered before it must finish before the scheduler
     /// reports it; every transaction delivered after it commits above `hlc`.
     CutMarker { hlc: u64 },
+    /// Part `index` of the plans of the multi-part transaction `txn`, whose
+    /// first task is the transaction's task `first_task`. The bytes are
+    /// shared by every scheduler of this node the part targets. `chunk` is
+    /// set on a part that holds one byte range of one task.
+    TxnPart {
+        txn: TxnIdWire,
+        index: u32,
+        first_task: u32,
+        plans: Arc<Vec<u8>>,
+        chunk: Option<TaskChunk>,
+    },
+    /// The multi-part transaction `txn` lost its parts and aborts.
+    PartsAbandoned { txn: TxnIdWire },
 }

@@ -76,6 +76,7 @@ pub(super) fn async_propose_error(vshard_id: u32, error: ClusterError) -> crate:
         | ClusterError::SpatialGather(_)
         | ClusterError::Bm25Gather(_)
         | ClusterError::TsGather(_)
+        | ClusterError::ShufflePush(_)
         | ClusterError::RemoteUntyped { .. }) => crate::Error::Internal {
             detail: format!("raft propose (async): {other}"),
         },
@@ -88,7 +89,10 @@ mod tests {
 
     #[test]
     fn a_missing_leader_is_retryable() {
-        let error = ClusterError::Raft(RaftError::NotLeader { leader_hint: None });
+        let error = ClusterError::Raft(RaftError::NotLeader {
+            leader_hint: None,
+            term: 1,
+        });
         assert!(matches!(
             async_propose_error(3, error),
             crate::Error::NoLeader { .. }

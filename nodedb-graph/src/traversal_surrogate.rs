@@ -15,7 +15,7 @@
 //! directly with any other engine's. Node names are resolved once, by the
 //! caller, and only for the rows that survive fusion.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 
 use nodedb_types::{Surrogate, SurrogateBitmap};
 
@@ -104,6 +104,12 @@ impl CsrIndex {
     /// string-keyed path; the difference is that nothing is ever converted to a
     /// name. Nodes without a surrogate stay traversable — they just cannot be
     /// reported (see [`SurrogateHops::unaddressable`]).
+    ///
+    /// The walk admits nodes in `(depth, node name)` order: each level's new
+    /// nodes in name order. When `max_visited` cuts the walk, the admitted set
+    /// is the same however the edges are stored, which lets a cluster
+    /// coordinator walking the same edges across partitions admit the same
+    /// nodes.
     pub fn traverse_surrogates_in_collection(
         &self,
         params: SurrogateBfsParams<'_>,
@@ -131,54 +137,69 @@ impl CsrIndex {
         let label_id = label_filter.and_then(|l| self.label_id(l));
 
         let mut visited: HashSet<u32> = HashSet::with_capacity(max_visited.min(1024));
-        let mut queue: VecDeque<(u32, usize)> = VecDeque::new();
+        let mut frontier: Vec<u32> = Vec::new();
         for &local in seeds {
-            if !self.is_local_node(local) {
-                continue;
+            if self.is_local_node(local) && visited.insert(local) {
+                frontier.push(local);
             }
-            if visited.insert(local) {
-                hops.record(self, local, 0);
-                queue.push_back((local, 0));
-            }
+        }
+        self.sort_by_name(&mut frontier);
+        for &local in &frontier {
+            hops.record(self, local, 0);
         }
 
         let want_out = matches!(direction, Direction::Out | Direction::Both);
         let want_in = matches!(direction, Direction::In | Direction::Both);
 
-        while let Some((node, depth)) = queue.pop_front() {
-            if depth >= max_depth {
-                continue;
+        // Level by level. Each level's new nodes are admitted in node-name
+        // order, so under the visit cap the admitted set is the same whatever
+        // order the edges are stored in, here or split across partitions.
+        for depth in 0..max_depth {
+            if frontier.is_empty() {
+                break;
             }
-            self.record_access(node);
-            let next_depth = depth + 1;
-
-            let mut neighbors: Vec<(u32, u32)> = Vec::new();
-            if want_out {
-                neighbors.extend(self.iter_out_edges_raw_in(node, collection_id));
-            }
-            if want_in {
-                neighbors.extend(self.iter_in_edges_raw_in(node, collection_id));
-            }
-
-            for (lid, other) in neighbors {
-                if label_id.is_some_and(|f| f != lid) {
-                    continue;
+            let mut candidates: Vec<u32> = Vec::new();
+            let mut offered: HashSet<u32> = HashSet::new();
+            for &node in &frontier {
+                self.record_access(node);
+                let mut neighbors: Vec<(u32, u32)> = Vec::new();
+                if want_out {
+                    neighbors.extend(self.iter_out_edges_raw_in(node, collection_id));
                 }
-                if visited.contains(&other) {
-                    continue;
+                if want_in {
+                    neighbors.extend(self.iter_in_edges_raw_in(node, collection_id));
                 }
+                for (lid, other) in neighbors {
+                    if label_id.is_some_and(|f| f != lid)
+                        || visited.contains(&other)
+                        || !offered.insert(other)
+                    {
+                        continue;
+                    }
+                    candidates.push(other);
+                }
+            }
+            self.sort_by_name(&mut candidates);
+            let mut next: Vec<u32> = Vec::with_capacity(candidates.len());
+            for other in candidates {
                 if visited.len() >= max_visited {
                     hops.truncated = true;
                     return hops;
                 }
                 visited.insert(other);
-                hops.record(self, other, next_depth);
+                hops.record(self, other, depth + 1);
                 self.prefetch_node(other);
-                queue.push_back((other, next_depth));
+                next.push(other);
             }
+            frontier = next;
         }
 
         hops
+    }
+
+    /// Order CSR-local ids by node name.
+    pub(crate) fn sort_by_name(&self, nodes: &mut [u32]) {
+        nodes.sort_by(|a, b| self.node_name_checked(*a).cmp(&self.node_name_checked(*b)));
     }
 
     /// Record the addressable seeds and nothing else. Used when the requested
@@ -363,6 +384,28 @@ mod tests {
         let hops = csr.traverse_surrogates_in_collection(p);
         assert_eq!(hops.reached.len(), 1);
         assert!(hops.reached.contains(Surrogate::new(10)));
+    }
+
+    /// Under the cap, a level admits its nodes in name order, whatever order
+    /// their edges were inserted in.
+    #[test]
+    fn a_capped_level_admits_nodes_in_name_order() {
+        let mut csr = CsrIndex::new(test_memory());
+        for dst in ["z", "m", "b"] {
+            csr.add_edge_in_collection("a", "knows", dst, "people")
+                .unwrap_or_else(|e| panic!("seed edge a->{dst}: {e}"));
+        }
+        let seeds = [local(&csr, "a")];
+        let mut p = params(&seeds, "people");
+        p.max_visited = 3;
+        let hops = csr.traverse_surrogates_in_collection(p);
+        assert!(hops.truncated);
+        let admitted: Vec<&str> = hops
+            .distances
+            .iter()
+            .filter_map(|&(l, _)| csr.node_name_checked(l))
+            .collect();
+        assert_eq!(admitted, vec!["a", "b", "m"]);
     }
 
     #[test]

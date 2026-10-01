@@ -106,7 +106,10 @@ impl SyncSession {
             };
 
             let tenant_id = self.tenant_id.map(|t| t.as_u64()).unwrap_or(0);
-            match self.durable_fencing_decision(msg, shared, tenant_id, user_id) {
+            match self
+                .durable_fencing_decision(msg, shared, tenant_id, user_id)
+                .await
+            {
                 Some(FencingDecision::Reject) => {
                     return self.fork_reject_frame(
                         &current_server_clock,
@@ -201,7 +204,10 @@ impl SyncSession {
         };
 
         let tenant_id = identity.tenant_id.as_u64();
-        match self.durable_fencing_decision(msg, shared, tenant_id, identity.user_id) {
+        match self
+            .durable_fencing_decision(msg, shared, tenant_id, identity.user_id)
+            .await
+        {
             Some(FencingDecision::Reject) => {
                 return self.fork_reject_frame(
                     &current_server_clock,
@@ -284,7 +290,7 @@ impl SyncSession {
         // The peer address is a property of the accepted TCP connection, not
         // of the authentication binding: it is stamped once before any frame
         // is read and is the same address whether this handshake succeeds or
-        // fails. Clearing it here would leave the IP half of
+        // fails. Clearing it here will leave the IP half of
         // `check_blacklist_and_status` inert for the rest of the connection,
         // so it survives alongside the other connection-lifetime state above.
         // Everything genuinely derived from the handshake is reset.
@@ -297,7 +303,7 @@ impl SyncSession {
     }
 
     /// Build a bounded, generic rejection for a Handshake frame whose body
-    /// could not be decoded. The fixed message intentionally exposes no
+    /// cannot be decoded. The fixed message intentionally exposes no
     /// decoder or payload details to the peer.
     pub(super) fn malformed_handshake_reject_frame(&self) -> Option<SyncFrame> {
         self.build_reject_frame(&HashMap::new(), "malformed handshake", false)
@@ -372,7 +378,6 @@ mod tests {
     };
 
     use crate::bridge::dispatch::Dispatcher;
-    use crate::control::security::catalog::SystemCatalog;
     use crate::control::server::sync::session::state::SyncSession;
     use crate::control::server::sync::wire::CompensationHint;
     use crate::control::state::SharedState;
@@ -389,11 +394,6 @@ mod tests {
             epoch: 0,
             wire_version,
         }
-    }
-
-    fn open_registry(dir: &std::path::Path) -> SyncProducerRegistry {
-        let catalog = Arc::new(SystemCatalog::open(&dir.join("system.redb")).unwrap());
-        SyncProducerRegistry::open(catalog).unwrap()
     }
 
     fn trust_state() -> (Arc<SharedState>, tempfile::TempDir) {
@@ -499,7 +499,7 @@ mod tests {
     /// A deployment with no `[auth.jwt]` provider cannot verify a presented
     /// credential. The token must be refused outright — never accepted, and
     /// never quietly downgraded to the configured trust identity, which the
-    /// empty-token branch above would otherwise hand out.
+    /// empty-token branch above will otherwise hand out.
     #[tokio::test]
     async fn presented_token_without_jwks_registry_is_refused() {
         let (state, _dir) = trust_state();
@@ -601,7 +601,7 @@ mod tests {
         session.announced_collections.insert("orders".into());
 
         // Round-trip through the framing codec so this is a CRC-valid
-        // Handshake frame whose MessagePack body simply has the wrong shape.
+        // Handshake frame whose MessagePack body has the wrong shape.
         let malformed_wire = SyncFrame::try_encode(
             SyncMessageType::Handshake,
             &"not a handshake message".to_string(),
@@ -676,24 +676,24 @@ mod tests {
         assert_eq!(session.mutations_processed, 0);
     }
 
-    #[tokio::test]
+    /// A Lite handshake proposes its producer registration and epoch fence
+    /// through the metadata group and blocks on the commit, so the test runs
+    /// on a one-node cluster with a multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stale_lite_rehandshake_clears_trust_binding_before_delta_dispatch() {
-        // Keep the WAL and Data-Plane endpoints alive for the complete
-        // SharedState lifetime, as the production-backed path requires.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let wal = Arc::new(
-            WalManager::open_for_testing(&dir.path().join("sync-fencing.wal")).expect("open WAL"),
-        );
-        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-        let mut shared = SharedState::new(dispatcher, Arc::clone(&wal)).expect("shared state");
+        // The registry shares the credential store's catalog, as boot wires it.
+        let cluster = crate::control::cluster::test_one_node::boot_with(|state| {
+            let catalog = Arc::new(state.credentials.catalog().clone());
+            state.producer_registry = Some(Arc::new(
+                SyncProducerRegistry::open(catalog).expect("open producer registry"),
+            ));
+        })
+        .await;
+        let shared = Arc::clone(&cluster.state);
         shared
             .credentials
             .bootstrap_trust_superuser("nodedb")
             .expect("bootstrap trust superuser");
-        let registry = Arc::new(open_registry(dir.path()));
-        Arc::get_mut(&mut shared)
-            .expect("SharedState has a single owner while configuring test")
-            .producer_registry = Some(registry);
 
         let mut high_epoch_session = SyncSession::new("high-epoch-session".into());
         // Stamped once at accept time, as `handle_sync_session` does.
@@ -760,7 +760,7 @@ mod tests {
         assert!(high_epoch_session.tracked_collections.is_empty());
         assert!(high_epoch_session.announced_collections.is_empty());
 
-        // The configured trust identity is a superuser, so this would be
+        // The configured trust identity is a superuser, so this will be
         // authorized and provisionally ACKed if the stale handshake retained
         // its staged identity. The production dispatch gate must deny it.
         let delta = DeltaPushMsg {
@@ -791,5 +791,6 @@ mod tests {
             Some(CompensationHint::PermissionDenied)
         );
         assert_eq!(high_epoch_session.mutations_processed, 0);
+        cluster.shutdown().await;
     }
 }

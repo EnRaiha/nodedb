@@ -10,8 +10,9 @@
 
 use tracing::debug;
 
-use crate::bridge::envelope::Response;
+use crate::bridge::envelope::{Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::redo_image::versioned_point_images;
 use crate::data::executor::enforcement::chain_guard::{self, ChainGuard};
 use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
@@ -65,6 +66,11 @@ impl CoreLoop {
             resolved_sum_targets,
             deferred_sum_targets,
         } = p;
+        if let Some(refusal) = crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+            "document", collection, surrogate,
+        ) {
+            return self.response_error(task, refusal);
+        }
         let storage_key = StorageKey::for_surrogate(surrogate);
         let document_identity = RowIdentity::from_user_key(document_id);
         debug!(
@@ -83,16 +89,14 @@ impl CoreLoop {
             wal_lsn: task.wal_lsn(),
         };
 
-        // Hash chaining rewrites the BODY (it injects `_chain_hash`), so it runs
-        // before the body is encoded and stored — not through the image funnel,
+        // Hash chaining marks the row before the write, so `build_stored_body`
+        // writes its link into the stored body — not through the image funnel,
         // which only sees a write that has already been applied. This handler is
         // INSERT-shaped by construction, so every write it performs is a link.
         let mut chain = ChainGuard::begin(self, database_id, tid, collection);
-        let chained = match chain.chain_insert(self, database_id, tid, document_id, value) {
-            Ok(chained) => chained,
-            Err(e) => return self.response_error(task, e),
-        };
-        let effective_value: &[u8] = chained.as_deref().unwrap_or(value);
+        if let Err(e) = chain.chain_insert(self, surrogate, value) {
+            return self.response_error(task, e);
+        }
 
         let txn = match self.sparse.begin_write() {
             Ok(t) => t,
@@ -137,10 +141,19 @@ impl CoreLoop {
                     // written, so there is no post-image to project, and a
                     // count payload would be decoded as a row set of the wrong
                     // shape by the RETURNING renderer.
-                    if let Some(spec) = returning {
-                        return self.stored_returning_response(task, spec, rls_filters, None, &[]);
-                    }
-                    return self.response_affected(task, 0);
+                    let mut response = match returning {
+                        Some(spec) => {
+                            self.stored_returning_response(task, spec, rls_filters, None, &[])
+                        }
+                        None => self.response_affected(task, 0),
+                    };
+                    // The pre-dispatch record carries the submitted row, which
+                    // was not written: replay must never apply it.
+                    response.write_set = vec![WriteSetEntry::cancel_forward(
+                        surrogate.as_u32(),
+                        document_identity,
+                    )];
+                    return response;
                 }
                 return self.response_error(
                     task,
@@ -173,10 +186,11 @@ impl CoreLoop {
                 collection,
                 storage_key,
                 surrogate,
-                value: effective_value,
+                value,
                 index_text: true,
                 user_roles: &task.request.user_roles,
                 enforce: true,
+                unique: crate::data::executor::enforcement::unique::UniqueJudge::Row,
                 wal_lsn: task.wal_lsn(),
                 resolved_targets: resolved_sum_targets,
             },
@@ -185,7 +199,7 @@ impl CoreLoop {
             Err(e) => {
                 chain_guard::abort_after_apply(
                     self,
-                    &chain,
+                    &mut chain,
                     database_id,
                     tid,
                     collection,
@@ -197,10 +211,13 @@ impl CoreLoop {
 
         // The advanced head lands in the SAME transaction as the row whose hash
         // it is, so head and row commit or roll back as one unit.
-        if let Err(e) = chain.persist_head(self, &txn) {
+        if let Err(e) = chain
+            .settle(self, surrogate, &outcome.stored_value)
+            .and_then(|()| chain.persist_head(self, &txn))
+        {
             chain_guard::abort_after_apply(
                 self,
-                &chain,
+                &mut chain,
                 database_id,
                 tid,
                 collection,
@@ -226,7 +243,7 @@ impl CoreLoop {
             Err(e) => {
                 chain_guard::abort_after_apply(
                     self,
-                    &chain,
+                    &mut chain,
                     database_id,
                     tid,
                     collection,
@@ -249,7 +266,7 @@ impl CoreLoop {
         {
             chain_guard::abort_after_apply(
                 self,
-                &chain,
+                &mut chain,
                 database_id,
                 tid,
                 collection,
@@ -259,6 +276,14 @@ impl CoreLoop {
         }
 
         if let Err(e) = txn.commit() {
+            chain_guard::abort_after_apply(
+                self,
+                &mut chain,
+                database_id,
+                tid,
+                collection,
+                &storage_key,
+            );
             return self.response_error(
                 task,
                 crate::Error::Storage {
@@ -329,9 +354,15 @@ impl CoreLoop {
             // The row was inserted: exactly one row affected.
             self.response_affected(task, 1)
         };
-        if !target_write_set.is_empty() {
-            response.write_set = target_write_set;
+        // A versioned row's key was decided here, so its stamped image
+        // replaces the unstamped pre-dispatch record.
+        if let Some(sys_from_ms) = outcome.bitemporal_sys_from_ms {
+            response.write_set = versioned_point_images(
+                WriteSetEntry::put(surrogate.as_u32(), document_identity, value.to_vec()),
+                sys_from_ms,
+            );
         }
+        response.write_set.extend(target_write_set);
         response
     }
 }

@@ -56,11 +56,13 @@ impl UdpTransport {
     /// mode (mirrors the Raft transport's `TransportCredentials::Insecure`
     /// escape hatch — only safe on isolated networks).
     pub async fn bind(addr: SocketAddr, mac_key: MacKey) -> Result<Self, SwimError> {
-        let socket = UdpSocket::bind(addr).await.map_err(|e| SwimError::Encode {
-            detail: format!("udp bind {addr}: {e}"),
+        let socket = UdpSocket::bind(addr).await.map_err(|e| SwimError::Bind {
+            addr,
+            detail: e.to_string(),
         })?;
-        let local_addr = socket.local_addr().map_err(|e| SwimError::Encode {
-            detail: format!("udp local_addr: {e}"),
+        let local_addr = socket.local_addr().map_err(|e| SwimError::Bind {
+            addr,
+            detail: format!("local_addr: {e}"),
         })?;
         Ok(Self {
             socket: Arc::new(socket),
@@ -68,6 +70,13 @@ impl UdpTransport {
             auth: SwimAuth::new(mac_key, local_addr),
             recv_buf: Mutex::new(vec![0u8; RECV_BUF_BYTES]),
         })
+    }
+
+    /// Send every later datagram in boot `epoch`'s sequence range. A peer
+    /// keeps its replay window for this address across this node's restart,
+    /// so the node calls it once per boot, before the detector sends.
+    pub fn enter_boot_epoch(&self, epoch: u64) {
+        self.auth.enter_boot_epoch(epoch);
     }
 }
 

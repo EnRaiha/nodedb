@@ -49,8 +49,8 @@ pub(super) fn serialize_array_op(op: &ArrayOp, ops: &mut Vec<RedoSubRecord>) -> 
         ArrayOp::Put {
             array_id,
             cells_msgpack,
-            wal_lsn: _,
             provenance,
+            ..
         } => {
             let cells = zerompk::from_msgpack::<Vec<ArrayPutCell>>(cells_msgpack).map_err(|e| {
                 crate::Error::Serialization {
@@ -77,8 +77,8 @@ pub(super) fn serialize_array_op(op: &ArrayOp, ops: &mut Vec<RedoSubRecord>) -> 
         ArrayOp::Delete {
             array_id,
             coords_msgpack,
-            wal_lsn: _,
             provenance,
+            ..
         } => {
             let cells =
                 zerompk::from_msgpack::<Vec<ArrayDeleteCell>>(coords_msgpack).map_err(|e| {
@@ -119,7 +119,7 @@ pub(super) fn serialize_array_op(op: &ArrayOp, ops: &mut Vec<RedoSubRecord>) -> 
         // Rejected like the KV / document index/DDL ops.
         ArrayOp::OpenArray { .. }
         | ArrayOp::DropArray { .. }
-        | ArrayOp::RestoreArrayDrop { .. }
+        | ArrayOp::RekeyArray { .. }
         | ArrayOp::PurgeArrayDrop { .. } => Err(crate::Error::PlanError {
             detail: "array OPEN/DROP (catalog DDL) is not supported in transaction resolve"
                 .to_string(),

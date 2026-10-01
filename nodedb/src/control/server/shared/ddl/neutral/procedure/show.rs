@@ -2,11 +2,8 @@
 
 //! `SHOW PROCEDURES` DDL handler.
 //!
-//! Ported from the pgwire `ddl::procedure::show` handler. The catalog read and
-//! per-row parameter formatting are preserved verbatim; only the result
-//! construction changed from a pgwire `QueryResponse` (5 text columns) to a
-//! protocol-neutral [`DdlResult::Rows`] carrying the same columns and per-row
-//! values.
+//! The catalog read and per-row parameter formatting run here. The result is
+//! a protocol-neutral [`DdlResult::Rows`] with five text columns.
 
 use serde_json::{Map, Value as JsonValue};
 

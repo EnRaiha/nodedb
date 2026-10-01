@@ -9,7 +9,7 @@ pub mod wcc;
 
 pub use barrier::{BspBarrierError, SuperstepTotals};
 pub use coordinator::BspCoordinator;
-pub use pagerank::ShardPageRankState;
+pub use pagerank::{PageRankUpdate, ShardPageRankState};
 pub use pattern_match::{
     DistributedMatchCoordinator, PatternContinuation, ResolvedContinuationArgs, ShardMatchResult,
 };

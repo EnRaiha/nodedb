@@ -3,10 +3,8 @@
 //! Protocol-neutral `SHOW SCHEMA VERSION` — current descriptor version
 //! visible on this node.
 //!
-//! Ported from the pgwire `ddl::cluster::schema_version` handler. The
-//! schema-version / metadata-cache reads are preserved verbatim; only the
-//! result construction changed from pgwire `Response` / `QueryResponse` to
-//! the protocol-neutral `DdlResult` over `ShapedRows`.
+//! The schema-version / metadata-cache reads run here. The result is the
+//! protocol-neutral `DdlResult` over `ShapedRows`.
 
 use serde_json::{Map, Value as JsonValue};
 

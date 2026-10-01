@@ -315,15 +315,21 @@ impl CoreLoop {
     /// Whether this shard's slice of a transaction's LSN-versioned read-set was
     /// still current against the local write versions.
     ///
-    /// Filters the read-set to the entries whose collection homes to this
-    /// request's vShard — the only reads this core holds versions for — then
-    /// checks each against the per-core write-version index via
+    /// Filters the read-set to the entries homed on this request's vShard —
+    /// the only reads this core holds versions for — then checks each against
+    /// the per-core write-version index via
     /// [`WriteVersionIndex::read_is_valid`]. Short-circuits on the first entry
     /// that is no longer current. An empty or fully-remote slice is vacuously
     /// current (`true`). The `(database, tenant)` scope mirrors the write-version
     /// recorder so a read validates against the same key space it was recorded
-    /// in; homing uses the same collection-in-database function the scheduler
-    /// routes plans with.
+    /// in.
+    ///
+    /// An entry's home is its `home_vshard` when set (a cross-shard graph read
+    /// names the key vShard it read edges on), else its collection's vShard,
+    /// by the same collection-in-database function the scheduler routes plans
+    /// with. A homed entry with no collection observed every collection on its
+    /// vShard, so it is current only while the core watermark has not passed
+    /// its read version.
     pub(in crate::data::executor) fn read_set_still_current(
         &self,
         task: &super::super::task::ExecutionTask,
@@ -333,9 +339,25 @@ impl CoreLoop {
         let db = task.request.database_id;
         let tenant = TenantId::new(tid);
         let local_vshard = task.request.vshard_id.as_u32();
-        // An entry carries the plan's database-qualified name. One that does not
-        // de-qualify cannot be homed or validated, so the read set fails closed.
         versioned_reads.iter().all(|entry| {
+            if let Some(home) = entry.home_vshard {
+                if home != local_vshard {
+                    return true;
+                }
+                if entry.collection.is_empty() {
+                    return self.watermark <= entry.read_lsn;
+                }
+                return self.write_index.read_is_valid(
+                    db,
+                    tenant,
+                    &entry.collection,
+                    &entry.key,
+                    entry.read_lsn,
+                );
+            }
+            // An entry carries the plan's database-qualified name. One that does
+            // not de-qualify cannot be homed or validated, so the read set fails
+            // closed.
             match nodedb_types::CollectionKey::from_qualified_str(db, &entry.collection) {
                 Err(_) => false,
                 Ok(key) if key.vshard().as_u32() != local_vshard => true,
@@ -744,6 +766,7 @@ pub(crate) mod tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: crate::bridge::envelope::Admission::Admitted,
         }
     }
@@ -756,7 +779,7 @@ pub(crate) mod tests {
             DocumentOp::PointGet {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
                 document_id: "y".into(),
-                surrogate: Surrogate::ZERO,
+                surrogate: None,
                 pk_bytes: Vec::new(),
                 rls_filters: Vec::new(),
                 system_time: nodedb_types::SystemTimeScope::Current,
@@ -765,11 +788,11 @@ pub(crate) mod tests {
         )))
     }
 
-    /// A msgpack-tagged `{k: v}` document body.
+    /// A `{k: v}` document body: a standard MessagePack map.
     fn doc_value(k: &str, v: &str) -> Vec<u8> {
         let mut obj = std::collections::HashMap::new();
         obj.insert(k.to_string(), nodedb_types::Value::String(v.into()));
-        zerompk::to_msgpack_vec(&nodedb_types::Value::Object(obj)).unwrap()
+        nodedb_types::value_to_msgpack(&nodedb_types::Value::Object(obj)).unwrap()
     }
 
     /// An `ExecutionTask` carrying a known WAL LSN, tenant 1 / database DEFAULT.
@@ -777,7 +800,7 @@ pub(crate) mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::PointGet {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
             document_id: "y".into(),
-            surrogate: Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -1040,7 +1063,7 @@ pub(crate) mod tests {
         let task = ExecutionTask::new(make_request(PhysicalPlan::Document(DocumentOp::PointGet {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
             document_id: "y".into(),
-            surrogate: Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -1110,7 +1133,7 @@ pub(crate) mod tests {
             ..make_request(PhysicalPlan::Document(DocumentOp::PointGet {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
                 document_id: "y".into(),
-                surrogate: Surrogate::ZERO,
+                surrogate: None,
                 pk_bytes: Vec::new(),
                 rls_filters: Vec::new(),
                 system_time: nodedb_types::SystemTimeScope::Current,
@@ -1127,7 +1150,7 @@ pub(crate) mod tests {
                 ..make_request(PhysicalPlan::Document(DocumentOp::PointGet {
                     collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
                     document_id: "y".into(),
-                    surrogate: Surrogate::ZERO,
+                    surrogate: None,
                     pk_bytes: Vec::new(),
                     rls_filters: Vec::new(),
                     system_time: nodedb_types::SystemTimeScope::Current,
@@ -1155,6 +1178,8 @@ pub(crate) mod tests {
             collection: collection.to_string(),
             key: ReadKeyIdent::Point(KeyRepr::Surrogate(surrogate)),
             read_lsn: Lsn::new(read_lsn),
+            home_vshard: None,
+            served_by: 0,
         }
     }
 
@@ -1164,6 +1189,8 @@ pub(crate) mod tests {
             collection: collection.to_string(),
             key: ReadKeyIdent::Predicate,
             read_lsn: Lsn::new(read_lsn),
+            home_vshard: None,
+            served_by: 0,
         }
     }
 
@@ -1233,6 +1260,51 @@ pub(crate) mod tests {
         let task = task_with_vshard(local_vshard("orders"));
         let reads = vec![predicate_entry("orders", 10)];
         assert!(!core.read_set_still_current(&task, 1, &reads));
+    }
+
+    fn homed_entry(collection: &str, home: VShardId, read_lsn: u64) -> VersionedReadEntry {
+        VersionedReadEntry {
+            home_vshard: Some(home.as_u32()),
+            served_by: 0,
+            ..predicate_entry(collection, read_lsn)
+        }
+    }
+
+    #[test]
+    fn a_homed_read_validates_on_its_home_not_its_collection_vshard() {
+        let (mut core, _, _, _dir) = make_core();
+        core.note_write_lsn(
+            DatabaseId::DEFAULT,
+            TenantId::new(1),
+            "edges",
+            None,
+            Lsn::new(20),
+        );
+        let home = other_vshard(local_vshard("edges"));
+        let stale = vec![homed_entry("edges", home, 10)];
+        assert!(!core.read_set_still_current(&task_with_vshard(home), 1, &stale));
+        assert!(
+            core.read_set_still_current(&task_with_vshard(local_vshard("edges")), 1, &stale),
+            "the collection's own vShard does not hold a homed read"
+        );
+        let fresh = vec![homed_entry("edges", home, 20)];
+        assert!(core.read_set_still_current(&task_with_vshard(home), 1, &fresh));
+    }
+
+    #[test]
+    fn a_homed_read_of_every_collection_validates_against_the_core_watermark() {
+        let (mut core, _, _, _dir) = make_core();
+        let home = local_vshard("edges");
+        core.note_write_lsn(
+            DatabaseId::DEFAULT,
+            TenantId::new(1),
+            "unrelated",
+            None,
+            Lsn::new(20),
+        );
+        let task = task_with_vshard(home);
+        assert!(!core.read_set_still_current(&task, 1, &[homed_entry("", home, 10)]));
+        assert!(core.read_set_still_current(&task, 1, &[homed_entry("", home, 20)]));
     }
 
     #[test]

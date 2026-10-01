@@ -9,7 +9,7 @@
 use serde_json::{Map, Value as JsonValue};
 
 use crate::control::catalog_entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::planner::sql_plan_convert::convert::db_qualified;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -23,7 +23,7 @@ use super::scope::{authorize_redaction_scope, status};
 
 /// `DROP REDACTION POLICY [IF EXISTS] ON <collection> FOR ROLE <role>
 ///     [TENANT <id>]`
-pub fn drop_redaction_policy(
+pub async fn drop_redaction_policy(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -53,19 +53,9 @@ pub fn drop_redaction_policy(
         collection: qualified_collection.clone(),
         for_role: for_role.to_string(),
     };
-    let outcome = propose_catalog_entry(state, &entry)
+    propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        {
-            let catalog = state.credentials.catalog();
-            catalog
-                .delete_redaction_policy(tenant_id, &qualified_collection, for_role)
-                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        }
-        state
-            .redaction
-            .install_replicated_drop_policy(tenant_id, &qualified_collection, for_role);
-    }
 
     state.audit_record(
         AuditEvent::AdminAction,

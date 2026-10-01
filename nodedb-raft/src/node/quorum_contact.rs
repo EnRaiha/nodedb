@@ -14,9 +14,9 @@
 //!
 //! Contact is measured from `AppendEntries` **responses**, not from replication
 //! progress. Any response proves the peer is reachable and still recognises
-//! this term, which is the whole question check-quorum asks; whether the peer's
-//! log has caught up is a different one. Counting `match_index` instead would
-//! break in both directions a healthy cluster routinely hits:
+//! this term, which is the whole question check-quorum asks. Whether the
+//! peer's log has caught up is a different question. Counting `match_index`
+//! instead breaks in two cases a healthy cluster routinely hits:
 //!
 //! - A follower rebuilding from a snapshot, or backtracking after a log
 //!   conflict, answers every heartbeat while its `match_index` sits far behind.
@@ -24,11 +24,15 @@
 //!   still in flight, so even fully healthy followers trail it.
 //!
 //! In both cases a `match_index` test sees no contact and deposes a leader
-//! whose quorum is intact. Responses are therefore counted through
-//! [`LeaderState::ack_count_for`], the same monotonic per-peer counter
-//! [`super::read_index`] uses, bumped on success and rejection alike.
+//! whose quorum is intact.
 //!
-//! [`LeaderState::ack_count_for`]: crate::state::LeaderState::ack_count_for
+//! # When contact happened
+//!
+//! Contact is dated at the **send time** of the request a quorum answered,
+//! the same anchor the leader lease uses (see [`super::leader_lease`]). The
+//! arrival time of a response says nothing about when the follower last heard
+//! this leader. Both checks read one clock, so the lease never outlives the
+//! contact that check-quorum counts.
 
 use std::time::Instant;
 
@@ -37,62 +41,44 @@ use crate::state::NodeRole;
 use crate::storage::LogStorage;
 
 impl<S: LogStorage> RaftNode<S> {
-    /// Start a fresh contact window at `now`, treating this instant as proven
-    /// contact.
+    /// Open the contact record of a new leadership term at `now`.
     ///
-    /// Called on winning an election — a quorum of voters just granted their
-    /// votes, which is contact by definition — and again each time a new
-    /// quorum is observed.
+    /// Called on winning an election. A quorum of voters just granted their
+    /// votes, which is contact by definition. The lease starts empty: a vote
+    /// grant does not make a voter refuse other candidates.
     pub(super) fn arm_quorum_window(&mut self, now: Instant) {
         self.last_quorum_contact = Some(now);
-        self.quorum_window = self
-            .leader_state
-            .as_ref()
-            .map(|ls| {
-                self.config
-                    .peers
-                    .iter()
-                    .map(|&id| (id, ls.ack_count_for(id)))
-                    .collect()
-            })
-            .unwrap_or_default();
+        self.quorum_window.clear();
+        self.lease.begin_term();
     }
 
-    /// Re-arm the contact window if a quorum of voters has answered since it
-    /// opened. No-op for any role but leader.
+    /// Move contact up to the send time of the latest round a quorum of
+    /// voters answered. No-op for any role but leader.
     ///
-    /// Called from the `AppendEntries` response path so contact tracks the
-    /// responses themselves, and from [`RaftNode::tick`] so a single-voter
-    /// group — which has no peers to answer and so never reaches the response
-    /// path — still refreshes on its own quorum of one.
+    /// Called from the `AppendEntries` response path, and from
+    /// [`RaftNode::tick`] so a single-voter group renews on its own quorum of
+    /// one. It has no peers to answer and never reaches the response path.
     pub(super) fn refresh_quorum_contact(&mut self, now: Instant) {
         if self.role != NodeRole::Leader {
             return;
         }
-        let Some(leader) = self.leader_state.as_ref() else {
+        if self.config.peers.is_empty() {
+            self.last_quorum_contact = Some(now);
+            return;
+        }
+        let Some(anchor) = self.settle_lease() else {
             return;
         };
-        // Self is always in contact with itself.
-        let mut count = 1usize;
-        for &peer in &self.config.peers {
-            let baseline = self
-                .quorum_window
-                .iter()
-                .find(|&&(id, _)| id == peer)
-                .map(|&(_, seen)| seen)
-                .unwrap_or(0);
-            if leader.ack_count_for(peer) > baseline {
-                count += 1;
-            }
-        }
-        if count >= self.config.quorum() {
-            self.arm_quorum_window(now);
+        if self.last_quorum_contact.is_none_or(|last| anchor > last) {
+            self.last_quorum_contact = Some(anchor);
         }
     }
 
-    /// Push the contact window back to `at` (for testing).
+    /// Push the last quorum contact back to `at` (for testing). The lease
+    /// anchor moves back with it: both read the same clock.
     pub fn quorum_contact_at_override(&mut self, at: Instant) {
         self.last_quorum_contact = Some(at);
+        self.lease.anchor = self.lease.anchor.map(|anchor| anchor.min(at));
     }
 
     /// Whether the leader has gone an entire election timeout without a
@@ -154,6 +140,11 @@ mod tests {
         node.quorum_contact_at_override(Instant::now() - Duration::from_secs(1));
     }
 
+    /// The round of the latest `AppendEntries` the leader sent.
+    fn latest_round(node: &RaftNode<MemStorage>) -> u64 {
+        node.lease.next_round - 1
+    }
+
     /// A rejection is contact. A follower backtracking through a log conflict
     /// answers every round while its `match_index` stays put; deposing that
     /// leader would be a false positive.
@@ -168,6 +159,8 @@ mod tests {
                 term: node.current_term(),
                 success: false,
                 last_log_index: 0,
+                round: latest_round(&node),
+                needs_snapshot: false,
             },
         );
 
@@ -197,6 +190,8 @@ mod tests {
                 term: node.current_term(),
                 success: true,
                 last_log_index: 1,
+                round: latest_round(&node),
+                needs_snapshot: false,
             },
         );
 
@@ -234,6 +229,8 @@ mod tests {
                 term: node.current_term(),
                 success: true,
                 last_log_index: node.last_log_index(),
+                round: latest_round(&node),
+                needs_snapshot: false,
             },
         );
 
@@ -291,6 +288,8 @@ mod tests {
             }],
             leader_commit: 1,
             group_id: 1,
+            round: 1,
+            replicated_floor: 0,
         });
 
         assert!(resp.success);
@@ -314,6 +313,8 @@ mod tests {
                 term: node.current_term(),
                 success: true,
                 last_log_index: node.last_log_index(),
+                round: latest_round(&node),
+                needs_snapshot: false,
             },
         );
         node.tick();
@@ -326,6 +327,37 @@ mod tests {
             node.role(),
             NodeRole::Follower,
             "a stale answer must not renew the window indefinitely"
+        );
+    }
+
+    /// Contact is dated when the answered request left the leader. A
+    /// response that took long to arrive proves nothing about the time since.
+    #[test]
+    fn contact_is_dated_at_send_time() {
+        let mut node = leader(vec![2, 3]);
+        go_silent(&mut node);
+        let round = latest_round(&node);
+        let silent_since = node.last_quorum_contact.expect("leader has contact");
+        // The answered request left after the silence began, and well before
+        // its answer is handled below.
+        let sent = silent_since + Duration::from_millis(100);
+        node.lease.set_sent_at(round, sent);
+
+        node.handle_append_entries_response(
+            2,
+            &AppendEntriesResponse {
+                term: node.current_term(),
+                success: true,
+                last_log_index: node.last_log_index(),
+                round,
+                needs_snapshot: false,
+            },
+        );
+
+        assert_eq!(
+            node.last_quorum_contact,
+            Some(sent),
+            "contact must be the send time, not the arrival time"
         );
     }
 
@@ -354,6 +386,8 @@ mod tests {
                 term: node.current_term(),
                 success: true,
                 last_log_index: node.last_log_index(),
+                round: latest_round(&node),
+                needs_snapshot: false,
             },
         );
 
@@ -370,10 +404,9 @@ mod tests {
     #[test]
     fn contact_is_not_lost_before_the_upper_election_bound() {
         let node = leader(vec![2, 3]);
-        let cfg_max = Duration::from_millis(300);
-        let just_inside = std::time::Instant::now() + cfg_max - Duration::from_millis(10);
-        assert!(!node.quorum_contact_lost(just_inside));
-        let past = std::time::Instant::now() + cfg_max + Duration::from_millis(10);
-        assert!(node.quorum_contact_lost(past));
+        let contact = node.last_quorum_contact.expect("leader has contact");
+        let cfg_max = node.config.election_timeout_max;
+        assert!(!node.quorum_contact_lost(contact + cfg_max - Duration::from_nanos(1)));
+        assert!(node.quorum_contact_lost(contact + cfg_max));
     }
 }

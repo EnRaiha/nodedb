@@ -32,11 +32,12 @@ use crate::control::backup::state::AppendError;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::security::request_scope::RequestAuthScope;
-use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
+use crate::control::server::shared::backup_metering::{
+    admit_backup_restore_quota, meter_backup_restore,
+};
 use crate::control::server::shared::session::{ConnectionId, SessionId};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
-use nodedb_types::calvin::EngineTag;
 
 use super::core::NodeDbPgHandler;
 
@@ -56,7 +57,7 @@ impl NodeDbPgHandler {
         // Blacklist + account status, no rate limit: backup/restore is
         // admin-scoped bulk data movement, not the per-query traffic the
         // rate-limiter's cost table models, so charging it against a query
-        // rate limit would throttle a legitimate restore. A blacklisted or
+        // rate limit will throttle a legitimate restore. A blacklisted or
         // suspended/banned account must not be able to run backup or
         // restore, though — `check_blacklist_and_status` runs that half of
         // `check_request_admission`'s gate (plus the internal-service
@@ -172,57 +173,6 @@ impl NodeDbPgHandler {
             }
         }
     }
-}
-
-/// Meter one completed whole-tenant backup or restore.
-///
-/// Shared by the backup branch of `intent_to_response` and
-/// `on_copy_done`'s restore completion below — both operate on a whole
-/// tenant rather than a `PhysicalPlan`-shaped single-collection dispatch, so
-/// this builds a [`PlanMeteringInfo`] directly via
-/// [`PlanMeteringInfo::for_collection`] instead of extracting one from a
-/// plan.
-/// Refuse a backup/restore whose covering scope has already spent its cap.
-///
-/// The sibling of [`meter_backup_restore`], and it describes the request the
-/// same way: a whole-tenant operation has no `PhysicalPlan`, so the collection
-/// dimension is the synthetic `tenant:<id>` marker that function bills under.
-/// A scope grant therefore only caps this if it was written against that same
-/// marker — which is exactly the entitlement an operator would define to cap
-/// backups.
-fn admit_backup_restore_quota(
-    state: &SharedState,
-    scope: &RequestAuthScope<'_>,
-    tenant_id: u64,
-) -> crate::Result<()> {
-    if !state.metering_config.enabled {
-        return Ok(());
-    }
-    let info = PlanMeteringInfo::for_collection(
-        format!("tenant:{tenant_id}"),
-        EngineTag::Meta,
-        "sql",
-        Permission::Backup,
-    );
-    crate::control::server::shared::quota_admission::admit_quota_for_dispatch(state, scope, &info)
-}
-
-fn meter_backup_restore(
-    state: &SharedState,
-    scope: &RequestAuthScope<'_>,
-    tenant_id: u64,
-    rows: Option<u64>,
-) {
-    if !state.metering_config.enabled {
-        return;
-    }
-    let info = PlanMeteringInfo::for_collection(
-        format!("tenant:{tenant_id}"),
-        EngineTag::Meta,
-        "sql",
-        Permission::Backup,
-    );
-    meter_dispatch(state, scope, &info, rows);
 }
 
 /// CopyHandler shared by the factory's per-connection handler. Holds
@@ -381,9 +331,8 @@ mod tests {
         )
     }
 
-    /// The regression this admission check exists to prevent: before it
-    /// existed, `intent_to_response` ran no blacklist or account-status
-    /// check at all, so a blacklisted client could still run backup/restore.
+    /// `intent_to_response` runs the blacklist and account-status check, so a
+    /// blacklisted client cannot run backup/restore.
     #[tokio::test]
     async fn intent_to_response_rejects_blacklisted_identity() {
         let (handler, _dir) = test_handler();

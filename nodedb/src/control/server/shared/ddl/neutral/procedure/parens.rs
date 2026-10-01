@@ -3,9 +3,7 @@
 //! Paren-matching helper shared by the procedure CREATE parser and the CALL
 //! parser.
 //!
-//! Inlined here (the pgwire `parse_utils` helper carried a pgwire-tinted module
-//! path) so the neutral procedure family carries no pgwire dependency; the
-//! matching logic is preserved verbatim.
+//! Defined here so the neutral procedure family carries no pgwire dependency.
 
 /// Find the matching closing paren for the open paren at `start`.
 ///

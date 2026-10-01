@@ -11,8 +11,8 @@
 //!
 //! A point read that HIT records [`ReadKey::Point`] carrying the row's
 //! [`KeyRepr`]; an absent DOCUMENT point read records [`ReadKey::Predicate`]
-//! (its placeholder surrogate would never collide with the phantom insert's
-//! fresh surrogate), while an absent KV point read keeps its precise `Point`
+//! (an unbound key carries no surrogate, and a phantom insert takes a fresh
+//! one no point key will name), while an absent KV point read keeps its precise `Point`
 //! key (the byte key any future write reuses). A
 //! scan / search / aggregate records [`ReadKey::Predicate`] (collection scope
 //! — the day-one phantom-safe floor). A multi-shard read records one entry per
@@ -52,7 +52,7 @@ pub use nodedb_types::calvin::EngineTag;
 /// validation later). `Predicate` is the coarse, collection-scoped observation
 /// for scans / searches / aggregates and for keyed ops whose observation spans
 /// more than one row (batch gets, secondary-index equality) — safe against
-/// phantoms, never under-approximating. A future refinement may narrow
+/// phantoms, never under-approximating. A future refinement can narrow
 /// `Predicate` to an index-range signature without a type change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadKey {
@@ -78,7 +78,7 @@ pub enum ReadKey {
 ///
 /// The exclusion (in the Calvin `TxClass` builders) removes reads whose
 /// collection the transaction also WRITES, because validating such a read
-/// against the transaction's own staged write would abort the transaction on
+/// against the transaction's own staged write will abort the transaction on
 /// itself. That reasoning holds only for reads the SESSION issued inside the
 /// transaction. It does NOT hold for a read the Control Plane performed at plan
 /// time to DERIVE a value the transaction now ships, so the two kinds are
@@ -86,7 +86,7 @@ pub enum ReadKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadOrigin {
     /// A read this transaction itself issued, through any transport, after it
-    /// began. Its observation may legitimately be superseded by the
+    /// began. Its observation can legitimately be superseded by the
     /// transaction's own writes, so the own-write exclusion applies.
     Session,
     /// A read the Control Plane performed BEFORE the transaction existed, whose
@@ -96,7 +96,7 @@ pub enum ReadOrigin {
     /// This is NOT a read-your-own-write. It observed COMMITTED base state at a
     /// point in time, and the derived value the transaction ships is only
     /// correct if that observation still holds at apply time. Dropping it
-    /// because the transaction happens to write the same collection would
+    /// because the transaction happens to write the same collection will
     /// discard the one check that catches a concurrent writer moving the base
     /// row out from under the derivation, so it survives the exclusion.
     PlanDerivation,
@@ -133,8 +133,38 @@ pub struct ReadSetEntry {
     /// Whether this observation is the transaction's own session read or a
     /// plan-time derivation read. Required at construction — the own-write
     /// exclusion in the `TxClass` builders reads it, and an entry that guessed
-    /// would be silently dropped from validation.
+    /// will be silently dropped from validation.
     pub origin: ReadOrigin,
+    /// The vShard whose write versions validate this entry, or `None` for the
+    /// collection's own vShard. A cross-shard graph read records one entry per
+    /// key vShard it read, each homed there. A homed entry with an empty
+    /// `collection` observed every collection on its vShard.
+    pub home: Option<VShardId>,
+    /// The node that served the read: of `home` for a homed read, of the
+    /// collection's vShard otherwise. Its WAL numbers the read's versions, so
+    /// only that node's current versions compare with them. `0` when no one
+    /// node is known to have served it, which every commit check treats as a
+    /// change.
+    pub home_node: u64,
+}
+
+/// The node that served the running statement's read of `vshard`.
+///
+/// The read dispatch notes it (`served_reads`). A read no dispatch noted ran
+/// on this node's cores: it is this node when there is no cluster or this node
+/// leads the vShard now, and unknown (`0`) otherwise.
+pub(crate) fn serving_node(state: &SharedState, vshard: u32) -> u64 {
+    if let Some(node) = super::served_reads::served_by(vshard) {
+        return node;
+    }
+    if state.cluster_routing.is_none() {
+        return state.node_id;
+    }
+    match crate::control::server::graph_dispatch::cluster_resolve::resolve_for_vshard(state, vshard)
+    {
+        crate::control::gateway::RouteDecision::Local => state.node_id,
+        _ => 0,
+    }
 }
 
 /// The observed read passed to [`record_read_set`]: the executed plan, the
@@ -202,7 +232,7 @@ pub async fn record_read_set(
     // Read-your-writes floor: raise the captured read-version to the session's
     // OWN highest committed write-version for this collection. Without it, a
     // read that observed a stale collection floor (0) before the session's own
-    // prior committed write was reflected on the serving core would, at
+    // prior committed write was reflected on the serving core will, at
     // cross-shard OCC validation, see that write's `coll_write_lsn` exceed the
     // read-version and false-abort with a serialization failure on the session's
     // OWN write. The floor is only ever raised by this session's own committed
@@ -213,6 +243,13 @@ pub async fn record_read_set(
     let own_write_version =
         sessions.own_write_version(session_id, database_id, tenant_id, &collection);
     let effective_read_version = read_version_lsn.max(own_write_version);
+    // The read validates on its collection's vShard, against the versions of
+    // the node that served it there.
+    let validation_vshard =
+        nodedb_types::CollectionKey::from_qualified_str(database_id, &collection)
+            .map(|key| key.vshard().as_u32())
+            .unwrap_or_else(|_| watermarks[0].0.as_u32());
+    let served_by = serving_node(state, validation_vshard);
 
     let entries: Vec<ReadSetEntry> = watermarks
         .iter()
@@ -227,6 +264,8 @@ pub async fn record_read_set(
             // Every entry captured here is a read the session issued inside its
             // own transaction, so the own-write exclusion applies to it.
             origin: ReadOrigin::Session,
+            home: None,
+            home_node: served_by,
         })
         .collect();
 
@@ -236,7 +275,7 @@ pub async fn record_read_set(
     // take a sequenced SHARED reservation on it and remember the granted owner on
     // the session so the eventual commit can carry it as `lock_owner`. The
     // reservation is a hint — `is_hot` varies per node, and a failed/absent
-    // reservation simply means the read proceeds under plain OCC. It never
+    // reservation means the read proceeds under plain OCC. It never
     // changes the read result and never fails the read.
 
     // Autocommit reads never reserve: there is no transaction to carry the owner.
@@ -519,7 +558,7 @@ mod tests {
         PhysicalPlan::Document(DocumentOp::PointGet {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             document_id: "d".to_string(),
-            surrogate: nodedb_types::Surrogate::new(surrogate),
+            surrogate: Some(nodedb_types::Surrogate::new(surrogate)),
             pk_bytes: Vec::new(),
             rls_filters: Vec::new(),
             system_time: Default::default(),
@@ -561,7 +600,7 @@ mod tests {
         let (state, _dir) = test_state();
         let (sessions, a) = begun_session();
         // A miss degrades to the collection-scoped predicate: the placeholder
-        // surrogate would never collide with a phantom insert's fresh surrogate,
+        // surrogate will never collide with a phantom insert's fresh surrogate,
         // so the collection floor is the only safe read identity.
         record_read_set(
             &state,
@@ -629,7 +668,7 @@ mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::PointGet {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             document_id: "d1".to_string(),
-            surrogate: nodedb_types::Surrogate::new(42),
+            surrogate: Some(nodedb_types::Surrogate::new(42)),
             pk_bytes: Vec::new(),
             rls_filters: Vec::new(),
             system_time: Default::default(),

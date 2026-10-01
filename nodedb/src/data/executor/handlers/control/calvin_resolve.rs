@@ -80,9 +80,17 @@ impl CoreLoop {
         // bitemporal stamps `execute_resolve_txn` assigns are identical across
         // replicas. The redo record carries them, so every install writes the
         // same version key.
+        // The graph versions take the transaction's ordinal. Every
+        // participant derives it from the same epoch instant and position, so
+        // a cross-shard edge's two homes write one version key. The local
+        // clock folds it in, so a later local write stamps above it.
+        let txn_ordinal = nodedb_types::calvin_txn_ordinal(epoch_system_ms, position);
+        self.hlc.update_from_remote(txn_ordinal);
         let prev_epoch_ms = self.epoch_system_ms;
         self.epoch_system_ms = Some(epoch_system_ms);
+        self.apply_scope.calvin_txn_ordinal = Some(txn_ordinal);
         let resp = self.execute_resolve_txn(task, tid, synthetic_txn_id, &plans);
+        self.apply_scope.calvin_txn_ordinal = None;
         self.epoch_system_ms = prev_epoch_ms;
         resp
     }
@@ -112,7 +120,7 @@ mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::PointGet {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
             document_id: "y".into(),
-            surrogate: Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -136,6 +144,7 @@ mod tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: Admission::Exempt(ExemptReason::Read),
         };
         ExecutionTask::new(request)
@@ -144,7 +153,7 @@ mod tests {
     fn doc_value(field: &str, val: &str) -> Vec<u8> {
         let mut obj = std::collections::HashMap::new();
         obj.insert(field.to_string(), Value::String(val.into()));
-        zerompk::to_msgpack_vec(&Value::Object(obj)).unwrap()
+        nodedb_types::value_to_msgpack(&Value::Object(obj)).unwrap()
     }
 
     fn point_insert_plan(collection: &str, document_id: &str, surrogate: u32) -> PhysicalPlan {
@@ -223,7 +232,8 @@ mod tests {
             epoch_system_ms: 0,
             is_group_leader: true,
         };
-        let resp = core.execute_calvin_execute_static(task, ctx, &TenantId::new(1), plans, &[]);
+        let resp =
+            core.execute_calvin_execute_static(task, ctx, &TenantId::new(1), plans, &[], &[]);
         assert_eq!(resp.status, Status::Ok, "staging must succeed: {resp:?}");
     }
 
@@ -420,6 +430,7 @@ mod tests {
             &TenantId::new(1),
             &[bulk_delete_plan("orders", None)],
             &[],
+            &[],
         );
         assert_eq!(
             resp.status,
@@ -516,6 +527,72 @@ mod tests {
             row.get("v"),
             Some(&Value::Integer(99)),
             "the redo carries the merged row, not the submitted one"
+        );
+    }
+
+    /// A cross-shard edge insert runs on both endpoint homes. Each home
+    /// resolves it on its own core, and both stamp the one version key the
+    /// transaction's epoch instant and position decide, whatever each
+    /// core's local clock reads.
+    #[test]
+    fn a_cross_shard_edge_resolves_to_one_version_key_on_both_homes() {
+        use nodedb_physical::physical_plan::GraphOp;
+
+        const EPOCH_MS: i64 = 1_700_000_000_000;
+        let edge_put = PhysicalPlan::Graph(GraphOp::EdgePut {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "g"),
+            src_id: "a".into(),
+            label: "knows".into(),
+            dst_id: "b".into(),
+            properties: b"{}".to_vec(),
+            src_surrogate: Surrogate::new(1),
+            dst_surrogate: Surrogate::new(2),
+        });
+        let homes = crate::types::RecordHomes::edge("a", "b");
+        let mut version_keys = Vec::new();
+        for home in [homes.owner(), homes.second()] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+            // Each home's clock reads differently.
+            core.hlc.update_from_remote(
+                nodedb_types::calvin_txn_ordinal(EPOCH_MS, 3)
+                    + i64::from(home.as_u32()) * 1_000_000_000,
+            );
+            let mut task = make_task();
+            task.request.vshard_id = home;
+            let ctx = CalvinExecCtx {
+                epoch: 8,
+                position: 3,
+                epoch_system_ms: EPOCH_MS,
+                is_group_leader: true,
+            };
+            let staged = core.execute_calvin_execute_static(
+                &task,
+                ctx,
+                &TenantId::new(1),
+                std::slice::from_ref(&edge_put),
+                &[],
+                &[],
+            );
+            assert_eq!(staged.status, Status::Ok, "staging: {staged:?}");
+            let resp = core.execute_calvin_resolve(&task, 8, 3);
+            assert_eq!(resp.status, Status::Ok, "resolve: {resp:?}");
+            assert_eq!(
+                core.apply_scope.calvin_txn_ordinal, None,
+                "the resolve clears the transaction ordinal"
+            );
+            let record = RedoRecord::from_bytes(resp.payload.as_bytes()).expect("decode redo");
+            let put = record
+                .ops
+                .iter()
+                .find_map(|op| zerompk::from_msgpack::<crate::wal::EdgePutRedo>(&op.payload).ok())
+                .expect("the resolve carries the edge put");
+            version_keys.push(put.system_from);
+        }
+        assert_eq!(
+            version_keys,
+            vec![Some(nodedb_types::calvin_txn_ordinal(EPOCH_MS, 3)); 2],
+            "both homes stamp the transaction's ordinal"
         );
     }
 }

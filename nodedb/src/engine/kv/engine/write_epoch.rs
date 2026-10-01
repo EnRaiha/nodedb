@@ -76,10 +76,9 @@ impl KvEngine {
 
 #[cfg(test)]
 mod tests {
-    use nodedb_types::Surrogate;
-
     use super::*;
     use crate::engine::kv::KvPutParams;
+    use crate::engine::kv::test_support::row_surrogate;
 
     fn make_engine() -> KvEngine {
         KvEngine::new(1000, 16, 0.75, 4, 64, 1000, 1024)
@@ -94,8 +93,9 @@ mod tests {
             value: b"v",
             ttl_ms: 0,
             now_ms: 1000,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(key),
+        })
+        .expect("a bound row writes");
     }
 
     #[test]

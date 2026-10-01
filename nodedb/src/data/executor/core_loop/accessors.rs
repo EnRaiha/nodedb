@@ -173,6 +173,12 @@ impl CoreLoop {
         self.quarantine_registry = Some(registry);
     }
 
+    /// Install the shared set of collections some Event Plane consumer
+    /// reads. Called once by the server bootstrap before the core recovers.
+    pub fn set_event_interest(&mut self, interest: Arc<crate::event::interest::EventInterest>) {
+        self.events.interest = interest;
+    }
+
     /// Set the last timeseries ingest timestamp (for testing idle flush).
     pub fn set_last_ts_ingest(&mut self, value: Option<std::time::Instant>) {
         self.last_ts_ingest = value;

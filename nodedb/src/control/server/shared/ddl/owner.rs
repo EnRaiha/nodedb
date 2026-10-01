@@ -18,19 +18,18 @@
 //! `sqlstate_error`).
 
 use crate::control::catalog_entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::security::permission::prepare_owner;
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
 use super::result::DdlError;
 
-/// Propose `PutOwner` through raft, falling back to a direct redb
-/// write + in-memory install on single-node mode.
+/// Propose `PutOwner`.
 ///
 /// `database_id` must name the database the object lives in. The owner row is
 /// keyed by it, and every authorization check looks it up database-scoped.
-pub fn propose_owner(
+pub async fn propose_owner(
     state: &SharedState,
     object_type: &str,
     database_id: u64,
@@ -45,26 +44,17 @@ pub fn propose_owner(
         object_name,
         owner_username,
     );
-    let entry = CatalogEntry::PutOwner(Box::new(stored.clone()));
-    let outcome = propose_catalog_entry(state, &entry)
+    let entry = CatalogEntry::PutOwner(Box::new(stored));
+    propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        {
-            let catalog = state.credentials.catalog();
-            catalog
-                .put_owner(&stored)
-                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        }
-        state.permissions.install_replicated_owner(&stored);
-    }
     Ok(())
 }
 
-/// Propose `DeleteOwner` through raft with the same single-node
-/// fallback shape.
+/// Propose `DeleteOwner`.
 ///
 /// `database_id` must match the value the matching [`propose_owner`] wrote.
-pub fn propose_delete_owner(
+pub async fn propose_delete_owner(
     state: &SharedState,
     object_type: &str,
     database_id: u64,
@@ -77,21 +67,8 @@ pub fn propose_delete_owner(
         tenant_id: tenant_id.as_u64(),
         object_name: object_name.to_string(),
     };
-    let outcome = propose_catalog_entry(state, &entry)
+    propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        {
-            let catalog = state.credentials.catalog();
-            catalog
-                .delete_owner(object_type, database_id, tenant_id.as_u64(), object_name)
-                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        }
-        state.permissions.install_replicated_remove_owner(
-            object_type,
-            database_id,
-            tenant_id.as_u64(),
-            object_name,
-        );
-    }
     Ok(())
 }

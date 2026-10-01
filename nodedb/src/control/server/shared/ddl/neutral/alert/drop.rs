@@ -25,7 +25,7 @@ fn err(sqlstate: &str, message: String) -> DdlError {
 }
 
 /// Existence check used by the `DROP ALERT IF EXISTS` short-circuit in the
-/// neutral router. Mirrors the pgwire `exists::alert_exists` helper.
+/// neutral router.
 pub fn alert_exists(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -39,7 +39,7 @@ pub fn alert_exists(
         .is_some()
 }
 
-pub fn drop_alert(
+pub async fn drop_alert(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -61,10 +61,10 @@ pub fn drop_alert(
         return Err(err("42704", format!("alert '{name}' does not exist")));
     }
 
-    super::replicate::propose_delete(state, database_id.as_u64(), tenant_id, &name)?;
+    super::replicate::propose_delete(state, database_id.as_u64(), tenant_id, &name).await?;
 
     // Emit CRDT tombstone delta. Handler-scoped: the apply path runs on every
-    // node, so emitting there would duplicate the delta.
+    // node, so emitting there will duplicate the delta.
     {
         let delta = crate::event::crdt_sync::types::OutboundDelta {
             database_id,

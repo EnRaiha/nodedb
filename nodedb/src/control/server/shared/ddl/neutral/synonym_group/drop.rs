@@ -41,8 +41,8 @@ pub async fn drop_synonym_group(
         ));
     }
 
-    let catalog = state.credentials.catalog();
-
+    // The apply unregisters the group and removes it from every core's FTS
+    // backend in post-apply. A buffered drop removes nothing until COMMIT.
     let entry = crate::control::catalog_entry::CatalogEntry::DeleteSynonymGroup {
         database_id: database_id_u64,
         tenant_id: tenant_id_u64,
@@ -50,30 +50,9 @@ pub async fn drop_synonym_group(
         // Frozen by the proposer's stamp.
         target_hlc: nodedb_types::Hlc::ZERO,
     };
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-
-    // Single node: no applier runs, so post-apply never fires. Run the two
-    // per-node effects the applier runs everywhere else — the catalog delete,
-    // and the fan-out that removes the group from every core's FTS backend.
-    if outcome.needs_local_apply() {
-        catalog
-            .delete_synonym_group(database_id_u64, tenant_id_u64, name)
-            .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))?;
-        crate::control::catalog_entry::post_apply::remove_synonym_group(
-            database_id_u64,
-            tenant_id_u64,
-            name.to_string(),
-            state,
-        )
-        .await;
-    }
-
-    // Idempotent: the applier's synchronous post-apply already removed the
-    // group on the replicated path.
-    state
-        .synonym_registry
-        .unregister(database_id_u64, tenant_id_u64, name);
 
     Ok(vec![DdlResult::Status {
         command: "DROP SYNONYM GROUP".to_string(),

@@ -2,15 +2,9 @@
 
 //! COMMIT-time flush of buffered DDL must populate the in-memory registries.
 //!
-//! Branch covered: the REPLICATED flush. `server.single_node_calvin` defaults
-//! on (`config/server/section.rs`), so the harness synthesises a one-node
-//! cluster, `start_raft` installs `metadata_raft`, and `DISTRIBUTED_CATALOG_VERSION`
-//! (1) is always met — COMMIT proposes a `MetadataEntry::Batch` and the raft
-//! applier runs the post-apply hooks.
-//!
-//! The unreplicated twin (`ddl_flush::flush_local`, reached only when
-//! `[cluster]` is absent AND `single_node_calvin = false`) is unreachable from
-//! this harness and is pinned by the unit tests in `session::ddl_flush`.
+//! A server with no `[cluster]` synthesises a one-node cluster and
+//! `start_raft` installs `metadata_raft` — COMMIT proposes a
+//! `MetadataEntry::Batch` and the raft applier runs the post-apply hooks.
 //!
 //! Each case observes the registry only through SQL — the `SHOW` handlers and
 //! the `DROP` existence pre-checks read the registry, never the catalog.

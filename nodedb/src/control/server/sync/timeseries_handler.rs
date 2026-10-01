@@ -15,7 +15,6 @@ use tracing::{debug, error};
 
 use super::session::SyncSession;
 use super::wire::*;
-use crate::control::server::dispatch_utils::RecordOwner;
 use crate::types::{DatabaseId, TenantId, VShardId};
 
 // ── Dispatcher trait ─────────────────────────────────────────────────────────
@@ -27,7 +26,8 @@ use crate::types::{DatabaseId, TenantId, VShardId};
 /// impossible to ACK a push without attempting dispatch.
 ///
 /// Returns the raw `Response.payload` bytes from the Data Plane so that the
-/// handler can decode the [`SyncAckResult`] for gate status propagation.
+/// handler can decode the [`SyncAckResult`] for gate status propagation, and
+/// the number of samples the resolve rejected.
 #[async_trait]
 pub trait TimeseriesDispatcher: Send + Sync {
     /// Immutable database scope selected for this connection.
@@ -45,7 +45,17 @@ pub trait TimeseriesDispatcher: Send + Sync {
         collection: String,
         ilp_payload: String,
         provenance: nodedb_types::sync::wire::SyncProvenance,
-    ) -> crate::Result<Vec<u8>>;
+    ) -> crate::Result<TimeseriesIngestResult>;
+}
+
+/// What one dispatched timeseries push produced.
+#[derive(Debug, Default)]
+pub struct TimeseriesIngestResult {
+    /// The Data Plane response payload: a [`SyncAckResult`].
+    pub payload: Vec<u8>,
+    /// The samples the resolve or the install rejected. They never land, so
+    /// the ACK does not count them as accepted.
+    pub rejected: u64,
 }
 
 // ── SharedState adapter ──────────────────────────────────────────────────────
@@ -72,14 +82,10 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
         collection: String,
         ilp_payload: String,
         provenance: nodedb_types::sync::wire::SyncProvenance,
-    ) -> crate::Result<Vec<u8>> {
+    ) -> crate::Result<TimeseriesIngestResult> {
         use crate::bridge::envelope::PhysicalPlan;
-        use crate::control::server::wal_dispatch::{
-            TimeseriesWalAppendContext, wal_append_timeseries,
-        };
         use nodedb_physical::physical_plan::TimeseriesOp;
 
-        let prov = provenance;
         let database_id = self.database_id;
 
         super::raft_dispatch::authorize_sync_collection(
@@ -89,42 +95,13 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
             database_id,
             &collection,
         )?;
-        let payload_bytes = ilp_payload.into_bytes();
-
-        // Allocate a WAL LSN on the Control Plane before dispatching to the
-        // Data Plane. This is the canonical LSN for dedup tracking.
-        let owner = RecordOwner {
-            tenant_id,
-            database_id,
-            vshard_id: vshard,
-        };
-        // The record's outcome-floor window opens before the append and
-        // closes from the dispatch's outcome.
-        let (minted, appended_lsn) =
-            super::raft_dispatch::append_under_window(self.shared, owner, |wal| {
-                wal_append_timeseries(
-                    wal,
-                    TimeseriesWalAppendContext {
-                        tenant_id,
-                        vshard_id: vshard,
-                        database_id,
-                        collection: &collection,
-                    },
-                    &payload_bytes,
-                    Some(&prov),
-                    Some(&self.shared.credentials),
-                )
-            })
-            .await?;
-        let wal_lsn = appended_lsn.map(|lsn| lsn.as_u64());
-
-        let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+        let unresolved = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
             collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
-            payload: payload_bytes,
+            payload: ilp_payload.into_bytes(),
             format: "ilp".to_string(),
-            wal_lsn,
+            wal_lsn: None,
             surrogates: Vec::new(),
-            provenance: Some(prov),
+            provenance: Some(provenance),
             // Edge-to-origin sync replays rows already decided by the policy
             // where they were written; the writing device's session is not
             // present here to resolve `$auth.*` against.
@@ -132,31 +109,46 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
             returning: None,
             rls_filters: Vec::new(),
         });
+        // The entry carries the rows the ingest resolves to, and every replica
+        // stores exactly those rows: the push resolves before its entry
+        // exists.
+        let resolved = crate::control::write_resolve::resolve_for_log(
+            self.shared,
+            crate::control::write_resolve::WriteResolveContext {
+                tenant_id,
+                database_id,
+            },
+            vshard,
+            &unresolved,
+        )
+        .await?;
+        let plan = resolved.unwrap_or(unresolved);
+        let rejected = crate::control::write_resolve::rejected_lines(&plan)?;
 
-        let authorized = match super::raft_dispatch::authorize_sync_task(
+        let authorized = super::raft_dispatch::authorize_sync_task(
             self.shared,
             self.identity,
             tenant_id,
             database_id,
             vshard,
             plan,
-        ) {
-            Ok(authorized) => authorized,
-            Err(error) => {
-                // A refused authorization reaches no core.
-                minted.cancel(&self.shared.wal, owner, 0).await?;
-                return Err(error);
-            }
-        };
-        super::raft_dispatch::dispatch_write_replicated(
+        )?;
+        // The replicated apply journals the write on every replica.
+        let payload = super::raft_dispatch::dispatch_write_replicated(
             self.shared,
             &collection,
             authorized,
-            std::time::Duration::from_secs(self.shared.tuning.network.default_deadline_secs),
             crate::event::EventSource::CrdtSync,
-            Some(minted),
         )
-        .await
+        .await?;
+        // The install's count covers the resolve's and adds the rows that
+        // conflict with the schema at the record's log position.
+        let applied =
+            crate::control::server::shared::sql::staging_predicates::extract_rejected_count(
+                &payload,
+            );
+        let rejected = rejected.max(applied);
+        Ok(TimeseriesIngestResult { payload, rejected })
     }
 }
 
@@ -166,7 +158,7 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
 ///
 /// Returns a loud `Internal` error — this is intentionally NOT a silent
 /// no-op. If this path is reached it means the listener wiring is wrong
-/// and the push would otherwise be silently dropped after being ACKed.
+/// and the push will otherwise be silently dropped after being ACKed.
 pub struct NoOpTimeseriesDispatcher;
 
 #[async_trait]
@@ -178,7 +170,7 @@ impl TimeseriesDispatcher for NoOpTimeseriesDispatcher {
         _collection: String,
         _ilp_payload: String,
         _provenance: nodedb_types::sync::wire::SyncProvenance,
-    ) -> crate::Result<Vec<u8>> {
+    ) -> crate::Result<TimeseriesIngestResult> {
         Err(super::raft_dispatch::noop_dispatch_error("timeseries push"))
     }
 }
@@ -204,7 +196,7 @@ impl SyncSession {
         }
         let Some(identity) = self.identity.as_ref() else {
             // `authenticated` is never a substitute for a handshake-bound
-            // identity: it could otherwise write under a fabricated tenant.
+            // identity: it can otherwise write under a fabricated tenant.
             return rejected_timeseries_ack(msg, "session has no handshake-bound identity");
         };
         let tenant_id = identity.tenant_id;
@@ -273,12 +265,12 @@ impl SyncSession {
             )
             .await
         {
-            Ok(payload_bytes) => {
+            Ok(result) => {
                 // Decode SyncAckResult from the Data Plane response payload.
                 // On decode failure fall back to Applied so the client is
                 // still ACKed (the ingest succeeded).
                 let wire = super::ack_decode::decode_sync_ack(
-                    &payload_bytes,
+                    &result.payload,
                     "timeseries",
                     &self.session_id,
                     &msg.collection,
@@ -287,9 +279,10 @@ impl SyncSession {
                 .into_wire();
 
                 // A terminally refused batch ingested no samples, so none of it
-                // may be reported as accepted.
+                // can be reported as accepted. A sample the resolve rejected
+                // never landed either.
                 let accepted = if wire.accepted {
-                    decoded_count as u64
+                    (decoded_count as u64).saturating_sub(result.rejected)
                 } else {
                     0
                 };
@@ -309,10 +302,10 @@ impl SyncSession {
                 SyncFrame::try_encode(SyncMessageType::TimeseriesAck, &ack)
             }
             Err(e) => {
-                // Whether the sender should re-send or compensate is read from
+                // Whether the sender re-sends or compensates is read from
                 // the typed error, not assumed from the fact that dispatch
                 // failed: a timeout or an unavailable leader refused nothing on
-                // the merits, and reporting it as terminal would drop the batch.
+                // the merits, and reporting it as terminal will drop the batch.
                 let status = super::refusal::ack_status_for_dispatch_error(&e, msg.seq);
                 error!(
                     session = %self.session_id,
@@ -343,7 +336,7 @@ impl SyncSession {
 /// Every one of these refusals is a property of the batch or the session that
 /// re-sending cannot change, so the sender must compensate rather than retry.
 /// The status carries the reason instead of a bare `Applied`: a receiver that
-/// matches on the status would otherwise read a refusal as an apply and retire
+/// matches on the status will otherwise read a refusal as an apply and retire
 /// a write that never landed.
 fn rejected_timeseries_ack(
     msg: &TimeseriesPushMsg,
@@ -385,9 +378,11 @@ mod tests {
         /// A factory rather than a stored `Result` so the error's *type*
         /// survives to the handler. The handler classifies retryable-vs-terminal
         /// on that type, so a mock that flattened every failure into `Internal`
-        /// could not express a retryable refusal at all — it would silently
+        /// cannot express a retryable refusal at all — it will silently
         /// assert only the terminal half of the behavior.
         outcome: Box<dyn Fn() -> crate::Result<Vec<u8>> + Send + Sync>,
+        /// Samples a successful dispatch reports its resolve rejected.
+        rejected: u64,
     }
 
     impl MockDispatcher {
@@ -400,6 +395,7 @@ mod tests {
                     calls: calls.clone(),
                     database_id: DatabaseId::DEFAULT,
                     outcome: Box::new(outcome),
+                    rejected: 0,
                 },
                 calls,
             )
@@ -444,7 +440,7 @@ mod tests {
             collection: String,
             ilp_payload: String,
             _provenance: nodedb_types::sync::wire::SyncProvenance,
-        ) -> crate::Result<Vec<u8>> {
+        ) -> crate::Result<TimeseriesIngestResult> {
             self.calls.lock().unwrap().push((
                 tenant_id,
                 self.database_id,
@@ -452,7 +448,10 @@ mod tests {
                 collection,
                 ilp_payload,
             ));
-            (self.outcome)()
+            (self.outcome)().map(|payload| TimeseriesIngestResult {
+                payload,
+                rejected: self.rejected,
+            })
         }
     }
 
@@ -533,6 +532,23 @@ mod tests {
     }
 
     // ── Test: every ack names the batch it answers ──────────────────────────
+
+    /// A sample the resolve rejected is reported rejected in the ACK, not
+    /// accepted.
+    #[tokio::test]
+    async fn a_resolve_rejected_sample_is_acked_as_rejected() {
+        let mut session = make_session();
+        authenticate(&mut session);
+        let (mut mock, _calls) = MockDispatcher::ok();
+        mock.rejected = 1;
+        let msg = make_push_msg("metrics");
+
+        let frame = session.handle_timeseries_push(&msg, &mock).await;
+
+        let decoded: TimeseriesAckMsg = frame.unwrap().decode_body().unwrap();
+        assert_eq!(decoded.accepted, 0);
+        assert_eq!(decoded.rejected, 1);
+    }
 
     #[tokio::test]
     async fn an_applied_ack_echoes_the_batch_it_answers() {

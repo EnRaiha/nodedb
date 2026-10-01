@@ -2,12 +2,9 @@
 
 //! Protocol-neutral `DROP CHANGE STREAM` DDL handler.
 //!
-//! Ported from the pgwire `ddl::change_stream::drop` handler. The catalog path
-//! (`propose_catalog_entry` + `LocalOnly` local delete / registry /
-//! cdc-router cleanup, the local-only webhook task stop, and the `audit_record`
-//! call) is preserved verbatim; only the result construction changed from pgwire
-//! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
-//! [`DdlError`].
+//! The catalog path (`propose_catalog_entry`, the local-only webhook task
+//! stop, and the `audit_record` call) runs here. The result is the
+//! protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
@@ -18,8 +15,8 @@ use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::{require_tenant_admin, status};
 
 /// Existence check used by the neutral router's `DROP CHANGE STREAM IF EXISTS`
-/// short-circuit. Folded in verbatim from the pgwire `change_stream_exists`
-/// guard helper: checks the in-memory stream registry for the identity tenant.
+/// short-circuit. It checks the in-memory stream registry for the identity
+/// tenant.
 pub fn change_stream_exists(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -31,7 +28,7 @@ pub fn change_stream_exists(
 }
 
 /// Handle `DROP CHANGE STREAM [IF EXISTS] <name>`
-pub fn drop_change_stream(
+pub async fn drop_change_stream(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -79,20 +76,11 @@ pub fn drop_change_stream(
         database_id: database_id.as_u64(),
         tenant_id,
         name: name.clone(),
+        target_hlc: nodedb_types::Hlc::ZERO,
     };
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        let _ = catalog
-            .delete_change_stream(database_id, tenant_id, &name)
-            .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))?;
-        state
-            .stream_registry
-            .unregister(database_id, tenant_id, &name);
-        state
-            .cdc_router
-            .remove_buffer(database_id, tenant_id, &name);
-    }
 
     // Stop webhook delivery task if one was running for this stream.
     // Only the proposing node had a webhook task active; followers

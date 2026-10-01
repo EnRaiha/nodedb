@@ -4,12 +4,14 @@
 //!
 //! Decode order, longest shape first:
 //!
-//! * `(collection, surrogate, field_name, Option<SyncProvenance>)`: the
-//!   delete-by-surrogate shape. It routes through the live handler so the
-//!   sync idempotency gate runs on replay exactly as on the live path.
+//! * `(collection, Option<surrogate>, field_name, Option<SyncProvenance>)`:
+//!   the delete-by-surrogate shape. It routes through the live handler so the
+//!   sync idempotency gate runs on replay exactly as on the live path. A
+//!   `None` surrogate names a key its home never bound.
 //! * `(collection, vector_id, Option<SyncProvenance>)`: a delete by local node
 //!   id. The provenance is not used.
-//! * `(collection, vector_id)`: the same delete without provenance.
+//!
+//! A payload of any other shape stops replay.
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::DatabaseId;
@@ -31,7 +33,7 @@ impl CoreLoop {
     ) -> bool {
         if let Ok((collection, surrogate_u32, field_name, provenance)) = zerompk::from_msgpack::<(
             String,
-            u32,
+            Option<u32>,
             String,
             Option<nodedb_types::sync::wire::SyncProvenance>,
         )>(payload)
@@ -39,7 +41,8 @@ impl CoreLoop {
             if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
                 return false;
             }
-            let surrogate = nodedb_types::Surrogate::new(surrogate_u32);
+            let surrogate = surrogate_u32.map(nodedb_types::Surrogate::new);
+            let surrogates: Vec<nodedb_types::Surrogate> = surrogate.into_iter().collect();
             // The handler resolves the field-suffixed index first, then the
             // plain one; the undo covers the index it will write.
             let field_key =
@@ -55,7 +58,7 @@ impl CoreLoop {
                     tid: tenant_id,
                     collection: &collection,
                     dim: 0,
-                    surrogates: &[surrogate],
+                    surrogates: &surrogates,
                     ids: &[],
                     sidecars: false,
                 },
@@ -112,8 +115,7 @@ impl CoreLoop {
             u32,
             Option<nodedb_types::sync::wire::SyncProvenance>,
         )>(payload)
-        .map(|(collection, vector_id, _prov)| (collection, vector_id))
-        .or_else(|_| zerompk::from_msgpack::<(String, u32)>(payload));
+        .map(|(collection, vector_id, _prov)| (collection, vector_id));
         let Ok((collection, vector_id)) = decoded else {
             self.replay_record_unapplied(
                 "vector",

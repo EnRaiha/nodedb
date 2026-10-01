@@ -2,28 +2,21 @@
 
 //! Protocol-neutral `CREATE CONTINUOUS AGGREGATE` handler.
 //!
-//! Ported from the pgwire `ddl::continuous_agg::create` handler. The catalog
-//! path (`propose_and_apply` for the `PutContinuousAggregate` entry, then the
-//! target-collection `propose_and_apply` + `dispatch_register_from_stored`, then
-//! the `LocalOnly` single-node `RegisterContinuousAggregate` sync dispatch),
-//! the source-existence / timeseries / duplicate checks, the def serialization,
-//! and the target-collection descriptor are preserved verbatim; only the result
-//! construction changed from pgwire `Response` / `PgWireError` to the
-//! protocol-neutral [`DdlResult`] / [`DdlError`].
-
-use std::time::Duration;
+//! The catalog path (`propose_and_apply` for the `PutContinuousAggregate`
+//! entry, then the target-collection `propose_and_apply` +
+//! `register_proposed_collection`), the source-existence / timeseries /
+//! duplicate checks, the def serialization, and the target-collection
+//! descriptor run here. The result is the protocol-neutral [`DdlResult`] /
+//! [`DdlError`].
 
 use nodedb_types::DatabaseId;
 
-use crate::bridge::envelope::PhysicalPlan;
-use crate::control::security::catalog::{StoredCollection, StoredContinuousAggregate, StoredOwner};
+use crate::control::security::catalog::{StoredCollection, StoredContinuousAggregate};
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::ddl::sync_dispatch;
 use crate::control::state::SharedState;
 use crate::engine::timeseries::continuous_agg::ContinuousAggregateDef;
-use nodedb_physical::physical_plan::MetaOp;
 
-use super::super::super::catalog::propose_and_apply;
+use super::super::super::catalog::propose_and_apply_async;
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::collection;
 use super::parse::{extract_with_options, parse_create_sql};
@@ -159,10 +152,9 @@ pub async fn create_continuous_aggregate(
         modification_hlc: nodedb_types::Hlc::ZERO,
     };
 
-    let entry = crate::control::catalog_entry::CatalogEntry::PutContinuousAggregate(Box::new(
-        stored.clone(),
-    ));
-    let outcome = propose_and_apply(state, &entry)?;
+    let entry =
+        crate::control::catalog_entry::CatalogEntry::PutContinuousAggregate(Box::new(stored));
+    propose_and_apply_async(state, &entry).await?;
 
     // Create the target collection so `SELECT * FROM <ca_name>` resolves
     // like any other relation. Schemaless document by parity with
@@ -187,6 +179,7 @@ pub async fn create_continuous_aggregate(
             constraint_version: 0,
             crdt_signing_required: false,
             modification_hlc: nodedb_types::Hlc::ZERO,
+            incarnation: nodedb_types::Hlc::ZERO,
             fields: Vec::new(),
             field_defs: Vec::new(),
             event_defs: Vec::new(),
@@ -223,39 +216,10 @@ pub async fn create_continuous_aggregate(
         };
         let coll_entry =
             crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(target.clone()));
-        propose_and_apply(state, &coll_entry)?;
-        collection::dispatch_register_from_stored(state, &target)
+        let outcome = propose_and_apply_async(state, &coll_entry).await?;
+        collection::register_proposed_collection(state, outcome, &target)
             .await
             .map_err(|e| DdlError::from_error(&e))?;
-    }
-
-    // Single-node / no-applier path: the async post-apply dispatcher
-    // only fires on the raft-applier path. Mirror
-    // the dispatch here so the local `continuous_agg_mgr` registers
-    // immediately, matching the cluster behaviour.
-    if outcome.needs_local_apply() {
-        state.permissions.install_replicated_owner(&StoredOwner {
-            database_id: stored.database_id,
-            object_type:
-                crate::control::security::catalog::auth_types::object_type::CONTINUOUS_AGGREGATE
-                    .to_string(),
-            object_name: stored.name.clone(),
-            tenant_id: stored.tenant_id,
-            owner_username: stored.owner.clone(),
-        });
-        let plan = PhysicalPlan::Meta(MetaOp::RegisterContinuousAggregate { def: def.clone() });
-        sync_dispatch::dispatch_system(
-            state,
-            sync_dispatch::SystemTask::new(
-                sync_dispatch::SystemReason::CatalogMaintenance,
-                tenant_id,
-                nodedb_types::CollectionKey::from_bare(database_id, &def.source),
-                plan,
-            ),
-            Duration::from_secs(5),
-        )
-        .await
-        .map_err(|e| DdlError::from_error_in_context("dispatch failed", &e))?;
     }
 
     tracing::info!(

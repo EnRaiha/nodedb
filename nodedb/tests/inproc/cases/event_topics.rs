@@ -29,6 +29,7 @@ fn topic_registry_crud() {
         created_at: 1000,
         last_sequence: 0,
         last_lsn: 0,
+        last_epoch: 0,
         modification_hlc: nodedb_types::Hlc::ZERO,
     };
     registry.register(def);
@@ -59,6 +60,8 @@ fn topic_buffer_publish_and_consume() {
             row_id: format!("msg-{i}"),
             event_time: now_ms(),
             lsn: i,
+            index: i,
+            epoch: 0,
             database_id: DatabaseId::new(7),
             tenant_id: 1,
             new_value: Some(serde_json::json!({"data": format!("message {i}")})),
@@ -77,10 +80,10 @@ fn topic_buffer_publish_and_consume() {
     assert_eq!(events[0].row_id, "msg-1");
     assert_eq!(events[2].row_id, "msg-3");
 
-    // A legacy LSN cursor acknowledges the complete first LSN.
-    let events = buf.read_from(CdcOffset::legacy_lsn(1), 100);
+    // A bare index cursor acknowledges every event of the first index.
+    let events = buf.read_from(CdcOffset::whole_index(1), 100);
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0].lsn, 2);
+    assert_eq!(events[0].index, 2);
 }
 
 #[test]
@@ -100,6 +103,8 @@ fn topic_retention_eviction() {
             row_id: format!("msg-{i}"),
             event_time: now_ms(),
             lsn: i,
+            index: i,
+            epoch: 0,
             database_id: DatabaseId::new(7),
             tenant_id: 1,
             new_value: None,
@@ -132,6 +137,7 @@ fn topic_list_all() {
             created_at: 0,
             last_sequence: 0,
             last_lsn: 0,
+            last_epoch: 0,
             modification_hlc: nodedb_types::Hlc::ZERO,
         });
     }

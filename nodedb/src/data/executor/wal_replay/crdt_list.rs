@@ -75,12 +75,35 @@ impl CoreLoop {
 
         let tenant_id = record.header.tenant_id;
         let record_lsn = record.header.lsn;
-        let collection = match &payload {
-            CrdtListOpWalRecord::Insert { collection, .. }
-            | CrdtListOpWalRecord::Delete { collection, .. }
-            | CrdtListOpWalRecord::Move { collection, .. } => collection,
+        let (collection, surrogate) = match &payload {
+            CrdtListOpWalRecord::Insert {
+                collection,
+                surrogate,
+                ..
+            }
+            | CrdtListOpWalRecord::Delete {
+                collection,
+                surrogate,
+                ..
+            }
+            | CrdtListOpWalRecord::Move {
+                collection,
+                surrogate,
+                ..
+            } => (collection, Surrogate::new(*surrogate)),
         };
         if tombstones.is_tombstoned(record.header.database_id, tenant_id, collection, record_lsn) {
+            return Some(0);
+        }
+        // Every list-op writer carries the document's bound surrogate. A
+        // record without it is refused, never replayed under `ZERO`.
+        if surrogate == Surrogate::ZERO {
+            self.replay_record_unapplied(
+                "crdt",
+                "list_identity",
+                record_lsn,
+                &format!("CRDT list op in '{collection}' carries no surrogate"),
+            );
             return Some(0);
         }
 
@@ -93,10 +116,8 @@ impl CoreLoop {
         // mirrors `try_replay_columnar_predicate_dml`'s rationale: a
         // placeholder plan would silently degrade to a no-op the day a
         // handler starts reading it, and on a once-per-record startup path
-        // the clone costs nothing worth that risk. `surrogate` is unused by
-        // every live `CrdtOp::List*` dispatch arm (`surrogate: _`), so
-        // `Surrogate::ZERO` here carries no live meaning; it exists only to
-        // fill the plan shape.
+        // the clone costs nothing worth that risk. The plan carries the
+        // surrogate the record carries.
         //
         // Every position field below comes straight off the decoded enum
         // variant — no `Option<u64>` + `unwrap_or(0)` fallback. A record
@@ -111,6 +132,7 @@ impl CoreLoop {
             CrdtListOpWalRecord::Insert {
                 collection,
                 document_id,
+                surrogate: _,
                 list_path,
                 index,
                 fields_json,
@@ -134,7 +156,7 @@ impl CoreLoop {
                     list_path: list_path.clone(),
                     index,
                     fields_json: fields_json.clone(),
-                    surrogate: Surrogate::ZERO,
+                    surrogate,
                 });
                 let task =
                     Self::replay_task(tid, database_id, vshard, plan, Some(Lsn::new(record_lsn)));
@@ -151,6 +173,7 @@ impl CoreLoop {
             CrdtListOpWalRecord::Delete {
                 collection,
                 document_id,
+                surrogate: _,
                 list_path,
                 index,
             } => {
@@ -172,7 +195,7 @@ impl CoreLoop {
                     document_id: document_id.clone().into_string(),
                     list_path: list_path.clone(),
                     index,
-                    surrogate: Surrogate::ZERO,
+                    surrogate,
                 });
                 let task =
                     Self::replay_task(tid, database_id, vshard, plan, Some(Lsn::new(record_lsn)));
@@ -188,6 +211,7 @@ impl CoreLoop {
             CrdtListOpWalRecord::Move {
                 collection,
                 document_id,
+                surrogate: _,
                 list_path,
                 from_index,
                 to_index,
@@ -213,7 +237,7 @@ impl CoreLoop {
                     list_path: list_path.clone(),
                     from_index,
                     to_index,
-                    surrogate: Surrogate::ZERO,
+                    surrogate,
                 });
                 let task =
                     Self::replay_task(tid, database_id, vshard, plan, Some(Lsn::new(record_lsn)));
@@ -257,6 +281,9 @@ impl CoreLoop {
     ) {
         let mut replayed = 0usize;
         for record in records {
+            if self.replay_halted() {
+                break;
+            }
             if let Some(applied) = self.try_replay_crdt_list(record, num_cores, tombstones) {
                 replayed += applied;
             }
@@ -289,6 +316,7 @@ mod tests {
     const TID: u64 = 1;
     const COLLECTION: &str = "pages";
     const DOCUMENT_ID: &str = "doc-1";
+    const DOCUMENT_SURROGATE: u32 = 41;
 
     /// Holds the bridge endpoints + tempdir alive for the core's lifetime.
     struct CoreHarness {
@@ -348,7 +376,7 @@ mod tests {
             list_path: "blocks".to_string(),
             index,
             fields_json: fields_json.to_string(),
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(DOCUMENT_SURROGATE),
         })
     }
 
@@ -359,7 +387,7 @@ mod tests {
             list_path: "blocks".to_string(),
             from_index,
             to_index,
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(DOCUMENT_SURROGATE),
         })
     }
 
@@ -369,7 +397,7 @@ mod tests {
             document_id: DOCUMENT_ID.to_string(),
             list_path: "blocks".to_string(),
             index,
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(DOCUMENT_SURROGATE),
         })
     }
 
@@ -405,11 +433,10 @@ mod tests {
         // (durable, but out of scope for this unit).
         let seed_payload = crate::wal::CrdtDeltaWalPayload::new(
             seed_empty_blocks_list_bytes(),
-            Some(COLLECTION.to_string()),
+            COLLECTION.to_string(),
             None,
             None,
-            None,
-            None,
+            crate::wal::CrdtDeltaTarget::Collection,
         );
         let seed_bytes = seed_payload.encode().expect("encode seed");
         wal.appender(crate::wal::manager::NO_APPLY_KEY)
@@ -483,11 +510,10 @@ mod tests {
 
         let seed_payload = crate::wal::CrdtDeltaWalPayload::new(
             seed_empty_blocks_list_bytes(),
-            Some(COLLECTION.to_string()),
+            COLLECTION.to_string(),
             None,
             None,
-            None,
-            None,
+            crate::wal::CrdtDeltaTarget::Collection,
         );
         let seed_bytes = seed_payload.encode().expect("encode seed");
         wal.appender(crate::wal::manager::NO_APPLY_KEY)

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -22,13 +22,41 @@ struct PendingRequest {
     final_tx: oneshot::Sender<Response>,
 }
 
+type PendingMap = Mutex<HashMap<RequestId, PendingRequest>>;
+
 /// The receiving end of one tracked request.
 ///
 /// Partial responses arrive through a bounded channel. The final response
 /// has a slot of its own, so a full partial channel never drops it.
+///
+/// Dropped before its final response, the receiver removes its tracker
+/// entry: nobody reads the rest of that request's answer.
 pub struct ResponseReceiver {
     partials: mpsc::Receiver<Response>,
     final_rx: Option<oneshot::Receiver<Response>>,
+    /// The tracker entry this receiver reads. `None` for a receiver no
+    /// tracker registered.
+    entry: Option<(Weak<PendingMap>, RequestId)>,
+}
+
+impl Drop for ResponseReceiver {
+    fn drop(&mut self) {
+        if self.final_rx.is_none() {
+            return;
+        }
+        if let Some((pending, request_id)) = &self.entry
+            && let Some(pending) = pending.upgrade()
+        {
+            lock(&pending).remove(request_id);
+        }
+    }
+}
+
+fn lock(pending: &PendingMap) -> MutexGuard<'_, HashMap<RequestId, PendingRequest>> {
+    match pending.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 impl ResponseReceiver {
@@ -76,6 +104,7 @@ impl ResponseReceiver {
         Self {
             partials,
             final_rx: None,
+            entry: None,
         }
     }
 }
@@ -92,21 +121,16 @@ impl ResponseReceiver {
 ///   request's final slot and request removed from the map.
 #[derive(Default)]
 pub struct RequestTracker {
-    pending: Mutex<HashMap<RequestId, PendingRequest>>,
+    pending: Arc<PendingMap>,
 }
 
 impl RequestTracker {
     pub fn new() -> Self {
-        Self {
-            pending: Mutex::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     fn lock_pending(&self) -> MutexGuard<'_, HashMap<RequestId, PendingRequest>> {
-        match self.pending.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        lock(&self.pending)
     }
 
     /// Register a pending request. Returns the receiver the session awaits.
@@ -127,6 +151,7 @@ impl RequestTracker {
         ResponseReceiver {
             partials: partials_rx,
             final_rx: Some(final_rx),
+            entry: Some((Arc::downgrade(&self.pending), id)),
         }
     }
 
@@ -314,5 +339,38 @@ mod tests {
 
         let last = rx.recv().await.expect("final response");
         assert_eq!(last.request_id, RequestId::new(12));
+    }
+
+    /// A receiver dropped before its final response removes its entry, so
+    /// no entry outlives its reader.
+    #[test]
+    fn a_receiver_dropped_before_its_final_removes_its_entry() {
+        let tracker = RequestTracker::new();
+        let rx = tracker.register(RequestId::new(13));
+        assert!(tracker.complete(Response {
+            partial: true,
+            ..make_response(13)
+        }));
+        assert_eq!(tracker.in_flight(), 1);
+
+        drop(rx);
+
+        assert_eq!(tracker.in_flight(), 0);
+        assert!(!tracker.complete(make_response(13)));
+    }
+
+    /// A receiver dropped after its final response leaves other entries in
+    /// place.
+    #[tokio::test]
+    async fn a_receiver_dropped_after_its_final_touches_no_other_entry() {
+        let tracker = RequestTracker::new();
+        let mut done = tracker.register(RequestId::new(14));
+        let _other = tracker.register(RequestId::new(15));
+        assert!(tracker.complete(make_response(14)));
+        assert!(done.recv().await.is_some());
+
+        drop(done);
+
+        assert_eq!(tracker.in_flight(), 1);
     }
 }

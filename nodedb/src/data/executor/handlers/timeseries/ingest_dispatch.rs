@@ -10,6 +10,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::response_codec;
 use crate::data::executor::sync_gate::{SyncAdmit, ack_status_from_admit};
 use crate::data::executor::task::ExecutionTask;
+use crate::engine::timeseries::resolved_ingest::RESOLVED_INGEST_FORMAT;
 
 /// Side-effect policy for a timeseries ingest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,7 +145,13 @@ impl CoreLoop {
             // handing it the wrong one would surface as a decode failure rather
             // than as the empty result this actually is.
             if let Some(spec) = returning {
-                return self.timeseries_stored_returning_response(task, spec, rls_filters, &[]);
+                return self.timeseries_stored_returning_response(
+                    task,
+                    spec,
+                    rls_filters,
+                    &[],
+                    None,
+                );
             }
             let result = serde_json::json!({
                 "accepted": 0,
@@ -185,6 +192,18 @@ impl CoreLoop {
             .unwrap_or_else(|| self.ingest_now_ms());
 
         let ingest_response = match format {
+            RESOLVED_INGEST_FORMAT => self.execute_resolved_ingest(TimeseriesIngestParams {
+                task,
+                tid,
+                collection,
+                payload,
+                wal_lsn,
+                now_ms,
+                mode,
+                rls_write_check,
+                returning,
+                rls_filters,
+            }),
             "ilp" => self.execute_ilp_ingest(TimeseriesIngestParams {
                 task,
                 tid,

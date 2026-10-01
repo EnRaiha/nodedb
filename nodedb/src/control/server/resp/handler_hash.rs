@@ -129,14 +129,18 @@ pub(super) async fn handle_hset(
 
     // Content-addressed cross-engine identity so the merged row keeps the
     // surrogate its original insert assigned.
-    let surrogate = match state.surrogate_assigner.assign(
+    let surrogate = match crate::control::server::surrogate_exchange::assign_surrogate_routed(
+        state,
         nodedb_types::CollectionKey::from_bare(
             nodedb_types::DatabaseId::DEFAULT,
             &session.collection,
         ),
         session.tenant_id,
         &key,
-    ) {
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => return RespValue::from_error(&e),
     };

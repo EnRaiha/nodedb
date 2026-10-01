@@ -5,7 +5,7 @@
 
 use nodedb_cluster::calvin::AbortReason;
 
-use crate::bridge::envelope::{Response, Status};
+use crate::bridge::envelope::{ErrorCode, Response, Status};
 
 /// A participant's local verdict on its staged slice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,6 +16,12 @@ pub(super) enum StagedVote {
     SerializationConflict,
     /// The participant never staged, so no read-set was ever validated.
     ParticipantError,
+    /// A collection the transaction names no longer holds its planned
+    /// incarnation in this replica's catalog.
+    CollectionSuperseded,
+    /// The stage refused with `OllpRetryRequired`: the state the coordinator
+    /// predicted moved. The coordinator reads again and retries.
+    PredictionDrift,
 }
 
 impl StagedVote {
@@ -25,16 +31,21 @@ impl StagedVote {
             Self::Commit => None,
             Self::SerializationConflict => Some(AbortReason::SerializationConflict),
             Self::ParticipantError => Some(AbortReason::ParticipantError),
+            Self::CollectionSuperseded => Some(AbortReason::CollectionSuperseded),
+            Self::PredictionDrift => Some(AbortReason::PredictionDrift),
         }
     }
 }
 
 /// Derive a local staged vote without ever treating an executor error as a
-/// commit, and keep the two abort causes apart. A `None` read-set stays
+/// commit, and keep the abort causes apart. A `None` read-set stays
 /// affirmative only for a successful dependent-read or active staged response,
 /// which has no versioned read-set.
 pub(super) fn staged_commit_vote(response: &Response) -> StagedVote {
     if response.status != Status::Ok {
+        if response.error_code.as_deref() == Some(&ErrorCode::OllpRetryRequired) {
+            return StagedVote::PredictionDrift;
+        }
         return StagedVote::ParticipantError;
     }
     if response.read_set_valid == Some(false) {
@@ -67,7 +78,7 @@ mod tests {
     #[test]
     fn executor_error_votes_participant_error_whatever_the_read_set_field_says() {
         // The participant never staged, so no read-set was ever validated —
-        // reporting a serialization conflict here would be a lie.
+        // reporting a serialization conflict here will be a lie.
         assert_eq!(
             staged_commit_vote(&staged_response(Status::Error, None)),
             StagedVote::ParticipantError
@@ -79,6 +90,17 @@ mod tests {
         assert_eq!(
             staged_commit_vote(&staged_response(Status::Error, Some(false))),
             StagedVote::ParticipantError
+        );
+    }
+
+    #[test]
+    fn an_ollp_retry_stage_error_votes_prediction_drift() {
+        let mut response = staged_response(Status::Error, None);
+        response.error_code = Some(Box::new(ErrorCode::OllpRetryRequired));
+        assert_eq!(staged_commit_vote(&response), StagedVote::PredictionDrift);
+        assert_eq!(
+            StagedVote::PredictionDrift.abort_reason(),
+            Some(AbortReason::PredictionDrift)
         );
     }
 
@@ -112,6 +134,10 @@ mod tests {
         assert_eq!(
             StagedVote::ParticipantError.abort_reason(),
             Some(AbortReason::ParticipantError)
+        );
+        assert_eq!(
+            StagedVote::CollectionSuperseded.abort_reason(),
+            Some(AbortReason::CollectionSuperseded)
         );
     }
 }

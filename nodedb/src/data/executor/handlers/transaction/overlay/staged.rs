@@ -20,6 +20,7 @@ use nodedb_types::RowIdentity;
 
 use super::lease::LeaseStamp;
 use super::staged_sidecar::{BitemporalStamp, StagedTtl};
+use crate::engine::timeseries::columnar_memtable::ColumnarSchema;
 use crate::types::{DatabaseId, TenantId};
 
 /// Per-core upper bound on the total staged-body bytes a single transaction's
@@ -67,6 +68,10 @@ pub struct CollectionOverlay {
     /// order. COMMIT resolve stamps the untimed rows of the Nth unkeyed
     /// ingest with the Nth instant.
     pub(super) unkeyed_ingest_now: Vec<i64>,
+    /// The schema the transaction's last staged timeseries ingest into this
+    /// collection previewed to. The next stage-time preview resolves against
+    /// it, the chain the COMMIT resolve follows.
+    pub(super) ts_preview_schema: Option<ColumnarSchema>,
 }
 
 impl CollectionOverlay {
@@ -79,6 +84,7 @@ impl CollectionOverlay {
             && self.base_pk_by_surrogate.is_empty()
             && self.ingest_now_by_surrogate.is_empty()
             && self.unkeyed_ingest_now.is_empty()
+            && self.ts_preview_schema.is_none()
     }
 }
 
@@ -99,6 +105,8 @@ pub(super) struct OverlayUndo {
     prev_ttl: Option<StagedTtl>,
     /// Prior `doc_id_to_surrogate` binding, or `None` if unbound.
     prev_doc_binding: Option<u32>,
+    /// Whether the row was tagged body-only before the mutation.
+    prev_body_tag: bool,
 }
 
 /// One overlay slot a staged mutation touched after a journal marker.
@@ -114,7 +122,8 @@ pub struct TouchedSlot<'a> {
     pub after: Option<&'a Staged>,
 }
 
-/// One undo-journal entry: a slot mutation or a truncate marker.
+/// One undo-journal entry: a slot mutation, a truncate marker, an unkeyed
+/// ingest instant, or a row-tag change.
 #[derive(Debug, Clone)]
 pub(super) enum JournalEntry {
     /// A slot's prior state, captured before a staged value/TTL mutation.
@@ -130,6 +139,14 @@ pub(super) enum JournalEntry {
     UnkeyedIngest {
         coll_key: (DatabaseId, TenantId, String),
     },
+    /// A timeseries preview schema set on `coll_key`. `prev` is the schema
+    /// it replaced.
+    PreviewSchema {
+        coll_key: (DatabaseId, TenantId, String),
+        prev: Option<ColumnarSchema>,
+    },
+    /// A row-tag or collection-set change. See [`super::row_tags`].
+    Tags(super::row_tags::TagUndo),
 }
 
 /// Per-transaction staging overlay: holds not-yet-durable writes for every
@@ -141,7 +158,7 @@ pub struct TxnOverlay {
     /// Collections this transaction truncated, keyed to the journal position
     /// of the marker. A truncated collection hides every base row that has
     /// no newer overlay entry.
-    truncated: HashMap<(DatabaseId, TenantId, String), usize>,
+    pub(super) truncated: HashMap<(DatabaseId, TenantId, String), usize>,
     /// Append-only undo journal recording each slot's prior state before a
     /// staged value/TTL mutation, and each truncate marker. `journal_len`
     /// reads its length (the savepoint marker); `rollback_to` replays it in
@@ -153,6 +170,8 @@ pub struct TxnOverlay {
     /// read-your-own-write, so a live transaction's stamp always tracks the
     /// clock. See [`LeaseStamp`].
     lease: LeaseStamp,
+    /// Rows only trigger bodies staged. See [`super::row_tags`].
+    pub(super) row_tags: super::row_tags::RowTags,
 }
 
 impl TxnOverlay {
@@ -194,6 +213,7 @@ impl TxnOverlay {
             ),
             None => (None, None, None),
         };
+        let prev_body_tag = self.row_tags.note(coll_key, doc_id, prev_value.is_some());
         self.journal.push(JournalEntry::Slot(OverlayUndo {
             coll_key: coll_key.clone(),
             surrogate,
@@ -201,6 +221,7 @@ impl TxnOverlay {
             prev_value,
             prev_ttl,
             prev_doc_binding,
+            prev_body_tag,
         }));
     }
 
@@ -383,7 +404,19 @@ impl TxnOverlay {
                     }
                     continue;
                 }
+                JournalEntry::PreviewSchema { coll_key, prev } => {
+                    if let Some(overlay) = self.collections.get_mut(&coll_key) {
+                        overlay.ts_preview_schema = prev;
+                    }
+                    continue;
+                }
+                JournalEntry::Tags(undo) => {
+                    self.row_tags.undo(undo);
+                    continue;
+                }
             };
+            self.row_tags
+                .restore(&undo.coll_key, &undo.doc_id, undo.prev_body_tag);
             let Some(overlay) = self.collections.get_mut(&undo.coll_key) else {
                 continue;
             };
@@ -415,75 +448,6 @@ impl TxnOverlay {
             }
         }
         self.collections.retain(|_, overlay| !overlay.is_empty());
-    }
-
-    /// Iterate all staged `(surrogate, Staged)` pairs for a collection.
-    /// Yields nothing if the collection has no overlay entries.
-    pub fn iter_for_collection<'a>(
-        &'a self,
-        coll_key: &(DatabaseId, TenantId, String),
-    ) -> impl Iterator<Item = (u32, &'a Staged)> {
-        self.collections
-            .get(coll_key)
-            .into_iter()
-            .flat_map(|overlay| overlay.by_surrogate.iter().map(|(k, v)| (*k, v)))
-    }
-
-    /// Iterate all staged `(identity, Staged)` pairs for a collection.
-    ///
-    /// Unlike [`iter_for_collection`](Self::iter_for_collection) (keyed by
-    /// surrogate, the Document scan's row identity), this is keyed by the
-    /// row's client identity -- the identity a KV scan merge needs, since a
-    /// KV row's scan identity is its raw key bytes, not a surrogate.
-    pub fn iter_doc_entries_for_collection<'a>(
-        &'a self,
-        coll_key: &(DatabaseId, TenantId, String),
-    ) -> impl Iterator<Item = (&'a RowIdentity, &'a Staged)> {
-        self.collections
-            .get(coll_key)
-            .into_iter()
-            .flat_map(|overlay| {
-                overlay
-                    .doc_id_to_surrogate
-                    .iter()
-                    .filter_map(move |(doc_id, surrogate)| {
-                        overlay
-                            .by_surrogate
-                            .get(surrogate)
-                            .map(|staged| (doc_id, staged))
-                    })
-            })
-    }
-
-    /// True if no collection has any staged mutation or truncate marker.
-    pub fn is_empty(&self) -> bool {
-        self.truncated.is_empty()
-            && self
-                .collections
-                .values()
-                .all(|overlay| overlay.by_surrogate.is_empty())
-    }
-
-    /// Total number of staged mutations across all collections.
-    pub fn len(&self) -> usize {
-        self.collections
-            .values()
-            .map(|overlay| overlay.by_surrogate.len())
-            .sum()
-    }
-
-    /// Sum of staged `Put` body byte lengths across all collections.
-    ///
-    /// Placeholder for a future memory cap — not enforced here.
-    pub fn memory_size_estimate(&self) -> usize {
-        self.collections
-            .values()
-            .flat_map(|overlay| overlay.by_surrogate.values())
-            .map(|staged| match staged {
-                Staged::Put(body) => body.len(),
-                Staged::Tombstone => 0,
-            })
-            .sum()
     }
 }
 

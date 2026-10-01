@@ -118,10 +118,20 @@ async fn define_field_and_event_require_alter_and_use_selected_database() {
         );
     }
 
+    // A collection grant binds the collection of the session's selected
+    // database, so the grant is issued from the non-default database.
+    server
+        .exec(&format!("USE DATABASE {DATABASE}"))
+        .await
+        .expect("select non-default database for the grant");
     server
         .exec(&format!("GRANT ALTER ON {COLLECTION} TO {ROLE}"))
         .await
         .expect("grant ALTER to custom role");
+    server
+        .exec("USE DATABASE default")
+        .await
+        .expect("return to default database");
     non_default_client
         .simple_query(&format!(
             "DEFINE FIELD authorized_field ON {COLLECTION} TYPE text"

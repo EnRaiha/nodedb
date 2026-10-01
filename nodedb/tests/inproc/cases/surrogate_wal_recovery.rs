@@ -39,8 +39,8 @@ fn local_alloc_one(registry: &SurrogateRegistryHandle) -> Surrogate {
     local.alloc_one().unwrap()
 }
 
-#[test]
-fn kill_restart_recovers_all_bindings_and_hwm() {
+#[tokio::test]
+async fn kill_restart_recovers_all_bindings_and_hwm() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("test.wal");
     let catalog_path = dir.path().join("system.redb");
@@ -77,6 +77,7 @@ fn kill_restart_recovers_all_bindings_and_hwm() {
                     nodedb_types::TenantId::new(0),
                     pk,
                 )
+                .await
                 .unwrap();
             // Track the FIRST allocation per (coll, pk); UPSERTs reuse.
             let already = expected
@@ -162,8 +163,8 @@ fn kill_restart_recovers_all_bindings_and_hwm() {
     );
 }
 
-#[test]
-fn kill_restart_after_hwm_flush_threshold_recovers_via_alloc_record() {
+#[tokio::test]
+async fn kill_restart_after_hwm_flush_threshold_recovers_via_alloc_record() {
     // Force the 1024-ops flush threshold to fire so a `SurrogateAlloc`
     // record actually lands in the WAL. Then kill+reopen and verify
     // that BOTH the catalog hwm row and the WAL alloc record are
@@ -193,6 +194,7 @@ fn kill_restart_after_hwm_flush_threshold_recovers_via_alloc_record() {
                         nodedb_types::TenantId::new(0),
                         pk.as_bytes(),
                     )
+                    .await
                     .unwrap(),
             );
         }

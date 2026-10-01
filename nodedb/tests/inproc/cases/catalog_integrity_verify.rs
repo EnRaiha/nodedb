@@ -261,6 +261,9 @@ fn classify(entry: &CatalogEntry) -> VariantClass {
         CatalogEntry::PutConsumerGroupIfAbsent(_) => VariantClass::Exempt,
         CatalogEntry::DeleteConsumerGroup { .. } => VariantClass::Exempt,
         CatalogEntry::MigrateConsumerGroupStream { .. } => VariantClass::Exempt,
+        // Committed offsets are cursor state on an existing consumer group.
+        // The apply path only raises them and writes no StoredOwner row.
+        CatalogEntry::CommitConsumerOffsets { .. } => VariantClass::Exempt,
         // Version-history checkpoints are standalone rows in
         // `_system.checkpoints`, keyed by
         // (database_id, tenant_id, collection, doc_id, checkpoint_name). They name a
@@ -289,6 +292,21 @@ fn classify(entry: &CatalogEntry) -> VariantClass {
         CatalogEntry::CloneDatabase { .. } => VariantClass::Exempt,
         // Move tenant cutover re-keys collections; no ownership object is created.
         CatalogEntry::MoveTenantCutover { .. } => VariantClass::Exempt,
+        // Clone copy-on-write rows (copy-up mappings, source tombstones, and
+        // source-drain claims) are bookkeeping on a clone collection the
+        // catalog already owns. The apply path writes no StoredOwner row.
+        CatalogEntry::PutCloneCopyup { .. } => VariantClass::Exempt,
+        CatalogEntry::PutCloneTombstone { .. } => VariantClass::Exempt,
+        CatalogEntry::PutKvCloneTombstone { .. } => VariantClass::Exempt,
+        CatalogEntry::PutCloneSourceDrain { .. } => VariantClass::Exempt,
+        CatalogEntry::DeleteCloneSourceDrain { .. } => VariantClass::Exempt,
+        // Array definitions are registry rows keyed by array id. The apply
+        // path writes no StoredOwner row, so there is no orphan pair.
+        CatalogEntry::PutArray { .. } => VariantClass::Exempt,
+        CatalogEntry::DeleteArray { .. } => VariantClass::Exempt,
+        // A scheduled backup's mark is scheduler state keyed by the schedule's
+        // config incarnation. It names no catalog object.
+        CatalogEntry::PutBackupScheduleMark { .. } => VariantClass::Exempt,
 
         // OIDC providers are cluster-level identity-provider config; no
         // per-object owner row required.

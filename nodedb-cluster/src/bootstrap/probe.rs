@@ -230,6 +230,7 @@ mod tests {
             install_snapshot_chunk_bytes: 4 * 1024 * 1024,
             orphan_partial_max_age_secs: 300,
             log_compaction_threshold: None,
+            wire_build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
         }
     }
 

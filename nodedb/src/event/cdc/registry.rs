@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use super::stream_def::ChangeStreamDef;
+use crate::event::interest::{Interest, InterestSlice};
 use crate::types::DatabaseId;
 
 /// Wildcard collection literal — matches every collection in the tenant.
@@ -78,12 +79,15 @@ impl Inner {
 
 pub struct StreamRegistry {
     inner: RwLock<Inner>,
+    /// The collections some stream reads, republished after every change.
+    interest: Arc<InterestSlice>,
 }
 
 impl StreamRegistry {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(Inner::new()),
+            interest: InterestSlice::new(),
         }
     }
 
@@ -95,14 +99,34 @@ impl StreamRegistry {
         self.inner.write().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// The collections whose write events a stream of this registry reads.
+    pub fn interest(&self) -> Arc<InterestSlice> {
+        Arc::clone(&self.interest)
+    }
+
+    /// Republish the collections of every registered stream. A `*` stream
+    /// names every collection of its database.
+    fn publish_interest(&self, inner: &Inner) {
+        let mut interest = Interest::default();
+        for (database_id, _, collection) in inner.by_collection.keys() {
+            interest.insert(*database_id, collection);
+        }
+        self.interest.publish(interest);
+    }
+
     /// Register a new change stream.
     pub fn register(&self, def: ChangeStreamDef) {
-        self.write().insert(def);
+        let mut inner = self.write();
+        inner.insert(def);
+        self.publish_interest(&inner);
     }
 
     /// Unregister a change stream by name. Returns true if it existed.
     pub fn unregister(&self, database_id: DatabaseId, tenant_id: u64, name: &str) -> bool {
-        self.write().remove(database_id, tenant_id, name)
+        let mut inner = self.write();
+        let existed = inner.remove(database_id, tenant_id, name);
+        self.publish_interest(&inner);
+        existed
     }
 
     /// Get a stream definition by name.
@@ -165,6 +189,7 @@ impl StreamRegistry {
         for stream in fresh {
             inner.insert(stream);
         }
+        self.publish_interest(&inner);
         Ok(())
     }
 
@@ -202,6 +227,7 @@ impl StreamRegistry {
         for stream in streams {
             inner.insert(stream);
         }
+        self.publish_interest(&inner);
         tracing::info!(
             count = inner.by_name.len() - count_before,
             "loaded change streams from catalog"
@@ -246,6 +272,7 @@ mod tests {
             owner: "admin".into(),
             created_at: 0,
             subscriber_roles: Vec::new(),
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 
@@ -293,5 +320,22 @@ mod tests {
         assert!(reg.unregister(DatabaseId::new(7), 1, "s1"));
         assert!(!reg.unregister(DatabaseId::new(7), 1, "s1"));
         assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn registered_streams_publish_their_collections() {
+        let reg = StreamRegistry::new();
+        let interest = reg.interest();
+        reg.register(sample_def("s1", "orders"));
+        assert!(interest.contains(DatabaseId::new(7), "orders"));
+        assert!(!interest.contains(DatabaseId::new(7), "users"));
+        assert!(!interest.contains(DatabaseId::DEFAULT, "orders"));
+
+        reg.register(sample_def("all", "*"));
+        assert!(interest.contains(DatabaseId::new(7), "users"));
+
+        reg.unregister(DatabaseId::new(7), 1, "all");
+        reg.unregister(DatabaseId::new(7), 1, "s1");
+        assert!(!interest.contains(DatabaseId::new(7), "orders"));
     }
 }

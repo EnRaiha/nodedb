@@ -196,6 +196,23 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         }
     }
 
+    // Streamed parts of a multi-part Calvin transaction: offered to this
+    // node's sequencer leader queue through the host-crate Calvin-inbox
+    // hook. Without the hook, the stream learns it cannot run here.
+    pub(super) async fn on_calvin_parts_impl(
+        &self,
+        req: crate::rpc_codec::CalvinPartsRequest,
+    ) -> crate::rpc_codec::CalvinPartsResponse {
+        match &self.calvin_submit_inbox {
+            Some(submit) => submit.on_calvin_parts(req).await,
+            None => crate::rpc_codec::CalvinPartsResponse {
+                status: crate::calvin::PartsOfferStatus::Unknown as u8,
+                next_index: 0,
+                detail: Some("calvin-parts not configured (no CalvinSubmitInbox installed)".into()),
+            },
+        }
+    }
+
     // Routed reserve-read (Calvin OLLP) — delegate to the host-crate
     // `ReserveRead`. This node is the sequencer-group leader; reserving
     // through it is correct because the leader's scheduler holds the

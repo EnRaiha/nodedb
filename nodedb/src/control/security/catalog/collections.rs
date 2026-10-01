@@ -3,24 +3,12 @@
 //! Collection metadata operations for the system catalog.
 //!
 //! The storage key is `(database_id: u64, "{tenant_id}:{name}")`.
-//! The inner key preserves the legacy `"{tenant_id}:{name}"` encoding so
-//! existing catalog-resolver call sites only need to add `database_id`
-//! (always `DatabaseId::DEFAULT` in Tier 1).
-//!
-//! ## Migration
-//!
-//! On first boot against pre-migration storage, `migrate_collections()`
-//! reads all rows from `_system.collections` (the legacy bare-String-keyed
-//! table) and rewrites them under `_system.collections_v2` with
-//! `DatabaseId::DEFAULT` prepended. The migration is idempotent: if the
-//! v2 table already has rows the migration skips; if the legacy table is
-//! absent or empty it is also a no-op.
 
 use nodedb_types::DatabaseId;
 use nodedb_types::columnar::schema::{TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL};
-use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
+use redb::{ReadableDatabase, ReadableTable};
 
-use super::types::{COLLECTIONS, COLLECTIONS_LEGACY, StoredCollection, SystemCatalog, catalog_err};
+use super::types::{COLLECTIONS, StoredCollection, SystemCatalog, catalog_err};
 
 /// Union inferred ingest fields into a collection's schema projection.
 ///
@@ -31,9 +19,9 @@ use super::types::{COLLECTIONS, COLLECTIONS_LEGACY, StoredCollection, SystemCata
 /// Deliberately pure: a collection descriptor is replicated catalog state, so
 /// the merged record has to reach storage through the replicated metadata path
 /// (see `catalog_entry::persist_collection`) rather than a local write. Mutating
-/// the persisted record in place would leave this node's copy at descriptor
+/// the persisted record in place leaves this node's copy at descriptor
 /// version N no longer byte-equal to the replicated entry at version N, and
-/// replaying that entry after a restart would wedge the metadata applier.
+/// replaying that entry after a restart wedges the metadata applier.
 pub fn merge_inferred_fields(
     collection: &mut StoredCollection,
     inferred_fields: &[(String, String)],
@@ -88,7 +76,8 @@ pub fn merge_inferred_fields(
 }
 
 impl SystemCatalog {
-    /// Store a collection record.
+    /// Store a collection record. A record with no incarnation is refused
+    /// with [`crate::Error::CollectionUnstamped`].
     pub fn put_collection(
         &self,
         database_id: DatabaseId,
@@ -104,6 +93,7 @@ impl SystemCatalog {
                 "injected collection write failure",
             ));
         }
+        super::collection_incarnation::require_incarnation(database_id, coll)?;
         let inner_key = format!("{}:{}", coll.tenant_id, coll.name);
         let bytes =
             zerompk::to_msgpack_vec(coll).map_err(|e| catalog_err("serialize collection", e))?;
@@ -134,6 +124,7 @@ impl SystemCatalog {
         database_id: DatabaseId,
         coll: &StoredCollection,
     ) -> crate::Result<bool> {
+        super::collection_incarnation::require_incarnation(database_id, coll)?;
         let inner_key = format!("{}:{}", coll.tenant_id, coll.name);
         let bytes =
             zerompk::to_msgpack_vec(coll).map_err(|e| catalog_err("serialize collection", e))?;
@@ -306,7 +297,7 @@ impl SystemCatalog {
 
     /// Committed-only read, bypassing the transaction DDL overlay. The
     /// descriptor stamper reads through this: a version derived from an
-    /// uncommitted overlay row would stamp two entries at the same version.
+    /// uncommitted overlay row stamps two entries at the same version.
     pub fn get_committed_collection(
         &self,
         database_id: DatabaseId,
@@ -330,85 +321,6 @@ impl SystemCatalog {
             Ok(None) => Ok(None),
             Err(e) => Err(catalog_err("get collection", e)),
         }
-    }
-
-    /// Idempotent migration: reads all rows from the legacy
-    /// `_system.collections` table (bare `"{tenant_id}:{name}"` key) and
-    /// rewrites them under `_system.collections_v2` with
-    /// `DatabaseId::DEFAULT` prepended.
-    ///
-    /// Safe to call on:
-    /// - Fresh boot: legacy table absent or empty → no-op.
-    /// - Pre-migration boot: legacy rows present → migrated to v2.
-    /// - Already-migrated boot: v2 rows already exist → no-op (skips if
-    ///   v2 table is non-empty; any duplicate put is an idempotent
-    ///   overwrite because the key+value are identical).
-    pub fn migrate_collections(&self) -> crate::Result<()> {
-        // Check legacy table existence and emptiness.
-        let legacy_rows: Vec<(String, Vec<u8>)> = {
-            let txn = self
-                .db
-                .begin_read()
-                .map_err(|e| catalog_err("migrate_collections read txn", e))?;
-            match txn.open_table(COLLECTIONS_LEGACY) {
-                Ok(table) => {
-                    let iter = table
-                        .iter()
-                        .map_err(|e| catalog_err("migrate_collections iter", e))?;
-                    let mut rows = Vec::new();
-                    for row in iter {
-                        let (k, v) = row.map_err(|e| catalog_err("migrate_collections row", e))?;
-                        rows.push((k.value().to_string(), v.value().to_vec()));
-                    }
-                    rows
-                }
-                Err(_) => Vec::new(), // legacy table does not exist yet
-            }
-        };
-
-        if legacy_rows.is_empty() {
-            return Ok(());
-        }
-
-        // Check if v2 is already populated (already-migrated boot).
-        let v2_empty = {
-            let txn = self
-                .db
-                .begin_read()
-                .map_err(|e| catalog_err("migrate_collections v2 check txn", e))?;
-            match txn.open_table(COLLECTIONS) {
-                Ok(table) => table
-                    .is_empty()
-                    .map_err(|e| catalog_err("migrate_collections v2 is_empty", e))?,
-                Err(_) => true,
-            }
-        };
-        if !v2_empty {
-            // Already migrated — idempotent no-op.
-            return Ok(());
-        }
-
-        // Write all legacy rows into v2 under DatabaseId::DEFAULT.
-        let db_id = DatabaseId::DEFAULT.as_u64();
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| catalog_err("migrate_collections write txn", e))?;
-        {
-            let mut table = write_txn
-                .open_table(COLLECTIONS)
-                .map_err(|e| catalog_err("migrate_collections open v2", e))?;
-            for (inner_key, bytes) in &legacy_rows {
-                table
-                    .insert((db_id, inner_key.as_str()), bytes.as_slice())
-                    .map_err(|e| catalog_err("migrate_collections insert v2", e))?;
-            }
-        }
-        write_txn
-            .commit()
-            .map_err(|e| catalog_err("migrate_collections commit", e))?;
-        // The migration wrote rows outside `put_collection`.
-        self.reload_event_definitions()
     }
 }
 
@@ -479,7 +391,7 @@ mod tests {
     use nodedb_types::CollectionType;
 
     use super::*;
-    use crate::control::security::catalog::types::{COLLECTIONS_LEGACY, StoredCollection};
+    use crate::control::security::catalog::types::StoredCollection;
 
     fn open_catalog() -> (tempfile::TempDir, SystemCatalog) {
         let dir = tempfile::tempdir().unwrap();
@@ -488,7 +400,7 @@ mod tests {
     }
 
     fn make_coll(tenant_id: u64, name: &str) -> StoredCollection {
-        let mut c = StoredCollection::new(tenant_id, name, "admin");
+        let mut c = StoredCollection::stamped_for_test(tenant_id, name, "admin");
         c.collection_type = CollectionType::document();
         c
     }
@@ -696,70 +608,5 @@ mod tests {
             .load_collections_for_tenant(DatabaseId::DEFAULT, 2)
             .unwrap();
         assert_eq!(t2.len(), 1);
-    }
-
-    // ── Migration tests ──────────────────────────────────────────────────
-
-    /// Helper: write a legacy (bare string key) row directly so we can
-    /// test the migration without going through put_collection.
-    fn insert_legacy_row(cat: &SystemCatalog, coll: &StoredCollection) {
-        let key = format!("{}:{}", coll.tenant_id, coll.name);
-        let bytes = zerompk::to_msgpack_vec(coll).unwrap();
-        let txn = cat.db.begin_write().unwrap();
-        {
-            let mut table = txn.open_table(COLLECTIONS_LEGACY).unwrap();
-            table.insert(key.as_str(), bytes.as_slice()).unwrap();
-        }
-        txn.commit().unwrap();
-    }
-
-    #[test]
-    fn fresh_boot_migration_is_noop() {
-        let (_dir, cat) = open_catalog();
-        // No legacy rows → migration is a no-op.
-        cat.migrate_collections().unwrap();
-        assert!(
-            cat.load_all_collections(DatabaseId::DEFAULT)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn pre_migration_boot_migrates_all_rows() {
-        let (_dir, cat) = open_catalog();
-        let coll1 = make_coll(1, "widgets");
-        let coll2 = make_coll(2, "orders");
-        insert_legacy_row(&cat, &coll1);
-        insert_legacy_row(&cat, &coll2);
-
-        cat.migrate_collections().unwrap();
-
-        let w = cat
-            .get_collection(DatabaseId::DEFAULT, 1, "widgets")
-            .unwrap();
-        assert!(w.is_some(), "widgets must be accessible after migration");
-        let o = cat
-            .get_collection(DatabaseId::DEFAULT, 2, "orders")
-            .unwrap();
-        assert!(o.is_some(), "orders must be accessible after migration");
-    }
-
-    #[test]
-    fn already_migrated_boot_is_idempotent() {
-        let (_dir, cat) = open_catalog();
-        // Write a v2 row directly (simulating already-migrated).
-        cat.put_collection(DatabaseId::DEFAULT, &make_coll(1, "existing"))
-            .unwrap();
-
-        // Also insert a legacy row that would conflict if re-migrated.
-        let coll_legacy = make_coll(1, "existing");
-        insert_legacy_row(&cat, &coll_legacy);
-
-        // Migration should be a no-op (v2 non-empty).
-        cat.migrate_collections().unwrap();
-
-        let all = cat.load_all_collections(DatabaseId::DEFAULT).unwrap();
-        assert_eq!(all.len(), 1, "should still be 1 row, not duplicated");
     }
 }

@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Read-only resolve pass for a governed `TimeseriesOp::Ingest`. A follower
-//! has no writing identity, so this normalizes the payload into line
-//! protocol, stamps timestamps, decides the policy, and reports the lines
-//! back for the Control Plane to propose as a decided `ilp-msgpack` ingest.
-//! Normalization stays here, not the Control Plane, because the time column
-//! and default timestamp both come from this core's local state.
+//! Read-only resolve pass for a `TimeseriesOp::Ingest`. It normalizes the
+//! payload into line protocol, stamps timestamps, decides the write policy,
+//! and resolves the lines to the exact rows they store
+//! ([`crate::engine::timeseries::resolved_ingest`]). The writer logs those
+//! rows and installs them as a `ts-resolved` ingest. Every autocommit ingest
+//! resolves here before its WAL record is appended, and a governed ingest
+//! resolves here before it is proposed: a follower has no writing identity.
+//! Resolution stays on the Data Plane because the time column, the default
+//! timestamp and the collection schema are this core's local state.
 
-use nodedb_physical::physical_plan::TimeseriesOp;
+use nodedb_physical::physical_plan::{TimeseriesOp, TimeseriesResolve};
 
 use super::normalize;
 use super::rls_gate;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
+use crate::engine::timeseries::resolved_ingest::{ResolveBase, TsDriftPolicy};
 
 /// One ingest payload to normalize and stamp.
 pub(in crate::data::executor) struct StampedIngest<'a> {
@@ -35,18 +39,42 @@ fn measurement_of(collection: &str) -> &str {
 }
 
 impl CoreLoop {
-    /// Resolve the wrapped ingest to the canonical lines it would store, as a
-    /// MessagePack `Vec<String>` — the same shape `"ilp-msgpack"` decodes.
+    /// Resolve the wrapped ingest to the rows it stores, as an encoded
+    /// [`crate::engine::timeseries::resolved_ingest::ResolvedTsBatch`] under
+    /// [`TsDriftPolicy::Refuse`]. A writer whose install must not refuse sets
+    /// its own policy on the batch.
+    ///
+    /// A resolve that names a base resolves against it in place of the live
+    /// schema: the schema an earlier ingest of the same transaction into the
+    /// same collection resolved to.
     pub(in crate::data::executor) fn execute_timeseries_resolve_ingest(
         &mut self,
         task: &ExecutionTask,
-        inner: &TimeseriesOp,
+        resolve: &TimeseriesResolve,
     ) -> Response {
+        let base = match resolve
+            .base
+            .as_deref()
+            .map(ResolveBase::from_bytes)
+            .transpose()
+        {
+            Ok(base) => base.map(|base| base.schema()),
+            Err(error) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("timeseries resolve: invalid base schema: {error}"),
+                    },
+                );
+            }
+        };
+        let inner = &resolve.ingest;
         let TimeseriesOp::Ingest {
             collection,
             payload,
             format,
             rls_write_check,
+            returning,
             ..
         } = inner
         else {
@@ -100,12 +128,48 @@ impl CoreLoop {
             return self.response_error(task, error);
         }
 
-        match zerompk::to_msgpack_vec(&lines) {
+        // The rows the lines store. The writer's install stores exactly these
+        // rows, or refuses when a concurrent write changed the schema.
+        let batch = self.resolve_ts_batch(
+            task,
+            super::TsResolveInput {
+                tid,
+                collection: collection.as_str(),
+                lines: &lines,
+                now_ms,
+                drift: TsDriftPolicy::Refuse,
+                needs_images: returning.is_some(),
+                base: base.as_ref(),
+            },
+        );
+        // A `RETURNING` ingest takes every row or none: its row set has no
+        // place to report a rejected row.
+        if returning.is_some()
+            && let Ok(resolved) = &batch
+            && resolved.rows.len() < lines.len()
+        {
+            return self.response_error(
+                task,
+                ErrorCode::RejectedPrevalidation {
+                    reason: format!(
+                        "timeseries ingest with RETURNING would reject {} of {} rows, and a row \
+                         set cannot report a rejected row; first rejection: {}",
+                        lines.len() - resolved.rows.len(),
+                        lines.len(),
+                        resolved
+                            .first_rejection
+                            .as_deref()
+                            .unwrap_or("no reason recorded")
+                    ),
+                },
+            );
+        }
+        match batch.and_then(|batch| batch.to_bytes()) {
             Ok(encoded) => self.response_with_payload(task, encoded),
             Err(error) => self.response_error(
                 task,
                 ErrorCode::Internal {
-                    detail: format!("timeseries resolve: could not encode resolved lines: {error}"),
+                    detail: format!("timeseries resolve: could not resolve rows: {error}"),
                 },
             ),
         }

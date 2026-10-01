@@ -16,14 +16,13 @@
 use serde_json::{Map, Value as JsonValue};
 
 use crate::control::catalog_entry::entry::CatalogEntry;
-use crate::control::catalog_entry::post_apply::scope_quota as scope_quota_post_apply;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::metering::quota::{QuotaDefinition, QuotaEnforcement};
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 
 use super::super::result::{DdlError, DdlResult};
-use super::replicate::propose_and_apply;
+use super::replicate::propose_and_apply_async;
 
 /// Default warning threshold when `WARN AT` is omitted, matching the
 /// documented default on `QuotaDefinition::warning_threshold`.
@@ -57,7 +56,7 @@ fn required_u64(parts: &[&str], keyword: &str) -> Result<u64, DdlError> {
 
 /// DEFINE QUOTA ON SCOPE '<scope>' MAX <n> TOKENS PER <secs> SECONDS
 /// ENFORCEMENT <mode> [WARN AT <fraction>]
-pub fn define_quota(
+pub async fn define_quota(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -121,19 +120,7 @@ pub fn define_quota(
 
     // Replicated: every node writes the row and installs the definition in
     // its `QuotaManager` via post-apply.
-    propose_and_apply(
-        state,
-        &CatalogEntry::PutScopeQuota(Box::new(stored.clone())),
-        || {
-            state
-                .credentials
-                .catalog()
-                .put_scope_quota(&stored)
-                .map_err(|e| DdlError::from_error(&e))?;
-            scope_quota_post_apply::put(&stored, state);
-            Ok(())
-        },
-    )?;
+    propose_and_apply_async(state, &CatalogEntry::PutScopeQuota(Box::new(stored))).await?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -152,7 +139,7 @@ pub fn define_quota(
 }
 
 /// DROP QUOTA ON SCOPE '<scope>'
-pub fn drop_quota(
+pub async fn drop_quota(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -167,7 +154,7 @@ pub fn drop_quota(
         .to_string();
 
     // Absence is decided on the leader, before the propose: a rejection at
-    // apply time would leave the followers disagreeing with the leader.
+    // apply time will leave the followers disagreeing with the leader.
     if !state.quota_manager.has_quota(&scope_name) {
         return Err(err(
             "42704",
@@ -175,21 +162,13 @@ pub fn drop_quota(
         ));
     }
 
-    propose_and_apply(
+    propose_and_apply_async(
         state,
         &CatalogEntry::DeleteScopeQuota {
             scope_name: scope_name.clone(),
         },
-        || {
-            state
-                .credentials
-                .catalog()
-                .delete_scope_quota(&scope_name)
-                .map_err(|e| DdlError::from_error(&e))?;
-            scope_quota_post_apply::delete(&scope_name, state);
-            Ok(())
-        },
-    )?;
+    )
+    .await?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

@@ -17,8 +17,8 @@ pub(crate) fn numeric_code_to_sqlstate(code: nodedb_types::error::ErrorCode) -> 
         // Mirrors the `RejectedConstraint` arm.
         Ec::CONSTRAINT_VIOLATION => sqlstate::UNIQUE_VIOLATION,
         // Mirrors the `ConflictRetry` / `CalvinSerializationConflict` /
-        // `SourceFrozen` / `RetryableSchemaChanged` arms, and `OllpExhausted`
-        // when it exhausted on drift.
+        // `RetryableSchemaChanged` arms, and `OllpExhausted` when it exhausted
+        // on drift.
         Ec::WRITE_CONFLICT => sqlstate::SERIALIZATION_FAILURE,
         // Mirrors the `CalvinParticipantError` arm.
         Ec::TRANSACTION_ROLLBACK => sqlstate::TRANSACTION_ROLLBACK,
@@ -51,8 +51,6 @@ pub(crate) fn numeric_code_to_sqlstate(code: nodedb_types::error::ErrorCode) -> 
         Ec::DATA_EXCEPTION => sqlstate::DATA_EXCEPTION,
         // Mirrors the `InvalidLimitValue` arm.
         Ec::INVALID_LIMIT_VALUE => sqlstate::INVALID_LIMIT_VALUE,
-        // Mirrors the `FanOutExceeded` arm.
-        Ec::FAN_OUT_EXCEEDED => sqlstate::STATEMENT_TOO_COMPLEX,
         // Mirrors the `RejectedAuthz` arm.
         Ec::AUTHORIZATION_DENIED => sqlstate::INSUFFICIENT_PRIVILEGE,
         // Mirrors the `SessionTokenExpired` arm.

@@ -5,7 +5,11 @@
 //! A core's state is unknown when a rollback fails part way, or when a
 //! committed record installed and the work after its install failed: a
 //! memtable flush that drained rows, a vector seal, or a truncate's removal.
-//! Restart replay rebuilds the state from the WAL.
+//! A core also stops when a logged record's resolved rows cannot all land
+//! on it: storing part of them diverges it from its peers.
+//! Restart replay rebuilds the state from the WAL. Replay itself stops a core
+//! that meets a committed record it cannot apply, and boot then refuses to
+//! start.
 //! Until then the core must not serve the state it holds.
 //!
 //! The first cause wins. It logs one ERROR, files one recorder report,
@@ -32,6 +36,15 @@ pub(in crate::data::executor) enum FailStopCause {
     /// A committed record installed, and the settle owed after its install
     /// failed. It cannot be rolled back.
     PostInstallFailed,
+    /// A logged record's resolved rows cannot all land on this node. Every
+    /// other node stores them, so skipping one diverges this node.
+    CommittedRowUnfit,
+    /// Restart replay met a committed record it cannot apply. The state past
+    /// it has a hole, so replay stops there.
+    ReplayRecordUnapplied,
+    /// A journalled write's write set cannot be stored beside its
+    /// effects, so a crash cannot settle its record group.
+    WriteSetUnpersisted,
 }
 
 impl FailStopCause {
@@ -39,6 +52,9 @@ impl FailStopCause {
         match self {
             Self::RollbackFailed => "rollback_failed",
             Self::PostInstallFailed => "post_install_failed",
+            Self::CommittedRowUnfit => "committed_row_unfit",
+            Self::ReplayRecordUnapplied => "replay_record_unapplied",
+            Self::WriteSetUnpersisted => "write_set_unpersisted",
         }
     }
 }
@@ -119,6 +135,7 @@ impl CoreLoop {
         );
         let mut refused = 0;
         while let Some(task) = self.task_queue.pop_front() {
+            self.drop_journal_group(task.request_id().as_u64());
             let response = self.response_error(
                 &task,
                 ErrorCode::RetryableRefusal {

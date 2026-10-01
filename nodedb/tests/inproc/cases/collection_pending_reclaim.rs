@@ -53,6 +53,8 @@ fn entry(name: &str, purge_lsn: u64, err: &str) -> StoredPendingReclaim {
         enqueued_at_ns: 42,
         last_error: err.to_string(),
         attempts: 0,
+        target_hlc: None,
+        cancelled_create: false,
     }
 }
 

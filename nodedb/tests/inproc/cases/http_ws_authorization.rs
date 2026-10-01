@@ -7,18 +7,16 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use nodedb::config::auth::AuthMode;
-use nodedb::control::change_stream::{ChangeEvent, ChangeOperation};
+use nodedb::control::change_stream::ReplayStart;
 use nodedb::control::security::apikey::CreateKeyParams;
 use nodedb::control::security::identity::Role;
 use nodedb::control::state::SharedState;
-use nodedb::types::{DatabaseId, Lsn, TenantId};
+use nodedb::types::{DatabaseId, TenantId};
 use nodedb_test_support::pgwire_harness::TestServer;
-use nodedb_types::RowIdentity;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Message, http};
 
-type WsStream =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+use super::http_ws_support::{WsStream, send_auth};
 
 struct AuthenticatedWsEndpoint {
     local_addr: std::net::SocketAddr,
@@ -42,7 +40,6 @@ async fn start_authenticated_ws(shared: Arc<SharedState>) -> AuthenticatedWsEndp
         .await
         .expect("authenticated WebSocket server");
     });
-    tokio::time::sleep(Duration::from_millis(40)).await;
     AuthenticatedWsEndpoint {
         local_addr,
         _server: handle,
@@ -133,20 +130,6 @@ async fn read_auth_exchange(
     panic!("auth response was not received within the bounded exchange");
 }
 
-async fn send_auth(ws: &mut WsStream, id: u64, session_id: &str, cursor: Option<&str>) {
-    let mut params = serde_json::json!({"session_id": session_id});
-    if let Some(cursor) = cursor {
-        params["cursor"] = serde_json::Value::String(cursor.to_owned());
-    }
-    ws.send(Message::Text(
-        serde_json::json!({"id": id, "method": "auth", "params": params})
-            .to_string()
-            .into(),
-    ))
-    .await
-    .expect("send auth");
-}
-
 async fn ws_request(
     endpoint: &AuthenticatedWsEndpoint,
     token: &str,
@@ -189,6 +172,25 @@ async fn ws_query(endpoint: &AuthenticatedWsEndpoint, token: &str, sql: &str) ->
     ws_request(endpoint, token, "query", sql).await
 }
 
+/// Wait until `tenant`'s `orders` feed holds an event: the apply loop
+/// publishes a write's events once it settles the write's entry.
+async fn await_order_published(shared: &SharedState, tenant: TenantId) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while shared
+        .change_stream
+        .query_changes(tenant, Some("orders"), ReplayStart::Timestamp(0), 1)
+        .expect("replay the orders feed")
+        .events
+        .is_empty()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "tenant {tenant:?}'s order event was never published"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn assert_permission_denied(response: &serde_json::Value, context: &str) {
     let error = response
         .get("error")
@@ -210,19 +212,24 @@ async fn ws_resume_session_id_is_not_shared_across_authenticated_identities() {
     let endpoint = start_authenticated_ws(Arc::clone(&srv.shared)).await;
     let session_id = "arbitrary-client-session-id";
 
-    for (lsn, tenant_id, document_id) in [
-        (Lsn::new(901), tenant_a, "tenant-a-order"),
-        (Lsn::new(902), tenant_b, "tenant-b-order"),
+    // Each tenant writes one order through its replicated entry.
+    for (tenant_name, tenant_id, document_id) in [
+        ("ws_tenant_a", tenant_a, "tenant-a-order"),
+        ("ws_tenant_b", tenant_b, "tenant-b-order"),
     ] {
-        srv.shared.change_stream.publish(ChangeEvent {
-            lsn,
-            tenant_id,
-            collection: "orders".into(),
-            document_id: RowIdentity::from_user_key(document_id),
-            operation: ChangeOperation::Insert,
-            timestamp_ms: 1_000,
-            after: None,
-        });
+        let tenant = tenant_id.as_u64();
+        for sql in [
+            format!("CREATE TENANT {tenant_name} ID {tenant}"),
+            format!("SET TENANT = {tenant}"),
+            "CREATE COLLECTION orders WITH (engine='document_schemaless')".to_owned(),
+            format!("INSERT INTO orders {{ id: '{document_id}' }}"),
+            "RESET TENANT".to_owned(),
+        ] {
+            srv.exec(&sql)
+                .await
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        }
+        await_order_published(&srv.shared, tenant_id).await;
     }
 
     let mut first_a = connect_authenticated_ws(&endpoint, &token_a).await;

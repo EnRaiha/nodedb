@@ -24,8 +24,6 @@ pub struct CompactionStats {
     pub collections_compacted: usize,
     /// Whether CSR write buffers were compacted.
     pub csr_compacted: bool,
-    /// Number of dangling edges swept.
-    pub edges_swept: usize,
     /// Number of L1 segments selected for merge compaction.
     pub segments_merged: usize,
 
@@ -34,8 +32,6 @@ pub struct CompactionStats {
     pub vectors_deferred: usize,
     /// Whether CSR compaction was skipped due to budget exhaustion.
     pub csr_deferred: bool,
-    /// Whether dangling-edge sweep was skipped due to budget exhaustion.
-    pub edges_deferred: bool,
     /// `(tenant, collection)` pairs whose L1 segment compaction was skipped
     /// due to budget exhaustion.
     pub segments_deferred: usize,

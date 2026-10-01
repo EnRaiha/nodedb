@@ -7,8 +7,11 @@
 //! - a raw Put or Delete record: every row carries the record's source;
 //! - a `TransactionRedo` record: a document row carries
 //!   [`EventSource::committed_row_source`] of the record's source, and a KV,
-//!   graph edge or node-label row carries the record's source. The live
-//!   committed-redo apply emits the same sources.
+//!   graph edge or node-label row carries
+//!   [`EventSource::committed_other_source`]. A row the record lists in its
+//!   row sources carries that source instead
+//!   ([`EventSource::committed_row_override`]). The live committed-redo apply
+//!   emits the same sources.
 
 use crate::event::types::EventSource;
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
@@ -35,7 +38,7 @@ impl RowSources {
     pub const fn committed_redo(source: EventSource) -> Self {
         Self {
             document: source.committed_row_source(),
-            other: source,
+            other: source.committed_other_source(),
         }
     }
 }
@@ -48,6 +51,9 @@ pub struct ReplayScope {
     pub vshard_id: VShardId,
     pub lsn: Lsn,
     pub sources: RowSources,
+    /// The record's commit HLC, from its header. `None` when the header
+    /// carries none.
+    pub commit_hlc: Option<u64>,
 }
 
 #[cfg(test)]

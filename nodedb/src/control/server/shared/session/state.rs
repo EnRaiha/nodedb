@@ -53,6 +53,8 @@ pub struct SavepointEntry {
     pub pending_inference_len: usize,
     /// Task-local DDL buffer length captured when the savepoint was established.
     pub ddl_buffer_len: usize,
+    /// `pending_publishes` length captured when the savepoint was established.
+    pub pending_publish_len: usize,
     /// Per-vShard overlay journal markers.
     pub markers: BTreeMap<VShardId, OverlayMarkers>,
 }
@@ -81,9 +83,9 @@ pub struct PendingOffsetCommit {
 
 /// Schema fields a transaction's writes inferred, deferred until it commits.
 ///
-/// Recording them at statement time would move the descriptor version out from
+/// Recording them at statement time will move the descriptor version out from
 /// under the transaction's own buffered writes, which `commit_fence` then
-/// rejects, and would drain against a lease the same session still holds.
+/// rejects, and will drain against a lease the same session still holds.
 #[derive(Debug)]
 pub struct PendingFieldInference {
     pub database_id: DatabaseId,
@@ -148,6 +150,14 @@ pub struct ConnSession {
     /// aligned with `tx_buffer`; a statement scope is shared by every task it
     /// buffers, keeping descriptor admission alive until transaction cleanup.
     pub tx_lease_scopes: Vec<Option<Arc<QueryLeaseScope>>>,
+    /// Indexes into `tx_buffer` of the tasks a trigger body buffered. COMMIT
+    /// commits their rows under `Trigger`, so they fire no trigger.
+    pub tx_body_tasks: BTreeSet<usize>,
+    /// Lines each staged timeseries ingest's stage-time preview rejected,
+    /// keyed by the ingest's index into `tx_buffer`. Only an ingest that
+    /// rejected a line has an entry. COMMIT compares these counts with its
+    /// authoritative resolve.
+    pub tx_ts_preview_rejected: BTreeMap<usize, u64>,
     /// Snapshot LSN captured at BEGIN for snapshot isolation.
     /// All reads within the transaction see data as of this LSN.
     /// Concurrent writes after this point are invisible to the transaction.
@@ -210,6 +220,9 @@ pub struct ConnSession {
     /// NOTIFY messages buffered inside an open transaction (COMMIT fires them).
     /// Each entry captures (database_id, channel, payload) at NOTIFY time.
     pub pending_notifies: Vec<(DatabaseId, String, String)>,
+    /// Publishes the transaction's trigger bodies made. COMMIT writes them
+    /// into the transaction's redo record, ROLLBACK drops them.
+    pub pending_publishes: Vec<crate::wal::RedoPublish>,
     /// Pending pgwire NOTICE messages queued during query execution.
     /// Drained between query and response delivery so the client receives a
     /// `NoticeResponse` for warnings raised by the response shaper (e.g. an
@@ -319,6 +332,8 @@ impl ConnSession {
             identity: None,
             tx_buffer: Vec::new(),
             tx_lease_scopes: Vec::new(),
+            tx_body_tasks: BTreeSet::new(),
+            tx_ts_preview_rejected: BTreeMap::new(),
             tx_snapshot_lsn: None,
             tx_snapshot_epoch: None,
             tx_id: None,
@@ -333,6 +348,7 @@ impl ConnSession {
             live_subscriptions: Vec::new(),
             listen_handles: Vec::new(),
             pending_notifies: Vec::new(),
+            pending_publishes: Vec::new(),
             pending_notices: Vec::new(),
             prepared_stmts: super::prepared_cache::PreparedStatementCache::new(256),
             temp_tables: super::temp_tables::TempTableRegistry::new(),

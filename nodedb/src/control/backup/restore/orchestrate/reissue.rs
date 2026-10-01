@@ -8,16 +8,42 @@
 //! the destination-qualified collection, and the write routes by the bare
 //! name in the destination database.
 
-use std::sync::Arc;
-
+use nodedb_physical::physical_plan::{ColumnarOp, TimeseriesOp, VectorOp};
 use nodedb_types::surrogate::Surrogate;
 
 use crate::Error;
+use crate::bridge::envelope::PhysicalPlan;
 use crate::control::state::SharedState;
 use crate::engine::vector::index_config::IndexConfig;
-use crate::types::TenantId;
+use crate::types::{SurrogateBindEntry, TenantId};
 
-use super::super::target::DatabaseTarget;
+use super::super::target::{DatabaseTarget, RestoredName};
+use super::super::vector_reissue;
+
+/// Durably clear a destination collection of an append-only engine before its
+/// rows re-issue.
+///
+/// A columnar or timeseries ingest appends, so a second re-issue of the same
+/// rows, after a failed restore or cutover, holds every row twice. The
+/// re-issue replaces the collection's contents instead: it clears the
+/// collection, then writes the captured rows. `truncate` is the engine's
+/// whole-collection truncate of `name`.
+async fn clear_before_append(
+    state: &SharedState,
+    tenant_id: u64,
+    target: DatabaseTarget,
+    name: &RestoredName,
+    truncate: PhysicalPlan,
+) -> Result<(), Error> {
+    super::super::durable::reissue_plan_durably(
+        state,
+        TenantId::new(tenant_id),
+        target,
+        &name.bare,
+        truncate,
+    )
+    .await
+}
 
 /// Decode and durably re-issue every restored timeseries collection.
 ///
@@ -28,7 +54,7 @@ use super::super::target::DatabaseTarget;
 /// of the two key sets is re-issued once per collection (memtable + flushed rows
 /// merged into a single ingest).
 pub(super) async fn reissue_timeseries_snapshots(
-    state: &Arc<SharedState>,
+    state: &SharedState,
     tenant_id: u64,
     target: DatabaseTarget,
     memtables: Vec<(String, Vec<u8>)>,
@@ -80,10 +106,21 @@ pub(super) async fn reissue_timeseries_snapshots(
             name.stored.as_str(),
             rows,
         )?;
+        clear_before_append(
+            state,
+            tenant_id,
+            target,
+            &name,
+            PhysicalPlan::Timeseries(TimeseriesOp::Truncate {
+                collection: name.stored.clone(),
+                restart_identity: false,
+            }),
+        )
+        .await?;
         super::super::durable::reissue_plan_durably(
             state,
             TenantId::new(tenant_id),
-            target.dest,
+            target,
             &name.bare,
             plan,
         )
@@ -99,7 +136,7 @@ pub(super) async fn reissue_timeseries_snapshots(
 /// were re-issued. `entries` are `("{db}:{tid}:{collection}", msgpack)` pairs
 /// (the `ColumnarEngineSnapshot` wire shape).
 pub(super) async fn reissue_columnar_snapshots(
-    state: &Arc<SharedState>,
+    state: &SharedState,
     tenant_id: u64,
     target: DatabaseTarget,
     entries: Vec<(String, Vec<u8>)>,
@@ -136,10 +173,21 @@ pub(super) async fn reissue_columnar_snapshots(
             name.stored.as_str(),
             decoded,
         )?;
+        clear_before_append(
+            state,
+            tenant_id,
+            target,
+            &name,
+            PhysicalPlan::Columnar(ColumnarOp::Truncate {
+                collection: name.stored.clone(),
+                restart_identity: false,
+            }),
+        )
+        .await?;
         super::super::durable::reissue_plan_durably(
             state,
             TenantId::new(tenant_id),
-            target.dest,
+            target,
             &name.bare,
             plan,
         )
@@ -149,13 +197,13 @@ pub(super) async fn reissue_columnar_snapshots(
     Ok(reissued)
 }
 
-/// Decode and durably re-issue every restored vector as an individual
-/// `VectorOp::Insert`.
+/// Decode and durably re-issue every restored vector: a single-vector row as
+/// one `VectorOp::Insert`, a multi-vector document as one `MultiVectorDelete`
+/// then one `MultiVectorInsert` of its full set. `multi_documents` names each
+/// index's multi-vector documents, keyed like `entries`.
 ///
-/// Returns the number of vectors re-issued. Unlike columnar/timeseries,
-/// `VectorOp::Insert` is a single-row op (there is no named-field-aware batch
-/// variant), so — unlike the collection-level counts above — this counts
-/// individual vectors, one re-issue per restored row.
+/// Returns the number of vectors re-issued, counted per vector, not per
+/// collection.
 ///
 /// `entries` are `("{db}:{tid}:{coll_key}", msgpack)` pairs where `coll_key`
 /// is `collection` or `collection:field_name` (see
@@ -163,12 +211,27 @@ pub(super) async fn reissue_columnar_snapshots(
 /// `Vec<(u32, Vec<f32>, Option<Surrogate>)>` — the raw HNSW export shape
 /// (`node_id`, vector data, surrogate) `VectorCollection::export_snapshot`
 /// produces.
+///
+/// `binds` are the backup's surrogate binds. A single-vector row or a
+/// multi-vector document whose surrogate the backup binds to a key re-issues
+/// bound by that key.
 pub(super) async fn reissue_vector_snapshots(
-    state: &Arc<SharedState>,
+    state: &SharedState,
     tenant_id: u64,
     target: DatabaseTarget,
     entries: Vec<(String, Vec<u8>)>,
+    multi_documents: Vec<(String, Vec<Surrogate>)>,
+    binds: &[SurrogateBindEntry],
 ) -> Result<usize, Error> {
+    let keys: std::collections::HashMap<(&str, u32), &[u8]> = binds
+        .iter()
+        .map(|bind| {
+            (
+                (bind.collection.as_str(), bind.surrogate),
+                bind.pk.as_slice(),
+            )
+        })
+        .collect();
     let mut reissued = 0usize;
     for (key, bytes) in entries {
         let coll_key = target.scoped_rest(&key, tenant_id)?;
@@ -189,23 +252,54 @@ pub(super) async fn reissue_vector_snapshots(
             continue;
         }
 
-        for (_node_id, vector, surrogate) in vectors {
-            let surrogate = surrogate.unwrap_or(Surrogate::ZERO);
-            let plan = super::super::vector_reissue::build_vector_insert_plan(
-                name.stored.as_str(),
+        let members: std::collections::HashSet<Surrogate> = multi_documents
+            .iter()
+            .filter(|(members_key, _)| *members_key == key)
+            .flat_map(|(_, documents)| documents.iter().copied())
+            .collect();
+        let grouped = vector_reissue::group_restored_vectors(vectors, &members)?;
+        let tenant = TenantId::new(tenant_id);
+        let stored = name.stored.as_str();
+        let mut plans = Vec::new();
+        for (surrogate, vector) in grouped.single {
+            let pk_bytes = keys
+                .get(&(collection, surrogate.as_u32()))
+                .map(|pk| pk.to_vec());
+            plans.push(vector_reissue::build_vector_insert_plan(
+                stored,
                 &field_name,
                 vector,
                 surrogate,
-            );
-            super::super::durable::reissue_plan_durably(
-                state,
-                TenantId::new(tenant_id),
-                target.dest,
-                &name.bare,
-                plan,
-            )
-            .await?;
-            reissued += 1;
+                pk_bytes,
+            ));
+        }
+        for (surrogate, group) in grouped.multi {
+            // A multi-vector document, whatever its vector count: clear it,
+            // then insert its full set, so a repeated re-issue neither drops
+            // nor doubles one.
+            reissued += group.len();
+            plans.push(vector_reissue::build_multi_vector_delete_plan(
+                stored,
+                &field_name,
+                surrogate,
+            ));
+            let pk_bytes = keys
+                .get(&(collection, surrogate.as_u32()))
+                .map(|pk| pk.to_vec());
+            plans.push(vector_reissue::build_multi_vector_insert_plan(
+                stored,
+                &field_name,
+                surrogate,
+                pk_bytes,
+                group,
+            ));
+        }
+        for plan in plans {
+            if matches!(plan, PhysicalPlan::Vector(VectorOp::Insert { .. })) {
+                reissued += 1;
+            }
+            super::super::durable::reissue_plan_durably(state, tenant, target, &name.bare, plan)
+                .await?;
         }
     }
     Ok(reissued)
@@ -218,7 +312,7 @@ pub(super) async fn reissue_vector_snapshots(
 /// (`handlers/vector.rs`) lazily creates the Data Plane HNSW index from
 /// `self.vector_params` on the FIRST `VectorOp::Insert` it sees for a
 /// (collection, field) — falling back to `HnswParams::default()` when no
-/// `SetParams` has landed yet. Re-issuing params after inserts would be a
+/// `SetParams` has landed yet. Re-issuing params after inserts is a
 /// no-op for the already-created index.
 ///
 /// `params` are `("{db}:{tid}:{coll_key}", msgpack)` pairs decoding to
@@ -232,7 +326,7 @@ pub(super) async fn reissue_vector_snapshots(
 /// number of (collection, field) configs re-issued. Any failure is fatal — no
 /// warn-and-continue.
 pub(super) async fn reissue_vector_params(
-    state: &Arc<SharedState>,
+    state: &SharedState,
     tenant_id: u64,
     target: DatabaseTarget,
     params: Vec<(String, Vec<u8>)>,
@@ -293,7 +387,7 @@ pub(super) async fn reissue_vector_params(
         super::super::durable::reissue_plan_durably(
             state,
             TenantId::new(tenant_id),
-            target.dest,
+            target,
             &name.bare,
             plan,
         )

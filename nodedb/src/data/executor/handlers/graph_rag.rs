@@ -44,8 +44,8 @@ type VectorNodeScores = (
     Vec<Surrogate>,
 );
 
-/// Parameters for `build_rag_response`.
-pub(in crate::data::executor) struct RagResponseParams<'a> {
+/// Parameters for `build_rag_response` and [`rag_response_body`].
+pub(crate) struct RagResponseParams<'a> {
     pub fused: &'a [FusedResult<RowIdentity>],
     pub vector_scores: &'a HashMap<RowIdentity, (usize, f32)>,
     pub hop_distances: &'a HashMap<String, usize>,
@@ -132,15 +132,7 @@ impl CoreLoop {
 
         let (vector_k, graph_k) = rrf_k;
 
-        let vector_list: Vec<RankedResult<RowIdentity>> = vector_scores
-            .iter()
-            .map(|(node_id, (rank, dist))| RankedResult {
-                document_id: node_id.clone(),
-                rank: *rank,
-                score: *dist,
-                source: "vector",
-            })
-            .collect();
+        let vector_list = vector_ranked_list(&vector_scores);
 
         let graph_expanded_count = expanded_nodes.len();
         let graph_list = graph_nodes_to_ranked_results(expanded_nodes, &hop_distances);
@@ -181,27 +173,15 @@ impl CoreLoop {
         vector_field: &str,
     ) -> Result<VectorNodeScores, Response> {
         let database_id = task.request.database_id.as_u64();
-        let index_key =
-            CoreLoop::vector_index_key(database_id, tenant_id, collection, vector_field);
-        let Some(index) = self.vector_collections.get(&index_key) else {
-            return Err(self.response_error(task, ErrorCode::NotFound));
-        };
-        // An empty vector leg is an empty score set, not an empty response:
-        // the other fusion legs still rank, and the envelope keeps its shape.
-        // A query of the wrong width fails first, on an empty index too.
-        let ef = vector_top_k.saturating_mul(4).max(64);
-        let vector_results = match super::vector_search::search_vector_leg(
-            index,
+        let hits = self.vector_leg_hits(
+            task,
+            tenant_id,
+            collection,
             query_vector,
             vector_top_k,
-            ef,
-            None,
-        ) {
-            Ok(results) => results,
-            Err(code) => return Err(self.response_error(task, code)),
-        };
-
-        if vector_results.is_empty() {
+            vector_field,
+        )?;
+        if hits.is_empty() {
             return Ok((Vec::new(), HashMap::new(), Vec::new()));
         }
 
@@ -218,9 +198,9 @@ impl CoreLoop {
         // the response's `node_id`.
         let csr = self.csr_partition(database_id, tenant_id);
         let mut vector_scores: HashMap<RowIdentity, (usize, f32)> = HashMap::new();
-        let mut seeds: Vec<Surrogate> = Vec::with_capacity(vector_results.len());
-        for (rank, result) in vector_results.iter().enumerate() {
-            let surrogate = index.get_surrogate(result.id);
+        let mut seeds: Vec<Surrogate> = Vec::with_capacity(hits.len());
+        let mut vector_results: Vec<SearchResult> = Vec::with_capacity(hits.len());
+        for (rank, (result, surrogate)) in hits.into_iter().enumerate() {
             if let Some(s) = surrogate {
                 seeds.push(s);
             }
@@ -236,9 +216,53 @@ impl CoreLoop {
                 None => RowIdentity::from_user_key(format!("__unbound_{}", result.id)),
             };
             vector_scores.insert(key, (rank, result.distance));
+            vector_results.push(result);
         }
 
         Ok((vector_results, vector_scores, seeds))
+    }
+
+    /// Run the vector leg: the HNSW search of `collection`'s index, each hit
+    /// paired with its surrogate when the entry carries one, in rank order.
+    ///
+    /// `Err(response)` when the index is missing or the query does not fit
+    /// it. An empty index yields no hits.
+    pub(in crate::data::executor) fn vector_leg_hits(
+        &self,
+        task: &ExecutionTask,
+        tenant_id: u64,
+        collection: &str,
+        query_vector: &[f32],
+        vector_top_k: usize,
+        vector_field: &str,
+    ) -> Result<Vec<(SearchResult, Option<Surrogate>)>, Response> {
+        let database_id = task.request.database_id.as_u64();
+        let index_key =
+            CoreLoop::vector_index_key(database_id, tenant_id, collection, vector_field);
+        let Some(index) = self.vector_collections.get(&index_key) else {
+            return Err(self.response_error(task, ErrorCode::NotFound));
+        };
+        // An empty vector leg is an empty score set, not an empty response:
+        // the other fusion legs still rank, and the envelope keeps its shape.
+        // A query of the wrong width fails first, on an empty index too.
+        let ef = vector_top_k.saturating_mul(4).max(64);
+        let results = match super::vector_search::search_vector_leg(
+            index,
+            query_vector,
+            vector_top_k,
+            ef,
+            None,
+        ) {
+            Ok(results) => results,
+            Err(code) => return Err(self.response_error(task, code)),
+        };
+        Ok(results
+            .into_iter()
+            .map(|result| {
+                let surrogate = index.get_surrogate(result.id);
+                (result, surrogate)
+            })
+            .collect())
     }
 
     /// Encode a `GraphRagResponse` from RRF-fused results.
@@ -250,38 +274,7 @@ impl CoreLoop {
         task: &ExecutionTask,
         p: RagResponseParams<'_>,
     ) -> Response {
-        let results: Vec<GraphRagResult> = p
-            .fused
-            .iter()
-            .map(|f| {
-                let (vector_rank, vector_distance) = p
-                    .vector_scores
-                    .get(&f.document_id)
-                    .map(|(rank, dist)| (Some(*rank), Some(*dist)))
-                    .unwrap_or((None, None));
-                let hop_distance = p.hop_distances.get(f.document_id.as_str()).copied();
-                GraphRagResult {
-                    // The identity is rendered here, at the response envelope.
-                    node_id: f.document_id.clone().into_string(),
-                    rrf_score: f.rrf_score,
-                    vector_rank,
-                    vector_distance,
-                    hop_distance,
-                }
-            })
-            .collect();
-
-        let response_body = GraphRagResponse {
-            results,
-            metadata: GraphRagMetadata {
-                vector_candidates: p.vector_candidate_count,
-                graph_expanded: p.graph_expanded_count,
-                truncated: p.bfs_truncated,
-                graph_unaddressable: p.graph_unaddressable,
-                watermark_lsn: self.watermark.as_u64(),
-            },
-        };
-
+        let response_body = rag_response_body(&p, self.watermark.as_u64());
         match encode(&response_body) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => {
@@ -297,11 +290,64 @@ impl CoreLoop {
     }
 }
 
+/// The response body of a fusion: each fused row with its vector rank and
+/// distance and its hop distance, plus the run's metadata. Shared by the
+/// single-core fusions and the cluster coordinator
+/// (`control::server::graph_dispatch::rag_fusion`), so both answer alike.
+pub(crate) fn rag_response_body(p: &RagResponseParams<'_>, watermark_lsn: u64) -> GraphRagResponse {
+    let results: Vec<GraphRagResult> = p
+        .fused
+        .iter()
+        .map(|f| {
+            let (vector_rank, vector_distance) = p
+                .vector_scores
+                .get(&f.document_id)
+                .map(|(rank, dist)| (Some(*rank), Some(*dist)))
+                .unwrap_or((None, None));
+            let hop_distance = p.hop_distances.get(f.document_id.as_str()).copied();
+            GraphRagResult {
+                // The identity is rendered here, at the response envelope.
+                node_id: f.document_id.clone().into_string(),
+                rrf_score: f.rrf_score,
+                vector_rank,
+                vector_distance,
+                hop_distance,
+            }
+        })
+        .collect();
+    GraphRagResponse {
+        results,
+        metadata: GraphRagMetadata {
+            vector_candidates: p.vector_candidate_count,
+            graph_expanded: p.graph_expanded_count,
+            truncated: p.bfs_truncated,
+            graph_unaddressable: p.graph_unaddressable,
+            watermark_lsn,
+        },
+    }
+}
+
+/// The vector leg as a ranked list, keyed by each hit's reporting key.
+pub(crate) fn vector_ranked_list(
+    vector_scores: &HashMap<RowIdentity, (usize, f32)>,
+) -> Vec<RankedResult<RowIdentity>> {
+    vector_scores
+        .iter()
+        .map(|(node_id, (rank, dist))| RankedResult {
+            document_id: node_id.clone(),
+            rank: *rank,
+            score: *dist,
+            source: "vector",
+        })
+        .collect()
+}
+
 /// Sort expanded graph nodes by hop distance and convert to `RankedResult` list.
 ///
 /// A graph node name is the row's client identity, so the list keys on
-/// `RowIdentity`. Used by 2-source GraphRAG and 3-source GraphRAG triple.
-pub(super) fn graph_nodes_to_ranked_results(
+/// `RowIdentity`. Used by 2-source GraphRAG, 3-source GraphRAG triple, and the
+/// cluster coordinator.
+pub(crate) fn graph_nodes_to_ranked_results(
     expanded_nodes: Vec<String>,
     hop_distances: &HashMap<String, usize>,
 ) -> Vec<RankedResult<RowIdentity>> {

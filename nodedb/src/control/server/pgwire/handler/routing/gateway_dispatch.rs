@@ -106,21 +106,25 @@ impl NodeDbPgHandler {
             redaction: &redaction,
             session_id,
         };
-        let gateway = self.state.gateway.get().ok_or_else(|| {
+        let gateway = self.state.installed_gateway().map_err(|e| {
+            let (severity, code, message) = super::super::super::types::error_to_sqlstate(&e);
             PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "55000".to_owned(),
-                "gateway not available".to_owned(),
+                severity.to_owned(),
+                code.to_owned(),
+                message,
             )))
         })?;
 
         // Forwarding is autocommit only: an in-block statement never reaches
         // here (`maybe_dispatch_tasks_via_gateway`), so no transaction id.
+        // A strong session's forwarded reads confirm on the node that serves
+        // them. Writes ignore the flag: Raft orders them.
         let gw_ctx = crate::control::gateway::core::QueryContext {
             tenant_id,
             trace_id: TraceId::generate(),
             database_id,
             txn_id: None,
+            linearizable: self.sessions.read_consistency(session_id).requires_leader(),
         };
 
         // A derived implicit-edge write beside the user's own never answers

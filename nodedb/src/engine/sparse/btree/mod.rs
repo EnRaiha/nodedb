@@ -7,8 +7,8 @@ pub mod crdt_dead_letter;
 pub mod document;
 pub mod engine;
 pub mod keys;
-pub mod rename;
 pub mod tables;
+pub mod write_set_capture;
 
 pub use engine::SparseEngine;
 pub(crate) use keys::coll_prefix;

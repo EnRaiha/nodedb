@@ -163,21 +163,38 @@ impl ArrayEngine {
         }
     }
 
-    /// Restore a staged drop. Idempotent when this core had no array store.
-    pub fn restore_drop_array(&mut self, id: &ArrayId) -> ArrayEngineResult<()> {
-        let dir = array_dir(&self.cfg.root, id);
-        let tombstone = drop_tombstone_dir(&dir);
-        match (dir.exists(), tombstone.exists()) {
-            (false, true) => std::fs::rename(&tombstone, &dir).map_err(|e| ArrayEngineError::Io {
-                detail: format!("restore array drop {tombstone:?} -> {dir:?}: {e}"),
-            }),
-            (true, false) | (false, false) => Ok(()),
+    /// Move the store of `from` under `to`: close it and rename its
+    /// directory. The caller flushed it first. A finalized-drop tombstone
+    /// under `to` is purged before the rename. Idempotent once the directory
+    /// sits under `to`, and a no-op on a core that never held the array.
+    pub fn rekey_array(&mut self, from: &ArrayId, to: &ArrayId) -> ArrayEngineResult<()> {
+        let _ = self.arrays.remove(from);
+        let source = array_dir(&self.cfg.root, from);
+        let target = array_dir(&self.cfg.root, to);
+        match (source.exists(), target.exists()) {
+            (false, _) => Ok(()),
             (true, true) => Err(ArrayEngineError::Io {
                 detail: format!(
-                    "array restore has both live and tombstone directories: {dir:?}, {tombstone:?}"
+                    "array rekey found both source and target directories: {source:?}, {target:?}"
                 ),
             }),
+            (true, false) => {
+                self.purge_drop_array(to)?;
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| ArrayEngineError::Io {
+                        detail: format!("mkdir {parent:?}: {e}"),
+                    })?;
+                }
+                std::fs::rename(&source, &target).map_err(|e| ArrayEngineError::Io {
+                    detail: format!("rekey array {source:?} -> {target:?}: {e}"),
+                })
+            }
         }
+    }
+
+    /// Whether this core holds `id` open.
+    pub fn is_open(&self, id: &ArrayId) -> bool {
+        self.arrays.contains_key(id)
     }
 
     /// Permanently remove a staged drop tombstone. A live directory is an
@@ -267,12 +284,7 @@ fn drop_tombstone_dir(dir: &std::path::Path) -> PathBuf {
 /// Build the store directory for one array. Hex-encoding the name keeps
 /// separators and traversal components out of the path.
 pub(super) fn array_dir(root: &std::path::Path, id: &ArrayId) -> PathBuf {
-    let encoded_name: String = id
-        .name
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let encoded_name = hex::encode(&id.name);
     root.join("arrays-v2")
         .join(format!("d{}", id.database_id.as_u64()))
         .join(format!("t{}", id.tenant_id.as_u64()))
@@ -300,7 +312,7 @@ mod tests {
             vec![ArrayPutCell {
                 coord: vec![CoordValue::Int64(4), CoordValue::Int64(4)],
                 attrs: vec![CellValue::Int64(99)],
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new(1),
                 system_from_ms: 0,
                 valid_from_ms: 0,
                 valid_until_ms: i64::MAX,
@@ -331,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_drop_restores_or_purges_without_exposing_stale_data() {
+    fn staged_drop_purges_without_exposing_stale_data() {
         use tempfile::TempDir;
 
         let dir = TempDir::new().unwrap();
@@ -347,11 +359,6 @@ mod tests {
         assert!(tombstone.exists());
         assert!(engine.open_array(id.clone(), schema(), 0xBEEF).is_err());
 
-        engine.restore_drop_array(&id).unwrap();
-        assert!(live.exists());
-        assert!(!tombstone.exists());
-
-        engine.stage_drop_array(&id).unwrap();
         // This is the authorized CREATE retry path after the prior DROP has
         // finalized its catalog deletion but its all-core purge was interrupted.
         engine.purge_finalized_drop_before_open(&id).unwrap();
@@ -382,5 +389,34 @@ mod tests {
             m.replay,
             crate::types::replay_stamp::ReplayStamp::through(2)
         );
+    }
+
+    /// A rekey moves the flushed store under the target identity, which
+    /// then opens with every segment. A replayed rekey is a no-op.
+    #[test]
+    fn rekey_moves_the_store_to_the_target_identity() {
+        use crate::engine::array::test_support::put_one;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let from = aid();
+        let to = ArrayId::in_database(
+            from.tenant_id,
+            nodedb_types::DatabaseId::new(from.database_id.as_u64() + 1),
+            &from.name,
+        );
+        let mut e = ArrayEngine::new(ArrayEngineConfig::new(dir.path().to_path_buf())).unwrap();
+        e.open_array(from.clone(), schema(), 0xBEEF).unwrap();
+        put_one(&mut e, 1, 1, 7, 1);
+        e.flush(&from, crate::types::replay_stamp::ReplayStamp::through(2))
+            .unwrap();
+
+        e.rekey_array(&from, &to).unwrap();
+        assert!(!e.is_open(&from));
+        assert!(!array_dir(dir.path(), &from).exists());
+        e.rekey_array(&from, &to).unwrap();
+
+        e.open_array(to.clone(), schema(), 0xBEEF).unwrap();
+        assert_eq!(e.store(&to).unwrap().manifest().segments.len(), 1);
     }
 }

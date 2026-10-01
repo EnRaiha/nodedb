@@ -80,7 +80,7 @@ pub(super) fn fts_index(
 
 pub(super) fn fts_delete(
     collection: &str,
-    surrogate: u32,
+    surrogate: Option<u32>,
     provenance: Option<Vec<u8>>,
 ) -> ReplicatedWrite {
     ReplicatedWrite::FtsDelete {
@@ -96,24 +96,27 @@ pub(super) fn spatial_insert(
     surrogate: u32,
     geometry: &nodedb_types::geometry::Geometry,
     provenance: Option<Vec<u8>>,
-) -> ReplicatedWrite {
-    ReplicatedWrite::SpatialInsert {
+) -> crate::Result<ReplicatedWrite> {
+    // A failed encode refuses the write rather than replicate bytes that
+    // fail every follower's decode.
+    let geometry_bytes =
+        zerompk::to_msgpack_vec(geometry).map_err(|e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("geometry of '{collection}.{field}': {e}"),
+        })?;
+    Ok(ReplicatedWrite::SpatialInsert {
         collection: collection.to_owned(),
         field: field.to_owned(),
         surrogate,
-        // Geometry is plain serializable data — encoding is infallible (same
-        // contract as `ReplicatedEntry::to_bytes`). Fail loud rather than
-        // replicate empty bytes that would error on follower decode.
-        geometry_bytes: zerompk::to_msgpack_vec(geometry)
-            .expect("Geometry serialization is infallible"),
+        geometry_bytes,
         provenance,
-    }
+    })
 }
 
 pub(super) fn spatial_delete(
     collection: &str,
     field: &str,
-    surrogate: u32,
+    surrogate: Option<u32>,
     provenance: Option<Vec<u8>>,
 ) -> ReplicatedWrite {
     ReplicatedWrite::SpatialDelete {
@@ -158,20 +161,23 @@ pub(super) fn bulk_update(
 pub(super) fn bulk_resolved_update(
     collection: &str,
     rows: &[(nodedb_types::Value, Vec<nodedb_types::Value>)],
-) -> ReplicatedWrite {
-    ReplicatedWrite::ColumnarBulkDmlResolved {
+) -> crate::Result<ReplicatedWrite> {
+    Ok(ReplicatedWrite::ColumnarBulkDmlResolved {
         collection: collection.to_owned(),
         is_update: true,
         rows: rows
             .iter()
-            .map(|(pk, new_row)| super::super::types::ColumnarResolvedRow {
-                pk_msgpack: encode_resolved_value(pk),
-                new_row_msgpack: encode_resolved_value(&nodedb_types::Value::Array(
-                    new_row.clone(),
-                )),
+            .map(|(pk, new_row)| {
+                Ok(super::super::types::ColumnarResolvedRow {
+                    pk_msgpack: encode_resolved_value(collection, pk)?,
+                    new_row_msgpack: encode_resolved_value(
+                        collection,
+                        &nodedb_types::Value::Array(new_row.clone()),
+                    )?,
+                })
             })
-            .collect(),
-    }
+            .collect::<crate::Result<_>>()?,
+    })
 }
 
 /// Columnar resolved-row-set DELETE (governed by an RLS write policy): see
@@ -179,24 +185,29 @@ pub(super) fn bulk_resolved_update(
 pub(super) fn bulk_resolved_delete(
     collection: &str,
     pks: &[nodedb_types::Value],
-) -> ReplicatedWrite {
-    ReplicatedWrite::ColumnarBulkDmlResolved {
+) -> crate::Result<ReplicatedWrite> {
+    Ok(ReplicatedWrite::ColumnarBulkDmlResolved {
         collection: collection.to_owned(),
         is_update: false,
         rows: pks
             .iter()
-            .map(|pk| super::super::types::ColumnarResolvedRow {
-                pk_msgpack: encode_resolved_value(pk),
-                new_row_msgpack: Vec::new(),
+            .map(|pk| {
+                Ok(super::super::types::ColumnarResolvedRow {
+                    pk_msgpack: encode_resolved_value(collection, pk)?,
+                    new_row_msgpack: Vec::new(),
+                })
             })
-            .collect(),
-    }
+            .collect::<crate::Result<_>>()?,
+    })
 }
 
-/// Encode a resolved row's `Value` for the wire. Same infallible contract as
-/// `geometry_bytes` above: a `Value` these rows carry never fails to encode.
-fn encode_resolved_value(value: &nodedb_types::Value) -> Vec<u8> {
-    nodedb_types::value_to_msgpack(value).expect("resolved row Value serialization is infallible")
+/// Encode a resolved row's `Value` for the wire. A failed encode refuses the
+/// write, like the geometry encode above.
+fn encode_resolved_value(collection: &str, value: &nodedb_types::Value) -> crate::Result<Vec<u8>> {
+    nodedb_types::value_to_msgpack(value).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("resolved row of '{collection}': {e}"),
+    })
 }
 
 /// `ColumnarOp::Truncate` replicates as a plain `ColumnarTruncate` entry:

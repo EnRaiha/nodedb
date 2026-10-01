@@ -6,13 +6,10 @@ use crate::types_expr::SqlValue;
 
 /// A single row for a vector-primary INSERT.
 ///
-/// The surrogate is allocated by the Control Plane before the op reaches
-/// the Data Plane; the Data Plane only stores the binding.
+/// The row carries no surrogate: the Control Plane binds one from the row's
+/// primary key when it converts the plan.
 #[derive(Debug, Clone)]
 pub struct VectorPrimaryRow {
-    /// Global surrogate allocated by the Control Plane (`Surrogate::ZERO`
-    /// is a sentinel meaning "not yet assigned").
-    pub surrogate: nodedb_types::Surrogate,
     /// FP32 vector extracted from the vector-field column.
     pub vector: Vec<f32>,
     /// Payload fields (non-vector columns that may feed bitmap indexes).

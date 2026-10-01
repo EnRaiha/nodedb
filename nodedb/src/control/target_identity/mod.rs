@@ -15,4 +15,4 @@ pub(crate) mod surrogate;
 pub(crate) use document_id::{derive_document_id, require_surrogate};
 pub(crate) use naming::bare_collection_name;
 pub(crate) use pk::{TargetPk, resolve_target_pk};
-pub(crate) use surrogate::assign_target_surrogate;
+pub(crate) use surrogate::assign_target_surrogates;

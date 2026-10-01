@@ -99,19 +99,12 @@ impl SinkEventKey {
 
     /// A hex token of the key, for text that carries it.
     pub fn to_token(&self) -> String {
-        self.to_bytes().iter().map(|b| format!("{b:02x}")).collect()
+        hex::encode(self.to_bytes())
     }
 
     /// Decode [`Self::to_token`].
     pub fn from_token(token: &str) -> Option<Self> {
-        if !token.len().is_multiple_of(2) {
-            return None;
-        }
-        let bytes: Option<Vec<u8>> = (0..token.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(token.get(i..i + 2)?, 16).ok())
-            .collect();
-        Self::from_bytes(&bytes?)
+        Self::from_bytes(&hex::decode(token).ok()?)
     }
 }
 

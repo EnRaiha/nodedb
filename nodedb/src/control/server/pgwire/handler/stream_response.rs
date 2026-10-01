@@ -74,7 +74,7 @@ pub(crate) fn streaming_multirow_response(
         // QueryResponse outlives the pgwire handler. Its row stream owns this
         // scope so descriptor leases remain held while the client polls rows,
         // including on a mid-stream error, until completion or disconnect.
-        let _lease_scope = lease_scope;
+        let lease_scope = lease_scope;
         // Owned by the lazy response for the same reason the lease scope is:
         // it charges on drop, which must be when the stream finishes or the
         // client disconnects — so what gets billed is rows actually written
@@ -82,7 +82,13 @@ pub(crate) fn streaming_multirow_response(
         let mut meter_guard = meter_guard;
         let mut emitted: usize = 0;
         let mut batches = stream;
-        while let Some(batch) = batches.next().await {
+        // A lease this node loses mid-stream ends the stream with a retryable
+        // error rather than more rows from a stale descriptor.
+        while let Some(batch) = lease_scope
+            .guard(batches.next())
+            .await
+            .unwrap_or_else(|revoked| Some(Err(revoked)))
+        {
             let batch = batch.map_err(|e| {
                 let (severity, code, message) = error_to_sqlstate(&e);
                 PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -163,7 +169,7 @@ pub(crate) fn streaming_shaped_response(
         .map(|c| c.display_name.clone())
         .collect();
     // Cells live in the shaped row maps under unique per-column keys
-    // (display names may repeat across columns, e.g. `SELECT w.id, b.id`);
+    // (display names can repeat across columns, e.g. `SELECT w.id, b.id`);
     // derive the same keys the shaper used so every column reads its own cell.
     let cell_keys = crate::control::server::response_shape::project::cell_keys(&display_columns);
     // Advertise each projected column's real catalog type so the streaming
@@ -192,7 +198,7 @@ pub(crate) fn streaming_shaped_response(
         // The lazy QueryResponse owns the admission scope rather than the
         // handler stack frame; dropping it on wire completion or disconnect
         // releases the descriptor leases.
-        let _lease_scope = lease_scope;
+        let lease_scope = lease_scope;
         // Owned by the lazy response for the same reason the lease scope is:
         // it charges on drop, which must be when the stream finishes or the
         // client disconnects — so what gets billed is rows actually written
@@ -200,7 +206,13 @@ pub(crate) fn streaming_shaped_response(
         let mut meter_guard = meter_guard;
         let mut emitted: usize = 0;
         let mut batches = stream;
-        while let Some(batch) = batches.next().await {
+        // A lease this node loses mid-stream ends the stream with a retryable
+        // error rather than more rows from a stale descriptor.
+        while let Some(batch) = lease_scope
+            .guard(batches.next())
+            .await
+            .unwrap_or_else(|revoked| Some(Err(revoked)))
+        {
             let batch = batch.map_err(|e| {
                 let (severity, code, message) = error_to_sqlstate(&e);
                 PgWireError::UserError(Box::new(ErrorInfo::new(

@@ -35,12 +35,6 @@ pub(super) const OWNERS: TableDefinition<&str, &[u8]> = TableDefinition::new("_s
 
 // ── Collections ───────────────────────────────────────────────────────
 
-/// Table (legacy, pre-database-boundary): `"{tenant_id}:{name}"` -> msgpack
-/// collection metadata. Used only by the idempotent migration path that reads
-/// legacy rows and rewrites them under `COLLECTIONS` with the database_id key.
-pub(super) const COLLECTIONS_LEGACY: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("_system.collections");
-
 /// Table: `(database_id: u64, "{tenant_id}:{name}")` -> MessagePack collection metadata.
 ///
 /// The compound key prepends `database_id` (as raw `u64`) so every collection
@@ -78,8 +72,8 @@ pub(super) const L2_CLEANUP_QUEUE: TableDefinition<(u64, u64, &str), &[u8]> =
 /// Populated when the synchronous, result-checked engine purge for a
 /// dropped collection (`clear_collection_all_engines` via
 /// `MetaOp::UnregisterCollection`) FAILS on this node after the catalog
-/// row has already been removed. Left unrecorded, that failure would
-/// leave engine storage rows behind a gone catalog row — permanent
+/// row has already been removed. Left unrecorded, that failure
+/// leaves engine storage rows behind a gone catalog row — permanent
 /// divergence that resurrects the dropped collection's history on
 /// re-CREATE. A Tokio worker (and a boot-time drain) retries the engine
 /// purge for each entry until it succeeds, then removes the row. This
@@ -138,7 +132,7 @@ pub(super) const SURROGATE_PK_V3: TableDefinition<(u64, u64, &str, &[u8]), u32> 
 
 /// Table (legacy): `(collection, surrogate)` -> encoded pk bytes.
 /// Used only by the idempotent migration that prefixes rows with database_id.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(super) const SURROGATE_PK_REV_LEGACY: TableDefinition<(&str, u32), &[u8]> =
     TableDefinition::new("_system.surrogate_pk_rev");
 
@@ -238,8 +232,9 @@ pub(super) const DATABASES: TableDefinition<u64, &[u8]> = TableDefinition::new("
 pub(super) const DATABASES_BY_NAME: TableDefinition<&str, u64> =
     TableDefinition::new("_system.databases_by_name");
 
-/// Table: singleton `"global"` -> highest allocated database id (`u64`).
-/// Persisted by `DatabaseRegistry::flush`; seeded at startup.
+/// Table: `"global"` -> highest issued database id, `"reserve_index"` ->
+/// highest metadata log index folded into it (`u64`). Written on every
+/// allocation; seeds `DatabaseRegistry` at startup.
 pub(super) const DATABASE_HWM: TableDefinition<&str, u64> =
     TableDefinition::new("_system.database_hwm");
 
@@ -273,7 +268,7 @@ pub(super) const BLACKLIST: TableDefinition<&str, &[u8]> =
 /// Table: scope name -> MessagePack-serialized `StoredScopeQuota`.
 ///
 /// Quota definitions are admin-authored catalog objects, like scope grants:
-/// a definition that lived only in process memory would be forgotten by every
+/// a definition that lived only in process memory is forgotten by every
 /// restart, silently lifting every cap it expressed.
 pub(super) const SCOPE_QUOTAS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.scope_quotas");

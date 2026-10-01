@@ -93,6 +93,9 @@ pub async fn crdt_state(
             // `AlreadyAdmitted` carries no address precisely so there is
             // nothing to invent here.
             admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
+            // No session reaches this handler, so its read takes the strong
+            // default (see `DmlTxnCtx::linearizable_reads`).
+            linearizable: true,
         },
     )
     .await
@@ -160,14 +163,15 @@ pub async fn crdt_apply(
     )
     .map_err(|error| DdlError::new("42501", format!("permission denied: {}", error.resource())))?;
 
-    let surrogate = state
-        .surrogate_assigner
-        .assign(
-            nodedb_types::CollectionKey::from_bare(database_id, collection),
-            tenant_id,
-            document_id.as_bytes(),
-        )
-        .map_err(|e| DdlError::from_error(&e))?;
+    let surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
+        state,
+        nodedb_types::CollectionKey::from_bare(database_id, collection),
+        tenant_id,
+        document_id.as_bytes(),
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| DdlError::from_error(&e))?;
 
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
         collection: nodedb_types::QualifiedCollection::new(database_id, collection),
@@ -203,8 +207,8 @@ pub async fn crdt_apply(
     .ok_or_else(|| DdlError::internal("authorization returned no capability"))?;
 
     // Route through the Raft proposer gate so the delta is quorum-durable under
-    // replication. A local-only dispatch would land the delta on the receiving
-    // node only — it would be lost to every follower and entirely on failover.
+    // replication. A local-only dispatch will land the delta on the receiving
+    // node only — it will be lost to every follower and entirely on failover.
     //
     // RLS write policies are stored keyed by `db_qualified(database_id,
     // collection)`, so the policy must be handed that same key or it silently

@@ -76,22 +76,31 @@ impl SharedState {
             // surrogate watermark above is: this constructor's whole purpose
             // is to resume a durable catalog, and a memory-only store here
             // silently drops every auth-user status and scope grant the
-            // previous session persisted — so a restart fixture would report
+            // previous session persisted — so a restart fixture reports
             // a clean slate rather than what was actually saved.
             s.auth_users =
                 crate::control::security::jit::auth_user::AuthUserStore::open(catalog.clone())?;
             s.scope_grants =
                 crate::control::security::scope::grant::ScopeGrantStore::open(catalog)?;
             // Same reasoning as the grants above: a quota definition is a
-            // durable catalog object, and a memory-only manager here would
-            // report every cap as absent after a restart.
+            // durable catalog object, and a memory-only manager here
+            // reports every cap as absent after a restart.
             s.quota_manager = QuotaManager::open(
                 s.metering_config.max_tracked_quota_grantees,
                 credentials.catalog(),
             )?;
+            // Database ids resume from the durable hwm, as in production
+            // bootstrap, so a restart fixture never reissues one.
+            s.database_registry = crate::control::database::DatabaseRegistry::from_persisted(
+                credentials.catalog().get_database_hwm()?,
+                credentials.catalog().get_database_reserve_index()?,
+            );
             s.credentials = credentials;
-            s.ep_topic_registry
-                .load_from_catalog(s.credentials.catalog())?;
+            // The metadata group restarts above its durable applied floor and
+            // never applies the entries below it again. Every registry their
+            // post-apply side effects wrote comes back from the catalog here,
+            // through the loader production boot runs.
+            s.load_catalog_host_state()?;
             crate::event::topic::hydrate_topic_buffers(s)?;
         }
         Ok(state)
@@ -144,14 +153,21 @@ impl SharedState {
     /// `AuditLog`, so `SessionHandleFingerprintMismatch` and
     /// `SessionHandleResolveMissSpike` are hash-chained with
     /// the rest of the auth-plane event stream. Captures the audit Arc
-    /// directly — a `Weak<Self>` would block the cluster wire-up phase's
+    /// directly — a `Weak<Self>` blocks the cluster wire-up phase's
     /// `Arc::get_mut` on `SharedState`.
     pub(super) fn wire_session_handle_audit(state: &Arc<Self>) {
         let audit = Arc::clone(&state.audit);
         state.session_handles.set_audit_hook(move |event| {
-            if let Ok(mut log) = audit.lock() {
-                let _ = log.record(event, None, "session_handle", "");
-            }
+            // A poisoned log still records, as `audit_record_with_db_strict`
+            // does: dropping a security event is worse than a warning.
+            let mut log = audit.lock().unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    ?event,
+                    "audit log mutex poisoned; recording session-handle event after recovery"
+                );
+                poisoned.into_inner()
+            });
+            log.record(event, None, "session_handle", "");
         });
     }
 }

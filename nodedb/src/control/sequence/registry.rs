@@ -43,6 +43,36 @@ impl SequenceRegistry {
         &self.gap_free
     }
 
+    /// Replace every sequence with the catalog's definitions and states.
+    ///
+    /// `unchanged(database_id, tenant_id, name)` reports a sequence whose
+    /// definition and state the replace left as they were. Its live handle
+    /// stays: the counter holds values this node issued that the catalog
+    /// never saw, and rebuilding it from the catalog reissues them.
+    pub fn reload_from_catalog(
+        &self,
+        catalog: &SystemCatalog,
+        unchanged: impl Fn(u64, u64, &str) -> bool,
+    ) -> crate::Result<()> {
+        let mut loaded = Vec::new();
+        for def in catalog.load_all_sequences()? {
+            let keep = unchanged(def.database_id, def.tenant_id, &def.name);
+            let state = catalog.get_sequence_state(def.database_id, def.tenant_id, &def.name)?;
+            loaded.push((def, keep, state));
+        }
+        let mut map = self.sequences.write().unwrap_or_else(|p| p.into_inner());
+        let mut live = std::mem::take(&mut *map);
+        for (def, keep, state) in loaded {
+            let key = registry_key(def.database_id, def.tenant_id, &def.name);
+            let handle = match live.remove(&key) {
+                Some(handle) if keep => handle,
+                _ => SequenceHandle::new(def, state),
+            };
+            map.insert(key, handle);
+        }
+        Ok(())
+    }
+
     /// Load all sequences from the catalog on startup.
     pub fn load_from_catalog(&self, catalog: &SystemCatalog) {
         let all_defs = match catalog.load_all_sequences() {
@@ -330,7 +360,7 @@ impl SequenceRegistry {
                 database_id: handle.def.database_id,
                 tenant_id: handle.def.tenant_id,
                 name: handle.def.name.clone(),
-                current_value: handle.current_value(),
+                current_value: handle.persisted_value(),
                 is_called: handle.is_called(),
                 epoch: handle.def.epoch,
                 period_key: handle.period_key(),

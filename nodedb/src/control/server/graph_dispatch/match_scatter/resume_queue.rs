@@ -25,7 +25,7 @@ use crate::types::VShardId;
 /// Keys on the anchor bindings (`source_row`), the frontier node identities, the
 /// triple index, and the hop depth — deliberately EXCLUDING each frontier
 /// entry's accumulating `path_so_far`, which grows one node longer every round
-/// and would otherwise make every re-emission look unique and defeat dedup.
+/// and will otherwise make every re-emission look unique and defeat dedup.
 ///
 /// Two resumes sharing a key re-expand the same frontier at the same depth from
 /// the same anchor and therefore reach the same onward bindings, so the
@@ -94,6 +94,7 @@ pub(super) fn resume_to_pending(
                 vshard_id: VShardId::new((vshard_id % VShardId::COUNT as u64) as u32),
                 leader_node: 0,
                 leader_addr: String::new(),
+                leader_term: 0,
             });
         }
         RouteDecision::Broadcast { .. } => {

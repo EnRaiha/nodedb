@@ -25,9 +25,8 @@ pub(super) async fn try_typed(
     match stmt {
         // Database DDL family (CREATE / DROP / ALTER DATABASE, SHOW DATABASES /
         // QUOTA / USAGE / LINEAGE, CLONE / MIRROR / PROMOTE, BACKUP / RESTORE,
-        // SHOW DATABASE MIRROR STATUS). Migrated from the pgwire typed-AST
-        // database router (`database_ops`); all catalog / audit / gate side
-        // effects are preserved verbatim in `database`.
+        // SHOW DATABASE MIRROR STATUS). All catalog / audit / gate side
+        // effects live in `database`.
         //
         // NOT here: `UseDatabase` (session-coupled, intercepted before the DDL
         // router). `AlterTenant` / `ShowTenantQuotaInDatabase` /
@@ -37,25 +36,21 @@ pub(super) async fn try_typed(
             name,
             if_not_exists,
             options,
-        }) => Some(database::create::create_database(
-            state,
-            identity,
-            name,
-            *if_not_exists,
-            options,
-        )),
+        }) => Some(
+            database::create::create_database(state, identity, name, *if_not_exists, options).await,
+        ),
 
         NodedbStatement::Database(DatabaseStmt::DropDatabase {
             name,
             if_exists,
             cascade,
-        }) => Some(database::drop::drop_database(
-            state, identity, name, *if_exists, *cascade,
-        )),
+        }) => {
+            Some(database::drop::drop_database(state, identity, name, *if_exists, *cascade).await)
+        }
 
-        NodedbStatement::Database(DatabaseStmt::AlterDatabase { name, operation }) => Some(
-            database::alter::alter_database(state, identity, name, operation),
-        ),
+        NodedbStatement::Database(DatabaseStmt::AlterDatabase { name, operation }) => {
+            Some(database::alter::alter_database(state, identity, name, operation).await)
+        }
 
         NodedbStatement::Database(DatabaseStmt::ShowDatabases) => {
             Some(database::show::show_databases(state, identity))
@@ -95,39 +90,49 @@ pub(super) async fn try_typed(
             source_cluster,
             source_database,
             mode,
-        }) => Some(database::mirror::create::mirror_database(
-            state,
-            identity,
-            local_name,
-            source_cluster,
-            source_database,
-            *mode,
-        )),
+        }) => Some(
+            database::mirror::create::mirror_database(
+                state,
+                identity,
+                local_name,
+                source_cluster,
+                source_database,
+                *mode,
+            )
+            .await,
+        ),
 
         NodedbStatement::Database(DatabaseStmt::ShowDatabaseMirrorStatus { name }) => Some(
             database::mirror::show::show_database_mirror_status(state, identity, name.as_deref()),
         ),
 
-        NodedbStatement::Database(DatabaseStmt::BackupDatabase { name, .. }) => Some(
-            database::backup_restore::backup_database(state, identity, name),
-        ),
+        NodedbStatement::Database(DatabaseStmt::BackupDatabase { name, uri }) => {
+            Some(database::backup_restore::backup_database(state, identity, name, uri).await)
+        }
 
-        NodedbStatement::Database(DatabaseStmt::RestoreDatabase { name, .. }) => Some(
-            database::backup_restore::restore_database(state, identity, name),
+        NodedbStatement::Database(DatabaseStmt::RestoreDatabase {
+            name,
+            uri,
+            force,
+            dry_run,
+        }) => Some(
+            database::backup_restore::restore_database(
+                state, identity, name, uri, *force, *dry_run,
+            )
+            .await,
         ),
 
         // Tenant DDL family (`ALTER TENANT ... IN DATABASE ... SET QUOTA`,
         // `SHOW TENANT QUOTA|USAGE FOR ... IN DATABASE ...`). These parse into
-        // typed `DatabaseStmt` variants and were dispatched from the pgwire
-        // typed-AST database router (`database_ops`); all catalog / audit /
-        // gate side effects are preserved verbatim in `tenant`.
+        // typed `DatabaseStmt` variants. All catalog / audit / gate side
+        // effects live in `tenant`.
         NodedbStatement::Database(DatabaseStmt::AlterTenant {
             name,
             database,
             operation,
-        }) => Some(tenant::handle_alter_tenant_quota(
-            state, identity, name, database, operation,
-        )),
+        }) => Some(
+            tenant::handle_alter_tenant_quota(state, identity, name, database, operation).await,
+        ),
 
         NodedbStatement::Database(DatabaseStmt::ShowTenantQuotaInDatabase { name, database }) => {
             Some(tenant::handle_show_tenant_quota_in_database(
@@ -143,10 +148,9 @@ pub(super) async fn try_typed(
 
         // `MOVE TENANT <name> FROM <source_db> TO <target_db>` — async,
         // 5-phase re-parenting sequence. Parses into a typed `DatabaseStmt`
-        // variant and was dispatched from the pgwire typed-AST async router
-        // (`async_ops`); every phase (pre-flight, drain, snapshot, cutover,
-        // resume), the journal, and the compensation paths are preserved
-        // verbatim in `tenant::move_tenant`.
+        // variant. Every phase (pre-flight, drain, snapshot, cutover,
+        // resume), the journal, and the compensation paths live in
+        // `tenant::move_tenant`.
         NodedbStatement::Database(DatabaseStmt::MoveTenant {
             tenant_name,
             from_db,
@@ -154,9 +158,8 @@ pub(super) async fn try_typed(
         }) => Some(tenant::handle_move_tenant(state, identity, tenant_name, from_db, to_db).await),
 
         // Tenant introspection by identifier / name filter. These parse into
-        // typed `DatabaseStmt` variants and were dispatched from the pgwire
-        // typed-AST database router (`database_ops`). The credential / usage
-        // reads are preserved verbatim in `inspect`.
+        // typed `DatabaseStmt` variants. The credential / usage reads live in
+        // `inspect`.
         NodedbStatement::Database(DatabaseStmt::ShowTenantByIdentifier { ident }) => {
             Some(inspect::show_tenant_by_identifier(state, identity, ident))
         }

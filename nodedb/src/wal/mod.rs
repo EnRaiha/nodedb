@@ -14,9 +14,17 @@ pub mod timeseries_batch_payload;
 pub use audit_segment::AuditWalSegment;
 pub(crate) use crdt_doc_payload::CrdtDocOpWalRecord;
 pub(crate) use crdt_list_payload::CrdtListOpWalRecord;
-pub(crate) use crdt_payload::{CrdtDeltaSigning, CrdtDeltaWalPayload};
+pub(crate) use crdt_payload::{
+    CrdtDeltaSigning, CrdtDeltaTarget, CrdtDeltaWalError, CrdtDeltaWalPayload,
+};
 pub use manager::WalManager;
-pub use redo::{CalvinStamp, EdgeDeleteRedo, EdgePutRedo, RedoRecord, RedoSubRecord};
+pub use redo::{
+    CalvinStamp, CapturedEntry, CascadedEdge, ContinuedRedo, CrossShardAppliedKey, EVERY_ROW,
+    EdgeCutRedo, EdgeDeleteRedo, EdgePutRedo, GroupMembership, NodeCascadeRedo, OriginAppend,
+    PublishPosition, RedoPublish, RedoRecord, RedoRowChange, RedoRowKind, RedoRowSource,
+    RedoSubRecord, RowSourceIndex, SplitRedo, WriteGroup, WriteGroupRecord, WriteSetCapture,
+    split_redo,
+};
 pub use replay::SyncHwmReplayMaps;
 pub use replay::SyncHwmReplayStats;
 pub use replay::replay_surrogate_records;

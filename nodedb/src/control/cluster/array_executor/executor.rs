@@ -11,6 +11,10 @@ use nodedb_cluster::rpc_codec::DataPlaneErrorCode;
 
 use super::refusal::execution_error;
 use crate::bridge::envelope::{Priority, Request, Response};
+use crate::control::cluster::linearizable_read::{
+    confirm_linearizable_read, groups_of_vshards, statement_read_deadline,
+};
+use crate::control::server::shared::write_admission::plan_is_write;
 use crate::control::state::SharedState;
 use crate::event::types::EventSource;
 use crate::types::{ReadConsistency, RequestId, TraceId, TxnId, VShardId};
@@ -50,17 +54,32 @@ impl DataPlaneArrayExecutor {
         plan: PhysicalPlan,
         txn_id: Option<TxnId>,
     ) -> Result<Response> {
+        // Array reads have no weaker consistency: a shard read confirms its
+        // group on this node before it reads.
+        if !plan_is_write(&plan) {
+            let groups = groups_of_vshards(&self.state, [local_vshard_id.as_u32()])
+                .map_err(|e| execution_error("array read confirmation", e))?;
+            confirm_linearizable_read(&self.state, &groups, statement_read_deadline(&self.state))
+                .await
+                .map_err(|e| execution_error("array read confirmation", e))?;
+        }
         let request_id = self.state.next_request_id();
         let request = local_request(request_id, array_id, local_vshard_id, plan, txn_id);
 
         let mut rx = self.state.tracker.register(request_id);
 
-        let dispatch_result = match self.state.dispatcher.lock() {
-            Ok(mut d) => d.dispatch(request),
-            Err(poisoned) => poisoned.into_inner().dispatch(request),
-        };
+        // A shard fan-out sends one request per shard, which can exceed the
+        // tenant's in-flight cap: each request waits for a freed slot until
+        // its deadline instead of refusing the statement.
+        let dispatch_result = crate::control::server::dispatch_utils::dispatch_when_capacity_frees(
+            &self.state,
+            request,
+            None,
+        )
+        .await;
 
-        // A dispatch refusal, such as a capacity limit, keeps its own class.
+        // A dispatch refusal, such as a capacity limit past the deadline,
+        // keeps its own class.
         if let Err(e) = dispatch_result {
             return Err(execution_error("array executor dispatch", e));
         }
@@ -114,6 +133,7 @@ fn local_request(
         txn_id,
         wal_lsn: None,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: crate::bridge::envelope::Admission::Exempt(
             crate::bridge::envelope::ExemptReason::AlreadyOrdered,
         ),
@@ -137,14 +157,14 @@ mod tests {
         assert_eq!(array_id.tenant_id, default_scope_array.tenant_id);
         assert_ne!(array_id.database_id, default_scope_array.database_id);
 
+        let vshard_id = VShardId::new(19);
         let plan = PhysicalPlan::Array(ArrayOp::Delete {
             array_id: array_id.clone(),
             coords_msgpack: Vec::new(),
             wal_lsn: 0,
             provenance: None,
+            vshard_id: vshard_id.as_u32(),
         });
-
-        let vshard_id = VShardId::new(19);
         let replicable = ReplicableWrite::decide_for_replication(&plan)
             .expect("array write plan carries no live RLS predicate");
         let entry = to_replicated_entry(tenant_id, database_id, vshard_id, &replicable)
@@ -193,6 +213,7 @@ mod tests {
             coords_msgpack: Vec::new(),
             wal_lsn: 0,
             provenance: None,
+            vshard_id: vshard_id.as_u32(),
         });
 
         let read_request = local_request(RequestId::new(8), &array_id, vshard_id, read, None);

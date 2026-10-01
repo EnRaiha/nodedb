@@ -2,9 +2,7 @@
 
 //! Entry point: `copy_to_file`, path validation, scan, and atomic file write.
 //!
-//! Relocated verbatim from the pgwire `ddl::collection::copy_to::entry`
-//! module (now deleted) except for the result type, which is [`DdlResult`] /
-//! [`DdlError`] throughout instead of pgwire `Response` / `PgWireResult`.
+//! The result type is [`DdlResult`] / [`DdlError`] throughout.
 
 use nodedb_types::DatabaseId;
 use std::path::Path;

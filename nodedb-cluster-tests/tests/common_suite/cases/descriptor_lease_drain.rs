@@ -49,17 +49,22 @@ async fn drain_blocks_new_acquires_at_drained_version() {
     // cancel it at the end of the test.
     let shared = Arc::clone(&leader.shared);
     let drain_id = id.clone();
-    tokio::task::spawn_blocking(move || {
+    tokio::spawn(async move {
         let now_hlc = shared.hlc_clock.now();
         let expires_at = nodedb_types::Hlc::new(now_hlc.wall_ns.saturating_add(60_000_000_000), 0);
         let entry = nodedb_cluster::MetadataEntry::DescriptorDrainStart {
             descriptor_id: drain_id,
             up_to_version: 1,
             expires_at,
+            proposer_node_id: shared.node_id,
+            owner: nodedb_cluster::DrainOwner::Ddl,
         };
         let raw = nodedb_cluster::encode_entry(&entry).expect("encode");
         let handle = shared.metadata_raft.get().expect("metadata raft handle");
-        handle.propose(raw).expect("propose drain start");
+        handle
+            .propose_async(raw)
+            .await
+            .expect("propose drain start");
     })
     .await
     .expect("join");
@@ -118,7 +123,7 @@ async fn drain_clears_after_end_entry() {
     // every node's tracker should be empty for this descriptor.
     let shared = Arc::clone(&leader.shared);
     let drain_id = id.clone();
-    tokio::task::spawn_blocking(move || {
+    tokio::spawn(async move {
         let now_hlc = shared.hlc_clock.now();
         let expires_at = nodedb_types::Hlc::new(now_hlc.wall_ns.saturating_add(60_000_000_000), 0);
         let handle = shared.metadata_raft.get().expect("handle");
@@ -126,15 +131,20 @@ async fn drain_clears_after_end_entry() {
             descriptor_id: drain_id.clone(),
             up_to_version: 5,
             expires_at,
+            proposer_node_id: shared.node_id,
+            owner: nodedb_cluster::DrainOwner::Ddl,
         };
         handle
-            .propose(nodedb_cluster::encode_entry(&start).unwrap())
+            .propose_async(nodedb_cluster::encode_entry(&start).unwrap())
+            .await
             .expect("start");
         let end = nodedb_cluster::MetadataEntry::DescriptorDrainEnd {
             descriptor_id: drain_id,
+            owner: nodedb_cluster::DrainOwner::Ddl,
         };
         handle
-            .propose(nodedb_cluster::encode_entry(&end).unwrap())
+            .propose_async(nodedb_cluster::encode_entry(&end).unwrap())
+            .await
             .expect("end");
     })
     .await
@@ -186,21 +196,16 @@ async fn ddl_waits_for_existing_lease_to_release() {
     )
     .await;
 
-    // Acquire a lease on v1 — this is what drain must wait for.
-    leader
-        .acquire_lease(
-            DescriptorKind::Collection,
-            TENANT,
-            "drainable",
-            1,
-            Duration::from_secs(60),
-        )
+    // Hold a v1 lease the way a running statement does. This is what the
+    // drain must wait for: a drain start releases an idle lease at once.
+    let hold = leader
+        .hold_lease(DescriptorKind::Collection, TENANT, "drainable", 1)
         .await
-        .expect("acquire v1 lease");
+        .expect("hold v1 lease");
 
-    // Kick off an ALTER directly via `propose_catalog_entry`
+    // Kick off an ALTER directly via `propose_catalog_entry_async`
     // rather than pgwire so the test can run it in a
-    // spawn_blocking task while the main task polls for drain
+    // spawned task while the main task polls for drain
     // state. We build a fresh `PutCollection` with the same
     // content as the existing v1 record — the applier will see
     // a Put* for an existing descriptor, run drain for prior=1,
@@ -214,13 +219,17 @@ async fn ddl_waits_for_existing_lease_to_release() {
         .expect("exists");
 
     let alter_shared = Arc::clone(&leader.shared);
-    let alter_handle = tokio::task::spawn_blocking(move || {
+    let alter_handle = tokio::spawn(async move {
         let entry = nodedb::control::catalog_entry::CatalogEntry::PutCollection(Box::new(existing));
-        nodedb::control::metadata_proposer::propose_catalog_entry_with_timeout(
-            &alter_shared,
-            &entry,
+        match tokio::time::timeout(
             Duration::from_secs(10),
+            nodedb::control::metadata_proposer::propose_catalog_entry_async(&alter_shared, &entry),
         )
+        .await
+        {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(_) => Err("propose_catalog_entry_async timed out after 10s".to_string()),
+        }
     });
 
     // Give the ALTER a chance to start draining. Poll until the
@@ -245,12 +254,10 @@ async fn ddl_waits_for_existing_lease_to_release() {
         "DDL must not have committed while drain is waiting"
     );
 
-    // Release the lease. Drain should complete; the Put* should
-    // commit; version should bump to 2 on every node.
-    leader
-        .release_leases(vec![coll_id("drainable")])
-        .await
-        .expect("release");
+    // End the statement. Its last hold ending under the drain releases the
+    // lease; the drain completes, the Put* commits, and the version bumps to
+    // 2 on every node.
+    drop(hold);
 
     let alter_result = alter_handle.await.expect("join");
     assert!(
@@ -289,29 +296,27 @@ async fn drain_timeout_clears_state() {
     // the way so drain cannot complete. The drain_for_ddl call
     // times out, emits DrainEnd, and returns an error.
     //
-    // Setup: acquire a long-lived lease at v1 so drain has
-    // something to wait for that it cannot clear on its own.
-    leader
-        .acquire_lease(
-            DescriptorKind::Collection,
-            TENANT,
-            "stuck",
-            1,
-            Duration::from_secs(60),
-        )
+    // Setup: hold a v1 lease the way a running statement does, so the drain
+    // has something to wait for that it cannot clear on its own.
+    let hold = leader
+        .hold_lease(DescriptorKind::Collection, TENANT, "stuck", 1)
         .await
-        .expect("acquire");
+        .expect("hold");
 
     let shared = Arc::clone(&leader.shared);
     let drain_id = id.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        // 0 own holds: the lease under test belongs to another holder, so
-        // nothing here may be excluded from the drain.
-        nodedb::control::lease::drain_for_ddl(&shared, drain_id, 1, Duration::from_millis(200), 0)
-    })
-    .await
-    .expect("join");
+    // 0 own holds: the lease under test belongs to another holder, so
+    // the drain excludes nothing here.
+    let result = nodedb::control::lease::drain_for_ddl_async(
+        &shared,
+        drain_id,
+        1,
+        Duration::from_millis(200),
+        0,
+    )
+    .await;
 
+    drop(hold);
     assert!(result.is_err(), "drain should have timed out");
     let err_msg = format!("{}", result.unwrap_err());
     assert!(

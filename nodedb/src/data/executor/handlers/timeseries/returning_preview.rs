@@ -9,7 +9,8 @@
 //! This preview ingests the same stamped lines into a scratch memtable that
 //! carries the collection's current schema, and reads them back through the
 //! same emitter. The live memtable, its dictionaries and its series catalog
-//! are not touched.
+//! are not touched. A transaction resolve reads the same scratch rows for the
+//! write events its redo record carries (`events`).
 
 use nodedb_types::timeseries::SeriesCatalog;
 
@@ -17,7 +18,9 @@ use super::raw_scan::emit_memtable_rows_at;
 use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
-use crate::engine::timeseries::columnar_memtable::{ColumnarMemtable, ColumnarMemtableConfig};
+use crate::engine::timeseries::columnar_memtable::{
+    ColumnarMemtable, ColumnarMemtableConfig, ColumnarSchema,
+};
 use crate::engine::timeseries::ilp;
 use crate::engine::timeseries::ilp_ingest;
 use crate::types::TenantId;
@@ -37,12 +40,54 @@ impl CoreLoop {
         lines: &[ilp::IlpLine<'_>],
         now_ms: i64,
     ) -> Result<Vec<rmpv::Value>, ErrorCode> {
+        let (outcome, scratch) =
+            self.scratch_ilp_ingest(task, tid, collection, lines, now_ms, None);
+        if outcome.rejected > 0 {
+            let reason = outcome
+                .first_rejection
+                .unwrap_or_else(|| "no reason recorded".to_string());
+            return Err(ErrorCode::RejectedPrevalidation {
+                reason: format!(
+                    "timeseries ingest with RETURNING would reject {} of {} rows, and a row set \
+                     cannot report a rejected row; first rejection: {reason}",
+                    outcome.rejected,
+                    outcome.accepted + outcome.rejected
+                ),
+            });
+        }
+        emit_memtable_rows_at(&scratch, &outcome.accepted_row_indices).map_err(ErrorCode::from)
+    }
+
+    /// Ingest `lines` into a scratch memtable that carries `collection`'s
+    /// current schema, or `base` when given, evolved for the lines. Returns
+    /// the outcome, with the row index of every accepted row, and the scratch
+    /// memtable those indices name.
+    pub(in crate::data::executor) fn scratch_ilp_ingest(
+        &self,
+        task: &ExecutionTask,
+        tid: TenantId,
+        collection: &str,
+        lines: &[ilp::IlpLine<'_>],
+        now_ms: i64,
+        base: Option<&ColumnarSchema>,
+    ) -> (ilp_ingest::IngestBatchOutcome, ColumnarMemtable) {
         let key = (task.request.database_id, tid, collection.to_string());
         let bitemporal =
             self.is_bitemporal(task.request.database_id.as_u64(), tid.as_u64(), collection);
-        let mut scratch = match self.columnar_memtables.get(&key) {
-            Some(live) => {
-                let mut scratch = ColumnarMemtable::new(live.schema().clone(), live.config());
+        let live = self
+            .columnar_memtables
+            .get(&key)
+            .map(|live| (live.schema().clone(), live.config()));
+        let base = base.cloned().map(|schema| {
+            let config = live.as_ref().map_or_else(
+                || ColumnarMemtableConfig::from_tuning(&self.ts_tuning),
+                |(_, config)| config.clone(),
+            );
+            (schema, config)
+        });
+        let mut scratch = match base.or(live) {
+            Some((schema, config)) => {
+                let mut scratch = ColumnarMemtable::new(schema, config);
                 ilp_ingest::evolve_schema(&mut scratch, lines);
                 scratch
             }
@@ -64,19 +109,6 @@ impl CoreLoop {
             bitemporal: bitemporal.then_some(ilp_ingest::BitempStamps { system_ms: now_ms }),
             collect_row_indices: true,
         });
-        if outcome.rejected > 0 {
-            let reason = outcome
-                .first_rejection
-                .unwrap_or_else(|| "no reason recorded".to_string());
-            return Err(ErrorCode::RejectedPrevalidation {
-                reason: format!(
-                    "timeseries ingest with RETURNING would reject {} of {} rows, and a row set \
-                     cannot report a rejected row; first rejection: {reason}",
-                    outcome.rejected,
-                    outcome.accepted + outcome.rejected
-                ),
-            });
-        }
-        emit_memtable_rows_at(&scratch, &outcome.accepted_row_indices).map_err(ErrorCode::from)
+        (outcome, scratch)
     }
 }

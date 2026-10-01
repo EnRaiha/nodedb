@@ -12,8 +12,9 @@ pub use context::{DATABASE_SCOPE, IlpFlushOutcome, LostResponseWrite, TENANT_SCO
 pub use recording::{
     IndexRebuildTarget, VectorBuildTarget, batch_insert_without_surrogates, calvin_apply_halted,
     calvin_completion_timeout, catalog_apply_orphan_row, collection_purge_row_missing,
-    consumer_group_offsets_retained, data_plane_core_fail_stopped, data_plane_response_lost,
-    data_plane_responses_lost, descriptor_lease_not_renewed, entry_kind, fts_index_update_failed,
+    consumer_group_offsets_retained, continuous_aggregate_not_applied,
+    data_plane_core_fail_stopped, data_plane_response_lost, data_plane_responses_lost,
+    descriptor_lease_not_renewed, entry_kind, fts_index_update_failed,
     history_compaction_not_applied, ilp_invalid_utf8_drop, ilp_line_read_drop,
     index_rebuild_not_installed, metadata_apply_wedged, orphaned_index_entry_after_delete,
     quota_row_invalid, quota_row_undecodable, quota_row_write_failed, quota_scope_purge_incomplete,

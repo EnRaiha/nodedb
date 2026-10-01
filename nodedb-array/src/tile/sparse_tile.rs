@@ -116,11 +116,15 @@ pub struct SparseTile {
     pub dim_dicts: Vec<DimDict>,
     /// One column per schema attr, parallel to `schema.attrs`.
     pub attr_cols: Vec<Vec<CellValue>>,
-    /// Per-cell global surrogate (one entry per row, parallel to the
-    /// dim-dict index streams and `attr_cols`). Cross-engine bitmap
-    /// joins read this column directly without translating coords back
-    /// to user-visible primary keys.
-    pub surrogates: Vec<Surrogate>,
+    /// Per-row global surrogate, parallel to the dim-dict index streams.
+    /// Cross-engine bitmap joins read this column directly without
+    /// translating coords back to user-visible primary keys.
+    ///
+    /// A stored live cell holds `Some` bound surrogate. A tombstone or
+    /// erasure row holds `None`: it names a coordinate, not a row. A
+    /// derived query result row, such as an elementwise output, holds
+    /// `None` and is never stored. `Surrogate::ZERO` never appears.
+    pub surrogates: Vec<Option<Surrogate>>,
     /// Per-cell valid-time lower bound in milliseconds (inclusive).
     /// Parallel to `surrogates`.
     pub valid_from_ms: Vec<i64>,
@@ -130,9 +134,6 @@ pub struct SparseTile {
     pub valid_until_ms: Vec<i64>,
     /// Per-row [`RowKind`] encoded as `u8`. Parallel to `surrogates`.
     /// `0` = Live, `1` = Tombstone, `2` = GdprErased.
-    ///
-    /// Older segments written before this column existed will deserialise
-    /// with an empty `Vec`; readers treat a missing entry as `Live`.
     pub row_kinds: Vec<u8>,
     pub mbr: TileMBR,
 }
@@ -185,21 +186,78 @@ impl SparseTile {
             Some(&b) => RowKind::from_u8(b),
         }
     }
+
+    /// The surrogate `row` holds: `Some` for a stored live cell, `None` for a
+    /// tombstone, an erasure, or a derived result row. A row index past the
+    /// surrogate column is a malformed tile.
+    pub fn row_surrogate(&self, row: usize) -> ArrayResult<Option<Surrogate>> {
+        self.surrogates
+            .get(row)
+            .copied()
+            .ok_or_else(|| ArrayError::SegmentCorruption {
+                detail: format!(
+                    "tile row {row} is past the surrogate column ({} rows)",
+                    self.surrogates.len()
+                ),
+            })
+    }
+
+    /// The surrogate of live `row`. A live row read from storage always holds
+    /// one, so a row without it is a malformed tile.
+    pub fn live_surrogate(&self, row: usize) -> ArrayResult<Surrogate> {
+        self.row_surrogate(row)?
+            .ok_or_else(|| ArrayError::SegmentCorruption {
+                detail: format!("live tile row {row} carries no surrogate"),
+            })
+    }
+
+    /// Check the identity invariant of a stored tile: every live row holds a
+    /// bound surrogate and every tombstone or erasure row holds none. The
+    /// segment codec runs it on every tile it encodes or decodes.
+    pub fn check_stored_identities(&self) -> ArrayResult<()> {
+        if self.row_kinds.len() != self.surrogates.len() {
+            return Err(ArrayError::SegmentCorruption {
+                detail: format!(
+                    "stored tile carries {} row kinds but {} surrogates",
+                    self.row_kinds.len(),
+                    self.surrogates.len()
+                ),
+            });
+        }
+        for (row, surrogate) in self.surrogates.iter().enumerate() {
+            let kind = self.row_kind(row)?;
+            match (kind, surrogate) {
+                (RowKind::Live, Some(s)) if *s != Surrogate::ZERO => {}
+                (RowKind::Tombstone | RowKind::GdprErased, None) => {}
+                (kind, surrogate) => {
+                    return Err(ArrayError::SegmentCorruption {
+                        detail: format!(
+                            "stored tile row {row} of kind {kind:?} holds surrogate \
+                             {surrogate:?}; a live row holds a bound surrogate and a \
+                             tombstone or erasure row holds none"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// All row-level data passed to [`SparseTileBuilder::push_row`].
 pub struct SparseRow<'a> {
     pub coord: &'a [CoordValue],
     pub attrs: &'a [CellValue],
-    pub surrogate: Surrogate,
+    /// `Some` bound surrogate for a stored live cell. `None` for a tombstone,
+    /// an erasure, or a derived result row that is never stored.
+    pub surrogate: Option<Surrogate>,
     pub valid_from_ms: i64,
     pub valid_until_ms: i64,
     pub kind: RowKind,
 }
 
 impl<'a> SparseRow<'a> {
-    /// Construct a live row. Convenience wrapper so callers that only write
-    /// live data don't have to spell out `kind: RowKind::Live` explicitly.
+    /// Construct a live row that holds its bound surrogate.
     pub fn live(
         coord: &'a [CoordValue],
         attrs: &'a [CellValue],
@@ -210,10 +268,23 @@ impl<'a> SparseRow<'a> {
         Self {
             coord,
             attrs,
-            surrogate,
+            surrogate: Some(surrogate),
             valid_from_ms,
             valid_until_ms,
             kind: RowKind::Live,
+        }
+    }
+
+    /// Construct a tombstone or erasure row. It carries no attributes and no
+    /// identity.
+    pub fn sentinel(coord: &'a [CoordValue], kind: RowKind) -> Self {
+        Self {
+            coord,
+            attrs: &[],
+            surrogate: None,
+            valid_from_ms: 0,
+            valid_until_ms: OPEN_UPPER,
+            kind,
         }
     }
 }
@@ -224,7 +295,7 @@ pub struct SparseTileBuilder<'a> {
     schema: &'a ArraySchema,
     dim_dicts: Vec<DimDict>,
     attr_cols: Vec<Vec<CellValue>>,
-    surrogates: Vec<Surrogate>,
+    surrogates: Vec<Option<Surrogate>>,
     valid_from_ms: Vec<i64>,
     valid_until_ms: Vec<i64>,
     row_kinds: Vec<u8>,
@@ -259,6 +330,26 @@ impl<'a> SparseTileBuilder<'a> {
             valid_until_ms,
             kind,
         } = row;
+        match (kind, surrogate) {
+            (_, Some(s)) if s == Surrogate::ZERO => {
+                return Err(ArrayError::InvalidOp {
+                    detail: format!(
+                        "row pushed into array '{}' carries Surrogate::ZERO, which names no row",
+                        self.schema.name
+                    ),
+                });
+            }
+            (RowKind::Tombstone | RowKind::GdprErased, Some(s)) => {
+                return Err(ArrayError::InvalidOp {
+                    detail: format!(
+                        "{kind:?} row pushed into array '{}' carries surrogate {s}; a \
+                         tombstone or erasure row carries no identity",
+                        self.schema.name
+                    ),
+                });
+            }
+            _ => {}
+        }
         if coord.len() != self.schema.arity() {
             return Err(ArrayError::CoordArityMismatch {
                 array: self.schema.name.clone(),
@@ -299,14 +390,14 @@ impl<'a> SparseTileBuilder<'a> {
         Ok(())
     }
 
-    /// Push a live row whose surrogate is unknown to the caller (recovery,
-    /// pure-shape ops). The slot is filled with [`Surrogate::ZERO`];
-    /// callers that have a real surrogate should use [`Self::push_row`].
+    /// Push a derived live row, such as an elementwise result. It holds no
+    /// surrogate, so the tile it lands in is a query result and never stored.
+    /// A stored cell goes through [`Self::push_row`] with its bound surrogate.
     pub fn push(&mut self, coord: &[CoordValue], attrs: &[CellValue]) -> ArrayResult<()> {
         self.push_row(SparseRow {
             coord,
             attrs,
-            surrogate: Surrogate::ZERO,
+            surrogate: None,
             valid_from_ms: 0,
             valid_until_ms: OPEN_UPPER,
             kind: RowKind::Live,
@@ -432,7 +523,7 @@ mod tests {
         b.push_row(SparseRow {
             coord: &[CoordValue::Int64(1), CoordValue::Int64(100)],
             attrs: &[CellValue::String("A".into()), CellValue::Float64(1.0)],
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: Some(Surrogate::new(1)),
             valid_from_ms: 50,
             valid_until_ms: 150,
             kind: RowKind::Live,
@@ -441,7 +532,7 @@ mod tests {
         b.push_row(SparseRow {
             coord: &[CoordValue::Int64(2), CoordValue::Int64(200)],
             attrs: &[CellValue::String("B".into()), CellValue::Float64(2.0)],
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: Some(Surrogate::new(2)),
             valid_from_ms: 300,
             valid_until_ms: 900,
             kind: RowKind::Live,
@@ -465,7 +556,7 @@ mod tests {
         b.push_row(SparseRow {
             coord: &[CoordValue::Int64(1), CoordValue::Int64(10)],
             attrs: &[CellValue::String("X".into()), CellValue::Float64(1.0)],
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: Some(Surrogate::new(1)),
             valid_from_ms: 0,
             valid_until_ms: OPEN_UPPER,
             kind: RowKind::Live,
@@ -475,7 +566,7 @@ mod tests {
         b.push_row(SparseRow {
             coord: &[CoordValue::Int64(2), CoordValue::Int64(20)],
             attrs: &[],
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: None,
             valid_from_ms: 0,
             valid_until_ms: OPEN_UPPER,
             kind: RowKind::Tombstone,
@@ -485,7 +576,7 @@ mod tests {
         b.push_row(SparseRow {
             coord: &[CoordValue::Int64(3), CoordValue::Int64(30)],
             attrs: &[],
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: None,
             valid_from_ms: 0,
             valid_until_ms: OPEN_UPPER,
             kind: RowKind::GdprErased,
@@ -509,5 +600,54 @@ mod tests {
             RowKind::from_u8(decoded.row_kinds[2]).unwrap(),
             RowKind::GdprErased
         );
+        assert_eq!(
+            decoded.surrogates,
+            vec![Some(Surrogate::new(1)), None, None]
+        );
+        decoded.check_stored_identities().unwrap();
+    }
+
+    /// `Surrogate::ZERO` names no row, so the builder refuses it on any row.
+    #[test]
+    fn builder_refuses_a_zero_surrogate() {
+        let s = schema();
+        let mut b = SparseTileBuilder::new(&s);
+        let r = b.push_row(SparseRow::live(
+            &[CoordValue::Int64(1), CoordValue::Int64(10)],
+            &[CellValue::String("X".into()), CellValue::Float64(1.0)],
+            Surrogate::ZERO,
+            0,
+            OPEN_UPPER,
+        ));
+        assert!(r.is_err(), "a live row under ZERO is refused");
+        assert_eq!(b.build().row_count(), 0, "the refused row is not stored");
+    }
+
+    /// A tombstone or erasure row names a coordinate, never a row identity.
+    #[test]
+    fn builder_refuses_a_sentinel_row_with_an_identity() {
+        let s = schema();
+        let mut b = SparseTileBuilder::new(&s);
+        let coord = [CoordValue::Int64(1), CoordValue::Int64(10)];
+        let mut row = SparseRow::sentinel(&coord, RowKind::Tombstone);
+        row.surrogate = Some(Surrogate::new(4));
+        assert!(b.push_row(row).is_err());
+    }
+
+    /// A derived row holds no surrogate, so its tile fails the stored-tile
+    /// check: it can be read but never written to a segment.
+    #[test]
+    fn a_derived_row_fails_the_stored_identity_check() {
+        let s = schema();
+        let mut b = SparseTileBuilder::new(&s);
+        b.push(
+            &[CoordValue::Int64(1), CoordValue::Int64(10)],
+            &[CellValue::String("X".into()), CellValue::Float64(1.0)],
+        )
+        .unwrap();
+        let tile = b.build();
+        assert_eq!(tile.row_surrogate(0).unwrap(), None);
+        assert!(tile.live_surrogate(0).is_err());
+        assert!(tile.check_stored_identities().is_err());
     }
 }

@@ -5,9 +5,9 @@
 
 use nodedb_physical::physical_plan::{ExchangeMode, ExchangeOp, PhysicalPlan, QueryOp};
 
+use crate::control::server::exchange::read_scope::ReadScope;
 use crate::control::server::exchange::resolve::capture::DistributedReadCapture;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId, TxnId};
 
 use super::aggregate_input_arm::AggregateFields;
 use super::entry::Resolved;
@@ -16,16 +16,6 @@ use super::post_process_arm::PostProcessFields;
 use super::{
     aggregate_input_arm, gather_arm, hash_join_arm, post_process_arm, set_op_arm, shuffle_arm,
 };
-
-/// Request-scoped identifiers threaded through every arm resolver, bundled
-/// to keep each resolver's argument list within the clippy default arity.
-#[derive(Clone, Copy)]
-pub(super) struct ResolveCtx {
-    pub database_id: DatabaseId,
-    pub tenant_id: TenantId,
-    pub trace_id: TraceId,
-    pub txn_id: Option<TxnId>,
-}
 
 /// Resolve any `Exchange` nodes in `plan`.
 ///
@@ -52,24 +42,15 @@ pub(super) struct ResolveCtx {
 /// already-taken captures up unchanged.
 pub(super) async fn resolve_exchange(
     state: &SharedState,
-    database_id: DatabaseId,
-    tenant_id: TenantId,
+    ctx: ReadScope,
     plan: PhysicalPlan,
-    trace_id: TraceId,
-    txn_id: Option<TxnId>,
     captures: &mut Vec<DistributedReadCapture>,
 ) -> crate::Result<Resolved> {
-    let ctx = ResolveCtx {
-        database_id,
-        tenant_id,
-        trace_id,
-        txn_id,
-    };
     match plan {
         // Root-level Gather: fan child to all vShards and merge. First resolve any
         // Exchange{Broadcast} nodes nested inside the child (e.g. a HashJoin's
         // build side) so the plan fanned to cores is self-contained — no
-        // Exchange node may reach a Data-Plane core.
+        // Exchange node can reach a Data-Plane core.
         PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
             child,
             mode: ExchangeMode::Gather { as_aggregate },

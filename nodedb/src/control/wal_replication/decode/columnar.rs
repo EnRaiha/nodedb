@@ -135,7 +135,7 @@ mod tests {
         let entry = to_replicated_entry(plan)
             .expect("encode must not error")
             .expect("a truncate must replicate");
-        let (_, _, decoded, _) = decode::from_replicated_entry(&entry.to_bytes(), None)
+        let (_, _, decoded, _) = decode::decode_replicated_entry(&entry.to_bytes())
             .expect("decode")
             .expect("a replicated entry");
         decoded

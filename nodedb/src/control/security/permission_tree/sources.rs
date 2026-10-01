@@ -15,17 +15,17 @@
 //!   before the cache takes it from the queue.
 //!
 //! A write therefore counts as an authorization change from the moment its
-//! tree definition committed on this node. A removed tree may count a little
+//! tree definition committed on this node. A removed tree can count a little
 //! longer, until both sets drop it, which only adds a barrier.
 //!
-//! Tree sources live in the default database, as the permission-tree DDL
-//! writes them, so each source collection homes on one vShard.
+//! A source lives in its tree's database. Collections are held by the
+//! database-qualified name plans carry, so the same name in two databases is
+//! two sources, each homing on its own vShard.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
-use crate::types::DatabaseId;
-
+use super::scope::TreeKey;
 use super::types::PermissionTreeDef;
 
 #[derive(Debug, Default)]
@@ -35,18 +35,14 @@ struct SourceSet {
 }
 
 impl SourceSet {
-    fn from_defs<'a>(
-        defs: impl IntoIterator<Item = (&'a (u64, String), &'a PermissionTreeDef)>,
-    ) -> Self {
+    fn from_defs<'a>(defs: impl IntoIterator<Item = (&'a TreeKey, &'a PermissionTreeDef)>) -> Self {
         let mut set = Self::default();
-        for ((_, governed), def) in defs {
-            for collection in [governed.as_str(), def.permission_table.as_str()] {
-                set.collections.insert(collection.to_owned());
-                set.vshards.insert(
-                    nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection)
-                        .vshard()
-                        .as_u32(),
-                );
+        for (governed, def) in defs {
+            let table = governed.scope.collection(def.permission_table.clone());
+            for source in [governed, &table] {
+                set.collections
+                    .insert(source.qualified().as_str().to_owned());
+                set.vshards.insert(source.vshard().as_u32());
             }
         }
         set
@@ -55,7 +51,7 @@ impl SourceSet {
 
 #[derive(Debug, Default)]
 struct Committed {
-    defs: HashMap<(u64, String), PermissionTreeDef>,
+    defs: HashMap<TreeKey, PermissionTreeDef>,
     set: SourceSet,
 }
 
@@ -68,26 +64,20 @@ pub struct SourceIndex {
 
 impl SourceIndex {
     /// Rebuild the cached set from the cache's tree definitions.
-    pub(super) fn rebuild(&self, tree_defs: &HashMap<(u64, String), PermissionTreeDef>) {
+    pub(super) fn rebuild(&self, tree_defs: &HashMap<TreeKey, PermissionTreeDef>) {
         *self.cached.write().unwrap_or_else(|p| p.into_inner()) = SourceSet::from_defs(tree_defs);
     }
 
     /// Record a tree definition the metadata applier committed. `None`
-    /// removes the tree of `(tenant_id, collection)`.
-    pub fn note_committed(
-        &self,
-        tenant_id: u64,
-        collection: &str,
-        def: Option<&PermissionTreeDef>,
-    ) {
+    /// removes the tree of `key`.
+    pub fn note_committed(&self, key: &TreeKey, def: Option<&PermissionTreeDef>) {
         let mut committed = self.committed.write().unwrap_or_else(|p| p.into_inner());
-        let key = (tenant_id, collection.to_owned());
         match def {
             Some(def) => {
-                committed.defs.insert(key, def.clone());
+                committed.defs.insert(key.clone(), def.clone());
             }
             None => {
-                committed.defs.remove(&key);
+                committed.defs.remove(key);
             }
         }
         committed.set = SourceSet::from_defs(&committed.defs);
@@ -103,7 +93,8 @@ impl SourceIndex {
         !self.any(|set| !set.collections.is_empty())
     }
 
-    /// Whether `collection` feeds a tree.
+    /// Whether `collection`, a database-qualified name as a plan carries it,
+    /// feeds a tree.
     pub fn is_source_collection(&self, collection: &str) -> bool {
         self.any(|set| set.collections.contains(collection))
     }
@@ -137,22 +128,26 @@ impl SourceIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::DatabaseId;
+
+    fn def() -> PermissionTreeDef {
+        sonic_rs::from_str(
+            r#"{"resource_column":"id","graph_index":"tree","permission_table":"grants"}"#,
+        )
+        .expect("tree def")
+    }
 
     #[test]
     fn the_index_names_governed_collections_and_permission_tables() {
-        let def: PermissionTreeDef = sonic_rs::from_str(
-            r#"{"resource_column":"id","graph_index":"tree","permission_table":"grants"}"#,
-        )
-        .expect("tree def");
         let mut defs = HashMap::new();
-        defs.insert((1, "docs".to_owned()), def);
+        defs.insert(TreeKey::new(DatabaseId::DEFAULT, 1, "docs"), def());
         let index = SourceIndex::default();
         assert!(index.is_empty());
         index.rebuild(&defs);
         assert!(index.is_source_collection("docs"));
         assert!(index.is_source_collection("grants"));
         assert!(!index.is_source_collection("other"));
-        let grants_vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "grants")
+        let grants_vshard = TreeKey::new(DatabaseId::DEFAULT, 1, "grants")
             .vshard()
             .as_u32();
         assert!(index.is_source_vshard(grants_vshard));
@@ -162,17 +157,32 @@ mod tests {
         assert!(!index.is_source_vshard(grants_vshard));
     }
 
+    /// A tree in a named database names its sources by their qualified
+    /// names and their own vShards, never the default database's.
+    #[test]
+    fn a_named_database_tree_names_its_own_sources() {
+        let db = DatabaseId::new(7);
+        let mut defs = HashMap::new();
+        defs.insert(TreeKey::new(db, 1, "docs"), def());
+        let index = SourceIndex::default();
+        index.rebuild(&defs);
+        assert!(index.is_source_collection("7/docs"));
+        assert!(index.is_source_collection("7/grants"));
+        assert!(!index.is_source_collection("docs"));
+        assert!(!index.is_source_collection("grants"));
+        let vshards = index.source_vshards();
+        assert!(vshards.contains(&TreeKey::new(db, 1, "grants").vshard().as_u32()));
+        assert!(vshards.contains(&TreeKey::new(db, 1, "docs").vshard().as_u32()));
+    }
+
     #[test]
     fn a_committed_tree_counts_before_the_cache_takes_it() {
-        let def: PermissionTreeDef = sonic_rs::from_str(
-            r#"{"resource_column":"id","graph_index":"tree","permission_table":"grants"}"#,
-        )
-        .expect("tree def");
+        let key = TreeKey::new(DatabaseId::DEFAULT, 1, "docs");
         let index = SourceIndex::default();
-        index.note_committed(1, "docs", Some(&def));
+        index.note_committed(&key, Some(&def()));
         assert!(index.is_source_collection("grants"));
         assert!(index.is_source_collection("docs"));
-        index.note_committed(1, "docs", None);
+        index.note_committed(&key, None);
         assert!(index.is_empty());
     }
 }

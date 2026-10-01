@@ -59,10 +59,12 @@ impl CoreLoop {
         governor: Arc<nodedb_mem::MemoryGovernor>,
         array_catalog: ArrayCatalogHandle,
     ) -> crate::Result<Self> {
-        let sparse_path = data_dir.join(format!("sparse/core-{core_id}.redb"));
+        let sparse_path =
+            crate::data::executor::snapshot::layout::sparse_store_path(data_dir, core_id);
         let sparse = SparseEngine::open(&sparse_path)?;
 
-        let graph_path = data_dir.join(format!("graph/core-{core_id}.redb"));
+        let graph_path =
+            crate::data::executor::snapshot::layout::graph_store_path(data_dir, core_id);
         let edge_store = EdgeStore::open(&graph_path)?;
         let csr = crate::engine::graph::csr::rebuild::rebuild_sharded_from_store(
             &edge_store,
@@ -80,19 +82,12 @@ impl CoreLoop {
         // `GENESIS_HASH`, so `VERIFY_HASH_CHAIN` breaks at the first row
         // inserted after a restart and blames an untampered row.
         //
-        // This reads the persisted heads; it does NOT rescan the collections to
-        // recompute them, and must not be "simplified" into one. `verify_chain`
-        // walks entries in INSERTION order, while a storage scan returns them in
-        // surrogate (key) order. The two coincide only if surrogates are
-        // allocated strictly monotonically per collection, which nothing
-        // guarantees: under cluster HiLo batching each node carves a disjoint
-        // reservation from the global watermark (see
-        // `control::surrogate::registry`) and hands surrogates out locally, so a
-        // later insert can carry a lower surrogate than an earlier one. A
-        // rescan would recompute a chain that is not the one that was written.
+        // This reads the persisted heads and never rescans the collections:
+        // `VERIFY_HASH_CHAIN` compares the last row against the head, so a head
+        // rebuilt from the rows cannot detect rows removed from the end.
         let chain_hashes = sparse.load_chain_heads()?;
 
-        let array_root = data_dir.join(format!("array/core-{core_id}"));
+        let array_root = crate::data::executor::snapshot::layout::array_root(data_dir, core_id);
         let array_engine = ArrayEngine::new(ArrayEngineConfig::new(array_root)).map_err(|e| {
             crate::Error::Internal {
                 detail: format!("open array engine: {e}"),
@@ -121,8 +116,7 @@ impl CoreLoop {
             data_dir: data_dir.to_path_buf(),
             paused_vshards: std::collections::HashSet::new(),
             deleted_nodes: HashMap::new(),
-            idempotency_cache: HashMap::new(),
-            idempotency_order: std::collections::VecDeque::new(),
+            idempotency: super::idempotency::IdempotencyCache::default(),
             sync_hwm: HashMap::new(),
             producer_epoch_floor: HashMap::new(),
             stats_store,
@@ -155,6 +149,7 @@ impl CoreLoop {
             vector_doc_map: std::collections::HashMap::new(),
             doc_configs: HashMap::new(),
             chain_hashes,
+            chain_intents: HashMap::new(),
             query_tuning: nodedb_types::config::tuning::QueryTuning::default(),
             graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
             ts_tuning: nodedb_types::config::tuning::TimeseriesToning::default(),
@@ -181,8 +176,7 @@ impl CoreLoop {
             throttle: super::pressure::SpscThrottle::new(),
             collection_arena_registry: None,
             metrics: None,
-            event_producer: None,
-            event_sequence: 0,
+            events: super::event_outlet::EventOutlet::new(),
             quiesce: None,
             quarantine_registry: None,
             epoch_system_ms: None,
@@ -190,13 +184,14 @@ impl CoreLoop {
             graph_txn_overlays: HashMap::new(),
             array_txn_overlays: HashMap::new(),
             txn_created_columnar_engines: HashMap::new(),
+            ts_resolve_holds: HashMap::new(),
             write_index: super::write_index::WriteVersionIndex::new(),
             calvin: super::calvin_state::CalvinCoreState::new(),
-            active_bitemporal_stamps: HashMap::new(),
-            active_graph_system_from: None,
+            apply_scope: super::apply_scope::ApplyScope::default(),
             redo_apply:
                 crate::data::executor::handlers::transaction::redo_apply::RedoApplyState::new(),
             fail_stop: super::fail_stop::CoreFailStop::default(),
+            write_set_journal: super::write_set_journal::WriteSetJournalState::default(),
         })
     }
 }

@@ -49,4 +49,26 @@ impl CoreLoop {
             "WAL vector replay: index drop applied"
         );
     }
+
+    /// Remove only the build configuration an index drop cancels: the
+    /// parameters, the index config, and the declared dimension. Replay runs
+    /// this for a drop the restored checkpoint already holds. The index
+    /// content is the checkpoint's, and a later re-CREATE's puts can live in
+    /// it.
+    pub(in crate::data::executor) fn forget_vector_index_config_record(
+        &mut self,
+        database_id: u64,
+        tenant_id: u64,
+        payload: &[u8],
+    ) {
+        let Ok((collection, field_name)) = zerompk::from_msgpack::<(String, String)>(payload)
+        else {
+            return;
+        };
+        let index_key =
+            CoreLoop::vector_index_key(database_id, tenant_id, &collection, &field_name);
+        self.vector_params.remove(&index_key);
+        self.index_configs.remove(&index_key);
+        self.declared_dims.remove(&index_key);
+    }
 }

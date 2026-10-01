@@ -116,6 +116,10 @@ impl RegistryShuffleProducer {
             // Shuffle produce is a non-transactional exchange-scan path; it does
             // not carry a transaction context.
             txn_id: None,
+            vshard_id: None,
+            // The coordinator's linearizable-read groups: the executor
+            // confirms them before this scan reads.
+            read_groups: req.read_groups.clone(),
         };
 
         let executor = LocalPlanExecutor::new(Arc::clone(&self.state));
@@ -136,7 +140,7 @@ impl RegistryShuffleProducer {
         // for this side — with the scan error if any — so each receiver's barrier
         // reaches `producer_count` and consumers fail fast on error.
         if let Err(e) = sink.finish(scan_outcome.clone()).await {
-            // A fan-out finalize failure is itself terminal: some receiver may be
+            // A fan-out finalize failure is itself terminal: some receiver can be
             // left without an `End`. Surface it (preferring the original scan
             // error if there was one) rather than reporting a clean produce.
             return ShuffleProduceResponse {

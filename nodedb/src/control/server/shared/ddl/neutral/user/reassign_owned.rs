@@ -3,7 +3,7 @@
 //! Owner reassignment + grant sweep for `DROP USER`.
 //!
 //! Dropping a user that owns catalog objects, or that has grants made
-//! *to* it, would leave dangling references behind:
+//! *to* it, will leave dangling references behind:
 //!
 //! - every owned object's `StoredOwner` row (and its in-band `.owner`
 //!   field) still names the deleted user — the boot integrity verifier
@@ -28,8 +28,7 @@
 //! `DROP USER` error rather than a silently-skipped dangling reference.
 
 use crate::control::catalog_entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
-use crate::control::propose_outcome::ProposeOutcome;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::security::catalog::{StoredOwner, SystemCatalog};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
@@ -41,7 +40,7 @@ use super::owner_kind::OwnerKind;
 /// tenant's validated ownership fallback, then revoke every grant made to the
 /// user. A fallback is required only when owned objects exist, allowing tenant
 /// teardown to remove an object-free final admin. Returns the selected target.
-pub(super) fn reassign_owned_and_sweep_grants(
+pub(super) async fn reassign_owned_and_sweep_grants(
     state: &SharedState,
     username: &str,
     user_tenant: TenantId,
@@ -52,7 +51,7 @@ pub(super) fn reassign_owned_and_sweep_grants(
         .owners_for_user(username, user_tenant.as_u64())
         .map_err(|e| DdlError::from_error_in_context("load owner rows", &e))?;
     if owned.is_empty() {
-        sweep_grants(state, catalog, username)?;
+        sweep_grants(state, catalog, username).await?;
         return Ok(None);
     }
     let admin_name = catalog
@@ -84,19 +83,19 @@ pub(super) fn reassign_owned_and_sweep_grants(
             user_tenant,
             &owner.object_name,
             &admin_name,
-        )?;
+        )
+        .await?;
     }
 
-    sweep_grants(state, catalog, username)?;
+    sweep_grants(state, catalog, username).await?;
     Ok(Some(admin_name))
 }
 
 /// Reassign a single owned object to `admin_name`. Re-proposes the
-/// object's `Put<Kind>` catalog entry with the rewritten in-band owner
-/// so followers converge; in single-node mode (`LocalOnly`) the
-/// primary row, the `StoredOwner` row, and the in-memory owner map are
-/// all rewritten directly, since no raft apply runs to do it.
-fn reassign_one(
+/// object's `Put<Kind>` catalog entry with the rewritten in-band owner.
+/// Its apply rewrites the primary row, the `StoredOwner` row, and the
+/// in-memory owner map on every node.
+async fn reassign_one(
     state: &SharedState,
     catalog: &SystemCatalog,
     kind: OwnerKind,
@@ -115,21 +114,8 @@ fn reassign_one(
                 .map_err(object_error("get", object_type, name))?
                 .ok_or_else(|| missing(object_type, name))?;
             stored.owner = admin_name.to_string();
-            let entry = CatalogEntry::PutCollection(Box::new(stored.clone()));
-            if propose(state, &entry)?.needs_local_apply() {
-                catalog
-                    .put_collection(database_id, &stored)
-                    .map_err(object_error("put", object_type, name))?;
-                persist_owner_local_in_database(
-                    state,
-                    catalog,
-                    object_type,
-                    database_id.as_u64(),
-                    tenant_id,
-                    name,
-                    admin_name,
-                )?;
-            }
+            let entry = CatalogEntry::PutCollection(Box::new(stored));
+            propose(state, &entry).await?;
         }
         OwnerKind::Function => {
             let mut s = catalog
@@ -141,21 +127,8 @@ fn reassign_one(
                 .map_err(object_error("get", object_type, name))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
-            let entry = CatalogEntry::PutFunction(Box::new(s.clone()));
-            if propose(state, &entry)?.needs_local_apply() {
-                catalog
-                    .put_function(&s)
-                    .map_err(object_error("put", object_type, name))?;
-                persist_owner_local_in_database(
-                    state,
-                    catalog,
-                    object_type,
-                    database_id,
-                    tenant_id,
-                    name,
-                    admin_name,
-                )?;
-            }
+            let entry = CatalogEntry::PutFunction(Box::new(s));
+            propose(state, &entry).await?;
         }
         OwnerKind::Procedure => {
             let mut s = catalog
@@ -167,21 +140,8 @@ fn reassign_one(
                 .map_err(object_error("get", object_type, name))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
-            let entry = CatalogEntry::PutProcedure(Box::new(s.clone()));
-            if propose(state, &entry)?.needs_local_apply() {
-                catalog
-                    .put_procedure(&s)
-                    .map_err(object_error("put", object_type, name))?;
-                persist_owner_local_in_database(
-                    state,
-                    catalog,
-                    object_type,
-                    database_id,
-                    tenant_id,
-                    name,
-                    admin_name,
-                )?;
-            }
+            let entry = CatalogEntry::PutProcedure(Box::new(s));
+            propose(state, &entry).await?;
         }
         OwnerKind::Trigger => {
             let mut s = catalog
@@ -193,21 +153,8 @@ fn reassign_one(
                 .map_err(object_error("get", object_type, name))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
-            let entry = CatalogEntry::PutTrigger(Box::new(s.clone()));
-            if propose(state, &entry)?.needs_local_apply() {
-                catalog
-                    .put_trigger(&s)
-                    .map_err(object_error("put", object_type, name))?;
-                persist_owner_local_in_database(
-                    state,
-                    catalog,
-                    object_type,
-                    database_id,
-                    tenant_id,
-                    name,
-                    admin_name,
-                )?;
-            }
+            let entry = CatalogEntry::PutTrigger(Box::new(s));
+            propose(state, &entry).await?;
         }
         OwnerKind::MaterializedView => {
             let mut s = catalog
@@ -215,23 +162,8 @@ fn reassign_one(
                 .map_err(object_error("get", object_type, name))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
-            let entry = CatalogEntry::PutMaterializedView(Box::new(s.clone()));
-            if propose(state, &entry)?.needs_local_apply() {
-                catalog.put_materialized_view(&s).map_err(object_error(
-                    "put",
-                    object_type,
-                    name,
-                ))?;
-                persist_owner_local_in_database(
-                    state,
-                    catalog,
-                    object_type,
-                    database_id,
-                    tenant_id,
-                    name,
-                    admin_name,
-                )?;
-            }
+            let entry = CatalogEntry::PutMaterializedView(Box::new(s));
+            propose(state, &entry).await?;
         }
         OwnerKind::StreamingMaterializedView => {
             let mut s = catalog
@@ -247,21 +179,8 @@ fn reassign_one(
                 })
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
-            let entry = CatalogEntry::PutStreamingMaterializedView(Box::new(s.clone()));
-            if propose(state, &entry)?.needs_local_apply() {
-                crate::control::catalog_entry::apply::apply_to(&entry, catalog)
-                    .map_err(|e| DdlError::from_error_in_context("catalog apply", &e))?;
-                state.mv_registry.register(s);
-                persist_owner_local_in_database(
-                    state,
-                    catalog,
-                    object_type,
-                    database_id,
-                    tenant_id,
-                    name,
-                    admin_name,
-                )?;
-            }
+            let entry = CatalogEntry::PutStreamingMaterializedView(Box::new(s));
+            propose(state, &entry).await?;
         }
         OwnerKind::Sequence => {
             let mut s = catalog
@@ -269,13 +188,8 @@ fn reassign_one(
                 .map_err(object_error("get", object_type, name))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
-            let entry = CatalogEntry::PutSequence(Box::new(s.clone()));
-            if propose(state, &entry)?.needs_local_apply() {
-                catalog
-                    .put_sequence(&s)
-                    .map_err(object_error("put", object_type, name))?;
-                persist_owner_local(state, catalog, object_type, tenant_id, name, admin_name)?;
-            }
+            let entry = CatalogEntry::PutSequence(Box::new(s));
+            propose(state, &entry).await?;
         }
         OwnerKind::Schedule => {
             // Schedules have no single-key getter; find within the tenant.
@@ -288,21 +202,8 @@ fn reassign_one(
                 })
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
-            let entry = CatalogEntry::PutSchedule(Box::new(s.clone()));
-            if propose(state, &entry)?.needs_local_apply() {
-                catalog
-                    .put_schedule(&s)
-                    .map_err(object_error("put", object_type, name))?;
-                persist_owner_local_in_database(
-                    state,
-                    catalog,
-                    object_type,
-                    database_id,
-                    tenant_id,
-                    name,
-                    admin_name,
-                )?;
-            }
+            let entry = CatalogEntry::PutSchedule(Box::new(s));
+            propose(state, &entry).await?;
         }
         OwnerKind::ChangeStream => {
             let mut s = catalog
@@ -310,21 +211,8 @@ fn reassign_one(
                 .map_err(object_error("get", object_type, name))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
-            let entry = CatalogEntry::PutChangeStream(Box::new(s.clone()));
-            if propose(state, &entry)?.needs_local_apply() {
-                catalog
-                    .put_change_stream(&s)
-                    .map_err(object_error("put", object_type, name))?;
-                persist_owner_local_in_database(
-                    state,
-                    catalog,
-                    object_type,
-                    database_id,
-                    tenant_id,
-                    name,
-                    admin_name,
-                )?;
-            }
+            let entry = CatalogEntry::PutChangeStream(Box::new(s));
+            propose(state, &entry).await?;
         }
         OwnerKind::ContinuousAggregate => {
             let mut stored = catalog
@@ -332,21 +220,8 @@ fn reassign_one(
                 .map_err(object_error("get", object_type, name))?
                 .ok_or_else(|| missing(object_type, name))?;
             stored.owner = admin_name.to_string();
-            let entry = CatalogEntry::PutContinuousAggregate(Box::new(stored.clone()));
-            if propose(state, &entry)?.needs_local_apply() {
-                catalog
-                    .put_continuous_aggregate(&stored)
-                    .map_err(object_error("put", object_type, name))?;
-                persist_owner_local_in_database(
-                    state,
-                    catalog,
-                    object_type,
-                    database_id,
-                    tenant_id,
-                    name,
-                    admin_name,
-                )?;
-            }
+            let entry = CatalogEntry::PutContinuousAggregate(Box::new(stored));
+            propose(state, &entry).await?;
         }
         OwnerKind::Index => {
             // Standalone owner row — the `StoredOwner` row is the whole
@@ -358,18 +233,8 @@ fn reassign_one(
                 tenant_id,
                 owner_username: admin_name.to_string(),
             };
-            let entry = CatalogEntry::PutOwner(Box::new(stored.clone()));
-            if propose(state, &entry)?.needs_local_apply() {
-                persist_owner_local_in_database(
-                    state,
-                    catalog,
-                    object_type,
-                    database_id,
-                    tenant_id,
-                    name,
-                    admin_name,
-                )?;
-            }
+            let entry = CatalogEntry::PutOwner(Box::new(stored));
+            propose(state, &entry).await?;
         }
     }
     Ok(())
@@ -377,7 +242,7 @@ fn reassign_one(
 
 /// Revoke every grant whose grantee is the dropped user, so no
 /// `permission.grantee → user` reference outlives the user row.
-pub(super) fn sweep_grants(
+pub(super) async fn sweep_grants(
     state: &SharedState,
     catalog: &SystemCatalog,
     username: &str,
@@ -392,70 +257,17 @@ pub(super) fn sweep_grants(
             grantee: grantee.clone(),
             permission: grant.permission.clone(),
         };
-        if propose(state, &entry)?.needs_local_apply() {
-            catalog
-                .delete_permission(&grant.target, &grantee, &grant.permission)
-                .map_err(|e| {
-                    DdlError::from_error_in_context(
-                        &format!("delete permission on '{}'", grant.target),
-                        &e,
-                    )
-                })?;
-            state
-                .permissions
-                .install_replicated_revoke(&grant.target, &grantee, &grant.permission);
-        }
+        propose(state, &entry).await?;
     }
     Ok(())
 }
 
-/// Rewrite the persistent `StoredOwner` row and the in-memory owner map
-/// for a parent-replicated object in single-node mode. In cluster mode
-/// the raft apply of the `Put<Kind>` entry does this on every node.
-fn persist_owner_local(
-    state: &SharedState,
-    catalog: &SystemCatalog,
-    object_type: &str,
-    tenant_id: u64,
-    name: &str,
-    admin_name: &str,
-) -> Result<(), DdlError> {
-    persist_owner_local_in_database(state, catalog, object_type, 0, tenant_id, name, admin_name)
-}
-
-fn persist_owner_local_in_database(
-    state: &SharedState,
-    catalog: &SystemCatalog,
-    object_type: &str,
-    database_id: u64,
-    tenant_id: u64,
-    name: &str,
-    admin_name: &str,
-) -> Result<(), DdlError> {
-    catalog
-        .rewrite_object_owner(object_type, database_id, tenant_id, name, admin_name)
-        .map_err(|e| {
-            DdlError::from_error_in_context(
-                &format!("rewrite owner for {object_type} '{name}'"),
-                &e,
-            )
-        })?;
-    state.permissions.install_replicated_owner(&StoredOwner {
-        database_id,
-        object_type: object_type.to_string(),
-        object_name: name.to_string(),
-        tenant_id,
-        owner_username: admin_name.to_string(),
-    });
+/// Propose `entry` and await its apply on this node, post-apply included.
+pub(super) async fn propose(state: &SharedState, entry: &CatalogEntry) -> Result<(), DdlError> {
+    propose_catalog_entry_async(state, entry)
+        .await
+        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
     Ok(())
-}
-
-pub(super) fn propose(
-    state: &SharedState,
-    entry: &CatalogEntry,
-) -> Result<ProposeOutcome, DdlError> {
-    propose_catalog_entry(state, entry)
-        .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))
 }
 
 /// The error for a failed catalog read or write of one owned object. It keeps

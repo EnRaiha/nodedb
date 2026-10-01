@@ -28,11 +28,10 @@ use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
-use super::super::catalog::propose_and_apply;
+use super::super::catalog::propose_and_apply_async;
 use super::super::result::{DdlError, DdlResult};
 
-/// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
-/// the pgwire handlers produced.
+/// Construct a [`DdlError`] from a SQLSTATE code and a message.
 fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
 }
@@ -80,7 +79,7 @@ pub async fn alter_set_on_conflict(
         sonic_rs::to_string(&policy).map_err(|e| DdlError::internal(e.to_string()))?;
     coll.conflict_policy = Some(policy_json);
     let entry = CatalogEntry::PutCollection(Box::new(coll));
-    propose_and_apply(state, &entry)?;
+    propose_and_apply_async(state, &entry).await?;
     state.schema_version.bump();
 
     let mut row = Map::new();

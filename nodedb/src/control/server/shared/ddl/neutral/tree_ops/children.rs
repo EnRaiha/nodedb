@@ -26,6 +26,7 @@ pub async fn tree_children(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
+    linearizable: bool,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
     let upper = sql.to_uppercase();
@@ -51,7 +52,7 @@ pub async fn tree_children(
     // collections whose node ids can come back is the whole tenant, and that
     // is the set the caller must be granted. The first denial ends the
     // statement rather than returning the subset the caller happens to be
-    // allowed, which would report a partial descendant set as the whole one.
+    // allowed, which will report a partial descendant set as the whole one.
     // The RLS half asks the same tenant-wide question: the reply is node ids,
     // which carry no row filter, so a read policy anywhere on this identity
     // cannot be honored through this shape.
@@ -73,6 +74,7 @@ pub async fn tree_children(
             direction: dir,
             max_depth,
             options: &GraphTraversalOptions::default(),
+            linearizable,
         },
     )
     .await

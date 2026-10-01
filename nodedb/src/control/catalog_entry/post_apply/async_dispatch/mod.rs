@@ -4,8 +4,8 @@
 //!
 //! # Per-node contract
 //!
-//! `spawn_post_apply_async_side_effects` is invoked unconditionally on
-//! **every node** (leader and followers alike) from the metadata
+//! `run_post_apply_async_side_effects` is awaited unconditionally on
+//! **every node** (leader and followers alike) by the metadata
 //! commit applier — there is NO `is_leader()` gate. Any side effect
 //! that must fire on every replica (WAL tombstone append, Data Plane
 //! `MetaOp::UnregisterCollection` dispatch, storage-reclaim spawning,
@@ -19,13 +19,15 @@
 //!
 //! [sync]: crate::control::catalog_entry::post_apply::sync
 
+pub mod array;
 pub mod collection;
 pub mod continuous_aggregate;
 mod core_fanout;
 pub mod crdt_compact;
 mod dispatcher;
 pub mod materialized_view;
+pub mod move_tenant;
 pub mod synonym_group;
 pub mod vector;
 
-pub use dispatcher::spawn_post_apply_async_side_effects;
+pub use dispatcher::run_post_apply_async_side_effects;

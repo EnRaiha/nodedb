@@ -43,6 +43,9 @@ impl CoreLoop {
         let mut skipped = 0usize;
 
         for record in records {
+            if self.replay_halted() {
+                break;
+            }
             let record_type = RecordType::from_raw(record.logical_record_type());
             let is_target = matches!(
                 record_type,
@@ -343,6 +346,7 @@ impl CoreLoop {
                 collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
                 field_name: field_name.clone(),
                 document_surrogate,
+                pk_bytes: None,
                 vectors: vectors_flat.clone(),
                 count,
                 dim,
@@ -437,9 +441,9 @@ impl CoreLoop {
                 document_surrogate,
             }),
         );
-        // Ignore the NotFound response for an already-absent document — the
-        // apply is idempotent. Advance the watermark regardless so a later
-        // checkpoint records the removal and gates the record on the next run.
+        // The delete is idempotent: an already-absent document answers Ok.
+        // Advance the watermark regardless so a later checkpoint records the
+        // removal and gates the record on the next run.
         let _ = self.execute_multi_vector_delete(
             &task,
             tenant_id,
@@ -696,6 +700,7 @@ mod tests {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "mc"),
             field_name: "mv".into(),
             document_surrogate: Surrogate::new(7),
+            pk_bytes: None,
             vectors: vec![1.0, 2.0, 3.0, 4.0], // 2 vectors of dim 2
             count: 2,
             dim: 2,
@@ -722,6 +727,7 @@ mod tests {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "mc"),
             field_name: "mv".into(),
             document_surrogate: Surrogate::new(7),
+            pk_bytes: None,
             vectors: vec![1.0, 2.0, 3.0, 4.0],
             count: 2,
             dim: 2,

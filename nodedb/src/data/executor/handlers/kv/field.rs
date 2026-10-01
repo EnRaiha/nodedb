@@ -190,7 +190,7 @@ impl CoreLoop {
             return self.response_error(task, e);
         }
 
-        self.kv_engine.put(crate::engine::kv::KvPutParams {
+        if let Err(e) = self.kv_engine.put(crate::engine::kv::KvPutParams {
             database_id: did,
             tenant_id: tid,
             collection,
@@ -199,7 +199,9 @@ impl CoreLoop {
             ttl_ms: 0,
             now_ms,
             surrogate,
-        });
+        }) {
+            return self.response_error(task, e);
+        }
         let op = if current.is_some() {
             crate::event::WriteOp::Update
         } else {

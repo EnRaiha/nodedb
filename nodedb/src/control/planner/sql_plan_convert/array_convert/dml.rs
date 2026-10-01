@@ -8,6 +8,7 @@ use nodedb_array::types::ArrayId;
 use nodedb_sql::types_array::{ArrayCoordLiteral, ArrayInsertRow};
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::array_catalog::ArrayCatalogEntry;
 use crate::engine::array::wal::{ArrayDeleteCell, ArrayPutCell};
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::{ArrayOp, ClusterArrayOp};
@@ -16,12 +17,13 @@ use super::super::convert::ConvertContext;
 use super::helpers::{coerce_attrs, coerce_coords};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-pub(in super::super) fn convert_insert_array(
+/// The catalog entry and decoded schema of the array `name` an
+/// `INSERT INTO ARRAY` writes.
+fn insert_target(
     name: &str,
-    rows: &[ArrayInsertRow],
     tenant_id: TenantId,
     ctx: &ConvertContext,
-) -> crate::Result<Vec<PhysicalTask>> {
+) -> crate::Result<(ArrayCatalogEntry, ArraySchema)> {
     let array_catalog = ctx
         .array_catalog
         .as_ref()
@@ -42,6 +44,30 @@ pub(in super::super) fn convert_insert_array(
             format: "msgpack".into(),
             detail: format!("array schema decode: {e}"),
         })?;
+    Ok((entry, schema))
+}
+
+/// The identity key of every cell an `INSERT INTO ARRAY` writes, in row
+/// order.
+pub(in super::super) fn insert_array_cell_pks(
+    name: &str,
+    rows: &[ArrayInsertRow],
+    tenant_id: TenantId,
+    ctx: &ConvertContext,
+) -> crate::Result<Vec<Vec<u8>>> {
+    let (_, schema) = insert_target(name, tenant_id, ctx)?;
+    rows.iter()
+        .map(|row| array_coord_pk(&row.coords, &schema))
+        .collect()
+}
+
+pub(in super::super) fn convert_insert_array(
+    name: &str,
+    rows: &[ArrayInsertRow],
+    tenant_id: TenantId,
+    ctx: &ConvertContext,
+) -> crate::Result<Vec<PhysicalTask>> {
+    let (entry, schema) = insert_target(name, tenant_id, ctx)?;
 
     let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
     let vshard = ctx.collection_key(name).vshard();
@@ -137,10 +163,12 @@ pub(in super::super) fn convert_insert_array(
             // Stamped by the write funnel with the LSN of the redo record it
             // appends for this write, so the live tile version equals the one
             // replay rebuilds from that record's header. The planner must not
-            // allocate one: it appends nothing, so any LSN it picked would name
+            // allocate one: it appends nothing, so any LSN it picked will name
             // a record that does not exist.
             wal_lsn: 0,
             provenance: None,
+            // Single node: the task's vShard holds every tile.
+            vshard_id: vshard.as_u32(),
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,
@@ -245,8 +273,19 @@ pub(in super::super) fn convert_delete_array(
             // Stamped by the write funnel — see `convert_insert_array`.
             wal_lsn: 0,
             provenance: None,
+            // Single node: the task's vShard holds every tile.
+            vshard_id: vshard.as_u32(),
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,
     }])
+}
+
+/// The identity key of an array cell: its coerced coordinate, msgpack-encoded.
+fn array_coord_pk(coords: &[ArrayCoordLiteral], schema: &ArraySchema) -> crate::Result<Vec<u8>> {
+    let coord = coerce_coords(coords, schema)?;
+    zerompk::to_msgpack_vec(&coord).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("array coord pk encode: {e}"),
+    })
 }

@@ -19,7 +19,7 @@ impl Scheduler {
         let barrier = match self.dependent_barrier.get_mut(&txn_id) {
             Some(b) => b,
             None => {
-                // No barrier for this txn — may have already timed out or
+                // No barrier for this txn — can have already timed out or
                 // been dispatched. Log and ignore.
                 warn!(
                     vshard_id = self.vshard_id,
@@ -40,10 +40,9 @@ impl Scheduler {
         }
 
         // All passive results in — remove barrier and dispatch active.
-        let barrier = self
-            .dependent_barrier
-            .remove(&txn_id)
-            .expect("barrier just confirmed present");
+        let Some(barrier) = self.dependent_barrier.remove(&txn_id) else {
+            return;
+        };
 
         let injected_reads = barrier.assemble_injected_reads();
         let lock_owner = barrier.lock_owner;

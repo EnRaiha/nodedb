@@ -12,14 +12,14 @@
 
 use nodedb_fts::FtsSearchParams;
 use nodedb_fts::posting::QueryMode;
-use nodedb_types::RowIdentity;
+use nodedb_types::{RowIdentity, Surrogate};
 use tracing::debug;
 
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::graph_expansion::{GraphExpansionParams, GraphSeeds};
 use crate::data::executor::handlers::graph_rag::{
-    RagResponseParams, graph_nodes_to_ranked_results,
+    RagResponseParams, graph_nodes_to_ranked_results, vector_ranked_list,
 };
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::graph::edge_store::Direction;
@@ -88,23 +88,11 @@ impl CoreLoop {
             Err(resp) => return resp,
         };
 
-        // BM25 text search.
-        let fetch_k = final_top_k.saturating_mul(3).max(20);
-        let text_results = match self.inverted.search(
-            task.request.database_id.as_u64(),
-            tid_typed,
-            collection,
-            FtsSearchParams {
-                query: bm25_query,
-                top_k: fetch_k,
-                fuzzy_enabled: true,
-                mode: QueryMode::And,
-                prefilter: None,
-            },
-        ) {
-            Ok(results) => results,
-            Err(e) => return self.response_error(task, e),
-        };
+        let text_results =
+            match self.bm25_leg_hits(task, tid_typed, collection, bm25_query, final_top_k) {
+                Ok(results) => results,
+                Err(resp) => return resp,
+            };
 
         // Graph expansion seeded directly by the vector hits' surrogates.
         let expansion = self.expand_graph(GraphExpansionParams {
@@ -126,26 +114,8 @@ impl CoreLoop {
 
         let (vector_k, text_k, graph_k) = rrf_k;
 
-        let vector_list: Vec<RankedResult<RowIdentity>> = vector_scores
-            .iter()
-            .map(|(node_id, (rank, dist))| RankedResult {
-                document_id: node_id.clone(),
-                rank: *rank,
-                score: *dist,
-                source: "vector",
-            })
-            .collect();
-
-        let text_list: Vec<RankedResult<RowIdentity>> = text_results
-            .iter()
-            .enumerate()
-            .map(|(rank, r)| RankedResult {
-                document_id: RowIdentity::for_surrogate(r.doc_id),
-                rank,
-                score: r.score,
-                source: "text",
-            })
-            .collect();
+        let vector_list = vector_ranked_list(&vector_scores);
+        let text_list = text_ranked_list(&text_results);
 
         let graph_expanded_count = expanded_nodes.len();
         let graph_list = graph_nodes_to_ranked_results(expanded_nodes, &hop_distances);
@@ -170,4 +140,47 @@ impl CoreLoop {
             },
         )
     }
+
+    /// Run the BM25 leg of a three-source fusion: `(surrogate, score)` per
+    /// hit, in rank order. It fetches three times `final_top_k`, at least 20,
+    /// so fusion has candidates past the final cut.
+    pub(in crate::data::executor) fn bm25_leg_hits(
+        &self,
+        task: &ExecutionTask,
+        tenant_id: TenantId,
+        collection: &str,
+        bm25_query: &str,
+        final_top_k: usize,
+    ) -> Result<Vec<(Surrogate, f32)>, Response> {
+        let fetch_k = final_top_k.saturating_mul(3).max(20);
+        match self.inverted.search(
+            task.request.database_id.as_u64(),
+            tenant_id,
+            collection,
+            FtsSearchParams {
+                query: bm25_query,
+                top_k: fetch_k,
+                fuzzy_enabled: true,
+                mode: QueryMode::And,
+                prefilter: None,
+            },
+        ) {
+            Ok(results) => Ok(results.iter().map(|r| (r.doc_id, r.score)).collect()),
+            Err(e) => Err(self.response_error(task, e)),
+        }
+    }
+}
+
+/// The BM25 leg as a ranked list. A text hit keys on its row's surrogate
+/// identity, the key a vector hit falls back to.
+pub(crate) fn text_ranked_list(hits: &[(Surrogate, f32)]) -> Vec<RankedResult<RowIdentity>> {
+    hits.iter()
+        .enumerate()
+        .map(|(rank, (doc_id, score))| RankedResult {
+            document_id: RowIdentity::for_surrogate(*doc_id),
+            rank,
+            score: *score,
+            source: "text",
+        })
+        .collect()
 }

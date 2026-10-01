@@ -198,6 +198,46 @@ impl SystemCatalog {
         write_txn.commit().map_err(|e| catalog_err("commit", e))
     }
 
+    /// Remove every permission row granted on exactly `target`. Returns how
+    /// many rows went.
+    pub fn delete_permissions_for_target(&self, target: &str) -> crate::Result<usize> {
+        let prefix = format!("{target}:");
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| catalog_err("write txn", e))?;
+        let removed = {
+            let mut table = write_txn
+                .open_table(PERMISSIONS)
+                .map_err(|e| catalog_err("open perms", e))?;
+            // A name can itself hold ':', so a key prefix match is only a
+            // candidate: the stored target must match exactly.
+            let mut keys = Vec::new();
+            for entry in table
+                .range(prefix.as_str()..)
+                .map_err(|e| catalog_err("range perms", e))?
+            {
+                let (key, value) = entry.map_err(|e| catalog_err("read perm", e))?;
+                if !key.value().starts_with(&prefix) {
+                    break;
+                }
+                let perm: StoredPermission = zerompk::from_msgpack(value.value())
+                    .map_err(|e| catalog_err("deser perm", e))?;
+                if perm.target == target {
+                    keys.push(key.value().to_string());
+                }
+            }
+            for key in &keys {
+                table
+                    .remove(key.as_str())
+                    .map_err(|e| catalog_err("remove perm", e))?;
+            }
+            keys.len()
+        };
+        write_txn.commit().map_err(|e| catalog_err("commit", e))?;
+        Ok(removed)
+    }
+
     pub fn load_all_permissions(&self) -> crate::Result<Vec<StoredPermission>> {
         let read_txn = self
             .db

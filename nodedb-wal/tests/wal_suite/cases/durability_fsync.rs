@@ -34,6 +34,36 @@ fn append(wal: &mut SegmentedWal, payload: &[u8]) -> WalResult<u64> {
     wal.append(RecordType::Put as u32, 1, 0, 0, payload)
 }
 
+/// Check that `result` is a roll refused by the armed `wal::fsync_directory`
+/// fail point. The fail point stays armed through the roll's cleanup, so the
+/// cleanup's own directory fsync fails too: the error is `RollCleanupFailed`,
+/// with the directory-fsync error as its roll cause. Returns the path of the
+/// segment file the roll created.
+fn expect_directory_fsync_roll_error(result: WalResult<u64>) -> std::path::PathBuf {
+    let is_directory_fsync = |error: &WalError| matches!(error, WalError::Io(io) if io.to_string().contains("wal::fsync_directory"));
+    match result {
+        Err(WalError::RollCleanupFailed {
+            path,
+            roll,
+            cleanup,
+        }) => {
+            assert!(
+                is_directory_fsync(&roll),
+                "the roll cause must be the directory fsync error, got {roll:?}"
+            );
+            assert!(
+                is_directory_fsync(&cleanup),
+                "the cleanup cause must be the directory fsync error, got {cleanup:?}"
+            );
+            std::path::PathBuf::from(path)
+        }
+        Err(other) => panic!("expected the directory fsync error, got {other:?}"),
+        Ok(lsn) => {
+            panic!("append at LSN {lsn} was acknowledged into a segment with no durable dirent")
+        }
+    }
+}
+
 /// A batch is flushed into the page cache and its fsync then fails. The buffer
 /// is already empty at that point, so a second waiter retrying `sync()` must
 /// not mistake emptiness for durability.
@@ -111,13 +141,12 @@ fn rollover_propagates_a_failed_directory_fsync() {
     wal.sync().unwrap();
 
     let _g = FailGuard::fail("wal::fsync_directory", "dirent not durable");
-    match append(&mut wal, b"second") {
-        Err(WalError::Io(_)) => {}
-        Err(other) => panic!("expected the directory fsync error, got {other:?}"),
-        Ok(lsn) => {
-            panic!("append at LSN {lsn} was acknowledged into a segment with no durable dirent")
-        }
-    }
+    let orphan = expect_directory_fsync_roll_error(append(&mut wal, b"second"));
+    assert!(
+        !orphan.exists(),
+        "the failed roll removes the segment file it created: {}",
+        orphan.display()
+    );
 }
 
 /// A rollover that fails must not brick the WAL. The old writer stays
@@ -132,11 +161,7 @@ fn a_failed_rollover_leaves_the_wal_writable() {
 
     {
         let _g = FailGuard::fail("wal::fsync_directory", "dirent not durable");
-        match append(&mut wal, b"rejected") {
-            Err(WalError::Io(_)) => {}
-            Err(other) => panic!("expected the directory fsync error, got {other:?}"),
-            Ok(lsn) => panic!("append at LSN {lsn} succeeded despite a failed roll"),
-        }
+        expect_directory_fsync_roll_error(append(&mut wal, b"rejected"));
     }
 
     // The fail point is disarmed; the WAL must still be usable.

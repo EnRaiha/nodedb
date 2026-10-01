@@ -9,10 +9,18 @@
 //!   with the keys of the events routed into them.
 //! - **Streaming materialized views:** the applied keys persisted with the
 //!   view state itself (see `streaming_mv::persist`).
+//! - **Committed topic messages:** [`PublishLedger`], which holds each
+//!   message under its origin until its partition's delivery cursor passes
+//!   it (see `topic::committed`).
+//! - **AFTER triggers and DEFINE EVENT actions:** [`ActionLane`], which holds
+//!   each firing event under its position until its partition's firing
+//!   cursor passes it (see `trigger::lane`).
 //!
 //! Each sink stores an event's key with its effect, so an event delivered
 //! again after a restart is applied once.
 
+use crate::event::topic::committed::PublishLedger;
+use crate::event::trigger::lane::ActionLane;
 use crate::event::watermark::WatermarkStore;
 use crate::wal::WalManager;
 
@@ -25,6 +33,8 @@ pub struct SinkLedgers {
     pub audited: AuditedKeys,
     pub crdt: CrdtLedger,
     pub cdc: CdcLedger,
+    pub publishes: PublishLedger,
+    pub actions: ActionLane,
 }
 
 impl SinkLedgers {
@@ -46,6 +56,8 @@ impl SinkLedgers {
             audited,
             crdt: CrdtLedger::open(watermarks.dir())?,
             cdc: CdcLedger::open(watermarks.dir())?,
+            publishes: PublishLedger::open(watermarks.dir())?,
+            actions: ActionLane::open(watermarks.dir(), num_cores)?,
         })
     }
 

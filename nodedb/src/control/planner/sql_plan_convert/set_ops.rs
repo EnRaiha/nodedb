@@ -23,7 +23,7 @@ pub(super) fn convert_constant_result(
 ) -> crate::Result<Vec<PhysicalTask>> {
     // A constant row is one object, which cannot hold two cells under one
     // key. `SELECT nextval('s'), nextval('s')` legally repeats an output name;
-    // keying both cells by the name would collapse them to the last value. Use
+    // keying both cells by the name will collapse them to the last value. Use
     // the same unique per-column keys every response encoder derives, so each
     // column keeps its own cell.
     let cell_keys = crate::control::server::response_shape::project::cell_keys(columns);
@@ -291,7 +291,7 @@ pub(super) fn convert_cte(
 }
 
 /// Lower `SqlPlan::Subquery` — relational post-processing over a subquery body
-/// whose leaf could not absorb the outer constraints — into a coordinator-
+/// whose leaf cannot absorb the outer constraints — into a coordinator-
 /// resolved `QueryOp::PostProcess`.
 ///
 /// The body lowers to ONE physical relation through
@@ -324,7 +324,7 @@ pub(super) fn convert_subquery(
     // computed columns, and window specs must address the same shape — an
     // unqualified key resolves to NULL on every merged row, and a sort where
     // every key is NULL is a no-op that silently answers an ordered query in
-    // the body's own order. The body may sit under the `Exchange{Gather}`
+    // the body's own order. The body can sit under the `Exchange{Gather}`
     // wrapper, so the detection looks through it.
     let merged_doc_body = is_merged_doc_body(&child);
 
@@ -480,7 +480,8 @@ mod tests {
             array_catalog: None,
             credentials: None,
             wal: None,
-            surrogate_assigner: None,
+            surrogate_assigner:
+                crate::control::planner::sql_plan_convert::test_support::test_assigner(),
             cluster_enabled: false,
             bitemporal_retention_registry: None,
             max_vector_dim: 0,
@@ -490,6 +491,7 @@ mod tests {
             shuffle_agg_num_parts: 0,
             broadcast_threshold_bytes: 8 * 1024 * 1024,
             shuffle_agg_threshold: 10_000,
+            prefetched: Default::default(),
             database_id: crate::types::DatabaseId::DEFAULT,
             tenant_id: crate::types::TenantId::new(0),
         }
@@ -616,7 +618,8 @@ mod tests {
                 array_catalog: None,
                 credentials: None,
                 wal: None,
-                surrogate_assigner: None,
+                surrogate_assigner:
+                    crate::control::planner::sql_plan_convert::test_support::test_assigner(),
                 cluster_enabled: false,
                 bitemporal_retention_registry: None,
                 max_vector_dim: 0,
@@ -626,6 +629,7 @@ mod tests {
                 shuffle_agg_num_parts: 0,
                 broadcast_threshold_bytes: 8 * 1024 * 1024,
                 shuffle_agg_threshold: 10_000,
+                prefetched: Default::default(),
                 database_id: crate::types::DatabaseId::DEFAULT,
                 tenant_id: crate::types::TenantId::new(0),
             },
@@ -675,7 +679,8 @@ mod tests {
                 array_catalog: None,
                 credentials: None,
                 wal: None,
-                surrogate_assigner: None,
+                surrogate_assigner:
+                    crate::control::planner::sql_plan_convert::test_support::test_assigner(),
                 cluster_enabled: false,
                 bitemporal_retention_registry: None,
                 max_vector_dim: 0,
@@ -685,6 +690,7 @@ mod tests {
                 shuffle_agg_num_parts: 0,
                 broadcast_threshold_bytes: 8 * 1024 * 1024,
                 shuffle_agg_threshold: 10_000,
+                prefetched: Default::default(),
                 database_id: crate::types::DatabaseId::DEFAULT,
                 tenant_id: crate::types::TenantId::new(0),
             },

@@ -2,10 +2,11 @@
 
 //! Dense tile payload — flat row-major attribute arrays.
 //!
-//! Used when a tile's fill ratio crosses
-//! [`super::DENSE_PROMOTION_THRESHOLD`]. The dense layout drops
-//! coordinate columns entirely: cell `i`'s coordinates are recovered
-//! from `i` and the tile's per-dim extents.
+//! The dense layout drops coordinate columns entirely: cell `i`'s
+//! coordinates are recovered from `i` and the tile's per-dim extents. It
+//! holds no row kinds, surrogates or valid times, so the bitemporal array
+//! store never writes it, and the engine refuses it as corruption wherever
+//! it reads a segment tile.
 
 use serde::{Deserialize, Serialize};
 

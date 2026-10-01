@@ -4,6 +4,7 @@
 
 use super::column_list::{extract_column_pairs, find_column_list_paren_end};
 use super::engine_suffix::extract_engine_suffix;
+use super::flags::extract_flags;
 use super::with_clause::{extract_balanced_raw, extract_with_options};
 use crate::error::SqlError;
 use nodedb_types::find_ascii_case_insensitive;
@@ -77,8 +78,6 @@ pub(super) fn parse_collection_body(trimmed: &str, name: &str) -> Result<Collect
     }
     let body = name_source[name_end..].trim();
 
-    let upper_body = body.to_ascii_uppercase();
-
     let columns = extract_column_pairs(body)?;
     let (with_engine, options) = extract_with_options(body);
 
@@ -108,19 +107,12 @@ pub(super) fn parse_collection_body(trimmed: &str, name: &str) -> Result<Collect
         (None, None) => None,
     };
 
-    let mut flags: Vec<String> = Vec::new();
-    if upper_body.contains("APPEND_ONLY") {
-        flags.push("APPEND_ONLY".to_string());
-    }
-    if upper_body.contains("HASH_CHAIN") {
-        flags.push("HASH_CHAIN".to_string());
-    }
-    if upper_body.contains("BITEMPORAL") {
-        flags.push("BITEMPORAL".to_string());
-    }
-    if upper_body.contains("SIGNED_DELTAS") {
-        flags.push("SIGNED_DELTAS".to_string());
-    }
+    let column_list = if columns.is_empty() {
+        None
+    } else {
+        body.find('(').zip(find_column_list_paren_end(body))
+    };
+    let flags = extract_flags(body, column_list);
 
     let balanced_raw = extract_balanced_raw(body);
 
@@ -130,6 +122,31 @@ pub(super) fn parse_collection_body(trimmed: &str, name: &str) -> Result<Collect
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trailing_hash_chain_flags_parse_with_their_engine_and_columns() {
+        let (engine, columns, _, flags, _) = parse_collection_body(
+            "CREATE COLLECTION ledger (id STRING PRIMARY KEY, amount INT) \
+             WITH (engine='document_schemaless') APPEND_ONLY HASH_CHAIN",
+            "ledger",
+        )
+        .expect("collection body should parse");
+        assert_eq!(engine, Some("document_schemaless".to_string()));
+        assert_eq!(columns.len(), 2);
+        assert_eq!(flags, vec!["APPEND_ONLY", "HASH_CHAIN"]);
+    }
+
+    /// A column whose name matches a flag declares a column, not the flag.
+    #[test]
+    fn a_column_named_like_a_flag_sets_no_flag() {
+        let (_, columns, _, flags, _) = parse_collection_body(
+            "CREATE COLLECTION t (id INT PRIMARY KEY, append_only BOOL) WITH (engine='kv')",
+            "t",
+        )
+        .expect("collection body should parse");
+        assert_eq!(columns.len(), 2);
+        assert!(flags.is_empty(), "got flags {flags:?}");
+    }
 
     /// The options clause without parentheses means what it says. Ignoring it
     /// silently sent the statement to the default engine instead of the one it

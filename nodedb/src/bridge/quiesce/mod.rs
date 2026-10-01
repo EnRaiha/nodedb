@@ -11,15 +11,17 @@
 //! Split:
 //! - [`refcount`] — per-`(tenant, collection)` scan refcount, `ScanGuard`
 //!   RAII type, `try_start_scan` entry point.
-//! - [`drain`] — `begin_drain` / `wait_until_drained` / `clear_drain`
-//!   async drain coordination.
+//! - [`drain`] — `wait_until_drained`.
+//! - [`hold`] — owned drain holds and the pending-reclaim hold.
 //!
 //! The backing [`CollectionQuiesce`] is shared (Arc). Calls are rare
 //! (one bump per scan, one drain per purge), so the internal `Mutex`
 //! is not a hot-path bottleneck.
 
 pub mod drain;
+pub mod hold;
 pub mod refcount;
 
 pub use drain::WaitDrain;
+pub use hold::{DrainHold, ReclaimOwner};
 pub use refcount::{CollectionQuiesce, ScanGuard, ScanStartError};

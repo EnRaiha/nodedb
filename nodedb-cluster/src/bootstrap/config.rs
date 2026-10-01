@@ -88,12 +88,10 @@ pub struct ClusterConfig {
     /// (`8` attempts, `32 s` ceiling). Tests override this with a
     /// faster policy.
     pub join_retry: JoinRetryPolicy,
-    /// Optional UDP bind address for the SWIM failure detector. `None`
-    /// disables SWIM entirely — cluster startup then relies solely on
-    /// the existing raft transport for membership observations. When
-    /// `Some`, the operator is expected to spawn SWIM separately via
-    /// [`crate::spawn_swim`] after the cluster is up and feed the
-    /// seed list from `seed_nodes`.
+    /// Bound UDP address of this node's SWIM failure detector, as returned by
+    /// [`crate::bind_swim_listener`]. Bootstrap, join, and restart advertise
+    /// it in this node's topology entry, which peers seed SWIM from. `None`
+    /// for a node that runs no SWIM detector.
     pub swim_udp_addr: Option<SocketAddr>,
     /// Raft election timeout range. Controls how long a follower waits
     /// before starting an election after losing contact with the leader.
@@ -121,6 +119,11 @@ pub struct ClusterConfig {
     /// naturally require an `InstallSnapshot`. The trigger is gated on
     /// the data-plane applied watermark, never raft's commit index.
     pub log_compaction_threshold: Option<u64>,
+    /// Build identity this node advertises in its `JoinRequest`. Production
+    /// callers set this to `nodedb_types::wire_version::WIRE_BUILD_ID`;
+    /// never read from the environment. Tests override it to a different
+    /// string to exercise `handle_join_request`'s build-id rejection path.
+    pub wire_build_id: String,
 }
 
 /// Result of cluster startup — everything needed to run the Raft loop.

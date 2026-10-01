@@ -169,10 +169,6 @@ impl ToMessagePack for ErrorDetails {
             ErrorDetails::PlanError { phase, detail } => {
                 write2(writer, TAG_PLAN_ERROR, phase, detail)
             }
-            ErrorDetails::FanOutExceeded {
-                shards_touched,
-                limit,
-            } => write2(writer, TAG_FAN_OUT_EXCEEDED, shards_touched, limit),
             ErrorDetails::SqlNotEnabled => write_unit(writer, TAG_SQL_NOT_ENABLED),
             ErrorDetails::UndefinedFunction { name } => {
                 write1(writer, TAG_UNDEFINED_FUNCTION, name)

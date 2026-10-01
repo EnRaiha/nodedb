@@ -19,7 +19,7 @@ use crate::types::TenantId;
 /// a separate, sqlparser-based tree-walk evaluator with no dependency on
 /// `nodedb_query` (whose own `EvalError::DivisionByZero`, from the
 /// DataFusion-backed row-expression evaluator, covers a different code path
-/// entirely). Every other historically `None`-folding case (unknown
+/// entirely). Every other `None`-folding case (unknown
 /// identifiers, unsupported operators, overflow, non-finite float results)
 /// is unaffected and keeps folding to `Ok(None)` — see `try_eval_constant`,
 /// `evaluate_to_value`.
@@ -125,15 +125,19 @@ pub async fn evaluate_to_value(
 ///
 /// Returns `Ok(None)` for anything this mini-evaluator doesn't handle
 /// (unparseable input, unknown identifiers, unsupported operators,
-/// overflow) — callers fold that to `Value::Null`, matching historical
-/// behavior. Returns `Err(ConstEvalError::DivisionByZero)` only when
+/// overflow) — callers fold that to `Value::Null`. Returns `Err(ConstEvalError::DivisionByZero)` only when
 /// evaluation reaches a `/` or `%` with a zero divisor.
 fn try_eval_constant(sql: &str) -> Result<Option<nodedb_types::Value>, ConstEvalError> {
     let trimmed = sql.trim();
-    let expr_str = if trimmed.to_uppercase().starts_with("SELECT ") {
-        trimmed[7..].trim()
-    } else {
-        trimmed
+    // An expression keeps its source spelling, so any whitespace can follow
+    // a leading `SELECT`.
+    let expr_str = match (trimmed.get(..6), trimmed.get(6..)) {
+        (Some(head), Some(rest))
+            if head.eq_ignore_ascii_case("SELECT") && rest.starts_with(char::is_whitespace) =>
+        {
+            rest.trim()
+        }
+        _ => trimmed,
     };
 
     let dialect = sqlparser::dialect::PostgreSqlDialect {};

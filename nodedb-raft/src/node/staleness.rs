@@ -106,6 +106,8 @@ mod tests {
             entries: vec![],
             leader_commit,
             group_id: 1,
+            round: 1,
+            replicated_floor: 0,
         });
     }
 

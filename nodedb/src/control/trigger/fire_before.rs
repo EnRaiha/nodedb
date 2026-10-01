@@ -8,17 +8,15 @@
 //! - Modify the NEW row (for INSERT/UPDATE) before it reaches storage
 //! - Execute side-effect DML (dispatched through normal plan+SPSC path)
 //!
-//! BEFORE triggers are ALWAYS synchronous — there is no ASYNC or DEFERRED variant.
+//! BEFORE triggers are ALWAYS synchronous — there is no ASYNC or DEFERRED
+//! variant. Every body joins the triggering statement's transaction.
 
 use std::collections::HashMap;
 
 use crate::control::planner::procedural::executor::bindings::RowBindings;
 use crate::control::security::catalog::trigger_types::TriggerTiming;
-use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId};
 
-use super::TriggerScope;
+use super::SyncFire;
 use super::fire_common::{
     BeforeTriggersMutationParams, FireErrorPolicy, FireTriggersParams, check_cascade_depth,
     fire_before_triggers_with_mutation, fire_triggers,
@@ -29,21 +27,24 @@ use super::registry::DmlEvent;
 ///
 /// Returns the (possibly modified) NEW fields. The caller MUST use the returned
 /// fields for the actual PointPut dispatch, not the original input — a BEFORE
-/// trigger may have normalized or enriched the row.
+/// trigger can have normalized or enriched the row.
 ///
 /// If a trigger raises an exception, the error propagates and the INSERT is aborted.
 pub async fn fire_before_insert(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    database_id: DatabaseId,
-    tenant_id: TenantId,
+    fire: SyncFire<'_>,
     collection: &str,
     new_fields: &HashMap<String, nodedb_types::Value>,
-    cascade_depth: u32,
 ) -> crate::Result<HashMap<String, nodedb_types::Value>> {
+    let SyncFire {
+        state,
+        identity,
+        scope,
+        cascade_depth,
+        txn,
+    } = fire;
     let triggers = state.trigger_registry.get_matching(
-        database_id,
-        tenant_id.as_u64(),
+        scope.database_id,
+        scope.tenant_id.as_u64(),
         collection,
         DmlEvent::Insert,
     );
@@ -64,12 +65,13 @@ pub async fn fire_before_insert(
     let result = fire_before_triggers_with_mutation(BeforeTriggersMutationParams {
         state,
         identity,
-        tenant_id,
+        tenant_id: scope.tenant_id,
         collection,
         triggers: &before_triggers,
         bindings: &bindings,
         cascade_depth,
         new_fields: Some(new_fields.clone()),
+        joined: txn,
     })
     .await?;
 
@@ -84,14 +86,18 @@ pub async fn fire_before_insert(
 ///
 /// If a trigger raises an exception, the UPDATE is aborted.
 pub async fn fire_before_update(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    scope: TriggerScope,
+    fire: SyncFire<'_>,
     collection: &str,
     old_fields: &HashMap<String, nodedb_types::Value>,
     new_fields: &HashMap<String, nodedb_types::Value>,
-    cascade_depth: u32,
 ) -> crate::Result<HashMap<String, nodedb_types::Value>> {
+    let SyncFire {
+        state,
+        identity,
+        scope,
+        cascade_depth,
+        txn,
+    } = fire;
     let triggers = state.trigger_registry.get_matching(
         scope.database_id,
         scope.tenant_id.as_u64(),
@@ -121,6 +127,7 @@ pub async fn fire_before_update(
         bindings: &bindings,
         cascade_depth,
         new_fields: Some(new_fields.clone()),
+        joined: txn,
     })
     .await?;
 
@@ -134,17 +141,20 @@ pub async fn fire_before_update(
 ///
 /// If a trigger raises an exception, the DELETE is aborted.
 pub async fn fire_before_delete(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    database_id: DatabaseId,
-    tenant_id: TenantId,
+    fire: SyncFire<'_>,
     collection: &str,
     old_fields: &HashMap<String, nodedb_types::Value>,
-    cascade_depth: u32,
 ) -> crate::Result<()> {
+    let SyncFire {
+        state,
+        identity,
+        scope,
+        cascade_depth,
+        txn,
+    } = fire;
     let triggers = state.trigger_registry.get_matching(
-        database_id,
-        tenant_id.as_u64(),
+        scope.database_id,
+        scope.tenant_id.as_u64(),
         collection,
         DmlEvent::Delete,
     );
@@ -165,7 +175,7 @@ pub async fn fire_before_delete(
     fire_triggers(FireTriggersParams {
         state,
         identity,
-        tenant_id,
+        tenant_id: scope.tenant_id,
         collection,
         triggers: &before_triggers,
         bindings: &bindings,
@@ -174,6 +184,7 @@ pub async fn fire_before_delete(
         // Event-Plane async cross-shard sender path.
         cross_shard_origin: None,
         on_error: FireErrorPolicy::Abort,
+        joined: Some(txn),
     })
     .await
     .into_result()

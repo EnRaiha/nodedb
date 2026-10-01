@@ -19,7 +19,7 @@ use super::DispatchOutcome;
 /// Attempt to dispatch `sql` as a NodeDB SQL extension.
 ///
 /// Returns `Some(result)` if the statement was handled (e.g. `PUBLISH TO`),
-/// or `None` if the SQL should be handled by the caller via `plan_sql`.
+/// or `None` if the caller handles the SQL via `plan_sql`.
 ///
 /// The caller is responsible for handling `None`.
 pub async fn dispatch_sql(
@@ -61,6 +61,25 @@ pub async fn dispatch_sql_in_database(
     Ok(None)
 }
 
+/// A `PUBLISH TO` whose syntax, authorization and topic were checked at the
+/// statement. A procedural transaction holds it and sends it after COMMIT.
+#[derive(Debug, Clone, PartialEq, Eq, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+pub struct PreparedPublish {
+    pub database_id: u64,
+    pub tenant_id: u64,
+    pub topic: String,
+    pub payload: String,
+    /// This node's metadata floor once it found the topic. See
+    /// [`crate::wal::RedoPublish::metadata_floor`].
+    pub metadata_floor: u64,
+}
+
+/// Whether `sql` is a NodeDB SQL extension this module dispatches.
+pub fn is_sql_extension(sql: &str) -> bool {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    nodedb_types::starts_with_ascii_case_insensitive(trimmed, "PUBLISH TO ")
+}
+
 /// Handle `PUBLISH TO <topic> <payload>` without pgwire coupling.
 async fn handle_publish(
     state: &SharedState,
@@ -68,6 +87,23 @@ async fn handle_publish(
     database_id: crate::types::DatabaseId,
     sql: &str,
 ) -> crate::Result<DispatchOutcome> {
+    let publish = prepare_publish(state, identity, database_id, sql)?;
+    send_publish(state, &publish).await?;
+    Ok(DispatchOutcome {
+        rows_affected: 1,
+        rows: Vec::new(),
+    })
+}
+
+/// Check a `PUBLISH TO <topic> <payload>` statement without sending it:
+/// syntax, write permission on the topic, and that the topic exists.
+pub fn prepare_publish(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
+    sql: &str,
+) -> crate::Result<PreparedPublish> {
+    let sql = sql.trim().trim_end_matches(';').trim();
     let prefix = "PUBLISH TO ";
     if !nodedb_types::starts_with_ascii_case_insensitive(sql, prefix) {
         return Err(crate::Error::BadRequest {
@@ -91,7 +127,6 @@ async fn handle_publish(
     let payload = parse_payload(payload_part.trim())?;
 
     let tenant_id = identity.tenant_id.as_u64();
-    let tenant = identity.tenant_id;
     let emitter =
         crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
     crate::control::server::shared::authorization::authorize_collection(
@@ -105,48 +140,54 @@ async fn handle_publish(
     )
     .map_err(crate::Error::from)?;
 
+    if state
+        .ep_topic_registry
+        .get(database_id, tenant_id, &topic_name)
+        .is_none()
+    {
+        return Err(crate::Error::CollectionNotFound {
+            tenant_id: identity.tenant_id,
+            collection: topic_name.to_string(),
+        });
+    }
+
+    Ok(PreparedPublish {
+        database_id: database_id.as_u64(),
+        tenant_id,
+        topic: topic_name.to_string(),
+        payload,
+        // Read after the topic lookup: covers the metadata batch that made
+        // the topic visible, even while that batch is still applying.
+        metadata_floor: state
+            .applied_index_watcher(nodedb_cluster::METADATA_GROUP_ID)
+            .floor(),
+    })
+}
+
+/// Send a checked publish to its topic. In a cluster it commits through the
+/// topic's home data group.
+pub async fn send_publish(state: &SharedState, publish: &PreparedPublish) -> crate::Result<()> {
     use crate::event::topic::publish::PublishError;
 
+    let database_id = crate::types::DatabaseId::new(publish.database_id);
+    let topic_name = publish.topic.as_str();
     match crate::event::topic::publish::publish_to_topic(
         state,
         database_id,
-        tenant_id,
-        &topic_name,
-        &payload,
+        publish.tenant_id,
+        topic_name,
+        &publish.payload,
     )
     .await
     {
-        Ok(_seq) => Ok(DispatchOutcome {
-            rows_affected: 1,
-            rows: Vec::new(),
-        }),
-        Err(PublishError::RemoteHome { leader_node, .. }) => {
-            crate::event::topic::publish::publish_remote(
-                state,
-                database_id,
-                tenant_id,
-                &topic_name,
-                &payload,
-                leader_node,
-            )
-            .await
-            .map_err(|e| crate::Error::Dispatch {
-                detail: format!("remote publish to '{topic_name}' failed: {e}"),
-            })?;
-            Ok(DispatchOutcome {
-                rows_affected: 1,
-                rows: Vec::new(),
-            })
-        }
+        Ok(_seq) => Ok(()),
         Err(PublishError::TopicNotFound(t)) => Err(crate::Error::CollectionNotFound {
-            tenant_id: tenant,
+            tenant_id: crate::types::TenantId::new(publish.tenant_id),
             collection: t,
         }),
-        Err(PublishError::Persistence(e)) | Err(PublishError::RemoteError(e)) => {
-            Err(crate::Error::Dispatch {
-                detail: format!("publish to '{topic_name}' failed: {e}"),
-            })
-        }
+        Err(PublishError::Persistence(e)) => Err(crate::Error::Dispatch {
+            detail: format!("publish to '{topic_name}' failed: {e}"),
+        }),
     }
 }
 

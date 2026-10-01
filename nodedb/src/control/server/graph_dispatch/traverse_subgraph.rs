@@ -26,8 +26,10 @@ use crate::engine::graph::edge_store::Direction;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
 use crate::types::{DatabaseId, TenantId};
 
+use super::bfs::{admit_by_name, walk_visit_cap, whole_hop};
 use super::helpers::ok_response;
 use super::hop::{NeighborHopParams, execute_neighbor_hop};
+use super::shard_reads::ShardReadLog;
 
 /// Wire-shape JSON node entry. Field names mirror the client decoder in
 /// `nodedb-client/src/remote/parse.rs::parse_graph_traverse_json`.
@@ -61,16 +63,23 @@ struct WireSubGraph<'a> {
 pub struct CrossCoreTraverseSubgraphParams<'a> {
     pub tenant_id: TenantId,
     pub database_id: DatabaseId,
-    /// Collection scope, or `None` for a label-only traversal.
+    /// Database-qualified collection scope, or `None` for a label-only
+    /// traversal.
     pub collection: Option<String>,
     pub start: String,
     pub edge_label: Option<String>,
     pub direction: Direction,
     pub max_depth: usize,
     pub options: &'a GraphTraversalOptions,
+    /// Each node that expands part of the walk confirms its groups first.
+    pub linearizable: bool,
 }
 
 /// BFS that returns a `{nodes,edges}` JSON subgraph for `GRAPH TRAVERSE`.
+///
+/// The walk runs level by level, as one core's subgraph does
+/// (`CsrIndex::subgraph`): each hop records every edge of the frontier, and
+/// the level's new nodes are admitted in node-name order until the visit cap.
 ///
 /// Each hop expands every frontier node at the node that owns
 /// `from_key(node)` via the shared [`execute_neighbor_hop`] helper and
@@ -83,76 +92,11 @@ pub async fn cross_core_traverse_subgraph(
     shared: &SharedState,
     params: CrossCoreTraverseSubgraphParams<'_>,
 ) -> crate::Result<Response> {
-    let CrossCoreTraverseSubgraphParams {
-        tenant_id,
-        collection,
-        database_id,
-        start,
-        edge_label,
-        direction,
-        max_depth,
-        options,
-    } = params;
-    // Per-node depth: the start node is at depth 0; subsequent nodes
-    // are tagged with the hop index that first surfaced them.
-    let mut depth_of: HashMap<String, u8> = HashMap::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut node_order: Vec<String> = Vec::new();
-    let mut edges: Vec<(String, String, String)> = Vec::new();
-    let mut frontier: Vec<String> = vec![start.clone()];
-
-    visited.insert(start.clone());
-    depth_of.insert(start.clone(), 0);
-    node_order.push(start);
-
-    for hop_idx in 0..max_depth {
-        if frontier.is_empty() {
-            break;
-        }
-
-        let hop = execute_neighbor_hop(
-            shared,
-            tenant_id,
-            database_id,
-            NeighborHopParams {
-                collection: collection.as_deref(),
-                frontier: &frontier,
-                edge_label: edge_label.as_deref(),
-                direction,
-                options,
-                discovered_so_far: node_order.len(),
-            },
-        )
-        .await?;
-
-        // Edges are fully attributed for BOTH local-shard and remote-shard
-        // expansion (each frontier node was expanded at its owner). Always
-        // record them — even when the destination is already visited (an
-        // A→B→C graph with a back-edge B→A should surface that edge once).
-        edges.extend(hop.local_triples);
-
-        // Tag newly-discovered nodes with the current hop's depth and
-        // build the next frontier. `hop_idx=0` expands the depth-0
-        // start node into depth-1 neighbors.
-        let next_depth_tag = (hop_idx + 1).min(u8::MAX as usize) as u8;
-        let mut next_frontier: Vec<String> = Vec::new();
-        for node in hop.merged_destinations {
-            if visited.insert(node.clone()) {
-                depth_of.insert(node.clone(), next_depth_tag);
-                node_order.push(node.clone());
-                next_frontier.push(node);
-                if node_order.len() >= options.max_visited {
-                    break;
-                }
-            }
-        }
-
-        frontier = next_frontier;
-
-        if node_order.len() >= options.max_visited {
-            break;
-        }
-    }
+    let SubgraphWalk {
+        node_order,
+        depth_of,
+        edges,
+    } = walk_subgraph(shared, params).await?;
 
     let wire_nodes: Vec<WireNode<'_>> = node_order
         .iter()
@@ -180,4 +124,92 @@ pub async fn cross_core_traverse_subgraph(
     })?;
 
     Ok(ok_response(payload))
+}
+
+/// What a subgraph walk found: every visited node in discovery order, the
+/// hop at which each was first reached, and every `(src, label, dst)` edge
+/// crossed.
+pub(crate) struct SubgraphWalk {
+    pub node_order: Vec<String>,
+    pub depth_of: HashMap<String, u8>,
+    pub edges: Vec<(String, String, String)>,
+}
+
+/// Walk the subgraph around `params.start`, expanding every frontier node at
+/// the node that owns `from_key(node)`.
+pub(crate) async fn walk_subgraph(
+    shared: &SharedState,
+    params: CrossCoreTraverseSubgraphParams<'_>,
+) -> crate::Result<SubgraphWalk> {
+    let CrossCoreTraverseSubgraphParams {
+        tenant_id,
+        collection,
+        database_id,
+        start,
+        edge_label,
+        direction,
+        max_depth,
+        options,
+        linearizable,
+    } = params;
+    // Per-node depth: the start node is at depth 0; subsequent nodes
+    // are tagged with the hop index that first surfaced them.
+    let mut depth_of: HashMap<String, u8> = HashMap::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut node_order: Vec<String> = Vec::new();
+    let mut edges: Vec<(String, String, String)> = Vec::new();
+    let mut frontier: Vec<String> = vec![start.clone()];
+    let mut reads = ShardReadLog::new();
+    let cap = walk_visit_cap(shared, options);
+    let whole = whole_hop();
+
+    visited.insert(start.clone());
+    depth_of.insert(start.clone(), 0);
+    node_order.push(start);
+
+    for hop_idx in 0..max_depth {
+        if frontier.is_empty() || node_order.len() >= cap {
+            break;
+        }
+
+        let hop = execute_neighbor_hop(
+            shared,
+            tenant_id,
+            database_id,
+            NeighborHopParams {
+                collection: collection.as_deref(),
+                frontier: &frontier,
+                edge_label: edge_label.as_deref(),
+                direction,
+                options: &whole,
+                discovered_so_far: node_order.len(),
+                linearizable,
+            },
+        )
+        .await?;
+
+        // Edges are fully attributed for BOTH local-shard and remote-shard
+        // expansion (each frontier node was expanded at its owner). Always
+        // record them — even when the destination is already visited (an
+        // A→B→C graph with a back-edge B→A must surface that edge once).
+        edges.extend(hop.local_triples);
+        reads.merge(hop.reads);
+
+        // Admit the level's new nodes in name order under the cap, and tag
+        // them with the current hop's depth. `hop_idx=0` expands the depth-0
+        // start node into depth-1 neighbors.
+        let next_depth_tag = (hop_idx + 1).min(u8::MAX as usize) as u8;
+        frontier = admit_by_name(hop.merged_destinations, &mut visited, &mut node_order, cap);
+        for node in &frontier {
+            depth_of.insert(node.clone(), next_depth_tag);
+        }
+    }
+
+    // Every vShard the walk expanded joins the transaction read-set.
+    reads.publish(shared, tenant_id, database_id, collection);
+    Ok(SubgraphWalk {
+        node_order,
+        depth_of,
+        edges,
+    })
 }

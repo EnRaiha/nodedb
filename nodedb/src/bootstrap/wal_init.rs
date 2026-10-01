@@ -59,6 +59,34 @@ pub fn init_wal(
             std::process::exit(1);
         }
     };
+    // Replay recorded the persisted time anchors. Records past the last one
+    // are durable now, so they take the boot time.
+    wal.anchor_recovered_tail();
+
+    // Settle every record group a crash left broken before any replay, then
+    // read the stream the settle completed.
+    let wal_records = match crate::bootstrap::write_group_settle::settle_write_groups(
+        &wal,
+        &config.server.data_dir,
+        &wal_records,
+    )
+    .and_then(|appended| {
+        if appended {
+            wal.replay()
+                .map(|records| Arc::from(records.into_boxed_slice()))
+        } else {
+            Ok(wal_records)
+        }
+    }) {
+        Ok(records) => records,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "StartupError: settling the write groups a crash left broken failed"
+            );
+            std::process::exit(1);
+        }
+    };
 
     tracing::warn!(
         catalog = %config.catalog_path().display(),

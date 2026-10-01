@@ -62,14 +62,15 @@ pub async fn restore_version(
         &checkpoint_name,
     )?;
 
-    let surrogate = state
-        .surrogate_assigner
-        .assign(
-            nodedb_types::CollectionKey::from_bare(database_id, &collection),
-            tenant_id,
-            doc_id.as_bytes(),
-        )
-        .map_err(|e| DdlError::from_error_in_context("surrogate assign", &e))?;
+    let surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
+        state,
+        nodedb_types::CollectionKey::from_bare(database_id, &collection),
+        tenant_id,
+        doc_id.as_bytes(),
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| DdlError::from_error_in_context("surrogate assign", &e))?;
 
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
     // RLS write policies are stored keyed by `db_qualified(database_id,
@@ -139,7 +140,7 @@ struct RestoreDeltaParams<'a> {
 
 /// Route RESTORE's generated forward delta through the same serialized,
 /// fenced CRDT admission boundary as every ordinary `CrdtOp::Apply`.
-/// Loro imports are idempotent, so replaying the just-produced delta on the
+/// Loro imports are idempotent, so replaying the produced delta on the
 /// local replica is safe while ensuring every replica observes the fence.
 #[cfg(test)]
 async fn persist_restore_delta(
@@ -224,8 +225,7 @@ fn parse_restore(sql: &str) -> Result<(String, String, String), DdlError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::time::Instant;
+    use std::sync::{Arc, Mutex};
 
     use loro::LoroValue;
     use nodedb_crdt::state::CrdtState;
@@ -259,48 +259,77 @@ mod tests {
         (state, side, dir)
     }
 
-    async fn respond_restore_apply(
-        state: Arc<SharedState>,
-        mut side: CoreChannelDataSide,
+    /// What the restore core expects and what it saw.
+    #[derive(Clone)]
+    struct RestoreCore {
         digest: [u8; 32],
         delta: Vec<u8>,
+        seen: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl RestoreCore {
+        fn seen(&self) -> Vec<&'static str> {
+            self.seen.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+    }
+
+    /// A Data Plane core for a one-node cluster that answers the restore
+    /// admission: the generate returns `delta`, the preview returns a result
+    /// with `digest`, and the fenced apply echoes its WAL LSN. It answers
+    /// every other request, the cluster's Raft applies included, with `Ok`.
+    /// It records each restore step it sees, marking a step whose delta or
+    /// digest differs from the expected one.
+    async fn answer_restore_admission(
+        core: RestoreCore,
+        state: Arc<SharedState>,
+        mut side: CoreChannelDataSide,
     ) {
         let preview = zerompk::to_msgpack_vec(&nodedb_types::CrdtPreviewResult {
             post_image_msgpack: vec![0xc0],
             imported_ops: 1,
             trimmed_ops: 0,
-            frontier_digest: digest,
+            frontier_digest: core.digest,
         })
         .expect("preview payload");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut handled = 0;
-        while handled < 3 && Instant::now() < deadline {
-            if let Ok(request) = side.request_rx.try_pop() {
+        loop {
+            while let Ok(request) = side.request_rx.try_pop() {
                 let request = request.inner;
                 let request_id = request.request_id;
-                let write_version = request.wal_lsn.unwrap_or(Lsn::ZERO);
-                match request.plan {
-                    PhysicalPlan::Crdt(CrdtOp::RestoreToVersion { .. }) if handled == 0 => {}
-                    PhysicalPlan::Crdt(CrdtOp::PreviewApply { delta: actual, .. })
-                        if handled == 1 =>
-                    {
-                        assert_eq!(actual, delta);
+                let wal_lsn = request.wal_lsn.unwrap_or(Lsn::ZERO);
+                let (step, payload, read_version_lsn) = match request.plan {
+                    PhysicalPlan::Crdt(CrdtOp::RestoreToVersion { .. }) => {
+                        (Some("generate"), core.delta.clone(), Lsn::ZERO)
+                    }
+                    PhysicalPlan::Crdt(CrdtOp::PreviewApply { delta, .. }) => {
+                        let step = if delta == core.delta {
+                            "preview"
+                        } else {
+                            "preview: wrong delta"
+                        };
+                        (Some(step), preview.clone(), Lsn::ZERO)
                     }
                     PhysicalPlan::Crdt(CrdtOp::Apply {
-                        delta: actual,
-                        expected_frontier_digest: Some(actual_digest),
+                        delta,
+                        expected_frontier_digest,
                         ..
-                    }) if handled == 2 => {
-                        assert_eq!(actual, delta);
-                        assert_eq!(actual_digest, digest);
+                    }) => {
+                        let step = if delta == core.delta
+                            && expected_frontier_digest == Some(core.digest)
+                        {
+                            "apply"
+                        } else {
+                            "apply: wrong delta or digest"
+                        };
+                        (Some(step), Vec::new(), wal_lsn)
                     }
-                    other => panic!("unexpected restore admission request: {other:?}"),
-                }
-                let payload = match handled {
-                    0 => delta.clone(),
-                    1 => preview.clone(),
-                    _ => Vec::new(),
+                    _ => (None, Vec::new(), Lsn::ZERO),
                 };
+                if let Some(step) = step {
+                    core.seen
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(step);
+                }
                 side.response_tx
                     .try_push(BridgeResponse {
                         inner: Response {
@@ -312,25 +341,15 @@ mod tests {
                             watermark_lsn: Lsn::ZERO,
                             error_code: None,
                             read_set_valid: None,
-                            read_version_lsn: if handled == 2 {
-                                write_version
-                            } else {
-                                Lsn::ZERO
-                            },
+                            read_version_lsn,
                             write_set: Vec::new(),
                         },
                     })
                     .expect("response queue capacity");
-                handled += 1;
             }
             state.poll_and_route_responses();
             tokio::task::yield_now().await;
         }
-        assert_eq!(
-            handled, 3,
-            "restore admission must generate, preview, then apply"
-        );
-        state.poll_and_route_responses();
     }
 
     /// Generates the same read-only forward delta as `CrdtOp::RestoreToVersion`:
@@ -358,7 +377,7 @@ mod tests {
         (pre_restore, delta)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_delta_is_wal_durable_and_replays_to_post_restore_state() {
         let (pre_restore, delta) = real_restore_delta();
         assert!(
@@ -366,7 +385,6 @@ mod tests {
             "restoring to a genuinely different prior version must produce a non-empty forward delta"
         );
 
-        let (state, side, _dir) = test_state().await;
         let pre_restore_state = CrdtState::new(99).expect("pre-restore state");
         pre_restore_state
             .import(&pre_restore)
@@ -377,12 +395,18 @@ mod tests {
             "notes",
             Some(&pre_restore_state),
         );
-        let responder = tokio::spawn(respond_restore_apply(
-            Arc::clone(&state),
-            side,
-            expected_frontier,
-            delta.clone(),
-        ));
+        let core = RestoreCore {
+            digest: expected_frontier,
+            delta: delta.clone(),
+            seen: Arc::new(Mutex::new(Vec::new())),
+        };
+        let serving = core.clone();
+        let cluster = crate::control::cluster::test_one_node::boot_with_core(
+            |_| {},
+            move |state, side| tokio::spawn(answer_restore_admission(serving, state, side)),
+        )
+        .await;
+        let state = Arc::clone(&cluster.state);
         let outcome = crate::control::crdt_admission::dispatch_crdt_restore_admitted(
             &state,
             crate::control::crdt_admission::CrdtRestoreAdmissionRequest {
@@ -401,23 +425,30 @@ mod tests {
         .await
         .expect("persist restore delta");
         let lsn = outcome.map(|outcome| outcome.write_version);
-        responder.await.expect("restore responder");
+        assert_eq!(
+            core.seen(),
+            ["generate", "preview", "apply"],
+            "restore admission must generate, preview, then apply"
+        );
         assert!(
             lsn.is_some(),
-            "the current bug: RESTORE dispatches with wal_lsn: None and appends nothing; \
-             a fixed single-node path must allocate and return a durable WAL LSN"
+            "a restore must allocate and return a durable WAL LSN"
         );
 
         state.wal.sync().expect("sync wal");
-        let records = state.wal.replay().expect("replay wal");
+        let records: Vec<_> = state
+            .wal
+            .replay()
+            .expect("replay wal")
+            .into_iter()
+            .filter(|record| {
+                record.header.record_type == nodedb_wal::record::RecordType::CrdtDelta as u32
+            })
+            .collect();
         assert_eq!(
             records.len(),
             1,
             "exactly one CrdtDelta record must be appended for the restore"
-        );
-        assert_eq!(
-            records[0].header.record_type,
-            nodedb_wal::record::RecordType::CrdtDelta as u32
         );
         let payload = crate::wal::CrdtDeltaWalPayload::decode(&records[0].payload)
             .expect("decode wal payload");
@@ -426,7 +457,7 @@ mod tests {
             payload.bytes, delta,
             "the WAL record must carry the exact delta bytes the restore handler produced"
         );
-        assert_eq!(payload.collection.as_deref(), Some("notes"));
+        assert_eq!(payload.collection, "notes");
 
         // Replay via the same idempotent Loro import `replay_crdt_wal` performs
         // in production, and confirm the result is the POST-restore value
@@ -442,6 +473,8 @@ mod tests {
             .read_field("notes", "doc1", "body")
             .expect("row must exist after replay");
         assert_eq!(restored, LoroValue::String("v1".into()));
+        drop(state);
+        cluster.shutdown().await;
     }
 
     #[tokio::test]

@@ -2,12 +2,10 @@
 
 //! Protocol-neutral `SHOW MATERIALIZED VIEWS [FOR <source>]` handler.
 //!
-//! Ported from the pgwire `ddl::materialized_view::show` handler. The catalog
-//! read, the optional `FOR <source>` filter, and the exact column set (all five
-//! columns `text`) are preserved verbatim; only the result construction changed
-//! from pgwire `Response` / `QueryResponse` to the protocol-neutral
+//! The catalog read, the optional `FOR <source>` filter, and the exact column
+//! set (all five columns `text`) run here. The result is the protocol-neutral
 //! [`DdlResult::Rows`] over [`ShapedRows`]. All columns are `text`, so
-//! `ShapedRows::text_types(5)` reproduces the RowDescription byte-identically.
+//! `ShapedRows::text_types(5)` gives the column types.
 
 use serde_json::{Map, Value as JsonValue};
 

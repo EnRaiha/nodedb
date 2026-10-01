@@ -2,9 +2,10 @@
 
 //! KV engine source-to-target row copy.
 //!
-//! Drives the source `KvOp::MaterializeScan` cursor to completion, and for
-//! each non-tombstoned key not yet present in target dispatches a `KvOp::Put`
-//! against target with a fresh surrogate. Calls the reaper at the end to flip
+//! Drives the source `KvOp::MaterializeScan` cursor to completion on the
+//! source shard's owner, and for each non-tombstoned key not yet present in
+//! target dispatches a replicated `KvOp::Put` against target with a fresh
+//! surrogate. Calls the reaper at the end to flip
 //! status to `Materialized` and clear `cloned_from`.
 //!
 //! ## Idempotency / restart-safety
@@ -15,18 +16,16 @@
 //! is the atomic Raft proposal at the end of the per-collection pass. The
 //! walker re-runs this function on the next sweep until the reaper succeeds.
 
-use nodedb_types::{CloneStatus, DatabaseId, Lsn, TenantId};
+use nodedb_types::{DatabaseId, TenantId};
 
-use crate::bridge::envelope::Status;
-use crate::control::catalog_entry::entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
 use crate::control::planner::sql_plan_convert::convert::db_qualified;
 use crate::control::security::catalog::{StoredCollection, SystemCatalog};
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
 
-use super::dispatch::dispatch_local;
+use super::dispatch::dispatch_to_owner;
 use super::reaper::{ReapParams, reap_materialized_collection};
+use super::status::{check_bound_surrogates, checkpoint_progress, mark_materializing};
 
 /// Rows fetched per scan round-trip. Larger = fewer round-trips, more memory
 /// per response. 4096 is a balance for typical clone sizes; very large
@@ -47,24 +46,7 @@ pub(super) async fn materialize_kv_collection(
     let target_qualified = db_qualified(db_id, &coll.name);
     let source_qualified = db_qualified(origin.source_database, &origin.source_collection);
     let tenant_id = TenantId::new(coll.tenant_id);
-
-    // Flip status to `Materializing` if still `Shadowed` so concurrent
-    // readers see in-progress state and a crash here resumes from `progress_lsn = 0`.
-    if matches!(coll.clone_status, CloneStatus::Shadowed) {
-        let mut updated = coll.clone();
-        updated.clone_status = CloneStatus::Materializing {
-            progress_lsn: Lsn::new(0),
-            bytes_done: 0,
-            bytes_total: 0,
-        };
-        let outcome = propose_catalog_entry(
-            state,
-            &CatalogEntry::PutCollection(Box::new(updated.clone())),
-        )?;
-        if outcome.needs_local_apply() {
-            catalog.put_collection(db_id, &updated)?;
-        }
-    }
+    mark_materializing(state, coll).await?;
 
     let tombstoned = catalog.list_kv_clone_tombstones(&target_qualified)?;
 
@@ -82,6 +64,7 @@ pub(super) async fn materialize_kv_collection(
         )
         .await?;
 
+        let mut pending: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len());
         for (key, value) in entries {
             total_seen += 1;
             let key_str = String::from_utf8_lossy(&key).into_owned();
@@ -92,12 +75,21 @@ pub(super) async fn materialize_kv_collection(
             if probe_target_key(state, tenant_id, db_id, &target_qualified, &key).await? {
                 continue;
             }
+            pending.push((key, value));
+        }
 
-            let surrogate = state.surrogate_assigner.assign(
-                nodedb_types::CollectionKey::from_bare(db_id, &coll.name),
-                tenant_id,
-                &key,
-            )?;
+        // The page's surrogates in one batch at the target collection's home.
+        let keys: Vec<&[u8]> = pending.iter().map(|(key, _)| key.as_slice()).collect();
+        let surrogates = crate::control::server::surrogate_exchange::assign_surrogates_routed(
+            state,
+            nodedb_types::CollectionKey::from_bare(db_id, &coll.name),
+            tenant_id,
+            &keys,
+            crate::types::TraceId::ZERO,
+        )
+        .await?;
+        check_bound_surrogates(&target_qualified, surrogates.len(), pending.len())?;
+        for ((key, value), surrogate) in pending.into_iter().zip(surrogates) {
             let plan = PhysicalPlan::Kv(KvOp::Put {
                 collection: nodedb_types::QualifiedCollection::new(db_id, &coll.name),
                 key: key.clone(),
@@ -108,32 +100,14 @@ pub(super) async fn materialize_kv_collection(
                 rls_filters: Vec::new(),
                 provenance: None,
             });
-            let resp =
-                dispatch_local(state, tenant_id, db_id, &target_qualified, plan, None).await?;
-            if resp.status != Status::Ok {
-                return Err(crate::Error::Storage {
-                    engine: "clone_materializer".into(),
-                    detail: format!(
-                        "kv put on target '{target_qualified}' for key {key_str} returned status {:?}",
-                        resp.status
-                    ),
-                });
-            }
+            dispatch_to_owner(state, tenant_id, db_id, &target_qualified, plan).await?;
             copied += 1;
         }
 
         // Persist a chunk-level progress checkpoint so a crash after this
         // batch resumes without re-walking already-copied keys (the per-key
         // probe makes that safe regardless, but cheaper to skip the round-trip).
-        checkpoint_progress(
-            state,
-            catalog,
-            db_id,
-            coll,
-            origin.as_of_lsn,
-            copied,
-            total_seen,
-        )?;
+        checkpoint_progress(state, coll, origin.as_of_lsn, copied, total_seen).await?;
 
         if next_cursor.is_empty() {
             break;
@@ -151,40 +125,14 @@ pub(super) async fn materialize_kv_collection(
     );
 
     reap_materialized_collection(ReapParams {
-        target_collection_qualified: &target_qualified,
         db_id,
         tenant_id: coll.tenant_id,
         name: &coll.name,
         state,
         catalog,
-    })?;
+    })
+    .await?;
 
-    Ok(())
-}
-
-/// Persist a `Materializing { progress_lsn, .. }` checkpoint between scan pages.
-fn checkpoint_progress(
-    state: &SharedState,
-    catalog: &SystemCatalog,
-    db_id: DatabaseId,
-    coll: &StoredCollection,
-    as_of_lsn: Lsn,
-    copied: u64,
-    total_seen: u64,
-) -> crate::Result<()> {
-    let mut updated = coll.clone();
-    updated.clone_status = CloneStatus::Materializing {
-        progress_lsn: as_of_lsn,
-        bytes_done: copied,
-        bytes_total: total_seen,
-    };
-    let outcome = propose_catalog_entry(
-        state,
-        &CatalogEntry::PutCollection(Box::new(updated.clone())),
-    )?;
-    if outcome.needs_local_apply() {
-        catalog.put_collection(db_id, &updated)?;
-    }
     Ok(())
 }
 
@@ -203,17 +151,8 @@ async fn scan_source_page(
         cursor: cursor.to_vec(),
         count: SCAN_PAGE,
     });
-    let resp = dispatch_local(state, tenant_id, source_db_id, source_qualified, plan, None).await?;
-    if resp.status != Status::Ok {
-        return Err(crate::Error::Storage {
-            engine: "clone_materializer".into(),
-            detail: format!(
-                "kv materialize-scan on source '{source_qualified}' returned status {:?}",
-                resp.status
-            ),
-        });
-    }
-    parse_materialize_scan_payload(resp.payload.as_ref())
+    let payload = dispatch_to_owner(state, tenant_id, source_db_id, source_qualified, plan).await?;
+    parse_materialize_scan_payload(&payload)
 }
 
 /// `(key, value)` pairs returned by one materialize-scan page.
@@ -283,6 +222,9 @@ async fn probe_target_key(
         // ceiling, so reads against the target stay unbounded here.
         surrogate_ceiling: None,
     });
-    let resp = dispatch_local(state, tenant_id, db_id, target_qualified, plan, None).await?;
-    Ok(resp.status == Status::Ok && !resp.payload.is_empty())
+    Ok(
+        !dispatch_to_owner(state, tenant_id, db_id, target_qualified, plan)
+            .await?
+            .is_empty(),
+    )
 }

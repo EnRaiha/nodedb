@@ -16,5 +16,6 @@ mod reissue;
 mod restore;
 mod stats;
 
+pub use database::reissue_into_database;
 pub use restore::restore_tenant;
-pub use stats::RestoreStats;
+pub use stats::{CollectionRows, RestoreStats};

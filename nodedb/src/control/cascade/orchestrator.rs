@@ -237,6 +237,7 @@ mod tests {
                     owner: "admin".into(),
                     created_at: 0,
                     subscriber_roles: Vec::new(),
+                    modification_hlc: nodedb_types::Hlc::ZERO,
                 })
                 .unwrap();
             catalog
@@ -254,7 +255,7 @@ mod tests {
                 .unwrap();
         }
 
-        // Periodic and streaming MVs live in separate catalogs and may share a
+        // Periodic and streaming MVs live in separate catalogs and can share a
         // name. The cascade must retain both instead of collapsing them in the
         // visited set.
         catalog

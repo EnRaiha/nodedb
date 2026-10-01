@@ -23,6 +23,15 @@ impl StoppedNode {
     pub(crate) fn listen_addr(&self) -> SocketAddr {
         self.listen_addr
     }
+
+    pub(crate) fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
+    /// The data directory the node restarts on.
+    pub(crate) fn data_dir(&self) -> &std::path::Path {
+        self.data_dir.path()
+    }
 }
 
 impl TestClusterNode {

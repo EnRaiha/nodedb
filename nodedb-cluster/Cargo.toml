@@ -53,6 +53,7 @@ uuid = { workspace = true }
 # Authenticated frame envelope (origin + anti-replay MAC) for Raft RPCs.
 hmac = { workspace = true }
 sha2 = { workspace = true }
+hex = { workspace = true }
 
 faultbox = { workspace = true, optional = true }
 

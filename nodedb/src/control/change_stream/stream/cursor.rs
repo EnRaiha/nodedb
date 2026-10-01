@@ -1,46 +1,128 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+//! Resumable positions in the Control-Plane change stream.
+//!
+//! The stream is a set of partitions. Each partition is one totally ordered
+//! feed that every node numbers alike:
+//!
+//! - `Group(g)`: the writes of data group `g`, at their Raft log index.
+//! - `Calvin(v)`: the Calvin transactions vShard `v` applied, at their
+//!   sequencer position.
+//!
+//! A cursor holds, per partition, the position of the last event it
+//! consumed. A cursor taken on one node therefore resumes on any node that
+//! holds the same feed.
+
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
-const TOKEN_PREFIX: &str = "v1:";
-const EPOCH_HEX_LEN: usize = 32;
-const MAX_TOKEN_LEN: usize = TOKEN_PREFIX.len() + EPOCH_HEX_LEN + 1 + 20;
+use crate::event::cdc::CdcOffset;
 
-/// Opaque, versioned position in one ChangeStream publication epoch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+use super::SequencedChangeEvent;
+
+const TOKEN_PREFIX: &str = "v2:";
+/// Partitions one cursor holds at most: every data group and every vShard's
+/// Calvin feed of a large cluster.
+const MAX_ENTRIES: usize = 8192;
+/// Upper bound on one entry's text: a tag, a 20-digit id, and three
+/// 20-digit numbers with their separators.
+const MAX_ENTRY_LEN: usize = 1 + 20 + 1 + 3 * 20 + 2;
+const MAX_TOKEN_LEN: usize = TOKEN_PREFIX.len() + MAX_ENTRIES * (MAX_ENTRY_LEN + 1);
+
+/// One totally ordered feed of the change stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ChangePartition {
+    /// A data group's writes, at their Raft log index.
+    Group(u64),
+    /// A vShard's Calvin transactions, at their sequencer position.
+    Calvin(u32),
+}
+
+/// What a consumer does with the next live event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorStep {
+    /// A new event: the cursor advanced past it.
+    Deliver,
+    /// An event the cursor already covers.
+    Skip,
+    /// The node's feed has a hole the cursor sits below. The consumer must
+    /// reset.
+    Reset,
+}
+
+/// Opaque, versioned resume position across every partition.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChangeCursor {
-    epoch: u128,
-    sequence: u64,
+    positions: BTreeMap<ChangePartition, CdcOffset>,
 }
 
 impl ChangeCursor {
-    pub(crate) const fn new(epoch: u128, sequence: u64) -> Self {
-        Self { epoch, sequence }
+    /// The last consumed position in `partition`, if any.
+    pub fn position(&self, partition: ChangePartition) -> Option<CdcOffset> {
+        self.positions.get(&partition).copied()
     }
 
-    pub(crate) const fn epoch(self) -> u128 {
-        self.epoch
+    pub fn is_empty(&self) -> bool {
+        self.positions.is_empty()
     }
 
-    pub(crate) const fn sequence(self) -> u64 {
-        self.sequence
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (ChangePartition, CdcOffset)> + '_ {
+        self.positions.iter().map(|(p, o)| (*p, *o))
     }
 
-    /// Whether two cursors belong to the same publication epoch.
-    pub const fn same_epoch(self, other: Self) -> bool {
-        self.epoch == other.epoch
+    /// Raise `partition` to `position`. A lower position leaves it as is.
+    pub(crate) fn raise(&mut self, partition: ChangePartition, position: CdcOffset) {
+        let held = self.positions.entry(partition).or_insert(position);
+        if *held < position {
+            *held = position;
+        }
     }
 
-    /// Compare sequences only after confirming the cursors share an epoch.
-    pub const fn is_after_in_same_epoch(self, other: Self) -> bool {
-        self.same_epoch(other) && self.sequence > other.sequence
+    /// Whether the cursor consumed `event` already.
+    pub fn covers(&self, event: &SequencedChangeEvent) -> bool {
+        self.position(event.partition())
+            .is_some_and(|held| held >= event.position())
+    }
+
+    /// Advance past `event` when it is new. Reports a reset when the node's
+    /// feed of the event's partition has a hole above this cursor.
+    pub fn accept(&mut self, event: &SequencedChangeEvent) -> CursorStep {
+        let partition = event.partition();
+        let position = event.position();
+        let Some(held) = self.position(partition) else {
+            self.positions.insert(partition, position);
+            return CursorStep::Deliver;
+        };
+        if held < event.floor() {
+            return CursorStep::Reset;
+        }
+        if held >= position {
+            return CursorStep::Skip;
+        }
+        self.positions.insert(partition, position);
+        CursorStep::Deliver
     }
 }
 
 impl fmt::Display for ChangeCursor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "v1:{:032x}:{}", self.epoch, self.sequence)
+        formatter.write_str(TOKEN_PREFIX)?;
+        for (index, (partition, position)) in self.positions.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(",")?;
+            }
+            match partition {
+                ChangePartition::Group(group) => write!(formatter, "g{group}")?,
+                ChangePartition::Calvin(vshard) => write!(formatter, "c{vshard}")?,
+            }
+            write!(
+                formatter,
+                "@{}.{}.{}",
+                position.epoch, position.index, position.sequence
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -64,46 +146,141 @@ impl FromStr for ChangeCursor {
         if token.len() > MAX_TOKEN_LEN {
             return Err(CursorParseError);
         }
-        let Some(rest) = token.strip_prefix(TOKEN_PREFIX) else {
-            return Err(CursorParseError);
-        };
-        let mut parts = rest.split(':');
-        let (Some(epoch), Some(sequence), None) = (parts.next(), parts.next(), parts.next()) else {
-            return Err(CursorParseError);
-        };
-        if epoch.len() != EPOCH_HEX_LEN
-            || !epoch
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || sequence.is_empty()
-            || sequence.len() > 20
-            || (sequence.len() > 1 && sequence.starts_with('0'))
-            || !sequence.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return Err(CursorParseError);
+        let rest = token.strip_prefix(TOKEN_PREFIX).ok_or(CursorParseError)?;
+        let mut positions = BTreeMap::new();
+        if rest.is_empty() {
+            return Ok(Self { positions });
         }
-        let epoch = u128::from_str_radix(epoch, 16).map_err(|_| CursorParseError)?;
-        let sequence = sequence.parse().map_err(|_| CursorParseError)?;
-        Ok(Self { epoch, sequence })
+        for entry in rest.split(',') {
+            if positions.len() == MAX_ENTRIES {
+                return Err(CursorParseError);
+            }
+            let (partition, position) = parse_entry(entry)?;
+            if positions.insert(partition, position).is_some() {
+                return Err(CursorParseError);
+            }
+        }
+        Ok(Self { positions })
     }
+}
+
+fn parse_entry(entry: &str) -> Result<(ChangePartition, CdcOffset), CursorParseError> {
+    let (partition, position) = entry.split_once('@').ok_or(CursorParseError)?;
+    let partition = match partition.as_bytes().first() {
+        Some(b'g') => ChangePartition::Group(number(&partition[1..])?),
+        Some(b'c') => ChangePartition::Calvin(
+            u32::try_from(number(&partition[1..])?).map_err(|_| CursorParseError)?,
+        ),
+        _ => return Err(CursorParseError),
+    };
+    let mut parts = position.split('.');
+    let (Some(epoch), Some(index), Some(sequence), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(CursorParseError);
+    };
+    Ok((
+        partition,
+        CdcOffset::at(number(epoch)?, number(index)?, number(sequence)?),
+    ))
+}
+
+/// A canonical decimal `u64`: digits only, no leading zero.
+fn number(text: &str) -> Result<u64, CursorParseError> {
+    if text.is_empty()
+        || text.len() > 20
+        || (text.len() > 1 && text.starts_with('0'))
+        || !text.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(CursorParseError);
+    }
+    text.parse().map_err(|_| CursorParseError)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::change_stream::{ChangeEvent, ChangeOperation};
+    use crate::types::{DatabaseId, Lsn, TenantId};
+
+    fn event(
+        partition: ChangePartition,
+        position: CdcOffset,
+        floor: CdcOffset,
+    ) -> SequencedChangeEvent {
+        SequencedChangeEvent::new(
+            partition,
+            position,
+            floor,
+            DatabaseId::DEFAULT,
+            ChangeEvent {
+                lsn: Lsn::new(1),
+                tenant_id: TenantId::new(1),
+                collection: "orders".into(),
+                document_id: nodedb_types::RowIdentity::from_user_key("a"),
+                operation: ChangeOperation::Insert,
+                timestamp_ms: 1,
+                after: None,
+            },
+        )
+    }
 
     #[test]
-    fn token_is_strict_and_bounded() {
-        let cursor = ChangeCursor::new(0xab, 42);
-        assert_eq!(cursor.to_string(), "v1:000000000000000000000000000000ab:42");
-        assert!(cursor.to_string().parse::<ChangeCursor>().is_ok());
+    fn token_round_trips_and_is_strict() {
+        let mut cursor = ChangeCursor::default();
+        cursor.raise(ChangePartition::Group(3), CdcOffset::data_event(0, 42, 1));
+        cursor.raise(
+            ChangePartition::Calvin(7),
+            CdcOffset::data_event_in(0, 9, 2, 1),
+        );
+        let token = cursor.to_string();
+        assert!(token.starts_with("v2:"));
+        assert_eq!(token.parse::<ChangeCursor>(), Ok(cursor));
+        assert_eq!("v2:".parse::<ChangeCursor>(), Ok(ChangeCursor::default()));
         for invalid in [
-            "v1:AB:1",
-            "v1:ab:01",
-            "v2:000000000000000000000000000000ab:1",
-            "v1:000000000000000000000000000000ab:-1",
+            "v1:000000000000000000000000000000ab:1",
+            "v2:g01@0.1.2",
+            "v2:g1@0.1",
+            "v2:g1@0.1.2,g1@0.1.3",
+            "v2:x1@0.1.2",
+            "v2:l@0.1.2",
+            "v2:l7@0.1.2",
+            "v2:c99999999999@0.1.2",
+            "v2:g1@0.-1.2",
         ] {
-            assert!(invalid.parse::<ChangeCursor>().is_err());
+            assert!(invalid.parse::<ChangeCursor>().is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn accept_delivers_new_events_and_skips_covered_ones() {
+        let group = ChangePartition::Group(1);
+        let mut cursor = ChangeCursor::default();
+        let first = event(group, CdcOffset::data_event(0, 5, 1), CdcOffset::ZERO);
+        let second = event(group, CdcOffset::data_event(0, 6, 1), CdcOffset::ZERO);
+        assert_eq!(cursor.accept(&first), CursorStep::Deliver);
+        assert_eq!(cursor.accept(&second), CursorStep::Deliver);
+        assert_eq!(cursor.accept(&first), CursorStep::Skip);
+        assert!(cursor.covers(&second));
+        // Another partition's positions never compare with this one.
+        let other = event(
+            ChangePartition::Group(2),
+            CdcOffset::data_event(0, 1, 1),
+            CdcOffset::ZERO,
+        );
+        assert_eq!(cursor.accept(&other), CursorStep::Deliver);
+    }
+
+    #[test]
+    fn a_hole_above_the_cursor_resets() {
+        let group = ChangePartition::Group(1);
+        let mut cursor = ChangeCursor::default();
+        cursor.raise(group, CdcOffset::whole_index(10));
+        let past_hole = event(
+            group,
+            CdcOffset::data_event(0, 30, 1),
+            CdcOffset::whole_index(20),
+        );
+        assert_eq!(cursor.accept(&past_hole), CursorStep::Reset);
     }
 }

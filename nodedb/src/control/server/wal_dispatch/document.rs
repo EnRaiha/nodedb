@@ -6,11 +6,14 @@
 
 use nodedb_physical::physical_plan::DocumentOp;
 
+use crate::bridge::envelope::RowVersion;
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use crate::wal::manager::WalAppender;
 
 /// Encode a document PUT redo record: `(collection, document_id, value,
-/// Option<SyncProvenance>, surrogate)`. Must match `wal_replay_redo_document`'s decode.
+/// Option<SyncProvenance>, surrogate)`, with `(sys_from_ms, valid_from_ms,
+/// valid_until_ms)` appended when `version` is `Some`. Must match
+/// `wal_replay_redo_document`'s decode.
 ///
 /// `document_id` is the row's client identity. The Event Plane replay reads
 /// it back verbatim as the event's row id.
@@ -19,36 +22,114 @@ pub(crate) fn encode_document_put_record(
     document_id: &str,
     value: &[u8],
     surrogate: u32,
+    version: Option<RowVersion>,
 ) -> crate::Result<Vec<u8>> {
     let prov: Option<nodedb_types::sync::wire::SyncProvenance> = None;
-    zerompk::to_msgpack_vec(&(collection, document_id, value, prov, surrogate)).map_err(|e| {
-        crate::Error::Serialization {
-            format: "msgpack".into(),
-            detail: format!("wal document put: {e}"),
-        }
+    match version {
+        Some(v) => zerompk::to_msgpack_vec(&(
+            collection,
+            document_id,
+            value,
+            prov,
+            surrogate,
+            v.sys_from_ms,
+            v.valid_from_ms,
+            v.valid_until_ms,
+        )),
+        None => zerompk::to_msgpack_vec(&(collection, document_id, value, prov, surrogate)),
+    }
+    .map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("wal document put: {e}"),
     })
 }
 
 /// Encode a document DELETE redo record: `(collection, document_id,
-/// Option<SyncProvenance>, surrogate)` — surrogate keys the redb storage row.
+/// Option<SyncProvenance>, surrogate)` — surrogate keys the redb storage row —
+/// with the tombstone's system time appended when `system_from_ms` is `Some`.
 ///
 /// `document_id` is the row's client identity, as for the PUT record.
 pub(crate) fn encode_document_delete_record(
     collection: &str,
     document_id: &str,
     surrogate: u32,
+    system_from_ms: Option<i64>,
 ) -> crate::Result<Vec<u8>> {
     let prov: Option<nodedb_types::sync::wire::SyncProvenance> = None;
-    zerompk::to_msgpack_vec(&(collection, document_id, prov, surrogate)).map_err(|e| {
-        crate::Error::Serialization {
-            format: "msgpack".into(),
-            detail: format!("wal document delete: {e}"),
-        }
+    match system_from_ms {
+        Some(sys) => zerompk::to_msgpack_vec(&(collection, document_id, prov, surrogate, sys)),
+        None => zerompk::to_msgpack_vec(&(collection, document_id, prov, surrogate)),
+    }
+    .map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("wal document delete: {e}"),
     })
 }
 
-/// Append the WAL record for a `DocumentOp`: the allocated LSN for point-write
-/// variants, `None` otherwise. Exhaustive so a new variant can't silently skip durability.
+/// The forward sub-record of a point write whose apply always reports rows
+/// beyond its own: a delete, whose node cascade and sum folds land after it,
+/// and a put or insert that folds materialized-sum targets. The funnel
+/// journals such a forward record as the opening record of the write's
+/// group, so a restore that lacks the parts drops the forward record too.
+/// `None` for every other op.
+pub(super) fn opening_forward_sub_record(
+    op: &DocumentOp,
+) -> crate::Result<Option<crate::wal::RedoSubRecord>> {
+    use nodedb_wal::record::RecordType;
+    if let DocumentOp::PointDelete {
+        collection,
+        document_id,
+        surrogate: Some(surrogate),
+        ..
+    } = op
+    {
+        return Ok(Some(crate::wal::RedoSubRecord {
+            record_type: RecordType::Delete as u32,
+            payload: encode_document_delete_record(
+                collection.as_str(),
+                document_id.as_str(),
+                surrogate.as_u32(),
+                None,
+            )?,
+        }));
+    }
+    if let DocumentOp::PointPut {
+        collection,
+        document_id,
+        value,
+        surrogate,
+        resolved_sum_targets,
+        ..
+    }
+    | DocumentOp::PointInsert {
+        collection,
+        document_id,
+        value,
+        surrogate,
+        resolved_sum_targets,
+        ..
+    } = op
+        && !resolved_sum_targets.is_empty()
+    {
+        return Ok(Some(crate::wal::RedoSubRecord {
+            record_type: RecordType::Put as u32,
+            payload: encode_document_put_record(
+                collection.as_str(),
+                document_id.as_str(),
+                value,
+                surrogate.as_u32(),
+                None,
+            )?,
+        }));
+    }
+    Ok(None)
+}
+
+/// Append the pre-dispatch WAL record for a `DocumentOp`: the allocated LSN
+/// for the point writes whose plan carries the row's post-image, `None`
+/// otherwise. Every other document write journals the rows it stored after
+/// apply, from `Response::write_set` (see `write_set_redo`). Exhaustive so a
+/// new variant can't silently skip durability.
 pub(super) fn wal_append_document_op(
     wal: WalAppender<'_>,
     tenant_id: TenantId,
@@ -69,11 +150,14 @@ pub(super) fn wal_append_document_op(
             // Plan-time materialized-sum resolution is not part of the applied record.
             resolved_sum_targets: _,
         } => {
+            // A versioned row's stamp is decided at apply, so its write set
+            // carries the stamped image and cancels this record.
             let entry = encode_document_put_record(
                 collection.as_str(),
                 document_id.as_str(),
                 value,
                 surrogate.as_u32(),
+                None,
             )?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
@@ -89,26 +173,35 @@ pub(super) fn wal_append_document_op(
             resolved_sum_targets: _,
             deferred_sum_targets: _,
         } => {
+            // An `if_absent` insert that finds the row writes nothing: its
+            // write set cancels this record, as it does for a versioned row.
             let entry = encode_document_put_record(
                 collection.as_str(),
                 document_id.as_str(),
                 value,
                 surrogate.as_u32(),
+                None,
             )?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
+        // A delete of a key unbound in its database removes no row, so it
+        // has no durable effect to journal.
+        DocumentOp::PointDelete {
+            surrogate: None, ..
+        } => None,
         DocumentOp::PointDelete {
             collection,
             document_id,
-            surrogate,
+            surrogate: Some(surrogate),
             ..
         } => {
-            // 4-tuple keys secondary vector-index removal by surrogate on restart —
-            // a 3-tuple would leave the deleted embedding to resurrect.
+            // The surrogate keys the row, its secondary indexes and its vector
+            // nodes on replay.
             let entry = encode_document_delete_record(
                 collection.as_str(),
                 document_id.as_str(),
                 surrogate.as_u32(),
+                None,
             )?;
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
@@ -120,25 +213,26 @@ pub(super) fn wal_append_document_op(
         | DocumentOp::IndexLookup { .. }
         | DocumentOp::IndexedFetch { .. }
         | DocumentOp::EstimateCount { .. }
-        | DocumentOp::MaterializeScan { .. }
-        // Durability comes from the post-apply write-set redo, which re-derives its vShard.
-        | DocumentOp::ApplyBalanceDelta { .. }
-        // Durable as the committed Raft entry; per-row redo shapes can't express a mutation list.
-        | DocumentOp::ResolvedWrite { .. } => None,
-        // Row is redb-synchronous-durable; secondary-vector-index restart fidelity
-        // would need an apply-time per-row Put/Delete record — tracked, not built here.
+        | DocumentOp::MaterializeScan { .. } => None,
+        // The rows these write are decided at apply: an update's post-image,
+        // a predicate's row set, an upsert's branch, a balance fold. The Data
+        // Plane reports every stored row in `Response::write_set`, and the
+        // post-apply redo journals each one.
         DocumentOp::PointUpdate { .. }
         | DocumentOp::Upsert { .. }
         | DocumentOp::BatchInsert { .. }
-        | DocumentOp::InsertSelect { .. }
         | DocumentOp::BulkUpdate { .. }
         | DocumentOp::BulkDelete { .. }
         | DocumentOp::Merge { .. }
-        | DocumentOp::UpdateFromJoin { .. } => None,
-        // Row deletion is redb-durable; per-row HNSW cleanup is carried in
-        // `Response::write_set` and minted as a post-apply `Delete` redo.
-        DocumentOp::Truncate { .. } => None,
-        // DurableElsewhere — index state is catalog + redb durable
+        | DocumentOp::UpdateFromJoin { .. }
+        | DocumentOp::Truncate { .. }
+        | DocumentOp::ApplyBalanceDelta { .. }
+        | DocumentOp::ResolvedWrite { .. } => None,
+        // Resolved on the Control Plane into `BatchInsert` pages; the Data
+        // Plane refuses it.
+        DocumentOp::InsertSelect { .. } => None,
+        // Collection config and derived index entries: the catalog holds the
+        // config, and the index entries derive from the journalled rows.
         DocumentOp::Register { .. }
         | DocumentOp::DropIndex { .. }
         | DocumentOp::BackfillIndex { .. } => None,
@@ -218,7 +312,7 @@ mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::PointDelete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "users"),
             document_id: "u1".to_string(),
-            surrogate: Surrogate::new(5),
+            surrogate: Some(Surrogate::new(5)),
             pk_bytes: vec![],
             returning: None,
             rls_filters: Vec::new(),

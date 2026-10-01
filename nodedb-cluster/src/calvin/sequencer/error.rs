@@ -52,11 +52,17 @@ pub enum SequencerError {
     #[error("transaction plans blob is {bytes} bytes, exceeds limit of {limit} bytes")]
     TxnTooLarge { bytes: usize, limit: usize },
 
-    /// The transaction touches more vShards than the configured fan-out cap.
+    /// A single-entry transaction or one part targets more vShards than one
+    /// sequencer entry carries.
     ///
-    /// The caller must split the transaction or reduce its write set.
-    #[error("transaction touches {vshards} vshards, exceeds limit of {limit}")]
+    /// The coordinator must split the plans into parts that fit.
+    #[error("transaction entry targets {vshards} vshards, exceeds limit of {limit}")]
     FanoutTooWide { vshards: usize, limit: usize },
+
+    /// A multi-part transaction's manifest or one of its streamed parts is
+    /// malformed.
+    #[error("multi-part transaction is malformed: {detail}")]
+    MalformedParts { detail: String },
 
     /// The submitting tenant already has `in_flight >= quota` transactions
     /// in the inbox. Back off and retry.

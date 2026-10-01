@@ -108,6 +108,9 @@ pub enum ArrayOp {
         /// `None` for locally-originated or Raft-replicated writes.
         #[serde(default)]
         provenance: Option<SyncProvenance>,
+        /// The vShard every cell of the op homes to: the vShard its tile
+        /// hashes to. A Calvin transaction routes and locks the write by it.
+        vshard_id: u32,
     },
 
     /// Delete by exact coordinates. `coords_msgpack` is an zerompk
@@ -122,6 +125,10 @@ pub enum ArrayOp {
         /// `None` for locally-originated or Raft-replicated writes.
         #[serde(default)]
         provenance: Option<SyncProvenance>,
+        /// The vShard every coordinate of the op homes to: the vShard its
+        /// tile hashes to. A Calvin transaction routes and locks the write
+        /// by it.
+        vshard_id: u32,
     },
 
     /// Coord-range slice with optional attribute projection.
@@ -251,9 +258,10 @@ pub enum ArrayOp {
     /// externally planned `DROP ARRAY` operation and is idempotent.
     DropArray { array_id: ArrayId },
 
-    /// Undo a staged array drop by restoring its deterministic tombstone.
-    /// This is an internal all-core compensation operation.
-    RestoreArrayDrop { array_id: ArrayId },
+    /// Move a store from `array_id` to `target` on one core: flush, close,
+    /// and rename its directory. The MOVE TENANT rekey sends it to every
+    /// core. Idempotent once the store sits under `target`.
+    RekeyArray { array_id: ArrayId, target: ArrayId },
 
     /// Permanently purge a successfully dropped array's tombstone. This is an
     /// internal all-core operation; failures must be retried before recreation.
@@ -276,7 +284,7 @@ impl ArrayOp {
             | ArrayOp::Flush { array_id, .. }
             | ArrayOp::Compact { array_id, .. }
             | ArrayOp::DropArray { array_id }
-            | ArrayOp::RestoreArrayDrop { array_id }
+            | ArrayOp::RekeyArray { array_id, .. }
             | ArrayOp::PurgeArrayDrop { array_id } => array_id,
             ArrayOp::Elementwise { left, .. } => left,
         }

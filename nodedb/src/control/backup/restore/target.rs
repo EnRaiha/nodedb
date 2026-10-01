@@ -18,6 +18,11 @@ pub(crate) struct DatabaseTarget {
     pub source: DatabaseId,
     /// The database id the rows restore into.
     pub dest: DatabaseId,
+    /// The id of the RESTORE that re-issues the rows. Every re-issued write
+    /// stamps it on its write mark, so a retry of the same envelope knows its
+    /// own writes. `0` for a re-issue that is no RESTORE: its writes mark as
+    /// user writes.
+    pub restore_id: u64,
 }
 
 /// A restored collection's names in the destination database.
@@ -104,6 +109,7 @@ mod tests {
     const TARGET: DatabaseTarget = DatabaseTarget {
         source: DatabaseId::new(1025),
         dest: DatabaseId::new(2048),
+        restore_id: 0,
     };
 
     #[test]
@@ -130,6 +136,7 @@ mod tests {
         let target = DatabaseTarget {
             source: DatabaseId::DEFAULT,
             dest: DatabaseId::DEFAULT,
+            restore_id: 0,
         };
         let name = target
             .resolve("orders")

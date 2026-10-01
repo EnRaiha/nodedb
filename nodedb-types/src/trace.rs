@@ -50,38 +50,16 @@ impl TraceId {
         if parts[0] != "00" {
             return None;
         }
-        // trace-id: 32 lowercase hex chars → 16 bytes.
-        let trace_hex = parts[1];
-        if trace_hex.len() != 32 {
-            return None;
-        }
+        // trace-id: 32 hex chars → 16 bytes. parent-id: 16 hex chars → 8
+        // bytes. flags: 2 hex chars. A wrong length fails the decode.
         let mut trace_bytes = [0u8; 16];
-        for (i, chunk) in trace_hex.as_bytes().chunks(2).enumerate() {
-            let hi = hex_val(chunk[0])?;
-            let lo = hex_val(chunk[1])?;
-            trace_bytes[i] = (hi << 4) | lo;
-        }
-        // parent-id: 16 lowercase hex chars → 8 bytes.
-        let span_hex = parts[2];
-        if span_hex.len() != 16 {
-            return None;
-        }
+        hex::decode_to_slice(parts[1], &mut trace_bytes).ok()?;
         let mut span_bytes = [0u8; 8];
-        for (i, chunk) in span_hex.as_bytes().chunks(2).enumerate() {
-            let hi = hex_val(chunk[0])?;
-            let lo = hex_val(chunk[1])?;
-            span_bytes[i] = (hi << 4) | lo;
-        }
-        // flags: exactly 2 hex chars.
-        let flags_hex = parts[3];
-        if flags_hex.len() != 2 {
-            return None;
-        }
-        let fhi = hex_val(flags_hex.as_bytes()[0])?;
-        let flo = hex_val(flags_hex.as_bytes()[1])?;
-        let flags = (fhi << 4) | flo;
+        hex::decode_to_slice(parts[2], &mut span_bytes).ok()?;
+        let mut flags = [0u8; 1];
+        hex::decode_to_slice(parts[3], &mut flags).ok()?;
 
-        Some((TraceId(trace_bytes), SpanId(span_bytes), flags))
+        Some((TraceId(trace_bytes), SpanId(span_bytes), flags[0]))
     }
 
     /// Render as a W3C `traceparent` header value.
@@ -92,23 +70,9 @@ impl TraceId {
     }
 }
 
-/// Decode a single ASCII hex nibble; returns `None` for non-hex characters.
-#[inline]
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
 impl fmt::Display for TraceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in &self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+        f.write_str(&hex::encode(self.0))
     }
 }
 
@@ -127,15 +91,8 @@ impl FromStr for TraceId {
     type Err = TraceIdParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.len() != 32 {
-            return Err(TraceIdParseError(s.to_owned()));
-        }
         let mut bytes = [0u8; 16];
-        for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-            let hi = hex_val(chunk[0]).ok_or_else(|| TraceIdParseError(s.to_owned()))?;
-            let lo = hex_val(chunk[1]).ok_or_else(|| TraceIdParseError(s.to_owned()))?;
-            bytes[i] = (hi << 4) | lo;
-        }
+        hex::decode_to_slice(s, &mut bytes).map_err(|_| TraceIdParseError(s.to_owned()))?;
         Ok(TraceId(bytes))
     }
 }
@@ -163,10 +120,7 @@ impl SpanId {
 
 impl fmt::Display for SpanId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in &self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+        f.write_str(&hex::encode(self.0))
     }
 }
 
@@ -185,15 +139,8 @@ impl FromStr for SpanId {
     type Err = SpanIdParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.len() != 16 {
-            return Err(SpanIdParseError(s.to_owned()));
-        }
         let mut bytes = [0u8; 8];
-        for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-            let hi = hex_val(chunk[0]).ok_or_else(|| SpanIdParseError(s.to_owned()))?;
-            let lo = hex_val(chunk[1]).ok_or_else(|| SpanIdParseError(s.to_owned()))?;
-            bytes[i] = (hi << 4) | lo;
-        }
+        hex::decode_to_slice(s, &mut bytes).map_err(|_| SpanIdParseError(s.to_owned()))?;
         Ok(SpanId(bytes))
     }
 }
@@ -242,11 +189,11 @@ mod tests {
         let s = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
         let (tid, sid, flags) = TraceId::from_traceparent(s).expect("valid traceparent");
         // Verify trace-id bytes.
-        let expected_trace = hex_decode_16("4bf92f3577b34da6a3ce929d0e0e4736");
-        assert_eq!(tid.0, expected_trace);
+        let expected_trace = hex::decode("4bf92f3577b34da6a3ce929d0e0e4736").unwrap();
+        assert_eq!(tid.0.as_slice(), expected_trace.as_slice());
         // Verify span-id bytes.
-        let expected_span = hex_decode_8("00f067aa0ba902b7");
-        assert_eq!(sid.0, expected_span);
+        let expected_span = hex::decode("00f067aa0ba902b7").unwrap();
+        assert_eq!(sid.0.as_slice(), expected_span.as_slice());
         assert_eq!(flags, 0x01);
     }
 
@@ -309,23 +256,5 @@ mod tests {
             s.chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
         );
-    }
-
-    // ── helpers ──────────────────────────────────────────────────────────────
-
-    fn hex_decode_16(s: &str) -> [u8; 16] {
-        let mut out = [0u8; 16];
-        for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-            out[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap();
-        }
-        out
-    }
-
-    fn hex_decode_8(s: &str) -> [u8; 8] {
-        let mut out = [0u8; 8];
-        for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-            out[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap();
-        }
-        out
     }
 }

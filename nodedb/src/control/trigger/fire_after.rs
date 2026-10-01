@@ -7,15 +7,21 @@
 //! and invokes the statement executor for each matching trigger body.
 //!
 //! Supports three execution modes via `mode_filter`:
-//! - `Some(Sync)`: fire in the Control Plane write path (same transaction)
+//! - `Some(Sync)`: fire in the Control Plane write path
 //! - `Some(Async)`: fire from Event Plane (eventually consistent)
-//! - `Some(Deferred)`: fire at COMMIT time (same transaction, batched)
-//! - `None`: fire all AFTER triggers regardless of mode (legacy behavior)
+//! - `Some(Deferred)`: fire at COMMIT time, batched
+//! - `None`: fire all AFTER triggers regardless of mode
+//!
+//! A SYNC body joins the transaction of the write that fired it (`joined`):
+//! the write and the body commit together or not at all. An ASYNC or
+//! DEFERRED body runs in its own transaction: its writes commit together when
+//! it succeeds and none apply when it fails.
 
 use crate::control::planner::procedural::executor::bindings::RowBindings;
 use crate::control::planner::procedural::executor::core::CrossShardOrigin;
 use crate::control::security::catalog::trigger_types::{TriggerExecutionMode, TriggerTiming};
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
 
@@ -53,18 +59,21 @@ pub struct FireAfterInsertParams<'a> {
     /// A retry sets this. Without it a retry re-fires every trigger matching
     /// the operation, re-running the siblings that already succeeded.
     pub only_trigger: Option<&'a str>,
+    /// The triggering statement's transaction, which a SYNC body joins.
+    /// `None` on the Event Plane: each body runs its own transaction.
+    pub joined: Option<&'a DmlTxnCtx<'a>>,
 }
 
 /// Fire AFTER ROW triggers for an INSERT operation.
 ///
 /// Called after a successful INSERT dispatch. `new_fields` contains the
-/// inserted row's field values. The trigger body's DML is dispatched through
-/// the normal plan+SPSC path, executing in the same logical transaction context.
+/// inserted row's field values. The trigger body's DML is planned through
+/// the normal path and commits as the body's own transaction.
 ///
 /// `mode_filter` selects which execution mode to fire:
 /// - `Some(Sync)`: only fire SYNC triggers (called from write path)
 /// - `Some(Async)`: only fire ASYNC triggers (called from Event Plane)
-/// - `None`: fire all AFTER triggers regardless of mode (legacy behavior)
+/// - `None`: fire all AFTER triggers regardless of mode
 pub async fn fire_after_insert(params: FireAfterInsertParams<'_>) -> FireReport {
     let FireAfterInsertParams {
         state,
@@ -78,6 +87,7 @@ pub async fn fire_after_insert(params: FireAfterInsertParams<'_>) -> FireReport 
         cross_shard_origin,
         on_error,
         only_trigger,
+        joined,
     } = params;
 
     let triggers = state.trigger_registry.get_matching(
@@ -114,6 +124,7 @@ pub async fn fire_after_insert(params: FireAfterInsertParams<'_>) -> FireReport 
         cascade_depth,
         cross_shard_origin,
         on_error,
+        joined,
     })
     .await
 }
@@ -147,6 +158,9 @@ pub struct FireAfterUpdateParams<'a> {
     /// A retry sets this. Without it a retry re-fires every trigger matching
     /// the operation, re-running the siblings that already succeeded.
     pub only_trigger: Option<&'a str>,
+    /// The triggering statement's transaction, which a SYNC body joins.
+    /// `None` on the Event Plane: each body runs its own transaction.
+    pub joined: Option<&'a DmlTxnCtx<'a>>,
 }
 
 /// Fire AFTER ROW triggers for an UPDATE operation.
@@ -167,6 +181,7 @@ pub async fn fire_after_update(params: FireAfterUpdateParams<'_>) -> FireReport 
         cross_shard_origin,
         on_error,
         only_trigger,
+        joined,
     } = params;
 
     let triggers = state.trigger_registry.get_matching(
@@ -203,6 +218,7 @@ pub async fn fire_after_update(params: FireAfterUpdateParams<'_>) -> FireReport 
         cascade_depth,
         cross_shard_origin,
         on_error,
+        joined,
     })
     .await
 }
@@ -234,6 +250,9 @@ pub struct FireAfterDeleteParams<'a> {
     /// A retry sets this. Without it a retry re-fires every trigger matching
     /// the operation, re-running the siblings that already succeeded.
     pub only_trigger: Option<&'a str>,
+    /// The triggering statement's transaction, which a SYNC body joins.
+    /// `None` on the Event Plane: each body runs its own transaction.
+    pub joined: Option<&'a DmlTxnCtx<'a>>,
 }
 
 /// Fire AFTER ROW triggers for a DELETE operation.
@@ -252,6 +271,7 @@ pub async fn fire_after_delete(params: FireAfterDeleteParams<'_>) -> FireReport 
         cross_shard_origin,
         on_error,
         only_trigger,
+        joined,
     } = params;
 
     let triggers = state.trigger_registry.get_matching(
@@ -288,28 +308,49 @@ pub async fn fire_after_delete(params: FireAfterDeleteParams<'_>) -> FireReport 
         cascade_depth,
         cross_shard_origin,
         on_error,
+        joined,
     })
     .await
+}
+
+/// One block of trigger DML shipped from another node, applied here.
+pub struct ShippedBlock<'a> {
+    pub tenant_id: TenantId,
+    pub database_id: DatabaseId,
+    /// One procedural block.
+    pub sql: &'a str,
+    pub cascade_depth: u32,
+    /// The vShard the request addresses. The block's writes and every write
+    /// they derive commit in one transaction, whichever vShards they span.
+    /// The request's key rides this vShard's redo record.
+    pub target_vshard: u32,
+    /// The request's dedup key, recorded by the commit's redo record.
+    pub applied_key: crate::wal::CrossShardAppliedKey,
 }
 
 /// Execute raw SQL in a trigger-like context (no row bindings).
 ///
 /// Used by the cross-shard receiver to execute trigger-originated DML
-/// on the target node. The SQL is parsed and executed through the normal
-/// Control Plane → Data Plane path with cascade depth tracking.
+/// on the target node. The block's statements commit as one transaction
+/// whose redo record carries its applied key, with cascade depth tracking.
 pub async fn fire_sql(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    sql: &str,
-    cascade_depth: u32,
+    shipped: ShippedBlock<'_>,
 ) -> crate::Result<()> {
     use crate::control::planner::procedural::executor::bindings::RowBindings;
     use crate::control::planner::procedural::executor::core::{
-        MAX_CASCADE_DEPTH, StatementExecutor,
+        AtomicBody, MAX_CASCADE_DEPTH, StatementExecutor,
     };
 
+    let ShippedBlock {
+        tenant_id,
+        database_id,
+        sql,
+        cascade_depth,
+        target_vshard,
+        applied_key,
+    } = shipped;
     if cascade_depth >= MAX_CASCADE_DEPTH {
         return Err(crate::Error::BadRequest {
             detail: format!("cross-shard cascade depth exceeded ({MAX_CASCADE_DEPTH})"),
@@ -329,9 +370,13 @@ pub async fn fire_sql(
         database_id,
         cascade_depth,
         crate::event::EventSource::Trigger,
-    );
+    )
+    .with_atomic_body(AtomicBody::CrossShardApply)
+    .with_applied_key(applied_key, target_vshard);
     let bindings = RowBindings::empty();
 
+    // The block has no post-commit effects: it refuses PUBLISH, and with no
+    // cross-shard origin every statement stages here.
     executor
         .execute_block(&block, &bindings)
         .await

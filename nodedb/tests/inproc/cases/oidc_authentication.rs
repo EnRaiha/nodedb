@@ -8,9 +8,33 @@ use base64::Engine;
 use nodedb::config::auth::{JwtAuthConfig, JwtProviderConfig};
 use nodedb::control::security::jwks::registry::JwksRegistry;
 use nodedb::control::security::oidc::{claim_mapping::apply_claim_mapping, verify_bearer_token};
-use nodedb_test_support::pgwire_auth_helpers::{ddl_ok, make_state_with_catalog, superuser};
+use nodedb_test_support::pgwire_auth_helpers::{
+    ddl_ok, make_state_with_catalog_configured, superuser,
+};
 
 // ── Catalog-backed bearer verification ─────────────────────────────────────
+
+/// The JWKS policy every catalog-provider test runs under: plain HTTP to the
+/// loopback fixture server.
+fn loopback_jwks_config() -> JwtAuthConfig {
+    JwtAuthConfig {
+        allow_http_jwks: true,
+        allow_jwks_hosts: vec!["localhost".into()],
+        allow_jwks_cidrs: vec!["127.0.0.0/8".into(), "::1/128".into()],
+        ..JwtAuthConfig::default()
+    }
+}
+
+/// A catalog-backed state whose JWKS registry is built from `config`. The
+/// registry is set before the gateway install, as production boot sets it.
+async fn state_with_registry(
+    config: JwtAuthConfig,
+) -> nodedb_test_support::pgwire_auth_helpers::BootedState {
+    let registry = JwksRegistry::init(config)
+        .await
+        .expect("test JWKS registry must initialize");
+    make_state_with_catalog_configured(|state| state.jwks_registry = Some(Arc::new(registry)))
+}
 
 async fn spawn_static_jwks(body: String) -> String {
     let listener = tokio::net::TcpListener::bind("[::]:0")
@@ -137,7 +161,7 @@ async fn catalog_provider_tenant_binding_overrides_signed_tenant_claim() {
     let issuer = "https://catalog-idp.example/";
     let (jwks, token) = signed_jwt_fixture(issuer, "nodedb-api", 999);
     let jwks_uri = spawn_static_jwks(jwks).await;
-    let mut state = make_state_with_catalog();
+    let state = state_with_registry(loopback_jwks_config()).await;
     let su = superuser();
 
     ddl_ok(&state, &su, "CREATE TENANT acme ID 42").await;
@@ -154,18 +178,6 @@ async fn catalog_provider_tenant_binding_overrides_signed_tenant_claim() {
         ),
     )
     .await;
-
-    let registry = JwksRegistry::init(JwtAuthConfig {
-        allow_http_jwks: true,
-        allow_jwks_hosts: vec!["localhost".into()],
-        allow_jwks_cidrs: vec!["127.0.0.0/8".into(), "::1/128".into()],
-        ..JwtAuthConfig::default()
-    })
-    .await
-    .expect("test JWKS registry must initialize");
-    Arc::get_mut(&mut state)
-        .expect("test state must remain uniquely owned")
-        .jwks_registry = Some(Arc::new(registry));
 
     let (identity, _claims) = verify_bearer_token(&state, &token)
         .await
@@ -184,7 +196,19 @@ async fn catalog_provider_does_not_reuse_static_provider_cache_entry() {
     let (catalog_jwks, _) = signed_jwt_fixture(catalog_issuer, "catalog-api", 999);
     let static_jwks_uri = spawn_static_jwks(static_jwks).await;
     let catalog_jwks_uri = spawn_static_jwks(catalog_jwks).await;
-    let mut state = make_state_with_catalog();
+    let state = state_with_registry(JwtAuthConfig {
+        providers: vec![JwtProviderConfig {
+            // This is exactly the catalog cache identity generated before
+            // static identities moved into their own generated domain.
+            name: format!("catalog:colliding_idp:{catalog_jwks_uri}"),
+            jwks_url: static_jwks_uri,
+            issuer: "https://static-collision-idp.example/".into(),
+            audience: "static-api".into(),
+            tenant_id: 1,
+        }],
+        ..loopback_jwks_config()
+    })
+    .await;
     let su = superuser();
 
     ddl_ok(&state, &su, "CREATE TENANT catalog_tenant ID 42").await;
@@ -201,27 +225,6 @@ async fn catalog_provider_does_not_reuse_static_provider_cache_entry() {
         ),
     )
     .await;
-
-    let registry = JwksRegistry::init(JwtAuthConfig {
-        allow_http_jwks: true,
-        allow_jwks_hosts: vec!["localhost".into()],
-        allow_jwks_cidrs: vec!["127.0.0.0/8".into(), "::1/128".into()],
-        providers: vec![JwtProviderConfig {
-            // This is exactly the catalog cache identity generated before
-            // static identities moved into their own generated domain.
-            name: format!("catalog:colliding_idp:{catalog_jwks_uri}"),
-            jwks_url: static_jwks_uri,
-            issuer: "https://static-collision-idp.example/".into(),
-            audience: "static-api".into(),
-            tenant_id: 1,
-        }],
-        ..JwtAuthConfig::default()
-    })
-    .await
-    .expect("test JWKS registry must initialize");
-    Arc::get_mut(&mut state)
-        .expect("test state must remain uniquely owned")
-        .jwks_registry = Some(Arc::new(registry));
 
     let err = verify_bearer_token(&state, &token)
         .await
@@ -243,7 +246,7 @@ async fn catalog_authentication_failures_are_client_indistinguishable() {
     let (expired_jwks, expired_token) =
         signed_jwt_fixture_with_expiry(issuer, "expired-audience", 999, 1);
     let expired_jwks_uri = spawn_static_jwks(expired_jwks).await;
-    let mut state = make_state_with_catalog();
+    let state = state_with_registry(loopback_jwks_config()).await;
     let su = superuser();
 
     ddl_ok(&state, &su, "CREATE TENANT auth_failure ID 42").await;
@@ -273,18 +276,6 @@ async fn catalog_authentication_failures_are_client_indistinguishable() {
         ),
     )
     .await;
-
-    let registry = JwksRegistry::init(JwtAuthConfig {
-        allow_http_jwks: true,
-        allow_jwks_hosts: vec!["localhost".into()],
-        allow_jwks_cidrs: vec!["127.0.0.0/8".into(), "::1/128".into()],
-        ..JwtAuthConfig::default()
-    })
-    .await
-    .expect("test JWKS registry must initialize");
-    Arc::get_mut(&mut state)
-        .expect("test state must remain uniquely owned")
-        .jwks_registry = Some(Arc::new(registry));
 
     let errors = [
         verify_bearer_token(&state, &unknown_issuer_token)
@@ -356,7 +347,7 @@ async fn authenticated_token_is_rejected_when_provider_tenant_was_dropped() {
     let issuer = "https://dropped-tenant-idp.example/";
     let (jwks, token) = signed_jwt_fixture(issuer, "nodedb-api", 999);
     let jwks_uri = spawn_static_jwks(jwks).await;
-    let mut state = make_state_with_catalog();
+    let state = state_with_registry(loopback_jwks_config()).await;
     let su = superuser();
 
     ddl_ok(&state, &su, "CREATE TENANT removed_tenant ID 42").await;
@@ -374,18 +365,6 @@ async fn authenticated_token_is_rejected_when_provider_tenant_was_dropped() {
     )
     .await;
     ddl_ok(&state, &su, "DROP TENANT removed_tenant").await;
-
-    let registry = JwksRegistry::init(JwtAuthConfig {
-        allow_http_jwks: true,
-        allow_jwks_hosts: vec!["localhost".into()],
-        allow_jwks_cidrs: vec!["127.0.0.0/8".into(), "::1/128".into()],
-        ..JwtAuthConfig::default()
-    })
-    .await
-    .expect("test JWKS registry must initialize");
-    Arc::get_mut(&mut state)
-        .expect("test state must remain uniquely owned")
-        .jwks_registry = Some(Arc::new(registry));
 
     let err = verify_bearer_token(&state, &forged_signature(&token))
         .await
@@ -406,7 +385,7 @@ async fn catalog_providers_with_shared_issuer_route_by_audience() {
     let issuer = "https://shared-catalog-idp.example/";
     let (jwks, token) = signed_jwt_fixture(issuer, "tenant-b-api", 999);
     let jwks_uri = spawn_static_jwks(jwks).await;
-    let mut state = make_state_with_catalog();
+    let state = state_with_registry(loopback_jwks_config()).await;
     let su = superuser();
 
     ddl_ok(&state, &su, "CREATE TENANT alpha ID 42").await;
@@ -429,18 +408,6 @@ async fn catalog_providers_with_shared_issuer_route_by_audience() {
         )
         .await;
     }
-
-    let registry = JwksRegistry::init(JwtAuthConfig {
-        allow_http_jwks: true,
-        allow_jwks_hosts: vec!["localhost".into()],
-        allow_jwks_cidrs: vec!["127.0.0.0/8".into(), "::1/128".into()],
-        ..JwtAuthConfig::default()
-    })
-    .await
-    .expect("test JWKS registry must initialize");
-    Arc::get_mut(&mut state)
-        .expect("test state must remain uniquely owned")
-        .jwks_registry = Some(Arc::new(registry));
 
     let (identity, _claims) = verify_bearer_token(&state, &token)
         .await
@@ -472,23 +439,12 @@ async fn catalog_provider_without_tenant_binding_is_rejected() {
     let encoded = zerompk::to_msgpack_vec(&legacy).expect("legacy provider must serialize");
     let provider = zerompk::from_msgpack(&encoded).expect("legacy provider must deserialize");
 
-    let mut state = make_state_with_catalog();
+    let state = state_with_registry(loopback_jwks_config()).await;
     state
         .credentials
         .catalog()
         .put_oidc_provider(&provider)
         .expect("legacy provider fixture must persist");
-    let registry = JwksRegistry::init(JwtAuthConfig {
-        allow_http_jwks: true,
-        allow_jwks_hosts: vec!["localhost".into()],
-        allow_jwks_cidrs: vec!["127.0.0.0/8".into(), "::1/128".into()],
-        ..JwtAuthConfig::default()
-    })
-    .await
-    .expect("test JWKS registry must initialize");
-    Arc::get_mut(&mut state)
-        .expect("test state must remain uniquely owned")
-        .jwks_registry = Some(Arc::new(registry));
 
     let err = verify_bearer_token(&state, &forged_signature(&token))
         .await

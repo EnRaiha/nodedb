@@ -4,12 +4,8 @@
 //!
 //! `KV_INCR` builds its `KvOp` by hand instead of planning a statement.
 //! Outside a transaction block it must take the durable route a planned write
-//! takes. The route depends on the node:
-//!
-//! - The default single-node Calvin stack proposes it through Raft, and the
-//!   applying funnel appends its WAL record.
-//! - A standalone node has no proposer, and the funnel appends the record on
-//!   the local route.
+//! takes: the node proposes it through Raft, and the applying funnel appends
+//! its WAL record.
 //!
 //! The checkpoint interval is pushed beyond the test's runtime, so the values
 //! read after the crash come from WAL replay alone.
@@ -31,11 +27,6 @@ const MAX_TEST_WALL_CLOCK: Duration = Duration::from_secs(120);
 #[tokio::test(flavor = "multi_thread")]
 async fn an_autocommit_kv_incr_survives_kill_9_on_the_raft_route() {
     survives_kill_9(CrashHarness::new()).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn an_autocommit_kv_incr_survives_kill_9_on_the_local_route() {
-    survives_kill_9(CrashHarness::new().standalone()).await;
 }
 
 async fn survives_kill_9(h: CrashHarness) {

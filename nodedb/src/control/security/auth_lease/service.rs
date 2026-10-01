@@ -169,18 +169,16 @@ impl LeaderLeaseService {
     }
 
     fn not_leader_renewal(state: Option<&SharedState>) -> AuthLeaseRenewResponse {
+        let (leader_hint, term) = state.map_or((None, 0), leader_hint);
         AuthLeaseRenewResponse {
-            outcome: AuthLeaseRenewOutcome::NotLeader {
-                leader_hint: state.and_then(leader_hint),
-            },
+            outcome: AuthLeaseRenewOutcome::NotLeader { leader_hint, term },
         }
     }
 
     fn not_leader_barrier(state: Option<&SharedState>) -> AuthBarrierResponse {
+        let (leader_hint, term) = state.map_or((None, 0), leader_hint);
         AuthBarrierResponse {
-            outcome: AuthBarrierOutcome::NotLeader {
-                leader_hint: state.and_then(leader_hint),
-            },
+            outcome: AuthBarrierOutcome::NotLeader { leader_hint, term },
         }
     }
 

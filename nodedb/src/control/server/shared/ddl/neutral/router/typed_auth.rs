@@ -30,30 +30,33 @@ pub(super) async fn try_typed(
             role,
             tenant,
             if_not_exists,
-        }) => Some(user::create_user(
-            state,
-            identity,
-            username,
-            password,
-            role.as_deref(),
-            tenant.as_ref(),
-            *if_not_exists,
-        )),
+        }) => Some(
+            user::create_user(
+                state,
+                identity,
+                username,
+                password,
+                role.as_deref(),
+                tenant.as_ref(),
+                *if_not_exists,
+            )
+            .await,
+        ),
 
         NodedbStatement::Auth(AuthStmt::AlterUser { username, op }) => {
-            Some(user::alter_user(state, identity, username, op))
+            Some(user::alter_user(state, identity, username, op).await)
         }
 
         NodedbStatement::Auth(AuthStmt::AlterRole { name, sub_op }) => {
-            Some(role::alter_role_typed(state, identity, name, sub_op))
+            Some(role::alter_role_typed(state, identity, database_id, name, sub_op).await)
         }
 
         NodedbStatement::Auth(AuthStmt::GrantRole { roles, grantee }) => {
-            Some(grant::role::grant_role(state, identity, roles, grantee))
+            Some(grant::role::grant_role(state, identity, roles, grantee).await)
         }
 
         NodedbStatement::Auth(AuthStmt::RevokeRole { roles, grantee }) => {
-            Some(grant::role::revoke_role(state, identity, roles, grantee))
+            Some(grant::role::revoke_role(state, identity, roles, grantee).await)
         }
 
         NodedbStatement::Auth(AuthStmt::GrantPermission {
@@ -61,44 +64,58 @@ pub(super) async fn try_typed(
             target_type,
             target_name,
             grantee,
-        }) => Some(grant::permission::grant_permission(
-            state,
-            identity,
-            permissions,
-            target_type,
-            target_name,
-            grantee,
-        )),
+        }) => Some(
+            grant::permission::grant_permission(
+                state,
+                identity,
+                database_id,
+                permissions,
+                target_type,
+                target_name,
+                grantee,
+            )
+            .await,
+        ),
 
         NodedbStatement::Auth(AuthStmt::RevokePermission {
             permissions,
             target_type,
             target_name,
             grantee,
-        }) => Some(grant::permission::revoke_permission(
-            state,
-            identity,
-            permissions,
-            target_type,
-            target_name,
-            grantee,
-        )),
+        }) => Some(
+            grant::permission::revoke_permission(
+                state,
+                identity,
+                database_id,
+                permissions,
+                target_type,
+                target_name,
+                grantee,
+            )
+            .await,
+        ),
 
         NodedbStatement::Auth(AuthStmt::GrantDatabasePermission {
             permission,
             db_name,
             grantee,
-        }) => Some(grant::database_permission::grant_database(
-            state, identity, permission, db_name, grantee,
-        )),
+        }) => Some(
+            grant::database_permission::grant_database(
+                state, identity, permission, db_name, grantee,
+            )
+            .await,
+        ),
 
         NodedbStatement::Auth(AuthStmt::RevokeDatabasePermission {
             permission,
             db_name,
             grantee,
-        }) => Some(grant::database_permission::revoke_database(
-            state, identity, permission, db_name, grantee,
-        )),
+        }) => Some(
+            grant::database_permission::revoke_database(
+                state, identity, permission, db_name, grantee,
+            )
+            .await,
+        ),
 
         NodedbStatement::Auth(AuthStmt::CreateOidcProvider {
             name,
@@ -107,31 +124,31 @@ pub(super) async fn try_typed(
             tenant_id,
             audience,
             claim_mappings,
-        }) => Some(oidc::create_oidc_provider(
-            state,
-            identity,
-            oidc::CreateOidcProviderParams {
-                name,
-                issuer,
-                jwks_uri,
-                tenant_id: *tenant_id,
-                audience: audience.as_deref(),
-                claim_mappings,
-            },
-        )),
+        }) => Some(
+            oidc::create_oidc_provider(
+                state,
+                identity,
+                oidc::CreateOidcProviderParams {
+                    name,
+                    issuer,
+                    jwks_uri,
+                    tenant_id: *tenant_id,
+                    audience: audience.as_deref(),
+                    claim_mappings,
+                },
+            )
+            .await,
+        ),
 
         NodedbStatement::Auth(AuthStmt::AlterOidcProviderClaimMapping {
             name,
             claim_mappings,
-        }) => Some(oidc::alter_oidc_provider_claim_mapping(
-            state,
-            identity,
-            name,
-            claim_mappings,
-        )),
+        }) => Some(
+            oidc::alter_oidc_provider_claim_mapping(state, identity, name, claim_mappings).await,
+        ),
 
         NodedbStatement::Auth(AuthStmt::DropOidcProvider { name, if_exists }) => {
-            Some(oidc::drop_oidc_provider(state, identity, name, *if_exists))
+            Some(oidc::drop_oidc_provider(state, identity, name, *if_exists).await)
         }
 
         NodedbStatement::Auth(AuthStmt::ShowOidcProviders) => {
@@ -139,9 +156,8 @@ pub(super) async fn try_typed(
         }
 
         // SHOW PERMISSIONS [ON <collection>] [FOR <grantee>]. Parses into a
-        // typed `AuthStmt::ShowPermissions` and was dispatched from the pgwire
-        // typed-AST sync router (`sync_ops`). The permission-store reads are
-        // preserved verbatim in `inspect`.
+        // typed `AuthStmt::ShowPermissions`. The permission-store reads live
+        // in `inspect`.
         NodedbStatement::Auth(AuthStmt::ShowPermissions {
             on_collection,
             for_grantee,

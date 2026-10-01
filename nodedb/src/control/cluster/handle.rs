@@ -16,6 +16,9 @@ use nodedb_cluster::GroupAppliedWatchers;
 /// rationale.
 pub struct PendingSubsystems {
     pub config: nodedb_cluster::ClusterConfig,
+    /// SWIM socket bound before `start_cluster`, so its address is already
+    /// in this node's topology entry.
+    pub swim_transport: Arc<nodedb_cluster::UdpTransport>,
 }
 
 /// Everything the main server needs to wire the cluster into the rest of
@@ -66,4 +69,7 @@ pub struct ClusterHandle {
     /// calls [`nodedb_cluster::start_cluster_subsystems`] with the
     /// loop's shared `multi_raft` handle.
     pub pending_subsystems: Mutex<Option<PendingSubsystems>>,
+    /// State of every vShard migration this node's rebalancer runs. Shared
+    /// with `SharedState` for `SHOW MIGRATIONS` and the status route.
+    pub migration_tracker: Arc<nodedb_cluster::MigrationTracker>,
 }

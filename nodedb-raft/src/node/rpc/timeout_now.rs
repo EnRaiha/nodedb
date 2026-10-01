@@ -21,12 +21,23 @@ impl<S: LogStorage> RaftNode<S> {
     /// Deliberately calls `start_election` rather than `start_pre_election`:
     /// a transfer needs an immediate, guaranteed term bump, and the outgoing
     /// leader has already confirmed the target is caught up.
+    ///
+    /// The campaign's vote requests carry `transfer`, so voters that still
+    /// hear the outgoing leader grant them. That leader stopped serving lease
+    /// reads when the transfer began.
     pub fn handle_timeout_now(&mut self, req: &TimeoutNowRequest) {
         if self.role == NodeRole::Follower
             && req.term == self.hard_state.current_term
             && req.leader_id == self.leader_id
         {
             self.start_election();
+            let term = self.hard_state.current_term;
+            self.transfer_campaign_term = term;
+            for (_, vote) in self.ready.vote_requests.iter_mut() {
+                if vote.term == term {
+                    vote.transfer = true;
+                }
+            }
         }
     }
 }
@@ -41,6 +52,7 @@ mod tests {
     };
     use crate::node::config::RaftConfig;
     use crate::node::core::RaftNode;
+    use crate::node::leader_lease::UNTRACKED_ROUND;
     use crate::state::NodeRole;
     use crate::storage::MemStorage;
     use crate::test_support::force_election;
@@ -89,6 +101,8 @@ mod tests {
             entries: vec![],
             leader_commit: 0,
             group_id: 1,
+            round: 1,
+            replicated_floor: 0,
         });
         assert_eq!(node.role(), NodeRole::Follower);
         assert_eq!(node.current_term(), 1);
@@ -101,6 +115,8 @@ mod tests {
             term: 1,
             success: true,
             last_log_index: idx,
+            round: UNTRACKED_ROUND,
+            needs_snapshot: false,
         }
     }
 
@@ -127,6 +143,29 @@ mod tests {
         target.handle_timeout_now(&req);
         assert_eq!(target.role(), NodeRole::Candidate);
         assert_eq!(target.current_term(), term_before + 1);
+
+        // Voters still hear leader 1, and grant only because this is a
+        // transfer campaign.
+        let votes = target.take_ready().vote_requests;
+        assert_eq!(votes.len(), 2);
+        assert!(votes.iter().all(|(_, vote)| vote.transfer));
+        let mut voter = RaftNode::new(cfg(3, vec![1, 2], vec![]), MemStorage::new());
+        voter.handle_append_entries(&AppendEntriesRequest {
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+            group_id: 1,
+            round: 1,
+            replicated_floor: 0,
+        });
+        let (_, vote) = votes
+            .iter()
+            .find(|(peer, _)| *peer == 3)
+            .expect("the target asks voter 3");
+        assert!(voter.handle_request_vote(vote).vote_granted);
     }
 
     // t2: transfer to a lagging target defers; the trigger fires once the
@@ -222,6 +261,8 @@ mod tests {
                 term: 5,
                 success: false,
                 last_log_index: 0,
+                round: UNTRACKED_ROUND,
+                needs_snapshot: false,
             },
         );
         assert_eq!(leader.role(), NodeRole::Follower);

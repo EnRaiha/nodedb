@@ -143,14 +143,13 @@ fn merge_overlay(
         by_prefix
             .entry(prefix)
             .or_insert_with(|| SparseTileBuilder::new(schema))
-            .push_row(SparseRow {
+            .push_row(SparseRow::live(
                 coord,
-                attrs: &put.attrs,
-                surrogate: put.surrogate,
-                valid_from_ms: put.valid_from_ms,
-                valid_until_ms: put.valid_until_ms,
-                kind: RowKind::Live,
-            })?;
+                &put.attrs,
+                put.surrogate,
+                put.valid_from_ms,
+                put.valid_until_ms,
+            ))?;
     }
     let mut staged: Vec<(u64, SparseTile)> = by_prefix
         .into_iter()
@@ -224,11 +223,12 @@ fn retain_rows(
         } else {
             Vec::new()
         };
-        let surrogate = tile
-            .surrogates
-            .get(row)
-            .copied()
-            .unwrap_or(nodedb_types::Surrogate::ZERO);
+        // A live row keeps its bound surrogate; a tombstone or erasure row
+        // keeps none.
+        let surrogate = match kind {
+            RowKind::Live => Some(tile.live_surrogate(row)?),
+            RowKind::Tombstone | RowKind::GdprErased => None,
+        };
         let valid_from_ms = tile.valid_from_ms.get(row).copied().unwrap_or(0);
         let valid_until_ms = tile
             .valid_until_ms
@@ -282,7 +282,7 @@ mod tests {
     fn put(v: i64) -> StagedCellPut {
         StagedCellPut {
             attrs: vec![CellValue::Int64(v)],
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1000 + v as u32),
             system_from_ms: 0,
             valid_from_ms: 0,
             valid_until_ms: i64::MAX,
@@ -292,7 +292,14 @@ mod tests {
     fn base_tile(schema: &ArraySchema, cells: &[(i64, i64)]) -> SparseTile {
         let mut b = SparseTileBuilder::new(schema);
         for (x, v) in cells {
-            b.push(&coord(*x), &[CellValue::Int64(*v)]).unwrap();
+            b.push_row(SparseRow::live(
+                &coord(*x),
+                &[CellValue::Int64(*v)],
+                Surrogate::new(*x as u32 + 1),
+                0,
+                i64::MAX,
+            ))
+            .unwrap();
         }
         b.build()
     }

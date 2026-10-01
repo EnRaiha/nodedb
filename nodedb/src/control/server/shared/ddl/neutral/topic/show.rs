@@ -2,10 +2,8 @@
 
 //! Protocol-neutral `SHOW TOPICS` DDL handler.
 //!
-//! Ported from the pgwire `ddl::topic::show` handler. The tenant scoping, the
-//! per-topic buffered-event counting, and the column layout are preserved
-//! verbatim; only the result construction changed from a pgwire `QueryResponse`
-//! to the protocol-neutral [`DdlResult::Rows`].
+//! The tenant scoping, the per-topic buffered-event counting, and the column
+//! layout run here. The result is the protocol-neutral [`DdlResult::Rows`].
 
 use serde_json::{Map, Value as JsonValue};
 

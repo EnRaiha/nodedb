@@ -2,8 +2,7 @@
 
 //! DDL-time validation for CHECK constraint expressions.
 //!
-//! Ported verbatim from the pgwire `ddl::constraint::validate`; only the error
-//! type changed from pgwire `PgWireError` to the protocol-neutral [`DdlError`].
+//! Validation errors are the protocol-neutral [`DdlError`].
 
 use crate::control::server::shared::ddl::result::DdlError;
 

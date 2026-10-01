@@ -18,14 +18,6 @@ use super::transaction_redo_wire::ReplicatedEventSource;
 pub struct ReplicatedEntry {
     pub tenant_id: u64,
     /// Database scope for the write. `0` decodes to `DatabaseId::DEFAULT`.
-    ///
-    /// This struct's zerompk representation is a plain positional array (no
-    /// `#[msgpack(map)]`), so adding this field changed the array length from
-    /// 4 to 5. An entry proposed by a not-yet-upgraded leader (still emitting
-    /// the 4-element shape) would otherwise fail `check_array_len` on a new
-    /// follower. `ReplicatedEntry::from_bytes` handles that case explicitly
-    /// by falling back to `super::legacy_entry::LegacyReplicatedEntry` (the
-    /// pre-`database_id` 4-field shape) and defaulting `database_id` to `0`.
     #[serde(default)]
     pub database_id: u64,
     pub vshard_id: u32,
@@ -37,10 +29,8 @@ pub struct ReplicatedEntry {
     /// reservation with a different proposer's entry — the apply path
     /// surfaces `RetryableLeaderChange` so the gateway re-proposes.
     ///
-    /// Zero is reserved as "no key" (legacy / synthetic entries that
-    /// pre-date the field). The tracker treats `0` as a wildcard to
-    /// preserve backwards compatibility with any in-flight log on
-    /// upgrade.
+    /// Zero is reserved as "no key" (synthetic entries and entries without
+    /// the field). The tracker treats `0` as a wildcard.
     pub idempotency_key: u64,
     pub write: ReplicatedWrite,
     /// HLC wall time, in nanoseconds, at which the proposer committed to the
@@ -59,6 +49,34 @@ pub struct ReplicatedEntry {
     /// The source every replica stamps on the write's events. It decides
     /// whether AFTER triggers fire, on every replica alike.
     pub event_source: ReplicatedEventSource,
+    /// The RESTORE that re-issued the write, `0` for any other write. Every
+    /// replica raises the write's tenant mark under this id, so a retry of the
+    /// same restore knows the write as its own.
+    pub restore_id: u64,
+    /// Every user collection the write names, with the incarnation its
+    /// proposer planned against. A replica applies the write only while each
+    /// collection still holds that incarnation.
+    pub incarnations: Vec<CollectionIncarnation>,
+}
+
+/// A user collection a replicated write names, and the incarnation its
+/// proposer planned against. `Hlc::ZERO` when the proposer's catalog held no
+/// incarnation for it.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct CollectionIncarnation {
+    /// The collection as the write's plan names it: database-qualified
+    /// outside the default database.
+    pub collection: String,
+    pub incarnation: nodedb_types::Hlc,
 }
 
 impl ReplicatedEntry {
@@ -68,7 +86,7 @@ impl ReplicatedEntry {
     /// preserved through `from_bytes`).
     pub fn new(tenant_id: u64, database_id: u64, vshard_id: u32, write: ReplicatedWrite) -> Self {
         // OR with 1 so the LSB is set: zero is reserved as the "no key"
-        // sentinel and a fresh `rand::random::<u64>()` could in principle
+        // sentinel and a fresh `rand::random::<u64>()` can in principle
         // hit zero (P ~= 2^-64 but cheap to make impossible).
         let idempotency_key = rand::random::<u64>() | 1;
         Self {
@@ -80,6 +98,8 @@ impl ReplicatedEntry {
             write_hlc: 0,
             metadata_floor: 0,
             event_source: ReplicatedEventSource::User,
+            restore_id: 0,
+            incarnations: Vec::new(),
         }
     }
 
@@ -89,32 +109,46 @@ impl ReplicatedEntry {
         self
     }
 
-    /// Serialize to bytes for Raft log entry data.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        zerompk::to_msgpack_vec(self).expect("ReplicatedEntry serialization cannot fail")
+    /// Stamp the RESTORE that re-issued the write.
+    pub fn with_restore_id(mut self, restore_id: u64) -> Self {
+        self.restore_id = restore_id;
+        self
     }
 
-    /// Deserialize from Raft log entry data bytes.
-    ///
-    /// Tries the current 8-field shape first. If that fails specifically
-    /// because the encoded array is the pre-`database_id` 4-element shape
-    /// (an entry proposed by an old leader still mid-upgrade), falls back to
-    /// [`super::legacy_entry::LegacyReplicatedEntry`] and defaults
-    /// `database_id` to `0` (`DatabaseId::DEFAULT`). Any other decode error
-    /// (corrupt data, genuinely unrelated shape) returns `None`, matching
-    /// prior behavior.
+    /// Name the user collections the write targets, as its plan names them.
+    /// The proposer stamps each one's incarnation before it proposes.
+    pub fn naming<'n>(mut self, collections: impl IntoIterator<Item = &'n str>) -> Self {
+        self.incarnations = collections
+            .into_iter()
+            .map(|collection| CollectionIncarnation {
+                collection: collection.to_owned(),
+                incarnation: nodedb_types::Hlc::ZERO,
+            })
+            .collect();
+        self
+    }
+
+    /// Serialize to bytes for Raft log entry data.
+    pub fn encode(&self) -> crate::Result<Vec<u8>> {
+        zerompk::to_msgpack_vec(self).map_err(|e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!(
+                "replicated entry for vshard {} (tenant {}, database {}): {e}",
+                self.vshard_id, self.tenant_id, self.database_id
+            ),
+        })
+    }
+
+    /// [`Self::encode`] for unit tests, which build only encodable entries.
+    #[cfg(test)]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.encode().expect("encode a test ReplicatedEntry")
+    }
+
+    /// Deserialize from Raft log entry data bytes. Bytes of any other shape
+    /// return `None`.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        match zerompk::from_msgpack::<Self>(data) {
-            Ok(entry) => Some(entry),
-            Err(zerompk::Error::ArrayLengthMismatch { actual, .. })
-                if actual == super::super::legacy_entry::LegacyReplicatedEntry::FIELD_COUNT =>
-            {
-                zerompk::from_msgpack::<super::super::legacy_entry::LegacyReplicatedEntry>(data)
-                    .ok()
-                    .map(super::super::legacy_entry::LegacyReplicatedEntry::into_current)
-            }
-            Err(_) => None,
-        }
+        zerompk::from_msgpack::<Self>(data).ok()
     }
 }
 
@@ -197,7 +231,11 @@ mod tests {
 
     #[test]
     fn the_event_source_roundtrips_and_defaults_to_user() {
-        let write = ReplicatedWrite::CutBarrier { hlc: 7 };
+        let write = ReplicatedWrite::CutBarrier {
+            hlc: 7,
+            restore_point: 0,
+            capture: None,
+        };
         let plain = ReplicatedEntry::new(1, 0, 3, write.clone());
         assert_eq!(plain.event_source, ReplicatedEventSource::User);
 
@@ -221,7 +259,7 @@ mod tests {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             document_id: "d".into(),
             value: vec![1, 2, 3],
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
@@ -241,9 +279,9 @@ mod tests {
             "database_id must survive the byte round-trip"
         );
 
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Document(DocumentOp::PointPut { collection, .. }) => {
                 assert_eq!(collection.as_str(), "c");

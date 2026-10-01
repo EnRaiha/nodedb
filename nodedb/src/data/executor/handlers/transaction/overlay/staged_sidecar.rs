@@ -9,6 +9,7 @@
 use nodedb_types::RowIdentity;
 
 use super::staged::{JournalEntry, TxnOverlay};
+use crate::engine::timeseries::columnar_memtable::ColumnarSchema;
 use crate::types::{DatabaseId, TenantId};
 
 /// A staged TTL delta for one KV row, kept OUTSIDE `Staged` because TTL is
@@ -225,6 +226,30 @@ impl TxnOverlay {
         self.journal.push(JournalEntry::UnkeyedIngest {
             coll_key: coll_key.clone(),
         });
+    }
+
+    /// Record the schema a staged timeseries ingest into `coll_key`
+    /// previewed to. A savepoint rollback restores the schema it replaced.
+    pub fn note_ts_preview_schema(
+        &mut self,
+        coll_key: &(DatabaseId, TenantId, String),
+        schema: ColumnarSchema,
+    ) {
+        let overlay = self.collections.entry(coll_key.clone()).or_default();
+        let prev = overlay.ts_preview_schema.replace(schema);
+        self.journal.push(JournalEntry::PreviewSchema {
+            coll_key: coll_key.clone(),
+            prev,
+        });
+    }
+
+    /// The schema the transaction's last staged timeseries ingest into
+    /// `coll_key` previewed to, if one did.
+    pub fn ts_preview_schema(
+        &self,
+        coll_key: &(DatabaseId, TenantId, String),
+    ) -> Option<&ColumnarSchema> {
+        self.collections.get(coll_key)?.ts_preview_schema.as_ref()
     }
 
     /// The instant the `ordinal`-th unkeyed ingest into `coll_key` read.

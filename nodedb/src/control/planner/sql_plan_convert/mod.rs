@@ -19,8 +19,12 @@ pub mod output_schema_types;
 pub mod scan;
 pub mod scan_params;
 pub mod set_ops;
+pub mod surrogate_prefetch;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod value;
 pub mod visitor;
 
 pub use cache_verdict::batch_cache_eligibility;
 pub use convert::{ConvertContext, PlanningPurpose, convert};
+pub use surrogate_prefetch::{PrefetchedSurrogates, convert_bound};

@@ -24,7 +24,8 @@ pub(super) fn describe_graph(op: &GraphOp) -> PlanKind {
         | GraphOp::WccSuperstep(_)
         | GraphOp::TemporalNeighbors { .. }
         | GraphOp::TemporalAlgorithm { .. }
-        | GraphOp::Stats { .. } => PlanKind::MultiRow,
+        | GraphOp::Stats { .. }
+        | GraphOp::NodePresenceRead { .. } => PlanKind::MultiRow,
 
         GraphOp::EdgePut { .. } | GraphOp::EdgePutBatch { .. } => PlanKind::DmlResult("INSERT"),
 
@@ -38,5 +39,11 @@ pub(super) fn describe_graph(op: &GraphOp) -> PlanKind {
         GraphOp::SetNodeLabels { .. } | GraphOp::RemoveNodeLabels { .. } => {
             PlanKind::DmlResult("UPDATE")
         }
+
+        // These ride a document delete or TRUNCATE whose own task names the
+        // statement's tag.
+        GraphOp::NodeEdgeGuard { .. }
+        | GraphOp::NodePresenceGuard { .. }
+        | GraphOp::TruncateEdges { .. } => PlanKind::DmlResult("DELETE"),
     }
 }

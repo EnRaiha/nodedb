@@ -481,6 +481,7 @@ mod tests {
             database_id: 0,
             apply_key: 0,
             event_source: crate::record::NO_EVENT_SOURCE,
+            commit_hlc: 0,
             crc32c: 0,
         };
         std::fs::write(&path, header.to_bytes()).unwrap();
@@ -504,6 +505,7 @@ mod tests {
             database_id: 0,
             apply_key: 0,
             event_source: crate::record::NO_EVENT_SOURCE,
+            commit_hlc: 0,
             crc32c: 0,
         };
         std::fs::write(&path, header.to_bytes()).unwrap();

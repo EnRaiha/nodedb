@@ -2,65 +2,51 @@
 
 //! Shared fixtures for `pgwire_auth_*` integration tests.
 //!
-//! Each split test file needs: a minimal `SharedState`, two canonical
+//! Each split test file needs: a `SharedState` that serves DDL, two canonical
 //! identities (superuser + readonly), and two DDL runners (expect ok /
 //! expect err). Keeping them here avoids copy-paste drift across files.
+//!
+//! A DDL proposes through the metadata group, so every state here is served
+//! by a booted one-node cluster ([`BootedState`]).
 
 #![allow(dead_code)]
 
-use std::sync::Arc;
-
-use nodedb::bridge::dispatch::Dispatcher;
 use nodedb::control::security::identity::{AuthMethod, AuthenticatedIdentity, DatabaseSet, Role};
 use nodedb::control::server::pgwire::ddl_encode;
 use nodedb::control::server::shared::ddl;
 use nodedb::control::server::shared::session::DetachedTxnScope;
 use nodedb::control::state::SharedState;
 use nodedb::types::TenantId;
-use nodedb::wal::WalManager;
 
-/// Shorten the Data Plane dispatch deadline on a fixture whose data side was
-/// dropped at construction.
-///
-/// These fixtures own no live core, so any dispatch can only ever time out.
-/// The production deadline turns each such test into a 30s wall wait.
-fn shorten_dead_core_deadline(state: &mut Arc<SharedState>) {
-    if let Some(state) = Arc::get_mut(state) {
-        state.tuning.network.default_deadline_secs = 1;
-    }
+use crate::booted_state::BootOptions;
+pub use crate::booted_state::BootedState;
+
+/// A booted state whose catalog holds no database yet.
+pub fn make_state() -> BootedState {
+    BootedState::boot(BootOptions {
+        default_database: false,
+        ..BootOptions::default()
+    })
 }
 
-/// Create a minimal `SharedState` (no Data Plane needed for DDL tests).
-pub fn make_state() -> Arc<SharedState> {
-    let dir = tempfile::tempdir().unwrap();
-    let wal_path = dir.path().join("test.wal");
-    let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
-    let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-    let mut state = SharedState::new(dispatcher, wal).expect("build shared state");
-    shorten_dead_core_deadline(&mut state);
-    state
+/// A booted state whose catalog holds the built-in `default` database. Use
+/// this for DDL tests that resolve database names (e.g.
+/// `FOR DATABASE default`).
+pub fn make_state_with_catalog() -> BootedState {
+    BootedState::boot(BootOptions::default())
 }
 
-/// Create a `SharedState` whose `CredentialStore` is backed by a real redb
-/// catalog and the built-in `default` database is bootstrapped. Use this for
-/// DDL tests that resolve database names (e.g. `FOR DATABASE default`).
-pub fn make_state_with_catalog() -> Arc<SharedState> {
-    let dir = tempfile::tempdir().unwrap();
-    let wal_path = dir.path().join("test.wal");
-    let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
-    let catalog_path = dir.path().join("system.redb");
-    let credentials = Arc::new(
-        nodedb::control::security::credential::store::CredentialStore::open(&catalog_path).unwrap(),
-    );
-    let _ = credentials.catalog().bootstrap_default_database();
-    let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-    let mut state = SharedState::new_with_credentials(dispatcher, wal, credentials, false)
-        .expect("build shared state");
-    shorten_dead_core_deadline(&mut state);
-    state
-    // `dir` drops here. On Linux, file handles held by `wal` and the redb
-    // catalog keep both files readable for the test's lifetime even after
-    // the directory entry is removed (open-then-unlink semantics).
+/// [`make_state_with_catalog`], with `configure` applied to the state before
+/// the gateway install. The installed gateway holds a back-reference, so no
+/// `Arc::get_mut` succeeds after this returns: set every field here.
+pub fn make_state_with_catalog_configured(
+    configure: impl FnOnce(&mut SharedState) + Send + 'static,
+) -> BootedState {
+    BootedState::boot(BootOptions {
+        default_database: true,
+        configure: Box::new(configure),
+        ..BootOptions::default()
+    })
 }
 
 /// Superuser identity for DDL tests.
@@ -90,16 +76,20 @@ pub fn readonly_user() -> AuthenticatedIdentity {
 
 /// Run DDL, expect success.
 pub async fn ddl_ok(state: &SharedState, identity: &AuthenticatedIdentity, sql: &str) {
+    ddl_ok_in(state, identity, sql, nodedb_types::id::DatabaseId::DEFAULT).await;
+}
+
+/// Run DDL with `database_id` as the session database, expect success.
+pub async fn ddl_ok_in(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    sql: &str,
+    database_id: nodedb_types::id::DatabaseId,
+) {
     let scope = DetachedTxnScope::new();
-    let result = ddl::dispatch(
-        state,
-        identity,
-        sql,
-        nodedb_types::id::DatabaseId::DEFAULT,
-        &scope.ctx(),
-    )
-    .await
-    .map(ddl_encode::ddl_results_to_pgwire);
+    let result = ddl::dispatch(state, identity, sql, database_id, &scope.ctx())
+        .await
+        .map(ddl_encode::ddl_results_to_pgwire);
     assert!(result.is_some(), "DDL not recognized: {sql}");
     result
         .unwrap()

@@ -2,11 +2,9 @@
 
 //! Protocol-neutral OIDC provider DDL — CREATE / ALTER / DROP / SHOW.
 //!
-//! Ported from the pgwire `ddl::oidc` handlers. All non-return logic
-//! (superuser gate + its denial audit, empty-field validation, duplicate
+//! The superuser gate + its denial audit, empty-field validation, duplicate
 //! name / issuer pre-checks, `StoredClaimMappingRule` build, catalog proposes,
-//! local single-node fallbacks, `audit_record`) is preserved verbatim; only the
-//! result construction changed from pgwire `Response` / `PgWireError` to the
+//! local single-node fallbacks, and `audit_record` run here. The result is the
 //! protocol-neutral [`DdlResult`] / [`DdlError`].
 //!
 //! OIDC providers are system-scoped (superuser-only) and backed by the
@@ -15,7 +13,7 @@
 use serde_json::{Map, Value as JsonValue};
 
 use crate::control::catalog_entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::catalog::StoredOidcProvider;
 use crate::control::security::catalog::oidc_providers::StoredClaimMappingRule;
@@ -34,10 +32,8 @@ fn status(command: &str) -> Vec<DdlResult> {
     }]
 }
 
-/// Superuser gate, folded in verbatim from the pgwire `require_superuser`
-/// helper: on denial it emits `AuditEvent::PermissionDenied` (database-less
-/// scope, matching the `None` `db_id` the pgwire handlers passed) and returns
-/// SQLSTATE 42501, preserving both the side effect and the wire error.
+/// Superuser gate: on denial it emits `AuditEvent::PermissionDenied`
+/// (database-less scope, a `None` `db_id`) and returns SQLSTATE 42501.
 fn require_superuser(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -60,7 +56,7 @@ fn require_superuser(
     }
 }
 
-/// Whether two providers would make the issuer route ambiguous.
+/// Whether two providers will make the issuer route ambiguous.
 fn has_ambiguous_issuer_route(existing_audience: Option<&str>, audience: Option<&str>) -> bool {
     let existing_audience = existing_audience.filter(|value| !value.is_empty());
     let audience = audience.filter(|value| !value.is_empty());
@@ -71,7 +67,7 @@ fn has_ambiguous_issuer_route(existing_audience: Option<&str>, audience: Option<
 }
 
 /// Refuse a claim mapping that grants superuser, or a role that is neither
-/// built in nor defined in the provider's tenant: a login mapped to it would
+/// built in nor defined in the provider's tenant: a login mapped to it will
 /// hold nothing. A role dropped after this check refuses the login instead.
 fn validate_claim_mapping_roles(
     state: &SharedState,
@@ -115,7 +111,7 @@ pub struct CreateOidcProviderParams<'a> {
 }
 
 /// Handle `CREATE OIDC PROVIDER <name> ISSUER '<iss>' JWKS_URI '<uri>' ...`.
-pub fn create_oidc_provider(
+pub async fn create_oidc_provider(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     params: CreateOidcProviderParams<'_>,
@@ -167,7 +163,7 @@ pub fn create_oidc_provider(
     }
 
     // A route is `(issuer, audience)`. An absent or empty audience makes an
-    // issuer route ambiguous, while distinct non-empty audiences may share it.
+    // issuer route ambiguous, while distinct non-empty audiences can share it.
     match catalog.list_oidc_providers() {
         Ok(providers) => {
             if providers.iter().any(|p| {
@@ -207,14 +203,10 @@ pub fn create_oidc_provider(
         created_at_lsn: 0,
     };
 
-    let entry = CatalogEntry::PutOidcProvider(Box::new(provider.clone()));
-    let outcome = propose_catalog_entry(state, &entry)
+    let entry = CatalogEntry::PutOidcProvider(Box::new(provider));
+    propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        catalog
-            .put_oidc_provider(&provider)
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-    }
 
     state.audit_record(
         AuditEvent::OidcProviderChanged,
@@ -229,7 +221,7 @@ pub fn create_oidc_provider(
 /// Handle `ALTER OIDC PROVIDER <name> SET CLAIM MAPPING WHEN ...`.
 ///
 /// Replaces the entire claim-mapping list for the named provider.
-pub fn alter_oidc_provider_claim_mapping(
+pub async fn alter_oidc_provider_claim_mapping(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
@@ -259,13 +251,9 @@ pub fn alter_oidc_provider_claim_mapping(
     provider.claim_mapping = stored_mappings;
 
     let entry = CatalogEntry::PutOidcProvider(Box::new(provider.clone()));
-    let outcome = propose_catalog_entry(state, &entry)
+    propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        catalog
-            .put_oidc_provider(&provider)
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-    }
 
     state.audit_record(
         AuditEvent::OidcProviderChanged,
@@ -281,7 +269,7 @@ pub fn alter_oidc_provider_claim_mapping(
 }
 
 /// Handle `DROP OIDC PROVIDER [IF EXISTS] <name>`.
-pub fn drop_oidc_provider(
+pub async fn drop_oidc_provider(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
@@ -308,13 +296,9 @@ pub fn drop_oidc_provider(
     let entry = CatalogEntry::DeleteOidcProvider {
         name: name.to_string(),
     };
-    let outcome = propose_catalog_entry(state, &entry)
+    propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        catalog
-            .delete_oidc_provider(name)
-            .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))?;
-    }
 
     state.audit_record(
         AuditEvent::OidcProviderChanged,

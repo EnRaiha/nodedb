@@ -16,6 +16,7 @@ use nodedb_cluster::{MetadataEntry, PendingDdlObject};
 use crate::control::catalog_entry::incarnation::RowKey;
 use crate::control::catalog_entry::incarnation::target::{carried_target, delete_key, written_row};
 use crate::control::catalog_entry::{self, CatalogEntry};
+use crate::control::metadata_proposer::MetadataRaftHandle;
 use crate::control::security::catalog::SystemCatalog;
 use crate::control::state::SharedState;
 
@@ -25,29 +26,42 @@ use super::ddl_flush::{propose_and_await, reverse_create};
 /// fenced batch. A fresh create is deleted, an alter is restored from the
 /// `before_image` captured at propose time. Every failure is returned: the
 /// caller surfaces it alongside the original dispatch failure.
-pub(super) fn compensate_finalized(
+///
+/// The authorization barrier runs after the preparation lease is released,
+/// as on the single-statement path.
+pub(super) async fn compensate_finalized(
     state: &SharedState,
     objects: &[PendingDdlObject],
 ) -> crate::Result<()> {
-    let Some(handle) = state.metadata_raft.get() else {
-        return Err(crate::Error::Internal {
-            detail: "compensate_finalized: no metadata raft group installed".into(),
-        });
-    };
-    let _local_guard = crate::control::metadata_proposer::lock_ddl_preparation(state)?;
+    let handle = state.metadata_raft_handle()?;
+    let _local_guard = crate::control::metadata_proposer::lock_ddl_preparation_async(state).await;
     let lease =
-        crate::control::metadata_proposer::acquire_ddl_prepare_lease(state, handle.as_ref())?;
-    let catalog = state.credentials.catalog();
+        crate::control::metadata_proposer::acquire_ddl_prepare_lease_async(state, handle.as_ref())
+            .await?;
+    let reversed = propose_reversals(state, handle.as_ref(), lease.token(), objects).await;
+    lease.release().await;
+    let log_index = reversed?;
+    // The compensation restores prior authorization state, which binds every
+    // node like any other authorization change.
+    if super::ddl_authorization::objects_bear_authorization(objects)? {
+        super::ddl_authorization::barrier_at(state, log_index).await?;
+    }
+    Ok(())
+}
 
+/// Plan, stamp, and propose the reversal batch under the preparation lease
+/// `token`, then check that every reversal applied. Returns the batch's log
+/// index.
+async fn propose_reversals(
+    state: &SharedState,
+    handle: &dyn MetadataRaftHandle,
+    token: u64,
+    objects: &[PendingDdlObject],
+) -> crate::Result<u64> {
+    let catalog = state.credentials.catalog();
     let reversals = plan_reversals(objects, catalog)?;
-    let stamped = if state
-        .cluster_version_view()
-        .can_activate_feature(crate::control::rolling_upgrade::DESCRIPTOR_VERSIONING_VERSION)
-    {
-        catalog_entry::descriptor_stamp::stamp_batch(reversals, &state.hlc_clock, catalog)?
-    } else {
-        reversals
-    };
+    let stamped =
+        catalog_entry::descriptor_stamp::stamp_batch(reversals, &state.hlc_clock, catalog)?;
     let mut entries = Vec::with_capacity(stamped.len());
     for entry in &stamped {
         entries.push(MetadataEntry::CatalogDdl {
@@ -55,11 +69,11 @@ pub(super) fn compensate_finalized(
         });
     }
     let prepared = MetadataEntry::DdlPrepared {
-        token: lease.token(),
+        token,
         entry: Box::new(MetadataEntry::Batch { entries }),
     };
-    let log_index = propose_and_await(state, handle.as_ref(), &prepared)?;
-    if state.metadata_ddl_applied_token.load(Ordering::Acquire) != lease.token() {
+    let log_index = propose_and_await(state, handle, &prepared).await?;
+    if state.metadata_ddl_applied_token.load(Ordering::Acquire) != token {
         return Err(crate::Error::Config {
             detail: "commit compensation: DDL preparation ownership was superseded before apply"
                 .into(),
@@ -68,12 +82,7 @@ pub(super) fn compensate_finalized(
     for entry in &stamped {
         verify_applied(entry, catalog)?;
     }
-    // The compensation restores prior authorization state, which binds every
-    // node like any other authorization change.
-    if super::ddl_authorization::objects_bear_authorization(objects)? {
-        super::ddl_authorization::barrier_at(state, log_index)?;
-    }
-    Ok(())
+    Ok(log_index)
 }
 
 /// One finalized object, decoded, with the image it replaced.
@@ -140,7 +149,7 @@ fn plan_reversals(
 }
 
 /// Refuse the reversal when the row no longer holds the incarnation this
-/// transaction left: a later DDL owns it, and a reversal would overwrite it.
+/// transaction left: a later DDL owns it, and a reversal will overwrite it.
 fn refuse_if_changed(
     key: &RowKey<'_>,
     last: &CatalogEntry,

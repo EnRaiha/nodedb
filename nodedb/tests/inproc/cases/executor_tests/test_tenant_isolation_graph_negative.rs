@@ -31,8 +31,8 @@ fn graph_cross_tenant_insert_does_not_contaminate_neighbors() {
             label: "FOLLOWS".into(),
             dst_id: "node_2".into(),
             properties: vec![],
-            src_surrogate: nodedb_types::Surrogate::ZERO,
-            dst_surrogate: nodedb_types::Surrogate::ZERO,
+            src_surrogate: doc_surrogate("node_1"),
+            dst_surrogate: doc_surrogate("node_2"),
         }),
     );
 
@@ -75,8 +75,8 @@ fn graph_cross_tenant_insert_does_not_contaminate_neighbors() {
                 label: "FOLLOWS".into(),
                 dst_id: format!("b_node_{i}"),
                 properties: vec![],
-                src_surrogate: nodedb_types::Surrogate::ZERO,
-                dst_surrogate: nodedb_types::Surrogate::ZERO,
+                src_surrogate: doc_surrogate("node_1"),
+                dst_surrogate: doc_surrogate(&format!("b_node_{i}")),
             }),
         );
     }
@@ -133,8 +133,8 @@ fn graph_cross_tenant_edge_delete_does_not_affect_owner() {
             label: "CONNECTED".into(),
             dst_id: "beta".into(),
             properties: vec![],
-            src_surrogate: nodedb_types::Surrogate::ZERO,
-            dst_surrogate: nodedb_types::Surrogate::ZERO,
+            src_surrogate: doc_surrogate("alpha"),
+            dst_surrogate: doc_surrogate("beta"),
         }),
     );
 
@@ -149,8 +149,8 @@ fn graph_cross_tenant_edge_delete_does_not_affect_owner() {
             src_id: "alpha".into(),
             label: "CONNECTED".into(),
             dst_id: "beta".into(),
-            src_surrogate: nodedb_types::Surrogate::ZERO,
-            dst_surrogate: nodedb_types::Surrogate::ZERO,
+            src_surrogate: doc_surrogate("alpha"),
+            dst_surrogate: doc_surrogate("beta"),
             rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         }),
     );

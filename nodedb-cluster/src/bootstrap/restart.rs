@@ -9,6 +9,7 @@ use tracing::info;
 use crate::catalog::ClusterCatalog;
 use crate::error::{ClusterError, Result};
 use crate::multi_raft::MultiRaft;
+use crate::topology::ClusterTopology;
 use crate::transport::NexarTransport;
 
 use super::config::{ClusterConfig, ClusterState};
@@ -19,11 +20,12 @@ pub(super) fn restart(
     catalog: &ClusterCatalog,
     transport: &NexarTransport,
 ) -> Result<ClusterState> {
-    let topology = catalog
+    let mut topology = catalog
         .load_topology()?
         .ok_or_else(|| ClusterError::Transport {
             detail: "catalog is bootstrapped but topology is missing".into(),
         })?;
+    readvertise_swim_addr(config, catalog, &mut topology)?;
 
     // ONE shared routing handle: MultiRaft and ClusterState read/write the
     // same table so committed Raft conf-changes converge the data-plane view.
@@ -105,6 +107,28 @@ pub(super) fn restart(
     })
 }
 
+/// Stamp this node's freshly bound SWIM address on its own topology entry.
+///
+/// A changed address bumps the topology version and is persisted. The health
+/// monitor's version comparison then pushes it to every peer.
+fn readvertise_swim_addr(
+    config: &ClusterConfig,
+    catalog: &ClusterCatalog,
+    topology: &mut ClusterTopology,
+) -> Result<()> {
+    let advertised = config.swim_udp_addr.map(|a| a.to_string());
+    let Some(own) = topology.get_node(config.node_id) else {
+        return Ok(());
+    };
+    if own.swim_addr == advertised {
+        return Ok(());
+    }
+    let mut own = own.clone();
+    own.swim_addr = advertised;
+    topology.add_node(own);
+    catalog.save_topology(topology)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::bootstrap_fn::bootstrap;
@@ -137,6 +161,7 @@ mod tests {
             install_snapshot_chunk_bytes: 4 * 1024 * 1024,
             orphan_partial_max_age_secs: 300,
             log_compaction_threshold: None,
+            wire_build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
         };
 
         // Bootstrap first.
@@ -158,5 +183,52 @@ mod tests {
         // num_groups() counts data groups + metadata group: 4 data + 1 = 5.
         assert_eq!(state.routing.read().unwrap().num_groups(), 5);
         assert_eq!(state.multi_raft.lock().unwrap().group_count(), 5);
+    }
+
+    /// A restart that binds a different SWIM address stamps it on this
+    /// node's topology entry and persists it.
+    #[tokio::test]
+    async fn restart_readvertises_a_changed_swim_address() {
+        let (dir, catalog) = temp_catalog();
+        let mut config = ClusterConfig {
+            node_id: 1,
+            listen_addr: "127.0.0.1:9400".parse().unwrap(),
+            seed_nodes: vec![],
+            num_groups: 1,
+            replication_factor: 1,
+            data_dir: dir.path().to_path_buf(),
+            force_bootstrap: false,
+            join_retry: Default::default(),
+            swim_udp_addr: "127.0.0.1:9401".parse().ok(),
+            election_timeout_min: Duration::from_millis(150),
+            election_timeout_max: Duration::from_millis(300),
+            install_snapshot_chunk_bytes: 4 * 1024 * 1024,
+            orphan_partial_max_age_secs: 300,
+            log_compaction_threshold: None,
+            wire_build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
+        };
+        let _ = bootstrap(&config, &catalog, None).unwrap();
+
+        use crate::transport::credentials::TransportCredentials;
+        let transport = NexarTransport::new(
+            1,
+            "127.0.0.1:0".parse().unwrap(),
+            TransportCredentials::Insecure,
+        )
+        .unwrap();
+        config.swim_udp_addr = "127.0.0.1:9501".parse().ok();
+        let state = restart(&config, &catalog, &transport).unwrap();
+
+        let expected: Option<std::net::SocketAddr> = "127.0.0.1:9501".parse().ok();
+        let live = state.topology.read().unwrap();
+        assert_eq!(
+            live.get_node(1).and_then(|n| n.swim_socket_addr()),
+            expected
+        );
+        let persisted = catalog.load_topology().unwrap().unwrap();
+        assert_eq!(
+            persisted.get_node(1).and_then(|n| n.swim_socket_addr()),
+            expected
+        );
     }
 }

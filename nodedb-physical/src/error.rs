@@ -7,8 +7,6 @@
 //! Origin maps `ConvertError → nodedb::Error`; Lite will map it to its
 //! own error type.
 
-use crate::surrogate::SurrogateAssignError;
-
 #[derive(Debug, thiserror::Error)]
 pub enum ConvertError {
     /// The plan shape is invalid (unsupported combination, missing field, etc.).
@@ -26,10 +24,6 @@ pub enum ConvertError {
         value: u64,
         max: u64,
     },
-
-    /// Surrogate allocation failed.
-    #[error(transparent)]
-    Surrogate(#[from] SurrogateAssignError),
 
     /// Serialization failure (msgpack encoding of filters, projections, etc.).
     #[error("serialization: {0}")]

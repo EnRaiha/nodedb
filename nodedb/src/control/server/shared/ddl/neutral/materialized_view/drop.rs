@@ -2,10 +2,8 @@
 
 //! Protocol-neutral `DROP MATERIALIZED VIEW [IF EXISTS]` handler.
 //!
-//! Ported from the pgwire `ddl::materialized_view::drop` handler. The DIRECT
-//! catalog path (`propose_catalog_entry` for the compound
-//! `DeleteMaterializedView` definition+target deletion, with synchronous local
-//! apply/reclaim when metadata Raft is absent), the token-based name / IF EXISTS
+//! The DIRECT catalog path (`propose_catalog_entry` for the compound
+//! `DeleteMaterializedView` definition+target deletion), the token-based name / IF EXISTS
 //! extraction, and the pre-check existence gate are shared by every protocol.
 
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -31,7 +29,7 @@ pub fn materialized_view_exists(
     state.mv_registry.get_def(database_id, tid, name).is_some()
 }
 
-pub fn drop_materialized_view(
+pub async fn drop_materialized_view(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -69,22 +67,9 @@ pub fn drop_materialized_view(
             tenant_id: tenant_id.as_u64(),
             name: name.clone(),
         };
-        let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+        crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+            .await
             .map_err(|error| DdlError::from_error_in_context("metadata propose", &error))?;
-        crate::control::catalog_entry::apply::local::apply_locally_if_needed(
-            state, &entry, outcome,
-        );
-        if outcome.needs_local_apply() {
-            state
-                .mv_registry
-                .unregister(database_id, tenant_id.as_u64(), &name);
-            state.permissions.install_replicated_remove_owner(
-                crate::control::security::catalog::auth_types::object_type::STREAMING_MATERIALIZED_VIEW,
-                database_id.as_u64(),
-                tenant_id.as_u64(),
-                &name,
-            );
-        }
         tracing::info!(view = name, "streaming materialized view dropped");
         return Ok(vec![DdlResult::Status {
             command: "DROP MATERIALIZED VIEW".to_string(),
@@ -123,58 +108,11 @@ pub fn drop_materialized_view(
         target_descriptor_version: 0,
         target_hlc: nodedb_types::Hlc::ZERO,
     };
-    let mut local_lifecycle = if state.metadata_raft.get().is_none() {
-        Some(
-            state
-                .quiesce
-                .try_acquire_lifecycle(database_id.as_u64(), tenant_id.as_u64(), &name)
-                .ok_or_else(|| {
-                    err(
-                        "55006",
-                        format!("materialized view '{name}' lifecycle is busy"),
-                    )
-                })?,
-        )
-    } else {
-        None
-    };
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    // The apply deletes the definition and its target, and reclaims the
+    // target's storage in post-apply on every node, this one included.
+    crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|error| DdlError::from_error_in_context("metadata propose", &error))?;
-    if outcome.needs_local_apply() {
-        // No metadata Raft is active, so apply the same compound catalog
-        // deletion locally and synchronously reclaim the implementation-owned
-        // target collection. A reclaim failure after catalog deletion is
-        // fatal: continuing would permit a same-name CREATE over stale rows.
-        crate::control::catalog_entry::apply::apply_to(&entry, state.credentials.catalog())
-            .map_err(|e| DdlError::from_error_in_context("catalog apply", &e))?;
-        let purge_lsn = state.wal.next_lsn().as_u64();
-        let purge_result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                crate::control::server::shared::ddl::neutral::collection::purge::hard_purge_collection(
-                    state,
-                    database_id.as_u64(),
-                    tenant_id.as_u64(),
-                    &name,
-                    purge_lsn,
-                    local_lifecycle.is_some(),
-                )
-                .await
-            })
-        });
-        if let Err(failure) = purge_result {
-            // Disarm only when a durable retry record owns the drain; a
-            // no-retry failure releases the hold via the guard's unwind Drop.
-            if failure.retry_queued
-                && let Some(guard) = local_lifecycle.take()
-            {
-                guard.disarm();
-            }
-            panic!(
-                "local materialized-view target reclaim failed: {}",
-                failure.error
-            );
-        }
-    }
 
     tracing::info!(view = name, "materialized view dropped");
 

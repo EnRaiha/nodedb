@@ -121,7 +121,8 @@ pub(crate) async fn run_insert_select(
             &spec,
             entries,
             &mut remaining,
-        )?;
+        )
+        .await?;
 
         // Phase 3: one atomic batch write for this page.
         if !rows.is_empty() {

@@ -24,6 +24,22 @@ pub(in crate::control::server::native::dispatch) fn collection_type(
         .map(|coll| coll.collection_type))
 }
 
+/// Whether an edge was ever written into `collection`. An absent collection
+/// row is not edge-bearing.
+pub(in crate::control::server::native::dispatch) fn collection_is_edge_bearing(
+    ctx: &DispatchCtx<'_>,
+    collection: &str,
+) -> crate::Result<bool> {
+    let catalog = ctx.state.credentials.catalog();
+    Ok(catalog
+        .get_collection(
+            ctx.database_id(),
+            ctx.identity.tenant_id.as_u64(),
+            collection,
+        )?
+        .is_some_and(|coll| coll.has_implicit_edges))
+}
+
 /// `collection`'s DDL-declared `PRIMARY KEY` column name, for the apply-time
 /// NOT NULL guard on `PointUpdate` / `BulkUpdate`. `None` means no `PRIMARY
 /// KEY` was declared, so the guard has nothing to enforce.
@@ -60,4 +76,57 @@ pub(in crate::control::server::native::dispatch) fn parse_direction(
         Some("both") => crate::engine::graph::edge_store::Direction::Both,
         _ => crate::engine::graph::edge_store::Direction::Out,
     }
+}
+
+/// The surrogates of `pks` in `collection`, bound at the collection's home
+/// when a key has none, in `pks` order. The async routed exchange answers
+/// them in one batch, and a binding this node's catalog holds answers without
+/// a request.
+pub(super) async fn assign_surrogates(
+    ctx: &DispatchCtx<'_>,
+    collection: &str,
+    pks: &[&[u8]],
+) -> crate::Result<Vec<nodedb_types::Surrogate>> {
+    crate::control::server::surrogate_exchange::assign_surrogates_routed(
+        ctx.state,
+        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
+        ctx.tenant_id(),
+        pks,
+        crate::types::TraceId::ZERO,
+    )
+    .await
+}
+
+/// [`assign_surrogates`] for one key.
+pub(super) async fn assign_surrogate(
+    ctx: &DispatchCtx<'_>,
+    collection: &str,
+    pk: &[u8],
+) -> crate::Result<nodedb_types::Surrogate> {
+    crate::control::server::surrogate_exchange::assign_surrogate_routed(
+        ctx.state,
+        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
+        ctx.tenant_id(),
+        pk,
+        crate::types::TraceId::ZERO,
+    )
+    .await
+}
+
+/// The surrogate `pk` is bound to in `collection`, or `None` when the key
+/// names no row: the home's binding, through the async routed exchange.
+/// Never binds.
+pub(super) async fn existing_surrogate(
+    ctx: &DispatchCtx<'_>,
+    collection: &str,
+    pk: &[u8],
+) -> crate::Result<Option<nodedb_types::Surrogate>> {
+    crate::control::server::surrogate_exchange::lookup_surrogate_routed(
+        ctx.state,
+        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
+        ctx.tenant_id(),
+        pk,
+        crate::types::TraceId::ZERO,
+    )
+    .await
 }

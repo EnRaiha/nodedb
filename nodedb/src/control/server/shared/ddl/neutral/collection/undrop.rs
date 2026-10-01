@@ -11,13 +11,11 @@
 //!
 //! Authorization matches `ALTER COLLECTION OWNER TO`: preserved owner,
 //! superuser, or tenant_admin. If the preserved-owner user no longer
-//! exists, only superuser / tenant_admin may undrop; the restore is
+//! exists, only superuser / tenant_admin can undrop; the restore is
 //! audit-logged with an `owner_user_missing` marker.
 //!
-//! Ported from the pgwire `ddl::collection::undrop` handler. The catalog /
-//! permission / audit reads and the metadata proposal are preserved verbatim;
-//! only the result construction changed from pgwire `Response` / `Tag` to the
-//! protocol-neutral `DdlResult` / `DdlError`.
+//! The catalog / permission / audit reads and the metadata proposal run
+//! here. The result is the protocol-neutral `DdlResult` / `DdlError`.
 
 use nodedb_types::DatabaseId;
 
@@ -28,7 +26,7 @@ use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
 
-pub fn undrop_collection(
+pub async fn undrop_collection(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -41,23 +39,6 @@ pub fn undrop_collection(
     let name_lower = parse_ident_token(parts[2])?;
     let name = name_lower.as_str();
     let tenant_id = identity.tenant_id;
-
-    // Metadata Raft serializes clustered lifecycle mutations. The local
-    // fallback must acquire the same exclusive name guard as CREATE/DROP
-    // before reading the preserved descriptor, otherwise it can restore an
-    // incarnation that a concurrent purge has already superseded.
-    let _local_lifecycle = if state.metadata_raft.get().is_none() {
-        Some(
-            state
-                .quiesce
-                .try_acquire_lifecycle(database_id.as_u64(), tenant_id.as_u64(), name)
-                .ok_or_else(|| {
-                    DdlError::new("55006", format!("collection '{name}' lifecycle is busy"))
-                })?,
-        )
-    } else {
-        None
-    };
 
     let catalog = state.credentials.catalog();
 
@@ -101,7 +82,7 @@ pub fn undrop_collection(
         ));
     }
 
-    // If the preserved-owner user no longer exists, only admin may restore.
+    // If the preserved-owner user no longer exists, only admin can restore.
     let owner_user_missing = preserved_owner
         .as_deref()
         .is_some_and(|u| state.credentials.get_user(u).is_none());
@@ -130,19 +111,10 @@ pub fn undrop_collection(
     // group. Fresh entry carries `is_active = true` and the preserved
     // owner (already present on `stored`).
     stored.is_active = true;
-    let entry =
-        crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(stored.clone()));
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(stored));
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error(&e))?;
-    if outcome.needs_local_apply() {
-        // Single-node fallback: run the same applier the replicated path runs
-        // on every node, so the restore carries every invariant of a
-        // `PutCollection` apply — the collection row, its owner row, and the
-        // visibility of the indexes the soft-delete hid. Writing the row
-        // directly here restored a collection whose indexes stayed hidden.
-        crate::control::catalog_entry::apply::collection::put(&stored, catalog)
-            .map_err(|e| DdlError::from_error_in_context("catalog restore failed", &e))?;
-    }
 
     let completion = UndropAuditDetail::new(name, UndropStage::Completed, owner_user_missing)
         .with_log_index(outcome.log_index())

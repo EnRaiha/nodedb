@@ -23,14 +23,12 @@ pub(super) async fn try_typed(
     stmt: &NodedbStatement,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     match stmt {
-        // CREATE COLLECTION / CREATE TABLE. Migrated from the pgwire typed-AST
-        // async router (`async_ops`) plus the `if_not_exists: true` guard
-        // short-circuit, formerly in the pgwire `guards` module
-        // (checked here, inline, before the create handler runs — same
-        // ordering). `build_and_persist` (name/duplicate/engine validation,
+        // CREATE COLLECTION / CREATE TABLE. The `if_not_exists: true` guard
+        // short-circuit runs inline here, before the create handler.
+        // `build_and_persist` (name/duplicate/engine validation,
         // schema construction, `StoredCollection` assembly, propose+apply,
-        // SERIAL sequence auto-creation) and the `dispatch_register_by_name`
-        // follow-up dispatch are preserved verbatim in `collection::create`.
+        // SERIAL sequence auto-creation) lives in `collection::create`.
+        // `register_created` registers the collection for a buffered CREATE.
         NodedbStatement::Collection(CollectionStmt::CreateCollection {
             name,
             if_not_exists,
@@ -60,16 +58,7 @@ pub(super) async fn try_typed(
                 database_id,
             )
             .await;
-            let result = match result {
-                Ok(resp) => {
-                    collection::dispatch_register_by_name(state, identity, name, database_id)
-                        .await
-                        .map(|()| resp)
-                        .map_err(|e| DdlError::from_error(&e))
-                }
-                Err(e) => Err(e),
-            };
-            Some(result)
+            Some(register_created(state, result).await)
         }
 
         NodedbStatement::Collection(CollectionStmt::CreateTable {
@@ -101,50 +90,42 @@ pub(super) async fn try_typed(
                 database_id,
             )
             .await;
-            let result = match result {
-                Ok(resp) => {
-                    collection::dispatch_register_by_name(state, identity, name, database_id)
-                        .await
-                        .map(|()| resp)
-                        .map_err(|e| DdlError::from_error(&e))
-                }
-                Err(e) => Err(e),
-            };
-            Some(result)
+            Some(register_created(state, result).await)
         }
 
         // DROP { COLLECTION | TABLE } [IF EXISTS] <name> [PURGE] [CASCADE
         // [FORCE]] — parser folds both spellings into `DropCollection`.
-        // Migrated from the pgwire typed-AST sync router (`sync_ops`). The
-        // handler honours `if_exists` internally via its existence-check
+        // The handler honours `if_exists` internally via its existence-check
         // matrix (no guard short-circuit); the catalog propose + single-node
         // fallback, cascade dependent enumeration, soft vs hard delete, the
-        // implicit-sequence sweep, and the audit pair are preserved verbatim
-        // in `collection::drop`.
+        // implicit-sequence sweep, and the audit pair live in
+        // `collection::drop`.
         NodedbStatement::Collection(CollectionStmt::DropCollection {
             name,
             if_exists,
             purge,
             cascade,
             cascade_force,
-        }) => Some(collection::drop_collection(
-            state,
-            identity,
-            &collection::DropCollectionRequest {
-                name,
-                if_exists: *if_exists,
-                purge: *purge,
-                cascade: *cascade,
-                cascade_force: *cascade_force,
-                database_id,
-            },
-        )),
+        }) => Some(
+            collection::drop_collection(
+                state,
+                identity,
+                &collection::DropCollectionRequest {
+                    name,
+                    if_exists: *if_exists,
+                    purge: *purge,
+                    cascade: *cascade,
+                    cascade_force: *cascade_force,
+                    database_id,
+                },
+            )
+            .await,
+        ),
 
         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON <collection>
         // (<field>) [WHERE ...].
-        // Migrated from the pgwire typed-AST async router (`async_ops`). The
-        // two-phase Building→Ready backfill, peer fan-out, Register refresh,
-        // and owner-ledger propose are preserved verbatim in `collection::index`.
+        // The two-phase Building→Ready backfill, peer fan-out, Register
+        // refresh, and owner-ledger propose live in `collection::index`.
         NodedbStatement::Collection(CollectionStmt::CreateIndex {
             unique,
             index_name,
@@ -183,11 +164,11 @@ pub(super) async fn try_typed(
             format_template_raw,
             reset_period_raw,
             gap_free,
-            scope,
+            scope: _,
         }) => {
             // IF NOT EXISTS on a non-existing sequence falls through to the
-            // planner today (the pgwire guard returned None and no create arm
-            // matched `if_not_exists: true`). Replicate by returning None.
+            // planner (no create arm matches `if_not_exists: true`), so this
+            // returns None.
             let tenant_id = identity.tenant_id.as_u64();
             if *if_not_exists
                 && !state
@@ -196,43 +177,48 @@ pub(super) async fn try_typed(
             {
                 return None;
             }
-            Some(sequence::create_sequence(
-                state,
-                identity,
-                database_id,
-                &CreateSequenceRequest {
-                    name,
-                    if_not_exists: *if_not_exists,
-                    start: *start,
-                    increment: *increment,
-                    min_value: *min_value,
-                    max_value: *max_value,
-                    cycle: *cycle,
-                    cache: *cache,
-                    format_template_raw: format_template_raw.as_deref(),
-                    reset_period_raw: reset_period_raw.as_deref(),
-                    gap_free: *gap_free,
-                    scope: scope.as_deref(),
-                },
-            ))
+            Some(
+                sequence::create_sequence(
+                    state,
+                    identity,
+                    database_id,
+                    &CreateSequenceRequest {
+                        name,
+                        if_not_exists: *if_not_exists,
+                        start: *start,
+                        increment: *increment,
+                        min_value: *min_value,
+                        max_value: *max_value,
+                        cycle: *cycle,
+                        cache: *cache,
+                        format_template_raw: format_template_raw.as_deref(),
+                        reset_period_raw: reset_period_raw.as_deref(),
+                        gap_free: *gap_free,
+                    },
+                )
+                .await,
+            )
         }
 
         NodedbStatement::Collection(CollectionStmt::AlterSequence {
             name,
             action,
             with_value,
-        }) => Some(sequence::alter_sequence(
-            state,
-            identity,
-            database_id,
-            name,
-            action,
-            with_value.as_deref(),
-        )),
-
-        NodedbStatement::Collection(CollectionStmt::DropSequence { name, if_exists }) => Some(
-            sequence::drop_sequence(state, identity, database_id, name, *if_exists),
+        }) => Some(
+            sequence::alter_sequence(
+                state,
+                identity,
+                database_id,
+                name,
+                action,
+                with_value.as_deref(),
+            )
+            .await,
         ),
+
+        NodedbStatement::Collection(CollectionStmt::DropSequence { name, if_exists }) => {
+            Some(sequence::drop_sequence(state, identity, database_id, name, *if_exists).await)
+        }
 
         NodedbStatement::Collection(CollectionStmt::ShowSequences) => {
             Some(sequence::show_sequences(state, identity, database_id))
@@ -246,11 +232,10 @@ pub(super) async fn try_typed(
         // `AlterCollectionOp` variant (ADD/DROP/RENAME/ALTER COLUMN, OWNER TO,
         // SET RETENTION / APPEND_ONLY / LAST_VALUE_CACHE / LEGAL_HOLD, ADD
         // MATERIALIZED_SUM, SET ON CONFLICT). `dispatch_alter_collection` is a
-        // total match over `AlterCollectionOp` — no variant falls through — so
-        // the pgwire path never sees an `AlterCollection` statement. Each
+        // total match over `AlterCollectionOp` — no variant falls through. Each
         // sub-handler's catalog / register / audit side effects and command tag
-        // (`ALTER TABLE` for ADD COLUMN, `ALTER COLLECTION` otherwise) are
-        // preserved verbatim in `collection::alter`.
+        // (`ALTER TABLE` for ADD COLUMN, `ALTER COLLECTION` otherwise) live in
+        // `collection::alter`.
         NodedbStatement::Collection(CollectionStmt::AlterCollection { name, operation }) => Some(
             collection::dispatch_alter_collection(state, identity, database_id, name, operation)
                 .await,
@@ -274,4 +259,21 @@ pub(super) async fn try_typed(
 
         _ => None,
     }
+}
+
+/// Finish a CREATE COLLECTION / CREATE TABLE: register the new collection on
+/// this node's Data Plane when the proposal left that to the handler.
+///
+/// A durable outcome ran the entry's awaited post-apply, which registered the
+/// collection on every core. A buffered outcome registered nothing, and the
+/// open transaction's later statements read the new shape.
+async fn register_created(
+    state: &SharedState,
+    created: Result<collection::create::build::CreatedCollection, DdlError>,
+) -> Result<Vec<DdlResult>, DdlError> {
+    let created = created?;
+    collection::register_proposed_collection(state, created.outcome, &created.collection)
+        .await
+        .map_err(|e| DdlError::from_error(&e))?;
+    Ok(created.results)
 }

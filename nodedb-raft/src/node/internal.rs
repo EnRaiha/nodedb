@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use rand::RngExt;
 use tracing::{debug, info};
 
-use crate::error::RaftError;
+use crate::error::{RaftError, Result};
 use crate::message::{AppendEntriesRequest, LogEntry, PreVoteRequest, RequestVoteRequest};
 use crate::state::{LeaderState, NodeRole, PreVoteRound};
 use crate::storage::LogStorage;
@@ -106,6 +106,7 @@ impl<S: LogStorage> RaftNode<S> {
                     last_log_index: self.log.last_index(),
                     last_log_term: self.log.last_term(),
                     group_id: self.config.group_id,
+                    transfer: false,
                 },
             ));
         }
@@ -126,8 +127,18 @@ impl<S: LogStorage> RaftNode<S> {
                 self.role = NodeRole::Follower;
             }
         }
+        // A vote binds for its whole term: a node that steps down within the
+        // term it voted in never votes in that term again.
+        if term > self.hard_state.current_term {
+            self.hard_state.voted_for = 0;
+        }
         self.hard_state.current_term = term;
-        self.hard_state.voted_for = 0;
+        // The leader of this term is unknown until it reaches this node. A
+        // caller that knows it (an AppendEntries or InstallSnapshot sender)
+        // sets it right after. So `leader_id`, when non-zero, always leads
+        // `current_term`: a stepped-down leader, or a follower that adopted a
+        // candidate's higher term, never names a leader of an older term.
+        self.leader_id = 0;
         self.leader_state = None;
         self.votes_received.clear();
         // Any in-progress leadership transfer is moot once we step down.
@@ -152,6 +163,8 @@ impl<S: LogStorage> RaftNode<S> {
     pub(super) fn become_leader(&mut self) {
         self.role = NodeRole::Leader;
         self.leader_id = self.config.node_id;
+        self.contested_win = !self.config.peers.is_empty()
+            && self.transfer_campaign_term != self.hard_state.current_term;
 
         // Leader tracks voter peers, learner peers, and observer peers for
         // replication. Only voters count toward the commit quorum (see
@@ -188,10 +201,9 @@ impl<S: LogStorage> RaftNode<S> {
         };
         let _ = self.log.append(noop);
 
-        // Single-voter cluster: commit the no-op immediately.
+        // Single-voter cluster: the no-op commits once it is durable here.
         if self.config.cluster_size() == 1 {
-            self.volatile.commit_index = self.log.last_index();
-            self.collect_committed_entries();
+            self.try_advance_commit_index();
         }
 
         self.replicate_to_all();
@@ -264,6 +276,7 @@ impl<S: LogStorage> RaftNode<S> {
             vec![]
         };
 
+        let round = self.stamp_lease_round();
         self.ready.messages.push((
             peer,
             AppendEntriesRequest {
@@ -274,6 +287,8 @@ impl<S: LogStorage> RaftNode<S> {
                 entries,
                 leader_commit: self.volatile.commit_index,
                 group_id: self.config.group_id,
+                round,
+                replicated_floor: self.replicated_floor(),
             },
         ));
     }
@@ -363,6 +378,8 @@ impl<S: LogStorage> RaftNode<S> {
                 entries,
                 leader_commit: self.volatile.commit_index,
                 group_id: self.config.group_id,
+                round: super::leader_lease::UNTRACKED_ROUND,
+                replicated_floor: self.replicated_floor(),
             },
         ));
 
@@ -386,6 +403,9 @@ impl<S: LogStorage> RaftNode<S> {
         };
 
         let last = self.log.last_index();
+        // This node acknowledges an entry once its storage holds it durably,
+        // as every follower does before it answers.
+        let self_stable = self.log.stable_index();
         for n in (self.volatile.commit_index + 1..=last).rev() {
             let term_at_n = match self.log.term_at(n) {
                 Some(t) => t,
@@ -396,7 +416,7 @@ impl<S: LogStorage> RaftNode<S> {
                 continue;
             }
 
-            let mut count = 1u64; // self counts.
+            let mut count = u64::from(self_stable >= n);
             for &peer in &self.config.peers {
                 if leader.match_index_for(peer) >= n {
                     count += 1;
@@ -411,7 +431,20 @@ impl<S: LogStorage> RaftNode<S> {
         }
     }
 
+    /// Queue newly committed entries into `Ready`. A range the log no longer
+    /// holds lands in `Ready::committed_read_error` for the driver to surface.
     pub(super) fn collect_committed_entries(&mut self) {
+        if let Err(e) = self.queue_committed_entries() {
+            self.ready.committed_read_error = Some(e);
+        }
+    }
+
+    /// Queue the committed range past everything applied or already queued.
+    ///
+    /// Returns [`RaftError::LogCompacted`] when that range starts below
+    /// `first_available_index`: the state machine lacks entries only a
+    /// snapshot can supply, so delivery halts rather than skip them.
+    fn queue_committed_entries(&mut self) -> Result<()> {
         // Resume from the furthest index already queued into `Ready`, not only
         // from `last_applied`. This runs on every commit-index advance — a
         // follower's AppendEntries, a single voter's propose — while the loop
@@ -427,11 +460,11 @@ impl<S: LogStorage> RaftNode<S> {
         let from = self.volatile.last_applied.max(queued_through) + 1;
         let to = self.volatile.commit_index;
         if from > to {
-            return;
+            return Ok(());
         }
-        if let Ok(entries) = self.log.entries_range(from, to) {
-            self.ready.committed_entries.extend(entries.iter().cloned());
-        }
+        let entries = self.log.entries_range(from, to)?;
+        self.ready.committed_entries.extend(entries.iter().cloned());
+        Ok(())
     }
 
     pub(super) fn persist_hard_state(&mut self) {
@@ -449,9 +482,12 @@ impl<S: LogStorage> RaftNode<S> {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::RaftError;
     use crate::node::core::RaftNode;
     use crate::storage::MemStorage;
-    use crate::test_support::{force_election, test_config};
+    use crate::test_support::{
+        apply_durably, force_election, leader_with_applied_noop, test_config,
+    };
 
     /// Two commit advances inside one `Ready` window queue each index once:
     /// the second collect resumes past what the first already queued.
@@ -480,5 +516,42 @@ mod tests {
             indices.windows(2).all(|pair| pair[0] < pair[1]),
             "queued indices must be strictly increasing: {indices:?}"
         );
+    }
+
+    /// A committed range below the log's first available index is a hard
+    /// error in `Ready`, never a silently empty delivery.
+    #[test]
+    fn compacted_committed_range_surfaces_error() {
+        let mut node = leader_with_applied_noop(test_config(1, vec![]));
+        for _ in 0..3 {
+            let idx = node
+                .propose(b"write".to_vec())
+                .expect("single voter commits");
+            let _ = node.take_ready();
+            apply_durably(&mut node, idx);
+        }
+        let snap = node.last_applied();
+        assert!(
+            node.compact_log_up_to(snap)
+                .expect("durable prefix compacts")
+        );
+
+        // Delivery watermark behind the compacted prefix.
+        node.volatile.last_applied = 1;
+        node.propose(b"next".to_vec())
+            .expect("single voter commits");
+
+        let ready = node.take_ready();
+        assert!(ready.committed_entries.is_empty());
+        match ready.committed_read_error {
+            Some(RaftError::LogCompacted {
+                requested,
+                first_available,
+            }) => {
+                assert_eq!(requested, 2);
+                assert_eq!(first_available, snap + 1);
+            }
+            other => panic!("expected LogCompacted, got {other:?}"),
+        }
     }
 }

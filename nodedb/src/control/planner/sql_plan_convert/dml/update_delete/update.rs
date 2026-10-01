@@ -15,7 +15,9 @@ use crate::control::planner::sql_plan_convert::value::{
 };
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-use super::shared::{document_collection_is_edge_bearing, pk_effective_filter};
+use super::shared::{
+    document_collection_is_edge_bearing, document_collection_is_shadowed_clone, pk_effective_filter,
+};
 
 /// Parameters for [`convert_update`], bundled to avoid an unwieldy argument
 /// list. Fields borrow from the caller exactly as the individual arguments
@@ -122,7 +124,6 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                 .collect();
             let key_bytes = sql_value_to_bytes(key)?;
             // Content-addressed identity: keeps the surrogate the original insert assigned.
-            // `Surrogate::ZERO` only when no assigner is wired (test / embedded-without-catalog).
             let surrogate = ctx.surrogate_for_pk(collection_key, &key_bytes)?;
             tasks.push(PhysicalTask {
                 tenant_id,
@@ -196,7 +197,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
         }]);
     }
 
-    // CRDT UPDATE never falls through to `DocumentOp`, which would bypass convergence.
+    // CRDT UPDATE never falls through to `DocumentOp`, which will bypass convergence.
     let is_crdt = super::super::crdt_gate::document_collection_is_crdt(ctx, collection)?;
     if is_crdt && target_keys.is_empty() {
         return Err(crate::Error::BadRequest {
@@ -220,13 +221,26 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
         && !target_keys.is_empty()
         && document_collection_is_edge_bearing(ctx, collection)?;
 
-    if edge_bearing {
+    // An UPDATE naming several keys is one unit: UNIQUE and BALANCED hold on
+    // its post-state, and it writes all its rows or none. One `PointUpdate`
+    // per key judges each row alone and applies each on its own, so a swap is
+    // refused and two rows claiming one value both land. `BulkUpdate` judges
+    // every matched row before the first write. A clone that reads through to
+    // its source copies rows up one point write at a time, so its UPDATE
+    // keeps one `PointUpdate` per key.
+    let multi_key = !is_crdt
+        && target_keys.len() > 1
+        && !document_collection_is_shadowed_clone(ctx, collection)?;
+
+    if edge_bearing || multi_key {
         // Reject `Expr` RHS to a reserved edge field: reconciliation diffs against
         // literal SET values only (mirrors the KV/columnar `Expr`-RHS rejection).
-        if let Some((field, _)) = assignments.iter().find(|(field, expr)| {
-            matches!(field.as_str(), "_from" | "_to" | "_type")
-                && !matches!(expr, SqlExpr::Literal(_))
-        }) {
+        if edge_bearing
+            && let Some((field, _)) = assignments.iter().find(|(field, expr)| {
+                matches!(field.as_str(), "_from" | "_to" | "_type")
+                    && !matches!(expr, SqlExpr::Literal(_))
+            })
+        {
             return Err(crate::Error::BadRequest {
                 detail: format!(
                     "expression updates to reserved edge fields (_from, _to, _type) \
@@ -278,10 +292,10 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                     rls_filters: Vec::new(),
                 })
             } else {
-                // Read-only resolution: a task always exists (the write hook
-                // still runs, an unbound row_key affects 0 rows, and the clone
-                // CoW resolver intercepts the ZERO sentinel), but an UPDATE
-                // creates no row, so it must never mint a binding.
+                // Read-only resolution: an UPDATE creates no row, so it must
+                // never mint a binding. An unbound key carries `None`: it
+                // affects 0 rows here, and the clone CoW resolver still sees
+                // the task and copies the source row up first.
                 let surrogate = ctx.surrogate_for_existing_pk(collection_key, &pk_bytes)?;
                 PhysicalPlan::Document(DocumentOp::PointUpdate {
                     collection: qualified_collection.clone(),
@@ -364,16 +378,16 @@ mod tests {
             CredentialStore::open(&dir.path().join("system.redb")).expect("open credential store");
         {
             let catalog = store.catalog();
-            let mut edges = StoredCollection::new(0, "edges", "owner");
+            let mut edges = StoredCollection::stamped_for_test(0, "edges", "owner");
             edges.has_implicit_edges = true;
             catalog
                 .put_collection(crate::types::DatabaseId::DEFAULT, &edges)
                 .expect("put edges collection");
-            let plain = StoredCollection::new(0, "plain", "owner");
+            let plain = StoredCollection::stamped_for_test(0, "plain", "owner");
             catalog
                 .put_collection(crate::types::DatabaseId::DEFAULT, &plain)
                 .expect("put plain collection");
-            let mut crdt_coll = StoredCollection::new(0, "crdt_coll", "owner");
+            let mut crdt_coll = StoredCollection::stamped_for_test(0, "crdt_coll", "owner");
             crdt_coll.crdt = true;
             catalog
                 .put_collection(crate::types::DatabaseId::DEFAULT, &crdt_coll)
@@ -386,7 +400,8 @@ mod tests {
             array_catalog: None,
             credentials: Some(Arc::new(store)),
             wal: None,
-            surrogate_assigner: None,
+            surrogate_assigner:
+                crate::control::planner::sql_plan_convert::test_support::test_assigner(),
             cluster_enabled: false,
             bitemporal_retention_registry: None,
             max_vector_dim: 0,
@@ -396,6 +411,7 @@ mod tests {
             shuffle_agg_num_parts: 0,
             broadcast_threshold_bytes: 8 * 1024 * 1024,
             shuffle_agg_threshold: 10_000,
+            prefetched: Default::default(),
             database_id: crate::types::DatabaseId::DEFAULT,
             tenant_id: crate::types::TenantId::new(0),
         };

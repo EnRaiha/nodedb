@@ -59,4 +59,20 @@ pub(super) struct DataPlaneDispatch {
     /// the write-admission guard, or the caller already recorded durability
     /// elsewhere and supplies the LSN it minted.
     pub(super) durability: super::submit_write::WalDurability,
+    /// Where a read in this dispatch runs. Writes ignore it.
+    pub(super) read_route: ReadRoute,
+    /// Whether the write publishes its change events on this node's feed.
+    pub(super) change_feed: super::submit_write::ChangeFeedOwner,
+}
+
+/// Where the funnel runs a read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReadRoute {
+    /// The caller routed the read to this node and confirmed it as its
+    /// session requires (the gateway's local route, a received leg). It runs
+    /// here as is.
+    Routed,
+    /// No caller routed the read. It is a strong read, and the funnel serves
+    /// it from the group that owns its vShard (`owner_read`).
+    Owned,
 }

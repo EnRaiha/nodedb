@@ -32,19 +32,24 @@ pub fn push_flat_rows(value: Value, out: &mut Vec<ShapedRow>) -> crate::Result<(
             {
                 let mut inner: ShapedRow = inner.into_iter().collect();
                 // The envelope carries the row's storage key, which is
-                // internal. A body with no `id` field carries identity
-                // nowhere else, so the key renders to an identity at this
-                // boundary. `or_insert` leaves a declared primary key as the
+                // internal. A body with no `id` field renders its identity at
+                // this boundary, by the rule the Data Plane's row shaping
+                // applies: the body's `_rowid`, else the storage key. A copy
+                // under a new surrogate keeps its `_rowid`, so it keeps its
+                // identity. `or_insert` leaves a declared primary key as the
                 // authority.
                 if let Some(Value::String(key)) = map.remove("id") {
-                    let identity = crate::engine::document::store::StorageKey::parse(&key)
+                    let storage_key = crate::engine::document::store::StorageKey::parse(&key)
                         .ok_or_else(|| crate::Error::Internal {
                             detail: format!("scan envelope id is not a storage key: '{key}'"),
-                        })?
-                        .to_identity();
+                        })?;
+                    let identity = match inner.get(nodedb_types::ROWID_COLUMN) {
+                        Some(Value::Integer(rowid)) => rowid.to_string(),
+                        _ => storage_key.to_identity().into_string(),
+                    };
                     inner
                         .entry("id".to_string())
-                        .or_insert(Value::String(identity.into_string()));
+                        .or_insert(Value::String(identity));
                 }
                 out.push(inner);
                 return Ok(());
@@ -99,9 +104,9 @@ pub fn is_scan_wrapper_json(map: &serde_json::Map<String, serde_json::Value>) ->
 
 /// Unique per-column cell keys for a shaped column list.
 ///
-/// SQL output column names may legally repeat — `SELECT w.id, b.id` displays
+/// SQL output column names can legally repeat — `SELECT w.id, b.id` displays
 /// both columns as `id` — but a shaped row is a JSON map and cannot hold two
-/// cells under one key: inserting the second cell would overwrite the first,
+/// cells under one key: inserting the second cell will overwrite the first,
 /// making both wire columns render the last value. The shaper therefore
 /// stores the first occurrence of a name under the name itself and each later
 /// duplicate under `<name>_<n>` (n = 1, 2, …), skipping any candidate that

@@ -42,6 +42,8 @@ pub struct TestServer {
     pub http_port: u16,
     /// RESP (Redis protocol) listener port.
     pub resp_port: u16,
+    /// ILP (InfluxDB Line Protocol) listener port.
+    pub ilp_port: u16,
     /// `None` once `graceful_shutdown` has consumed it.
     pub(super) spawned: Option<SpawnedServer>,
     pub(super) conn_handle: Option<tokio::task::JoinHandle<()>>,

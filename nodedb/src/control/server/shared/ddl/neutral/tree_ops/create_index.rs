@@ -18,20 +18,16 @@
 //! 3. **schema_version gated**: `state.schema_version.bump()` runs only
 //!    on success so consumers observing catalog version do not see a
 //!    half-built index.
-//! 4. **WAL-backed + replicated**: each batch is first appended to the
-//!    local WAL via `wal_append_if_write` (one `Put`/`Delete` record per
-//!    edge — see `wal_dispatch/graph.rs`), which is what makes the write
-//!    durable on a single-node deployment. It is then dispatched via
-//!    `dispatch_sync_response`, which additionally proposes the write
-//!    through the destination shard's Raft group under RF>1 so every
-//!    replica receives it — the local WAL append and the Raft-replicated
-//!    log entry are two independent durability mechanisms, exactly like
-//!    every other sync-style ingest path (FTS, spatial, vector) in this
-//!    codebase, not a duplicate of the same record.
-//! 5. **Broadcast scan**: documents live on hash-of-doc-id vshards, not
-//!    the collection-name vshard. The scan uses `broadcast_to_all_cores`
-//!    to see every document, then partitions the resulting edges by
-//!    destination-shard for batched dispatch.
+//! 4. **Replicated**: each batch is proposed through the destination
+//!    shard's Raft group. The entry's apply appends the batch's WAL records
+//!    on every replica, this node included.
+//! 5. **Owner scan**: the scan reads the collection's home group, here when
+//!    this node replicates it and on its leader otherwise, then partitions
+//!    the resulting edges by destination-shard for batched dispatch.
+//! 6. **Linearizable scan**: the index serves every reader, so the scan
+//!    always confirms the collection's home group first, whatever the
+//!    session's read consistency. A stale replica will leave rows out of
+//!    the index for good.
 
 use std::collections::HashMap;
 
@@ -114,7 +110,7 @@ pub async fn create_graph_index(
 
     // A read policy on the collection makes the index unbuildable rather than
     // partially built: the index is shared by every reader, so deriving it from
-    // one principal's filtered view would answer other principals' queries from
+    // one principal's filtered view will answer other principals' queries from
     // rows that were never indexed. Refuse instead of silently indexing a
     // subset.
     let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
@@ -147,14 +143,42 @@ pub async fn create_graph_index(
         valid_at_ms: None,
         prefilter: None,
     });
-    let scan_resp = broadcast_to_all_cores(state, tenant_id, database_id, scan_plan, TraceId::ZERO)
-        .await
+    // The collection's rows live on its home vShard (`types/record_home.rs`).
+    // The scan runs here when this node replicates that group, and on the
+    // group's leader otherwise. It is always linearizable (point 6).
+    let home = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
+    let scope = crate::control::server::dispatch_utils::OwnedReadScope {
+        tenant_id,
+        database_id,
+        vshard_id: home,
+        trace_id: TraceId::ZERO,
+        txn_id: None,
+        linearizable: true,
+    };
+    let scan_resp =
+        match crate::control::server::dispatch_utils::route_owned_read(state, scope, scan_plan)
+            .await
+            .map_err(|e| DdlError::from_error_in_context("scan failed", &e))?
+        {
+            crate::control::server::dispatch_utils::OwnedRead::Served(resp) => resp,
+            crate::control::server::dispatch_utils::OwnedRead::Local(scan_plan) => {
+                broadcast_to_all_cores(state, tenant_id, database_id, *scan_plan, TraceId::ZERO)
+                    .await
+                    .map_err(|e| DdlError::from_error_in_context("scan failed", &e))?
+            }
+        };
+    crate::control::local_dispatch::reject_data_plane_error(&scan_resp)
         .map_err(|e| DdlError::from_error_in_context("scan failed", &e))?;
 
     let payload_json =
         crate::data::executor::response_codec::decode_payload_to_json(&scan_resp.payload);
-    let docs: Vec<serde_json::Value> = sonic_rs::from_str(&payload_json)
-        .map_err(|e| ddl_err("22P02", format!("invalid JSON in scan response: {e}")))?;
+    // An empty payload is a scan that found no rows.
+    let docs: Vec<serde_json::Value> = if payload_json.is_empty() {
+        Vec::new()
+    } else {
+        sonic_rs::from_str(&payload_json)
+            .map_err(|e| ddl_err("22P02", format!("invalid JSON in scan response: {e}")))?
+    };
 
     // ── Build edge list partitioned by destination vshard ────────────
     //
@@ -162,12 +186,11 @@ pub async fn create_graph_index(
     // mixed-type `parent` field (e.g. an integer) surfaces SQLSTATE
     // `22P02` loudly; the earlier `.and_then(as_str).drop` behaviour
     // silently omitted the edge, leaving the index incomplete.
-    let mut edges_by_shard: HashMap<VShardId, Vec<BatchEdge>> = HashMap::new();
-    let mut total_edges = 0u64;
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
     for doc in &docs {
         // `DocumentOp::Scan` emits `{id, data: {...}}` per
         // `encode_raw_document_rows`. Anything else is a protocol bug,
-        // not a shape we should silently accommodate.
+        // not a shape to silently accommodate.
         let Some(obj_outer) = doc.as_object() else {
             continue;
         };
@@ -204,35 +227,49 @@ pub async fn create_graph_index(
                 if parent.is_empty() || parent == child {
                     continue;
                 }
-                let shard = VShardId::from_key(parent.as_bytes());
-                let src_surrogate = state
-                    .surrogate_assigner
-                    .assign(
-                        nodedb_types::CollectionKey::from_bare(database_id, &collection),
-                        tenant_id,
-                        parent.as_bytes(),
-                    )
-                    .map_err(|e| DdlError::from_error(&e))?;
-                let dst_surrogate = state
-                    .surrogate_assigner
-                    .assign(
-                        nodedb_types::CollectionKey::from_bare(database_id, &collection),
-                        tenant_id,
-                        child.as_bytes(),
-                    )
-                    .map_err(|e| DdlError::from_error(&e))?;
-                edges_by_shard.entry(shard).or_default().push(BatchEdge {
-                    collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
-                    src_id: parent.to_string(),
-                    label: index_name.clone(),
-                    dst_id: child.to_string(),
-                    src_surrogate,
-                    dst_surrogate,
-                });
-                total_edges += 1;
+                pairs.push((parent, child));
             }
             _ => {}
         }
+    }
+
+    // Every endpoint's identity, in one batch at the collection's home:
+    // `[parent, child]` per edge, in edge order.
+    let endpoint_keys: Vec<&[u8]> = pairs
+        .iter()
+        .flat_map(|(parent, child)| [parent.as_bytes(), child.as_bytes()])
+        .collect();
+    let endpoint_surrogates = crate::control::server::surrogate_exchange::assign_surrogates_routed(
+        state,
+        nodedb_types::CollectionKey::from_bare(database_id, &collection),
+        tenant_id,
+        &endpoint_keys,
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| DdlError::from_error(&e))?;
+    if endpoint_surrogates.len() != endpoint_keys.len() {
+        return Err(DdlError::internal(format!(
+            "CREATE GRAPH INDEX: the home answered {} surrogates for {} edge endpoints",
+            endpoint_surrogates.len(),
+            endpoint_keys.len()
+        )));
+    }
+
+    let mut edges_by_shard: HashMap<VShardId, Vec<BatchEdge>> = HashMap::new();
+    let mut total_edges = 0u64;
+    let (endpoint_pairs, _) = endpoint_surrogates.as_chunks::<2>();
+    for ((parent, child), [src_surrogate, dst_surrogate]) in pairs.iter().zip(endpoint_pairs) {
+        let shard = VShardId::from_key(parent.as_bytes());
+        edges_by_shard.entry(shard).or_default().push(BatchEdge {
+            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
+            src_id: parent.to_string(),
+            label: index_name.clone(),
+            dst_id: child.to_string(),
+            src_surrogate: *src_surrogate,
+            dst_surrogate: *dst_surrogate,
+        });
+        total_edges += 1;
     }
 
     // ── Dispatch batches, WAL + rollback discipline ──────────────────
@@ -241,24 +278,9 @@ pub async fn create_graph_index(
         let plan = PhysicalPlan::Graph(GraphOp::EdgePutBatch {
             edges: edges.clone(),
         });
-        // Append locally first so the batch is durable on a single-node
-        // deployment with no Raft proposer configured (see the module doc
-        // comment, point 4). Under RF>1 the dispatch below proposes through
-        // Raft: the entry's apply appends its own record, and the dispatch
-        // cancels this one.
-        let minted = append_edge_batch(state, tenant_id, shard, &plan)
-            .await
-            .map_err(|e| DdlError::from_error_in_context("edge-insert WAL append failed", &e))?;
-
-        match crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_minted_sync_response(
-            state,
-            edge_batch_owner(tenant_id, shard),
-            plan,
-            crate::event::EventSource::User,
-            minted,
-        )
-        .await
-        {
+        // The shard's Raft entry carries the batch, and its apply appends
+        // the records on every replica.
+        match dispatch_edge_batch(state, tenant_id, shard, plan).await {
             Ok(_) => committed_shards.push((shard, edges)),
             Err(e) => {
                 return surface_failure(
@@ -288,42 +310,23 @@ pub async fn create_graph_index(
     ))])
 }
 
-/// Append an edge batch's records under an outcome-floor window opened before
-/// the first append. The dispatch that follows closes the window.
-async fn append_edge_batch(
+/// Propose an edge batch through `shard`'s Raft group and wait until it
+/// applied on this node.
+async fn dispatch_edge_batch(
     state: &SharedState,
     tenant_id: TenantId,
     shard: VShardId,
-    plan: &PhysicalPlan,
-) -> crate::Result<crate::control::server::dispatch_utils::MintedRecords> {
-    let owner = edge_batch_owner(tenant_id, shard);
-    let minted = crate::control::server::dispatch_utils::MintedRecords::open(&state.outcome_floor);
-    match minted.append_plan(
-        &state.wal,
-        owner,
-        plan,
-        // The same source the index write is dispatched with.
-        crate::event::EventSource::User,
-    ) {
-        Ok(_) => Ok(minted),
-        Err(e) => {
-            // Any record appended before the error never reaches a core.
-            minted.cancel(&state.wal, owner, 0).await?;
-            Err(e)
-        }
-    }
-}
-
-/// Where an edge batch's record lives.
-fn edge_batch_owner(
-    tenant_id: TenantId,
-    shard: VShardId,
-) -> crate::control::server::dispatch_utils::RecordOwner {
-    crate::control::server::dispatch_utils::RecordOwner {
+    plan: PhysicalPlan,
+) -> crate::Result<crate::bridge::envelope::Response> {
+    crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
+        state,
         tenant_id,
-        database_id: DatabaseId::DEFAULT,
-        vshard_id: shard,
-    }
+        DatabaseId::DEFAULT,
+        shard,
+        plan,
+        crate::event::EventSource::User,
+    )
+    .await
 }
 
 /// Surface a build-time failure.
@@ -338,7 +341,7 @@ fn edge_batch_owner(
 /// `XX001 GRAPH INDEX LEFT IN INCONSISTENT STATE` with the list of
 /// shards that failed to revert. Clients MUST treat this as a hard
 /// error requiring operator intervention; silently warn-logging the
-/// failure would be the exact pattern the forward-path bug had.
+/// failure hides the error that needs the operator.
 async fn surface_failure(
     state: &SharedState,
     tenant_id: TenantId,
@@ -353,23 +356,9 @@ async fn surface_failure(
         });
         let shard = *shard;
         async move {
-            // Same discipline as the forward path above: append locally
-            // first so the rollback tombstones are durable on single-node,
-            // then dispatch, which proposes through Raft under RF>1.
-            let minted = match append_edge_batch(state, tenant_id, shard, &plan).await {
-                Ok(minted) => minted,
-                Err(e) => return (shard, Err(e)),
-            };
             (
                 shard,
-                crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_minted_sync_response(
-                    state,
-                    edge_batch_owner(tenant_id, shard),
-                    plan,
-                    crate::event::EventSource::User,
-                    minted,
-                )
-                .await,
+                dispatch_edge_batch(state, tenant_id, shard, plan).await,
             )
         }
     });

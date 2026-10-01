@@ -17,7 +17,9 @@
 //!   [`ReplicatedWrite::CutBarrier`] carrying `W` into every data group this
 //!   node hosts and waits for this node's apply of it. Every entry before the
 //!   barrier applied first. Every entry after it records a commit HLC above
-//!   `W`, however early its proposer stamped it.
+//!   `W`, however early its proposer stamped it. A database backup's barrier
+//!   also captures its tenants at that log position (see
+//!   [`super::cut_capture`]).
 //! - **Calvin transactions.** A Calvin transaction commits at its place in
 //!   the sequencer log. The cut proposes a `CutMarker` carrying `W` into the
 //!   sequencer log and waits until every Calvin scheduler on this node passed
@@ -27,9 +29,6 @@
 //!   after its record is minted inside an outcome-floor window. The cut reads
 //!   the highest LSN any window minted, after it picks `W`, and waits for the
 //!   outcome floor to reach it. A record minted later stamps itself above `W`.
-//!   On a server with no Raft groups a write stamps itself before it mints, so
-//!   its mark is durable first. The cut first waits for every such stamp at or
-//!   below `W` to mint, then reads the highest LSN.
 //!
 //! Two stamps can share a wall time. Once it picks `W`, the cut moves this
 //! node's clock past `W`, so every later stamp here reads above it.
@@ -39,12 +38,12 @@
 //! `W`, and its Control Plane runs [`cut_at`] first.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use nodedb_cluster::METADATA_GROUP_ID;
 use nodedb_cluster::calvin::SEQUENCER_GROUP_ID;
 use nodedb_cluster::calvin::SequencerEntry;
+use nodedb_physical::physical_plan::CutCaptureRequest;
 use nodedb_types::Hlc;
 
 use crate::Error;
@@ -55,7 +54,7 @@ use crate::types::{DatabaseId, VShardId};
 
 /// Pick the envelope watermark and wait until every write committed below it
 /// has a final outcome on this node. Returns the watermark.
-pub(super) async fn consistent_cut(state: &Arc<SharedState>, tenant_id: u64) -> Result<u64, Error> {
+pub(super) async fn consistent_cut(state: &SharedState, tenant_id: u64) -> Result<u64, Error> {
     let watermark = state.hlc_clock.now().wall_ns;
     cut_at(state, tenant_id, watermark).await?;
     Ok(watermark)
@@ -65,38 +64,56 @@ pub(super) async fn consistent_cut(state: &Arc<SharedState>, tenant_id: u64) -> 
 /// write committed below it has a final outcome here. A remote source node
 /// runs it for the watermark the backup's coordinator picked.
 pub(crate) async fn cut_at(
-    state: &Arc<SharedState>,
+    state: &SharedState,
     tenant_id: u64,
     watermark: u64,
+) -> Result<(), Error> {
+    cut_at_point(state, tenant_id, watermark, 0).await
+}
+
+/// [`cut_at`] for the cluster restore point `restore_point`, `0` for a
+/// backup's cut. The barriers and the Calvin marker carry the point's id, so
+/// every replica records its group's place at the point.
+pub(crate) async fn cut_at_point(
+    state: &SharedState,
+    tenant_id: u64,
+    watermark: u64,
+    restore_point: u64,
+) -> Result<(), Error> {
+    cut_barriers(state, tenant_id, watermark, restore_point, None).await
+}
+
+/// [`cut_at`] whose barriers carry a database backup's capture `request`.
+/// The leader of each group this node hosts captures the request's tenants
+/// when it applies the request's first barrier in that group.
+pub(crate) async fn cut_with_capture(
+    state: &SharedState,
+    tenant_id: u64,
+    watermark: u64,
+    request: &CutCaptureRequest,
+) -> Result<(), Error> {
+    cut_barriers(state, tenant_id, watermark, 0, Some(request)).await
+}
+
+async fn cut_barriers(
+    state: &SharedState,
+    tenant_id: u64,
+    watermark: u64,
+    restore_point: u64,
+    capture: Option<&CutCaptureRequest>,
 ) -> Result<(), Error> {
     state
         .hlc_clock
         .update(Hlc::new(watermark.saturating_add(1), 0));
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
     let deadline = tokio::time::Instant::now() + timeout;
-    // A local write stamped at or below the watermark has not always minted
-    // its record yet. Every stamp taken from here on reads above it.
-    if !state
-        .tenant_marks
-        .await_local_stamps_minted(watermark, deadline)
-        .await
-    {
-        return Err(Error::Internal {
-            detail: format!(
-                "backup: local writes stamped at or below watermark {watermark} did not mint \
-                 their WAL records within {}s, so the backup cannot take a consistent cut. \
-                 Retry the backup",
-                timeout.as_secs(),
-            ),
-        });
-    }
     // Read after the watermark: a record minted after this read stamps its
     // write above the watermark.
     let target = state.outcome_floor.max_noted();
 
     let (groups, calvin) = tokio::join!(
-        cut_data_groups(state, tenant_id, watermark),
-        cut_calvin(state, watermark, deadline),
+        cut_data_groups(state, tenant_id, watermark, restore_point, capture),
+        cut_calvin_point(state, watermark, restore_point, deadline),
     );
     groups?;
     calvin?;
@@ -120,13 +137,13 @@ pub(crate) async fn cut_at(
 /// Propose a cut barrier carrying `watermark` into every data group this node
 /// hosts, and wait for this node's apply of each.
 async fn cut_data_groups(
-    state: &Arc<SharedState>,
+    state: &SharedState,
     tenant_id: u64,
     watermark: u64,
+    restore_point: u64,
+    capture: Option<&CutCaptureRequest>,
 ) -> Result<(), Error> {
-    let Some(proposer) = state.async_raft_proposer() else {
-        return Ok(());
-    };
+    let proposer = state.async_raft_proposer()?;
     let barriers = futures::future::join_all(barrier_vshards(state).into_iter().map(
         |(group_id, vshard_id)| {
             // The barrier orders every entry of its group, whatever database
@@ -136,7 +153,11 @@ async fn cut_data_groups(
                 tenant_id,
                 DatabaseId::DEFAULT.as_u64(),
                 vshard_id,
-                ReplicatedWrite::CutBarrier { hlc: watermark },
+                ReplicatedWrite::CutBarrier {
+                    hlc: watermark,
+                    restore_point,
+                    capture: capture.cloned(),
+                },
             );
             async move {
                 propose_replicated_entry(state, proposer, entry)
@@ -180,8 +201,19 @@ const CUT_MARKER_RETRY: Duration = Duration::from_secs(1);
 /// Propose a Calvin cut marker carrying `watermark`, and wait until every
 /// Calvin scheduler on this node passed it, or `deadline`.
 pub(crate) async fn cut_calvin(
-    state: &Arc<SharedState>,
+    state: &SharedState,
     watermark: u64,
+    deadline: tokio::time::Instant,
+) -> Result<(), Error> {
+    cut_calvin_point(state, watermark, 0, deadline).await
+}
+
+/// [`cut_calvin`] with a marker that carries the cluster restore point
+/// `restore_point`, `0` for none.
+async fn cut_calvin_point(
+    state: &SharedState,
+    watermark: u64,
+    restore_point: u64,
     deadline: tokio::time::Instant,
 ) -> Result<(), Error> {
     let cuts = &state.calvin.cuts;
@@ -199,11 +231,13 @@ pub(crate) async fn cut_calvin(
                      once the cluster finished starting"
                 .into(),
         })?;
-    let marker = zerompk::to_msgpack_vec(&SequencerEntry::CutMarker { hlc: watermark }).map_err(
-        |error| Error::Internal {
-            detail: format!("backup: encode the Calvin cut marker: {error}"),
-        },
-    )?;
+    let marker = zerompk::to_msgpack_vec(&SequencerEntry::CutMarker {
+        hlc: watermark,
+        restore_point,
+    })
+    .map_err(|error| Error::Internal {
+        detail: format!("backup: encode the Calvin cut marker: {error}"),
+    })?;
     let mut last_refusal = None;
     loop {
         if let Err(error) = proposer.propose(marker.clone()) {

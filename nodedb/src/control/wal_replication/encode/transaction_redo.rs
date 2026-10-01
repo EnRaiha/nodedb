@@ -41,4 +41,5 @@ pub fn transaction_redo_entry(
         },
     )
     .with_event_source(payload.event_source)
+    .naming(payload.collections.iter().map(String::as_str))
 }

@@ -6,16 +6,28 @@
 //! the durable engine state (BASE) and the not-yet-committed staged writes of
 //! the current transaction (OVERLAY). A prior in-transaction tombstone on a
 //! primary key makes it "absent" (so a re-insert after an in-transaction
-//! delete succeeds); a prior in-transaction put under a different surrogate
-//! sharing a unique value is a conflict. A staged TRUNCATE hides every base
-//! row, so only the overlay is consulted afterwards.
+//! delete succeeds). A unique value is judged on the transaction's post-state
+//! so far: a staged put under another surrogate that holds it is a conflict,
+//! and a base row the transaction rewrote or deleted no longer owns its
+//! values. A staged TRUNCATE hides every base row, so only the overlay is
+//! consulted afterwards.
 
-use super::context::StageCtx;
+use std::collections::HashSet;
+
+use super::context::{CollKey, StageCtx};
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::point::apply_put::unique::{
-    UniqueCheck, check_unique_constraints,
-};
-use crate::engine::document::store::{CollectionConfig, StorageKey, extract_index_values};
+use crate::data::executor::enforcement::unique::{PostImage, UniqueScope, check_unique_post_state};
+use crate::data::executor::handlers::transaction::overlay::Staged;
+use crate::engine::document::store::{CollectionConfig, StorageKey};
+use crate::types::{DatabaseId, TenantId, TxnId};
+
+/// The transaction and collection one staged statement writes.
+pub(in crate::data::executor) struct StagedStatement<'a> {
+    pub database_id: u64,
+    pub tid: u64,
+    pub txn_id: TxnId,
+    pub coll_key: &'a (DatabaseId, TenantId, String),
+}
 
 /// The overlay's verdict on a primary key within the current transaction.
 pub(super) enum OverlayPk {
@@ -29,12 +41,12 @@ pub(super) enum OverlayPk {
 }
 
 impl CoreLoop {
-    /// Whether `ctx.collection`'s base rows are visible inside `ctx.txn_id`.
+    /// Whether the base rows of `coll_key` are visible inside `txn_id`.
     /// `false` after a staged TRUNCATE of the collection.
-    pub(super) fn stage_base_visible(&self, ctx: &StageCtx<'_>) -> bool {
+    pub(super) fn stage_base_visible(&self, txn_id: TxnId, coll_key: &CollKey) -> bool {
         self.txn_overlays
-            .get(&ctx.txn_id)
-            .is_none_or(|overlay| overlay.base_visible(&ctx.coll_key))
+            .get(&txn_id)
+            .is_none_or(|overlay| overlay.base_visible(coll_key))
     }
 
     /// True when the primary key is present under BASE ∪ OVERLAY semantics.
@@ -78,88 +90,103 @@ impl CoreLoop {
     }
 
     /// Reject the incoming document if it violates a UNIQUE index under
-    /// BASE ∪ OVERLAY. `staged_others` are the collection's staged put bodies
-    /// under surrogates OTHER than the incoming one (tombstones excluded).
+    /// BASE ∪ OVERLAY.
     pub(super) fn stage_unique_check(
         &self,
         ctx: &StageCtx<'_>,
         config: &CollectionConfig,
         incoming_doc: &serde_json::Value,
-        staged_others: &[Vec<u8>],
     ) -> crate::Result<()> {
-        let collection = ctx.collection;
-        // BASE: another durable row already owning one of the unique values.
-        // The row's own index entries are keyed by its storage key. The
-        // self-match exclusion compares that key, not the plan's document id.
-        // Skipped after a staged TRUNCATE: no base row survives COMMIT.
-        if self.stage_base_visible(ctx) {
-            let storage_key = StorageKey::for_surrogate(ctx.surrogate);
-            check_unique_constraints(UniqueCheck {
-                sparse: &self.sparse,
+        self.stage_statement_unique_check(
+            &StagedStatement {
                 database_id: ctx.database_id,
                 tid: ctx.tid,
-                collection,
-                doc: incoming_doc,
-                document_id: &storage_key,
+                txn_id: ctx.txn_id,
+                coll_key: &ctx.coll_key,
+            },
+            config,
+            &[(ctx.surrogate.0, incoming_doc)],
+        )
+    }
+
+    /// Judge the stored post-images one staged UPDATE statement writes, all
+    /// together, under BASE ∪ OVERLAY. A value one row of the statement
+    /// releases is free for another. A collection with no UNIQUE index
+    /// decodes nothing.
+    pub(in crate::data::executor) fn stage_stored_unique_check(
+        &self,
+        statement: &StagedStatement<'_>,
+        rows: &[(u32, &[u8])],
+    ) -> crate::Result<()> {
+        let collection = statement.coll_key.2.as_str();
+        let Some(config) = self.unique_config(statement.database_id, statement.tid, collection)
+        else {
+            return Ok(());
+        };
+        let docs = rows
+            .iter()
+            .map(|(_, body)| self.decode_stored_document(config, body))
+            .collect::<crate::Result<Vec<_>>>()?;
+        let incoming: Vec<(u32, &serde_json::Value)> = rows
+            .iter()
+            .zip(&docs)
+            .map(|((surrogate, _), doc)| (*surrogate, doc))
+            .collect();
+        self.stage_statement_unique_check(statement, config, &incoming)
+    }
+
+    /// Judge `incoming` against the transaction's post-state so far: the
+    /// collection's other staged rows count with their staged images, and
+    /// their base images no longer count. COMMIT judges the whole record again,
+    /// since a concurrent transaction can claim the value in between.
+    fn stage_statement_unique_check(
+        &self,
+        statement: &StagedStatement<'_>,
+        config: &CollectionConfig,
+        incoming: &[(u32, &serde_json::Value)],
+    ) -> crate::Result<()> {
+        let written: HashSet<u32> = incoming.iter().map(|(surrogate, _)| *surrogate).collect();
+        let overlay = self.txn_overlays.get(&statement.txn_id);
+        // A staged body that will not decode cannot show the value it claims,
+        // so the check fails rather than let an incoming row take it.
+        let staged: Vec<(u32, Option<serde_json::Value>)> = match overlay {
+            Some(overlay) => overlay
+                .iter_for_collection(statement.coll_key)
+                .filter(|(surrogate, _)| !written.contains(surrogate))
+                .map(|(surrogate, staged)| match staged {
+                    Staged::Put(body) => self
+                        .decode_stored_document(config, body)
+                        .map(|doc| (surrogate, Some(doc))),
+                    Staged::Tombstone => Ok((surrogate, None)),
+                })
+                .collect::<crate::Result<_>>()?,
+            None => Vec::new(),
+        };
+        let rows: Vec<PostImage<'_>> = staged
+            .iter()
+            .map(|(surrogate, doc)| PostImage {
+                surrogate: *surrogate,
+                doc: doc.as_ref(),
+                judged: false,
+            })
+            .chain(incoming.iter().map(|(surrogate, doc)| PostImage {
+                surrogate: *surrogate,
+                doc: Some(*doc),
+                judged: true,
+            }))
+            .collect();
+        check_unique_post_state(
+            &UniqueScope {
+                sparse: &self.sparse,
+                database_id: statement.database_id,
+                tid: statement.tid,
+                collection: statement.coll_key.2.as_str(),
                 paths: &config.index_paths,
                 bitemporal: config.bitemporal,
-            })?;
-        }
-
-        // OVERLAY: a staged put under a different surrogate sharing a value.
-        for path in &config.index_paths {
-            if !path.unique {
-                continue;
-            }
-            if let Some(ref pred) = path.predicate
-                && !pred.evaluate_json(incoming_doc)
-            {
-                continue;
-            }
-            let incoming: std::collections::HashSet<String> =
-                extract_index_values(incoming_doc, &path.path, path.is_array)
-                    .into_iter()
-                    .map(|raw| {
-                        if path.case_insensitive {
-                            raw.to_lowercase()
-                        } else {
-                            raw
-                        }
-                    })
-                    .collect();
-            if incoming.is_empty() {
-                continue;
-            }
-            for body in staged_others {
-                // A staged body that will not decode cannot be checked for the
-                // unique value it might already own, so skipping it would let
-                // the incoming row take a value another staged row in the same
-                // transaction is claiming.
-                let staged_doc = self.decode_stored_document(config, body)?;
-                if let Some(ref pred) = path.predicate
-                    && !pred.evaluate_json(&staged_doc)
-                {
-                    continue;
-                }
-                for raw in extract_index_values(&staged_doc, &path.path, path.is_array) {
-                    let needle = if path.case_insensitive {
-                        raw.to_lowercase()
-                    } else {
-                        raw
-                    };
-                    if incoming.contains(&needle) {
-                        return Err(crate::Error::RejectedConstraint {
-                            collection: collection.to_string(),
-                            constraint: "unique".to_string(),
-                            detail: format!(
-                                "unique index '{}' violation on field '{}' (value '{}')",
-                                path.name, path.path, needle
-                            ),
-                        });
-                    }
-                }
-            }
-        }
-        Ok(())
+                base_visible: overlay
+                    .is_none_or(|overlay| overlay.base_visible(statement.coll_key)),
+            },
+            &rows,
+        )
     }
 }

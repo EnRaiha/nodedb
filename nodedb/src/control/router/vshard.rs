@@ -6,9 +6,8 @@ use crate::types::VShardId;
 
 /// Maps virtual shards to Data Plane core IDs.
 ///
-/// In single-node mode, vShards are distributed round-robin across cores.
-/// In cluster mode, the routing table is maintained by Raft consensus and
-/// updated atomically during vShard migrations.
+/// vShards are distributed round-robin across this node's cores. Which node
+/// owns a vShard is the cluster routing table's concern, not this map's.
 pub struct VShardRouter {
     /// vShard -> core ID mapping. Core ID is the index into the Data Plane
     /// core array (0..data_plane_cores-1).
@@ -17,11 +16,12 @@ pub struct VShardRouter {
 }
 
 impl VShardRouter {
-    /// Create a round-robin router for single-node mode.
+    /// Create a round-robin router over `num_cores` cores.
     pub fn round_robin(num_cores: usize) -> Self {
         let mut routes = HashMap::with_capacity(VShardId::COUNT as usize);
         for i in 0..VShardId::COUNT {
-            routes.insert(VShardId::new(i), i as usize % num_cores);
+            let vshard = VShardId::new(i);
+            routes.insert(vshard, crate::types::core_for_vshard(vshard, num_cores));
         }
         Self { routes, num_cores }
     }

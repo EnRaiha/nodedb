@@ -18,7 +18,9 @@ use super::super::admission::{admit, admit_without_rate_limit};
 use super::super::auth::{ApiError, AppState, ResolvedIdentity};
 use super::super::peer::PeerAddr;
 use super::query::{DatabaseQueryParam, resolve_database_id};
-use crate::control::change_stream::{ChangeCursor, ReplayError, ReplayStart, SequencedChangeEvent};
+use crate::control::change_stream::{
+    ChangeCursor, CursorStep, ReplayError, ReplayStart, SequencedChangeEvent,
+};
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::Permission;
 use crate::control::server::shared::authorization::{authorize_collection, authorize_database};
@@ -81,23 +83,27 @@ pub async fn sse_stream(
         Some(tenant_id),
         database_id,
     );
+    // The ring is bounded, so the replay returns every event it holds. Live
+    // events the replay already covered are skipped by the running cursor.
     let snapshot = shared
         .change_stream
-        .query_changes_in_database(tenant_id, database_id, Some(&collection), start, 10_000)
+        .query_changes_in_database(tenant_id, database_id, Some(&collection), start, usize::MAX)
         .map_err(reset_error)?;
-    let snapshot_cursor = snapshot.snapshot_cursor;
+    let mut cursor = snapshot.cursor;
     let stream = async_stream::stream! {
-        for event in snapshot.events { yield Ok(format_sse_event(&event)); }
+        for replayed in snapshot.events { yield Ok(format_sse_event(&replayed.event, &replayed.cursor)); }
         loop {
             match subscription.recv_sequenced().await {
-                Ok(event) => {
-                    if !event.cursor().same_epoch(snapshot_cursor) {
-                        yield Ok(Event::default().event("reset_required").data("change stream epoch changed; reconnect with a fresh snapshot"));
+                Ok(event) => match cursor.accept(&event) {
+                    CursorStep::Deliver => {
+                        yield Ok(format_sse_event(&event, &cursor));
+                    }
+                    CursorStep::Skip => {}
+                    CursorStep::Reset => {
+                        yield Ok(Event::default().event("reset_required").data("this node's change feed has a gap above the stream position; reconnect with a fresh snapshot"));
                         break;
                     }
-                    if !event.cursor().is_after_in_same_epoch(snapshot_cursor) { continue; }
-                    yield Ok(format_sse_event(&event));
-                }
+                },
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     yield Ok(Event::default().event("reset_required").data("change stream lagged; reconnect with a fresh snapshot"));
                     break;
@@ -146,23 +152,22 @@ pub async fn poll_changes(
         .map(ReplayStart::Cursor)
         .unwrap_or(ReplayStart::Timestamp(params.since_ms.unwrap_or(0)));
     let limit = params.limit.unwrap_or(100).clamp(1, 10_000);
-    let mut snapshot = state
+    let snapshot = state
         .shared
         .change_stream
-        .query_changes_in_database(tenant_id, database_id, Some(&collection), start, limit + 1)
+        .query_changes_in_database(tenant_id, database_id, Some(&collection), start, limit)
         .map_err(reset_error)?;
-    let has_more = snapshot.events.len() > limit;
-    if has_more {
-        snapshot.events.truncate(limit);
-    }
-    let changes: Vec<_> = snapshot.events.iter().map(change_json).collect();
-    let next_cursor = snapshot
+    let changes: Vec<_> = snapshot
         .events
-        .last()
-        .map(|event| serde_json::json!({"cursor": event.cursor().to_string()}));
+        .iter()
+        .map(|replayed| change_json(&replayed.event, &replayed.cursor))
+        .collect();
+    // The cursor resumes past every held event the poll passed over, even
+    // when it returned none.
+    let next_cursor = serde_json::json!({"cursor": snapshot.cursor.to_string()});
     Ok((
         rate_limit_headers,
-        Json(serde_json::json!({ "changes": changes, "next_cursor": next_cursor, "has_more": has_more, "count": snapshot.events.len() })),
+        Json(serde_json::json!({ "changes": changes, "next_cursor": next_cursor, "has_more": snapshot.has_more, "count": snapshot.events.len() })),
     )
         .into_response())
 }
@@ -221,18 +226,18 @@ fn parse_last_event_id(headers: &HeaderMap) -> Result<Option<ChangeCursor>, ApiE
 fn reset_error(_: ReplayError) -> ApiError {
     ApiError::HttpStatus(
         410,
-        "reset_required: cursor is expired, from a different stream epoch, or ahead of the stream"
-            .into(),
+        "reset_required: this node no longer holds every change past the cursor".into(),
     )
 }
 
-fn change_json(event: &SequencedChangeEvent) -> serde_json::Value {
-    serde_json::json!({ "operation": event.operation.as_str(), "document_id": event.document_id.as_str(), "timestamp_ms": event.timestamp_ms, "lsn": event.lsn.as_u64(), "collection": event.collection, "cursor": event.cursor().to_string() })
+/// One change, and the cursor that resumes right after it.
+fn change_json(event: &SequencedChangeEvent, cursor: &ChangeCursor) -> serde_json::Value {
+    serde_json::json!({ "operation": event.operation.as_str(), "document_id": event.document_id.as_str(), "timestamp_ms": event.timestamp_ms, "lsn": event.lsn.as_u64(), "collection": event.collection, "cursor": cursor.to_string() })
 }
 
-fn format_sse_event(event: &SequencedChangeEvent) -> Event {
+fn format_sse_event(event: &SequencedChangeEvent, cursor: &ChangeCursor) -> Event {
     Event::default()
-        .id(event.cursor().to_string())
+        .id(cursor.to_string())
         .event(event.operation.as_str().to_lowercase())
-        .data(change_json(event).to_string())
+        .data(change_json(event, cursor).to_string())
 }

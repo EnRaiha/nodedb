@@ -2,17 +2,15 @@
 
 //! Shared implementation behind `CREATE COLLECTION` and `CREATE TABLE`.
 //!
-//! Relocated verbatim from the pgwire `pgwire::ddl::collection::create::build`
-//! module (now deleted). The two surface DDLs differ in only five places: the
+//! The two surface DDLs differ in only five places: the
 //! error label ("collection" vs "table"), whether an empty column list is
 //! allowed, the default `CollectionType` when no engine is named (schemaless
 //! vs strict), the audit-log verb, and the response tag. Everything in
 //! between — name validation, duplicate check, engine validation, schema
 //! construction, vector-primary parsing, flag validation, `StoredCollection`
 //! assembly, propose+apply, SERIAL sequence auto-creation, vector-field
-//! auto-config — is identical, and is preserved verbatim here; only the
-//! result construction changed from pgwire `Response` / `PgWireError` to the
-//! protocol-neutral [`DdlResult`] / [`DdlError`].
+//! auto-config — is identical and runs here. The
+//! result is the protocol-neutral [`DdlResult`] / [`DdlError`].
 //!
 //! [`build_and_persist`] is the single body; [`Variant`] supplies the five
 //! differences declaratively. Name/flag validation lives in
@@ -21,20 +19,25 @@
 
 use nodedb_types::DatabaseId;
 
+use crate::control::propose_outcome::ProposeOutcome;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::catalog::StoredCollection;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::super::catalog::propose_and_apply;
+use super::super::super::super::catalog::propose_and_apply_async;
 use super::super::super::super::result::{DdlError, DdlResult};
 use super::super::enforcement::{
     parse_and_validate_balanced_clause, resolve_custom_type_columns, validate_hash_chain_flags,
+    validate_hash_chain_storage,
 };
 use super::engine_option::validate_engine_name;
 use super::request::CreateCollectionRequest;
 
-use super::build_flags::{err, resolve_crdt_flag, validate_crdt_signing_storage, validate_name};
+use super::build_flags::{
+    declare_hash_chain_columns, err, resolve_crdt_flag, validate_crdt_signing_storage,
+    validate_name,
+};
 use super::build_post_create::{create_serial_sequences, log_vector_fields};
 use super::build_primary_engine::resolve_primary_engine;
 use crate::control::server::shared::ddl::neutral::column_default::validate_column_defaults;
@@ -58,6 +61,18 @@ pub struct Variant {
     pub default_strict: bool,
 }
 
+/// A proposed CREATE COLLECTION / CREATE TABLE.
+pub struct CreatedCollection {
+    /// The client response.
+    pub results: Vec<DdlResult>,
+    /// What the proposer did with the `PutCollection` entry. A durable outcome
+    /// already registered the collection on every local core. A buffered one
+    /// registered nothing.
+    pub outcome: ProposeOutcome,
+    /// The collection the entry carries.
+    pub collection: StoredCollection,
+}
+
 /// Shared body. Validates the request, builds the
 /// `StoredCollection`, replicates it through the metadata raft
 /// group, and runs the post-create side effects (SERIAL sequence
@@ -68,7 +83,7 @@ pub async fn build_and_persist(
     req: &CreateCollectionRequest<'_>,
     database_id: DatabaseId,
     variant: &Variant,
-) -> Result<Vec<DdlResult>, DdlError> {
+) -> Result<CreatedCollection, DdlError> {
     let CreateCollectionRequest {
         name,
         engine,
@@ -97,20 +112,6 @@ pub async fn build_and_persist(
 
     let tenant_id = identity.tenant_id;
 
-    // Metadata Raft serializes clustered DDL. Without it, hold an exclusive
-    // per-name lifecycle guard across validation, any predecessor reclaim,
-    // catalog creation, and Data Plane registration.
-    let mut local_lifecycle = if state.metadata_raft.get().is_none() {
-        Some(
-            state
-                .quiesce
-                .acquire_lifecycle(database_id.as_u64(), tenant_id.as_u64(), name)
-                .await,
-        )
-    } else {
-        None
-    };
-
     // A materialized-view definition durably owns its same-name target even if
     // a crash occurred between definition and target registration.
     let catalog = state.credentials.catalog();
@@ -126,7 +127,7 @@ pub async fn build_and_persist(
     }
 
     // Check if the object already exists. A catalog-read fault must abort the
-    // CREATE — proceeding as if no row exists could build a fresh collection
+    // CREATE — proceeding as if no row exists can build a fresh collection
     // over a soft-deleted incarnation's still-present storage.
     let existing = catalog
         .get_collection(database_id, tenant_id.as_u64(), name)
@@ -153,9 +154,9 @@ pub async fn build_and_persist(
         // row sits below it and is shadowed on replay, while every row the
         // new collection writes sits at or above it and survives.
         let purge_lsn = state.wal.next_lsn().as_u64();
-        // Fail closed: if the hard-purge could not remove the old
+        // Fail closed: if the hard-purge cannot remove the old
         // catalog row, ABORT the CREATE rather than build a new
-        // collection over un-purged data (which would resurrect the
+        // collection over un-purged data (which will resurrect the
         // stale rows). Surface as an internal error to the client.
         let purge_result =
             crate::control::server::shared::ddl::neutral::collection::purge::hard_purge_collection(
@@ -164,18 +165,10 @@ pub async fn build_and_persist(
                 tenant_id.as_u64(),
                 name,
                 purge_lsn,
-                local_lifecycle.is_some(),
+                false,
             )
             .await;
         if let Err(failure) = purge_result {
-            // Only disarm when a durable retry record owns the drain. Otherwise
-            // let the guard release the in-memory hold so this same-name CREATE
-            // can be retried against the durable inactive catalog row.
-            if failure.retry_queued
-                && let Some(guard) = local_lifecycle.take()
-            {
-                guard.disarm();
-            }
             return Err(DdlError::from_error(&failure.error));
         }
     }
@@ -205,14 +198,19 @@ pub async fn build_and_persist(
         tenant_id.as_u64(),
     );
 
-    let (collection_type, columnar_schema_columns) = nodedb_sql::ddl_ast::build_collection_type(
-        canonical_engine,
-        &resolved_columns,
-        options,
-        bitemporal_flag,
-        variant.default_strict,
-    )
-    .map_err(|e| err("42601", e.to_string()))?;
+    let (mut collection_type, columnar_schema_columns) =
+        nodedb_sql::ddl_ast::build_collection_type(
+            canonical_engine,
+            &resolved_columns,
+            options,
+            bitemporal_flag,
+            variant.default_strict,
+        )
+        .map_err(|e| err("42601", e.to_string()))?;
+    declare_hash_chain_columns(
+        &mut collection_type,
+        flags.iter().any(|f| f == "HASH_CHAIN"),
+    )?;
 
     let mut fields = expanded_columns.clone();
     if fields.is_empty() && !columnar_schema_columns.is_empty() {
@@ -238,6 +236,7 @@ pub async fn build_and_persist(
         .map_err(|e| err(e.sqlstate(), e.to_string()))?;
 
     let crdt = resolve_crdt_flag(options, &collection_type)?;
+    validate_hash_chain_storage(hash_chain, crdt).map_err(|e| err(e.sqlstate(), e.to_string()))?;
     validate_crdt_signing_storage(
         crdt_signing_required,
         crdt,
@@ -247,9 +246,9 @@ pub async fn build_and_persist(
     // physically TEXT, so the resolved list is the one to check.
     //
     // A schemaless collection is deliberately not checked: its field list is
-    // advisory, a write may carry any field whether or not it appears there,
+    // advisory, a write can carry any field whether or not it appears there,
     // and the commit-time check reads whatever the row actually holds. Refusing
-    // a BALANCED column that is merely absent from that list would reject
+    // a BALANCED column that is merely absent from that list will reject
     // `CREATE COLLECTION x WITH BALANCED ON (...)` — a declaration with no
     // column list at all, which is the ordinary schemaless spelling.
     let balanced =
@@ -279,6 +278,7 @@ pub async fn build_and_persist(
         constraint_version: 0,
         crdt_signing_required,
         modification_hlc: nodedb_types::Hlc::ZERO,
+        incarnation: nodedb_types::Hlc::ZERO,
         fields,
         field_defs: Vec::new(),
         event_defs: Vec::new(),
@@ -314,11 +314,13 @@ pub async fn build_and_persist(
         declared_primary_key,
     };
 
+    // The apply of a new incarnation clears the name's storage before the
+    // engine registers, on every node, this one included.
     let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll.clone()));
-    propose_and_apply(state, &entry)?;
+    let outcome = propose_and_apply_async(state, &entry).await?;
 
     log_vector_fields(name, &coll.fields);
-    create_serial_sequences(state, identity, database_id, name, &serial_fields, now)?;
+    create_serial_sequences(state, identity, database_id, name, &serial_fields, now).await?;
 
     state.audit_record(
         AuditEvent::AdminAction,
@@ -327,8 +329,12 @@ pub async fn build_and_persist(
         &format!("created {} '{name}'", variant.label),
     );
 
-    Ok(vec![DdlResult::Status {
-        command: variant.response_tag.to_string(),
-        rows_affected: None,
-    }])
+    Ok(CreatedCollection {
+        results: vec![DdlResult::Status {
+            command: variant.response_tag.to_string(),
+            rows_affected: None,
+        }],
+        outcome,
+        collection: coll,
+    })
 }

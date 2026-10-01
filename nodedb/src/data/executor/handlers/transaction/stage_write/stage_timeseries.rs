@@ -50,6 +50,7 @@ use nodedb_types::value::Value;
 use nodedb_types::{RowIdentity, Surrogate};
 
 use super::context::StageCtx;
+use super::stage_timeseries_ilp::{PreviewTarget, preview_target};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
@@ -112,6 +113,9 @@ impl CoreLoop {
             surrogates,
             rls_write_check,
         };
+        if format == crate::engine::timeseries::resolved_ingest::RESOLVED_INGEST_FORMAT {
+            return self.stage_resolved_timeseries(stage);
+        }
         // The canonical line list always travels with one token per line.
         if format == "ilp-msgpack" {
             return self.stage_canonical_ilp_rows(stage);
@@ -187,10 +191,16 @@ impl CoreLoop {
         ) {
             return self.response_error(task, error);
         }
+        // A row the preview rejects is not staged: the statement reports it.
+        let target = preview_target(&stage);
+        let preview = match self.stage_preview(&target, payload, format, now_ms) {
+            Ok(preview) => preview,
+            Err(error) => return self.response_error(task, error),
+        };
 
         let mut staged = 0usize;
         for (row_idx, row) in rows.iter().enumerate() {
-            if !matches!(row, Value::Object(_)) {
+            if !matches!(row, Value::Object(_)) || !preview.accepts(row_idx) {
                 continue;
             }
 
@@ -232,8 +242,8 @@ impl CoreLoop {
             staged += 1;
         }
         self.note_staged_ingest_now(task, tid, txn_id, collection, surrogates, now_ms);
-
-        self.stage_count_response(task, staged)
+        self.note_stage_preview(&target, preview.schema);
+        self.stage_ts_count_response(task, staged, preview.rejected)
     }
 
     pub(super) fn stage_canonical_ilp_rows(&mut self, args: CanonicalIlpStage<'_>) -> Response {
@@ -352,6 +362,16 @@ impl CoreLoop {
         ) {
             return self.response_error(task, error);
         }
+        let target = PreviewTarget {
+            task,
+            tid,
+            txn_id,
+            collection,
+        };
+        let preview = match self.stage_preview(&target, payload, "ilp-msgpack", now_ms) {
+            Ok(preview) => preview,
+            Err(error) => return self.response_error(task, error),
+        };
 
         // A staged row is read back by name, so the line's timestamp must be
         // keyed under the collection's own time column — the same name the
@@ -439,7 +459,8 @@ impl CoreLoop {
             .txn_overlays
             .get(&txn_id)
             .map(|overlay| overlay.journal_len());
-        for (surrogate, body) in surrogates.iter().copied().zip(encoded_rows) {
+        let accepted = surrogates.iter().copied().zip(encoded_rows).enumerate();
+        for (_, (surrogate, body)) in accepted.filter(|(line, _)| preview.accepts(*line)) {
             let ctx = StageCtx::new(
                 task,
                 tid,
@@ -454,34 +475,9 @@ impl CoreLoop {
             }
         }
         self.note_staged_ingest_now(task, tid, txn_id, collection, surrogates, now_ms);
-        self.stage_count_response(task, lines.len())
-    }
-
-    /// Restore the exact overlay state from before canonical ILP row staging.
-    /// When this batch created the overlay, remove the now-empty representation
-    /// and balance the creation gauge exactly once.
-    fn rollback_canonical_ilp_stage(&mut self, txn_id: TxnId, prior_marker: Option<usize>) {
-        match prior_marker {
-            Some(marker) => {
-                if let Some(overlay) = self.txn_overlays.get_mut(&txn_id) {
-                    overlay.rollback_to(marker);
-                }
-            }
-            None => {
-                let remove_empty = self.txn_overlays.get_mut(&txn_id).is_some_and(|overlay| {
-                    overlay.rollback_to(0);
-                    overlay.is_empty()
-                });
-                if remove_empty
-                    && self.txn_overlays.remove(&txn_id).is_some()
-                    && let Some(metrics) = &self.metrics
-                {
-                    metrics
-                        .active_txn_overlays
-                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-        }
+        let rejected = preview.rejected;
+        self.note_stage_preview(&target, preview.schema);
+        self.stage_ts_count_response(task, lines.len().saturating_sub(rejected), rejected)
     }
 }
 
@@ -556,6 +552,7 @@ mod tests {
                 txn_id: None,
                 wal_lsn: None,
                 resolved_now_ms: None,
+                commit_hlc: None,
                 admission: Admission::Exempt(ExemptReason::AlreadyOrdered),
             },
             state: TaskState::Running,

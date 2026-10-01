@@ -2,17 +2,13 @@
 
 //! Protocol-neutral `SHOW CONTINUOUS AGGREGATES [FOR <source>]` handler.
 //!
-//! Ported from the pgwire `ddl::continuous_agg::show` handler. The catalog read
-//! (durable source of truth), the best-effort runtime-stats merge from the local
-//! Data Plane manager, the optional `FOR <source>` filter, the decode-failure
-//! skip, and the exact column set are preserved verbatim; only the result
-//! construction changed from pgwire `Response` / `QueryResponse` to the
-//! protocol-neutral [`DdlResult::Rows`] over [`ShapedRows`]. The mixed
-//! text/`int8` column OIDs (`watermark_ts`, `rows_aggregated`,
-//! `materialized_buckets` are `int8`) are reproduced by building `column_types`
-//! manually so the RowDescription stays byte-identical; the `int8` cells are
-//! emitted as their decimal text form, the same bytes the pgwire
-//! `DataRowEncoder::encode_field(&i64)` produced.
+//! The catalog read (durable source of truth), the best-effort runtime-stats
+//! merge from the local Data Plane manager, the optional `FOR <source>`
+//! filter, the decode-failure skip, and the exact column set run here. The
+//! result is the protocol-neutral [`DdlResult::Rows`] over [`ShapedRows`].
+//! The mixed text/`int8` column OIDs (`watermark_ts`, `rows_aggregated`,
+//! `materialized_buckets` are `int8`) come from building `column_types`
+//! manually; the `int8` cells are emitted as their decimal text form.
 
 use std::time::Duration;
 

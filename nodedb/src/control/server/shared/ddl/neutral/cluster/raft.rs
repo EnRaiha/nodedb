@@ -3,10 +3,8 @@
 //! Protocol-neutral raft group DDL commands: SHOW RAFT GROUPS, SHOW RAFT
 //! GROUP, ALTER RAFT GROUP.
 //!
-//! Ported from the pgwire `ddl::cluster::raft` handlers. The raft-status /
-//! routing reads and the `ALTER RAFT GROUP` `ConfChange` propose are
-//! preserved verbatim; only the result construction changed from pgwire
-//! `Response` / `QueryResponse` to the protocol-neutral `DdlResult` over
+//! The raft-status / routing reads and the `ALTER RAFT GROUP` `ConfChange`
+//! propose run here. The result is the protocol-neutral `DdlResult` over
 //! `ShapedRows`.
 
 use serde_json::{Map, Value as JsonValue};
@@ -16,7 +14,7 @@ use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::support::ddl_err;
+use super::support::{cluster_not_started, ddl_err};
 
 /// SHOW RAFT GROUPS — list all Raft groups with leader, term, and status.
 ///
@@ -34,12 +32,7 @@ pub fn show_raft_groups(
 
     let status_fn = match state.raft_status_fn.get() {
         Some(f) => f,
-        None => {
-            return Err(ddl_err(
-                "55000",
-                "cluster mode not enabled (single-node instance)",
-            ));
-        }
+        None => return Err(cluster_not_started("raft status function")),
     };
 
     let statuses = status_fn();
@@ -132,12 +125,7 @@ pub fn show_raft_group(
 
     let status_fn = match state.raft_status_fn.get() {
         Some(f) => f,
-        None => {
-            return Err(ddl_err(
-                "55000",
-                "cluster mode not enabled (single-node instance)",
-            ));
-        }
+        None => return Err(cluster_not_started("raft status function")),
     };
 
     let statuses = status_fn();
@@ -244,15 +232,9 @@ pub fn alter_raft_group(
         }
     };
 
-    let proposer = match state.raft_proposer.get() {
-        Some(p) => p,
-        None => {
-            return Err(ddl_err(
-                "55000",
-                "cluster mode not enabled (single-node instance)",
-            ));
-        }
-    };
+    let proposer = state
+        .sync_raft_proposer()
+        .map_err(|e| DdlError::from_error_in_context("raft proposer", &e))?;
 
     let change = nodedb_cluster::ConfChange {
         change_type,
@@ -265,9 +247,7 @@ pub fn alter_raft_group(
     // Find a vShard that maps to this group to propose through Raft.
     let routing = match &state.cluster_routing {
         Some(r) => r,
-        None => {
-            return Err(ddl_err("55000", "cluster routing not available"));
-        }
+        None => return Err(cluster_not_started("cluster routing table")),
     };
 
     let routing = routing.read().unwrap_or_else(|p| p.into_inner());

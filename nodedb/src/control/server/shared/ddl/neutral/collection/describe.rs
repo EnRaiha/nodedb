@@ -2,10 +2,8 @@
 
 //! Protocol-neutral DESCRIBE COLLECTION and SHOW COLLECTIONS DDL.
 //!
-//! Ported from the pgwire `ddl::collection::describe` handlers. The catalog
-//! reads, row ordering, and error paths are preserved verbatim; only the result
-//! construction changed from pgwire `Response` / `QueryResponse` to the
-//! protocol-neutral `DdlResult` over `ShapedRows`.
+//! The catalog reads, row ordering, and error paths run here. The result is
+//! the protocol-neutral `DdlResult` over `ShapedRows`.
 
 use nodedb_types::DatabaseId;
 use serde_json::{Map, Value as JsonValue};

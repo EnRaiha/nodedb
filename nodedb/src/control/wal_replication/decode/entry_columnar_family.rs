@@ -133,8 +133,9 @@ mod tests {
     fn a_replicated_timeseries_ingest_carries_the_proposers_instant() {
         let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
-            payload: b"metrics value=1".to_vec(),
-            format: "ilp".to_string(),
+            payload: b"resolved rows".to_vec(),
+            // A proposal carries resolved rows; the encoder does not read them.
+            format: crate::engine::timeseries::resolved_ingest::RESOLVED_INGEST_FORMAT.to_string(),
             wal_lsn: None,
             surrogates: Vec::new(),
             provenance: None,
@@ -156,13 +157,13 @@ mod tests {
         let after = crate::engine::kv::current_ms();
 
         let bytes = entry.to_bytes();
-        let (_, _, _, resolved_now_ms) = decode::from_replicated_entry(&bytes, None)
+        let (_, _, _, resolved_now_ms) = decode::decode_replicated_entry(&bytes)
             .expect("decode")
             .expect("an entry");
         let instant = resolved_now_ms.expect("the ingest carries an instant");
         assert!((before..=after).contains(&instant));
         // Every replica decodes the same bytes, so every replica stamps alike.
-        let (_, _, _, again) = decode::from_replicated_entry(&bytes, None)
+        let (_, _, _, again) = decode::decode_replicated_entry(&bytes)
             .expect("decode")
             .expect("an entry");
         assert_eq!(again, Some(instant));

@@ -15,9 +15,8 @@
 //! `control::sequence::ddl_overlay` — because `NEXTVAL` mutates shared
 //! runtime state a rolled-back transaction must never let another connection
 //! observe. Array DDL is not buffered at all: `CREATE`/`ALTER`/`DROP ARRAY`
-//! apply and persist synchronously in the write funnel
-//! (`array_catalog::ddl::apply_authorized_ddl`), regardless of transaction
-//! state, so there is no uncommitted state for an overlay to replay.
+//! refuse to run inside a transaction block (`array_catalog::ddl`), so
+//! there is no uncommitted state for an overlay to replay.
 
 mod collection;
 mod core;

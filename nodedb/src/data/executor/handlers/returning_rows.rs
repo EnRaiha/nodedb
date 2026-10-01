@@ -10,7 +10,7 @@ use super::{returning_doc, rls_eval};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
-use crate::data::executor::response_codec::RowsPayload;
+use crate::data::executor::response_codec::{IngestRejection, RejectingRowsPayload, RowsPayload};
 use crate::data::executor::scan_normalize::{kv_row_to_doc, sparse_row_to_doc};
 use crate::data::executor::sparse_body_format::SparseBodyFormatRef;
 use crate::data::executor::task::ExecutionTask;
@@ -125,16 +125,19 @@ impl CoreLoop {
     /// Build a timeseries ingest's `RETURNING` response from the points it
     /// stored. `rows` are already `raw_scan::emit_memtable_rows_at` output, so
     /// a point renders exactly as `SELECT` would, `NaN`-as-NULL included; this
-    /// only re-keys the shape, no per-cell decisions of its own.
+    /// only re-keys the shape, no per-cell decisions of its own. A
+    /// `rejection` travels beside the rows, and the Control Plane raises it
+    /// as the rejected-lines notice.
     pub(in crate::data::executor) fn timeseries_stored_returning_response(
         &self,
         task: &ExecutionTask,
         spec: &ReturningSpec,
         rls_filters: &[u8],
         rows: &[rmpv::Value],
+        rejection: Option<IngestRejection>,
     ) -> Response {
         let docs: Vec<Value> = rows.iter().map(rmpv_to_value).collect();
-        match build_rows_payload(spec, rls_filters, &docs) {
+        match build_rejecting_rows_payload(spec, rls_filters, &docs, rejection) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
                 task,
@@ -224,6 +227,34 @@ pub(super) fn build_rows_payload(
     rls_filters: &[u8],
     docs: &[Value],
 ) -> crate::Result<Vec<u8>> {
+    build_rejecting_rows_payload(spec, rls_filters, docs, None)
+}
+
+/// [`build_rows_payload`] for an ingest that rejected rows: with a
+/// `rejection`, the blob is a [`RejectingRowsPayload`] that reports them
+/// beside the rows.
+pub(super) fn build_rejecting_rows_payload(
+    spec: &ReturningSpec,
+    rls_filters: &[u8],
+    docs: &[Value],
+    rejection: Option<IngestRejection>,
+) -> crate::Result<Vec<u8>> {
+    let RowsPayload { columns, rows } = rows_payload(spec, rls_filters, docs);
+    let encoded = match rejection {
+        None => zerompk::to_msgpack_vec(&RowsPayload { columns, rows }),
+        Some(rejected) => zerompk::to_msgpack_vec(&RejectingRowsPayload {
+            columns,
+            rows,
+            rejected,
+        }),
+    };
+    encoded.map_err(|e| crate::Error::Codec {
+        detail: format!("RowsPayload encode: {e}"),
+    })
+}
+
+/// The projected, policy-filtered rows of `docs`.
+fn rows_payload(spec: &ReturningSpec, rls_filters: &[u8], docs: &[Value]) -> RowsPayload {
     let visible: Vec<&Value> = docs
         .iter()
         .filter(|doc| rls_eval::rls_check_value(rls_filters, doc))
@@ -232,7 +263,10 @@ pub(super) fn build_rows_payload(
     let (columns, source_names) = match &spec.columns {
         ReturningColumns::Star => {
             if visible.is_empty() {
-                return encode_empty(Vec::new());
+                return RowsPayload {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                };
             }
             // Derive column names from the first doc's keys, sorted so the
             // shape is deterministic; both output and source names are
@@ -259,20 +293,7 @@ pub(super) fn build_rows_payload(
         .map(|doc| project_row(doc, &source_names))
         .collect();
 
-    let payload = RowsPayload { columns, rows };
-    zerompk::to_msgpack_vec(&payload).map_err(|e| crate::Error::Codec {
-        detail: format!("RowsPayload encode: {e}"),
-    })
-}
-
-fn encode_empty(columns: Vec<String>) -> crate::Result<Vec<u8>> {
-    let payload = RowsPayload {
-        columns,
-        rows: Vec::new(),
-    };
-    zerompk::to_msgpack_vec(&payload).map_err(|e| crate::Error::Codec {
-        detail: format!("RowsPayload encode empty: {e}"),
-    })
+    RowsPayload { columns, rows }
 }
 
 /// Project a single document into one typed cell per source name.
@@ -341,6 +362,29 @@ mod tests {
             Value::from(json!({"id": "r1", "owner": "alice", "note": "hidden"})),
             Value::from(json!({"id": "r2", "owner": "bob", "note": "shown"})),
         ]
+    }
+
+    /// An ingest that rejected rows reports them beside its rows. Without a
+    /// rejection the blob is a plain `RowsPayload`.
+    #[test]
+    fn a_rejection_travels_beside_the_rows() {
+        use crate::data::executor::response_codec::ReturningRowsReply;
+        let rejection = IngestRejection {
+            collection: "metrics".into(),
+            lines: 2,
+        };
+        let payload =
+            build_rejecting_rows_payload(&named(&["id"]), &[], &docs(), Some(rejection.clone()))
+                .expect("build");
+        let reply: ReturningRowsReply = zerompk::from_msgpack(&payload).expect("decode reply");
+        assert_eq!(reply.rows.len(), 2);
+        assert_eq!(reply.rejected, Some(rejection));
+
+        let plain =
+            build_rejecting_rows_payload(&named(&["id"]), &[], &docs(), None).expect("build");
+        assert_eq!(decode(&plain).rows.len(), 2);
+        let reply: ReturningRowsReply = zerompk::from_msgpack(&plain).expect("decode reply");
+        assert!(reply.rejected.is_none());
     }
 
     #[test]

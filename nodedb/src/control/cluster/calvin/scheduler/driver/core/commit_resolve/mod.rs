@@ -13,5 +13,6 @@
 //! drop.
 
 mod apply_tail;
+mod flush_parts;
 mod verdict;
 mod vote;

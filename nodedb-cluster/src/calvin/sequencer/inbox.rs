@@ -17,9 +17,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tracing::warn;
 
+use crate::calvin::completion::{AssignmentReceiver, CalvinCompletionRegistry};
 use crate::calvin::sequencer::config::SequencerConfig;
 use crate::calvin::sequencer::error::SequencerError;
-use crate::calvin::types::TxClass;
+use crate::calvin::sequencer::parts_intake::{PartsIntake, PartsOffer};
+use crate::calvin::types::{PartStreamId, StreamedPart, TxClass};
 
 use nodedb_types::TenantId;
 
@@ -69,6 +71,8 @@ pub struct Inbox {
     tenant_in_flight: Arc<Mutex<BTreeMap<u64, u64>>>,
     max_plans_bytes: usize,
     max_participating_vshards: usize,
+    /// The leader's queue of streamed parts, shared with the receiver.
+    parts: Arc<PartsIntake>,
     tenant_quota: usize,
     max_dependent_read_bytes: usize,
     max_dependent_read_passives: usize,
@@ -90,6 +94,8 @@ pub struct InboxReceiver {
     /// `depth_counter` are NOT decremented while an item sits here — they are
     /// decremented when the item is finally moved into the output vector.
     pending: Option<AdmittedTx>,
+    /// The leader's queue of streamed parts, shared with every sender.
+    parts: Arc<PartsIntake>,
 }
 
 impl Inbox {
@@ -98,8 +104,10 @@ impl Inbox {
     /// Checks are performed in fail-fast order; no state mutation occurs on
     /// rejection:
     ///
-    /// 1. Plans blob too large → `TxnTooLarge`.
-    /// 2. Too many participating vShards → `FanoutTooWide`.
+    /// 1. A single entry above the per-entry byte cap → `TxnTooLarge`. A
+    ///    multi-part header with plans or a malformed manifest →
+    ///    `MalformedParts`.
+    /// 2. A single entry above the per-entry vShard cap → `FanoutTooWide`.
     /// 3. Dependent-read payload too large → `DependentReadTooLarge`.
     /// 4. Dependent-read fan-in too wide → `DependentReadFanoutTooWide`.
     /// 5. Tenant in-flight quota exceeded → `TenantQuotaExceeded`.
@@ -109,22 +117,44 @@ impl Inbox {
     ///
     /// This call is **non-blocking**: it never waits for the epoch ticker.
     pub fn submit(&self, tx_class: TxClass) -> Result<u64, SequencerError> {
-        // Check 1: plans byte size.
-        if tx_class.plans.len() > self.max_plans_bytes {
-            return Err(SequencerError::TxnTooLarge {
-                bytes: tx_class.plans.len(),
-                limit: self.max_plans_bytes,
-            });
-        }
+        self.admit(tx_class, |_| (), |_| ()).map(|(seq, ())| seq)
+    }
 
-        // Check 2: vshard fan-out.
-        let vshards = tx_class.participating_vshards().len();
-        if vshards > self.max_participating_vshards {
-            return Err(SequencerError::FanoutTooWide {
-                vshards,
-                limit: self.max_participating_vshards,
-            });
-        }
+    /// [`Self::submit`], registering for the submission's assignment in
+    /// `registry` before the submission reaches the channel.
+    ///
+    /// The epoch tick can drain the submission the moment it is sent. Its
+    /// `note_assigned` then always finds the sender, so no assignment is lost.
+    /// A send that fails drops the registration again.
+    pub fn submit_with(
+        &self,
+        tx_class: TxClass,
+        registry: &CalvinCompletionRegistry,
+    ) -> Result<(u64, AssignmentReceiver), SequencerError> {
+        self.admit(
+            tx_class,
+            |seq| registry.register_submission(seq),
+            |seq| registry.drop_assignment(seq),
+        )
+    }
+
+    /// The submit body. `register` runs with the assigned seq before the
+    /// send. `unregister` runs with it when the send fails.
+    fn admit<R>(
+        &self,
+        tx_class: TxClass,
+        register: impl FnOnce(u64) -> R,
+        unregister: impl FnOnce(u64),
+    ) -> Result<(u64, R), SequencerError> {
+        // Checks 1 & 2: a single entry fits one entry, and a multi-part
+        // header is well formed. Its parts are checked as they stream in.
+        crate::calvin::sequencer::entry_limits::check_entry_shape(
+            &tx_class,
+            crate::calvin::sequencer::entry_limits::EntryLimits {
+                max_plans_bytes: self.max_plans_bytes,
+                max_participating_vshards: self.max_participating_vshards,
+            },
+        )?;
 
         // Checks 3 & 4: dependent-read caps.
         if let Some(spec) = &tx_class.dependent_reads {
@@ -180,12 +210,14 @@ impl Inbox {
             inbox_seq = seq,
         );
 
+        let registered = register(seq);
         match self.tx.try_send(admitted) {
             Ok(()) => {
                 self.depth_counter.fetch_add(1, Ordering::Relaxed);
-                Ok(seq)
+                Ok((seq, registered))
             }
             Err(e) => {
+                unregister(seq);
                 // Roll back the tenant counter because the message was never
                 // enqueued.
                 {
@@ -211,6 +243,12 @@ impl Inbox {
     /// Current number of items queued in the inbox (approximate).
     pub fn depth(&self) -> usize {
         self.depth_counter.load(Ordering::Relaxed) as usize
+    }
+
+    /// Offer streamed parts of a multi-part transaction to this node's
+    /// sequencer leader queue.
+    pub fn offer_parts(&self, stream: PartStreamId, parts: Vec<StreamedPart>) -> PartsOffer {
+        self.parts.offer(stream, parts)
     }
 }
 
@@ -276,31 +314,38 @@ impl InboxReceiver {
 
     /// Drain and discard all items including the `pending` slot.
     ///
-    /// Used by the non-leader discard path. Decrements `tenant_in_flight` and
-    /// `depth_counter` per item. Returns the total count discarded.
-    pub fn drain_all_discard(&mut self) -> usize {
-        let mut count = 0;
+    /// Used by the non-leader and halted discard paths. Decrements
+    /// `tenant_in_flight` and `depth_counter` per item. Returns the
+    /// `inbox_seq` of every discarded item, so the caller can drop each
+    /// one's assignment.
+    pub fn drain_all_discard(&mut self) -> Vec<u64> {
+        let mut discarded = Vec::new();
 
         // Discard the pending slot.
         if let Some(pending) = self.pending.take() {
             self.decrement_tenant(&pending.tx_class.tenant_id);
             self.depth_counter.fetch_sub(1, Ordering::Relaxed);
-            count += 1;
+            discarded.push(pending.inbox_seq);
         }
 
         // Drain the channel.
         while let Ok(tx) = self.rx.try_recv() {
             self.decrement_tenant(&tx.tx_class.tenant_id);
             self.depth_counter.fetch_sub(1, Ordering::Relaxed);
-            count += 1;
+            discarded.push(tx.inbox_seq);
         }
 
-        count
+        discarded
     }
 
     /// The inbox's configured capacity.
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// The leader's queue of streamed parts.
+    pub fn parts_intake(&self) -> Arc<PartsIntake> {
+        Arc::clone(&self.parts)
     }
 
     /// Approximate current depth (items queued).
@@ -329,6 +374,7 @@ pub fn new_inbox(capacity: usize, config: &SequencerConfig) -> (Inbox, InboxRece
     let next_seq = Arc::new(AtomicU64::new(0));
     let depth_counter = Arc::new(AtomicU64::new(0));
     let tenant_in_flight: Arc<Mutex<BTreeMap<u64, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    let parts = Arc::new(PartsIntake::new(config));
 
     let inbox = Inbox {
         tx,
@@ -337,6 +383,7 @@ pub fn new_inbox(capacity: usize, config: &SequencerConfig) -> (Inbox, InboxRece
         tenant_in_flight: Arc::clone(&tenant_in_flight),
         max_plans_bytes: config.max_plans_bytes_per_txn,
         max_participating_vshards: config.max_participating_vshards_per_txn,
+        parts: Arc::clone(&parts),
         tenant_quota: config.tenant_inbox_quota,
         max_dependent_read_bytes: config.max_dependent_read_bytes_per_txn,
         max_dependent_read_passives: config.max_dependent_read_passives_per_txn,
@@ -347,6 +394,7 @@ pub fn new_inbox(capacity: usize, config: &SequencerConfig) -> (Inbox, InboxRece
         depth_counter,
         tenant_in_flight,
         pending: None,
+        parts,
     };
     (inbox, receiver)
 }
@@ -464,6 +512,63 @@ mod tests {
         // Second drain should find nothing.
         let n2 = rx.drain_into_capped(&mut out, 100, usize::MAX);
         assert_eq!(n2, 0);
+    }
+
+    /// The tick can drain a submission before the submitter's next line runs.
+    /// Registering inside `submit_with` means the assignment still reaches the
+    /// submitter.
+    #[test]
+    fn submit_with_delivers_the_assignment_to_a_drain_right_after_submit() {
+        let registry = CalvinCompletionRegistry::new_detached();
+        let (inbox, mut rx) = new_inbox(10, &default_config());
+        let (seq, mut assignment) = inbox
+            .submit_with(make_tx_class(), &registry)
+            .expect("submit");
+
+        let mut out = Vec::new();
+        assert_eq!(rx.drain_into_capped(&mut out, 100, usize::MAX), 1);
+        registry.note_assigned(out[0].inbox_seq, crate::calvin::TxnId::new(3, 0), 2);
+
+        assert_eq!(out[0].inbox_seq, seq);
+        assert_eq!(assignment.try_recv(), Ok((3, 0, 2)));
+    }
+
+    /// A submission the channel refuses holds no assignment sender.
+    #[test]
+    fn submit_with_drops_the_registration_when_the_send_fails() {
+        let registry = CalvinCompletionRegistry::new_detached();
+        let config = SequencerConfig {
+            inbox_capacity: 1,
+            tenant_inbox_quota: 10,
+            ..default_config()
+        };
+        let (inbox, _rx) = new_inbox(1, &config);
+        inbox
+            .submit_with(make_tx_class(), &registry)
+            .expect("first submit fills the channel");
+        let err = inbox
+            .submit_with(make_tx_class(), &registry)
+            .expect_err("channel full");
+        assert_eq!(err, SequencerError::Overloaded);
+        assert_eq!(registry.pending_assignments_len(), 1);
+    }
+
+    #[test]
+    fn drain_all_discard_returns_every_discarded_seq() {
+        let (inbox, mut rx) = new_inbox(10, &default_config());
+        for _ in 0..3 {
+            inbox.submit(make_tx_class()).expect("submit");
+        }
+        // Park one item in the pending slot: a zero-byte cap defers it.
+        let mut tx = make_tx_class();
+        tx.plans = vec![0u8; 4];
+        inbox.submit(tx).expect("submit");
+        let mut out = Vec::new();
+        rx.drain_into_capped(&mut out, 100, 0);
+        assert_eq!(out.len(), 3);
+
+        assert_eq!(rx.drain_all_discard(), vec![3]);
+        assert_eq!(rx.depth(), 0);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::control::distributed_applier::applied_index::AppliedPrefix;
 use crate::control::distributed_applier::propose_tracker::{ApplyingEntry, ProposeTracker};
 use crate::control::server::shared::write_admission::plan_writes_user_data;
 use crate::control::state::tenant_marks::{MarkSite, TenantMarks};
-use crate::control::wal_replication::{ReplicatedEntry, ReplicatedWrite, from_replicated_entry};
+use crate::control::wal_replication::{ReplicatedEntry, ReplicatedWrite, decode_replicated_entry};
 
 use super::proposal_gate::PrefixStep;
 
@@ -51,20 +51,23 @@ impl QueuedEntry {
         self.decoded.as_ref().map_or(0, |e| e.metadata_floor)
     }
 
-    /// `(tenant_id, write_hlc)` of an entry that writes a tenant's data. A
-    /// cut barrier and a Calvin read result write nothing, and an entry with
-    /// no proposer stamp has no commit HLC to record.
-    pub fn write_stamp(&self) -> Option<(u64, u64)> {
+    /// `(tenant_id, write_hlc, restore_id)` of an entry that writes a
+    /// tenant's data. A cut barrier, a Calvin read result and a surrogate
+    /// bind write no data, and an entry with no proposer stamp has no commit
+    /// HLC to record.
+    pub fn write_stamp(&self) -> Option<(u64, u64, u64)> {
         let decoded = self.decoded.as_ref()?;
         if decoded.write_hlc == 0
             || matches!(
                 decoded.write,
-                ReplicatedWrite::CutBarrier { .. } | ReplicatedWrite::CalvinReadResult { .. }
+                ReplicatedWrite::CutBarrier { .. }
+                    | ReplicatedWrite::CalvinReadResult { .. }
+                    | ReplicatedWrite::SurrogateBind { .. }
             )
         {
             return None;
         }
-        Some((decoded.tenant_id, decoded.write_hlc))
+        Some((decoded.tenant_id, decoded.write_hlc, decoded.restore_id))
     }
 
     /// Whether the entry's plan writes user data, as the write funnel decides
@@ -81,9 +84,10 @@ impl QueuedEntry {
             | ReplicatedWrite::TransactionRedo { .. } => true,
             ReplicatedWrite::ArraySchema { .. }
             | ReplicatedWrite::CutBarrier { .. }
-            | ReplicatedWrite::CalvinReadResult { .. } => false,
+            | ReplicatedWrite::CalvinReadResult { .. }
+            | ReplicatedWrite::SurrogateBind { .. } => false,
             _ => matches!(
-                from_replicated_entry(&self.entry.data, None),
+                decode_replicated_entry(&self.entry.data),
                 Ok(Some((_, _, plan, _))) if plan_writes_user_data(&plan)
             ),
         }
@@ -92,7 +96,10 @@ impl QueuedEntry {
     /// Whether the entry must apply with nothing else of its group in
     /// flight. The array paths await their own write inside the apply, so
     /// the loop cannot fix their arrival order at the core any other way,
-    /// and a schema import must follow every earlier entry's apply.
+    /// and a schema import must follow every earlier entry's apply. A topic
+    /// publication awaits its proposal marker's fsync. A cut barrier
+    /// persists its floor, and a capturing one snapshots its tenants, after
+    /// every earlier entry and before every later one.
     pub fn is_exclusive(&self) -> bool {
         self.decoded.as_ref().is_some_and(|e| {
             matches!(
@@ -101,6 +108,8 @@ impl QueuedEntry {
                     | ReplicatedWrite::ArraySchema { .. }
                     | ReplicatedWrite::ArrayCellPut { .. }
                     | ReplicatedWrite::ArrayCellDelete { .. }
+                    | ReplicatedWrite::TopicPublish { .. }
+                    | ReplicatedWrite::CutBarrier { .. }
             )
         })
     }
@@ -125,9 +134,10 @@ pub(super) struct Slot {
     pub proposal_key: u64,
     /// The collection the entry writes, when its apply named one.
     pub collection: Option<String>,
-    /// `(tenant_id, commit_hlc)` the entry records on its tenant's mark in
-    /// this group once it settles, when it carries a proposer stamp.
-    pub write_mark: Option<(u64, u64)>,
+    /// `(tenant_id, commit_hlc, restore_id)` the entry records on its
+    /// tenant's mark in this group once it settles, when it carries a
+    /// proposer stamp. A non-zero `restore_id` raises the restore mark.
+    pub write_mark: Option<(u64, u64, u64)>,
     /// Whether the entry's plan writes user data. Only such an entry raises
     /// its tenant's mark.
     pub user_write: bool,
@@ -144,10 +154,12 @@ pub(super) struct Lane {
     pub blocking: Option<u64>,
     /// The durable prefix over every entry this process settled for the
     /// group. A break holds for the life of the process: an index saved past
-    /// a non-durable entry would let the next boot skip it.
+    /// a non-durable entry lets the next boot skip it.
     prefix: AppliedPrefix,
     /// The floor last saved for the group.
     saved_floor: Option<u64>,
+    /// The entry the last settle ended at.
+    last_settled: Option<u64>,
 }
 
 impl Lane {
@@ -159,7 +171,18 @@ impl Lane {
             blocking: None,
             prefix: AppliedPrefix::new(),
             saved_floor: None,
+            last_settled: None,
         }
+    }
+
+    /// The first started entry not yet settled.
+    pub fn front_index(&self) -> Option<u64> {
+        self.slots.front().map(|slot| slot.log_index)
+    }
+
+    /// The entry the last settle ended at.
+    pub fn last_settled(&self) -> Option<u64> {
+        self.last_settled
     }
 
     /// Whether any started entry of the group has not concluded.
@@ -246,7 +269,7 @@ impl Lane {
                 SlotState::Starting | SlotState::Running => break,
                 SlotState::Barrier => {
                     // Every entry before the barrier finished; a waiting
-                    // backup may snapshot this group now.
+                    // backup can snapshot this group now.
                     tracker.complete(
                         self.group_id,
                         front.log_index,
@@ -263,15 +286,25 @@ impl Lane {
             };
             let log_index = front.log_index;
             if front.user_write
-                && let Some((tenant_id, commit_hlc)) = front.write_mark
+                && let Some((tenant_id, commit_hlc, restore_id)) = front.write_mark
             {
-                marks.raise(
-                    self.group_id,
-                    tenant_id,
-                    commit_hlc,
-                    MarkSite::ReplicatedApply,
-                    front.collection.as_deref(),
-                );
+                if restore_id == 0 {
+                    marks.raise(
+                        self.group_id,
+                        tenant_id,
+                        commit_hlc,
+                        MarkSite::ReplicatedApply,
+                        front.collection.as_deref(),
+                    );
+                } else {
+                    marks.raise_restore(
+                        self.group_id,
+                        tenant_id,
+                        commit_hlc,
+                        front.collection.as_deref(),
+                        restore_id,
+                    );
+                }
             }
             self.slots.pop_front();
             match step {
@@ -279,6 +312,7 @@ impl Lane {
                 PrefixStep::Record(durable) => self.prefix.record(log_index, durable),
             }
             tracker.note_applied(self.group_id, log_index);
+            self.last_settled = Some(log_index);
             settled += 1;
         }
         tracker.note_applying(
@@ -403,11 +437,11 @@ mod tests {
         let marks = TenantMarks::default();
         let mut lane = Lane::new(4);
         let mut write = slot(1, SlotState::Concluded(PrefixStep::Record(true)));
-        write.write_mark = Some((7, 500));
+        write.write_mark = Some((7, 500, 0));
         write.user_write = true;
         write.collection = Some("docs".to_owned());
         let mut index_change = slot(2, SlotState::Concluded(PrefixStep::Record(true)));
-        index_change.write_mark = Some((7, 900));
+        index_change.write_mark = Some((7, 900, 0));
         lane.push(write);
         lane.push(index_change);
 
@@ -421,12 +455,29 @@ mod tests {
     }
 
     #[test]
+    fn a_restore_write_raises_the_restore_mark_under_its_id() {
+        let tracker = ProposeTracker::new();
+        let marks = TenantMarks::default();
+        let mut lane = Lane::new(4);
+        let mut write = slot(1, SlotState::Concluded(PrefixStep::Record(true)));
+        write.write_mark = Some((7, 600, 42));
+        write.user_write = true;
+        lane.push(write);
+
+        lane.settle(&tracker, &marks);
+        assert_eq!(marks.get(4, 7), None, "a restore write raises no user mark");
+        let all = marks.get_all(4, 7);
+        assert_eq!(all.len(), 1);
+        assert_eq!((all[0].hlc, all[0].restore_id), (600, 42));
+    }
+
+    #[test]
     fn a_refused_user_write_raises_no_mark() {
         let tracker = ProposeTracker::new();
         let marks = TenantMarks::default();
         let mut lane = Lane::new(4);
         let mut refused = slot(1, SlotState::Running);
-        refused.write_mark = Some((7, 500));
+        refused.write_mark = Some((7, 500, 0));
         refused.user_write = true;
         refused.collection = Some("docs".to_owned());
         lane.push(refused);

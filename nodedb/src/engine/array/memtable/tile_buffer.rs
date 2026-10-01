@@ -29,7 +29,7 @@ use nodedb_array::tile::tile_id_for_cell;
 use nodedb_array::types::TileId;
 use nodedb_array::types::cell_value::value::CellValue;
 use nodedb_array::types::coord::value::CoordValue;
-use nodedb_types::{OPEN_UPPER, Surrogate};
+use nodedb_types::Surrogate;
 
 /// Raw-byte write buffer for a single tile version.
 ///
@@ -48,6 +48,13 @@ impl TileBuffer {
     /// Iterate over all raw coord keys stored in this tile version.
     pub fn all_coord_keys(&self) -> impl Iterator<Item = &[u8]> {
         self.entries.keys().map(|k| k.as_slice())
+    }
+
+    /// Iterate over every `(coord_key, payload_or_sentinel)` entry.
+    pub fn iter_raw(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.entries
+            .iter()
+            .map(|(key, bytes)| (key.as_slice(), bytes.as_slice()))
     }
 
     fn encode_coord(coord: &Vec<CoordValue>) -> ArrayResult<Vec<u8>> {
@@ -137,33 +144,18 @@ impl TileBuffer {
         for (coord_key, bytes) in &self.entries {
             let coord = Self::decode_coord(coord_key)?;
             if is_cell_tombstone(bytes) {
-                b.push_row(SparseRow {
-                    coord: &coord,
-                    attrs: &[],
-                    surrogate: Surrogate::ZERO,
-                    valid_from_ms: 0,
-                    valid_until_ms: OPEN_UPPER,
-                    kind: RowKind::Tombstone,
-                })?;
+                b.push_row(SparseRow::sentinel(&coord, RowKind::Tombstone))?;
             } else if is_cell_gdpr_erasure(bytes) {
-                b.push_row(SparseRow {
-                    coord: &coord,
-                    attrs: &[],
-                    surrogate: Surrogate::ZERO,
-                    valid_from_ms: 0,
-                    valid_until_ms: OPEN_UPPER,
-                    kind: RowKind::GdprErased,
-                })?;
+                b.push_row(SparseRow::sentinel(&coord, RowKind::GdprErased))?;
             } else {
                 let payload = CellPayload::decode(bytes)?;
-                b.push_row(SparseRow {
-                    coord: &coord,
-                    attrs: &payload.attrs,
-                    surrogate: payload.surrogate,
-                    valid_from_ms: payload.valid_from_ms,
-                    valid_until_ms: payload.valid_until_ms,
-                    kind: RowKind::Live,
-                })?;
+                b.push_row(SparseRow::live(
+                    &coord,
+                    &payload.attrs,
+                    payload.surrogate,
+                    payload.valid_from_ms,
+                    payload.valid_until_ms,
+                ))?;
             }
         }
         Ok(b.build())
@@ -368,7 +360,7 @@ mod tests {
         PutCell {
             coord: c,
             attrs: a,
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
             system_from_ms: sys,
             valid_from_ms: vf,
             valid_until_ms: vu,
@@ -547,5 +539,36 @@ mod tests {
         let drained = m.drain_sorted();
         assert!(drained.windows(2).all(|w| w[0].0 < w[1].0));
         assert!(m.is_empty());
+    }
+
+    /// A live cell always holds a bound surrogate: a put under
+    /// `Surrogate::ZERO` is refused and buffers nothing, and a materialised
+    /// tombstone row holds no identity.
+    #[test]
+    fn a_cell_under_zero_is_refused_and_a_tombstone_holds_no_identity() {
+        let s = schema();
+        let mut m = Memtable::new();
+        let mut unbound = put(coord(1, 1), attrs(1), 100, 0, OPEN_UPPER, 1);
+        unbound.surrogate = Surrogate::ZERO;
+        assert!(m.put_cell(&s, unbound).is_err());
+        assert!(m.is_empty(), "a refused put buffers nothing");
+
+        m.put_cell(&s, put(coord(1, 1), attrs(1), 100, 0, OPEN_UPPER, 1))
+            .unwrap();
+        m.delete_cell(&s, coord(1, 2), 100, 2).unwrap();
+        for (_, buf) in m.iter() {
+            let tile = buf.materialise(&s).unwrap();
+            tile.check_stored_identities().unwrap();
+            for row in 0..tile.row_count() {
+                match tile.row_kind(row).unwrap() {
+                    RowKind::Live => {
+                        assert_eq!(tile.row_surrogate(row).unwrap(), Some(Surrogate::new(1)))
+                    }
+                    RowKind::Tombstone | RowKind::GdprErased => {
+                        assert_eq!(tile.row_surrogate(row).unwrap(), None)
+                    }
+                }
+            }
+        }
     }
 }

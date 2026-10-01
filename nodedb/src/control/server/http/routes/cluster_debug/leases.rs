@@ -21,6 +21,8 @@ struct LeaseRow {
 #[derive(serde::Serialize)]
 struct DrainRow {
     descriptor_id: String,
+    /// The operation that owns the drain.
+    owner: String,
     up_to_version: u64,
     expires_at: String,
 }
@@ -71,13 +73,18 @@ pub async fn leases_debug(
             .lease_drain
             .snapshot()
             .into_iter()
-            .map(|(descriptor_id, entry)| DrainRow {
+            .map(|(descriptor_id, owner, entry)| DrainRow {
                 descriptor_id: format!("{descriptor_id:?}"),
+                owner: format!("{owner:?}"),
                 up_to_version: entry.up_to_version,
                 expires_at: format!("{:?}", entry.expires_at),
             })
             .collect();
-        rows.sort_by(|a, b| a.descriptor_id.cmp(&b.descriptor_id));
+        rows.sort_by(|a, b| {
+            a.descriptor_id
+                .cmp(&b.descriptor_id)
+                .then_with(|| a.owner.cmp(&b.owner))
+        });
         rows
     };
 

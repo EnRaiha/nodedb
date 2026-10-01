@@ -91,19 +91,19 @@ impl<'a> StatementExecutor<'a> {
                     Ok(Flow::Continue)
                 }
                 Statement::Rollback => {
-                    self.execute_rollback()?;
+                    self.execute_rollback().await?;
                     Ok(Flow::Continue)
                 }
                 Statement::Savepoint { name } => {
-                    self.execute_savepoint(name)?;
+                    self.execute_savepoint(name).await?;
                     Ok(Flow::Continue)
                 }
                 Statement::RollbackTo { name } => {
-                    self.execute_rollback_to(name)?;
+                    self.execute_rollback_to(name).await?;
                     Ok(Flow::Continue)
                 }
                 Statement::ReleaseSavepoint { name } => {
-                    self.execute_release_savepoint(name)?;
+                    self.execute_release_savepoint(name).await?;
                     Ok(Flow::Continue)
                 }
             }

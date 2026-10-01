@@ -36,7 +36,7 @@ pub(super) fn inject_vector(ctx: &RlsCtx<'_>, op: &mut VectorOp) -> crate::Resul
         } => ctx.set_post_filters(collection, rls_filters),
 
         // Refuse: both return scored document identities with no filter slot,
-        // so the rows a policy hides would still be ranked and returned.
+        // so the rows a policy hides will still be ranked and returned.
         VectorOp::SparseSearch { collection, .. }
         | VectorOp::MultiVectorScoreSearch { collection, .. } => ctx.refuse_if_policy(
             collection,
@@ -53,7 +53,7 @@ pub(super) fn inject_vector(ctx: &RlsCtx<'_>, op: &mut VectorOp) -> crate::Resul
         ),
 
         // Admit: a vector-primary collection stores the row here and nowhere
-        // else — no companion document write would gate it — and this op
+        // else — no companion document write will gate it — and this op
         // carries `payload`, the MessagePack image of every non-vector column
         // the statement supplied, so the policy decides that image directly.
         //
@@ -85,7 +85,7 @@ pub(super) fn inject_vector(ctx: &RlsCtx<'_>, op: &mut VectorOp) -> crate::Resul
             // The read filter is independent of that write admission. A
             // `RETURNING` clause on this op ships the stored row back, and that
             // output is a read, so a row a read-only policy hides must not
-            // become visible just because the statement wrote it. A collection
+            // become visible only because the statement wrote it. A collection
             // can carry a `FOR SELECT` policy and no write policy at all, in
             // which case the write is unrestricted and only the returned row
             // set shrinks.
@@ -135,7 +135,7 @@ pub(super) fn inject_vector(ctx: &RlsCtx<'_>, op: &mut VectorOp) -> crate::Resul
         // Refuse: these carry an embedding, a surrogate, or an opaque document
         // id — never the row body a policy predicate names — so no image is
         // available for the write policy to be evaluated against. A vector
-        // entry is a claim about a row, and admitting it unchecked would let an
+        // entry is a claim about a row, and admitting it unchecked will let an
         // identity the policy restricts make a hidden row reachable by search.
         //
         // `Insert` is also reachable from the document insert path, where the
@@ -162,7 +162,7 @@ pub(super) fn inject_vector(ctx: &RlsCtx<'_>, op: &mut VectorOp) -> crate::Resul
             "a truncate removes every row without reading one, so no row image is available",
         ),
 
-        // No-op: already decided by the resolve pass; re-injecting would
+        // No-op: already decided by the resolve pass; re-injecting will
         // replace a verdict with a predicate no applying node can decide.
         VectorOp::ResolvedDirectWrite { .. } => Ok(()),
 
@@ -197,7 +197,7 @@ mod tests {
             vector: vec![0.0],
             dim: 1,
             field_name: String::new(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             pk_bytes: None,
             provenance: None,
         })
@@ -305,7 +305,7 @@ mod tests {
                 collection,
             ),
             field: "emb".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             pk_bytes: Vec::new(),
             vector: vec![0.1, 0.2],
             payload,

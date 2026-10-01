@@ -2,21 +2,13 @@
 
 //! Durable per-collection hash-chain heads for `HASH_CHAIN` collections.
 //!
-//! The head is the SHA-256 link the next INSERT chains from. It is durable
-//! state, not a cache: without it every restart would restart every chain at
-//! `GENESIS_HASH`, and `VERIFY_HASH_CHAIN` would report the first row written
-//! after a restart as broken even though nothing was tampered with.
+//! The head is the last link, its install-order position and SHA-256 hash.
+//! The next INSERT chains from it. It is durable state, not a cache: without
+//! it every restart restarts every chain at `GENESIS_HASH`.
 //!
-//! The head is NOT rebuilt by rescanning the collection at boot, and must not
-//! be "simplified" into one. `verify_chain` walks entries in INSERTION order,
-//! while a storage scan yields them in surrogate (key) order. Those two orders
-//! coincide only if surrogates are handed out strictly monotonically per
-//! collection, and nothing guarantees that: in cluster mode each node carves a
-//! disjoint HiLo batch of surrogates from the global watermark (see
-//! `control::surrogate::registry`) and hands them out locally, so a row
-//! inserted later can carry a lower surrogate than one inserted earlier. A
-//! rescan would therefore recompute a chain that is not the one that was
-//! written.
+//! The head is never rebuilt by rescanning the collection. `VERIFY_HASH_CHAIN`
+//! compares the last row against it, so a head rebuilt from the rows cannot
+//! detect rows removed from the end of the chain.
 //!
 //! Storage: its own `chain_heads` redb table, keyed
 //! `"{database_id}:{tenant_id}:{collection}"`. A separate table is what makes
@@ -31,12 +23,29 @@ use std::collections::HashMap;
 
 use redb::{ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 
+pub use crate::types::hash_chain::ChainHead;
+
 use super::engine::SparseEngine;
 use super::tables::redb_err;
 
 /// Table definition for persisted hash-chain heads.
-/// Key: `"{database_id}:{tenant_id}:{collection}"` → Value: 64-char hex hash.
-pub(super) const CHAIN_HEADS: TableDefinition<&str, &str> = TableDefinition::new("chain_heads");
+/// Key: `"{database_id}:{tenant_id}:{collection}"` → Value: MessagePack
+/// [`ChainHead`].
+pub(super) const CHAIN_HEADS: TableDefinition<&str, &[u8]> = TableDefinition::new("chain_heads");
+
+fn encode_head(head: &ChainHead) -> crate::Result<Vec<u8>> {
+    zerompk::to_msgpack_vec(head).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("chain head encode: {e}"),
+    })
+}
+
+fn decode_head(key: &str, bytes: &[u8]) -> crate::Result<ChainHead> {
+    zerompk::from_msgpack(bytes).map_err(|e| crate::Error::Storage {
+        engine: "sparse".into(),
+        detail: format!("chain head '{key}' does not decode: {e}"),
+    })
+}
 
 /// Build the chain-head key for one collection.
 fn chain_head_key(database_id: u64, tenant_id: u64, collection: &str) -> String {
@@ -73,14 +82,14 @@ impl SparseEngine {
         database_id: u64,
         tenant_id: u64,
         collection: &str,
-    ) -> crate::Result<Option<String>> {
+    ) -> crate::Result<Option<ChainHead>> {
         let key = chain_head_key(database_id, tenant_id, collection);
         let read_txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
         let table = read_txn
             .open_table(CHAIN_HEADS)
             .map_err(|e| redb_err("open chain heads", e))?;
         match table.get(key.as_str()) {
-            Ok(Some(v)) => Ok(Some(v.value().to_string())),
+            Ok(Some(v)) => decode_head(&key, v.value()).map(Some),
             Ok(None) => Ok(None),
             Err(e) => Err(redb_err("get chain head", e)),
         }
@@ -100,14 +109,15 @@ impl SparseEngine {
         database_id: u64,
         tenant_id: u64,
         collection: &str,
-        head: &str,
+        head: &ChainHead,
     ) -> crate::Result<()> {
         let key = chain_head_key(database_id, tenant_id, collection);
+        let bytes = encode_head(head)?;
         let mut table = txn
             .open_table(CHAIN_HEADS)
             .map_err(|e| redb_err("open chain heads", e))?;
         table
-            .insert(key.as_str(), head)
+            .insert(key.as_str(), bytes.as_slice())
             .map_err(|e| redb_err("insert chain head", e))?;
         Ok(())
     }
@@ -140,7 +150,7 @@ impl SparseEngine {
         database_id: u64,
         tenant_id: u64,
         collection: &str,
-        head: &str,
+        head: &ChainHead,
     ) -> crate::Result<()> {
         let txn = self
             .db
@@ -224,7 +234,7 @@ impl SparseEngine {
     /// from the row that preceded it rather than from `GENESIS_HASH`.
     pub fn load_chain_heads(
         &self,
-    ) -> crate::Result<HashMap<(nodedb_types::DatabaseId, nodedb_types::TenantId, String), String>>
+    ) -> crate::Result<HashMap<(nodedb_types::DatabaseId, nodedb_types::TenantId, String), ChainHead>>
     {
         let read_txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
         let table = read_txn
@@ -234,13 +244,14 @@ impl SparseEngine {
         for entry in table.iter().map_err(|e| redb_err("iter chain heads", e))? {
             let (k, v) = entry.map_err(|e| redb_err("scan chain head", e))?;
             let (database_id, tenant_id, collection) = parse_chain_head_key(k.value())?;
+            let head = decode_head(k.value(), v.value())?;
             out.insert(
                 (
                     nodedb_types::DatabaseId::new(database_id),
                     nodedb_types::TenantId::new(tenant_id),
                     collection,
                 ),
-                v.value().to_string(),
+                head,
             );
         }
         Ok(out)
@@ -250,6 +261,13 @@ impl SparseEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn head(seq: u64, hash: &str) -> ChainHead {
+        ChainHead {
+            seq,
+            hash: hash.to_string(),
+        }
+    }
 
     fn open_temp() -> (SparseEngine, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -268,14 +286,14 @@ mod tests {
             let engine = SparseEngine::open(&path).unwrap();
             let txn = engine.begin_write().unwrap();
             engine
-                .put_chain_head_in_txn(&txn, 0, 1, "ledger", "abc123")
+                .put_chain_head_in_txn(&txn, 0, 1, "ledger", &head(7, "abc123"))
                 .unwrap();
             txn.commit().unwrap();
         }
         let engine = SparseEngine::open(&path).unwrap();
         assert_eq!(
             engine.get_chain_head(0, 1, "ledger").unwrap(),
-            Some("abc123".to_string())
+            Some(head(7, "abc123"))
         );
         let heads = engine.load_chain_heads().unwrap();
         assert_eq!(
@@ -284,7 +302,7 @@ mod tests {
                 nodedb_types::TenantId::new(1),
                 "ledger".to_string()
             )),
-            Some(&"abc123".to_string())
+            Some(&head(7, "abc123"))
         );
     }
 
@@ -292,9 +310,15 @@ mod tests {
     #[test]
     fn chain_heads_are_removable_per_collection_and_per_tenant() {
         let (engine, _dir) = open_temp();
-        engine.put_chain_head(0, 1, "ledger", "h1").unwrap();
-        engine.put_chain_head(0, 1, "audit", "h2").unwrap();
-        engine.put_chain_head(0, 2, "ledger", "h3").unwrap();
+        engine
+            .put_chain_head(0, 1, "ledger", &head(1, "h1"))
+            .unwrap();
+        engine
+            .put_chain_head(0, 1, "audit", &head(2, "h2"))
+            .unwrap();
+        engine
+            .put_chain_head(0, 2, "ledger", &head(3, "h3"))
+            .unwrap();
 
         engine.delete_chain_head(0, 1, "ledger").unwrap();
         assert_eq!(engine.get_chain_head(0, 1, "ledger").unwrap(), None);
@@ -303,7 +327,7 @@ mod tests {
         assert_eq!(engine.get_chain_head(0, 1, "audit").unwrap(), None);
         assert_eq!(
             engine.get_chain_head(0, 2, "ledger").unwrap(),
-            Some("h3".to_string())
+            Some(head(3, "h3"))
         );
     }
 }

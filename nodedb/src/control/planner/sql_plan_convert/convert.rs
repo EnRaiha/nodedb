@@ -49,7 +49,7 @@ pub enum PlanningPurpose {
 
 /// Conversion context holding optional references needed during plan conversion.
 pub struct ConvertContext {
-    /// Execution conversion may allocate identities and apply converter-owned
+    /// Execution conversion can allocate identities and apply converter-owned
     /// catalog changes. Metadata conversion is strictly side-effect-free.
     pub purpose: PlanningPurpose,
     pub retention_registry: Option<Arc<RetentionPolicyRegistry>>,
@@ -65,10 +65,8 @@ pub struct ConvertContext {
     /// CP-side surrogate assigner — bound to the same `Arc` held on
     /// `SharedState`. Threaded into INSERT/UPSERT/KV-INSERT converters
     /// to bind `(collection, pk_bytes)` → `Surrogate` before the op
-    /// crosses the SPSC bridge. `None` only for converters used by
-    /// sub-planners that never lower to the surrogate-bearing variants
-    /// (e.g. CREATE/DROP/ARRAY paths).
-    pub surrogate_assigner: Option<Arc<SurrogateAssigner>>,
+    /// crosses the SPSC bridge.
+    pub surrogate_assigner: Arc<SurrogateAssigner>,
     /// `true` when the node is running in cluster mode with a live
     /// topology. Array DML/query converters emit `ClusterArray` variants
     /// when this flag is set; single-node mode emits local `Array` variants.
@@ -129,6 +127,11 @@ pub struct ConvertContext {
     /// `DEFAULT_SHUFFLE_AGG_THRESHOLD`; overridable per-session via
     /// `nodedb.shuffle_agg_threshold` for operator control and test determinism.
     pub shuffle_agg_threshold: usize,
+    /// The surrogate answers for this batch's keys, resolved async before
+    /// conversion (`convert_bound`). Conversion reads them and never draws a
+    /// surrogate or asks a key's home. A key with no answer is recorded here
+    /// as a miss for the bind step to resolve.
+    pub prefetched: super::surrogate_prefetch::PrefetchedSurrogates,
 }
 
 impl ConvertContext {
@@ -142,48 +145,72 @@ impl ConvertContext {
         nodedb_types::CollectionKey::from_bare(self.database_id, bare)
     }
 
-    /// Resolve an existing surrogate without creating a mapping while planning
-    /// metadata. Execute planning retains the allocating assignment behavior.
+    /// The surrogate a write that creates its row plans `pk_bytes` with.
+    ///
+    /// The bind step's answer or this node's catalog binding answers. A key
+    /// neither answers is recorded as a miss and plans with the
+    /// `Surrogate::ZERO` placeholder: the bind step binds it and converts the
+    /// plan again. A metadata plan binds nothing, so it reads the existing
+    /// binding and renders an unbound key as the placeholder.
     pub fn surrogate_for_pk(
         &self,
         key: nodedb_types::CollectionKey<'_>,
         pk_bytes: &[u8],
     ) -> crate::Result<nodedb_types::Surrogate> {
-        let Some(assigner) = self.surrogate_assigner.as_ref() else {
-            return Ok(nodedb_types::Surrogate::ZERO);
-        };
         if self.is_metadata() {
-            return Ok(assigner
-                .lookup(key, self.tenant_id, pk_bytes)?
+            return Ok(self
+                .surrogate_for_existing_pk(key, pk_bytes)?
                 .unwrap_or(nodedb_types::Surrogate::ZERO));
         }
-        assigner.assign(key, self.tenant_id, pk_bytes)
+        if let Some(bound) = self.prefetched.bound(key, pk_bytes) {
+            return Ok(bound);
+        }
+        if let Some(bound) = self
+            .surrogate_assigner
+            .lookup_bound(key, self.tenant_id, pk_bytes)?
+        {
+            return Ok(bound);
+        }
+        self.prefetched.record_bind_miss(key, pk_bytes);
+        Ok(nodedb_types::Surrogate::ZERO)
     }
 
-    /// Resolve an EXISTING pk → surrogate binding read-only, yielding
-    /// `Surrogate::ZERO` when the key is unbound. Used by writes that mutate
-    /// rows they never create (PK UPDATE / DELETE): allocating there would mint
-    /// a node-local phantom binding for a key no replica agrees on.
+    /// Resolve an EXISTING pk → surrogate binding read-only, or `None` when
+    /// the key is unbound in this database. Used by reads and by writes that
+    /// mutate rows they never create (PK UPDATE / DELETE): allocating there
+    /// will mint a node-local phantom binding for a key no replica agrees on.
+    ///
+    /// A single node's catalog miss is the answer. A cluster node records a
+    /// key neither the bind step nor its catalog answers as a miss, and plans
+    /// it as unbound until the bind step asks the key's home.
     pub fn surrogate_for_existing_pk(
         &self,
         key: nodedb_types::CollectionKey<'_>,
         pk_bytes: &[u8],
-    ) -> crate::Result<nodedb_types::Surrogate> {
-        let Some(assigner) = self.surrogate_assigner.as_ref() else {
-            return Ok(nodedb_types::Surrogate::ZERO);
-        };
-        Ok(assigner
-            .lookup(key, self.tenant_id, pk_bytes)?
-            .unwrap_or(nodedb_types::Surrogate::ZERO))
+    ) -> crate::Result<Option<nodedb_types::Surrogate>> {
+        if let Some(answer) = self.prefetched.get(key, pk_bytes) {
+            return Ok(answer);
+        }
+        let assigner = &self.surrogate_assigner;
+        if let Some(bound) = assigner.lookup_bound(key, self.tenant_id, pk_bytes)? {
+            return Ok(Some(bound));
+        }
+        if assigner.resolves_at_home()? {
+            self.prefetched.record_lookup_miss(key, pk_bytes);
+        }
+        Ok(None)
     }
 
-    /// Allocate a new surrogate and its bound identity string, only while
-    /// producing executable work.
+    /// The next fresh surrogate and its bound identity string the bind step
+    /// drew for `key`, only while producing executable work.
     ///
-    /// A metadata plan, or a plan with no wired assigner, returns a
-    /// `Surrogate::ZERO` placeholder paired with its rendered identity, via
+    /// A metadata plan, and an execute plan whose drawn identities ran out,
+    /// get a `Surrogate::ZERO` placeholder paired with its rendered identity,
+    /// via
     /// [`RowIdentity::for_surrogate`](crate::engine::document::store::RowIdentity::for_surrogate),
-    /// the same type the allocator renders through.
+    /// the same type the allocator renders through. The execute plan also
+    /// records the shortfall as a miss, so the bind step draws one more
+    /// identity and converts the plan again.
     pub fn fresh_surrogate(
         &self,
         key: nodedb_types::CollectionKey<'_>,
@@ -198,9 +225,12 @@ impl ConvertContext {
         if self.is_metadata() {
             return placeholder();
         }
-        match self.surrogate_assigner.as_ref() {
-            Some(assigner) => assigner.assign_fresh(key, self.tenant_id),
-            None => placeholder(),
+        match self.prefetched.take_fresh(key) {
+            Some(fresh) => Ok(fresh),
+            None => {
+                self.prefetched.record_fresh_miss(key);
+                placeholder()
+            }
         }
     }
 
@@ -213,29 +243,14 @@ impl ConvertContext {
         }
         Ok(())
     }
-
-    /// Build the deployment-neutral subset shared with `nodedb-physical`'s
-    /// converter helpers. Cheap: 3 `Copy` fields + an `Arc` clone.
-    pub fn shared(&self) -> nodedb_physical::SharedConvertContext {
-        nodedb_physical::SharedConvertContext {
-            database_id: self.database_id,
-            max_vector_dim: self.max_vector_dim,
-            cluster_enabled: self.cluster_enabled,
-            surrogate_assigner: self
-                .surrogate_assigner
-                .as_ref()
-                .map(|a| a.clone() as std::sync::Arc<dyn nodedb_physical::SurrogateAssigner>),
-        }
-    }
 }
 
-/// Convert a list of SqlPlans to PhysicalTasks.
-///
-/// After each task is produced, any top-level read plan that is a sharded
-/// source is wrapped in `Exchange{Gather}` so the coordinator knows to fan
-/// it to all Data Plane cores and merge the results. Non-sharded plans
-/// (point gets, writes, constant `ProviderScan`s, coordinator-local joins)
-/// are left unwrapped.
+/// Convert a list of SqlPlans to PhysicalTasks with the surrogate answers
+/// `ctx` already holds. A pure planning pass: it draws nothing and asks no
+/// home. A key it finds no answer for fails the conversion. Execution
+/// planning converts through
+/// [`convert_bound`](super::surrogate_prefetch::convert_bound), which awaits
+/// every answer first.
 pub fn convert(
     plans: &[SqlPlan],
     tenant_id: TenantId,
@@ -243,35 +258,60 @@ pub fn convert(
 ) -> crate::Result<Vec<PhysicalTask>> {
     let mut tasks = Vec::new();
     for plan in plans {
-        let mut one = convert_one(plan, tenant_id, ctx)?;
-        for task in &mut one {
-            if task.plan.is_sharded_source() {
-                let as_aggregate = matches!(
-                    &task.plan,
-                    PhysicalPlan::Query(QueryOp::Aggregate { .. })
-                        | PhysicalPlan::Query(QueryOp::PartialAggregate { .. })
-                );
-                // Move the plan out, wrap it in Exchange{Gather}, put it back.
-                let sentinel = PhysicalPlan::Query(QueryOp::ProviderScan {
-                    provider: None,
-                    rows: Vec::new(),
-                    filters: Vec::new(),
-                    projection: Vec::new(),
-                    computed_columns: Vec::new(),
-                    window_functions: Vec::new(),
-                    sort_keys: Vec::new(),
-                    limit: None,
-                    offset: 0,
-                    distinct: false,
-                });
-                let inner = std::mem::replace(&mut task.plan, sentinel);
-                task.plan = PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
-                    child: Box::new(inner),
-                    mode: ExchangeMode::Gather { as_aggregate },
-                }));
-            }
+        tasks.extend(convert_plan(plan, tenant_id, ctx)?);
+    }
+    let misses = ctx.prefetched.take_misses();
+    if !misses.is_empty() {
+        return Err(crate::Error::PlanError {
+            detail: format!(
+                "surrogate keys of {} have no answer; convert through `convert_bound`, which \
+                 resolves them first",
+                misses.collection_names()
+            ),
+        });
+    }
+    Ok(tasks)
+}
+
+/// Convert one SqlPlan to PhysicalTasks.
+///
+/// After each task is produced, any top-level read plan that is a sharded
+/// source is wrapped in `Exchange{Gather}` so the coordinator knows to fan
+/// it to all Data Plane cores and merge the results. Non-sharded plans
+/// (point gets, writes, constant `ProviderScan`s, coordinator-local joins)
+/// are left unwrapped.
+pub(super) fn convert_plan(
+    plan: &SqlPlan,
+    tenant_id: TenantId,
+    ctx: &ConvertContext,
+) -> crate::Result<Vec<PhysicalTask>> {
+    let mut tasks = convert_one(plan, tenant_id, ctx)?;
+    for task in &mut tasks {
+        if task.plan.is_sharded_source() {
+            let as_aggregate = matches!(
+                &task.plan,
+                PhysicalPlan::Query(QueryOp::Aggregate { .. })
+                    | PhysicalPlan::Query(QueryOp::PartialAggregate { .. })
+            );
+            // Move the plan out, wrap it in Exchange{Gather}, put it back.
+            let sentinel = PhysicalPlan::Query(QueryOp::ProviderScan {
+                provider: None,
+                rows: Vec::new(),
+                filters: Vec::new(),
+                projection: Vec::new(),
+                computed_columns: Vec::new(),
+                window_functions: Vec::new(),
+                sort_keys: Vec::new(),
+                limit: None,
+                offset: 0,
+                distinct: false,
+            });
+            let inner = std::mem::replace(&mut task.plan, sentinel);
+            task.plan = PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
+                child: Box::new(inner),
+                mode: ExchangeMode::Gather { as_aggregate },
+            }));
         }
-        tasks.extend(one);
     }
     Ok(tasks)
 }
@@ -303,7 +343,7 @@ mod tests {
             array_catalog: None,
             credentials: None,
             wal: None,
-            surrogate_assigner: Some(assigner),
+            surrogate_assigner: assigner,
             cluster_enabled: false,
             bitemporal_retention_registry: None,
             max_vector_dim: 0,
@@ -315,6 +355,7 @@ mod tests {
             shuffle_agg_num_parts: 0,
             broadcast_threshold_bytes: 0,
             shuffle_agg_threshold: 0,
+            prefetched: Default::default(),
         }
     }
 
@@ -350,7 +391,7 @@ mod tests {
         );
         assert_eq!(
             assigner
-                .lookup(
+                .lookup_bound(
                     nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
                     TenantId::new(1),
                     b"new-user",
@@ -359,25 +400,50 @@ mod tests {
             None
         );
         assert_eq!(registry.read().expect("registry").current_hwm(), 0);
+        assert!(metadata.prefetched.take_misses().is_empty());
+    }
 
+    /// Execute conversion never draws: an unanswered key plans with the
+    /// placeholder and is recorded for the bind step, and the registry stays
+    /// untouched.
+    #[test]
+    fn execute_conversion_records_unanswered_keys_instead_of_drawing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let credentials = Arc::new(
+            CredentialStore::open(&dir.path().join("system.redb")).expect("credential store"),
+        );
+        let registry = Arc::new(RwLock::new(SurrogateRegistry::new()));
+        let wal: Arc<dyn SurrogateWalAppender> = Arc::new(NoopWalAppender);
+        let assigner = Arc::new(SurrogateAssigner::new(
+            Arc::clone(&registry),
+            credentials,
+            wal,
+        ));
         let execute = context(PlanningPurpose::Execute, Arc::clone(&assigner));
-        let allocated = execute
-            .surrogate_for_pk(execute.collection_key("users"), b"new-user")
-            .unwrap();
-        assert_ne!(allocated.as_u32(), 0);
+        let users = execute.collection_key("users");
+
         assert_eq!(
-            assigner
-                .lookup(
-                    nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
-                    TenantId::new(1),
-                    b"new-user",
-                )
-                .unwrap(),
-            Some(allocated)
+            execute
+                .surrogate_for_pk(users, b"new-user")
+                .unwrap()
+                .as_u32(),
+            0
         );
+        assert_eq!(execute.fresh_surrogate(users).unwrap().0.as_u32(), 0);
+        // A single node's catalog miss is the answer: no lookup is recorded.
         assert_eq!(
-            registry.read().expect("registry").current_hwm(),
-            allocated.as_u32()
+            execute.surrogate_for_existing_pk(users, b"ghost").unwrap(),
+            None
         );
+        assert_eq!(registry.read().expect("registry").current_hwm(), 0);
+
+        let misses = execute.prefetched.take_misses();
+        assert_eq!(misses.len(), 2);
+        let (key, recorded) = misses.iter().next().expect("one collection");
+        assert_eq!(key.name(), "users");
+        assert!(recorded.binds.contains(b"new-user".as_slice()));
+        assert!(recorded.lookups.is_empty());
+        assert_eq!(recorded.fresh, 1);
+        assert!(execute.prefetched.take_misses().is_empty());
     }
 }

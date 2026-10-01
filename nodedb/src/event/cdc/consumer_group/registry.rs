@@ -231,6 +231,7 @@ mod tests {
             stream_name: stream.into(),
             owner: "admin".into(),
             created_at: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 

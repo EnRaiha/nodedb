@@ -53,7 +53,7 @@ pub fn spawn_signal_handlers(
     conn_semaphore: Arc<tokio::sync::Semaphore>,
     max_connections: usize,
     shutdown_bus: ShutdownBus,
-    cluster_handle: Option<Arc<ClusterHandle>>,
+    cluster_handle: Arc<ClusterHandle>,
 ) {
     let (force_stop_tx, force_stop_rx) = tokio::sync::oneshot::channel::<()>();
     let sem_clone = Arc::clone(&conn_semaphore);
@@ -113,23 +113,21 @@ pub fn spawn_signal_handlers(
         // (transitively, via the shared `MultiRaft` handle) before the
         // process exits. `RunningCluster::shutdown_all` consumes the
         // value, so it must be taken out of the handle's slot exactly
-        // once; a `None` here means either single-node mode or that
-        // shutdown already ran.
-        if let Some(handle) = &cluster_handle {
-            let running = handle
-                .running_cluster
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take();
-            if let Some(running) = running {
-                let errors = running
-                    .shutdown_all(CLUSTER_SUBSYSTEM_SHUTDOWN_DEADLINE)
-                    .await;
-                if errors.is_empty() {
-                    tracing::info!("cluster subsystems stopped cleanly");
-                } else {
-                    tracing::error!(?errors, "cluster subsystem shutdown errors");
-                }
+        // once. A `None` here means shutdown already ran, or the signal
+        // arrived before `start_raft` installed the running subsystems.
+        let running = cluster_handle
+            .running_cluster
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(running) = running {
+            let errors = running
+                .shutdown_all(CLUSTER_SUBSYSTEM_SHUTDOWN_DEADLINE)
+                .await;
+            if errors.is_empty() {
+                tracing::info!("cluster subsystems stopped cleanly");
+            } else {
+                tracing::error!(?errors, "cluster subsystem shutdown errors");
             }
         }
 

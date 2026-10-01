@@ -9,7 +9,9 @@ use redb::WriteTransaction;
 
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::redo_image::submitted_row_image;
 use crate::data::executor::enforcement::balanced::BalancedEntry;
+use crate::data::executor::enforcement::chain_guard::ChainGuard;
 use crate::data::executor::enforcement::write_hook;
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
@@ -27,8 +29,6 @@ pub(super) struct InsertRowsCtx<'a> {
     pub(super) database_id: u64,
     pub(super) tid: u64,
     pub(super) collection: &'a str,
-    /// Whether the target maintains a secondary vector index.
-    pub(super) has_vectors: bool,
     /// Whether the statement carries a `RETURNING` projection.
     pub(super) returning: bool,
     pub(super) resolved_sum_targets: &'a [nodedb_physical::physical_plan::ResolvedSumTarget],
@@ -69,7 +69,6 @@ impl CoreLoop {
             database_id,
             tid,
             collection,
-            has_vectors,
             returning,
             resolved_sum_targets,
             surrogate_for,
@@ -85,6 +84,16 @@ impl CoreLoop {
             returned_docs,
         } = tally;
 
+        // Every NOT-MATCHED INSERT row of a HASH_CHAIN target is a chain link.
+        // The head advances in the shared transaction, and the pre-image goes
+        // on the undo log so an aborted MERGE puts it back.
+        let mut chain = ChainGuard::begin(self, database_id, tid, collection);
+        if let Some(prior) = chain.prior() {
+            undo_log.push(UndoEntry::ChainHead {
+                collection: collection.to_string(),
+                prior,
+            });
+        }
         for ins in inserts {
             // The verify above proved every insert key has a pre-assigned
             // surrogate; the lookup cannot miss, but a missing entry is treated
@@ -109,6 +118,18 @@ impl CoreLoop {
             // body: the declared primary key, else the decimal surrogate.
             let row_identity =
                 RowIdentity::of_stored_row(&ins.body, declared_primary_key, storage_key);
+            if let Err(e) = chain.chain_insert(self, surrogate, &ins.body) {
+                chain.restore(self);
+                return Err(self.abort_merge_apply(MergeAbort {
+                    task,
+                    database_id,
+                    tid,
+                    collection,
+                    applied_keys: applied_keys.as_slice(),
+                    undo_log: std::mem::take(undo_log),
+                    err: e.into(),
+                }));
+            }
             match self.apply_point_put(
                 txn,
                 PointPutParams {
@@ -121,12 +142,25 @@ impl CoreLoop {
                     index_text: true,
                     user_roles: &task.request.user_roles,
                     enforce: true,
+                    unique: crate::data::executor::enforcement::unique::UniqueJudge::Unit,
                     wal_lsn: task.wal_lsn(),
                     resolved_targets: resolved_sum_targets,
                 },
             ) {
                 Ok(mut outcome) => {
                     record_put_index_undo(undo_log, &mut outcome);
+                    if let Err(e) = chain.settle(self, surrogate, &outcome.stored_value) {
+                        chain.restore(self);
+                        return Err(self.abort_merge_apply(MergeAbort {
+                            task,
+                            database_id,
+                            tid,
+                            collection,
+                            applied_keys: applied_keys.as_slice(),
+                            undo_log: std::mem::take(undo_log),
+                            err: e.into(),
+                        }));
+                    }
                     // A NOT-MATCHED INSERT arm credits its target with the whole
                     // new row — post-image only, which is exactly what
                     // `RowImages::Insert` expresses.
@@ -162,15 +196,14 @@ impl CoreLoop {
                             }));
                         }
                     }
-                    if has_vectors {
-                        write_set.push(WriteSetEntry {
-                            surrogate: surrogate.as_u32(),
-                            identity: row_identity.clone(),
-                            is_delete: false,
-                            value: ins.body.clone(),
-                            collection: None,
-                        });
-                    }
+                    // The inserted row, journalled after the phase-A commit
+                    // from the MessagePack body `apply_point_put` took.
+                    write_set.push(submitted_row_image(
+                        surrogate.as_u32(),
+                        row_identity.clone(),
+                        ins.body.clone(),
+                        outcome.bitemporal_sys_from_ms,
+                    ));
                     if returning {
                         match returning_doc(&ins.body, &storage_key) {
                             Ok(doc) => returned_docs.push(doc),
@@ -191,6 +224,7 @@ impl CoreLoop {
                     *affected += 1;
                 }
                 Err(e) => {
+                    chain.restore(self);
                     return Err(self.abort_merge_apply(MergeAbort {
                         task,
                         database_id,
@@ -202,6 +236,18 @@ impl CoreLoop {
                     }));
                 }
             }
+        }
+        if let Err(e) = chain.persist_head(self, txn) {
+            chain.restore(self);
+            return Err(self.abort_merge_apply(MergeAbort {
+                task,
+                database_id,
+                tid,
+                collection,
+                applied_keys: applied_keys.as_slice(),
+                undo_log: std::mem::take(undo_log),
+                err: e.into(),
+            }));
         }
         Ok(())
     }

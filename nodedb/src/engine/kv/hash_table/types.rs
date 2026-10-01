@@ -36,9 +36,16 @@ pub struct KvExportEntry {
     pub value: Vec<u8>,
     /// Absolute expiry instant in ms since epoch, or `NO_EXPIRY` (`0`).
     pub expire_at_ms: u64,
-    /// Stable global row identity, or `Surrogate::ZERO` when unbound.
+    /// Stable global row identity. Never `Surrogate::ZERO`: every entry is
+    /// bound.
     pub surrogate: Surrogate,
 }
+
+/// One KV row of a tenant snapshot's KV section:
+/// `(key, value, expire_at_ms, surrogate)`. `expire_at_ms` is `0` for a row
+/// with no TTL. `surrogate` is the row's bound identity in the source
+/// database.
+pub type KvSnapshotRow = (Vec<u8>, Vec<u8>, u64, u32);
 
 /// Robin Hood hash table with incremental rehash.
 ///
@@ -125,19 +132,17 @@ impl KvHashTable {
         self.len == 0
     }
 
-    /// Export all entries for snapshot/backup.
-    ///
-    /// Returns `(key_bytes, value_bytes, expire_at_ms)` for every live entry.
-    /// Drops the surrogate — prefer [`KvHashTable::export_entries_with_surrogates`]
-    /// for any path that restores into a live engine, since a dropped surrogate
-    /// severs the row's cross-engine identity.
-    pub fn export_entries(&self) -> Vec<(Vec<u8>, Vec<u8>, u64)> {
+    /// Export every live entry as a tenant-snapshot row, [`KvSnapshotRow`].
+    /// Each row carries its bound surrogate, so a snapshot install keeps the
+    /// row's cross-engine identity.
+    pub fn export_entries(&self) -> Vec<KvSnapshotRow> {
         self.live_entries()
             .map(|entry| {
                 (
                     entry.key.clone(),
                     extract_value_from(&entry.value, &self.overflow),
                     entry.expire_at_ms,
+                    entry.surrogate.as_u32(),
                 )
             })
             .collect()
@@ -146,10 +151,8 @@ impl KvHashTable {
     /// Export all entries INCLUDING each row's stable cross-engine surrogate.
     ///
     /// The surrogate is read straight off the entry rather than reversed out of
-    /// `surrogate_to_key`: the entry is the authority (the reverse map is a
-    /// derived index of it), and entries created by internal read-modify-write
-    /// paths carry `Surrogate::ZERO` and have no reverse-map row at all — so
-    /// reversing the map would silently drop them.
+    /// `surrogate_to_key`: the entry is the authority, and the reverse map is
+    /// a derived index of it.
     pub fn export_entries_with_surrogates(&self) -> Vec<KvExportEntry> {
         self.live_entries()
             .map(|entry| KvExportEntry {

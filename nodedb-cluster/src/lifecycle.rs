@@ -14,7 +14,7 @@
 //! [`MetadataEntry::TopologyChange`] / [`MetadataEntry::RoutingChange`]
 //! entries and applied through the `MetadataApplier` on every node.
 
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::error::{ClusterError, Result};
 use crate::metadata_group::{MetadataEntry, TopologyChange};
@@ -82,22 +82,28 @@ pub fn is_safe_to_remove(node_id: u64, topology: &ClusterTopology, routing: &Rou
 
 /// Register a joining node in the local topology and produce the
 /// [`MetadataEntry`] to be proposed on the metadata Raft group.
-pub fn handle_node_join(node_id: u64, addr: &str, topology: &mut ClusterTopology) -> MetadataEntry {
-    use std::net::SocketAddr;
+///
+/// An `addr` that does not parse as a socket address is refused. The
+/// topology is left unchanged and nothing is proposed.
+pub fn handle_node_join(
+    node_id: u64,
+    addr: &str,
+    swim_addr: Option<std::net::SocketAddr>,
+    topology: &mut ClusterTopology,
+) -> Result<MetadataEntry> {
+    let socket_addr: std::net::SocketAddr = addr.parse().map_err(|e| ClusterError::Config {
+        detail: format!("join: node {node_id} advertises invalid address {addr:?}: {e}"),
+    })?;
 
-    let socket_addr: SocketAddr = addr.parse().unwrap_or_else(|_| {
-        warn!(node_id, addr, "invalid address, using default");
-        SocketAddr::from(([0, 0, 0, 0], 0))
-    });
-
-    let info = NodeInfo::new(node_id, socket_addr, NodeState::Joining);
+    let info = NodeInfo::new(node_id, socket_addr, NodeState::Joining).with_swim_addr(swim_addr);
     topology.join_as_learner(info);
 
     info!(node_id, addr, "node joining as learner");
-    MetadataEntry::TopologyChange(TopologyChange::Join {
+    Ok(MetadataEntry::TopologyChange(TopologyChange::Join {
         node_id,
         addr: addr.to_string(),
-    })
+        swim_addr: swim_addr.map(|a| a.to_string()),
+    }))
 }
 
 /// Handle learner promotion after state catch-up validation.
@@ -173,15 +179,31 @@ mod tests {
     #[test]
     fn node_join_creates_learner() {
         let mut topo = ClusterTopology::new();
-        let entry = handle_node_join(5, "10.0.0.5:9000", &mut topo);
+        let swim: Option<SocketAddr> = "10.0.0.5:9001".parse().ok();
+        let entry = handle_node_join(5, "10.0.0.5:9000", swim, &mut topo).unwrap();
         assert!(topo.contains(5));
         assert_eq!(topo.learner_nodes().len(), 1);
+        assert_eq!(topo.get_node(5).and_then(NodeInfo::swim_socket_addr), swim);
         match entry {
-            MetadataEntry::TopologyChange(TopologyChange::Join { node_id, .. }) => {
+            MetadataEntry::TopologyChange(TopologyChange::Join {
+                node_id, swim_addr, ..
+            }) => {
                 assert_eq!(node_id, 5);
+                assert_eq!(swim_addr.as_deref(), Some("10.0.0.5:9001"));
             }
             other => panic!("expected Join, got {other:?}"),
         }
+    }
+
+    /// An invalid join address is refused at propose time. The topology
+    /// stays unchanged.
+    #[test]
+    fn node_join_refuses_invalid_address() {
+        let mut topo = ClusterTopology::new();
+        let err = handle_node_join(5, "not-an-address", None, &mut topo)
+            .expect_err("an invalid address must be refused");
+        assert!(matches!(err, ClusterError::Config { .. }), "got {err:?}");
+        assert!(!topo.contains(5));
     }
 
     #[test]

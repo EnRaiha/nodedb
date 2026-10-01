@@ -101,7 +101,7 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
         ),
 
         // Refuse: streams raw triples with no filter slot — every stored
-        // body would be copied regardless of policy.
+        // body will be copied regardless of policy.
         DocumentOp::MaterializeScan { collection, .. } => ctx.refuse_if_policy(
             collection,
             "the materializing scan streams raw stored bodies through a cursor payload that \
@@ -172,7 +172,7 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
         ),
 
         // Refuse: removes every row without reading one, so no image the
-        // policy could be evaluated against exists.
+        // policy can be evaluated against exists.
         DocumentOp::Truncate { collection, .. } => ctx.refuse_if_write_policy(
             collection,
             "a truncate removes every row without reading one, so no row image is available",
@@ -188,7 +188,7 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
         // decided when the SOURCE row it derives from was admitted.
         DocumentOp::ApplyBalanceDelta { .. } => Ok(()),
 
-        // No-op: already decided by the resolve pass; re-injecting would
+        // No-op: already decided by the resolve pass; re-injecting will
         // replace a verdict with a predicate no applying node can decide.
         DocumentOp::ResolvedWrite { .. } => Ok(()),
 
@@ -227,7 +227,7 @@ mod tests {
             document_id: "d1".into(),
             value: body(owner_id),
             if_absent: false,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
             resolved_sum_targets: Vec::new(),
@@ -242,7 +242,7 @@ mod tests {
                 collection,
             ),
             document_id: "d1".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             updates: Vec::new(),
             returning: None,
@@ -289,7 +289,7 @@ mod tests {
     }
 
     /// A batch fails whole when any one of its rows violates the policy: a
-    /// silently dropped row would report a write that never happened.
+    /// silently dropped row will report a write that never happened.
     #[test]
     fn batch_insert_is_rejected_when_any_row_violates_the_policy() {
         let store = store_with_write_policy("orders");
@@ -411,7 +411,7 @@ mod tests {
             document_id: "d1".into(),
             value: body("42"),
             on_conflict_updates: Vec::new(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             returning: None,
             rls_filters: Vec::new(),
@@ -422,7 +422,7 @@ mod tests {
     }
 
     /// A `RETURNING` on an insert ships rows back, so a read-only policy must
-    /// land in the insert's post-filter slot. Leaving it empty would return
+    /// land in the insert's post-filter slot. Leaving it empty will return
     /// rows the same principal's `SELECT` hides.
     #[test]
     fn insert_receives_the_read_policy_filter() {
@@ -459,7 +459,7 @@ mod tests {
     }
 
     /// A truncate removes every row without reading one, so there is no image
-    /// the policy could decide.
+    /// the policy can decide.
     #[test]
     fn truncate_is_refused_under_a_write_policy() {
         let store = store_with_write_policy("orders");

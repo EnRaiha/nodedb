@@ -70,7 +70,6 @@ pub(crate) fn data_plane_code_to_public(code: ErrorCode) -> NodeDbError {
             PublicCode::WRITE_CONFLICT,
             "CRDT state changed after preview; retry the write",
         ),
-        ErrorCode::FanOutExceeded => NodeDbError::fan_out_exceeded(0, 0),
         ErrorCode::ResourcesExhausted => NodeDbError::memory_exhausted("query"),
         // A dangling edge is a referential-integrity refusal, which the
         // public surface expresses as a constraint violation.

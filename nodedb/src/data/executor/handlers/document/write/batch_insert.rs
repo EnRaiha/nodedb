@@ -6,7 +6,9 @@ use tracing::{debug, warn};
 
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::redo_image::submitted_row_image;
 use crate::data::executor::enforcement::chain_guard::ChainGuard;
+use crate::data::executor::enforcement::unique::SubmittedWrite;
 use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
@@ -87,6 +89,18 @@ impl CoreLoop {
                 },
             );
         }
+        // One unbound row refuses the whole batch before any row is written.
+        for surrogate in params.surrogates {
+            if let Some(refusal) =
+                crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+                    "document",
+                    params.collection,
+                    *surrogate,
+                )
+            {
+                return self.response_error(task, refusal);
+            }
+        }
 
         self.execute_document_batch_insert_indexed(task, params)
     }
@@ -96,9 +110,9 @@ impl CoreLoop {
     /// Applies every row through [`CoreLoop::apply_point_put`] under ONE redb
     /// write transaction so the document store, FTS inverted index, HNSW vector
     /// index, spatial R-tree, and secondary indexes are all maintained and keyed
-    /// by each row's stable surrogate. Any per-row error (including a UNIQUE
-    /// constraint violation) drops the transaction, leaving the whole page
-    /// unchanged. On success the transaction commits once and one Insert write
+    /// by each row's stable surrogate. UNIQUE is judged on the page's
+    /// post-state before the first row. Any per-row error drops the
+    /// transaction, leaving the whole page unchanged. On success the transaction commits once and one Insert write
     /// event is emitted per row.
     fn execute_document_batch_insert_indexed(
         &mut self,
@@ -124,6 +138,21 @@ impl CoreLoop {
             deferred_sum_targets,
             wal_lsn: task.wal_lsn(),
         };
+        // The page lands as one unit, so UNIQUE is judged on its post-state:
+        // two rows of the page claiming one value are refused.
+        let page: Vec<SubmittedWrite<'_>> = documents
+            .iter()
+            .zip(surrogates)
+            .map(|((_, value), surrogate)| SubmittedWrite {
+                collection,
+                surrogate: surrogate.as_u32(),
+                body: Some(value.as_slice()),
+                judged: true,
+            })
+            .collect();
+        if let Err(e) = self.check_submitted_unit_unique(database_id, tid, &page) {
+            return self.response_error(task, e);
+        }
         // One guard for the whole page: each row advances the head, and a
         // failure anywhere rolls the page back to the head it started from.
         let mut chain = ChainGuard::begin(self, database_id, tid, collection);
@@ -131,19 +160,6 @@ impl CoreLoop {
             Ok(t) => t,
             Err(e) => return self.response_error(task, e),
         };
-
-        // Gate post-apply write-set accumulation once for the whole batch so a
-        // collection with no vector/sparse field pays nothing. Each row's
-        // `apply_point_put` above reconciles storage + the btree/FTS/graph/HNSW/
-        // sparse overlays, but `wal_append_document_op` mints no redo for
-        // `BatchInsert` (row durability is redb-synchronous). On a WAL-only
-        // restart the HNSW and sparse indexes are rebuilt only from redo `Put`
-        // records, so a vector- or sparse-indexed batch insert that journals
-        // nothing would lose its rows' index entries. Carrying the surrogate +
-        // post-image back per row lets the Control Plane mint a durable `Put`
-        // redo for each (see `plan_post_apply_redo` / `append_write_set_redo`).
-        let has_vectors = self.collection_has_vectors(database_id, tid, collection)
-            || self.collection_has_sparse(database_id, tid, collection);
 
         // Row identity + storage key for post-commit event emission and cache
         // invalidation, captured as each row applies successfully; the value
@@ -154,7 +170,10 @@ impl CoreLoop {
             crate::engine::document::store::RowIdentity,
             nodedb_types::StorageKey,
         )> = Vec::with_capacity(documents.len());
-        let mut write_set: Vec<WriteSetEntry> = Vec::new();
+        // One post-apply `Put` redo entry per stored row, in insert order:
+        // `wal_append_document_op` mints no pre-dispatch record for
+        // `BatchInsert`, so these entries are the rows' only WAL record.
+        let mut write_set: Vec<WriteSetEntry> = Vec::with_capacity(documents.len());
         // Per-row secondary-index tuples (added ∪ removed ∪ bitemporal),
         // parallel to `applied`. Recorded into the per-index write-value
         // substrate only after `txn.commit()` succeeds below — a row that
@@ -185,19 +204,14 @@ impl CoreLoop {
             let row_identity =
                 crate::engine::document::store::RowIdentity::from_user_key(document_id.as_str());
             // Every row of a batch insert is INSERT-shaped, so every row is a
-            // chain link. The chain rewrites the BODY, so it runs before the
-            // body is encoded and stored. The link covers the user-visible
-            // document id — the same identity `VERIFY_HASH_CHAIN` recomputes
-            // against — not the storage key.
-            let chained = match chain.chain_insert(self, database_id, tid, document_id, value) {
-                Ok(chained) => chained,
-                Err(e) => {
-                    // `key` is `Copy`, so this costs nothing.
-                    failure = Some((key, e));
-                    break;
-                }
-            };
-            let effective_value: &[u8] = chained.as_deref().unwrap_or(value);
+            // chain link. The row is marked before its write, `build_stored_body`
+            // writes the link, and settling it makes it the head the next row
+            // links after.
+            if let Err(e) = chain.chain_insert(self, surrogate, value) {
+                // `key` is `Copy`, so this costs nothing.
+                failure = Some((key, e));
+                break;
+            }
             let outcome = match self.apply_point_put(
                 &txn,
                 PointPutParams {
@@ -206,10 +220,11 @@ impl CoreLoop {
                     collection,
                     storage_key: key,
                     surrogate,
-                    value: effective_value,
+                    value,
                     index_text: true,
                     user_roles: &task.request.user_roles,
                     enforce: true,
+                    unique: crate::data::executor::enforcement::unique::UniqueJudge::Unit,
                     wal_lsn: task.wal_lsn(),
                     resolved_targets: resolved_sum_targets,
                 },
@@ -223,6 +238,10 @@ impl CoreLoop {
                     break;
                 }
             };
+            if let Err(e) = chain.settle(self, surrogate, &outcome.stored_value) {
+                failure = Some((key, e));
+                break;
+            }
             // Image-folding enforcement per row, in the SAME transaction the
             // page is being applied in, so a derived total lands or rolls back
             // with every row that moved it. The post-image is the SUBMITTED
@@ -247,15 +266,12 @@ impl CoreLoop {
             if returning.is_some() {
                 stored_bodies.push(outcome.stored_value);
             }
-            if has_vectors {
-                write_set.push(WriteSetEntry {
-                    surrogate: surrogate.as_u32(),
-                    identity: row_identity.clone(),
-                    is_delete: false,
-                    value: value.clone(),
-                    collection: None,
-                });
-            }
+            write_set.push(submitted_row_image(
+                surrogate.as_u32(),
+                row_identity.clone(),
+                value.clone(),
+                outcome.bitemporal_sys_from_ms,
+            ));
             if task.wal_lsn().is_some() {
                 let mut tuples = outcome.secondary_index_added;
                 tuples.extend(outcome.secondary_index_removed);
@@ -304,6 +320,10 @@ impl CoreLoop {
         }
 
         if let Err(e) = txn.commit() {
+            chain.restore(self);
+            for (_, key) in &applied {
+                self.doc_cache.invalidate(database_id, tid, collection, key);
+            }
             return self.response_error(
                 task,
                 ErrorCode::Internal {
@@ -451,6 +471,7 @@ mod tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: crate::bridge::envelope::Admission::Admitted,
         })
     }

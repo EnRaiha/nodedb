@@ -290,6 +290,14 @@ impl NexarTransport {
         std::sync::Arc::clone(&self.auth.epoch)
     }
 
+    /// Send every later frame in boot `epoch`'s sequence range (see
+    /// [`crate::rpc_codec::PeerSeqSender::enter_boot_epoch`]). The node calls
+    /// it once per boot, with the epoch its catalog just raised, before the
+    /// transport sends anything.
+    pub fn enter_boot_epoch(&self, epoch: u64) {
+        self.auth.peer_seq_out.enter_boot_epoch(epoch);
+    }
+
     /// The cluster MAC key carried by this transport. SWIM subsystem
     /// uses it to authenticate UDP datagrams on the same key material.
     pub fn mac_key(&self) -> crate::rpc_codec::MacKey {
@@ -436,6 +444,8 @@ mod tests {
                         term: req.term,
                         success: true,
                         last_log_index: req.prev_log_index + req.entries.len() as u64,
+                        round: req.round,
+                        needs_snapshot: false,
                     }))
                 }
                 RaftRpc::RequestVoteRequest(req) => {
@@ -639,6 +649,8 @@ mod tests {
             ],
             leader_commit: 10,
             group_id: 7,
+            round: 1,
+            replicated_floor: 0,
         };
 
         let resp = client.append_entries(1, req).await.unwrap();
@@ -677,6 +689,8 @@ mod tests {
             trace_id: [0u8; 16],
             descriptor_versions: vec![],
             txn_id: None,
+            vshard_id: None,
+            read_groups: Vec::new(),
         });
 
         let stream = client.send_rpc_stream(1, req).await.unwrap();
@@ -721,6 +735,7 @@ mod tests {
             last_log_index: 100,
             last_log_term: 9,
             group_id: 3,
+            transfer: false,
         };
 
         let resp = client.request_vote(1, req).await.unwrap();
@@ -755,6 +770,8 @@ mod tests {
             done: true,
             group_id: 0,
             total_size: 0,
+            voters: Vec::new(),
+            learners: Vec::new(),
         };
 
         let resp = client.install_snapshot(1, req).await.unwrap();
@@ -790,6 +807,8 @@ mod tests {
                     entries: vec![],
                     leader_commit: i * 10,
                     group_id: 0,
+                    round: i,
+                    replicated_floor: 0,
                 };
                 let resp = c.append_entries(1, req).await.unwrap();
                 assert_eq!(resp.term, i);
@@ -826,6 +845,7 @@ mod tests {
                 last_log_index: 0,
                 last_log_term: 0,
                 group_id: 0,
+                transfer: false,
             };
             client.request_vote(1, req).await.unwrap();
         }
@@ -846,6 +866,8 @@ mod tests {
             entries: vec![],
             leader_commit: 0,
             group_id: 0,
+            round: 1,
+            replicated_floor: 0,
         };
 
         let err = client.append_entries(99, req).await.unwrap_err();
@@ -880,6 +902,8 @@ mod tests {
             entries: vec![],
             leader_commit: 50,
             group_id: 0,
+            round: 1,
+            replicated_floor: 0,
         };
 
         let resp = client.append_entries(1, req).await.unwrap();

@@ -5,9 +5,7 @@
 //! scan the live handler uses, computes each post-image with the same merge,
 //! and reports the mutations instead of applying them.
 
-use nodedb_types::Surrogate;
-
-use super::context::{ResolveResult, ResolvedPut, delete_mutation, put_mutation};
+use super::context::{ResolveResult, ResolvedRewrite, delete_mutation, rewrite_mutation};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::kv::field_compute::merge_field_updates;
 use crate::data::executor::handlers::kv::predicate::KvPredicateCtx;
@@ -58,7 +56,8 @@ impl CoreLoop {
         let mutations = writes
             .into_iter()
             .map(|(key, body, new_value)| {
-                put_mutation(ResolvedPut {
+                // The row exists and keeps its bound surrogate through the merge.
+                rewrite_mutation(ResolvedRewrite {
                     collection,
                     key: &key,
                     value: new_value,
@@ -66,10 +65,7 @@ impl CoreLoop {
                     // keyed field merge's behaviour. Preserved verbatim.
                     ttl_ms: 0,
                     expire_at_ms: 0,
-                    // The row exists, so its bound surrogate must survive the
-                    // merge — `ZERO` leaves it alone.
-                    surrogate: Surrogate::ZERO,
-                    precondition: Some(body),
+                    precondition: body,
                 })
             })
             .collect();

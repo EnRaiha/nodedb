@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Classification of a Data-Plane failure into "the write was refused and
-//! nothing was applied" versus "the write may in fact have landed".
+//! nothing was applied" versus "the write can in fact have landed".
 //!
 //! The write funnel appends a write's redo record BEFORE the Data Plane decides
 //! whether to accept it, so a refusal always arrives with the record already in
 //! the log. Left alone, restart replay re-applies it and a write the server told
 //! the client it refused comes back. The cure is a `WriteAborted` marker naming
 //! the forward record's LSN — but emitting one for a failure whose write
-//! actually landed is strictly worse than the bug: recovery would then DELETE
+//! actually landed is strictly worse than the bug: recovery will then DELETE
 //! committed data.
 //!
 //! So the predicate below is deliberately one-directional. A code earns an abort
 //! only when the code itself is proof that nothing was installed. Anything whose
-//! outcome is ambiguous — the shard state is unknown, the failure could have
+//! outcome is ambiguous — the shard state is unknown, the failure can have
 //! occurred part way through apply, or the code is an opaque catch-all — keeps
 //! the current behaviour and replays. That is the safe side of the trade: a
 //! refused write that survives a restart is a bug, a committed write erased by
@@ -66,7 +66,6 @@ fn is_transient_verdict(code: &ErrorCode) -> bool {
         | ErrorCode::NotFound
         | ErrorCode::RejectedAuthz { .. }
         | ErrorCode::CrdtFrontierMismatch { .. }
-        | ErrorCode::FanOutExceeded
         | ErrorCode::ResourcesExhausted
         | ErrorCode::RejectedDanglingEdge { .. }
         | ErrorCode::DuplicateWrite
@@ -160,10 +159,10 @@ pub(crate) fn write_definitely_not_applied(code: &ErrorCode) -> bool {
         | ErrorCode::UndefinedColumn { .. } => true,
 
         // NOT established — every one of these can be reported by a request
-        // whose write reached, or may have reached, engine state. Emitting an
+        // whose write reached, or can have reached, engine state. Emitting an
         // abort for one risks deleting a committed write on recovery.
         //
-        // * `DeadlineExceeded` — the Data Plane may still be applying.
+        // * `DeadlineExceeded` — the Data Plane can still be applying.
         // * `RollbackFailed` — documented as leaving shard state unknown; the
         //   forward record is precisely what recovery needs.
         // * `ResourcesExhausted` — memory can run out part way through apply.
@@ -172,8 +171,8 @@ pub(crate) fn write_definitely_not_applied(code: &ErrorCode) -> bool {
         // * `CrdtFrontierMismatch` — a mismatch detected against an applied
         //   Loro frontier; whether the local doc absorbed the delta is not
         //   decidable from the code.
-        // * `FanOutExceeded` / `RecursionDepthExceeded` — a limit tripped part
-        //   way through a multi-step plan, which may already have written rows.
+        // * `RecursionDepthExceeded` — a limit tripped part
+        //   way through a multi-step plan, which can already have written rows.
         // * `DuplicateWrite` — the idempotency gate fired because the write
         //   ALREADY applied under the original request; nothing to undo, and
         //   the duplicate record replays to the same state.
@@ -185,7 +184,6 @@ pub(crate) fn write_definitely_not_applied(code: &ErrorCode) -> bool {
         | ErrorCode::ResourcesExhausted
         | ErrorCode::Internal { .. }
         | ErrorCode::CrdtFrontierMismatch { .. }
-        | ErrorCode::FanOutExceeded
         | ErrorCode::RecursionDepthExceeded { .. }
         | ErrorCode::DuplicateWrite => false,
     }
@@ -239,7 +237,7 @@ mod tests {
     }
 
     /// The asymmetry that keeps this safe: an ambiguous outcome must never
-    /// produce an abort, because the write it would erase may have landed.
+    /// produce an abort, because the write it will erase can have landed.
     #[test]
     fn ambiguous_outcomes_never_abort_the_record() {
         assert!(!write_definitely_not_applied(&ErrorCode::DeadlineExceeded));

@@ -38,6 +38,9 @@ pub enum ViolationType {
     /// Foreign key reference missing.
     #[serde(rename = "foreign_key_missing")]
     ForeignKeyMissing { referenced_id: String },
+    /// NOT NULL violation: a required field is absent or null.
+    #[serde(rename = "not_null_violation")]
+    NotNullViolation { field: String },
     /// Permission denied (no write access to target resource).
     #[serde(rename = "permission_denied")]
     PermissionDenied,
@@ -71,6 +74,7 @@ impl std::fmt::Display for ViolationType {
             Self::ForeignKeyMissing { referenced_id } => {
                 write!(f, "fk_missing:{referenced_id}")
             }
+            Self::NotNullViolation { field } => write!(f, "not_null:{field}"),
             Self::PermissionDenied => write!(f, "permission_denied"),
             Self::RateLimited => write!(f, "rate_limited"),
             Self::TokenExpired => write!(f, "token_expired"),
@@ -109,6 +113,10 @@ impl ViolationType {
                 field: field.clone(),
                 reason: reason.clone(),
             },
+            Self::NotNullViolation { field } => CompensationHint::SchemaViolation {
+                field: field.clone(),
+                reason: "required field missing".into(),
+            },
             Self::ConstraintViolation { detail } => CompensationHint::Custom {
                 constraint: "constraint".into(),
                 detail: detail.clone(),
@@ -139,6 +147,13 @@ mod tests {
             }
             .to_string(),
             "unique:email=x@y.com"
+        );
+        assert_eq!(
+            ViolationType::NotNullViolation {
+                field: "name".into()
+            }
+            .to_string(),
+            "not_null:name"
         );
     }
 
@@ -222,6 +237,7 @@ mod tests {
             ViolationType::ForeignKeyMissing {
                 referenced_id: "r".into(),
             },
+            ViolationType::NotNullViolation { field: "f".into() },
             ViolationType::RlsPolicyViolation {
                 policy_name: "p".into(),
             },

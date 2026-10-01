@@ -96,16 +96,18 @@ mod tests {
     }
 
     fn put(engine: &mut KvEngine, key: &[u8], value: Vec<u8>, surrogate: u32) {
-        engine.put(KvPutParams {
-            database_id: DB,
-            tenant_id: TID,
-            collection: COLL,
-            key,
-            value: &value,
-            ttl_ms: 0,
-            now_ms: NOW,
-            surrogate: Surrogate(surrogate),
-        });
+        engine
+            .put(KvPutParams {
+                database_id: DB,
+                tenant_id: TID,
+                collection: COLL,
+                key,
+                value: &value,
+                ttl_ms: 0,
+                now_ms: NOW,
+                surrogate: Surrogate(surrogate),
+            })
+            .expect("a bound row writes");
     }
 
     fn leaderboard_def() -> SortedIndexDef {
@@ -142,19 +144,21 @@ mod tests {
     /// exported content.
     fn restore_like_load(engine: &mut KvEngine, file: &KvCheckpointFile) {
         for entry in &file.entries {
-            engine.put_with_absolute_expiry(
-                KvPutParams {
-                    database_id: DB,
-                    tenant_id: TID,
-                    collection: COLL,
-                    key: &entry.key,
-                    value: &entry.value,
-                    ttl_ms: 0,
-                    now_ms: NOW,
-                    surrogate: Surrogate(entry.surrogate),
-                },
-                entry.expire_at_ms,
-            );
+            engine
+                .put_with_absolute_expiry(
+                    KvPutParams {
+                        database_id: DB,
+                        tenant_id: TID,
+                        collection: COLL,
+                        key: &entry.key,
+                        value: &entry.value,
+                        ttl_ms: 0,
+                        now_ms: NOW,
+                        surrogate: Surrogate(entry.surrogate),
+                    },
+                    entry.expire_at_ms,
+                )
+                .expect("a checkpointed row is bound");
         }
         let indexes = decode_kv_indexes(&file.indexes).expect("indexes must decode");
         restore_collection_indexes(engine, DB, TID, COLL, &indexes);

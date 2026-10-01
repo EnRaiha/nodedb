@@ -62,6 +62,7 @@ fn calvin_static(epoch: u64, plans: Vec<PhysicalPlan>) -> PhysicalPlan {
         epoch_system_ms: 1_700_000_000_000,
         is_group_leader: true,
         versioned_reads: vec![],
+        body_plans: vec![],
     })
 }
 
@@ -136,7 +137,7 @@ fn kv_put_in(coll: &str, key: &[u8], value: &[u8]) -> PhysicalPlan {
         key: key.to_vec(),
         value: value.to_vec(),
         ttl_ms: 0,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(key),
         returning: None,
         rls_filters: Vec::new(),
         provenance: None,
@@ -384,6 +385,7 @@ fn calvin_static_replay_sees_only_committed_data() {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: nodedb::bridge::envelope::Admission::Admitted,
         };
 
@@ -464,6 +466,7 @@ fn calvin_static_replay_sees_only_committed_data() {
         txn_id: None,
         wal_lsn: None,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: nodedb::bridge::envelope::Admission::Exempt(
             nodedb::bridge::envelope::ExemptReason::Read,
         ),

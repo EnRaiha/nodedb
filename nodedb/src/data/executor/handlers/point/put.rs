@@ -5,8 +5,9 @@
 
 use tracing::debug;
 
-use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::redo_image::versioned_point_images;
 use crate::data::executor::enforcement::chain_guard::{self, ChainGuard};
 use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
@@ -48,6 +49,11 @@ impl CoreLoop {
             rls_filters,
             resolved_sum_targets,
         } = params;
+        if let Some(refusal) = crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+            "document", collection, surrogate,
+        ) {
+            return self.response_error(task, refusal);
+        }
         let storage_key = StorageKey::for_surrogate(surrogate);
         let document_identity = RowIdentity::from_user_key(document_id);
         debug!(core = self.core_id, %collection, %document_id, "point put");
@@ -63,27 +69,22 @@ impl CoreLoop {
         };
 
         // A PUT is an upsert, so whether it is a chain link depends on whether a
-        // row is already there. The chain rewrites the BODY, so that question
-        // has to be answered BEFORE the write — `apply_point_put`'s outcome
-        // comes too late for it. The probe is paid only by a collection that
+        // row is already there. The link is written while the body is built, so
+        // that question has to be answered BEFORE the write — `apply_point_put`'s
+        // outcome comes too late for it. The probe is paid only by a collection that
         // actually declares `HASH_CHAIN`.
         let mut chain = ChainGuard::begin(self, database_id, tid, collection);
-        let chained = if chain.enabled()
-            && self
-                .sparse
-                .get(database_id, tid, collection, &storage_key)
-                .ok()
-                .flatten()
-                .is_none()
-        {
-            match chain.chain_insert(self, database_id, tid, document_id, value) {
-                Ok(chained) => chained,
+        if chain.enabled() {
+            let existing = match self.current_row(database_id, tid, collection, &storage_key) {
+                Ok(existing) => existing,
                 Err(e) => return self.response_error(task, e),
+            };
+            if existing.is_none()
+                && let Err(e) = chain.chain_insert(self, surrogate, value)
+            {
+                return self.response_error(task, e);
             }
-        } else {
-            None
-        };
-        let effective_value: &[u8] = chained.as_deref().unwrap_or(value);
+        }
 
         // Unified write transaction: document + inverted index + stats in one commit.
         let txn = match self.sparse.begin_write() {
@@ -102,10 +103,11 @@ impl CoreLoop {
                 collection,
                 storage_key,
                 surrogate,
-                value: effective_value,
+                value,
                 index_text: true,
                 user_roles: &task.request.user_roles,
                 enforce: true,
+                unique: crate::data::executor::enforcement::unique::UniqueJudge::Row,
                 wal_lsn: task.wal_lsn(),
                 resolved_targets: resolved_sum_targets,
             },
@@ -114,7 +116,7 @@ impl CoreLoop {
             Err(e) => {
                 chain_guard::abort_after_apply(
                     self,
-                    &chain,
+                    &mut chain,
                     database_id,
                     tid,
                     collection,
@@ -124,10 +126,13 @@ impl CoreLoop {
             }
         };
 
-        if let Err(e) = chain.persist_head(self, &txn) {
+        if let Err(e) = chain
+            .settle(self, surrogate, &prior.stored_value)
+            .and_then(|()| chain.persist_head(self, &txn))
+        {
             chain_guard::abort_after_apply(
                 self,
-                &chain,
+                &mut chain,
                 database_id,
                 tid,
                 collection,
@@ -154,7 +159,7 @@ impl CoreLoop {
             Err(e) => {
                 chain_guard::abort_after_apply(
                     self,
-                    &chain,
+                    &mut chain,
                     database_id,
                     tid,
                     collection,
@@ -173,7 +178,7 @@ impl CoreLoop {
         {
             chain_guard::abort_after_apply(
                 self,
-                &chain,
+                &mut chain,
                 database_id,
                 tid,
                 collection,
@@ -183,6 +188,14 @@ impl CoreLoop {
         }
 
         if let Err(e) = txn.commit() {
+            chain_guard::abort_after_apply(
+                self,
+                &mut chain,
+                database_id,
+                tid,
+                collection,
+                &storage_key,
+            );
             return self.response_error(
                 task,
                 ErrorCode::Internal {
@@ -242,9 +255,15 @@ impl CoreLoop {
             // An upsert always writes the row, whether or not one was there before.
             self.response_affected(task, 1)
         };
-        if !target_write_set.is_empty() {
-            response.write_set = target_write_set;
+        // A versioned row's key was decided here, so its stamped image
+        // replaces the unstamped pre-dispatch record.
+        if let Some(sys_from_ms) = prior.bitemporal_sys_from_ms {
+            response.write_set = versioned_point_images(
+                WriteSetEntry::put(surrogate.as_u32(), document_identity, value.to_vec()),
+                sys_from_ms,
+            );
         }
+        response.write_set.extend(target_write_set);
         response
     }
 }
@@ -385,5 +404,44 @@ mod tests {
             "an overwrite must delta the total, not add the new amount on top of \
              the old one"
         );
+    }
+
+    /// A put that carries `Surrogate::ZERO` is refused before any write: no
+    /// row lands under the zero key and no target total moves.
+    #[test]
+    fn an_unbound_document_put_is_refused_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut core = seeded_core(dir.path());
+        let task = make_default_task();
+        let targets = resolved();
+
+        let response = core.execute_point_put(
+            &task,
+            PointPutExec {
+                tid: TID,
+                collection: SOURCE,
+                document_id: "e1",
+                surrogate: Surrogate::ZERO,
+                value: &entry(A1, 10),
+                returning: None,
+                rls_filters: &[],
+                resolved_sum_targets: &targets,
+            },
+        );
+        assert!(matches!(
+            response.error_code.as_deref(),
+            Some(ErrorCode::RejectedPrevalidation { .. })
+        ));
+        let stored = core
+            .sparse
+            .get(
+                DB,
+                TID,
+                SOURCE,
+                &nodedb_types::StorageKey::for_surrogate(Surrogate::ZERO),
+            )
+            .expect("read source");
+        assert!(stored.is_none(), "nothing is stored under the zero key");
+        assert_eq!(balance(&core, T1), "0", "no target total moves");
     }
 }

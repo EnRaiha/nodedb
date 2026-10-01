@@ -13,6 +13,9 @@ use crate::control::security::credential::CredentialStore;
 #[derive(Clone)]
 pub(super) struct CatalogInputs {
     pub(super) credentials: Arc<CredentialStore>,
+    /// The node's array catalog, which every adapter resolves array names
+    /// against.
+    pub(super) array_catalog: crate::control::array_catalog::ArrayCatalogHandle,
     pub(super) shared: Option<std::sync::Weak<crate::control::state::SharedState>>,
     pub(super) retention_policy_registry:
         Option<Arc<crate::engine::timeseries::retention_policy::RetentionPolicyRegistry>>,
@@ -36,6 +39,7 @@ impl CatalogInputs {
         } else {
             super::super::catalog_adapter::OriginCatalog::new(
                 Arc::clone(&self.credentials),
+                self.array_catalog.clone(),
                 tenant_id,
                 database_id,
                 self.retention_policy_registry.clone(),

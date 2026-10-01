@@ -54,6 +54,8 @@ impl<S: LogStorage> RaftNode<S> {
         }
 
         self.config.peers = new_voters;
+        // The next lease anchor needs a quorum of the new voter set.
+        self.lease.clear_anchor();
     }
 
     /// Add a single voter peer to this group.
@@ -86,10 +88,15 @@ impl<S: LogStorage> RaftNode<S> {
     /// forever: it never applies the change, and every view it derives from
     /// that log stays stale for a group it has already left.
     ///
-    /// Call this immediately BEFORE [`Self::remove_peer`], while `peer` is
-    /// still tracked. No-op unless this node leads and still tracks `peer`.
+    /// A learner is told the same way: a learner that never applies its own
+    /// removal keeps listing itself as a replica of the group.
+    ///
+    /// Call this immediately BEFORE [`Self::remove_peer`] or
+    /// [`Self::remove_learner`], while `peer` is still tracked. No-op unless
+    /// this node leads and still tracks `peer` as a voter or a learner.
     pub fn notify_removed_peer(&mut self, peer: u64) {
-        if self.role != NodeRole::Leader || !self.config.peers.contains(&peer) {
+        let tracked = self.config.peers.contains(&peer) || self.config.learners.contains(&peer);
+        if self.role != NodeRole::Leader || !tracked {
             return;
         }
         self.send_append_entries(peer);
@@ -231,6 +238,7 @@ impl<S: LogStorage> RaftNode<S> {
                 } else {
                     None
                 },
+                term: self.hard_state.current_term,
             });
         }
 
@@ -249,6 +257,9 @@ impl<S: LogStorage> RaftNode<S> {
             emitted: false,
             deadline,
         });
+        // The target's campaign bypasses vote refusal, so no lease holds from
+        // here to the end of this term.
+        self.lease.revoke();
 
         // Emit immediately if the target is already at the frontier; otherwise
         // the ack hook retries once it catches up.
@@ -485,6 +496,30 @@ mod tests {
             "the final message must carry the commit index that covers the removal"
         );
         assert!(!node.voters().contains(&2), "peer is removed afterwards");
+    }
+
+    /// A removed learner gets the same final message as a removed voter.
+    #[test]
+    fn a_removed_learner_is_told_before_replication_stops() {
+        let mut node = elect_with_voters(vec![2, 3]);
+        node.add_learner(4);
+        node.volatile.commit_index = node.log.last_index();
+
+        node.notify_removed_peer(4);
+        node.remove_learner(4);
+
+        let ready = node.take_ready();
+        let to_departing: Vec<_> = ready.messages.iter().filter(|(p, _)| *p == 4).collect();
+        assert_eq!(
+            to_departing.len(),
+            1,
+            "the departing learner must get exactly one final AppendEntries"
+        );
+        assert_eq!(to_departing[0].1.leader_commit, node.commit_index());
+        assert!(
+            !node.learners().contains(&4),
+            "learner is removed afterwards"
+        );
     }
 
     /// Ordering matters: once the peer is gone from the configuration there is

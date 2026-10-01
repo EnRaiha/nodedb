@@ -74,7 +74,18 @@ fn sql_to_physical(sql: &str) -> PhysicalPlan {
         array_catalog: None,
         credentials: None,
         wal: None,
-        surrogate_assigner: None,
+        surrogate_assigner: std::sync::Arc::new(
+            nodedb::control::surrogate::SurrogateAssigner::new(
+                std::sync::Arc::new(std::sync::RwLock::new(
+                    nodedb::control::surrogate::registry::SurrogateRegistry::new(),
+                )),
+                std::sync::Arc::new(
+                    nodedb::control::security::credential::CredentialStore::new()
+                        .expect("in-memory credential store"),
+                ),
+                std::sync::Arc::new(nodedb::control::surrogate::NoopWalAppender),
+            ),
+        ),
         cluster_enabled: false,
         bitemporal_retention_registry: None,
         max_vector_dim: 0,
@@ -86,6 +97,7 @@ fn sql_to_physical(sql: &str) -> PhysicalPlan {
         shuffle_agg_num_parts: 0,
         broadcast_threshold_bytes: 8 * 1024 * 1024,
         shuffle_agg_threshold: 10_000,
+        prefetched: Default::default(),
     };
     let tenant_id = nodedb::types::TenantId::new(1);
     let tasks = convert(&plans, tenant_id, &ctx).unwrap();

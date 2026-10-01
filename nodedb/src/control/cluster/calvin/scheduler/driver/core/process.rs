@@ -15,7 +15,7 @@ use super::super::barrier::PendingDependentBarrier;
 use super::scheduler::Scheduler;
 use crate::control::cluster::calvin::scheduler::lock_manager::{AcquireOutcome, TxnId};
 
-/// Epochs a read reservation may live before the scheduler reaps it as orphaned.
+/// Epochs a read reservation can live before the scheduler reaps it as orphaned.
 /// At the default 20ms epoch tick this is ~5s of wall-clock — far longer than any
 /// real think-time between reservation install and commit, yet short enough that a
 /// crashed coordinator's reservation is reclaimed promptly. Expressed in epochs
@@ -50,22 +50,35 @@ impl Scheduler {
         }
 
         match input {
-            SchedulerInput::Txn(txn) => self.process_new_txn(txn),
+            SchedulerInput::Txn(txn) => self.process_or_hold_for_metadata(*txn),
             SchedulerInput::Reserve { owner, key } => self.install_reservation(owner, key),
             SchedulerInput::Release { owner, reason } => self.release_reservation(owner, reason),
             SchedulerInput::CutMarker { hlc } => self.receive_cut_marker(hlc),
+            SchedulerInput::TxnPart {
+                txn,
+                index,
+                first_task,
+                plans,
+                chunk,
+            } => self.receive_part(txn, index, first_task, plans, chunk),
+            SchedulerInput::PartsAbandoned { txn } => self.receive_parts_abandoned(txn),
         }
     }
 
     /// The replicated epoch an input is stamped with — the monotonic logical
     /// clock the lease reap advances on. A cut marker carries no epoch, so it
-    /// reports `0`, which never advances the clock.
+    /// reports `0`, which never advances the clock. A part and an abandonment
+    /// report `0` too: they name their header's epoch, which this scheduler
+    /// already saw, and a replay delivers an abandonment to vShards the live
+    /// fan-out skips.
     fn input_epoch(input: &SchedulerInput) -> u64 {
         match input {
             SchedulerInput::Txn(txn) => txn.epoch,
             SchedulerInput::Reserve { owner, .. } => owner.epoch,
             SchedulerInput::Release { owner, .. } => owner.epoch,
-            SchedulerInput::CutMarker { .. } => 0,
+            SchedulerInput::CutMarker { .. }
+            | SchedulerInput::TxnPart { .. }
+            | SchedulerInput::PartsAbandoned { .. } => 0,
         }
     }
 
@@ -134,12 +147,12 @@ impl Scheduler {
         // Exact per-position skip: never re-apply a position that already
         // committed (its CalvinApplied marker is durable), and never re-run a
         // whole epoch that has fully folded into the watermark. Re-running an
-        // applied position would re-fire its side effects — this gate IS the
+        // applied position will re-fire its side effects — this gate IS the
         // exactly-once mechanism. Skipping a whole epoch on its first completing
         // position (the previous per-epoch gate) dropped every other position of
         // that epoch across a restart: a torn transaction.
         if self.applied.is_applied(txn.epoch, txn.position) {
-            // Learning the count for an already-applied position may complete a
+            // Learning the count for an already-applied position can complete a
             // historical epoch's applied set (during restart re-fan-out), folding
             // it into the watermark and pruning its tail — bounding memory.
             if let Some(watermark) = self.applied.advance() {
@@ -151,7 +164,7 @@ impl Scheduler {
         // In-flight guard (catch-up-replay idempotency). Skip a txn that is
         // already in-flight on this scheduler — dispatched-and-awaiting-response
         // (`pending`), blocked on locks (`blocked`), or parked on a dependent-read
-        // barrier (`dependent_barrier`). Re-running any of these would dispatch a
+        // barrier (`dependent_barrier`). Re-running any of these will dispatch a
         // SECOND copy and double-execute the transaction.
         //
         // This is a strict NO-OP for LIVE inputs: the sequencer delivers each
@@ -160,15 +173,19 @@ impl Scheduler {
         // when the catch-up drain replays a committed log range that overlaps an
         // input already delivered live and still in-flight — the exact overlap
         // the drain cannot avoid (it replays from the earliest dropped index
-        // forward, which may re-cover inputs that were NOT dropped). Reserve /
+        // forward, which can re-cover inputs that were NOT dropped). Reserve /
         // Release replay is already idempotent in the lock manager, so only Txn
         // needs this guard.
         if self.pending.contains_key(&txn_id)
             || self.blocked.contains_key(&lock_owner)
             || self.dependent_barrier.contains_key(&txn_id)
+            || self.parts.is_awaiting(txn_id)
         {
             return;
         }
+        // A multi-part txn collects the parts that target this vShard from
+        // here on, whether its locks are granted now or later.
+        self.open_assembly(&txn);
 
         let keys = super::super::helpers::expand_rw_set(&txn);
         let keys_count = keys.len();
@@ -211,6 +228,10 @@ impl Scheduler {
         txn_id: TxnId,
         lock_owner: TxnId,
     ) {
+        // A multi-part txn dispatches only once its parts arrived.
+        let Some(txn) = self.gate_on_parts(txn, txn_id, lock_owner) else {
+            return;
+        };
         let is_dependent = txn.tx_class.dependent_reads.is_some();
         if is_dependent {
             self.insert_dependent_barrier(txn, txn_id, lock_owner);
@@ -307,6 +328,8 @@ impl Scheduler {
         if let Some(watermark) = folded {
             self.publish_watermark(watermark);
         }
+        // A finished txn can give the next committed flush its turn.
+        self.pump_flush_turn();
     }
 
     /// Dispatch transactions that a `LockManager::release` promoted to holder.
@@ -342,7 +365,7 @@ impl Scheduler {
             for waiter_id in promoted {
                 let Some(blocked) = self.blocked.get(&waiter_id) else {
                     // A promotion can only name a waiter this scheduler enqueued
-                    // (its key set lives in `blocked`), so a miss should not
+                    // (its key set lives in `blocked`), so a miss must not
                     // happen. Skip defensively rather than panic — the txn holds
                     // no dispatch state here to act on.
                     tracing::debug!(
@@ -413,7 +436,8 @@ mod tests {
         fill_tenant_inflight(&shared, &mut data_side, TenantId::new(1));
         let watermark_before = shared.calvin.last_applied_epoch.load(Ordering::Acquire);
 
-        scheduler.process_scheduler_input(SchedulerInput::Txn(make_validate_only_txn(3, 0)));
+        scheduler
+            .process_scheduler_input(SchedulerInput::Txn(Box::new(make_validate_only_txn(3, 0))));
 
         assert!(
             !scheduler.applied.is_applied(3, 0),
@@ -436,8 +460,10 @@ mod tests {
         let shared = Arc::clone(&scheduler.shared);
         fill_tenant_inflight(&shared, &mut data_side, TenantId::new(1));
 
-        scheduler.process_scheduler_input(SchedulerInput::Txn(make_validate_only_txn(3, 0)));
-        scheduler.process_scheduler_input(SchedulerInput::Txn(make_validate_only_txn(4, 0)));
+        scheduler
+            .process_scheduler_input(SchedulerInput::Txn(Box::new(make_validate_only_txn(3, 0))));
+        scheduler
+            .process_scheduler_input(SchedulerInput::Txn(Box::new(make_validate_only_txn(4, 0))));
 
         assert!(
             scheduler.blocked.contains_key(&TxnId::new(4, 0)),
@@ -455,7 +481,8 @@ mod tests {
         fill_tenant_inflight(&shared, &mut data_side, TenantId::new(1));
         let tracked_before = shared.tracker.in_flight();
 
-        scheduler.process_scheduler_input(SchedulerInput::Txn(make_validate_only_txn(3, 0)));
+        scheduler
+            .process_scheduler_input(SchedulerInput::Txn(Box::new(make_validate_only_txn(3, 0))));
 
         assert_eq!(
             shared.tracker.in_flight(),
@@ -474,7 +501,8 @@ mod tests {
         let shared = Arc::clone(&scheduler.shared);
         let fillers = fill_tenant_inflight(&shared, &mut data_side, TenantId::new(1));
 
-        scheduler.process_scheduler_input(SchedulerInput::Txn(make_validate_only_txn(3, 0)));
+        scheduler
+            .process_scheduler_input(SchedulerInput::Txn(Box::new(make_validate_only_txn(3, 0))));
         let running = spawn_scheduler_loop(scheduler);
         release_filler(&shared, &mut data_side, fillers[0]);
 
@@ -522,7 +550,7 @@ mod tests {
         // exactly what `drain_catch_up` does for a dropped-then-recovered input that
         // overlaps an already-in-flight live one. The in-flight guard must turn it
         // into a no-op: no second dispatch, no duplicate in-flight entry.
-        scheduler.process_scheduler_input(SchedulerInput::Txn(txn));
+        scheduler.process_scheduler_input(SchedulerInput::Txn(Box::new(txn)));
 
         let dispatched_after = scheduler.metrics.dispatch_count.load(Ordering::Relaxed);
         assert_eq!(

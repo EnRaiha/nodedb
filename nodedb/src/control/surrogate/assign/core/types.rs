@@ -12,6 +12,7 @@ use tokio::sync::{Notify, oneshot};
 
 use super::super::super::registry::SurrogateRegistry;
 use super::super::super::wal_appender::SurrogateWalAppender;
+use super::home::HomeSurrogateAuthority;
 use crate::control::security::credential::CredentialStore;
 use crate::control::state::SharedState;
 
@@ -46,7 +47,7 @@ pub struct SurrogateAssigner {
     /// local WAL record so all followers advance their HWM.
     pub(in crate::control::surrogate::assign) shared: std::sync::OnceLock<Weak<SharedState>>,
     /// Pending cluster-mode batch reservations keyed by `request_id`.
-    /// `ensure_batch` registers a oneshot here before proposing; the
+    /// `reserve_batch` registers a oneshot here before proposing; the
     /// metadata applier removes + fires it via `complete_reservation`
     /// once the carved `[start, end)` range is known at apply time.
     pub(in crate::control::surrogate::assign) pending_reservations:
@@ -56,7 +57,7 @@ pub struct SurrogateAssigner {
     pub(in crate::control::surrogate::assign) next_request_id: AtomicU64,
     /// Serializes in-flight reservations so at most one batch is being
     /// reserved at a time per node. Without this, a burst of allocators
-    /// that all observe an empty batch would each propose a reservation,
+    /// that all observe an empty batch each propose a reservation,
     /// over-reserving and wasting surrogate space.
     pub(in crate::control::surrogate::assign) reserve_gate: tokio::sync::Mutex<()>,
     /// Wakes the background refill loop. The hot path nudges it (via
@@ -66,6 +67,14 @@ pub struct SurrogateAssigner {
     /// while the refiller is already running is remembered as one pending
     /// permit, so no top-up is ever lost.
     pub(in crate::control::surrogate::assign) refill_notify: Arc<Notify>,
+    /// Wakes every async drawer waiting on an empty batch. Fired by
+    /// `complete_reservation` once it installs a batch.
+    pub(in crate::control::surrogate::assign) batch_ready: Notify,
+    /// Where a cluster node obtains a key's bound surrogate from the key's
+    /// collection home (see [`super::home`]). Installed once the node's state
+    /// is built. Unset on a single node, which is every key's home.
+    pub(in crate::control::surrogate::assign) home_authority:
+        std::sync::OnceLock<Arc<dyn HomeSurrogateAuthority>>,
 }
 
 impl SurrogateAssigner {
@@ -83,6 +92,8 @@ impl SurrogateAssigner {
             next_request_id: AtomicU64::new(1),
             reserve_gate: tokio::sync::Mutex::new(()),
             refill_notify: Arc::new(Notify::new()),
+            batch_ready: Notify::new(),
+            home_authority: std::sync::OnceLock::new(),
         }
     }
 
@@ -91,6 +102,12 @@ impl SurrogateAssigner {
     /// after SharedState is fully wired.
     pub fn install_shared(&self, shared: Weak<SharedState>) {
         let _ = self.shared.set(shared);
+    }
+
+    /// Install the home authority a cluster node resolves keys through.
+    /// Called once the node's state is built.
+    pub fn install_home_authority(&self, authority: Arc<dyn HomeSurrogateAuthority>) {
+        let _ = self.home_authority.set(authority);
     }
 
     /// Expose the registry handle for read access by the Raft applier.

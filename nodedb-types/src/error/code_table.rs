@@ -92,7 +92,6 @@ error_code_table! {
 
     // Query.
     PLAN_ERROR => PlanError { phase: "remote".into(), detail: message.to_owned() },
-    FAN_OUT_EXCEEDED => FanOutExceeded { shards_touched: 0, limit: 0 },
     SQL_NOT_ENABLED => SqlNotEnabled,
     UNDEFINED_FUNCTION => UndefinedFunction { name: String::new() },
     UNDEFINED_COLUMN => UndefinedColumn { column: String::new() },

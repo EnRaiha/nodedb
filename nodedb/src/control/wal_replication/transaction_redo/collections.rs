@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan, SpatialOp, VectorOp};
+use nodedb_physical::physical_plan::{GraphOp, MetaOp, PhysicalPlan, SpatialOp, VectorOp};
 
 /// The written collections of `plans`, sorted and deduplicated.
 pub fn written_collections(plans: &[PhysicalPlan]) -> Vec<String> {
@@ -42,6 +42,8 @@ fn collect_plan(plan: &PhysicalPlan, out: &mut BTreeSet<String>) {
     ) = plan
     {
         out.extend(edges.iter().map(|edge| edge.collection.to_string()));
+    } else if let PhysicalPlan::Meta(MetaOp::RestoreRedo(batch)) = plan {
+        out.extend(batch.collections.iter().cloned());
     } else if let Some(collection) = plan.collection() {
         out.insert(collection.to_string());
     }
@@ -57,7 +59,7 @@ mod tests {
         let delete = PhysicalPlan::Spatial(SpatialOp::Delete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
             field: "loc".into(),
-            surrogate: nodedb_types::Surrogate::new(1),
+            surrogate: Some(nodedb_types::Surrogate::new(1)),
             provenance: None,
         });
         assert_eq!(

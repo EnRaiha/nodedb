@@ -7,8 +7,8 @@
 
 use super::super::decode_sync_engines::{decode_provenance, decode_returning};
 use super::super::types::ReplicatedWrite;
-use super::kv;
 use super::kv::{PutFields, ReturningFields};
+use super::{kv, kv_resolved};
 use crate::bridge::envelope::PhysicalPlan;
 
 pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<(PhysicalPlan, Option<u64>)> {
@@ -251,7 +251,7 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<(PhysicalPlan
             amount,
             debit_surrogate,
             credit_surrogate,
-        } => kv::transfer(kv::TransferFields {
+        } => kv_resolved::transfer(kv_resolved::TransferFields {
             collection,
             source_key,
             dest_key,
@@ -263,7 +263,7 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<(PhysicalPlan
         ReplicatedWrite::KvResolvedWrite {
             mutations,
             response_payload,
-        } => kv::resolved_write(mutations, response_payload)?,
+        } => kv_resolved::resolved_write(mutations, response_payload)?,
         ReplicatedWrite::KvPredicateUpdate {
             collection,
             filters,
@@ -298,7 +298,7 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<(PhysicalPlan
             item_key,
             dest_key,
             surrogate,
-        } => kv::transfer_item(
+        } => kv_resolved::transfer_item(
             source_collection,
             dest_collection,
             item_key,
@@ -365,9 +365,9 @@ mod tests {
         );
         let bytes = entry.to_bytes();
 
-        let (_, _, plan, decoded_resolved_now_ms) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, plan, decoded_resolved_now_ms) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
 
         assert_eq!(
             decoded_resolved_now_ms,
@@ -412,9 +412,9 @@ mod tests {
         );
         let bytes = entry.to_bytes();
 
-        let (_, _, plan, decoded_resolved_now_ms) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, plan, decoded_resolved_now_ms) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
 
         assert_eq!(
             decoded_resolved_now_ms, None,
@@ -447,9 +447,9 @@ mod tests {
         );
         let bytes = entry.to_bytes();
 
-        let (_, _, plan, decoded_resolved_now_ms) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, plan, decoded_resolved_now_ms) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
 
         assert_eq!(
             decoded_resolved_now_ms,
@@ -486,9 +486,9 @@ mod tests {
             },
         );
         let bytes = entry_with_ttl.to_bytes();
-        let (_, _, plan, decoded_resolved_now_ms) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, plan, decoded_resolved_now_ms) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         assert_eq!(decoded_resolved_now_ms, Some(1_000));
         match plan {
             PhysicalPlan::Kv(KvOp::Incr { ttl_ms, .. }) => assert_eq!(ttl_ms, 60_000),
@@ -512,9 +512,9 @@ mod tests {
         );
         let bytes_no_ttl = entry_no_ttl.to_bytes();
         let (_, _, _, decoded_resolved_now_ms_no_ttl) =
-            decode::from_replicated_entry(&bytes_no_ttl, None)
-                .expect("from_replicated_entry error")
-                .expect("from_replicated_entry returned None");
+            decode::decode_replicated_entry(&bytes_no_ttl)
+                .expect("decode_replicated_entry error")
+                .expect("decode_replicated_entry returned None");
         assert_eq!(decoded_resolved_now_ms_no_ttl, None);
     }
 

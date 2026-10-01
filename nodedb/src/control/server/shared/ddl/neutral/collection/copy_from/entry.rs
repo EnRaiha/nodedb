@@ -2,11 +2,9 @@
 
 //! Entry point: `copy_from_file`, path validation, and engine-support check.
 //!
-//! Relocated verbatim from the pgwire `ddl::collection::copy_from::entry`
-//! module (now deleted) except for the result type, which is [`DdlResult`] /
-//! [`DdlError`] throughout instead of pgwire `Response` / `PgWireResult`. Each
-//! error site builds a `DdlError` directly via [`ddl_err`] so the whole call
-//! chain speaks one error type.
+//! The result type is [`DdlResult`] / [`DdlError`] throughout. Each error
+//! site builds a `DdlError` directly via [`ddl_err`] so the whole call chain
+//! speaks one error type.
 
 use nodedb_types::DatabaseId;
 use std::path::Path;
@@ -19,6 +17,9 @@ use crate::control::server::shared::ddl::neutral::collection::dml::authorize_wri
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
+
+use crate::control::trigger::statement_txn::{fires_joined_body, in_block, with_statement_txn};
+use crate::control::trigger::{DmlEvent, TriggerScope};
 
 use super::csv_import::{CsvOptions, import_csv};
 use super::import_ctx::ImportCtx;
@@ -85,30 +86,52 @@ pub async fn copy_from_file(
 
     let tenant_id = identity.tenant_id;
 
-    let import_ctx = ImportCtx {
+    // Each row fires its collection's BEFORE, INSTEAD OF and SYNC AFTER
+    // bodies, which join the statement's transaction. Outside a transaction
+    // block a COPY into such a collection runs in an implicit one: its rows
+    // and the bodies' writes commit together, or none of them do.
+    let implicit = !in_block(txn_ctx)
+        && fires_joined_body(
+            state,
+            TriggerScope {
+                database_id,
+                tenant_id,
+            },
+            collection,
+            DmlEvent::Insert,
+        );
+    let row_count = with_statement_txn(
         state,
         identity,
-        tenant_id,
-        database_id,
         txn_ctx,
-    };
-
-    let row_count = match resolved_format {
-        CopyFormat::Ndjson => import_ndjson(&import_ctx, collection, path).await?,
-        CopyFormat::JsonArray => import_json_array(&import_ctx, collection, path).await?,
-        CopyFormat::Csv => {
-            import_csv(
-                &import_ctx,
-                collection,
-                path,
-                CsvOptions {
-                    delimiter: delimiter.unwrap_or(','),
-                    has_header: header,
-                },
-            )
-            .await?
-        }
-    };
+        implicit,
+        async |txn_ctx: &DmlTxnCtx<'_>| {
+            let import_ctx = ImportCtx {
+                state,
+                identity,
+                tenant_id,
+                database_id,
+                txn_ctx,
+            };
+            match resolved_format {
+                CopyFormat::Ndjson => import_ndjson(&import_ctx, collection, path).await,
+                CopyFormat::JsonArray => import_json_array(&import_ctx, collection, path).await,
+                CopyFormat::Csv => {
+                    import_csv(
+                        &import_ctx,
+                        collection,
+                        path,
+                        CsvOptions {
+                            delimiter: delimiter.unwrap_or(','),
+                            has_header: header,
+                        },
+                    )
+                    .await
+                }
+            }
+        },
+    )
+    .await?;
 
     // The count is baked into `command` (not `rows_affected`) because the
     // native and HTTP encoders (`ddl_result_to_native`, `ddl_results_to_json`)
@@ -200,7 +223,7 @@ fn check_engine_support(
 /// Row-level import helpers (`import_csv`, `import_ndjson`, `import_json_array`)
 /// call `plan_and_dispatch`, which returns a protocol-neutral [`DdlError`] (not
 /// a pgwire `PgWireError`), so this wraps the same type — only the message is
-/// decorated with the row number, matching the original pgwire behavior.
+/// decorated with the row number.
 pub(super) fn wrap_row_error(e: DdlError, line_no: usize, fmt: &str) -> DdlError {
     DdlError::new(
         e.sqlstate,

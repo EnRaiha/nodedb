@@ -4,8 +4,10 @@
 
 mod auth_parts;
 mod bootstrap;
+mod catalog_registries;
 mod handles;
 mod open;
 mod post_init;
+mod stores;
 
 pub use handles::DataPlaneHandles;

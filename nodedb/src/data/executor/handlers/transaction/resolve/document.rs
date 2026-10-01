@@ -63,9 +63,13 @@ use nodedb_types::sync::wire::SyncProvenance;
 use nodedb_types::{RowIdentity, StorageKey};
 use nodedb_wal::record::RecordType;
 
+use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
+
+use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::transaction::overlay::{Staged, TxnOverlay};
 use crate::data::executor::handlers::transaction::stage_write::stored_row_identity;
 use crate::data::executor::strict_format;
+use crate::data::executor::task::ExecutionTask;
 use crate::types::{DatabaseId, TenantId};
 use crate::wal::RedoSubRecord;
 
@@ -184,6 +188,71 @@ fn delete_sub_record(
     })
 }
 
+impl CoreLoop {
+    /// The base rows a staged TRUNCATE of `collection` removes at COMMIT:
+    /// every base row with no overlay entry. The redo record is the only
+    /// thing a replica installs, so each removed row travels as its own
+    /// `Delete`. Read-only against base.
+    pub(super) fn truncated_base_rows(
+        &self,
+        task: &ExecutionTask,
+        tid: u64,
+        collection: &str,
+        overlay: &TxnOverlay,
+        coll_key: &(DatabaseId, TenantId, String),
+    ) -> crate::Result<Vec<(StorageKey, Vec<u8>)>> {
+        let database_id = task.request.database_id.as_u64();
+        let bitemporal = self.is_bitemporal(database_id, tid, collection);
+        let mut rows = Vec::new();
+        for key in self.scan_matching_documents(database_id, tid, collection, &[])? {
+            if overlay.get(coll_key, key.surrogate().as_u32()).is_some() {
+                continue;
+            }
+            let body = if bitemporal {
+                self.sparse
+                    .versioned_get_current(database_id, tid, collection, &key)?
+            } else {
+                self.sparse.get(database_id, tid, collection, &key)?
+            };
+            if let Some(body) = body {
+                rows.push((key, body));
+            }
+        }
+        Ok(rows)
+    }
+}
+
+/// The declared primary key of every document collection a `Truncate` plan
+/// names, keyed by collection.
+pub(super) fn truncate_declared_primary_keys(
+    plans: &[PhysicalPlan],
+) -> BTreeMap<String, Option<String>> {
+    plans
+        .iter()
+        .filter_map(|plan| match plan {
+            PhysicalPlan::Document(DocumentOp::Truncate {
+                collection,
+                declared_primary_key,
+                ..
+            }) => Some((collection.to_string(), declared_primary_key.clone())),
+            PhysicalPlan::Document(_)
+            | PhysicalPlan::Kv(_)
+            | PhysicalPlan::Graph(_)
+            | PhysicalPlan::Crdt(_)
+            | PhysicalPlan::Text(_)
+            | PhysicalPlan::Query(_)
+            | PhysicalPlan::Meta(_)
+            | PhysicalPlan::Vector(_)
+            | PhysicalPlan::Array(_)
+            | PhysicalPlan::Columnar(_)
+            | PhysicalPlan::Timeseries(_)
+            | PhysicalPlan::Spatial(_)
+            | PhysicalPlan::ClusterArray(_)
+            | PhysicalPlan::ClusterEvent(_) => None,
+        })
+        .collect()
+}
+
 /// The base rows a staged TRUNCATE removes at COMMIT, with what names each
 /// one in its redo entry.
 pub(super) struct TruncatedBaseRows<'a> {
@@ -265,7 +334,7 @@ mod tests {
     fn schemaless_body(name: &str) -> Vec<u8> {
         let mut obj = std::collections::HashMap::new();
         obj.insert("name".to_string(), Value::String(name.to_string()));
-        zerompk::to_msgpack_vec(&Value::Object(obj)).expect("encode msgpack")
+        nodedb_types::value_to_msgpack(&Value::Object(obj)).expect("encode msgpack")
     }
 
     fn id(text: &str) -> RowIdentity {

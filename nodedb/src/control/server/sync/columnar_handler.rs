@@ -25,8 +25,8 @@ use crate::types::{DatabaseId, TenantId, VShardId};
 
 /// Extract the primary-key bytes for a decoded columnar row, mirroring the
 /// non-sync planner's key precedence (`id`, `document_id`, `key`). Returns an
-/// empty `Vec` for headless rows (no PK column found, or PK is null/empty) —
-/// callers map that to `Surrogate::ZERO`.
+/// empty `Vec` for headless rows (no PK column found, or PK is null/empty),
+/// which the caller binds to a fresh anonymous surrogate.
 ///
 /// String rendering matches `sql_value_to_string` in the non-sync path so
 /// that a numeric id such as `Value::Integer(5)` produces `b"5"`, not
@@ -62,7 +62,7 @@ pub trait ColumnarDispatcher: Send + Sync {
     ///
     /// `rows` contains one element per accepted row, each a `Vec<Value>`
     /// in schema column order. `schema_bytes` is the MessagePack-encoded
-    /// `ColumnarSchema` hint from the wire message (may be empty).
+    /// `ColumnarSchema` hint from the wire message (can be empty).
     async fn dispatch_insert(
         &self,
         tenant_id: TenantId,
@@ -121,7 +121,6 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
         provenance: nodedb_types::sync::wire::SyncProvenance,
     ) -> crate::Result<Vec<u8>> {
         use crate::bridge::envelope::PhysicalPlan;
-        use crate::control::server::wal_dispatch::{ColumnarWalAppendArgs, wal_append_columnar};
         use nodedb_physical::physical_plan::columnar::{ColumnarInsertIntent, ColumnarOp};
         use nodedb_types::columnar::ColumnarSchema;
         use std::collections::HashMap;
@@ -167,18 +166,42 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
 
         // Assign cross-engine surrogates in row order before WAL append so
         // every replica stores and applies the same surrogate set. The
-        // coordinator assigns once; followers replay from the WAL record.
-        let mut surrogates: Vec<nodedb_types::Surrogate> = Vec::with_capacity(object_rows.len());
-        for row in &object_rows {
-            let pk = columnar_row_pk_bytes(row);
+        // coordinator assigns once, in one batch at the collection's home.
+        // Followers replay from the WAL record. A row with no key gets a fresh
+        // anonymous surrogate.
+        let pks: Vec<Vec<u8>> = object_rows.iter().map(columnar_row_pk_bytes).collect();
+        let keyed: Vec<&[u8]> = pks
+            .iter()
+            .filter(|pk| !pk.is_empty())
+            .map(Vec::as_slice)
+            .collect();
+        let mut bound = crate::control::server::surrogate_exchange::assign_surrogates_routed(
+            self.shared,
+            nodedb_types::CollectionKey::from_bare(database_id, &collection),
+            tenant_id,
+            &keyed,
+            crate::types::TraceId::ZERO,
+        )
+        .await?
+        .into_iter();
+        let mut surrogates: Vec<nodedb_types::Surrogate> = Vec::with_capacity(pks.len());
+        for pk in &pks {
             if pk.is_empty() {
-                surrogates.push(nodedb_types::Surrogate::ZERO);
+                surrogates.push(
+                    self.shared
+                        .surrogate_assigner
+                        .assign_anonymous(
+                            nodedb_types::CollectionKey::from_bare(database_id, &collection),
+                            tenant_id,
+                        )
+                        .await?,
+                );
             } else {
-                surrogates.push(self.shared.surrogate_assigner.assign(
-                    nodedb_types::CollectionKey::from_bare(database_id, &collection),
-                    tenant_id,
-                    &pk,
-                )?);
+                surrogates.push(bound.next().ok_or_else(|| crate::Error::Internal {
+                    detail: format!(
+                        "columnar sync into '{collection}': a keyed row got no surrogate"
+                    ),
+                })?);
             }
         }
 
@@ -190,33 +213,13 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
                 detail: format!("columnar sync: msgpack serialize rows: {e}"),
             })?;
 
-        // WAL append — surrogates are persisted so followers never mint their
-        // own divergent ids.
+        // The replicated entry carries the surrogates, so followers never mint
+        // their own divergent ids.
         let owner = RecordOwner {
             tenant_id,
             database_id,
             vshard_id: vshard,
         };
-        // The record's outcome-floor window opens before the append and
-        // closes from the dispatch's outcome.
-        let (minted, appended_lsn) =
-            super::raft_dispatch::append_under_window(self.shared, owner, |wal| {
-                wal_append_columnar(
-                    wal,
-                    tenant_id,
-                    vshard,
-                    database_id,
-                    ColumnarWalAppendArgs {
-                        collection: &collection,
-                        payload: &payload,
-                        provenance: Some(&prov),
-                        surrogates: &surrogates,
-                    },
-                )
-            })
-            .await?;
-        let wal_lsn = appended_lsn.map(|lsn| lsn.as_u64());
-
         let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
             collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
             payload,
@@ -226,7 +229,8 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
             surrogates,
             schema_bytes,
             provenance: Some(prov),
-            wal_lsn,
+            // Each replica's apply allocates its own LSN.
+            wal_lsn: None,
             // Edge-to-origin sync replays rows already decided by the policy
             // where they were written; the writing device's session is not
             // present here to resolve `$auth.*` against.
@@ -237,14 +241,7 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
             rls_filters: Vec::new(),
         });
 
-        super::raft_dispatch::authorize_and_dispatch_minted(
-            self.shared,
-            self.identity,
-            owner,
-            plan,
-            minted,
-        )
-        .await
+        super::raft_dispatch::authorize_and_dispatch(self.shared, self.identity, owner, plan).await
     }
 }
 
@@ -305,7 +302,7 @@ impl SyncSession {
         //
         // Fail-fast: the first decode failure aborts the whole batch and
         // returns a rejection ACK pinpointing the failing row index. We do
-        // NOT silently shrink the batch — that would partially apply user
+        // NOT silently shrink the batch — that will partially apply user
         // writes while reporting success on the rest.
         let total = msg.rows.len() as u64;
         let mut decoded_rows: Vec<Vec<Value>> = Vec::with_capacity(msg.rows.len());
@@ -384,7 +381,7 @@ impl SyncSession {
                 )
                 .into_wire();
 
-                // A terminally refused batch landed no rows, so none of it may
+                // A terminally refused batch landed no rows, so none of it can
                 // be counted as processed or reported as accepted.
                 let accepted = if wire.accepted { decoded } else { 0 };
                 self.mutations_processed += accepted;

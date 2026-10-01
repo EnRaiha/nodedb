@@ -230,7 +230,7 @@ mod tests {
     use crate::wal::WalManager;
 
     /// One-core state plus the Data-Plane side of its channel, so a test can
-    /// answer a request the way a core would.
+    /// answer a request the way a core does.
     fn test_state() -> (
         Arc<SharedState>,
         Vec<CoreChannelDataSide>,
@@ -255,7 +255,7 @@ mod tests {
             plan: PhysicalPlan::Document(DocumentOp::PointGet {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: None,
                 pk_bytes: Vec::new(),
                 rls_filters: Vec::new(),
                 system_time: nodedb_types::SystemTimeScope::Current,
@@ -273,6 +273,7 @@ mod tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: Admission::Exempt(ExemptReason::Read),
         }
     }
@@ -293,7 +294,7 @@ mod tests {
     }
 
     /// Hand the request to the single core and register its waiter, exactly as
-    /// a session would.
+    /// a session does.
     fn dispatch_one(shared: &SharedState, id: u64) -> crate::control::ResponseReceiver {
         let rx = shared.tracker.register(RequestId::new(id));
         shared
@@ -305,7 +306,7 @@ mod tests {
         rx
     }
 
-    /// Answer as the core would: push the response onto the Data-Plane side of
+    /// Answer as the core does: push the response onto the Data-Plane side of
     /// the SPSC pair.
     fn answer_as_core(data_sides: &mut [CoreChannelDataSide], id: u64) {
         data_sides[0]

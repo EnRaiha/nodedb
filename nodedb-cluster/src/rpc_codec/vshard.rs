@@ -108,11 +108,13 @@ mod tests {
     fn a_raft_redirect_keeps_its_leader_hint() {
         let error = ClusterError::Raft(nodedb_raft::RaftError::NotLeader {
             leader_hint: Some(5),
+            term: 4,
         });
         assert!(matches!(
             round_trip(error),
             ClusterError::Raft(nodedb_raft::RaftError::NotLeader {
-                leader_hint: Some(5)
+                leader_hint: Some(5),
+                term: 4,
             })
         ));
     }

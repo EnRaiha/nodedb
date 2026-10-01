@@ -2,8 +2,7 @@
 
 //! NDJSON and JSON array import for `COPY FROM`.
 //!
-//! Relocated verbatim from the pgwire `ddl::collection::copy_from::json_import`
-//! module (now deleted). `plan_and_dispatch` returns the protocol-neutral
+//! `plan_and_dispatch` returns the protocol-neutral
 //! [`DdlError`] directly (it is the neutral collection-DML helper), so this
 //! module's own file-read/parse errors are built as `DdlError` at their call
 //! sites to keep one error type end to end.
@@ -66,6 +65,8 @@ pub(super) async fn import_ndjson(
             ctx.database_id,
             &sql,
             ctx.txn_ctx,
+            // Each row fires its collection's triggers, as an INSERT does.
+            true,
         )
         .await
         .map_err(|e| wrap_row_error(e, *line_no, "NDJSON"))?;
@@ -123,6 +124,8 @@ pub(super) async fn import_json_array(
             ctx.database_id,
             &sql,
             ctx.txn_ctx,
+            // Each row fires its collection's triggers, as an INSERT does.
+            true,
         )
         .await
         .map_err(|e| wrap_row_error(e, line_no, "JSON array"))?;

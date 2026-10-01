@@ -37,6 +37,10 @@ pub(super) async fn singular_period_value(
             surrogate,
             ..
         } => {
+            // A key unbound in its database names no row to remove.
+            let Some(surrogate) = surrogate else {
+                return Ok(None);
+            };
             let read = recon_point_row(
                 state,
                 tenant_id,

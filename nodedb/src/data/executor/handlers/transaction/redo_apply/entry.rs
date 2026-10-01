@@ -26,10 +26,11 @@
 //!    the open [`RedoApplyScope`];
 //! 3. a collection-floor write version for every collection written, and the
 //!    index-value versions of every document row;
-//! 4. the record's events, sent once the post-install work succeeded (see
+//! 4. the record's events, sent once the post-install work succeeded, with
+//!    one publish event per message its transaction published (see
 //!    `events`);
-//! 5. the fold target rows in `Response::write_set`, so the funnel journals
-//!    them.
+//! 5. the fold target rows in `Response::write_set`, so the funnel
+//!    journals them.
 
 use nodedb_physical::physical_plan::{RedoOrigin, RedoSumTargets};
 use nodedb_wal::WalRecord;
@@ -44,8 +45,9 @@ use crate::types::TenantId;
 use crate::wal::RedoRecord;
 
 use super::passes::{RedoTarget, final_refusal};
-use super::state::{RedoApplyPass, RedoApplyScope};
+use super::state::{RedoApplyPass, RedoApplyScope, TsInstalled};
 use super::sub_ops::{document_ops, kv_ops, label_ops};
+use crate::engine::timeseries::install_counts::TsInstallCounts;
 
 /// The `MetaOp::ApplyTransactionRedo` fields the handler reads.
 pub(in crate::data::executor) struct CommittedRedo<'a> {
@@ -64,30 +66,48 @@ impl CoreLoop {
         tid: u64,
         committed: CommittedRedo<'_>,
     ) -> Response {
-        self.install_committed_redo(task, tid, committed)
+        self.install_redo(task, tid, committed, RedoOrigin::Commit)
     }
 
-    /// Install one committed redo record at the LSN the request carries:
-    /// validate every sub-record, install with undo, then settle.
-    /// Every committed transaction installs here, whichever path committed it,
-    /// and restart replay drives the same arms over the same record.
-    pub(in crate::data::executor) fn install_committed_redo(
+    /// [`Self::install_redo`] for a committed record from `origin` that also
+    /// hands back what each resolved timeseries batch of the record stored,
+    /// in `ts_installs`.
+    pub(in crate::data::executor) fn install_committed_redo_into(
         &mut self,
         task: &ExecutionTask,
         tid: u64,
         committed: CommittedRedo<'_>,
+        origin: RedoOrigin,
+        ts_installs: &mut Vec<TsInstalled>,
     ) -> Response {
-        self.install_redo(task, tid, committed, RedoOrigin::Commit)
+        self.install_redo_into(task, tid, committed, origin, ts_installs)
     }
 
-    /// [`Self::install_committed_redo`] for a record from `origin`, which
+    /// Install one committed redo record at the LSN the request carries:
+    /// validate every sub-record, install with undo, then settle. `origin`
     /// decides the commit-boundary checks the validate pass runs.
+    /// Every committed transaction installs here, whichever path committed it,
+    /// and restart replay drives the same arms over the same record.
     pub(in crate::data::executor) fn install_redo(
         &mut self,
         task: &ExecutionTask,
         tid: u64,
         committed: CommittedRedo<'_>,
         origin: RedoOrigin,
+    ) -> Response {
+        self.install_redo_into(task, tid, committed, origin, &mut Vec::new())
+    }
+
+    /// Install one committed redo record from `origin`. When the record
+    /// stored resolved timeseries batches, the response payload carries
+    /// their [`TsInstallCounts`] and `ts_installs` receives what each stored.
+    fn install_redo_into(
+        &mut self,
+        task: &ExecutionTask,
+        tid: u64,
+        committed: CommittedRedo<'_>,
+        origin: RedoOrigin,
+        ts_installs: &mut Vec<TsInstalled>,
     ) -> Response {
         let Some(lsn) = task.wal_lsn() else {
             return self.response_error(
@@ -138,11 +158,13 @@ impl CoreLoop {
             sub_records: redo.ops.len(),
             database_id,
             tid,
+            origin,
         };
         if let Err(refusal) = self.validate_redo_pass(&target, committed.sum_targets) {
             return self.response_error(task, refusal.into_code());
         }
-        let mut scope = match self.install_redo_pass(&target, committed.sum_targets) {
+        let installed = self.install_redo_pass(&target, committed.sum_targets);
+        let mut scope = match installed {
             Ok(scope) => scope,
             Err(refusal) => return self.response_error(task, refusal.into_code()),
         };
@@ -181,8 +203,30 @@ impl CoreLoop {
         }
         // Events leave only once the record is settled. Every
         // one names the record's LSN: the install held the watermark back.
+        // A handler stamped each with the record's source: it takes the
+        // committed source of its kind of row, or its row-source group's.
+        // A handler that ran under a replay task stamped no commit HLC or
+        // author: each takes the record's.
+        let rows = crate::wal::RowSourceIndex::new(&redo.row_sources);
+        let record_source = task.request.event_source;
         for mut event in std::mem::take(&mut scope.pending_events) {
             event.lsn = lsn;
+            if event.commit_hlc.is_none() {
+                event.commit_hlc = task.request.commit_hlc;
+            }
+            if event.user_id.is_none() {
+                event.user_id = task.request.user_id.clone();
+            }
+            if event.statement_digest.is_none() {
+                event.statement_digest = task.request.statement_digest.clone();
+            }
+            event.source = super::events::committed_source(
+                &rows,
+                record_source,
+                record_source.committed_other_source(),
+                &event.collection,
+                event.row_id.as_str(),
+            );
             self.send_write_event(event);
         }
 
@@ -200,10 +244,28 @@ impl CoreLoop {
             );
         }
         let write_set = target_write_set(&scope.target_writes);
-        self.emit_committed_redo_events(task, scope.doc_writes, kv_images, labels);
+        self.emit_committed_redo_events(task, scope.doc_writes, kv_images, labels, &rows);
+        self.emit_committed_publishes(task, &redo.publishes);
 
         let mut response = self.response_ok(task);
         response.write_set = write_set;
+        // The writer reports each resolved batch's apply count, not its
+        // resolve's: the install rejected the rows that conflict with the
+        // schema at this record's position.
+        let counts = TsInstallCounts::new(
+            scope
+                .ts_installs
+                .iter()
+                .map(|installed| installed.count.clone())
+                .collect(),
+        );
+        if !counts.is_empty() {
+            match counts.to_bytes() {
+                Ok(bytes) => response.payload = crate::bridge::envelope::Payload::from_vec(bytes),
+                Err(error) => response.error_code = Some(Box::new(ErrorCode::from(error))),
+            }
+        }
+        ts_installs.append(&mut scope.ts_installs);
         response
     }
 }
@@ -226,7 +288,7 @@ mod tests {
             "name".to_string(),
             nodedb_types::Value::String(name.to_string()),
         );
-        zerompk::to_msgpack_vec(&nodedb_types::Value::Object(obj)).expect("encode body")
+        nodedb_types::value_to_msgpack(&nodedb_types::Value::Object(obj)).expect("encode body")
     }
 
     fn redo_bytes(ops: Vec<RedoSubRecord>) -> Vec<u8> {
@@ -234,6 +296,10 @@ mod tests {
             version: 1,
             ops,
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         }
         .to_bytes()
         .expect("encode redo")
@@ -273,6 +339,58 @@ mod tests {
         let mut task = make_default_task();
         task.wal_lsn = lsn.map(Lsn::new);
         task
+    }
+
+    /// Every message a committed record carries leaves the install as one
+    /// publish event on its topic's stream, at the record's LSN.
+    #[test]
+    fn an_installed_record_emits_one_publish_event_per_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        let (mut producers, mut consumers) =
+            crate::event::bus::create_event_bus_with_capacity(1, 64);
+        core.set_event_producer(producers.pop().expect("producer"));
+        let mut events = consumers.pop().expect("consumer");
+        let redo = RedoRecord {
+            version: 1,
+            ops: vec![kv_put("cache", b"k1", b"v1", 12)],
+            calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: vec![crate::wal::RedoPublish {
+                owner: "trigger/0/notify".into(),
+                database_id: 0,
+                tenant_id: TID,
+                topic: "cache_feed".into(),
+                payload: "k1 set".into(),
+                metadata_floor: 0,
+                position: None,
+            }],
+            row_changes: Vec::new(),
+        }
+        .to_bytes()
+        .expect("encode redo");
+
+        let response = core.execute_apply_transaction_redo(
+            &task_at(Some(60)),
+            TID,
+            CommittedRedo {
+                redo: &redo,
+                collections: &["cache".to_string()],
+                sum_targets: &[],
+            },
+        );
+        assert_eq!(response.status, Status::Ok, "{:?}", response.error_code);
+
+        let mut publishes = Vec::new();
+        while let Some(event) = events.try_recv() {
+            if event.op == crate::event::WriteOp::Publish {
+                publishes.push(event);
+            }
+        }
+        assert_eq!(publishes.len(), 1, "one event per message");
+        assert_eq!(publishes[0].collection.as_ref(), "topic:cache_feed");
+        assert_eq!(publishes[0].lsn, Lsn::new(60));
     }
 
     #[test]
@@ -381,14 +499,16 @@ mod tests {
         let batch_bytes = zerompk::to_msgpack_vec(&batch).expect("encode samples");
         RedoSubRecord {
             record_type: RecordType::TimeseriesBatch as u32,
-            payload:
-                crate::control::server::wal_dispatch::encode_timeseries_batch_payload_with_format(
+            payload: crate::control::server::wal_dispatch::encode_timeseries_ingest_payload(
+                crate::control::server::wal_dispatch::TimeseriesIngestRecord {
                     collection,
-                    &batch_bytes,
-                    None,
-                    "samples",
-                )
-                .expect("encode timeseries sub-record"),
+                    payload: &batch_bytes,
+                    provenance: None,
+                    format: "samples",
+                    default_timestamp_ms: 0,
+                },
+            )
+            .expect("encode timeseries sub-record"),
         }
     }
 
@@ -593,19 +713,21 @@ mod tests {
         let (mut core, _req, _resp) = make_core_with_dir(dir.path());
         let now_ms = crate::engine::kv::current_ms();
         let expire_at_ms = now_ms + 3_600_000;
-        core.kv_engine.put_with_absolute_expiry(
-            crate::engine::kv::KvPutParams {
-                database_id: 0,
-                tenant_id: TID,
-                collection: "cache",
-                key: b"k1",
-                value: b"old",
-                ttl_ms: 0,
-                now_ms,
-                surrogate: Surrogate::new(5),
-            },
-            expire_at_ms,
-        );
+        core.kv_engine
+            .put_with_absolute_expiry(
+                crate::engine::kv::KvPutParams {
+                    database_id: 0,
+                    tenant_id: TID,
+                    collection: "cache",
+                    key: b"k1",
+                    value: b"old",
+                    ttl_ms: 0,
+                    now_ms,
+                    surrogate: Surrogate::new(5),
+                },
+                expire_at_ms,
+            )
+            .expect("a bound row writes");
         let before = core
             .kv_engine
             .entry_image(0, TID, "cache", b"k1", now_ms)
@@ -661,15 +783,93 @@ mod tests {
             .expect("encode lines");
         RedoSubRecord {
             record_type: RecordType::TimeseriesBatch as u32,
-            payload:
-                crate::control::server::wal_dispatch::encode_timeseries_batch_payload_with_format(
-                    "metrics",
-                    &lines,
-                    None,
-                    "ilp-msgpack",
-                )
-                .expect("encode ingest"),
+            payload: crate::control::server::wal_dispatch::encode_timeseries_ingest_payload(
+                crate::control::server::wal_dispatch::TimeseriesIngestRecord {
+                    collection: "metrics",
+                    payload: &lines,
+                    provenance: None,
+                    format: "ilp-msgpack",
+                    default_timestamp_ms: 0,
+                },
+            )
+            .expect("encode ingest"),
         }
+    }
+
+    /// A batch `VectorPut` carries every vector's surrogate, and the install
+    /// binds each one.
+    #[test]
+    fn a_batch_vector_put_binds_every_surrogate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        let batch = RedoSubRecord {
+            record_type: RecordType::VectorPut as u32,
+            payload: crate::control::server::wal_dispatch::encode_vector_batch_put_payload(
+                "docs",
+                &[vec![0.5f32, 0.5], vec![0.25, 0.75]],
+                2,
+                &[Surrogate::new(31), Surrogate::new(32)],
+            )
+            .expect("encode vector batch put"),
+        };
+        let redo = redo_bytes(vec![batch]);
+
+        let response = core.execute_apply_transaction_redo(
+            &task_at(Some(91)),
+            TID,
+            CommittedRedo {
+                redo: &redo,
+                collections: &[],
+                sum_targets: &[],
+            },
+        );
+
+        assert_eq!(response.status, Status::Ok, "{:?}", response.error_code);
+        let key = CoreLoop::vector_index_key(0, TID, "docs", "");
+        let collection = core
+            .vector_collections
+            .get(&key)
+            .expect("the batch's index");
+        for surrogate in [Surrogate::new(31), Surrogate::new(32)] {
+            assert!(
+                collection.local_for_surrogate(surrogate).is_some(),
+                "{surrogate:?} is bound after the install"
+            );
+        }
+    }
+
+    /// A `VectorPut` payload of neither current shape (here the retired
+    /// identity-less `(collection, vector, dim)`) is refused, never installed
+    /// as an unbound vector.
+    #[test]
+    fn a_vector_put_of_no_current_shape_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        let retired = RedoSubRecord {
+            record_type: RecordType::VectorPut as u32,
+            payload: zerompk::to_msgpack_vec(&("docs", vec![0.5f32, 0.5], 2usize))
+                .expect("encode retired vector put"),
+        };
+        let redo = redo_bytes(vec![retired]);
+
+        let response = core.execute_apply_transaction_redo(
+            &task_at(Some(92)),
+            TID,
+            CommittedRedo {
+                redo: &redo,
+                collections: &[],
+                sum_targets: &[],
+            },
+        );
+
+        assert_eq!(response.status, Status::Error);
+        let key = CoreLoop::vector_index_key(0, TID, "docs", "");
+        assert!(
+            core.vector_collections
+                .get(&key)
+                .is_none_or(|collection| collection.live_count() == 0),
+            "no vector is installed"
+        );
     }
 
     /// The vector node an install inserted is withdrawn with the rest of the
@@ -680,15 +880,14 @@ mod tests {
         let (mut core, _req, _resp) = make_core_with_dir(dir.path());
         let vector_put = RedoSubRecord {
             record_type: RecordType::VectorPut as u32,
-            payload: zerompk::to_msgpack_vec(&(
+            payload: crate::control::server::wal_dispatch::encode_vector_put_payload(
                 "docs",
-                vec![0.5f32, 0.5],
-                2usize,
+                &[0.5f32, 0.5],
+                2,
                 "",
-                None::<String>,
-                21u32,
-                None::<SyncProvenance>,
-            ))
+                nodedb_types::Surrogate::new(21),
+                None,
+            )
             .expect("encode vector put"),
         };
         let redo = redo_bytes(vec![vector_put, mismatched_ingest()]);
@@ -733,6 +932,7 @@ mod tests {
                 src_surrogate: 31,
                 dst_surrogate: 32,
                 system_from: Some(500),
+                applied: None,
             })
             .expect("encode edge put"),
         };

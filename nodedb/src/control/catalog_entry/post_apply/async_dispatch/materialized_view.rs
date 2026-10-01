@@ -16,9 +16,8 @@ use crate::control::state::SharedState;
 ///
 /// `reclaim_collection_storage` provides the durable pending-reclaim fallback
 /// and dispatches `UnregisterCollection` to every local Data Plane core. The
-/// caller treats an error as fatal because the catalog deletion is already
-/// committed; serving through an incomplete reclaim would violate object
-/// incarnation isolation.
+/// catalog deletion is already committed, so an error with no retry queued
+/// stops the apply batch, and the re-delivered entry retries the reclaim.
 pub async fn delete_async(
     database_id: u64,
     tenant_id: u64,

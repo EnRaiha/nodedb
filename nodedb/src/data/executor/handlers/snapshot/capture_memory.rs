@@ -64,6 +64,12 @@ impl CoreLoop {
                 .map_err(|e| capture_error("vector collection", &key_str, e))?;
             let bytes = zerompk::to_msgpack_vec(&vectors)
                 .map_err(|e| capture_error("vector collection", &key_str, e))?;
+            let documents = collection.multi_vector_documents();
+            if !documents.is_empty() {
+                snapshot
+                    .vector_multi_documents
+                    .push((key_str.clone(), documents));
+            }
             snapshot.vectors.push((key_str, bytes));
         }
         for (key, params) in &self.vector_params {

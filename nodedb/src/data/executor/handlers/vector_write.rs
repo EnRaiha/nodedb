@@ -32,6 +32,24 @@ impl CoreLoop {
         if let Some(bad) = vectors.iter().find(|vector| vector.len() != dim) {
             return self.response_error(task, super::vector::dimension_mismatch(dim, bad.len()));
         }
+        // Every vector carries its own bound surrogate.
+        if surrogates.len() != vectors.len() {
+            return self.response_error(
+                task,
+                ErrorCode::RejectedPrevalidation {
+                    reason: format!(
+                        "vector batch into '{collection}' carries {} surrogates for {} vectors",
+                        surrogates.len(),
+                        vectors.len()
+                    ),
+                },
+            );
+        }
+        if let Some(refusal) = surrogates.iter().find_map(|surrogate| {
+            super::unbound_surrogate::refuse_unbound("vector", collection, *surrogate)
+        }) {
+            return self.response_error(task, refusal);
+        }
         let index_key = CoreLoop::vector_index_key(database_id, tid, collection, "");
         // A committed-redo install seals once the whole record landed.
         let defer_seal = self.recording_redo_undo();
@@ -46,18 +64,12 @@ impl CoreLoop {
                 self.checkpoint_coordinator
                     .mark_dirty("vector", vectors.len());
                 // Record this write's version so cross-shard OCC read-set
-                // validation sees this batch. Per-surrogate when the batch
-                // carries a bound surrogate (a superset of the collection
-                // floor); floor-only when headless (no surrogates at all, or
-                // none of them bound to a real identity).
-                let mut any_surrogate_recorded = false;
+                // validation sees this batch: per surrogate, a superset of the
+                // collection floor. An empty batch records the floor only.
                 for s in surrogates {
-                    if *s != Surrogate::ZERO {
-                        self.note_surrogate_write_lsn(task, tid, collection, s.as_u32());
-                        any_surrogate_recorded = true;
-                    }
+                    self.note_surrogate_write_lsn(task, tid, collection, s.as_u32());
                 }
-                if !any_surrogate_recorded {
+                if surrogates.is_empty() {
                     self.note_collection_write_lsn(task, collection);
                 }
                 match super::super::response_codec::encode_count("inserted", vectors.len()) {
@@ -233,6 +245,7 @@ mod tests {
             txn_id: None,
             wal_lsn: Some(Lsn::new(lsn)),
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: Admission::Exempt(ExemptReason::Read),
         })
     }
@@ -256,6 +269,33 @@ mod tests {
             h.core.vector_collections.get(&key).map_or(0, |c| c.len()),
             0,
             "the vector before the bad one is not inserted"
+        );
+    }
+
+    /// Every vector of a batch carries its own bound surrogate: a batch short
+    /// of surrogates, or carrying `Surrogate::ZERO`, is refused whole.
+    #[test]
+    fn a_batch_without_a_bound_surrogate_per_vector_inserts_no_vector() {
+        let mut h = make_core();
+        let task = make_task_with_lsn(13);
+        let vectors = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        for surrogates in [
+            vec![Surrogate::new(1)],
+            vec![Surrogate::new(1), Surrogate::ZERO],
+        ] {
+            let response =
+                h.core
+                    .execute_vector_batch_insert(&task, 1, "docs", &vectors, 2, &surrogates);
+            assert!(matches!(
+                response.error_code.as_deref(),
+                Some(ErrorCode::RejectedPrevalidation { .. })
+            ));
+        }
+        let key = CoreLoop::vector_index_key(0, 1, "docs", "");
+        assert_eq!(
+            h.core.vector_collections.get(&key).map_or(0, |c| c.len()),
+            0,
+            "no vector of a refused batch is inserted"
         );
     }
 

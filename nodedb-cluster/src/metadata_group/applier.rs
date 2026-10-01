@@ -11,6 +11,7 @@ use uuid;
 
 use crate::auth::raft_backed_store::apply_token_transition_to_mirror;
 use crate::auth::token_state::SharedTokenStateMirror;
+use crate::error::ClusterError;
 use crate::metadata_group::cache::{
     MetadataCache, apply_migration_abort, apply_migration_checkpoint,
 };
@@ -28,11 +29,90 @@ use crate::topology::{ClusterTopology, NodeInfo, NodeState};
 /// applier in the `nodedb` crate to additionally decode the
 /// `CatalogDdl` payload as a `CatalogEntry` and write through to
 /// `SystemCatalog`.
+///
+/// The apply is awaited: an entry whose effects await other work completes
+/// them before the raft loop advances past it.
+#[async_trait::async_trait]
 pub trait MetadataApplier: Send + Sync + 'static {
-    /// Apply a batch of committed raft entries. Entries with empty
-    /// `data` (raft no-ops) are skipped. Returns the highest log
-    /// index applied.
-    fn apply(&self, entries: &[(u64, Vec<u8>)]) -> u64;
+    /// Apply a batch of committed raft entries, each decoded once by the
+    /// caller. Entries with an empty payload (raft no-ops and conf changes)
+    /// apply nothing. Returns the highest log index applied.
+    async fn apply_decoded(&self, entries: &[CommittedMetadata<'_>]) -> u64;
+
+    /// Decode each encoded entry once, then apply the batch through
+    /// [`apply_decoded`](Self::apply_decoded). For callers that hold the
+    /// encoded bytes.
+    async fn apply(&self, entries: &[(u64, Vec<u8>)]) -> u64 {
+        let committed: Vec<CommittedMetadata<'_>> = entries
+            .iter()
+            .map(|(index, data)| CommittedMetadata::decode(*index, data))
+            .collect();
+        self.apply_decoded(&committed).await
+    }
+
+    /// Whether every effect of an entry `apply` reports as applied is durable
+    /// when `apply` returns. When true, the raft loop saves the returned index
+    /// as the group's applied floor, and a restart resumes delivery above it.
+    /// When false, a restart replays the whole retained log.
+    fn durable_effects(&self) -> bool {
+        false
+    }
+}
+
+/// One committed metadata entry: its raw payload and its payload decoded
+/// once.
+#[derive(Debug)]
+pub struct CommittedMetadata<'a> {
+    pub index: u64,
+    /// The entry's payload. Empty for a raft no-op or a conf change.
+    pub data: &'a [u8],
+    pub payload: MetadataPayload,
+}
+
+/// The decoded payload of a [`CommittedMetadata`].
+#[derive(Debug)]
+pub enum MetadataPayload {
+    /// A raft no-op or a conf change. It applies nothing.
+    Empty,
+    Decoded(MetadataEntry),
+    /// The payload does not decode. Every replica fails the same way.
+    Undecodable(ClusterError),
+}
+
+impl<'a> CommittedMetadata<'a> {
+    /// Decode `data`, the payload committed at `index`.
+    pub fn decode(index: u64, data: &'a [u8]) -> Self {
+        let payload = if data.is_empty() {
+            MetadataPayload::Empty
+        } else {
+            match decode_entry(data) {
+                Ok(entry) => MetadataPayload::Decoded(entry),
+                Err(e) => MetadataPayload::Undecodable(e),
+            }
+        };
+        Self {
+            index,
+            data,
+            payload,
+        }
+    }
+
+    /// An entry that applies nothing, such as a conf change.
+    pub fn empty(index: u64) -> Self {
+        Self {
+            index,
+            data: &[],
+            payload: MetadataPayload::Empty,
+        }
+    }
+
+    /// The decoded entry, if the payload decoded.
+    pub fn entry(&self) -> Option<&MetadataEntry> {
+        match &self.payload {
+            MetadataPayload::Decoded(entry) => Some(entry),
+            MetadataPayload::Empty | MetadataPayload::Undecodable(_) => None,
+        }
+    }
 }
 
 /// Default applier that writes committed entries to an in-memory
@@ -123,15 +203,37 @@ impl CacheApplier {
         };
         let mut topo = live.write().unwrap_or_else(|p| p.into_inner());
         match change {
-            TopologyChange::Join { node_id, addr } => {
-                if topo.contains(*node_id) {
+            TopologyChange::Join {
+                node_id,
+                addr,
+                swim_addr,
+            } => {
+                let swim: Option<SocketAddr> = swim_addr.as_deref().and_then(|raw| {
+                    raw.parse()
+                        .inspect_err(|_| warn!(node_id, raw, "join: invalid SWIM address, dropped"))
+                        .ok()
+                });
+                if let Some(existing) = topo.get_node(*node_id) {
+                    // A known node re-advertising a new SWIM address updates
+                    // its entry; nothing else about it changes here.
+                    if swim.is_some() && existing.swim_socket_addr() != swim {
+                        let updated = existing.clone().with_swim_addr(swim);
+                        topo.add_node(updated);
+                    }
                     return;
                 }
-                let parsed: SocketAddr = addr.parse().unwrap_or_else(|_| {
-                    warn!(node_id, addr, "join: invalid address, using placeholder");
-                    SocketAddr::from(([0, 0, 0, 0], 0))
-                });
-                topo.join_as_learner(NodeInfo::new(*node_id, parsed, NodeState::Joining));
+                // Propose refuses an invalid address. One that still
+                // commits never enters topology with a placeholder.
+                let parsed: SocketAddr = match addr.parse() {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        error!(node_id, addr, error = %e, "join: invalid address, join skipped");
+                        return;
+                    }
+                };
+                topo.join_as_learner(
+                    NodeInfo::new(*node_id, parsed, NodeState::Joining).with_swim_addr(swim),
+                );
             }
             TopologyChange::PromoteToVoter { node_id } => {
                 topo.promote_to_voter(*node_id);
@@ -150,16 +252,16 @@ impl CacheApplier {
 
     /// Cascade live-state mutations for a committed entry. Handles
     /// `Batch` by recursing into each sub-entry.
-    fn cascade_live_state(&self, entry: &MetadataEntry) {
+    fn cascade_live_state(&self, index: u64, entry: &MetadataEntry) {
         match entry {
             // The applied epoch advances in the raft loop, on every node,
             // regardless of which applier the host installed.
             MetadataEntry::ClusterEpochBump { .. } => {}
             MetadataEntry::TopologyChange(change) => self.apply_topology_change(change),
-            MetadataEntry::RoutingChange(change) => self.apply_routing_change(change),
+            MetadataEntry::RoutingChange(change) => self.apply_routing_change(index, change),
             MetadataEntry::Batch { entries } => {
                 for sub in entries {
-                    self.cascade_live_state(sub);
+                    self.cascade_live_state(index, sub);
                 }
             }
             MetadataEntry::MigrationCheckpoint {
@@ -232,8 +334,8 @@ impl CacheApplier {
     }
 
     /// Mutate the live routing handle (if attached) in response to
-    /// a committed `RoutingChange`.
-    fn apply_routing_change(&self, change: &RoutingChange) {
+    /// a committed `RoutingChange` at metadata log `index`.
+    fn apply_routing_change(&self, index: u64, change: &RoutingChange) {
         let Some(live) = &self.live_routing else {
             return;
         };
@@ -244,13 +346,18 @@ impl CacheApplier {
                 new_group_id,
                 new_leaseholder_node_id,
             } => {
-                rt.reassign_vshard(*vshard_id, *new_group_id);
+                rt.reassign_vshard(*vshard_id, *new_group_id, index);
+                // The entry names a planned leaseholder with no term. It
+                // fills only a hint that holds no term.
                 rt.set_leader(*new_group_id, *new_leaseholder_node_id);
             }
             RoutingChange::LeadershipTransfer {
                 group_id,
                 new_leader_node_id,
             } => {
+                // The entry names the transfer target before its election,
+                // so it carries no term. The election's leader reaches the
+                // hint with its term from Raft or a redirect.
                 rt.set_leader(*group_id, *new_leader_node_id);
             }
             RoutingChange::RemoveMember { group_id, node_id } => {
@@ -266,24 +373,26 @@ impl CacheApplier {
     }
 }
 
+#[async_trait::async_trait]
 impl MetadataApplier for CacheApplier {
-    fn apply(&self, entries: &[(u64, Vec<u8>)]) -> u64 {
+    async fn apply_decoded(&self, entries: &[CommittedMetadata<'_>]) -> u64 {
         let mut last = 0u64;
         let mut guard = self
             .cache
             .write()
             .unwrap_or_else(|poison| poison.into_inner());
-        for (index, data) in entries {
-            last = *index;
-            if data.is_empty() {
-                continue;
-            }
-            match decode_entry(data) {
-                Ok(entry) => {
-                    guard.apply(*index, &entry);
-                    self.cascade_live_state(&entry);
+        for committed in entries {
+            let index = committed.index;
+            last = index;
+            match &committed.payload {
+                MetadataPayload::Empty => {}
+                MetadataPayload::Decoded(entry) => {
+                    guard.apply(index, entry);
+                    self.cascade_live_state(index, entry);
                 }
-                Err(e) => warn!(index = *index, error = %e, "metadata decode failed"),
+                MetadataPayload::Undecodable(e) => {
+                    warn!(index, error = %e, "metadata decode failed")
+                }
             }
         }
         last
@@ -295,9 +404,10 @@ impl MetadataApplier for CacheApplier {
 /// index so raft can advance its applied watermark.
 pub struct NoopMetadataApplier;
 
+#[async_trait::async_trait]
 impl MetadataApplier for NoopMetadataApplier {
-    fn apply(&self, entries: &[(u64, Vec<u8>)]) -> u64 {
-        entries.last().map(|(idx, _)| *idx).unwrap_or(0)
+    async fn apply_decoded(&self, entries: &[CommittedMetadata<'_>]) -> u64 {
+        entries.last().map_or(0, |e| e.index)
     }
 }
 
@@ -307,8 +417,8 @@ mod tests {
     use crate::metadata_group::codec::encode_entry;
     use crate::metadata_group::entry::{MetadataEntry, TopologyChange};
 
-    #[test]
-    fn cache_applier_counts_catalog_ddl() {
+    #[tokio::test]
+    async fn cache_applier_counts_catalog_ddl() {
         let cache = Arc::new(RwLock::new(MetadataCache::new()));
         let applier = CacheApplier::new(cache.clone());
 
@@ -319,10 +429,11 @@ mod tests {
         let topo = encode_entry(&MetadataEntry::TopologyChange(TopologyChange::Join {
             node_id: 7,
             addr: "10.0.0.7:9000".into(),
+            swim_addr: None,
         }))
         .unwrap();
 
-        let last = applier.apply(&[(1, ddl), (2, topo)]);
+        let last = applier.apply(&[(1, ddl), (2, topo)]).await;
         assert_eq!(last, 2);
 
         let guard = cache.read().unwrap();
@@ -331,8 +442,8 @@ mod tests {
         assert_eq!(guard.topology_log.len(), 1);
     }
 
-    #[test]
-    fn cache_applier_idempotent() {
+    #[tokio::test]
+    async fn cache_applier_idempotent() {
         let cache = Arc::new(RwLock::new(MetadataCache::new()));
         let applier = CacheApplier::new(cache.clone());
 
@@ -340,16 +451,16 @@ mod tests {
             payload: vec![9, 9],
         })
         .unwrap();
-        applier.apply(&[(5, bytes.clone())]);
-        applier.apply(&[(3, bytes)]); // Earlier index — ignored.
+        applier.apply(&[(5, bytes.clone())]).await;
+        applier.apply(&[(3, bytes)]).await; // Earlier index — ignored.
 
         let guard = cache.read().unwrap();
         assert_eq!(guard.applied_index, 5);
         assert_eq!(guard.catalog_entries_applied, 1);
     }
 
-    #[test]
-    fn cache_applier_mutates_live_topology_on_start_decommission() {
+    #[tokio::test]
+    async fn cache_applier_mutates_live_topology_on_start_decommission() {
         use crate::topology::{ClusterTopology, NodeInfo, NodeState};
         use std::net::SocketAddr;
 
@@ -370,14 +481,83 @@ mod tests {
             TopologyChange::StartDecommission { node_id: 7 },
         ))
         .unwrap();
-        applier.apply(&[(1, bytes)]);
+        applier.apply(&[(1, bytes)]).await;
 
         let topo = topology.read().unwrap();
         assert_eq!(topo.get_node(7).unwrap().state, NodeState::Draining);
     }
 
-    #[test]
-    fn cache_applier_mutates_live_routing_on_remove_member() {
+    /// A committed `Join` puts the joiner's SWIM address into the live
+    /// topology, and a later `Join` with a new address updates it.
+    #[tokio::test]
+    async fn cache_applier_applies_join_swim_address() {
+        let cache = Arc::new(RwLock::new(MetadataCache::new()));
+        let topology = Arc::new(RwLock::new(crate::topology::ClusterTopology::new()));
+        let routing = Arc::new(RwLock::new(crate::routing::RoutingTable::uniform(
+            1,
+            &[1],
+            1,
+        )));
+        let applier =
+            CacheApplier::new(cache.clone()).with_live_state(topology.clone(), routing.clone());
+        let join = |swim: &str| {
+            encode_entry(&MetadataEntry::TopologyChange(TopologyChange::Join {
+                node_id: 9,
+                addr: "10.0.0.9:9400".into(),
+                swim_addr: Some(swim.into()),
+            }))
+            .unwrap()
+        };
+
+        applier.apply(&[(1, join("10.0.0.9:9401"))]).await;
+        assert_eq!(
+            topology
+                .read()
+                .unwrap()
+                .get_node(9)
+                .unwrap()
+                .swim_socket_addr(),
+            "10.0.0.9:9401".parse().ok()
+        );
+
+        applier.apply(&[(2, join("10.0.0.9:9501"))]).await;
+        assert_eq!(
+            topology
+                .read()
+                .unwrap()
+                .get_node(9)
+                .unwrap()
+                .swim_socket_addr(),
+            "10.0.0.9:9501".parse().ok()
+        );
+    }
+
+    /// A committed `Join` with an invalid address is skipped. The node
+    /// never enters topology with a placeholder address.
+    #[tokio::test]
+    async fn cache_applier_skips_join_with_invalid_address() {
+        let cache = Arc::new(RwLock::new(MetadataCache::new()));
+        let topology = Arc::new(RwLock::new(crate::topology::ClusterTopology::new()));
+        let routing = Arc::new(RwLock::new(crate::routing::RoutingTable::uniform(
+            1,
+            &[1],
+            1,
+        )));
+        let applier =
+            CacheApplier::new(cache.clone()).with_live_state(topology.clone(), routing.clone());
+        let bytes = encode_entry(&MetadataEntry::TopologyChange(TopologyChange::Join {
+            node_id: 9,
+            addr: "not-an-address".into(),
+            swim_addr: None,
+        }))
+        .unwrap();
+
+        assert_eq!(applier.apply(&[(1, bytes)]).await, 1);
+        assert!(!topology.read().unwrap().contains(9));
+    }
+
+    #[tokio::test]
+    async fn cache_applier_mutates_live_routing_on_remove_member() {
         use crate::metadata_group::entry::RoutingChange;
 
         let cache = Arc::new(RwLock::new(MetadataCache::new()));
@@ -395,14 +575,14 @@ mod tests {
             node_id: 2,
         }))
         .unwrap();
-        applier.apply(&[(1, bytes)]);
+        applier.apply(&[(1, bytes)]).await;
 
         let rt = routing.read().unwrap();
         assert!(!rt.group_info(0).unwrap().members.contains(&2));
     }
 
-    #[test]
-    fn cache_applier_mutates_live_routing_on_set_placement() {
+    #[tokio::test]
+    async fn cache_applier_mutates_live_routing_on_set_placement() {
         use crate::metadata_group::entry::RoutingChange;
 
         let cache = Arc::new(RwLock::new(MetadataCache::new()));
@@ -420,7 +600,7 @@ mod tests {
             placement: vec![1, 2],
         }))
         .unwrap();
-        applier.apply(&[(1, bytes)]);
+        applier.apply(&[(1, bytes)]).await;
 
         let rt = routing.read().unwrap();
         assert_eq!(
@@ -430,8 +610,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cache_applier_without_live_state_stays_log_only() {
+    #[tokio::test]
+    async fn cache_applier_without_live_state_stays_log_only() {
         let cache = Arc::new(RwLock::new(MetadataCache::new()));
         let applier = CacheApplier::new(cache.clone());
         let bytes = encode_entry(&MetadataEntry::TopologyChange(
@@ -439,14 +619,17 @@ mod tests {
         ))
         .unwrap();
         // Must not panic and must still advance the applied index.
-        let last = applier.apply(&[(1, bytes)]);
+        let last = applier.apply(&[(1, bytes)]).await;
         assert_eq!(last, 1);
     }
 
-    #[test]
-    fn noop_applier_advances_watermark() {
+    #[tokio::test]
+    async fn noop_applier_advances_watermark() {
         let noop = NoopMetadataApplier;
-        assert_eq!(noop.apply(&[(7, b"x".to_vec()), (9, b"y".to_vec())]), 9);
-        assert_eq!(noop.apply(&[]), 0);
+        assert_eq!(
+            noop.apply(&[(7, b"x".to_vec()), (9, b"y".to_vec())]).await,
+            9
+        );
+        assert_eq!(noop.apply(&[]).await, 0);
     }
 }

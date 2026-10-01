@@ -26,8 +26,8 @@ pub(in crate::data::executor) struct PointDeleteParams<'a> {
     pub database_id: u64,
     pub tid: u64,
     pub collection: &'a str,
-    /// The row's client identity. The graph cascade removes the edges of,
-    /// and marks deleted, the node this names.
+    /// The row's client identity. The delete marks deleted the node this
+    /// names.
     pub document_id: &'a str,
     pub surrogate: Surrogate,
     /// Roles held by the authenticated user. Currently unused by DELETE
@@ -82,22 +82,13 @@ pub(in crate::data::executor) struct PointDeleteOutcome {
     /// had no spatial fields. Autocommit callers ignore it (an aborted redb txn
     /// does not reverse in-memory spatial writes).
     pub spatial_deletes: Vec<(SpatialIndexKey, u64, nodedb_types::BoundingBox, String)>,
-    /// Graph edges the unconditional graph-edge cascade removed from BOTH the
-    /// in-memory CSR partition AND the persistent edge store, each with its
-    /// prior properties and the tombstone version the cascade added.
-    /// Populated regardless of caller (the cascade is unconditional), so a
-    /// transactional caller pushes one `UndoEntry::EdgeWrite` per entry and a
-    /// rolled-back delete restores every cascaded edge into both stores.
-    /// Autocommit callers ignore it.
-    pub edge_deletes: Vec<crate::engine::graph::edge_store::EdgeRestore>,
     /// The node id this delete NEWLY marked deleted in the in-memory
     /// `deleted_nodes` edge referential-integrity tracker, if any. `Some(id)`
     /// only when `mark_node_deleted` newly inserted the node (it was not already
     /// tombstoned by a prior committed op). A transactional caller pushes an
     /// `UndoEntry::MarkNodeDeleted` so a rolled-back delete un-marks exactly the
     /// node it added — never resurrecting a pre-existing tombstone. `None` when
-    /// the cascade didn't run or the node was already marked. Autocommit callers
-    /// ignore it.
+    /// the node was already marked. Autocommit callers ignore it.
     pub mark_node_deleted: Option<String>,
 }
 
@@ -106,9 +97,10 @@ impl CoreLoop {
     ///
     /// Handles the bitemporal-aware tombstone/versioned-index-tombstone
     /// branch, the non-bitemporal overwrite-delete branch, and all cascades
-    /// (inverted index, secondary indexes, graph edges, spatial R-tree,
-    /// node-deleted bookkeeping, doc cache invalidation). Does NOT commit the
-    /// transaction.
+    /// (inverted index, secondary indexes, spatial R-tree, node-deleted
+    /// bookkeeping, doc cache invalidation). The node's graph edges are
+    /// tombstoned by the transaction's own `EdgeDelete` tasks. Does NOT
+    /// commit the transaction.
     ///
     /// Every redb write this performs on the sparse database — the row removal
     /// or bitemporal tombstone, the versioned index tombstones, the inverted
@@ -149,13 +141,14 @@ impl CoreLoop {
         let _ = user_roles;
 
         let storage_key = crate::engine::document::store::StorageKey::for_surrogate(surrogate);
-        // A stamp in `active_bitemporal_stamps` (a committed redo delete)
+        // A stamp in `apply_scope.bitemporal_stamps` (a committed redo delete)
         // forces the versioned branch at the EXACT resolve-time system time,
         // so every replica and every restart tombstones the same version key.
         // Absent an override, derive bitemporality from config and mint the
         // system time here.
         let carried_sys_from = self
-            .active_bitemporal_stamps
+            .apply_scope
+            .bitemporal_stamps
             .get(&surrogate.as_u32())
             .map(|stamp| stamp.sys_from_ms);
         let bitemporal =
@@ -343,26 +336,12 @@ impl CoreLoop {
             return Err(e);
         }
 
-        // Cascade 3: Remove graph edges where this document is src or dst.
-        // Captured unconditionally (the cascade runs for both autocommit and
-        // transactional callers) so a transactional caller can restore every
-        // removed edge on rollback via `UndoEntry::EdgeWrite`, which restores
-        // BOTH the CSR partition and the persistent edge store — matching the
-        // two stores this cascade removes from.
-        // The store cascade runs first and is one transaction: its error
-        // refuses the delete with neither edge store nor CSR changed.
-        let edge_deletes = match self.cascade_node_edges(database_id, tid, document_id) {
-            Ok(removed) => removed,
-            Err(e) => {
-                warn!(core = self.core_id, %document_id, error = %e, "edge cascade failed; rejecting the delete");
-                return Err(e);
-            }
-        };
-        if !edge_deletes.is_empty() {
-            tracing::trace!(core = self.core_id, %document_id, edges_removed = edge_deletes.len(), "EDGE_CASCADE_DELETE");
-        }
+        // The row's graph node keeps its edges here. The Control Plane
+        // tombstones the node's edges in its collection with `EdgeDelete`
+        // tasks of the delete's own transaction, at the ordinal that
+        // transaction decides on both homes of each edge.
 
-        // Cascade 4: Remove from spatial R-tree indexes + reverse map, and
+        // Cascade 3: Remove from spatial R-tree indexes + reverse map, and
         // record the node deletion for edge referential integrity. Both are
         // fully captured (`spatial_deletes` + `mark_node_deleted` in the
         // outcome) and reversed on rollback, so they run unconditionally for
@@ -390,11 +369,11 @@ impl CoreLoop {
         // for undo ONLY when this call newly marked it — un-marking a node
         // a prior committed op already tombstoned would wrongly resurrect
         // it as a valid edge target.
-        if self.mark_node_deleted(database_id, tid, document_id) {
+        if self.mark_node_deleted(database_id, tid, collection, document_id) {
             mark_node_deleted_capture = Some(document_id.to_string());
         }
 
-        // Cascade 5 (CORE, UNCONDITIONAL): soft-delete any HNSW vector entries
+        // Cascade 4 (CORE, UNCONDITIONAL): soft-delete any HNSW vector entries
         // this document produced. Runs for BOTH autocommit and transactional
         // callers — leaving them behind orphans the vector index forever (a
         // deleted doc keeps scoring in KNN). The reverse map `vector_doc_map`
@@ -432,7 +411,6 @@ impl CoreLoop {
             secondary_index_tuples,
             vector_deletes,
             spatial_deletes,
-            edge_deletes,
             mark_node_deleted: mark_node_deleted_capture,
         })
     }

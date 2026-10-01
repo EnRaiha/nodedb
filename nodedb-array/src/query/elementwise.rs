@@ -14,9 +14,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::error::ArrayResult;
+use crate::error::{ArrayError, ArrayResult};
 use crate::schema::ArraySchema;
-use crate::tile::sparse_tile::{SparseTile, SparseTileBuilder};
+use crate::tile::sparse_tile::{RowKind, SparseTile, SparseTileBuilder};
 use crate::types::cell_value::value::CellValue;
 use crate::types::coord::value::CoordValue;
 
@@ -37,8 +37,8 @@ pub fn elementwise(
     op: BinaryOp,
 ) -> ArrayResult<SparseTile> {
     let n_attrs = schema.attrs.len();
-    let by_coord_a = index_rows(a);
-    let by_coord_b = index_rows(b);
+    let by_coord_a = index_rows(a)?;
+    let by_coord_b = index_rows(b)?;
     let mut keys: BTreeMap<Vec<CoordKey>, ()> = BTreeMap::new();
     for k in by_coord_a.keys().chain(by_coord_b.keys()) {
         keys.insert(k.clone(), ());
@@ -136,19 +136,38 @@ fn decode_key(k: &[CoordKey]) -> Vec<CoordValue> {
         .collect()
 }
 
-fn index_rows(tile: &SparseTile) -> BTreeMap<Vec<CoordKey>, Vec<CellValue>> {
+/// The live cells of `tile` by coordinate. Tombstone and erasure rows hold
+/// no attribute entries, so attributes are read at the live-row index.
+fn index_rows(tile: &SparseTile) -> ArrayResult<BTreeMap<Vec<CoordKey>, Vec<CellValue>>> {
+    let corrupt = |row: usize| ArrayError::SegmentCorruption {
+        detail: format!("elementwise: sparse tile row {row} is out of range"),
+    };
     let mut out = BTreeMap::new();
-    let n = tile.nnz() as usize;
-    for row in 0..n {
-        let coord: Vec<CoordValue> = tile
+    let mut live_row = 0usize;
+    for row in 0..tile.row_count() {
+        if tile.row_kind(row)? != RowKind::Live {
+            continue;
+        }
+        let coord = tile
             .dim_dicts
             .iter()
-            .map(|d| d.values[d.indices[row] as usize].clone())
-            .collect();
-        let attrs: Vec<CellValue> = tile.attr_cols.iter().map(|col| col[row].clone()).collect();
+            .map(|d| {
+                d.indices
+                    .get(row)
+                    .and_then(|&i| d.values.get(i as usize))
+                    .cloned()
+                    .ok_or_else(|| corrupt(row))
+            })
+            .collect::<ArrayResult<Vec<CoordValue>>>()?;
+        let attrs = tile
+            .attr_cols
+            .iter()
+            .map(|col| col.get(live_row).cloned().ok_or_else(|| corrupt(row)))
+            .collect::<ArrayResult<Vec<CellValue>>>()?;
+        live_row += 1;
         out.insert(encode_key(&coord), attrs);
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -215,6 +234,42 @@ mod tests {
         let b = tile(&[(0, 0)]);
         let out = elementwise(&s, &a, &b, BinaryOp::Div).unwrap();
         assert_eq!(out.attr_cols[0][0], CellValue::Null);
+    }
+
+    /// A tombstone row before a live row neither joins the result nor
+    /// shifts the live row's attributes.
+    #[test]
+    fn a_tombstone_row_is_skipped() {
+        use crate::tile::sparse_tile::SparseRow;
+        use nodedb_types::{OPEN_UPPER, Surrogate};
+
+        let s = schema();
+        let mut builder = SparseTileBuilder::new(&s);
+        builder
+            .push_row(SparseRow {
+                coord: &[CoordValue::Int64(0)],
+                attrs: &[],
+                surrogate: None,
+                valid_from_ms: 0,
+                valid_until_ms: OPEN_UPPER,
+                kind: RowKind::Tombstone,
+            })
+            .unwrap();
+        builder
+            .push_row(SparseRow {
+                coord: &[CoordValue::Int64(1)],
+                attrs: &[CellValue::Int64(4)],
+                surrogate: Some(Surrogate::new(1)),
+                valid_from_ms: 0,
+                valid_until_ms: OPEN_UPPER,
+                kind: RowKind::Live,
+            })
+            .unwrap();
+        let a = builder.build();
+        let b = tile(&[(1, 6)]);
+        let out = elementwise(&s, &a, &b, BinaryOp::Add).unwrap();
+        assert_eq!(out.nnz(), 1);
+        assert_eq!(out.attr_cols[0][0], CellValue::Int64(10));
     }
 
     #[test]

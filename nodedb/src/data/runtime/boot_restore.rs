@@ -21,7 +21,7 @@ use crate::data::executor::core_loop::CoreLoop;
 ///
 /// The relative order of the loaders WITHIN this function is load-bearing too —
 /// each call below carries the comment stating what its position rests on.
-pub(super) fn load_boot_checkpoints(core: &mut CoreLoop) -> crate::Result<()> {
+pub(crate) fn load_boot_checkpoints(core: &mut CoreLoop) -> crate::Result<()> {
     // The array engine needs no loader: its checkpoint IS its on-disk tile
     // segments, which `ArrayStore::open` mmaps whenever the array is opened —
     // by replay, or lazily by the first read.

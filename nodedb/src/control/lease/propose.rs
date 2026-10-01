@@ -1,7 +1,16 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `acquire_lease` — synchronous propose-and-wait helper for
-//! descriptor leases. Mirrors `metadata_proposer::propose_catalog_entry`.
+//! `acquire_lease` — the descriptor lease grant, proposed through the
+//! metadata group and awaited.
+//!
+//! Two gates order it:
+//!
+//! - `lease_admission_gate`, a std mutex held only while drain state is
+//!   checked and a refcount unit is reserved. It is never held across an
+//!   await.
+//! - `lease_grant_gate`, an async mutex held from the grant's cache check
+//!   through its metadata apply. A release of this node's leases holds it
+//!   too, so a grant and a release never interleave.
 
 use std::time::Duration;
 
@@ -16,13 +25,13 @@ use crate::error::Error;
 pub const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(300);
 
 /// Compute the HLC at which a lease granted at `now` for the given
-/// duration should expire. Pure function so it can be unit-tested
+/// duration expires. Pure function so it can be unit-tested
 /// without spinning up a cluster.
 ///
 /// HLC arithmetic: we only advance the wall-clock component. The
 /// logical counter resets to 0 on the synthetic future timestamp
 /// because it represents a "this is the earliest moment a real HLC
-/// could observe past expiry" sentinel, not a real causal event.
+/// can observe past expiry" sentinel, not a real causal event.
 pub fn compute_expires_at(now: Hlc, duration: Duration) -> Hlc {
     let delta_ns: u64 = duration.as_nanos().try_into().unwrap_or(u64::MAX);
     Hlc::new(now.wall_ns.saturating_add(delta_ns), 0)
@@ -35,13 +44,17 @@ pub fn compute_expires_at(now: Hlc, duration: Duration) -> Hlc {
 /// held while proposing or waiting for raft. A slow-path caller reserves its
 /// exact descriptor version under the gate before releasing it; that reservation
 /// is visible to a drain that applies while the grant is in flight.
-pub fn acquire_lease(
+pub async fn acquire_lease(
     shared: &SharedState,
     descriptor_id: DescriptorId,
     version: u64,
     duration: Duration,
 ) -> Result<DescriptorLease, Error> {
-    {
+    // Read before any lease lock: the fence takes the raft coordinator lock.
+    let fenced = super::lease_use_is_fenced(shared);
+    // Keep this reservation live until the grant path has either installed a
+    // metadata lease or returned an error. A cancelled grant drops it too.
+    let _reservation = {
         let _admission_gate = shared
             .lease_admission_gate
             .lock()
@@ -55,22 +68,19 @@ pub fn acquire_lease(
             .read()
             .unwrap_or_else(|p| p.into_inner());
         // A cached metadata lease itself keeps a drain from clearing, so it
-        // needs no temporary reservation after the gate is released.
-        if let Some(existing) = cache.leases.get(&cache_key)
+        // needs no temporary reservation after the gate is released. A fenced
+        // holder skips it and re-acquires through raft.
+        if !fenced
+            && let Some(existing) = cache.leases.get(&cache_key)
             && existing.version >= version
             && existing.expires_at > now
         {
             return Ok(existing.clone());
         }
+        super::refcount::RefcountReservation::reserve(shared, descriptor_id.clone(), version)
+    };
 
-        // Keep this reservation live until the grant path has either installed
-        // a metadata lease or returned an error.
-        shared.lease_refcount.increment(&descriptor_id, version);
-    }
-
-    let result = acquire_lease_after_admission(shared, descriptor_id.clone(), version, duration);
-    shared.lease_refcount.decrement(&descriptor_id, version);
-    result
+    acquire_lease_after_admission(shared, descriptor_id, version, duration).await
 }
 
 /// Acquire a descriptor lease after plan admission has already checked drain
@@ -78,18 +88,17 @@ pub fn acquire_lease(
 /// takes neither the admission gate nor another drain snapshot: the existing
 /// reservation is the linearized admission record while its raft grant is in
 /// flight.
-pub(crate) fn acquire_lease_after_admission(
+pub(crate) async fn acquire_lease_after_admission(
     shared: &SharedState,
     descriptor_id: DescriptorId,
     version: u64,
     duration: Duration,
 ) -> Result<DescriptorLease, Error> {
+    // Read before any lease lock: the fence takes the raft coordinator lock.
+    let fenced = super::lease_use_is_fenced(shared);
     // This gate is intentionally independent from admission: it serializes
     // first-holder and version-upgrade grants while raft applies metadata.
-    let _grant_gate = shared
-        .lease_grant_gate
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let _grant_gate = shared.lease_grant_gate.lock().await;
     let now = shared.hlc_clock.now();
     let cache_key = (descriptor_id.clone(), shared.node_id);
     {
@@ -97,7 +106,8 @@ pub(crate) fn acquire_lease_after_admission(
             .metadata_cache
             .read()
             .unwrap_or_else(|p| p.into_inner());
-        if let Some(existing) = cache.leases.get(&cache_key)
+        if !fenced
+            && let Some(existing) = cache.leases.get(&cache_key)
             && existing.version >= version
             && existing.expires_at > now
         {
@@ -105,7 +115,7 @@ pub(crate) fn acquire_lease_after_admission(
         }
     }
 
-    refresh_lease_after_admission(shared, descriptor_id, version, duration)
+    refresh_lease_after_admission(shared, descriptor_id, version, duration).await
 }
 
 /// Reject an acquisition covered by an active descriptor drain.
@@ -122,22 +132,38 @@ pub(crate) fn ensure_not_draining(
     descriptor_id: &DescriptorId,
     version: u64,
 ) -> Result<(), Error> {
-    if shared.lease_drain.is_draining(descriptor_id, version) {
-        return Err(drain_in_progress_error(descriptor_id, version));
+    let owners = shared.lease_drain.draining_owners(descriptor_id, version);
+    if !owners.is_empty() {
+        return Err(drain_in_progress_error(descriptor_id, version, &owners));
     }
     Ok(())
 }
 
 /// Build the retryable error for an acquisition covered by an active drain.
 ///
-/// The full descriptor identity and the requested version stay in the message
-/// so a retry-budget exhaustion is still diagnosable from the client error.
-fn drain_in_progress_error(descriptor_id: &DescriptorId, version: u64) -> Error {
+/// The full descriptor identity, the requested version, and every drain owner
+/// stay in the message, so a retry-budget exhaustion names what holds the
+/// descriptor.
+fn drain_in_progress_error(
+    descriptor_id: &DescriptorId,
+    version: u64,
+    owners: &[nodedb_cluster::DrainOwner],
+) -> Error {
     Error::RetryableSchemaChanged {
         descriptor: format!(
-            "{descriptor_id:?} at version {version} (descriptor lease drain in progress)"
+            "{descriptor_id:?} at version {version} (descriptor lease drain in progress: {})",
+            drain_owner_list(owners)
         ),
     }
+}
+
+/// Every drain owner, joined for an error message.
+pub(crate) fn drain_owner_list(owners: &[nodedb_cluster::DrainOwner]) -> String {
+    owners
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Unconditionally propose a fresh lease grant, skipping the
@@ -146,44 +172,37 @@ fn drain_in_progress_error(descriptor_id: &DescriptorId, version: u64) -> Error 
 /// expiry and must be refreshed even though it hasn't technically
 /// expired yet.
 ///
-/// The single-node fallback and the cluster propose path are
-/// identical to [`acquire_lease`]; the only difference is that
-/// this function always stamps a new `expires_at = now + duration`.
-pub fn force_refresh_lease(
+/// The propose path is identical to [`acquire_lease`]; the only
+/// difference is that this function always stamps a new
+/// `expires_at = now + duration`.
+pub async fn force_refresh_lease(
     shared: &SharedState,
     descriptor_id: DescriptorId,
     version: u64,
     duration: Duration,
 ) -> Result<DescriptorLease, Error> {
-    {
+    // The existing metadata lease plus this reservation keeps drain safe
+    // until the renewal's raft grant has completed.
+    let _reservation = {
         let _admission_gate = shared
             .lease_admission_gate
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         ensure_not_draining(shared, &descriptor_id, version)?;
-        // The existing metadata lease plus this reservation keeps drain safe
-        // until the renewal's raft grant has completed.
-        shared.lease_refcount.increment(&descriptor_id, version);
-    }
+        super::refcount::RefcountReservation::reserve(shared, descriptor_id.clone(), version)
+    };
 
     // Force refresh bypasses the cache fast path, but serializes its raw
     // proposal with all first-holder and version-upgrade grants.
-    let result = {
-        let _grant_gate = shared
-            .lease_grant_gate
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        refresh_lease_after_admission(shared, descriptor_id.clone(), version, duration)
-    };
-    shared.lease_refcount.decrement(&descriptor_id, version);
-    result
+    let _grant_gate = shared.lease_grant_gate.lock().await;
+    refresh_lease_after_admission(shared, descriptor_id, version, duration).await
 }
 
 /// Unconditionally refresh after the caller has already linearized admission.
 /// This raw helper must not lock the admission gate or re-check drain state:
-/// doing either while its raft operation is in flight would reintroduce the
+/// doing either while its raft operation is in flight reintroduces the
 /// drain/applier deadlock.
-fn refresh_lease_after_admission(
+async fn refresh_lease_after_admission(
     shared: &SharedState,
     descriptor_id: DescriptorId,
     version: u64,
@@ -199,22 +218,13 @@ fn refresh_lease_after_admission(
         expires_at,
     };
 
-    // Single-node / no-cluster fallback: write straight into the
-    // local cache. The cache is shared with the rest of the process
-    // via `Arc<RwLock<_>>` so subsequent reads see it immediately.
-    if shared.metadata_raft.get().is_none() {
-        install_into_local_cache(shared, &lease);
-        return Ok(lease);
-    }
-
-    // Cluster path: encode + propose + block on apply via the
-    // shared `propose_and_wait` helper.
+    // Encode, propose, and await the local apply.
     let entry = MetadataEntry::DescriptorLeaseGrant(lease.clone());
-    super::propose_and_wait(shared, &entry, "grant")?;
+    super::propose_and_wait(shared, &entry, "grant").await?;
 
     // Re-read the cache. Under normal conditions the apply path
-    // already installed the lease before `wait_for` returned, so
-    // this read is just confirmation. If for some reason the lease
+    // already installed the lease before the apply wait returned, so
+    // this read is only confirmation. If for some reason the lease
     // is missing (race with cluster shutdown, lost commit), return
     // the in-memory copy we proposed — every committed lease at the
     // applied index is by definition durable.
@@ -228,22 +238,6 @@ fn refresh_lease_after_admission(
         }
     }
     Ok(lease)
-}
-
-/// Install a lease directly into the in-memory cache. Used by the
-/// single-node fallback only — the cluster path goes through the
-/// raft applier, which calls `MetadataCache::apply` on every node.
-fn install_into_local_cache(shared: &SharedState, lease: &DescriptorLease) {
-    let mut cache = shared
-        .metadata_cache
-        .write()
-        .unwrap_or_else(|p| p.into_inner());
-    cache
-        .leases
-        .insert((lease.descriptor_id.clone(), lease.node_id), lease.clone());
-    if lease.expires_at > cache.last_applied_hlc {
-        cache.last_applied_hlc = lease.expires_at;
-    }
 }
 
 #[cfg(test)]
@@ -271,13 +265,18 @@ mod tests {
         use nodedb_cluster::DescriptorKind;
 
         let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
-        match drain_in_progress_error(&descriptor, 7) {
+        let owners = [nodedb_cluster::DrainOwner::MoveTenant {
+            tenant_id: 1,
+            source_db_id: 1024,
+        }];
+        match drain_in_progress_error(&descriptor, 7, &owners) {
             Error::RetryableSchemaChanged { descriptor: detail } => {
                 assert!(
                     detail.contains("orders"),
                     "descriptor identity lost: {detail}"
                 );
                 assert!(detail.contains("version 7"), "version lost: {detail}");
+                assert!(detail.contains("being moved"), "drain owner lost: {detail}");
             }
             other => panic!("expected RetryableSchemaChanged, got {other:?}"),
         }

@@ -62,37 +62,35 @@ pub(super) async fn dispatch_authorized_single_task(
     // resolves to a concrete row set here, while the identity is live, the
     // way the planned native and pgwire writes resolve.
     if checked.txn_id().is_none()
-        && ctx.state.async_raft_proposer().is_some()
         && let Some(resolver) = crate::control::write_resolve::resolver_for_plan(checked.plan())
     {
+        let (authorized, _lease) = checked.into_parts();
         return crate::control::write_resolve::run_authorized_write_resolve(
-            ctx.state,
-            checked.into_authorized(),
-            resolver,
+            ctx.state, authorized, resolver,
         )
         .await;
     }
+    let gateway = ctx.state.installed_gateway()?;
     // A staged write and the other transaction meta-ops run on the core of
-    // the task's own vShard. The gateway would route them to vShard 0.
-    let gateway = ctx
-        .state
-        .gateway
-        .get()
-        .filter(|_| !is_task_vshard_scoped(checked.plan()));
-    match gateway {
-        Some(gateway) => {
-            let query = GatewayQueryContext {
-                tenant_id,
-                trace_id: TraceId::generate(),
-                database_id: ctx.database_id(),
-                txn_id,
-            };
-            // The typed error passes through unchanged. The native frame
-            // renders its SQLSTATE and numeric code from it.
-            gateway.execute_response(&query, checked).await
-        }
-        None => dispatch_without_gateway(ctx, checked).await,
+    // the task's own vShard. The gateway will route them to vShard 0.
+    if is_task_vshard_scoped(checked.plan()) {
+        return dispatch_utils::dispatch_authorized_durable_write(
+            ctx.state,
+            checked,
+            TraceId::ZERO,
+        )
+        .await;
     }
+    let query = GatewayQueryContext {
+        tenant_id,
+        trace_id: TraceId::generate(),
+        database_id: ctx.database_id(),
+        txn_id,
+        linearizable: true,
+    };
+    // The typed error passes through unchanged. The native frame renders its
+    // SQLSTATE and numeric code from it.
+    gateway.execute_response(&query, checked).await
 }
 
 async fn dispatch_external_crdt_apply(
@@ -150,7 +148,7 @@ async fn dispatch_external_crdt_apply(
     // misses a policy on a non-default database. `collection` is already
     // qualified here (the plan builder qualifies it against `ctx.database_id()`
     // before this dispatch runs), so no re-qualification happens — doing so
-    // would double-prefix the name.
+    // will double-prefix the name.
     let qualified_collection = collection.as_str();
     let policy = crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
         tenant_id,
@@ -184,28 +182,4 @@ async fn dispatch_external_crdt_apply(
         read_version_lsn: outcome.write_version,
         write_set: Vec::new(),
     })
-}
-
-pub(super) async fn dispatch_without_gateway(
-    ctx: &DispatchCtx<'_>,
-    checked: crate::control::server::shared::clone_write::CloneCheckedTask,
-) -> crate::Result<Response> {
-    let vshard_id = checked.vshard_id();
-    let frontier_mutation = checked.txn_id().is_none()
-        && matches!(
-            checked.plan(),
-            PhysicalPlan::Crdt(op)
-                if crate::control::crdt_admission::changes_crdt_frontier(op)
-        );
-    let write = || async move {
-        dispatch_utils::dispatch_authorized_durable_write(ctx.state, checked, TraceId::ZERO).await
-    };
-    if frontier_mutation {
-        ctx.state
-            .vshard_admission_sequencer
-            .run(vshard_id, write)
-            .await
-    } else {
-        write().await
-    }
 }

@@ -20,6 +20,7 @@ use crate::event::types::WriteEvent;
 
 use super::cache::PermissionCache;
 use super::invalidation;
+use super::scope::TreeKey;
 use super::types::PermissionGrant;
 
 /// Apply the permission effect of `events`, taken off core `core_id`'s ring
@@ -58,11 +59,19 @@ pub async fn apply_ring_events(
 /// Apply one data event to the cache when its collection is a permission
 /// table or a governed collection of a registered tree.
 fn apply_event(cache: &mut PermissionCache, event: &WriteEvent) {
-    let collection = event.collection.as_ref();
-    let tenant_id = event.tenant_id.as_u64();
+    // An event carries the qualified name of its database's collection. A
+    // name that is not qualified for that database names no tree source.
+    let Ok(key) = TreeKey::from_qualified(
+        event.database_id,
+        event.tenant_id.as_u64(),
+        event.collection.as_ref(),
+    ) else {
+        return;
+    };
+    let scope = key.scope;
 
-    let is_permission_table = cache.tree_defs_using_permission_table(tenant_id, collection);
-    let is_resource_graph = cache.tree_defs_using_graph(tenant_id, collection);
+    let is_permission_table = cache.tree_defs_using_permission_table(&key);
+    let is_resource_graph = cache.tree_defs_using_graph(&key);
 
     if !is_permission_table && !is_resource_graph {
         return;
@@ -79,13 +88,13 @@ fn apply_event(cache: &mut PermissionCache, event: &WriteEvent) {
                 && let Some(ref val) = new_val
                 && let Some(grant) = extract_grant(val)
             {
-                invalidation::on_grant_upsert(cache, tenant_id, &grant);
+                invalidation::on_grant_upsert(cache, scope, &grant);
             }
             if is_resource_graph
                 && let Some(ref val) = new_val
                 && let Some((child_id, parent_id)) = extract_edge(val)
             {
-                invalidation::on_edge_upsert(cache, tenant_id, child_id, parent_id);
+                invalidation::on_edge_upsert(cache, scope, child_id, parent_id);
             }
         }
         crate::event::types::WriteOp::Delete => {
@@ -101,23 +110,26 @@ fn apply_event(cache: &mut PermissionCache, event: &WriteEvent) {
                     val.get("grantee").and_then(|v| v.as_str()),
                 )
             {
-                invalidation::on_grant_delete(cache, tenant_id, resource_id, grantee);
+                invalidation::on_grant_delete(cache, scope, resource_id, grantee);
             }
             if is_resource_graph
                 && let Some(ref val) = old_val
                 && let Some(child_id) = val.get("id").and_then(|v| v.as_str())
             {
-                invalidation::on_edge_delete(cache, tenant_id, child_id);
+                invalidation::on_edge_delete(cache, scope, child_id);
             }
         }
         crate::event::types::WriteOp::BulkInsert { .. }
         | crate::event::types::WriteOp::BulkDelete { .. }
-        | crate::event::types::WriteOp::Heartbeat => {}
+        | crate::event::types::WriteOp::Heartbeat
+        | crate::event::types::WriteOp::Publish => {}
     }
 
     debug!(
-        tenant_id,
-        collection, "permission_tree: cache updated from a write event"
+        database_id = scope.database_id.as_u64(),
+        tenant_id = scope.tenant_id,
+        collection = %key.collection,
+        "permission_tree: cache updated from a write event"
     );
 }
 
@@ -144,23 +156,38 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::control::security::permission_tree::scope::TreeScope;
     use crate::event::types::{EventSource, RowId, WriteOp};
     use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 
     const TENANT: u64 = 1;
+    const SCOPE: TreeScope = TreeScope {
+        database_id: DatabaseId::DEFAULT,
+        tenant_id: TENANT,
+    };
 
-    fn cache_with_tree() -> Arc<tokio::sync::RwLock<PermissionCache>> {
+    fn cache_with_tree_in(scope: TreeScope) -> Arc<tokio::sync::RwLock<PermissionCache>> {
         let def = sonic_rs::from_str(
             r#"{"resource_column":"id","graph_index":"docs_tree","permission_table":"grants"}"#,
         )
         .expect("tree def");
         let mut cache = PermissionCache::new();
-        cache.register_tree_def(TENANT, "docs", def);
+        cache.register_tree_def(scope.collection("docs"), def);
         cache.progress_mut().install_reload(&[0]);
         Arc::new(tokio::sync::RwLock::new(cache))
     }
 
+    fn cache_with_tree() -> Arc<tokio::sync::RwLock<PermissionCache>> {
+        cache_with_tree_in(SCOPE)
+    }
+
     fn grant_event(sequence: u64, op: WriteOp) -> WriteEvent {
+        grant_event_in(DatabaseId::DEFAULT, sequence, op)
+    }
+
+    /// A grant row written to `grants` of `database_id`, as the Data Plane
+    /// emits it: the collection carries the database-qualified name.
+    fn grant_event_in(database_id: DatabaseId, sequence: u64, op: WriteOp) -> WriteEvent {
         let row = serde_json::json!({
             "resource_id": "d1",
             "grantee": "role_a",
@@ -176,12 +203,14 @@ mod tests {
         };
         WriteEvent {
             sequence,
-            collection: Arc::from("grants"),
+            collection: Arc::from(
+                nodedb_types::QualifiedCollection::new(database_id, "grants").as_str(),
+            ),
             op,
             row_id: RowId::row(nodedb_types::RowIdentity::from_user_key("g1")),
             lsn: Lsn::new(sequence),
             record: None,
-            database_id: DatabaseId::DEFAULT,
+            database_id,
             tenant_id: TenantId::new(TENANT),
             vshard_id: VShardId::new(0),
             source: EventSource::User,
@@ -191,6 +220,7 @@ mod tests {
             valid_time_ms: None,
             user_id: None,
             statement_digest: None,
+            commit_hlc: Some(crate::event::test_utils::test_commit_hlc()),
         }
     }
 
@@ -215,14 +245,14 @@ mod tests {
 
         let guard = cache.read().await;
         assert_eq!(
-            guard.get_grant(TENANT, "d1", "role_a"),
+            guard.get_grant(SCOPE, "d1", "role_a"),
             Some(("viewer", false))
         );
         assert_eq!(guard.tenant_version(TENANT), version_before + 1);
         assert!(guard.progress().caught_up(&[1]));
     }
 
-    /// An event a reload already covers is not applied again: the ring may
+    /// An event a reload already covers is not applied again: the ring can
     /// have dropped a later write to the same row.
     #[tokio::test]
     async fn an_event_covered_by_a_reload_is_not_applied_again() {
@@ -235,13 +265,13 @@ mod tests {
             cache
                 .read()
                 .await
-                .get_grant(TENANT, "d1", "role_a")
+                .get_grant(SCOPE, "d1", "role_a")
                 .is_none()
         );
 
         apply_ring_events(0, &[grant_event(3, WriteOp::Insert)], &cache, &notify).await;
         let guard = cache.read().await;
-        assert!(guard.get_grant(TENANT, "d1", "role_a").is_some());
+        assert!(guard.get_grant(SCOPE, "d1", "role_a").is_some());
         assert!(guard.progress().caught_up(&[3]));
     }
 
@@ -262,8 +292,43 @@ mod tests {
         )
         .await;
         let guard = cache.read().await;
-        assert!(guard.get_grant(TENANT, "d1", "role_a").is_none());
+        assert!(guard.get_grant(SCOPE, "d1", "role_a").is_none());
         assert!(!guard.progress().caught_up(&[3]));
         assert!(guard.progress().needs_reload_for(&[3]));
+    }
+
+    /// A grant written in a named database updates that database's tree
+    /// only, and the same table name in another database updates nothing.
+    #[tokio::test]
+    async fn a_grant_event_applies_to_its_own_database_only() {
+        let db1 = TreeScope::new(DatabaseId::new(7), TENANT);
+        let db2 = TreeScope::new(DatabaseId::new(8), TENANT);
+        let cache = cache_with_tree_in(db1);
+        let notify = tokio::sync::Notify::new();
+
+        apply_ring_events(
+            0,
+            &[grant_event_in(db2.database_id, 1, WriteOp::Insert)],
+            &cache,
+            &notify,
+        )
+        .await;
+        assert!(cache.read().await.get_grant(db1, "d1", "role_a").is_none());
+        assert!(cache.read().await.get_grant(db2, "d1", "role_a").is_none());
+
+        apply_ring_events(
+            0,
+            &[grant_event_in(db1.database_id, 2, WriteOp::Insert)],
+            &cache,
+            &notify,
+        )
+        .await;
+        let guard = cache.read().await;
+        assert_eq!(
+            guard.get_grant(db1, "d1", "role_a"),
+            Some(("viewer", false))
+        );
+        assert!(guard.get_grant(db2, "d1", "role_a").is_none());
+        assert!(guard.get_grant(SCOPE, "d1", "role_a").is_none());
     }
 }

@@ -11,7 +11,7 @@ use super::kernel::{empty_shaped, shape_decoded_rows};
 /// NOTICE text for an `AS OF SYSTEM TIME` cutoff older than the oldest
 /// retained tile version. This is the canonical definition, surfaced to
 /// every protocol via [`ShapedRows::notice`].
-const TRUNCATED_BEFORE_HORIZON_NOTICE: &str = "AS OF SYSTEM TIME cutoff is older than the oldest retained tile version; \
+pub(crate) const TRUNCATED_BEFORE_HORIZON_NOTICE: &str = "AS OF SYSTEM TIME cutoff is older than the oldest retained tile version; \
      results may be incomplete";
 
 /// Shape an `ArrayOp::Slice` response: decode the `ArraySliceResponse`

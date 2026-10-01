@@ -1,81 +1,73 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Node-level cascade: soft-delete every edge incident on a node.
+//! Node-level edge reads, and the replay of journalled node cascades.
+//!
+//! A live delete never cascades here: its transaction tombstones the edges
+//! it removes with `EdgeDelete`, or cuts the collection with `TruncateEdges`
+//! for a TRUNCATE. A node cascade record an older WAL journalled replays at
+//! its own ordinals through [`EdgeStore::apply_node_cascade`].
 
-use redb::{ReadableDatabase, ReadableTable};
-use std::collections::HashMap;
+use redb::ReadableTable;
 
-use super::store::{BaseKey, EDGES, EdgeStore, NODE_SURROGATES, redb_err};
-use super::temporal::write::write_sentinel_in;
-use super::temporal::{
-    EdgeRef, EdgeValuePayload, EdgeVersionWrite, TOMBSTONE_SENTINEL, is_sentinel,
-    parse_versioned_edge_key,
-};
+use super::store::{Direction, EDGES, EdgeStore, NODE_SURROGATES, redb_err};
+use super::temporal::NeighborsAsOfParams;
+use super::temporal::write::{VersionStamp, write_version_in};
+use super::temporal::{EdgeRef, TOMBSTONE_SENTINEL, is_sentinel};
 use nodedb_types::{DatabaseId, TenantId};
 
-/// A single cascaded edge removal captured for transactional rollback.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EdgeRestore {
-    pub collection: String,
-    pub src: String,
-    pub label: String,
-    pub dst: String,
-    /// The edge's properties before the tombstone. The CSR restore reads its
-    /// weight from them.
-    pub old_properties: Vec<u8>,
-    /// The tombstone version the cascade added. A rollback removes it.
-    pub tombstone: EdgeVersionWrite,
-}
-
 impl EdgeStore {
-    /// Soft-delete every edge incident on `node` (as either src or dst) in
-    /// the caller's tenant, across all collections, and drop the node's
-    /// identity binding. Emits a tombstone version at `system_from` for each
-    /// distinct base edge that has a live (non-sentinel) latest version.
-    ///
-    /// One transaction holds every tombstone and the binding removal, so the
-    /// cascade lands whole or not at all.
-    ///
-    /// Returns the edges actually soft-deleted, each with its pre-delete
-    /// properties and its tombstone, so a transactional caller can push one
-    /// `UndoEntry::EdgeWrite` per edge and fully reverse the cascade on
-    /// rollback. Already-tombstoned bases are skipped and not returned.
-    pub fn delete_edges_for_node(
+    /// Write the tombstones a node cascade journalled: one for each edge of
+    /// `edges` at the edge's journalled ordinal, then drop `node`'s identity
+    /// binding, all in one transaction. A key that already holds a tombstone
+    /// is left as it is, so re-applying a cascade changes nothing and counts
+    /// no edge twice.
+    pub fn apply_node_cascade(
         &self,
         db: u64,
         tid: TenantId,
         node: &str,
-        system_from: i64,
-    ) -> crate::Result<Vec<EdgeRestore>> {
-        // Snapshot all live bases touching `node` in a read txn first.
-        let bases = self.live_bases_touching_node(db, tid, node)?;
+        edges: &[crate::wal::CascadedEdge],
+    ) -> crate::Result<()> {
         let database = DatabaseId::new(db);
         let write_txn = self
             .db
             .begin_write()
             .map_err(|e| redb_err("begin_write", e))?;
-        let mut removed = Vec::with_capacity(bases.len());
-        for ((collection, src, label, dst), old_properties) in bases {
-            let tombstone = write_sentinel_in(
+        for edge in edges {
+            let key = super::temporal::versioned_edge_key(
+                &edge.collection,
+                &edge.src,
+                &edge.label,
+                &edge.dst,
+                edge.system_from,
+            )?;
+            let tombstoned = {
+                let table = write_txn
+                    .open_table(EDGES)
+                    .map_err(|e| redb_err("open edges", e))?;
+                table
+                    .get((db, tid.as_u64(), key.as_str()))
+                    .map_err(|e| redb_err("read cascaded edge", e))?
+                    .is_some_and(|value| is_sentinel(value.value()))
+            };
+            if tombstoned {
+                continue;
+            }
+            write_version_in(
                 &write_txn,
-                EdgeRef::new(database, tid, &collection, &src, &label, &dst),
-                system_from,
+                EdgeRef::new(
+                    database,
+                    tid,
+                    &edge.collection,
+                    &edge.src,
+                    &edge.label,
+                    &edge.dst,
+                ),
+                VersionStamp::at(edge.system_from),
                 TOMBSTONE_SENTINEL,
                 true,
             )?;
-            removed.push(EdgeRestore {
-                collection,
-                src,
-                label,
-                dst,
-                old_properties,
-                tombstone,
-            });
         }
-        // The node itself is going away, so its identity binding goes with it.
-        // Only this node's: the neighbours survive and keep theirs. A rolled-back
-        // delete restores the binding along with the edges (see the transaction
-        // undo path), so this is not a one-way loss.
         {
             let mut surrogates = write_txn
                 .open_table(NODE_SURROGATES)
@@ -86,71 +78,55 @@ impl EdgeStore {
         }
         write_txn
             .commit()
-            .map_err(|e| redb_err("commit node edge cascade", e))?;
-        Ok(removed)
+            .map_err(|e| redb_err("commit journalled node cascade", e))
     }
 
-    /// Every base edge in this `(database, tenant)` whose latest version
-    /// touches `node` as src or dst and is live, with that version's
-    /// properties.
-    fn live_bases_touching_node(
+    /// Every live edge of `collection` with `node` as source or destination,
+    /// as `(src, label, dst)` in sorted order. A node delete's guard compares
+    /// it against the edges the planner read with a current-state
+    /// `TemporalNeighbors`, which reads through [`EdgeStore::node_edges_as_of`]
+    /// too.
+    pub fn live_edges_of_node(
         &self,
         db: u64,
         tid: TenantId,
+        collection: &str,
         node: &str,
-    ) -> crate::Result<Vec<(BaseKey, Vec<u8>)>> {
-        let t = tid.as_u64();
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| redb_err("begin_read", e))?;
-        let table = read_txn
-            .open_table(EDGES)
-            .map_err(|e| redb_err("open edges", e))?;
+    ) -> crate::Result<Vec<(String, String, String)>> {
+        self.node_edges_as_of(
+            NeighborsAsOfParams {
+                db,
+                tid,
+                collection,
+                node,
+                label_filter: None,
+                system_as_of_ms: None,
+                valid_at_ms: None,
+            },
+            Direction::Both,
+        )
+    }
 
-        // Latest version per base: its system time and its raw value.
-        let mut latest: HashMap<BaseKey, (i64, Vec<u8>)> = HashMap::new();
-        // DB-scoped range: a node-delete in database A must NOT cascade into
-        // the same tenant's edges in database B.
-        let range = table
-            .range((db, t, "")..(db, t + 1, ""))
-            .map_err(|e| redb_err("iter", e))?;
-        for entry in range {
-            let (k, v) = entry.map_err(|e| redb_err("iter entry", e))?;
-            let composite = k.value().2;
-            let Some((coll, src, label, dst, sys)) = parse_versioned_edge_key(composite) else {
-                continue;
-            };
-            if src != node && dst != node {
-                continue;
-            }
-            let base = (
-                coll.to_string(),
-                src.to_string(),
-                label.to_string(),
-                dst.to_string(),
-            );
-            let value = v.value();
-            match latest.get_mut(&base) {
-                Some((cur, bytes)) if sys > *cur => {
-                    *cur = sys;
-                    *bytes = value.to_vec();
-                }
-                Some(_) => {}
-                None => {
-                    latest.insert(base, (sys, value.to_vec()));
-                }
+    /// The edges of `params.node` in `direction` that are visible at the
+    /// cutoffs of `params`, as `(src, label, dst)` in sorted order. A
+    /// self-loop appears once.
+    pub fn node_edges_as_of(
+        &self,
+        params: NeighborsAsOfParams<'_>,
+        direction: Direction,
+    ) -> crate::Result<Vec<(String, String, String)>> {
+        let mut edges = std::collections::BTreeSet::new();
+        if matches!(direction, Direction::Out | Direction::Both) {
+            for edge in self.neighbors_out_as_of(params)? {
+                edges.insert((edge.src_id, edge.label, edge.dst_id));
             }
         }
-        let mut live = Vec::with_capacity(latest.len());
-        for (base, (_sys, bytes)) in latest {
-            if is_sentinel(&bytes) {
-                continue;
+        if matches!(direction, Direction::In | Direction::Both) {
+            for edge in self.neighbors_in_as_of(params)? {
+                edges.insert((edge.src_id, edge.label, edge.dst_id));
             }
-            let properties = EdgeValuePayload::decode(&bytes)?.properties;
-            live.push((base, properties));
         }
-        Ok(live)
+        Ok(edges.into_iter().collect())
     }
 }
 
@@ -170,92 +146,86 @@ mod tests {
         (store, dir)
     }
 
-    fn put(store: &EdgeStore, clock: &OrdinalClock, src: &str, label: &str, dst: &str, p: &[u8]) {
+    fn put_in(store: &EdgeStore, clock: &OrdinalClock, coll: &str, src: &str, dst: &str) -> i64 {
         let ord = clock.next_ordinal();
         store
             .put_edge_versioned(
-                EdgeRef::new(DB, T, COLL, src, label, dst),
-                p,
+                EdgeRef::new(DB, T, coll, src, "KNOWS", dst),
+                b"p",
                 ord,
                 ord,
                 i64::MAX,
             )
             .unwrap();
+        ord
     }
 
-    #[test]
-    fn delete_edges_for_node_soft_deletes_all_incident() {
-        let (store, _dir) = make_store();
-        let clock = OrdinalClock::new();
-        put(&store, &clock, "alice", "KNOWS", "bob", b"1");
-        put(&store, &clock, "alice", "KNOWS", "carol", b"2");
-        put(&store, &clock, "dave", "KNOWS", "alice", b"3");
-        put(&store, &clock, "eve", "KNOWS", "frank", b"4");
-
-        let purge_ord = clock.next_ordinal();
-        let removed = store
-            .delete_edges_for_node(D, T, "alice", purge_ord)
-            .unwrap();
-        // Three live bases touch alice (alice→bob, alice→carol, dave→alice),
-        // each returned with its captured pre-delete properties.
-        assert_eq!(removed.len(), 3);
-        assert!(
-            removed
-                .iter()
-                .any(|r| r.src == "alice" && r.dst == "bob" && r.old_properties == b"1")
-        );
-        assert!(
-            removed
-                .iter()
-                .any(|r| r.src == "dave" && r.dst == "alice" && r.old_properties == b"3")
-        );
-
-        assert!(
-            store
-                .get_edge(D, T, COLL, "alice", "KNOWS", "bob")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .get_edge(D, T, COLL, "alice", "KNOWS", "carol")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .get_edge(D, T, COLL, "dave", "KNOWS", "alice")
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            store.get_edge(D, T, COLL, "eve", "KNOWS", "frank").unwrap(),
-            Some(b"4".to_vec())
-        );
+    fn edge(src: &str, dst: &str) -> (String, String, String) {
+        (src.to_string(), "KNOWS".to_string(), dst.to_string())
     }
 
+    /// A node's live edges are the edges of its own collection that name it
+    /// at either end. A tombstoned edge and another collection's edge are
+    /// not among them.
     #[test]
-    fn delete_edges_for_node_skips_already_tombstoned() {
+    fn a_nodes_live_edges_stay_in_its_collection() {
         let (store, _dir) = make_store();
         let clock = OrdinalClock::new();
-        put(&store, &clock, "alice", "KNOWS", "bob", b"1");
+        put_in(&store, &clock, COLL, "alice", "bob");
+        put_in(&store, &clock, COLL, "dave", "alice");
+        put_in(&store, &clock, COLL, "alice", "carol");
+        put_in(&store, &clock, "social", "alice", "erin");
+        put_in(&store, &clock, COLL, "eve", "frank");
         store
             .soft_delete_edge(
-                EdgeRef::new(DB, T, COLL, "alice", "KNOWS", "bob"),
+                EdgeRef::new(DB, T, COLL, "alice", "KNOWS", "carol"),
                 clock.next_ordinal(),
             )
             .unwrap();
 
-        // Should be a no-op — no live bases to cascade through.
-        let removed = store
-            .delete_edges_for_node(D, T, "alice", clock.next_ordinal())
-            .unwrap();
-        assert!(removed.is_empty());
-        assert!(
-            store
-                .get_edge(D, T, COLL, "alice", "KNOWS", "bob")
-                .unwrap()
-                .is_none()
+        assert_eq!(
+            store.live_edges_of_node(D, T, COLL, "alice").unwrap(),
+            vec![edge("alice", "bob"), edge("dave", "alice")]
         );
+        assert_eq!(
+            store.live_edges_of_node(D, T, "social", "alice").unwrap(),
+            vec![edge("alice", "erin")]
+        );
+    }
+
+    /// A journalled cascade re-applies each edge's own tombstone ordinal.
+    #[test]
+    fn a_journalled_cascade_writes_each_edge_at_its_ordinal() {
+        let (store, _dir) = make_store();
+        for dst in ["bob", "carol"] {
+            store
+                .put_edge_versioned(
+                    EdgeRef::new(DB, T, COLL, "alice", "KNOWS", dst),
+                    b"p",
+                    100,
+                    100,
+                    i64::MAX,
+                )
+                .unwrap();
+        }
+        let edges: Vec<crate::wal::CascadedEdge> = [("bob", 200), ("carol", 300)]
+            .into_iter()
+            .map(|(dst, system_from)| crate::wal::CascadedEdge {
+                collection: COLL.into(),
+                src: "alice".into(),
+                label: "KNOWS".into(),
+                dst: dst.into(),
+                system_from,
+            })
+            .collect();
+        store.apply_node_cascade(D, T, "alice", &edges).unwrap();
+        for (dst, ord) in [("bob", 200), ("carol", 300)] {
+            assert_eq!(
+                store
+                    .latest_version_ordinal(EdgeRef::new(DB, T, COLL, "alice", "KNOWS", dst))
+                    .unwrap(),
+                Some(ord)
+            );
+        }
     }
 }

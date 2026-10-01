@@ -36,5 +36,7 @@ mod spawn_full;
 mod spawn_variants;
 mod teardown;
 mod types;
+mod wire_state;
 
+pub(crate) use restart::StoppedNode;
 pub use types::{HARNESS_SUPERUSER, TestClusterNode};

@@ -94,7 +94,7 @@ mod tests {
         let change = ProposedChange {
             collection: "users".into(),
             row_id: "u1".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             fields: vec![
                 ("name".into(), LoroValue::String("Alice".into())),
                 ("age".into(), LoroValue::I64(30)),
@@ -122,7 +122,7 @@ mod tests {
         let change1 = ProposedChange {
             collection: "users".into(),
             row_id: "u1".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             fields: vec![("name".into(), LoroValue::String("Alice".into()))],
         };
         crdt.validate_and_apply(
@@ -136,7 +136,7 @@ mod tests {
         let change2 = ProposedChange {
             collection: "users".into(),
             row_id: "u1".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             fields: vec![("name".into(), LoroValue::String("Bob".into()))],
         };
         crdt.validate_and_apply(

@@ -5,7 +5,6 @@
 
 use super::types::TestServer;
 
-#[allow(dead_code)]
 impl TestServer {
     /// Execute a SQL statement, returning the text of each row's first column.
     pub async fn query_text(&self, sql: &str) -> Result<Vec<String>, String> {

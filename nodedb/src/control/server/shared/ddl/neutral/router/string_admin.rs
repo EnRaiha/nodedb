@@ -30,62 +30,54 @@ pub(super) async fn try_string(
     // String-recognized user/role families. `DROP USER` parses into a typed
     // `AuthStmt::DropUser` that carries no `if_exists` flag (so it mishandles
     // `DROP USER IF EXISTS`), and `CREATE ROLE` / `DROP ROLE` do not parse into
-    // any typed variant at all — the pgwire router dispatched all three from the
-    // raw token slice. Replicate that exactly here, before the parse gate, so
-    // the token-based `strip_if_exists` / `strip_if_not_exists` handling and the
-    // syntax messages stay byte-identical.
+    // any typed variant at all — the router dispatches all three from the
+    // raw token slice, before the parse gate, with token-based
+    // `strip_if_exists` / `strip_if_not_exists` handling.
     if upper.starts_with("DROP USER ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(user::drop_user(state, identity, &parts));
+        return Some(user::drop_user(state, identity, &parts).await);
     }
     if upper.starts_with("CREATE ROLE ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(role::create_role(state, identity, &parts));
+        return Some(role::create_role(state, identity, &parts).await);
     }
     if upper.starts_with("DROP ROLE ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(role::drop_role(state, identity, &parts));
+        return Some(role::drop_role(state, identity, &parts).await);
     }
 
     // Service accounts. These statements do not parse into any typed AST
-    // variant — the pgwire router dispatched all three from the raw token
-    // slice by string prefix. Replicate that exactly here, before the parse
-    // gate, so the token-based `IF [NOT] EXISTS` stripping and syntax messages
-    // stay byte-identical.
+    // variant — the router dispatches all three from the raw token slice by
+    // string prefix, before the parse gate, with token-based
+    // `IF [NOT] EXISTS` stripping.
     if upper.starts_with("CREATE SERVICE ACCOUNT ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(service_account::create_service_account(
-            state, identity, &parts,
-        ));
+        return Some(service_account::create_service_account(state, identity, &parts).await);
     }
     if upper.starts_with("DROP SERVICE ACCOUNT ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(service_account::drop_service_account(
-            state, identity, &parts,
-        ));
+        return Some(service_account::drop_service_account(state, identity, &parts).await);
     }
     if upper.starts_with("ALTER SERVICE ACCOUNT ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(service_account::alter_service_account_set_databases(
-            state, identity, &parts,
-        ));
+        return Some(
+            service_account::alter_service_account_set_databases(state, identity, &parts).await,
+        );
     }
 
     // Auth-admin DDL families (API keys, auth-scoped API keys, auth user
     // management, blacklist). None of these parse into any typed AST variant —
-    // the pgwire admin router dispatched all of them by string prefix from the
-    // raw token slice. Replicate that exactly here, before the parse gate, so
-    // the prefix recognition and syntax messages stay byte-identical. The
-    // `BLACKLIST ` prefix intentionally precedes the (non-migrated) emergency
-    // `BLACKLIST AUTH USERS WHERE` handler exactly as it did in the pgwire admin
-    // router, so the shadowing behavior is unchanged.
+    // the router dispatches all of them by string prefix from the raw token
+    // slice, before the parse gate. The `BLACKLIST ` prefix intentionally
+    // precedes the emergency `BLACKLIST AUTH USERS WHERE` handler, which it
+    // shadows.
     if upper.starts_with("CREATE API KEY ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(apikey::create_api_key(state, identity, &parts));
+        return Some(apikey::create_api_key(state, identity, &parts).await);
     }
     if upper.starts_with("REVOKE API KEY ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(apikey::revoke_api_key(state, identity, &parts));
+        return Some(apikey::revoke_api_key(state, identity, &parts).await);
     }
     if upper.starts_with("LIST API KEYS") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
@@ -133,11 +125,10 @@ pub(super) async fn try_string(
     }
 
     // Tenant management. `CREATE TENANT`, `DROP TENANT`, and `PURGE TENANT`
-    // parse into no typed AST variant — the pgwire auth router dispatched all
-    // three by string prefix from the raw token slice. Replicate that exactly
-    // here, before the parse gate, so the `IF [NOT] EXISTS` stripping and
-    // syntax messages stay byte-identical. `PURGE TENANT` dispatches an async
-    // Data Plane meta op.
+    // parse into no typed AST variant — the router dispatches all three by
+    // string prefix from the raw token slice, before the parse gate, with
+    // `IF [NOT] EXISTS` stripping. `PURGE TENANT` dispatches an async Data
+    // Plane meta op.
     //
     // `ALTER TENANT ` is ambiguous: `ALTER TENANT <id|name> SET QUOTA ...`
     // (this string form) and `ALTER TENANT <name> IN DATABASE <db> SET QUOTA
@@ -152,13 +143,11 @@ pub(super) async fn try_string(
     // `SHOW TENANT USAGE` / `SHOW TENANT QUOTA` (bare, no `IN DATABASE`) are
     // NOT recognized here: the typed `ddl_ast` tenant parser never returns
     // `None` for `SHOW TENANT USAGE|QUOTA...` — every such input resolves to
-    // either the typed `IN DATABASE` variant or a `42601` parse error. Their
-    // pgwire string handlers were therefore confirmed dead code and deleted,
-    // not migrated; adding a neutral string prefix for them would make that
-    // dead code reachable and break parity.
+    // either the typed `IN DATABASE` variant or a `42601` parse error. A
+    // neutral string prefix for them will be unreachable and break parity.
     if upper.starts_with("CREATE TENANT ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(tenant::create_tenant(state, identity, &parts));
+        return Some(tenant::create_tenant(state, identity, &parts).await);
     }
     if upper.starts_with("ALTER TENANT ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
@@ -166,12 +155,12 @@ pub(super) async fn try_string(
             && parts[3].eq_ignore_ascii_case("IN")
             && parts[4].eq_ignore_ascii_case("DATABASE");
         if !is_in_database_form {
-            return Some(tenant::alter_tenant(state, identity, database_id, &parts));
+            return Some(tenant::alter_tenant(state, identity, database_id, &parts).await);
         }
     }
     if upper.starts_with("DROP TENANT ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(tenant::drop_tenant(state, identity, &parts));
+        return Some(tenant::drop_tenant(state, identity, &parts).await);
     }
     if upper.starts_with("PURGE TENANT ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
@@ -179,15 +168,12 @@ pub(super) async fn try_string(
     }
 
     // Emergency & incident response DDL. `EMERGENCY LOCKDOWN` / `EMERGENCY
-    // UNLOCK` parse into no typed AST variant — the pgwire admin router
-    // dispatched both by string prefix from the raw token slice. Replicate that
-    // exactly here, before the parse gate, so the prefix recognition and syntax
-    // messages stay byte-identical. `BLACKLIST AUTH USERS WHERE …` is likewise
-    // string-recognized, but the `BLACKLIST ` prefix above already claims it
-    // (exactly as it shadowed the pgwire emergency handler, which ran only after
-    // this neutral router). This guard is therefore intentionally kept after the
-    // `BLACKLIST ` guard so `bulk_blacklist` remains unreachable — preserving the
-    // dead-but-present state verbatim.
+    // UNLOCK` parse into no typed AST variant — the router dispatches both by
+    // string prefix from the raw token slice, before the parse gate.
+    // `BLACKLIST AUTH USERS WHERE …` is likewise string-recognized, but the
+    // `BLACKLIST ` prefix above already claims it. This guard is therefore
+    // intentionally kept after the `BLACKLIST ` guard, so `bulk_blacklist`
+    // stays unreachable.
     if upper.starts_with("EMERGENCY LOCKDOWN") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(emergency_ddl::emergency_lockdown(state, identity, &parts));
@@ -202,10 +188,9 @@ pub(super) async fn try_string(
     }
 
     // System-level settings: `ALTER SYSTEM SET <field> = <value>`. Parses into
-    // no typed AST variant — the pgwire auth router dispatched it by string
-    // prefix from the raw token slice. Replicate that exactly here, before the
-    // parse gate, so the prefix recognition and the `parts`-based field / value
-    // extraction stay byte-identical.
+    // no typed AST variant — the router dispatches it by string prefix from
+    // the raw token slice, before the parse gate, with `parts`-based field /
+    // value extraction.
     if upper.starts_with("ALTER SYSTEM ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(system_ddl::alter_system(state, identity, &parts));

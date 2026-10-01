@@ -13,11 +13,9 @@
 //! ALTER COLLECTION journal_entries DROP PERIOD LOCK;
 //! ```
 //!
-//! Ported from the pgwire `ddl::period_lock` handlers; the token parsing,
-//! catalog get/put, schema-version bump, and audit side effects are preserved
-//! verbatim. Only the result construction changed from pgwire `Response` /
-//! `Tag` to the protocol-neutral [`DdlResult`]; the SQLSTATE codes, messages,
-//! and command tags are unchanged.
+//! The token parsing, catalog get/put, schema-version bump, and audit side
+//! effects run here. The result is the protocol-neutral [`DdlResult`] with its
+//! SQLSTATE codes, messages, and command tags.
 
 use nodedb_types::DatabaseId;
 
@@ -29,14 +27,13 @@ use crate::control::state::SharedState;
 
 use super::super::result::{DdlError, DdlResult};
 
-/// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
-/// the pgwire handlers produced.
+/// Construct a [`DdlError`] from a SQLSTATE code and a message.
 fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
 }
 
 /// Handle `ALTER COLLECTION x ADD PERIOD LOCK ON col REFERENCES table(pk) ...`
-pub fn add_period_lock(
+pub async fn add_period_lock(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
@@ -105,7 +102,8 @@ pub fn add_period_lock(
 
     coll.period_lock = Some(def);
 
-    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, &coll)
+        .await
         .map_err(|e| DdlError::from_error(&e))?;
 
     state.schema_version.bump();
@@ -125,7 +123,7 @@ pub fn add_period_lock(
 }
 
 /// Handle `ALTER COLLECTION x DROP PERIOD LOCK`.
-pub fn drop_period_lock(
+pub async fn drop_period_lock(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -146,7 +144,8 @@ pub fn drop_period_lock(
 
     coll.period_lock = None;
 
-    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, &coll)
+        .await
         .map_err(|e| DdlError::from_error(&e))?;
 
     state.schema_version.bump();

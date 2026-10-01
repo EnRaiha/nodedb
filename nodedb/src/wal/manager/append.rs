@@ -111,6 +111,10 @@ mod tests {
                 payload: vec![1, 2, 3],
             }],
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         };
 
         let appender = wal

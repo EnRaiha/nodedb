@@ -43,6 +43,12 @@ pub struct MvPersistence {
     flushed_generation: std::sync::atomic::AtomicU64,
 }
 
+impl crate::storage::RedbBacked for MvPersistence {
+    fn redb_database(&self) -> &redb::Database {
+        &self.db
+    }
+}
+
 impl MvPersistence {
     /// Open or create the MV state store.
     pub fn open(data_dir: &Path) -> crate::Result<Self> {

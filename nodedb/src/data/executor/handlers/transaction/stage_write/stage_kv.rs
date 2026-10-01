@@ -46,6 +46,11 @@ impl CoreLoop {
         txn_id: TxnId,
         op: &KvOp,
     ) -> Response {
+        if let Some(refusal) =
+            crate::data::executor::handlers::kv::unbound::refuse_unbound_kv_write(op)
+        {
+            return self.response_error(task, refusal);
+        }
         match op {
             KvOp::Put {
                 collection,
@@ -323,14 +328,15 @@ impl CoreLoop {
     ) -> Option<Surrogate> {
         let doc_id = kv_row_identity(key);
         let overlay = self.txn_overlays.get(&txn_id);
-        match overlay.and_then(|o| o.get_by_doc_id(coll_key, &doc_id)) {
-            Some(Staged::Put(_)) => Some(
-                overlay
-                    .and_then(|o| o.surrogate_for_doc_id(coll_key, &doc_id))
-                    .map(Surrogate::new)
-                    .unwrap_or(Surrogate::ZERO),
-            ),
-            Some(Staged::Tombstone) => None,
+        // A staged row is found through its doc-id binding, so a staged put
+        // resolves to the surrogate that binding names.
+        let staged = overlay.and_then(|o| {
+            let surrogate = o.surrogate_for_doc_id(coll_key, &doc_id)?;
+            Some((surrogate, o.get(coll_key, surrogate)?))
+        });
+        match staged {
+            Some((surrogate, Staged::Put(_))) => Some(Surrogate::new(surrogate)),
+            Some((_, Staged::Tombstone)) => None,
             None if !overlay.is_none_or(|o| o.base_visible(coll_key)) => None,
             None => self
                 .kv_engine
@@ -356,7 +362,7 @@ impl CoreLoop {
         {
             Some(Staged::Put(body)) => Some(body.clone()),
             Some(Staged::Tombstone) => None,
-            None if !self.stage_base_visible(ctx) => None,
+            None if !self.stage_base_visible(ctx.txn_id, &ctx.coll_key) => None,
             None => {
                 let now_ms = self.kv_read_now_ms();
                 self.kv_engine
@@ -388,7 +394,7 @@ mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::PointGet {
             collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
             document_id: "y".into(),
-            surrogate: Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -412,6 +418,7 @@ mod tests {
             txn_id,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: Admission::Exempt(ExemptReason::Read),
         };
         ExecutionTask::new(request)

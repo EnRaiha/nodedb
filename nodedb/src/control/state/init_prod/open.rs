@@ -8,8 +8,6 @@ use std::sync::{Arc, Mutex};
 use nodedb_types::config::TuningConfig;
 
 use crate::control::request_tracker::RequestTracker;
-use crate::control::security::metering::store::UsageStore;
-use crate::control::security::ratelimit::limiter::RateLimiter;
 use crate::control::security::tenant::{TenantIsolation, TenantQuota};
 use crate::control::server::sync::dlq::{DlqConfig, SyncDlq};
 use crate::wal::WalManager;
@@ -87,6 +85,34 @@ impl SharedState {
             quota_manager,
         } = super::auth_parts::build(auth_config, &credentials)?;
 
+        let super::stores::DiskStores {
+            data_dir,
+            array_sync_op_log,
+            array_ack_registry,
+            array_snapshot_store,
+            array_sync_schemas,
+            array_subscriber_cursors,
+            offset_store,
+            job_history,
+            mv_persistence,
+        } = super::stores::open_disk_stores(catalog_path)?;
+        let super::stores::SecurityStores {
+            orgs,
+            scope_defs,
+            usage_counter,
+            usage_store,
+            auth_api_keys,
+            impersonation,
+            emergency,
+            auth_metrics,
+            ceilings,
+        } = super::stores::security_stores(&metering_config);
+        let super::stores::SessionControls {
+            rate_limiter,
+            session_handles,
+        } = super::stores::session_controls(auth_config, &rate_limit_config);
+
+        let hlc_clock = wal.hlc_clock();
         let state = Arc::new(Self {
             outcome_floor: dispatcher.outcome_floor(),
             dispatcher: Mutex::new(dispatcher),
@@ -101,18 +127,9 @@ impl SharedState {
             permissions,
             trigger_registry,
             array_catalog,
-            array_sync_op_log: {
-                let data_dir = catalog_path.parent().unwrap_or(std::path::Path::new("."));
-                std::sync::Arc::new(crate::control::array_sync::OriginOpLog::open(data_dir)?)
-            },
-            array_ack_registry: {
-                let data_dir = catalog_path.parent().unwrap_or(std::path::Path::new("."));
-                crate::control::array_sync::ArrayAckRegistry::open(data_dir)?
-            },
-            array_snapshot_store: {
-                let data_dir = catalog_path.parent().unwrap_or(std::path::Path::new("."));
-                crate::control::array_sync::OriginSnapshotStore::open(data_dir)?
-            },
+            array_sync_op_log,
+            array_ack_registry,
+            array_snapshot_store,
             array_snapshot_hlcs: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::<
                     (nodedb_types::DatabaseId, u64, String),
@@ -123,51 +140,11 @@ impl SharedState {
             session_invalidation_bus: si_bus,
             user_change_bus: uc_bus,
             bus_consumer_handle,
-            array_sync_schemas: {
-                let data_dir = catalog_path.parent().unwrap_or(std::path::Path::new("."));
-                let schema_db = {
-                    let dir = data_dir.join("array_sync");
-                    std::fs::create_dir_all(&dir).map_err(|e| crate::Error::Storage {
-                        engine: "array_sync".into(),
-                        detail: format!("create array_sync dir: {e}"),
-                    })?;
-                    let path = dir.join("schema_docs.redb");
-                    std::sync::Arc::new(redb::Database::create(&path).map_err(|e| {
-                        crate::Error::Storage {
-                            engine: "array_sync".into(),
-                            detail: format!("schema_registry db open: {e}"),
-                        }
-                    })?)
-                };
-                let replica_id = nodedb_array::sync::ReplicaId::new(0);
-                let hlc_gen =
-                    std::sync::Arc::new(nodedb_array::sync::HlcGenerator::new(replica_id));
-                std::sync::Arc::new(crate::control::array_sync::OriginSchemaRegistry::open(
-                    schema_db, replica_id, hlc_gen,
-                )?)
-            },
+            array_sync_schemas,
             array_delivery: std::sync::Arc::new(
                 crate::control::array_sync::ArrayDeliveryRegistry::new(),
             ),
-            array_subscriber_cursors: {
-                let data_dir = catalog_path.parent().unwrap_or(std::path::Path::new("."));
-                let cursor_db = {
-                    let dir = data_dir.join("array_sync");
-                    std::fs::create_dir_all(&dir).map_err(|e| crate::Error::Storage {
-                        engine: "array_sync".into(),
-                        detail: format!("create array_sync dir for cursors: {e}"),
-                    })?;
-                    let path = dir.join("subscriber_cursors.redb");
-                    std::sync::Arc::new(redb::Database::create(&path).map_err(|e| {
-                        crate::Error::Storage {
-                            engine: "array_sync".into(),
-                            detail: format!("subscriber_cursor db open: {e}"),
-                        }
-                    })?)
-                };
-                let store = crate::control::array_sync::SubscriberStore::open(cursor_db)?;
-                std::sync::Arc::new(crate::control::array_sync::SubscriberMap::new(store))
-            },
+            array_subscriber_cursors,
             array_merger_registry: std::sync::Arc::new(
                 crate::control::array_sync::MergerRegistry::new(),
             ),
@@ -184,9 +161,7 @@ impl SharedState {
                     .with_metrics(Arc::clone(&system_metrics)),
             ),
             group_registry,
-            offset_store: Arc::new(crate::event::cdc::OffsetStore::open(
-                catalog_path.parent().unwrap_or(std::path::Path::new(".")),
-            )?),
+            offset_store,
             retention_policy_registry,
             bitemporal_retention_registry: Arc::new(
                 crate::engine::bitemporal::BitemporalRetentionRegistry::new(),
@@ -196,9 +171,7 @@ impl SharedState {
             schedule_registry,
             synonym_registry,
             custom_type_registry,
-            job_history: Arc::new(crate::event::scheduler::JobHistoryStore::open(
-                catalog_path.parent().unwrap_or(std::path::Path::new(".")),
-            )?),
+            job_history,
             ep_topic_registry,
             webhook_manager: crate::event::webhook::WebhookManager::new(shutdown.raw_receiver()),
             mv_registry,
@@ -208,16 +181,14 @@ impl SharedState {
             cross_shard_dispatcher: None,
             cross_shard_dlq: None,
             cross_shard_metrics: None,
-            hwm_store: None,
+            cross_shard_dedup: std::sync::OnceLock::new(),
             kafka_manager: crate::event::kafka::KafkaManager::new(shutdown.raw_receiver()),
             definition_sync_fanout: std::sync::Arc::new(
                 crate::control::server::sync::definition_fanout::DefinitionSyncFanout::new(),
             ),
             crdt_sync_delivery: Arc::new(crate::event::crdt_sync::CrdtSyncDelivery::new()),
             delta_packager: Arc::new(crate::event::crdt_sync::DeltaPackager::new()),
-            mv_persistence: Arc::new(crate::event::streaming_mv::MvPersistence::open(
-                catalog_path.parent().unwrap_or(std::path::Path::new(".")),
-            )?),
+            mv_persistence,
             tenants: Mutex::new(TenantIsolation::new(TenantQuota::default())),
             cluster_topology: None,
             cluster_routing: None,
@@ -229,9 +200,10 @@ impl SharedState {
             )
             .0,
             group_watchers: Arc::new(nodedb_cluster::GroupAppliedWatchers::new()),
-            metadata_ddl_lock: std::sync::Mutex::new(()),
+            metadata_ddl_lock: tokio::sync::Mutex::new(()),
             metadata_ddl_owner: std::sync::Mutex::new(None),
             metadata_ddl_applied_token: std::sync::atomic::AtomicU64::new(0),
+            metadata_apply_progress: std::sync::atomic::AtomicU64::new(0),
             metadata_ddl_token_seq: std::sync::atomic::AtomicU64::new(1),
             pending_ddl: crate::control::pending_ddl::PendingDdlTable::new(),
             metadata_apply_wedge: std::sync::Arc::default(),
@@ -246,6 +218,7 @@ impl SharedState {
             ),
             raft_compactor: std::sync::OnceLock::new(),
             raft_applied_index_sink: std::sync::OnceLock::new(),
+            raft_apply_gates: std::sync::OnceLock::new(),
             raft_read_gate: std::sync::OnceLock::new(),
             cluster_epoch: std::sync::OnceLock::new(),
             raft_status_fn: std::sync::OnceLock::new(),
@@ -259,30 +232,22 @@ impl SharedState {
             rls: rls_store,
             blacklist,
             auth_users,
-            orgs: crate::control::security::org::store::OrgStore::new(),
-            scope_defs: crate::control::security::scope::store::ScopeStore::new(),
+            orgs,
+            scope_defs,
             scope_grants,
-            rate_limiter: RateLimiter::new(rate_limit_config.clone()),
-            session_handles:
-                crate::control::security::session_handle::SessionHandleStore::from_config(
-                    &auth_config.session,
-                ),
+            rate_limiter,
+            session_handles,
             session_registry: prod_session_registry,
             escalation,
-            usage_counter: Arc::new(
-                crate::control::security::metering::counter::UsageCounter::new(),
-            ),
-            usage_store: Arc::new(UsageStore::with_bounds(
-                metering_config.max_usage_events,
-                metering_config.max_tracked_scopes,
-            )),
+            usage_counter,
+            usage_store,
             quota_manager,
-            metering_config: metering_config.clone(),
-            auth_api_keys: crate::control::security::auth_apikey::AuthApiKeyStore::new(),
-            impersonation: crate::control::security::impersonation::ImpersonationStore::default(),
-            emergency: crate::control::security::emergency::EmergencyState::default(),
-            auth_metrics: crate::control::security::observability::AuthMetrics::new(),
-            ceilings: crate::control::security::ceiling::CeilingStore::new(),
+            metering_config,
+            auth_api_keys,
+            impersonation,
+            emergency,
+            auth_metrics,
+            ceilings,
             redaction: redaction_store,
             risk_scorer,
             tls_policy,
@@ -319,16 +284,18 @@ impl SharedState {
             ts_partition_registries: Some(Mutex::new(std::collections::HashMap::new())),
             cold_storage: None,
             snapshot_storage: Arc::new(object_store::memory::InMemory::new()),
+            pitr: Default::default(),
             quarantine_storage: Arc::new(object_store::memory::InMemory::new()),
-            hlc_clock: Arc::new(nodedb_types::HlcClock::new()),
+            hlc_clock,
             tenant_write_hlc: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             tenant_marks: crate::control::state::tenant_marks::TenantMarks::load(
                 credentials.catalog(),
             )?,
             lease_admission_gate: Mutex::new(()),
-            lease_grant_gate: Arc::new(Mutex::new(())),
+            lease_grant_gate: Arc::new(tokio::sync::Mutex::new(())),
             lease_drain: Arc::new(crate::control::lease::DescriptorDrainTracker::new()),
             lease_refcount: Arc::new(crate::control::lease::LeaseRefCount::new()),
+            lease_runtime: crate::control::lease::LeaseRuntime::new(),
             sequencer_inbox: std::sync::OnceLock::new(),
             reservation_inbox: std::sync::OnceLock::new(),
             sequencer_metrics: std::sync::OnceLock::new(),
@@ -355,6 +322,8 @@ impl SharedState {
             write_order_locks: Arc::new(
                 crate::control::server::shared::write_admission::KeyedWriteOrderLock::new(),
             ),
+            write_order_fence:
+                crate::control::server::shared::write_admission::WriteOrderFence::new(),
             presence: Arc::new(tokio::sync::RwLock::new(
                 crate::control::server::sync::presence::PresenceManager::new(
                     crate::control::server::sync::presence::PresenceConfig::default(),
@@ -369,6 +338,9 @@ impl SharedState {
             gateway_invalidator: std::sync::OnceLock::new(),
             gateway: std::sync::OnceLock::new(),
             backup_kek: None,
+            backup_storage: None,
+            cut_captures: Arc::new(crate::control::backup::cut_capture::CutCaptures::new()),
+            backup_schedules: Vec::new(),
             quarantine_registry: Arc::new(crate::storage::quarantine::QuarantineRegistry::new()),
             admission_registry: Arc::new(
                 crate::control::server::admission::AdmissionRegistry::new(),
@@ -380,15 +352,8 @@ impl SharedState {
             collection_to_database: Arc::new(
                 crate::control::state::collection_to_database::CollectionToDatabase::new(),
             ),
-            lsn_ms_map: Arc::new(Mutex::new(nodedb_types::temporal::LsnMsMap::new())),
-            materialize_freeze: crate::control::clone::MaterializeFreezeRegistry::new(),
             shuffle_registry: Arc::new(
-                crate::control::server::shuffle::ShuffleReceiverRegistry::new(
-                    catalog_path
-                        .parent()
-                        .unwrap_or(std::path::Path::new("."))
-                        .to_path_buf(),
-                ),
+                crate::control::server::shuffle::ShuffleReceiverRegistry::new(data_dir),
             ),
             shutdown: Arc::clone(&shutdown),
             loop_registry: Arc::clone(&loop_registry),
@@ -398,6 +363,7 @@ impl SharedState {
 
         crate::event::topic::hydrate_topic_buffers(&state)?;
         super::post_init::hydrate_caches(&state);
+        crate::control::cluster::metadata_applier::seed_host_tables(&state)?;
         super::post_init::spawn_array_gc(&state);
 
         Ok(state)

@@ -3,6 +3,8 @@
 pub mod append_only;
 pub mod balanced;
 pub mod chain_guard;
+pub mod chain_link;
+pub mod chain_verify;
 pub mod funnel;
 pub mod hash_chain;
 pub mod images;
@@ -13,4 +15,5 @@ pub mod state_transition;
 pub mod statement;
 pub mod transition_check;
 pub mod typeguard;
+pub mod unique;
 pub mod write_hook;

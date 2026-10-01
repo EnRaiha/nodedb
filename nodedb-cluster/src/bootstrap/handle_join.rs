@@ -11,11 +11,13 @@
 //! Semantics:
 //!
 //! - **New node**: added to topology as `Active`, full wire response returned.
-//! - **Known node, same address**: idempotent — no mutation, full wire response returned.
+//! - **Known node, same address**: idempotent. The entry changes only to
+//!   normalize its state to `Active` or to adopt a newly advertised SWIM address.
 //! - **Known node, different address**: rejected with `success: false`. This
 //!   catches node-id reuse (operator error or a ghost node coming back with a
 //!   stale id on a new address).
-//! - **Invalid `listen_addr` in the request**: rejected with `success: false`.
+//! - **Invalid `listen_addr` or `swim_addr` in the request**: rejected with
+//!   `success: false`.
 
 use std::net::SocketAddr;
 
@@ -57,8 +59,28 @@ pub fn handle_join_request(
         );
         return reject(format!(
             "joiner wire_version {} does not match this cluster's wire_version {} — \
-             rolling upgrade is required before this node can join",
+             all nodes must run one build before 1.0; restart every node on the same build",
             req.wire_version, CLUSTER_WIRE_FORMAT_VERSION
+        ));
+    }
+
+    // Wire shapes can change without a `CLUSTER_WIRE_FORMAT_VERSION` bump (see
+    // `nodedb_types::wire_version`), so the version check above cannot by
+    // itself prevent two different builds from joining the same cluster and
+    // misdecoding each other. Build identity is the invariant that actually
+    // protects this — require an exact match.
+    let local_build_id = nodedb_types::wire_version::WIRE_BUILD_ID;
+    if req.build_id != local_build_id {
+        warn!(
+            node_id = req.node_id,
+            joiner_build_id = %req.build_id,
+            local_build_id,
+            "join request rejected: joiner build_id mismatch"
+        );
+        return reject(format!(
+            "joiner build {} does not match this cluster's build {local_build_id} — \
+             all nodes must run one build before 1.0; restart every node on the same build",
+            req.build_id
         ));
     }
 
@@ -68,6 +90,14 @@ pub fn handle_join_request(
         Err(e) => {
             return reject(format!("invalid listen_addr '{}': {e}", req.listen_addr));
         }
+    };
+
+    let swim_addr: Option<SocketAddr> = match req.swim_addr.as_deref() {
+        Some(raw) => match raw.parse() {
+            Ok(a) => Some(a),
+            Err(e) => return reject(format!("invalid swim_addr '{raw}': {e}")),
+        },
+        None => None,
     };
 
     let spki_pin: Option<[u8; 32]> = match req.spki_pin.as_deref() {
@@ -96,12 +126,20 @@ pub fn handle_join_request(
                 req.node_id
             ));
         }
-        // Same id, same address, same identity. If already Active we
-        // short-circuit; otherwise normalize it to Active.
-        if existing.state != NodeState::Active
-            && let Some(entry) = topology.get_node_mut(req.node_id)
+        // Same id, same address, same identity: normalize to Active and adopt
+        // the SWIM address the node advertises now. A restarted node may have
+        // bound a different one.
+        let needs_active = existing.state != NodeState::Active;
+        let advertised = swim_addr.map(|a| a.to_string());
+        let swim_changed = existing.swim_addr != advertised;
+        if (needs_active || swim_changed)
+            && let Some(mut entry) = topology.get_node(req.node_id).cloned()
         {
             entry.state = NodeState::Active;
+            entry.swim_addr = advertised;
+            // `add_node` replaces the entry and bumps the topology version,
+            // so the change reaches peers through the topology broadcast.
+            topology.add_node(entry);
         }
         return build_response(topology, routing, cluster_id);
     }
@@ -125,7 +163,8 @@ pub fn handle_join_request(
         NodeInfo::new(req.node_id, addr, NodeState::Active)
             .with_wire_version(req.wire_version)
             .with_spiffe_id(req.spiffe_id.clone())
-            .with_spki_pin(spki_pin),
+            .with_spki_pin(spki_pin)
+            .with_swim_addr(swim_addr),
     );
     build_response(topology, routing, cluster_id)
 }
@@ -136,18 +175,7 @@ fn build_response(
     routing: &RoutingTable,
     cluster_id: u64,
 ) -> JoinResponse {
-    let nodes: Vec<JoinNodeInfo> = topology
-        .all_nodes()
-        .map(|n| JoinNodeInfo {
-            node_id: n.node_id,
-            addr: n.addr.clone(),
-            state: n.state.as_u8(),
-            raft_groups: n.raft_groups.clone(),
-            wire_version: n.wire_version,
-            spiffe_id: n.spiffe_id.clone(),
-            spki_pin: n.spki_pin.map(|arr| arr.to_vec()),
-        })
-        .collect();
+    let nodes: Vec<JoinNodeInfo> = topology.all_nodes().map(NodeInfo::to_wire).collect();
 
     let groups: Vec<JoinGroupInfo> = routing
         .group_members()
@@ -205,8 +233,10 @@ mod tests {
             node_id: 2,
             listen_addr: "10.0.0.2:9400".into(),
             wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
+            build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
             spiffe_id: None,
             spki_pin: None,
+            swim_addr: None,
         };
 
         let resp = handle_join_request(&req, &mut topology, &routing, 42);
@@ -230,8 +260,10 @@ mod tests {
             node_id: 2,
             listen_addr: "10.0.0.2:9400".into(),
             wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
+            build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
             spiffe_id: None,
             spki_pin: None,
+            swim_addr: None,
         };
 
         let _ = handle_join_request(&req, &mut topology, &routing, 42);
@@ -254,8 +286,10 @@ mod tests {
             node_id: 2,
             listen_addr: "10.0.0.2:9400".into(),
             wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
+            build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
             spiffe_id: None,
             spki_pin: None,
+            swim_addr: None,
         };
 
         let resp1 = handle_join_request(&req, &mut topology, &routing, 7);
@@ -287,8 +321,10 @@ mod tests {
             node_id: 2,
             listen_addr: "10.0.0.2:9400".into(),
             wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
+            build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
             spiffe_id: None,
             spki_pin: None,
+            swim_addr: None,
         };
         let resp1 = handle_join_request(&req1, &mut topology, &routing, 11);
         assert!(resp1.success);
@@ -298,8 +334,10 @@ mod tests {
             node_id: 2,
             listen_addr: "10.0.0.99:9400".into(),
             wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
+            build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
             spiffe_id: None,
             spki_pin: None,
+            swim_addr: None,
         };
         let resp2 = handle_join_request(&req2, &mut topology, &routing, 11);
 
@@ -325,13 +363,46 @@ mod tests {
             node_id: 2,
             listen_addr: "10.0.0.2:9400".into(),
             wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
+            build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
             spiffe_id: Some("spiffe://nodedb/node/2".into()),
             spki_pin: Some(pin.to_vec()),
+            swim_addr: None,
         };
 
         let response = handle_join_request(&request, &mut topology, &routing, 11);
         assert!(!response.success);
         assert!(response.error.contains("already registered to node_id 1"));
+        assert!(!topology.contains(2));
+    }
+
+    /// A joiner running a different build is rejected with the
+    /// operator-facing "restart every node" message, not a rolling-upgrade
+    /// claim.
+    #[test]
+    fn handle_join_rejects_build_id_mismatch() {
+        let mut topology = topo_with_one_node();
+        let routing = RoutingTable::uniform(1, &[1], 1);
+
+        let req = JoinRequest {
+            node_id: 2,
+            listen_addr: "10.0.0.2:9400".into(),
+            wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
+            build_id: "some-other-build".into(),
+            spiffe_id: None,
+            spki_pin: None,
+            swim_addr: None,
+        };
+
+        let resp = handle_join_request(&req, &mut topology, &routing, 42);
+
+        assert!(!resp.success);
+        assert!(resp.error.contains("some-other-build"));
+        assert!(
+            resp.error
+                .contains("all nodes must run one build before 1.0"),
+            "rejection error must name the fix: {}",
+            resp.error
+        );
         assert!(!topology.contains(2));
     }
 
@@ -344,12 +415,84 @@ mod tests {
             node_id: 2,
             listen_addr: "not-a-valid-address".into(),
             wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
+            build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
             spiffe_id: None,
             spki_pin: None,
+            swim_addr: None,
         };
 
         let resp = handle_join_request(&req, &mut topology, &routing, 42);
         assert!(!resp.success);
         assert!(!resp.error.is_empty());
+    }
+
+    fn join_with_swim(swim_addr: &str) -> JoinRequest {
+        JoinRequest {
+            node_id: 2,
+            listen_addr: "10.0.0.2:9400".into(),
+            wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
+            build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
+            spiffe_id: None,
+            spki_pin: None,
+            swim_addr: Some(swim_addr.into()),
+        }
+    }
+
+    /// The joiner's SWIM address lands in its topology entry and in the wire
+    /// response every peer seeds SWIM from.
+    #[test]
+    fn join_carries_the_swim_address() {
+        let mut topology = topo_with_one_node();
+        let routing = RoutingTable::uniform(1, &[1], 1);
+
+        let resp =
+            handle_join_request(&join_with_swim("10.0.0.2:9401"), &mut topology, &routing, 1);
+
+        assert!(resp.success, "{}", resp.error);
+        let entry = topology.get_node(2).expect("joiner admitted");
+        assert_eq!(entry.swim_socket_addr(), "10.0.0.2:9401".parse().ok());
+        let wire = resp
+            .nodes
+            .iter()
+            .find(|n| n.node_id == 2)
+            .expect("joiner in response");
+        assert_eq!(wire.swim_addr.as_deref(), Some("10.0.0.2:9401"));
+    }
+
+    /// A known node that re-advertises a different SWIM address updates its
+    /// entry and bumps the topology version so peers pick the change up.
+    #[test]
+    fn rejoin_with_a_new_swim_address_updates_the_entry() {
+        let mut topology = topo_with_one_node();
+        let routing = RoutingTable::uniform(1, &[1], 1);
+        let first =
+            handle_join_request(&join_with_swim("10.0.0.2:9401"), &mut topology, &routing, 1);
+        assert!(first.success, "{}", first.error);
+        let version_before = topology.version();
+
+        let second =
+            handle_join_request(&join_with_swim("10.0.0.2:9501"), &mut topology, &routing, 1);
+
+        assert!(second.success, "{}", second.error);
+        assert_eq!(
+            topology.get_node(2).and_then(NodeInfo::swim_socket_addr),
+            "10.0.0.2:9501".parse().ok()
+        );
+        assert!(topology.version() > version_before);
+    }
+
+    #[test]
+    fn join_rejects_an_invalid_swim_address() {
+        let mut topology = topo_with_one_node();
+        let routing = RoutingTable::uniform(1, &[1], 1);
+        let resp = handle_join_request(
+            &join_with_swim("not-an-address"),
+            &mut topology,
+            &routing,
+            1,
+        );
+        assert!(!resp.success);
+        assert!(resp.error.contains("swim_addr"), "{}", resp.error);
+        assert!(!topology.contains(2));
     }
 }

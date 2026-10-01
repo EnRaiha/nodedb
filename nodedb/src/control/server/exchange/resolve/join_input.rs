@@ -5,14 +5,12 @@
 
 use nodedb_physical::physical_plan::{ExchangeMode, ExchangeOp, PhysicalPlan, QueryOp};
 
+use crate::control::server::exchange::read_scope::ReadScope;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec::flatten_to_relational_rows;
-use crate::types::{DatabaseId, TenantId, TraceId, TxnId};
 
 use crate::control::server::exchange::full_scan::{ScanSide, full_scan_plan_for_collection};
-use crate::control::server::exchange::gather::{
-    finalize_aggregate, gather_all_cores, gather_all_vshards,
-};
+use crate::control::server::exchange::gather::{finalize_aggregate, gather_all_vshards};
 
 use super::capture::DistributedReadCapture;
 use super::exchange::provider_scan_of_rows;
@@ -29,13 +27,16 @@ use super::exchange::provider_scan_of_rows;
 /// materialized side is validated at commit like every other distributed read.
 pub(super) async fn resolve_join_input(
     state: &SharedState,
-    database_id: DatabaseId,
-    tenant_id: TenantId,
+    scope: ReadScope,
     input: Option<Box<PhysicalPlan>>,
-    trace_id: TraceId,
-    txn_id: Option<TxnId>,
     captures: &mut Vec<DistributedReadCapture>,
 ) -> crate::Result<Option<Box<PhysicalPlan>>> {
+    let ReadScope {
+        database_id,
+        tenant_id,
+        txn_id,
+        ..
+    } = scope;
     let Some(boxed) = input else {
         return Ok(None);
     };
@@ -54,8 +55,10 @@ pub(super) async fn resolve_join_input(
             // producing a Response whose payload is exactly `merged_array`.
             // `decode_response_to_docs` in `hash_handlers.rs` then reads that
             // Response as a msgpack array — so the two shapes match.
-            let outcome =
-                gather_all_cores(state, tenant_id, database_id, *child, trace_id, txn_id).await?;
+            // The gather reads every vShard of the child from its owner, not
+            // only the groups this node replicates, and confirms each leg as
+            // `scope` requires.
+            let outcome = Box::pin(gather_all_vshards(state, *child, scope)).await?;
             let provider_scan =
                 provider_scan_of_rows(flatten_to_relational_rows(&outcome.merged_array));
             Ok(Some(Box::new(provider_scan)))
@@ -102,8 +105,8 @@ pub(super) async fn resolve_join_input(
             } else {
                 None
             };
-            let outcome =
-                gather_all_cores(state, tenant_id, database_id, *child, trace_id, txn_id).await?;
+            // Read from every vShard's owner, as the Broadcast arm does.
+            let outcome = Box::pin(gather_all_vshards(state, *child, scope)).await?;
             if let Some(coll) = child_collection
                 && let Some(scan_plan) = full_scan_plan_for_collection(
                     state,
@@ -142,7 +145,7 @@ pub(super) async fn resolve_join_input(
 ///
 /// `side` carries the collection together with the RLS filters injected for
 /// it, so the gathered rows are filtered per side *before* the join, exactly
-/// as the local name-scan this gather replaces would have filtered them.
+/// as the local name-scan this gather replaces filtered them.
 ///
 /// Returns `Ok(None)` (the name-scan fallback) when the catalog has no record
 /// for the collection. This is graceful degradation, never an error: a missing
@@ -150,13 +153,16 @@ pub(super) async fn resolve_join_input(
 /// the executing node.
 pub(super) async fn gather_join_build_side(
     state: &SharedState,
-    database_id: DatabaseId,
-    tenant_id: TenantId,
+    scope: ReadScope,
     side: ScanSide<'_>,
-    trace_id: TraceId,
-    txn_id: Option<TxnId>,
     captures: &mut Vec<DistributedReadCapture>,
 ) -> crate::Result<Option<Box<PhysicalPlan>>> {
+    let ReadScope {
+        database_id,
+        tenant_id,
+        txn_id,
+        ..
+    } = scope;
     // Build an unprojected full-collection scan for the engine via the shared
     // builder, carrying this side's read policy. `Ok(None)` (no catalog / unknown
     // collection) keeps the existing graceful name-scan fallback — never an
@@ -198,15 +204,7 @@ pub(super) async fn gather_join_build_side(
     // → `resolve_exchange` → here. The cycle terminates at runtime (the scan
     // plan is Exchange-free), but the future must be heap-indirected so its size
     // is finite.
-    let outcome = Box::pin(gather_all_vshards(
-        state,
-        tenant_id,
-        database_id,
-        scan_plan,
-        trace_id,
-        txn_id,
-    ))
-    .await?;
+    let outcome = Box::pin(gather_all_vshards(state, scan_plan, scope)).await?;
 
     if let Some(scan_plan) = capture_plan {
         captures.push(DistributedReadCapture {

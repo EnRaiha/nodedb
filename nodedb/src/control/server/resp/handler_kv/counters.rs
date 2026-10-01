@@ -20,10 +20,10 @@ use super::surrogate::resp_kv_surrogate;
 /// `INCR` / `DECR` / `INCRBY` / `DECRBY` / `INCRBYFLOAT` answer with the row's
 /// new stored value, which the KV engine holds as the single-value form — the
 /// column every SQL-side read of that row calls `value`. Masking the answer
-/// would report a number the key does not hold, so the command is refused
+/// will report a number the key does not hold, so the command is refused
 /// instead, on the same fail-closed principle the planner applies to an
 /// aggregate over a redacted column. The refusal happens BEFORE dispatch, so
-/// the increment the caller could not observe is never performed either.
+/// the increment the caller cannot observe is never performed either.
 fn refuse_if_counter_is_redacted(state: &SharedState, session: &RespSession) -> Option<RespValue> {
     let redaction = resp_redaction(state, session)?;
     redaction
@@ -93,7 +93,7 @@ async fn dispatch_incr(
     if let Some(refusal) = refuse_if_counter_is_redacted(state, session) {
         return refusal;
     }
-    let surrogate = match resp_kv_surrogate(state, session, &key) {
+    let surrogate = match resp_kv_surrogate(state, session, &key).await {
         Ok(s) => s,
         Err(e) => return e,
     };
@@ -114,7 +114,7 @@ async fn dispatch_incr(
         Ok(resp) => match payload_field_i64(&resp.payload, "value") {
             Some(new_val) => RespValue::integer(new_val),
             // The counter did change; a response we cannot read means we do
-            // not know its new value, and echoing 0 would report a value the
+            // not know its new value, and echoing 0 will report a value the
             // key does not hold.
             None => RespValue::err("ERR counter response could not be decoded"),
         },
@@ -144,7 +144,7 @@ pub(in crate::control::server::resp) async fn handle_incrbyfloat(
         return refusal;
     }
 
-    let surrogate = match resp_kv_surrogate(state, session, &key) {
+    let surrogate = match resp_kv_surrogate(state, session, &key).await {
         Ok(s) => s,
         Err(e) => return e,
     };

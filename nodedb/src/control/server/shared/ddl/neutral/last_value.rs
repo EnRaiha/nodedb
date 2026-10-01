@@ -48,6 +48,9 @@ pub async fn query_last_values(
             // Admitted at this request's own transport entry; this handler
             // has no session or peer information of its own.
             admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
+            // No session reaches this handler, so its read takes the strong
+            // default (see `DmlTxnCtx::linearizable_reads`).
+            linearizable: true,
         },
     )
     .await
@@ -117,6 +120,9 @@ pub async fn query_last_value(
             // Admitted at this request's own transport entry; this handler
             // has no session or peer information of its own.
             admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
+            // No session reaches this handler, so its read takes the strong
+            // default (see `DmlTxnCtx::linearizable_reads`).
+            linearizable: true,
         },
     )
     .await
@@ -124,7 +130,7 @@ pub async fn query_last_value(
 
     // MessagePack, as in `query_last_values` above — an absent series is
     // encoded as a null (decoding to `None`), which is a different fact from a
-    // payload that could not be read at all.
+    // payload that cannot be read at all.
     let entry: Option<(i64, f64)> = crate::data::executor::response_codec::decode_payload(&payload)
         .map_err(|e| DdlError::from_error_in_context("LAST_VALUE reply", &e))?;
 

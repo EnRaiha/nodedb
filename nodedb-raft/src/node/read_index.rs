@@ -6,6 +6,12 @@
 //! partition does not notify the old leader. Serving a read on that belief
 //! returns state the new leader has since moved past. The read index is
 //! therefore confirmed against a quorum before it is served.
+//!
+//! A new leader's commit index can also lag entries an earlier leader already
+//! committed: Raft only advances it through an entry of the leader's own term.
+//! The read index is therefore never below the first entry of the current term
+//! (the election no-op), and the probe stays `Pending` until that entry
+//! commits.
 
 use crate::node::core::RaftNode;
 use crate::state::NodeRole;
@@ -18,9 +24,11 @@ use crate::storage::LogStorage;
 /// stops immediately and reports that this node cannot serve the read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadIndexStatus {
-    /// A quorum has answered — the read may be served.
+    /// A quorum has answered and the read index is committed. The read may be
+    /// served.
     Confirmed,
-    /// Still leading, still waiting for responses.
+    /// Still leading, still waiting for responses or for the current term's
+    /// first entry to commit.
     Pending,
     /// No longer leader in the probe's term. The read can never confirm.
     LeadershipLost,
@@ -52,7 +60,7 @@ impl<S: LogStorage> RaftNode<S> {
         }
         let leader = self.leader_state.as_ref()?;
         let probe = ReadIndexProbe {
-            read_index: self.volatile.commit_index,
+            read_index: self.term_read_floor(),
             term: self.hard_state.current_term,
             acks: self
                 .config
@@ -76,6 +84,9 @@ impl<S: LogStorage> RaftNode<S> {
         let Some(leader) = self.leader_state.as_ref() else {
             return ReadIndexStatus::LeadershipLost;
         };
+        if self.volatile.commit_index < probe.read_index {
+            return ReadIndexStatus::Pending;
+        }
         let mut count = 1u64; // self counts.
         for &(peer, seen) in &probe.acks {
             if leader.ack_count_for(peer) > seen {
@@ -94,15 +105,45 @@ impl<S: LogStorage> RaftNode<S> {
     pub fn read_index_confirmed(&self, probe: &ReadIndexProbe) -> bool {
         self.read_index_status(probe) == ReadIndexStatus::Confirmed
     }
+
+    /// Whether the entry at the commit index belongs to the current term.
+    ///
+    /// Until it does, entries an earlier leader committed can sit above the
+    /// commit index, so the commit index is no read index.
+    pub(super) fn current_term_committed(&self) -> bool {
+        self.log.term_at(self.volatile.commit_index) == Some(self.hard_state.current_term)
+    }
+
+    /// Lowest index a read may be served at: the commit index once the
+    /// current term has committed an entry, else the first entry of the
+    /// current term.
+    ///
+    /// Every entry committed before this term sits below that first entry. A
+    /// leader whose term has no entry yet answers `last_index + 1`, which
+    /// holds the read until the term commits something.
+    fn term_read_floor(&self) -> u64 {
+        let commit = self.volatile.commit_index;
+        if self.current_term_committed() {
+            return commit;
+        }
+        let term = self.hard_state.current_term;
+        let last = self.log.last_index();
+        (commit + 1..=last)
+            .find(|&index| self.log.term_at(index) == Some(term))
+            .unwrap_or(last + 1)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
-    use crate::message::{AppendEntriesResponse, RequestVoteResponse};
+    use crate::message::{
+        AppendEntriesRequest, AppendEntriesResponse, LogEntry, RequestVoteResponse,
+    };
     use crate::node::config::RaftConfig;
     use crate::node::core::RaftNode;
+    use crate::node::read_index::ReadIndexStatus;
     use crate::state::NodeRole;
     use crate::storage::MemStorage;
     use crate::test_support::force_election;
@@ -148,8 +189,18 @@ mod tests {
                 term: node.current_term(),
                 success,
                 last_log_index: node.last_log_index(),
+                round: node.lease.next_round - 1,
+                needs_snapshot: false,
             },
         );
+    }
+
+    /// `leader()` with its election no-op committed.
+    fn settled_leader() -> RaftNode<MemStorage> {
+        let mut node = leader();
+        ack(&mut node, 2, true);
+        assert_eq!(node.commit_index(), node.last_log_index());
+        node
     }
 
     #[test]
@@ -181,7 +232,7 @@ mod tests {
     /// the leadership check needs — so it counts.
     #[test]
     fn a_rejected_append_still_confirms_leadership() {
-        let mut node = leader();
+        let mut node = settled_leader();
         let probe = node.start_read_index().expect("leader starts a read");
         ack(&mut node, 2, false);
         assert!(node.read_index_confirmed(&probe));
@@ -216,6 +267,8 @@ mod tests {
                 term: node.current_term() + 1,
                 success: false,
                 last_log_index: 0,
+                round: 0,
+                needs_snapshot: false,
             },
         );
 
@@ -243,7 +296,7 @@ mod tests {
     /// has reached since.
     #[test]
     fn the_probe_pins_the_commit_index_it_was_taken_at() {
-        let mut node = leader();
+        let mut node = settled_leader();
         let probe = node.start_read_index().expect("leader starts a read");
         assert_eq!(probe.read_index, node.commit_index());
     }
@@ -261,5 +314,59 @@ mod tests {
             "both peers must be asked, got {:?}",
             ready.messages
         );
+    }
+
+    /// A new leader's commit index can sit below entries an earlier leader
+    /// committed. Serving at it would miss them, so the probe waits for the
+    /// current term's no-op.
+    #[test]
+    fn a_new_leader_with_a_stale_commit_is_pending() {
+        let mut node = RaftNode::new(config(1, vec![2, 3]), MemStorage::new());
+        let entries = (1..=3)
+            .map(|index| LogEntry {
+                term: 1,
+                index,
+                data: vec![1],
+            })
+            .collect();
+        // Leader 2 replicated three entries but told this node of one commit.
+        node.handle_append_entries(&AppendEntriesRequest {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries,
+            leader_commit: 1,
+            group_id: 1,
+            round: 1,
+            replicated_floor: 0,
+        });
+        assert_eq!(node.commit_index(), 1);
+
+        force_election(&mut node);
+        let _ = node.take_ready();
+        node.handle_request_vote_response(
+            2,
+            &RequestVoteResponse {
+                term: node.current_term(),
+                vote_granted: true,
+            },
+        );
+        assert_eq!(node.role(), NodeRole::Leader);
+        let _ = node.take_ready();
+        let noop = node.last_log_index();
+        assert_eq!(noop, 4);
+
+        let probe = node.start_read_index().expect("leader starts a read");
+        assert_eq!(probe.read_index, noop, "the read index covers the no-op");
+
+        // A quorum answers, but the no-op is not stored anywhere else yet.
+        ack(&mut node, 2, false);
+        assert_eq!(node.commit_index(), 1);
+        assert_eq!(node.read_index_status(&probe), ReadIndexStatus::Pending);
+
+        ack(&mut node, 3, true);
+        assert_eq!(node.commit_index(), noop);
+        assert_eq!(node.read_index_status(&probe), ReadIndexStatus::Confirmed);
     }
 }

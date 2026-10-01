@@ -63,8 +63,10 @@ pub enum SpatialOp {
     Delete {
         collection: QualifiedCollection,
         field: String,
-        /// Stable global surrogate for the row.
-        surrogate: Surrogate,
+        /// Stable global surrogate for the row. `None` when the key's home
+        /// binds none: the delete removes nothing and still commits its sync
+        /// provenance.
+        surrogate: Option<Surrogate>,
         /// Sync provenance: identifies the originating peer and sequence for idempotency.
         #[serde(default)]
         provenance: Option<nodedb_types::sync::wire::SyncProvenance>,

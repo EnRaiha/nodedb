@@ -139,11 +139,12 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// here lets the existing replication → snapshot → promotion machinery
     /// converge the group to `members == placement`.
     ///
-    /// At most ONE group is mounted per tick. `add_group_as_learner` opens a
-    /// per-group redb file synchronously while holding the `multi_raft` lock;
-    /// capping at one bounds that work so a burst of newly-placed groups cannot
-    /// stall the reactor past an election timeout. The phase is idempotent and
-    /// runs every tick, so remaining groups mount on subsequent ticks.
+    /// The tick never touches the disk here. The mount opens the group's redb
+    /// log and restores it on a blocking thread, without the `multi_raft`
+    /// lock, and then mounts it under the lock. One mount of a group runs at
+    /// a time. At most one group starts per tick, so a burst of newly placed
+    /// groups spreads its disk work. The phase is idempotent and runs every
+    /// tick, so remaining groups mount on subsequent ticks.
     pub(super) fn mount_entering_groups(&self) {
         // Phase 1: snapshot the hosted set and the first planned mount under one
         // lock acquisition. Lock order is multi_raft THEN routing (the
@@ -175,31 +176,55 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                 })
         };
 
-        // Phase 2: mount under a re-acquired lock, re-checking `contains_group`
-        // to stay idempotent against a race with the join-time mount.
-        if let Some((gid, voters, other_learners)) = mount {
-            let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-            if mr.contains_group(gid) {
-                return;
-            }
-            match mr.add_group_as_learner(gid, voters, other_learners) {
-                Ok(()) => {
-                    debug!(
-                        group_id = gid,
-                        node_id = self.node_id,
-                        "mount: added local learner replica for placed group"
-                    );
-                }
-                Err(e) => {
-                    debug!(
-                        group_id = gid,
-                        node_id = self.node_id,
-                        error = %e,
-                        "mount: add_group_as_learner failed; retrying next tick"
-                    );
-                }
-            }
+        // Phase 2: open the group's disk off the async threads, then mount it
+        // under a re-acquired lock. `insert_opened` re-checks the group, so a
+        // race with the join-time mount keeps the replica mounted first.
+        let Some((gid, voters, other_learners)) = mount else {
+            return;
+        };
+        if !self.tick_state.begin_mount(gid) {
+            return;
         }
+        let spec = self
+            .multi_raft
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .mount_spec(gid, voters, other_learners, true);
+        let multi_raft = std::sync::Arc::clone(&self.multi_raft);
+        let tick_state = std::sync::Arc::clone(&self.tick_state);
+        let node_id = self.node_id;
+        tokio::spawn(async move {
+            let opened = tokio::task::spawn_blocking(move || spec.open()).await;
+            match opened {
+                Ok(Ok(opened)) => {
+                    let unused = multi_raft
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert_opened(opened);
+                    match unused {
+                        // Closing the unused replica's disk blocks.
+                        Some(unused) => drop(tokio::task::spawn_blocking(move || drop(unused))),
+                        None => debug!(
+                            group_id = gid,
+                            node_id, "mount: added local learner replica for placed group"
+                        ),
+                    }
+                }
+                Ok(Err(e)) => debug!(
+                    group_id = gid,
+                    node_id,
+                    error = %e,
+                    "mount: opening the group failed; retrying next tick"
+                ),
+                Err(e) => debug!(
+                    group_id = gid,
+                    node_id,
+                    error = %e,
+                    "mount: the open task failed; retrying next tick"
+                ),
+            }
+            tick_state.end_mount(gid);
+        });
     }
 
     /// For each group this node leads that has an authored placement set,
@@ -455,6 +480,7 @@ mod tests {
     fn group(members: Vec<u64>, learners: Vec<u64>, placement: Option<Vec<u64>>) -> GroupInfo {
         GroupInfo {
             leader: members.first().copied().unwrap_or(0),
+            leader_term: 0,
             members,
             learners,
             placement,

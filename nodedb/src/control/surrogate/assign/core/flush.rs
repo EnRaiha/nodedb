@@ -32,7 +32,7 @@ impl SurrogateAssigner {
     ///
     /// A `Cluster`-mode registry is a no-op here — its watermark is
     /// advanced and persisted by the `SurrogateReserve` apply path, so a
-    /// local flush would double-advance `G` and corrupt determinism.
+    /// local flush double-advances `G` and corrupts determinism.
     pub(in crate::control::surrogate::assign) fn maybe_flush(
         &self,
         registry: &SurrogateRegistry,
@@ -75,14 +75,11 @@ impl SurrogateHwmPersist for CombinedPersist<'_> {
         // weight for it — it only advances peers' (and a future joiner's)
         // view of the watermark.
         //
-        // Awaiting it inline was a liveness bug. `propose_surrogate_hwm`
+        // Awaiting it inline stalls the writer. `propose_surrogate_hwm`
         // blocks for `DEFAULT_PROPOSE_TIMEOUT` (5s) waiting for the entry
-        // to commit, and surrogate assignment runs on the Raft apply loop
-        // as well as on the coordinator — so a flush triggered from the
-        // apply path parked the very loop that had to commit the entry,
-        // and only unwound when the timeout fired. Every such write ate a
-        // 5s stall, which is what made Lite's sync deltas time out before
-        // Origin could ack them.
+        // to commit. Surrogate assignment runs on the Raft apply loop as
+        // well as on the coordinator. A flush from the apply path parks
+        // the very loop that must commit the entry until the timeout fires.
         //
         // Out-of-order or duplicate delivery is safe: `apply_surrogate_alloc`
         // advances the watermark through `restore_hwm`, which is idempotent
@@ -99,14 +96,11 @@ impl SurrogateHwmPersist for CombinedPersist<'_> {
 }
 
 /// Dispatch the `SurrogateAlloc { hwm }` metadata propose without blocking
-/// the caller.
-///
-/// Spawned as a normal runtime task rather than via `spawn_blocking` because
-/// `propose_surrogate_hwm` uses `block_in_place` internally, which is only
-/// legal on a multi-threaded runtime worker.
+/// the caller. The spawned task awaits the propose, so it runs on any runtime
+/// flavor.
 ///
 /// A missing reactor means this checkpoint ran outside a Tokio context, where
-/// the propose could not have been issued at all. That is not silent data
+/// no propose can be issued at all. That is not silent data
 /// loss — the hwm is already durable in the catalog and WAL, and the next
 /// flush that does run under a reactor re-proposes the (higher) watermark —
 /// but it is logged so a node that never advances peer watermarks is
@@ -122,7 +116,8 @@ fn spawn_hwm_propose(shared: Arc<SharedState>, hwm: u32) {
         return;
     };
     handle.spawn(async move {
-        if let Err(e) = crate::control::metadata_proposer::propose_surrogate_hwm(&shared, hwm) {
+        if let Err(e) = crate::control::metadata_proposer::propose_surrogate_hwm(&shared, hwm).await
+        {
             tracing::warn!(hwm, error = %e, "surrogate hwm raft propose failed; followers may lag");
         }
     });

@@ -2,14 +2,12 @@
 
 //! Handler for `CREATE [IF NOT EXISTS] DATABASE <name> [WITH (...)]`.
 //!
-//! Ported from the pgwire `ddl::database::create` handler. The catalog
-//! allocation, Raft propose / single-node fallback, allocator-hwm flush,
-//! per-database metric registration, and the `DatabaseCreated` audit record are
-//! preserved verbatim; only the result construction changed from pgwire
-//! `Response` to the protocol-neutral [`DdlResult`].
+//! The database id comes from `allocate_database_id`, which replicates it
+//! through the metadata log. The descriptor is proposed through metadata
+//! Raft.
 
 use crate::control::catalog_entry::entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::security::catalog::database_types::{DatabaseDescriptor, DatabaseStatus};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -53,7 +51,7 @@ fn parse_create_options(options: &[(String, String)]) -> Result<CreateDatabaseOp
 /// Handle `CREATE [IF NOT EXISTS] DATABASE <name> [WITH (...)]`.
 ///
 /// Required role: `ClusterAdmin` or `Superuser`.
-pub fn create_database(
+pub async fn create_database(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
@@ -83,12 +81,12 @@ pub fn create_database(
         }
     }
 
-    // Allocate a new DatabaseId from the registry (local atomic counter;
-    // authoritative proposal via Raft metadata group 0 is wired separately).
-    let db_id = state.database_registry.alloc_one();
+    let db_id = crate::control::database::allocate_database_id(state)
+        .await
+        .map_err(|e| DdlError::from_error_in_context("database id allocation failed", &e))?;
 
     // Stamp the descriptor with the next WAL LSN. This is the LSN the very
-    // next WAL append on this server would receive; it is monotonically
+    // next WAL append on this server will receive; it is monotonically
     // greater than any record observed before this DDL ran and gives the
     // descriptor a well-ordered creation point relative to the WAL.
     let created_at_lsn = state.wal.next_lsn().as_u64();
@@ -105,31 +103,14 @@ pub fn create_database(
         idle_session_timeout_secs: 0,
     };
 
-    // Propose through metadata Raft group 0 so all replicas apply the
-    // descriptor atomically. In single-node mode `propose_catalog_entry`
-    // reports `LocalOnly` and falls through to the direct write below.
-    let outcome = propose_catalog_entry(
+    // Propose through the metadata proposer so every replica applies the
+    // descriptor atomically.
+    propose_catalog_entry_async(
         state,
         &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
     )
+    .await
     .map_err(|e| DdlError::from_error_in_context("catalog propose failed", &e))?;
-
-    // Direct write for single-node mode (`LocalOnly`) or as a fallback
-    // when the cluster is in mixed-version compat mode.
-    if outcome.needs_local_apply() {
-        catalog
-            .put_database(&descriptor)
-            .map_err(|e| DdlError::from_error_in_context("catalog write failed", &e))?;
-    }
-
-    // Flush the allocator hwm on the periodic threshold so restarts
-    // pick up the correct next-id boundary.
-    if state.database_registry.should_flush() {
-        let hwm = state.database_registry.current_hwm();
-        if let Err(e) = catalog.put_database_hwm(hwm) {
-            tracing::warn!("database hwm flush failed: {e}");
-        }
-    }
 
     // Register per-database metric series so the names appear in Prometheus
     // output immediately after creation. Tenants, memory, and storage start
@@ -154,26 +135,12 @@ pub fn create_database(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use nodedb_types::error::ErrorCode;
 
     use super::*;
-    use crate::bridge::dispatch::Dispatcher;
+    use crate::control::cluster::test_one_node;
     use crate::control::security::identity::{DatabaseSet, Role};
     use crate::types::TenantId;
-    use crate::wal::WalManager;
-
-    fn test_state() -> (tempfile::TempDir, Arc<SharedState>) {
-        let dir = tempfile::tempdir().expect("create test directory");
-        let wal = Arc::new(
-            WalManager::open_for_testing(&dir.path().join("create-database.wal"))
-                .expect("open test WAL"),
-        );
-        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-        let state = SharedState::new(dispatcher, wal).expect("construct shared state");
-        (dir, state)
-    }
 
     fn admin() -> AuthenticatedIdentity {
         AuthenticatedIdentity::new_internal_service(
@@ -189,19 +156,46 @@ mod tests {
 
     /// CREATE DATABASE of a name already taken is `duplicate_database`
     /// (`42P04`) with the already-exists code, never an internal error.
-    #[test]
-    fn creating_an_existing_database_is_a_duplicate_database() {
-        let (_dir, state) = test_state();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn creating_an_existing_database_is_a_duplicate_database() {
+        let cluster = test_one_node::boot().await;
+        let state = &cluster.state;
         let identity = admin();
-        create_database(&state, &identity, "orders", false, &[]).expect("first create succeeds");
+        create_database(state, &identity, "orders", false, &[])
+            .await
+            .expect("first create succeeds");
 
-        let err = create_database(&state, &identity, "orders", false, &[])
+        let err = create_database(state, &identity, "orders", false, &[])
+            .await
             .expect_err("a second create of the same name is refused");
         assert_eq!(err.sqlstate, "42P04", "{err:?}");
         assert_eq!(err.code, ErrorCode::ALREADY_EXISTS);
 
-        let existing = create_database(&state, &identity, "orders", true, &[])
+        let existing = create_database(state, &identity, "orders", true, &[])
+            .await
             .expect("IF NOT EXISTS on an existing name succeeds");
         assert_eq!(existing.len(), 1);
+        cluster.shutdown().await;
+    }
+
+    /// Every CREATE persists the hwm before it returns, so the id survives a
+    /// restart that happens right after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_persists_the_hwm_of_every_issued_id() {
+        let cluster = test_one_node::boot().await;
+        let state = &cluster.state;
+        let identity = admin();
+        let catalog = state.credentials.catalog();
+        for name in ["a", "b"] {
+            create_database(state, &identity, name, false, &[])
+                .await
+                .expect("create");
+            let id = catalog
+                .get_database_id_by_name(name)
+                .expect("lookup")
+                .expect("created");
+            assert_eq!(catalog.get_database_hwm().expect("hwm"), id.as_u64());
+        }
+        cluster.shutdown().await;
     }
 }

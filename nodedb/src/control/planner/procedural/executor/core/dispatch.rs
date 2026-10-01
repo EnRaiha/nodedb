@@ -2,14 +2,26 @@
 
 //! DML dispatch and transaction control for the statement executor.
 
-use super::super::transaction::ProcedureTransactionCtx;
+use super::super::transaction::{ProcedureTransactionCtx, RemoteWrite};
 use super::StatementExecutor;
+use super::route::StatementRoute;
 use super::sql_literal_concat::fold_literal_string_concat;
 use crate::control::planner::procedural::ast::SqlExpr;
 use crate::control::planner::procedural::executor::bindings::RowBindings;
 use crate::control::planner::procedural::executor::eval;
-use crate::control::server::dispatch_utils::{MintedRecords, RecordOwner};
-use crate::types::TraceId;
+use crate::control::system_txn::{OpenSystemTxn, SystemTxnStatement};
+
+/// Whether a body statement goes to the DDL router before the planner.
+/// `INSERT` and `UPSERT` go to the planner: the router's object-literal and
+/// `UPSERT INTO` forms fire the target's triggers again.
+fn routes_through_ddl_router(sql: &str) -> bool {
+    let head = sql.trim_start();
+    let starts_with = |word: &str| {
+        head.get(..word.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(word))
+    };
+    !(starts_with("INSERT") || starts_with("UPSERT"))
+}
 
 impl<'a> StatementExecutor<'a> {
     // ── ASSIGN handling ─────────────────────────────────────────────────
@@ -49,29 +61,55 @@ impl<'a> StatementExecutor<'a> {
     pub(super) async fn execute_sql(&self, sql: &str, bindings: &RowBindings) -> crate::Result<()> {
         let bound_sql = fold_literal_string_concat(&bindings.substitute(sql));
 
-        // First, attempt unified dispatch for NodeDB SQL extensions (PUBLISH TO,
-        // topic/consumer-group DDL, etc.). If the SQL is not an extension,
-        // `dispatch_sql` returns None and we fall through to plan_sql with
-        // transaction-buffer semantics preserved exactly as before.
-        if let Some(_outcome) = crate::control::sql_dispatch::dispatch_sql_in_database(
-            self.state,
-            &self.identity_for_dispatch(),
-            self.database_id,
-            &bound_sql,
-        )
-        .await?
-        {
-            return Ok(());
+        // A NodeDB SQL extension (`PUBLISH TO`) is checked now and sent only
+        // after the transaction commits, so a rolled-back body publishes
+        // nothing.
+        if crate::control::sql_dispatch::is_sql_extension(&bound_sql) {
+            // A shipped block carries only the DML its origin routed here:
+            // the origin publishes from its own commit.
+            if matches!(self.body, Some(super::AtomicBody::CrossShardApply)) {
+                return Err(crate::Error::BadRequest {
+                    detail: "PUBLISH is not accepted in a cross-shard trigger write".into(),
+                });
+            }
+            let publish = crate::control::sql_dispatch::prepare_publish(
+                self.state,
+                &self.identity_for_dispatch(),
+                self.database_id,
+                &bound_sql,
+            )?;
+            let mut guard = self.tx_ctx.lock().unwrap_or_else(|p| p.into_inner());
+            return guard.buffer_publish(publish);
         }
 
-        // Not a NodeDB extension: plan with descriptor versions so admission
-        // occurs before this internal path buffers, WAL-appends, or dispatches.
-        // Stored procedures are trusted internal execution, so this deliberately
-        // does not add user authorization beyond their existing semantics.
+        // DDL and the other router-owned statements run on the open
+        // transaction's session, as in a client transaction: DDL buffers and
+        // commits with the body's writes.
+        if routes_through_ddl_router(bound_sql.as_str()) {
+            let mut txn = self.txn.lock().await;
+            let open = self.open_txn(&mut txn).await?;
+            let txn_ctx = open.txn_ctx()?;
+            if let Some(result) = crate::control::server::shared::ddl::dispatch(
+                self.state,
+                &self.identity,
+                &bound_sql,
+                self.database_id,
+                &txn_ctx,
+            )
+            .await
+            {
+                return result.map(drop).map_err(crate::Error::from);
+            }
+        }
+
+        // Plan with descriptor versions so admission occurs before this
+        // internal path stages anything. Stored procedures are trusted
+        // internal execution, so this deliberately does not add user
+        // authorization beyond their existing semantics.
         //
         // Planning and lease admission run as ONE retried unit: the lease that
         // pins the planned descriptor version is acquired after the catalog
-        // read, so a descriptor drain starting in between would otherwise fail
+        // read, so a descriptor drain starting in between will otherwise fail
         // the whole procedure. Re-planning is pure, and admission fails closed
         // before granting anything, so an absorbed attempt reads nothing.
         let ctx = crate::control::planner::context::QueryContext::for_state(self.state);
@@ -80,183 +118,113 @@ impl<'a> StatementExecutor<'a> {
         // A stored-procedure body is server-defined code, not a client
         // statement, and runs SECURITY DEFINER exactly as a trigger body does —
         // so it plans as the system rather than under the invoker's scope. The
-        // context is built once and borrowed by the retry closure, which may run
+        // context is built once and borrowed by the retry closure, which can run
         // it several times.
         let security = crate::control::planner::context::SystemPlanSecurity::new(
             self.tenant_id,
             "_system_procedure",
         );
         let security = &security;
-        let (tasks, lease_scope) =
-            crate::control::server::shared::retry::retry_on_schema_change(move || async move {
-                let (tasks, _output_schema, versions, _) = ctx
-                    .plan_sql_with_rls_and_versions(
-                        bound_sql,
-                        self.tenant_id,
-                        self.database_id,
-                        &security.context(self.state),
-                        None,
-                    )
-                    .await?;
-                let lease_scope = self.state.acquire_plan_lease_scope(&versions)?;
-                Ok::<_, crate::Error>((tasks, lease_scope))
-            })
+        // The derived writes (implicit edges, materialized sums, period
+        // locks) join the statement as they do for a client statement. The
+        // plan never carries a Calvin OLLP prediction or a resolved write:
+        // the planner emits neither, so every task takes the staging gate.
+        let (tasks, planned, lease_scope, sum_target_reads) =
+            crate::control::server::shared::retry::retry_on_schema_change(
+                &self.state.lease_drain,
+                move || async move {
+                    let (mut tasks, _output_schema, versions, _) = ctx
+                        .plan_sql_with_rls_and_versions(
+                            bound_sql,
+                            self.tenant_id,
+                            self.database_id,
+                            &security.context(self.state),
+                            None,
+                        )
+                        .await?;
+                    let planned = tasks.len();
+                    let sum_target_reads =
+                        crate::control::server::shared::plan_admission::append_derived_tasks(
+                            self.state,
+                            &mut tasks,
+                            self.tenant_id,
+                            self.database_id,
+                            crate::types::TraceId::ZERO,
+                        )
+                        .await?;
+                    let lease_scope = self.state.acquire_plan_lease_scope(&versions).await?;
+                    Ok::<_, crate::Error>((tasks, planned, lease_scope, sum_target_reads))
+                },
+            )
             .await?;
+        // A lease this node lost ends the procedure with a retryable error
+        // before the statement stages.
+        lease_scope.check_not_revoked()?;
 
-        if let Some(ref tx_ctx) = self.tx_ctx {
-            let mut guard = tx_ctx.lock().unwrap_or_else(|p| p.into_inner());
-            guard.buffer_statement(tasks, lease_scope);
-        } else {
-            // Keep the scope through every route decision, WAL append, and
-            // Data-Plane dispatch; errors also release it via Drop.
-            let _lease_scope = lease_scope;
-            for task in tasks {
-                // Cross-shard trigger origination: when this executor carries a
-                // source-write origin (Event-Plane AFTER-trigger fire path) AND
-                // the node is clustered, a task whose target collection is homed
-                // on a remote node must be dispatched to that node via the
-                // cross-shard event subsystem — NOT written to the local core
-                // (the historical silent mis-write). Stored procedures and
-                // normal client SQL carry no origin, so `route` is `None` and
-                // they always take the unchanged local path below.
-                if let Some(origin) = self.cross_shard_origin.as_ref() {
-                    let route = {
-                        let routing_guard = self
-                            .state
-                            .cluster_routing
-                            .as_ref()
-                            .map(|rw| rw.read().unwrap_or_else(|p| p.into_inner()));
-                        routing_guard.as_deref().map(|routing| {
-                            crate::control::gateway::router::resolve_decision(
-                                task.vshard_id.as_u32(),
-                                self.state.node_id,
-                                Some(routing),
-                                None,
-                            )
-                        })
-                    };
-
-                    match route {
-                        // Single-node (no routing table) or this node owns the
-                        // target vShard: fall through to the local write path.
-                        None | Some(crate::control::gateway::RouteDecision::Local) => {}
-                        Some(crate::control::gateway::RouteDecision::Remote {
-                            node_id, ..
-                        }) => {
-                            self.enqueue_cross_shard_write(
-                                node_id,
-                                origin,
-                                task.vshard_id.as_u32(),
-                                bound_sql,
-                            )?;
-                            continue;
-                        }
-                        Some(crate::control::gateway::RouteDecision::LeaderUnknown {
-                            vshard_id,
-                        }) => {
-                            return Err(crate::Error::NotLeader {
-                                vshard_id: crate::types::VShardId::new(vshard_id as u32),
-                                leader_node: 0,
-                                leader_addr: String::new(),
-                            });
-                        }
-                        Some(crate::control::gateway::RouteDecision::Broadcast { .. }) => {
-                            // `resolve_decision` resolves a single vShard and
-                            // never returns Broadcast; treat as an invariant
-                            // violation rather than silently mis-routing.
-                            return Err(crate::Error::Internal {
-                                detail: "cross-shard trigger: resolve_decision returned \
-                                         Broadcast for a single vShard"
-                                    .into(),
-                            });
-                        }
-                    }
-                }
-
-                // The window opens before the append and closes from the
-                // write's outcome inside the funnel.
-                let owner = RecordOwner {
-                    tenant_id: task.tenant_id,
-                    database_id: task.database_id,
-                    vshard_id: task.vshard_id,
-                };
-                let minted = MintedRecords::open(&self.state.outcome_floor);
-                let outcome =
-                    match minted.append_plan(&self.state.wal, owner, &task.plan, self.event_source)
-                    {
-                        Ok(outcome) => outcome,
-                        Err(error) => {
-                            // Any record appended before the error never reaches
-                            // a core.
-                            minted.cancel(&self.state.wal, owner, 0).await?;
-                            return Err(error);
-                        }
-                    };
-
-                crate::control::server::dispatch_utils::dispatch_trusted_internal_write_to_data_plane(
-                    self.state,
-                    crate::control::server::dispatch_utils::WriteDispatch {
-                        tenant_id: task.tenant_id,
-                        database_id: task.database_id,
-                        vshard_id: task.vshard_id,
-                        plan: task.plan,
-                        trace_id: TraceId::ZERO,
-                        event_source: self.event_source,
-                        txn_id: None,
-                        wal_lsn: outcome.lsn,
-                        resolved_now_ms: outcome.resolved_now_ms,
-                        minted: Some(minted),
-                    },
-                )
-                .await?;
+        // A statement led by another node ships whole and waits for the local
+        // COMMIT. That node plans it again and derives every write it makes,
+        // on every vShard, so the statement and its derived writes commit in
+        // one transaction there, or not at all. Every other statement stages
+        // into the open transaction now, so the next statement sees its
+        // writes. A derived write on another shard stages on that shard's
+        // leader, so placement reads the statement's own tasks only.
+        match self.statement_route(tasks.get(..planned).unwrap_or(&tasks))? {
+            StatementRoute::Remote { vshard_id, .. } => {
+                let mut guard = self.tx_ctx.lock().unwrap_or_else(|p| p.into_inner());
+                guard.buffer_remote(RemoteWrite {
+                    target_vshard: vshard_id,
+                    sql: bound_sql.to_string(),
+                })
             }
+            StatementRoute::Local => self.stage_tasks(tasks, sum_target_reads, lease_scope).await,
         }
-
-        Ok(())
     }
 
-    /// Enqueue a trigger-originated write for delivery to the vShard's owning
-    /// node via the cross-shard event dispatcher.
-    ///
-    /// Event-Plane safe: this only performs a bounded in-memory push (the
-    /// dispatcher's per-target queue). The durable write happens on the target
-    /// node's `CrossShardReceiver`, which WAL-appends and dispatches there. No
-    /// storage I/O or remote DML executes inline here.
-    fn enqueue_cross_shard_write(
+    /// Stage `tasks` and record `reads` in the open transaction, beginning it
+    /// when none is open.
+    async fn stage_tasks(
         &self,
-        target_node: u64,
-        origin: &super::CrossShardOrigin,
-        target_vshard: u32,
-        bound_sql: &str,
+        tasks: Vec<nodedb_physical::physical_task::PhysicalTask>,
+        reads: Vec<crate::control::server::shared::session::read_set::ReadSetEntry>,
+        lease_scope: crate::control::lease::QueryLeaseScope,
     ) -> crate::Result<()> {
-        let request = crate::event::cross_shard::types::CrossShardWriteRequest {
-            sql: bound_sql.to_string(),
-            tenant_id: self.tenant_id.as_u64(),
-            database_id: self.database_id.as_u64(),
-            source_vshard: origin.source_vshard,
-            source_lsn: origin.source_lsn,
-            source_sequence: origin.source_sequence,
-            cascade_depth: self.cascade_depth(),
-            source_collection: origin.source_collection.clone(),
-            target_vshard,
-        };
+        let mut txn = self.txn.lock().await;
+        let open = self.open_txn(&mut txn).await?;
+        open.record_reads(reads)?;
+        open.stage(SystemTxnStatement {
+            tasks,
+            lease_scope: std::sync::Arc::new(lease_scope),
+        })
+        .await
+        .map_err(crate::Error::from)
+    }
 
-        let dispatcher =
-            self.state
-                .cross_shard_dispatcher
-                .as_ref()
-                .ok_or(crate::Error::Dispatch {
-                    detail: "cross-shard dispatcher not initialised for trigger origination"
-                        .to_string(),
-                })?;
-
-        if !dispatcher.enqueue(target_node, request) {
-            return Err(crate::Error::Dispatch {
-                detail: format!("cross-shard send queue full for target node {target_node}"),
-            });
+    /// The open transaction, begun now when none is open. A joined body
+    /// joins its statement's transaction instead.
+    async fn open_txn<'g>(
+        &self,
+        txn: &'g mut Option<OpenSystemTxn<'a>>,
+    ) -> crate::Result<&'g OpenSystemTxn<'a>> {
+        if txn.is_none() {
+            let open = match self.joined {
+                Some(ctx) => {
+                    OpenSystemTxn::join(self.state, self.identity.clone(), ctx, self.tenant_id)
+                        .await?
+                }
+                None => {
+                    let mut open =
+                        OpenSystemTxn::begin(self.state, self.identity.clone(), self.event_source)?;
+                    if let Some((key, target_vshard)) = self.commit_key() {
+                        open.set_applied_key(key, target_vshard);
+                    }
+                    open
+                }
+            };
+            *txn = Some(open);
         }
-
-        Ok(())
+        txn.as_ref().ok_or(crate::Error::Internal {
+            detail: "the procedural transaction did not open".into(),
+        })
     }
 
     /// Return the procedural session's identity for use when dispatching SQL extensions.
@@ -267,119 +235,150 @@ impl<'a> StatementExecutor<'a> {
     // ── Transaction control ─────────────────────────────────────────────
 
     pub(super) async fn execute_commit(&self) -> crate::Result<()> {
+        self.refuse_in_atomic_body("COMMIT")?;
         self.flush_transaction_buffer().await
     }
 
-    pub(super) fn execute_rollback(&self) -> crate::Result<()> {
-        self.with_tx_ctx("ROLLBACK", |ctx| {
-            ctx.rollback();
-            Ok(())
-        })
+    pub(super) async fn execute_rollback(&self) -> crate::Result<()> {
+        self.refuse_in_atomic_body("ROLLBACK")?;
+        self.discard_transaction_buffer().await;
+        Ok(())
     }
 
-    pub(super) fn execute_savepoint(&self, name: &str) -> crate::Result<()> {
-        self.with_tx_ctx("SAVEPOINT", |ctx| {
+    pub(super) async fn execute_savepoint(&self, name: &str) -> crate::Result<()> {
+        let mut txn = self.txn.lock().await;
+        self.open_txn(&mut txn)
+            .await?
+            .savepoint(self.tenant_id, name)
+            .await?;
+        self.with_tx_ctx(|ctx| {
             ctx.savepoint(name);
             Ok(())
         })
     }
 
-    pub(super) fn execute_rollback_to(&self, name: &str) -> crate::Result<()> {
-        self.with_tx_ctx("ROLLBACK TO", |ctx| ctx.rollback_to(name))
-    }
-
-    pub(super) fn execute_release_savepoint(&self, name: &str) -> crate::Result<()> {
-        self.with_tx_ctx("RELEASE SAVEPOINT", |ctx| ctx.release_savepoint(name))
-    }
-
-    fn with_tx_ctx(
-        &self,
-        stmt_name: &str,
-        f: impl FnOnce(&mut ProcedureTransactionCtx) -> crate::Result<()>,
-    ) -> crate::Result<()> {
-        match self.tx_ctx {
-            Some(ref tx_ctx) => {
-                let mut guard = tx_ctx.lock().unwrap_or_else(|p| p.into_inner());
-                f(&mut guard)
-            }
+    pub(super) async fn execute_rollback_to(&self, name: &str) -> crate::Result<()> {
+        self.with_tx_ctx(|ctx| ctx.rollback_to(name))?;
+        let txn = self.txn.lock().await;
+        match txn.as_ref() {
+            Some(open) => open.rollback_to(self.tenant_id, name).await,
             None => Err(crate::Error::BadRequest {
-                detail: format!("{stmt_name} is only valid inside stored procedures"),
+                detail: format!("savepoint '{name}' does not exist"),
             }),
         }
     }
 
-    /// Commit the procedure transaction buffer as one system transaction.
-    ///
-    /// Every statement's tasks stage through the same path a client
-    /// transaction takes, and COMMIT resolves them into one redo record that
-    /// installs all of them or none. Restart replay installs that same
-    /// record. Each statement's descriptor leases stay on the tasks it
-    /// buffered until COMMIT has checked them.
-    pub(super) async fn flush_transaction_buffer(&self) -> crate::Result<()> {
-        let statements = if let Some(ref tx_ctx) = self.tx_ctx {
-            let mut guard = tx_ctx.lock().unwrap_or_else(|p| p.into_inner());
-            guard.take_statements()
-        } else {
-            return Ok(());
-        };
-        if statements.iter().all(|(tasks, _)| tasks.is_empty()) {
-            return Ok(());
+    pub(super) async fn execute_release_savepoint(&self, name: &str) -> crate::Result<()> {
+        self.with_tx_ctx(|ctx| ctx.release_savepoint(name))?;
+        let txn = self.txn.lock().await;
+        match txn.as_ref() {
+            Some(open) => open.release(name),
+            None => Err(crate::Error::BadRequest {
+                detail: format!("savepoint '{name}' does not exist"),
+            }),
         }
-        let statements = statements
-            .into_iter()
-            .map(
-                |(tasks, lease_scope)| crate::control::system_txn::SystemTxnStatement {
-                    tasks,
-                    lease_scope: std::sync::Arc::new(lease_scope),
-                },
-            )
-            .collect();
-        crate::control::system_txn::run_statements_atomically(
-            self.state,
-            &self.identity_for_dispatch(),
-            statements,
-            self.event_source,
-        )
-        .await
-        .map_err(crate::Error::from)
+    }
+
+    /// A server-run body commits once, at its end, so it refuses statements
+    /// that end its transaction early.
+    fn refuse_in_atomic_body(&self, statement: &str) -> crate::Result<()> {
+        match self.body {
+            Some(ref body) => Err(body.refuse_transaction_control(statement)),
+            None => Ok(()),
+        }
+    }
+
+    fn with_tx_ctx(
+        &self,
+        f: impl FnOnce(&mut ProcedureTransactionCtx) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        let mut guard = self.tx_ctx.lock().unwrap_or_else(|p| p.into_inner());
+        f(&mut guard)
+    }
+
+    /// Roll back the open transaction and drop its held effects.
+    pub(super) async fn discard_transaction_buffer(&self) {
+        {
+            let mut guard = self.tx_ctx.lock().unwrap_or_else(|p| p.into_inner());
+            guard.rollback();
+        }
+        let open = self.txn.lock().await.take();
+        if let Some(open) = open {
+            open.rollback().await;
+        }
+    }
+
+    /// Commit the open transaction: every staged and buffered write lands in
+    /// one redo record that installs all of them or none. Restart replay
+    /// installs that same record. Each statement's descriptor leases stay on
+    /// the tasks it buffered until COMMIT has checked them.
+    ///
+    /// Held publishes commit in a redo record: a joined body's in its
+    /// statement's, every other body's in this one, so a publish and its
+    /// transaction commit together. Held cross-node writes are queued once
+    /// the commit succeeds, and a queueing error leaves a durable retry
+    /// record. All of them drop with the commit when it fails.
+    pub(super) async fn flush_transaction_buffer(&self) -> crate::Result<()> {
+        let mut effects = {
+            let mut guard = self.tx_ctx.lock().unwrap_or_else(|p| p.into_inner());
+            guard.take_effects()
+        };
+        if let Some(ctx) = self.joined {
+            let open = self.txn.lock().await.take();
+            if let Some(open) = open {
+                open.commit().await.map_err(crate::Error::from)?;
+            }
+            return self.defer_to_statement(ctx, effects);
+        }
+        // The body's messages and its cross-node requests commit in its redo
+        // record, with its writes.
+        let mut publishes = self.redo_publishes(std::mem::take(&mut effects.publishes));
+        publishes.extend(self.outbox_messages(std::mem::take(&mut effects.remote))?);
+        if !publishes.is_empty() {
+            let mut txn = self.txn.lock().await;
+            self.open_txn(&mut txn).await?.hold_publishes(publishes)?;
+        }
+        let open = self.txn.lock().await.take();
+        if let Some(open) = open {
+            open.commit().await.map_err(crate::Error::from)?;
+        }
+        Ok(())
     }
 }
 
-/// Deterministic coverage for the cross-shard trigger ORIGINATION logic
-/// (the `execute_sql` routing branch above). A full-cluster e2e test cannot
-/// cover this: that harness cannot place different vShards' Raft leadership
-/// on different nodes, so a same-node "remote" route never arises there.
-/// Here the routing table is built directly, so both `Local` and `Remote`
-/// decisions are reachable without a cluster.
+/// A trigger body's local writes on a one-node cluster: staging, rollback,
+/// transaction control, and committed publishes. The cluster applies its
+/// Raft entries through a fake Data-Plane core, so tests observe what is
+/// staged, WAL-appended and queued at each statement.
 ///
-/// The send/receive path (dispatcher retry/DLQ/HWM-dedup, wire
-/// serialization, receiver apply) is covered separately by
-/// `nodedb/tests/event_cross_shard.rs` and
-/// `nodedb/src/event/cross_shard/dispatcher.rs`'s own unit tests; this
-/// module only proves the origination gate in `execute_sql`.
+/// The cross-node half of origination runs on the multi-node cluster harness
+/// (`trigger_cross_shard_origination` and `trigger_body_atomic_cross_node`
+/// in the cluster test suite), where a real remote node exists. The
+/// send/receive path (dispatcher retry/DLQ, dedup, wire serialization,
+/// receiver apply) is covered by `nodedb/tests/inproc/cases/event_cross_shard.rs`
+/// and the `event::cross_shard` unit tests. Read-your-own-writes against a
+/// real Data Plane is covered by `nodedb/tests/wire/cases/procedural_txn_visibility.rs`.
 #[cfg(test)]
-mod cross_shard_origination_tests {
-    use std::sync::{Arc, RwLock};
+mod origination_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    use nodedb_cluster::RoutingTable;
+    use nodedb_physical::physical_plan::MetaOp;
     use nodedb_types::DatabaseId;
 
+    use crate::bridge::dispatch::{BridgeResponse, CoreChannelDataSide};
+    use crate::bridge::envelope::{ErrorCode, Payload, PhysicalPlan, Response, Status};
+    use crate::control::cluster::test_one_node::{OneNodeCluster, boot_with_core};
     use crate::control::planner::procedural::executor::bindings::RowBindings;
     use crate::control::planner::procedural::executor::core::{
-        CrossShardOrigin, StatementExecutor,
+        AtomicBody, CrossShardOrigin, StatementExecutor,
     };
     use crate::control::security::identity::AuthenticatedIdentity;
     use crate::control::server::shared::ddl::neutral::collection::create::handler::create_collection;
     use crate::control::server::shared::ddl::neutral::collection::create::request::CreateCollectionRequest;
     use crate::control::state::SharedState;
-    use crate::event::cross_shard::{CrossShardDispatcher, CrossShardMetrics};
-    use crate::types::TenantId;
-    use crate::wal::WalManager;
-
-    /// This node's id in every fixture below.
-    const LOCAL_NODE: u64 = 1;
-    /// The other cluster member every fixture routes remote writes to.
-    const REMOTE_NODE: u64 = 2;
+    use crate::types::{Lsn, TenantId};
 
     fn test_identity() -> AuthenticatedIdentity {
         AuthenticatedIdentity::new_internal_service(
@@ -393,101 +392,164 @@ mod cross_shard_origination_tests {
         )
     }
 
-    /// Build a `SharedState` wired for cross-shard trigger origination: a
-    /// 2-group routing table (data group 1 led by `LOCAL_NODE`, data group 2
-    /// led by `REMOTE_NODE`) plus a live `CrossShardDispatcher`. Under
-    /// `RoutingTable::uniform`, even vShards map to group 1 (local) and odd
-    /// vShards map to group 2 (remote). Also creates `coll_name` as a
-    /// `document_strict` collection with `id TEXT PRIMARY KEY` so `INSERT`
-    /// plans against it.
-    async fn build_state_with_collection(
-        dir: &tempfile::TempDir,
-        coll_name: &str,
-    ) -> Arc<SharedState> {
-        let wal_path = dir.path().join("test.wal");
-        let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
-        let (dispatcher, _data_sides) = crate::bridge::dispatch::Dispatcher::new(1, 16);
-        let mut state = SharedState::new(dispatcher, wal).unwrap();
+    /// Create `name` as a `document_strict` collection with
+    /// `id TEXT PRIMARY KEY, val INT` in `database_id`.
+    async fn create_strict(state: &Arc<SharedState>, name: &str, database_id: DatabaseId) {
+        let columns = vec![
+            ("id".to_string(), "TEXT PRIMARY KEY".to_string()),
+            ("val".to_string(), "INT".to_string()),
+        ];
+        let req = CreateCollectionRequest {
+            name,
+            engine: Some("document_strict"),
+            columns: &columns,
+            options: &[],
+            flags: &[],
+            balanced_raw: None,
+        };
+        create_collection(state, &test_identity(), &req, database_id)
+            .await
+            .unwrap_or_else(|e| panic!("create_collection({name}) failed: {e:?}"));
+    }
 
-        {
-            let s = Arc::get_mut(&mut state)
-                .expect("sole owner: no clone has been taken yet in this fixture");
-            s.node_id = LOCAL_NODE;
-            let routing = RoutingTable::uniform(2, &[LOCAL_NODE, REMOTE_NODE], 1);
-            s.cluster_routing = Some(Arc::new(RwLock::new(routing)));
-            s.cross_shard_dispatcher = Some(Arc::new(CrossShardDispatcher::new(
-                LOCAL_NODE,
-                Arc::new(CrossShardMetrics::new()),
-            )));
+    /// How the fake core answers everything that is not a staged write.
+    #[derive(Clone, Copy)]
+    enum OtherRequests {
+        Succeed,
+        Fail,
+    }
+
+    /// A fake Data-Plane core the one-node cluster applies its Raft entries
+    /// through. A staged write answers with one affected row. It records the
+    /// staged writes and overlay releases it sees, in order.
+    #[derive(Clone)]
+    struct FakeCore {
+        seen: Arc<Mutex<Vec<&'static str>>>,
+        fail_other: Arc<AtomicBool>,
+    }
+
+    impl FakeCore {
+        fn new() -> Self {
+            Self {
+                seen: Arc::new(Mutex::new(Vec::new())),
+                fail_other: Arc::new(AtomicBool::new(false)),
+            }
         }
 
-        let identity = test_identity();
-        let columns = vec![
-            ("id".to_string(), "TEXT PRIMARY KEY".to_string()),
-            ("val".to_string(), "INT".to_string()),
-        ];
-        let req = CreateCollectionRequest {
-            name: coll_name,
-            engine: Some("document_strict"),
-            columns: &columns,
-            options: &[],
-            flags: &[],
-            balanced_raw: None,
-        };
-        create_collection(&state, &identity, &req, DatabaseId::DEFAULT)
-            .await
-            .unwrap_or_else(|e| panic!("create_collection({coll_name}) failed: {e:?}"));
+        fn seen(&self) -> Vec<&'static str> {
+            self.seen.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
 
-        state
+        /// Answer every later request that is not a staged write as `other`.
+        fn answer_other(&self, other: OtherRequests) {
+            self.fail_other
+                .store(matches!(other, OtherRequests::Fail), Ordering::Relaxed);
+        }
+
+        fn spawn(
+            &self,
+            state: Arc<SharedState>,
+            side: CoreChannelDataSide,
+        ) -> tokio::task::JoinHandle<()> {
+            tokio::spawn(answer(self.clone(), state, side))
+        }
     }
 
-    /// Build an unclustered state with a collection in an explicit database.
-    /// This keeps procedural DML buffered while the test verifies planning
-    /// scope, and lets procedural PUBLISH complete locally.
-    async fn build_unrouted_state_with_collection(
-        dir: &tempfile::TempDir,
-        coll_name: &str,
-        database_id: DatabaseId,
-    ) -> Arc<SharedState> {
-        let wal_path = dir.path().join("test-unrouted.wal");
-        let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
-        let (dispatcher, _data_sides) = crate::bridge::dispatch::Dispatcher::new(1, 16);
-        let state = SharedState::new(dispatcher, wal).unwrap();
-        let identity = test_identity();
-        let columns = vec![
-            ("id".to_string(), "TEXT PRIMARY KEY".to_string()),
-            ("val".to_string(), "INT".to_string()),
-        ];
-        let req = CreateCollectionRequest {
-            name: coll_name,
-            engine: Some("document_strict"),
-            columns: &columns,
-            options: &[],
-            flags: &[],
-            balanced_raw: None,
-        };
-        create_collection(&state, &identity, &req, database_id)
-            .await
-            .unwrap_or_else(|e| panic!("create_collection({coll_name}) failed: {e:?}"));
-        state
+    async fn answer(core: FakeCore, state: Arc<SharedState>, mut side: CoreChannelDataSide) {
+        loop {
+            while let Ok(request) = side.request_rx.try_pop() {
+                let request = request.inner;
+                let kind = match &request.plan {
+                    PhysicalPlan::Meta(MetaOp::StageWrite { .. }) => Some("stage"),
+                    PhysicalPlan::Meta(MetaOp::DropTxnOverlay { .. }) => Some("drop_overlay"),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    core.seen
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(kind);
+                }
+                let (status, payload, error_code) = match kind {
+                    Some("stage") => (
+                        Status::Ok,
+                        crate::data::executor::response_codec::encode_count("affected", 1)
+                            .expect("count payload"),
+                        None,
+                    ),
+                    _ if core.fail_other.load(Ordering::Relaxed) => (
+                        Status::Error,
+                        Vec::new(),
+                        Some(Box::new(ErrorCode::Internal {
+                            detail: "fake core refuses".into(),
+                        })),
+                    ),
+                    _ => (Status::Ok, Vec::new(), None),
+                };
+                let response = Response {
+                    request_id: request.request_id,
+                    status,
+                    attempt: 1,
+                    partial: false,
+                    payload: Payload::from_vec(payload),
+                    watermark_lsn: Lsn::ZERO,
+                    error_code,
+                    read_set_valid: None,
+                    read_version_lsn: Lsn::ZERO,
+                    write_set: Vec::new(),
+                };
+                side.response_tx
+                    .try_push(BridgeResponse { inner: response })
+                    .expect("fake core response queue has capacity");
+            }
+            state.poll_and_route_responses();
+            tokio::task::yield_now().await;
+        }
     }
 
-    /// Procedural PUBLISH and DML must both retain the executor's explicit
-    /// database instead of falling back to `DatabaseId::DEFAULT`.
-    #[tokio::test]
-    async fn procedural_publish_and_dml_use_explicit_non_default_database() {
-        let dir = tempfile::tempdir().unwrap();
-        let database_id = DatabaseId::new(9);
-        let state = build_unrouted_state_with_collection(&dir, "scoped_orders", database_id).await;
+    /// A one-node cluster whose Data Plane is `core`, with every name in
+    /// `collections` created in the default database.
+    async fn node_with_collections(core: &FakeCore, collections: &[&str]) -> OneNodeCluster {
+        let spawner = core.clone();
+        let cluster = boot_with_core(|_| {}, move |state, side| spawner.spawn(state, side)).await;
+        for name in collections {
+            create_strict(&cluster.state, name, DatabaseId::DEFAULT).await;
+        }
+        cluster
+    }
+
+    /// The WAL's data records at or above `from`: row writes and committed
+    /// transaction redo.
+    fn data_records_since(state: &SharedState, from: Lsn) -> usize {
+        use nodedb_wal::record::RecordType;
+        state.wal.sync().expect("sync wal");
+        state
+            .wal
+            .replay()
+            .expect("read wal")
+            .into_iter()
+            .filter(|record| record.header.lsn >= from.as_u64())
+            .filter(|record| {
+                matches!(
+                    RecordType::from_raw(record.logical_record_type()),
+                    Some(RecordType::Put | RecordType::Delete | RecordType::TransactionRedo)
+                )
+            })
+            .count()
+    }
+
+    /// Register `name` as a durable topic in `database_id`.
+    fn register_topic(state: &SharedState, name: &str, database_id: DatabaseId) {
         let topic = crate::event::topic::TopicDef {
             tenant_id: 1,
-            name: "scoped_events".into(),
+            name: name.into(),
             retention: crate::event::cdc::stream_def::RetentionConfig::default(),
             owner: "cross_shard_origin_test".into(),
             created_at: 0,
             database_id,
             last_sequence: 0,
             last_lsn: 0,
+            last_epoch: 0,
             modification_hlc: nodedb_types::Hlc::ZERO,
         };
         // A topic exists only once it is durable: PUBLISH revalidates the
@@ -499,16 +561,68 @@ mod cross_shard_origination_tests {
             .put_ep_topic(&topic)
             .expect("persist topic");
         state.ep_topic_registry.register(topic);
+    }
+
+    /// A trigger-body executor carrying a source-write origin.
+    fn trigger_executor(state: &SharedState) -> StatementExecutor<'_> {
+        StatementExecutor::with_source(
+            state,
+            test_identity(),
+            TenantId::new(1),
+            0,
+            crate::event::EventSource::Trigger,
+        )
+        .with_atomic_body(AtomicBody::trigger("probe"))
+        .with_cross_shard_origin(CrossShardOrigin {
+            source_lsn: 100,
+            source_sequence: 7,
+            source_vshard: 999,
+            source_collection: "src_probe".to_string(),
+        })
+    }
+
+    fn parse(sql: &str) -> crate::control::planner::procedural::ast::ProceduralBlock {
+        crate::control::planner::procedural::parse_block(sql)
+            .unwrap_or_else(|e| panic!("parse {sql}: {e}"))
+    }
+
+    /// Writes this node's cross-shard dispatcher holds for another node. A
+    /// one-node cluster homes every collection here, so it never holds one.
+    fn pending(state: &SharedState) -> usize {
+        state
+            .cross_shard_dispatcher
+            .as_ref()
+            .expect("the cluster wiring installs the dispatcher")
+            .total_pending()
+    }
+
+    /// PUBLISH and DML both keep the executor's explicit database instead of
+    /// falling back to `DatabaseId::DEFAULT`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn procedural_publish_and_dml_use_explicit_non_default_database() {
+        let core = FakeCore::new();
+        let cluster = node_with_collections(&core, &[]).await;
+        let state = &cluster.state;
+        let database_id = DatabaseId::new(9);
+        let mut database = crate::control::security::catalog::DatabaseDescriptor::default_db();
+        database.id = database_id;
+        database.name = "scoped_database".into();
+        state
+            .credentials
+            .catalog()
+            .put_database(&database)
+            .expect("add the scoped database");
+        create_strict(state, "scoped_orders", database_id).await;
+        register_topic(state, "scoped_events", database_id);
 
         let executor = StatementExecutor::with_source_in_database(
-            &state,
+            state,
             test_identity(),
             TenantId::new(1),
             database_id,
             0,
             crate::event::EventSource::User,
-        )
-        .with_transaction_context();
+        );
 
         executor
             .execute_sql(
@@ -523,148 +637,297 @@ mod cross_shard_origination_tests {
                 &RowBindings::empty(),
             )
             .await
-            .expect("DML must plan against the executor database");
+            .expect("DML must plan and stage against the executor database");
+        executor.discard_transaction_buffer().await;
+        drop(executor);
+        cluster.shutdown().await;
     }
 
-    /// Find a `{prefix}_<i>` collection name whose vShard is homed on
-    /// `REMOTE_NODE` under the routing table `build_state_with_collection`
-    /// installs (odd vShard → data group 2 → `REMOTE_NODE`).
-    fn remote_homed_name(prefix: &str) -> String {
-        for i in 0..4096u32 {
-            let name = format!("{prefix}_{i}");
-            let vshard = nodedb_cluster::routing::vshard_for_collection(
-                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &name),
-            );
-            if vshard % 2 == 1 {
-                return name;
-            }
-        }
-        panic!("could not find a remote-homed collection name for prefix {prefix}");
-    }
+    /// A local write stages into the overlay at its statement, before the next
+    /// statement plans. Nothing reaches the WAL until COMMIT.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_write_stages_at_its_statement() {
+        let core = FakeCore::new();
+        let cluster = node_with_collections(&core, &["cs_stage_local"]).await;
+        let state = &cluster.state;
+        let lsn_before = state.wal.next_lsn();
+        let executor = trigger_executor(state);
 
-    /// Find a `{prefix}_<i>` collection name whose vShard is homed on
-    /// `LOCAL_NODE` (even vShard → data group 1 → `LOCAL_NODE`).
-    fn local_homed_name(prefix: &str) -> String {
-        for i in 0..4096u32 {
-            let name = format!("{prefix}_{i}");
-            let vshard = nodedb_cluster::routing::vshard_for_collection(
-                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &name),
-            );
-            if vshard.is_multiple_of(2) {
-                return name;
-            }
-        }
-        panic!("could not find a local-homed collection name for prefix {prefix}");
-    }
-
-    /// WHEN `cross_shard_origin` is set AND the write's target vShard
-    /// resolves to a REMOTE node, THEN `execute_sql` enqueues a
-    /// `CrossShardWriteRequest` to that node's dispatcher queue instead of
-    /// taking the local write path. Non-vacuous: reverting the `Some(origin)`
-    /// branch in `execute_sql` back to always-local would make this test
-    /// enqueue nothing and fail the `total_pending() == 1` assertion.
-    #[tokio::test]
-    async fn trigger_write_to_remote_homed_collection_enqueues_cross_shard() {
-        let dir = tempfile::tempdir().unwrap();
-        let tgt = remote_homed_name("cs_origin_remote");
-        let state = build_state_with_collection(&dir, &tgt).await;
-
-        let executor = StatementExecutor::with_source(
-            &state,
-            test_identity(),
-            TenantId::new(1),
-            0,
-            crate::event::EventSource::Trigger,
-        )
-        .with_cross_shard_origin(CrossShardOrigin {
-            source_lsn: 100,
-            source_sequence: 7,
-            source_vshard: 999,
-            source_collection: "src_probe".to_string(),
-        });
-
-        let sql = format!("INSERT INTO {tgt} (id, val) VALUES ('fired', 1)");
         executor
-            .execute_sql(&sql, &RowBindings::empty())
+            .execute_sql(
+                "INSERT INTO cs_stage_local (id, val) VALUES ('local', 1)",
+                &RowBindings::empty(),
+            )
             .await
-            .expect("execute_sql should enqueue the remote write, not fail");
+            .expect("the local write stages");
 
-        let dispatcher = state
-            .cross_shard_dispatcher
-            .as_ref()
-            .expect("dispatcher configured by build_state_with_collection");
         assert_eq!(
-            dispatcher.total_pending(),
-            1,
-            "exactly one cross-shard write must be enqueued"
+            core.seen(),
+            vec!["stage"],
+            "staged before the statement returns"
         );
         assert_eq!(
-            dispatcher.active_targets(),
-            vec![REMOTE_NODE],
-            "the write must be enqueued to the target's owning node"
+            data_records_since(state, lsn_before),
+            0,
+            "nothing is WAL-appended"
         );
-
-        let pending = dispatcher.peek_pending(REMOTE_NODE);
-        assert_eq!(pending.len(), 1);
-        let req = &pending[0];
-        assert_eq!(req.sql, sql);
-        assert_eq!(req.source_lsn, 100);
-        assert_eq!(req.source_sequence, 7);
-        assert_eq!(req.source_vshard, 999);
-        assert_eq!(req.source_collection, "src_probe");
-        assert_eq!(req.cascade_depth, 0);
-        assert_eq!(
-            req.target_vshard,
-            nodedb_cluster::routing::vshard_for_collection(nodedb_types::CollectionKey::from_bare(
-                DatabaseId::DEFAULT,
-                &tgt,
-            ))
-        );
+        assert_eq!(pending(state), 0, "a local write is never queued remotely");
+        executor.discard_transaction_buffer().await;
+        drop(executor);
+        cluster.shutdown().await;
     }
 
-    /// Companion gate assertion: with the SAME `cross_shard_origin` set, a
-    /// write whose target vShard resolves to `Local` (this node owns it)
-    /// must NOT be enqueued to the cross-shard dispatcher — proving the gate
-    /// is routing-driven, not "always enqueue when origin is set". No Data
-    /// Plane core is running to drain the SPSC bridge in this fixture, so the
-    /// local path's `dispatch_write_to_data_plane` await never resolves on
-    /// its own; bounding it with a timeout is enough to observe that the
-    /// cross-shard dispatcher was never touched before that await blocks.
-    #[tokio::test]
-    async fn trigger_write_to_locally_homed_collection_never_enqueues_cross_shard() {
-        let dir = tempfile::tempdir().unwrap();
-        let tgt = local_homed_name("cs_origin_local");
-        let state = build_state_with_collection(&dir, &tgt).await;
+    /// An executor dropped with its transaction open (its future cancelled)
+    /// releases the staging overlay on a spawned rollback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_open_transaction_releases_its_overlay() {
+        let core = FakeCore::new();
+        // The spawned rollback takes its owned handle to the state through
+        // the node's gateway.
+        let cluster = node_with_collections(&core, &["cs_drop_local"]).await;
+        let state = &cluster.state;
+        let tgt = "cs_drop_local";
 
-        let executor = StatementExecutor::with_source(
-            &state,
+        let executor = trigger_executor(state);
+        executor
+            .execute_sql(
+                &format!("INSERT INTO {tgt} (id, val) VALUES ('dropped', 1)"),
+                &RowBindings::empty(),
+            )
+            .await
+            .expect("the local write stages");
+        drop(executor);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !core.seen().contains(&"drop_overlay") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the dropped transaction never released its overlay: {:?}",
+                core.seen()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cluster.shutdown().await;
+    }
+
+    /// A body whose local COMMIT fails reports the refusal and queues
+    /// nothing for another node.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_local_commit_fails_the_body() {
+        let core = FakeCore::new();
+        let cluster = node_with_collections(&core, &["cs_wait_local"]).await;
+        let state = &cluster.state;
+        let executor = trigger_executor(state);
+        executor
+            .execute_sql(
+                "INSERT INTO cs_wait_local (id, val) VALUES ('l', 1)",
+                &RowBindings::empty(),
+            )
+            .await
+            .expect("the local write stages");
+
+        core.answer_other(OtherRequests::Fail);
+        let committed =
+            tokio::time::timeout(Duration::from_secs(5), executor.flush_transaction_buffer())
+                .await
+                .expect("the refused COMMIT returns");
+        core.answer_other(OtherRequests::Succeed);
+        assert!(committed.is_err(), "the fake core refuses the COMMIT");
+        assert_eq!(pending(state), 0, "a refused body queues nothing");
+        drop(executor);
+        cluster.shutdown().await;
+    }
+
+    /// A body whose second statement fails WAL-appends nothing and rolls its
+    /// staged write back out of the overlay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_body_leaves_no_local_write() {
+        let core = FakeCore::new();
+        let cluster = node_with_collections(&core, &["cs_fail_local"]).await;
+        let state = &cluster.state;
+        let lsn_before = state.wal.next_lsn();
+
+        let executor = trigger_executor(state);
+        let block = parse(
+            "BEGIN INSERT INTO cs_fail_local (id, val) VALUES ('a', 1); \
+             INSERT INTO cs_fail_missing (id, val) VALUES ('b', 2); END",
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            executor.execute_block(&block, &RowBindings::empty()),
+        )
+        .await
+        .expect("a failed body returns");
+        assert!(
+            result.is_err(),
+            "the second statement's collection is missing"
+        );
+
+        assert_eq!(
+            data_records_since(state, lsn_before),
+            0,
+            "nothing is WAL-appended"
+        );
+        let seen = core.seen();
+        assert_eq!(
+            seen.first(),
+            Some(&"stage"),
+            "the first write staged: {seen:?}"
+        );
+        assert!(
+            seen.contains(&"drop_overlay"),
+            "the failed body releases its overlay: {seen:?}"
+        );
+        assert_eq!(pending(state), 0);
+        drop(executor);
+        cluster.shutdown().await;
+    }
+
+    /// COMMIT and ROLLBACK are refused inside a trigger body. SAVEPOINT is
+    /// allowed, and a stored procedure still accepts COMMIT.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transaction_control_is_refused_in_trigger_bodies() {
+        let core = FakeCore::new();
+        let cluster = node_with_collections(&core, &[]).await;
+        let state = &cluster.state;
+
+        for statement in ["COMMIT", "ROLLBACK"] {
+            let result = trigger_executor(state)
+                .execute_block(
+                    &parse(&format!("BEGIN {statement}; END")),
+                    &RowBindings::empty(),
+                )
+                .await;
+            assert!(
+                matches!(result, Err(crate::Error::NotInTransactionBlock { .. })),
+                "{statement} in a trigger body must be refused, got {result:?}"
+            );
+        }
+
+        let savepoints = trigger_executor(state);
+        savepoints
+            .execute_savepoint("sp1")
+            .await
+            .expect("SAVEPOINT is allowed in a trigger body");
+        savepoints
+            .execute_rollback_to("sp1")
+            .await
+            .expect("ROLLBACK TO is allowed in a trigger body");
+        savepoints
+            .execute_release_savepoint("sp1")
+            .await
+            .expect("RELEASE SAVEPOINT is allowed in a trigger body");
+        savepoints.discard_transaction_buffer().await;
+        drop(savepoints);
+
+        StatementExecutor::with_source(
+            state,
             test_identity(),
             TenantId::new(1),
             0,
+            crate::event::EventSource::User,
+        )
+        .execute_block(&parse("BEGIN COMMIT; END"), &RowBindings::empty())
+        .await
+        .expect("a stored procedure accepts COMMIT");
+        cluster.shutdown().await;
+    }
+
+    /// A shipped block never carries PUBLISH: its origin publishes from its
+    /// own commit. One that does is refused before anything applies, so the
+    /// receiver never holds a publish it owes after its commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shipped_block_refuses_publish() {
+        let core = FakeCore::new();
+        let cluster = node_with_collections(&core, &["shipped_rows"]).await;
+        let state = &cluster.state;
+        register_topic(state, "shipped_events", DatabaseId::DEFAULT);
+
+        let result = StatementExecutor::with_source(
+            state,
+            test_identity(),
+            TenantId::new(1),
+            1,
             crate::event::EventSource::Trigger,
         )
-        .with_cross_shard_origin(CrossShardOrigin {
-            source_lsn: 1,
-            source_sequence: 1,
-            source_vshard: 0,
-            source_collection: "src_probe".to_string(),
-        });
-
-        let sql = format!("INSERT INTO {tgt} (id, val) VALUES ('local', 1)");
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            executor.execute_sql(&sql, &RowBindings::empty()),
+        .with_atomic_body(AtomicBody::CrossShardApply)
+        .execute_block(
+            &parse("BEGIN PUBLISH TO shipped_events 'x'; END"),
+            &RowBindings::empty(),
         )
         .await;
-
-        let dispatcher = state
-            .cross_shard_dispatcher
-            .as_ref()
-            .expect("dispatcher configured by build_state_with_collection");
-        assert_eq!(
-            dispatcher.total_pending(),
-            0,
-            "a Local-routed write must never be enqueued to the cross-shard dispatcher"
+        assert!(
+            matches!(result, Err(crate::Error::BadRequest { .. })),
+            "{result:?}"
         );
+        cluster.shutdown().await;
+    }
+
+    /// A PUBLISH in a body that fails is never sent. The same PUBLISH in a
+    /// body that succeeds is sent once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_in_a_failed_body_is_never_sent() {
+        let core = FakeCore::new();
+        // One node homes every collection, so the body commits on this
+        // node's own apply.
+        let cluster = node_with_collections(&core, &["body_rows"]).await;
+        let state = &cluster.state;
+        register_topic(state, "body_events", DatabaseId::DEFAULT);
+        let mut messages = state
+            .ep_topic_registry
+            .sender(DatabaseId::DEFAULT, 1, "body_events")
+            .expect("topic sender")
+            .subscribe();
+
+        let failed = trigger_executor(state)
+            .execute_block(
+                &parse("BEGIN PUBLISH TO body_events 'rolled back'; RAISE EXCEPTION 'boom'; END"),
+                &RowBindings::empty(),
+            )
+            .await;
+        assert!(failed.is_err(), "the body raises");
+        assert!(
+            committed_publishes(state).is_empty(),
+            "a rolled-back body commits no message"
+        );
+
+        trigger_executor(state)
+            .execute_block(
+                &parse("BEGIN PUBLISH TO body_events 'committed'; END"),
+                &RowBindings::empty(),
+            )
+            .await
+            .expect("the body commits");
+        let committed = committed_publishes(state);
+        assert_eq!(committed.len(), 1, "the message commits once");
+        assert_eq!(committed[0].topic, "body_events");
+        assert_eq!(committed[0].payload, "committed");
+        assert!(
+            messages.try_recv().is_err(),
+            "the body sends nothing itself: the Event Plane delivers the committed message"
+        );
+        drop(messages);
+        cluster.shutdown().await;
+    }
+
+    /// Every `PUBLISH TO` message the node's WAL holds in a committed redo
+    /// record, in WAL order.
+    fn committed_publishes(state: &SharedState) -> Vec<crate::wal::RedoPublish> {
+        state.wal.sync().expect("sync wal");
+        state
+            .wal
+            .replay()
+            .expect("read wal")
+            .into_iter()
+            .filter(|record| {
+                nodedb_wal::record::RecordType::from_raw(record.logical_record_type())
+                    == Some(nodedb_wal::record::RecordType::TransactionRedo)
+            })
+            .flat_map(|record| {
+                crate::wal::RedoRecord::from_bytes(&record.payload)
+                    .expect("decode redo record")
+                    .publishes
+            })
+            .collect()
     }
 }

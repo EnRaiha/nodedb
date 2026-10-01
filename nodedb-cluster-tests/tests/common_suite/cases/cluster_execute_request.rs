@@ -39,7 +39,7 @@ fn make_kv_put_request(
         key: b"test-key".to_vec(),
         value: value_bytes,
         ttl_ms: 0,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"test-key".as_ref()),
         returning: None,
         rls_filters: Vec::new(),
         provenance: None,
@@ -58,6 +58,8 @@ fn make_kv_put_request(
             version: descriptor_version,
         }],
         txn_id: None,
+        vshard_id: None,
+        read_groups: Vec::new(),
     }
 }
 
@@ -168,6 +170,8 @@ async fn execute_request_read_carries_watermark_lsn() {
         trace_id: [0u8; 16],
         descriptor_versions: vec![],
         txn_id: None,
+        vshard_id: None,
+        read_groups: Vec::new(),
     };
 
     let resp = send_execute_request(transport, node1.listen_addr, req).await;
@@ -284,7 +288,7 @@ async fn execute_request_cross_node_dispatch() {
                 key: b"k1".to_vec(),
                 value: value_bytes,
                 ttl_ms: 0,
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"k1".as_ref()),
                 returning: None,
                 rls_filters: Vec::new(),
                 provenance: None,
@@ -300,6 +304,8 @@ async fn execute_request_cross_node_dispatch() {
             version: 0, // Accept any version (pre-B.1 sentinel bypass)
         }],
         txn_id: None,
+        vshard_id: None,
+        read_groups: Vec::new(),
     };
 
     let resp = send_execute_request(sender_transport, target_addr, req).await;

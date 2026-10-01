@@ -143,7 +143,7 @@ impl SyncSession {
                     // Nothing applied, so the producer frontier does not move.
                     applied_seq: msg.seq.saturating_sub(1),
                     // Retryable, not terminal: the data is fine and the wiring
-                    // is not. Telling the sender to compensate would destroy a
+                    // is not. Telling the sender to compensate will destroy a
                     // good batch over a server-side misconfiguration, whereas a
                     // re-send succeeds the moment interception is repaired.
                     status: AckStatus::Gap { expected: msg.seq },
@@ -242,7 +242,7 @@ impl SyncSession {
                 // catalog-visible and queryable cluster-wide; the handler
                 // handles the permissive `shared == None` path by warn+skip.
                 let msg: CollectionSchemaSyncMsg = frame.decode_body()?;
-                self.handle_collection_schema(&msg, shared)
+                self.handle_collection_schema(&msg, shared).await
             }
             _ => {
                 warn!(

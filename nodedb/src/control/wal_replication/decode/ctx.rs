@@ -10,4 +10,6 @@ use crate::types::{DatabaseId, TenantId};
 pub(super) struct DecodeCtx {
     pub(super) database_id: DatabaseId,
     pub(super) tenant_id: TenantId,
+    /// The vShard the entry applies on. An array cell write homes to it.
+    pub(super) vshard_id: u32,
 }

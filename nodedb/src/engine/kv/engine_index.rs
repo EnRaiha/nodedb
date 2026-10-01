@@ -61,7 +61,7 @@ impl KvEngine {
         }
 
         // Backfill: collect entries first, then update indexes.
-        // Two-phase approach avoids borrow conflicts on self.indexes vs self.tables.
+        // `idx_set` borrows `self.indexes` only, so `self.tables` stays readable.
         let entries_to_backfill: Vec<(Vec<u8>, Vec<u8>)> = match self.tables.get(&tkey) {
             Some(table) => {
                 let mut all = Vec::new();
@@ -82,11 +82,6 @@ impl KvEngine {
             None => return 0,
         };
 
-        // Now update indexes — idx_set is guaranteed to exist (inserted above).
-        let idx_set = self
-            .indexes
-            .get_mut(&tkey)
-            .expect("index set was inserted at entry point of register_index");
         let mut backfilled = 0;
         for (key, value) in &entries_to_backfill {
             let field_values = extract_field_values_from_msgpack(value, field);
@@ -172,9 +167,8 @@ impl KvEngine {
 
 #[cfg(test)]
 mod tests {
-    use nodedb_types::Surrogate;
-
     use crate::engine::kv::KvPutParams;
+    use crate::engine::kv::test_support::row_surrogate;
 
     use super::*;
 
@@ -209,8 +203,9 @@ mod tests {
             value: &mp_obj(&[("region", "us-east"), ("status", "active")]),
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"s1"),
+        })
+        .expect("a bound row writes");
         e.put(KvPutParams {
             database_id: 0,
             tenant_id: 1,
@@ -219,8 +214,9 @@ mod tests {
             value: &mp_obj(&[("region", "us-east"), ("status", "inactive")]),
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"s2"),
+        })
+        .expect("a bound row writes");
         e.put(KvPutParams {
             database_id: 0,
             tenant_id: 1,
@@ -229,8 +225,9 @@ mod tests {
             value: &mp_obj(&[("region", "eu-west"), ("status", "active")]),
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"s3"),
+        })
+        .expect("a bound row writes");
 
         // Create index with backfill.
         let backfilled = e.register_index(RegisterIndexParams {
@@ -279,8 +276,9 @@ mod tests {
             value: &mp_obj(&[("status", "active")]),
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"k1"),
+        })
+        .expect("a bound row writes");
         assert_eq!(e.index_lookup_eq(0, 1, "c", "status", b"active").len(), 1);
 
         // Update: status changes.
@@ -292,8 +290,9 @@ mod tests {
             value: &mp_obj(&[("status", "inactive")]),
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"k1"),
+        })
+        .expect("a bound row writes");
         assert!(e.index_lookup_eq(0, 1, "c", "status", b"active").is_empty());
         assert_eq!(e.index_lookup_eq(0, 1, "c", "status", b"inactive").len(), 1);
     }
@@ -320,8 +319,9 @@ mod tests {
             value: &mp_obj(&[("region", "us")]),
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"k1"),
+        })
+        .expect("a bound row writes");
         e.put(KvPutParams {
             database_id: 0,
             tenant_id: 1,
@@ -330,8 +330,9 @@ mod tests {
             value: &mp_obj(&[("region", "us")]),
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"k2"),
+        })
+        .expect("a bound row writes");
 
         assert_eq!(e.index_lookup_eq(0, 1, "c", "region", b"us").len(), 2);
 
@@ -354,8 +355,9 @@ mod tests {
             value: b"raw_value",
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"k"),
+        })
+        .expect("a bound row writes");
         assert!(e.get(0, 1, "c", b"k", n).is_some());
         assert_eq!(e.write_amp_ratio(0, 1, "c"), 0.0);
     }
@@ -382,8 +384,9 @@ mod tests {
             value: &mp_obj(&[("status", "active")]),
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"k1"),
+        })
+        .expect("a bound row writes");
         assert_eq!(e.index_count(0, 1, "c"), 1);
 
         let dropped = e.drop_index(0, 1, "c", "status");
@@ -426,8 +429,9 @@ mod tests {
                 value: &mp_obj(&[("a", "x"), ("b", "y")]),
                 ttl_ms: 0,
                 now_ms: n,
-                surrogate: Surrogate::ZERO,
-            });
+                surrogate: row_surrogate(k.as_bytes()),
+            })
+            .expect("a bound row writes");
         }
 
         // 10 PUTs, 2 indexes each = write amp ratio of 2.0.

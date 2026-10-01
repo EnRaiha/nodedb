@@ -24,7 +24,7 @@ use super::ddl_effect::DeferredDdlEffect;
 /// [`super::audit_context::current()`] at buffer time. The audit
 /// context is stamped at *statement* time, not at COMMIT time, so
 /// each sub-entry's audit record correctly names the DDL that
-/// produced it (not just the COMMIT).
+/// produced it (not only the COMMIT).
 #[derive(Debug, Clone)]
 pub struct BufferedDdl {
     pub entry: CatalogEntry,
@@ -57,7 +57,7 @@ pub fn activate() {
 
 /// Try to buffer an unstamped DDL entry. Returns `true` if the buffer is
 /// active and the entry was pushed. Returns `false` if no buffer is active
-/// (caller should prepare and propose normally).
+/// (caller must prepare and propose normally).
 pub fn try_buffer(entry: CatalogEntry) -> bool {
     with_slot(false, |b| {
         let mut guard = b.borrow_mut();
@@ -113,6 +113,61 @@ pub fn with_buffered<T>(f: impl FnOnce(&[BufferedDdl]) -> T) -> Option<T> {
     with_slot(None, |b| b.borrow().as_ref().map(|buf| f(buf)))
 }
 
+/// Source rows a clone's buffered copy-on-write entries hide.
+#[derive(Debug, Default)]
+pub struct CloneSuppressions {
+    /// Source surrogates a buffered tombstone or copy-up hides.
+    pub surrogates: std::collections::HashSet<u32>,
+    /// Source KV keys a buffered KV tombstone hides.
+    pub kv_keys: std::collections::HashSet<String>,
+}
+
+/// The source rows this connection's open transaction hides from the clone
+/// `target_collection_key` (database-qualified) through the tombstones and
+/// copy-ups it buffered. They land in the catalog at COMMIT, so a read or a
+/// write inside the transaction applies them from here. Empty outside a
+/// transaction.
+pub fn buffered_clone_suppressions(target_collection_key: &str) -> CloneSuppressions {
+    let names_target = |database_id: u64, collection: &str| {
+        crate::control::planner::sql_plan_convert::convert::db_qualified(
+            crate::types::DatabaseId::new(database_id),
+            collection,
+        ) == target_collection_key
+    };
+    with_buffered(|entries| {
+        let mut hidden = CloneSuppressions::default();
+        for item in entries {
+            match &item.entry {
+                CatalogEntry::PutCloneTombstone {
+                    database_id,
+                    collection,
+                    source_surrogate,
+                    ..
+                }
+                | CatalogEntry::PutCloneCopyup {
+                    database_id,
+                    collection,
+                    source_surrogate,
+                    ..
+                } if names_target(*database_id, collection) => {
+                    hidden.surrogates.insert(*source_surrogate);
+                }
+                CatalogEntry::PutKvCloneTombstone {
+                    database_id,
+                    collection,
+                    kv_key,
+                    ..
+                } if names_target(*database_id, collection) => {
+                    hidden.kv_keys.insert(kv_key.clone());
+                }
+                _ => {}
+            }
+        }
+        hidden
+    })
+    .unwrap_or_default()
+}
+
 /// Take the accumulated buffer contents and deactivate. Returns
 /// `None` if the buffer was never activated.
 pub fn take() -> Option<DdlBuffer> {
@@ -164,6 +219,52 @@ mod tests {
             target_descriptor_version: 0,
             target_hlc: nodedb_types::Hlc::ZERO,
         }
+    }
+
+    /// A buffered tombstone and copy-up hide their source rows from the
+    /// clone they name, and from no other collection.
+    #[tokio::test]
+    async fn buffered_clone_entries_hide_their_source_rows() {
+        conn_scope::scoped(async {
+            activate();
+            assert!(try_buffer(CatalogEntry::PutCloneTombstone {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "docs".into(),
+                source_surrogate: 7,
+            }));
+            assert!(try_buffer(CatalogEntry::PutCloneCopyup {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "docs".into(),
+                source_surrogate: 8,
+                target_surrogate: 80,
+            }));
+            assert!(try_buffer(CatalogEntry::PutKvCloneTombstone {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "cache".into(),
+                kv_key: "k1".into(),
+            }));
+            let docs = buffered_clone_suppressions("docs");
+            assert_eq!(
+                docs.surrogates,
+                [7, 8]
+                    .into_iter()
+                    .collect::<std::collections::HashSet<u32>>()
+            );
+            assert!(docs.kv_keys.is_empty());
+            let cache = buffered_clone_suppressions("cache");
+            assert!(cache.surrogates.is_empty());
+            assert_eq!(
+                cache.kv_keys,
+                ["k1".to_string()]
+                    .into_iter()
+                    .collect::<std::collections::HashSet<String>>()
+            );
+        })
+        .await;
+        assert!(buffered_clone_suppressions("docs").surrogates.is_empty());
     }
 
     #[tokio::test]

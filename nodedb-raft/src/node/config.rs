@@ -19,6 +19,14 @@
 
 use std::time::Duration;
 
+/// Fraction of `election_timeout_min` the leader lease gives up to clock-rate
+/// drift between the leader and its followers.
+///
+/// A follower measures its vote-refusal window on its own clock. A lease that
+/// ran the full window on the leader's clock would outlive that window on any
+/// follower whose clock runs faster.
+pub const MAX_CLOCK_DRIFT_RATIO: f64 = 0.1;
+
 /// Configuration for a Raft node.
 #[derive(Debug, Clone)]
 pub struct RaftConfig {
@@ -96,6 +104,22 @@ impl RaftConfig {
     pub fn quorum(&self) -> usize {
         self.cluster_size() / 2 + 1
     }
+
+    /// Slack the leader lease subtracts from `election_timeout_min` for
+    /// clock-rate drift.
+    pub fn lease_drift_margin(&self) -> Duration {
+        self.election_timeout_min.mul_f64(MAX_CLOCK_DRIFT_RATIO)
+    }
+
+    /// How long a leader lease lasts past its anchor:
+    /// `election_timeout_min - lease_drift_margin()`.
+    ///
+    /// A follower refuses votes for `election_timeout_min` after hearing the
+    /// leader, so no successor can win inside this window.
+    pub fn lease_duration(&self) -> Duration {
+        self.election_timeout_min
+            .saturating_sub(self.lease_drift_margin())
+    }
 }
 
 #[cfg(test)]
@@ -134,5 +158,14 @@ mod tests {
         let c = cfg(vec![2, 3, 4, 5], vec![6, 7]);
         assert_eq!(c.cluster_size(), 5);
         assert_eq!(c.quorum(), 3);
+    }
+
+    #[test]
+    fn lease_duration_leaves_the_drift_margin() {
+        let c = cfg(vec![2, 3], vec![]);
+        let margin = c.lease_drift_margin();
+        // A tenth of 150ms, within float rounding.
+        assert!(margin > Duration::from_millis(14) && margin < Duration::from_millis(16));
+        assert_eq!(c.lease_duration() + margin, c.election_timeout_min);
     }
 }

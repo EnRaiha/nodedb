@@ -28,7 +28,8 @@ pub(super) struct ResolvePointUpdate<'a> {
     pub tid: u64,
     pub collection: &'a str,
     pub document_id: &'a str,
-    pub surrogate: Surrogate,
+    /// `None` when the key is unbound in this database: no row matches.
+    pub surrogate: Option<Surrogate>,
     pub updates: &'a [(String, UpdateValue)],
     pub returning: Option<&'a ReturningSpec>,
     pub rls_filters: &'a [u8],
@@ -44,7 +45,8 @@ pub(super) struct ResolvePointDelete<'a> {
     pub tid: u64,
     pub collection: &'a str,
     pub document_id: &'a str,
-    pub surrogate: Surrogate,
+    /// `None` when the key is unbound in this database: no row matches.
+    pub surrogate: Option<Surrogate>,
     pub returning: Option<&'a ReturningSpec>,
     pub rls_filters: &'a [u8],
     pub rls_write_check: &'a RlsWriteCheck,
@@ -73,6 +75,13 @@ impl CoreLoop {
             resolved_sum_targets,
             declared_primary_key,
         } = args;
+        // An unbound key names no row: `{"affected": 0}`, as for a gone row.
+        let Some(surrogate) = surrogate else {
+            return Ok(DocumentResolveOutcome {
+                mutations: Vec::new(),
+                response_payload: affected_payload(0),
+            });
+        };
         let ctx = self.doc_resolve_ctx(task, tid, collection);
         let row_key = row_key_of(surrogate);
         let row_identity = StorageKey::for_surrogate(surrogate).to_identity();
@@ -186,13 +195,18 @@ impl CoreLoop {
             resolved_sum_targets,
         } = args;
         let ctx = self.doc_resolve_ctx(task, tid, collection);
-        let row_key = row_key_of(surrogate);
-        let row_identity = StorageKey::for_surrogate(surrogate).to_identity();
         let document_identity = RowIdentity::from_user_key(document_id);
 
-        // A row that is already absent removes nothing, so there is no image for
-        // the policy to restrict — the same admission `gate_point_delete` makes.
-        let Some(prior) = self.doc_resolve_read(&ctx, collection, &row_key)? else {
+        // A row that is already absent, or a key unbound in this database,
+        // removes nothing, so there is no image for the policy to restrict —
+        // the same admission `gate_point_delete` makes.
+        let prior = match surrogate {
+            Some(surrogate) => self
+                .doc_resolve_read(&ctx, collection, &row_key_of(surrogate))?
+                .map(|prior| (surrogate, prior)),
+            None => None,
+        };
+        let Some((surrogate, prior)) = prior else {
             return Ok(DocumentResolveOutcome {
                 mutations: Vec::new(),
                 response_payload: resolved_response_payload(
@@ -203,6 +217,7 @@ impl CoreLoop {
                 )?,
             });
         };
+        let row_identity = StorageKey::for_surrogate(surrogate).to_identity();
 
         rls_write_gate::admit_stored_row(
             rls_write_check,

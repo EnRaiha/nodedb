@@ -13,5 +13,5 @@ pub mod payload;
 pub mod sum_targets;
 
 pub use apply::RedoTarget;
-pub(crate) use apply::{apply_transaction_redo, enqueue_transaction_redo};
+pub(crate) use apply::{enqueue_transaction_redo, record_cross_shard_key};
 pub use payload::TransactionRedoPayload;

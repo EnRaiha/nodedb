@@ -1,27 +1,32 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Protocol-neutral `ClusterArray` plan dispatch, shared by pgwire and native.
+//! Protocol-neutral `ClusterArray` plan dispatch, shared by every transport.
 //!
 //! `ClusterArrayOp` plans are handled entirely on the Control Plane by the
-//! `ArrayCoordinator` — they must never reach the SPSC bridge or the
-//! trigger/DML machinery. Each protocol's dispatch loop intercepts a
-//! `PhysicalPlan::ClusterArray` task right after its own in-transaction
-//! routing gate, calls [`execute_cluster_array`], then renders the
-//! [`ClusterArrayShaped`] outcome in its own wire format. pgwire's adapter
-//! lives in `pgwire::handler::routing::cluster_array`; native's lives in
-//! `native::dispatch::cluster_array`.
+//! `ArrayCoordinator`. They never reach the gateway, the SPSC bridge or the
+//! trigger/DML machinery. Each transport's dispatch loop intercepts a
+//! `PhysicalPlan::ClusterArray` task after authorization:
+//!
+//! - pgwire and native call [`execute_cluster_array`] and render the
+//!   [`ClusterArrayShaped`] outcome in their own wire format. The adapters
+//!   live in `pgwire::handler::routing::cluster_array` and
+//!   `native::dispatch::cluster_array`.
+//! - HTTP and WebSocket RPC call [`run_cluster_array`] and shape the raw
+//!   payload the way they shape a gateway payload.
 
 use std::sync::Arc;
 
 use nodedb_physical::physical_plan::{ClusterArrayOp, PhysicalPlan};
+use nodedb_physical::physical_task::PhysicalTask;
 
 use crate::control::cluster::ClusterArrayExecutor;
 use crate::control::security::auth_context::AuthContext;
-use crate::control::server::dispatch_utils::publish_cluster_array_change_events;
 use crate::control::server::response_shape::compose::{self, ShapeOutcome};
 use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::response_shape::schema::OutputSchema;
-use crate::control::server::response_shape::types::{DmlOutcome, PlanKind, ShapedRows};
+use crate::control::server::response_shape::types::{
+    DmlOutcome, PlanKind, ShapedRows, describe_plan,
+};
 use crate::control::server::shared::authorization::AuthorizedTask;
 use crate::control::server::shared::sql::staging_predicates::require_affected_count;
 use crate::control::state::SharedState;
@@ -35,28 +40,39 @@ pub(crate) enum ClusterArrayShaped {
     Affected(DmlOutcome),
 }
 
+/// Whether `plan` is a `ClusterArray` plan. Every transport tests this after
+/// authorization and runs a match through [`run_cluster_array`] or
+/// [`execute_cluster_array`], never through the gateway.
+pub(crate) fn is_cluster_array(plan: &PhysicalPlan) -> bool {
+    matches!(plan, PhysicalPlan::ClusterArray(_))
+}
+
 /// Execute one authorized `ClusterArrayOp` via the `ArrayCoordinator` and
-/// shape its payload into protocol-neutral rows or a count-bearing outcome.
+/// return its raw payload.
 ///
-/// On a successful `Put`/`Delete` (writes; `Slice`/`Agg` are reads and
-/// publish nothing), publishes a CDC change event keyed by the op's own
-/// `wal_lsn` — this path never touches the SPSC bridge, so there is no
-/// Data-Plane `Response::watermark_lsn` to read the LSN from the way the
-/// normal dispatch funnel does (see `publish_cluster_array_change_events`'s
-/// own doc comment).
-pub(crate) async fn execute_cluster_array(
+/// The payload has the shape the local `ArrayOp` counterpart answers with,
+/// so a transport shapes it with `describe_plan` of the task's plan, exactly
+/// as it shapes a gateway payload.
+///
+/// A `Put`/`Delete` publishes no change event here: each shard's committed
+/// array write publishes as its replicas apply it.
+pub(crate) async fn run_cluster_array(
     state: &Arc<SharedState>,
-    auth: &AuthContext,
     authorized: AuthorizedTask,
-    projection: Option<&OutputSchema>,
-) -> crate::Result<ClusterArrayShaped> {
-    // Read before the task is consumed: an in-transaction `Slice`/`Agg`
-    // carries the session's transaction id, and each shard folds that
-    // transaction's staged cells into its result.
-    let txn_id = authorized.txn_id();
-    let task = authorized.into_physical_task();
-    let tenant_id = task.tenant_id;
-    let database_id = task.database_id;
+) -> crate::Result<Vec<u8>> {
+    run_trusted_cluster_array(state, authorized.into_physical_task()).await
+}
+
+/// [`run_cluster_array`] for a task whose authority comes from an already
+/// admitted operation, such as a read inside a trigger or procedure body's
+/// system transaction.
+pub(crate) async fn run_trusted_cluster_array(
+    state: &Arc<SharedState>,
+    task: PhysicalTask,
+) -> crate::Result<Vec<u8>> {
+    // An in-transaction `Slice`/`Agg` carries the transaction id, and each
+    // shard folds that transaction's staged cells into its result.
+    let txn_id = task.txn_id;
     let PhysicalPlan::ClusterArray(cluster_op) = task.plan else {
         return Err(crate::Error::Internal {
             detail: "authorized task is not a ClusterArray operation".to_owned(),
@@ -93,39 +109,29 @@ pub(crate) async fn execute_cluster_array(
         array = %cluster_op.array_id().name,
         "cluster array dispatch"
     );
-    let payload_bytes = executor.execute(&cluster_op, txn_id).await?;
+    executor.execute(&cluster_op, txn_id).await
+}
 
-    // Publish CDC change event(s) for a successful write. `Slice`/`Agg` are
-    // reads and publish nothing; `Put`/`Delete` carry their own
-    // Control-Plane-allocated `wal_lsn` since there is no Data-Plane
-    // `Response::watermark_lsn` on this coordinator-only path.
-    let write_lsn = match &cluster_op {
-        ClusterArrayOp::Put { wal_lsn, .. } | ClusterArrayOp::Delete { wal_lsn, .. } => {
-            Some(*wal_lsn)
-        }
-        ClusterArrayOp::Slice { .. } | ClusterArrayOp::Agg { .. } => None,
-    };
-    if let Some(lsn) = write_lsn {
-        publish_cluster_array_change_events(state, tenant_id, database_id, &cluster_op, lsn);
-    }
-
-    let cluster_plan_kind = match &cluster_op {
-        ClusterArrayOp::Slice { .. } => PlanKind::ArraySlice,
-        ClusterArrayOp::Agg { .. } => PlanKind::MultiRow,
-        // The coordinator reports `{"inserted": n}` / `{"deleted": n}`, the
-        // same count map the local array handlers emit.
-        ClusterArrayOp::Put { .. } => PlanKind::DmlResult("INSERT"),
-        ClusterArrayOp::Delete { .. } => PlanKind::DmlResult("DELETE"),
-    };
-    // This coordinator path never builds a `PhysicalPlan`, so the source
+/// Execute one authorized `ClusterArrayOp` through [`run_cluster_array`] and
+/// shape its payload into protocol-neutral rows or a count-bearing outcome.
+pub(crate) async fn execute_cluster_array(
+    state: &Arc<SharedState>,
+    auth: &AuthContext,
+    authorized: AuthorizedTask,
+    projection: Option<&OutputSchema>,
+) -> crate::Result<ClusterArrayShaped> {
+    let tenant_id = authorized.tenant_id();
+    let cluster_plan_kind = describe_plan(authorized.plan());
+    // The coordinator path builds no `PhysicalPlan` per shard, so the source
     // collection comes straight off the op's array name. A single source
     // means bare-key matching, which is what an array's cell rows carry.
-    let array_name = match &cluster_op {
-        ClusterArrayOp::Slice { array_id, .. }
-        | ClusterArrayOp::Agg { array_id, .. }
-        | ClusterArrayOp::Put { array_id, .. }
-        | ClusterArrayOp::Delete { array_id, .. } => array_id.name.clone(),
+    let PhysicalPlan::ClusterArray(cluster_op) = authorized.plan() else {
+        return Err(crate::Error::Internal {
+            detail: "authorized task is not a ClusterArray operation".to_owned(),
+        });
     };
+    let array_name = cluster_op.array_id().name.clone();
+    let payload_bytes = run_cluster_array(state, authorized).await?;
     let redaction =
         QueryRedaction::for_collections(tenant_id, auth, vec![(String::new(), array_name)]);
     // A cluster array plan projects attribute names only, never a

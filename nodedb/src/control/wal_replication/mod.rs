@@ -10,20 +10,21 @@
 pub mod decode;
 mod decode_sync_engines;
 pub mod encode;
-mod legacy_entry;
 pub mod propose;
 pub mod replicable_write;
 pub mod transaction_redo;
 pub mod types;
 
-pub use decode::from_replicated_entry;
+pub use decode::{decode_replicated_entry, from_replicated_entry};
 pub use encode::to_replicated_entry;
-pub(crate) use propose::propose_replicated_entry;
+pub(crate) use propose::{
+    propose_replicated_entry, stamp_collection_incarnations, stamp_metadata_floor,
+};
 pub use replicable_write::ReplicableWrite;
 pub use types::{
-    AsyncRaftProposer, ConstraintChangeOp, RaftAppliedIndexSink, RaftCompactor, RaftProposer,
-    ReplicatedEntry, ReplicatedEventSource, ReplicatedIdentity, ReplicatedSumTarget,
-    ReplicatedWrite,
+    AppliedWait, AsyncRaftProposer, AsyncRaftSubmit, CollectionIncarnation, ConstraintChangeOp,
+    ProposedAt, ProposedWrite, RaftAppliedIndexSink, RaftCompactor, RaftProposer, ReplicatedEntry,
+    ReplicatedEventSource, ReplicatedIdentity, ReplicatedSumTarget, ReplicatedWrite,
 };
 
 pub use crate::control::distributed_applier::{

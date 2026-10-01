@@ -16,14 +16,15 @@
 //!   the rows the record leaves untouched and the rows it writes.
 //! * Stateless PUT / DELETE enforcement — append-only, period lock, state
 //!   transitions, transition checks, retention and legal hold, each against
-//!   the stored pre-image.
+//!   the stored pre-image. A put to a `HASH_CHAIN` collection that sets a
+//!   chain field is refused.
 //!
 //! A [`RedoOrigin::Restore`] record re-installs rows a backup captured. Each
 //! row passed BALANCED and the stateless rules when it was first written, and
 //! a bitemporal row's earlier versions are history. So a restore runs UNIQUE
 //! only. UNIQUE judges the post-state: the last write to each row.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 
 use nodedb_physical::physical_plan::RedoOrigin;
 use nodedb_types::Surrogate;
@@ -31,12 +32,12 @@ use nodedb_types::Surrogate;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use crate::data::executor::enforcement::balanced::{self, BalancedEntry};
+use crate::data::executor::enforcement::hash_chain;
 use crate::data::executor::enforcement::images::RowImages;
+use crate::data::executor::enforcement::unique::{PostImage, UniqueScope, check_unique_post_state};
 use crate::data::executor::handlers::point::apply_delete::run_delete_enforcement;
 use crate::data::executor::handlers::point::apply_put::PutEnforcement;
-use crate::engine::document::store::{
-    CollectionConfig, DocumentEngine, StorageKey, extract_index_values,
-};
+use crate::engine::document::store::{CollectionConfig, StorageKey};
 use crate::types::{DatabaseId, TenantId};
 
 use super::sub_ops::RedoDocOp;
@@ -80,7 +81,7 @@ impl CoreLoop {
             if origin == RedoOrigin::Commit {
                 self.check_collection_ops(&scope, &collection_ops)?;
             }
-            self.check_unique_post_state(&scope, &collection_ops)?;
+            self.check_record_unique(&scope, &collection_ops)?;
         }
         Ok(())
     }
@@ -105,6 +106,12 @@ impl CoreLoop {
             };
             match op {
                 RedoDocOp::Put { value, .. } => {
+                    // The install writes the chain fields; a submitted value
+                    // for either is refused before anything is written.
+                    if enforcement.hash_chain {
+                        let doc = doc_format::decode_document(value)?;
+                        hash_chain::refuse_supplied_link(scope.collection, &doc)?;
+                    }
                     self.check_stateless_put_enforcement(
                         true,
                         PutEnforcement {
@@ -169,89 +176,45 @@ impl CoreLoop {
     }
 
     /// Every unique index value the record's post-state holds has one owner.
-    fn check_unique_post_state(
+    /// The install writes row by row, so its puts do not judge UNIQUE.
+    fn check_record_unique(
         &self,
         scope: &CollectionScope<'_>,
         ops: &[&RedoDocOp],
     ) -> crate::Result<()> {
-        let unique_paths: Vec<_> = scope
-            .config
-            .index_paths
-            .iter()
-            .filter(|path| path.unique)
-            .collect();
-        if unique_paths.is_empty() {
+        if !scope.config.index_paths.iter().any(|path| path.unique) {
             return Ok(());
         }
-        // Rows this record rewrites or removes: their stored values do not
-        // count, whatever they are.
-        let touched: HashSet<u32> = ops.iter().map(|op| op.surrogate()).collect();
-        // The post-state holds each row's last write only. A restored
-        // bitemporal row writes each of its versions in order, and a value an
-        // earlier version held is not in the post-state.
-        let last_write: HashMap<u32, usize> = ops
+        // The install re-evaluates generated columns before it indexes a row,
+        // so the judge reads the same image: a UNIQUE index can cover one.
+        let docs = ops
             .iter()
-            .enumerate()
-            .map(|(index, op)| (op.surrogate(), index))
+            .map(|op| match op {
+                RedoDocOp::Put { value, .. } => self.unique_image(scope.config, value).map(Some),
+                RedoDocOp::Delete { .. } => Ok(None),
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        let rows: Vec<PostImage<'_>> = ops
+            .iter()
+            .zip(&docs)
+            .map(|(op, doc)| PostImage {
+                surrogate: op.surrogate(),
+                doc: doc.as_ref(),
+                judged: true,
+            })
             .collect();
-        let doc_engine = DocumentEngine::new(&self.sparse, scope.database_id, scope.tid);
-        for path in unique_paths {
-            // Needle → the surrogate of the record's own row holding it.
-            let mut claimed: HashMap<String, u32> = HashMap::new();
-            for (index, op) in ops.iter().enumerate() {
-                let RedoDocOp::Put {
-                    value, surrogate, ..
-                } = op
-                else {
-                    continue;
-                };
-                if last_write.get(surrogate) != Some(&index) {
-                    continue;
-                }
-                let Ok(doc) = doc_format::decode_document(value) else {
-                    continue;
-                };
-                if let Some(predicate) = &path.predicate
-                    && !predicate.evaluate_json(&doc)
-                {
-                    continue;
-                }
-                for raw in extract_index_values(&doc, &path.path, path.is_array) {
-                    let needle = if path.case_insensitive {
-                        raw.to_lowercase()
-                    } else {
-                        raw
-                    };
-                    let violation = || crate::Error::RejectedConstraint {
-                        collection: scope.collection.to_string(),
-                        constraint: "unique".to_string(),
-                        detail: format!(
-                            "unique index '{}' violation on field '{}' (value '{}')",
-                            path.name, path.path, needle
-                        ),
-                    };
-                    if let Some(owner) = claimed.insert(needle.clone(), *surrogate)
-                        && owner != *surrogate
-                    {
-                        return Err(violation());
-                    }
-                    let stored_owners = doc_engine.index_lookup(
-                        scope.collection,
-                        &path.path,
-                        &needle,
-                        scope.bitemporal,
-                    )?;
-                    let foreign_owner = stored_owners.iter().any(|key: &StorageKey| {
-                        let owner = key.surrogate().as_u32();
-                        owner != *surrogate && !touched.contains(&owner)
-                    });
-                    if foreign_owner {
-                        return Err(violation());
-                    }
-                }
-            }
-        }
-        Ok(())
+        check_unique_post_state(
+            &UniqueScope {
+                sparse: &self.sparse,
+                database_id: scope.database_id,
+                tid: scope.tid,
+                collection: scope.collection,
+                paths: &scope.config.index_paths,
+                bitemporal: scope.bitemporal,
+                base_visible: true,
+            },
+            &rows,
+        )
     }
 
     /// The row as stored now, in the store this collection writes.

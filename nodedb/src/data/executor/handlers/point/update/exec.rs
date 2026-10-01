@@ -12,8 +12,9 @@
 
 use tracing::debug;
 
-use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
+use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::redo_image::StoredRow;
 use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::handlers::rls_write_gate;
@@ -31,7 +32,9 @@ pub(in crate::data::executor) struct PointUpdateParams<'a> {
     pub tid: u64,
     pub collection: &'a str,
     pub document_id: &'a str,
-    pub surrogate: Surrogate,
+    /// `None` when the key is unbound in this database: the update matches
+    /// no row.
+    pub surrogate: Option<Surrogate>,
     pub updates: &'a [(String, UpdateValue)],
     pub returning: Option<&'a ReturningSpec>,
     /// Compiled RLS read policy gating the `RETURNING` rows. Empty = no policy.
@@ -67,6 +70,10 @@ impl CoreLoop {
             resolved_sum_targets,
             declared_primary_key,
         } = params;
+        // A key unbound in this database names no row here.
+        let Some(surrogate) = surrogate else {
+            return self.point_update_matched_nothing(task);
+        };
         let storage_key = StorageKey::for_surrogate(surrogate);
         let document_identity = RowIdentity::from_user_key(document_id);
         debug!(
@@ -109,9 +116,8 @@ impl CoreLoop {
 
         // Refuse the statement outright on a collection that declared its rows
         // immutable. A hash-chained collection is refused here for the reason
-        // its links exist: each link covers its predecessor's hash, so rewriting
-        // a row makes `verify_chain` report the row AFTER it as broken, and the
-        // tamper-evidence would accuse an untampered row.
+        // its links exist: `VERIFY_HASH_CHAIN` reports a rewritten row as a
+        // break, so an admitted update reads as tampering.
         if let Some(config) = self.doc_configs.get(&config_key)
             && let Err(e) = crate::data::executor::enforcement::append_only::check_point_update(
                 collection,
@@ -276,14 +282,10 @@ impl CoreLoop {
                         );
 
                         // Build the response for both the RETURNING and
-                        // non-RETURNING branches first, then — only when the
-                        // collection carries a secondary vector index — carry the
-                        // surrogate + post-image back in the write-set so the
-                        // Control Plane can mint a post-apply `Put` redo record.
-                        // The autocommit WAL path mints none for a PointUpdate, so
-                        // without this a WAL-only restart rebuilds the HNSW from the
-                        // pre-update body and resurrects the old embedding.
-                        // `updated_bytes` is moved in as its last use.
+                        // non-RETURNING branches first, then carry the row's
+                        // post-image back in the write-set so the Control Plane
+                        // journals it after apply: the autocommit WAL path mints
+                        // no pre-dispatch record for a PointUpdate.
                         let mut response = if let Some(spec) = returning {
                             // Post-update image, decoded in the collection's
                             // storage mode; the user-visible key only fills in
@@ -313,34 +315,41 @@ impl CoreLoop {
                             nodedb_query::msgpack_scan::write_kv_i64(&mut payload, "affected", 1);
                             self.response_with_payload(task, payload)
                         };
-                        if has_vectors {
-                            response.write_set = vec![WriteSetEntry {
+                        // A versioned row landed at the system time the
+                        // update encoded it with, valid for all time.
+                        response.write_set = vec![self.stored_row_image(
+                            StoredRow {
+                                database_id,
+                                tid,
+                                collection,
                                 surrogate: surrogate.as_u32(),
                                 identity: document_identity,
-                                is_delete: false,
-                                value: updated_bytes,
-                                collection: None,
-                            }];
-                        }
+                            },
+                            &updated_bytes,
+                            bitemporal.then_some(sys_from_for_encode),
+                        )];
                         // Derived target rows live in a DIFFERENT collection
                         // than this statement's, so each carries its own
                         // `Some(collection)` and homes to that collection's
                         // vShard. Appended rather than replacing: the row's own
-                        // vector redo above and these are both required.
+                        // redo above and these are both required.
                         response.write_set.extend(target_write_set);
                         response
                     }
                     Err(e) => self.response_error(task, e),
                 }
             }
-            Ok(None) => {
-                let mut payload = Vec::with_capacity(16);
-                nodedb_query::msgpack_scan::write_map_header(&mut payload, 1);
-                nodedb_query::msgpack_scan::write_kv_i64(&mut payload, "affected", 0);
-                self.response_with_payload(task, payload)
-            }
+            Ok(None) => self.point_update_matched_nothing(task),
             Err(e) => self.response_error(task, e),
         }
+    }
+
+    /// The answer of a point update that matched no row: zero rows affected.
+    fn point_update_matched_nothing(&mut self, task: &ExecutionTask) -> Response {
+        let mut payload = Vec::with_capacity(16);
+        nodedb_query::msgpack_scan::write_map_header(&mut payload, 1);
+        nodedb_query::msgpack_scan::write_kv_i64(&mut payload, "affected", 0);
+        self.response_with_payload(task, payload)
     }
 }
 
@@ -500,7 +509,7 @@ mod tests {
                 tid: TID,
                 collection: SOURCE,
                 document_id: "e41",
-                surrogate: Surrogate(41),
+                surrogate: Some(Surrogate(41)),
                 updates: &updates,
                 returning: None,
                 rls_filters: &[],
@@ -543,7 +552,7 @@ mod tests {
                 tid: TID,
                 collection: SOURCE,
                 document_id: "e51",
-                surrogate: Surrogate(51),
+                surrogate: Some(Surrogate(51)),
                 updates: &updates,
                 returning: None,
                 rls_filters: &[],
@@ -604,7 +613,7 @@ mod tests {
                 tid: TID,
                 collection: SOURCE,
                 document_id: "e1",
-                surrogate: Surrogate(91),
+                surrogate: Some(Surrogate(91)),
                 updates: &updates,
                 returning: None,
                 rls_filters: &[],

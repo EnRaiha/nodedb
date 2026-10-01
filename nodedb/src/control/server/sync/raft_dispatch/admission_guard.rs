@@ -4,7 +4,7 @@
 //! having gone through admission.
 //!
 //! An apply that skips admission skips the post-merge RLS evaluation and the
-//! frontier fence with it, so it would durably land a delta nobody authorized
+//! frontier fence with it, so it will durably land a delta nobody authorized
 //! against its real post-image. Refusing loudly here is what makes the
 //! admission path non-optional rather than merely conventional.
 
@@ -42,7 +42,7 @@ mod tests {
             delta: Vec::new(),
             peer_id: 1,
             mutation_id: 1,
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
             provenance: None,
             constraint_version_required: 0,
             expected_frontier_digest: None,

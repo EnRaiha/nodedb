@@ -9,6 +9,9 @@
 //!   parse-then-check entry point DDL uses
 //! - [`validate_hash_chain_flags`]    — HASH_CHAIN implies an append-only
 //!   collection
+//! - [`validate_hash_chain_storage`]  — HASH_CHAIN is refused on CRDT storage
+//! - [`validate_sum_target`]          — a HASH_CHAIN collection is never a
+//!   materialized-sum target
 //! - [`find_materialized_sum_bindings`] — cross-collection
 //!   materialized_sum lookup
 //! - [`build_generated_column_specs`] — extract generated-column
@@ -48,7 +51,7 @@ pub enum EnforcementDeclError {
 
     /// The commit-time check reads `group_key` and `entry_type` as strings; a
     /// column of any other type yields no entry at all, so the constraint
-    /// would silently never fire.
+    /// will silently never fire.
     #[error(
         "BALANCED ON: {field} column '{column}' must be a text column for the \
          balance check to read it, got '{declared_type}'"
@@ -71,12 +74,26 @@ pub enum EnforcementDeclError {
         declared_type: String,
     },
 
-    /// A hash chain exists to make retroactive modification detectable, and
-    /// `verify_chain` walks entries in order: removing or rewriting a chained
-    /// row reports the SUCCESSOR's link as broken, blaming an untampered row.
-    /// The chain is only meaningful on a collection that cannot be modified.
+    /// A hash chain exists to make retroactive modification detectable, so
+    /// every rewrite or removal of a chained row reads as tampering. The chain
+    /// is only meaningful on a collection that cannot be modified.
     #[error("HASH_CHAIN requires APPEND_ONLY")]
     HashChainRequiresAppendOnly,
+
+    /// A CRDT collection's rows are written by merged sync deltas, which
+    /// materialize outside the chain. A chain over them cannot cover them.
+    #[error("HASH_CHAIN cannot be combined with crdt=true")]
+    HashChainOnCrdt,
+
+    /// A materialized sum rewrites its target row on every source write. A
+    /// chained row admits no rewrite.
+    #[error("'{collection}' declares HASH_CHAIN and cannot be a materialized-sum target")]
+    HashChainAsSumTarget { collection: String },
+
+    /// CONVERT re-encodes every row, which rewrites the contents each link
+    /// covers.
+    #[error("'{collection}' declares HASH_CHAIN and cannot be converted")]
+    HashChainConvert { collection: String },
 }
 
 impl EnforcementDeclError {
@@ -89,6 +106,9 @@ impl EnforcementDeclError {
             | Self::MissingField { .. }
             | Self::InvalidColumnName { .. }
             | Self::HashChainRequiresAppendOnly => "42601",
+            Self::HashChainOnCrdt
+            | Self::HashChainAsSumTarget { .. }
+            | Self::HashChainConvert { .. } => "42P16",
             Self::UnknownColumn { .. } => "42703",
             Self::NonTextKeyColumn { .. } | Self::NonNumericAmountColumn { .. } => "42804",
         }
@@ -106,13 +126,34 @@ impl From<EnforcementDeclError> for crate::Error {
 /// `HASH_CHAIN` is only sound on an append-only collection.
 ///
 /// Rejecting the contradictory combination is deliberate: silently switching
-/// on `APPEND_ONLY` would impose a restriction the user never asked for.
+/// on `APPEND_ONLY` will impose a restriction the user never asked for.
 pub fn validate_hash_chain_flags(
     hash_chain: bool,
     append_only: bool,
 ) -> Result<(), EnforcementDeclError> {
     if hash_chain && !append_only {
         return Err(EnforcementDeclError::HashChainRequiresAppendOnly);
+    }
+    Ok(())
+}
+
+/// `HASH_CHAIN` is refused on a CRDT collection.
+pub fn validate_hash_chain_storage(
+    hash_chain: bool,
+    crdt: bool,
+) -> Result<(), EnforcementDeclError> {
+    if hash_chain && crdt {
+        return Err(EnforcementDeclError::HashChainOnCrdt);
+    }
+    Ok(())
+}
+
+/// A `HASH_CHAIN` collection is refused as a materialized-sum target.
+pub fn validate_sum_target(target: &StoredCollection) -> Result<(), EnforcementDeclError> {
+    if target.hash_chain {
+        return Err(EnforcementDeclError::HashChainAsSumTarget {
+            collection: target.name.clone(),
+        });
     }
     Ok(())
 }
@@ -476,6 +517,30 @@ mod tests {
     #[test]
     fn hash_chain_with_append_only_is_accepted() {
         assert!(validate_hash_chain_flags(true, true).is_ok());
+    }
+
+    #[test]
+    fn a_hash_chained_collection_is_refused_as_a_sum_target() {
+        let mut target = StoredCollection::new(1, "ledger", "owner");
+        assert!(validate_sum_target(&target).is_ok());
+        target.hash_chain = true;
+        let error = validate_sum_target(&target).expect_err("must refuse");
+        assert_eq!(
+            error,
+            EnforcementDeclError::HashChainAsSumTarget {
+                collection: "ledger".into()
+            }
+        );
+        assert_eq!(error.sqlstate(), "42P16");
+    }
+
+    #[test]
+    fn hash_chain_on_crdt_storage_is_refused() {
+        let error = validate_hash_chain_storage(true, true).expect_err("must refuse");
+        assert_eq!(error, EnforcementDeclError::HashChainOnCrdt);
+        assert_eq!(error.sqlstate(), "42P16");
+        assert!(validate_hash_chain_storage(true, false).is_ok());
+        assert!(validate_hash_chain_storage(false, true).is_ok());
     }
 
     #[test]

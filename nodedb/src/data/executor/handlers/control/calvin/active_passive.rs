@@ -13,7 +13,7 @@ use nodedb_types::Value;
 use crate::bridge::envelope::{ErrorCode, Payload, Response, Status};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::commit_pending::PendingCommit;
-use crate::data::executor::handlers::control::calvin_reply::CalvinReply;
+use crate::data::executor::handlers::control::calvin_reply::{CalvinReply, CalvinStaging};
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
@@ -157,11 +157,11 @@ impl CoreLoop {
         // A panic while staging drops the staged state like any refusal,
         // instead of unwinding past a half-staged overlay.
         let staged = catch_unwind(AssertUnwindSafe(|| {
-            let mut reply = CalvinReply::default();
+            let mut staging = CalvinStaging::default();
             for plan in plans {
-                self.stage_calvin_plan(task, synthetic_txn_id, *tenant_id, plan, &mut reply)?;
+                self.stage_calvin_plan(task, synthetic_txn_id, *tenant_id, plan, &mut staging)?;
             }
-            Ok::<CalvinReply, ErrorCode>(reply)
+            Ok::<CalvinReply, ErrorCode>(staging.reply)
         }));
         self.epoch_system_ms = prev_epoch_ms;
         let reply = match staged {

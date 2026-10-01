@@ -38,6 +38,7 @@ fn stream_def(tenant: u64, name: &str, collection: &str) -> ChangeStreamDef {
         owner: "admin".into(),
         created_at: 0,
         subscriber_roles: Vec::new(),
+        modification_hlc: nodedb_types::Hlc::ZERO,
     }
 }
 

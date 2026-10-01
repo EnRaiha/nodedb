@@ -3,8 +3,9 @@
 //! The upsert insert branch: no existing row was found, so insert fresh
 //! (identical in shape to a `PointPut`, plus chain + enforcement).
 
-use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
+use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::redo_image::submitted_row_image;
 use crate::data::executor::enforcement::chain_guard::{self, ChainGuard};
 use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
@@ -27,7 +28,6 @@ pub(super) struct InsertCtx<'a> {
     pub rls_filters: &'a [u8],
     pub database_id: u64,
     pub hook_ctx: &'a HookCtx<'a>,
-    pub has_vectors: bool,
     pub strict_schema: Option<&'a StrictSchema>,
 }
 
@@ -51,7 +51,6 @@ impl CoreLoop {
             rls_filters,
             database_id,
             hook_ctx,
-            has_vectors,
             strict_schema,
         } = ctx;
 
@@ -78,14 +77,12 @@ impl CoreLoop {
 
         // This arm is INSERT-shaped by construction — the probe above
         // found no row — so every write it performs is a chain link.
-        // Chaining rewrites the BODY, so it runs before the body is
-        // encoded and stored.
+        // The row is marked before the write, so `build_stored_body`
+        // writes its link into the stored body.
         let mut chain = ChainGuard::begin(self, database_id, tid, collection);
-        let chained = match chain.chain_insert(self, database_id, tid, document_id, value) {
-            Ok(chained) => chained,
-            Err(e) => return self.response_error(task, e),
-        };
-        let effective_value: &[u8] = chained.as_deref().unwrap_or(value);
+        if let Err(e) = chain.chain_insert(self, surrogate, value) {
+            return self.response_error(task, e);
+        }
 
         let txn = match self.sparse.begin_write() {
             Ok(t) => t,
@@ -107,10 +104,11 @@ impl CoreLoop {
                 collection,
                 storage_key,
                 surrogate,
-                value: effective_value,
+                value,
                 index_text: true,
                 user_roles: &task.request.user_roles,
                 enforce: true,
+                unique: crate::data::executor::enforcement::unique::UniqueJudge::Row,
                 wal_lsn: task.wal_lsn(),
                 resolved_targets: hook_ctx.resolved_targets,
             },
@@ -119,7 +117,7 @@ impl CoreLoop {
             Err(e) => {
                 chain_guard::abort_after_apply(
                     self,
-                    &chain,
+                    &mut chain,
                     database_id,
                     tid,
                     collection,
@@ -131,10 +129,13 @@ impl CoreLoop {
 
         // The advanced head lands in the SAME transaction as the row
         // whose hash it is.
-        if let Err(e) = chain.persist_head(self, &txn) {
+        if let Err(e) = chain
+            .settle(self, surrogate, &prior.stored_value)
+            .and_then(|()| chain.persist_head(self, &txn))
+        {
             chain_guard::abort_after_apply(
                 self,
-                &chain,
+                &mut chain,
                 database_id,
                 tid,
                 collection,
@@ -158,7 +159,7 @@ impl CoreLoop {
             Err(e) => {
                 chain_guard::abort_after_apply(
                     self,
-                    &chain,
+                    &mut chain,
                     database_id,
                     tid,
                     collection,
@@ -176,7 +177,7 @@ impl CoreLoop {
         {
             chain_guard::abort_after_apply(
                 self,
-                &chain,
+                &mut chain,
                 database_id,
                 tid,
                 collection,
@@ -186,6 +187,14 @@ impl CoreLoop {
         }
 
         if let Err(e) = txn.commit() {
+            chain_guard::abort_after_apply(
+                self,
+                &mut chain,
+                database_id,
+                tid,
+                collection,
+                &storage_key,
+            );
             return self.response_error(
                 task,
                 ErrorCode::Internal {
@@ -203,11 +212,6 @@ impl CoreLoop {
             prior.prior_value.as_deref(),
         );
 
-        // `apply_point_put` already inserted this row's vectors into the
-        // live HNSW, so the insert branch needs no live re-index — only a
-        // durable post-apply `Put` redo so a WAL-only restart rebuilds the
-        // index with the new embedding. `value` is a borrowed param here,
-        // so the post-image is copied. No-op when `has_vectors` is false.
         // An upsert always writes the row: one row affected.
         let mut response = match returning {
             Some(spec) => self.stored_returning_response(
@@ -219,15 +223,15 @@ impl CoreLoop {
             ),
             None => self.response_affected(task, 1),
         };
-        if has_vectors {
-            response.write_set = vec![WriteSetEntry {
-                surrogate: surrogate.as_u32(),
-                identity: document_identity,
-                is_delete: false,
-                value: value.to_vec(),
-                collection: None,
-            }];
-        }
+        // `wal_append_document_op` mints no pre-dispatch record for an
+        // upsert, so the row the insert branch stored is journalled after
+        // apply, from the body `apply_point_put` took.
+        response.write_set = vec![submitted_row_image(
+            surrogate.as_u32(),
+            document_identity,
+            value.to_vec(),
+            prior.bitemporal_sys_from_ms,
+        )];
         response.write_set.extend(target_write_set);
         response
     }

@@ -38,6 +38,7 @@ impl CoreLoop {
                 | GraphOp::EdgePutBatch { .. }
                 | GraphOp::EdgeDelete { .. }
                 | GraphOp::EdgeDeleteBatch { .. }
+                | GraphOp::TruncateEdges { .. }
         );
         if is_write && let Some(r) = self.check_engine_pressure(task, nodedb_mem::EngineId::Graph) {
             return r;
@@ -72,8 +73,9 @@ impl CoreLoop {
                 src_id,
                 label,
                 dst_id,
+                src_surrogate,
+                dst_surrogate,
                 rls_write_check,
-                ..
             } => self.execute_edge_delete(
                 task,
                 crate::data::executor::handlers::graph::EdgeDeleteParams {
@@ -82,6 +84,8 @@ impl CoreLoop {
                     src_id,
                     label,
                     dst_id,
+                    src_surrogate: *src_surrogate,
+                    dst_surrogate: *dst_surrogate,
                     rls_write_check,
                 },
             ),
@@ -98,7 +102,7 @@ impl CoreLoop {
                 edge_label,
                 direction,
                 depth,
-                options: _,
+                options,
                 rls_filters: _,
                 frontier_bitmap,
             } => self.execute_graph_hop(
@@ -109,6 +113,7 @@ impl CoreLoop {
                     edge_label,
                     direction: *direction,
                     depth: *depth,
+                    max_visited: self.walk_visit_cap(options),
                     frontier_bitmap: frontier_bitmap.as_ref(),
                 },
             ),
@@ -155,7 +160,7 @@ impl CoreLoop {
                 dst,
                 edge_label,
                 max_depth,
-                options: _,
+                options,
                 rls_filters: _,
                 frontier_bitmap,
             } => self.execute_graph_path(
@@ -166,6 +171,7 @@ impl CoreLoop {
                     dst,
                     edge_label,
                     max_depth: *max_depth,
+                    max_visited: self.walk_visit_cap(options),
                     frontier_bitmap: frontier_bitmap.as_ref(),
                 },
             ),
@@ -177,9 +183,18 @@ impl CoreLoop {
                 start_nodes,
                 edge_label,
                 depth,
-                options: _,
+                options,
                 rls_filters: _,
-            } => self.execute_graph_subgraph(task, tid, start_nodes, edge_label, *depth),
+            } => self.execute_graph_subgraph(
+                task,
+                crate::data::executor::handlers::graph::graph_traversal::GraphSubgraphParams {
+                    tid,
+                    start_nodes,
+                    edge_label,
+                    depth: *depth,
+                    max_visited: self.walk_visit_cap(options),
+                },
+            ),
 
             GraphOp::RagFusion {
                 collection,
@@ -195,7 +210,41 @@ impl CoreLoop {
                 options,
                 bm25_query,
                 bm25_field,
+                stage,
             } => {
+                let triple_text = match (bm25_query.as_deref(), bm25_field.as_deref(), rrf_k_triple)
+                {
+                    (Some(query), Some(_), Some(_)) => Some(query),
+                    _ => None,
+                };
+                match stage {
+                    nodedb_physical::physical_plan::RagStage::Local => {}
+                    nodedb_physical::physical_plan::RagStage::ExportLegs => {
+                        return self.execute_rag_export_legs(
+                            task,
+                            crate::data::executor::handlers::graph_rag_stages::RagExportParams {
+                                tenant_id: tid,
+                                collection: collection.as_str(),
+                                query_vector,
+                                vector_top_k: *vector_top_k,
+                                vector_field: vector_field.as_str(),
+                                final_top_k: *final_top_k,
+                                bm25_query: triple_text,
+                            },
+                        );
+                    }
+                    nodedb_physical::physical_plan::RagStage::Bindings { surrogates, names } => {
+                        return self.execute_rag_bindings(
+                            task,
+                            crate::data::executor::handlers::graph_rag_stages::RagBindingsParams {
+                                tenant_id: tid,
+                                collection: collection.as_str(),
+                                surrogates,
+                                names,
+                            },
+                        );
+                    }
+                }
                 if let (Some(bm25_q), Some(bm25_f), Some(triple_k)) =
                     (bm25_query.as_deref(), bm25_field.as_deref(), rrf_k_triple)
                 {
@@ -237,9 +286,11 @@ impl CoreLoop {
                 }
             }
 
-            GraphOp::Algo { algorithm, params } => {
-                self.execute_graph_algo(task, tid, algorithm, params)
-            }
+            GraphOp::Algo {
+                algorithm,
+                params,
+                stage,
+            } => self.execute_graph_algo(task, tid, algorithm, params, stage),
 
             GraphOp::Match {
                 query,
@@ -358,16 +409,50 @@ impl CoreLoop {
                     rank_seed: &plan.rank_seed,
                     global_dangling: plan.global_dangling,
                     personalization_sum: plan.personalization_sum,
+                    system_as_of: plan.system_as_of,
                 },
             ),
 
-            GraphOp::WccSuperstep(plan) => {
-                self.execute_wcc_superstep(task, tid, &plan.params, &plan.owned_vshards)
-            }
+            GraphOp::WccSuperstep(plan) => self.execute_wcc_superstep(
+                task,
+                tid,
+                &plan.params,
+                &plan.owned_vshards,
+                plan.system_as_of,
+            ),
 
             GraphOp::Stats { collection, as_of } => {
                 self.execute_graph_stats(task, tid, collection.as_ref().map(|c| c.as_str()), *as_of)
             }
+
+            GraphOp::NodeEdgeGuard {
+                collection,
+                node_id,
+                expected,
+            } => self.execute_node_edge_guard(task, tid, collection.as_str(), node_id, expected),
+
+            GraphOp::NodePresenceRead {
+                collection, ids, ..
+            } => self.execute_node_presence_read(task, collection.as_str(), ids),
+
+            // A presence guard checks the state a Calvin transaction commits
+            // on. Outside one it has nothing to guard.
+            GraphOp::NodePresenceGuard { .. } => self.response_error(
+                task,
+                crate::Error::Internal {
+                    detail: "a CRDT delete's presence guard runs only inside a Calvin transaction"
+                        .into(),
+                },
+            ),
+
+            // A TRUNCATE's edge share resolves inside a Calvin transaction,
+            // at the transaction's ordinal. Outside one it has no cut.
+            GraphOp::TruncateEdges { .. } => self.response_error(
+                task,
+                crate::Error::Internal {
+                    detail: "a TRUNCATE edge share runs only inside a Calvin transaction".into(),
+                },
+            ),
         }
     }
 }
@@ -432,6 +517,7 @@ mod tests {
             txn_id: None,
             wal_lsn: Some(Lsn::new(lsn)),
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: Admission::Exempt(ExemptReason::Read),
         })
     }

@@ -16,7 +16,19 @@ pub(in crate::data::executor) struct GraphPathParams<'a> {
     pub dst: &'a str,
     pub edge_label: &'a Option<String>,
     pub max_depth: usize,
+    /// The walk's visit cap ([`CoreLoop::walk_visit_cap`]).
+    pub max_visited: usize,
     pub frontier_bitmap: Option<&'a nodedb_types::SurrogateBitmap>,
+}
+
+/// Bundled arguments for [`CoreLoop::execute_graph_subgraph`].
+pub(in crate::data::executor) struct GraphSubgraphParams<'a> {
+    pub tid: u64,
+    pub start_nodes: &'a [String],
+    pub edge_label: &'a Option<String>,
+    pub depth: usize,
+    /// The walk's visit cap ([`CoreLoop::walk_visit_cap`]).
+    pub max_visited: usize,
 }
 
 impl CoreLoop {
@@ -31,6 +43,7 @@ impl CoreLoop {
             dst,
             edge_label,
             max_depth,
+            max_visited,
             frontier_bitmap,
         } = params;
         let max_depth =
@@ -62,7 +75,7 @@ impl CoreLoop {
                     dst,
                     label_filter: edge_label.as_deref(),
                     max_depth,
-                    max_visited: self.graph_tuning.max_visited,
+                    max_visited,
                     frontier_bitmap,
                 },
                 delta.as_ref(),
@@ -94,11 +107,15 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_graph_subgraph(
         &self,
         task: &ExecutionTask,
-        tid: u64,
-        start_nodes: &[String],
-        edge_label: &Option<String>,
-        depth: usize,
+        params: GraphSubgraphParams<'_>,
     ) -> Response {
+        let GraphSubgraphParams {
+            tid,
+            start_nodes,
+            edge_label,
+            depth,
+            max_visited,
+        } = params;
         debug!(
             core = self.core_id,
             tid,
@@ -137,7 +154,7 @@ impl CoreLoop {
                 edge_label.as_deref(),
                 direction,
                 depth,
-                self.graph_tuning.max_visited,
+                max_visited,
                 delta.as_ref(),
             ),
             None => Vec::new(),

@@ -36,6 +36,13 @@ pub struct RoutingTable {
     vshard_to_group: Vec<u64>,
     /// raft_group_id → (leader_node, [replica_nodes]).
     group_members: HashMap<u64, GroupInfo>,
+    /// vshard_id → (raft_group_id → epoch at which the vShard moved to that
+    /// group). A committed `ReassignVShard` metadata entry sets the epoch to
+    /// its own metadata log index, so every node derives the same value and a
+    /// replay reproduces it. It is the only event that sets an epoch. A vShard
+    /// in its initial group has epoch `0`.
+    #[serde(default)]
+    vshard_epochs: HashMap<u32, HashMap<u64, u64>>,
 }
 
 #[derive(
@@ -50,6 +57,15 @@ pub struct RoutingTable {
 pub struct GroupInfo {
     /// Current leader node ID (0 = no leader known).
     pub leader: u64,
+    /// The Raft term `leader` is known at: from this node's own Raft, or
+    /// from a leader redirect that named the leader with its term. `0` when
+    /// the hint came from a source with no term (the metadata log,
+    /// placement). A termed hint at a higher term always replaces the hint.
+    /// A term-less hint never replaces a termed one. A clear keeps the term.
+    /// Only a confirmation (see [`RoutingTable::confirm_leader`]) fills a
+    /// cleared hint at that term.
+    #[serde(default)]
+    pub leader_term: u64,
     /// All voting members (including leader).
     pub members: Vec<u64>,
     /// Non-voting learner peers catching up to this group.
@@ -102,6 +118,7 @@ impl RoutingTable {
                 group_id,
                 GroupInfo {
                     leader,
+                    leader_term: 0,
                     members,
                     learners: Vec::new(),
                     placement: None,
@@ -116,6 +133,7 @@ impl RoutingTable {
             0,
             GroupInfo {
                 leader: meta_leader,
+                leader_term: 0,
                 members: meta_members,
                 learners: Vec::new(),
                 placement: None,
@@ -125,6 +143,7 @@ impl RoutingTable {
         Self {
             vshard_to_group,
             group_members,
+            vshard_epochs: HashMap::new(),
         }
     }
 
@@ -146,24 +165,135 @@ impl RoutingTable {
         Ok(info.leader)
     }
 
+    /// The leader hint of the group that owns `vshard_id`, with the term the
+    /// hint is known at: `(leader, leader_term)`.
+    pub fn leader_at_term_for_vshard(&self, vshard_id: u32) -> Result<(u64, u64)> {
+        let group_id = self.group_for_vshard(vshard_id)?;
+        let info = self
+            .group_members
+            .get(&group_id)
+            .ok_or(ClusterError::GroupNotFound { group_id })?;
+        Ok((info.leader, info.leader_term))
+    }
+
     /// Get group info.
     pub fn group_info(&self, group_id: u64) -> Option<&GroupInfo> {
         self.group_members.get(&group_id)
     }
 
-    /// Update the leader for a Raft group.
-    pub fn set_leader(&mut self, group_id: u64, leader: u64) {
-        if let Some(info) = self.group_members.get_mut(&group_id) {
-            info.leader = leader;
+    /// Set the leader hint of a Raft group from a source that names a
+    /// leader without a term. It applies only while the hint holds no term,
+    /// so it never replaces a leader some node's Raft observed. Returns
+    /// whether the hint changed.
+    ///
+    /// The callers with no term:
+    /// - the metadata log's `RoutingChange` entries, which name a planned
+    ///   leaseholder or transfer target, not an elected leader;
+    /// - the migration executor's cut-over when no metadata proposer is
+    ///   wired, which names the transfer target;
+    /// - a migration compensation that restores a hint it replaced;
+    /// - routing tables built by tests.
+    ///
+    /// Every source that knows the leader's term calls
+    /// [`Self::observe_leader`] instead.
+    pub fn set_leader(&mut self, group_id: u64, leader: u64) -> bool {
+        match self.group_members.get_mut(&group_id) {
+            Some(info) if info.leader_term == 0 && info.leader != leader => {
+                info.leader = leader;
+                true
+            }
+            _ => false,
         }
     }
 
-    /// Atomically reassign a vShard to a different Raft group.
-    /// Used during Phase 3 (atomic cut-over) of shard migration.
-    pub fn reassign_vshard(&mut self, vshard_id: u32, new_group_id: u64) {
+    /// Forget the leader of a Raft group, as when its leaseholder is
+    /// suspected dead. The term stays, so an observation of the same leader
+    /// at the same term does not restore it. A new election's higher term
+    /// does.
+    pub fn clear_leader(&mut self, group_id: u64) {
+        if let Some(info) = self.group_members.get_mut(&group_id) {
+            info.leader = 0;
+        }
+    }
+
+    /// Whether [`Self::observe_leader`] would change the hint.
+    pub fn leader_observation_is_new(&self, group_id: u64, leader: u64, term: u64) -> bool {
+        self.group_members
+            .get(&group_id)
+            .is_some_and(|info| leader != 0 && term > info.leader_term)
+    }
+
+    /// Whether [`Self::confirm_leader`] would change the hint.
+    pub fn leader_confirmation_is_new(&self, group_id: u64, leader: u64, term: u64) -> bool {
+        self.group_members.get(&group_id).is_some_and(|info| {
+            leader != 0
+                && (term > info.leader_term || (term == info.leader_term && info.leader == 0))
+        })
+    }
+
+    /// Record `leader` of `group_id` at `term` from a source that shows the
+    /// leader serves that term now:
+    /// - this node's Raft, while it leads or the leader's contact is fresh;
+    /// - a node that answered as the leader, or named the leader it follows;
+    /// - SWIM, when a node it suspected answers again.
+    ///
+    /// It applies above the hint's term, as [`Self::observe_leader`] does.
+    /// It also fills a hint cleared at the same term: a clear is a suspicion,
+    /// and this source shows the leader still serves. Returns whether the
+    /// hint changed.
+    pub fn confirm_leader(&mut self, group_id: u64, leader: u64, term: u64) -> bool {
+        if !self.leader_confirmation_is_new(group_id, leader, term) {
+            return false;
+        }
+        match self.group_members.get_mut(&group_id) {
+            Some(info) => {
+                info.leader = leader;
+                info.leader_term = term;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Record `leader` of `group_id` as known at `term`: observed by this
+    /// node's Raft, or named by a leader redirect with the redirecting
+    /// node's term. Applies only above the hint's term: Raft elects at most
+    /// one leader per term, so a higher term is newer. Returns whether the
+    /// hint changed.
+    pub fn observe_leader(&mut self, group_id: u64, leader: u64, term: u64) -> bool {
+        if !self.leader_observation_is_new(group_id, leader, term) {
+            return false;
+        }
+        match self.group_members.get_mut(&group_id) {
+            Some(info) => {
+                info.leader = leader;
+                info.leader_term = term;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Atomically reassign a vShard to a different Raft group, at `epoch`,
+    /// the metadata log index of the reassignment.
+    pub fn reassign_vshard(&mut self, vshard_id: u32, new_group_id: u64, epoch: u64) {
         if (vshard_id as usize) < self.vshard_to_group.len() {
             self.vshard_to_group[vshard_id as usize] = new_group_id;
+            let epochs = self.vshard_epochs.entry(vshard_id).or_default();
+            let current = epochs.entry(new_group_id).or_insert(epoch);
+            *current = (*current).max(epoch);
         }
+    }
+
+    /// The epoch at which `vshard_id` moved to `group_id`: `0` while the
+    /// vShard stays in its initial group. An entry the group applies for the
+    /// vShard is positioned in this epoch, however late it applies.
+    pub fn vshard_epoch(&self, vshard_id: u32, group_id: u64) -> u64 {
+        self.vshard_epochs
+            .get(&vshard_id)
+            .and_then(|epochs| epochs.get(&group_id))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// All vShards assigned to a given group.
@@ -294,6 +424,7 @@ impl RoutingTable {
         Self {
             vshard_to_group,
             group_members,
+            vshard_epochs: HashMap::new(),
         }
     }
 }
@@ -338,6 +469,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_table_with_vshard_epochs_round_trips_through_msgpack() {
+        let mut rt = RoutingTable::uniform(4, &[1, 2, 3], 3);
+        rt.reassign_vshard(7, 3, 41);
+        rt.reassign_vshard(7, 2, 58);
+        rt.reassign_vshard(9, 4, 60);
+        let bytes = zerompk::to_msgpack_vec(&rt).expect("encode routing table");
+        let decoded: RoutingTable = zerompk::from_msgpack(&bytes).expect("decode routing table");
+        assert_eq!(decoded.vshard_epoch(7, 3), 41);
+        assert_eq!(decoded.vshard_epoch(7, 2), 58);
+        assert_eq!(decoded.vshard_epoch(9, 4), 60);
+        assert_eq!(decoded.vshard_epoch(1, 1), 0);
+        assert_eq!(decoded.group_for_vshard(7).ok(), Some(2));
+        assert_eq!(decoded.vshard_epochs, rt.vshard_epochs);
+    }
+
+    #[test]
     fn uniform_distribution() {
         // 16 data groups → groups 1..=16 for vShards, plus metadata group 0.
         // Total group_members entries = 17, but vShard groups = 16.
@@ -369,8 +516,23 @@ mod tests {
         let old_group = rt.group_for_vshard(0).unwrap();
         // old_group is 1 (first data group); reassign to data group 2.
         let new_group = if old_group < 4 { old_group + 1 } else { 1 };
-        rt.reassign_vshard(0, new_group);
+        rt.reassign_vshard(0, new_group, 17);
         assert_eq!(rt.group_for_vshard(0).unwrap(), new_group);
+    }
+
+    #[test]
+    fn a_reassignment_raises_the_vshard_epoch_and_a_replay_keeps_it() {
+        let mut rt = RoutingTable::uniform(4, &[1, 2, 3], 3);
+        let initial = rt.group_for_vshard(0).unwrap();
+        assert_eq!(rt.vshard_epoch(0, initial), 0);
+        let moved = if initial < 4 { initial + 1 } else { 1 };
+        rt.reassign_vshard(0, moved, 40);
+        assert_eq!(rt.vshard_epoch(0, moved), 40);
+        // The old group keeps its epoch, so its late entries stay below.
+        assert_eq!(rt.vshard_epoch(0, initial), 0);
+        // A metadata replay applies the same index again.
+        rt.reassign_vshard(0, moved, 40);
+        assert_eq!(rt.vshard_epoch(0, moved), 40);
     }
 
     #[test]
@@ -379,6 +541,63 @@ mod tests {
         // Data group 1 owns vshard 0.
         rt.set_leader(1, 99);
         assert_eq!(rt.leader_for_vshard(0).unwrap(), 99);
+    }
+
+    #[test]
+    fn a_raft_observation_at_a_higher_term_wins_over_every_other_writer() {
+        let mut rt = RoutingTable::uniform(2, &[1, 2, 3], 3);
+        // A term-less hint is replaced by the first observation. `uniform`
+        // seeds group 1's hint with node 1, so the term-less write names
+        // another node to change it.
+        assert!(rt.set_leader(1, 3));
+        assert_eq!(rt.leader_at_term_for_vshard(0).unwrap(), (3, 0));
+        assert!(rt.observe_leader(1, 2, 5));
+        assert_eq!(rt.leader_for_vshard(0).unwrap(), 2);
+
+        // SWIM clears the suspected leader. The same leader at the same term
+        // is not restored, and an unknown leader is never recorded.
+        rt.clear_leader(1);
+        assert!(!rt.observe_leader(1, 2, 5));
+        assert!(!rt.observe_leader(1, 0, 6));
+        assert_eq!(rt.leader_for_vshard(0).unwrap(), 0);
+
+        // The next election's leader is recorded, and an older term never
+        // replaces it.
+        assert!(rt.observe_leader(1, 3, 6));
+        assert!(!rt.observe_leader(1, 2, 5));
+        assert_eq!(rt.leader_for_vshard(0).unwrap(), 3);
+
+        // A term-less hint never replaces the observed leader.
+        assert!(!rt.set_leader(1, 1));
+        assert_eq!(rt.leader_at_term_for_vshard(0).unwrap(), (3, 6));
+
+        // Nor does it fill a cleared hint that holds a term.
+        rt.clear_leader(1);
+        assert!(!rt.set_leader(1, 1));
+        assert_eq!(rt.leader_at_term_for_vshard(0).unwrap(), (0, 6));
+    }
+
+    #[test]
+    fn a_confirmation_fills_a_hint_cleared_at_its_term_and_nothing_older() {
+        let mut rt = RoutingTable::uniform(2, &[1, 2, 3], 3);
+        assert!(rt.observe_leader(1, 2, 5));
+        rt.clear_leader(1);
+
+        // The leader still serves term 5: the confirmation fills the clear.
+        assert!(!rt.leader_observation_is_new(1, 2, 5));
+        assert!(rt.confirm_leader(1, 2, 5));
+        assert_eq!(rt.leader_at_term_for_vshard(0).unwrap(), (2, 5));
+
+        // It never replaces a live hint at the same term, or any older term.
+        assert!(!rt.confirm_leader(1, 3, 5));
+        assert!(!rt.confirm_leader(1, 3, 4));
+        rt.clear_leader(1);
+        assert!(!rt.confirm_leader(1, 3, 4));
+        assert!(!rt.confirm_leader(1, 0, 5));
+
+        // A newer term applies as an observation does.
+        assert!(rt.confirm_leader(1, 3, 6));
+        assert_eq!(rt.leader_at_term_for_vshard(0).unwrap(), (3, 6));
     }
 
     #[test]

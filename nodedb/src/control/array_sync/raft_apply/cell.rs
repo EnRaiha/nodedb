@@ -48,6 +48,9 @@ pub(crate) struct ArrayCellTarget {
     /// forwarded so this replica's redo record carries it verbatim rather than
     /// re-reading a clock that has since moved.
     pub resolved_now_ms: Option<u64>,
+    /// The source the proposer stamped on the entry: `User` for a client
+    /// write, `Restore` for a cell a RESTORE re-issued.
+    pub event_source: crate::event::EventSource,
 }
 
 /// Apply a decoded array cell write plan (`PhysicalPlan::Array(Put | Delete)`)
@@ -75,6 +78,7 @@ pub(crate) async fn apply_array_cell_write(
         database_id,
         vshard,
         resolved_now_ms,
+        event_source,
     } = target;
 
     // The caller (the distributed apply loop) only routes decoded
@@ -115,13 +119,16 @@ pub(crate) async fn apply_array_cell_write(
             vshard,
             plan,
             // Cluster mode has exactly one write-apply path — this one — so a
-            // committed user write keeps the `User` source its proposer had,
-            // exactly as the generic committed-write branch does.
-            event_source: crate::event::EventSource::User,
+            // committed write keeps the source its proposer stamped, exactly
+            // as the generic committed-write branch does. A restored cell
+            // stays `Restore` and raises no user write mark.
+            event_source,
             resolved_now_ms,
             apply_key: applied_key,
             commit_hlc,
             op_label: "array cell write",
+            group_id,
+            log_index,
         },
     )
     .await;

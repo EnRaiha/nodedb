@@ -19,10 +19,12 @@
 use crate::bridge::envelope::Status;
 use crate::control::array_sync::raft_apply::AppliedPosition;
 use crate::control::distributed_applier::propose_tracker::{AppliedWrite, ProposeTracker};
-use crate::control::server::dispatch_utils::{SubmitOutcome, refusal_is_final};
-use crate::control::wal_replication::ReplicatedEntry;
+use crate::control::server::dispatch_utils::{ChangeFeedOwner, SubmitOutcome, refusal_is_final};
 use crate::control::wal_replication::decode::transaction_redo_payload;
-use crate::control::wal_replication::transaction_redo::{RedoTarget, enqueue_transaction_redo};
+use crate::control::wal_replication::transaction_redo::{
+    RedoTarget, enqueue_transaction_redo, record_cross_shard_key,
+};
+use crate::control::wal_replication::{CollectionIncarnation, ReplicatedEntry};
 use crate::types::{DatabaseId, TenantId, VShardId};
 
 use super::context::{ApplyContext, FinishedApply, Started, StartedEntry};
@@ -34,10 +36,14 @@ use super::start::Prepared;
 /// record and hands it to its core. The apply that follows resolves the
 /// propose waiter. Its outcome says whether the entry's effect is durable on
 /// this node, which is what the group's applied prefix records.
+///
+/// `incarnations` are the entry's collection incarnations, moved out of the
+/// decoded entry.
 pub(super) fn prepare_transaction_redo_entry<'a>(
     ctx: ApplyContext<'a>,
     pos: AppliedPosition,
     entry: &ReplicatedEntry,
+    incarnations: Vec<CollectionIncarnation>,
 ) -> Prepared<'a> {
     let ApplyContext { state, tracker, .. } = ctx;
     let payload = match transaction_redo_payload(&entry.write) {
@@ -60,17 +66,60 @@ pub(super) fn prepare_transaction_redo_entry<'a>(
     };
     Prepared::Enqueue(Box::pin(async move {
         let collection = payload.collections.first().cloned();
+        // A redo for a collection incarnation this node no longer holds has
+        // nothing to mutate. The gates stay held until the redo is enqueued.
+        let routed = super::collection_route::route(
+            state,
+            target.tenant_id.as_u64(),
+            target.database_id,
+            &incarnations,
+        )
+        .await;
+        let _gates = match routed {
+            Ok(super::collection_route::CollectionRoute::Apply(gates)) => gates,
+            Ok(super::collection_route::CollectionRoute::Superseded) => {
+                tracker.complete(
+                    pos.group_id,
+                    pos.log_index,
+                    pos.applied_key,
+                    Err(crate::Error::DataPlane(
+                        crate::bridge::envelope::ErrorCode::NotFound,
+                    )),
+                );
+                return StartedEntry::concluded(EntryOutcome::Applied {
+                    durable: true,
+                    result: None,
+                });
+            }
+            Err(error) => {
+                tracker.complete(pos.group_id, pos.log_index, pos.applied_key, Err(error));
+                return StartedEntry::concluded(EntryOutcome::Applied {
+                    durable: false,
+                    result: None,
+                });
+            }
+        };
         let enqueued = enqueue_transaction_redo(
             state,
             target,
             &payload,
             pos.applied_key,
             pos.carried_commit_hlc(),
+            Some(pos.change_position(state, target.vshard_id.as_u32())),
+            // Every replica stages the redo's row changes under the entry and
+            // publishes them at its log position once the entry settles.
+            ChangeFeedOwner::Replicated {
+                group_id: pos.group_id,
+                log_index: pos.log_index,
+            },
         )
         .await;
         let started = match enqueued {
             Ok(pending) => Started::Running(Box::pin(async move {
                 let submitted = pending.finish(state).await;
+                if let Ok(outcome) = &submitted {
+                    record_cross_shard_key(state, &payload, outcome);
+                }
                 FinishedApply {
                     group_id: pos.group_id,
                     log_index: pos.log_index,

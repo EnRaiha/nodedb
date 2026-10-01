@@ -54,21 +54,33 @@ impl ContinuousAggregateManager {
 
     /// Register a new continuous aggregate. The database scope is taken
     /// from `def.database_id` so every internal map is keyed consistently.
+    ///
+    /// Idempotent: boot re-registration and a replayed post-apply both
+    /// register a definition the core can already hold. A repeated dependency
+    /// edge refreshes the aggregate twice per flush.
     pub fn register(&mut self, def: ContinuousAggregateDef) {
         let database_id = def.database_id;
         let source = def.source.clone();
         let name = def.name.clone();
 
+        if let Some(previous) = self.definitions.get(&(database_id, name.clone()))
+            && previous.source != source
+            && let Some(deps) = self
+                .dependencies
+                .get_mut(&(database_id, previous.source.clone()))
+        {
+            deps.retain(|n| n != &name);
+        }
         self.watermarks
             .entry((database_id, name.clone()))
             .or_default();
         self.materialized
             .entry((database_id, name.clone()))
             .or_default();
-        self.dependencies
-            .entry((database_id, source))
-            .or_default()
-            .push(name.clone());
+        let deps = self.dependencies.entry((database_id, source)).or_default();
+        if !deps.contains(&name) {
+            deps.push(name.clone());
+        }
         self.definitions.insert((database_id, name), def);
     }
 
@@ -420,6 +432,20 @@ mod tests {
 
         assert_eq!(mgr.aggregate_count(), 2);
         assert_eq!(mgr.list_aggregates().len(), 2);
+    }
+
+    /// A second register of the same definition refreshes it once per flush.
+    #[test]
+    fn repeated_register_refreshes_once_per_flush() {
+        let mut mgr = ContinuousAggregateManager::new();
+        mgr.register(make_agg_def("metrics_1m", "metrics", "1m"));
+        mgr.register(make_agg_def("metrics_1m", "metrics", "1m"));
+
+        let drain = make_drain(600, 1_700_000_000_000, 1000);
+        let refreshed = mgr.on_flush(0, "metrics", &drain, 1_700_000_100_000);
+        assert_eq!(refreshed, vec!["metrics_1m"]);
+        let wm = mgr.get_watermark(0, "metrics_1m").unwrap();
+        assert_eq!(wm.rows_aggregated, 600);
     }
 
     #[test]

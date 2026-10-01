@@ -31,6 +31,13 @@ impl CoreLoop {
         on_conflict_updates: &[(String, UpdateValue)],
         rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
+        if let Some(refusal) = crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+            "document",
+            ctx.collection,
+            ctx.surrogate,
+        ) {
+            return self.response_error(ctx.task, refusal);
+        }
         let existing_bytes = match self.stage_current_body(ctx) {
             Ok(b) => b,
             Err(e) => return self.response_error(ctx.task, e),

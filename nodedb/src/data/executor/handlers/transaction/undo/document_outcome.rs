@@ -6,8 +6,8 @@
 //! The transaction batch and the committed-redo apply build them here, so a
 //! rolled-back write reverses the same side effects on both paths: the row,
 //! its secondary and versioned index entries, its HNSW vectors, its R-tree
-//! entries, its column stats, its hash-chain head, the edges a delete
-//! cascaded, and every materialized-sum target row the write folded into.
+//! entries, its column stats, its hash-chain head, and every
+//! materialized-sum target row the write folded into.
 //!
 //! Entries are pushed in the order the writes happened. Rollback runs the log
 //! in reverse.
@@ -19,7 +19,6 @@ use crate::data::executor::handlers::point::apply_delete::PointDeleteOutcome;
 use crate::data::executor::handlers::point::apply_put::PointPutOutcome;
 
 use super::UndoEntry;
-use super::edge_write::{EdgeCsrPrior, EdgeWriteUndo};
 
 /// The document row one write touched.
 pub(in crate::data::executor::handlers) struct DocumentRow<'a> {
@@ -65,7 +64,7 @@ pub(in crate::data::executor::handlers) fn push_put_undo(
     undo_log: &mut Vec<UndoEntry>,
     row: DocumentRow<'_>,
     outcome: PointPutOutcome,
-    chain_hash_prior: Option<Option<String>>,
+    chain_hash_prior: Option<Option<crate::types::hash_chain::ChainHead>>,
 ) {
     undo_log.push(UndoEntry::PutDocument {
         collection: row.collection.to_string(),
@@ -126,28 +125,9 @@ pub(in crate::data::executor::handlers) fn push_delete_undo(
         undo_log.push(UndoEntry::MarkNodeDeleted {
             database_id: row.database_id,
             tid: row.tid,
+            collection: row.collection.to_string(),
             node_id,
         });
-    }
-    // The cascade dropped the deleted node's identity binding with its
-    // edges, so the undo binds the endpoints again.
-    for cascaded in outcome.edge_deletes {
-        let weight =
-            crate::engine::graph::csr::extract_weight_from_properties(&cascaded.old_properties);
-        undo_log.push(UndoEntry::EdgeWrite(Box::new(EdgeWriteUndo {
-            database_id: row.database_id,
-            tid: row.tid,
-            collection: cascaded.collection,
-            src_id: cascaded.src,
-            label: cascaded.label,
-            dst_id: cascaded.dst,
-            version: cascaded.tombstone,
-            csr: EdgeCsrPrior {
-                weight: Some(weight),
-                ..EdgeCsrPrior::default()
-            },
-            rebind_endpoints: true,
-        })));
     }
 }
 

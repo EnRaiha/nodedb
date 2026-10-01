@@ -2,9 +2,9 @@
 
 //! Distributed maintenance operations: ANALYZE/COMPACT/REINDEX across shards.
 //!
-//! In cluster mode, these operations are dispatched to each shard leader
-//! independently. Results are merged on the coordinator node.
-//! In single-node mode, they execute directly on the local Data Plane.
+//! These operations are dispatched to each shard leader independently.
+//! Results are merged on the coordinator node. On a one-node cluster every
+//! leader is this node, so they run on the local Data Plane.
 
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request};
 use crate::control::state::SharedState;
@@ -16,14 +16,14 @@ use nodedb_physical::physical_plan::MetaOp;
 ///
 /// Deliberately not `tuning.network.default_deadline_secs`: that bounds a
 /// client statement, and a maintenance pass rewrites whole segments at
-/// `Priority::Background`. Bounding it by a query deadline would abandon the
+/// `Priority::Background`. Bounding it by a query deadline will abandon the
 /// rewrite partway on every collection large enough to need it.
 const MAINTENANCE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Dispatch a maintenance operation (COMPACT/REINDEX) to all Data Plane cores.
 ///
 /// In single-node: dispatches to core 0 (the only core in most test configs).
-/// In cluster: would dispatch to each shard leader. Currently dispatches locally.
+/// In cluster: will dispatch to each shard leader. Currently dispatches locally.
 pub fn dispatch_maintenance_to_all_cores(
     state: &SharedState,
     tenant_id: TenantId,
@@ -48,6 +48,7 @@ pub fn dispatch_maintenance_to_all_cores(
         txn_id: None,
         wal_lsn: None,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: crate::bridge::envelope::Admission::Exempt(
             crate::bridge::envelope::ExemptReason::AlreadyOrdered,
         ),
@@ -69,7 +70,7 @@ pub fn dispatch_maintenance_to_all_cores(
 /// The coordinator calls this to merge them:
 /// - row_count: sum across shards
 /// - null_count: sum across shards
-/// - distinct_count: max across shards (HLL merge would be more accurate)
+/// - distinct_count: max across shards (HLL merge will be more accurate)
 /// - min_value: min of all shard mins
 /// - max_value: max of all shard maxes
 pub fn merge_column_stats(
@@ -85,7 +86,7 @@ pub fn merge_column_stats(
     for shard in &shards[1..] {
         merged.row_count += shard.row_count;
         merged.null_count += shard.null_count;
-        // Approximate: take max distinct count (HLL merge would be better).
+        // Approximate: take max distinct count (HLL merge will be better).
         merged.distinct_count = merged.distinct_count.max(shard.distinct_count);
 
         // Merge min/max.

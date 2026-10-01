@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Resolvers for the predicate document writes: `BulkUpdate`, `BulkDelete`.
-//! Each scans the matched set via [`CoreLoop::scan_matching_documents`],
+//! Each resolves the matched set via [`CoreLoop::resolve_matched_rows`],
 //! decides the write policy per row, and reports one mutation per row. The
 //! matched set is resolved and shipped here so no replica re-scans the
 //! predicate — drift is caught by each row's own content precondition instead.
+//!
+//! A resolve that carries a transaction id reads the transaction's own staged
+//! writes too. The transaction route uses a `BulkDelete` resolve to find the
+//! rows a predicate `UPDATE` or `DELETE` matches, and writes each one by its
+//! primary key so its row triggers fire.
 
 use nodedb_physical::physical_plan::{
     DocumentResolveOutcome, ResolvedSumTarget, ReturningSpec, UpdateValue,
@@ -20,7 +25,7 @@ use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use crate::data::executor::handlers::bulk_dml::update_project::{
-    ProjectUpdateRows, ProjectedUpdateRow,
+    MatchedRows, ProjectUpdateRows, ProjectedUpdateRow,
 };
 use crate::data::executor::handlers::{returning_rows, rls_write_gate};
 use crate::data::executor::task::ExecutionTask;
@@ -84,9 +89,7 @@ impl CoreLoop {
         }
 
         let filters = decode_filters(filter_bytes)?;
-        let doc_ids = self
-            .scan_matching_documents(ctx.database_id, tid, collection, &filters)
-            .map_err(ErrorCode::from)?;
+        let matched = self.resolve_matched_rows(task, &ctx, collection, &filters)?;
 
         // The same projection the live handler runs before it writes anything,
         // so the resolve and the apply agree on each row's post-image.
@@ -95,7 +98,7 @@ impl CoreLoop {
                 database_id: ctx.database_id,
                 tid,
                 collection,
-                doc_ids: &doc_ids,
+                rows: MatchedRows::Read(matched),
                 updates,
                 strict_schema: ctx.strict_schema.as_ref(),
                 declared_primary_key,
@@ -163,16 +166,11 @@ impl CoreLoop {
         } = args;
         let ctx = self.doc_resolve_ctx(task, tid, collection);
         let filters = decode_filters(filter_bytes)?;
-        let doc_ids = self
-            .scan_matching_documents(ctx.database_id, tid, collection, &filters)
-            .map_err(ErrorCode::from)?;
+        let matched = self.resolve_matched_rows(task, &ctx, collection, &filters)?;
 
-        let mut mutations = Vec::with_capacity(doc_ids.len());
+        let mut mutations = Vec::with_capacity(matched.len());
         let mut rows: Vec<(RowIdentity, Vec<u8>)> = Vec::new();
-        for key in doc_ids {
-            let Some(stored) = self.doc_resolve_read(&ctx, collection, &key)? else {
-                continue;
-            };
+        for (key, stored) in matched {
             // `RETURNING` reports the row's client-visible identity, never
             // the storage key.
             let identity = key.to_identity();

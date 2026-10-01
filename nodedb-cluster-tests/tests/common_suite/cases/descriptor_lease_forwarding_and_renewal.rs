@@ -116,6 +116,16 @@ async fn lease_renews_before_expiry() {
 
     let leader = &cluster.nodes[0];
 
+    // The renewal loop renews a held lease and lets an idle one lapse, so a
+    // statement's hold stands in for the query running across the window.
+    let held = nodedb_cluster::DescriptorId::new(
+        0,
+        TENANT,
+        DescriptorKind::Collection,
+        "renewable".to_string(),
+    );
+    leader.shared.lease_refcount.increment(&held, 1);
+
     // Acquire on the leader. Lease has ~3s expiry from now.
     let initial = leader
         .acquire_lease(
@@ -148,6 +158,7 @@ async fn lease_renews_before_expiry() {
         initial_expiry,
         renewed.expires_at
     );
+    leader.shared.lease_refcount.decrement(&held, 1);
 
     cluster.shutdown().await;
 }

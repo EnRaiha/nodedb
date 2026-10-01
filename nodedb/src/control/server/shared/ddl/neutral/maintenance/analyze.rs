@@ -136,13 +136,8 @@ pub async fn handle_analyze(
             .collect()
     };
 
-    let local_rows = stats_rows.clone();
     let entry = CatalogEntry::PutColumnStats(Box::new(stats_rows));
-    super::super::replicate::propose_and_apply(state, &entry, || {
-        catalog
-            .put_column_stats_batch(&local_rows)
-            .map_err(|e| DdlError::from_error_in_context("failed to store column stats", &e))
-    })?;
+    super::super::replicate::propose_and_apply_async(state, &entry).await?;
 
     state
         .dml_counter

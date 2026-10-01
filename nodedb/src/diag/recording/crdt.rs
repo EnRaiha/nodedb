@@ -8,8 +8,8 @@ use super::shared::error_class;
 use crate::diag::context;
 
 /// Report the per-node oplog compaction that failed while applying a
-/// committed `CompactHistory`. Called from the post-apply arm, which
-/// cannot propagate: `stage` names which part of the work was lost.
+/// committed `CompactHistory`. Called from the compaction fan-out, whose
+/// owed-compaction row stays for a retry: `stage` names which part failed.
 pub fn history_compaction_not_applied(
     err: &crate::Error,
     stage: &'static str,

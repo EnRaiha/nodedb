@@ -39,7 +39,7 @@ pub fn canonical_stream_name(
 ///
 /// The catalog re-key is replicated; the offsets move first, in their separate
 /// database, so a failure there leaves the legacy identity whole.
-pub fn migrate_legacy_topic_group(
+pub async fn migrate_legacy_topic_group(
     state: &SharedState,
     database_id: DatabaseId,
     tenant_id: u64,
@@ -72,6 +72,6 @@ pub fn migrate_legacy_topic_group(
             group,
         )
         .map_err(|error| DdlError::from_error_in_context("consumer-group migration", &error))?;
-    super::replicate::propose_migrate(state, &def, legacy_stream)?;
+    super::replicate::propose_migrate(state, &def, legacy_stream).await?;
     Ok(true)
 }

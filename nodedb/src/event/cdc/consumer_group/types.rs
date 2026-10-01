@@ -23,6 +23,10 @@ pub struct ConsumerGroupDef {
     /// decode into the built-in default database.
     #[msgpack(default)]
     pub database_id: DatabaseId,
+    /// Stamped at propose time on every put; fences a replayed delete to the
+    /// incarnation it targeted.
+    #[msgpack(default)]
+    pub modification_hlc: nodedb_types::Hlc,
 }
 
 /// A single partition offset: (partition_id, committed composite position).
@@ -42,6 +46,21 @@ impl PartitionOffset {
             committed_offset,
         }
     }
+}
+
+/// One replicated `COMMIT OFFSET`: raise a group's offsets on every node.
+#[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+#[msgpack(map)]
+pub struct OffsetCommit {
+    pub database_id: DatabaseId,
+    pub tenant_id: u64,
+    pub stream_name: String,
+    pub group_name: String,
+    /// The group incarnation (`ConsumerGroupDef::modification_hlc`) the
+    /// commit targets. A node whose registered group is another incarnation
+    /// skips the commit.
+    pub group_hlc: nodedb_types::Hlc,
+    pub offsets: Vec<PartitionOffset>,
 }
 
 #[cfg(test)]

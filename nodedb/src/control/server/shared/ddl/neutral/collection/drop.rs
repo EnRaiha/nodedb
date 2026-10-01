@@ -22,11 +22,9 @@
 //! slice so the `IF EXISTS` and spelling-synonym contracts cannot be
 //! lost by an off-by-one index into the tokens.
 //!
-//! Ported from the pgwire `ddl::collection::drop` handler. The catalog
-//! (propose + single-node fallback), cascade dependent enumeration, soft
-//! vs hard delete, implicit-sequence sweep, and audit pair are preserved
-//! verbatim; only the result construction changed from pgwire `Response`
-//! / `Tag` to the protocol-neutral `DdlResult` / `DdlError`.
+//! The catalog (propose + single-node fallback), cascade dependent
+//! enumeration, soft vs hard delete, implicit-sequence sweep, and audit pair
+//! run here. The result is the protocol-neutral `DdlResult` / `DdlError`.
 
 use nodedb_types::DatabaseId;
 
@@ -67,7 +65,7 @@ pub struct DropCollectionRequest<'a> {
 /// without ownership or admin rights gets `42501` (permission denied)
 /// regardless of whether the target actually exists — this prevents
 /// using error-code differences to probe collection existence.
-pub fn drop_collection(
+pub async fn drop_collection(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     req: &DropCollectionRequest<'_>,
@@ -160,7 +158,7 @@ pub fn drop_collection(
     }
 
     // PURGE requires admin — it bypasses the retention safety net,
-    // which an owner alone should not be able to invoke.
+    // which an owner alone cannot invoke.
     if purge && !is_admin {
         return Err(err(
             "42501",
@@ -180,7 +178,7 @@ pub fn drop_collection(
     //
     // The two idempotency branches (already-deleted, already-purged)
     // short-circuit with a success tag and skip the audit pair +
-    // propose — re-running a drop that's already a no-op should not
+    // propose — re-running a drop that's already a no-op must not
     // spawn extra raft rounds or audit noise. The `if_exists` case
     // joins them on the absent-name branch.
     {
@@ -261,101 +259,31 @@ pub fn drop_collection(
             modification_hlc: nodedb_types::Hlc::ZERO,
         }
     };
-    // Without metadata Raft, acquire the per-name lifecycle guard before the
-    // catalog mutation and hold it through local reclaim.
-    let mut local_lifecycle = if state.metadata_raft.get().is_none() {
-        Some(
-            state
-                .quiesce
-                .try_acquire_lifecycle(database_id.as_u64(), tenant_id.as_u64(), name)
-                .ok_or_else(|| err("55006", format!("collection '{name}' lifecycle is busy")))?,
-        )
-    } else {
-        None
-    };
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|error| DdlError::from_error(&error))?;
-    if outcome.needs_local_apply() {
-        let catalog = state.credentials.catalog();
-        if purge {
-            let purge_lsn = state.wal.next_lsn().as_u64();
-            let purge_result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    crate::control::server::shared::ddl::neutral::collection::purge::hard_purge_collection(
-                        state,
-                        database_id.as_u64(),
-                        tenant_id.as_u64(),
-                        name,
-                        purge_lsn,
-                        local_lifecycle.is_some(),
-                    )
-                    .await
-                })
-            });
-            if let Err(failure) = purge_result {
-                // Disarm only when a durable retry record owns the drain; on a
-                // no-retry failure the guard's unwind Drop releases the hold so
-                // a same-name CREATE is not wedged behind an orphaned drain.
-                if failure.retry_queued
-                    && let Some(guard) = local_lifecycle.take()
-                {
-                    guard.disarm();
-                }
-                panic!("local collection reclaim failed: {}", failure.error);
-            }
-            state.permissions.install_replicated_remove_owner(
-                "collection",
-                database_id.as_u64(),
-                tenant_id.as_u64(),
-                name,
-            );
-            state
-                .permissions
-                .remove_grants_for_target(&format!("collection:{}:{name}", tenant_id.as_u64()));
-        } else {
-            // Local apply is only reached without a metadata raft group, where
-            // the entry is never stamped. The sentinel version leaves the
-            // row's existing ordering metadata in place.
-            crate::control::catalog_entry::apply::collection::deactivate(
-                database_id.as_u64(),
-                tenant_id.as_u64(),
-                name,
-                crate::control::catalog_entry::apply::collection::DeactivateStamp {
-                    descriptor_version: 0,
-                    modification_hlc: nodedb_types::Hlc::ZERO,
-                },
-                catalog,
-            )
-            .map_err(|error| {
-                DdlError::from_error_in_context("catalog deactivate failed", &error)
-            })?;
-        }
-    }
 
-    // Cascade: drop implicit sequences (SERIAL/BIGSERIAL fields create {coll}_{field}_seq).
+    // Cascade: drop implicit sequences (SERIAL/BIGSERIAL fields create
+    // {coll}_{field}_seq). Each delete replicates, so every node's catalog
+    // and sequence registry lose it.
     let catalog = state.credentials.catalog();
-    if let Ok(seqs) = catalog.load_sequences_for_tenant(database_id.as_u64(), tenant_id.as_u64()) {
-        let prefix = format!("{name}_");
-        let suffix = "_seq";
-        for seq in &seqs {
-            if seq.name.starts_with(&prefix) && seq.name.ends_with(suffix) {
-                catalog
-                    .delete_sequence(database_id.as_u64(), tenant_id.as_u64(), &seq.name)
-                    .map_err(|e| {
-                        DdlError::from_error_in_context(
-                            &format!("failed to drop sequence '{}'", seq.name),
-                            &e,
-                        )
-                    })?;
-                // Best-effort: registry removal is non-critical since catalog
-                // is the source of truth and the sequence won't be reloaded.
-                let _ = state.sequence_registry.remove(
-                    database_id.as_u64(),
-                    tenant_id.as_u64(),
-                    &seq.name,
-                );
-            }
-        }
+    let seqs = catalog
+        .load_sequences_for_tenant(database_id.as_u64(), tenant_id.as_u64())
+        .map_err(|e| DdlError::from_error_in_context("failed to list sequences", &e))?;
+    let prefix = format!("{name}_");
+    for seq in seqs
+        .iter()
+        .filter(|seq| seq.name.starts_with(&prefix) && seq.name.ends_with("_seq"))
+    {
+        let entry = crate::control::catalog_entry::CatalogEntry::DeleteSequence {
+            database_id: database_id.as_u64(),
+            tenant_id: tenant_id.as_u64(),
+            name: seq.name.clone(),
+            // Frozen by the proposer's stamp.
+            target_descriptor_version: 0,
+            target_hlc: nodedb_types::Hlc::ZERO,
+        };
+        super::super::replicate::propose_and_apply_async(state, &entry).await?;
     }
 
     // Emit a second audit record with the completion status so the

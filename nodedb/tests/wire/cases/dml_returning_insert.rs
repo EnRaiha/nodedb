@@ -315,33 +315,32 @@ async fn multi_row_insert_returning_star_keeps_every_column_in_one_result_set() 
     }
 }
 
-/// Inside an explicit transaction the write is staged or buffered until COMMIT,
-/// so it has no stored row to project — the statement is refused, naming the
-/// limitation, rather than succeeding with no rows.
-///
-/// Success-with-no-rows is the exact silence this clause exists to remove: a
-/// caller asked for rows and would be handed a command tag with no indication
-/// the request had been dropped.
+/// Inside an explicit transaction the write stages into the transaction's
+/// overlay, and the statement answers with the row it staged. A ROLLBACK
+/// discards the row the statement answered with.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn in_transaction_insert_returning_is_refused_not_silently_dropped() {
+async fn in_transaction_insert_returning_answers_the_staged_row() {
     let server = TestServer::start().await;
     server
         .exec("CREATE COLLECTION ins_ret_txn (id TEXT PRIMARY KEY, n INT)")
         .await
         .expect("create collection");
 
-    for sql in [
-        "INSERT INTO ins_ret_txn (id, n) VALUES ('t1', 1) RETURNING id",
-        "UPSERT INTO ins_ret_txn (id, n) VALUES ('t2', 2) RETURNING id",
+    for (sql, expected) in [
+        (
+            "INSERT INTO ins_ret_txn (id, n) VALUES ('t1', 1) RETURNING id, n",
+            "t1|1",
+        ),
+        (
+            "UPSERT INTO ins_ret_txn (id, n) VALUES ('t2', 2) RETURNING id, n",
+            "t2|2",
+        ),
     ] {
         server.exec("BEGIN").await.expect("begin");
-        let message = server
-            .exec(sql)
-            .await
-            .expect_err("an in-transaction RETURNING write must be refused");
-        assert!(
-            message.contains("RETURNING") && message.contains("transaction"),
-            "the refusal must name the clause and the limitation; sql = {sql}, got: {message}"
+        assert_eq!(
+            rows(&server, sql).await,
+            vec![expected.to_string()],
+            "an in-transaction RETURNING write answers with its staged row; sql = {sql}"
         );
         server
             .client
@@ -349,9 +348,12 @@ async fn in_transaction_insert_returning_is_refused_not_silently_dropped() {
             .await
             .expect("rollback");
     }
+    assert!(
+        rows(&server, "SELECT id FROM ins_ret_txn").await.is_empty(),
+        "the rolled-back writes left no row"
+    );
 
-    // Autocommit is unaffected: the same statement outside a transaction
-    // answers with its row.
+    // Autocommit answers with the row it wrote.
     assert_eq!(
         rows(
             &server,
@@ -359,7 +361,6 @@ async fn in_transaction_insert_returning_is_refused_not_silently_dropped() {
         )
         .await,
         vec!["t3".to_string()],
-        "the refusal must be scoped to explicit transactions"
     );
 }
 

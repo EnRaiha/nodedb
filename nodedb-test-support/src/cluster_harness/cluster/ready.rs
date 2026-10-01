@@ -1,19 +1,33 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! The convergence barriers a cluster passes before a test issues anything:
-//! topology size, rolling-upgrade compat-mode exit, metadata-group leader
-//! stability, and per-group Raft leader stability. A fresh bringup and an
-//! in-place restart both wait here.
+//! topology size, metadata-group leader stability, and data groups settled
+//! on their placement and leader. A fresh bringup and an in-place restart
+//! both wait here.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use super::TestCluster;
-use crate::cluster_harness::wait::wait_for;
+use crate::cluster_harness::TestClusterNode;
+use crate::cluster_harness::wait::{wait_for, wait_for_report};
+
+/// Which leader a settled data group must have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LeaderBar {
+    /// The group's preferred leader. The leader balance moves every group's
+    /// leader there as the cluster forms.
+    Preferred,
+    /// Any leader. A restart elects its leaders against other voters, and
+    /// the leader balance holds such a win for ten election timeouts.
+    Elected,
+}
 
 impl TestCluster {
-    /// Wait until every node agrees on the topology, every node left compat
-    /// mode, and every Raft group has one leader every node sees.
-    pub(super) async fn await_ready(&self) {
+    /// Wait until every node agrees on the topology, the metadata group has
+    /// one leader every node sees, and every data group has settled with a
+    /// leader that meets `bar`.
+    pub(super) async fn await_ready(&self, bar: LeaderBar) {
         let node_count = self.nodes.len();
         wait_for(
             "every node reports the full topology",
@@ -23,49 +37,11 @@ impl TestCluster {
         )
         .await;
 
-        // CRITICAL: wait for every node to exit rolling-upgrade
-        // compat mode before letting the test issue any DDL.
-        //
-        // `metadata_proposer::propose_catalog_entry` consults
-        // `cluster_version_view().can_activate_feature(DISTRIBUTED_CATALOG_VERSION)`
-        // and, while even one node still reports a lower wire
-        // version, returns `Ok(0)` without going through the raft
-        // group. The pgwire DDL handlers (CREATE USER, etc.) then
-        // fall through to a LEGACY path that writes the record
-        // directly on the proposing node — **with zero
-        // replication** to followers. Any subsequent
-        // `has_active_user` check on a follower returns false and
-        // the test flakes.
-        //
-        // Topology has three members the moment the join request
-        // completes, but the `wire_version` field on each node's
-        // topology entry is updated asynchronously by the gossip
-        // path. That's why `topology_size == 3` converges fast yet
-        // `can_activate_feature(...)` can still be false for
-        // several hundred milliseconds afterwards. Waiting here
-        // closes the window deterministically — no retries, no
-        // flakes, no compat-mode fallback silently breaking
-        // replication.
-        wait_for(
-            "every node exits rolling-upgrade compat mode",
-            Duration::from_secs(30),
-            Duration::from_millis(20),
-            || {
-                self.nodes.iter().all(|n| {
-                    n.shared.cluster_version_view().can_activate_feature(
-                        nodedb::control::rolling_upgrade::DISTRIBUTED_CATALOG_VERSION,
-                    )
-                })
-            },
-        )
-        .await;
-
         // CRITICAL: wait for the metadata Raft group to elect a leader
         // and for every node's local view to agree on the same leader id.
         //
-        // Topology convergence + rolling-upgrade exit only guarantees
-        // membership and wire version are agreed; they say nothing about
-        // election state. Under heavy host load (e.g. running this test
+        // Topology convergence only guarantees membership is agreed; it
+        // says nothing about election state. Under heavy host load (e.g. running this test
         // immediately after another full-suite cluster test exits and
         // the unit-test pool ramps back up), the initial Raft heartbeat
         // window can be missed and the first `acquire`/`propose` issued
@@ -74,8 +50,7 @@ impl TestCluster {
         // descriptor-lease or DDL call.
         //
         // Waiting until every node reports the same non-zero leader id
-        // closes the window deterministically. Symmetric to the
-        // rolling-upgrade wait above: no retries, no flakes, no
+        // closes the window deterministically: no retries, no flakes, no
         // wasted CI minutes on cleanup of a doomed cluster bringup.
         wait_for(
             "metadata group has stable leader visible on every node",
@@ -93,70 +68,203 @@ impl TestCluster {
         )
         .await;
 
-        // CRITICAL: wait for EVERY data Raft group to elect a stable
-        // leader visible on every node. Without this barrier, the
-        // first data-group write after `spawn_three()` returns can
-        // race a still-electing group:
+        // CRITICAL: wait for EVERY data Raft group to settle before the
+        // test issues anything. Without this barrier, the first data-group
+        // write can race a still-electing group: a proposer that thinks it
+        // leads gets a `log_index` that never commits, and an unrelated
+        // entry at that index wakes its waiter.
         //
-        // 1. Proposer's local `propose()` runs on a node that thinks
-        //    it's leader (stale routing-table hint), gets an Ok back
-        //    with a `log_index` that was never actually committed.
-        // 2. `ProposeTracker::register((group_id, log_index))`.
-        // 3. Some unrelated entry that *does* commit at that index
-        //    (e.g., a leadership-change no-op) fires `tracker.complete`,
-        //    waking the waiter with `Ok([])` even though the user's
-        //    `INSERT` row was never replicated.
-        // 4. `simple_query` returns success; the row is permanently
-        //    lost.
+        // A data group has settled once:
+        // - its replicas are exactly its placement, as every replica's
+        //   routing view records it, and no other node hosts a replica.
+        //   With a replication factor below the node count, the nodes
+        //   outside a group's placement host none of it;
+        // - every replica's Raft names one leader that meets `bar`;
+        // - every replica's routing hint names that leader, and every
+        //   other node's hint names a replica;
+        // - every node's routing view lists the replicas as the group's
+        //   voters, with no learners. A node outside the group learns its
+        //   membership from the group leader's answer to its leader probe.
         //
-        // The metadata-group-only wait above is insufficient because
-        // data groups elect independently and lag the metadata group
-        // by hundreds of milliseconds under load. Waiting until every
-        // group on every node reports a non-zero leader closes the
-        // window deterministically.
-        wait_for(
-            "every Raft group has a stable leader visible on every node",
+        // The Calvin sequencer group is not part of the routing topology.
+        // Calvin tests gate on it separately (`wait_for_sequencer_leader`).
+        wait_for_report(
+            "every data group has settled on its placement and leader",
             Duration::from_secs(30),
             Duration::from_millis(20),
-            || {
-                // Snapshot every node's per-group leader view. A group
-                // is "ready" iff every node reports the same non-zero
-                // leader for it.
-                let per_node: Vec<Vec<(u64, u64)>> =
-                    self.nodes.iter().map(|n| n.all_group_leaders()).collect();
-                if per_node.iter().any(|v| v.is_empty()) {
-                    return false;
-                }
-                // The Calvin sequencer group is an internal Raft group that is
-                // not part of the data/metadata routing topology. Cluster
-                // readiness for data operations does not depend on it, and its
-                // leader is surfaced to the observer on a slower/independent path
-                // than the routing groups — so gating general cluster startup on
-                // it makes every test (Calvin or not) flake when the sequencer
-                // group's observed leader lags. Calvin tests gate on the
-                // sequencer separately (`wait_for_sequencer_leader`). Exclude it
-                // from the general readiness gate.
-                let group_ids: std::collections::BTreeSet<u64> = per_node
-                    .iter()
-                    .flat_map(|v| v.iter().map(|(gid, _)| *gid))
-                    .filter(|gid| *gid != nodedb_cluster::calvin::SEQUENCER_GROUP_ID)
-                    .collect();
-                if group_ids.is_empty() {
-                    return false;
-                }
-                group_ids.iter().all(|gid| {
-                    let leaders: Vec<u64> = per_node
-                        .iter()
-                        .filter_map(|v| v.iter().find(|(g, _)| g == gid).map(|(_, l)| *l))
-                        .collect();
-                    if leaders.len() != per_node.len() {
-                        return false;
-                    }
-                    let first = leaders[0];
-                    first != 0 && leaders.iter().all(|&l| l == first)
-                })
-            },
+            || self.data_groups_settled(bar),
         )
         .await;
     }
+
+    /// Every data group's leader, as a replica's Raft reports it:
+    /// `group_id → leader`. A group no replica knows a leader of is absent.
+    ///
+    /// No single node answers this. With a replication factor below the
+    /// node count, a node hosts only the groups placed on it.
+    pub fn data_group_leaders(&self) -> HashMap<u64, u64> {
+        let mut leaders = HashMap::new();
+        for node in &self.nodes {
+            for (group_id, leader) in node.all_group_leaders() {
+                if group_id == nodedb_cluster::METADATA_GROUP_ID
+                    || group_id == nodedb_cluster::calvin::SEQUENCER_GROUP_ID
+                    || leader == 0
+                    || !node.replicates_data_group(group_id)
+                {
+                    continue;
+                }
+                leaders.entry(group_id).or_insert(leader);
+            }
+        }
+        leaders
+    }
+
+    /// `Ok` once every data group has settled, as [`Self::await_ready`]
+    /// describes. `Err` names each group and node that has not, and why.
+    fn data_groups_settled(&self, bar: LeaderBar) -> Result<(), String> {
+        let routing = self
+            .nodes
+            .first()
+            .and_then(|n| n.shared.cluster_routing.as_ref())
+            .ok_or("node 1 has no routing table")?;
+        let group_ids: Vec<u64> = routing
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .group_ids()
+            .into_iter()
+            .filter(|gid| {
+                *gid != nodedb_cluster::METADATA_GROUP_ID
+                    && *gid != nodedb_cluster::calvin::SEQUENCER_GROUP_ID
+            })
+            .collect();
+        if group_ids.is_empty() {
+            return Err("node 1's routing table holds no data group".into());
+        }
+        let reasons: Vec<String> = group_ids
+            .into_iter()
+            .filter_map(|gid| {
+                self.data_group_settled(gid, bar)
+                    .err()
+                    .map(|why| format!("group {gid}: {why}"))
+            })
+            .collect();
+        if reasons.is_empty() {
+            Ok(())
+        } else {
+            Err(reasons.join("; "))
+        }
+    }
+
+    fn data_group_settled(&self, group_id: u64, bar: LeaderBar) -> Result<(), String> {
+        let replicas: Vec<&TestClusterNode> = self
+            .nodes
+            .iter()
+            .filter(|n| n.replicates_data_group(group_id))
+            .collect();
+        if replicas.is_empty() {
+            return Err("no node replicates it".into());
+        }
+        let stale: Vec<u64> = self
+            .nodes
+            .iter()
+            .filter(|n| n.hosts_data_group(group_id) && !n.replicates_data_group(group_id))
+            .map(|n| n.node_id)
+            .collect();
+        if !stale.is_empty() {
+            return Err(format!("nodes {stale:?} host a replica they left"));
+        }
+        let mut replica_ids: Vec<u64> = replicas.iter().map(|n| n.node_id).collect();
+        replica_ids.sort_unstable();
+
+        let leader = raft_leader(replicas[0], group_id);
+        if leader == 0 {
+            return Err(format!(
+                "replica {} knows no leader; replicas {replica_ids:?}",
+                replicas[0].node_id
+            ));
+        }
+        for replica in &replicas {
+            let node = replica.node_id;
+            let routing = replica
+                .shared
+                .cluster_routing
+                .as_ref()
+                .ok_or(format!("node {node} has no routing table"))?;
+            let routing = routing.read().unwrap_or_else(|p| p.into_inner());
+            let info = routing
+                .group_info(group_id)
+                .ok_or(format!("node {node} has no routing entry"))?;
+            let mut placement = routing.effective_placement(group_id);
+            placement.sort_unstable();
+            let mut members = info.members.clone();
+            members.sort_unstable();
+            if placement != replica_ids || members != replica_ids || !info.learners.is_empty() {
+                return Err(format!(
+                    "node {node}: replicas {replica_ids:?}, placement {placement:?}, members \
+                     {members:?}, learners {:?}",
+                    info.learners
+                ));
+            }
+            let raft = raft_leader(replica, group_id);
+            if raft != leader || info.leader != leader {
+                return Err(format!(
+                    "node {node}: raft leader {raft}, hint ({}, term {}), replica {} names {leader}",
+                    info.leader, info.leader_term, replicas[0].node_id
+                ));
+            }
+            if bar == LeaderBar::Preferred {
+                let preferred = nodedb_cluster::rebalancer::preferred_leaders(&routing)
+                    .get(&group_id)
+                    .copied();
+                if preferred != Some(leader) {
+                    return Err(format!(
+                        "node {node}: leader {leader}, preferred leader {preferred:?}"
+                    ));
+                }
+            }
+        }
+        for node in &self.nodes {
+            let view = node.shared.cluster_routing.as_ref().and_then(|routing| {
+                routing
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .group_info(group_id)
+                    .map(|info| {
+                        let mut members = info.members.clone();
+                        members.sort_unstable();
+                        (
+                            info.leader,
+                            info.leader_term,
+                            members,
+                            info.learners.clone(),
+                        )
+                    })
+            });
+            let Some((leader, term, members, learners)) = view else {
+                return Err(format!("node {}: no routing entry", node.node_id));
+            };
+            if !replica_ids.contains(&leader) {
+                return Err(format!(
+                    "node {}: hint ({leader}, term {term}) names no replica of {replica_ids:?}",
+                    node.node_id
+                ));
+            }
+            if members != replica_ids || !learners.is_empty() {
+                return Err(format!(
+                    "node {}: members {members:?}, learners {learners:?}, replicas \
+                     {replica_ids:?}",
+                    node.node_id
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The leader of `group_id` as `node`'s Raft reports it, `0` when none.
+fn raft_leader(node: &TestClusterNode, group_id: u64) -> u64 {
+    node.all_group_leaders()
+        .into_iter()
+        .find(|&(group, _)| group == group_id)
+        .map_or(0, |(_, leader)| leader)
 }

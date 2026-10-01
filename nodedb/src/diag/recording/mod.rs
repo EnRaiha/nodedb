@@ -9,6 +9,7 @@
 //! discarded.
 
 mod catalog;
+mod continuous_agg;
 mod crdt;
 mod data_plane;
 mod index_rebuild;
@@ -27,6 +28,7 @@ pub use catalog::{
     catalog_apply_orphan_row, collection_purge_row_missing, consumer_group_offsets_retained,
     metadata_apply_wedged, synonym_group_not_applied,
 };
+pub use continuous_agg::continuous_aggregate_not_applied;
 pub use crdt::history_compaction_not_applied;
 pub use data_plane::{
     calvin_apply_halted, calvin_completion_timeout, data_plane_core_fail_stopped,

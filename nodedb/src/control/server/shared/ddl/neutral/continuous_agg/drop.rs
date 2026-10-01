@@ -2,26 +2,17 @@
 
 //! Protocol-neutral `DROP CONTINUOUS AGGREGATE` handler.
 //!
-//! Ported from the pgwire `ddl::continuous_agg::drop` handler. The catalog path
-//! (`propose_and_apply` for the `DeleteContinuousAggregate` entry, then the
-//! `LocalOnly` single-node `UnregisterContinuousAggregate` sync dispatch),
-//! the `parts[3]` name extraction, and the arity check are preserved verbatim;
-//! only the result construction changed from pgwire `Response` / `PgWireError` to
-//! the protocol-neutral [`DdlResult`] / [`DdlError`]. The
-//! [`continuous_aggregate_exists`] helper (moved from the pgwire router's
-//! `ast::exists`) backs the router's IF EXISTS short-circuit guard.
+//! The catalog path (`propose_and_apply` for the `DeleteContinuousAggregate` entry),
+//! the `parts[3]` name extraction, and the arity check run here;
+//! the result is the protocol-neutral [`DdlResult`] / [`DdlError`]. The
+//! [`continuous_aggregate_exists`] helper backs the router's IF EXISTS short-circuit guard.
 
-use std::time::Duration;
-
-use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::{AuthenticatedIdentity, Role};
 use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
-use crate::control::server::shared::ddl::sync_dispatch;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
-use nodedb_physical::physical_plan::MetaOp;
 
-use super::super::super::catalog::propose_and_apply;
+use super::super::super::catalog::propose_and_apply_async;
 use super::super::super::result::{DdlError, DdlResult};
 
 fn err(sqlstate: &str, message: String) -> DdlError {
@@ -99,32 +90,7 @@ pub async fn drop_continuous_aggregate(
         target_descriptor_version: 0,
         target_hlc: nodedb_types::Hlc::ZERO,
     };
-    let outcome = propose_and_apply(state, &entry)?;
-
-    // Single-node / no-applier path: mirror the unregister dispatch the
-    // raft-applier path would have done so the local manager forgets the
-    // aggregate immediately.
-    if outcome.needs_local_apply() {
-        state.permissions.install_replicated_remove_owner(
-            crate::control::security::catalog::auth_types::object_type::CONTINUOUS_AGGREGATE,
-            database_id.as_u64(),
-            tenant_id.as_u64(),
-            &name,
-        );
-        let plan = PhysicalPlan::Meta(MetaOp::UnregisterContinuousAggregate { name: name.clone() });
-        sync_dispatch::dispatch_system(
-            state,
-            sync_dispatch::SystemTask::new(
-                sync_dispatch::SystemReason::CatalogMaintenance,
-                tenant_id,
-                nodedb_types::CollectionKey::from_bare(database_id, &stored.source),
-                plan,
-            ),
-            Duration::from_secs(5),
-        )
-        .await
-        .map_err(|e| DdlError::from_error_in_context("dispatch failed", &e))?;
-    }
+    propose_and_apply_async(state, &entry).await?;
 
     tracing::info!(name, "continuous aggregate dropped");
 

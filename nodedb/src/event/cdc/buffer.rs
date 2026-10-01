@@ -4,7 +4,8 @@
 //!
 //! Events are shared `Arc<CdcEvent>` values so fan-out and repeated polls do
 //! not deep-clone JSON payloads. Consumer cursors are [`CdcOffset`] values,
-//! not bare LSNs: sibling events at one LSN remain independently consumable.
+//! not bare indexes: sibling events of one write remain independently
+//! consumable.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
@@ -65,8 +66,14 @@ impl StreamBuffer {
         }
     }
 
-    /// Insert an event in composite-position order, returning `None` if that
-    /// exact partition position already exists.
+    /// Insert an event, returning `None` if that exact partition position
+    /// already exists.
+    ///
+    /// Events keep arrival order, and each partition's events keep position
+    /// order: an event arriving behind a later position of its own partition
+    /// is placed before it. Positions of different partitions are not
+    /// comparable in a cluster, where each data group numbers its own log, so
+    /// arrival order is what retention evicts by.
     fn push_locked(
         &self,
         events: &mut VecDeque<Arc<CdcEvent>>,
@@ -92,7 +99,9 @@ impl StreamBuffer {
 
         let insertion_index = events
             .iter()
-            .position(|current| current.position() > position)
+            .position(|current| {
+                current.partition == event.partition && current.position() > position
+            })
             .unwrap_or(events.len());
         events.insert(insertion_index, event);
         self.changed
@@ -132,6 +141,18 @@ impl StreamBuffer {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// The retained event of one partition with the highest position. Events
+    /// are kept in position order, so it is the partition's last event.
+    pub fn partition_tail_event(&self, partition_id: u32) -> Option<Arc<CdcEvent>> {
+        self.events
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .rev()
+            .find(|event| event.partition == partition_id)
+            .cloned()
     }
 
     /// Read events strictly after one composite position.
@@ -336,6 +357,8 @@ mod tests {
             row_id: format!("row-{sequence}"),
             event_time: u64::MAX,
             lsn,
+            index: lsn,
+            epoch: 0,
             database_id: crate::types::DatabaseId::new(7),
             tenant_id: 1,
             new_value: None,
@@ -349,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn transaction_siblings_at_one_lsn_remain_independently_readable() {
+    fn transaction_siblings_at_one_index_remain_independently_readable() {
         let buffer = StreamBuffer::new("test".into(), RetentionConfig::default());
         buffer.push(event(1, 10));
         buffer.push(event(2, 10));

@@ -4,12 +4,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nodedb::bridge::dispatch::Dispatcher;
 use nodedb::config::auth::AuthMode;
 use nodedb::control::server::pgwire::listener::PgListener;
-use nodedb::control::state::SharedState;
-use nodedb::data::executor::core_loop::CoreLoop;
-use nodedb::wal::WalManager;
+use nodedb_test_support::booted_state::{BootOptions, BootedState};
 
 async fn shown_connection_ids(client: &tokio_postgres::Client) -> HashSet<u64> {
     client
@@ -30,53 +27,12 @@ async fn shown_connection_ids(client: &tokio_postgres::Client) -> HashSet<u64> {
 /// sends a query, and gets a response.
 #[tokio::test]
 async fn pgwire_connect_and_query() {
-    // Set up infrastructure (mirrors session::tests::full_request_response_roundtrip).
-    let dir = tempfile::tempdir().unwrap();
-    let wal_path = dir.path().join("test.wal");
-    let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
-
-    let (dispatcher, data_sides) = Dispatcher::new(1, 64);
-    let shared = SharedState::new(dispatcher, wal).unwrap();
+    // A one-node cluster with its core, response poller and Event Plane.
+    let shared = BootedState::boot(BootOptions::default());
     shared
         .credentials
         .bootstrap_trust_superuser("nodedb")
         .expect("materialize configured trust superuser");
-
-    // Start a Data Plane core in a background thread.
-    let data_side = data_sides.into_iter().next().unwrap();
-    let core_dir = dir.path().to_path_buf();
-    let (core_stop_tx, core_stop_rx) = std::sync::mpsc::channel::<()>();
-    let core_handle = tokio::task::spawn_blocking(move || {
-        let mut core = CoreLoop::open(
-            0,
-            data_side.request_rx,
-            data_side.response_tx,
-            &core_dir,
-            std::sync::Arc::new(nodedb_types::OrdinalClock::new()),
-            nodedb::data::executor::core_loop::test_governor(),
-        )
-        .unwrap();
-        while matches!(
-            core_stop_rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ) {
-            core.tick();
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    });
-
-    // Start response poller.
-    let shared_poller = Arc::clone(&shared);
-    let (poller_shutdown_tx, mut poller_shutdown_rx) = tokio::sync::watch::channel(false);
-    let poller_handle = tokio::spawn(async move {
-        loop {
-            shared_poller.poll_and_route_responses();
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(1)) => {}
-                _ = poller_shutdown_rx.changed() => break,
-            }
-        }
-    });
 
     // Bind pgwire listener on random port.
     let pg_listener = PgListener::bind("127.0.0.1:0".parse().unwrap())
@@ -86,7 +42,7 @@ async fn pgwire_connect_and_query() {
 
     let (shutdown_bus, _) =
         nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&shared.shutdown));
-    let shared_pg = Arc::clone(&shared);
+    let shared_pg = Arc::clone(&*shared);
     let test_startup_gate = Arc::clone(&shared.startup);
     let bus_pg = shutdown_bus.clone();
     let pg_handle = tokio::spawn(async move {
@@ -222,8 +178,6 @@ async fn pgwire_connect_and_query() {
     let _ = conn_handle.await;
     shutdown_bus.initiate();
     let _ = pg_handle.await;
-    let _ = poller_shutdown_tx.send(true);
-    let _ = poller_handle.await;
-    let _ = core_stop_tx.send(());
-    let _ = core_handle.await;
+    // Dropping the booted state stops the node.
+    drop(shared);
 }

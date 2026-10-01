@@ -6,11 +6,12 @@
 
 use nodedb_physical::physical_plan::PhysicalPlan;
 
+use crate::control::server::exchange::resolve::peers::ShuffleRead;
 use crate::control::server::exchange::resolve::{shuffle, shuffle_aggregate};
 use crate::control::state::SharedState;
 
-use super::dispatch::ResolveCtx;
 use super::entry::Resolved;
+use crate::control::server::exchange::read_scope::ReadScope;
 
 /// Resolve a root-level `Exchange{Shuffle}` node: orchestrate a real
 /// cross-node grace hash join. The child must be a `QueryOp::HashJoin`
@@ -19,7 +20,7 @@ use super::entry::Resolved;
 /// rows as `Resolved::Gathered`.
 pub(super) async fn resolve_shuffle(
     state: &SharedState,
-    ctx: ResolveCtx,
+    ctx: ReadScope,
     child: PhysicalPlan,
     keys: Vec<(String, String)>,
     num_parts: usize,
@@ -31,7 +32,10 @@ pub(super) async fn resolve_shuffle(
         child,
         keys,
         num_parts,
-        ctx.trace_id,
+        ShuffleRead {
+            trace_id: ctx.trace_id,
+            linearizable: ctx.linearizable,
+        },
     )
     .await
 }
@@ -44,7 +48,7 @@ pub(super) async fn resolve_shuffle(
 /// finalized rows as `Resolved::Gathered`.
 pub(super) async fn resolve_shuffle_aggregate(
     state: &SharedState,
-    ctx: ResolveCtx,
+    ctx: ReadScope,
     child: PhysicalPlan,
     keys: Vec<String>,
     num_parts: usize,
@@ -56,7 +60,10 @@ pub(super) async fn resolve_shuffle_aggregate(
         child,
         keys,
         num_parts,
-        ctx.trace_id,
+        ShuffleRead {
+            trace_id: ctx.trace_id,
+            linearizable: ctx.linearizable,
+        },
     )
     .await
 }

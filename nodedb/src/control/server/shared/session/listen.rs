@@ -144,6 +144,28 @@ impl SessionStore {
         }
     }
 
+    /// Hold `publishes` a trigger body made until the transaction commits.
+    pub fn buffer_publishes(
+        &self,
+        addr: impl Into<SessionId>,
+        publishes: Vec<crate::wal::RedoPublish>,
+    ) {
+        if publishes.is_empty() {
+            return;
+        }
+        self.write_session(addr, |s| s.pending_publishes.extend(publishes));
+    }
+
+    /// Take the publishes the transaction's trigger bodies made, for its
+    /// redo record.
+    pub fn take_pending_publishes(
+        &self,
+        addr: impl Into<SessionId>,
+    ) -> Vec<crate::wal::RedoPublish> {
+        self.write_session(addr, |s| std::mem::take(&mut s.pending_publishes))
+            .unwrap_or_default()
+    }
+
     /// Discard all buffered NOTIFYs without delivery (called on ROLLBACK).
     pub fn discard_pending_notifies(&self, addr: impl Into<SessionId>) {
         self.write_session(addr, |s| s.pending_notifies.clear());

@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use tokio::sync::Notify;
 
 use tracing::{debug, instrument};
@@ -189,10 +190,16 @@ impl Drop for NativeTxnCleanupGuard {
 impl NativeSession {
     /// Run the session. The guard begins detached cleanup on normal return,
     /// panic unwinding, or task cancellation; normal completion waits for it.
-    pub async fn run(self) -> crate::Result<()> {
+    ///
+    /// The session future is boxed, once per connection. Every request path
+    /// nests inside it, and unboxed it overflows the compiler's layout depth
+    /// limit in the listener's connection task.
+    pub fn run(self) -> BoxFuture<'static, crate::Result<()>> {
         // The connection-scoped slots wrap the cleanup guard too, so its
         // synchronous take still reaches this connection's DDL buffer.
-        crate::control::server::shared::session::conn_scope::scoped(self.run_guarded()).await
+        Box::pin(crate::control::server::shared::session::conn_scope::scoped(
+            self.run_guarded(),
+        ))
     }
 
     async fn run_guarded(mut self) -> crate::Result<()> {
@@ -293,9 +300,20 @@ impl NativeSession {
             // Crash-injection coverage verifies that a panic after a request
             // mutates transaction state still runs detached connection cleanup.
             crate::fail_point!("native_session::after_request");
+            // Cross-shard graph reads the request made join the transaction's
+            // read-set.
+            crate::control::server::shared::session::graph_reads::record_pending(
+                &self.sessions,
+                self.peer_addr.into(),
+            );
 
             match outcome {
-                dispatch::SqlOutcome::Response(response) => {
+                dispatch::SqlOutcome::Response(mut response) => {
+                    // Notices raised below the response shaper during this
+                    // request (`session::statement_notice`).
+                    response
+                        .warnings
+                        .extend(crate::control::server::shared::session::statement_notice::take());
                     // Encode and write response — chunk if it exceeds frame limit.
                     let resp_bytes = codec::encode_response(&response, format)?;
                     if resp_bytes.len() <= MAX_FRAME_SIZE as usize {

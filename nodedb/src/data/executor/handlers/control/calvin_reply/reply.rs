@@ -23,6 +23,10 @@ pub(in crate::data::executor) enum CalvinReply {
     /// `RETURNING` rows the flush reads from base after the install, so each
     /// row is exactly what a `SELECT` reads.
     PostImages(PostImages),
+    /// `RETURNING` rows of a resolved timeseries ingest: the rows its install
+    /// stored, as a scan reads them. Rows the install rejected are reported
+    /// beside them.
+    InstalledTimeseries(InstalledTimeseries),
 }
 
 impl Default for CalvinReply {
@@ -51,6 +55,34 @@ impl CalvinReply {
     pub(super) fn has_rows(&self) -> bool {
         !matches!(self, Self::Count(_))
     }
+}
+
+/// The `RETURNING` projection of a resolved timeseries ingest, rendered from
+/// what its own install stored into `collection`.
+#[derive(Debug)]
+pub(in crate::data::executor) struct InstalledTimeseries {
+    pub(super) spec: ReturningSpec,
+    pub(super) rls_filters: Vec<u8>,
+    pub(super) collection: String,
+    /// The ingest's position among the transaction's timeseries ingests on
+    /// this vShard. Each ingest becomes one redo sub-record in plan order,
+    /// and its install is the install at this position.
+    pub(super) ordinal: usize,
+}
+
+/// What staging a Calvin transaction's plans carries from one plan to the
+/// next.
+#[derive(Debug, Default)]
+pub(in crate::data::executor) struct CalvinStaging {
+    /// The reply the plans staged so far answer with.
+    pub(in crate::data::executor) reply: CalvinReply,
+    /// The timeseries ingests staged so far.
+    pub(super) ts_ingests: usize,
+    /// Whether a plan the statement names, not a derived one, decided the
+    /// count in `reply`.
+    pub(super) user_count: bool,
+    /// The edges this home owns among the edge writes staged so far.
+    pub(super) owned_edges: u64,
 }
 
 /// The rows of a `RETURNING` plan the flush reads after the install.

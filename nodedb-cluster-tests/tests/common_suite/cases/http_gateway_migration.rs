@@ -32,6 +32,7 @@ fn test_ctx() -> QueryContext {
         trace_id: nodedb_types::TraceId::ZERO,
         database_id: nodedb_types::id::DatabaseId::DEFAULT,
         txn_id: None,
+        linearizable: false,
     }
 }
 
@@ -74,7 +75,7 @@ async fn http_gateway_migration_single_node_query() {
         key: b"row-1".to_vec(),
         value: mp_string("hello-http"),
         ttl_ms: 0,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"row-1".as_ref()),
         returning: None,
         rls_filters: Vec::new(),
         provenance: None,
@@ -154,7 +155,7 @@ async fn http_gateway_migration_cross_node_query() {
         key: b"cross-key".to_vec(),
         value: mp_string("cross-value"),
         ttl_ms: 0,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"cross-key".as_ref()),
         returning: None,
         rls_filters: Vec::new(),
         provenance: None,
@@ -257,6 +258,7 @@ fn http_gateway_error_mapping_not_leader_is_503() {
         vshard_id: VShardId::new(1),
         leader_node: 2,
         leader_addr: "10.0.0.2:9000".into(),
+        leader_term: 1,
     };
     let (status, _) = GatewayErrorMap::to_http(&err);
     assert_eq!(status, 503, "NotLeader should map to 503, got {status}");

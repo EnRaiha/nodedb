@@ -12,8 +12,8 @@ use crate::control::server::exchange::resolve::join_input::{
 };
 use crate::control::state::SharedState;
 
-use super::dispatch::ResolveCtx;
 use super::entry::Resolved;
+use crate::control::server::exchange::read_scope::ReadScope;
 
 /// Fields of a `QueryOp::HashJoin` plan node, carried through resolution as
 /// one value instead of as individually threaded arguments.
@@ -45,16 +45,10 @@ pub(super) struct HashJoinFields {
 /// in `left_input` / `right_input`, then cross-node gather the build side.
 pub(super) async fn resolve_hash_join(
     state: &SharedState,
-    ctx: ResolveCtx,
+    ctx: ReadScope,
     captures: &mut Vec<DistributedReadCapture>,
     fields: HashJoinFields,
 ) -> crate::Result<Resolved> {
-    let ResolveCtx {
-        database_id,
-        tenant_id,
-        trace_id,
-        txn_id,
-    } = ctx;
     let HashJoinFields {
         left_collection,
         right_collection,
@@ -79,37 +73,18 @@ pub(super) async fn resolve_hash_join(
         right_scan_filters,
     } = fields;
 
-    let left_input = resolve_join_input(
-        state,
-        database_id,
-        tenant_id,
-        left_input,
-        trace_id,
-        txn_id,
-        captures,
-    )
-    .await?;
-    right_input = resolve_join_input(
-        state,
-        database_id,
-        tenant_id,
-        right_input,
-        trace_id,
-        txn_id,
-        captures,
-    )
-    .await?;
+    let left_input = resolve_join_input(state, ctx, left_input, captures).await?;
+    right_input = resolve_join_input(state, ctx, right_input, captures).await?;
 
     // Cross-node build-side gather.
     //
     // The HashJoin task routes to the LEFT (probe) collection's owning
     // vShard, where the LEFT side is scanned locally. The RIGHT (build)
     // collection is otherwise scanned BY NAME from that same node — but
-    // a single-vShard-homed build collection may live on a DIFFERENT
+    // a single-vShard-homed build collection can live on a DIFFERENT
     // node, so the by-name scan returns nothing and the join drops rows.
     //
-    // When a gateway is installed (it always is, single node included),
-    // and the build side has not already been materialized by
+    // When the build side has not already been materialized by
     // `resolve_join_input` (`right_input` still `None`), and
     // `right_collection` names a real user collection (catalog sides
     // carry an empty name and are already embedded as a
@@ -118,17 +93,14 @@ pub(super) async fn resolve_hash_join(
     // `ProviderScan`. The HashJoin shipped to the probe node is then
     // self-contained. Only the RIGHT/build side is gathered; the
     // LEFT/probe side stays local to the routed vShard.
-    if state.gateway.get().is_some() && right_input.is_none() && !right_collection.is_empty() {
+    if right_input.is_none() && !right_collection.is_empty() {
         right_input = gather_join_build_side(
             state,
-            database_id,
-            tenant_id,
+            ctx,
             // The side's own collection and its own injected policy,
             // taken as one value: a planner that swaps build and probe
             // swaps both together, never one without the other.
             ScanSide::join_side(&right_collection, &right_rls_filters, &right_scan_filters),
-            trace_id,
-            txn_id,
             captures,
         )
         .await?;

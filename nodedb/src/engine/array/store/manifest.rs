@@ -15,7 +15,8 @@ use nodedb_array::types::TileId;
 
 use crate::types::replay_stamp::{InvalidReplayStamp, ReplayStamp};
 
-const MANIFEST_FILENAME: &str = "manifest.ndam";
+/// The manifest file name inside one array's store directory.
+pub const MANIFEST_FILENAME: &str = "manifest.ndam";
 
 #[derive(
     Debug,

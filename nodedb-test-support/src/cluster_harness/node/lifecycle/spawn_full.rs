@@ -17,9 +17,9 @@ use nodedb::config::server::ClusterSettings;
 use nodedb::control::server::pgwire::listener::PgListener;
 use nodedb::control::state::SharedState;
 use nodedb::event::{EventPlane, EventPlaneConfig, create_event_bus};
-use nodedb::wal::WalManager;
 
 use crate::cluster_harness::cluster::ClusterSpawnConfig;
+use crate::cluster_harness::pitr::{open_node_wal, wire_boot};
 
 use super::client_slot::ClusterTestClient;
 use super::types::{DataDir, HARNESS_SUPERUSER, TestClusterNode};
@@ -101,9 +101,7 @@ impl TestClusterNode {
         // Open WAL + dispatcher + event bus. Replay whatever is already on
         // disk (empty for a fresh directory) so every core can rebuild its
         // in-memory-only structures before it starts ticking.
-        let wal = Arc::new(WalManager::open_for_testing(
-            &data_dir_path.join("test.wal"),
-        )?);
+        let wal = open_node_wal(config.pitr.as_ref(), &data_dir_path)?;
         let wal_records: Arc<[nodedb_wal::WalRecord]> = Arc::from(wal.replay()?.into_boxed_slice());
         let replay_tombstones = nodedb_wal::extract_tombstones(&wal_records).unwrap();
         let (dispatcher, data_sides) = Dispatcher::new(num_cores, DATA_PLANE_QUEUE_CAPACITY);
@@ -124,7 +122,7 @@ impl TestClusterNode {
         // Static, deployment-time surrogate-registry mode — same predicate as
         // production's `config.cluster.is_some()`. `single_node_calvin` here
         // takes the `init_single_node_calvin` synthesis below (never joinable,
-        // mirrors production's default standalone path); every other branch
+        // mirrors production boot without `[cluster]`); every other branch
         // builds a real `ClusterSettings` and joins/bootstraps a genuine Raft
         // group, so it must start in `Cluster` mode from construction — this
         // node was never going to promote into it later.
@@ -170,7 +168,7 @@ impl TestClusterNode {
                 node_id,
                 listen: listen_addr,
                 seed_nodes: seeds,
-                num_groups: 2,
+                num_groups: config.num_groups,
                 replication_factor,
                 force_bootstrap: false,
                 tls: None,
@@ -181,6 +179,9 @@ impl TestClusterNode {
                 log_compaction_threshold,
                 join_retry_max_attempts: 8,
                 join_retry_max_backoff_secs: 32,
+                // `listen` port + 1 can belong to another test's socket, so
+                // take an OS-assigned port on the same IP. It is advertised.
+                swim_listen: Some(std::net::SocketAddr::new(listen_addr.ip(), 0)),
             };
 
             // Initialise the cluster using the pre-bound transport.
@@ -194,54 +195,36 @@ impl TestClusterNode {
             (handle, listen_addr)
         };
 
-        // Wire cluster handles into SharedState (mirrors main.rs).
-        // `Arc::get_mut` is valid here: `shared` has not been cloned.
+        // Wire cluster handles into SharedState with the function production
+        // boot runs. `Arc::get_mut` is valid here: `shared` has not been
+        // cloned. Before `EventPlane::spawn` below: the Event Plane starts the
+        // cross-shard drain only when its sender is wired.
         if let Some(state) = Arc::get_mut(&mut shared) {
-            state.node_id = handle.node_id;
-            state.cluster_topology = Some(Arc::clone(&handle.topology));
-            state.cluster_routing = Some(Arc::clone(&handle.routing));
-            state.cluster_transport = Some(Arc::clone(&handle.transport));
-            state.metadata_cache = Arc::clone(&handle.metadata_cache);
-            state.group_watchers = Arc::clone(&handle.group_watchers);
-            // Wire the cross-shard event SENDER (mirrors production
-            // `bootstrap::state_wiring::wire_state`) so an AFTER-trigger body
-            // writing to a remote-homed collection is dispatched to the owning
-            // node instead of silently mis-written locally. Must be set BEFORE
-            // `EventPlane::spawn` below, whose gate spawns the dispatcher drain
-            // task only when these fields are `Some`. The receiver builds its
-            // own HWM store at Raft group setup, so `hwm_store` stays `None`.
-            let cross_shard_metrics =
-                Arc::new(nodedb::event::cross_shard::CrossShardMetrics::new());
-            state.cross_shard_dispatcher = Some(Arc::new(
-                nodedb::event::cross_shard::CrossShardDispatcher::new(
-                    handle.node_id,
-                    Arc::clone(&cross_shard_metrics),
-                ),
-            ));
-            state.cross_shard_dlq = Some(Arc::new(std::sync::Mutex::new(
-                nodedb::event::cross_shard::CrossShardDlq::open(&data_dir_path)?,
-            )));
-            state.cross_shard_metrics = Some(cross_shard_metrics);
+            // Consumer offsets, job history, MV state and the array-sync
+            // stores live in the data directory in the production layout. A
+            // restart reopens them there, since no metadata entry below the
+            // applied floor re-applies to rebuild them.
+            state.open_disk_stores_at(&data_dir_path)?;
+            nodedb::bootstrap::state_wiring::wire_cluster_handle(state, &handle, &data_dir_path)?;
+            // The Control Plane runs with the graph and query tuning the
+            // cores run with, as a production node reads both from its one
+            // `[tuning]` section. A walk coordinator's visit cap reads it.
+            state.tuning.graph = graph_tuning.clone();
+            state.tuning.query = query_tuning.clone();
             // Fixed test KEK so backup tests produce encrypted envelopes.
             state.backup_kek = Some(Arc::new([0x42u8; 32]));
-            // Durable producer registry, sharing the credential store's
-            // already-open catalog (mirrors production `SharedState::open`).
-            // Required for sync handshake fencing to replicate via the
-            // metadata Raft group on cluster nodes.
-            let catalog = state.credentials.catalog().clone();
-            match nodedb::control::sync_producer::registry::SyncProducerRegistry::open(Arc::new(
-                catalog,
-            )) {
-                Ok(reg) => state.producer_registry = Some(Arc::new(reg)),
-                Err(e) => {
-                    return Err(
-                        format!("SyncProducerRegistry::open failed in test harness: {e}").into(),
-                    );
-                }
+            state.backup_storage = config.backup_storage.clone().map(Arc::new);
+            super::wire_state::open_producer_registry(state)?;
+            // Drains, pending DDL records, and the DDL preparation owner load
+            // from their rows (mirrors production `SharedState::open`).
+            nodedb::control::cluster::metadata_applier::seed_host_tables(state)?;
+            if let Some(pitr) = &config.pitr {
+                pitr.install_stores(state)?;
             }
         } else {
             return Err("SharedState already cloned before cluster wire-up".into());
         }
+        wire_boot(config.pitr.as_ref(), &shared, &handle.catalog).await?;
 
         // Start one Data-Plane core loop per core. Each core gets its own SPSC
         // data side and event producer; per-core stores live under the shared
@@ -272,6 +255,7 @@ impl TestClusterNode {
                     replay,
                     graph_tuning: graph_tuning.clone(),
                     query_tuning: query_tuning.clone(),
+                    timeseries_tuning: config.timeseries_tuning_for(node_id),
                     // Seeded from the SAME durable catalog production reads, so a
                     // harness restart reconstructs cores the way a real one does.
                     // An empty catalog yields an empty seed, which is exactly what
@@ -279,6 +263,7 @@ impl TestClusterNode {
                     doc_config_seed: nodedb::bootstrap::data_plane::load_doc_config_registry_from(
                         shared.credentials.catalog(),
                     ),
+                    event_interest: crate::core_loop_runner::event_interest_for(&shared),
                     stop_rx: core_stop_rx,
                 });
             core_stop_txs.push(core_stop_tx);
@@ -307,6 +292,10 @@ impl TestClusterNode {
         ));
         let (pg_shutdown_bus, _) =
             nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&shared.shutdown));
+        // Sink delivery managers, wired as the server's background loops
+        // wire them, so every node runs a task for every sink stream.
+        shared.webhook_manager.set_state(&shared);
+        shared.kafka_manager.set_state(&shared);
         let event_plane = EventPlane::spawn(EventPlaneConfig {
             consumers_rx: event_consumers,
             wal: Arc::clone(&wal),
@@ -320,7 +309,8 @@ impl TestClusterNode {
 
         // Start Raft + install MetadataCommitApplier.
         let (cluster_shutdown_tx, cluster_shutdown_rx) = tokio::sync::watch::channel(false);
-        nodedb::control::cluster::start_raft(&handle, Arc::clone(&shared), &data_dir_path, tuning)?;
+        nodedb::control::cluster::start_raft(&handle, Arc::clone(&shared), &data_dir_path, tuning)
+            .await?;
 
         // `start_raft` spawns the cluster subsystems (SWIM, reachability,
         // decommission, rebalancer) and stashes the resulting
@@ -355,34 +345,19 @@ impl TestClusterNode {
                 .constraint_reconcile_interval_ms,
         );
 
-        // Spawn the descriptor lease renewal loop on the same
-        // shutdown channel as raft so cluster shutdown stops it
-        // cleanly. Returns None on single-node clusters that
-        // never wired metadata_raft (the harness always wires it,
-        // so this returns Some in practice for cluster tests).
-        let lease_renewal_handle = nodedb::control::lease::LeaseRenewalLoop::spawn(
-            Arc::clone(&shared),
-            tuning,
-            cluster_shutdown_rx,
-        )
-        .map(|(join, metrics)| {
-            shared.loop_metrics_registry.register(metrics);
-            join
-        });
+        // Spawn the descriptor lease renewal loop on the cluster shutdown
+        // channel so cluster shutdown stops it cleanly. `start_raft` above
+        // installed the metadata Raft handle it needs.
+        let (lease_renewal_handle, lease_metrics) =
+            nodedb::control::lease::LeaseRenewalLoop::spawn(
+                Arc::clone(&shared),
+                tuning,
+                cluster_shutdown_rx,
+            )?;
+        shared.loop_metrics_registry.register(lease_metrics);
 
-        // Construct the gateway and install it (plus its DDL invalidator) on
-        // SharedState, mirroring what main.rs does before listeners bind. The
-        // fields are `OnceLock`s, set through `&self`, so no `Arc::get_mut`
-        // (which `shared` being already cloned would defeat) or raw-pointer
-        // write is needed.
-        {
-            let gateway = Arc::new(nodedb::control::gateway::Gateway::new(Arc::clone(&shared)));
-            let invalidator = Arc::new(nodedb::control::gateway::PlanCacheInvalidator::new(
-                &gateway.plan_cache,
-            ));
-            let _ = shared.gateway.set(gateway);
-            let _ = shared.gateway_invalidator.set(invalidator);
-        }
+        // The gateway install production boot runs before listeners bind.
+        nodedb::bootstrap::state_wiring::install_gateway(&shared)?;
 
         // pgwire listener.
         // In the test harness, use the startup gate already on SharedState
@@ -481,7 +456,7 @@ impl TestClusterNode {
             _poller_handle: Some(poller_handle),
             _core_handles: core_handles,
             _event_plane: Some(event_plane),
-            _lease_renewal_handle: lease_renewal_handle,
+            _lease_renewal_handle: Some(lease_renewal_handle),
             _running_cluster: running_cluster,
         })
     }

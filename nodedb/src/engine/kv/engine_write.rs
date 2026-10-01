@@ -18,7 +18,62 @@ pub struct KvPutParams<'a> {
     pub value: &'a [u8],
     pub ttl_ms: u64,
     pub now_ms: u64,
+    /// The row's bound identity, never `Surrogate::ZERO`. An existing row
+    /// keeps the surrogate it was first bound under.
     pub surrogate: Surrogate,
+}
+
+/// Parameters for [`KvEngine::rewrite_with_absolute_expiry`]: a new value
+/// for a row the table already holds. It carries no surrogate: the row keeps
+/// the identity it was bound under.
+#[derive(Debug, Clone, Copy)]
+pub struct KvRewriteParams<'a> {
+    pub database_id: u64,
+    pub tenant_id: u64,
+    pub collection: &'a str,
+    pub key: &'a [u8],
+    pub value: &'a [u8],
+    pub ttl_ms: u64,
+    pub now_ms: u64,
+}
+
+/// A KV write refused because it binds a row to `Surrogate::ZERO`. Every
+/// stored row is bound, so the engine writes nothing for it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "KV write into '{collection}' binds a row to Surrogate::ZERO; every row must be bound \
+     before it is stored"
+)]
+pub struct UnboundKvWrite {
+    pub collection: String,
+}
+
+impl UnboundKvWrite {
+    /// The refusal of a write binding `surrogate` into `collection`, or `Ok`
+    /// when it is bound. A multi-row write checks every row with this before
+    /// it writes any.
+    pub fn check(collection: &str, surrogate: Surrogate) -> Result<(), Self> {
+        if surrogate == Surrogate::ZERO {
+            return Err(Self {
+                collection: collection.to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// See [`UnboundKvWrite::check`].
+pub(super) fn require_bound(collection: &str, surrogate: Surrogate) -> Result<(), UnboundKvWrite> {
+    UnboundKvWrite::check(collection, surrogate)
+}
+
+/// The identity a resolved write leaves on its row.
+#[derive(Clone, Copy)]
+enum RowIdentity {
+    /// Bind the row to this surrogate. An existing row keeps its own.
+    Bind(Surrogate),
+    /// Keep the existing row's surrogate. An absent row is not written.
+    KeepExisting,
 }
 
 impl KvEngine {
@@ -27,10 +82,12 @@ impl KvEngine {
     /// If `ttl_ms > 0`, schedules expiry. If the key already had a TTL,
     /// the old expiry is cancelled and replaced.
     ///
-    /// `surrogate` is the row's stable global identity. Pass
-    /// `Surrogate::ZERO` from internal RMW callers that do not allocate
-    /// one — existing entries preserve their bound surrogate either way.
-    pub fn put(&mut self, params: KvPutParams<'_>) -> Option<Vec<u8>> {
+    /// `surrogate` is the row's stable global identity. An existing entry
+    /// keeps the surrogate it was first bound under. A rewrite of an existing
+    /// row that allocates no identity uses
+    /// [`KvEngine::rewrite_with_absolute_expiry`]. A `Surrogate::ZERO` write
+    /// is refused with [`UnboundKvWrite`] and writes nothing.
+    pub fn put(&mut self, params: KvPutParams<'_>) -> Result<Option<Vec<u8>>, UnboundKvWrite> {
         let expire_at = if params.ttl_ms > 0 {
             params.now_ms + params.ttl_ms
         } else {
@@ -53,16 +110,65 @@ impl KvEngine {
         &mut self,
         params: KvPutParams<'_>,
         expire_at_ms: u64,
-    ) -> Option<Vec<u8>> {
+    ) -> Result<Option<Vec<u8>>, UnboundKvWrite> {
         self.put_resolved(params, expire_at_ms)
+    }
+
+    /// Replace the value and expiry of a row the table already holds, keeping
+    /// the row's bound surrogate. Returns the old value. An absent row is not
+    /// written and returns `None`. `expire_at_ms` is installed verbatim, as
+    /// for [`KvEngine::put_with_absolute_expiry`].
+    pub fn rewrite_with_absolute_expiry(
+        &mut self,
+        params: KvRewriteParams<'_>,
+        expire_at_ms: u64,
+    ) -> Option<Vec<u8>> {
+        self.write_resolved(params, RowIdentity::KeepExisting, expire_at_ms)
     }
 
     /// Shared PUT body: insert/update the key with an already-resolved absolute
     /// `expire_at` (or [`NO_EXPIRY`]), maintaining the expiry wheel and both
     /// secondary and sorted indexes. `params.ttl_ms` is intentionally unused
     /// here — expiry is fully determined by `expire_at`.
-    fn put_resolved(&mut self, params: KvPutParams<'_>, expire_at: u64) -> Option<Vec<u8>> {
+    fn put_resolved(
+        &mut self,
+        params: KvPutParams<'_>,
+        expire_at: u64,
+    ) -> Result<Option<Vec<u8>>, UnboundKvWrite> {
         let KvPutParams {
+            database_id,
+            tenant_id,
+            collection,
+            key,
+            value,
+            ttl_ms,
+            now_ms,
+            surrogate,
+        } = params;
+        require_bound(collection, surrogate)?;
+        Ok(self.write_resolved(
+            KvRewriteParams {
+                database_id,
+                tenant_id,
+                collection,
+                key,
+                value,
+                ttl_ms,
+                now_ms,
+            },
+            RowIdentity::Bind(surrogate),
+            expire_at,
+        ))
+    }
+
+    /// The write body shared by a bound put and a rewrite.
+    fn write_resolved(
+        &mut self,
+        params: KvRewriteParams<'_>,
+        identity: RowIdentity,
+        expire_at: u64,
+    ) -> Option<Vec<u8>> {
+        let KvRewriteParams {
             database_id,
             tenant_id,
             collection,
@@ -70,10 +176,16 @@ impl KvEngine {
             value,
             ttl_ms: _,
             now_ms,
-            surrogate,
         } = params;
 
         let tkey = table_key(database_id, tenant_id, collection);
+        let present = self
+            .tables
+            .get(&tkey)
+            .is_some_and(|t| t.get_entry_meta(key).is_some());
+        if matches!(identity, RowIdentity::KeepExisting) && !present {
+            return None;
+        }
 
         // Single-pass: check indexes + get old entry meta in one HashMap lookup.
         let has_indexes = self.indexes.get(&tkey).is_some_and(|idx| !idx.is_empty());
@@ -98,7 +210,10 @@ impl KvEngine {
         // Fetch-or-create the table, bumping its write epoch — the single
         // chokepoint the aggregate result cache reads to detect this write.
         let table = self.table_for_write_or_create(tkey, tenant_id, collection);
-        let old = table.put(key, value, expire_at, surrogate);
+        let old = match identity {
+            RowIdentity::Bind(surrogate) => table.put(key, value, expire_at, surrogate),
+            RowIdentity::KeepExisting => table.rewrite(key, value, expire_at),
+        };
 
         // Schedule new expiry.
         if expire_at != NO_EXPIRY {
@@ -307,12 +422,59 @@ impl KvEngine {
 
 #[cfg(test)]
 mod tests {
+    use crate::engine::kv::test_support::row_surrogate;
     use crate::engine::kv::{KvBatchPutParams, RegisterIndexParams};
 
     use super::*;
 
     fn now() -> u64 {
         1_000_000
+    }
+
+    /// A write binding a row to `Surrogate::ZERO` is refused and stores
+    /// nothing, and a bound write of the same row succeeds.
+    #[test]
+    fn an_unbound_put_is_refused_and_writes_nothing() {
+        let mut e = make_engine();
+        let n = now();
+        let params = KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "cache",
+            key: b"k1",
+            value: b"v1",
+            ttl_ms: 0,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        };
+        assert!(e.put(params).is_err());
+        assert!(e.get(0, 1, "cache", b"k1", n).is_none());
+
+        let entries = vec![
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"b".to_vec(), b"2".to_vec()),
+        ];
+        let refused = e.batch_put(KvBatchPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "cache",
+            entries: &entries,
+            ttl_ms: 0,
+            now_ms: n,
+            surrogates: &[Surrogate::new(1), Surrogate::ZERO],
+        });
+        assert!(refused.is_err());
+        assert!(
+            e.get(0, 1, "cache", b"a", n).is_none(),
+            "a refused batch writes no entry"
+        );
+
+        e.put(KvPutParams {
+            surrogate: Surrogate::new(5),
+            ..params
+        })
+        .expect("a bound put writes");
+        assert_eq!(e.get(0, 1, "cache", b"k1", n), Some(b"v1".to_vec()));
     }
 
     fn make_engine() -> KvEngine {
@@ -343,8 +505,9 @@ mod tests {
             value: b"v1",
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"k1"),
+        })
+        .expect("a bound row writes");
         assert_eq!(e.get(0, 1, "cache", b"k1", n).unwrap(), b"v1");
 
         e.put(KvPutParams {
@@ -355,8 +518,9 @@ mod tests {
             value: b"v2",
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"k1"),
+        })
+        .expect("a bound row writes");
         assert_eq!(e.get(0, 1, "cache", b"k1", n).unwrap(), b"v2");
 
         assert_eq!(e.delete(0, 1, "cache", &[b"k1".to_vec()], n), 1);
@@ -376,8 +540,9 @@ mod tests {
             value: b"v",
             ttl_ms: 3000,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"k"),
+        })
+        .expect("a bound row writes");
         assert!(e.persist(0, 1, "cache", b"k"));
 
         // Should never expire now.
@@ -397,8 +562,9 @@ mod tests {
             value: b"v",
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"k"),
+        })
+        .expect("a bound row writes");
         assert!(e.get(0, 1, "cache", b"k", n + 100_000).is_some()); // No TTL.
 
         assert!(e.expire(0, 1, "cache", b"k", 2000, n));
@@ -412,16 +578,19 @@ mod tests {
         let n = now();
 
         let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..5u8).map(|i| (vec![i], vec![i * 10])).collect();
-        let surrogates = vec![Surrogate::ZERO; entries.len()];
-        let new_count = e.batch_put(KvBatchPutParams {
-            database_id: 0,
-            tenant_id: 1,
-            collection: "c",
-            entries: &entries,
-            ttl_ms: 0,
-            now_ms: n,
-            surrogates: &surrogates,
-        });
+        let surrogates: Vec<Surrogate> =
+            entries.iter().map(|(key, _)| row_surrogate(key)).collect();
+        let new_count = e
+            .batch_put(KvBatchPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "c",
+                entries: &entries,
+                ttl_ms: 0,
+                now_ms: n,
+                surrogates: &surrogates,
+            })
+            .expect("a bound batch writes");
         assert_eq!(new_count, 5);
 
         let keys: Vec<Vec<u8>> = (0..7u8).map(|i| vec![i]).collect();
@@ -433,20 +602,9 @@ mod tests {
         assert!(results[6].is_none());
     }
 
-    /// A native `KvBatchPut` must call `KvEngine::batch_put` with a
-    /// per-entry surrogate. Without one, every batch-put row lands with
-    /// `Surrogate::ZERO` -- invisible to any surrogate-keyed
-    /// cross-engine read/join, unlike a single-key `put` which always
-    /// carries a real, CP-assigned surrogate. This asserts `batch_put`
-    /// stores the REAL surrogate passed for each entry (observable via
+    /// `batch_put` stores the surrogate passed for each entry (observable via
     /// `get_with_surrogate`, the same accessor the clone-delegated read path
-    /// uses), exactly mirroring what a loop of single-key `put` calls would
-    /// do. Fails pre-fix because pre-fix `batch_put` took no `surrogates`
-    /// parameter at all and hardcoded `Surrogate::ZERO` for every entry --
-    /// this test would not have compiled against that signature, and the
-    /// equivalent assertion against the old code (stubbing `Surrogate::ZERO`
-    /// in) observes `get_with_surrogate` returning `Surrogate::ZERO` instead
-    /// of the distinct real identity asserted here.
+    /// uses), exactly like a loop of single-key `put` calls.
     #[test]
     fn batch_put_stores_real_per_entry_surrogates() {
         let mut e = make_engine();
@@ -454,15 +612,17 @@ mod tests {
 
         let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..3u8).map(|i| (vec![i], vec![i * 10])).collect();
         let surrogates: Vec<Surrogate> = (1..=3u32).map(Surrogate::new).collect();
-        let new_count = e.batch_put(KvBatchPutParams {
-            database_id: 0,
-            tenant_id: 1,
-            collection: "c",
-            entries: &entries,
-            ttl_ms: 0,
-            now_ms: n,
-            surrogates: &surrogates,
-        });
+        let new_count = e
+            .batch_put(KvBatchPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "c",
+                entries: &entries,
+                ttl_ms: 0,
+                now_ms: n,
+                surrogates: &surrogates,
+            })
+            .expect("a bound batch writes");
         assert_eq!(new_count, 3);
 
         for (i, expected) in surrogates.iter().enumerate() {
@@ -473,12 +633,7 @@ mod tests {
             assert_eq!(value, entries[i].1, "entry {i} value must round-trip");
             assert_eq!(
                 stored_surrogate, *expected,
-                "entry {i} must carry its assigned surrogate, not Surrogate::ZERO"
-            );
-            assert_ne!(
-                stored_surrogate,
-                Surrogate::ZERO,
-                "entry {i} must not fall back to the unbound sentinel"
+                "entry {i} must carry its assigned surrogate"
             );
         }
     }
@@ -496,8 +651,9 @@ mod tests {
             value: b"t1",
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: Surrogate::new(1),
+        })
+        .expect("a bound row writes");
         e.put(KvPutParams {
             database_id: 0,
             tenant_id: 2,
@@ -506,8 +662,9 @@ mod tests {
             value: b"t2",
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: Surrogate::new(2),
+        })
+        .expect("a bound row writes");
 
         assert_eq!(e.get(0, 1, "c", b"k", n).unwrap(), b"t1");
         assert_eq!(e.get(0, 2, "c", b"k", n).unwrap(), b"t2");
@@ -540,8 +697,9 @@ mod tests {
             value: &mp_obj(&[("region", "us")]),
             ttl_ms: 5000,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"s1"),
+        })
+        .expect("a bound row writes");
         assert_eq!(e.index_lookup_eq(0, 1, "sess", "region", b"us").len(), 1);
 
         // No tick — the row is expired but still present.
@@ -569,8 +727,9 @@ mod tests {
                 value: &value,
                 ttl_ms: 0,
                 now_ms: n,
-                surrogate: Surrogate::ZERO,
-            });
+                surrogate: row_surrogate(key),
+            })
+            .expect("a bound row writes");
         }
 
         // Timed: 100K updates (keys already exist).
@@ -586,8 +745,9 @@ mod tests {
                 value: &value,
                 ttl_ms: 0,
                 now_ms: n,
-                surrogate: Surrogate::ZERO,
-            });
+                surrogate: row_surrogate(key),
+            })
+            .expect("a bound row writes");
         }
         let elapsed = start.elapsed();
         let ns_per_op = elapsed.as_nanos() / iters as u128;

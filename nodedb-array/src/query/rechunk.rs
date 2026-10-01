@@ -49,11 +49,8 @@ pub fn rechunk_sparse(
             .iter()
             .map(|col| col[attr_row].clone())
             .collect();
-        let surrogate = tile
-            .surrogates
-            .get(row)
-            .copied()
-            .unwrap_or(nodedb_types::Surrogate::ZERO);
+        // A stored cell keeps its identity; a derived row keeps none.
+        let surrogate = tile.row_surrogate(row)?;
         let valid_from_ms = tile.valid_from_ms.get(row).copied().unwrap_or(0);
         let valid_until_ms = tile
             .valid_until_ms

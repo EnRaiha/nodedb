@@ -18,6 +18,23 @@ pub fn after(prior: Option<Hlc>, clock: &HlcClock, now: Hlc) -> Hlc {
     }
 }
 
+/// The incarnation a collection put leaves on its row. A put carrying one
+/// (ALTER, UNDROP, MOVE TENANT) keeps it. Otherwise an active prior row keeps
+/// its own, and a create names a new one with the put's clock.
+pub fn collection_incarnation(
+    carried: Hlc,
+    prior: Option<&crate::control::security::catalog::StoredCollection>,
+    stamped: Hlc,
+) -> Hlc {
+    if carried != Hlc::ZERO {
+        return carried;
+    }
+    match prior {
+        Some(prior) if prior.is_active && prior.incarnation != Hlc::ZERO => prior.incarnation,
+        _ => stamped,
+    }
+}
+
 /// Freeze a fenced delete's target from the committed row it names. An absent
 /// row leaves the target `UNSTAMPED`. A failed read fails the stamp.
 pub fn stamp_delete(entry: CatalogEntry, catalog: &SystemCatalog) -> crate::Result<CatalogEntry> {
@@ -29,7 +46,7 @@ pub fn stamp_delete(entry: CatalogEntry, catalog: &SystemCatalog) -> crate::Resu
 }
 
 /// Stamp `modification_hlc` on a put whose stored type carries no descriptor
-/// version. A topic create that finds its topic keeps the existing clock,
+/// version. A create-only put that finds its row keeps the existing clock,
 /// since apply keeps the existing definition.
 pub fn stamp_put(
     mut entry: CatalogEntry,
@@ -47,9 +64,33 @@ pub fn stamp_put(
         CatalogEntry::PutVectorIndexParams(row) => {
             row.modification_hlc = after(prior, clock, now);
         }
+        CatalogEntry::PutChangeStream(row) => row.modification_hlc = after(prior, clock, now),
+        CatalogEntry::PutConsumerGroupIfAbsent(def) => def.modification_hlc = prior.unwrap_or(now),
+        CatalogEntry::MigrateConsumerGroupStream { def, .. } => {
+            def.modification_hlc = after(prior, clock, now);
+        }
+        CatalogEntry::PutArray(row) => {
+            row.modification_hlc = after(prior, clock, now);
+            // A create names its incarnation. ALTER and MOVE TENANT carry the
+            // incarnation of the row they replace.
+            if row.incarnation == Hlc::ZERO {
+                row.incarnation = row.modification_hlc;
+            }
+        }
         _ => {}
     }
     Ok(entry)
+}
+
+/// Name the incarnation a clone's shadow collections take: the propose clock,
+/// fresh for every clone. A re-stamp keeps the named one.
+pub fn stamp_clone(mut entry: CatalogEntry, now: Hlc) -> CatalogEntry {
+    if let CatalogEntry::CloneDatabase { incarnation, .. } = &mut entry
+        && *incarnation == Hlc::ZERO
+    {
+        *incarnation = now;
+    }
+    entry
 }
 
 /// Retarget a fenced delete at the row an earlier entry of the same batch
@@ -117,7 +158,7 @@ mod tests {
     fn purge_targets_the_committed_row() {
         let (store, _tmp) = make_catalog();
         let catalog = store.catalog();
-        let mut row = StoredCollection::new(1, "orders", "tester");
+        let mut row = StoredCollection::stamped_for_test(1, "orders", "tester");
         row.descriptor_version = 3;
         row.modification_hlc = Hlc::new(30, 0);
         catalog

@@ -27,8 +27,8 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::resolve_arms::{ResolvedMergeArms, decode_resolve};
 use crate::control::target_identity::{
-    TargetPk, assign_target_surrogate, bare_collection_name, derive_document_id, require_surrogate,
-    resolve_target_pk,
+    TargetPk, assign_target_surrogates, bare_collection_name, derive_document_id,
+    require_surrogate, resolve_target_pk,
 };
 
 /// Resolve one in-transaction `DocumentOp::Merge` task into the concrete,
@@ -63,7 +63,7 @@ pub(crate) async fn resolve_and_emit_merge_ops(
     // Gate every resolved arm on the target's write policy (post-image for
     // UPDATE/INSERT, pre-image for DELETE): this expansion rewrites the
     // statement past RLS injection, so without this check a governed MERGE
-    // would launder into ungoverned point writes.
+    // launders into ungoverned point writes.
     if let nodedb_types::WriteGateDecision::Evaluate(predicate) = rls_write_check.decision() {
         let bodies = arms
             .updates
@@ -105,7 +105,8 @@ pub(crate) async fn resolve_and_emit_merge_ops(
         vshard_id,
         arms,
         &mut out,
-    )?;
+    )
+    .await?;
     Ok(out)
 }
 
@@ -189,9 +190,9 @@ async fn resolve_merge_arms(
 
 /// Rewrite the three resolved arms into concrete point-write tasks appended
 /// to `out`. An UPDATE/DELETE arm with no registered surrogate is a hard
-/// error — emitting a degraded raw op would reproduce the indexing /
+/// error — emitting a degraded raw op reproduces the indexing /
 /// durability defect this expansion fixes.
-fn emit_arms(
+async fn emit_arms(
     state: &SharedState,
     task: &PhysicalTask,
     target_collection: &str,
@@ -200,14 +201,21 @@ fn emit_arms(
     arms: ResolvedMergeArms,
     out: &mut Vec<PhysicalTask>,
 ) -> crate::Result<()> {
-    for (_join_key, body) in arms.inserts {
-        let surrogate = assign_target_surrogate(
-            state,
-            nodedb_types::CollectionKey::from_qualified_str(task.database_id, target_collection)?,
-            task.tenant_id,
-            target_pk,
-            &body,
-        )?;
+    // Every inserted row's surrogate in one batch at the target's home.
+    let insert_bodies: Vec<&[u8]> = arms
+        .inserts
+        .iter()
+        .map(|(_, body)| body.as_slice())
+        .collect();
+    let insert_surrogates = assign_target_surrogates(
+        state,
+        nodedb_types::CollectionKey::from_qualified_str(task.database_id, target_collection)?,
+        task.tenant_id,
+        target_pk,
+        &insert_bodies,
+    )
+    .await?;
+    for ((_join_key, body), surrogate) in arms.inserts.into_iter().zip(insert_surrogates) {
         let document_id = derive_document_id(target_pk, &body, surrogate);
         out.push(point_task(
             task,
@@ -267,13 +275,13 @@ fn emit_arms(
                     target_collection.to_string(),
                 ),
                 document_id,
-                surrogate,
+                surrogate: Some(surrogate),
                 pk_bytes,
                 returning: None,
                 rls_filters: Vec::new(),
                 // Already decided against the merge's write predicate by
                 // `admit_compiled_write_image` above; this op removes that
-                // same row, so re-checking would re-run the same test.
+                // same row, so re-checking re-runs the same test.
                 rls_write_check: nodedb_types::RlsWriteCheck::decided_earlier_in_request(),
                 resolved_sum_targets: Vec::new(),
             }),

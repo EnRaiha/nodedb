@@ -2,7 +2,7 @@
 
 //! Which catalog entries change authorization state.
 //!
-//! An entry that changes who may do what, or what a statement may see, is
+//! An entry that changes who can do what, or what a statement can see, is
 //! acknowledged only after it binds every node (see the authorization
 //! lease). The match is exhaustive, so a new entry kind is classified when
 //! it is added.
@@ -96,7 +96,16 @@ impl CatalogEntry {
             | Self::DeleteVectorModel { .. }
             | Self::PutVectorIndexParams(_)
             | Self::PutColumnStats(_)
-            | Self::DeleteVectorIndexParams { .. } => false,
+            | Self::PutCloneCopyup { .. }
+            | Self::PutCloneTombstone { .. }
+            | Self::PutKvCloneTombstone { .. }
+            | Self::PutCloneSourceDrain(_)
+            | Self::DeleteCloneSourceDrain { .. }
+            | Self::PutArray(_)
+            | Self::DeleteArray { .. }
+            | Self::DeleteVectorIndexParams { .. }
+            | Self::CommitConsumerOffsets(_)
+            | Self::PutBackupScheduleMark(_) => false,
         }
     }
 }

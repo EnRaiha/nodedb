@@ -107,9 +107,9 @@ mod tests {
         )
         .expect("encode must not error")
         .expect("the resolved shape replicates");
-        let (_, _, decoded, _) = decode::from_replicated_entry(&entry.to_bytes(), None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded, _) = decode::decode_replicated_entry(&entry.to_bytes())
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         decoded
     }
 

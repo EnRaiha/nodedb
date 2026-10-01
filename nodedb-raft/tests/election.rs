@@ -60,6 +60,7 @@ fn force_election(node: &mut RaftNode<MemStorage>) {
 #[test]
 fn vote_grant_is_idempotent_for_same_candidate() {
     let mut node = RaftNode::new(config(1, vec![2, 3]), MemStorage::new());
+    node.expire_boot_vote_fence();
 
     let req = RequestVoteRequest {
         term: 1,
@@ -67,6 +68,7 @@ fn vote_grant_is_idempotent_for_same_candidate() {
         last_log_index: 0,
         last_log_term: 0,
         group_id: 1,
+        transfer: false,
     };
     let r1 = node.handle_request_vote(&req);
     assert!(r1.vote_granted);
@@ -86,6 +88,7 @@ fn vote_grant_is_idempotent_for_same_candidate() {
 #[test]
 fn stale_term_request_vote_rejected_with_current_term() {
     let mut node = RaftNode::new(config(1, vec![2, 3]), MemStorage::new());
+    node.expire_boot_vote_fence();
 
     // Drive the node up to term 5 via a higher-term AE.
     let bump = AppendEntriesRequest {
@@ -96,9 +99,13 @@ fn stale_term_request_vote_rejected_with_current_term() {
         entries: vec![],
         leader_commit: 0,
         group_id: 1,
+        round: 1,
+        replicated_floor: 0,
     };
     let _ = node.handle_append_entries(&bump);
     assert_eq!(node.current_term(), 5);
+    // Age the leader contact so the term rule, not vote refusal, decides.
+    node.leader_contact_at_override(Instant::now() - Duration::from_secs(1));
 
     let stale = RequestVoteRequest {
         term: 3,
@@ -106,6 +113,7 @@ fn stale_term_request_vote_rejected_with_current_term() {
         last_log_index: 0,
         last_log_term: 0,
         group_id: 1,
+        transfer: false,
     };
     let resp = node.handle_request_vote(&stale);
     assert!(!resp.vote_granted);
@@ -121,6 +129,7 @@ fn stale_term_request_vote_rejected_with_current_term() {
 #[test]
 fn vote_denied_when_candidate_log_not_up_to_date() {
     let mut node = RaftNode::new(config(1, vec![2, 3]), MemStorage::new());
+    node.expire_boot_vote_fence();
 
     // Seed the voter's log with two entries at term 2 via AE.
     let seed = AppendEntriesRequest {
@@ -142,9 +151,13 @@ fn vote_denied_when_candidate_log_not_up_to_date() {
         ],
         leader_commit: 0,
         group_id: 1,
+        round: 1,
+        replicated_floor: 0,
     };
     assert!(node.handle_append_entries(&seed).success);
     assert_eq!(node.current_term(), 2);
+    // Age the leader contact so the up-to-date rule, not vote refusal, decides.
+    node.leader_contact_at_override(Instant::now() - Duration::from_secs(1));
 
     // Candidate at term 3 but with a shorter log (last_log at term 1).
     let stale_log = RequestVoteRequest {
@@ -153,6 +166,7 @@ fn vote_denied_when_candidate_log_not_up_to_date() {
         last_log_index: 5, // long, but...
         last_log_term: 1,  // ...older term — loses to our term-2 tail
         group_id: 1,
+        transfer: false,
     };
     let resp = node.handle_request_vote(&stale_log);
     assert!(
@@ -167,6 +181,7 @@ fn vote_denied_when_candidate_log_not_up_to_date() {
         last_log_index: 1,
         last_log_term: 2,
         group_id: 1,
+        transfer: false,
     };
     let resp = node.handle_request_vote(&shorter);
     assert!(!resp.vote_granted, "same term, shorter log must lose");
@@ -178,6 +193,7 @@ fn vote_denied_when_candidate_log_not_up_to_date() {
         last_log_index: 2,
         last_log_term: 2,
         group_id: 1,
+        transfer: false,
     };
     let resp = node.handle_request_vote(&equal);
     assert!(
@@ -205,6 +221,8 @@ fn candidate_steps_down_on_higher_term_append_entries() {
         entries: vec![],
         leader_commit: 0,
         group_id: 1,
+        round: 1,
+        replicated_floor: 0,
     };
     let resp = node.handle_append_entries(&intruder);
     assert!(resp.success);
@@ -244,6 +262,7 @@ fn consecutive_failed_elections_strictly_increment_term() {
 #[test]
 fn second_candidate_rejected_in_same_term_after_vote_already_cast() {
     let mut node = RaftNode::new(config(1, vec![2, 3]), MemStorage::new());
+    node.expire_boot_vote_fence();
 
     let a = RequestVoteRequest {
         term: 1,
@@ -251,6 +270,7 @@ fn second_candidate_rejected_in_same_term_after_vote_already_cast() {
         last_log_index: 0,
         last_log_term: 0,
         group_id: 1,
+        transfer: false,
     };
     assert!(node.handle_request_vote(&a).vote_granted);
 
@@ -260,6 +280,7 @@ fn second_candidate_rejected_in_same_term_after_vote_already_cast() {
         last_log_index: 0,
         last_log_term: 0,
         group_id: 1,
+        transfer: false,
     };
     let resp = node.handle_request_vote(&b);
     assert!(
@@ -295,6 +316,7 @@ fn candidate_steps_down_on_higher_term_vote_response() {
 #[test]
 fn restart_does_not_double_vote_in_same_term() {
     let mut node = RaftNode::new(config(1, vec![2, 3]), MemStorage::new());
+    node.expire_boot_vote_fence();
 
     // Node 1 votes for candidate 2 in term 1.
     let vote_for_a = RequestVoteRequest {
@@ -303,6 +325,7 @@ fn restart_does_not_double_vote_in_same_term() {
         last_log_index: 0,
         last_log_term: 0,
         group_id: 1,
+        transfer: false,
     };
     assert!(node.handle_request_vote(&vote_for_a).vote_granted);
     assert_eq!(node.current_term(), 1);
@@ -327,6 +350,7 @@ fn restart_does_not_double_vote_in_same_term() {
         last_log_index: 0,
         last_log_term: 0,
         group_id: 1,
+        transfer: false,
     };
     let resp = node.handle_request_vote(&vote_for_b);
     assert!(

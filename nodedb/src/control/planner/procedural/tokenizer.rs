@@ -73,23 +73,73 @@ pub enum Token {
     NumberLit(String),
 }
 
+impl Token {
+    /// Whether this token is a `--` or `/* */` comment.
+    pub fn is_comment(&self) -> bool {
+        matches!(self, Token::SqlFragment(text) if text.starts_with("--") || text.starts_with("/*"))
+    }
+}
+
+/// The tokens of one source text, each with its byte span in that text.
+///
+/// A parser reads the tokens through `Deref`. It takes the SQL a statement or
+/// expression covers from the source through [`TokenStream::source_of`], so
+/// the SQL keeps its original spelling. Rejoining the tokens will split
+/// multi-character operators (`>=`, `||`, `::`) and re-space every literal.
+#[derive(Debug)]
+pub struct TokenStream<'a> {
+    source: &'a str,
+    tokens: Vec<Token>,
+    spans: Vec<std::ops::Range<usize>>,
+}
+
+impl<'a> TokenStream<'a> {
+    /// The source text from the start of token `first` to the end of token
+    /// `last`, both included. `None` when either index is out of range or
+    /// `last` precedes `first`.
+    pub fn source_of(&self, first: usize, last: usize) -> Option<&'a str> {
+        let start = self.spans.get(first)?.start;
+        let end = self.spans.get(last)?.end;
+        self.source.get(start..end)
+    }
+}
+
+impl std::ops::Deref for TokenStream<'_> {
+    type Target = [Token];
+
+    fn deref(&self) -> &[Token] {
+        &self.tokens
+    }
+}
+
 /// Tokenize procedural SQL text into a token stream.
 ///
 /// The tokenizer is keyword-aware: it recognizes procedural keywords and
 /// captures everything else as `SqlFragment` tokens. String literals are
-/// preserved (not split on keywords inside strings).
-pub fn tokenize(input: &str) -> Result<Vec<Token>, ProceduralError> {
+/// preserved (not split on keywords inside strings). Each token keeps its
+/// byte span in `input`.
+pub fn tokenize(input: &str) -> Result<TokenStream<'_>, ProceduralError> {
     let mut tokens = Vec::new();
+    let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
     let bytes = input.as_bytes();
     let len = bytes.len();
     let mut i = 0;
+    let mut token_start = 0;
 
     while i < len {
+        // Each branch below pushes at most one token and moves `i` past it,
+        // so the token an iteration pushed spans `token_start..i` at the top
+        // of the next iteration.
+        if spans.len() < tokens.len() {
+            spans.push(token_start..i);
+        }
+
         // Skip whitespace.
         if bytes[i].is_ascii_whitespace() {
             i += 1;
             continue;
         }
+        token_start = i;
 
         // Opaque SQL regions must not surface procedural keywords.
         if bytes[i] == b'"' {
@@ -239,8 +289,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ProceduralError> {
         tokens.push(Token::Ident(ch.to_string()));
         i += ch.len_utf8();
     }
+    if spans.len() < tokens.len() {
+        spans.push(token_start..i);
+    }
 
-    Ok(tokens)
+    Ok(TokenStream {
+        source: input,
+        tokens,
+        spans,
+    })
 }
 
 /// Read a single-quoted string literal, handling escaped quotes ('').
@@ -483,6 +540,20 @@ mod tests {
         assert!(tokens.contains(&Token::DotDot));
         assert!(tokens.contains(&Token::Break));
         assert!(tokens.contains(&Token::EndLoop));
+    }
+
+    #[test]
+    fn each_token_spans_its_source_text() {
+        let input = "IF x>=1 THEN RETURN 'it''s'::text; END IF;";
+        let tokens = tokenize(input).expect("tokenize");
+        assert_eq!(tokens.source_of(1, 4), Some("x>=1"));
+        let semicolon = tokens
+            .iter()
+            .position(|token| *token == Token::Semicolon)
+            .expect("a semicolon");
+        assert_eq!(tokens.source_of(7, semicolon - 1), Some("'it''s'::text"));
+        assert_eq!(tokens.source_of(0, tokens.len() - 1), Some(input));
+        assert_eq!(tokens.source_of(0, tokens.len()), None);
     }
 
     #[test]

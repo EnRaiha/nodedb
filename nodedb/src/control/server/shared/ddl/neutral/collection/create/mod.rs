@@ -2,7 +2,7 @@
 
 //! `CREATE COLLECTION` / `CREATE TABLE` DDL — split by concern.
 //!
-//! Relocated from `pgwire::ddl::collection::create` (now deleted):
+//! Modules:
 //! - [`build`] — the shared `build_and_persist` body + `Variant`
 //! - [`build_flags`] — name / flag validation for `build`
 //! - [`build_primary_engine`] — vector-primary resolution for `build`

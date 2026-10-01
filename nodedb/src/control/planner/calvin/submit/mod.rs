@@ -31,10 +31,13 @@
 //! schedulers; this module never does storage I/O or io_uring directly.
 
 pub mod assign;
+pub mod edge_slices;
 pub mod local;
+pub mod parts;
 pub mod routed;
+pub mod stream;
 
 pub(crate) use assign::submit_local_assign;
 pub use assign::{RoutedAssignment, submit_calvin_routed_assign};
 pub use local::{submit_and_await_calvin, submit_and_await_calvin_with_timeout};
-pub use routed::submit_calvin_routed;
+pub use routed::{submit_calvin_routed, submit_calvin_routed_write};

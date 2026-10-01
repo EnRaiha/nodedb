@@ -17,6 +17,8 @@ impl<S: LogStorage> RaftNode<S> {
                 term: self.hard_state.current_term,
                 success: false,
                 last_log_index: self.log.last_index(),
+                round: req.round,
+                needs_snapshot: false,
             };
         }
 
@@ -33,6 +35,9 @@ impl<S: LogStorage> RaftNode<S> {
 
         self.leader_id = req.leader_id;
         self.reset_election_timeout();
+        // The leader's knowledge of every voter's log, whether or not this
+        // log matches.
+        self.replicated_floor = self.replicated_floor.max(req.replicated_floor);
         // Recorded before the log checks: contact happened and the leader's
         // commit index is authoritative whether or not our log matches. A
         // mismatched follower is behind, which is exactly what the staleness
@@ -41,6 +46,31 @@ impl<S: LogStorage> RaftNode<S> {
             leader_commit: req.leader_commit,
             at: std::time::Instant::now(),
         });
+
+        // A follower with no state to resume from takes no entries. The
+        // leader answers the refusal with a snapshot.
+        if self.snapshot_required {
+            return AppendEntriesResponse {
+                term: self.hard_state.current_term,
+                success: false,
+                last_log_index: self.log.last_index(),
+                round: req.round,
+                needs_snapshot: true,
+            };
+        }
+
+        // Committed entries this node never applied are gone from its log.
+        // Rejecting at `last_applied` walks the leader's `next_index` below its
+        // compacted prefix, where the leader sends InstallSnapshot instead.
+        if self.has_apply_gap() {
+            return AppendEntriesResponse {
+                term: self.hard_state.current_term,
+                success: false,
+                last_log_index: self.volatile.last_applied,
+                round: req.round,
+                needs_snapshot: false,
+            };
+        }
 
         // Check prev_log consistency.
         if req.prev_log_index > 0 {
@@ -51,6 +81,8 @@ impl<S: LogStorage> RaftNode<S> {
                         term: self.hard_state.current_term,
                         success: false,
                         last_log_index: self.log.last_index(),
+                        round: req.round,
+                        needs_snapshot: false,
                     };
                 }
             }
@@ -62,6 +94,8 @@ impl<S: LogStorage> RaftNode<S> {
                 term: self.hard_state.current_term,
                 success: false,
                 last_log_index: self.log.last_index(),
+                round: req.round,
+                needs_snapshot: false,
             };
         }
 
@@ -74,6 +108,8 @@ impl<S: LogStorage> RaftNode<S> {
             term: self.hard_state.current_term,
             success: true,
             last_log_index: self.log.last_index(),
+            round: req.round,
+            needs_snapshot: false,
         }
     }
 
@@ -117,11 +153,13 @@ impl<S: LogStorage> RaftNode<S> {
             } else {
                 if let Some(state) = leader.observer_state_mut(peer) {
                     let new_next = resp.last_log_index + 1;
-                    if new_next < state.next_index {
-                        state.next_index = new_next.max(1);
+                    let backed_off = if new_next < state.next_index {
+                        new_next
                     } else {
-                        state.next_index = state.next_index.saturating_sub(1).max(1);
-                    }
+                        state.next_index.saturating_sub(1)
+                    };
+                    // A stale rejection never moves below the match.
+                    state.next_index = backed_off.max(state.match_index.saturating_add(1)).max(1);
                     state.pending_count = state.pending_count.saturating_sub(1);
                 }
                 self.send_append_entries_to_observer(peer);
@@ -139,9 +177,10 @@ impl<S: LogStorage> RaftNode<S> {
         // recognises this term, which is all a leadership check needs.
         leader.record_ack(peer);
 
-        // Same signal drives check-quorum: this peer has answered, so a
-        // majority may now have answered inside the current contact window.
-        if peer_is_voter {
+        // Same signal drives check-quorum and the lease. A rejection counts:
+        // the follower recorded this leader's contact before its log check.
+        if peer_is_voter && resp.term == self.hard_state.current_term {
+            self.record_lease_ack(peer, resp.round);
             self.refresh_quorum_contact(std::time::Instant::now());
         }
         let leader = match self.leader_state.as_mut() {
@@ -149,6 +188,11 @@ impl<S: LogStorage> RaftNode<S> {
             None => return,
         };
 
+        if resp.needs_snapshot {
+            leader.awaiting_snapshot.insert(peer);
+        } else {
+            leader.awaiting_snapshot.remove(&peer);
+        }
         if resp.success {
             let new_match = resp.last_log_index;
             if new_match > leader.match_index_for(peer) {
@@ -157,15 +201,28 @@ impl<S: LogStorage> RaftNode<S> {
             }
             if peer_is_voter {
                 self.try_advance_commit_index();
+                self.replicated_floor = self.replicated_floor();
+            }
+        } else if resp.needs_snapshot {
+            // The peer holds no state to resume from: entries from any index
+            // leave it as it is, so it gets a snapshot.
+            if !self.ready.snapshots_needed.contains(&peer) {
+                self.ready.snapshots_needed.push(peer);
             }
         } else {
             let new_next = resp.last_log_index + 1;
             let current_next = leader.next_index_for(peer);
-            if new_next < current_next {
-                leader.set_next_index(peer, new_next.max(1));
+            let backed_off = if new_next < current_next {
+                new_next
             } else {
-                leader.set_next_index(peer, current_next.saturating_sub(1).max(1));
-            }
+                current_next.saturating_sub(1)
+            };
+            // The peer holds every entry through its `match_index`. A stale
+            // rejection, from a request sent before a later one matched, never
+            // moves the next index below it: that would send entries the peer
+            // holds, or a snapshot once the log compacted them.
+            let floor = leader.match_index_for(peer).saturating_add(1);
+            leader.set_next_index(peer, backed_off.max(floor).max(1));
             self.send_append_entries(peer);
         }
 
@@ -185,6 +242,7 @@ mod tests {
     };
     use crate::node::config::RaftConfig;
     use crate::node::core::RaftNode;
+    use crate::node::leader_lease::UNTRACKED_ROUND;
     use crate::node::rpc::test_helpers::{setup_leader_with_observer, test_config};
     use crate::state::NodeRole;
     use crate::storage::MemStorage;
@@ -204,6 +262,8 @@ mod tests {
             entries: vec![],
             leader_commit: 0,
             group_id: 1,
+            round: 1,
+            replicated_floor: 0,
         };
 
         let resp = node.handle_append_entries(&req);
@@ -235,6 +295,8 @@ mod tests {
             ],
             leader_commit: 1,
             group_id: 1,
+            round: 1,
+            replicated_floor: 0,
         };
 
         let resp = node.handle_append_entries(&req);
@@ -262,6 +324,8 @@ mod tests {
             }],
             leader_commit: 1,
             group_id: 1,
+            round: 1,
+            replicated_floor: 0,
         };
 
         let resp = node.handle_append_entries(&req);
@@ -270,6 +334,105 @@ mod tests {
         // Crucially, the learner did not turn into a Follower.
         assert_eq!(node.role(), NodeRole::Learner);
         assert_eq!(node.leader_id(), 1);
+    }
+
+    /// A follower that requires a snapshot refuses entries with
+    /// `needs_snapshot`, and its leader flags it for a snapshot even though
+    /// the leader's log holds every entry.
+    #[test]
+    fn a_follower_that_requires_a_snapshot_gets_one() {
+        let mut follower = RaftNode::new(test_config(2, vec![1]), MemStorage::new());
+        follower.set_snapshot_required(true);
+        let req = AppendEntriesRequest {
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                term: 1,
+                index: 1,
+                data: b"x".to_vec(),
+            }],
+            leader_commit: 1,
+            group_id: 1,
+            round: 1,
+            replicated_floor: 0,
+        };
+        let refusal = follower.handle_append_entries(&req);
+        assert!(!refusal.success);
+        assert!(refusal.needs_snapshot);
+        assert_eq!(follower.last_log_index(), 0, "no entry was appended");
+        assert_eq!(follower.leader_id(), 1, "the leader's contact still counts");
+
+        let mut leader = RaftNode::new(test_config(1, vec![2]), MemStorage::new());
+        force_election(&mut leader);
+        leader.handle_request_vote_response(
+            2,
+            &RequestVoteResponse {
+                term: 1,
+                vote_granted: true,
+            },
+        );
+        assert_eq!(leader.role(), NodeRole::Leader);
+        let _ = leader.take_ready();
+        leader.handle_append_entries_response(2, &refusal);
+        assert!(leader.take_ready().snapshots_needed.contains(&2));
+
+        follower.set_snapshot_required(false);
+        assert!(follower.handle_append_entries(&req).success);
+    }
+
+    /// A stale rejection, answering a request sent before a later one
+    /// matched, never moves the peer's next index below its match.
+    #[test]
+    fn a_stale_rejection_keeps_the_next_index_above_the_match() {
+        let mut node = RaftNode::new(test_config(1, vec![2, 3]), MemStorage::new());
+        force_election(&mut node);
+        let _ = node.take_ready();
+        node.handle_request_vote_response(
+            2,
+            &RequestVoteResponse {
+                term: 1,
+                vote_granted: true,
+            },
+        );
+        assert_eq!(node.role(), NodeRole::Leader);
+        let answer = |success, last_log_index| AppendEntriesResponse {
+            term: 1,
+            success,
+            last_log_index,
+            round: 1,
+            needs_snapshot: false,
+        };
+        node.handle_append_entries_response(2, &answer(true, 1));
+        node.handle_append_entries_response(2, &answer(false, 0));
+        let leader = node.leader_state.as_ref().expect("leader state");
+        assert_eq!(leader.match_index_for(2), 1);
+        assert_eq!(leader.next_index_for(2), 2);
+    }
+
+    /// A node that steps down within the term it voted in keeps that vote.
+    /// It never votes twice in one term.
+    #[test]
+    fn a_step_down_within_a_term_keeps_its_vote() {
+        let mut node = RaftNode::new(test_config(1, vec![2, 3]), MemStorage::new());
+        force_election(&mut node);
+        let _ = node.take_ready();
+        node.handle_request_vote_response(
+            2,
+            &RequestVoteResponse {
+                term: 1,
+                vote_granted: true,
+            },
+        );
+        assert_eq!(node.role(), NodeRole::Leader);
+
+        node.become_follower(1);
+        assert_eq!(node.current_term(), 1);
+        assert_eq!(node.hard_state.voted_for, 1, "the vote of term 1 stands");
+
+        node.become_follower(2);
+        assert_eq!(node.hard_state.voted_for, 0, "a new term frees the vote");
     }
 
     #[test]
@@ -294,6 +457,8 @@ mod tests {
             entries: vec![],
             leader_commit: 0,
             group_id: 1,
+            round: 1,
+            replicated_floor: 0,
         };
         node.handle_append_entries(&req);
         assert_eq!(node.role(), NodeRole::Follower);
@@ -324,6 +489,8 @@ mod tests {
             entries: vec![],
             leader_commit: 0,
             group_id: 1,
+            round: 1,
+            replicated_floor: 0,
         };
         node.handle_append_entries(&req);
 
@@ -368,6 +535,8 @@ mod tests {
             term: 1,
             success: true,
             last_log_index: 2,
+            round: UNTRACKED_ROUND,
+            needs_snapshot: false,
         };
         node.handle_append_entries_response(4, &ae_ok);
         assert_eq!(
@@ -388,6 +557,7 @@ mod tests {
 
         let mut node1 = RaftNode::new(config1, MemStorage::new());
         let mut node2 = RaftNode::new(config2, MemStorage::new());
+        node2.expire_boot_vote_fence();
 
         force_election(&mut node1);
         let ready = node1.take_ready();
@@ -470,6 +640,8 @@ mod tests {
             term: 1,
             success: true,
             last_log_index: idx,
+            round: UNTRACKED_ROUND,
+            needs_snapshot: false,
         };
         leader.handle_append_entries_response(2, &ae_ok);
         assert_eq!(leader.commit_index(), idx);
@@ -522,6 +694,8 @@ mod tests {
             term: 1,
             success: true,
             last_log_index: idx,
+            round: UNTRACKED_ROUND,
+            needs_snapshot: false,
         };
         node1.handle_append_entries_response(5, &obs_ack);
         assert_eq!(
@@ -546,6 +720,8 @@ mod tests {
             term: 1,
             success: true,
             last_log_index: idx,
+            round: UNTRACKED_ROUND,
+            needs_snapshot: false,
         };
         leader.handle_append_entries_response(2, &voter_ack);
         assert_eq!(

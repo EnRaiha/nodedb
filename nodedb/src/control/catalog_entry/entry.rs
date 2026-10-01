@@ -13,6 +13,7 @@
 //! accepted. Variants appended at the end of the enum stay there to keep
 //! MessagePack discriminants stable across rolling upgrades.
 
+use crate::control::security::catalog::backup_schedule_marks::StoredBackupScheduleMark;
 use crate::control::security::catalog::column_stats::StoredColumnStats;
 use crate::control::security::catalog::types::CheckpointRecord;
 use crate::control::security::catalog::{
@@ -31,6 +32,7 @@ use crate::control::security::catalog::{
 use crate::engine::timeseries::retention_policy::RetentionPolicyDef;
 use crate::event::alert::types::AlertDef;
 use crate::event::cdc::consumer_group::ConsumerGroupDef;
+use crate::event::cdc::consumer_group::OffsetCommit;
 use crate::event::cdc::stream_def::ChangeStreamDef;
 use crate::event::scheduler::types::ScheduleDef;
 use crate::event::topic::TopicDef;
@@ -178,6 +180,9 @@ pub enum CatalogEntry {
         database_id: u64,
         tenant_id: u64,
         name: String,
+        /// Incarnation this delete targets, frozen at propose time from the
+        /// stored row. `Hlc::ZERO` applies unfenced.
+        target_hlc: nodedb_types::Hlc,
     },
 
     // ── User ───────────────────────────────────────────────────────
@@ -300,8 +305,10 @@ pub enum CatalogEntry {
     /// `CREATE DATABASE`, `ALTER DATABASE RENAME`, `SET QUOTA`, `MATERIALIZE`,
     /// `PROMOTE`.
     PutDatabase(Box<crate::control::security::catalog::database_types::DatabaseDescriptor>),
-    /// `DROP DATABASE`: removes the descriptor and its `_system.databases_by_name`
-    /// row. Does not touch collection rows — cascade those before proposing.
+    /// `DROP DATABASE`: removes the descriptor, its `_system.databases_by_name`
+    /// row, and its quota and mirror rows. The objects inside the database,
+    /// arrays included, travel as their own deletes in the same commit, ahead
+    /// of this entry.
     DeleteDatabase {
         /// Numeric database id.
         db_id: u64,
@@ -395,6 +402,10 @@ pub enum CatalogEntry {
             Box<crate::control::security::catalog::database_types::DatabaseDescriptor>,
         /// Numeric id of the source database (for lineage update).
         source_db_id: u64,
+        /// The incarnation every shadow collection of the clone takes. A
+        /// shadow is a new collection under a new key, never the source's
+        /// incarnation. The proposer stamps it.
+        incarnation: nodedb_types::Hlc,
     },
 
     /// Streaming MV definition plus its database-scoped owner row.
@@ -506,9 +517,13 @@ pub enum CatalogEntry {
         tenant_id: u64,
         stream_name: String,
         name: String,
+        /// Incarnation this delete targets, frozen at propose time from the
+        /// stored row. `Hlc::ZERO` applies unfenced.
+        target_hlc: nodedb_types::Hlc,
     },
     /// Re-keys a bare-topic group row onto its canonical `topic:<name>` stream.
-    /// `def` carries the legacy record; `legacy_stream` is its bare topic name.
+    /// `def` carries the row as the canonical key stores it; `legacy_stream` is
+    /// the bare topic name of the row it replaces.
     MigrateConsumerGroupStream {
         def: Box<ConsumerGroupDef>,
         legacy_stream: String,
@@ -583,4 +598,79 @@ pub enum CatalogEntry {
     /// plans from the same figures. One entry carries every column so a
     /// planner never sees a subset and costs against it.
     PutColumnStats(Box<Vec<StoredColumnStats>>),
+
+    // ── Clone copy-on-write rows ───────────────────────────────────
+    // Each names the clone collection by `(database_id, tenant_id,
+    // collection)`. Apply writes only while that collection is still a clone,
+    // so a replay after its materialization or purge is a no-op.
+    /// Maps a source row a clone copied up to its target surrogate.
+    PutCloneCopyup {
+        database_id: u64,
+        tenant_id: u64,
+        collection: String,
+        source_surrogate: u32,
+        target_surrogate: u32,
+    },
+    /// Hides a source row, by its surrogate, from the clone's reads.
+    PutCloneTombstone {
+        database_id: u64,
+        tenant_id: u64,
+        collection: String,
+        source_surrogate: u32,
+    },
+    /// Hides a source KV key from the clone's reads.
+    PutKvCloneTombstone {
+        database_id: u64,
+        tenant_id: u64,
+        collection: String,
+        kv_key: String,
+    },
+
+    // ── Clone source drain claims ──────────────────────────────────
+    /// A materialization claims its KV source's drain. Written before the
+    /// drain starts, so a later singleton worker can end an orphaned drain.
+    PutCloneSourceDrain(
+        Box<crate::control::security::catalog::clone_source_drains::CloneSourceDrain>,
+    ),
+    /// Releases a claim once its drain ended or its copy is no longer needed.
+    DeleteCloneSourceDrain {
+        clone_database: u64,
+        tenant_id: u64,
+        clone_collection: String,
+    },
+
+    // ── Array ──────────────────────────────────────────────────────
+    /// CREATE ARRAY and ALTER ARRAY: the full stored definition. Post-apply
+    /// opens the array on every core of every node.
+    PutArray(Box<crate::control::array_catalog::ArrayCatalogEntry>),
+    /// DROP ARRAY, the DROP DATABASE teardown, and the source side of a MOVE
+    /// TENANT rekey. Removes the row and its surrogate bindings.
+    DeleteArray {
+        database_id: u64,
+        tenant_id: u64,
+        name: String,
+        /// Incarnation this delete targets, frozen at propose time from the
+        /// stored row. `Hlc::ZERO` applies unfenced.
+        target_hlc: nodedb_types::Hlc,
+        /// MOVE TENANT only. Apply rekeys the surrogate bindings to the
+        /// target database, and post-apply renames the cell store there
+        /// instead of purging it.
+        moved_to: Option<crate::control::array_catalog::ArrayMove>,
+    },
+
+    // ── Consumer offsets ───────────────────────────────────────────
+    /// Raises one consumer group's committed offsets on every node, so a
+    /// consumer that moves to another node resumes where it committed. A
+    /// node whose registered group is another incarnation than the commit's
+    /// `group_hlc` skips the entry, so a replayed commit of a dropped group
+    /// never moves a recreated group's cursor. Apply only raises offsets, so
+    /// a replay is a no-op.
+    CommitConsumerOffsets(Box<OffsetCommit>),
+
+    // ── Scheduled backups ──────────────────────────────────────────
+    /// Raises one scheduled backup's mark on every node, so the node that
+    /// runs scheduled backups after a leader change neither skips a due
+    /// minute nor repeats a finished one. The mark is keyed by the schedule's
+    /// config incarnation, and apply only raises it, so a replay is a no-op.
+    PutBackupScheduleMark(Box<StoredBackupScheduleMark>),
 }

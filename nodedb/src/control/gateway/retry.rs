@@ -3,8 +3,10 @@
 //! Typed `NotLeader` retry with 3-attempt budget + 50/100/200 ms backoff.
 //!
 //! When a remote dispatch returns `Error::NotLeader`, the retry helper:
-//! 1. Extracts the hinted new leader from the error.
-//! 2. Updates the routing table entry for the affected group.
+//! 1. Extracts the hinted new leader and its term from the error.
+//! 2. Offers them to the routing table entry for the affected group. The
+//!    hint moves only when the redirect's term is above the hint's term, so
+//!    a stale redirect never undoes a newer leader.
 //! 3. Sleeps for the appropriate backoff duration.
 //! 4. Re-invokes the closure.
 //!
@@ -52,25 +54,39 @@ where
             Err(Error::NotLeader {
                 vshard_id,
                 leader_node,
+                leader_term,
                 ..
             }) => {
                 debug!(
                     attempt,
                     vshard_id = vshard_id.as_u32(),
                     leader_node,
+                    leader_term,
                     "gateway: NotLeader — will retry with new leader hint"
                 );
 
-                // Update routing table with the new leader hint:
-                //   • `leader_node != 0` → a redirect hint; set the group leader.
+                // Update routing table with the redirect:
+                //   • `leader_node != 0` with a term → offer the leader at its
+                //     term. It applies above the hint's term, and fills a hint
+                //     cleared at that term.
+                //   • `leader_node != 0` with term 0 → the source named an
+                //     owner without a term. It fills only a hint that holds
+                //     no term.
                 //   • `leader_node == 0` → transport failure or no hint; clear
-                //     the group leader to 0 so the next attempt falls back to
-                //     local dispatch rather than retrying the same dead node.
+                //     the group leader and keep its term, so the next attempt
+                //     falls back to local dispatch rather than retrying the
+                //     same dead node.
                 if let Some(rt) = routing
                     && let Ok(mut table) = rt.write()
                     && let Ok(group_id) = table.group_for_vshard(vshard_id.as_u32())
                 {
-                    table.set_leader(group_id, leader_node);
+                    if leader_node == 0 {
+                        table.clear_leader(group_id);
+                    } else if leader_term == 0 {
+                        table.set_leader(group_id, leader_node);
+                    } else {
+                        table.confirm_leader(group_id, leader_node, leader_term);
+                    }
                 }
 
                 if attempt + 1 < MAX_RETRIES {
@@ -81,6 +97,7 @@ where
                     vshard_id,
                     leader_node,
                     leader_addr: String::new(),
+                    leader_term,
                 });
             }
             Err(Error::RetryableLeaderChange {
@@ -145,6 +162,7 @@ mod tests {
                         vshard_id: VShardId::new(0),
                         leader_node: 2,
                         leader_addr: "10.0.0.2:9400".into(),
+                        leader_term: 1,
                     })
                 } else {
                     Ok::<u32, Error>(99)
@@ -163,6 +181,7 @@ mod tests {
                 vshard_id: VShardId::new(1),
                 leader_node: 0,
                 leader_addr: String::new(),
+                leader_term: 0,
             })
         })
         .await;
@@ -205,6 +224,7 @@ mod tests {
                         vshard_id: VShardId::new(0),
                         leader_node: 2,
                         leader_addr: "addr".into(),
+                        leader_term: 4,
                     })
                 } else {
                     Ok::<(), Error>(())
@@ -214,6 +234,68 @@ mod tests {
         .await;
 
         let table = rt.read().unwrap();
-        assert_eq!(table.leader_for_vshard(0).unwrap(), 2);
+        assert_eq!(table.leader_at_term_for_vshard(0).unwrap(), (2, 4));
+    }
+
+    /// A redirect at a lower term than the hint never moves it back.
+    #[tokio::test]
+    async fn a_stale_redirect_leaves_a_newer_hint() {
+        let mut table = RoutingTable::uniform(1, &[1, 2, 3], 3);
+        let group_id = table.group_for_vshard(0).unwrap();
+        assert!(table.observe_leader(group_id, 3, 7));
+        let rt = RwLock::new(table);
+
+        let _ = retry_not_leader(Some(&rt), |attempt| async move {
+            if attempt == 0 {
+                Err(Error::NotLeader {
+                    vshard_id: VShardId::new(0),
+                    leader_node: 2,
+                    leader_addr: "addr".into(),
+                    leader_term: 5,
+                })
+            } else {
+                Ok::<(), Error>(())
+            }
+        })
+        .await;
+
+        let table = rt.read().unwrap();
+        assert_eq!(table.leader_at_term_for_vshard(0).unwrap(), (3, 7));
+    }
+
+    /// A redirect without a term fills a hint that holds no term, and never
+    /// replaces a termed one.
+    #[tokio::test]
+    async fn a_term_less_redirect_never_replaces_a_termed_hint() {
+        async fn redirect_to(rt: &RwLock<RoutingTable>, leader_node: u64) {
+            let _ = retry_not_leader(Some(rt), |attempt| async move {
+                if attempt == 0 {
+                    Err(Error::NotLeader {
+                        vshard_id: VShardId::new(0),
+                        leader_node,
+                        leader_addr: String::new(),
+                        leader_term: 0,
+                    })
+                } else {
+                    Ok::<(), Error>(())
+                }
+            })
+            .await;
+        }
+
+        let rt = RwLock::new(RoutingTable::uniform(1, &[1, 2, 3], 3));
+        redirect_to(&rt, 2).await;
+        assert_eq!(
+            rt.read().unwrap().leader_at_term_for_vshard(0).unwrap(),
+            (2, 0)
+        );
+
+        let group_id = rt.read().unwrap().group_for_vshard(0).unwrap();
+        assert!(rt.write().unwrap().observe_leader(group_id, 3, 7));
+        redirect_to(&rt, 2).await;
+        assert_eq!(
+            rt.read().unwrap().leader_at_term_for_vshard(0).unwrap(),
+            (3, 7)
+        );
     }
 }

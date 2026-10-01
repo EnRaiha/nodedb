@@ -14,9 +14,7 @@
 //! purged rows were still in the replayed WAL tail, so an empty purged
 //! collection shows the tombstone gate worked and not that nothing replayed.
 //!
-//! Every engine runs in a named database and in the default database, with
-//! the metadata Raft group and without it (`standalone`). The two modes reach
-//! the purge through different apply paths.
+//! Every engine runs in a named database and in the default database.
 
 mod crash_harness;
 
@@ -63,20 +61,18 @@ impl Engine {
     }
 }
 
-/// One scenario: the engine, the database it runs in, and the boot mode.
+/// One scenario: the engine and the database it runs in.
 struct Case {
     engine: Engine,
     /// `None` runs in the default database.
     database: Option<&'static str>,
-    standalone: bool,
     prefix: &'static str,
 }
 
 /// An incidental checkpoint could move the replay floor past the inserts, and
 /// replay would then have nothing to resurrect.
-fn harness(standalone: bool) -> CrashHarness {
-    let h = CrashHarness::new().with_env("NODEDB_CHECKPOINT_INTERVAL_SECS", "3600");
-    if standalone { h.standalone() } else { h }
+fn harness() -> CrashHarness {
+    CrashHarness::new().with_env("NODEDB_CHECKPOINT_INTERVAL_SECS", "3600")
 }
 
 async fn count(h: &CrashHarness, database: &str, collection: &str) -> Vec<String> {
@@ -89,7 +85,7 @@ async fn run(case: Case) {
     let kept = format!("{}_kept", case.prefix);
     let database = case.database.unwrap_or("default");
 
-    let mut h = harness(case.standalone);
+    let mut h = harness();
     h.spawn();
     h.wait_ready();
 
@@ -142,7 +138,7 @@ async fn run_recreated(case: Case) {
     let name = format!("{}_recreated", case.prefix);
     let database = case.database.unwrap_or("default");
 
-    let mut h = harness(case.standalone);
+    let mut h = harness();
     h.spawn();
     h.wait_ready();
 
@@ -193,7 +189,6 @@ async fn recreated_document_survives_replayed_purge() {
     run_recreated(Case {
         engine: Engine::Document,
         database: Some("recreate_doc_db"),
-        standalone: false,
         prefix: "rdoc",
     })
     .await;
@@ -204,7 +199,6 @@ async fn recreated_kv_survives_replayed_purge() {
     run_recreated(Case {
         engine: Engine::Kv,
         database: Some("recreate_kv_db"),
-        standalone: false,
         prefix: "rkv",
     })
     .await;
@@ -215,7 +209,6 @@ async fn recreated_columnar_survives_replayed_purge() {
     run_recreated(Case {
         engine: Engine::Columnar,
         database: Some("recreate_col_db"),
-        standalone: false,
         prefix: "rcol",
     })
     .await;
@@ -226,7 +219,6 @@ async fn purged_document_rows_stay_gone_in_a_named_database() {
     run(Case {
         engine: Engine::Document,
         database: Some("purge_doc_db"),
-        standalone: false,
         prefix: "pdoc",
     })
     .await;
@@ -237,7 +229,6 @@ async fn purged_document_rows_stay_gone_in_the_default_database() {
     run(Case {
         engine: Engine::Document,
         database: None,
-        standalone: false,
         prefix: "pdoc",
     })
     .await;
@@ -248,7 +239,6 @@ async fn purged_kv_rows_stay_gone_in_a_named_database() {
     run(Case {
         engine: Engine::Kv,
         database: Some("purge_kv_db"),
-        standalone: false,
         prefix: "pkv",
     })
     .await;
@@ -259,7 +249,6 @@ async fn purged_kv_rows_stay_gone_in_the_default_database() {
     run(Case {
         engine: Engine::Kv,
         database: None,
-        standalone: false,
         prefix: "pkv",
     })
     .await;
@@ -270,7 +259,6 @@ async fn purged_columnar_rows_stay_gone_in_a_named_database() {
     run(Case {
         engine: Engine::Columnar,
         database: Some("purge_col_db"),
-        standalone: false,
         prefix: "pcol",
     })
     .await;
@@ -281,73 +269,6 @@ async fn purged_columnar_rows_stay_gone_in_the_default_database() {
     run(Case {
         engine: Engine::Columnar,
         database: None,
-        standalone: false,
-        prefix: "pcol",
-    })
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn standalone_purged_document_rows_stay_gone_in_a_named_database() {
-    run(Case {
-        engine: Engine::Document,
-        database: Some("purge_doc_db"),
-        standalone: true,
-        prefix: "pdoc",
-    })
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn standalone_purged_document_rows_stay_gone_in_the_default_database() {
-    run(Case {
-        engine: Engine::Document,
-        database: None,
-        standalone: true,
-        prefix: "pdoc",
-    })
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn standalone_purged_kv_rows_stay_gone_in_a_named_database() {
-    run(Case {
-        engine: Engine::Kv,
-        database: Some("purge_kv_db"),
-        standalone: true,
-        prefix: "pkv",
-    })
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn standalone_purged_kv_rows_stay_gone_in_the_default_database() {
-    run(Case {
-        engine: Engine::Kv,
-        database: None,
-        standalone: true,
-        prefix: "pkv",
-    })
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn standalone_purged_columnar_rows_stay_gone_in_a_named_database() {
-    run(Case {
-        engine: Engine::Columnar,
-        database: Some("purge_col_db"),
-        standalone: true,
-        prefix: "pcol",
-    })
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn standalone_purged_columnar_rows_stay_gone_in_the_default_database() {
-    run(Case {
-        engine: Engine::Columnar,
-        database: None,
-        standalone: true,
         prefix: "pcol",
     })
     .await;

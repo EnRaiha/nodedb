@@ -1,48 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Per-slice write classification: primary-write / RETURNING / change-set
-//! predicates shared by the static and active dispatch paths.
+//! Per-slice write classification: primary-write and RETURNING predicates
+//! shared by the static and active dispatch paths.
 
 use nodedb_physical::physical_plan::PhysicalPlan;
-
-use crate::types::VShardId;
-
-/// Whether this vShard's slice carries a PRIMARY user data write — the write
-/// whose applied `Response` (affected-count + any RETURNING rows) the
-/// coordinator surfaces.
-///
-/// A primary write is a Document / KV / Vector / Timeseries / Columnar / Array
-/// write — NOT the implicit graph-edge cleanup (`EdgePut` / `EdgeDelete`) that
-/// dual-homes alongside a document delete/update. For a single-collection user
-/// DML (plus its implicit edges) exactly ONE participant carries the primary
-/// write, so only it deposits the applied `Response` into the coordinator's
-/// sidecar and the edge participants never clobber the entry.
-///
-/// This gate subsumes the RETURNING case (a RETURNING write IS a primary write,
-/// so its rows are still deposited) while ALSO carrying the affected-count of a
-/// plain (non-RETURNING) write — which a RETURNING-only gate dropped, making a
-/// routed plain write report zero rows affected.
-pub(super) fn participant_change_sets(
-    plans: &[PhysicalPlan],
-    tenant_id: crate::types::TenantId,
-    vshard_id: u32,
-) -> Vec<crate::control::server::dispatch_utils::WriteChangeSet> {
-    plans
-        .iter()
-        .filter(|plan| match plan {
-            // Edge plans are dual-homed; only the source participant publishes
-            // the one logical Control-Plane event.
-            PhysicalPlan::Graph(
-                nodedb_physical::physical_plan::GraphOp::EdgePut { src_id, .. }
-                | nodedb_physical::physical_plan::GraphOp::EdgeDelete { src_id, .. },
-            ) => VShardId::from_key(src_id.as_bytes()).as_u32() == vshard_id,
-            _ => true,
-        })
-        .map(|plan| {
-            crate::control::server::dispatch_utils::extract_write_change_set(plan, tenant_id)
-        })
-        .collect()
-}
 
 /// Whether the transaction carries any write that is NOT a derived side
 /// effect (an implicit graph edge, a cross-shard balance delta). Decided over

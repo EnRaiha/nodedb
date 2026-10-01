@@ -13,9 +13,10 @@ use tracing::warn;
 use crate::DispatchCapacityScope;
 use crate::bridge::admission_chokepoint::{assert_write_admitted, reject_uninjected_write};
 use crate::bridge::envelope;
-use crate::types::Lsn;
+use crate::types::{Lsn, VShardId};
 
 use super::dispatcher::Dispatcher;
+use super::journal::JournalGroup;
 use super::refusal::DispatchRefusal;
 
 impl Dispatcher {
@@ -33,6 +34,17 @@ impl Dispatcher {
     /// A caller that must retry a capacity refusal re-sends the returned
     /// request. The dispatcher tracks nothing for a refused request.
     pub fn try_dispatch(&mut self, request: envelope::Request) -> Result<(), Box<DispatchRefusal>> {
+        self.try_dispatch_journalled(request, None)
+    }
+
+    /// Dispatch like [`Self::try_dispatch`]. `journal` is the record group
+    /// the write journals its write set into, which the push hands to the
+    /// core with the request.
+    pub fn try_dispatch_journalled(
+        &mut self,
+        request: envelope::Request,
+        journal: Option<JournalGroup>,
+    ) -> Result<(), Box<DispatchRefusal>> {
         if let Err(error) = reject_uninjected_write(&request) {
             return Err(DispatchRefusal::boxed(error, request));
         }
@@ -97,9 +109,22 @@ impl Dispatcher {
                 request,
             ));
         }
+        if let Some(journal) = journal {
+            channel.journals.insert(req_id, journal);
+        }
 
         self.commit_enqueued(core_id, database_id, tenant_id, req_id, wal_lsn);
         Ok(())
+    }
+
+    /// Note that the parts of the group at `origin`, a write of `vshard_id`,
+    /// are durable. The next push to the write's core hands the note over.
+    pub fn note_write_set_settled(&mut self, vshard_id: VShardId, origin: Lsn) {
+        if let Some(core_id) = self.router.resolve(vshard_id)
+            && let Some(channel) = self.cores.get_mut(core_id)
+        {
+            channel.settled_write_sets.push(origin);
+        }
     }
 
     /// Dispatch a request directly to a specific core by index.

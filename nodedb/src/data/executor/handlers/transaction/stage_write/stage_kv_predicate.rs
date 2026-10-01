@@ -266,7 +266,7 @@ mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::PointGet {
             collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
             document_id: "y".into(),
-            surrogate: Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -290,6 +290,7 @@ mod tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: Admission::Exempt(ExemptReason::Read),
         })
     }
@@ -310,16 +311,18 @@ mod tests {
     }
 
     fn put_base(core: &mut CoreLoop, key: &[u8], n: i64, surrogate: u32) {
-        core.kv_engine.put(KvPutParams {
-            database_id: DatabaseId::DEFAULT.as_u64(),
-            tenant_id: 1,
-            collection: "c",
-            key,
-            value: &body(n),
-            ttl_ms: 0,
-            now_ms: current_ms(),
-            surrogate: Surrogate::new(surrogate),
-        });
+        core.kv_engine
+            .put(KvPutParams {
+                database_id: DatabaseId::DEFAULT.as_u64(),
+                tenant_id: 1,
+                collection: "c",
+                key,
+                value: &body(n),
+                ttl_ms: 0,
+                now_ms: current_ms(),
+                surrogate: Surrogate::new(surrogate),
+            })
+            .expect("a bound row writes");
     }
 
     fn coll_key() -> (DatabaseId, TenantId, String) {

@@ -73,22 +73,22 @@ pub async fn transfer(
     // never collapse onto one identity.
     let source_bytes = source_key.into_bytes();
     let dest_bytes = dest_key.into_bytes();
-    let debit_surrogate = state
-        .surrogate_assigner
-        .assign(
-            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
-            identity.tenant_id,
-            &source_bytes,
-        )
-        .map_err(|e| DdlError::from_error(&e))?;
-    let credit_surrogate = state
-        .surrogate_assigner
-        .assign(
-            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
-            identity.tenant_id,
-            &dest_bytes,
-        )
-        .map_err(|e| DdlError::from_error(&e))?;
+    // Both identities resolve in one batch at the collection's home.
+    let bound = crate::control::server::surrogate_exchange::assign_surrogates_routed(
+        state,
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
+        identity.tenant_id,
+        &[source_bytes.as_slice(), dest_bytes.as_slice()],
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| DdlError::from_error(&e))?;
+    let [debit_surrogate, credit_surrogate] = bound[..] else {
+        return Err(DdlError::internal(format!(
+            "TRANSFER: the home answered {} surrogates for 2 keys",
+            bound.len()
+        )));
+    };
     let plan = PhysicalPlan::Kv(KvOp::Transfer {
         collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
         source_key: source_bytes,
@@ -160,14 +160,15 @@ pub async fn transfer_item(
     // The moved row's identity is content-addressed at its DESTINATION
     // `(dest_collection, dest_key)`, matching the engine write-back.
     let dest_bytes = dest_key.into_bytes();
-    let surrogate = state
-        .surrogate_assigner
-        .assign(
-            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &dest_collection),
-            identity.tenant_id,
-            &dest_bytes,
-        )
-        .map_err(|e| DdlError::from_error(&e))?;
+    let surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
+        state,
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &dest_collection),
+        identity.tenant_id,
+        &dest_bytes,
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| DdlError::from_error(&e))?;
 
     // Dispatch to Data Plane — verify + delete + insert is atomic. Routed
     // through the same in-transaction staging gate as `TRANSFER` (see above).

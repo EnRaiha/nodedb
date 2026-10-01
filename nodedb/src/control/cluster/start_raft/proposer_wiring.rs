@@ -28,6 +28,17 @@ pub(super) fn wire_proposers(
     calvin_read_result_senders: Arc<Mutex<BTreeMap<u32, Sender<ReadResultEvent>>>>,
     sequencer_state_machine: Arc<Mutex<nodedb_cluster::calvin::SequencerStateMachine>>,
 ) -> crate::Result<()> {
+    install_sync_proposer(shared, raft_loop);
+    install_compactor(shared, raft_loop, sequencer_state_machine);
+    install_applied_index_sink(shared, raft_loop);
+    install_apply_gates(shared, raft_loop);
+    install_async_proposer(shared, raft_loop, &tracker)?;
+    spawn_apply_loop(shared, tracker, apply_rx, calvin_read_result_senders);
+    Ok(())
+}
+
+/// Install the sync `raft_proposer`.
+fn install_sync_proposer(shared: &Arc<SharedState>, raft_loop: &Arc<RaftLoopType>) {
     // Wire the Raft proposer into SharedState so CP dispatch paths
     // (pgwire, HTTP, array inbound) can route writes through Raft.
     // Hold `raft_loop` weakly: `SharedState` owns this closure, and the
@@ -52,7 +63,14 @@ pub(super) fn wire_proposers(
     if shared.raft_proposer.set(proposer).is_err() {
         tracing::warn!("raft_proposer already set — start_raft appears to have run twice");
     }
+}
 
+/// Install the `raft_compactor`, held below the sequencer's replay range.
+fn install_compactor(
+    shared: &Arc<SharedState>,
+    raft_loop: &Arc<RaftLoopType>,
+    sequencer_state_machine: Arc<Mutex<nodedb_cluster::calvin::SequencerStateMachine>>,
+) {
     // Wire the Raft log-compaction trigger. `run_apply_loop` invokes this
     // after a committed entry has been durably applied to the Data Plane,
     // so compaction is gated on the data-plane applied watermark — never
@@ -60,7 +78,9 @@ pub(super) fn wire_proposers(
     // `log_compaction_threshold` is `None`.
     // Weak for the same cycle-breaking reason as `raft_proposer` above.
     let raft_loop_for_compact = Arc::downgrade(raft_loop);
-    let sm_for_compact = Arc::clone(&sequencer_state_machine);
+    let sm_for_compact = sequencer_state_machine;
+    // Weak: the compactor lives in `shared`.
+    let shared_for_compact = Arc::downgrade(shared);
     let compactor: Arc<crate::control::wal_replication::RaftCompactor> =
         Arc::new(move |group_id, applied_index| {
             let rl = raft_loop_for_compact
@@ -79,12 +99,41 @@ pub(super) fn wire_proposers(
             // cross-shard graph edge means the edge silently vanishes from that
             // node's index. Floor the compaction boundary strictly below the
             // lowest armed catch-up so the replay range always survives.
+            //
+            // An open multi-part transaction holds the log down the same way:
+            // a replica that replays the log must meet its header before its
+            // parts, so the header's index survives until the transaction
+            // closes.
+            //
+            // Two more ranges hold it down. An input a scheduler received
+            // and has not made durable is gone with a restart unless the log
+            // keeps it. And a vShard of a group mounted here whose scheduler
+            // has not started yet replays the log from its Calvin base.
             let effective_index = if group_id == nodedb_cluster::calvin::SEQUENCER_GROUP_ID {
-                match sm_for_compact
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .min_catch_up_from()
-                {
+                let shared =
+                    shared_for_compact
+                        .upgrade()
+                        .ok_or_else(|| crate::Error::Internal {
+                            detail: "raft log compaction: shared state dropped".into(),
+                        })?;
+                let mirrors = shared.authorization_fence.calvin_mirrors();
+                let mut sm = sm_for_compact.lock().unwrap_or_else(|p| p.into_inner());
+                let undurable = sm.undurable_floor(|vshard, epoch, position| {
+                    // A vShard with no scheduler here holds no state to lose.
+                    mirrors
+                        .get(vshard)
+                        .is_none_or(|mirror| mirror.is_applied(epoch, position))
+                });
+                let floor = [
+                    sm.min_catch_up_from(),
+                    sm.min_open_parts_index(),
+                    undurable,
+                    shared.calvin.bases.replay_floor(),
+                ]
+                .into_iter()
+                .flatten()
+                .min();
+                match floor {
                     // Keep index `m` itself: compaction discards entries at and
                     // below its boundary, and the replay range starts AT `m`.
                     Some(m) => applied_index.min(m.saturating_sub(1)),
@@ -106,7 +155,10 @@ pub(super) fn wire_proposers(
     if shared.raft_compactor.set(compactor).is_err() {
         tracing::warn!("raft_compactor already set — start_raft appears to have run twice");
     }
+}
 
+/// Install the durable `raft_applied_index_sink`.
+fn install_applied_index_sink(shared: &Arc<SharedState>, raft_loop: &Arc<RaftLoopType>) {
     // Wire the durable applied-index sink. `run_apply_loop` invokes this for
     // each committed entry once the write funnel's durable-at-ack barrier has
     // fsynced that entry's redo record, so the next boot resumes Raft delivery
@@ -135,11 +187,36 @@ pub(super) fn wire_proposers(
             "raft_applied_index_sink already set — start_raft appears to have run twice"
         );
     }
+}
 
+/// Install the per-group apply gates the apply loop takes.
+fn install_apply_gates(shared: &Arc<SharedState>, raft_loop: &Arc<RaftLoopType>) {
+    // The apply loop takes a group's apply gate before each write, so an
+    // entry a snapshot install covers never reaches the Data Plane after the
+    // restore. Set before the loop spawns: it reads the gates at start.
+    let apply_gates = raft_loop
+        .multi_raft_handle()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .apply_gates();
+    if shared.raft_apply_gates.set(apply_gates).is_err() {
+        tracing::warn!("raft_apply_gates already set — start_raft appears to have run twice");
+    }
+}
+
+/// Install the `async_raft_proposer` in two phases: propose, then await this
+/// node's apply. The admission sequencer holds a vShard's slot across the
+/// first phase only.
+fn install_async_proposer(
+    shared: &Arc<SharedState>,
+    raft_loop: &Arc<RaftLoopType>,
+    tracker: &Arc<ProposeTracker>,
+) -> crate::Result<()> {
     // Install the async proposer with transparent leader forwarding.
     //
-    // Proposes via the data group leader (forwarding to a remote leader if
-    // needed), then registers a ProposeTracker waiter and awaits apply.
+    // The first phase proposes via the data group leader (forwarding to a
+    // remote leader if needed) and registers a ProposeTracker waiter. The
+    // second phase awaits the apply.
     //
     // The ProposeTracker is race-safe: if `run_apply_loop` calls complete()
     // before register() is called (possible on fast clusters where the entry
@@ -151,7 +228,7 @@ pub(super) fn wire_proposers(
     // Held weakly for the same cycle-breaking reason as `raft_proposer` above:
     // the proposer lives on `SharedState`.
     let state_for_proposer = Arc::downgrade(shared);
-    let async_proposer: Arc<crate::control::wal_replication::AsyncRaftProposer> =
+    let async_submit: Arc<crate::control::wal_replication::AsyncRaftSubmit> =
         Arc::new(move |vshard_id, idempotency_key, data, deadline| {
             let rl_weak = raft_loop_async.clone();
             let tk = tracker_for_proposer.clone();
@@ -178,77 +255,94 @@ pub(super) fn wire_proposers(
                 // `RetryableLeaderChange` instead of leaking a
                 // not-our-payload back to the caller.
                 let rx = tk.register(group_id, log_index, idempotency_key);
-                let applied = await_local_apply(LocalApplyWait {
-                    state: &state_weak,
-                    tracker: &tk,
-                    group_id,
-                    log_index,
-                    vshard_id,
-                    deadline,
-                    rx,
-                })
-                .await
-                // Preserve `RetryableLeaderChange` so the gateway
-                // retry loop can re-propose against the new leader
-                // — wrapping it in `Dispatch` would hide the
-                // retryable signal and surface as silent INSERT
-                // success. Only machinery failures stay wrapped for
-                // diagnostics; a classified apply verdict keeps its
-                // client-visible classification.
-                .map_err(|e| {
-                    if crate::error_classify::is_unclassified_failure(&e) {
-                        crate::Error::Dispatch {
-                            detail: format!("apply error: {e}"),
+                let applied: crate::control::wal_replication::AppliedWait = Box::pin(async move {
+                    let applied = await_local_apply(LocalApplyWait {
+                        state: &state_weak,
+                        tracker: &tk,
+                        group_id,
+                        log_index,
+                        vshard_id,
+                        deadline,
+                        rx,
+                    })
+                    .await
+                    // Preserve `RetryableLeaderChange` so the gateway
+                    // retry loop can re-propose against the new leader
+                    // — wrapping it in `Dispatch` will hide the
+                    // retryable signal and surface as silent INSERT
+                    // success. Only machinery failures stay wrapped for
+                    // diagnostics; a classified apply verdict keeps its
+                    // client-visible classification.
+                    .map_err(|e| {
+                        if crate::error_classify::is_unclassified_failure(&e) {
+                            crate::Error::Dispatch {
+                                detail: format!("apply error: {e}"),
+                            }
+                        } else {
+                            e
                         }
-                    } else {
-                        e
+                    })
+                    // Carry out the write-version the APPLY side stamped, not
+                    // `log_index`. The tracker resolves on the node that applied
+                    // the entry locally, so `write_version` is this replica's own
+                    // post-write `coll_write_lsn` — a WAL LSN, the same domain
+                    // every other feed of that map records in, and the only
+                    // domain the shard-local OCC read validator compares in. The
+                    // raft log index is a per-group counter on a different scale
+                    // entirely; publishing it here made reads validate a WAL LSN
+                    // against a log index.
+                    .map(|applied| (applied.payload, applied.write_version));
+                    let applied = applied?;
+                    // A write to a vShard homing a permission-tree source is
+                    // acknowledged only once every lease holder covers it, or its
+                    // lease expired.
+                    if let Some(state) = state_weak.upgrade()
+                        && state
+                            .authorization_fence
+                            .sources()
+                            .is_source_vshard(vshard_id)
+                    {
+                        crate::control::security::auth_lease::authorization_barrier(
+                            &state,
+                            vec![nodedb_cluster::GroupCoverage {
+                                group_id,
+                                through: log_index,
+                            }],
+                        )
+                        .await?;
                     }
+                    Ok(applied)
+                });
+                Ok(crate::control::wal_replication::ProposedWrite {
+                    at: Some(crate::control::wal_replication::ProposedAt {
+                        group_id,
+                        log_index,
+                    }),
+                    applied,
                 })
-                // Carry out the write-version the APPLY side stamped, not
-                // `log_index`. The tracker resolves on the node that applied
-                // the entry locally, so `write_version` is this replica's own
-                // post-write `coll_write_lsn` — a WAL LSN, the same domain
-                // every other feed of that map records in, and the only
-                // domain the shard-local OCC read validator compares in. The
-                // raft log index is a per-group counter on a different scale
-                // entirely; publishing it here made reads validate a WAL LSN
-                // against a log index.
-                .map(|applied| (applied.payload, applied.write_version));
-                let applied = applied?;
-                // A write to a vShard homing a permission-tree source is
-                // acknowledged only once every lease holder covers it, or its
-                // lease expired.
-                if let Some(state) = state_weak.upgrade()
-                    && state
-                        .authorization_fence
-                        .sources()
-                        .is_source_vshard(vshard_id)
-                {
-                    crate::control::security::auth_lease::authorization_barrier(
-                        &state,
-                        vec![nodedb_cluster::GroupCoverage {
-                            group_id,
-                            through: log_index,
-                        }],
-                    )
-                    .await?;
-                }
-                Ok(applied)
             })
         });
-    crate::control::vshard_admission::install_async_raft_proposer(shared, async_proposer)?;
+    crate::control::vshard_admission::install_async_raft_proposer(shared, async_submit)
+}
 
+/// Spawn the background apply loop.
+fn spawn_apply_loop(
+    shared: &Arc<SharedState>,
+    tracker: Arc<ProposeTracker>,
+    apply_rx: mpsc::Receiver<ApplyBatch>,
+    calvin_read_result_senders: Arc<Mutex<BTreeMap<u32, Sender<ReadResultEvent>>>>,
+) {
     // Spawn the background apply loop. It reads from the mpsc channel
     // pushed by `DistributedApplier::apply_committed`, dispatches to the
     // Data Plane, and notifies propose waiters. Registered via
     // `spawn_loop_no_abort` so the Control Plane drain waits for it to exit
     // (dropping its captured `Arc<SharedState>` deterministically) but NEVER
-    // force-aborts it — an abort mid-apply would strand
+    // force-aborts it — an abort mid-apply will strand
     // committed-but-unapplied entries. It drains at `DrainingControlPlane`
     // because its applies dispatch to the Data Plane.
     let apply_state = shared.clone();
-    let apply_tracker = tracker.clone();
-    let apply_calvin_read_result_senders = Arc::clone(&calvin_read_result_senders);
+    let apply_tracker = tracker;
+    let apply_calvin_read_result_senders = calvin_read_result_senders;
     crate::control::shutdown::spawn_loop_no_abort(
         &shared.loop_registry,
         &shared.shutdown,
@@ -271,7 +365,6 @@ pub(super) fn wire_proposers(
             }
         },
     );
-    Ok(())
 }
 
 /// Where a group's pipeline stands, for a propose waiter that timed out: the
@@ -366,6 +459,7 @@ async fn await_local_apply(
                 leader_addr: format!(
                     "this node left raft group {group_id} before it applied index {log_index}"
                 ),
+                leader_term: 0,
             });
         }
         if tokio::time::Instant::now() >= deadline {

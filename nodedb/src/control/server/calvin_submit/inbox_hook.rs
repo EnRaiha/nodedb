@@ -39,8 +39,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use nodedb_cluster::calvin::types::TxClass;
-use nodedb_cluster::{SubmitCalvinInboxRequest, SubmitCalvinInboxResponse, TypedClusterError};
+use nodedb_cluster::calvin::PartsOfferStatus;
+use nodedb_cluster::calvin::types::{PartStreamId, StreamedPart, TxClass};
+use nodedb_cluster::{
+    CalvinPartsRequest, CalvinPartsResponse, SubmitCalvinInboxRequest, SubmitCalvinInboxResponse,
+    TypedClusterError,
+};
 
 use crate::control::planner::calvin::submit::submit_local_assign;
 use crate::control::state::SharedState;
@@ -118,6 +122,35 @@ impl nodedb_cluster::CalvinSubmitInbox for RegistryCalvinSubmitInbox {
                     message: format!("calvin-inbox local submit-and-assign failed: {e}"),
                 }),
             },
+        }
+    }
+
+    async fn on_calvin_parts(&self, req: CalvinPartsRequest) -> CalvinPartsResponse {
+        let refused = |detail: String| CalvinPartsResponse {
+            status: PartsOfferStatus::Rejected as u8,
+            next_index: 0,
+            detail: Some(detail),
+        };
+        let parts: Vec<StreamedPart> = match zerompk::from_msgpack(&req.parts_bytes) {
+            Ok(parts) => parts,
+            Err(e) => return refused(format!("calvin-parts: failed to decode parts: {e}")),
+        };
+        let Some(inbox) = self.state.sequencer_inbox.get() else {
+            return CalvinPartsResponse {
+                status: PartsOfferStatus::Unknown as u8,
+                next_index: 0,
+                detail: Some("calvin-parts: no sequencer inbox on this node".into()),
+            };
+        };
+        let stream = PartStreamId {
+            node: req.stream_node,
+            seq: req.stream_seq,
+        };
+        let offer = inbox.offer_parts(stream, parts);
+        CalvinPartsResponse {
+            status: offer.status as u8,
+            next_index: offer.next_index,
+            detail: offer.detail,
         }
     }
 }

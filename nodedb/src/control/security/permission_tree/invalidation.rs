@@ -9,17 +9,19 @@
 use tracing::debug;
 
 use super::cache::PermissionCache;
+use super::scope::TreeScope;
 use super::types::PermissionGrant;
 
 /// Handle an INSERT/UPDATE on the permission grant table.
 ///
 /// Upserts the grant into the cache. The grant's `resource_id` and `grantee`
 /// determine the cache key; the `level` and `inherited` are the new values.
-pub fn on_grant_upsert(cache: &mut PermissionCache, tenant_id: u64, grant: &PermissionGrant) {
-    cache.put_grant(tenant_id, grant);
-    cache.bump_tenant_version(tenant_id);
+pub fn on_grant_upsert(cache: &mut PermissionCache, scope: TreeScope, grant: &PermissionGrant) {
+    cache.put_grant(scope, grant);
+    cache.bump_tenant_version(scope.tenant_id);
     debug!(
-        tenant_id,
+        tenant_id = scope.tenant_id,
+        database_id = scope.database_id.as_u64(),
         resource_id = %grant.resource_id,
         grantee = %grant.grantee,
         level = %grant.level,
@@ -33,15 +35,18 @@ pub fn on_grant_upsert(cache: &mut PermissionCache, tenant_id: u64, grant: &Perm
 /// inherited permissions from ancestors.
 pub fn on_grant_delete(
     cache: &mut PermissionCache,
-    tenant_id: u64,
+    scope: TreeScope,
     resource_id: &str,
     grantee: &str,
 ) {
-    cache.remove_grant(tenant_id, resource_id, grantee);
-    cache.bump_tenant_version(tenant_id);
+    cache.remove_grant(scope, resource_id, grantee);
+    cache.bump_tenant_version(scope.tenant_id);
     debug!(
-        tenant_id,
-        resource_id, grantee, "permission_tree: grant deleted"
+        tenant_id = scope.tenant_id,
+        database_id = scope.database_id.as_u64(),
+        resource_id,
+        grantee,
+        "permission_tree: grant deleted"
     );
 }
 
@@ -51,17 +56,20 @@ pub fn on_grant_delete(
 /// and children map accordingly.
 pub fn on_edge_upsert(
     cache: &mut PermissionCache,
-    tenant_id: u64,
+    scope: TreeScope,
     child_id: &str,
     parent_id: &str,
 ) {
     // Remove old edge first (if child was previously under a different parent).
-    cache.remove_edge(tenant_id, child_id);
-    cache.put_edge(tenant_id, child_id, parent_id);
-    cache.bump_tenant_version(tenant_id);
+    cache.remove_edge(scope, child_id);
+    cache.put_edge(scope, child_id, parent_id);
+    cache.bump_tenant_version(scope.tenant_id);
     debug!(
-        tenant_id,
-        child_id, parent_id, "permission_tree: edge upserted"
+        tenant_id = scope.tenant_id,
+        database_id = scope.database_id.as_u64(),
+        child_id,
+        parent_id,
+        "permission_tree: edge upserted"
     );
 }
 
@@ -69,27 +77,33 @@ pub fn on_edge_upsert(
 ///
 /// The resource `child_id` is no longer under any parent (becomes a root or
 /// is being deleted entirely).
-pub fn on_edge_delete(cache: &mut PermissionCache, tenant_id: u64, child_id: &str) {
-    cache.remove_edge(tenant_id, child_id);
-    cache.bump_tenant_version(tenant_id);
-    debug!(tenant_id, child_id, "permission_tree: edge deleted");
+pub fn on_edge_delete(cache: &mut PermissionCache, scope: TreeScope, child_id: &str) {
+    cache.remove_edge(scope, child_id);
+    cache.bump_tenant_version(scope.tenant_id);
+    debug!(
+        tenant_id = scope.tenant_id,
+        database_id = scope.database_id.as_u64(),
+        child_id,
+        "permission_tree: edge deleted"
+    );
 }
 
-/// Bulk reload all edges and grants for a tenant.
+/// Bulk reload all edges and grants for a scope.
 ///
 /// Called on startup or when the cache is suspected to be stale.
-/// Clears existing state for the tenant before loading.
+/// Adds to the scope's existing state.
 pub fn full_reload(
     cache: &mut PermissionCache,
-    tenant_id: u64,
+    scope: TreeScope,
     edges: &[(String, String)],
     grants: &[PermissionGrant],
 ) {
-    cache.load_edges(tenant_id, edges);
-    cache.load_grants(tenant_id, grants);
-    cache.bump_tenant_version(tenant_id);
+    cache.load_edges(scope, edges);
+    cache.load_grants(scope, grants);
+    cache.bump_tenant_version(scope.tenant_id);
     debug!(
-        tenant_id,
+        tenant_id = scope.tenant_id,
+        database_id = scope.database_id.as_u64(),
         edges = edges.len(),
         grants = grants.len(),
         "permission_tree: full reload complete"
@@ -99,6 +113,12 @@ pub fn full_reload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::DatabaseId;
+
+    const S1: TreeScope = TreeScope {
+        database_id: DatabaseId::DEFAULT,
+        tenant_id: 1,
+    };
 
     #[test]
     fn every_mutator_bumps_the_tenant_version() {
@@ -111,19 +131,19 @@ mod tests {
             level: "editor".into(),
             inherited: false,
         };
-        on_grant_upsert(&mut cache, 1, &grant);
+        on_grant_upsert(&mut cache, S1, &grant);
         assert_eq!(cache.tenant_version(1), 1);
 
-        on_grant_delete(&mut cache, 1, "doc-1", "user-1");
+        on_grant_delete(&mut cache, S1, "doc-1", "user-1");
         assert_eq!(cache.tenant_version(1), 2);
 
-        on_edge_upsert(&mut cache, 1, "doc-1", "folder-a");
+        on_edge_upsert(&mut cache, S1, "doc-1", "folder-a");
         assert_eq!(cache.tenant_version(1), 3);
 
-        on_edge_delete(&mut cache, 1, "doc-1");
+        on_edge_delete(&mut cache, S1, "doc-1");
         assert_eq!(cache.tenant_version(1), 4);
 
-        full_reload(&mut cache, 1, &[], &[]);
+        full_reload(&mut cache, S1, &[], &[]);
         assert_eq!(cache.tenant_version(1), 5);
 
         // An unrelated tenant is never touched.
@@ -140,28 +160,28 @@ mod tests {
             level: "editor".into(),
             inherited: false,
         };
-        on_grant_upsert(&mut cache, 1, &grant);
+        on_grant_upsert(&mut cache, S1, &grant);
         assert_eq!(
-            cache.get_grant(1, "doc-1", "user-1").map(|(l, _)| l),
+            cache.get_grant(S1, "doc-1", "user-1").map(|(l, _)| l),
             Some("editor")
         );
 
-        on_grant_delete(&mut cache, 1, "doc-1", "user-1");
-        assert!(cache.get_grant(1, "doc-1", "user-1").is_none());
+        on_grant_delete(&mut cache, S1, "doc-1", "user-1");
+        assert!(cache.get_grant(S1, "doc-1", "user-1").is_none());
     }
 
     #[test]
     fn edge_upsert_replaces_old_parent() {
         let mut cache = PermissionCache::new();
 
-        on_edge_upsert(&mut cache, 1, "doc-1", "folder-a");
-        assert_eq!(cache.get_parent(1, "doc-1"), Some("folder-a"));
+        on_edge_upsert(&mut cache, S1, "doc-1", "folder-a");
+        assert_eq!(cache.get_parent(S1, "doc-1"), Some("folder-a"));
 
         // Move doc-1 to folder-b.
-        on_edge_upsert(&mut cache, 1, "doc-1", "folder-b");
-        assert_eq!(cache.get_parent(1, "doc-1"), Some("folder-b"));
-        // Old parent should no longer have doc-1 as child.
-        assert!(cache.get_children(1, "folder-a").is_empty());
+        on_edge_upsert(&mut cache, S1, "doc-1", "folder-b");
+        assert_eq!(cache.get_parent(S1, "doc-1"), Some("folder-b"));
+        // Old parent no longer has doc-1 as child.
+        assert!(cache.get_children(S1, "folder-a").is_empty());
     }
 
     #[test]
@@ -179,12 +199,12 @@ mod tests {
             inherited: false,
         }];
 
-        full_reload(&mut cache, 1, &edges, &grants);
+        full_reload(&mut cache, S1, &edges, &grants);
 
-        assert_eq!(cache.get_parent(1, "doc-1"), Some("folder-1"));
-        assert_eq!(cache.get_parent(1, "folder-1"), Some("workspace"));
+        assert_eq!(cache.get_parent(S1, "doc-1"), Some("folder-1"));
+        assert_eq!(cache.get_parent(S1, "folder-1"), Some("workspace"));
         assert_eq!(
-            cache.get_grant(1, "workspace", "user-1").map(|(l, _)| l),
+            cache.get_grant(S1, "workspace", "user-1").map(|(l, _)| l),
             Some("owner")
         );
     }

@@ -51,13 +51,13 @@ impl CsrIndex {
             return Vec::new();
         };
         self.record_access(node_id);
-        let label_id = label_filter.and_then(|l| self.label_to_id.get(l).copied());
+        let labels = self.label_filter(label_filter);
 
         let mut result = Vec::new();
 
         if matches!(direction, Direction::Out | Direction::Both) {
             for (lid, dst) in self.dense_iter_out(node_id) {
-                if label_id.is_none_or(|f| f == lid) {
+                if labels.keeps(lid) {
                     result.push((
                         self.id_to_label[lid as usize].clone(),
                         self.id_to_node[dst as usize].clone(),
@@ -67,7 +67,7 @@ impl CsrIndex {
         }
         if matches!(direction, Direction::In | Direction::Both) {
             for (lid, src) in self.dense_iter_in(node_id) {
-                if label_id.is_none_or(|f| f == lid) {
+                if labels.keeps(lid) {
                     result.push((
                         self.id_to_label[lid as usize].clone(),
                         self.id_to_node[src as usize].clone(),
@@ -94,7 +94,9 @@ impl CsrIndex {
             .iter()
             .filter_map(|l| self.label_to_id.get(*l).copied())
             .collect();
-        let match_label = |lid: u32| label_ids.is_empty() || label_ids.contains(&lid);
+        // Filters this partition has never seen match no edge here; they must
+        // not widen the filter to every edge.
+        let match_label = |lid: u32| label_filters.is_empty() || label_ids.contains(&lid);
 
         let mut result = Vec::new();
 

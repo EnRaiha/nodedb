@@ -11,23 +11,43 @@ use nodedb_types::{DatabaseId, QualifiedCollection, Surrogate, TenantId};
 use crate::bridge::envelope::{Priority, Request, Response, Status};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
-use crate::types::{ReadConsistency, RequestId, TraceId, VShardId};
+use crate::types::{ReadConsistency, RequestId, TraceId, TxnId, VShardId};
 use nodedb_physical::physical_plan::{DocumentOp, KvOp, PhysicalPlan};
+
+/// The clone collection a presence probe reads, and the transaction it runs
+/// in.
+#[derive(Clone, Copy)]
+pub(super) struct ProbeTarget<'a> {
+    pub tenant_id: TenantId,
+    pub db_id: DatabaseId,
+    pub collection_qualified: &'a str,
+    /// The transaction whose overlay the probe reads, `None` outside one.
+    pub txn_id: Option<TxnId>,
+}
 
 /// Probe whether `document_id` exists in target storage.
 ///
 /// Issues a synchronous PointGet to the local Data Plane and returns `true`
-/// if the row is present.  Uses `Surrogate::ZERO` when the catalog has no
-/// registered surrogate for the PK — the handler will return "not found".
+/// if the row is present. A key with no target binding (`None`) names no
+/// target row, so it is absent without a read. Inside transaction `txn_id`
+/// the probe reads the transaction's overlay: a row it staged is present,
+/// and a row it deleted is absent.
 pub(super) async fn probe_row_in_target(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    tenant_id: TenantId,
-    db_id: DatabaseId,
-    collection_qualified: &str,
+    target: ProbeTarget<'_>,
     document_id: &str,
-    surrogate: Surrogate,
+    surrogate: Option<Surrogate>,
 ) -> crate::Result<bool> {
+    if surrogate.is_none() {
+        return Ok(false);
+    }
+    let ProbeTarget {
+        tenant_id,
+        db_id,
+        collection_qualified,
+        txn_id,
+    } = target;
     let plan = PhysicalPlan::Document(DocumentOp::PointGet {
         collection: QualifiedCollection::from_stored(collection_qualified.to_string()),
         document_id: document_id.to_string(),
@@ -40,7 +60,17 @@ pub(super) async fn probe_row_in_target(
     let plan = with_caller_rls(state, identity, tenant_id, db_id, plan)?;
     let vshard_id =
         nodedb_types::CollectionKey::from_qualified_str(db_id, collection_qualified)?.vshard();
-    let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, db_id, plan).await?;
+    let resp = dispatch_data_plane_raw(
+        state,
+        RawTarget {
+            tenant_id,
+            vshard_id,
+            database_id: db_id,
+            txn_id,
+        },
+        plan,
+    )
+    .await?;
     Ok(!resp.payload.is_empty() && resp.status == Status::Ok)
 }
 
@@ -59,7 +89,7 @@ pub(super) async fn fetch_source_row(
     let plan = PhysicalPlan::Document(DocumentOp::PointGet {
         collection: QualifiedCollection::from_stored(source_coll_qualified.to_string()),
         document_id: document_id.to_string(),
-        surrogate,
+        surrogate: Some(surrogate),
         pk_bytes: document_id.as_bytes().to_vec(),
         rls_filters: Vec::new(),
         system_time: nodedb_types::SystemTimeScope::Current,
@@ -69,7 +99,17 @@ pub(super) async fn fetch_source_row(
     let vshard_id =
         nodedb_types::CollectionKey::from_qualified_str(source_db_id, source_coll_qualified)?
             .vshard();
-    let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, source_db_id, plan).await?;
+    let resp = dispatch_data_plane_raw(
+        state,
+        RawTarget {
+            tenant_id,
+            vshard_id,
+            database_id: source_db_id,
+            txn_id: None,
+        },
+        plan,
+    )
+    .await?;
     if resp.payload.is_empty() || resp.status != Status::Ok {
         return Ok(None);
     }
@@ -79,15 +119,19 @@ pub(super) async fn fetch_source_row(
 /// Probe whether `kv_key` exists in target KV storage.
 ///
 /// Issues a KvOp::Get to the local Data Plane and returns `true` if the key
-/// is present.
+/// is present. Inside a transaction the probe reads its overlay.
 pub(super) async fn probe_kv_key_in_target(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    tenant_id: TenantId,
-    db_id: DatabaseId,
-    collection_qualified: &str,
+    target: ProbeTarget<'_>,
     kv_key: &[u8],
 ) -> crate::Result<bool> {
+    let ProbeTarget {
+        tenant_id,
+        db_id,
+        collection_qualified,
+        txn_id,
+    } = target;
     let plan = PhysicalPlan::Kv(KvOp::Get {
         collection: QualifiedCollection::from_stored(collection_qualified.to_string()),
         key: kv_key.to_vec(),
@@ -99,7 +143,17 @@ pub(super) async fn probe_kv_key_in_target(
     let plan = with_caller_rls(state, identity, tenant_id, db_id, plan)?;
     let vshard_id =
         nodedb_types::CollectionKey::from_qualified_str(db_id, collection_qualified)?.vshard();
-    let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, db_id, plan).await?;
+    let resp = dispatch_data_plane_raw(
+        state,
+        RawTarget {
+            tenant_id,
+            vshard_id,
+            database_id: db_id,
+            txn_id,
+        },
+        plan,
+    )
+    .await?;
     Ok(!resp.payload.is_empty() && resp.status == Status::Ok)
 }
 
@@ -120,14 +174,24 @@ pub(super) async fn fetch_kv_source_value(
         rls_filters: Vec::new(),
         // Copy-up reads must see every binding in the source — the
         // post-copy target write reflects the latest source state, and
-        // a missed source row would silently drop data on the clone.
+        // a missed source row will silently drop data on the clone.
         surrogate_ceiling: None,
     });
     let plan = with_caller_rls(state, identity, tenant_id, source_db_id, plan)?;
     let vshard_id =
         nodedb_types::CollectionKey::from_qualified_str(source_db_id, source_coll_qualified)?
             .vshard();
-    let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, source_db_id, plan).await?;
+    let resp = dispatch_data_plane_raw(
+        state,
+        RawTarget {
+            tenant_id,
+            vshard_id,
+            database_id: source_db_id,
+            txn_id: None,
+        },
+        plan,
+    )
+    .await?;
     if resp.payload.is_empty() || resp.status != Status::Ok {
         return Ok(None);
     }
@@ -138,7 +202,7 @@ pub(super) async fn fetch_kv_source_value(
 ///
 /// Copy-up reads a row out of the source collection and writes it into the
 /// clone, where the source's policies no longer govern it. Without this the
-/// clone would launder policy-excluded rows into readable ones. Presence probes
+/// clone will launder policy-excluded rows into readable ones. Presence probes
 /// carry the same filters so a row the caller cannot see is not reported as
 /// present either.
 ///
@@ -176,15 +240,29 @@ fn with_caller_rls(
     Ok(plan)
 }
 
+/// Where [`dispatch_data_plane_raw`] sends a plan.
+pub(super) struct RawTarget {
+    pub tenant_id: TenantId,
+    pub vshard_id: VShardId,
+    pub database_id: DatabaseId,
+    /// The transaction whose overlay a read consults, `None` outside one.
+    pub txn_id: Option<TxnId>,
+}
+
 /// Dispatch a plan directly to the local Data Plane, bypassing WAL and Raft.
-/// Used only for read probes inside the clone write helper.
+/// Used for the read probes and the autocommit KV delete inside the clone
+/// write helper.
 pub(super) async fn dispatch_data_plane_raw(
     state: &SharedState,
-    tenant_id: TenantId,
-    vshard_id: VShardId,
-    database_id: DatabaseId,
+    target: RawTarget,
     plan: PhysicalPlan,
 ) -> crate::Result<Response> {
+    let RawTarget {
+        tenant_id,
+        vshard_id,
+        database_id,
+        txn_id,
+    } = target;
     let req_id = RequestId::new(
         state
             .request_id_counter
@@ -207,9 +285,10 @@ pub(super) async fn dispatch_data_plane_raw(
         user_roles: Vec::new(),
         user_id: None,
         statement_digest: None,
-        txn_id: None,
+        txn_id,
         wal_lsn: None,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: crate::bridge::envelope::Admission::Exempt(
             crate::bridge::envelope::ExemptReason::Read,
         ),

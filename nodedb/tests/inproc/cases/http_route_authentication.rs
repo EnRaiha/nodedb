@@ -34,20 +34,17 @@ use nodedb::bridge::dispatch::Dispatcher;
 use nodedb::config::auth::AuthMode;
 use nodedb::control::state::SharedState;
 use nodedb::wal::WalManager;
+use nodedb_test_support::booted_state::{BootOptions, BootedState};
 use tokio_tungstenite::tungstenite::Message;
 
 struct TestServer {
     local_addr: std::net::SocketAddr,
-    shared: Arc<SharedState>,
+    shared: BootedState,
     _server: tokio::task::JoinHandle<()>,
-    _dir: tempfile::TempDir,
 }
 
 async fn start_http(auth_mode: AuthMode) -> TestServer {
-    let dir = tempfile::tempdir().unwrap();
-    let wal = Arc::new(WalManager::open_for_testing(&dir.path().join("auth.wal")).unwrap());
-    let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-    let shared = SharedState::new(dispatcher, wal).unwrap();
+    let shared = BootedState::boot(BootOptions::default());
     if auth_mode == AuthMode::Trust {
         shared
             .credentials
@@ -59,7 +56,7 @@ async fn start_http(auth_mode: AuthMode) -> TestServer {
     let local_addr = listener.local_addr().unwrap();
 
     let (bus, _) = nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&shared.shutdown));
-    let shared_http = Arc::clone(&shared);
+    let shared_http = Arc::clone(&*shared);
     let handle = tokio::spawn(async move {
         nodedb::control::server::http::server::run_with_listener(
             listener,
@@ -78,7 +75,6 @@ async fn start_http(auth_mode: AuthMode) -> TestServer {
         local_addr,
         shared,
         _server: handle,
-        _dir: dir,
     }
 }
 
@@ -92,7 +88,7 @@ fn is_unauthorized_ish(status: reqwest::StatusCode) -> bool {
 async fn http_trust_auth_uses_configured_durable_identity() {
     let srv = start_http(AuthMode::Trust).await;
     let app_state = nodedb::control::server::http::auth::AppState {
-        shared: Arc::clone(&srv.shared),
+        shared: Arc::clone(&*srv.shared),
         auth_mode: AuthMode::Trust,
         shutdown_bus: nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&srv.shared.shutdown))
             .0,

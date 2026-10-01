@@ -14,10 +14,8 @@
 //! `SHOW MEMORY` reports per-engine memory budgets and current
 //! utilisation from `nodedb_mem::MemoryGovernor`.
 //!
-//! Ported from the pgwire `ddl::observability` handlers. The metric source
-//! reads, ordering, and the tenant-admin gate are preserved verbatim; only the
-//! result construction changed from pgwire `Response` / `QueryResponse` to the
-//! protocol-neutral `DdlResult` over `ShapedRows`.
+//! The metric source reads, ordering, and the tenant-admin gate run here. The
+//! result is the protocol-neutral `DdlResult` over `ShapedRows`.
 
 use serde_json::{Map, Value as JsonValue};
 

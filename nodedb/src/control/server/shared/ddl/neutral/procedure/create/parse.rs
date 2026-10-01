@@ -8,9 +8,7 @@
 //! parser here lifts the body verbatim and lets the procedural-SQL
 //! parser handle it downstream.
 //!
-//! Ported from the pgwire `ddl::procedure::create::parse` module; only the
-//! error type changed from pgwire `PgWireError` to the protocol-neutral
-//! [`DdlError`].
+//! Parse errors are the protocol-neutral [`DdlError`].
 
 use crate::control::security::catalog::procedure_types::{ParamDirection, ProcedureParam};
 use crate::control::server::shared::ddl::sql_parse::parse_ident_token;

@@ -16,14 +16,14 @@ pub(super) const SYNC_HWM_CKPT_STATE: &str = "STATE";
 /// cores and the gate maps are per-core state; without it, cores would
 /// race-overwrite each other's file and every core but the last would restore a
 /// gate belonging to a different core.
-pub(super) fn sync_hwm_ckpt_dir(data_dir: &std::path::Path, core_id: usize) -> std::path::PathBuf {
+pub(crate) fn sync_hwm_ckpt_dir(data_dir: &std::path::Path, core_id: usize) -> std::path::PathBuf {
     data_dir
         .join("sync-hwm-ckpt")
         .join(format!("core-{core_id}"))
 }
 
 /// Path of the state file itself.
-pub(super) fn sync_hwm_ckpt_state_path(ckpt_dir: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn sync_hwm_ckpt_state_path(ckpt_dir: &std::path::Path) -> std::path::PathBuf {
     ckpt_dir.join(SYNC_HWM_CKPT_STATE)
 }
 

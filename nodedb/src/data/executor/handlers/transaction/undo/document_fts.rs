@@ -130,7 +130,7 @@ mod tests {
             "body".to_string(),
             Value::String("searchable elephant paragraph".into()),
         );
-        zerompk::to_msgpack_vec(&Value::Object(obj)).unwrap()
+        nodedb_types::value_to_msgpack(&Value::Object(obj)).unwrap()
     }
 
     fn fts_searchable(core: &CoreLoop) -> bool {

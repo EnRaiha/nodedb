@@ -20,12 +20,12 @@ use super::stored::stored_row_scope;
 use crate::control::server::shared::session::read_set::ReadSetEntry;
 use crate::control::server::surrogate_exchange::lookup_surrogate_routed;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, TraceId};
 
 /// Resolve the materialized-sum target rows for every document write in
 /// `tasks`, storing the result in that op's `resolved_sum_targets`.
 ///
-/// Three join-value sources feed resolution, and one op may draw on more
+/// Three join-value sources feed resolution, and one op can draw on more
 /// than one: row BODIES read straight off each op; the PREDICATE
 /// `BulkUpdate`/`BulkDelete`/`TRUNCATE` name rows by (via a recon scan);
 /// and the STORED row a point write rewrites/removes (`PointDelete`/
@@ -116,7 +116,7 @@ pub async fn resolve_materialized_sum_targets(
             // A point write that rewrites a stored row reads it here — for the
             // join values it addresses AND for the pre-image a cross-shard
             // delta is folded from. One read, one snapshot: settling from a
-            // second read would total a different one.
+            // second read will total a different one.
             match &stored {
                 None => (resolved.into_vec(), None),
                 Some(scope) => {
@@ -136,6 +136,7 @@ pub async fn resolve_materialized_sum_targets(
                         images: &images.images,
                         source_row: Some(scope.surrogate),
                         read_version_lsn: images.read_version_lsn,
+                        served_by: images.served_by,
                     };
                     let settlement = settle_cross_shard_images(
                         &bindings,
@@ -146,7 +147,7 @@ pub async fn resolve_materialized_sum_targets(
                         database_id,
                     )?;
                     // The resolution the source op keeps is the one the source
-                    // core may still apply. Removing the shipped values IS the
+                    // core can still apply. Removing the shipped values IS the
                     // deferral: what is left resolved is exactly what no
                     // sibling task carries.
                     omit_shipped(
@@ -283,8 +284,8 @@ fn set_resolved(op: &mut DocumentOp, resolved: Vec<ResolvedSumTarget>) {
 /// `MERGE` and `UPDATE ... FROM` all resolve their rows on the Control Plane and
 /// re-issue concrete work (a `BatchInsert` page, an APPLY pass, a write pass)
 /// through `dispatch_local`, which never passes through
-/// [`resolve_materialized_sum_targets`]. Without this they would ship an empty
-/// resolution and the Data-Plane fold would have no target to address.
+/// [`resolve_materialized_sum_targets`]. Without this they will ship an empty
+/// resolution and the Data-Plane fold will have no target to address.
 ///
 /// `source_collection` is the db-qualified name as it appears on the plan.
 /// Returns an empty vec — and issues no lookup at all — when the collection
@@ -353,10 +354,8 @@ pub(super) async fn lookup_join_value(
     database_id: DatabaseId,
     trace_id: TraceId,
 ) -> crate::Result<Surrogate> {
-    let vshard = VShardId::from_key(join_value.as_bytes());
     lookup_surrogate_routed(
         state,
-        vshard,
         nodedb_types::CollectionKey::from_bare(database_id, &binding.target_collection),
         tenant_id,
         join_value.as_bytes(),
@@ -375,7 +374,7 @@ pub(super) async fn lookup_join_value(
 /// One entry per DISTINCT `(target collection, join value)` PAIR: a batch that
 /// touches the same target row many times resolves it once, while two bindings
 /// that share a join column and name different targets each get their own entry
-/// — deduping on the value alone would resolve the first and silently hand its
+/// — deduping on the value alone will resolve the first and silently hand its
 /// target row to the second.
 async fn resolve_bodies(
     state: &SharedState,
@@ -424,6 +423,7 @@ mod tests {
 
     use crate::bridge::dispatch::Dispatcher;
     use crate::control::security::catalog::{MaterializedSumDef, StoredCollection};
+    use crate::types::VShardId;
     use crate::wal::WalManager;
 
     const TENANT: TenantId = TenantId::new(7);
@@ -444,7 +444,7 @@ mod tests {
     /// `balance` materialized sum on `accounts`, joined on `account_id`.
     fn declare_binding(state: &SharedState) {
         let catalog = state.credentials.catalog();
-        let mut target = StoredCollection::new(TENANT.as_u64(), "accounts", "tester");
+        let mut target = StoredCollection::stamped_for_test(TENANT.as_u64(), "accounts", "tester");
         target.materialized_sums.push(MaterializedSumDef {
             target_collection: "accounts".to_string(),
             target_column: "balance".to_string(),
@@ -455,7 +455,7 @@ mod tests {
         catalog
             .put_collection(DB, &target)
             .expect("persist target collection");
-        let source = StoredCollection::new(TENANT.as_u64(), "entries", "tester");
+        let source = StoredCollection::stamped_for_test(TENANT.as_u64(), "entries", "tester");
         catalog
             .put_collection(DB, &source)
             .expect("persist source collection");
@@ -466,7 +466,8 @@ mod tests {
     /// join column into a DIFFERENT target collection.
     fn declare_second_binding(state: &SharedState) {
         let catalog = state.credentials.catalog();
-        let mut target = StoredCollection::new(TENANT.as_u64(), "audit_totals", "tester");
+        let mut target =
+            StoredCollection::stamped_for_test(TENANT.as_u64(), "audit_totals", "tester");
         target.materialized_sums.push(MaterializedSumDef {
             target_collection: "audit_totals".to_string(),
             target_column: "balance".to_string(),
@@ -540,6 +541,7 @@ mod tests {
                 TENANT,
                 b"acc-1",
             )
+            .await
             .expect("bind target row");
 
         let mut tasks = vec![insert_task("entries", body("acc-1"))];
@@ -577,6 +579,7 @@ mod tests {
                 TENANT,
                 b"acc-1",
             )
+            .await
             .expect("bind accounts row");
         let audit_row = state
             .surrogate_assigner
@@ -585,6 +588,7 @@ mod tests {
                 TENANT,
                 b"acc-1",
             )
+            .await
             .expect("bind audit_totals row");
         assert_ne!(
             accounts_row, audit_row,
@@ -617,8 +621,8 @@ mod tests {
     }
 
     /// A join key naming no target row fails the statement with a typed error
-    /// that says which collection, column, and value could not be resolved.
-    /// Skipping the row would leave the stored balance short of the sum
+    /// that says which collection, column, and value cannot be resolved.
+    /// Skipping the row will leave the stored balance short of the sum
     /// `VERIFY_BALANCE` recomputes over every source row.
     #[tokio::test]
     async fn unresolvable_join_key_fails_with_a_typed_error() {
@@ -688,6 +692,7 @@ mod tests {
                 TENANT,
                 b"acc-1",
             )
+            .await
             .expect("bind target row");
 
         let mut tasks = vec![PhysicalTask {

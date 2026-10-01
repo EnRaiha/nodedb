@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 
-use nodedb_cluster::calvin::{CalvinCompletionRegistry, SEQUENCER_GROUP_ID, SequencerStateMachine};
-use nodedb_cluster::distributed_array::{ArrayLocalExecutor, handle_array_shard_rpc};
-use nodedb_cluster::vshard_handler::{DispatchTarget, dispatch_by_type};
-use nodedb_cluster::wire::VShardEnvelope;
+use nodedb_cluster::calvin::{CalvinCompletionRegistry, SequencerStateMachine};
 
 use crate::control::cluster::calvin::scheduler::metrics::SchedulerMetrics;
 use crate::control::cluster::calvin::scheduler::recover_applied;
@@ -14,80 +10,9 @@ use crate::control::cluster::calvin::{
     RaftSequencerProposer, ReadResultEvent, Scheduler, SchedulerConfig, SchedulerParams,
     SequencerProposer,
 };
+use crate::control::cluster::calvin_snapshot;
 use crate::control::cluster::handle::ClusterHandle;
 use crate::control::state::SharedState;
-use crate::event::cross_shard::CrossShardReceiver;
-
-/// Build the `VShardEnvelopeHandler` closure used by `RaftLoop`.
-///
-/// The closure receives raw envelope bytes from the QUIC transport layer,
-/// dispatches based on `msg_type`, and returns a serialized response.
-pub(super) fn build_vshard_handler(
-    array_executor: Arc<dyn ArrayLocalExecutor>,
-    cross_shard_receiver: Arc<CrossShardReceiver>,
-) -> nodedb_cluster::VShardEnvelopeHandler {
-    Arc::new(move |bytes: Vec<u8>| {
-        let executor = array_executor.clone();
-        let receiver = Arc::clone(&cross_shard_receiver);
-        let fut: Pin<
-            Box<dyn std::future::Future<Output = nodedb_cluster::error::Result<Vec<u8>>> + Send>,
-        > = Box::pin(async move {
-            let envelope = VShardEnvelope::from_bytes(&bytes).ok_or_else(|| {
-                nodedb_cluster::error::ClusterError::Codec {
-                    detail: "vshard_handler: failed to deserialize VShardEnvelope".into(),
-                }
-            })?;
-
-            let target = dispatch_by_type(&envelope);
-            match target {
-                DispatchTarget::ArrayShard => {
-                    let opcode = envelope.msg_type as u32;
-                    let resp_payload = handle_array_shard_rpc(
-                        opcode,
-                        envelope.vshard_id,
-                        &envelope.payload,
-                        &executor,
-                    )
-                    .await?;
-
-                    // Response opcode = request opcode + 1 for all array shard RPCs.
-                    // Resolve the msg_type variant via a minimal scratch envelope parse
-                    // (avoids any unsafe transmute — the `from_bytes` mapping in wire.rs
-                    // is the canonical source of truth for the opcode→variant table).
-                    let resp_opcode = opcode + 1;
-                    let resp_msg_type = resolve_vshard_msg_type(resp_opcode)?;
-                    let resp_envelope = VShardEnvelope::new(
-                        resp_msg_type,
-                        envelope.target_node,
-                        envelope.source_node,
-                        envelope.vshard_id,
-                        resp_payload,
-                    );
-                    Ok(resp_envelope.to_bytes())
-                }
-
-                // `CrossShardEvent` (remote trigger DML) and `NotifyBroadcast`
-                // (cluster-wide CDC fan-out) both land here. `handle_envelope`
-                // re-parses the raw bytes and returns a fully-formed response
-                // envelope — including the error-shaped one for a message type
-                // that may not arrive as a REQUEST. The `*Ack` variants are such
-                // a case: every sender reads its Ack as the RESPONSE on the same
-                // QUIC stream, so an inbound Ack request is a protocol violation,
-                // not a case to handle. Unlike the ArrayShard arm there is no
-                // opcode+1 convention to apply: the receiver picks the response
-                // msg_type per request type itself.
-                DispatchTarget::EventPlane => Ok(receiver.handle_envelope(bytes).await),
-
-                other => Err(nodedb_cluster::error::ClusterError::Transport {
-                    detail: format!(
-                        "vshard_handler: no handler registered for dispatch target {other:?}"
-                    ),
-                }),
-            }
-        });
-        fut
-    })
-}
 
 /// Type alias for the shared per-vShard read-result sender registry.
 type ReadResultSenders =
@@ -109,6 +34,81 @@ fn hosted_vshards(routing: &RwLock<nodedb_cluster::RoutingTable>, node_id: u64) 
     vshards
 }
 
+/// Stop the scheduler of every vShard this node served and either no longer
+/// hosts or holds a new base for.
+///
+/// A node that left a vShard's group holds none of its state. Its scheduler
+/// will go on applying the vShard's slices against stale data and acking
+/// them. A snapshot install replaced the state a running scheduler started
+/// from. Dropping the vShard's sequencer sender closes the scheduler's
+/// intake, and the scheduler exits. Its other channels and its lock table go
+/// too. The next reconcile that finds the vShard hosted spawns a new
+/// scheduler from the vShard's base.
+fn retire_vshard_schedulers(
+    hosted: &[u32],
+    shared: &Arc<SharedState>,
+    sequencer_state_machine: &Arc<Mutex<SequencerStateMachine>>,
+    calvin_read_result_senders: &ReadResultSenders,
+    calvin_completion_registry: &Arc<CalvinCompletionRegistry>,
+) {
+    let (left, rebased): (Vec<u32>, Vec<u32>) = {
+        let mut senders = calvin_read_result_senders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let served: Vec<u32> = senders.keys().copied().collect();
+        let left: Vec<u32> = served
+            .iter()
+            .copied()
+            .filter(|vshard| hosted.binary_search(vshard).is_err())
+            .collect();
+        let rebased: Vec<u32> = calvin_snapshot::rebased(shared, &served)
+            .into_iter()
+            .filter(|vshard| !left.contains(vshard))
+            .collect();
+        for vshard in left.iter().chain(&rebased) {
+            senders.remove(vshard);
+        }
+        (left, rebased)
+    };
+    calvin_snapshot::forget_left(shared, &left);
+    for &vshard in &rebased {
+        tracing::info!(
+            vshard_id = vshard,
+            "calvin: a snapshot replaced the vShard's state; its scheduler starts again"
+        );
+    }
+    let left: Vec<u32> = left.into_iter().chain(rebased).collect();
+    if left.is_empty() {
+        return;
+    }
+    {
+        let mut sm = sequencer_state_machine
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for &vshard in &left {
+            sm.remove_vshard_sender(vshard);
+        }
+    }
+    for &vshard in &left {
+        shared
+            .calvin
+            .lock_managers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&vshard);
+        shared
+            .calvin
+            .promotion_senders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&vshard);
+        calvin_completion_registry.unregister_verdict_signal_sender(vshard);
+        // A cut on this node waits only on the schedulers it runs.
+        shared.calvin.cuts.unregister(vshard);
+        tracing::info!(vshard_id = vshard, "calvin: the vShard's scheduler stops");
+    }
+}
+
 /// Parameters for [`reconcile_vshard_schedulers`].
 struct ReconcileSchedulersParams<'a> {
     node_id: u64,
@@ -123,18 +123,15 @@ struct ReconcileSchedulersParams<'a> {
     scheduler_config: &'a SchedulerConfig,
 }
 
-/// Idempotently ensure a Calvin `Scheduler` is running for every vShard this
+/// Idempotently ensure a Calvin `Scheduler` runs for exactly the vShards this
 /// node currently hosts.
 ///
 /// A vShard is considered already-served iff it has a registered read-result
-/// sender (the schedulers' presence registry). Only newly-hosted vShards get a
-/// fresh scheduler — this pass never double-spawns. Returns the number of NEW
+/// sender (the schedulers' presence registry). A served vShard this node no
+/// longer hosts has its scheduler stopped first (see
+/// [`retire_left_vshard_schedulers`]). Only newly-hosted vShards get a fresh
+/// scheduler — this pass never double-spawns. Returns the number of NEW
 /// schedulers started.
-///
-/// This is `add-only`: it never tears down a scheduler for a vShard that has
-/// left this node. vShard removal happens via migration / decommission, which
-/// own their own teardown path; wiring scheduler removal into that lifecycle is
-/// tracked as a separate follow-up.
 fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::Result<usize> {
     let ReconcileSchedulersParams {
         node_id,
@@ -148,8 +145,18 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
         scheduler_config,
     } = params;
 
+    let hosted = hosted_vshards(routing, node_id);
+    retire_vshard_schedulers(
+        &hosted,
+        shared,
+        sequencer_state_machine,
+        calvin_read_result_senders,
+        calvin_completion_registry,
+    );
+    calvin_snapshot::retain_mounted(shared, raft_loop_handle, routing);
     let mut spawned = 0usize;
-    for vshard_id in hosted_vshards(routing, node_id) {
+    let mut kept = Vec::new();
+    for vshard_id in hosted {
         // Already-served vShards keep their running scheduler untouched.
         if calvin_read_result_senders
             .lock()
@@ -159,20 +166,57 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
             continue;
         }
 
+        // The earliest committed sequencer index still in the retained log — the
+        // lower bound the spawn-time catch-up (below) arms from. `None` while
+        // the log has no known start.
+        let sequencer_start = raft_loop_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .sequencer_log_start();
+        let group_id = routing
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .group_for_vshard(vshard_id)
+            .ok();
+        // A scheduler starts only from Calvin state that reaches the log it
+        // catches up from. The sequencer log keeps that range meanwhile.
+        if !calvin_snapshot::may_start(
+            shared,
+            raft_loop_handle,
+            vshard_id,
+            group_id,
+            sequencer_start,
+        ) {
+            continue;
+        }
+        let Some(first_available) = sequencer_start else {
+            continue;
+        };
+
         // The applied state the last checkpoint saved, with the markers the
         // WAL still holds: a checkpoint deletes the segments that held older
         // markers, and the sequencer log delivers their entries again.
-        let recovery = recover_applied(&shared.wal, shared.credentials.catalog(), vshard_id)?;
+        // A failed read leaves the vShard for the next pass. The pass goes
+        // on, so the schedulers it started keep their bases.
+        let recovery = match recover_applied(
+            &shared.wal,
+            shared.credentials.catalog(),
+            vshard_id,
+            group_id,
+        ) {
+            Ok(recovery) => recovery,
+            Err(error) => {
+                tracing::warn!(
+                    vshard_id,
+                    %error,
+                    "calvin: the vShard's applied state did not load; its scheduler starts \
+                     on a later pass"
+                );
+                continue;
+            }
+        };
         let (sequenced_tx, sequenced_rx) =
             tokio::sync::mpsc::channel(scheduler_config.channel_capacity);
-
-        // The earliest committed sequencer index still in the retained log — the
-        // lower bound the spawn-time catch-up (below) arms from.
-        let first_available = raft_loop_handle
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .first_available_index(SEQUENCER_GROUP_ID)
-            .unwrap_or(1);
 
         {
             let mut sm = sequencer_state_machine
@@ -182,10 +226,10 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
             // Arm a spawn-time catch-up BEFORE the scheduler runs. A scheduler
             // subscribes only once this node's membership in the vShard's data
             // group lands (a late, reconcile-driven event on a forming cluster),
-            // by which point the sequencer may have already committed — and
+            // by which point the sequencer can have already committed — and
             // fanned out to a then-absent sender, i.e. SILENTLY skipped — epochs
             // for this vShard. A fresh replica has nothing durably applied to
-            // rebuild from, so it would otherwise consider itself caught up and
+            // rebuild from, so it will otherwise consider itself caught up and
             // never receive those txns (cross-shard graph edges among them),
             // losing them permanently after it becomes leader. Arming from the
             // first available index makes the scheduler's drain replay every
@@ -194,6 +238,8 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
             // no-ops).
             sm.arm_catch_up_from(vshard_id, first_available);
         }
+        // The armed catch-up holds the log from here, so the base is kept.
+        kept.push((vshard_id, first_available));
 
         let (read_result_tx, read_result_rx) =
             tokio::sync::mpsc::channel(scheduler_config.channel_capacity);
@@ -263,7 +309,7 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
         // waits for the scheduler to exit (dropping its captured
         // `Arc<SharedState>` deterministically) but NEVER force-aborts it: a
         // Calvin `Scheduler` advances a replicated state machine and a
-        // mid-epoch `.abort()` would diverge this node from its peers.
+        // mid-epoch `.abort()` will diverge this node from its peers.
         // `Scheduler::run` already breaks at an epoch-safe boundary (its
         // `biased` shutdown arm sits at the top of the select loop), so on a
         // signal it exits well within the shutdown deadline.
@@ -287,6 +333,7 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
         );
         spawned += 1;
     }
+    calvin_snapshot::note_kept(shared, &kept);
     Ok(spawned)
 }
 
@@ -315,7 +362,8 @@ pub(super) struct SpawnVshardSchedulersParams<'a> {
 /// and resilient to later ownership changes — this runs an initial reconcile
 /// (covers the bootstrap node, which already sees its membership) and then
 /// spawns a background task that re-reconciles on a short interval until
-/// shutdown. Reconcile is idempotent and add-only.
+/// shutdown. Reconcile is idempotent: it starts schedulers for vShards this
+/// node gained and stops those of vShards it left.
 pub(super) fn spawn_vshard_schedulers(
     params: SpawnVshardSchedulersParams<'_>,
 ) -> crate::Result<()> {
@@ -402,23 +450,4 @@ pub(super) fn spawn_vshard_schedulers(
     );
 
     Ok(())
-}
-
-/// Resolve a raw opcode `u32` to a `VShardMessageType` variant.
-///
-/// Uses `VShardEnvelope::from_bytes` as the canonical opcode→variant mapping
-/// so this helper stays in sync with the wire format without duplicating the
-/// match table.
-pub(super) fn resolve_vshard_msg_type(
-    opcode: u32,
-) -> nodedb_cluster::error::Result<nodedb_cluster::wire::VShardMessageType> {
-    let mut scratch = [0u8; 26];
-    scratch[0..2].copy_from_slice(&1u16.to_le_bytes()); // version
-    scratch[2..4].copy_from_slice(&(opcode as u16).to_le_bytes()); // msg_type
-
-    VShardEnvelope::from_bytes(&scratch)
-        .map(|e| e.msg_type)
-        .ok_or_else(|| nodedb_cluster::error::ClusterError::Codec {
-            detail: format!("resolve_vshard_msg_type: unknown opcode {opcode}"),
-        })
 }

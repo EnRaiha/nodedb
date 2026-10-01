@@ -6,7 +6,9 @@ use nodedb_types::RowIdentity;
 
 use crate::types::{DatabaseId, Lsn, TenantId};
 
-use super::ChangeCursor;
+use crate::event::cdc::CdcOffset;
+
+use super::ChangePartition;
 
 /// A single mutation event broadcast by the change stream.
 #[derive(Debug, Clone)]
@@ -40,26 +42,45 @@ impl ChangeOperation {
     }
 }
 
-/// A publication-ordered change event. The cursor is allocated atomically with
-/// ring insertion and broadcast, rather than derived from the WAL LSN.
+/// A change event at its position in its partition's feed.
 #[derive(Debug, Clone)]
 pub struct SequencedChangeEvent {
-    cursor: ChangeCursor,
+    partition: ChangePartition,
+    position: CdcOffset,
+    /// The node's feed of `partition` holds every event above this position.
+    /// A consumer whose cursor sits below it can have missed events.
+    floor: CdcOffset,
     database_id: DatabaseId,
     event: ChangeEvent,
 }
 
 impl SequencedChangeEvent {
-    pub(crate) fn new(cursor: ChangeCursor, database_id: DatabaseId, event: ChangeEvent) -> Self {
+    pub(crate) fn new(
+        partition: ChangePartition,
+        position: CdcOffset,
+        floor: CdcOffset,
+        database_id: DatabaseId,
+        event: ChangeEvent,
+    ) -> Self {
         Self {
-            cursor,
+            partition,
+            position,
+            floor,
             database_id,
             event,
         }
     }
 
-    pub fn cursor(&self) -> ChangeCursor {
-        self.cursor
+    pub fn partition(&self) -> ChangePartition {
+        self.partition
+    }
+
+    pub fn position(&self) -> CdcOffset {
+        self.position
+    }
+
+    pub fn floor(&self) -> CdcOffset {
+        self.floor
     }
 
     pub fn database_id(&self) -> DatabaseId {

@@ -39,6 +39,7 @@ hex = { workspace = true }
 loro = { workspace = true }
 nexar = { workspace = true }
 quinn = { workspace = true }
+rdkafka = { workspace = true }
 redb = { workspace = true }
 rustls = { workspace = true }
 serde_json = { workspace = true }

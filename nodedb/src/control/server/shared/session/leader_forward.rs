@@ -65,7 +65,7 @@ pub(crate) fn resolve_leader(task: &PhysicalTask, state: &SharedState) -> RouteD
 /// `version_plan` is the plan used to compute the descriptor version set the
 /// leader validates for OCC: for a `StageWrite` it is the INNER (un-wrapped)
 /// write, so the forwarded stage carries the same descriptor versions a normal
-/// remote write would and is not spuriously rejected; a `DropTxnOverlay` touches
+/// remote write does and is not spuriously rejected; a `DropTxnOverlay` touches
 /// no user collection, so its version set is empty.
 pub(crate) async fn forward_to_leader(
     state: &SharedState,
@@ -103,6 +103,8 @@ pub(crate) async fn forward_to_leader(
         // The leader's session-less staging handler reads THIS to key the
         // per-transaction overlay; forwarding it is the whole point.
         txn_id: forward_task.txn_id,
+        // A staged write or overlay drop, never a read.
+        linearizable: false,
     })
     .await?;
 

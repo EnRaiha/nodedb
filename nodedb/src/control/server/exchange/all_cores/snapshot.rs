@@ -13,7 +13,8 @@ use super::dispatch::NodeLevelResult;
 use super::fanout::gather_every_core;
 
 /// Snapshot `tenant_id` in `database_id` on every local core and return the
-/// one merged `TenantDataSnapshot` blob.
+/// one merged `TenantDataSnapshot` blob. `arrays` exports every array cell
+/// version too.
 ///
 /// Every local caller that snapshots a tenant goes through this function. Each
 /// core stores only the collections its vShards home to, so a snapshot taken
@@ -23,10 +24,13 @@ pub(crate) async fn snapshot_tenant_on_local_cores(
     tenant_id: TenantId,
     database_id: DatabaseId,
     timeout: Duration,
+    arrays: bool,
 ) -> crate::Result<Vec<u8>> {
     let plan = PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot {
         tenant_id: tenant_id.as_u64(),
         cut_watermark: None,
+        cut_capture: None,
+        arrays,
     });
     let fan =
         fan_tenant_snapshot_all_cores(state, tenant_id, database_id, plan, TraceId::generate());
@@ -47,9 +51,9 @@ pub(crate) async fn snapshot_tenant_on_local_cores(
 /// concatenation, and re-encode ONE snapshot blob.
 ///
 /// Each core scans only the engine state for the vShards homed on that core, so
-/// the per-core snapshots cover DISJOINT key sets — concatenating every `Vec`
-/// field requires no dedup, exactly like the BSP/WCC superstep merges. Every
-/// core must answer: a core that fails would leave its collections out of the
+/// the per-core snapshots cover disjoint key sets, except a cross-shard edge,
+/// which both of its endpoint homes store ([`merge_core_snapshots`]). Every
+/// core must answer: a core that fails will leave its collections out of the
 /// snapshot, so its error fails the snapshot. At 1 core/node this yields the
 /// lone core's snapshot unchanged.
 pub(super) async fn fan_tenant_snapshot_all_cores(
@@ -59,8 +63,6 @@ pub(super) async fn fan_tenant_snapshot_all_cores(
     plan: PhysicalPlan,
     trace_id: TraceId,
 ) -> crate::Result<NodeLevelResult> {
-    use crate::types::TenantDataSnapshot;
-
     let responses = gather_every_core(
         state,
         tenant_id,
@@ -70,6 +72,17 @@ pub(super) async fn fan_tenant_snapshot_all_cores(
         "tenant-snapshot",
     )
     .await?;
+    merge_core_snapshots(responses)
+}
+
+/// Merge every core's partial [`TenantDataSnapshot`] of one tenant into one
+/// snapshot blob. The cores cover disjoint key sets, so every field
+/// concatenates, except the edges: a cross-shard edge lives on both
+/// endpoint homes, so two cores can report one edge version, kept once.
+pub(super) fn merge_core_snapshots(
+    responses: Vec<crate::bridge::envelope::Response>,
+) -> crate::Result<NodeLevelResult> {
+    use crate::types::TenantDataSnapshot;
 
     let mut merged = TenantDataSnapshot::default();
     let mut watermark_lsn = Lsn::ZERO;
@@ -104,11 +117,35 @@ pub(super) async fn fan_tenant_snapshot_all_cores(
             index_configs,
             surrogate_pk,
             tenant_edges,
+            edge_hidden,
+            edge_cuts,
+            edge_applied,
+            tenant_edge_cuts,
+            tenant_edge_applied,
             group_write_marks,
+            group_proposal_keys,
+            group_proposal_keys_complete_from,
             documents_versioned,
             indexes_versioned,
+            vector_multi_documents,
+            arrays,
+            metadata_floor,
+            group_cut_index,
+            // The group snapshot builder sets the lane state and the Calvin
+            // cut on the merged payload. A per-core part carries neither.
+            group_event_lane: _,
+            group_calvin: _,
         } = part;
+        // The group snapshot builder sets the cut on the merged payload. A
+        // per-core part carries none.
+        merged.group_cut_index = merged.group_cut_index.max(group_cut_index);
+        merged.edge_hidden.extend(edge_hidden);
+        merged.edge_cuts.extend(edge_cuts);
+        merged.edge_applied.extend(edge_applied);
+        merged.tenant_edge_cuts.extend(tenant_edge_cuts);
+        merged.tenant_edge_applied.extend(tenant_edge_applied);
         merged.documents.extend(documents);
+        merged.vector_multi_documents.extend(vector_multi_documents);
         merged.indexes.extend(indexes);
         merged.edges.extend(edges);
         merged.vectors.extend(vectors);
@@ -123,9 +160,29 @@ pub(super) async fn fan_tenant_snapshot_all_cores(
         merged.surrogate_pk.extend(surrogate_pk);
         merged.tenant_edges.extend(tenant_edges);
         merged.group_write_marks.extend(group_write_marks);
+        merged.group_proposal_keys.extend(group_proposal_keys);
+        merged.group_proposal_keys_complete_from = merged
+            .group_proposal_keys_complete_from
+            .max(group_proposal_keys_complete_from);
         merged.documents_versioned.extend(documents_versioned);
         merged.indexes_versioned.extend(indexes_versioned);
+        merged.arrays.extend(arrays);
+        merged.metadata_floor = merged.metadata_floor.max(metadata_floor);
     }
+    // A cross-shard edge is stored on both endpoint homes under one version
+    // key. When the two homes sit on different cores, both cores report it.
+    dedup_edges(&mut merged.edges, |(key, _)| key.clone());
+    dedup_edges(&mut merged.tenant_edges, |(db, tid, key, _)| {
+        (*db, *tid, key.clone())
+    });
+    dedup_edges(&mut merged.edge_hidden, |(key, _)| key.clone());
+    dedup_edges(&mut merged.edge_applied, |(key, _)| key.clone());
+    dedup_edges(&mut merged.tenant_edge_applied, |(db, tid, key, _)| {
+        (*db, *tid, key.clone())
+    });
+    // Every core that holds a vShard of the collection records the cut.
+    dedup_edges(&mut merged.edge_cuts, Clone::clone);
+    dedup_edges(&mut merged.tenant_edge_cuts, Clone::clone);
 
     let payload = zerompk::to_msgpack_vec(&merged).map_err(|e| crate::Error::Serialization {
         format: "msgpack".into(),
@@ -137,4 +194,32 @@ pub(super) async fn fan_tenant_snapshot_all_cores(
         watermark_lsn,
         read_version_lsn: Lsn::ZERO,
     })
+}
+
+/// Keep the first entry of every `identity` in `entries`, in order.
+fn dedup_edges<T, K: std::hash::Hash + Eq>(entries: &mut Vec<T>, identity: impl Fn(&T) -> K) {
+    let mut seen = std::collections::HashSet::new();
+    entries.retain(|entry| seen.insert(identity(entry)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dedup_edges;
+
+    #[test]
+    fn an_edge_both_homes_report_is_kept_once() {
+        let mut edges = vec![
+            ("g\0a\0L\0b\x007".to_string(), vec![1]),
+            ("g\0a\0L\0c\x007".to_string(), vec![2]),
+            ("g\0a\0L\0b\x007".to_string(), vec![1]),
+        ];
+        dedup_edges(&mut edges, |(key, _)| key.clone());
+        assert_eq!(
+            edges,
+            vec![
+                ("g\0a\0L\0b\x007".to_string(), vec![1]),
+                ("g\0a\0L\0c\x007".to_string(), vec![2]),
+            ]
+        );
+    }
 }

@@ -246,6 +246,10 @@ mod tests {
             version: 1,
             ops: Vec::new(),
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         }
         .to_bytes()
         .expect("encode redo");
@@ -314,7 +318,7 @@ mod tests {
         let wal = open_wal(dir.path());
         let plan = PhysicalPlan::Text(TextOp::FtsDeleteDoc {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
-            surrogate: Surrogate::new(7),
+            surrogate: Some(Surrogate::new(7)),
             provenance: None,
         });
 
@@ -337,8 +341,10 @@ mod tests {
         assert_eq!(decoded.collection, "docs");
         assert_eq!(
             decoded.doc_id,
-            crate::engine::document::store::StorageKey::for_surrogate(Surrogate::new(7))
-                .to_string()
+            Some(
+                crate::engine::document::store::StorageKey::for_surrogate(Surrogate::new(7))
+                    .to_string()
+            )
         );
     }
 
@@ -384,7 +390,7 @@ mod tests {
         let plan = PhysicalPlan::Spatial(SpatialOp::Delete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
             field: "loc".to_string(),
-            surrogate: Surrogate::new(9),
+            surrogate: Some(Surrogate::new(9)),
             provenance: None,
         });
 
@@ -410,7 +416,7 @@ mod tests {
 
     /// Whether the on-disk WAL segments hold a `VectorIndexDrop` record.
     /// Reads the files, never the writer's buffer, so this is exactly what a
-    /// restart would replay.
+    /// restart will replay.
     fn drop_record_on_disk(wal: &WalManager) -> bool {
         wal.replay().expect("read wal").iter().any(|r| {
             nodedb_wal::record::RecordType::from_raw(r.logical_record_type())

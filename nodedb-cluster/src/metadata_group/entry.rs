@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use nodedb_types::Hlc;
 
 use crate::metadata_group::compensation::Compensation;
-use crate::metadata_group::descriptors::{DescriptorId, DescriptorLease};
+use crate::metadata_group::descriptors::{DescriptorId, DescriptorLease, DrainOwner};
 use crate::metadata_group::migration_state::{MigrationCheckpointPayload, MigrationPhaseTag};
 
 /// An entry in the replicated metadata log.
@@ -103,8 +103,12 @@ pub enum MetadataEntry {
     /// Acquire the replicated global descriptor-preparation lease. The first
     /// unexpired owner wins; contenders observe the winner after this entry is
     /// applied and retry after its matching release or expiry.
+    ///
+    /// `node_id` is the proposing node. The metadata leader reclaims the lease
+    /// once that node is SWIM-Dead and Raft-silent past its grace.
     DdlPrepareAcquire {
         token: u64,
+        node_id: u64,
     },
     /// Release the descriptor-preparation lease iff `token` still owns it.
     DdlPrepareRelease {
@@ -116,7 +120,8 @@ pub enum MetadataEntry {
     /// pending-DDL table; nothing is written to the catalog yet. A crash
     /// after this applies but before the matching finalize leaves the
     /// pending record for a future reconciliation pass, never orphaned
-    /// catalog state.
+    /// catalog state. Applies only while `token` owns the preparation lease,
+    /// like `DdlPrepared`: a reclaimed owner's late propose is a no-op.
     DdlPendingPropose {
         token: u64,
         objects: Vec<PendingDdlObject>,
@@ -125,7 +130,8 @@ pub enum MetadataEntry {
     /// Commit the objects `token`'s `DdlPendingPropose` reserved: replay
     /// each object's host-side effects, then drop the pending record.
     /// Idempotent — a record already finalized, or absent, is a no-op, so
-    /// Raft re-delivery is always safe.
+    /// Raft re-delivery is always safe. Applies only while `token` owns the
+    /// preparation lease.
     DdlPendingFinalize {
         token: u64,
     },
@@ -171,6 +177,12 @@ pub enum MetadataEntry {
         descriptor_id: DescriptorId,
         up_to_version: u64,
         expires_at: Hlc,
+        /// Node that proposed the drain. When it leaves the topology, the
+        /// cluster ends its drains: no proposer is left to end them.
+        proposer_node_id: u64,
+        /// Who holds this drain. Other owners' drains on the same descriptor
+        /// are independent.
+        owner: DrainOwner,
     },
     /// End draining on a descriptor. Emitted explicitly on drain
     /// timeout so the cluster can make progress. On the happy
@@ -179,6 +191,8 @@ pub enum MetadataEntry {
     /// hatch for the failure path.
     DescriptorDrainEnd {
         descriptor_id: DescriptorId,
+        /// The owner whose drain ends. Other owners' drains stay.
+        owner: DrainOwner,
     },
 
     /// Cluster-wide CA trust mutation (L.4). Proposed by
@@ -350,6 +364,33 @@ pub enum MetadataEntry {
         spki: [u8; 32],
         expires_at_ms: u64,
     },
+
+    /// Reserve one database id for `node_id`.
+    ///
+    /// The id is not carried: every node computes it at apply time as the
+    /// next id past the replicated database high-watermark, in log order, so
+    /// all nodes agree on it. `request_id` routes the id back to the waiting
+    /// allocation on `node_id`.
+    DatabaseIdReserve {
+        node_id: u64,
+        request_id: u64,
+    },
+
+    /// A cluster restore point: one consistent instant across every Raft
+    /// group. Its id is this entry's log index, and the metadata group's place
+    /// at the point is that index. `hlc` is the point's watermark: a
+    /// point-in-time restore to it keeps every write committed below it.
+    /// Every node records the point, then cuts each group it hosts at `hlc`.
+    RestorePoint {
+        hlc: u64,
+        created_at_ms: u64,
+    },
+
+    /// A stamped entry the metadata log archiver proposes on the leader when
+    /// the log holds no recent stamp. Stamps rise with the log index, so the
+    /// archive covers every stamp up to the newest one it holds. This entry
+    /// moves that frontier forward on an idle log. It applies nothing.
+    ArchiveMark,
 }
 
 /// The direction of a join-token lifecycle transition.
@@ -425,11 +466,25 @@ pub enum PendingDdlObject {
     zerompk::FromMessagePack,
 )]
 pub enum TopologyChange {
-    Join { node_id: u64, addr: String },
-    Leave { node_id: u64 },
-    PromoteToVoter { node_id: u64 },
-    StartDecommission { node_id: u64 },
-    FinishDecommission { node_id: u64 },
+    /// `swim_addr` is the joiner's bound SWIM UDP address, if it runs SWIM.
+    Join {
+        node_id: u64,
+        addr: String,
+        #[serde(default)]
+        swim_addr: Option<String>,
+    },
+    Leave {
+        node_id: u64,
+    },
+    PromoteToVoter {
+        node_id: u64,
+    },
+    StartDecommission {
+        node_id: u64,
+    },
+    FinishDecommission {
+        node_id: u64,
+    },
 }
 
 /// Routing-table mutations proposed through the metadata group.

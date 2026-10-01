@@ -1,39 +1,56 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! WAL redo replay arm for the Document engine.
+//! WAL replay arm for the Document engine.
 //!
-//! Document point writes have no standalone WAL replay: they survive a crash
-//! today because redb commits synchronously at apply time. Under the
-//! write-ahead-then-install protocol a crash between appending the redo record
-//! and installing its effects loses them, so a transaction's document
-//! sub-records must replay too.
+//! Every stored document row has a WAL record carrying its post-image, and
+//! this arm applies them all in LSN order: the standalone records of
+//! autocommit writes, and the sub-records of committed `TransactionRedo`
+//! records and of `WriteGroup` records alike. A point write's pre-dispatch
+//! record carries the row its plan names. The parts of a write's
+//! `WriteGroup`, journalled from the write's `Response::write_set`, carry
+//! every row the apply decided. A restart replays the tail above the durable
+//! floor, and a point-in-time restore replays every archived record above
+//! its base, so both rebuild exactly the rows the WAL names.
 //!
-//! ## Sub-record payload shape (chosen here)
+//! A delete tombstones no edge here. The edges of its node carry their own
+//! records, which the graph arm writes at the ordinal the live write
+//! stamped.
 //!
-//! Reuses the autocommit `RecordType::Put` / `Delete` document shapes
-//! (`wal_append_if_write`) so the producer and this decoder share one encoding:
+//! ## Record payload shape
+//!
+//! One encoding serves every producer (`wal_dispatch::document`) and this
+//! decoder:
 //!
 //! * PUT — `(collection, document_id, value, Option<SyncProvenance>, surrogate)`.
-//!   Byte-identical to the autocommit `PointPut` / `PointInsert` shape; the
-//!   trailing `surrogate` is the stable identity `apply_point_put` keys on. A
-//!   `bitemporal=true` collection's put instead carries an 8-tuple that appends
-//!   `(sys_from_ms, valid_from_ms, valid_until_ms)`; the decoder tries the
-//!   8-tuple first and falls back to the 5-tuple, and a decoded stamp forces the
-//!   put onto the versioned store at that exact version key (needed because
-//!   `doc_configs` is empty during replay, so `is_bitemporal` would say false).
+//!   The trailing `surrogate` is the stable identity `apply_point_put` keys on,
+//!   and `value` is the MessagePack body `apply_point_put` encodes into storage.
+//!   A `bitemporal=true` collection's put instead carries an 8-tuple that
+//!   appends `(sys_from_ms, valid_from_ms, valid_until_ms)`; the decoder tries
+//!   the 8-tuple first and falls back to the 5-tuple, and a decoded stamp
+//!   forces the put onto the versioned store at that exact version key.
 //! * DELETE — `(collection, document_id, Option<SyncProvenance>, surrogate)`.
-//!   The autocommit delete shape `(collection, document_id, prov)` omits the
-//!   surrogate; replay needs it (the redb storage key is
-//!   `StorageKey::for_surrogate(surrogate)`, and the delete cascade keys on
-//!   it), so the redo shape appends it as a fourth element. A
-//!   `bitemporal=true` collection's delete appends its resolve-time
-//!   `sys_from_ms` as a fifth element, and the decoded stamp forces the
-//!   versioned tombstone at that exact version key.
+//!   The redb storage key is `StorageKey::for_surrogate(surrogate)`, and the
+//!   delete cascade keys on it. A `bitemporal=true` collection's delete
+//!   appends its `sys_from_ms` as a fifth element, and the decoded stamp
+//!   forces the versioned tombstone at that exact version key.
+//!
+//! A record without a stamp on a `bitemporal=true` collection is a point
+//! write's pre-dispatch record: the apply decided that row's version key, and
+//! the write journalled its stamped image after it. The unstamped record is
+//! skipped, so the row lands once, at the key the live write used.
 //!
 //! ## Idempotency
 //!
 //! Both ops are absolute: a PUT is an overwrite of the surrogate-keyed row, a
-//! DELETE removes it. Re-applying either converges — no checkpoint gate needed.
+//! DELETE removes it, and a stamped op writes its exact version key. Replaying
+//! a suffix of records that already applied re-applies each post-image in
+//! the order the core applied them, and converges on the state the last one
+//! left, so no checkpoint gate is needed. A secondary vector index is gated by
+//! the vector checkpoint's stamp inside `apply_point_put`, so a vector node the
+//! restored index holds is never inserted twice. A PUT to a hash-chained
+//! collection stores the submitted body with the row's link, which replay
+//! reuses from the durable row or derives from the durable head (see
+//! `wal_replay_redo_document_apply`).
 //! Applied through the same shared core write path the transaction batch uses
 //! (`apply_point_put` / `apply_point_delete`), never a reimplementation.
 //!
@@ -92,18 +109,17 @@ use nodedb_wal::WalRecord;
 use nodedb_wal::record::RecordType;
 
 use super::core_loop::CoreLoop;
-use super::handlers::point::apply_delete::PointDeleteParams;
-use super::handlers::point::apply_put::PointPutParams;
 use super::handlers::transaction::overlay::BitemporalStamp;
 use super::handlers::transaction::redo_apply::CommittedDocWrite;
+use super::wal_replay_redo_document_apply::{ReplayDocDelete, ReplayDocPut};
 use crate::data::executor::core_loop::write_index::KeyRepr;
-use crate::engine::document::store::StorageKey;
 
 impl CoreLoop {
-    /// Replay reconstituted document `Put` / `Delete` redo sub-records.
+    /// Replay every document `Put` / `Delete` record in `records`, standalone
+    /// and reconstituted alike, in slice order.
     ///
     /// Only records whose payload decodes as a document tuple are applied; KV
-    /// (leading `"kv_*"` discriminator) and graph (distinct tuple arity/types)
+    /// (leading `"kv_*"` discriminator) and graph (map-encoded edge payload)
     /// `Put`/`Delete` records fail the strict decode and are skipped for the
     /// KV / graph arms to handle.
     pub(crate) fn replay_document_redo(
@@ -116,6 +132,9 @@ impl CoreLoop {
         let mut deletes = 0usize;
 
         for record in records {
+            if self.replay_halted() {
+                break;
+            }
             let record_type = RecordType::from_raw(record.logical_record_type());
             let is_put = record_type == Some(RecordType::Put);
             let is_delete = record_type == Some(RecordType::Delete);
@@ -138,11 +157,14 @@ impl CoreLoop {
             let record_lsn = record.header.lsn;
 
             if is_put {
+                // A KV value must never be read as a document body.
+                if is_kv_put_record(&record.payload) {
+                    continue;
+                }
                 // Try the bitemporal 8-tuple first, then fall back to the plain
                 // 5-tuple (mirrors the KV base-vs-extended tuple discrimination).
-                // A `bitemporal=true` collection's put carries its resolve-time
-                // stamp; `doc_configs` is empty during replay, so the stamp is
-                // the ONLY signal that this row belongs on the versioned store.
+                // A decoded stamp places the row on the versioned store at
+                // exactly the version key the live write used.
                 type BitemporalPut = (
                     String,
                     String,
@@ -186,6 +208,24 @@ impl CoreLoop {
                 if tombstones.is_tombstoned(database_id, tenant_id, &collection, record_lsn) {
                     continue;
                 }
+                // The stamped image journalled after apply carries the row.
+                if stamp.is_none() && self.is_bitemporal(database_id, tenant_id, &collection) {
+                    continue;
+                }
+                // Every document writer binds the row's surrogate before the
+                // append. A record without it is refused, never replayed
+                // under `ZERO`.
+                if surrogate_u32 == Surrogate::ZERO.as_u32() {
+                    self.replay_record_unapplied(
+                        "document",
+                        "put_identity",
+                        record_lsn,
+                        &format!(
+                            "document put of '{document_id}' in '{collection}' carries no surrogate"
+                        ),
+                    );
+                    continue;
+                }
                 if self.claim_for_validation() {
                     continue;
                 }
@@ -194,7 +234,7 @@ impl CoreLoop {
                 // advance the per-core HLC so post-restart writes stay monotonic.
                 if let Some(s) = stamp {
                     self.observe_bitemporal_stamp(s.sys_from_ms);
-                    self.active_bitemporal_stamps.insert(surrogate_u32, s);
+                    self.apply_scope.bitemporal_stamps.insert(surrogate_u32, s);
                 }
                 let folds = self.redo_folds_at(record_lsn, &collection);
                 let applied = if folds {
@@ -211,16 +251,18 @@ impl CoreLoop {
                     )
                 } else {
                     self.apply_document_put(
-                        database_id,
-                        tenant_id,
-                        &collection,
-                        surrogate_u32,
+                        ReplayDocPut {
+                            database_id,
+                            tenant_id,
+                            collection: &collection,
+                            surrogate: surrogate_u32,
+                            record_lsn,
+                        },
                         &value,
-                        record_lsn,
                     )
                 };
                 if stamp.is_some() {
-                    self.active_bitemporal_stamps.remove(&surrogate_u32);
+                    self.apply_scope.bitemporal_stamps.remove(&surrogate_u32);
                 }
                 if applied {
                     puts += 1;
@@ -260,12 +302,31 @@ impl CoreLoop {
                 if tombstones.is_tombstoned(database_id, tenant_id, &collection, record_lsn) {
                     continue;
                 }
+                // The stamped image journalled after apply carries the removal.
+                if sys_from_ms.is_none() && self.is_bitemporal(database_id, tenant_id, &collection)
+                {
+                    continue;
+                }
+                // A delete record names a bound row. One under `ZERO` is
+                // refused, never replayed.
+                if surrogate_u32 == Surrogate::ZERO.as_u32() {
+                    self.replay_record_unapplied(
+                        "document",
+                        "delete_identity",
+                        record_lsn,
+                        &format!(
+                            "document delete of '{document_id}' in '{collection}' carries no \
+                             surrogate"
+                        ),
+                    );
+                    continue;
+                }
                 if self.claim_for_validation() {
                     continue;
                 }
                 if let Some(sys) = sys_from_ms {
                     self.observe_bitemporal_stamp(sys);
-                    self.active_bitemporal_stamps.insert(
+                    self.apply_scope.bitemporal_stamps.insert(
                         surrogate_u32,
                         BitemporalStamp {
                             sys_from_ms: sys,
@@ -285,16 +346,16 @@ impl CoreLoop {
                         record_lsn,
                     })
                 } else {
-                    self.apply_document_delete(
+                    self.apply_document_delete(ReplayDocDelete {
                         database_id,
                         tenant_id,
-                        &collection,
-                        &document_id,
-                        surrogate_u32,
-                    )
+                        collection: &collection,
+                        document_id: &document_id,
+                        surrogate: surrogate_u32,
+                    })
                 };
                 if sys_from_ms.is_some() {
-                    self.active_bitemporal_stamps.remove(&surrogate_u32);
+                    self.apply_scope.bitemporal_stamps.remove(&surrogate_u32);
                 }
                 if removed {
                     deletes += 1;
@@ -332,146 +393,23 @@ impl CoreLoop {
                 .replay_folds_for(record_lsn, collection)
                 .is_some()
     }
+}
 
-    /// Apply one document PUT through the shared `apply_point_put` core write
-    /// path in its own redb write transaction. `enforce = false`: replayed
-    /// writes were admission-checked when first committed, so re-running
-    /// stateless enforcement here would double-check already-accepted writes
-    /// (matching the CRDT-sync materialization contract). Returns whether the
-    /// write was applied and committed.
-    fn apply_document_put(
-        &mut self,
-        database_id: u64,
-        tenant_id: u64,
-        collection: &str,
-        surrogate_u32: u32,
-        value: &[u8],
-        record_lsn: u64,
-    ) -> bool {
-        let surrogate = Surrogate::new(surrogate_u32);
-        let storage_key = StorageKey::for_surrogate(surrogate);
-        let txn = match self.sparse.begin_write() {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(
-                    core = self.core_id,
-                    %collection,
-                    error = %e,
-                    "WAL document redo: begin_write failed; skipping put"
-                );
-                return false;
-            }
-        };
-        match self.apply_point_put(
-            &txn,
-            PointPutParams {
-                database_id,
-                tid: tenant_id,
-                collection,
-                storage_key,
-                surrogate,
-                value,
-                index_text: true,
-                user_roles: &[],
-                enforce: false,
-                resolved_targets: &[],
-                wal_lsn: (record_lsn != 0).then(|| crate::types::Lsn::new(record_lsn)),
-            },
-        ) {
-            Ok(_) => match txn.commit() {
-                Ok(()) => {
-                    self.checkpoint_coordinator.mark_dirty("sparse", 1);
-                    true
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        core = self.core_id,
-                        %collection,
-                        error = %e,
-                        "WAL document redo: commit failed; skipping put"
-                    );
-                    false
-                }
-            },
-            Err(e) => {
-                // The write txn is dropped un-committed (rolled back) on the
-                // early return.
-                tracing::warn!(
-                    core = self.core_id,
-                    %collection,
-                    error = %e,
-                    "WAL document redo: apply_point_put failed; skipping put"
-                );
-                false
-            }
-        }
-    }
-
-    /// Apply one document DELETE through the shared `apply_point_delete` core
-    /// path in its own redb write transaction. `enforce = false` for the same
-    /// reason as the put path. Returns whether a row was removed.
-    fn apply_document_delete(
-        &mut self,
-        database_id: u64,
-        tenant_id: u64,
-        collection: &str,
-        document_id: &str,
-        surrogate_u32: u32,
-    ) -> bool {
-        let surrogate = Surrogate::new(surrogate_u32);
-        let txn = match self.sparse.begin_write() {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(
-                    core = self.core_id,
-                    %collection,
-                    error = %e,
-                    "WAL document redo: begin_write failed; skipping delete"
-                );
-                return false;
-            }
-        };
-        match self.apply_point_delete(
-            &txn,
-            PointDeleteParams {
-                database_id,
-                tid: tenant_id,
-                collection,
-                // The graph cascade keys nodes by the client key.
-                document_id,
-                surrogate,
-                user_roles: &[],
-                enforce: false,
-                resolved_targets: &[],
-            },
-        ) {
-            Ok(outcome) => match txn.commit() {
-                Ok(()) => {
-                    self.checkpoint_coordinator.mark_dirty("sparse", 1);
-                    outcome.prior_value.is_some()
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        core = self.core_id,
-                        %collection,
-                        error = %e,
-                        "WAL document redo: commit failed; skipping delete"
-                    );
-                    false
-                }
-            },
-            Err(e) => {
-                // The write txn is dropped un-committed (rolled back) on the
-                // early return.
-                tracing::warn!(
-                    core = self.core_id,
-                    %collection,
-                    error = %e,
-                    "WAL document redo: apply_point_delete failed; skipping delete"
-                );
-                false
-            }
-        }
+/// True when `payload` is a KV put or KV batch-put record: both share
+/// `RecordType::Put` with document writes but lead with a discriminator no
+/// document record carries.
+fn is_kv_put_record(payload: &[u8]) -> bool {
+    let discriminator = |disc: &str| disc == "kv_put" || disc == "kv_batch_put";
+    // Only the leading element decides: every KV put arity opens with its
+    // discriminator string, and a document record opens with its collection.
+    match zerompk::from_msgpack::<(String, String, Vec<u8>, Vec<u8>, u64, Option<u64>, u32)>(
+        payload,
+    ) {
+        Ok((disc, ..)) => discriminator(&disc),
+        Err(_) => matches!(
+            zerompk::from_msgpack::<(String, String, Vec<(Vec<u8>, Vec<u8>)>, u64, Option<u64>, Vec<u32>)>(payload),
+            Ok((disc, ..)) if discriminator(&disc)
+        ),
     }
 }
 
@@ -480,6 +418,7 @@ mod tests {
     use super::*;
     use crate::types::{DatabaseId, Lsn, TenantId};
     use crate::wal::{RedoRecord, RedoSubRecord};
+    use nodedb_types::Surrogate;
     use nodedb_wal::WalRecord;
     use nodedb_wal::record::WalRecordArgs;
     use std::sync::Arc;
@@ -524,7 +463,7 @@ mod tests {
             "name".to_string(),
             nodedb_types::Value::String(name.to_string()),
         );
-        zerompk::to_msgpack_vec(&nodedb_types::Value::Object(m)).expect("encode doc")
+        nodedb_types::value_to_msgpack(&nodedb_types::Value::Object(m)).expect("encode doc")
     }
 
     fn doc_put_sub(collection: &str, surrogate: u32, name: &str) -> RedoSubRecord {
@@ -549,14 +488,16 @@ mod tests {
     }
 
     fn kv_put_sub_with_expiry(collection: &str, key: &[u8], expire_at_ms: u64) -> RedoSubRecord {
-        // Six-element extended tuple carrying the absolute expiry instant.
+        // The `kv_put` shape, carrying the absolute expiry instant and a bound
+        // surrogate.
         let payload = zerompk::to_msgpack_vec(&(
             "kv_put",
             collection,
             key,
             b"v".as_slice(),
             5_000u64,
-            expire_at_ms,
+            Some(expire_at_ms),
+            1u32,
         ))
         .expect("encode kv put sub-record");
         RedoSubRecord {
@@ -570,6 +511,10 @@ mod tests {
             version: 1,
             ops,
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         };
         WalRecord::new(WalRecordArgs {
             record_type: RecordType::TransactionRedo as u32,
@@ -717,8 +662,15 @@ mod tests {
 
     fn vector_put_sub(collection: &str, vector: Vec<f32>) -> RedoSubRecord {
         let dim = vector.len();
-        let payload = zerompk::to_msgpack_vec(&(collection, vector, dim))
-            .expect("encode vector put sub-record");
+        let payload = crate::control::server::wal_dispatch::encode_vector_put_payload(
+            collection,
+            &vector,
+            dim,
+            "",
+            nodedb_types::Surrogate::new(1),
+            None,
+        )
+        .expect("encode vector put sub-record");
         RedoSubRecord {
             record_type: RecordType::VectorPut as u32,
             payload,
@@ -869,6 +821,10 @@ mod tests {
                 version: 1,
                 ops: vec![doc_delete_sub("notes", surrogate)],
                 calvin_stamp: None,
+                cross_shard_applied: None,
+                row_sources: Vec::new(),
+                publishes: Vec::new(),
+                row_changes: Vec::new(),
             }
             .to_bytes()
             .expect("encode redo record"),
@@ -1010,9 +966,42 @@ mod tests {
                 "the tombstone sits at the carried system time, not a locally minted one"
             );
             assert!(
-                h.core.active_bitemporal_stamps.is_empty(),
+                h.core.apply_scope.bitemporal_stamps.is_empty(),
                 "the carried stamp is scoped to its own apply"
             );
         }
+    }
+
+    /// A document put or delete record under `Surrogate::ZERO` names no row:
+    /// the committed apply refuses it through `replay_record_unapplied` and
+    /// stores nothing under the `ZERO` key.
+    #[test]
+    fn a_document_record_under_zero_is_refused_and_writes_nothing() {
+        use crate::data::executor::handlers::transaction::redo_apply::test_commit::{
+            doc_delete_sub_record, doc_put_sub_record,
+        };
+        use nodedb_physical::physical_plan::RedoOrigin;
+
+        let mut h = make_core();
+        let put = doc_put_sub_record("notes", "unbound", &doc_value("alice"), 0);
+        let (_, error) = h
+            .core
+            .install_from_for_test(7, 10, vec![put], RedoOrigin::Commit);
+        assert!(error.is_some(), "a put under ZERO is refused");
+        let zero_key = nodedb_types::StorageKey::for_surrogate(Surrogate::ZERO);
+        assert!(
+            h.core
+                .sparse
+                .get(0, 7, "notes", &zero_key)
+                .expect("get")
+                .is_none(),
+            "nothing is stored under the ZERO key"
+        );
+
+        let delete = doc_delete_sub_record("notes", "unbound", 0);
+        let (_, error) = h
+            .core
+            .install_from_for_test(7, 11, vec![delete], RedoOrigin::Commit);
+        assert!(error.is_some(), "a delete under ZERO is refused");
     }
 }

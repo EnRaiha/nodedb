@@ -96,6 +96,12 @@ pub struct SubscriberMap {
     store: Arc<SubscriberStore>,
 }
 
+impl crate::storage::RedbBacked for SubscriberMap {
+    fn redb_database(&self) -> &redb::Database {
+        &self.store.db
+    }
+}
+
 impl SubscriberMap {
     /// Construct from a pre-loaded backing store.
     pub fn new(store: Arc<SubscriberStore>) -> Self {
@@ -107,7 +113,7 @@ impl SubscriberMap {
 
     /// Register a new subscriber (or restore an existing one from the store).
     ///
-    /// Returns the current `ArraySubscriberState` (may have a non-ZERO
+    /// Returns the current `ArraySubscriberState` (can have a non-ZERO
     /// `last_pushed_hlc` if the subscriber previously connected).
     pub fn register(
         &self,

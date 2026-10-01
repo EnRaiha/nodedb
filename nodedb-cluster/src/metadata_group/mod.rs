@@ -18,11 +18,15 @@ pub mod migration_recovery;
 pub mod migration_state;
 pub mod state;
 
-pub use applier::{CacheApplier, MetadataApplier, NoopMetadataApplier};
+pub use applier::{
+    CacheApplier, CommittedMetadata, MetadataApplier, MetadataPayload, NoopMetadataApplier,
+};
 pub use cache::{MetadataCache, apply_migration_abort, apply_migration_checkpoint};
-pub use codec::{decode_entry, encode_entry};
+pub use codec::{decode_entry, encode_entry, entry_stamp, stamp_entry};
 pub use compensation::Compensation;
-pub use descriptors::{DescriptorHeader, DescriptorId, DescriptorKind, DescriptorLease};
+pub use descriptors::{
+    DescriptorHeader, DescriptorId, DescriptorKind, DescriptorLease, DrainOwner,
+};
 pub use entry::{MetadataEntry, PendingDdlObject, RoutingChange, TopologyChange};
 pub use ids::METADATA_GROUP_ID;
 pub use migration_recovery::{

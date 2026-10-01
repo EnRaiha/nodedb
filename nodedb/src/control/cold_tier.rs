@@ -5,7 +5,8 @@
 //! Each cycle scans `{data_dir}/segments/` for segment files whose modification
 //! time exceeds `tier_after_secs`. Eligible files are uploaded as raw binary
 //! objects to the configured cold store under `{prefix}segments/{name}`, then
-//! deleted locally on success.
+//! deleted locally on success. An upload never overwrites an object a kept
+//! base snapshot references: that local file stays until the base is retired.
 //!
 //! Runs on the Control Plane (Tokio) — `ColdStorage` is async and `Send + Sync`.
 
@@ -72,7 +73,15 @@ pub fn spawn_cold_tier_task(
                     return;
                 }
             };
-            run_tier_cycle_at(&cold, &segments_dir, tier_after, &prefix, &key).await;
+            run_tier_cycle_at(
+                &cold,
+                &segments_dir,
+                tier_after,
+                &prefix,
+                &key,
+                shared.pitr.cold_pins(),
+            )
+            .await;
         }
     })
 }
@@ -87,6 +96,7 @@ pub(crate) async fn run_tier_cycle_at(
     tier_after: Duration,
     prefix: &str,
     key: &nodedb_wal::crypto::WalEncryptionKey,
+    pins: &tokio::sync::RwLock<crate::control::pitr::ColdPins>,
 ) {
     let now = SystemTime::now();
 
@@ -134,7 +144,19 @@ pub(crate) async fn run_tier_cycle_at(
         let object_path = format!("{}segments/{}", prefix, segment_name);
         let entry_path_clone = entry_path.clone();
 
-        match upload_raw_segment(cold, &entry_path_clone, &object_path, key).await {
+        // Held across the upload, so no base pins the key mid-overwrite.
+        let held = pins.read().await;
+        if held.is_pinned(&object_path) {
+            debug!(
+                object_path = %object_path,
+                "cold tier: a kept base snapshot references this key, skipping"
+            );
+            continue;
+        }
+        let uploaded = upload_raw_segment(cold, &entry_path_clone, &object_path, key).await;
+        drop(held);
+
+        match uploaded {
             Ok(()) => {
                 info!(
                     segment = %segment_name,
@@ -274,5 +296,56 @@ mod tests {
         assert!(path.exists(), "forged source must not be deleted");
         let object = object_store::path::Path::from("segments/forged.seg");
         assert!(cold.object_store().head(&object).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_pinned_key_is_never_overwritten_until_its_base_is_retired() {
+        use crate::control::pitr::ColdPins;
+        use crate::storage::segment::{SegmentFooter, encrypt_untrusted_segment_bytes};
+        use crate::types::Lsn;
+
+        let segments = tempfile::tempdir().expect("local segment directory");
+        let cold_dir = tempfile::tempdir().expect("cold object directory");
+        let key = nodedb_wal::crypto::WalEncryptionKey::from_bytes(&[0xA5; 32])
+            .expect("test encryption key");
+        let footer = SegmentFooter::new("n", 0, Lsn::new(1), Lsn::new(1));
+        let bytes = encrypt_untrusted_segment_bytes(b"new", &footer, &key).expect("encrypt");
+        let local = segments.path().join("s.seg");
+        std::fs::write(&local, &bytes).expect("write segment");
+
+        let cold = crate::storage::cold::ColdStorage::new(ColdStorageConfig {
+            local_dir: Some(cold_dir.path().to_path_buf()),
+            ..ColdStorageConfig::default()
+        })
+        .expect("cold storage");
+        let object = object_store::path::Path::from("p/segments/s.seg");
+        cold.object_store()
+            .put(
+                &object,
+                object_store::PutPayload::from_static(b"referenced"),
+            )
+            .await
+            .expect("seed object");
+        let pins = tokio::sync::RwLock::new(ColdPins::default());
+        pins.write()
+            .await
+            .pin("snap-1", vec!["p/segments/s.seg".to_string()]);
+
+        run_tier_cycle_at(&cold, segments.path(), Duration::ZERO, "p/", &key, &pins).await;
+        let kept = cold.object_store().get(&object).await.expect("get");
+        assert_eq!(kept.bytes().await.expect("bytes").as_ref(), b"referenced");
+        assert!(
+            local.exists(),
+            "the local copy stays while the key is pinned"
+        );
+
+        pins.write().await.unpin("snap-1");
+        run_tier_cycle_at(&cold, segments.path(), Duration::ZERO, "p/", &key, &pins).await;
+        let replaced = cold.object_store().get(&object).await.expect("get");
+        assert_eq!(
+            replaced.bytes().await.expect("bytes").as_ref(),
+            bytes.as_slice()
+        );
+        assert!(!local.exists(), "the local copy goes once the upload lands");
     }
 }

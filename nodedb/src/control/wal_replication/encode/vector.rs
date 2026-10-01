@@ -91,6 +91,7 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             collection,
             field_name,
             document_surrogate,
+            pk_bytes,
             vectors,
             count,
             dim,
@@ -99,8 +100,10 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             field_name: field_name.to_owned(),
             // All `count` vectors are bound to this one leader-assigned
             // surrogate; carried verbatim so every replica shares the same
-            // document identity instead of re-allocating.
+            // document identity instead of re-allocating. Followers bind it
+            // by `pk_bytes` when present, else by its own self-key.
             document_surrogate: document_surrogate.as_u32(),
+            pk_bytes: pk_bytes.clone(),
             vectors: vectors.clone(),
             count: *count,
             dim: *dim,
@@ -121,7 +124,7 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             provenance,
         } => ReplicatedWrite::DeleteBySurrogate {
             collection: collection.as_str().to_owned(),
-            surrogate: surrogate.as_u32(),
+            surrogate: surrogate.map(|s| s.as_u32()),
             field_name: field_name.to_owned(),
             provenance: super::entry::encode_provenance(provenance),
         },
@@ -444,7 +447,7 @@ mod tests {
         let plans = vec![
             PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
-                surrogate: Surrogate::new(1),
+                surrogate: Some(Surrogate::new(1)),
                 field_name: "emb".into(),
                 provenance: None,
             }),
@@ -463,6 +466,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
                 field_name: "colbert".into(),
                 document_surrogate: Surrogate::new(2),
+                pk_bytes: None,
                 vectors: vec![0.1, 0.2, 0.3, 0.4],
                 count: 2,
                 dim: 2,
@@ -539,7 +543,7 @@ mod tests {
             .expect("encode must not error")
             .expect("the resolved form must replicate");
         let (_, _, decoded, _) =
-            crate::control::wal_replication::from_replicated_entry(&entry.to_bytes(), None)
+            crate::control::wal_replication::decode_replicated_entry(&entry.to_bytes())
                 .expect("decode")
                 .expect("a replicated entry");
         let PhysicalPlan::Vector(VectorOp::ResolvedDirectWrite {
@@ -571,7 +575,7 @@ mod tests {
             .expect("encode must not error")
             .expect("a truncate must replicate");
         let (_, _, decoded, _) =
-            crate::control::wal_replication::from_replicated_entry(&entry.to_bytes(), None)
+            crate::control::wal_replication::decode_replicated_entry(&entry.to_bytes())
                 .expect("decode")
                 .expect("a replicated entry");
         let PhysicalPlan::Vector(VectorOp::DirectTruncate {

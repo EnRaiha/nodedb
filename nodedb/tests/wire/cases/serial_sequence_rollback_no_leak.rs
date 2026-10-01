@@ -6,10 +6,10 @@
 //!
 //! The auto-created sequence rides the same buffered-DDL `PutSequence`
 //! proposal a standalone `CREATE SEQUENCE` uses. Installing it into the
-//! shared registry unconditionally — rather than gating on
-//! `ProposeOutcome::needs_local_apply()` — would let another connection see,
-//! and consume values from, a sequence this transaction has not committed,
-//! and would leave it stranded with no cleanup path if the transaction then
+//! shared registry unconditionally, rather than leaving it to the COMMIT
+//! apply, lets another connection see
+//! and consume values from a sequence this transaction has not committed,
+//! and leaves it stranded with no cleanup path if the transaction then
 //! rolls back. This proves ROLLBACK leaves nothing behind: a different
 //! connection must not see the sequence, and the collection name must be
 //! free to reuse.

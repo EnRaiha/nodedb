@@ -26,7 +26,7 @@
 
 use std::fs;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use nodedb_cluster::transport::pki_types::{
     CertificateDer, CertificateRevocationListDer, PrivateKeyDer,
@@ -57,6 +57,9 @@ const CA_KEY_FILE: &str = "ca.key";
 /// set. Every CA in this directory is added to the rustls
 /// RootCertStore for both the server and client configs.
 pub const CA_TRUST_DIR: &str = "ca.d";
+
+use super::ca_trust::load_extra_cas;
+pub use super::ca_trust::{remove_trusted_ca, write_trusted_ca};
 /// Cluster-wide HMAC key used by the authenticated Raft frame envelope.
 /// Persisted as raw 32 bytes (no PEM framing) with 0600 perms.
 const CLUSTER_SECRET_FILE: &str = "cluster_secret.bin";
@@ -250,60 +253,6 @@ fn load_from_data_dir(tls_dir: &Path) -> crate::Result<TlsCredentials> {
     })
 }
 
-/// Load every PEM-encoded CA certificate from `tls_dir/ca.d/*.crt`,
-/// sorted by filename for deterministic output. Missing directory is
-/// treated as "no overlap CAs" and returns an empty vec.
-fn load_extra_cas(tls_dir: &Path) -> crate::Result<Vec<CertificateDer<'static>>> {
-    let dir = tls_dir.join(CA_TRUST_DIR);
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
-        .map_err(|e| crate::Error::Config {
-            detail: format!("read ca.d {}: {e}", dir.display()),
-        })?
-        .filter_map(|r| r.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("crt"))
-        .collect();
-    entries.sort();
-    let mut out = Vec::with_capacity(entries.len());
-    for p in entries {
-        out.push(read_single_cert(&p)?);
-    }
-    Ok(out)
-}
-
-/// Write a PEM-encoded CA cert into `tls_dir/ca.d/<fp_hex>.crt`.
-/// Called by the production applier when a `CaTrustChange { add: ... }`
-/// entry commits.
-pub fn write_trusted_ca(tls_dir: &Path, ca_der: &[u8]) -> crate::Result<[u8; 32]> {
-    let dir = tls_dir.join(CA_TRUST_DIR);
-    fs::create_dir_all(&dir).map_err(|e| crate::Error::Config {
-        detail: format!("create ca.d dir {}: {e}", dir.display()),
-    })?;
-    let cert = CertificateDer::from(ca_der.to_vec());
-    let fp = nodedb_cluster::ca_fingerprint(&cert);
-    let name = format!("{}.crt", nodedb_cluster::ca_fingerprint_hex(&fp));
-    write_pem_cert(&dir, &name, ca_der)?;
-    Ok(fp)
-}
-
-/// Delete the overlap-CA file identified by `fp` from `tls_dir/ca.d/`.
-/// No-op (and returns `Ok(())`) when the file isn't present — applier
-/// behaviour must be idempotent across re-apply and snapshot replay.
-pub fn remove_trusted_ca(tls_dir: &Path, fp: &[u8; 32]) -> crate::Result<()> {
-    let dir = tls_dir.join(CA_TRUST_DIR);
-    let path = dir.join(format!("{}.crt", nodedb_cluster::ca_fingerprint_hex(fp)));
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(crate::Error::Config {
-            detail: format!("remove ca.d entry {}: {e}", path.display()),
-        }),
-    }
-}
-
 /// L.4 joiner-side helper: connect to `seed`'s bootstrap listener with
 /// `token`, receive `(ca_cert, node_cert, node_key, cluster_secret)`,
 /// write the files to `tls_dir/`, and return the loaded credentials.
@@ -424,7 +373,7 @@ fn write_cluster_secret(path: &Path, secret: &[u8; CLUSTER_SECRET_LEN]) -> crate
     })
 }
 
-fn read_single_cert(path: &Path) -> crate::Result<CertificateDer<'static>> {
+pub(crate) fn read_single_cert(path: &Path) -> crate::Result<CertificateDer<'static>> {
     let bytes = fs::read(path).map_err(|e| crate::Error::Config {
         detail: format!("read cert {}: {e}", path.display()),
     })?;
@@ -528,6 +477,7 @@ mod tests {
             log_compaction_threshold: None,
             join_retry_max_attempts: 8,
             join_retry_max_backoff_secs: 32,
+            swim_listen: None,
         }
     }
 

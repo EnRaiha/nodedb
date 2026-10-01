@@ -31,7 +31,7 @@ impl WaitOutcome {
 }
 
 /// Tracks the highest Raft log index applied on this node for one
-/// Raft group.
+/// Raft group, and the last index of the batch being applied now.
 #[derive(Debug, Default)]
 pub struct AppliedIndexWatcher {
     state: Mutex<State>,
@@ -41,6 +41,10 @@ pub struct AppliedIndexWatcher {
 #[derive(Debug, Default)]
 struct State {
     applied: u64,
+    /// The last index of the batch the applier is applying now. A batch
+    /// makes its effects visible entry by entry before `applied` reaches
+    /// its end.
+    applying_through: u64,
     closed: bool,
 }
 
@@ -65,6 +69,26 @@ impl AppliedIndexWatcher {
     /// Read the current watermark without blocking.
     pub fn current(&self) -> u64 {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).applied
+    }
+
+    /// Declare that the applier starts a batch ending at `last_index`. The
+    /// applier calls it before the batch mutates any state a reader can see.
+    /// Idempotent: smaller indices are ignored.
+    pub fn begin_batch(&self, last_index: u64) {
+        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        guard.applying_through = guard.applying_through.max(last_index);
+    }
+
+    /// The floor a reader stamps on work planned against what it sees now:
+    /// `max(applied, applying-through)`.
+    ///
+    /// A reader that sees an effect of the batch in progress gets a floor at
+    /// or above the index of the entry that made it visible. A waiter for
+    /// that floor waits on [`Self::wait_for`], which the finished batch
+    /// satisfies.
+    pub fn floor(&self) -> u64 {
+        let guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        guard.applied.max(guard.applying_through)
     }
 
     /// True once [`Self::close`] has been called.
@@ -172,5 +196,21 @@ mod tests {
         w.close();
         w.close();
         assert!(w.is_closed());
+    }
+
+    #[test]
+    fn the_floor_covers_the_batch_in_progress() {
+        let w = AppliedIndexWatcher::new();
+        w.bump(4);
+        assert_eq!(w.floor(), 4);
+        w.begin_batch(9);
+        assert_eq!(w.current(), 4, "the applied watermark waits for the batch");
+        assert_eq!(w.floor(), 9);
+        w.begin_batch(7);
+        assert_eq!(w.floor(), 9, "a smaller batch end is ignored");
+        w.bump(9);
+        assert_eq!(w.floor(), 9);
+        w.bump(12);
+        assert_eq!(w.floor(), 12);
     }
 }

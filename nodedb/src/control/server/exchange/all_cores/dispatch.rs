@@ -9,7 +9,7 @@ use crate::types::{DatabaseId, Lsn, TenantId, TraceId, TxnId};
 use nodedb_physical::physical_plan::{GraphOp, MetaOp, PhysicalPlan};
 
 use super::bsp::fan_bsp_all_cores;
-use super::fanout::gather_graph_op_all_cores;
+use super::fanout::gather_every_core;
 use super::snapshot::fan_tenant_snapshot_all_cores;
 use super::wcc::fan_wcc_all_cores;
 
@@ -47,13 +47,20 @@ pub(crate) async fn execute_plan_all_local_cores(
                 use crate::data::executor::handlers::graph_match::encode_match_envelope_raw;
 
                 // Forwarded `txn_id` resolves the staged overlay once present on this node.
+                // Not linearizable here: the callers confirm before they fan out.
+                // A leg received from another node was confirmed by
+                // `exec_receiver::read_leg` when it carried `read_groups`, and the
+                // graph superstep path confirms in `cluster_resolve`.
                 let outcome = broadcast_match_to_all_cores(
                     state,
                     tenant_id,
                     database_id,
                     plan,
                     trace_id,
-                    txn_id,
+                    crate::control::server::graph_dispatch::GraphRead {
+                        txn_id,
+                        linearizable: false,
+                    },
                 )
                 .await?;
 
@@ -65,9 +72,11 @@ pub(crate) async fn execute_plan_all_local_cores(
                     &outcome.resume,
                 )?;
 
+                // The served watermark rides back so the coordinator can put
+                // the read on a transaction's read-set at its true version.
                 Ok(NodeLevelResult {
                     payload: envelope,
-                    watermark_lsn: Lsn::ZERO,
+                    watermark_lsn: outcome.watermark_lsn,
                     read_version_lsn: Lsn::ZERO,
                 })
             }
@@ -99,7 +108,11 @@ pub(crate) async fn execute_plan_all_local_cores(
             | GraphOp::RemoveNodeLabels { .. }
             | GraphOp::TemporalNeighbors { .. }
             | GraphOp::TemporalAlgorithm { .. }
-            | GraphOp::Stats { .. } => {
+            | GraphOp::Stats { .. }
+            | GraphOp::NodeEdgeGuard { .. }
+            | GraphOp::NodePresenceGuard { .. }
+            | GraphOp::TruncateEdges { .. }
+            | GraphOp::NodePresenceRead { .. } => {
                 generic_gather(state, tenant_id, database_id, plan, trace_id, txn_id).await
             }
         },
@@ -107,35 +120,53 @@ pub(crate) async fn execute_plan_all_local_cores(
         // Most Meta ops return row arrays (generic gather); per-node snapshot ops
         // return one opaque per-node blob and must not be array-wrapped.
         PhysicalPlan::Meta(meta) => match meta {
-            // Single `TenantDataSnapshot` map per core — the row gather would prepend a
+            // Single `TenantDataSnapshot` map per core — the row gather will prepend a
             // fixarray header, breaking restore's decode.
             MetaOp::CreateTenantSnapshot { .. } => {
                 fan_tenant_snapshot_all_cores(state, tenant_id, database_id, plan, trace_id).await
             }
-            // Single JSON result object, not an array — same single-blob corruption
-            // class; return the lone core's payload verbatim.
+            // One JSON result object from the core that restores the snapshot.
             MetaOp::RestoreTenantSnapshot { .. } => {
-                single_blob_gather(state, tenant_id, database_id, plan, trace_id, None).await
+                let op = "RestoreTenantSnapshot";
+                single_blob_gather(state, tenant_id, database_id, plan, trace_id, op).await
             }
-            // Single `RedoRecord` blob, never actually fans across cores, but routed
-            // through `single_blob_gather` so the payload returns verbatim.
-            MetaOp::ResolveTxn { .. } => {
-                single_blob_gather(state, tenant_id, database_id, plan, trace_id, None).await
-            }
-            // Same single `RedoRecord` blob shape as `ResolveTxn` (reuses it internally).
+            // One `RedoRecord` blob from the core that holds Calvin's staging state.
             MetaOp::CalvinResolve { .. } => {
-                single_blob_gather(state, tenant_id, database_id, plan, trace_id, None).await
+                let op = "CalvinResolve";
+                single_blob_gather(state, tenant_id, database_id, plan, trace_id, op).await
             }
-
-            // Row gather would array-wrap the affected-count blob, corrupting extraction.
-            MetaOp::StageWrite { .. } | MetaOp::DropTxnOverlay { .. } => {
-                single_blob_gather(state, tenant_id, database_id, plan, trace_id, txn_id).await
+            // A transaction meta-op runs on the one core that holds the
+            // transaction's staging overlay (`execute_received_plan`). Fanned to
+            // every core, it stages, resolves, or applies on each of them.
+            MetaOp::StageWrite { .. } => Err(fanned_scoped_plan("StageWrite")),
+            MetaOp::DropTxnOverlay { .. } => Err(fanned_scoped_plan("DropTxnOverlay")),
+            MetaOp::ResolveTxn { .. } => Err(fanned_scoped_plan("ResolveTxn")),
+            MetaOp::MarkSavepoint { .. } => Err(fanned_scoped_plan("MarkSavepoint")),
+            MetaOp::RollbackToSavepoint { .. } => Err(fanned_scoped_plan("RollbackToSavepoint")),
+            MetaOp::TransactionBatch { .. } => Err(fanned_scoped_plan("TransactionBatch")),
+            MetaOp::ApplyTransactionRedo { .. } => Err(fanned_scoped_plan("ApplyTransactionRedo")),
+            MetaOp::RestoreRedo(_) => Err(fanned_scoped_plan("RestoreRedo")),
+            // One image per core, kept apart by core id. A merged payload
+            // loses which core each image belongs to.
+            // Each core answers the probes of the vShards it owns.
+            MetaOp::HomeVersions { .. } => {
+                super::home_versions::fan_home_versions(
+                    state,
+                    tenant_id,
+                    database_id,
+                    plan,
+                    trace_id,
+                )
+                .await
             }
+            MetaOp::CreateSnapshot => Err(crate::Error::Internal {
+                detail: "CreateSnapshot reached the all-core fan; it runs through \
+                         capture_base_on_local_cores"
+                    .into(),
+            }),
             // Enumerated exhaustively (no `_ =>`) so a new single-blob MetaOp forces a decision.
             MetaOp::WalAppend { .. }
             | MetaOp::Cancel { .. }
-            | MetaOp::TransactionBatch { .. }
-            | MetaOp::CreateSnapshot
             | MetaOp::Compact
             | MetaOp::Checkpoint
             | MetaOp::RegisterContinuousAggregate { .. }
@@ -157,19 +188,16 @@ pub(crate) async fn execute_plan_all_local_cores(
             | MetaOp::QueryAggregateWatermark { .. }
             | MetaOp::QueryLastValues { .. }
             | MetaOp::QueryLastValue { .. }
+            | MetaOp::VerifyHashChain { .. }
             | MetaOp::CalvinExecuteStatic { .. }
             | MetaOp::CalvinExecutePassive { .. }
             | MetaOp::CalvinExecuteActive { .. }
             | MetaOp::RebuildIndex { .. }
             | MetaOp::PutSynonymGroup { .. }
             | MetaOp::DeleteSynonymGroup { .. }
-            | MetaOp::RenameCollection { .. }
-            | MetaOp::MarkSavepoint { .. }
-            | MetaOp::RollbackToSavepoint { .. }
             | MetaOp::RecordCalvinWriteVersions { .. }
             | MetaOp::CalvinFlush { .. }
-            | MetaOp::CalvinDrop { .. }
-            | MetaOp::ApplyTransactionRedo { .. } => {
+            | MetaOp::CalvinDrop { .. } => {
                 generic_gather(state, tenant_id, database_id, plan, trace_id, txn_id).await
             }
         },
@@ -248,33 +276,34 @@ async fn generic_gather(
     })
 }
 
-/// Single-blob gather: fan `plan` across all local cores but return the lone
-/// non-empty core's payload verbatim, with no row array-wrap.
+/// The error for a vShard-scoped transaction meta-op that reached the
+/// all-core fan instead of its one owning core.
+fn fanned_scoped_plan(op: &'static str) -> crate::Error {
+    crate::Error::Internal {
+        detail: format!("{op} reached the all-core fan; it runs on its one owning core"),
+    }
+}
+
+/// Single-blob gather: fan `plan` across all local cores and return the one
+/// core's payload verbatim, with no row array-wrap.
 ///
-/// The row gather would prepend a msgpack array header and corrupt a Meta op's
-/// opaque blob. If more than one core returns non-empty, the first is kept.
+/// The row gather will prepend a msgpack array header and corrupt a Meta op's
+/// opaque blob. Every core must answer, and at most one answers with a
+/// payload. `op` names the plan in the error when a second core does.
 async fn single_blob_gather(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     plan: PhysicalPlan,
     trace_id: TraceId,
-    txn_id: Option<TxnId>,
+    op: &'static str,
 ) -> crate::Result<NodeLevelResult> {
-    let responses = gather_graph_op_all_cores(
-        state,
-        tenant_id,
-        database_id,
-        plan,
-        trace_id,
-        txn_id,
-        "single-blob",
-    )
-    .await?;
+    let responses =
+        gather_every_core(state, tenant_id, database_id, plan, trace_id, "single-blob").await?;
 
     let mut watermark_lsn = Lsn::ZERO;
     let mut read_version_lsn = Lsn::ZERO;
-    let mut payload: Option<Vec<u8>> = None;
+    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(responses.len());
     for resp in responses {
         if resp.watermark_lsn > watermark_lsn {
             watermark_lsn = resp.watermark_lsn;
@@ -282,14 +311,73 @@ async fn single_blob_gather(
         if resp.read_version_lsn > read_version_lsn {
             read_version_lsn = resp.read_version_lsn;
         }
-        if payload.is_none() && !resp.payload.is_empty() {
-            payload = Some(resp.payload.as_ref().to_vec());
-        }
+        payloads.push(resp.payload.as_ref().to_vec());
     }
 
     Ok(NodeLevelResult {
-        payload: payload.unwrap_or_default(),
+        payload: pick_single_blob(payloads, op)?,
         watermark_lsn,
         read_version_lsn,
     })
+}
+
+/// Return the one non-empty payload, in core order, or an empty one when no
+/// core answered with a payload. A second non-empty payload is an invariant
+/// break named by `op`.
+fn pick_single_blob(payloads: Vec<Vec<u8>>, op: &'static str) -> crate::Result<Vec<u8>> {
+    let mut non_empty = payloads.into_iter().filter(|p| !p.is_empty());
+    let first = non_empty.next().unwrap_or_default();
+    let extra = non_empty.count();
+    if extra == 0 {
+        return Ok(first);
+    }
+    Err(crate::Error::Internal {
+        detail: format!(
+            "{op}: {} local cores answered with a payload, expected at most one",
+            extra + 1
+        ),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_lone_payload_is_returned() {
+        let picked = pick_single_blob(
+            vec![Vec::new(), b"redo".to_vec(), Vec::new()],
+            "CalvinResolve",
+        )
+        .unwrap();
+        assert_eq!(picked, b"redo".to_vec());
+    }
+
+    #[test]
+    fn no_payload_is_empty() {
+        let picked = pick_single_blob(vec![Vec::new(), Vec::new()], "CalvinResolve").unwrap();
+        assert!(picked.is_empty());
+    }
+
+    #[test]
+    fn a_second_payload_breaks_the_one_owner_invariant() {
+        match pick_single_blob(
+            vec![b"a".to_vec(), Vec::new(), b"b".to_vec()],
+            "RestoreTenantSnapshot",
+        ) {
+            Err(crate::Error::Internal { detail }) => {
+                assert!(detail.contains("RestoreTenantSnapshot"), "{detail}");
+                assert!(detail.contains("2 local cores"), "{detail}");
+            }
+            other => panic!("expected an invariant error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fanned_scoped_plan_names_the_op() {
+        match fanned_scoped_plan("StageWrite") {
+            crate::Error::Internal { detail } => assert!(detail.contains("StageWrite")),
+            other => panic!("expected an internal error, got {other:?}"),
+        }
+    }
 }

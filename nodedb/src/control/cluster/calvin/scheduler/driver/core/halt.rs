@@ -10,6 +10,9 @@
 //!
 //! A halted scheduler:
 //! - keeps the stuck txn unapplied, with its locks and its `pending` entry;
+//! - releases the collection gates of every txn with no flush in flight, so a
+//!   purge never waits on it. Such a txn checks its incarnations again, and
+//!   takes its gates back, before a later flush;
 //! - closes intake with [`IntakeClosure::ApplyHalted`]. The fan-out then drops
 //!   new input and arms catch-up, which keeps the sequencer log retained;
 //! - stops the deferred re-send and the catch-up drain;
@@ -56,6 +59,9 @@ pub(in crate::control::cluster::calvin::scheduler::driver::core) enum HaltReason
     IdentityBindFailed,
     /// A redo or `CalvinApplied` WAL append failed.
     WalAppendFailed,
+    /// The metadata group left this node before its apply reached a held
+    /// txn's floor.
+    MetadataGroupGone,
 }
 
 impl HaltReason {
@@ -70,6 +76,7 @@ impl HaltReason {
             Self::LocalStageFailed => apply_halt_reason::LOCAL_STAGE_FAILED,
             Self::IdentityBindFailed => apply_halt_reason::IDENTITY_BIND_FAILED,
             Self::WalAppendFailed => apply_halt_reason::WAL_APPEND_FAILED,
+            Self::MetadataGroupGone => apply_halt_reason::METADATA_GROUP_GONE,
         }
     }
 
@@ -100,6 +107,8 @@ pub(in crate::control::cluster::calvin::scheduler::driver::core) enum HaltStep {
     AppliedMarker,
     /// The surrogate identity binding before the stage dispatch.
     IdentityBind,
+    /// The wait for this node's metadata apply to reach the txn's floor.
+    MetadataHold,
 }
 
 impl HaltStep {
@@ -116,6 +125,7 @@ impl HaltStep {
             Self::RedoAppend => "redo_append",
             Self::AppliedMarker => "applied_marker",
             Self::IdentityBind => "identity_bind",
+            Self::MetadataHold => "metadata_hold",
         }
     }
 
@@ -125,7 +135,10 @@ impl HaltStep {
     ) -> Self {
         match state {
             Some(CommitState::Staged | CommitState::AwaitingVerdict) => Self::Stage,
-            Some(CommitState::AwaitingRedoResolve) => Self::Resolve,
+            Some(CommitState::AwaitingRedoResolve | CommitState::AwaitingResolveTurn) => {
+                Self::Resolve
+            }
+            Some(CommitState::AwaitingFlushTurn { .. }) => Self::Flush,
             Some(CommitState::AwaitingResolve {
                 committed: true, ..
             }) => Self::Flush,
@@ -223,6 +236,7 @@ impl Scheduler {
                     "calvin scheduler: apply halted; holding another txn unapplied"
                 );
             }
+            self.release_gates_on_halt(txn_id);
             return;
         }
 
@@ -269,6 +283,7 @@ impl Scheduler {
                 .record(report.clone());
         }
         self.halt.first = Some(ApplyHalt { reason, report });
+        self.release_gates_on_halt(txn_id);
     }
 
     /// Whether the node shuts down: the shutdown watch fired, or the

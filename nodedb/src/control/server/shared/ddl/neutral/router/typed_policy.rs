@@ -26,9 +26,8 @@ pub(super) async fn try_typed(
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     match stmt {
         // `SHOW CONFLICT POLICY ON <collection>`. Parses into a typed
-        // `PolicyStmt::ShowConflictPolicy` and was dispatched from the pgwire
-        // typed-AST async router. The Data Plane `GetPolicy` read is preserved
-        // verbatim in `conflict_policy`.
+        // `PolicyStmt::ShowConflictPolicy`. The Data Plane `GetPolicy` read
+        // lives in `conflict_policy`.
         NodedbStatement::Policy(PolicyStmt::ShowConflictPolicy { collection }) => Some(
             conflict_policy::show_conflict_policy(state, identity, database_id, collection).await,
         ),
@@ -41,35 +40,41 @@ pub(super) async fn try_typed(
             is_restrictive,
             on_deny_raw,
             tenant_id_override,
-        }) => Some(rls::create_rls_policy(
-            state,
-            identity,
-            &CreateRlsPolicyRequest {
-                name,
-                collection,
-                policy_type_raw: policy_type,
-                predicate_raw,
-                is_restrictive: *is_restrictive,
-                on_deny_raw: on_deny_raw.as_deref(),
-                tenant_id_override: *tenant_id_override,
-                database_id,
-            },
-        )),
+        }) => Some(
+            rls::create_rls_policy(
+                state,
+                identity,
+                &CreateRlsPolicyRequest {
+                    name,
+                    collection,
+                    policy_type_raw: policy_type,
+                    predicate_raw,
+                    is_restrictive: *is_restrictive,
+                    on_deny_raw: on_deny_raw.as_deref(),
+                    tenant_id_override: *tenant_id_override,
+                    database_id,
+                },
+            )
+            .await,
+        ),
 
         NodedbStatement::Policy(PolicyStmt::DropRlsPolicy {
             name,
             collection,
             if_exists,
             tenant_id_override,
-        }) => Some(rls::drop_rls_policy(
-            state,
-            identity,
-            database_id,
-            name,
-            collection,
-            *if_exists,
-            *tenant_id_override,
-        )),
+        }) => Some(
+            rls::drop_rls_policy(
+                state,
+                identity,
+                database_id,
+                name,
+                collection,
+                *if_exists,
+                *tenant_id_override,
+            )
+            .await,
+        ),
 
         NodedbStatement::Policy(PolicyStmt::ShowRlsPolicies {
             collection,
@@ -89,34 +94,40 @@ pub(super) async fn try_typed(
             rules,
             if_not_exists,
             tenant_id_override,
-        }) => Some(redaction::create_redaction_policy(
-            state,
-            identity,
-            &CreateRedactionPolicyRequest {
-                name,
-                collection,
-                for_role,
-                rules,
-                if_not_exists: *if_not_exists,
-                tenant_id_override: *tenant_id_override,
-                database_id,
-            },
-        )),
+        }) => Some(
+            redaction::create_redaction_policy(
+                state,
+                identity,
+                &CreateRedactionPolicyRequest {
+                    name,
+                    collection,
+                    for_role,
+                    rules,
+                    if_not_exists: *if_not_exists,
+                    tenant_id_override: *tenant_id_override,
+                    database_id,
+                },
+            )
+            .await,
+        ),
 
         NodedbStatement::Policy(PolicyStmt::DropRedactionPolicy {
             collection,
             for_role,
             if_exists,
             tenant_id_override,
-        }) => Some(redaction::drop_redaction_policy(
-            state,
-            identity,
-            database_id,
-            collection,
-            for_role,
-            *if_exists,
-            *tenant_id_override,
-        )),
+        }) => Some(
+            redaction::drop_redaction_policy(
+                state,
+                identity,
+                database_id,
+                collection,
+                for_role,
+                *if_exists,
+                *tenant_id_override,
+            )
+            .await,
+        ),
 
         NodedbStatement::Policy(PolicyStmt::ShowRedactionPolicies {
             collection,
@@ -129,20 +140,20 @@ pub(super) async fn try_typed(
             *tenant_id_override,
         )),
 
-        NodedbStatement::Policy(PolicyStmt::CreateEnumType { name, labels }) => Some(
-            custom_type::create_enum_type(state, identity, database_id, name, labels),
-        ),
+        NodedbStatement::Policy(PolicyStmt::CreateEnumType { name, labels }) => {
+            Some(custom_type::create_enum_type(state, identity, database_id, name, labels).await)
+        }
 
         NodedbStatement::Policy(PolicyStmt::CreateCompositeType { name, fields }) => Some(
-            custom_type::create_composite_type(state, identity, database_id, name, fields),
+            custom_type::create_composite_type(state, identity, database_id, name, fields).await,
         ),
 
-        NodedbStatement::Policy(PolicyStmt::DropType { name, if_exists }) => Some(
-            custom_type::drop_type(state, identity, database_id, name, *if_exists),
-        ),
+        NodedbStatement::Policy(PolicyStmt::DropType { name, if_exists }) => {
+            Some(custom_type::drop_type(state, identity, database_id, name, *if_exists).await)
+        }
 
         NodedbStatement::Policy(PolicyStmt::AlterTypeAddValue { type_name, label }) => Some(
-            custom_type::alter_type_add_value(state, identity, database_id, type_name, label),
+            custom_type::alter_type_add_value(state, identity, database_id, type_name, label).await,
         ),
 
         NodedbStatement::Policy(PolicyStmt::ShowTypes) => {
@@ -172,18 +183,21 @@ pub(super) async fn try_typed(
             action,
             set_key,
             set_value,
-        }) => Some(retention_policy::alter_retention_policy(
-            state,
-            identity,
-            database_id,
-            name,
-            action,
-            set_key.as_deref(),
-            set_value.as_deref(),
-        )),
+        }) => Some(
+            retention_policy::alter_retention_policy(
+                state,
+                identity,
+                database_id,
+                name,
+                action,
+                set_key.as_deref(),
+                set_value.as_deref(),
+            )
+            .await,
+        ),
 
         NodedbStatement::Policy(PolicyStmt::DropRetentionPolicy { name, if_exists }) => {
-            // IF EXISTS short-circuit folded from the pgwire guard: a DROP of a
+            // IF EXISTS short-circuit: a DROP of a
             // non-existing retention policy returns the tag before the handler
             // runs (and before the tenant-admin gate). The existence check reads
             // the in-memory registry for the identity tenant scoped to the

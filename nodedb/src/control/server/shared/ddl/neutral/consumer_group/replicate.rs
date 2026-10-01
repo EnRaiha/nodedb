@@ -6,75 +6,90 @@
 //! each node writes the row and installs it in its own `GroupRegistry`. A group
 //! created on one node resolves on all.
 
-use crate::control::catalog_entry::apply::consumer_group as apply;
 use crate::control::catalog_entry::entry::CatalogEntry;
-use crate::control::catalog_entry::post_apply::consumer_group as post_apply;
 use crate::control::state::SharedState;
-use crate::event::cdc::consumer_group::ConsumerGroupDef;
+use crate::event::cdc::consumer_group::{ConsumerGroupDef, OffsetCommit, PartitionOffset};
 use crate::types::DatabaseId;
 
 use super::super::super::result::DdlError;
-use super::super::replicate::propose_and_apply;
+use super::super::replicate::propose_and_apply_async;
 
 /// Propose the group definition. The leader reports the duplicate before
 /// proposing, so apply is a create-only write that never rejects.
-pub(super) fn propose_create(state: &SharedState, def: &ConsumerGroupDef) -> Result<(), DdlError> {
+pub(super) async fn propose_create(
+    state: &SharedState,
+    def: &ConsumerGroupDef,
+) -> Result<(), DdlError> {
     let entry = CatalogEntry::PutConsumerGroupIfAbsent(Box::new(def.clone()));
-    propose_and_apply(state, &entry, || {
-        apply::put_if_absent(def, state.credentials.catalog())
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        post_apply::put_if_absent(def, state);
-        Ok(())
-    })
+    propose_and_apply_async(state, &entry).await
 }
 
 /// Propose removal of the group row, its registration, and its durable offsets
 /// on every node.
-pub(super) fn propose_delete(
+pub(super) async fn propose_delete(
     state: &SharedState,
     database_id: DatabaseId,
     tenant_id: u64,
     stream_name: &str,
     name: &str,
 ) -> Result<(), DdlError> {
-    let database_id = database_id.as_u64();
     let entry = CatalogEntry::DeleteConsumerGroup {
-        database_id,
+        database_id: database_id.as_u64(),
         tenant_id,
         stream_name: stream_name.to_string(),
         name: name.to_string(),
+        target_hlc: nodedb_types::Hlc::ZERO,
     };
-    propose_and_apply(state, &entry, || {
-        apply::delete(
-            database_id,
-            tenant_id,
-            stream_name,
-            name,
-            state.credentials.catalog(),
-        )
-        .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))?;
-        post_apply::delete(database_id, tenant_id, stream_name, name, state);
-        Ok(())
-    })
+    propose_and_apply_async(state, &entry).await
 }
 
 /// Propose the re-key of a legacy bare-topic group onto its canonical stream.
 ///
 /// The caller moves the durable offsets first: they live in a separate
 /// database this entry cannot carry.
-pub(super) fn propose_migrate(
+pub(super) async fn propose_migrate(
     state: &SharedState,
     def: &ConsumerGroupDef,
     legacy_stream: &str,
 ) -> Result<(), DdlError> {
+    // The entry names the canonical row, which is what its incarnation fences.
+    let canonical = ConsumerGroupDef {
+        stream_name: format!("topic:{legacy_stream}"),
+        ..def.clone()
+    };
     let entry = CatalogEntry::MigrateConsumerGroupStream {
-        def: Box::new(def.clone()),
+        def: Box::new(canonical),
         legacy_stream: legacy_stream.to_string(),
     };
-    propose_and_apply(state, &entry, || {
-        apply::migrate_stream(def, legacy_stream, state.credentials.catalog())
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        post_apply::migrate_stream(def, legacy_stream, state);
-        Ok(())
-    })
+    propose_and_apply_async(state, &entry).await
+}
+
+/// Propose raising the group's committed offsets. Every node raises its own
+/// offset store on apply, so a consumer resumes from this commit on any node.
+///
+/// Offsets apply as a monotonic max and stamp no descriptor version, so the
+/// commit takes no DDL preparation lease. Inside a transaction block it is
+/// buffered until COMMIT, like every other DDL the transaction issues.
+pub(super) async fn propose_commit_offsets(
+    state: &SharedState,
+    def: &ConsumerGroupDef,
+    offsets: Vec<PartitionOffset>,
+) -> Result<(), DdlError> {
+    let commit = OffsetCommit {
+        database_id: def.database_id,
+        tenant_id: def.tenant_id,
+        stream_name: def.stream_name.clone(),
+        group_name: def.name.clone(),
+        group_hlc: def.modification_hlc,
+        offsets,
+    };
+    if crate::control::server::shared::session::ddl_buffer::try_buffer(
+        CatalogEntry::CommitConsumerOffsets(Box::new(commit.clone())),
+    ) {
+        return Ok(());
+    }
+    crate::control::metadata_proposer::propose_cursor_commit(state, commit)
+        .await
+        .map(|_| ())
+        .map_err(|e| DdlError::from_error_in_context("consumer offset commit failed", &e))
 }

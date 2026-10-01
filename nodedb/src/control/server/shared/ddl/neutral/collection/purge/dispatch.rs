@@ -9,7 +9,8 @@
 
 use std::time::{Duration, Instant};
 
-use futures::future::join_all;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use nodedb_physical::physical_plan::MetaOp;
 
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Status};
@@ -20,7 +21,7 @@ use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
 /// `Ok` acknowledgement from each one.
 ///
 /// The catalog row has already been removed when this runs. Returning success
-/// after only a subset of cores reclaimed would allow a same-name re-CREATE to
+/// after only a subset of cores reclaimed will allow a same-name re-CREATE to
 /// observe predecessor state, so partial success is always an error. The caller
 /// records a durable pending-reclaim entry and the applied-index barrier fails
 /// closed.
@@ -83,6 +84,7 @@ pub async fn dispatch_unregister_collection(
                 txn_id: None,
                 wal_lsn: None,
                 resolved_now_ms: None,
+                commit_hlc: None,
                 admission: crate::bridge::envelope::Admission::Exempt(
                     crate::bridge::envelope::ExemptReason::AlreadyOrdered,
                 ),
@@ -99,8 +101,11 @@ pub async fn dispatch_unregister_collection(
         }
     }
 
-    let responses = join_all(receivers.into_iter().map(
-        |(_request_id, core_id, mut receiver)| async move {
+    // Each core's acknowledgement counts as apply progress as it arrives, so
+    // a proposer waiting on this purge sees a slow reclaim move.
+    let mut pending: FuturesUnordered<_> = receivers
+        .into_iter()
+        .map(|(_request_id, core_id, mut receiver)| async move {
             let response = tokio::time::timeout(timeout, receiver.recv())
                 .await
                 .map_err(|_| crate::Error::Dispatch {
@@ -123,12 +128,21 @@ pub async fn dispatch_unregister_collection(
                 });
             }
             Ok(())
-        },
-    ))
-    .await;
+        })
+        .collect();
 
-    for response in responses {
-        response?;
+    let mut first_error = None;
+    while let Some(response) = pending.next().await {
+        match response {
+            Ok(()) => {
+                state
+                    .metadata_apply_progress
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }

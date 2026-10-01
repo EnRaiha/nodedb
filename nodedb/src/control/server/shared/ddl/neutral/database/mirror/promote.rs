@@ -2,18 +2,16 @@
 
 //! Handler for `ALTER DATABASE <name> PROMOTE`.
 //!
-//! Ported from the pgwire `ddl::database::mirror::promote` handler. The catalog
-//! lookup, superuser gate (after db-id resolution), idempotent already-promoted
-//! short-circuit, not-a-mirror rejection, observer-link teardown BEFORE the
-//! descriptor mutation, status flip, Raft propose / single-node fallback,
-//! mirror-only catalog cleanup, and `DatabasePromoted` audit are preserved
-//! verbatim; only the result construction changed from pgwire `Response` to the
-//! protocol-neutral [`DdlResult`].
+//! The catalog lookup, superuser gate (after db-id resolution), idempotent
+//! already-promoted short-circuit, not-a-mirror rejection, observer-link
+//! teardown BEFORE the descriptor mutation, status flip, Raft propose /
+//! single-node fallback, mirror-only catalog cleanup, and `DatabasePromoted`
+//! audit run here. The result is the protocol-neutral [`DdlResult`].
 
 use nodedb_types::MirrorStatus;
 
 use crate::control::catalog_entry::entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::security::catalog::database_types::DatabaseStatus;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -25,7 +23,7 @@ use super::super::support::{ddl_err, status};
 /// Handle `ALTER DATABASE <name> PROMOTE`.
 ///
 /// Required role: `Superuser`.
-pub fn promote_database(
+pub async fn promote_database(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
@@ -93,19 +91,14 @@ pub fn promote_database(
     // Persist atomically through Raft. On restart the descriptor is reloaded
     // with status=Active + origin.status=Promoted, so the database remains
     // writable without any further intervention.
-    let outcome = propose_catalog_entry(
+    propose_catalog_entry_async(
         state,
         &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
     )
+    .await
     .map_err(|e| DdlError::from_error_in_context("catalog propose failed", &e))?;
 
-    if outcome.needs_local_apply() {
-        catalog
-            .put_database(&descriptor)
-            .map_err(|e| DdlError::from_error_in_context("catalog write failed", &e))?;
-    }
-
-    // The database is now writable. Clear the mirror-only catalog state so
+    // The database is writable. Clear the mirror-only catalog state so
     // it does not linger as stale data:
     //   - mirror_collection_map: source→local collection name routing used
     //     by the observer-side DDL applier; meaningless once writes are local.

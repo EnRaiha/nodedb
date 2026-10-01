@@ -3,12 +3,10 @@
 //! `ALTER {TABLE,COLLECTION} <name> ADD [COLUMN] <def>` — append a column
 //! to a strict-document / columnar collection's schema.
 //!
-//! Ported verbatim from the pgwire `ddl::collection::alter::add_column`
-//! handler; only the result type changed from pgwire `PgWireResult` /
-//! `Response` to the protocol-neutral [`DdlResult`] / [`DdlError`]. The
+//! The result type is the protocol-neutral [`DdlResult`] / [`DdlError`]. The
 //! multi-version add (`added_at_version` stamp + `schema.version` bump),
-//! duplicate-column check, propose + register, and audit are unchanged, as
-//! is the `ALTER TABLE` command tag.
+//! duplicate-column check, propose + register, and audit run here, and the
+//! command tag is `ALTER TABLE`.
 
 use nodedb_types::DatabaseId;
 
@@ -108,8 +106,8 @@ pub(super) async fn alter_table_add_column(
                     // Offload the durable catalog commit (redb `fsync`) off the
                     // Tokio worker so this online ALTER never stalls concurrent
                     // INSERTs on the same runtime.
-                    super::support::propose_and_apply_async(state, entry).await?;
-                    Some(updated)
+                    let outcome = super::support::propose_and_apply_async(state, entry).await?;
+                    Some((updated, outcome))
                 } else {
                     None
                 }
@@ -123,8 +121,8 @@ pub(super) async fn alter_table_add_column(
         }
     };
 
-    if let Some(ref coll) = updated {
-        super::super::register::dispatch_register_from_stored(state, coll)
+    if let Some((ref coll, outcome)) = updated {
+        super::super::register::register_proposed_collection(state, outcome, coll)
             .await
             .map_err(|e| DdlError::from_error(&e))?;
         super::strict_schema::recompile_rls_policies(state, coll)?;

@@ -144,7 +144,7 @@ impl AuthApiKeyStore {
         } else {
             0
         };
-        let hash_hex = hex_encode(&secret_hash);
+        let hash_hex = hex::encode(&secret_hash);
         let record = AuthApiKey {
             key_id,
             secret_hash,
@@ -202,7 +202,7 @@ impl AuthApiKeyStore {
         }
         let secret = parts[1];
         let secret_hash = hash_secret(secret);
-        let hash_hex = hex_encode(&secret_hash);
+        let hash_hex = hex::encode(&secret_hash);
 
         let state = self.state.read();
         let key_id = state.hash_index.get(&hash_hex)?;
@@ -332,15 +332,12 @@ fn generate_secret() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    // 32 bytes of cryptographic randomness + sequential suffix for uniqueness.
+    // 32 bytes of OS randomness + sequential suffix for uniqueness. The
+    // secret never falls back to a guessable value.
+    use argon2::password_hash::rand_core::{OsRng, RngCore};
     let mut random_bytes = [0u8; 32];
-    getrandom::fill(&mut random_bytes).unwrap_or_else(|_| {
-        // Fallback: use timestamp + counter if getrandom unavailable (e.g., early boot).
-        let ts = now_secs();
-        random_bytes[..8].copy_from_slice(&ts.to_le_bytes());
-        random_bytes[8..16].copy_from_slice(&seq.to_le_bytes());
-    });
-    format!("{}{seq:08x}", hex_encode(&random_bytes))
+    OsRng.fill_bytes(&mut random_bytes);
+    format!("{}{seq:08x}", hex::encode(random_bytes))
 }
 
 fn hash_secret(secret: &str) -> Vec<u8> {
@@ -350,11 +347,6 @@ fn hash_secret(secret: &str) -> Vec<u8> {
 
 fn now_secs() -> u64 {
     crate::control::security::time::now_secs()
-}
-
-/// Hex-encode a byte slice (lowercase).
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -374,7 +366,7 @@ mod tests {
         let key = store
             .verify(&token)
             .expect("lookup after interrupted update");
-        let hash_hex = hex_encode(&key.secret_hash);
+        let hash_hex = hex::encode(&key.secret_hash);
         let state = store.state.read();
         assert_eq!(state.hash_index.get(&hash_hex), Some(&key.key_id));
         assert!(state.keys.contains_key(&key.key_id));
@@ -476,11 +468,11 @@ mod tests {
         let new_token = store.rotate(&old_key.key_id, 24).unwrap();
         assert!(new_token.starts_with("nda_"));
 
-        // Both old and new should be valid during overlap.
+        // Both old and new must be valid during overlap.
         assert!(store.verify(&old_token).is_some());
         assert!(store.verify(&new_token).is_some());
 
-        // New key should inherit scopes.
+        // New key must inherit scopes.
         let new_key = store.verify(&new_token).unwrap();
         assert_eq!(new_key.scopes, vec!["scope_a"]);
         assert!(new_key.replaces_key_id.is_some());
@@ -508,7 +500,7 @@ mod tests {
 
     #[test]
     fn rotate_chain_invalidates_intermediate_key() {
-        // Spec: rotation chains invalidate every superseded key, not just the
+        // Spec: rotation chains invalidate every superseded key, not only the
         // first. After A→B→C with zero overlap, both A and B must be rejected.
         let store = AuthApiKeyStore::new();
         let token_a = store.create_key("u1", 1, vec![], 0, 0, 0);
@@ -533,8 +525,8 @@ mod tests {
     #[test]
     fn list_for_user_excludes_superseded_keys_past_overlap() {
         // Spec: listing active keys must reflect supersession, not only the
-        // is_revoked bit. An operator auditing active credentials should not
-        // see a rotated-out key as still active after its overlap elapsed.
+        // is_revoked bit. An operator auditing active credentials never
+        // sees a rotated-out key as still active after its overlap elapsed.
         let store = AuthApiKeyStore::new();
         let token_old = store.create_key("u1", 1, vec![], 0, 0, 0);
         let old_id = store.verify(&token_old).unwrap().key_id;
@@ -558,12 +550,9 @@ mod tests {
 
     #[test]
     fn rotate_persists_invalidation_marker_on_old_key() {
-        // Regression guard against the specific silent-failure mode: rotate()
-        // historically decorated only the NEW key and left the OLD key
-        // untouched, so verify() had no way to learn the old key was being
-        // retired. The fix must leave an invalidation marker on the OLD
-        // record itself so verify() can reject by inspecting the old record
-        // alone — no cross-record lookup.
+        // rotate() must leave an invalidation marker on the OLD record
+        // itself, not only decorate the NEW key. verify() then rejects by
+        // inspecting the old record alone, with no cross-record lookup.
         let store = AuthApiKeyStore::new();
         let old_token = store.create_key("u1", 1, vec![], 0, 0, 0);
         let old_id = store.verify(&old_token).unwrap().key_id;

@@ -15,12 +15,8 @@ use crate::wal::manager::WalAppender;
 /// `FtsIndexDoc` / `FtsDeleteDoc` are handled here so any call site that
 /// reaches [`super::wal_append_if_write_with_creds`] with one of these
 /// variants is durable by construction. The sync-inbound handler
-/// (`sync/fts_handler.rs`) already calls `wal_append_fts_index` /
-/// `wal_append_fts_delete` directly and dispatches straight to the Data
-/// Plane via `dispatch_sync_payload` — it never reaches this function, so
-/// this arm cannot double-append on that path today (mirrors
-/// `VectorOp::DeleteBySurrogate`'s identical "sync path bypasses it, but log
-/// here too" reasoning in `wal_dispatch/vector.rs`).
+/// (`sync/fts_handler.rs`) proposes its write, and the replicated apply
+/// journals it through this function.
 pub(crate) fn wal_append_text_op(
     wal: WalAppender<'_>,
     tenant_id: TenantId,
@@ -67,11 +63,11 @@ pub(crate) fn encode_text_op_record(op: &TextOp) -> crate::Result<Option<(Record
             surrogate,
             provenance,
         } => {
-            let doc_id =
-                crate::engine::document::store::StorageKey::for_surrogate(*surrogate).to_string();
+            let doc_id = surrogate
+                .map(|s| crate::engine::document::store::StorageKey::for_surrogate(s).to_string());
             let prov = provenance.clone().unwrap_or_default();
             let payload =
-                nodedb_wal::record::FtsDeletePayload::new(prov, collection.as_str(), &doc_id);
+                nodedb_wal::record::FtsDeletePayload::new(prov, collection.as_str(), doc_id);
             Some((
                 RecordType::FtsDelete,
                 payload.to_bytes().map_err(crate::Error::Wal)?,

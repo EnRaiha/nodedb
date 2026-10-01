@@ -127,7 +127,8 @@ pub struct SequenceState {
     pub database_id: u64,
     pub tenant_id: u64,
     pub name: String,
-    /// Current value (last returned by nextval on this node).
+    /// Last value nextval returned once `is_called`. Before that, the value
+    /// the next nextval returns.
     pub current_value: i64,
     /// Whether nextval has been called at least once on this node.
     pub is_called: bool,
@@ -151,7 +152,7 @@ impl SequenceState {
             database_id,
             tenant_id,
             name,
-            // Start one step before start_value so the first nextval returns start_value.
+            // Uncalled: the first nextval returns start_value.
             current_value: start_value,
             is_called: false,
             epoch,

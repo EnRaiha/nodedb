@@ -222,6 +222,12 @@ pub struct ClusterTransportTuning {
     /// earlier in the lease lifecycle.
     #[serde(default = "default_descriptor_lease_renewal_threshold_pct")]
     pub descriptor_lease_renewal_threshold_pct: u8,
+    /// Longest interval, in milliseconds, a data-group leader lets a node
+    /// that does not replicate the group go without the group's change-feed
+    /// position. A settled run with events carries the position at once; an
+    /// idle feed carries it on a heartbeat at this interval.
+    #[serde(default = "default_change_feed_heartbeat_ms")]
+    pub change_feed_heartbeat_ms: u64,
 }
 
 impl ClusterTransportTuning {
@@ -272,8 +278,13 @@ impl Default for ClusterTransportTuning {
                 default_descriptor_lease_renewal_check_interval_secs(),
             descriptor_lease_renewal_threshold_pct: default_descriptor_lease_renewal_threshold_pct(
             ),
+            change_feed_heartbeat_ms: default_change_feed_heartbeat_ms(),
         }
     }
+}
+
+fn default_change_feed_heartbeat_ms() -> u64 {
+    1_000
 }
 
 fn default_descriptor_lease_duration_secs() -> u64 {

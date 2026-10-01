@@ -17,7 +17,7 @@ pub(super) use crate::control::server::response_shape::types::{PlanKind, describ
 /// Outcome of shaping a Data Plane payload into a pgwire `Response`.
 ///
 /// `notice` is set when the response shaper detected a condition the client
-/// should know about (e.g. `truncated_before_horizon` on an array slice).
+/// must know about (e.g. `truncated_before_horizon` on an array slice).
 /// Callers forward it to the per-connection notice queue.
 pub(super) struct ShapedResponse {
     pub response: Response,
@@ -94,7 +94,7 @@ mod tests {
             key: Vec::new(),
             value: Vec::new(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,

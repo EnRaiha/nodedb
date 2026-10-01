@@ -33,6 +33,13 @@ impl SessionStore {
         });
     }
 
+    /// Clone the read-set without draining it, so a caller can classify the
+    /// commit's dispatch before COMMIT runs.
+    pub fn read_set(&self, addr: impl Into<SessionId>) -> Vec<ReadSetEntry> {
+        self.read_session(addr, |session| session.tx_read_set.clone())
+            .unwrap_or_default()
+    }
+
     /// Drain the read-set for conflict checking at COMMIT time.
     pub fn take_read_set(&self, addr: impl Into<SessionId>) -> Vec<ReadSetEntry> {
         self.write_session(addr, |session| std::mem::take(&mut session.tx_read_set))
@@ -73,7 +80,7 @@ impl SessionStore {
     ///
     /// Stamps the task's `txn_id` from the session's active transaction
     /// identity before buffering, inside the same session-lock scope, so
-    /// there is no separate lock acquisition that could race or deadlock
+    /// there is no separate lock acquisition that can race or deadlock
     /// against `buffer_write`'s own lock.
     ///
     /// Returns `true` if buffered (in transaction), `false` if not (dispatch immediately).
@@ -91,6 +98,43 @@ impl SessionStore {
             }
         })
         .unwrap_or(false)
+    }
+
+    /// Mark every task buffered since `start` as a trigger body's.
+    pub fn mark_body_tasks_since(&self, addr: impl Into<SessionId>, start: usize) {
+        self.write_session(addr, |session| {
+            let end = session.tx_buffer.len();
+            session.tx_body_tasks.extend(start.min(end)..end);
+        });
+    }
+
+    /// Record that the stage-time preview of the most recently buffered task,
+    /// a timeseries ingest, rejected `rejected` lines.
+    pub fn note_ts_preview_rejected(&self, addr: impl Into<SessionId>, rejected: u64) {
+        if rejected == 0 {
+            return;
+        }
+        self.write_session(addr, |session| {
+            if let Some(index) = session.tx_buffer.len().checked_sub(1) {
+                session.tx_ts_preview_rejected.insert(index, rejected);
+            }
+        });
+    }
+
+    /// Lines each buffered timeseries ingest's stage-time preview rejected,
+    /// by index into the buffered tasks.
+    pub fn ts_preview_rejected(
+        &self,
+        addr: impl Into<SessionId>,
+    ) -> std::collections::BTreeMap<usize, u64> {
+        self.read_session(addr, |session| session.tx_ts_preview_rejected.clone())
+            .unwrap_or_default()
+    }
+
+    /// Indexes into the buffered tasks of the tasks a trigger body buffered.
+    pub fn body_tasks(&self, addr: impl Into<SessionId>) -> std::collections::BTreeSet<usize> {
+        self.read_session(addr, |session| session.tx_body_tasks.clone())
+            .unwrap_or_default()
     }
 
     /// Number of tasks currently buffered for this transaction.
@@ -125,6 +169,19 @@ impl SessionStore {
         .unwrap_or_default()
     }
 
+    /// The retryable error if this node lost a lease any of this
+    /// transaction's buffered statements holds, else `None`.
+    pub fn tx_lease_revoked(&self, addr: impl Into<SessionId>) -> Option<crate::Error> {
+        self.read_session(addr, |session| {
+            session
+                .tx_lease_scopes
+                .iter()
+                .flatten()
+                .find_map(|scope| scope.check_not_revoked().err())
+        })
+        .flatten()
+    }
+
     /// Retain a statement's descriptor lease scope for every task buffered
     /// since `start`. Fails closed when the transaction state or the aligned
     /// holders are invalid, or when a different statement already owns one.
@@ -157,5 +214,58 @@ impl SessionStore {
             true
         })
         .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
+    use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
+
+    use super::super::super::store::SessionStore;
+    use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
+
+    fn ingest_task() -> PhysicalTask {
+        PhysicalTask {
+            tenant_id: TenantId::new(1),
+            vshard_id: VShardId::new(0),
+            database_id: DatabaseId::DEFAULT,
+            plan: PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+                collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
+                payload: b"metrics value=1".to_vec(),
+                format: "ilp".to_owned(),
+                wal_lsn: None,
+                surrogates: Vec::new(),
+                provenance: None,
+                rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+                returning: None,
+                rls_filters: Vec::new(),
+            }),
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        }
+    }
+
+    /// A staged ingest's preview count is kept against its buffer index
+    /// until the transaction ends. A preview that rejected nothing keeps no
+    /// entry.
+    #[test]
+    fn a_preview_rejection_is_kept_until_the_transaction_ends() {
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:5311".parse().expect("addr");
+        store.ensure_session(addr);
+        store.begin(addr, Lsn::new(1), 0).expect("begin");
+
+        assert!(store.buffer_write(addr, ingest_task()));
+        store.note_ts_preview_rejected(addr, 0);
+        assert!(store.buffer_write(addr, ingest_task()));
+        store.note_ts_preview_rejected(addr, 2);
+        assert_eq!(
+            store.ts_preview_rejected(addr),
+            std::collections::BTreeMap::from([(1usize, 2u64)])
+        );
+
+        store.rollback(addr).expect("rollback");
+        assert!(store.ts_preview_rejected(addr).is_empty());
     }
 }

@@ -52,7 +52,7 @@ impl IdleTimeoutCache {
         }
     }
 
-    /// Populate the cache from all descriptors in the catalog.
+    /// Replace the cache with every descriptor in the catalog.
     ///
     /// Called at startup. Only databases with a non-zero `idle_session_timeout_secs`
     /// are inserted; `get` returns `0` for unknown databases (same semantics as
@@ -60,6 +60,7 @@ impl IdleTimeoutCache {
     pub fn load_from_catalog(&self, catalog: &SystemCatalog) -> crate::Result<()> {
         let databases = catalog.list_databases()?;
         let mut map = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        map.clear();
         for descriptor in databases {
             if descriptor.idle_session_timeout_secs > 0 {
                 map.insert(descriptor.id, descriptor.idle_session_timeout_secs);

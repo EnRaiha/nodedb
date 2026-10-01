@@ -37,18 +37,15 @@ pub(super) async fn try_string(
     // SHOW GRANTS. `SHOW USERS`, `SHOW GRANTS`, and `SHOW AUDIT…` parse into
     // typed AST variants (`AuthStmt::ShowUsers` / `ShowGrants`,
     // `MiscStmt::ShowAuditLog`) and bare `SHOW TENANTS` into
-    // `DatabaseStmt::ShowTenants`, but the pgwire typed-AST path has no arm for
-    // any of them — they fell through to the admin/observability string router,
-    // which dispatched them by prefix from the raw token slice. `SHOW ROLES`,
+    // `DatabaseStmt::ShowTenants`, but the router dispatches all of them by
+    // prefix from the raw token slice, before the parse gate. `SHOW ROLES`,
     // `SHOW SESSION`, and `EXPORT AUDIT` parse into no typed DDL variant.
-    // Replicate the string dispatch exactly here, before the parse gate, so the
-    // prefix recognition and the `parts`-based extraction stay byte-identical.
     // `SHOW SESSIONS` is excluded here (see the `session_admin::show_sessions`
-    // arm above, which is now checked first) so the two never race.
+    // arm above, which is checked first) so the two never race.
     //
     // Audit-log truncation is rejected: entries are pruned only by the retention
     // policy. Recognized by string prefix before the parse gate so the message
-    // stays byte-identical regardless of how the tail parses.
+    // is the same regardless of how the tail parses.
     if upper.starts_with("TRUNCATE AUDIT")
         || upper.starts_with("DELETE AUDIT")
         || upper.starts_with("CLEAR AUDIT")
@@ -63,7 +60,7 @@ pub(super) async fn try_string(
     }
     // Exact-match only. Filtered forms (`SHOW TENANTS WITH NAME <name>`,
     // `SHOW TENANT <ident>`) are parsed into typed variants and routed through
-    // the typed match below; a prefix match here would silently drop the filter
+    // the typed match below; a prefix match here will silently drop the filter
     // and list every tenant.
     if upper == "SHOW TENANTS" {
         return Some(inspect::show_tenants(state, identity));
@@ -144,10 +141,8 @@ pub(super) async fn try_string(
 
     // Impersonation & delegation: IMPERSONATE AUTH USER, STOP IMPERSONATION,
     // DELEGATE AUTH USER, REVOKE DELEGATION, SHOW DELEGATIONS. None of these
-    // parse into any typed AST variant — the pgwire admin router dispatched
-    // all five by string prefix from the raw token slice. Replicate that
-    // exactly here, before the parse gate, so the prefix recognition and the
-    // `parts`-based extraction / syntax messages stay byte-identical.
+    // parse into any typed AST variant — the router dispatches all five by
+    // string prefix from the raw token slice, before the parse gate.
     if upper.starts_with("IMPERSONATE AUTH USER ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(impersonation::impersonate(state, identity, &parts));
@@ -171,12 +166,9 @@ pub(super) async fn try_string(
 
     // Session management: SHOW SESSIONS, KILL SESSION, KILL USER SESSIONS,
     // VERIFY AUDIT CHAIN. None of these parse into any typed AST variant —
-    // the pgwire admin router dispatched all four by string prefix from the
-    // raw token slice. Replicate that exactly here, before the parse gate, so
-    // the prefix recognition and the `parts`-based extraction / syntax
-    // messages stay byte-identical. `SHOW SESSIONS` is matched here (before
-    // the observability `SHOW SESSION` prefix below), mirroring the pgwire
-    // admin router's precedence over the pgwire observability router; the
+    // the router dispatches all four by string prefix from the raw token
+    // slice, before the parse gate. `SHOW SESSIONS` is matched here (before
+    // the observability `SHOW SESSION` prefix below); the
     // `SHOW SESSION` guard below already excludes `SHOW SESSIONS` explicitly,
     // so the two never race regardless of which is checked first.
     if upper.starts_with("SHOW SESSIONS") {
@@ -198,11 +190,9 @@ pub(super) async fn try_string(
 
     // Administrative observability: SHOW SERVER STATS / SHOW STATS / SHOW
     // METRICS / SHOW MEMORY. None of these parse into a typed DDL AST variant —
-    // the pgwire admin observability router recognized all four by the
-    // exact-or-trailing-space prefix from the raw SQL. Replicate that exactly
-    // here, before the parse gate, so the recognition (and the `SHOW SERVER
-    // STATS` / `SHOW STATS` shared handler) stays byte-identical. `SHOW SERVER
-    // STATS` is checked before `SHOW STATS` exactly as the pgwire router did.
+    // the router recognizes all four by the exact-or-trailing-space prefix
+    // from the raw SQL, before the parse gate. `SHOW SERVER STATS` and
+    // `SHOW STATS` share a handler, and `SHOW SERVER STATS` is checked first.
     if upper == "SHOW SERVER STATS" || upper.starts_with("SHOW SERVER STATS ") {
         return Some(observability::show_server_stats(state, identity));
     }
@@ -217,14 +207,11 @@ pub(super) async fn try_string(
     }
 
     // Permission / scope introspection: EXPLAIN PERMISSION / EXPLAIN SCOPE.
-    // Neither parses into a typed DDL AST variant — the pgwire admin router
-    // recognized both by string prefix from the raw token slice. Replicate that
-    // exactly here, before the parse gate, so the prefix recognition and the
-    // `parts`-based extraction / syntax messages stay byte-identical. The
-    // pgwire wire path reaches these full-`EXPLAIN …` statements through the
+    // Neither parses into a typed DDL AST variant — the router recognizes
+    // both by string prefix from the raw token slice, before the parse gate.
+    // The wire path reaches these full-`EXPLAIN …` statements through the
     // DDL dispatch (native / http always; pgwire only for the non-`EXPLAIN `
-    // full-SQL dispatch), so recognizing them here preserves behavior; the
-    // `EXPLAIN <query>` handler strips the leading `EXPLAIN ` and never yields a
+    // full-SQL dispatch). The `EXPLAIN <query>` handler strips the leading `EXPLAIN ` and never yields a
     // `PERMISSION …` / `SCOPE …` prefix, so it is unaffected.
     if upper.starts_with("EXPLAIN PERMISSION ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
@@ -237,11 +224,9 @@ pub(super) async fn try_string(
 
     // Usage metering: DEFINE METERING DIMENSION, SHOW USAGE FOR TENANT, EXPORT
     // USAGE, SHOW USAGE, SHOW QUOTA. None of these parse into a typed DDL AST
-    // variant — the pgwire admin router recognized all five by string prefix
-    // from the raw token slice. Replicate that exactly here, before the parse
-    // gate, so the prefix recognition and the `parts`-based extraction / syntax
-    // messages stay byte-identical. Guard ordering (SHOW USAGE FOR TENANT and
-    // EXPORT USAGE before the broader SHOW USAGE) mirrors the pgwire router.
+    // variant — the router recognizes all five by string prefix from the raw
+    // token slice, before the parse gate. Guard ordering: SHOW USAGE FOR
+    // TENANT and EXPORT USAGE come before the broader SHOW USAGE.
     if upper.starts_with("DEFINE METERING DIMENSION ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(metering_ddl::define_dimension(state, identity, &parts));
@@ -267,11 +252,11 @@ pub(super) async fn try_string(
     // has an `S`.
     if upper.starts_with("DEFINE QUOTA ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(quota_ddl::define_quota(state, identity, &parts));
+        return Some(quota_ddl::define_quota(state, identity, &parts).await);
     }
     if upper.starts_with("DROP QUOTA ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(quota_ddl::drop_quota(state, identity, &parts));
+        return Some(quota_ddl::drop_quota(state, identity, &parts).await);
     }
     if upper.starts_with("SHOW QUOTAS") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
@@ -280,10 +265,8 @@ pub(super) async fn try_string(
 
     // Organization management. None of `CREATE ORG`, `ALTER ORG`, `DROP ORG`,
     // `SHOW ORGS`, or `SHOW MEMBERS OF ORG` parse into any typed AST variant —
-    // the pgwire admin router dispatched all of them by string prefix from the
-    // raw token slice. Replicate that exactly here, before the parse gate, so
-    // the prefix recognition and the `parts`-based extraction / syntax messages
-    // stay byte-identical.
+    // the router dispatches all of them by string prefix from the raw token
+    // slice, before the parse gate.
     if upper.starts_with("CREATE ORG ")
         || upper.starts_with("ALTER ORG ")
         || upper.starts_with("DROP ORG ")
@@ -304,15 +287,11 @@ pub(super) async fn try_string(
     // SHOW MY SCOPES, SHOW SCOPES FOR, SHOW SCOPE GRANTS, SHOW SCOPE(S). None of
     // these parse into any typed AST variant — `GRANT SCOPE` / `REVOKE SCOPE`
     // are explicitly excluded from the typed grant parser (returning `None`),
-    // and the rest have no grammar at all — so the pgwire admin router
-    // dispatched all of them by string prefix from the raw token slice.
-    // Replicate that exactly here, before the parse gate, so the prefix
-    // recognition and the `parts`-based extraction / syntax messages stay
-    // byte-identical. Guard ordering mirrors the pgwire admin router: `SHOW MY
-    // SCOPES` and `SHOW SCOPES FOR ` are matched before the broader `SHOW SCOPE
-    // GRANTS` / `SHOW SCOPE` pair (nothing between them in the pgwire router
-    // claimed a scope input, so grouping them here is behavior-preserving), and
-    // `SHOW SCOPE GRANTS` is checked before the `SHOW SCOPE` catch-all.
+    // and the rest have no grammar at all — so the router
+    // dispatches all of them by string prefix from the raw token slice, before
+    // the parse gate. Guard ordering: `SHOW MY SCOPES` and `SHOW SCOPES FOR `
+    // are matched before the broader `SHOW SCOPE GRANTS` / `SHOW SCOPE` pair,
+    // and `SHOW SCOPE GRANTS` is checked before the `SHOW SCOPE` catch-all.
     if upper.starts_with("DEFINE SCOPE ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(scope_ddl::define_scope(state, identity, &parts));
@@ -323,11 +302,11 @@ pub(super) async fn try_string(
     }
     if upper.starts_with("GRANT SCOPE ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(scope_ddl::grant_scope(state, identity, &parts));
+        return Some(scope_ddl::grant_scope(state, identity, &parts).await);
     }
     if upper.starts_with("REVOKE SCOPE ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(scope_ddl::revoke_scope(state, identity, &parts));
+        return Some(scope_ddl::revoke_scope(state, identity, &parts).await);
     }
     if upper.starts_with("ALTER SCOPE ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
@@ -343,7 +322,7 @@ pub(super) async fn try_string(
     }
     if upper.starts_with("RENEW SCOPE ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(scope_ddl::renew_scope(state, identity, &parts));
+        return Some(scope_ddl::renew_scope(state, identity, &parts).await);
     }
     if upper.starts_with("SHOW SCOPE GRANTS") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
@@ -356,17 +335,15 @@ pub(super) async fn try_string(
 
     // Collection introspection: DESCRIBE <collection> / `\D <collection>`,
     // UNDROP COLLECTION|TABLE, SHOW COLLECTIONS, SHOW INDEXES|INDEX. All four
-    // parse into typed `CollectionStmt` variants, but the pgwire schema string
-    // router dispatched them by string prefix from the raw token slice, using
+    // parse into typed `CollectionStmt` variants, but the router
+    // dispatches them by string prefix from the raw token slice, using
     // `parts`-based name / filter extraction and the `\D` alias that the typed
     // parser does not reproduce (`\D <coll>` never parses into
     // `DescribeCollection`; bare `\D` parses into `ShowCollections`; the
     // `SHOW INDEXES` typed `collection` field is `parts[2]`, not the handler's
-    // `parts[3]` filter). Replicate the string dispatch exactly here, before the
-    // parse gate, so the prefix recognition, `parts` extraction, and syntax
-    // messages stay byte-identical. `DESCRIBE SEQUENCE` is excluded so it falls
-    // through to the typed `DescribeSequence` arm (claimed by the sequence
-    // family), exactly as it was before this block existed.
+    // `parts[3]` filter). The string dispatch runs before the parse gate.
+    // `DESCRIBE SEQUENCE` is excluded so it falls through to the typed
+    // `DescribeSequence` arm (claimed by the sequence family).
     if (upper.starts_with("DESCRIBE ") && !upper.starts_with("DESCRIBE SEQUENCE"))
         || upper.starts_with("\\D ")
     {
@@ -380,12 +357,7 @@ pub(super) async fn try_string(
     }
     if upper.starts_with("UNDROP COLLECTION ") || upper.starts_with("UNDROP TABLE ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(collection::undrop_collection(
-            state,
-            identity,
-            &parts,
-            database_id,
-        ));
+        return Some(collection::undrop_collection(state, identity, &parts, database_id).await);
     }
     if upper == "SHOW COLLECTIONS" || upper.starts_with("SHOW COLLECTIONS") {
         return Some(collection::show_collections(state, identity, database_id));

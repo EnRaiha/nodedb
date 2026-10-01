@@ -10,13 +10,13 @@
 pub mod assign;
 pub mod bootstrap;
 pub mod persist;
-pub mod physical_impl;
 pub mod registry;
 pub mod wal_appender;
 
 pub use assign::{
-    CarriedIdentity, IdentityBinder, SurrogateAssigner, SurrogateRegistryHandle,
-    bind_carried_identities, bind_plan_identities, collect_plan_identities,
+    CarriedIdentity, HomeSurrogateAuthority, IdentityBinder, SurrogateAssigner,
+    SurrogateRegistryHandle, bind_carried_identities, bind_plan_identities,
+    collect_plan_identities,
 };
 pub use bootstrap::bootstrap_registry;
 pub use persist::{SURROGATE_HWM, SurrogateHwmPersist, SystemCatalogHwm};

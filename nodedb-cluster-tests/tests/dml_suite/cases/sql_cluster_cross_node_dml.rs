@@ -11,6 +11,8 @@
 
 #[path = "../../sql_cluster_cross_node_dml_tests/auth_objects.rs"]
 mod auth_objects;
+#[path = "../../sql_cluster_cross_node_dml_tests/calvin_read_failover_cross_node.rs"]
+mod calvin_read_failover_cross_node;
 #[path = "../../sql_cluster_cross_node_dml_tests/cluster_boot.rs"]
 mod cluster_boot;
 #[path = "../../sql_cluster_cross_node_dml_tests/ddl_objects.rs"]
@@ -27,16 +29,32 @@ mod graph_algo_pagerank_personalized_cross_node;
 mod graph_algo_wcc_cross_node;
 #[path = "../../sql_cluster_cross_node_dml_tests/graph_delete_reverse_cross_node.rs"]
 mod graph_delete_reverse_cross_node;
+#[path = "../../sql_cluster_cross_node_dml_tests/graph_homed_read_failover.rs"]
+mod graph_homed_read_failover;
+#[path = "../../sql_cluster_cross_node_dml_tests/graph_homed_read_per_core.rs"]
+mod graph_homed_read_per_core;
 #[path = "../../sql_cluster_cross_node_dml_tests/graph_implicit_reverse_cross_node.rs"]
 mod graph_implicit_reverse_cross_node;
 #[path = "../../sql_cluster_cross_node_dml_tests/graph_match_cross_node.rs"]
 mod graph_match_cross_node;
+#[path = "../../sql_cluster_cross_node_dml_tests/graph_match_read_set_cross_node.rs"]
+mod graph_match_read_set_cross_node;
 #[path = "../../sql_cluster_cross_node_dml_tests/graph_match_ryow_cross_node.rs"]
 mod graph_match_ryow_cross_node;
 #[path = "../../sql_cluster_cross_node_dml_tests/graph_match_varlen_truncation_recovery_cross_node.rs"]
 mod graph_match_varlen_truncation_recovery_cross_node;
 #[path = "../../sql_cluster_cross_node_dml_tests/graph_multicore_cross_node.rs"]
 mod graph_multicore_cross_node;
+#[path = "../../sql_cluster_cross_node_dml_tests/graph_native_capped_walks_cross_node.rs"]
+mod graph_native_capped_walks_cross_node;
+#[path = "../../sql_cluster_cross_node_dml_tests/graph_native_walks_cross_node.rs"]
+mod graph_native_walks_cross_node;
+#[path = "../../sql_cluster_cross_node_dml_tests/graph_native_walks_support.rs"]
+mod graph_native_walks_support;
+#[path = "../../sql_cluster_cross_node_dml_tests/graph_owner_reads_cross_node.rs"]
+mod graph_owner_reads_cross_node;
+#[path = "../../sql_cluster_cross_node_dml_tests/graph_rag_fusion_cross_node.rs"]
+mod graph_rag_fusion_cross_node;
 #[path = "../../sql_cluster_cross_node_dml_tests/graph_traverse_cross_node.rs"]
 mod graph_traverse_cross_node;
 #[path = "../../sql_cluster_cross_node_dml_tests/graph_traverse_reverse_cross_node.rs"]
@@ -45,6 +63,8 @@ mod graph_traverse_reverse_cross_node;
 mod join_cross_node;
 #[path = "../../sql_cluster_cross_node_dml_tests/native_implicit_edge_delete_cross_node.rs"]
 mod native_implicit_edge_delete_cross_node;
+#[path = "../../sql_cluster_cross_node_dml_tests/native_remote_home_surrogate_cross_node.rs"]
+mod native_remote_home_surrogate_cross_node;
 #[path = "../../sql_cluster_cross_node_dml_tests/permission_tree_cross_node.rs"]
 mod permission_tree_cross_node;
 #[path = "../../sql_cluster_cross_node_dml_tests/permission_tree_lease_partition.rs"]
@@ -55,3 +75,9 @@ mod schema_objects;
 mod select_remote_stream_cross_node;
 #[path = "../../sql_cluster_cross_node_dml_tests/select_streaming_cross_node.rs"]
 mod select_streaming_cross_node;
+#[path = "../../sql_cluster_cross_node_dml_tests/surrogate_identity_cross_node.rs"]
+mod surrogate_identity_cross_node;
+#[path = "../../sql_cluster_cross_node_dml_tests/txn_resolve_on_follower_cross_node.rs"]
+mod txn_resolve_on_follower_cross_node;
+#[path = "../../sql_cluster_cross_node_dml_tests/txn_stage_forward_cross_node.rs"]
+mod txn_stage_forward_cross_node;

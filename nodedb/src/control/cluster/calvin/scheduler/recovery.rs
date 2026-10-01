@@ -14,7 +14,7 @@
 //! Each `CalvinApplied` marker is per `(epoch, position, vShard)` — one per
 //! independent transaction position — so the scan preserves `position` rather
 //! than collapsing an epoch to a single "applied" bit. Collapsing to the max
-//! epoch would mark a whole epoch applied on the strength of its first committed
+//! epoch will mark a whole epoch applied on the strength of its first committed
 //! position and, on restart, skip every other position of that epoch: a lost /
 //! torn transaction.
 //!
@@ -61,12 +61,33 @@ pub struct AppliedRecovery {
 /// Records that fail to decode are logged and skipped — a corrupt record does
 /// not abort the scan.
 pub fn read_applied_recovery(wal: &WalManager, vshard_id: u32) -> crate::Result<AppliedRecovery> {
+    scan_applied(wal, vshard_id, None)
+}
+
+/// [`read_applied_recovery`] for a vShard of data group `group_id`: a
+/// snapshot install of the group drops every marker before it. The install
+/// replaced the vShard's storage, and the applied state it brought replaced
+/// this node's in the catalog.
+fn scan_applied(
+    wal: &WalManager,
+    vshard_id: u32,
+    group_id: Option<u64>,
+) -> crate::Result<AppliedRecovery> {
     let records = wal.replay()?;
     let mut applied_tail = BTreeSet::new();
     let mut max_applied_epoch = NOT_YET_APPLIED_EPOCH;
 
     for record in &records {
         match record_type_of(record) {
+            Some(RecordType::SnapshotInstalled) => {
+                let installed = <[u8; 8]>::try_from(record.payload.as_slice())
+                    .ok()
+                    .map(u64::from_le_bytes);
+                if group_id.is_some() && installed == group_id {
+                    applied_tail.clear();
+                    max_applied_epoch = NOT_YET_APPLIED_EPOCH;
+                }
+            }
             Some(RecordType::CalvinApplied) => {
                 match CalvinAppliedPayload::from_bytes(&record.payload) {
                     Ok(p) if p.vshard_id == vshard_id => {
@@ -129,15 +150,19 @@ pub fn read_applied_recovery(wal: &WalManager, vshard_id: u32) -> crate::Result<
 ///
 /// A checkpoint deletes WAL segments that hold applied markers, while the
 /// sequencer log keeps delivering their entries after a restart. Without the
-/// saved state the scheduler would take an applied transaction for a new
+/// saved state the scheduler will take an applied transaction for a new
 /// one: its local stage refuses the rows it already wrote, the scheduler
 /// halts, and the transaction's completion ack never settles.
+///
+/// `group_id` is the data group of the vShard, when known: the markers
+/// before the group's last snapshot install no longer hold.
 pub fn recover_applied(
     wal: &WalManager,
     catalog: &crate::control::security::catalog::SystemCatalog,
     vshard_id: u32,
+    group_id: Option<u64>,
 ) -> crate::Result<AppliedRecovery> {
-    let from_wal = read_applied_recovery(wal, vshard_id)?;
+    let from_wal = scan_applied(wal, vshard_id, group_id)?;
     let Some(saved) = catalog.load_calvin_applied(vshard_id)? else {
         return Ok(from_wal);
     };
@@ -307,6 +332,10 @@ mod tests {
                 collections: Vec::new(),
                 sum_targets: Vec::new(),
             }),
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         };
         wal.appender(crate::wal::manager::NO_APPLY_KEY)
             .with_event_source(crate::event::EventSource::User)
@@ -327,6 +356,10 @@ mod tests {
                 payload: vec![9, 9, 9],
             }],
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         };
         wal.appender(crate::wal::manager::NO_APPLY_KEY)
             .with_event_source(crate::event::EventSource::User)
@@ -378,14 +411,41 @@ mod tests {
             ])
             .unwrap();
 
-        let rec = recover_applied(&wal, &catalog, 1).unwrap();
+        let rec = recover_applied(&wal, &catalog, 1, None).unwrap();
         assert_eq!(rec.fully_applied_epoch, 2);
         assert!(rec.applied_tail.contains(&(4, 1)));
         assert!(rec.applied_tail.contains(&(6, 0)));
         assert_eq!(rec.max_applied_epoch, 6);
 
         // A vShard with nothing saved keeps the plain WAL scan.
-        let other = recover_applied(&wal, &catalog, 9).unwrap();
+        let other = recover_applied(&wal, &catalog, 9, None).unwrap();
         assert_eq!(other, read_applied_recovery(&wal, 9).unwrap());
+    }
+
+    /// A snapshot install of the vShard's group drops every marker before
+    /// it: the install replaced the storage those positions wrote.
+    #[test]
+    fn a_group_snapshot_install_drops_the_markers_before_it() {
+        use crate::types::VShardId;
+        let dir = TempDir::new().unwrap();
+        let wal = open_wal(&dir);
+        let appender = || wal.appender(crate::wal::manager::NO_APPLY_KEY);
+        appender()
+            .append_calvin_applied(VShardId::new(1), 3, 0)
+            .unwrap();
+        appender().append_snapshot_installed(8).unwrap();
+        appender()
+            .append_calvin_applied(VShardId::new(1), 5, 2)
+            .unwrap();
+        appender().append_snapshot_installed(9).unwrap();
+        wal.sync().unwrap();
+
+        let in_group = scan_applied(&wal, 1, Some(8)).unwrap();
+        assert_eq!(in_group.applied_tail, [(5, 2)].into_iter().collect());
+        assert_eq!(in_group.max_applied_epoch, 5);
+
+        let other_group = scan_applied(&wal, 1, Some(4)).unwrap();
+        assert_eq!(other_group, read_applied_recovery(&wal, 1).unwrap());
+        assert!(other_group.applied_tail.contains(&(3, 0)));
     }
 }

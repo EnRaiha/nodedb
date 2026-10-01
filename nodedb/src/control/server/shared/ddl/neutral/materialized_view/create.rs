@@ -3,12 +3,11 @@
 //! Protocol-neutral `CREATE MATERIALIZED VIEW` handler — replicates through the
 //! metadata raft group via `CatalogEntry::PutMaterializedView`.
 //!
-//! Ported from the pgwire `ddl::materialized_view::create` handler. The catalog
-//! path (`propose_and_apply` for the view definition, then `propose_and_apply`
-//! for the target collection, then `dispatch_register_from_stored`), the
-//! duplicate / source-existence checks, and the target-collection descriptor are
-//! preserved verbatim; only the result construction changed from pgwire
-//! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
+//! The catalog path (`propose_and_apply` for the view definition, then
+//! `propose_and_apply` for the target collection, then
+//! `register_proposed_collection`), the duplicate / source-existence checks,
+//! and the target-collection descriptor run here. The result is the
+//! protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use nodedb_types::DatabaseId;
 
@@ -16,7 +15,7 @@ use crate::control::security::catalog::{StoredCollection, StoredMaterializedView
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::catalog::propose_and_apply;
+use super::super::super::catalog::propose_and_apply_async;
 use super::super::super::result::{DdlError, DdlResult};
 
 fn err(sqlstate: &str, message: String) -> DdlError {
@@ -49,20 +48,6 @@ pub async fn create_materialized_view(
         return create_streaming_mv(state, identity, database_id, &name, &query_sql).await;
     }
 
-    // Metadata Raft serializes clustered DDL. Without it, hold an exclusive
-    // name lifecycle guard through definition+target creation and Data Plane
-    // registration so DROP or another CREATE cannot interleave.
-    let _local_lifecycle = if state.metadata_raft.get().is_none() {
-        Some(
-            state
-                .quiesce
-                .acquire_lifecycle(database_id.as_u64(), tenant_id.as_u64(), &name)
-                .await,
-        )
-    } else {
-        None
-    };
-
     // Validate source collection exists.
     {
         let catalog = state.credentials.catalog();
@@ -76,7 +61,7 @@ pub async fn create_materialized_view(
             }
         }
 
-        // A catalog-read fault must abort the CREATE: proceeding could adopt a
+        // A catalog-read fault must abort the CREATE: proceeding can adopt a
         // same-name target over an object whose existence check transiently
         // failed.
         if catalog
@@ -123,11 +108,11 @@ pub async fn create_materialized_view(
     // it up on its next tick.
     let entry =
         crate::control::catalog_entry::CatalogEntry::PutMaterializedView(Box::new(view.clone()));
-    propose_and_apply(state, &entry)?;
+    propose_and_apply_async(state, &entry).await?;
 
     // Create the implementation-owned target collection so REFRESH can insert
     // into it and clients can SELECT from it. The pre-check rejects every
-    // same-name collection; DROP may therefore purge this target without ever
+    // same-name collection; DROP can therefore purge this target without ever
     // deleting a user-owned collection.
     let target = StoredCollection {
         tenant_id: tenant_id.as_u64(),
@@ -139,6 +124,7 @@ pub async fn create_materialized_view(
         constraint_version: 0,
         crdt_signing_required: false,
         modification_hlc: nodedb_types::Hlc::ZERO,
+        incarnation: nodedb_types::Hlc::ZERO,
         fields: Vec::new(),
         field_defs: Vec::new(),
         event_defs: Vec::new(),
@@ -175,8 +161,8 @@ pub async fn create_materialized_view(
     };
     let coll_entry =
         crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(target.clone()));
-    propose_and_apply(state, &coll_entry)?;
-    super::super::collection::dispatch_register_from_stored(state, &target)
+    let outcome = propose_and_apply_async(state, &coll_entry).await?;
+    super::super::collection::register_proposed_collection(state, outcome, &target)
         .await
         .map_err(|e| DdlError::from_error(&e))?;
 
@@ -195,10 +181,9 @@ pub async fn create_materialized_view(
 
 /// `CREATE MATERIALIZED VIEW <name> [ON <coll>] STREAMING AS SELECT ... FROM <stream> ...`
 ///
-/// Ported from the deleted pgwire `ddl::streaming_mv::create` handler: the
-/// tenant-admin gate, source-stream existence check, duplicate guard, catalog
-/// persist, in-memory registration, and buffer backfill are preserved; only the
-/// result / error types changed to the protocol-neutral [`DdlResult`] /
+/// The handler runs the tenant-admin gate, source-stream existence check,
+/// duplicate guard, catalog persist, in-memory registration, and buffer
+/// backfill. The result / error types are the protocol-neutral [`DdlResult`] /
 /// [`DdlError`]. The source is the change stream named in the query's FROM
 /// clause, not the `ON` lineage collection.
 async fn create_streaming_mv(
@@ -273,25 +258,11 @@ async fn create_streaming_mv(
         created_at: now,
     };
 
-    let entry = crate::control::catalog_entry::CatalogEntry::PutStreamingMaterializedView(
-        Box::new(def.clone()),
-    );
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let entry =
+        crate::control::catalog_entry::CatalogEntry::PutStreamingMaterializedView(Box::new(def));
+    crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|error| DdlError::from_error_in_context("metadata propose", &error))?;
-    crate::control::catalog_entry::apply::local::apply_locally_if_needed(state, &entry, outcome);
-    if outcome.needs_local_apply() {
-        state.permissions.install_replicated_owner(
-            &crate::control::security::catalog::StoredOwner {
-                database_id: database_id.as_u64(),
-                object_type: crate::control::security::catalog::auth_types::object_type::STREAMING_MATERIALIZED_VIEW
-                    .to_string(),
-                object_name: name.to_string(),
-                tenant_id,
-                owner_username: identity.username.clone(),
-            },
-        );
-        state.mv_registry.register(def);
-    }
 
     // Backfill: replay events already in the source stream's buffer so the MV
     // bootstraps with historical data instead of only future events.

@@ -74,9 +74,9 @@ fn ddl_col_type_to_pg(ty: &DdlColType) -> Type {
 /// encoding, so a lossy mapping is worse than saying nothing: an unknown
 /// parameter type is sent as text, which the bind layer already handles.
 /// `Decimal`, `Uuid`, `Vector` and `Geometry` all currently fold into
-/// `DdlColType::Text`, so advertising them would tell a client holding a
+/// `DdlColType::Text`, so advertising them will tell a client holding a
 /// `Decimal`/`Uuid` that the server wants TEXT — a client-side `WrongType`
-/// failure where `Unknown` would have worked. They stay unresolved until
+/// failure where `Unknown` works. They stay unresolved until
 /// each has a real wire type.
 fn inferred_param_type(inferred: &nodedb_sql::InferredParamType) -> Option<Type> {
     use crate::control::server::response_shape::schema::sql_data_type_to_ddl_col_type_with_width;
@@ -148,7 +148,7 @@ impl NodeDbQueryParser {
     /// Used on both Parse paths — the schema-inferring one and the fallback
     /// for SQL the planner cannot plan — because inference reads only the SQL
     /// text: whether planning succeeded has no bearing on it, and letting the
-    /// advertised parameter types depend on that would be arbitrary.
+    /// advertised parameter types depend on that will be arbitrary.
     fn param_types_with_inference(
         sql: &str,
         client_types: &[Option<Type>],
@@ -163,7 +163,7 @@ impl NodeDbQueryParser {
     /// inferred from the SQL itself.
     ///
     /// A client-declared type always wins — that is PostgreSQL semantics: the
-    /// Parse message's type oids are the client's contract, and the server may
+    /// Parse message's type oids are the client's contract, and the server can
     /// only resolve the positions the client left as unspecified (oid 0).
     ///
     /// Inference runs on the *unsubstituted* SQL. The schema-inference pass
@@ -211,10 +211,12 @@ impl NodeDbQueryParser {
         );
         // Parse plans against the same authorization state as every other
         // planning path. A refusal is an error, not "not plannable".
-        let permission_cache =
-            crate::control::security::auth_fence::permission_view(&self.state, identity.tenant_id)
-                .await
-                .map_err(|e| crate::control::server::pgwire::types::error_map::error_to_pg(&e))?;
+        crate::control::security::auth_fence::admit_permission_view(
+            &self.state,
+            identity.tenant_id,
+        )
+        .await
+        .map_err(|e| crate::control::server::pgwire::types::error_map::error_to_pg(&e))?;
         let security = crate::control::planner::context::PlanSecurityContext {
             identity,
             auth: scope.auth(),
@@ -222,7 +224,9 @@ impl NodeDbQueryParser {
             redaction_store: &self.state.redaction,
             permissions: &self.state.permissions,
             roles: &self.state.roles,
-            permission_cache: Some(&*permission_cache),
+            permission_tree: crate::control::planner::context::PermissionTreeSource::Live(
+                &self.state.permission_cache,
+            ),
         };
         let Ok((tasks, _)) = query_ctx
             .plan_sql_with_rls_metadata(crate::control::planner::context::PlanSqlWithRlsParams {
@@ -235,7 +239,6 @@ impl NodeDbQueryParser {
         else {
             return Ok(false);
         };
-        drop(permission_cache);
 
         // Parse/Describe is metadata-only: authorize the original task set,
         // but do not materialize implicit graph edges while describing it.
@@ -263,6 +266,7 @@ impl NodeDbQueryParser {
     ) -> crate::control::planner::catalog_adapter::OriginCatalog {
         crate::control::planner::catalog_adapter::OriginCatalog::new(
             Arc::clone(&self.state.credentials),
+            self.state.array_catalog.clone(),
             tenant_id,
             database_id,
             Some(Arc::clone(&self.state.retention_policy_registry)),
@@ -298,7 +302,7 @@ impl NodeDbQueryParser {
         // The planner type-checks WHERE/projection expressions, which
         // fails on raw `$N` placeholders (no bound value to typecheck).
         // For schema inference we only need the collection + projection
-        // structure, so substitute placeholders with NULL literals just
+        // structure, so substitute placeholders with NULL literals
         // for this planning pass. Execution re-plans with real bound
         // values.
         let sql_for_inference = substitute_placeholders_with_null(&sql_stripped);
@@ -402,7 +406,7 @@ impl QueryParser for NodeDbQueryParser {
         // One catalog per Parse, shared by parameter-type inference and schema
         // planning. The unplannable branch still needs it: inference resolves
         // `WHERE col = $1` from the catalog whether or not the statement as a
-        // whole could be planned.
+        // whole can be planned.
         let catalog = self.build_catalog(identity.tenant_id.as_u64(), database_id);
         let (param_types, result_fields) = if can_infer_schema {
             self.try_infer_types(sql, types, &catalog, database_id, identity.tenant_id)

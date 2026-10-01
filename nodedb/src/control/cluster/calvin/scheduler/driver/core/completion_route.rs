@@ -63,7 +63,7 @@ impl Scheduler {
         let commit_state = self.pending.get(&txn_id).and_then(|p| p.commit_state);
 
         // OLLP mismatch: the active executor detected predicate drift and returned
-        // OllpRetryRequired without writing. The retry loop is now COORDINATOR-owned
+        // OllpRetryRequired without writing. The retry loop is COORDINATOR-owned
         // (`run_dependent_with_retry`): the scheduler must NOT re-submit a stale
         // prediction. Instead it (1) releases the aborted attempt's locks and
         // (2) signals the coordinator's completion waiter via the registry so it
@@ -76,11 +76,10 @@ impl Scheduler {
             // A mismatch is a normal OLLP retry signal, not a failure: the executor
             // correctly detected predicate drift and declined to write. Count it as
             // a received executor response, but NOT as an executor error or infra
-            // abort — those would inflate failure metrics on every routine retry.
+            // abort — those will inflate failure metrics on every routine retry.
             self.metrics.record_completed();
             // (1) Release the aborted attempt's locks and clean up pending state.
-            // This fixes the lock-leak: the old `schedule_ollp_retry` re-submitted
-            // without ever releasing the aborted attempt's locks.
+            // A retry that left the aborted attempt's locks held will leak them.
             self.on_txn_complete(txn_id);
             // OLLP mismatch broadcast is LEADER-ONLY. The optimistic-lock
             // verification runs only on the data-group leader (the data plane
@@ -88,9 +87,9 @@ impl Scheduler {
             // bulk-DML handlers), so by construction only a leader's executor can
             // return `OllpRetryRequired`. This guard is defense-in-depth: a
             // non-leader scheduler must never broadcast a mismatch — a lagging
-            // follower could otherwise poison an attempt the leader already
+            // follower can otherwise poison an attempt the leader already
             // completed, exhausting retries on a static dataset. A non-leader
-            // simply releases locks (done above) and returns; the leader owns the
+            // releases locks (done above) and returns; the leader owns the
             // single mismatch signal that the completion registry observes.
             if !self.is_group_leader() {
                 tracing::debug!(
@@ -137,12 +136,24 @@ impl Scheduler {
                     .await;
                 return;
             }
+            Some(CommitState::AwaitingFlushTurn { .. } | CommitState::AwaitingResolveTurn) => {
+                // A txn waiting for its flush or resolve turn has no request
+                // out.
+                tracing::warn!(
+                    vshard_id = self.vshard_id,
+                    request_id = request_id.as_u64(),
+                    epoch = txn_id.epoch,
+                    position = txn_id.position,
+                    "calvin: executor completion for a txn waiting for its flush turn; ignoring"
+                );
+                return;
+            }
             Some(CommitState::AwaitingVerdict) => {
                 // A parked txn dispatched no executor request (it is waiting on
                 // the cross-shard verdict, not the Data Plane), so no response
                 // bridge is outstanding for it — a completion here indicates a
                 // logic error, not a real Data-Plane reply. Do NOT run the commit
-                // tail or release locks (that could tear the transaction);
+                // tail or release locks (that can tear the transaction);
                 // remain parked and let the verdict path resume it.
                 tracing::warn!(
                     vshard_id = self.vshard_id,

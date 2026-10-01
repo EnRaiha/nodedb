@@ -65,6 +65,33 @@ impl SystemCatalog {
         Ok(inserted)
     }
 
+    /// Read one committed consumer group by its durable identity.
+    pub fn get_consumer_group(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        stream: &str,
+        group: &str,
+    ) -> crate::Result<Option<ConsumerGroupDef>> {
+        let key = group_key(database_id, tenant_id, stream, group);
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("read txn", e))?;
+        let table = read_txn
+            .open_table(CONSUMER_GROUPS)
+            .map_err(|e| catalog_err("open consumer_groups", e))?;
+        let Some(value) = table
+            .get(key.as_str())
+            .map_err(|e| catalog_err("get consumer_group", e))?
+        else {
+            return Ok(None);
+        };
+        decode_consumer_group(value.value())
+            .map(Some)
+            .ok_or_else(|| catalog_err("deser consumer_group", key))
+    }
+
     /// Delete a consumer group.
     pub fn delete_consumer_group(
         &self,
@@ -187,6 +214,7 @@ impl From<LegacyConsumerGroupDef> for ConsumerGroupDef {
             owner: legacy.owner,
             created_at: legacy.created_at,
             database_id: DatabaseId::DEFAULT,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 }
@@ -216,6 +244,7 @@ mod tests {
             owner: "admin".into(),
             created_at: 0,
             database_id,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 

@@ -3,11 +3,10 @@
 //! Single-shard COMMIT: resolve the transaction's staged post-images into one
 //! redo record, then commit that record through the vShard's apply log.
 //!
-//! The vShard has one apply log. With Raft it is the data-group log: the
-//! record is proposed there and every replica, this node included, appends
-//! it to its own WAL and installs it when the entry commits. With no Raft the
-//! record goes through the same apply on this node alone. COMMIT returns only
-//! once the record is durable and installed here.
+//! The vShard has one apply log, its data-group log: the record is proposed
+//! there and every replica, this node included, appends it to its own WAL and
+//! installs it when the entry commits. COMMIT returns only once the record is
+//! durable and installed here.
 
 use nodedb_physical::physical_plan::MetaOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -17,21 +16,22 @@ use crate::control::gateway::RouteDecision;
 use crate::control::state::SharedState;
 use crate::control::wal_replication::encode::transaction_redo_entry;
 use crate::control::wal_replication::propose_replicated_entry;
-use crate::control::wal_replication::transaction_redo::{
-    RedoTarget, TransactionRedoPayload, apply_transaction_redo,
-};
+use crate::control::wal_replication::transaction_redo::{RedoTarget, TransactionRedoPayload};
+use crate::wal::RedoPublish;
 
 use super::super::outcome::{AbortReason, TxnDataPlane};
 
 /// Single-shard commit: resolve the transaction's staged post-images into one
-/// `RedoRecord`, then commit it through the vShard's apply log. Returns
-/// `Some(reason)` on failure.
+/// `RedoRecord` that also carries `publishes`, then commit it through the
+/// vShard's apply log. Returns `Some(reason)` on failure.
 pub(super) async fn dispatch_single_shard(
     state: &SharedState,
     dp: &impl TxnDataPlane,
     buffered: &[PhysicalTask],
     tenant_id: crate::types::TenantId,
     vshard_id: crate::types::VShardId,
+    publishes: Vec<RedoPublish>,
+    ts_preview: &super::ts_rejections::RejectedByCollection,
 ) -> Option<AbortReason> {
     let plans: Vec<PhysicalPlan> = buffered.iter().map(|t| t.plan.clone()).collect();
     let database_id = buffered
@@ -73,7 +73,7 @@ pub(super) async fn dispatch_single_shard(
         }
         Err(e) => return Some(AbortReason::Dispatch(e)),
     };
-    let redo = match crate::wal::RedoRecord::from_bytes(resolve_resp.payload.as_bytes()) {
+    let mut redo = match crate::wal::RedoRecord::from_bytes(resolve_resp.payload.as_bytes()) {
         Ok(r) => r,
         Err(e) => {
             return Some(AbortReason::Dispatch(crate::Error::Internal {
@@ -85,7 +85,7 @@ pub(super) async fn dispatch_single_shard(
     // Re-verify local vShard leadership before anything durable happens.
     // `run_commit` resolved this vShard as `Local` and validated the read set
     // against this node's write versions, but a leadership handoff can land
-    // during the `ResolveTxn` await above. The new leader may already have
+    // during the `ResolveTxn` await above. The new leader can already have
     // applied writes this node's validation never saw, so the commit aborts
     // side-effect-free and retryable: the retry sees the vShard is non-local
     // and routes through Calvin's replicated barrier.
@@ -99,10 +99,15 @@ pub(super) async fn dispatch_single_shard(
         return Some(AbortReason::Serialization);
     }
 
-    // A transaction with no durable write (all reads) installs nothing.
-    if redo.ops.is_empty() {
+    // A transaction with no durable write and no message installs nothing.
+    redo.publishes = publishes;
+    if redo.ops.is_empty() && redo.publishes.is_empty() {
         return None;
     }
+    redo.cross_shard_applied = dp.applied_key();
+    // The lines this authoritative resolve rejected, for the notice owed
+    // once the record commits.
+    let ts_committed = super::ts_rejections::redo_rejected_by_collection(&redo);
 
     // 2. Commit the record through the vShard's apply log. The payload carries
     //    the resolve-time bitemporal stamps inside the redo sub-records, so
@@ -118,6 +123,62 @@ pub(super) async fn dispatch_single_shard(
         Ok(payload) => payload,
         Err(e) => return Some(AbortReason::Dispatch(e)),
     };
+    let outcome = commit_redo(
+        state,
+        RedoTarget {
+            tenant_id,
+            database_id,
+            vshard_id,
+        },
+        &payload,
+    )
+    .await;
+    match outcome {
+        Ok(applied) => {
+            // The install's counts cover the resolve's and add the rows it
+            // rejected at the record's log position.
+            let committed = super::ts_rejections::with_applied(ts_committed, &applied);
+            super::ts_rejections::raise_commit_rejections(ts_preview, &committed);
+            None
+        }
+        Err(reason) => Some(reason),
+    }
+}
+
+/// Commit the messages of a transaction with no buffered write in a redo
+/// record of their own, on the home vShard of the first message's topic.
+/// Returns `Some(reason)` on failure, `None` when there is nothing to commit.
+pub(super) async fn commit_publishes(
+    state: &SharedState,
+    tenant_id: crate::types::TenantId,
+    publishes: Vec<RedoPublish>,
+) -> Option<AbortReason> {
+    let first = publishes.first()?;
+    let database_id = crate::types::DatabaseId::new(first.database_id);
+    let vshard_id = crate::types::VShardId::new(crate::event::topic::publish::topic_vshard(
+        database_id,
+        &first.topic,
+    ));
+    let redo = crate::wal::RedoRecord {
+        version: 1,
+        ops: Vec::new(),
+        calvin_stamp: None,
+        cross_shard_applied: None,
+        row_sources: Vec::new(),
+        publishes,
+        row_changes: Vec::new(),
+    };
+    let payload = match TransactionRedoPayload::from_commit(
+        state,
+        database_id,
+        tenant_id,
+        redo,
+        &[],
+        crate::event::EventSource::User,
+    ) {
+        Ok(payload) => payload,
+        Err(e) => return Some(AbortReason::Dispatch(e)),
+    };
     commit_redo(
         state,
         RedoTarget {
@@ -128,54 +189,42 @@ pub(super) async fn dispatch_single_shard(
         &payload,
     )
     .await
+    .err()
 }
 
 /// Commit `payload` through the vShard's apply log and wait until it is
-/// durable and installed on this node.
+/// durable and installed on this node. Returns the lines and rows the
+/// install's timeseries batches rejected, by collection.
 ///
 /// A fail point ahead of the real commit lets a test force this exact
-/// synchronous-failure branch (`Option<AbortReason>` back to `run_commit`,
+/// synchronous-failure branch (an `AbortReason` back to `run_commit`,
 /// which compensates a finalized DDL) without touching disk.
 async fn commit_redo(
     state: &SharedState,
     target: RedoTarget,
     payload: &TransactionRedoPayload,
-) -> Option<AbortReason> {
+) -> Result<super::ts_rejections::RejectedByCollection, AbortReason> {
     if let Err(e) = inject_commit_failure() {
-        return Some(AbortReason::Dispatch(e));
+        return Err(AbortReason::Dispatch(e));
     }
-    match state.async_raft_proposer() {
-        // The proposer forwards to the group leader and returns once the entry
-        // is committed and applied on this node by the apply loop.
-        Some(proposer) => {
-            let entry = transaction_redo_entry(
-                target.tenant_id,
-                target.database_id,
-                target.vshard_id,
-                payload,
-            );
-            match propose_replicated_entry(state, proposer, entry).await {
-                Ok(_) => None,
-                Err(crate::Error::DataPlane(code)) => {
-                    Some(AbortReason::BatchRejected { code: Some(code) })
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "transaction redo commit failed");
-                    Some(AbortReason::Dispatch(e))
-                }
-            }
+    let proposer = state.async_raft_proposer().map_err(AbortReason::Dispatch)?;
+    // The proposer forwards to the group leader and returns once the entry is
+    // committed and applied on this node by the apply loop.
+    let entry = transaction_redo_entry(
+        target.tenant_id,
+        target.database_id,
+        target.vshard_id,
+        payload,
+    );
+    match propose_replicated_entry(state, proposer, entry).await {
+        Ok((applied, _)) => Ok(super::ts_rejections::applied_rejected_by_collection(
+            &applied,
+        )),
+        Err(crate::Error::DataPlane(code)) => Err(AbortReason::BatchRejected { code: Some(code) }),
+        Err(e) => {
+            tracing::warn!(error = %e, "transaction redo commit failed");
+            Err(AbortReason::Dispatch(e))
         }
-        // No Raft: this node is the only replica, and its apply is the log.
-        None => match apply_transaction_redo(state, target, payload, 0, None).await {
-            Ok(outcome) if outcome.response.status == Status::Ok => None,
-            Ok(outcome) => Some(AbortReason::BatchRejected {
-                code: outcome.response.error_code.as_deref().cloned(),
-            }),
-            Err(e) => {
-                tracing::warn!(error = %e, "transaction redo commit failed");
-                Some(AbortReason::Dispatch(e))
-            }
-        },
     }
 }
 

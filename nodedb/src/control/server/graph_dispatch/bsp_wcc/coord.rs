@@ -7,7 +7,9 @@
 //! 1. **Enumerate.** One shard per distinct owner node (local + each distinct
 //!    non-local data-group leader), each carrying that node's FULL owned-vShard
 //!    set. Reuses `bsp_pagerank::enumerate::enumerate_shards`.
-//! 2. **Contract.** Dispatch ONE `GraphOp::WccSuperstep` per owner node. Each
+//! 2. **Contract.** Dispatch ONE `GraphOp::WccSuperstep` per owner node, with
+//!    one fresh cut marker. Every node resolves the same read cut from it and
+//!    reads the graph at it (see `graph_dispatch::run_cut`). Each
 //!    shard contracts its OWNED nodes into local components and returns
 //!    `node_labels` (`(name, local_component_root_name)`) plus `boundary_edges`
 //!    (`(owned_name, ghost_name)` for every owned→ghost out-edge).
@@ -28,7 +30,9 @@ use crate::control::state::SharedState;
 use crate::engine::graph::algo::result::AlgoResultBatch;
 use crate::types::{DatabaseId, TenantId};
 
-use super::scatter::scatter_wcc_round;
+use super::scatter::{WccRound, scatter_wcc_round};
+use crate::control::server::graph_dispatch::run_cut::{agreed_cut, new_cut_marker};
+use crate::control::server::graph_dispatch::shard_reads::{ShardReadLog, qualified};
 
 /// Run distributed WCC and return the bare `AlgoResultBatch` payload (the exact
 /// shape `algo_payload_to_query_response` consumes — identical to the
@@ -42,6 +46,7 @@ pub async fn run_bsp_wcc(
     database_id: DatabaseId,
     params: AlgoParams,
     deadline_ms: u64,
+    linearizable: bool,
 ) -> crate::Result<Payload> {
     // ── Enumerate shards (one per distinct owner node, local + remote). ──
     let enumeration = enumerate_shards(state)?;
@@ -52,15 +57,43 @@ pub async fn run_bsp_wcc(
     }
 
     // ── Single contraction round across every owner node. ──
+    // Every node reads at one read cut, so every node reads the same graph.
     let results = scatter_wcc_round(
+        state,
+        WccRound {
+            tenant_id,
+            database_id,
+            params: &params,
+            targets: &targets,
+            read_cut_marker: new_cut_marker(state),
+            deadline_ms,
+            linearizable,
+        },
+    )
+    .await?;
+    agreed_cut(
+        results
+            .iter()
+            .map(|sr| (sr.node_id, sr.result.system_as_of)),
+    )?;
+
+    // Every owner's partition was read once, at the watermark it served.
+    let mut reads = ShardReadLog::new();
+    for sr in &results {
+        if let Some(target) = targets.iter().find(|t| t.node_id == sr.node_id) {
+            reads.note(
+                target.owned_vshards.iter().copied(),
+                sr.watermark_lsn,
+                target.node_id,
+            );
+        }
+    }
+    reads.publish(
         state,
         tenant_id,
         database_id,
-        &params,
-        &targets,
-        deadline_ms,
-    )
-    .await?;
+        Some(qualified(database_id, &params.collection)),
+    );
 
     // Concatenate every shard's local labels + boundary edges. Each owner node
     // holds a disjoint owned-node set, so the union of labels has one entry per

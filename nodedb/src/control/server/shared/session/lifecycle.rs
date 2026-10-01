@@ -48,8 +48,7 @@ pub fn run_begin(
 /// rolls back GAP_FREE reservations (with sequence-log audit), clears the write
 /// buffer + read-set, closes non-hold cursors, discards buffered NOTIFY
 /// messages, and releases the staging overlay on its home vShard. Infallible —
-/// every cleanup step is best-effort, mirroring the original swallow-on-error
-/// behavior.
+/// every cleanup step is best-effort and swallows its error.
 pub async fn run_rollback(
     sessions: &SessionStore,
     session_id: SessionId,
@@ -62,7 +61,7 @@ pub async fn run_rollback(
     let discarded_ddl = ddl_buffer::take();
     // Snapshot the overlay identity BEFORE `rollback()` clears session state,
     // so the staging overlay can be released on EVERY vShard the transaction
-    // staged writes to (a transaction may span multiple cores).
+    // staged writes to (a transaction can span multiple cores).
     let (overlay_txn_id, overlay_vshards) = sessions.txn_identity(session_id);
     // Release this transaction's read reservations while the reservation owner is
     // still set — `rollback` below clears it. Best-effort; lease GC backstops.
@@ -75,7 +74,7 @@ pub async fn run_rollback(
     .await;
     // Keep the session's transaction identity intact until every overlay has
     // been released. Detached connection teardown can be cancelled at any
-    // await point; clearing `tx_id` first would make an interrupted cleanup
+    // await point; clearing `tx_id` first will make an interrupted cleanup
     // permanently lose the only identifiers needed to reclaim the overlays.
     if let Some(txn_id) = overlay_txn_id {
         for vshard_id in overlay_vshards {
@@ -119,7 +118,8 @@ pub async fn run_rollback(
         }
     }
     sessions.close_non_hold_cursors(session_id);
-    // Discard NOTIFY messages buffered during this transaction.
+    // Discard NOTIFY messages buffered during this transaction. `rollback`
+    // above dropped the trigger publishes.
     sessions.discard_pending_notifies(session_id);
     // Last, once the staging overlay is gone: put the Data Plane back to the
     // committed shape, so the rolled-back DDL survives nowhere.

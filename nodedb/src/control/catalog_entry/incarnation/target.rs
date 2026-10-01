@@ -19,7 +19,7 @@ pub struct Incarnation {
 }
 
 impl Incarnation {
-    /// Carried by a delete proposed against an absent row or in compat mode.
+    /// Carried by a delete proposed against an absent row.
     pub const UNSTAMPED: Self = Self {
         descriptor_version: 0,
         hlc: Hlc::ZERO,
@@ -41,7 +41,8 @@ impl Incarnation {
 }
 
 /// Identity of one stored row: `(database_id, tenant_id, name)`, plus the
-/// field name for vector index parameters.
+/// field name for vector index parameters and the stream name for consumer
+/// groups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKey<'a> {
     Collection(u64, u64, &'a str),
@@ -54,6 +55,10 @@ pub enum RowKey<'a> {
     SynonymGroup(u64, u64, &'a str),
     Topic(u64, u64, &'a str),
     VectorIndexParams(u64, u64, &'a str, &'a str),
+    ChangeStream(u64, u64, &'a str),
+    /// `(database_id, tenant_id, stream_name, group_name)`.
+    ConsumerGroup(u64, u64, &'a str, &'a str),
+    Array(u64, u64, &'a str),
 }
 
 impl<'a> RowKey<'a> {
@@ -68,7 +73,10 @@ impl<'a> RowKey<'a> {
             | Self::MaterializedView(_, _, name)
             | Self::ContinuousAggregate(_, _, name)
             | Self::SynonymGroup(_, _, name)
-            | Self::Topic(_, _, name) => name,
+            | Self::Topic(_, _, name)
+            | Self::ChangeStream(_, _, name)
+            | Self::ConsumerGroup(_, _, _, name)
+            | Self::Array(_, _, name) => name,
             Self::VectorIndexParams(_, _, collection, _) => collection,
         }
     }
@@ -105,6 +113,19 @@ impl<'a> RowKey<'a> {
                 .map(|row| Incarnation::unversioned(row.modification_hlc)),
             Self::VectorIndexParams(db, tenant, collection, field) => catalog
                 .get_committed_vector_index_params(db, tenant, collection, field)?
+                .map(|row| Incarnation::unversioned(row.modification_hlc)),
+            Self::ChangeStream(db, tenant, name) => catalog
+                .get_change_stream(DatabaseId::new(db), tenant, name)?
+                .map(|row| Incarnation::unversioned(row.modification_hlc)),
+            Self::ConsumerGroup(db, tenant, stream, group) => catalog
+                .get_consumer_group(DatabaseId::new(db), tenant, stream, group)?
+                .map(|row| Incarnation::unversioned(row.modification_hlc)),
+            Self::Array(db, tenant, name) => catalog
+                .get_array_in_database(
+                    nodedb_types::TenantId::new(tenant),
+                    DatabaseId::new(db),
+                    name,
+                )?
                 .map(|row| Incarnation::unversioned(row.modification_hlc)),
         })
     }
@@ -174,6 +195,25 @@ pub fn delete_key(entry: &CatalogEntry) -> Option<RowKey<'_>> {
             field_name,
             ..
         } => RowKey::VectorIndexParams(*database_id, *tenant_id, collection, field_name),
+        CatalogEntry::DeleteChangeStream {
+            database_id,
+            tenant_id,
+            name,
+            ..
+        } => RowKey::ChangeStream(*database_id, *tenant_id, name),
+        CatalogEntry::DeleteConsumerGroup {
+            database_id,
+            tenant_id,
+            stream_name,
+            name,
+            ..
+        } => RowKey::ConsumerGroup(*database_id, *tenant_id, stream_name, name),
+        CatalogEntry::DeleteArray {
+            database_id,
+            tenant_id,
+            name,
+            ..
+        } => RowKey::Array(*database_id, *tenant_id, name),
         _ => return None,
     })
 }
@@ -221,7 +261,10 @@ pub fn carried_target(entry: &CatalogEntry) -> Option<Incarnation> {
         )),
         CatalogEntry::DeleteSynonymGroup { target_hlc, .. }
         | CatalogEntry::DeleteTopicWithConsumerGroups { target_hlc, .. }
-        | CatalogEntry::DeleteVectorIndexParams { target_hlc, .. } => {
+        | CatalogEntry::DeleteVectorIndexParams { target_hlc, .. }
+        | CatalogEntry::DeleteChangeStream { target_hlc, .. }
+        | CatalogEntry::DeleteConsumerGroup { target_hlc, .. }
+        | CatalogEntry::DeleteArray { target_hlc, .. } => {
             Some(Incarnation::unversioned(*target_hlc))
         }
         _ => None,
@@ -271,7 +314,10 @@ pub fn with_target(mut entry: CatalogEntry, target: Incarnation) -> CatalogEntry
         }
         CatalogEntry::DeleteSynonymGroup { target_hlc, .. }
         | CatalogEntry::DeleteTopicWithConsumerGroups { target_hlc, .. }
-        | CatalogEntry::DeleteVectorIndexParams { target_hlc, .. } => {
+        | CatalogEntry::DeleteVectorIndexParams { target_hlc, .. }
+        | CatalogEntry::DeleteChangeStream { target_hlc, .. }
+        | CatalogEntry::DeleteConsumerGroup { target_hlc, .. }
+        | CatalogEntry::DeleteArray { target_hlc, .. } => {
             *target_hlc = target.hlc;
         }
         _ => {}
@@ -334,6 +380,28 @@ pub fn written_row(entry: &CatalogEntry) -> Option<(RowKey<'_>, Incarnation)> {
                 row.tenant_id,
                 &row.collection,
                 &row.field_name,
+            ),
+            Incarnation::unversioned(row.modification_hlc),
+        ),
+        CatalogEntry::PutChangeStream(row) => (
+            RowKey::ChangeStream(row.database_id.as_u64(), row.tenant_id, &row.name),
+            Incarnation::unversioned(row.modification_hlc),
+        ),
+        CatalogEntry::PutConsumerGroupIfAbsent(row)
+        | CatalogEntry::MigrateConsumerGroupStream { def: row, .. } => (
+            RowKey::ConsumerGroup(
+                row.database_id.as_u64(),
+                row.tenant_id,
+                &row.stream_name,
+                &row.name,
+            ),
+            Incarnation::unversioned(row.modification_hlc),
+        ),
+        CatalogEntry::PutArray(row) => (
+            RowKey::Array(
+                row.array_id.database_id.as_u64(),
+                row.array_id.tenant_id.as_u64(),
+                &row.name,
             ),
             Incarnation::unversioned(row.modification_hlc),
         ),

@@ -5,26 +5,57 @@
 //! Every section re-issues as durable writes: Raft-replicated to every
 //! replica of its group in cluster mode, WAL-appended then installed on a
 //! single node. None is installed straight into a Data-Plane map, which
-//! would hold it on one node only and lose it on restart. Every write names
+//! holds it on one node only and loses it on restart. Every write names
 //! the destination database, so each row lands on the vShard and core its
 //! destination collection key homes to.
 
-use std::sync::Arc;
-
 use crate::Error;
 use crate::control::state::SharedState;
-use crate::types::TenantDataSnapshot;
+use crate::types::{DatabaseId, TenantDataSnapshot};
 
+use super::super::bind_conflicts::{CarriedBind, check_carried_binds};
 use super::super::target::DatabaseTarget;
 use super::rebind;
 use super::reissue;
 use super::stats::RestoreStats;
 
+/// Re-issue `snap`, one tenant's data of database `source` gathered from
+/// every vShard, into database `dest`. Each collection of `dest` must already
+/// exist. Every Raft group must have a reachable majority, or nothing is
+/// written.
+pub async fn reissue_into_database(
+    state: &SharedState,
+    tenant_id: u64,
+    source: DatabaseId,
+    dest: DatabaseId,
+    snap: TenantDataSnapshot,
+) -> Result<RestoreStats, Error> {
+    super::super::quorum::require_quorum(state)?;
+    let mut stats = RestoreStats {
+        tenant_id,
+        ..Default::default()
+    };
+    reissue_database(
+        state,
+        tenant_id,
+        // MOVE TENANT is no RESTORE: its writes mark as user writes.
+        DatabaseTarget {
+            source,
+            dest,
+            restore_id: 0,
+        },
+        snap,
+        &mut stats,
+    )
+    .await?;
+    Ok(stats)
+}
+
 /// Re-issue every section of `snap`, the merged backup of the source
 /// database `target.source`, into `target.dest`. Any failure is fatal — no
 /// warn-and-continue.
 pub(super) async fn reissue_database(
-    state: &Arc<SharedState>,
+    state: &SharedState,
     tenant_id: u64,
     target: DatabaseTarget,
     mut snap: TenantDataSnapshot,
@@ -36,16 +67,53 @@ pub(super) async fn reissue_database(
     let crdt_state = std::mem::take(&mut snap.crdt_state);
     let kv_tables = std::mem::take(&mut snap.kv_tables);
     let vector_snapshots = std::mem::take(&mut snap.vectors);
+    let vector_multi_documents = std::mem::take(&mut snap.vector_multi_documents);
     // Vector-index config re-issues as `VectorOp::SetParams` before the first
     // vector `Insert`: the Data Plane creates a (collection, field) HNSW index
     // on its first `Insert`, from whatever params it holds by then.
     let vector_params_snapshots = std::mem::take(&mut snap.vector_params);
     let index_config_snapshots = std::mem::take(&mut snap.index_configs);
+    let array_cells = std::mem::take(&mut snap.arrays);
 
     // The PK→surrogate identity map. It is bound on this node before any
     // re-issue, so a re-issued row keeps the surrogate the backup stored it
     // under unless this node already binds its key.
     let surrogate_binds = std::mem::take(&mut snap.surrogate_pk);
+    // No node issues a carried surrogate again: the floor rises above the
+    // highest one before the first bind, on every node.
+    let highest = surrogate_binds
+        .iter()
+        .map(|bind| bind.surrogate)
+        .max()
+        .unwrap_or(0)
+        .max(super::super::redo_reissue::max_row_surrogate(
+            tenant_id,
+            &snap.documents,
+            &snap.documents_versioned,
+        )?);
+    super::super::surrogate_floor::raise_surrogate_floor(state, tenant_id, highest).await?;
+
+    // Every surrogate the re-issue binds, checked against this node and each
+    // one's home leader before any bind: another key holding one fails the
+    // re-issue with nothing bound.
+    let documents = super::super::redo_reissue::prepare_documents(
+        state,
+        tenant_id,
+        target,
+        std::mem::take(&mut snap.documents),
+        std::mem::take(&mut snap.documents_versioned),
+        &surrogate_binds,
+    )?;
+    let carried: Vec<CarriedBind> = surrogate_binds
+        .iter()
+        .map(|bind| CarriedBind {
+            collection: bind.collection.clone(),
+            pk: bind.pk.clone(),
+            surrogate: bind.surrogate,
+        })
+        .chain(documents.iter().flat_map(|rows| rows.carried()))
+        .collect();
+    check_carried_binds(state, tenant_id, target.dest, carried).await?;
     rebind::rebind_surrogates(state, target, &surrogate_binds)?;
 
     // Document rows, their versions and graph edges re-issue as committed
@@ -58,10 +126,8 @@ pub(super) async fn reissue_database(
         tenant_id,
         target,
         super::super::redo_reissue::RestoredRows {
-            documents: std::mem::take(&mut snap.documents),
-            documents_versioned: std::mem::take(&mut snap.documents_versioned),
+            documents,
             edges: std::mem::take(&mut snap.edges),
-            binds: &surrogate_binds,
         },
     )
     .await?;
@@ -107,9 +173,23 @@ pub(super) async fn reissue_database(
     )
     .await?;
 
-    // Vector rows, one `VectorOp::Insert` per restored vector.
-    stats.vectors_reissued +=
-        reissue::reissue_vector_snapshots(state, tenant_id, target, vector_snapshots).await?;
+    // Vector rows: one `VectorOp::Insert` per single-vector row, and one
+    // delete-then-insert per multi-vector document.
+    stats.vectors_reissued += reissue::reissue_vector_snapshots(
+        state,
+        tenant_id,
+        target,
+        vector_snapshots,
+        vector_multi_documents,
+        &surrogate_binds,
+    )
+    .await?;
+
+    // Array cell versions, in system-time order per array and vShard. Each
+    // array's catalog row was restored before any database re-issues.
+    stats.array_cells_reissued +=
+        super::super::array_reissue::reissue_array_cells(state, tenant_id, target, array_cells)
+            .await?;
 
     Ok(())
 }

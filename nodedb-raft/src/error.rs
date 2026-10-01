@@ -6,8 +6,11 @@ pub type Result<T> = std::result::Result<T, RaftError>;
 
 #[derive(Debug, Error)]
 pub enum RaftError {
-    #[error("not leader (leader hint: {leader_hint:?})")]
-    NotLeader { leader_hint: Option<u64> },
+    /// `leader_hint` is the leader this node knows at `term`, its current
+    /// term. A receiver keeps the hint only when `term` is above the term
+    /// of the hint it holds.
+    #[error("not leader (leader hint: {leader_hint:?} at term {term})")]
+    NotLeader { leader_hint: Option<u64>, term: u64 },
 
     #[error("log compacted: requested index {requested}, first available {first_available}")]
     LogCompacted {

@@ -44,14 +44,13 @@ use super::sync_dispatch::dispatch_authorized;
 /// request is ever admitted.
 ///
 /// The peer address lives on the `NotYetAdmitted` variant rather than beside
-/// it, because it is read on exactly that path and nowhere else. When it was a
-/// separate field, every `AlreadyAdmitted` caller had to supply an empty
-/// string it knew would never be read — a placeholder indistinguishable from a
-/// transport that simply forgot its address.
+/// it, because it is read on exactly that path and nowhere else. A separate
+/// field will force every `AlreadyAdmitted` caller to supply an empty
+/// string that is never read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequestAdmission<'a> {
     /// The caller's own transport entry already ran the full admission gate
-    /// for this request; running it again here would double-charge it.
+    /// for this request; running it again here will double-charge it.
     AlreadyAdmitted,
     /// Nothing upstream of this call has admitted the request yet — this is
     /// the one gate it passes through, against `peer_addr`: the caller's real
@@ -75,6 +74,9 @@ pub(crate) struct DispatchRequest<'a> {
     /// Whether this request still has to pass the admission gate, and — when
     /// it does — the real remote address it is admitted against.
     pub admission: RequestAdmission<'a>,
+    /// A read confirms its group on this node before it reads. Writes ignore
+    /// it: Raft orders them.
+    pub linearizable: bool,
 }
 
 /// Authorize `plan` for `identity`, apply row-level security, and dispatch it.
@@ -90,6 +92,7 @@ pub(crate) async fn dispatch_for_identity(req: DispatchRequest<'_>) -> crate::Re
         plan,
         timeout,
         admission,
+        linearizable,
     } = req;
     // Extracted before `plan` is moved into `authorize_for_identity` (which
     // consumes it for RLS injection and task construction) — metering needs
@@ -112,7 +115,7 @@ pub(crate) async fn dispatch_for_identity(req: DispatchRequest<'_>) -> crate::Re
             // caller cannot tell the two apart by error shape.
             CloneCheckedOutcome::Handled(response) => payload_or_typed_error(response),
             CloneCheckedOutcome::Proceed(checked) => {
-                dispatch_authorized(state, checked, collection, timeout).await
+                dispatch_authorized(state, checked, collection, timeout, linearizable).await
             }
         };
     if result.is_ok() {
@@ -126,11 +129,11 @@ pub(crate) async fn dispatch_for_identity(req: DispatchRequest<'_>) -> crate::Re
         // every other caller in this file, so it cannot disagree with it.
         //
         // `rows: None` — `dispatch_authorized` returns a raw MessagePack
-        // payload, and decoding it here solely to count rows would add real
+        // payload, and decoding it here solely to count rows will add real
         // per-request cost on this fan-in path for every one of the ~200
         // handlers that go through this door. `meter_dispatch` charges one
         // unit for `None`, which is correct for the lookup/mutation that
-        // just happened.
+        // happened.
         if let Some(info) = &plan_metering_info {
             let metering_scope = resolve_dispatch_scope(state, identity, database_id, admission);
             meter_dispatch(state, &metering_scope, info, None);
@@ -149,10 +152,9 @@ pub(crate) async fn dispatch_for_identity(req: DispatchRequest<'_>) -> crate::Re
 /// dispatch machinery.
 ///
 /// `database_id` flows through [`RequestAuthScope::builder`] as the session
-/// database rather than being used directly for `PhysicalTask::database_id`
-/// while `$auth.database_id` is resolved separately from `identity` — that
-/// split was the defect this function exists to close. `scope.database_id()`
-/// is what actually lands on the task, so the two provably cannot disagree.
+/// database, so `PhysicalTask::database_id` and `$auth.database_id` never
+/// resolve separately from `identity`. `scope.database_id()`
+/// is what lands on the task, so the two cannot disagree.
 ///
 /// The trailing step is [`intercept_and_authorize`], not a bare
 /// `authorize_task_set`: this door hands its task straight to
@@ -242,7 +244,7 @@ async fn authorize_for_identity(
 /// are live on this path too. An `AlreadyAdmitted` request was admitted at its
 /// own transport entry and reaches this fan-in door with no address in hand;
 /// its scope is resolved without one rather than against a placeholder that
-/// would be scored as if it were a real client.
+/// will be scored as if it were a real client.
 fn resolve_dispatch_scope<'a>(
     state: &'a SharedState,
     identity: &'a AuthenticatedIdentity,
@@ -283,16 +285,12 @@ mod tests {
         })
     }
 
-    /// The exact regression this module exists to prevent: an identity whose
-    /// session default database differs from the database the caller passed
-    /// in for this dispatch. Before the `RequestAuthScope` fix, the
-    /// `PhysicalTask` was built from the passed-in `database_id` while
-    /// `$auth.database_id` came from `build_auth_context(identity)`, which
-    /// stamps `identity.default_database` — so an RLS policy comparing
-    /// `database_id = $auth.database_id` would evaluate against the wrong
-    /// database. This test fails if `resolve_dispatch_scope` regresses to
-    /// resolving `$auth.database_id` from `identity.default_database`
-    /// instead of the passed-in `database_id`: it asserts both
+    /// An identity whose session default database differs from the database
+    /// the caller passed in for this dispatch. An RLS policy comparing
+    /// `database_id = $auth.database_id` must see the passed-in database.
+    /// This test fails if `resolve_dispatch_scope` resolves `$auth.database_id`
+    /// from `identity.default_database` instead of the passed-in
+    /// `database_id`. It asserts both
     /// `scope.database_id()` (what lands on the task) and
     /// `scope.auth().database_id` (what RLS substitutes for `$auth.*`)
     /// equal the passed-in database, not the identity's default.
@@ -339,7 +337,7 @@ mod tests {
     ///
     /// Neither database here names a clone, so the gate must hand back the
     /// capability rather than serving the request itself — asserted, because a
-    /// `Handled` outcome would carry no task for the database claim to be made
+    /// `Handled` outcome will carry no task for the database claim to be made
     /// about at all.
     #[tokio::test]
     async fn authorized_task_database_matches_passed_in_database_not_identity_default() {
@@ -385,20 +383,12 @@ mod tests {
         assert_eq!(checked.database_id(), dispatch_target);
     }
 
-    /// The regression this module exists to prevent going forward: a caller
-    /// that has already run the transport's own admission gate must not be
-    /// charged against the rate-limit budget a second time here. Two calls
-    /// with `AlreadyAdmitted` must both succeed with no consumed budget,
-    /// which `NotYetAdmitted` would eventually reject once the budget is
-    /// exhausted — this test only needs to prove `AlreadyAdmitted` never
-    /// touches the limiter at all, so a large repeat count would still pass
-    /// even if a future regression re-added the check, making a direct
-    /// "did it run" assertion the only way to catch a re-added call. Since
-    /// `check_request_admission` has no test-visible counter, this instead
+    /// A caller that already ran the transport's own admission gate is not
+    /// charged against the rate-limit budget a second time here.
+    /// `check_request_admission` has no test-visible counter, so this test
     /// pins the observable contract: `AlreadyAdmitted` runs no blacklist
-    /// check, so a blacklisted identity is still authorized when the caller
-    /// asserts it already admitted the request — the exact bypass a re-added
-    /// call would break.
+    /// check, so a blacklisted identity stays authorized when the caller
+    /// asserts it already admitted the request.
     #[tokio::test]
     async fn already_admitted_skips_the_gate_even_for_a_blacklisted_identity() {
         let dir = tempfile::tempdir().expect("create test directory");
@@ -441,7 +431,7 @@ mod tests {
 
         // `AlreadyAdmitted` skips it: the same blacklisted identity is
         // authorized, because the caller's own transport entry already
-        // admitted (or would have rejected) this request.
+        // admitted (or rejected) this request.
         let allowed = authorize_for_identity(
             &state,
             &identity,
@@ -545,6 +535,7 @@ mod tests {
             plan: trivial_kv_get_plan(),
             timeout: Duration::from_secs(5),
             admission: RequestAdmission::AlreadyAdmitted,
+            linearizable: false,
         })
         .await;
         responder.await.expect("responder completes");
@@ -582,6 +573,7 @@ mod tests {
             admission: RequestAdmission::NotYetAdmitted {
                 peer_addr: "127.0.0.1:9",
             },
+            linearizable: false,
         })
         .await;
 
@@ -590,7 +582,7 @@ mod tests {
     }
 
     /// An internal-service identity's dispatch succeeds but is never metered
-    /// — billing a tenant for server-owned work would be wrong.
+    /// — billing a tenant for server-owned work will be wrong.
     #[tokio::test]
     async fn internal_service_identity_records_nothing_on_success() {
         let (mut state, side, _dir) = metering_fixture();
@@ -614,6 +606,7 @@ mod tests {
             plan: trivial_kv_get_plan(),
             timeout: Duration::from_secs(5),
             admission: RequestAdmission::AlreadyAdmitted,
+            linearizable: false,
         })
         .await;
         responder.await.expect("responder completes");
@@ -643,6 +636,7 @@ mod tests {
             plan: trivial_kv_get_plan(),
             timeout: Duration::from_secs(5),
             admission: RequestAdmission::AlreadyAdmitted,
+            linearizable: false,
         })
         .await;
         responder.await.expect("responder completes");

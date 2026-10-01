@@ -7,19 +7,21 @@
 //! decide write-key-set membership. Mirrors `plan_vshard`: every op in the
 //! eight write-capable engines is matched explicitly `true`/`false` (no
 //! wildcard), so a new op variant is a compile error here. Text/Spatial/
-//! Query/Meta stay one blanket `false` arm each (`NotAWrite` in
-//! `plan_vshard`), still exhaustive over `PhysicalPlan`.
+//! Query stay one blanket `false` arm each (`NotAWrite` in `plan_vshard`),
+//! still exhaustive over `PhysicalPlan`. Meta is `false` except a RESTORE
+//! batch, which routes to the vShard it names.
 //!
 //! Does NOT delegate to `plan_is_write` (`Permission::Write`): several
 //! `Permission::Write` variants carry no vshard to lock in `plan_vshard`
 //! (index-metadata ops, cross-collection writes like `Merge`/`TransferItem`,
-//! Text/Spatial write ops, most `MetaOp` writes) and would misclassify as
+//! Text/Spatial write ops, most `MetaOp` writes) and will misclassify as
 //! Calvin writes, turning a routing gap into an aborted transaction.
 
 #![deny(clippy::wildcard_enum_match_arm)]
 
 use nodedb_physical::physical_plan::{
-    ArrayOp, ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, PhysicalPlan, TimeseriesOp, VectorOp,
+    ArrayOp, ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, MetaOp, PhysicalPlan, TimeseriesOp,
+    VectorOp,
 };
 
 fn document_is_write(op: &DocumentOp) -> bool {
@@ -42,7 +44,7 @@ fn document_is_write(op: &DocumentOp) -> bool {
         | DocumentOp::ApplyBalanceDelta { .. }
         // Mutates the rows its mutation list names, like any other write.
         | DocumentOp::ResolvedWrite { .. } => true,
-        // Read-only: reports what the wrapped write would apply, mutates nothing.
+        // Read-only: reports what the wrapped write will apply, mutates nothing.
         DocumentOp::ResolveWrite(_)
         | DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
@@ -68,7 +70,7 @@ fn document_is_write(op: &DocumentOp) -> bool {
 /// Both are real writes that must enter Calvin's write-key set — what they
 /// must NOT do is answer the client: a derived participant's response
 /// describes a row the statement never named, so shaping `CommandComplete`
-/// from it would report the wrong count. Named once here rather than as an
+/// from it will report the wrong count. Named once here rather than as an
 /// inline negation, after the balance write (modelled on the implicit graph
 /// edge) failed to inherit an ad hoc `!matches!` check and raced the source
 /// write to deposit the statement's response.
@@ -147,7 +149,7 @@ fn kv_is_write(op: &KvOp) -> bool {
         | KvOp::SortedIndexCount { .. }
         | KvOp::SortedIndexScore { .. }
         | KvOp::SortedIndexTxnRead { .. }
-        // Read-only: reports what a governed write would apply, mutates
+        // Read-only: reports what a governed write will apply, mutates
         // nothing, and is `NotAWrite` in `plan_vshard`.
         | KvOp::ResolveWrite(_)
         // `Permission::Write` but `NotAWrite` in `plan_vshard` — index
@@ -160,7 +162,7 @@ fn kv_is_write(op: &KvOp) -> bool {
         // (cross-collection write, no enforced co-location).
         | KvOp::TransferItem { .. }
         // `Permission::Write` but `Unroutable` in `plan_vshard` — its
-        // mutations may span two collections, so no single vshard to lock on.
+        // mutations can span two collections, so no single vshard to lock on.
         | KvOp::ResolvedWrite { .. } => false,
     }
 }
@@ -183,7 +185,7 @@ fn vector_is_write(op: &VectorOp) -> bool {
         | VectorOp::DirectUpdate { .. }
         // Mutates the rows its mutation list names, like any other write.
         | VectorOp::ResolvedDirectWrite { .. } => true,
-        // Read-only: reports what the wrapped write would apply, mutates nothing.
+        // Read-only: reports what the wrapped write will apply, mutates nothing.
         VectorOp::ResolveDirectWrite(_)
         | VectorOp::Search { .. }
         | VectorOp::MultiSearch { .. }
@@ -208,7 +210,12 @@ fn graph_is_write(op: &GraphOp) -> bool {
         | GraphOp::EdgeDelete { .. }
         | GraphOp::EdgeDeleteBatch { .. }
         | GraphOp::SetNodeLabels { .. }
-        | GraphOp::RemoveNodeLabels { .. } => true,
+        | GraphOp::RemoveNodeLabels { .. }
+        | GraphOp::TruncateEdges { .. } => true,
+        // A node delete's guards write nothing, but they take part in the
+        // delete's transaction on their vShards, so they route and sequence
+        // like writes.
+        GraphOp::NodeEdgeGuard { .. } | GraphOp::NodePresenceGuard { .. } => true,
         // The resolve pass writes nothing; the delete it decides is proposed
         // separately by the write-resolve orchestrator.
         GraphOp::ResolveEdgeDelete(_)
@@ -226,7 +233,8 @@ fn graph_is_write(op: &GraphOp) -> bool {
         | GraphOp::WccSuperstep(_)
         | GraphOp::TemporalNeighbors { .. }
         | GraphOp::TemporalAlgorithm { .. }
-        | GraphOp::Stats { .. } => false,
+        | GraphOp::Stats { .. }
+        | GraphOp::NodePresenceRead { .. } => false,
     }
 }
 
@@ -290,7 +298,7 @@ fn array_is_write(op: &ArrayOp) -> bool {
         ArrayOp::OpenArray { .. }
         | ArrayOp::Compact { .. }
         | ArrayOp::DropArray { .. }
-        | ArrayOp::RestoreArrayDrop { .. }
+        | ArrayOp::RekeyArray { .. }
         | ArrayOp::PurgeArrayDrop { .. }
         | ArrayOp::Slice { .. }
         | ArrayOp::Project { .. }
@@ -315,7 +323,10 @@ pub fn is_write_plan(plan: &PhysicalPlan) -> bool {
         PhysicalPlan::Columnar(op) => columnar_is_write(op),
         PhysicalPlan::Crdt(op) => crdt_is_write(op),
         PhysicalPlan::Array(op) => array_is_write(op),
-        // Reads, scans, queries, meta, spatial, text: none of these
+        // A RESTORE batch writes the rows and edges it names, on the vShard
+        // it names.
+        PhysicalPlan::Meta(MetaOp::RestoreRedo(_)) => true,
+        // Reads, scans, queries, other meta, spatial, text: none of these
         // families carry a Calvin-lockable write in `plan_vshard`.
         PhysicalPlan::Spatial(_)
         | PhysicalPlan::Text(_)
@@ -353,7 +364,7 @@ mod tests {
             delta: Vec::new(),
             peer_id: 0,
             mutation_id: 0,
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
             provenance: None,
             constraint_version_required: 0,
             expected_frontier_digest: None,
@@ -672,7 +683,7 @@ mod tests {
     /// is.
     ///
     /// Both are appended by the Control Plane alongside a statement they do not
-    /// appear in, and neither may own that statement's applied response: the
+    /// appear in, and neither can own that statement's applied response: the
     /// `CommandComplete` tag is shaped from ONE deposited response, so a derived
     /// participant winning the deposit hands the user's `INSERT` a count that
     /// belongs to a row the statement never named.
@@ -682,7 +693,7 @@ mod tests {
     }
 
     /// The user's own write is not, so it remains the participant that deposits.
-    /// Without this the fix would leave every cross-shard statement with no applied
+    /// Without a depositing participant, a cross-shard statement has no applied
     /// response at all.
     #[test]
     fn the_users_own_write_is_not_a_derived_side_effect() {

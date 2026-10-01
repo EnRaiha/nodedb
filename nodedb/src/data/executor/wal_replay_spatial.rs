@@ -53,21 +53,27 @@ impl CoreLoop {
     /// In the install pass of a committed-redo apply, record the undo of one
     /// spatial write before it runs: the row's pre-image and the sync
     /// high-water mark. Returns `false` when the pre-image cannot be read;
-    /// the error is kept on the apply and the write is skipped.
+    /// the error is kept on the apply and the write is skipped. A delete of a
+    /// key its home never bound (`None`) has no row pre-image: only the high-
+    /// water mark is recorded.
     fn record_spatial_row_undo(
         &mut self,
         database_id: DatabaseId,
         tenant_id: u64,
         (collection, field): (&str, &str),
-        surrogate: Surrogate,
+        surrogate: Option<Surrogate>,
         provenance: &nodedb_types::sync::wire::SyncProvenance,
     ) -> bool {
         if !self.recording_redo_undo() {
             return true;
         }
-        let captured = self
-            .capture_spatial_row_undo(database_id, tenant_id, collection, field, surrogate)
-            .map(|row| std::iter::once(row).chain(self.capture_sync_hwm_undo(Some(provenance))));
+        let hwm = self.capture_sync_hwm_undo(Some(provenance));
+        let captured = match surrogate {
+            Some(surrogate) => self
+                .capture_spatial_row_undo(database_id, tenant_id, collection, field, surrogate)
+                .map(|row| std::iter::once(row).chain(hwm).collect::<Vec<_>>()),
+            None => Ok(hwm.into_iter().collect()),
+        };
         self.record_redo_capture(captured)
     }
 
@@ -98,6 +104,7 @@ impl CoreLoop {
                 txn_id: None,
                 wal_lsn: None,
                 resolved_now_ms: None,
+                commit_hlc: None,
                 admission: crate::bridge::envelope::Admission::Exempt(
                     crate::bridge::envelope::ExemptReason::AlreadyOrdered,
                 ),
@@ -126,6 +133,9 @@ impl CoreLoop {
         let mut skipped = 0usize;
 
         for record in records {
+            if self.replay_halted() {
+                break;
+            }
             let logical_type = record.logical_record_type();
             let record_type = RecordType::from_raw(logical_type);
 
@@ -219,7 +229,7 @@ impl CoreLoop {
                     database_id,
                     tenant_id,
                     (&payload.collection, &payload.field),
-                    surrogate,
+                    Some(surrogate),
                     &prov,
                 ) {
                     skipped += 1;
@@ -297,21 +307,24 @@ impl CoreLoop {
                     continue;
                 }
 
-                let surrogate = match u32::from_str_radix(&payload.doc_id, 16) {
-                    Ok(raw) => Surrogate::new(raw),
-                    Err(e) => {
-                        self.replay_record_unapplied(
-                            "spatial",
-                            "doc_id",
-                            record_lsn,
-                            &format!(
-                                "doc_id '{}' is not the hex surrogate the insert path writes: {e}",
-                                payload.doc_id
-                            ),
-                        );
-                        skipped += 1;
-                        continue;
-                    }
+                // An absent id is a delete of a key its home never bound.
+                let surrogate = match payload.doc_id.as_deref() {
+                    None => None,
+                    Some(doc_id) => match u32::from_str_radix(doc_id, 16) {
+                        Ok(raw) => Some(Surrogate::new(raw)),
+                        Err(e) => {
+                            self.replay_record_unapplied(
+                                "spatial",
+                                "doc_id",
+                                record_lsn,
+                                &format!(
+                                    "doc_id '{doc_id}' is not the hex surrogate the delete path writes: {e}"
+                                ),
+                            );
+                            skipped += 1;
+                            continue;
+                        }
+                    },
                 };
 
                 let prov = payload.provenance.clone();
@@ -484,7 +497,7 @@ mod tests {
             SyncProvenance::default(),
             COLLECTION,
             FIELD,
-            storage_key().to_string(),
+            Some(storage_key().to_string()),
         )
         .to_bytes()
         .expect("encode SpatialDeletePayload");

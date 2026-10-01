@@ -60,26 +60,23 @@ impl CollectionToDatabase {
             .remove(&(tenant_id, Arc::from(collection)));
     }
 
-    /// Populate the cache from the catalog at startup.
-    ///
-    /// Iterates over all databases and their collections, building the reverse
-    /// map. Called once after catalog loading completes.
+    /// Replace the cache with the reverse map of every database's
+    /// collections in the catalog.
     pub fn load_from_catalog(
         &self,
         catalog: &crate::control::security::catalog::SystemCatalog,
     ) -> crate::Result<()> {
-        let databases = catalog.list_databases()?;
-        let mut map = self.inner.write().unwrap_or_else(|p| p.into_inner());
-        for descriptor in databases {
-            let collections = catalog.load_all_collections(descriptor.id)?;
-            for collection in collections {
+        let mut fresh = HashMap::new();
+        for descriptor in catalog.list_databases()? {
+            for collection in catalog.load_all_collections(descriptor.id)? {
                 let tenant_id = TenantId::new(collection.tenant_id);
-                map.insert(
+                fresh.insert(
                     (tenant_id, Arc::from(collection.name.as_str())),
                     descriptor.id,
                 );
             }
         }
+        *self.inner.write().unwrap_or_else(|p| p.into_inner()) = fresh;
         Ok(())
     }
 }

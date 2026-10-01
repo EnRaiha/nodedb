@@ -11,14 +11,13 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
-use super::super::super::catalog::propose_and_apply;
+use super::super::super::catalog::propose_and_apply_async;
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::{require_tenant_admin, status};
 use super::create::emit_trigger_put;
 
 /// Existence check used by the `DROP TRIGGER IF EXISTS` guard in the neutral
-/// router. Mirrors the pgwire `exists::trigger_exists` helper: `false` when the
-/// catalog is unavailable or the read errors.
+/// router. Returns `false` when the catalog is unavailable or the read errors.
 pub fn trigger_exists(state: &SharedState, identity: &AuthenticatedIdentity, name: &str) -> bool {
     let catalog = state.credentials.catalog();
     let tenant_id = identity.tenant_id.as_u64();
@@ -32,7 +31,7 @@ pub fn trigger_exists(state: &SharedState, identity: &AuthenticatedIdentity, nam
 }
 
 /// Handle `DROP TRIGGER [IF EXISTS] <name>`
-pub fn drop_trigger(
+pub async fn drop_trigger(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -71,15 +70,7 @@ pub fn drop_trigger(
         target_descriptor_version: 0,
         target_hlc: nodedb_types::Hlc::ZERO,
     };
-    let outcome = propose_and_apply(state, &entry)?;
-    if outcome.needs_local_apply() {
-        crate::control::catalog_entry::post_apply::trigger::delete(
-            database_id,
-            tenant_id,
-            name.clone(),
-            state,
-        );
-    }
+    propose_and_apply_async(state, &entry).await?;
 
     // Broadcast deletion to connected Lite sessions.
     {
@@ -109,7 +100,7 @@ pub fn drop_trigger(
 ///
 /// `name` and `action` come from the typed `AutomationStmt::AlterTrigger`
 /// variant. `new_owner` is `Some` when `action == "OWNER"`.
-pub fn alter_trigger(
+pub async fn alter_trigger(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
@@ -119,7 +110,7 @@ pub fn alter_trigger(
     require_tenant_admin(identity, "alter triggers")?;
 
     if action == "OWNER" {
-        return alter_trigger_owner(state, identity, name, new_owner);
+        return alter_trigger_owner(state, identity, name, new_owner).await;
     }
 
     let enabled = match action {
@@ -146,10 +137,7 @@ pub fn alter_trigger(
 
     trigger.enabled = enabled;
     let entry = crate::control::catalog_entry::CatalogEntry::PutTrigger(Box::new(trigger.clone()));
-    let outcome = propose_and_apply(state, &entry)?;
-    if outcome.needs_local_apply() {
-        crate::control::catalog_entry::post_apply::trigger::put(trigger.clone(), state);
-    }
+    propose_and_apply_async(state, &entry).await?;
     emit_trigger_put(state, &trigger);
 
     state.audit_record(
@@ -163,7 +151,7 @@ pub fn alter_trigger(
 }
 
 /// Handle `ALTER TRIGGER <name> OWNER TO <new_owner>`
-fn alter_trigger_owner(
+async fn alter_trigger_owner(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
@@ -197,10 +185,7 @@ fn alter_trigger_owner(
     let old_owner = trigger.owner.clone();
     trigger.owner = new_owner.clone();
     let entry = crate::control::catalog_entry::CatalogEntry::PutTrigger(Box::new(trigger.clone()));
-    let outcome = propose_and_apply(state, &entry)?;
-    if outcome.needs_local_apply() {
-        crate::control::catalog_entry::post_apply::trigger::put(trigger.clone(), state);
-    }
+    propose_and_apply_async(state, &entry).await?;
     emit_trigger_put(state, &trigger);
 
     state.audit_record(

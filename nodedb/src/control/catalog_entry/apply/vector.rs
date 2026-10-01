@@ -5,7 +5,7 @@
 //!
 //! Writes only. The leader resolves the duplicate index, the missing
 //! collection, and every build-parameter rule before proposing, so apply runs
-//! the unvalidated catalog path: a rejection here would diverge a follower
+//! the unvalidated catalog path: a rejection here diverges a follower
 //! from a statement the leader already accepted.
 //!
 //! Both tables describe the same object — a collection's embedding column and

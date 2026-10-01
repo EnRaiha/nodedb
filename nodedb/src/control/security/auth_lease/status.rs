@@ -91,7 +91,10 @@ pub async fn await_planning_admitted(
     while !lease_status(state, Instant::now()).admits_planning() {
         if Instant::now() >= deadline {
             return Err(crate::Error::AuthorizationStateBehind {
-                detail: format!("no authorization lease was granted within {timeout:?}"),
+                detail: format!(
+                    "no authorization lease was granted within {timeout:?}; last renewal: {}",
+                    state.authorization_fence.holder().last_attempt()
+                ),
             });
         }
         tokio::time::sleep(poll).await;

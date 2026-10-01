@@ -95,7 +95,7 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
             ctx.set_post_filters(collection, rls_filters)
         }
 
-        // Admit every entry: a silently dropped row would report a write
+        // Admit every entry: a silently dropped row will report a write
         // that never happened.
         KvOp::BatchPut {
             collection,
@@ -232,7 +232,7 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
         KvOp::ResolveWrite(inner) => inject_kv(ctx, inner),
 
         // No-op: already decided before this write was proposed;
-        // re-injecting would replace a verdict with an unevaluable predicate.
+        // re-injecting will replace a verdict with an unevaluable predicate.
         KvOp::ResolvedWrite { .. } => Ok(()),
 
         // No-op: index DDL writes no user row, so no row policy restricts it.
@@ -278,7 +278,7 @@ mod tests {
             key: b"k1".to_vec(),
             value: body(owner_id),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -339,7 +339,7 @@ mod tests {
     }
 
     /// A single-column `value` write stores one opaque scalar: it carries no
-    /// field the predicate could name, so it fails closed rather than being
+    /// field the predicate can name, so it fails closed rather than being
     /// waved through as "not a document".
     #[test]
     fn an_opaque_scalar_value_is_rejected_under_a_write_policy() {
@@ -352,7 +352,7 @@ mod tests {
             key: b"k1".to_vec(),
             value: b"v1".to_vec(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -364,7 +364,7 @@ mod tests {
     }
 
     /// A `RETURNING` on a KV write ships rows back, so a read-only policy must
-    /// land in the write's post-filter slot. Leaving it empty would return rows
+    /// land in the write's post-filter slot. Leaving it empty will return rows
     /// the same principal's `SELECT` hides.
     #[test]
     fn a_kv_write_receives_the_read_policy_filter() {
@@ -443,7 +443,7 @@ mod tests {
             ),
             key: b"k1".to_vec(),
             updates: Vec::new(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             if_present: false,
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             returning: None,
@@ -475,7 +475,7 @@ mod tests {
                 collection: collection(),
                 key: b"k1".to_vec(),
                 updates: Vec::new(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new(1),
                 if_present: false,
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 returning: None,
@@ -528,7 +528,7 @@ mod tests {
             key: b"k1".to_vec(),
             delta: 1,
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             shape: nodedb_physical::physical_plan::KvCounterShape::Raw,
         });
@@ -557,7 +557,7 @@ mod tests {
             ),
             key: b"k1".to_vec(),
             new_value: body("42"),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             rls_filters: Vec::new(),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });
@@ -597,7 +597,7 @@ mod tests {
             ),
             item_key: b"i1".to_vec(),
             dest_key: b"d1".to_vec(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             source_rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             dest_rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });
@@ -622,7 +622,7 @@ mod tests {
     }
 
     /// A truncate removes every row without reading one, so there is no image
-    /// the policy could decide.
+    /// the policy can decide.
     #[test]
     fn truncate_is_refused_under_a_write_policy() {
         let store = store_with_write_policy("sessions");
@@ -682,7 +682,7 @@ mod tests {
 
     /// A sorted-index read names no collection, so a read policy anywhere in
     /// the tenant refuses it: its ranked keys come from stored rows and carry
-    /// no filter slot the policy could be applied through.
+    /// no filter slot the policy can be applied through.
     #[test]
     fn sorted_index_read_is_refused_under_a_read_policy() {
         let store = store_with_read_policy("scores");

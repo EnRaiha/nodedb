@@ -3,8 +3,8 @@
 //! `SqlPlan::AlterArray` → `PhysicalTask` lowering.
 //!
 //! Conversion only reads the current catalog entry and validates the requested
-//! change. The authorized dispatch boundary persists the new entry and updates
-//! the runtime retention mirror immediately around execution.
+//! change. The front door proposes the updated entry as a replicated
+//! `PutArray` (`array_catalog::ddl`).
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::array_catalog::ArrayCatalogEntry;
@@ -65,20 +65,6 @@ pub(super) fn convert_alter_array(
             detail: format!("ALTER ARRAY {name}: {e}"),
         })?;
     }
-
-    let updated = ArrayCatalogEntry {
-        audit_retain_ms: new_retain,
-        minimum_audit_retain_ms: if minimum_audit_retain_ms.is_some() {
-            Some(new_min)
-        } else {
-            current.minimum_audit_retain_ms
-        },
-        ..current.clone()
-    };
-
-    // `updated` is intentionally not installed here. It is reconstructed and
-    // durably installed by the authorized dispatch boundary.
-    let _updated = updated;
 
     let vshard = ctx.collection_key(name).vshard();
     Ok(vec![PhysicalTask {

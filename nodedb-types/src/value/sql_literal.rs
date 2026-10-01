@@ -20,7 +20,7 @@ impl Value {
             | Value::Uuid(value)
             | Value::Ulid(value)
             | Value::Regex(value) => quote_literal(value),
-            Value::Bytes(value) => quote_literal(&format!("\\x{}", hex_encode(value))),
+            Value::Bytes(value) => quote_literal(&format!("\\x{}", hex::encode(value))),
             Value::Array(values) | Value::Set(values) => array_literal(values),
             Value::Object(values) => object_literal(values),
             Value::DateTime(value) | Value::NaiveDateTime(value) => {
@@ -75,16 +75,6 @@ fn finite_float_literal(value: f64) -> String {
     } else {
         quote_literal(&value.to_string())
     }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
 }
 
 fn array_literal(values: &[Value]) -> String {

@@ -9,12 +9,9 @@
 //! `PutCollection` entry, replicate it through the metadata raft group,
 //! refresh the Data Plane register, and bump the schema version.
 //!
-//! Ported verbatim from the pgwire
-//! `ddl::collection::alter::strict_schema` module; only the result type
-//! changed from pgwire `PgWireResult` / `sqlstate_error` to the
-//! protocol-neutral [`DdlError`]. The catalog lookup, engine gate, schema
-//! (de)serialization, propose + register + version-bump ordering, and the
-//! SQLSTATE codes / messages are unchanged.
+//! The error type is the protocol-neutral [`DdlError`]. The catalog lookup,
+//! engine gate, schema (de)serialization, propose + register + version-bump
+//! ordering, and the SQLSTATE codes / messages run here.
 
 use nodedb_types::DatabaseId;
 
@@ -73,8 +70,8 @@ pub(super) fn write_schema_back(
 /// spelling drives the column's advertised wire OID and the range accepted on
 /// write, which is exactly why `ALTER COLUMN TYPE` — whose only supported use
 /// *is* an alias change such as `INT` → `BIGINT` — has to update it. Leaving
-/// it stale would make the alter a silent no-op for the case it exists to
-/// serve, and would keep rejecting writes the new type allows.
+/// it stale will make the alter a silent no-op for the case it exists to
+/// serve, and will keep rejecting writes the new type allows.
 pub(super) fn retype_field(coll: &mut StoredCollection, column: &str, new_type: &str) {
     for (name, type_str) in coll.fields.iter_mut() {
         if name.eq_ignore_ascii_case(column) {
@@ -106,19 +103,20 @@ pub(super) fn add_field(coll: &mut StoredCollection, column: &str, declared_type
         .push((column.to_string(), declared_type.to_string()));
 }
 
-/// Replicate the mutated collection through the metadata raft group,
-/// refresh this node's Data Plane register so the in-memory shape
-/// catches up with the new schema, recompile the collection's RLS
-/// policies against it, then bump `schema_version`.
+/// Replicate the mutated collection through the metadata raft group, and
+/// register the new schema on this node's Data Plane. A durable apply
+/// registers it in its post-apply, and a buffered one registers it here.
+/// Then recompile the collection's RLS policies against it and bump
+/// `schema_version`.
 pub(super) async fn persist_schema_change(
     state: &SharedState,
     updated: &StoredCollection,
 ) -> Result<(), DdlError> {
     let entry =
         crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(updated.clone()));
-    super::support::propose_and_apply(state, &entry)?;
+    let outcome = super::support::propose_and_apply_async(state, entry).await?;
 
-    super::super::register::dispatch_register_from_stored(state, updated)
+    super::super::register::register_proposed_collection(state, outcome, updated)
         .await
         .map_err(|e| DdlError::from_error(&e))?;
     recompile_rls_policies(state, updated)?;

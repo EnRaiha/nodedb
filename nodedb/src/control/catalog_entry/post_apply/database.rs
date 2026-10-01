@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Synchronous post-apply side effects for database catalog entries.
+//! Post-apply side effects for database catalog entries.
 //!
 //! Database descriptors and grants are read directly from redb on the hot
 //! path (no separate in-memory registry), so most arms are no-ops. The
-//! `DeleteDatabase` arm releases the dropped scope's quota caps on every node.
+//! synchronous `DeleteDatabase` arm releases the dropped scope's quota caps.
 
 use std::sync::Arc;
 
@@ -16,8 +16,8 @@ use crate::control::state::SharedState;
 /// Post-apply for `PutDatabase` — no in-memory cache to update.
 pub fn put(_descriptor: DatabaseDescriptor, _shared: Arc<SharedState>) {}
 
-/// Post-apply for `DeleteDatabase` — release the quota caps of the dropped
-/// scope, its tenants' caps included.
+/// Synchronous post-apply for `DeleteDatabase` — release the quota caps of
+/// the dropped scope, its tenants' caps included.
 pub fn delete(db_id: u64, shared: Arc<SharedState>) {
     super::quota::release_database_scope(DatabaseId::new(db_id), &shared);
 }

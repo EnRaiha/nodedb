@@ -24,6 +24,9 @@ pub struct SequenceHandle {
 
 impl SequenceHandle {
     /// Create a new handle from a sequence definition and optional persisted state.
+    ///
+    /// A called state holds the last value `nextval` returned. An uncalled
+    /// state holds the value the next `nextval` returns, as `RESTART` sets it.
     pub fn new(
         def: crate::control::security::catalog::sequence_types::StoredSequence,
         state: Option<crate::control::security::catalog::sequence_types::SequenceState>,
@@ -32,7 +35,11 @@ impl SequenceHandle {
             if s.is_called {
                 (s.current_value, true, s.period_key)
             } else {
-                (def.start_value - def.increment, false, s.period_key)
+                (
+                    s.current_value.saturating_sub(def.increment),
+                    false,
+                    s.period_key,
+                )
             }
         } else {
             (def.start_value - def.increment, false, String::new())
@@ -243,6 +250,17 @@ impl SequenceHandle {
         self.counter.load(Ordering::Relaxed)
     }
 
+    /// The value a persisted state stores: the last value returned once
+    /// called, else the value the next `nextval` returns.
+    pub fn persisted_value(&self) -> i64 {
+        let counter = self.current_value();
+        if self.is_called() {
+            counter
+        } else {
+            counter.saturating_add(self.def.increment)
+        }
+    }
+
     /// Whether nextval has been called.
     pub fn is_called(&self) -> bool {
         self.called.load(Ordering::Relaxed)
@@ -348,6 +366,25 @@ mod tests {
         assert_eq!(h.nextval().unwrap(), 1);
         assert_eq!(h.nextval().unwrap(), 2);
         assert_eq!(h.nextval().unwrap(), 3);
+    }
+
+    #[test]
+    fn restarted_state_survives_a_reload() {
+        use crate::control::security::catalog::sequence_types::SequenceState;
+        let mut def = StoredSequence::new(4, 1, "test".into(), "admin".into());
+        def.increment = 5;
+        let restarted = SequenceState::new(4, 1, "test".into(), 100, def.epoch);
+        let h = SequenceHandle::new(def.clone(), Some(restarted));
+        assert_eq!(h.persisted_value(), 100);
+        assert_eq!(h.nextval().unwrap(), 100);
+
+        let persisted = SequenceState {
+            current_value: h.persisted_value(),
+            is_called: h.is_called(),
+            ..SequenceState::new(4, 1, "test".into(), 0, def.epoch)
+        };
+        let reloaded = SequenceHandle::new(def, Some(persisted));
+        assert_eq!(reloaded.nextval().unwrap(), 105);
     }
 
     #[test]

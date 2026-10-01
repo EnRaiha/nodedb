@@ -22,7 +22,7 @@ fn vector_insert_and_search() {
                 vector: vec![i as f32, 0.0, 0.0],
                 dim: 3,
                 field_name: String::new(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new(i + 1),
                 pk_bytes: None,
                 provenance: None,
             }),

@@ -61,10 +61,9 @@ impl TestClusterNode {
         // directory.
         let _ = self.shared.wal.sync();
 
-        // Abort+await the lease-renewal loop so its `Arc<SharedState>` clone
-        // releases before we return. Previously this `JoinHandle` was bound
-        // to a local and dropped (detached, not cancelled) when
-        // `spawn_with_full_config_at` returned.
+        // Abort and await the lease-renewal loop, so its `Arc<SharedState>`
+        // clone drops before this function returns. A dropped `JoinHandle`
+        // detaches its task and never cancels it, so the node keeps this one.
         if let Some(h) = self._lease_renewal_handle.take() {
             h.abort();
             let _ = h.await;
@@ -150,29 +149,28 @@ impl TestClusterNode {
             );
         }
 
-        // `start_raft` fans out to background tasks (raft apply loop, tick
-        // loop, sequencer service, RPC server, health monitor, per-vShard
-        // Calvin schedulers, reconcile loop) that each hold an
-        // `Arc<SharedState>` clone. They are fire-and-forget inside production
-        // code — the harness has no `JoinHandle` to await — but they were all
-        // signaled to stop via `cluster_shutdown_tx.send(true)` at the top of
-        // this function and exit asynchronously after their next `.await`.
-        // Until every one of them drops its clone, the catalog redb `Database`
-        // (owned transitively by `SharedState`) stays open and the next
-        // `spawn_single_node_calvin_on_path` on this directory fails with
-        // "Database already open. Cannot acquire lock." Condition-wait (NOT a
-        // fixed sleep) for the strong count to fall to 1 — meaning `self.shared`
-        // is the last surviving clone — so `self` dropping below actually
-        // releases every redb file lock.
+        // `start_raft` spawns tasks the harness holds no `JoinHandle` for:
+        // the raft apply and tick loops, the sequencer service, the RPC
+        // server, the health monitor, and the per-vShard Calvin schedulers.
+        // Each holds an `Arc<SharedState>` clone and exits after the shutdown
+        // signal sent above. `SharedState` owns the catalog redb and the QUIC
+        // endpoint, so both stay open until its last clone drops. Wait for
+        // `self.shared` to be the only clone, then drop it with `self`.
+        //
+        // A clone that survives the wait is a leak: a task that ignores
+        // shutdown, or a reference cycle through `SharedState`. The node
+        // fails here, at the leak, never later as a locked catalog or a
+        // bound port on the next open.
         let poll_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while std::sync::Arc::strong_count(&self.shared) > 1 {
             if tokio::time::Instant::now() >= poll_deadline {
-                eprintln!(
-                    "graceful_shutdown_wal_only: SharedState still has {} strong refs after 5s \
-                     — a background task did not release its clone",
+                panic!(
+                    "graceful_shutdown_wal_only: node {} SharedState still has {} strong refs \
+                     5s after shutdown, where 1 is expected: a task or a reference cycle still \
+                     holds SharedState, which keeps its redb files and QUIC endpoint open",
+                    self.node_id,
                     std::sync::Arc::strong_count(&self.shared)
                 );
-                break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

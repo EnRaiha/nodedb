@@ -27,7 +27,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | DocumentOp::IndexedFetch { .. }
             | DocumentOp::EstimateCount { .. }
             | DocumentOp::MaterializeScan { .. }
-            // Read-only: reports what the wrapped write would apply; that write is authorized separately.
+            // Read-only: reports what the wrapped write applies; that write is authorized separately.
             | DocumentOp::ResolveWrite(_),
         ) => Permission::Read,
 
@@ -37,7 +37,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | VectorOp::QueryStats { .. }
             | VectorOp::SparseSearch { .. }
             | VectorOp::MultiVectorScoreSearch { .. }
-            // Read-only: reports what the wrapped write would apply; that write is authorized separately.
+            // Read-only: reports what the wrapped write applies; that write is authorized separately.
             | VectorOp::ResolveDirectWrite(_),
         ) => Permission::Read,
 
@@ -51,7 +51,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
         ) => Permission::Read,
 
         PhysicalPlan::Graph(
-            // Read-only: decides what a governed delete would do; that delete is authorized separately.
+            // Read-only: decides what a governed delete does; that delete is authorized separately.
             GraphOp::ResolveEdgeDelete(_)
             | GraphOp::Hop { .. }
             | GraphOp::Neighbors { .. }
@@ -67,7 +67,10 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | GraphOp::TemporalAlgorithm { .. }
             | GraphOp::BspSuperstep(_)
             | GraphOp::WccSuperstep(_)
-            | GraphOp::Stats { .. },
+            | GraphOp::Stats { .. }
+            // Never client-issued: a CRDT delete's planner reads which ids
+            // are stored before it builds the delete's presence guard.
+            | GraphOp::NodePresenceRead { .. },
         ) => Permission::Read,
 
         PhysicalPlan::Query(
@@ -125,7 +128,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             Permission::Read
         }
 
-        // Read-only: reports what a governed ingest would store; that ingest is authorized separately.
+        // Read-only: reports what a governed ingest stores; that ingest is authorized separately.
         PhysicalPlan::Timeseries(TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_)) => {
             Permission::Read
         }
@@ -189,7 +192,13 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | GraphOp::EdgeDelete { .. }
             | GraphOp::EdgeDeleteBatch { .. }
             | GraphOp::SetNodeLabels { .. }
-            | GraphOp::RemoveNodeLabels { .. },
+            | GraphOp::RemoveNodeLabels { .. }
+            // Never client-issued: the planner derives these from a
+            // document delete or TRUNCATE after that statement is
+            // authorized.
+            | GraphOp::NodeEdgeGuard { .. }
+            | GraphOp::NodePresenceGuard { .. }
+            | GraphOp::TruncateEdges { .. },
         ) => Permission::Write,
 
         PhysicalPlan::Meta(MetaOp::WalAppend { .. }) => Permission::Write,
@@ -257,7 +266,6 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | MetaOp::QueryCollectionSize { .. }
             | MetaOp::AlterArray { .. }
             | MetaOp::RebuildIndex { .. }
-            | MetaOp::RenameCollection { .. }
             | MetaOp::DropTxnOverlay { .. },
         ) => Permission::Admin,
 
@@ -275,6 +283,9 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
         // Installs a committed transaction's post-images into base state.
         PhysicalPlan::Meta(MetaOp::ApplyTransactionRedo { .. }) => Permission::Write,
 
+        // Installs a RESTORE's rows and edge versions into base state.
+        PhysicalPlan::Meta(MetaOp::RestoreRedo(_)) => Permission::Write,
+
         // KV engine: read operations.
         PhysicalPlan::Kv(
             KvOp::Get { .. }
@@ -289,7 +300,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | KvOp::SortedIndexCount { .. }
             | KvOp::SortedIndexScore { .. }
             | KvOp::SortedIndexTxnRead { .. }
-            // Read-only: reports what a governed write would apply; that write is authorized separately.
+            // Read-only: reports what a governed write applies; that write is authorized separately.
             | KvOp::ResolveWrite(_),
         ) => Permission::Read,
 
@@ -342,6 +353,13 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             Permission::Read
         }
 
+        // Hash-chain verification reads every stored row of one collection.
+        PhysicalPlan::Meta(MetaOp::VerifyHashChain { .. }) => Permission::Read,
+
+        // A home version check reads the versions a transaction's own reads
+        // observed, and no row.
+        PhysicalPlan::Meta(MetaOp::HomeVersions { .. }) => Permission::Read,
+
         // Array engine: query ops are reads, put/delete are writes, OpenArray is DDL, flush/compact are admin.
         PhysicalPlan::Array(
             ArrayOp::Slice { .. }
@@ -356,7 +374,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             ArrayOp::Flush { .. }
             | ArrayOp::Compact { .. }
             | ArrayOp::DropArray { .. }
-            | ArrayOp::RestoreArrayDrop { .. }
+            | ArrayOp::RekeyArray { .. }
             | ArrayOp::PurgeArrayDrop { .. },
         ) => Permission::Admin,
 

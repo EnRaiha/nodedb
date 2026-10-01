@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! SET / SHOW / RESET (SQL form) and EXPLAIN handling for the native SQL
-//! dispatch path. Split out of `sql.rs` to keep that file under the
-//! file-size limit; behavior is unchanged.
+//! dispatch path.
 
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 use nodedb_types::protocol::NativeResponse;
@@ -101,13 +100,12 @@ pub(super) async fn handle_explain(ctx: &DispatchCtx<'_>, seq: u64, sql: &str) -
         };
     }
 
-    let perm_cache =
-        match crate::control::security::auth_fence::permission_view(ctx.state, ctx.tenant_id())
+    if let Err(e) =
+        crate::control::security::auth_fence::admit_permission_view(ctx.state, ctx.tenant_id())
             .await
-        {
-            Ok(view) => view,
-            Err(e) => return error_to_native(seq, &e),
-        };
+    {
+        return error_to_native(seq, &e);
+    }
     let sec = crate::control::planner::context::PlanSecurityContext {
         identity: ctx.identity,
         auth: ctx.auth_context(),
@@ -115,7 +113,9 @@ pub(super) async fn handle_explain(ctx: &DispatchCtx<'_>, seq: u64, sql: &str) -
         redaction_store: &ctx.state.redaction,
         permissions: &ctx.state.permissions,
         roles: &ctx.state.roles,
-        permission_cache: Some(&*perm_cache),
+        permission_tree: crate::control::planner::context::PermissionTreeSource::Live(
+            &ctx.state.permission_cache,
+        ),
     };
     let database_id = ctx.database_id();
     match ctx
@@ -129,7 +129,6 @@ pub(super) async fn handle_explain(ctx: &DispatchCtx<'_>, seq: u64, sql: &str) -
         .await
     {
         Ok((tasks, _output_schema)) => {
-            drop(perm_cache);
             // EXPLAIN is metadata-only. Authorize the original plan to protect
             // metadata, but never materialize implicit edges while describing it.
             let emitter = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(

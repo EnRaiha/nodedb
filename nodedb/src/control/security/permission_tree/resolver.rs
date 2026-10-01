@@ -8,6 +8,7 @@
 //! grant, access is denied (returns the lowest level, typically "none").
 
 use super::cache::PermissionCache;
+use super::scope::TreeScope;
 use super::types::PermissionTreeDef;
 
 /// Resolve the effective permission level for a user on a resource.
@@ -19,7 +20,7 @@ use super::types::PermissionTreeDef;
 /// # Arguments
 /// * `cache` — In-memory permission cache (read-only reference).
 /// * `def` — Permission tree definition for the collection.
-/// * `tenant_id` — Tenant isolation scope.
+/// * `scope` — The database and tenant the tree lives in.
 /// * `user_id` — The user to check.
 /// * `user_roles` — Roles the user belongs to (also checked as grantees).
 /// * `resource_id` — The resource to check access on.
@@ -29,7 +30,7 @@ use super::types::PermissionTreeDef;
 pub fn resolve_permission(
     cache: &PermissionCache,
     def: &PermissionTreeDef,
-    tenant_id: u64,
+    scope: TreeScope,
     user_id: &str,
     user_roles: &[String],
     resource_id: &str,
@@ -46,19 +47,19 @@ pub fn resolve_permission(
 
     for _ in 0..max_depth {
         // Check for explicit grant at this node for the user.
-        if let Some((level, _inherited)) = cache.get_grant(tenant_id, &current, user_id) {
+        if let Some((level, _inherited)) = cache.get_grant(scope, &current, user_id) {
             return level.to_owned();
         }
 
         // Check for grants via roles.
         for role in user_roles {
-            if let Some((level, _inherited)) = cache.get_grant(tenant_id, &current, role) {
+            if let Some((level, _inherited)) = cache.get_grant(scope, &current, role) {
                 return level.to_owned();
             }
         }
 
         // Walk to parent.
-        match cache.get_parent(tenant_id, &current) {
+        match cache.get_parent(scope, &current) {
             Some(parent) => current = parent.to_owned(),
             None => break, // Reached root.
         }
@@ -69,7 +70,7 @@ pub fn resolve_permission(
 
 /// Find all resource IDs that a user can access at or above a required level.
 ///
-/// Iterates all known resources for the tenant and resolves each one.
+/// Iterates all known resources of the scope and resolves each one.
 /// Returns the set of resource IDs where the effective permission meets
 /// the required threshold.
 ///
@@ -83,7 +84,7 @@ pub fn resolve_permission(
 pub fn accessible_resources(
     cache: &PermissionCache,
     def: &PermissionTreeDef,
-    tenant_id: u64,
+    scope: TreeScope,
     user_id: &str,
     user_roles: &[String],
     required_level: &str,
@@ -93,11 +94,11 @@ pub fn accessible_resources(
         None => return Vec::new(), // Unknown level = deny all.
     };
 
-    let all_ids = cache.all_resource_ids(tenant_id);
+    let all_ids = cache.all_resource_ids(scope);
     let mut accessible = Vec::new();
 
     for rid in all_ids {
-        let effective = resolve_permission(cache, def, tenant_id, user_id, user_roles, rid);
+        let effective = resolve_permission(cache, def, scope, user_id, user_roles, rid);
         if let Some(effective_ordinal) = def.level_ordinal(&effective)
             && effective_ordinal >= required_ordinal
         {
@@ -114,13 +115,13 @@ pub fn accessible_resources(
 pub fn check_permission(
     cache: &PermissionCache,
     def: &PermissionTreeDef,
-    tenant_id: u64,
+    scope: TreeScope,
     user_id: &str,
     user_roles: &[String],
     resource_id: &str,
     required_level: &str,
 ) -> bool {
-    let effective = resolve_permission(cache, def, tenant_id, user_id, user_roles, resource_id);
+    let effective = resolve_permission(cache, def, scope, user_id, user_roles, resource_id);
     def.level_meets_requirement(&effective, required_level)
 }
 
@@ -128,6 +129,12 @@ pub fn check_permission(
 mod tests {
     use super::*;
     use crate::control::security::permission_tree::types::PermissionGrant;
+    use crate::types::DatabaseId;
+
+    const S1: TreeScope = TreeScope {
+        database_id: DatabaseId::DEFAULT,
+        tenant_id: 1,
+    };
 
     fn setup() -> (PermissionCache, PermissionTreeDef) {
         let mut cache = PermissionCache::new();
@@ -148,12 +155,12 @@ mod tests {
         };
 
         // Hierarchy: workspace → folder-design → doc-mockup
-        cache.put_edge(1, "folder-design", "workspace-acme");
-        cache.put_edge(1, "doc-mockup", "folder-design");
+        cache.put_edge(S1, "folder-design", "workspace-acme");
+        cache.put_edge(S1, "doc-mockup", "folder-design");
 
         // Grant: user-42 is editor on folder-design.
         cache.put_grant(
-            1,
+            S1,
             &PermissionGrant {
                 resource_id: "folder-design".into(),
                 grantee: "user-42".into(),
@@ -164,7 +171,7 @@ mod tests {
 
         // Grant: user-99 is viewer on workspace-acme.
         cache.put_grant(
-            1,
+            S1,
             &PermissionGrant {
                 resource_id: "workspace-acme".into(),
                 grantee: "user-99".into(),
@@ -181,7 +188,7 @@ mod tests {
         let (cache, def) = setup();
 
         // user-42 has editor on folder-design → doc-mockup inherits editor.
-        let level = resolve_permission(&cache, &def, 1, "user-42", &[], "doc-mockup");
+        let level = resolve_permission(&cache, &def, S1, "user-42", &[], "doc-mockup");
         assert_eq!(level, "editor");
     }
 
@@ -190,7 +197,7 @@ mod tests {
         let (cache, def) = setup();
 
         // user-42 has direct editor on folder-design.
-        let level = resolve_permission(&cache, &def, 1, "user-42", &[], "folder-design");
+        let level = resolve_permission(&cache, &def, S1, "user-42", &[], "folder-design");
         assert_eq!(level, "editor");
     }
 
@@ -199,7 +206,7 @@ mod tests {
         let (cache, def) = setup();
 
         // user-unknown has no grants anywhere.
-        let level = resolve_permission(&cache, &def, 1, "user-unknown", &[], "doc-mockup");
+        let level = resolve_permission(&cache, &def, S1, "user-unknown", &[], "doc-mockup");
         assert_eq!(level, "none");
     }
 
@@ -209,7 +216,7 @@ mod tests {
 
         // Grant role "design-team" editor on folder-design.
         cache.put_grant(
-            1,
+            S1,
             &PermissionGrant {
                 resource_id: "folder-design".into(),
                 grantee: "design-team".into(),
@@ -222,7 +229,7 @@ mod tests {
         let level = resolve_permission(
             &cache,
             &def,
-            1,
+            S1,
             "user-77",
             &["design-team".into()],
             "doc-mockup",
@@ -235,7 +242,7 @@ mod tests {
         let (cache, def) = setup();
 
         // user-99 has viewer on workspace → inherits to folder and doc.
-        let level = resolve_permission(&cache, &def, 1, "user-99", &[], "doc-mockup");
+        let level = resolve_permission(&cache, &def, S1, "user-99", &[], "doc-mockup");
         assert_eq!(level, "viewer");
     }
 
@@ -245,7 +252,7 @@ mod tests {
 
         // user-42 can access folder-design (editor) and doc-mockup (inherited editor).
         // user-42 cannot access workspace-acme (no grant).
-        let accessible = accessible_resources(&cache, &def, 1, "user-42", &[], "viewer");
+        let accessible = accessible_resources(&cache, &def, S1, "user-42", &[], "viewer");
         assert!(accessible.contains(&"folder-design".to_owned()));
         assert!(accessible.contains(&"doc-mockup".to_owned()));
         assert!(!accessible.contains(&"workspace-acme".to_owned()));
@@ -259,7 +266,7 @@ mod tests {
         assert!(check_permission(
             &cache,
             &def,
-            1,
+            S1,
             "user-42",
             &[],
             "doc-mockup",
@@ -268,7 +275,7 @@ mod tests {
         assert!(check_permission(
             &cache,
             &def,
-            1,
+            S1,
             "user-42",
             &[],
             "doc-mockup",
@@ -277,7 +284,7 @@ mod tests {
         assert!(!check_permission(
             &cache,
             &def,
-            1,
+            S1,
             "user-42",
             &[],
             "doc-mockup",
@@ -291,7 +298,7 @@ mod tests {
 
         // Override: user-99 is viewer at workspace, but editor at doc-mockup.
         cache.put_grant(
-            1,
+            S1,
             &PermissionGrant {
                 resource_id: "doc-mockup".into(),
                 grantee: "user-99".into(),
@@ -301,7 +308,23 @@ mod tests {
         );
 
         // Direct grant at doc-mockup takes precedence (short-circuits before walking up).
-        let level = resolve_permission(&cache, &def, 1, "user-99", &[], "doc-mockup");
+        let level = resolve_permission(&cache, &def, S1, "user-99", &[], "doc-mockup");
         assert_eq!(level, "editor");
+    }
+
+    /// A tree and its grants in one database resolve nothing in another
+    /// database of the same tenant.
+    #[test]
+    fn grants_in_one_database_do_not_resolve_in_another() {
+        let (cache, def) = setup();
+        let other = TreeScope::new(DatabaseId::new(9), 1);
+
+        let level = resolve_permission(&cache, &def, other, "user-42", &[], "doc-mockup");
+        assert_eq!(level, "none");
+        assert!(accessible_resources(&cache, &def, other, "user-42", &[], "viewer").is_empty());
+        assert_eq!(
+            resolve_permission(&cache, &def, S1, "user-42", &[], "doc-mockup"),
+            "editor"
+        );
     }
 }

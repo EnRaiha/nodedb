@@ -11,4 +11,4 @@ pub use bind_plan::{
     CarriedIdentity, IdentityBinder, bind_carried_identities, bind_plan_identities,
     collect_plan_identities,
 };
-pub use core::{SurrogateAssigner, SurrogateRegistryHandle};
+pub use core::{HomeSurrogateAuthority, SurrogateAssigner, SurrogateRegistryHandle};

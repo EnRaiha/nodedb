@@ -19,7 +19,10 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         let response = match &self.auth_lease {
             Some(service) => service.renew(req).await,
             None => AuthLeaseRenewResponse {
-                outcome: AuthLeaseRenewOutcome::NotLeader { leader_hint: None },
+                outcome: AuthLeaseRenewOutcome::NotLeader {
+                    leader_hint: None,
+                    term: 0,
+                },
             },
         };
         Ok(RaftRpc::AuthLeaseRenewResponse(response))
@@ -29,7 +32,10 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         let response = match &self.auth_lease {
             Some(service) => service.barrier(req).await,
             None => AuthBarrierResponse {
-                outcome: AuthBarrierOutcome::NotLeader { leader_hint: None },
+                outcome: AuthBarrierOutcome::NotLeader {
+                    leader_hint: None,
+                    term: 0,
+                },
             },
         };
         Ok(RaftRpc::AuthBarrierResponse(response))

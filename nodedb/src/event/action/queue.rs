@@ -126,6 +126,15 @@ impl ActionRetryQueue {
         }
     }
 
+    /// A consistent image of the durable store, or `None` when this core has
+    /// never kept an action and so has no store file.
+    pub fn store_image(&self) -> crate::Result<Option<Vec<u8>>> {
+        match &self.durability {
+            Durability::Open(store) => store.image().map(Some),
+            Durability::None | Durability::Deferred { .. } => Ok(None),
+        }
+    }
+
     /// The store, opening it now if this is the first action worth keeping.
     fn store(&mut self) -> Option<&ActionStore> {
         if let Durability::Deferred { data_dir, core_id } = &self.durability {
@@ -174,6 +183,11 @@ impl ActionRetryQueue {
             warn!(owner = %action.owner(), error = %e, "persist pending action failed");
         }
 
+        self.hold(action, next_retry_at);
+    }
+
+    /// Keep `action` in memory, replacing a queued entry with the same key.
+    fn hold(&mut self, action: FailedAction, next_retry_at: Instant) {
         if let Some(existing) = self
             .queue
             .iter_mut()
@@ -193,18 +207,24 @@ impl ActionRetryQueue {
     /// Take every action whose backoff has elapsed.
     ///
     /// Returns `(ready_to_retry, exhausted)`. An exhausted action has spent
-    /// its attempts and belongs in the DLQ; it is already removed from the
-    /// durable set, since retrying it again is not wanted after a restart
-    /// either.
+    /// its attempts and belongs in the DLQ. It stays in the durable set until
+    /// the caller calls [`Self::complete`] after the DLQ accepts it, so a
+    /// crash in between re-offers it to the DLQ after the restart. When the
+    /// DLQ refuses it, the caller hands it back with [`Self::hold_exhausted`].
     pub fn drain_due(&mut self) -> (Vec<FailedAction>, Vec<FailedAction>) {
         let now = Instant::now();
         let mut ready = Vec::new();
         let mut exhausted = Vec::new();
 
-        while self.queue.front().is_some_and(|q| q.next_retry_at <= now) {
-            let Some(queued) = self.queue.pop_front() else {
-                break;
-            };
+        // Backoffs differ per action, so the queue is not ordered by due
+        // time. Every entry is checked, and entries not yet due keep their
+        // order.
+        let (due, waiting): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.queue)
+            .into_iter()
+            .partition(|q| q.next_retry_at <= now);
+        self.queue = waiting;
+
+        for queued in due {
             if queued.action.attempts >= self.max_retries {
                 warn!(
                     owner = %queued.action.owner(),
@@ -212,7 +232,6 @@ impl ActionRetryQueue {
                     attempts = queued.action.attempts,
                     "deferred action exhausted its retries, routing to DLQ"
                 );
-                self.forget(&queued.action.key);
                 exhausted.push(queued.action);
             } else {
                 ready.push(queued.action);
@@ -222,7 +241,15 @@ impl ActionRetryQueue {
         (ready, exhausted)
     }
 
-    /// Drop an action from the durable set once it has run to completion.
+    /// Keep an exhausted action the DLQ refused. The attempt count is not
+    /// changed, so the action drains as exhausted again after `MAX_BACKOFF`
+    /// and is offered to the DLQ once more. The durable set still holds it.
+    pub fn hold_exhausted(&mut self, action: FailedAction) {
+        self.hold(action, Instant::now() + MAX_BACKOFF);
+    }
+
+    /// Drop an action from the durable set once it has run to completion or
+    /// the DLQ has accepted it.
     ///
     /// A crash before this lands replays the action, which is what makes the
     /// delivery guarantee at-least-once rather than at-most-once.
@@ -239,6 +266,16 @@ impl ActionRetryQueue {
         }
     }
 
+    /// Take every queued action, due or not. For an in-memory queue whose
+    /// owner keeps the retry state elsewhere: the trigger action lane
+    /// collects one event's failures in one.
+    pub fn take_all(&mut self) -> Vec<FailedAction> {
+        std::mem::take(&mut self.queue)
+            .into_iter()
+            .map(|queued| queued.action)
+            .collect()
+    }
+
     /// Actions currently awaiting retry.
     pub fn len(&self) -> usize {
         self.queue.len()
@@ -250,11 +287,11 @@ impl ActionRetryQueue {
 
     /// Time until the next action is due, or `None` when the queue is empty.
     pub fn next_retry_delay(&self) -> Option<Duration> {
-        self.queue.front().map(|queued| {
-            queued
-                .next_retry_at
-                .saturating_duration_since(Instant::now())
-        })
+        self.queue
+            .iter()
+            .map(|queued| queued.next_retry_at)
+            .min()
+            .map(|at| at.saturating_duration_since(Instant::now()))
     }
 }
 
@@ -372,6 +409,45 @@ mod tests {
     }
 
     #[test]
+    fn an_action_behind_a_longer_backoff_still_drains_when_due() {
+        let mut queue = ActionRetryQueue::in_memory();
+        let mut spent = action("audit", 10);
+        spent.attempts = DEFAULT_MAX_RETRIES;
+        queue.hold_exhausted(spent);
+        queue.enqueue(action("notify", 11));
+        queue.queue[1].next_retry_at = Instant::now();
+        let (ready, exhausted) = queue.drain_due();
+        assert_eq!(ready.len(), 1, "a later entry is not blocked by the head");
+        assert!(exhausted.is_empty());
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn an_exhausted_action_stays_durable_until_the_dlq_takes_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = action("audit", 10).key.clone();
+        {
+            let mut queue = ActionRetryQueue::open(dir.path(), 0).expect("open");
+            let mut spent = action("audit", 10);
+            spent.attempts = DEFAULT_MAX_RETRIES - 1;
+            queue.enqueue(spent);
+            due_now(&mut queue);
+            let (_, exhausted) = queue.drain_due();
+            assert_eq!(exhausted.len(), 1);
+            // The DLQ refused it: the queue keeps it.
+            queue.hold_exhausted(exhausted.into_iter().next().expect("one"));
+            assert_eq!(queue.len(), 1);
+        }
+        {
+            let mut queue = ActionRetryQueue::open(dir.path(), 0).expect("reopen");
+            assert_eq!(queue.len(), 1, "a restart re-offers it to the DLQ");
+            queue.complete(&key);
+        }
+        let reopened = ActionRetryQueue::open(dir.path(), 0).expect("reopen");
+        assert_eq!(reopened.len(), 0, "once the DLQ takes it, it is gone");
+    }
+
+    #[test]
     fn a_core_with_no_pending_actions_creates_no_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let queue = ActionRetryQueue::for_core(dir.path(), 0);
@@ -408,6 +484,28 @@ mod tests {
         }
         let reopened = ActionRetryQueue::open(dir.path(), 0).expect("reopen");
         assert_eq!(reopened.len(), 2, "a restart must not lose pending actions");
+    }
+
+    /// A captured store image placed into another data directory brings the
+    /// pending actions back, as a snapshot restore does.
+    #[test]
+    fn pending_retries_survive_a_restore_of_the_store_image() {
+        let source = tempfile::tempdir().expect("tempdir");
+        let mut queue = ActionRetryQueue::for_core(source.path(), 0);
+        assert_eq!(queue.store_image().expect("image"), None, "no store yet");
+        queue.enqueue(action("audit", 10));
+        queue.enqueue(action("notify", 11));
+        let image = queue
+            .store_image()
+            .expect("image")
+            .expect("a store holds the pending actions");
+
+        let target = tempfile::tempdir().expect("tempdir");
+        let path = ActionStore::path_for(target.path(), 0);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, image).expect("place image");
+        let restored = ActionRetryQueue::for_core(target.path(), 0);
+        assert_eq!(restored.len(), 2, "a restore must not lose pending retries");
     }
 
     #[test]

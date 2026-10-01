@@ -75,6 +75,7 @@ fn test_ctx() -> QueryContext {
         trace_id: nodedb_types::TraceId::ZERO,
         database_id: nodedb_types::id::DatabaseId::DEFAULT,
         txn_id: None,
+        linearizable: false,
     }
 }
 
@@ -176,7 +177,7 @@ async fn pgwire_not_leader_retry_uses_shared_gateway() {
         key: b"pgwire-key".to_vec(),
         value: mp_string("val"),
         ttl_ms: 0,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"pgwire-key".as_ref()),
         returning: None,
         rls_filters: Vec::new(),
         provenance: None,
@@ -242,7 +243,7 @@ async fn http_not_leader_gateway_error_mapping() {
         key: b"http-key".to_vec(),
         value: mp_string("v"),
         ttl_ms: 0,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"http-key".as_ref()),
         returning: None,
         rls_filters: Vec::new(),
         provenance: None,
@@ -261,6 +262,7 @@ async fn http_not_leader_gateway_error_mapping() {
         vshard_id: VShardId::new(0),
         leader_node: 2,
         leader_addr: "10.0.0.2:9400".into(),
+        leader_term: 1,
     };
     let (status, _body) = GatewayErrorMap::to_http(&not_leader);
     assert_eq!(
@@ -314,7 +316,7 @@ async fn resp_not_leader_gateway_error_mapping() {
         key: b"resp-key".to_vec(),
         value: mp_string("v"),
         ttl_ms: 0,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"resp-key".as_ref()),
         returning: None,
         rls_filters: Vec::new(),
         provenance: None,
@@ -334,6 +336,7 @@ async fn resp_not_leader_gateway_error_mapping() {
         vshard_id: VShardId::new(0),
         leader_node: 3,
         leader_addr: "10.0.0.3:9400".into(),
+        leader_term: 1,
     };
     let resp_err = GatewayErrorMap::to_resp(&not_leader);
     assert!(
@@ -395,6 +398,7 @@ async fn ilp_not_leader_gateway_error_mapping() {
         vshard_id: VShardId::new(0),
         leader_node: 2,
         leader_addr: "10.0.0.2:9400".into(),
+        leader_term: 1,
     };
     let err_str = GatewayErrorMap::to_resp(&not_leader);
     assert!(
@@ -449,7 +453,7 @@ async fn native_not_leader_gateway_error_mapping() {
         key: b"native-key".to_vec(),
         value: mp_string("v"),
         ttl_ms: 0,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"native-key".as_ref()),
         returning: None,
         rls_filters: Vec::new(),
         provenance: None,
@@ -469,6 +473,7 @@ async fn native_not_leader_gateway_error_mapping() {
         vshard_id: VShardId::new(0),
         leader_node: 1,
         leader_addr: "127.0.0.1:9400".into(),
+        leader_term: 1,
     };
     let (native_code, _native_msg) = GatewayErrorMap::to_native(&not_leader);
     assert_eq!(
@@ -509,6 +514,7 @@ async fn not_leader_counter_increments_per_retry_attempt() {
                     vshard_id: VShardId::new(0),
                     leader_node: 0,
                     leader_addr: String::new(),
+                    leader_term: 0,
                 })
             } else {
                 Ok::<(), Error>(())

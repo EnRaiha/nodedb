@@ -30,6 +30,7 @@ fn test_ctx() -> QueryContext {
         trace_id: nodedb_types::TraceId::ZERO,
         database_id: nodedb_types::id::DatabaseId::DEFAULT,
         txn_id: None,
+        linearizable: false,
     }
 }
 
@@ -209,6 +210,7 @@ fn ilp_gateway_error_not_leader_is_moved() {
         vshard_id: VShardId::new(1),
         leader_node: 2,
         leader_addr: "10.0.0.2:9000".into(),
+        leader_term: 1,
     };
     let msg = GatewayErrorMap::to_resp(&err);
     assert!(

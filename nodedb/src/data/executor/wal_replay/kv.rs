@@ -41,6 +41,9 @@ impl CoreLoop {
         let now_ms = crate::engine::kv::current_ms();
 
         for record in records {
+            if self.replay_halted() {
+                break;
+            }
             let logical_type = record.logical_record_type();
             let record_type = RecordType::from_raw(logical_type);
             let is_put = record_type == Some(RecordType::Put);
@@ -79,6 +82,10 @@ impl CoreLoop {
                 };
 
                 if let Some(applied) = self.try_replay_kv_put(&kv_record, tombstones) {
+                    puts += applied;
+                    continue;
+                }
+                if let Some(applied) = self.try_replay_kv_rewrite(&kv_record, tombstones) {
                     puts += applied;
                     continue;
                 }
@@ -242,6 +249,21 @@ impl CoreLoop {
                     tombstones,
                 ) {
                     puts += applied;
+                    continue;
+                }
+
+                // A KV put-family record of no current shape: refused, never
+                // replayed without its surrogate. Any other `Put` payload
+                // belongs to another engine's replay pass.
+                if let Some(discriminator) =
+                    super::kv_put::kv_put_family_discriminator(&record.payload)
+                {
+                    self.replay_record_unapplied(
+                        "kv",
+                        "put_decode",
+                        record_lsn,
+                        &format!("{discriminator} payload matched none of its record shapes"),
+                    );
                     continue;
                 }
             }

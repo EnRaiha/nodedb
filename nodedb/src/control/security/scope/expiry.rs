@@ -20,12 +20,11 @@ use super::grant::{ScopeGrantParams, ScopeStatus};
 /// Spawn the periodic scope-grant expiry sweep.
 ///
 /// The sweep must run exactly once cluster-wide — each pass proposes catalog
-/// mutations, so every node running it would duplicate them — but it must
-/// still run on a standalone node, which has no metadata group and therefore
-/// no leader; [`SharedState::is_singleton_worker`] covers both.
+/// mutations, so every node running it duplicates them. The metadata
+/// leader runs it ([`SharedState::is_singleton_worker`]). A one-node cluster
+/// leads its own metadata group.
 ///
-/// The pass itself is synchronous and writes redb, so it runs on a blocking
-/// thread rather than the reactor.
+/// The pass awaits each replicated `ON EXPIRE` action on the loop's task.
 pub fn spawn_expiry_task(shared: Arc<SharedState>, interval_secs: u64) {
     // Below ~10s the sweep costs more than the resolution it buys: expiry is
     // already enforced on every read by `ScopeGrant::is_effective`, and this
@@ -54,14 +53,7 @@ pub fn spawn_expiry_task(shared: Arc<SharedState>, interval_secs: u64) {
                 if !loop_shared.is_singleton_worker() {
                     continue;
                 }
-                let state_for_sweep = Arc::clone(&loop_shared);
-                let result = tokio::task::spawn_blocking(move || {
-                    process_expired_grants(&state_for_sweep);
-                })
-                .await;
-                if let Err(e) = result {
-                    warn!(error = %e, "scope expiry sweep task panicked");
-                }
+                process_expired_grants(&loop_shared).await;
             }
         },
     );
@@ -78,9 +70,9 @@ pub struct ScopeEvent {
 }
 
 /// Process all expired and grace-period grants. Returns emitted events.
-pub fn process_expired_grants_with_events(state: &SharedState) -> Vec<ScopeEvent> {
+pub async fn process_expired_grants_with_events(state: &SharedState) -> Vec<ScopeEvent> {
     let mut events = Vec::new();
-    process_expired_grants_inner(state, &mut events);
+    process_expired_grants_inner(state, &mut events).await;
     events
 }
 
@@ -89,9 +81,9 @@ pub fn process_expired_grants_with_events(state: &SharedState) -> Vec<ScopeEvent
 ///
 /// Scope lifetime changes happen with no operator in the loop, so the audit
 /// trail is the only record that a grant was downgraded or cut off; dropping
-/// these events would leave the change invisible after the fact.
-pub fn process_expired_grants(state: &SharedState) {
-    for event in process_expired_grants_with_events(state) {
+/// these events leaves the change invisible after the fact.
+pub async fn process_expired_grants(state: &SharedState) {
+    for event in process_expired_grants_with_events(state).await {
         state.audit_record(
             AuditEvent::AdminAction,
             None,
@@ -108,7 +100,7 @@ pub fn process_expired_grants(state: &SharedState) {
     }
 }
 
-fn process_expired_grants_inner(state: &SharedState, events: &mut Vec<ScopeEvent>) {
+async fn process_expired_grants_inner(state: &SharedState, events: &mut Vec<ScopeEvent>) {
     let all_grants = state.scope_grants.list(None);
     let mut expired_count = 0u32;
     let mut grace_count = 0u32;
@@ -141,7 +133,7 @@ fn process_expired_grants_inner(state: &SharedState, events: &mut Vec<ScopeEvent
                 // sweep for every other expired grant: report it and carry on.
                 // The grant stays expired — so it authorizes nothing — and the
                 // next sweep retries the action.
-                if let Err(e) = execute_on_expire(state, grant) {
+                if let Err(e) = execute_on_expire(state, grant).await {
                     warn!(
                         scope = %grant.scope_name,
                         grantee_type = %grant.grantee_type,
@@ -177,13 +169,16 @@ fn process_expired_grants_inner(state: &SharedState, events: &mut Vec<ScopeEvent
 ///
 /// Every mutation goes through the replicated propose path, so the outcome is
 /// durable and reaches every node: a downgrade or cutoff that only touched the
-/// sweeping node's memory would be undone by the next restart and would leave
+/// sweeping node's memory is undone by the next restart and leaves
 /// the rest of the cluster authorizing on the retired grant.
-fn execute_on_expire(state: &SharedState, grant: &super::grant::ScopeGrant) -> crate::Result<()> {
+async fn execute_on_expire(
+    state: &SharedState,
+    grant: &super::grant::ScopeGrant,
+) -> crate::Result<()> {
     let action = &grant.on_expire_action;
 
     if action.is_empty() {
-        // No action configured — just let it stay expired.
+        // No action configured — let it stay expired.
         // The grant is already filtered out of effective_scopes().
         return Ok(());
     }
@@ -195,7 +190,8 @@ fn execute_on_expire(state: &SharedState, grant: &super::grant::ScopeGrant) -> c
             &grant.scope_name,
             &grant.grantee_type,
             &grant.grantee_id,
-        )?;
+        )
+        .await?;
         info!(
             scope = %grant.scope_name,
             grantee = %grant.grantee_id,
@@ -223,13 +219,14 @@ fn execute_on_expire(state: &SharedState, grant: &super::grant::ScopeGrant) -> c
         // idempotent upserts, so a failure here leaves the expired (and
         // therefore ineffective) original in place for the next sweep to
         // retry — rather than dropping the grantee to no scope at all.
-        propose_grant(state, &stored)?;
+        propose_grant(state, &stored).await?;
         propose_revoke(
             state,
             &grant.scope_name,
             &grant.grantee_type,
             &grant.grantee_id,
-        )?;
+        )
+        .await?;
         info!(
             old_scope = %grant.scope_name,
             new_scope = %downgrade_scope,
@@ -243,9 +240,8 @@ fn execute_on_expire(state: &SharedState, grant: &super::grant::ScopeGrant) -> c
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
+    use crate::control::cluster::test_one_node;
 
     fn now_secs() -> u64 {
         std::time::SystemTime::now()
@@ -254,20 +250,15 @@ mod tests {
             .as_secs()
     }
 
-    fn test_state(dir: &tempfile::TempDir) -> Arc<SharedState> {
-        let (_, _, state, _, _) = crate::event::test_utils::event_test_deps(dir);
-        state
-    }
-
     /// Install a grant the way a `GRANT SCOPE` statement does — through the
     /// replicated propose path, so the catalog row exists too and the tests
     /// can assert on durable state rather than only the in-memory map.
-    fn install(state: &SharedState, params: ScopeGrantParams<'_>) {
+    async fn install(state: &SharedState, params: ScopeGrantParams<'_>) {
         let stored = state
             .scope_grants
             .prepare_grant(params)
             .expect("prepare grant");
-        propose_grant(state, &stored).expect("propose grant");
+        propose_grant(state, &stored).await.expect("propose grant");
     }
 
     fn catalog_scopes(state: &SharedState) -> Vec<String> {
@@ -281,13 +272,13 @@ mod tests {
             .collect()
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn expired_grant_with_revoke_all() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = test_state(&dir);
+        let cluster = test_one_node::boot().await;
+        let state = &cluster.state;
         let past = now_secs() - 100;
         install(
-            &state,
+            state,
             ScopeGrantParams {
                 scope_name: "pro:all",
                 grantee_type: "org",
@@ -298,7 +289,8 @@ mod tests {
                 on_expire_action: "revoke_all",
                 conditions: Vec::new(),
             },
-        );
+        )
+        .await;
 
         // Grant exists but is expired.
         assert!(
@@ -307,23 +299,24 @@ mod tests {
                 .has_scope("u1", &["acme".into()], "pro:all")
         );
 
-        // Process expiry — should revoke.
-        process_expired_grants(&state);
+        // Process expiry — must revoke.
+        process_expired_grants(state).await;
 
-        // Grant should be gone.
+        // Grant is gone.
         assert_eq!(state.scope_grants.count(), 0);
+        cluster.shutdown().await;
     }
 
-    /// The whole point of routing the action through the propose path: a
-    /// revoke that only cleared the in-memory map would come back at the next
+    /// Why the action goes through the propose path: a
+    /// revoke that only cleared the in-memory map comes back at the next
     /// restart, re-granting an expired scope.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn expiry_removes_the_durable_grant() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = test_state(&dir);
+        let cluster = test_one_node::boot().await;
+        let state = &cluster.state;
         let past = now_secs() - 100;
         install(
-            &state,
+            state,
             ScopeGrantParams {
                 scope_name: "pro:all",
                 grantee_type: "org",
@@ -334,24 +327,26 @@ mod tests {
                 on_expire_action: "revoke_all",
                 conditions: Vec::new(),
             },
-        );
-        assert_eq!(catalog_scopes(&state), vec!["pro:all".to_string()]);
+        )
+        .await;
+        assert_eq!(catalog_scopes(state), vec!["pro:all".to_string()]);
 
-        process_expired_grants(&state);
+        process_expired_grants(state).await;
 
         assert!(
-            catalog_scopes(&state).is_empty(),
+            catalog_scopes(state).is_empty(),
             "expired grant survived in the catalog"
         );
+        cluster.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn expired_grant_with_downgrade() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = test_state(&dir);
+        let cluster = test_one_node::boot().await;
+        let state = &cluster.state;
         let past = now_secs() - 100;
         install(
-            &state,
+            state,
             ScopeGrantParams {
                 scope_name: "pro:all",
                 grantee_type: "org",
@@ -362,11 +357,12 @@ mod tests {
                 on_expire_action: "grant:free:basic",
                 conditions: Vec::new(),
             },
-        );
+        )
+        .await;
 
-        process_expired_grants(&state);
+        process_expired_grants(state).await;
 
-        // pro:all should be gone, free:basic should exist.
+        // pro:all is gone, free:basic exists.
         assert!(
             !state
                 .scope_grants
@@ -377,18 +373,19 @@ mod tests {
                 .scope_grants
                 .has_scope("u1", &["acme".into()], "free:basic")
         );
-        // …and the swap is durable, not just in memory.
-        assert_eq!(catalog_scopes(&state), vec!["free:basic".to_string()]);
+        // …and the swap is durable, not only in memory.
+        assert_eq!(catalog_scopes(state), vec!["free:basic".to_string()]);
+        cluster.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn grace_period_still_effective() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = test_state(&dir);
+        let cluster = test_one_node::boot().await;
+        let state = &cluster.state;
         // Expired 10s ago but grace is 60s.
         let past = now_secs() - 10;
         install(
-            &state,
+            state,
             ScopeGrantParams {
                 scope_name: "pro:all",
                 grantee_type: "org",
@@ -399,7 +396,8 @@ mod tests {
                 on_expire_action: "revoke_all",
                 conditions: Vec::new(),
             },
-        );
+        )
+        .await;
 
         // In grace period — still effective.
         assert!(
@@ -408,9 +406,10 @@ mod tests {
                 .has_scope("u1", &["acme".into()], "pro:all")
         );
 
-        // Process expiry — should NOT revoke (still in grace).
-        process_expired_grants(&state);
+        // Process expiry — does NOT revoke (still in grace).
+        process_expired_grants(state).await;
         assert_eq!(state.scope_grants.count(), 1); // Still there.
-        assert_eq!(catalog_scopes(&state), vec!["pro:all".to_string()]);
+        assert_eq!(catalog_scopes(state), vec!["pro:all".to_string()]);
+        cluster.shutdown().await;
     }
 }

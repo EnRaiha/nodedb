@@ -45,7 +45,7 @@ pub struct CreateAlertRequest<'a> {
 }
 
 /// Handle `CREATE ALERT`. Converts raw strings to `AlertCondition` and `Vec<NotifyTarget>`.
-pub fn create_alert(
+pub async fn create_alert(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     req: &CreateAlertRequest<'_>,
@@ -126,10 +126,10 @@ pub fn create_alert(
     };
 
     // Replicate the row and the registry install to every node.
-    super::replicate::propose_put(state, &def)?;
+    super::replicate::propose_put(state, &def).await?;
 
     // Emit CRDT sync delta for Lite visibility. Handler-scoped: the apply
-    // path runs on every node, so emitting there would duplicate the delta.
+    // path runs on every node, so emitting there will duplicate the delta.
     {
         let delta_payload = zerompk::to_msgpack_vec(&def).unwrap_or_default();
         let delta = crate::event::crdt_sync::types::OutboundDelta {

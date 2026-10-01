@@ -127,6 +127,7 @@ fn counts_against_breaker(err: &ClusterError) -> bool {
         | ClusterError::SpatialGather(_)
         | ClusterError::Bm25Gather(_)
         | ClusterError::TsGather(_)
+        | ClusterError::ShufflePush(_)
         | ClusterError::RemoteUntyped { .. } => true,
     }
 }

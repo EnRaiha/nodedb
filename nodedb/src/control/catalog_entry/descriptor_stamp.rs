@@ -13,21 +13,22 @@
 //! Every prior read is committed-only. Deriving a version from the
 //! transaction's own uncommitted DDL overlay stamps one descriptor twice.
 //!
-//! Rolling upgrade: stamping is gated by
-//! [`crate::control::rolling_upgrade::DESCRIPTOR_VERSIONING_VERSION`], and the
-//! applier skips this helper in compat mode. That gate lives at the call site.
+//! Every proposer stamps. There is no unstamped compat path.
 //!
 //! Variants without descriptor fields pass through unchanged: `PutUser`,
 //! `PutRole`, `PutPermission`, `PutOwner`, `PutTenant`, `PutApiKey`,
-//! `PutAuthUser`, `PutRlsPolicy`, `PutSchedule`, `PutChangeStream`,
-//! `PutSequenceState`, and every unfenced `Delete*` variant.
+//! `PutAuthUser`, `PutRlsPolicy`, `PutSchedule`, `PutSequenceState`, and
+//! every unfenced `Delete*` variant.
 //! `DeactivateCollection` does carry them: a soft delete rewrites the row, so it
 //! consumes a version like any other mutation.
 //!
 //! A fenced delete (`PurgeCollection` and the `Delete*` of every stored type
 //! with an incarnation clock) freezes the target row's incarnation instead.
-//! `PutSynonymGroup`, `PutVectorIndexParams`, and `CreateTopicIfAbsent` stamp
-//! only `modification_hlc`. See [`super::incarnation`].
+//! `PutSynonymGroup`, `PutVectorIndexParams`, `CreateTopicIfAbsent`,
+//! `PutChangeStream`, `PutConsumerGroupIfAbsent`,
+//! `MigrateConsumerGroupStream`, and `PutArray` stamp only `modification_hlc`. See
+//! [`super::incarnation`].
+//! `CloneDatabase` stamps the fresh incarnation its shadow collections take.
 //! The match is exhaustive on [`CatalogEntry`], so a new variant is a compile
 //! error here. Deciding whether it needs a stamp is deliberate.
 
@@ -51,9 +52,8 @@ fn next_collection_stamp(
 /// Read the prior persisted descriptor, assign `descriptor_version = prior + 1`
 /// (or `1` on create), stamp `modification_hlc = clock.now()`, return the entry.
 ///
-/// A failed catalog read fails the stamp: a guessed prior would emit a
-/// version-1 put or an unfenced delete. Version `0` is never emitted — it is
-/// strictly the pre-stamping compat-mode sentinel.
+/// A failed catalog read fails the stamp: a guessed prior emits a
+/// version-1 put or an unfenced delete. Version `0` is never emitted.
 pub fn stamp(
     entry: CatalogEntry,
     clock: &HlcClock,
@@ -87,6 +87,11 @@ pub fn stamp(
                 prior_constraint_version
             };
             stored.modification_hlc = hlc;
+            stored.incarnation = super::incarnation::stamp::collection_incarnation(
+                stored.incarnation,
+                prior.as_ref(),
+                hlc,
+            );
             CatalogEntry::PutCollection(stored)
         }
         CatalogEntry::PutCollectionIfAbsent(mut stored) => {
@@ -104,6 +109,8 @@ pub fn stamp(
             let new_set = crate::control::security::catalog::collection_constraints(&stored);
             stored.constraint_version = u64::from(!new_set.is_empty());
             stored.modification_hlc = hlc;
+            stored.incarnation =
+                super::incarnation::stamp::collection_incarnation(stored.incarnation, None, hlc);
             CatalogEntry::PutCollectionIfAbsent(stored)
         }
         CatalogEntry::PutMaterializedView(mut stored) => {
@@ -183,7 +190,7 @@ pub fn stamp(
             ..
         } => {
             // A soft delete rewrites the row, advancing the same ordering
-            // metadata a `PutCollection` would.
+            // metadata a `PutCollection` does.
             let prior = catalog.get_committed_collection(
                 crate::types::DatabaseId::new(database_id),
                 tenant_id,
@@ -199,6 +206,9 @@ pub fn stamp(
                 modification_hlc: stamped_hlc,
             }
         }
+        entry @ CatalogEntry::CloneDatabase { .. } => {
+            super::incarnation::stamp::stamp_clone(entry, hlc)
+        }
         entry @ (CatalogEntry::PurgeCollection { .. }
         | CatalogEntry::DeleteSequence { .. }
         | CatalogEntry::DeleteTrigger { .. }
@@ -208,12 +218,19 @@ pub fn stamp(
         | CatalogEntry::DeleteContinuousAggregate { .. }
         | CatalogEntry::DeleteSynonymGroup { .. }
         | CatalogEntry::DeleteTopicWithConsumerGroups { .. }
-        | CatalogEntry::DeleteVectorIndexParams { .. }) => {
+        | CatalogEntry::DeleteVectorIndexParams { .. }
+        | CatalogEntry::DeleteChangeStream { .. }
+        | CatalogEntry::DeleteConsumerGroup { .. }
+        | CatalogEntry::DeleteArray { .. }) => {
             super::incarnation::stamp::stamp_delete(entry, catalog)?
         }
         entry @ (CatalogEntry::PutSynonymGroup(_)
         | CatalogEntry::PutVectorIndexParams(_)
-        | CatalogEntry::CreateTopicIfAbsent(_)) => {
+        | CatalogEntry::CreateTopicIfAbsent(_)
+        | CatalogEntry::PutChangeStream(_)
+        | CatalogEntry::PutConsumerGroupIfAbsent(_)
+        | CatalogEntry::MigrateConsumerGroupStream { .. }
+        | CatalogEntry::PutArray(_)) => {
             super::incarnation::stamp::stamp_put(entry, clock, catalog, hlc)?
         }
         // Variants without descriptor versioning pass through unchanged.
@@ -222,8 +239,6 @@ pub fn stamp(
         | CatalogEntry::PutSequenceState(_)
         | CatalogEntry::PutSchedule(_)
         | CatalogEntry::DeleteSchedule { .. }
-        | CatalogEntry::PutChangeStream(_)
-        | CatalogEntry::DeleteChangeStream { .. }
         | CatalogEntry::PutUser(_)
         | CatalogEntry::DropUser { .. }
         | CatalogEntry::PutRole(_)
@@ -255,7 +270,6 @@ pub fn stamp(
         | CatalogEntry::PutOidcProvider(_)
         | CatalogEntry::DeleteOidcProvider { .. }
         | CatalogEntry::RecordWalTombstone { .. }
-        | CatalogEntry::CloneDatabase { .. }
         | CatalogEntry::PutDatabaseQuota { .. }
         | CatalogEntry::DeleteDatabaseQuota { .. }
         | CatalogEntry::PutTenantQuota { .. }
@@ -266,16 +280,20 @@ pub fn stamp(
         | CatalogEntry::DeleteRetentionPolicy { .. }
         | CatalogEntry::PutAlertRule(_)
         | CatalogEntry::DeleteAlertRule { .. }
-        | CatalogEntry::PutConsumerGroupIfAbsent(_)
-        | CatalogEntry::DeleteConsumerGroup { .. }
-        | CatalogEntry::MigrateConsumerGroupStream { .. }
         | CatalogEntry::PutCheckpoint(_)
         | CatalogEntry::DeleteCheckpoint { .. }
         | CatalogEntry::CompactHistory { .. }
         | CatalogEntry::PutVectorModel(_)
         | CatalogEntry::DeleteVectorModel { .. }
         | CatalogEntry::PutColumnStats(_)
-        | CatalogEntry::MoveTenantCutover { .. }) => entry,
+        | CatalogEntry::PutCloneCopyup { .. }
+        | CatalogEntry::PutCloneTombstone { .. }
+        | CatalogEntry::PutKvCloneTombstone { .. }
+        | CatalogEntry::PutCloneSourceDrain(_)
+        | CatalogEntry::DeleteCloneSourceDrain { .. }
+        | CatalogEntry::MoveTenantCutover { .. }
+        | CatalogEntry::CommitConsumerOffsets(_)
+        | CatalogEntry::PutBackupScheduleMark(_)) => entry,
     })
 }
 
@@ -456,6 +474,11 @@ fn advance_collection(
     current: &mut crate::control::security::catalog::StoredCollection,
 ) {
     current.descriptor_version = prior.descriptor_version.saturating_add(1);
+    // A later put of a row an earlier entry of the batch leaves active keeps
+    // that entry's incarnation.
+    if prior.is_active && prior.incarnation != Hlc::ZERO {
+        current.incarnation = prior.incarnation;
+    }
     let prior_set = crate::control::security::catalog::collection_constraints(prior);
     let current_set = crate::control::security::catalog::collection_constraints(current);
     current.constraint_version = if prior_set == current_set {
@@ -550,7 +573,7 @@ mod tests {
 
     /// Persist a collection at `version` so the next stamp reads it as prior.
     fn seed_prior(catalog: &SystemCatalog, name: &str, version: u64) {
-        let mut stored = StoredCollection::new(1, name, "tester");
+        let mut stored = StoredCollection::stamped_for_test(1, name, "tester");
         stored.descriptor_version = version;
         catalog
             .put_collection(DatabaseId::DEFAULT, &stored)
@@ -705,11 +728,8 @@ mod tests {
         assert_eq!(second.descriptor_version, 2);
     }
 
-    /// A soft delete (`DeactivateCollection`) must advance the same
-    /// descriptor version and HLC a `PutCollection` would — it is a mutation
-    /// of the row, not a pass-through. `stamp_ignores_deletes` previously
-    /// asserted the opposite (pass-through unchanged), which encoded the
-    /// bug this test now guards against.
+    /// A soft delete (`DeactivateCollection`) advances the descriptor version
+    /// and HLC the same way a `PutCollection` does. It mutates the row.
     #[test]
     fn stamp_advances_deactivate_collection_version_and_hlc() {
         let (store, _tmp) = make_catalog();

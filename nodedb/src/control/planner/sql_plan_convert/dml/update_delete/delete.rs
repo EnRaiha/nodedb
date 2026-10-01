@@ -115,7 +115,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
 
     // CRDT gate: a `crdt = true` collection routes to `CrdtOp::DocDelete`.
     // Only a PK-targeted DELETE is representable; a predicate DELETE is
-    // rejected — no silent fallthrough that would bypass CRDT convergence.
+    // rejected — no silent fallthrough that will bypass CRDT convergence.
     let is_crdt = super::super::crdt_gate::document_collection_is_crdt(ctx, collection)?;
     if is_crdt && target_keys.is_empty() {
         return Err(crate::Error::BadRequest {
@@ -165,10 +165,10 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
         for key in target_keys {
             let pk_string = sql_value_to_string(key);
             let pk_bytes = pk_string.clone().into_bytes();
-            // Read-only resolution: a task always exists (the write hook still
-            // runs, an unbound row_key affects 0 rows, and the clone CoW
-            // resolver intercepts the ZERO sentinel), but a key this statement
-            // never creates must never mint a binding.
+            // Read-only resolution: a key this statement never creates must
+            // never mint a binding. A delete of an unbound key carries `None`:
+            // it affects 0 rows, so the statement still answers `DELETE 0`,
+            // and the clone CoW resolver still sees a document task.
             let surrogate = ctx.surrogate_for_existing_pk(collection_key, &pk_bytes)?;
             let plan = if is_crdt {
                 PhysicalPlan::Crdt(CrdtOp::DocDelete {
@@ -244,16 +244,16 @@ mod tests {
             CredentialStore::open(&dir.path().join("system.redb")).expect("open credential store");
         {
             let catalog = store.catalog();
-            let mut edges = StoredCollection::new(0, "edges", "owner");
+            let mut edges = StoredCollection::stamped_for_test(0, "edges", "owner");
             edges.has_implicit_edges = true;
             catalog
                 .put_collection(crate::types::DatabaseId::DEFAULT, &edges)
                 .expect("put edges collection");
-            let plain = StoredCollection::new(0, "plain", "owner");
+            let plain = StoredCollection::stamped_for_test(0, "plain", "owner");
             catalog
                 .put_collection(crate::types::DatabaseId::DEFAULT, &plain)
                 .expect("put plain collection");
-            let mut crdt_coll = StoredCollection::new(0, "crdt_coll", "owner");
+            let mut crdt_coll = StoredCollection::stamped_for_test(0, "crdt_coll", "owner");
             crdt_coll.crdt = true;
             catalog
                 .put_collection(crate::types::DatabaseId::DEFAULT, &crdt_coll)
@@ -266,7 +266,8 @@ mod tests {
             array_catalog: None,
             credentials: Some(Arc::new(store)),
             wal: None,
-            surrogate_assigner: None,
+            surrogate_assigner:
+                crate::control::planner::sql_plan_convert::test_support::test_assigner(),
             cluster_enabled: false,
             bitemporal_retention_registry: None,
             max_vector_dim: 0,
@@ -276,6 +277,7 @@ mod tests {
             shuffle_agg_num_parts: 0,
             broadcast_threshold_bytes: 8 * 1024 * 1024,
             shuffle_agg_threshold: 10_000,
+            prefetched: Default::default(),
             database_id: crate::types::DatabaseId::DEFAULT,
             tenant_id: crate::types::TenantId::new(0),
         };
@@ -331,9 +333,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn delete_by_pk_on_crdt_routes_doc_delete() {
+    #[tokio::test]
+    async fn delete_by_pk_on_crdt_routes_doc_delete() {
         let (ctx, _dir) = ctx_with_catalog();
+        // The row exists: its key is bound, as the insert that created it
+        // bound it.
+        let bound = ctx
+            .surrogate_assigner
+            .assign(ctx.collection_key("crdt_coll"), ctx.tenant_id, b"k1")
+            .await
+            .expect("bind k1");
         let keys = vec![SqlValue::String("k1".to_string())];
         let tasks = convert_delete(
             "crdt_coll",
@@ -346,11 +355,51 @@ mod tests {
         .expect("convert_delete");
         assert_eq!(tasks.len(), 1);
         match &tasks[0].plan {
-            PhysicalPlan::Crdt(CrdtOp::DocDelete { document_id, .. }) => {
+            PhysicalPlan::Crdt(CrdtOp::DocDelete {
+                document_id,
+                surrogate,
+                ..
+            }) => {
                 assert_eq!(document_id, "k1");
+                assert_eq!(*surrogate, Some(bound));
             }
             other => panic!("expected CrdtOp::DocDelete, got {other:?}"),
         }
+    }
+
+    /// A key no row holds still plans its delete, so the statement answers
+    /// `DELETE 0`. The delete carries no surrogate and mints no binding.
+    #[test]
+    fn delete_of_an_unbound_crdt_key_plans_a_delete_matching_nothing() {
+        let (ctx, _dir) = ctx_with_catalog();
+        let keys = vec![SqlValue::String("ghost".to_string())];
+        let tasks = convert_delete(
+            "crdt_coll",
+            &EngineType::DocumentSchemaless,
+            &[],
+            &keys,
+            TenantId::new(0),
+            &ctx,
+        )
+        .expect("convert_delete");
+        assert_eq!(tasks.len(), 1);
+        match &tasks[0].plan {
+            PhysicalPlan::Crdt(CrdtOp::DocDelete {
+                document_id,
+                surrogate,
+                ..
+            }) => {
+                assert_eq!(document_id, "ghost");
+                assert_eq!(*surrogate, None);
+            }
+            other => panic!("expected CrdtOp::DocDelete, got {other:?}"),
+        }
+        assert_eq!(
+            ctx.surrogate_for_existing_pk(ctx.collection_key("crdt_coll"), b"ghost")
+                .expect("lookup"),
+            None,
+            "planning the delete bound no key"
+        );
     }
 
     #[test]

@@ -67,6 +67,23 @@ impl Scheduler {
             return;
         }
 
+        // A slice that truncates rows resolves at its turn, once every lower
+        // txn of this vShard finished.
+        if committed
+            && let Some(pending) = self.pending.get_mut(&txn_id)
+            && pending.flush_scope.resolve_at_turn
+        {
+            pending.commit_state = Some(CommitState::AwaitingResolveTurn);
+            pending.verdict_deadline = None;
+            self.shared
+                .calvin
+                .counters
+                .commits_flushed
+                .fetch_add(1, Ordering::Relaxed);
+            self.pump_flush_turn();
+            return;
+        }
+
         let (outcome, step) = if committed {
             // Resolve the staged post-images into a replayable `RedoRecord`
             // first; the redo is WAL-appended (in `finish_redo_resolve`) before
@@ -142,7 +159,7 @@ impl Scheduler {
     /// emit a stall metric + warning, and re-arm the deadline so the warning is
     /// rate-limited rather than per-iteration. It NEVER releases locks and NEVER
     /// unilaterally aborts: a participant cannot know whether a peer already
-    /// flushed a COMMIT, so aborting one side while a peer committed would tear
+    /// flushed a COMMIT, so aborting one side while a peer committed will tear
     /// the transaction. The verdict is guaranteed to arrive eventually — a
     /// post-failover leader re-aggregates the replicated votes (seeded on every
     /// replica) into the same verdict — so waiting is always the safe action.
@@ -245,6 +262,10 @@ mod tests {
             version: 1,
             ops: Vec::new(),
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         };
         let mut response = staged_response(Status::Ok, None);
         response.payload = Payload::from_vec(redo.to_bytes().expect("encode empty redo record"));
@@ -403,7 +424,7 @@ mod tests {
             .insert(txn_id, staged_pending(make_sequenced_txn(14, 2), txn_id));
 
         // Local staging votes only park their own staged slices; neither the
-        // affirmative nor the failed participant may resolve or drop unilaterally.
+        // affirmative nor the failed participant can resolve or drop unilaterally.
         first_scheduler.resolve_staged_commit(txn_id, &staged_response(Status::Ok, Some(true)));
         second_scheduler.resolve_staged_commit(txn_id, &staged_response(Status::Error, None));
         for (scheduler, data_side) in [
@@ -428,18 +449,18 @@ mod tests {
         registry.note_vote(
             txn,
             9,
-            ParticipantVote::Abort(Some(AbortReason::SerializationConflict)),
+            ParticipantVote::Abort(AbortReason::SerializationConflict),
         );
         assert_eq!(
             registry.drain_unproposed_verdicts(),
             vec![(
                 txn,
-                VerdictOutcome::Abort(Some(AbortReason::SerializationConflict))
+                VerdictOutcome::Abort(AbortReason::SerializationConflict)
             )]
         );
         registry.note_verdict(
             txn,
-            VerdictOutcome::Abort(Some(AbortReason::SerializationConflict)),
+            VerdictOutcome::Abort(AbortReason::SerializationConflict),
         );
         assert_eq!(registry.verdict(txn), Some(false));
 

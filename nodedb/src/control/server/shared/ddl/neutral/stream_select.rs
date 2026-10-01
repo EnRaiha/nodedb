@@ -7,16 +7,13 @@
 //! SELECT * FROM STREAM <stream> CONSUMER GROUP <group> [PARTITION <p>] [LIMIT <n>]
 //! ```
 //!
-//! Ported from the pgwire `ddl::stream_select::select_from_stream` handler.
 //! Reads events from the stream buffer starting after the consumer group's
 //! committed offsets and returns a materialized result set — there is no
 //! per-connection push stream — so this handler carries no per-connection
 //! state. The partition/limit token parsing, the cluster-aware forwarding to
 //! the leader node on `ConsumeError::RemotePartition`, the empty-result
 //! short-circuit on `ConsumeError::BufferEmpty`, and the column layout are
-//! preserved verbatim; only the result construction changed from pgwire
-//! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
-//! [`DdlError`].
+//! run here. The result is the protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use serde_json::{Map, Value as JsonValue};
 use sonic_rs;
@@ -133,15 +130,22 @@ pub async fn select_from_stream(
         limit,
     };
 
-    let mut result = match consume_stream(state, &consume_params) {
+    let mut result = match consume_stream(state, &consume_params).await {
         Ok(r) => r,
         Err(ConsumeError::RemotePartition { leader_node, .. }) => {
             match crate::event::cdc::consume::consume_remote(state, &consume_params, leader_node)
                 .await
             {
                 Ok(r) => r,
+                // The consumer resets its offset; the message names where.
+                Err(e @ ConsumeError::OffsetOutOfRange { .. }) => {
+                    return Err(err("55000", e.to_string()));
+                }
                 Err(e) => return Err(err("58000", e.to_string())),
             }
+        }
+        Err(e @ ConsumeError::OffsetOutOfRange { .. }) => {
+            return Err(err("55000", e.to_string()));
         }
         Err(ConsumeError::BufferEmpty(_)) => {
             // Return empty result set.

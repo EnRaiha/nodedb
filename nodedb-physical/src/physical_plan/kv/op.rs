@@ -50,8 +50,8 @@ pub enum KvOp {
         /// Per-key TTL override in milliseconds. 0 = use collection default.
         ttl_ms: u64,
         /// Stable cross-engine identity assigned by the CP-side
-        /// `SurrogateAssigner` from `(collection, key)`.
-        /// `Surrogate::ZERO` only appears in test fixtures.
+        /// `SurrogateAssigner` from `(collection, key)`. Never
+        /// `Surrogate::ZERO`: a write that carries it is refused.
         surrogate: Surrogate,
         /// When `Some`, return the STORED post-image (row as `SELECT` would
         /// show it, `key` included). Never the caller's submitted body.
@@ -75,7 +75,7 @@ pub enum KvOp {
         key: Vec<u8>,
         value: Vec<u8>,
         ttl_ms: u64,
-        /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
+        /// Stable cross-engine identity. Never `Surrogate::ZERO`.
         surrogate: Surrogate,
         /// See `Put::returning`.
         #[serde(default)]
@@ -92,7 +92,7 @@ pub enum KvOp {
         key: Vec<u8>,
         value: Vec<u8>,
         ttl_ms: u64,
-        /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
+        /// Stable cross-engine identity. Never `Surrogate::ZERO`.
         surrogate: Surrogate,
         /// See `Put::returning`.
         #[serde(default)]
@@ -114,7 +114,7 @@ pub enum KvOp {
         value: Vec<u8>,
         ttl_ms: u64,
         updates: Vec<(String, crate::physical_plan::document::UpdateValue)>,
-        /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
+        /// Stable cross-engine identity. Never `Surrogate::ZERO`.
         surrogate: Surrogate,
         /// Write policy against the body actually persisted — insert branch
         /// or the conflict-merge, neither of which exists at plan time.
@@ -231,7 +231,7 @@ pub enum KvOp {
         /// Stable cross-engine identity for each entry, same order and
         /// length as `entries`, assigned by the CP-side `SurrogateAssigner`
         /// from `(collection, key)` -- the same mechanism `Put`/`Insert`
-        /// use. `Surrogate::ZERO` only appears in test fixtures.
+        /// use. Never `Surrogate::ZERO`.
         #[serde(default)]
         surrogates: Vec<Surrogate>,
         /// When `Some`, return one row per written entry — the STORED
@@ -344,7 +344,7 @@ pub enum KvOp {
         /// protocol boundary. It is parsed once, where it is added, so no
         /// digit is lost to an `f64` on the way.
         delta: String,
-        /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
+        /// Stable cross-engine identity. Never `Surrogate::ZERO`.
         surrogate: Surrogate,
         /// Compiled row-level-security WRITE predicate — see `Incr`, whose
         /// engine-internal compute-and-persist this mirrors.
@@ -362,7 +362,7 @@ pub enum KvOp {
         key: Vec<u8>,
         expected: Vec<u8>,
         new_value: Vec<u8>,
-        /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
+        /// Stable cross-engine identity. Never `Surrogate::ZERO`.
         surrogate: Surrogate,
         /// Compiled row-level-security WRITE predicate, evaluated against
         /// `new_value` before the swap is attempted, or the reason no
@@ -377,7 +377,7 @@ pub enum KvOp {
         collection: QualifiedCollection,
         key: Vec<u8>,
         new_value: Vec<u8>,
-        /// Stable cross-engine identity. `Surrogate::ZERO` only in tests.
+        /// Stable cross-engine identity. Never `Surrogate::ZERO`.
         surrogate: Surrogate,
         /// Row-level-security READ filters applied to the OLD value this op
         /// hands back. The reply is a row body, so a row the read policy hides

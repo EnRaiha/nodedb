@@ -121,7 +121,7 @@ pub async fn query(
     .map_err(ApiError::from)?;
     let tasks = admission.tasks;
     let output_schema = admission.output_schema;
-    let _lease_scope = admission.lease_scope;
+    let lease_scope = admission.lease_scope;
 
     if tasks.is_empty() {
         return Ok((
@@ -133,7 +133,13 @@ pub async fn query(
     // Track active request for quota accounting.
     let _request = state.shared.tenant_request_guard(tenant_id);
 
-    let result_rows = run_task_loop(
+    // A statement admitted under a lease this node then loses ends with a
+    // retryable error: a read mid-flight, a write only before dispatch.
+    lease_scope.check_not_revoked().map_err(ApiError::from)?;
+    let read_only = tasks
+        .iter()
+        .all(|task| !crate::control::server::shared::write_admission::plan_is_write(&task.plan));
+    let run = run_task_loop(
         tasks,
         TaskLoopParams {
             state: &state,
@@ -144,8 +150,12 @@ pub async fn query(
             tenant_id,
             trace_id,
         },
-    )
-    .await?;
+    );
+    let result_rows = if read_only {
+        lease_scope.guard(run).await.map_err(ApiError::from)??
+    } else {
+        run.await?
+    };
 
     Ok((
         rate_limit_headers,

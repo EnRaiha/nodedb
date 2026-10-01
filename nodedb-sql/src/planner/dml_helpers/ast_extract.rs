@@ -35,47 +35,58 @@ pub fn extract_point_keys(selection: Option<&ast::Expr>, info: &CollectionInfo) 
     };
 
     let mut keys = Vec::new();
-    collect_pk_equalities(expr, &pk, &mut keys);
-    keys
+    // The keys stand for the WHERE only when they cover every row it matches.
+    // A disjunct that is no key equality (`id = 'd' OR v < 2`) matches rows no
+    // key names, so the statement takes the predicate path.
+    if collect_pk_equalities(expr, &pk, &mut keys) {
+        keys
+    } else {
+        Vec::new()
+    }
 }
 
-fn collect_pk_equalities(expr: &ast::Expr, pk: &str, keys: &mut Vec<SqlValue>) {
+/// Push the keys `expr` names into `keys`. Returns `false` when `expr` matches
+/// a row no pushed key names: a disjunct that is no key equality, or a key
+/// value that is no literal.
+fn collect_pk_equalities(expr: &ast::Expr, pk: &str, keys: &mut Vec<SqlValue>) -> bool {
     match expr {
         ast::Expr::BinaryOp {
             left,
             op: ast::BinaryOperator::Eq,
             right,
         } => {
-            if is_column(left, pk)
-                && let Ok(v) = expr_to_sql_value(right)
-            {
-                keys.push(v);
-            } else if is_column(right, pk)
-                && let Ok(v) = expr_to_sql_value(left)
-            {
-                keys.push(v);
+            let value = if is_column(left, pk) {
+                right
+            } else if is_column(right, pk) {
+                left
+            } else {
+                return false;
+            };
+            match expr_to_sql_value(value) {
+                Ok(v) => {
+                    keys.push(v);
+                    true
+                }
+                Err(_) => false,
             }
         }
         ast::Expr::BinaryOp {
             left,
             op: ast::BinaryOperator::Or,
             right,
-        } => {
-            collect_pk_equalities(left, pk, keys);
-            collect_pk_equalities(right, pk, keys);
-        }
+        } => collect_pk_equalities(left, pk, keys) && collect_pk_equalities(right, pk, keys),
         ast::Expr::InList {
             expr: inner,
             list,
             negated: false,
-        } if is_column(inner, pk) => {
-            for item in list {
-                if let Ok(v) = expr_to_sql_value(item) {
-                    keys.push(v);
-                }
+        } if is_column(inner, pk) => list.iter().all(|item| match expr_to_sql_value(item) {
+            Ok(v) => {
+                keys.push(v);
+                true
             }
-        }
-        _ => {}
+            Err(_) => false,
+        }),
+        _ => false,
     }
 }
 

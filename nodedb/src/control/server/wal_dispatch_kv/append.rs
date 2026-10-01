@@ -12,8 +12,8 @@ use super::encode::{
     encode_kv_expire, encode_kv_field_set, encode_kv_getset, encode_kv_incr, encode_kv_incr_float,
     encode_kv_insert_on_conflict_update, encode_kv_persist, encode_kv_predicate_delete,
     encode_kv_predicate_update, encode_kv_put, encode_kv_register_index,
-    encode_kv_register_sorted_index, encode_kv_transfer, encode_kv_transfer_item,
-    encode_kv_truncate,
+    encode_kv_register_sorted_index, encode_kv_rewrite, encode_kv_transfer,
+    encode_kv_transfer_item, encode_kv_truncate,
 };
 
 /// Outcome of [`wal_append_kv_op`]: the allocated WAL LSN and, for a TTL-bearing
@@ -126,7 +126,7 @@ pub fn wal_append_kv_op(
             value,
             ttl_ms,
             updates,
-            surrogate: _,
+            surrogate,
             // Compiled RLS predicate is a session property, not the row's — stays out.
             rls_write_check: _,
             // Projection is answered from the response, not the journal — stays out.
@@ -142,6 +142,7 @@ pub fn wal_append_kv_op(
                 *ttl_ms,
                 updates,
                 expire_at_ms,
+                surrogate.as_u32(),
             )?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
@@ -447,6 +448,17 @@ fn append_kv_resolved_mutation(
                 Some(*expire_at_ms),
                 surrogate.as_u32(),
             )?;
+            wal.append_put(tenant_id, vshard_id, database_id, &entry)
+        }
+        M::Rewrite {
+            collection,
+            key,
+            value,
+            ttl_ms,
+            expire_at_ms,
+            precondition: _,
+        } => {
+            let entry = encode_kv_rewrite(collection.as_str(), key, value, *ttl_ms, *expire_at_ms)?;
             wal.append_put(tenant_id, vshard_id, database_id, &entry)
         }
         M::Delete {

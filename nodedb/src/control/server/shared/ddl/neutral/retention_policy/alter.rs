@@ -40,7 +40,7 @@ fn parse_auto_tier(value: &str) -> Result<bool, DdlError> {
 /// `name`, `action`, `set_key`, and `set_value` come from the typed
 /// [`PolicyStmt::AlterRetentionPolicy`] variant. `database_id` scopes
 /// the in-memory registry lookup to the session's database.
-pub fn alter_retention_policy(
+pub async fn alter_retention_policy(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -88,7 +88,7 @@ pub fn alter_retention_policy(
     }
 
     // Replicated: every node writes the row and refreshes its registry.
-    propose_put(state, &def)?;
+    propose_put(state, &def).await?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

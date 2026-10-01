@@ -2,9 +2,8 @@
 
 //! Shared parsing helpers for the protocol-neutral API-key DDL family.
 //!
-//! Ported from the pgwire `ddl::apikey` helpers. The scope / database / owner
-//! resolution logic is preserved verbatim; only the error construction changed
-//! from pgwire `sqlstate_error` to the protocol-neutral [`DdlError`].
+//! The scope / database / owner resolution logic reports errors as the
+//! protocol-neutral [`DdlError`].
 
 use nodedb_types::id::DatabaseId;
 use smallvec::SmallVec;
@@ -14,8 +13,7 @@ use crate::control::state::SharedState;
 
 use super::super::super::result::DdlError;
 
-/// Construct a [`DdlError`] with the given SQLSTATE and message, preserving the
-/// exact codes and messages the pgwire handlers produced.
+/// Construct a [`DdlError`] with the given SQLSTATE and message.
 pub(super) fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
 }

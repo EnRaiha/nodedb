@@ -24,19 +24,25 @@ pub(crate) struct DataPlaneBootstrap {
     pub(crate) event_consumers: Vec<nodedb::event::bus::EventConsumerRx>,
     pub(crate) system_metrics: Arc<nodedb::control::metrics::SystemMetrics>,
     pub(crate) quiesce: Arc<nodedb::bridge::quiesce::CollectionQuiesce>,
+    /// The collections some Event Plane consumer reads. Every core holds it.
+    /// The Control Plane registries' slices are installed once
+    /// `SharedState` exists.
+    pub(crate) event_interest: Arc<nodedb::event::interest::EventInterest>,
     pub(crate) array_catalog: nodedb::control::array_catalog::ArrayCatalogHandle,
     pub(crate) quarantine_registry: Arc<nodedb::storage::quarantine::QuarantineRegistry>,
     pub(crate) maintenance_budget: Arc<nodedb::control::maintenance::MaintenanceBudgetTracker>,
     pub(crate) governor: Arc<nodedb_mem::governor::MemoryGovernor>,
     pub(crate) watermark_store: Arc<nodedb::event::watermark::WatermarkStore>,
     pub(crate) trigger_dlq: Arc<std::sync::Mutex<nodedb::event::trigger::TriggerDlq>>,
-    pub(crate) cluster_handle: Option<Arc<nodedb::control::cluster::ClusterHandle>>,
+    /// The cluster handle. A server with no `[cluster]` section runs a
+    /// synthesized one-node cluster, so every server has one.
+    pub(crate) cluster_handle: Arc<nodedb::control::cluster::ClusterHandle>,
     // Held only to keep the Data Plane core threads alive; never read.
     pub(crate) _core_handles: Vec<std::thread::JoinHandle<()>>,
     /// Per-core WAL-replay-completion signals. Boot awaits every one before
     /// firing the gateway readiness gate so `/healthz` reports ready only once
     /// every core has rebuilt its in-memory indexes from the WAL.
-    pub(crate) replay_done: Vec<tokio::sync::oneshot::Receiver<()>>,
+    pub(crate) replay_done: Vec<tokio::sync::oneshot::Receiver<nodedb::Result<()>>>,
 }
 
 /// Run the full Data Plane bootstrap phase. Runs between WAL init and
@@ -74,6 +80,10 @@ pub(crate) async fn bootstrap_data_plane(
     // Plane purge-time `begin_drain` and per-core scan-time
     // `try_start_scan` — splitting it would make drain a no-op.
     let quiesce = nodedb::bridge::quiesce::CollectionQuiesce::new();
+
+    // One set for every core. It holds no collection until the Control
+    // Plane registries are installed, so WAL replay emits no on-demand event.
+    let event_interest = nodedb::event::interest::EventInterest::new();
 
     // Load the persisted ND-array catalog once, before spawning cores.
     let array_catalog = bootstrap::data_plane::load_array_catalog(config);
@@ -119,6 +129,7 @@ pub(crate) async fn bootstrap_data_plane(
         bootstrap::data_plane::CoreSharedResources {
             governor: Arc::clone(&governor),
             quiesce: Arc::clone(&quiesce),
+            event_interest: Arc::clone(&event_interest),
             hlc: Arc::new(nodedb_types::OrdinalClock::new()),
             array_catalog: Arc::clone(&array_catalog),
             quarantine_registry: Arc::clone(&quarantine_registry),
@@ -140,33 +151,28 @@ pub(crate) async fn bootstrap_data_plane(
             .expect("failed to open trigger DLQ"),
     ));
 
-    // Initialize cluster mode if configured.
-    let cluster_handle = if let Some(ref cluster_cfg) = config.cluster {
+    // Every server runs a cluster handle. `[cluster]` selects a real
+    // deployment. Without it, the server synthesizes a one-node cluster so
+    // the sequencer and per-vShard schedulers run, and cross-core
+    // transactions take the deterministic Calvin path.
+    let handle = if let Some(ref cluster_cfg) = config.cluster {
         cluster_cfg
             .validate()
             .map_err(|e| anyhow::anyhow!("cluster config: {e}"))?;
-        let handle = nodedb::control::cluster::init_cluster(
+        nodedb::control::cluster::init_cluster(
             cluster_cfg,
             &config.server.data_dir,
             &config.tuning.cluster_transport,
         )
-        .await?;
-        Some(Arc::new(handle))
-    } else if config.server.single_node_calvin {
-        // Single-node Calvin (on by default): synthesize a one-node cluster so
-        // the sequencer + per-vShard schedulers run and cross-core transactions
-        // take the deterministic Calvin path. Set `single_node_calvin = false`
-        // to skip this branch and take the legacy standalone path (the `else`
-        // below), where cross-shard interactive transactions are rejected.
-        let handle = nodedb::control::cluster::init_single_node_calvin(
+        .await?
+    } else {
+        nodedb::control::cluster::init_single_node_calvin(
             &config.server.data_dir,
             &config.tuning.cluster_transport,
         )
-        .await?;
-        Some(Arc::new(handle))
-    } else {
-        None
+        .await?
     };
+    let cluster_handle = Arc::new(handle);
 
     Ok(DataPlaneBootstrap {
         dispatcher,
@@ -177,6 +183,7 @@ pub(crate) async fn bootstrap_data_plane(
         event_consumers,
         system_metrics,
         quiesce,
+        event_interest,
         array_catalog,
         quarantine_registry,
         maintenance_budget,

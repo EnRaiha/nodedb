@@ -34,7 +34,6 @@ pub enum DataPlaneErrorCode {
         expected: [u8; 32],
         actual: [u8; 32],
     },
-    FanOutExceeded,
     ResourcesExhausted,
     RejectedDanglingEdge {
         missing_node: String,

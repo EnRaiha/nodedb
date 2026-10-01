@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::enforcement::unique::SubmittedWrite;
 use crate::data::executor::handlers::merge::MergeParams;
 use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
@@ -75,10 +76,44 @@ impl CoreLoop {
             return self.response_error(task, e);
         }
 
-        // One post-apply redo entry per indexed row — a `Put` for each
-        // UPDATE/INSERT post-image, a `Delete` for each removed row — carried
-        // back so the Control Plane mints the durable WAL redo the vector index
-        // needs to survive a WAL-only restart. Empty on non-vector targets.
+        // The rows land row by row and the DELETE arms after phase A, so
+        // UNIQUE is judged on the whole MERGE's post-state first. An insert
+        // missing its surrogate claims nothing here: phase A refuses it.
+        let collection = params.target_collection;
+        let unit: Vec<SubmittedWrite<'_>> = plan
+            .updates
+            .iter()
+            .map(|update| {
+                (
+                    update.key.surrogate().as_u32(),
+                    Some(update.body.as_slice()),
+                )
+            })
+            .chain(plan.inserts.iter().filter_map(|insert| {
+                surrogate_for
+                    .get(insert.join_key.as_str())
+                    .map(|surrogate| (*surrogate, Some(insert.body.as_slice())))
+            }))
+            .chain(
+                plan.deletes
+                    .iter()
+                    .map(|delete| (delete.key.surrogate().as_u32(), None)),
+            )
+            .map(|(surrogate, body)| SubmittedWrite {
+                collection,
+                surrogate,
+                body,
+                judged: true,
+            })
+            .collect();
+        if let Err(e) = self.check_submitted_unit_unique(database_id, tid, &unit) {
+            return self.response_error(task, e);
+        }
+
+        // One post-apply redo entry per row the MERGE stores — a `Put` for
+        // each UPDATE/INSERT post-image, a `Delete` for each removed row — in
+        // the order the rows land. The plan carries no pre-dispatch record, so
+        // these entries are the rows' only WAL record.
         let mut write_set: Vec<WriteSetEntry> = Vec::new();
 
         // The whole MERGE is ONE boundary, so its DELETE arms are accounted
@@ -96,9 +131,9 @@ impl CoreLoop {
         );
 
         // Phase A: matched UPDATE + NOT-MATCHED INSERT share ONE redb write
-        // transaction. Any per-row error (including a UNIQUE violation from
-        // `apply_point_put`) aborts, dropping the txn and rolling the whole set
-        // back — the all-or-nothing guarantee the atomicity test pins.
+        // transaction. Any per-row error aborts, dropping the txn and rolling
+        // the whole set back — the all-or-nothing guarantee the atomicity test
+        // pins.
         let txn = match self.sparse.begin_write() {
             Ok(t) => t,
             Err(e) => return self.response_error(task, e),
@@ -109,8 +144,8 @@ impl CoreLoop {
         let mut put_events: Vec<MergePutEvent<'_>> = Vec::new();
         let mut affected = 0u64;
         // Every row key written into `txn`, pushed BEFORE the write so a row that
-        // fails mid-apply (its cache entry is populated before the UNIQUE check)
-        // is evicted on abort too — see `rollback_merge_cache`.
+        // fails mid-apply (its cache entry is populated before the put's later
+        // steps) is evicted on abort too — see `rollback_merge_cache`.
         let mut applied_keys: Vec<String> = Vec::new();
         // In-memory (HNSW + R-tree) index deltas applied this pass, reversed on
         // any abort path — the redb txn drop only reverses store-backed state.
@@ -156,7 +191,6 @@ impl CoreLoop {
                 database_id,
                 tid,
                 collection: params.target_collection,
-                has_vectors,
                 returning: params.returning.is_some(),
                 resolved_sum_targets: params.resolved_sum_targets,
                 surrogate_for: &surrogate_for,
@@ -232,7 +266,6 @@ impl CoreLoop {
                 tid,
                 collection: params.target_collection,
                 deletes: &plan.deletes,
-                has_vectors,
                 returning: params.returning.is_some(),
                 resolved_targets: params.resolved_sum_targets,
                 declared_primary_key: params.declared_primary_key,
@@ -243,38 +276,38 @@ impl CoreLoop {
                 returned_docs: &mut returned_docs,
             },
         ) {
+            // Phase A and every earlier DELETE arm committed: the refusal
+            // carries their entries so they are journalled.
+            let mut response = response;
+            response.write_set = write_set;
             return response;
         }
 
+        // Every arm committed, so an encode error answers with the rows'
+        // entries as well.
         let mut response = if let Some(spec) = params.returning {
             match returning_rows::build_rows_payload(spec, params.rls_filters, &returned_docs) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("RETURNING encode: {e}"),
-                        },
-                    );
-                }
+                Err(e) => self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("RETURNING encode: {e}"),
+                    },
+                ),
             }
         } else {
             let result = serde_json::json!({ "affected": affected });
             match encode_json_as_msgpack(&result) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
-                }
+                Err(e) => self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: e.to_string(),
+                    },
+                ),
             }
         };
-        if !write_set.is_empty() {
-            response.write_set = write_set;
-        }
+        response.write_set = write_set;
         response
     }
 }

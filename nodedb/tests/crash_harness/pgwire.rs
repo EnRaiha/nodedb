@@ -167,7 +167,7 @@ impl CrashHarness {
     /// submit cross-shard transaction` after `/healthz` is already green.
     /// pgwire callers never see that race because `simple_query_ready`
     /// above already retries this exact condition — but ILP has no such
-    /// retry (`handle_ilp_connection` in `control/server/ilp_listener.rs`
+    /// retry (`handle_ilp_connection` in `control/server/ilp_connection.rs`
     /// logs the error and drops the connection), so an ILP line sent into
     /// that window is silently dropped with no client-visible signal at
     /// all. A caller that is about to drive ILP must wait for this

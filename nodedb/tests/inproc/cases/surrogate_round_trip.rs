@@ -89,6 +89,7 @@ fn make_req(plan: PhysicalPlan) -> Request {
         txn_id: None,
         wal_lsn: None,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: nodedb::bridge::envelope::Admission::Admitted,
     }
 }
@@ -384,6 +385,7 @@ fn surrogate_round_trip_all_engines() {
                 cells_msgpack: cells_mp,
                 wal_lsn: 1,
                 provenance: None,
+                vshard_id: 0,
             }),
         );
     }

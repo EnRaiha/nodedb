@@ -14,7 +14,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use crate::control::planner::calvin::{DispatchClass, classify_dispatch};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::session::{SessionId, TransactionState};
-use crate::control::server::shared::write_admission::all_writes_bufferable;
+use crate::control::server::shared::write_admission::{all_writes_bufferable, plan_is_write};
 use crate::types::TenantId;
 
 use super::super::super::types::error_to_sqlstate;
@@ -47,7 +47,7 @@ impl NodeDbPgHandler {
             .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
         let (tasks, output_schema, auth_ctx, plan_lease_scope, sum_target_reads) =
-            retry_on_schema_change(move || async move {
+            retry_on_schema_change(&self.state.lease_drain, move || async move {
                 let (mut tasks, output_schema, versions, auth_ctx) = self
                     .plan_statement_to_tasks(identity, sql, tenant_id, session_id, params)
                     .await?;
@@ -104,7 +104,7 @@ impl NodeDbPgHandler {
                 .map_err(StatementSetupError::from)?;
 
                 // Period-lock reference rows are resolved here for the same
-                // reason as the materialized-sum targets just above, into the
+                // reason as the materialized-sum targets right above, into the
                 // same plan slot.
                 crate::control::planner::period_lock::resolve_period_lock_targets(
                     &self.state,
@@ -126,6 +126,7 @@ impl NodeDbPgHandler {
                 let plan_lease_scope = self
                     .state
                     .acquire_plan_lease_scope(&versions)
+                    .await
                     .map_err(StatementSetupError::from)?;
 
                 Ok::<_, StatementSetupError>((
@@ -140,54 +141,80 @@ impl NodeDbPgHandler {
             .map_err(PgWireError::from)?;
         let plan_lease_scope = Arc::new(plan_lease_scope);
 
-        if tasks.is_empty() {
-            return Ok(vec![Response::Execution(Tag::new("OK"))]);
+        // A statement admitted under a lease this node then loses ends with a
+        // retryable error. A read is cancelled mid-flight. A write is checked
+        // only before dispatch: cancelling a proposed write will leave its
+        // outcome unknown to the client.
+        if let Err(revoked) = plan_lease_scope.check_not_revoked() {
+            return Err(sql_error(&revoked));
         }
+        let read_only = tasks.iter().all(|task| !plan_is_write(&task.plan));
+        let guard_scope = Arc::clone(&plan_lease_scope);
+        let body = async {
+            if tasks.is_empty() {
+                return Ok(vec![Response::Execution(Tag::new("OK"))]);
+            }
 
-        // An externally-supplied prepared-statement schema (from the Describe
-        // phase) names the columns; otherwise the planner's fresh output
-        // schema for this statement does. The Control-Plane computed list is
-        // known only to this statement's plan, so it rides along under the
-        // Describe-phase columns: the shaper evaluates it before those
-        // columns project, and a computed alias never renders as NULL.
-        let effective_schema_owned = match shaping.projection {
-            Some(described) => crate::control::server::response_shape::schema::OutputSchema {
-                columns: described.columns.clone(),
-                is_star: described.is_star,
-                cp_computed: output_schema.cp_computed,
-            },
-            None => output_schema,
-        };
-        let effective_schema = Some(&effective_schema_owned);
-
-        // Implicit-edge dependent predicates must be preempted onto the
-        // OLLP/Calvin path before gateway forwarding or ordinary dispatch.
-        if let Some(responses) = self
-            .maybe_dispatch_implicit_edge_recon(
-                &tasks,
-                tenant_id,
-                identity,
-                session_id,
-                ResultShaping {
-                    projection: effective_schema,
-                    formats: shaping.formats,
+            // An externally-supplied prepared-statement schema (from the Describe
+            // phase) names the columns; otherwise the planner's fresh output
+            // schema for this statement does. The Control-Plane computed list is
+            // known only to this statement's plan, so it rides along under the
+            // Describe-phase columns: the shaper evaluates it before those
+            // columns project, and a computed alias never renders as NULL.
+            let effective_schema_owned = match shaping.projection {
+                Some(described) => crate::control::server::response_shape::schema::OutputSchema {
+                    columns: described.columns.clone(),
+                    is_star: described.is_star,
+                    cp_computed: output_schema.cp_computed,
                 },
-                &auth_ctx,
-            )
-            .await?
-        {
-            return Ok(responses);
-        }
+                None => output_schema,
+            };
+            let effective_schema = Some(&effective_schema_owned);
 
-        // Read once, ahead of the gateway gate: an in-block write must never
-        // forward here, or it applies durably outside the transaction.
-        let tx_state = self.sessions.transaction_state(session_id);
-        if tx_state != TransactionState::InBlock
-            && let Some(responses) = self
-                .maybe_dispatch_tasks_via_gateway(
+            // A statement outside a transaction block whose writes fire a
+            // BEFORE, INSTEAD OF or SYNC AFTER body, or a MERGE into an
+            // edge-bearing collection, runs in an implicit transaction,
+            // ahead of every autocommit route:
+            // its writes stage on their vShards' leaders and commit together
+            // at its end.
+            let tx_state = self.sessions.transaction_state(session_id);
+            if tx_state != TransactionState::InBlock
+                && crate::control::server::shared::txn_route::statement_needs_implicit_txn(
+                    &self.state,
                     &tasks,
-                    identity,
+                )
+            {
+                if !all_writes_bufferable(&tasks) {
+                    return Err(sql_error(
+                        &crate::control::server::shared::txn_route::unbufferable_joined_statement(),
+                    ));
+                }
+                return self
+                    .dispatch_task_loop_implicit(
+                        tasks,
+                        DispatchTaskContext {
+                            plan_lease_scope: Arc::clone(&plan_lease_scope),
+                            tenant_id,
+                            identity,
+                            auth_ctx: &auth_ctx,
+                            session_id,
+                            shaping: ResultShaping {
+                                projection: effective_schema,
+                                formats: shaping.formats,
+                            },
+                            sum_target_reads,
+                        },
+                    )
+                    .await;
+            }
+
+            // Implicit-edge dependent predicates must be preempted onto the
+            // OLLP/Calvin path before gateway forwarding or ordinary dispatch.
+            if let Some(responses) = self
+                .maybe_dispatch_implicit_edge_recon(
+                    &tasks,
                     tenant_id,
+                    identity,
                     session_id,
                     ResultShaping {
                         projection: effective_schema,
@@ -196,89 +223,129 @@ impl NodeDbPgHandler {
                     &auth_ctx,
                 )
                 .await?
-        {
-            return Ok(responses);
-        }
-
-        // Autocommit statement routing: the only reads to widen with are the
-        // ones the materialized-sum settlement stamped on the source rows its
-        // shipped balances were folded from.
-        let sum_read_vshards =
-            match crate::control::planner::calvin::read_vshards_of(&sum_target_reads) {
-                Ok(vshards) => vshards,
-                Err(error) => {
-                    let (severity, code, message) = error_to_sqlstate(&error);
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        severity.to_owned(),
-                        code.to_owned(),
-                        message,
-                    ))));
-                }
-            };
-        match classify_dispatch(&tasks, &sum_read_vshards) {
-            DispatchClass::SingleShard { .. } => {
-                // A single-shard dependent-predicate write (e.g. `DELETE ...
-                // WHERE <non-pk>`) doesn't need OLLP/Calvin: one shard is one
-                // Raft group, so the normal replicated-write dispatch path
-                // applies it deterministically. Edge-bearing dependent
-                // predicates are already preempted onto Calvin above; only
-                // genuine multi-shard bulk writes need OLLP. Fall through.
+            {
+                return Ok(responses);
             }
-            DispatchClass::MultiShard { .. } => {
-                // Dispatching to Calvin here would apply the statement durably
-                // at statement time, escaping the transaction buffer. Inside a
-                // block, fall through to the per-task staging gate when the gate
-                // can buffer every write — COMMIT then flushes the whole buffer
-                // through Calvin. Anything else is refused, never applied.
-                if tx_state == TransactionState::InBlock {
-                    if !all_writes_bufferable(&tasks) {
-                        let (severity, code, message) =
-                            error_to_sqlstate(&crate::Error::CrossShardInExplicitTransaction);
+
+            // Read once, ahead of the gateway gate: an in-block write must never
+            // forward here, or it applies durably outside the transaction.
+            if tx_state != TransactionState::InBlock
+                && let Some(responses) = self
+                    .maybe_dispatch_tasks_via_gateway(
+                        &tasks,
+                        identity,
+                        tenant_id,
+                        session_id,
+                        ResultShaping {
+                            projection: effective_schema,
+                            formats: shaping.formats,
+                        },
+                        &auth_ctx,
+                    )
+                    .await?
+            {
+                return Ok(responses);
+            }
+
+            // Autocommit statement routing: the only reads to widen with are the
+            // ones the materialized-sum settlement stamped on the source rows its
+            // shipped balances were folded from.
+            let sum_read_vshards =
+                match crate::control::planner::calvin::read_vshards_of(&sum_target_reads) {
+                    Ok(vshards) => vshards,
+                    Err(error) => {
+                        let (severity, code, message) = error_to_sqlstate(&error);
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             severity.to_owned(),
                             code.to_owned(),
                             message,
                         ))));
                     }
-                    // Bufferable: fall through to the staging gate below.
-                } else {
-                    let cross_shard_mode = self.sessions.cross_shard_txn_mode(session_id);
-                    if cross_shard_mode
-                        == crate::control::server::shared::session::cross_shard_mode::CrossShardTxnMode::Strict
-                    {
-                        return self
-                            .dispatch_calvin_multishard(
-                                tasks,
-                                tenant_id,
-                                super::calvin_dispatch::CalvinDispatchSession {
-                                    identity,
-                                    session_id,
-                                    result_formats: shaping.formats,
-                                    auth: &auth_ctx,
-                                    projection: effective_schema,
-                                },
-                                &sum_target_reads,
-                            )
-                            .await;
+                };
+            match classify_dispatch(&tasks, &sum_read_vshards) {
+                DispatchClass::SingleShard { .. } => {
+                    // A single-shard dependent-predicate write (e.g. `DELETE ...
+                    // WHERE <non-pk>`) doesn't need OLLP/Calvin: one shard is one
+                    // Raft group, so the normal replicated-write dispatch path
+                    // applies it deterministically. Edge-bearing dependent
+                    // predicates are already preempted onto Calvin above; only
+                    // genuine multi-shard bulk writes need OLLP. Fall through.
+                }
+                DispatchClass::MultiShard { .. } => {
+                    // Dispatching to Calvin here will apply the statement durably
+                    // at statement time, escaping the transaction buffer. Inside a
+                    // block, fall through to the per-task staging gate when the gate
+                    // can buffer every write — COMMIT then flushes the whole buffer
+                    // through Calvin. Anything else is refused, never applied.
+                    if tx_state == TransactionState::InBlock {
+                        if !all_writes_bufferable(&tasks) {
+                            let (severity, code, message) =
+                                error_to_sqlstate(&crate::Error::CrossShardInExplicitTransaction);
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                severity.to_owned(),
+                                code.to_owned(),
+                                message,
+                            ))));
+                        }
+                        // Bufferable: fall through to the staging gate below.
+                    } else {
+                        let cross_shard_mode = self.sessions.cross_shard_txn_mode(session_id);
+                        if cross_shard_mode
+                            == crate::control::server::shared::session::cross_shard_mode::CrossShardTxnMode::Strict
+                        {
+                            return self
+                                .dispatch_calvin_multishard(
+                                    tasks,
+                                    tenant_id,
+                                    super::calvin_dispatch::CalvinDispatchSession {
+                                        identity,
+                                        session_id,
+                                        result_formats: shaping.formats,
+                                        auth: &auth_ctx,
+                                        projection: effective_schema,
+                                    },
+                                    &sum_target_reads,
+                                )
+                                .await;
+                        }
                     }
                 }
             }
-        }
 
-        self.dispatch_task_loop(
-            tasks,
-            DispatchTaskContext {
-                plan_lease_scope: Arc::clone(&plan_lease_scope),
-                tenant_id,
-                identity,
-                auth_ctx: &auth_ctx,
-                session_id,
-                shaping: ResultShaping {
-                    projection: effective_schema,
-                    formats: shaping.formats,
+            self.dispatch_task_loop(
+                tasks,
+                DispatchTaskContext {
+                    plan_lease_scope: Arc::clone(&plan_lease_scope),
+                    tenant_id,
+                    identity,
+                    auth_ctx: &auth_ctx,
+                    session_id,
+                    shaping: ResultShaping {
+                        projection: effective_schema,
+                        formats: shaping.formats,
+                    },
+                    sum_target_reads,
                 },
-            },
-        )
-        .await
+            )
+            .await
+        };
+        if read_only {
+            match guard_scope.guard(body).await {
+                Ok(result) => result,
+                Err(revoked) => Err(sql_error(&revoked)),
+            }
+        } else {
+            body.await
+        }
     }
+}
+
+/// The client-facing form of an engine error.
+fn sql_error(error: &crate::Error) -> PgWireError {
+    let (severity, code, message) = error_to_sqlstate(error);
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        severity.to_owned(),
+        code.to_owned(),
+        message,
+    )))
 }

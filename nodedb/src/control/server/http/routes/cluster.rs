@@ -7,9 +7,9 @@
 //! peer, every Raft group hosted on this node — sourced from the
 //! `ClusterObserver` published by `control::cluster::start_raft`.
 //!
-//! In single-node mode (no `[cluster]` config) the endpoint returns
-//! `503 Service Unavailable` with a short JSON error body so clients
-//! can distinguish "cluster mode disabled" from "cluster mode broken".
+//! Every node runs a cluster, a node with no `[cluster]` config included:
+//! it runs a one-node cluster. `start_raft` publishes the observer before
+//! the startup gate admits this route.
 
 use axum::extract::State;
 use axum::http::{StatusCode, header};
@@ -42,25 +42,19 @@ pub async fn cluster_status(
         return error.into_response();
     }
 
-    match state.shared.cluster_observer.get() {
-        Some(observer) => {
-            let snap = observer.snapshot();
-            match sonic_rs::to_string(&snap) {
-                Ok(body) => json_response(StatusCode::OK, body),
-                Err(e) => {
-                    tracing::warn!(error = %e, "cluster snapshot serialization failed");
-                    json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        r#"{"error":"snapshot serialization failed"}"#.to_string(),
-                    )
-                }
-            }
+    let Some(observer) = state.shared.cluster_observer.get() else {
+        return super::cluster_debug::guard::cluster_not_started();
+    };
+    let snap = observer.snapshot();
+    match sonic_rs::to_string(&snap) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(e) => {
+            tracing::warn!(error = %e, "cluster snapshot serialization failed");
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"snapshot serialization failed"}"#.to_string(),
+            )
         }
-        None => json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"error":"cluster mode not enabled","detail":"this node is running in single-node mode; /v1/cluster/status requires a [cluster] config section"}"#
-                .to_string(),
-        ),
     }
 }
 

@@ -8,19 +8,17 @@
 //! BLACKLIST AUTH USERS WHERE email LIKE '%@compromised.com' WITH KILL SESSIONS
 //! ```
 //!
-//! Ported from the pgwire `ddl::emergency_ddl` handlers; the superuser gates,
-//! two-party approval check, emergency-state mutation, blacklist / session
-//! side effects, and audit records are preserved verbatim. Only the result
-//! construction changed from pgwire `Response` / `Tag` to the protocol-neutral
-//! [`DdlResult`]; the SQLSTATE codes, messages, and command tags are unchanged.
+//! The superuser gates, two-party approval check, emergency-state mutation,
+//! blacklist / session side effects, and audit records run here. The result
+//! is the protocol-neutral [`DdlResult`] with its SQLSTATE codes, messages,
+//! and command tags.
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
 use super::super::result::{DdlError, DdlResult};
 
-/// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
-/// the pgwire handlers produced.
+/// Construct a [`DdlError`] from a SQLSTATE code and a message.
 fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
 }

@@ -108,7 +108,7 @@ pub(crate) async fn apply_delta_and_finalize(
 
     // Blacklist + account status, no rate limit: CRDT delta sync is not the
     // per-query traffic the rate-limiter's cost table models, so charging it
-    // against a query rate limit would throttle legitimate offline-first
+    // against a query rate limit will throttle legitimate offline-first
     // sync traffic. A blacklisted or suspended/banned account must not be
     // able to keep pushing deltas, though — `check_blacklist_and_status`
     // runs that half of `check_request_admission`'s gate (plus the
@@ -249,8 +249,8 @@ pub(crate) async fn apply_delta_and_finalize(
             );
         }
         Err(error) => {
-            // The binding could not be established, so whether this peer id is
-            // safe to write under is unknown. Admitting the delta would gamble
+            // The binding cannot be established, so whether this peer id is
+            // safe to write under is unknown. Admitting the delta will gamble
             // the client's write on it; refusing retryably costs a re-push.
             warn!(
                 %error,
@@ -262,11 +262,15 @@ pub(crate) async fn apply_delta_and_finalize(
         }
     }
 
-    let surrogate = match shared.surrogate_assigner.assign(
+    let surrogate = match crate::control::server::surrogate_exchange::assign_surrogate_routed(
+        shared,
         nodedb_types::CollectionKey::from_bare(database_id, &delta_msg.collection),
         tenant_id,
         delta_msg.document_id.as_bytes(),
-    ) {
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "sync: surrogate assignment failed");
@@ -388,7 +392,7 @@ pub(crate) async fn apply_delta_and_finalize(
 }
 
 /// Refuse retryably: nothing was applied and the identical delta at the same
-/// sequence should be re-pushed once the binding can be established.
+/// sequence must be re-pushed once the binding can be established.
 fn retryable_binding_refusal(delta_msg: &DeltaPushMsg) -> Option<SyncFrame> {
     use nodedb_types::sync::wire::AckStatus;
 
@@ -463,12 +467,12 @@ mod tests {
     }
 
     /// The delta must be authorized before it reaches the admission gate, or
-    /// the test would be measuring the wrong refusal.
+    /// the test will be measuring the wrong refusal.
     fn grant_write(shared: &SharedState) {
         shared
             .permissions
             .grant(
-                "collection:3:notes",
+                "collection:0:3:notes",
                 "user:device",
                 Permission::Write,
                 "admin",
@@ -534,9 +538,8 @@ mod tests {
     /// authorized delta must pass the admission gate and be refused only by
     /// the next step (its collection does not exist here).
     ///
-    /// Before the session's address reached this scope, the gate had no score
-    /// to enforce and failed closed: enabling `[auth.risk]` refused every
-    /// delta push with "sender is blocked" no matter who sent it.
+    /// The session's address reaches this scope, so the gate has a score to
+    /// enforce and does not refuse every delta push when `[auth.risk]` is on.
     #[tokio::test]
     async fn scored_delta_passes_the_admission_gate_instead_of_failing_closed() {
         let (state, _dir) = state_with_risk(RiskConfig {

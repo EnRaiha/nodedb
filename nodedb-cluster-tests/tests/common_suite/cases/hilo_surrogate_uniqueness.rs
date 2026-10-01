@@ -147,10 +147,9 @@ async fn hilo_surrogate_globally_unique_and_disjoint_across_nodes() {
     insert_batch(&cluster.nodes[1].client, COLLECTION, "n1", KEYS_PER_NODE).await;
 
     // ── Step 4: Wait for catalogs to reflect both batches ─────────────────────
-    // The catalog is written on the inserting node synchronously (before the
-    // INSERT response is returned), so both nodes should already have their own
-    // entries. We wait up to 10 s for each node's count to reach the expected
-    // value to absorb any scheduling jitter.
+    // Every replica of the collection's home group binds each key when the
+    // INSERT applies there. We wait up to 10 s for each node's count to reach
+    // the expected value to absorb apply lag.
     for (idx, node) in cluster.nodes[..2].iter().enumerate() {
         let node_prefix = if idx == 0 { "n0" } else { "n1" };
         wait_for(
@@ -173,11 +172,10 @@ async fn hilo_surrogate_globally_unique_and_disjoint_across_nodes() {
     let node0_bindings = read_catalog_surrogates(&cluster.nodes[0].shared, COLLECTION);
     let node1_bindings = read_catalog_surrogates(&cluster.nodes[1].shared, COLLECTION);
 
-    // Each node only has its own prefix keys in its local catalog. The surrogate
-    // assigner writes a catalog row on the node that received the INSERT; binding
-    // replication is WAL-replay-based, not an immediate Raft write. So node 0
-    // holds all `n0_*` bindings and node 1 holds all `n1_*` bindings; we union
-    // them to form the cluster-wide view.
+    // The inserting node draws each key's surrogate from its own reserved
+    // batch and the write carries it; the collection home binds it. The `n0_*`
+    // keys therefore hold node 0's values and the `n1_*` keys node 1's; we
+    // union them to form the cluster-wide view.
     let node0_set: HashSet<u32> = node0_bindings
         .iter()
         .filter(|(pk, _)| pk.starts_with("n0"))

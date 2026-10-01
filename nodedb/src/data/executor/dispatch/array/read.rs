@@ -273,11 +273,19 @@ impl CoreLoop {
                         .enumerate()
                     {
                         if let Some(f) = cell_filter {
-                            let sur = final_tile
-                                .surrogates
-                                .get(row_idx)
-                                .copied()
-                                .unwrap_or(nodedb_types::Surrogate::ZERO);
+                            // A slice holds live rows only, one per cell, and
+                            // a stored live row always holds its surrogate.
+                            let sur = match final_tile.live_surrogate(row_idx) {
+                                Ok(sur) => sur,
+                                Err(e) => {
+                                    return self.response_error(
+                                        task,
+                                        ErrorCode::Internal {
+                                            detail: format!("array slice filter: {e}"),
+                                        },
+                                    );
+                                }
+                            };
                             if !f.contains(sur) {
                                 continue;
                             }
@@ -524,6 +532,7 @@ mod tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: crate::bridge::envelope::Admission::Admitted,
         }
     }
@@ -612,6 +621,7 @@ mod tests {
                 cells_msgpack: bytes,
                 wal_lsn: lsn,
                 provenance: None,
+                vshard_id: 0,
             });
             assert_eq!(r.status, Status::Ok, "put failed: {r:?}");
         }
@@ -629,7 +639,7 @@ mod tests {
         ArrayPutCell {
             coord: vec![CoordValue::Int64(x), CoordValue::Int64(y)],
             attrs: vec![CellValue::Float64(v)],
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new((x * 100 + y + 1) as u32),
             system_from_ms: 0,
             valid_from_ms: 0,
             valid_until_ms: i64::MAX,
@@ -763,7 +773,7 @@ mod tests {
         let mk = |v: f64, sys: i64| ArrayPutCell {
             coord: vec![CoordValue::Int64(0), CoordValue::Int64(0)],
             attrs: vec![CellValue::Float64(v)],
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
             system_from_ms: sys,
             valid_from_ms: 0,
             valid_until_ms: i64::MAX,

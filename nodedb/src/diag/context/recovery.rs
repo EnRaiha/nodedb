@@ -52,7 +52,7 @@ impl DomainContext for ReplayRecordUnapplied<'_> {
 /// A WAL segment due for deletion could not be archived to cold storage, so
 /// the checkpoint held truncation back at that segment.
 pub(in crate::diag) struct WalArchivalFailedTruncationHeld<'a> {
-    /// Which archival step failed (`list_segments`, `upload`, `segment_path`).
+    /// Which archival step failed (`list_segments`, `recover`, `upload`).
     pub stage: &'a str,
     /// Stable class of the failure, as the cold-storage layer described it.
     pub error_class: &'a str,

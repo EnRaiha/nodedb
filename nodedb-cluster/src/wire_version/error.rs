@@ -39,6 +39,19 @@ pub enum WireVersionError {
         remote_min: WireVersion,
         remote_max: WireVersion,
     },
+
+    /// The peer negotiated a compatible wire version but is running a
+    /// different build. Refused unconditionally before 1.0 — see
+    /// `nodedb_types::wire_version` for why build identity, not wire
+    /// version, is the invariant that actually protects mixed builds.
+    #[error(
+        "build identity mismatch: local build {local_build_id}, peer build {peer_build_id} — \
+         all nodes must run one build before 1.0; restart every node on the same build"
+    )]
+    BuildIdMismatch {
+        local_build_id: String,
+        peer_build_id: String,
+    },
 }
 
 impl From<WireVersionError> for crate::error::ClusterError {

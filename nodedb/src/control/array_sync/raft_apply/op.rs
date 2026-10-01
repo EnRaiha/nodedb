@@ -28,6 +28,7 @@ pub(crate) async fn apply_array_op(
     pos: AppliedPosition,
     target: ArrayOpTarget<'_>,
     op_bytes: &[u8],
+    cell_surrogate: Option<u32>,
     provenance_bytes: Option<&[u8]>,
 ) -> bool {
     let ArrayOpTarget {
@@ -131,10 +132,30 @@ pub(crate) async fn apply_array_op(
 
     let data_op = match op.kind {
         ArrayOpKind::Put => {
+            // A put carries the cell surrogate its proposer bound at the
+            // array's home. An entry without one names no row and is refused.
+            let Some(surrogate) = cell_surrogate.map(nodedb_types::Surrogate::new) else {
+                warn!(
+                    group_id, index = log_index, array = %array,
+                    "apply_array_op: put carries no cell surrogate"
+                );
+                tracker.complete(
+                    group_id,
+                    log_index,
+                    applied_key,
+                    Err(crate::Error::Internal {
+                        detail: format!(
+                            "array put into '{array}' carries no cell surrogate; every put \
+                             carries the one its proposer bound"
+                        ),
+                    }),
+                );
+                return false;
+            };
             let cells = vec![crate::engine::array::wal::ArrayPutCell {
                 coord: op.coord.clone(),
                 attrs: op.attrs.clone().unwrap_or_default(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate,
                 system_from_ms: op.header.system_from_ms,
                 valid_from_ms: op.header.valid_from_ms,
                 valid_until_ms: op.header.valid_until_ms,
@@ -162,6 +183,7 @@ pub(crate) async fn apply_array_op(
                 // the one replay reconstructs from the record header.
                 wal_lsn: 0,
                 provenance: provenance.clone(),
+                vshard_id: vshard.as_u32(),
             }
         }
         ArrayOpKind::Delete | ArrayOpKind::Erase => {
@@ -187,11 +209,27 @@ pub(crate) async fn apply_array_op(
                 // Minted and stamped by the funnel — see the `Put` arm above.
                 wal_lsn: 0,
                 provenance,
+                vshard_id: vshard.as_u32(),
             }
         }
     };
 
-    let plan = crate::bridge::envelope::PhysicalPlan::Array(data_op);
+    let mut plan = crate::bridge::envelope::PhysicalPlan::Array(data_op);
+    // Install the put's carried cell surrogate in this replica's catalog,
+    // first-wins, so a later SQL read or write of the cell resolves it.
+    if let Err(e) = crate::control::surrogate::bind_plan_identities(
+        &state.surrogate_assigner,
+        database_id,
+        tenant_id,
+        &mut plan,
+    ) {
+        warn!(
+            group_id, index = log_index, array = %array, error = %e,
+            "apply_array_op: cell surrogate bind failed"
+        );
+        tracker.complete(group_id, log_index, applied_key, Err(e));
+        return false;
+    }
     let result = submit_array_write(
         state,
         ArrayWriteSubmit {
@@ -206,6 +244,8 @@ pub(crate) async fn apply_array_op(
             apply_key: applied_key,
             commit_hlc,
             op_label: "array op",
+            group_id,
+            log_index,
         },
     )
     .await;

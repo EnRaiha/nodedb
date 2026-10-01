@@ -6,11 +6,13 @@
 use nodedb_raft::RaftError;
 
 /// A `RaftError` carried across a node hop. `NotLeader` keeps its leader
-/// hint, so the caller can chase the redirect.
+/// hint and the term the responder knew it at, so the caller can chase the
+/// redirect and rank it against the hint it holds.
 #[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum RaftErrorWire {
     NotLeader {
         leader_hint: Option<u64>,
+        term: u64,
     },
     LogCompacted {
         requested: u64,
@@ -48,7 +50,7 @@ pub enum RaftErrorWire {
 impl From<RaftError> for RaftErrorWire {
     fn from(error: RaftError) -> Self {
         match error {
-            RaftError::NotLeader { leader_hint } => Self::NotLeader { leader_hint },
+            RaftError::NotLeader { leader_hint, term } => Self::NotLeader { leader_hint, term },
             RaftError::LogCompacted {
                 requested,
                 first_available,
@@ -79,7 +81,7 @@ impl From<RaftError> for RaftErrorWire {
 impl From<RaftErrorWire> for RaftError {
     fn from(wire: RaftErrorWire) -> Self {
         match wire {
-            RaftErrorWire::NotLeader { leader_hint } => Self::NotLeader { leader_hint },
+            RaftErrorWire::NotLeader { leader_hint, term } => Self::NotLeader { leader_hint, term },
             RaftErrorWire::LogCompacted {
                 requested,
                 first_available,

@@ -128,6 +128,15 @@ impl AppliedMirrors {
             .collect()
     }
 
+    /// Drop the mirror of `vshard_id`: this node left the vShard's group and
+    /// holds none of its applied positions.
+    pub fn remove(&self, vshard_id: u32) {
+        self.by_vshard
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&vshard_id);
+    }
+
     /// The mirror of `vshard_id`, when this node runs its scheduler.
     pub fn get(&self, vshard_id: u32) -> Option<Arc<AppliedMirror>> {
         self.by_vshard

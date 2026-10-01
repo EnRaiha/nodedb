@@ -412,12 +412,7 @@ pub fn ca_fingerprint(cert: &rustls::pki_types::CertificateDer<'_>) -> [u8; 32] 
 /// Format a CA fingerprint as a short lowercase hex string (8 bytes).
 /// Used as the filename stem under `data_dir/tls/ca.d/<fp>.crt`.
 pub fn ca_fingerprint_hex(fp: &[u8; 32]) -> String {
-    let mut out = String::with_capacity(16);
-    for b in &fp[..8] {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{b:02x}");
-    }
-    out
+    hex::encode(&fp[..8])
 }
 
 /// Load CRLs from a PEM file.

@@ -22,8 +22,13 @@ use nodedb::wal::WalManager;
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// A bare state: these tests drive the credential store and its buses
+/// directly, and serve no request.
 fn make_state() -> Arc<SharedState> {
-    nodedb_test_support::pgwire_auth_helpers::make_state()
+    let dir = tempfile::tempdir().unwrap();
+    let wal = Arc::new(WalManager::open_for_testing(&dir.path().join("test.wal")).unwrap());
+    let (dispatcher, _) = Dispatcher::new(1, 64);
+    SharedState::new(dispatcher, wal).unwrap()
 }
 
 fn sample_params(user_id: u64, username: &str) -> SessionParams {

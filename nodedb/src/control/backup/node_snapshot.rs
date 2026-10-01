@@ -6,7 +6,6 @@
 //! plan in a `RaftRpc::ExecuteRequest`. Either way the request names the
 //! database, and the Data Plane snapshot covers that database only.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use nodedb_cluster::rpc_codec::{ExecuteRequest, ExecuteResponse, RaftRpc, TypedClusterError};
@@ -23,30 +22,33 @@ const NODE_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Whether `node_id` names this node.
 pub(super) fn is_self(state: &SharedState, node_id: u64) -> bool {
-    node_id == state.node_id || node_id == 0 || state.cluster_transport.is_none()
+    node_id == state.node_id || node_id == 0
 }
 
-/// Snapshot `tenant_id` in `database_id` on every core of this node.
+/// Snapshot `tenant_id` in `database_id` on every core of this node, with
+/// every array cell version when `arrays` is set.
 ///
 /// This node already took the backup's cut, so the local snapshot carries no
 /// cut request.
 pub(super) async fn snapshot_self(
-    state: &Arc<SharedState>,
+    state: &SharedState,
     tenant_id: u64,
     database_id: DatabaseId,
+    arrays: bool,
 ) -> Result<Vec<u8>, Error> {
     snapshot_tenant_on_local_cores(
         state,
         TenantId::new(tenant_id),
         database_id,
         NODE_SNAPSHOT_TIMEOUT,
+        arrays,
     )
     .await
 }
 
 /// Snapshot `tenant_id` in `database_id` on the remote node `node_id`.
 pub(super) async fn snapshot_remote(
-    state: &Arc<SharedState>,
+    state: &SharedState,
     node_id: u64,
     tenant_id: u64,
     database_id: DatabaseId,
@@ -71,6 +73,8 @@ pub(super) async fn snapshot_remote(
         descriptor_versions: Vec::new(),
         // Backup snapshot dispatch is not session-transaction-scoped.
         txn_id: None,
+        vshard_id: None,
+        read_groups: Vec::new(),
     });
 
     let resp = transport
@@ -140,5 +144,7 @@ fn map_typed_error(err: TypedClusterError, node_id: u64) -> Error {
             constraint,
             detail,
         },
+        // A Calvin abort keeps the error a local submit returns.
+        aborted @ TypedClusterError::CalvinAborted { .. } => Error::from(aborted),
     }
 }

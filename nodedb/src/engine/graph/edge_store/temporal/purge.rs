@@ -9,6 +9,7 @@
 //! the current state.
 
 use super::keys::{parse_versioned_edge_key, versioned_edge_key};
+use super::visibility::{EDGE_APPLIED, read_visibility};
 use crate::engine::graph::edge_store::store::{EDGES, EdgeStore, REVERSE_EDGES, redb_err};
 use nodedb_types::TenantId;
 use nodedb_types::temporal::ms_to_ordinal_upper;
@@ -21,9 +22,10 @@ impl EdgeStore {
     ///
     /// Preserves:
     /// - Every version whose `system_from >= cutoff_ordinal`.
-    /// - The latest-per-base version (tombstones / GDPR markers included)
-    ///   even if it is older than the cutoff — otherwise the base would be
-    ///   silently resurrected on a subsequent scan.
+    /// - The current version of each base: its newest version no TRUNCATE
+    ///   hides (tombstones / GDPR markers included), even if it is older
+    ///   than the cutoff — otherwise the base is silently resurrected
+    ///   on a subsequent scan.
     ///
     /// Deletes from both `EDGES` and `REVERSE_EDGES` inside a single
     /// write transaction so the two indexes never diverge mid-purge.
@@ -57,6 +59,9 @@ impl EdgeStore {
             let mut rev = write_txn
                 .open_table(REVERSE_EDGES)
                 .map_err(|e| redb_err("open reverse purge", e))?;
+            let mut applied = write_txn
+                .open_table(EDGE_APPLIED)
+                .map_err(|e| redb_err("open edge_applied purge", e))?;
 
             for v in &victims {
                 edges
@@ -64,6 +69,9 @@ impl EdgeStore {
                     .map_err(|e| redb_err("remove edge", e))?;
                 rev.remove((db, t, v.rev_key.as_str()))
                     .map_err(|e| redb_err("remove reverse", e))?;
+                applied
+                    .remove((db, t, v.fwd_key.as_str()))
+                    .map_err(|e| redb_err("remove edge applied ordinal", e))?;
             }
         }
         write_txn
@@ -87,73 +95,54 @@ impl EdgeStore {
         let edges = read_txn
             .open_table(EDGES)
             .map_err(|e| redb_err("open edges read purge", e))?;
+        let mut visibility = read_visibility(&read_txn)?;
 
-        // Versioned keys sort chronologically within a base (ascending
-        // system_from). We walk the full tenant range once, group by base,
-        // and for each base:
-        //   - keep the single newest version (latest per base)
-        //   - keep any version with system_from >= cutoff_ordinal
-        //   - every other version becomes a purge victim
-        // Streaming implementation: since redb returns keys in sorted order
-        // and the base prefix is a strict lex-prefix, we can emit victims as
-        // soon as we see "the next version for this same base" — i.e., the
-        // current candidate is provably not the latest and the cutoff
-        // predicate gates inclusion.
-
-        let low = (db, t, "");
-        let high = (db, t + 1, "");
+        // Versioned keys sort by base, then by system time ascending. Each
+        // base keeps its current version: the newest one no TRUNCATE hides.
+        // Removing it changes what the edge resolves to. Every other
+        // version below the cutoff is a victim. A version a TRUNCATE hides
+        // can go even when it is the newest: no read at the current system
+        // time reaches it.
+        let prefix = format!("{collection}\x00");
         let range = edges
-            .range(low..high)
+            .range((db, t, prefix.as_str())..)
             .map_err(|e| redb_err("range purge", e))?;
 
-        let mut pending: Option<PendingVersion> = None;
         let mut victims: Vec<Victim> = Vec::new();
+        let mut group: Option<BaseVersions> = None;
         for entry in range {
             let (k, _v) = entry.map_err(|e| redb_err("entry purge", e))?;
-            let (_db, _tid, key_str) = k.value();
-            let Some((parsed_coll, src, label, dst, system_from)) =
-                parse_versioned_edge_key(key_str)
-            else {
+            let (kd, kt, key_str) = k.value();
+            if kd != db || kt != t || !key_str.starts_with(&prefix) {
+                break;
+            }
+            let Some((_, src, label, dst, system_from)) = parse_versioned_edge_key(key_str) else {
                 continue;
             };
-            if parsed_coll != collection {
-                // Wrong collection within this tenant — skip.
-                if let Some(p) = pending.take() {
-                    // Flushing pending unconditionally: since we're leaving
-                    // its base, whatever was held is the latest-for-base
-                    // and must be kept.
-                    drop(p);
-                }
-                continue;
-            }
+            let hidden = visibility.hidden(db, t, collection, key_str, system_from, i64::MAX)?;
             let base = Base {
                 src: src.to_string(),
                 label: label.to_string(),
                 dst: dst.to_string(),
             };
-
-            match pending.take() {
-                None => {
-                    pending = Some(PendingVersion { base, system_from });
+            match group.as_mut() {
+                Some(current) if current.base == base => {
+                    current.versions.push((system_from, hidden));
                 }
-                Some(prev) if prev.base == base => {
-                    // prev is older than the current one (sorted ascending),
-                    // and by definition not the latest for this base — it is
-                    // eligible to be a victim if it's below the cutoff.
-                    if prev.system_from < cutoff_ordinal {
-                        victims.push(Victim::new(collection, &prev.base, prev.system_from)?);
+                _ => {
+                    if let Some(done) = group.take() {
+                        done.push_victims(collection, cutoff_ordinal, &mut victims)?;
                     }
-                    pending = Some(PendingVersion { base, system_from });
-                }
-                Some(_) => {
-                    // Base boundary — prev was the latest for its base, keep.
-                    pending = Some(PendingVersion { base, system_from });
+                    group = Some(BaseVersions {
+                        base,
+                        versions: vec![(system_from, hidden)],
+                    });
                 }
             }
         }
-        // The last pending version is the latest for its base and is kept.
-        drop(pending);
-
+        if let Some(done) = group {
+            done.push_victims(collection, cutoff_ordinal, &mut victims)?;
+        }
         Ok(victims)
     }
 }
@@ -165,9 +154,29 @@ struct Base {
     dst: String,
 }
 
-struct PendingVersion {
+/// Every version of one base, ascending, each with whether a TRUNCATE hides
+/// it from a current read.
+struct BaseVersions {
     base: Base,
-    system_from: i64,
+    versions: Vec<(i64, bool)>,
+}
+
+impl BaseVersions {
+    /// Push the versions below `cutoff_ordinal` other than the current one.
+    fn push_victims(
+        self,
+        collection: &str,
+        cutoff_ordinal: i64,
+        victims: &mut Vec<Victim>,
+    ) -> crate::Result<()> {
+        let current = self.versions.iter().rposition(|(_, hidden)| !hidden);
+        for (index, (system_from, _)) in self.versions.iter().enumerate() {
+            if Some(index) != current && *system_from < cutoff_ordinal {
+                victims.push(Victim::new(collection, &self.base, *system_from)?);
+            }
+        }
+        Ok(())
+    }
 }
 
 struct Victim {

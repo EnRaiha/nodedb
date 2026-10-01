@@ -136,7 +136,8 @@ pub async fn drop_index(
         tenant_id,
         index_name,
         &record.collection,
-    )?;
+    )
+    .await?;
 
     crate::control::server::shared::ddl::owner::propose_delete_owner(
         state,
@@ -144,7 +145,8 @@ pub async fn drop_index(
         database_id.as_u64(),
         tenant_id,
         index_name,
-    )?;
+    )
+    .await?;
 
     if in_transaction {
         super::teardown::teardown(state, &record, database_id, tenant_id).await?;

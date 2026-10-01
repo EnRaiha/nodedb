@@ -2,11 +2,9 @@
 
 //! Protocol-neutral DDL handlers for adding and dropping constraints.
 //!
-//! Ported from the pgwire `ddl::constraint::handlers`. All non-return logic
-//! (token parsing, catalog get/put, duplicate pre-checks, `schema_version.bump`)
-//! is preserved verbatim; only the result construction changed from pgwire
-//! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
-//! [`DdlError`].
+//! The token parsing, catalog get/put, duplicate pre-checks, and
+//! `schema_version.bump` run here. The result is the protocol-neutral
+//! [`DdlResult`] / [`DdlError`].
 
 use nodedb_types::DatabaseId;
 
@@ -20,7 +18,7 @@ use crate::control::state::SharedState;
 use super::support::err;
 
 /// Handle `ALTER COLLECTION x ADD CONSTRAINT name ON COLUMN col TRANSITIONS (...)`.
-pub fn add_state_constraint(
+pub async fn add_state_constraint(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
@@ -78,7 +76,8 @@ pub fn add_state_constraint(
     }
 
     coll.state_constraints.push(def);
-    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, &coll)
+        .await
         .map_err(|e| DdlError::from_error(&e))?;
 
     state.schema_version.bump();
@@ -90,7 +89,7 @@ pub fn add_state_constraint(
 }
 
 /// Handle `ALTER COLLECTION x ADD TRANSITION CHECK name (predicate)`.
-pub fn add_transition_check(
+pub async fn add_transition_check(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
@@ -138,7 +137,8 @@ pub fn add_transition_check(
     }
 
     coll.transition_checks.push(def);
-    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, &coll)
+        .await
         .map_err(|e| DdlError::from_error(&e))?;
 
     state.schema_version.bump();
@@ -150,7 +150,7 @@ pub fn add_transition_check(
 }
 
 /// Handle `ALTER COLLECTION x ADD CONSTRAINT name CHECK (expr)`.
-pub fn add_check_constraint(
+pub async fn add_check_constraint(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
@@ -226,7 +226,8 @@ pub fn add_check_constraint(
     }
 
     coll.check_constraints.push(def);
-    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, &coll)
+        .await
         .map_err(|e| DdlError::from_error(&e))?;
 
     state.schema_version.bump();
@@ -238,7 +239,7 @@ pub fn add_check_constraint(
 }
 
 /// Handle `DROP CONSTRAINT name ON collection`.
-pub fn drop_constraint(
+pub async fn drop_constraint(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -284,7 +285,8 @@ pub fn drop_constraint(
         ));
     }
 
-    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, &coll)
+        .await
         .map_err(|e| DdlError::from_error(&e))?;
 
     state.schema_version.bump();

@@ -37,7 +37,7 @@ impl SystemCatalog {
     // ── database_quotas ───────────────────────────────────────────────────────
 
     /// Retrieve the quota record for a database. Returns `None` if no explicit
-    /// quota has been configured (callers should fall back to `QuotaRecord::DEFAULT`).
+    /// quota has been configured (callers fall back to `QuotaRecord::DEFAULT`).
     pub fn get_database_quota(&self, db_id: DatabaseId) -> crate::Result<Option<QuotaRecord>> {
         let txn = self
             .db
@@ -90,13 +90,38 @@ impl SystemCatalog {
             || ceiling.max_qps > 0
             || ceiling.max_connections > 0
         {
-            self.check_database_quota_ceiling(db_id, record, ceiling)?;
+            self.check_database_quota_ceiling(Some(db_id), &[record], ceiling)?;
+        }
+        Ok(())
+    }
+
+    /// Check the quotas of several databases not yet in the catalog, together.
+    ///
+    /// Each record is validated, and the sum of every existing quota plus all
+    /// of `records` must fit `ceiling`. A restore runs this before it creates
+    /// any of the databases, so a refusal leaves the catalog unchanged.
+    pub fn check_new_database_quotas(
+        &self,
+        records: &[&QuotaRecord],
+        ceiling: &GlobalQuotaCeiling,
+    ) -> crate::Result<()> {
+        for record in records {
+            record.validate().map_err(|e| crate::Error::BadRequest {
+                detail: e.to_string(),
+            })?;
+        }
+        if ceiling.max_memory_bytes > 0
+            || ceiling.max_storage_bytes > 0
+            || ceiling.max_qps > 0
+            || ceiling.max_connections > 0
+        {
+            self.check_database_quota_ceiling(None, records, ceiling)?;
         }
         Ok(())
     }
 
     /// Write a database quota record consensus already accepted. No validation
-    /// and no ceiling check — a rejection here would diverge nodes.
+    /// and no ceiling check — a rejection here diverges nodes.
     pub fn write_database_quota(
         &self,
         db_id: DatabaseId,
@@ -216,8 +241,8 @@ impl SystemCatalog {
     /// sum past any non-zero ceiling dimension.
     fn check_database_quota_ceiling(
         &self,
-        db_id: DatabaseId,
-        proposed: &QuotaRecord,
+        replaced: Option<DatabaseId>,
+        proposed: &[&QuotaRecord],
         ceiling: &GlobalQuotaCeiling,
     ) -> crate::Result<()> {
         let all = self.list_database_quotas()?;
@@ -229,7 +254,7 @@ impl SystemCatalog {
         let mut sum_connections: u64 = 0;
 
         for (id, rec) in &all {
-            if *id == db_id {
+            if Some(*id) == replaced {
                 continue; // Will be replaced by `proposed`.
             }
             sum_memory = sum_memory.saturating_add(rec.max_memory_bytes);
@@ -239,10 +264,12 @@ impl SystemCatalog {
         }
 
         // Add the proposed values.
-        sum_memory = sum_memory.saturating_add(proposed.max_memory_bytes);
-        sum_storage = sum_storage.saturating_add(proposed.max_storage_bytes);
-        sum_qps = sum_qps.saturating_add(proposed.max_qps as u64);
-        sum_connections = sum_connections.saturating_add(proposed.max_connections as u64);
+        for rec in proposed {
+            sum_memory = sum_memory.saturating_add(rec.max_memory_bytes);
+            sum_storage = sum_storage.saturating_add(rec.max_storage_bytes);
+            sum_qps = sum_qps.saturating_add(rec.max_qps as u64);
+            sum_connections = sum_connections.saturating_add(rec.max_connections as u64);
+        }
 
         if ceiling.max_memory_bytes > 0 && sum_memory > ceiling.max_memory_bytes {
             return Err(crate::Error::QuotaOvercommit {
@@ -394,7 +421,7 @@ mod tests {
         cat.put_database_quota(DatabaseId::new(1), &r1, &ceiling)
             .unwrap();
 
-        // Second database would push total to 3 GB, exceeding 2 GB ceiling.
+        // Second database pushes total to 3 GB, exceeding 2 GB ceiling.
         let r2 = QuotaRecord {
             max_memory_bytes: 1_500_000_000,
             ..QuotaRecord::DEFAULT
@@ -418,7 +445,7 @@ mod tests {
         };
         cat.put_database_quota(DatabaseId::new(1), &r, &ceiling)
             .unwrap();
-        // Updating the same database to 1.8 GB should succeed (replaces, not adds).
+        // Updating the same database to 1.8 GB succeeds (replaces, not adds).
         let r2 = QuotaRecord {
             max_memory_bytes: 1_800_000_000,
             ..QuotaRecord::DEFAULT

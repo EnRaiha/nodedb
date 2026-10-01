@@ -50,7 +50,9 @@ pub async fn try_dispatch(
     if let Some(r) = string_schema::try_string(state, identity, sql, &upper, database_id).await {
         return Some(r);
     }
-    if let Some(r) = string_streaming::try_string(state, identity, sql, &upper, database_id).await {
+    if let Some(r) =
+        string_streaming::try_string(state, identity, sql, &upper, database_id, txn_ctx).await
+    {
         return Some(r);
     }
     if let Some(r) =
@@ -73,14 +75,13 @@ pub async fn try_dispatch(
     // planner path gives the same `SqlError` (`UnsupportedConstraint` is
     // `0A000`, a parse error `42601`) and the parser's own `Display` text as
     // the message. This is the sole parse-error gate for the DDL router; the
-    // GRAPH / MATCH / SHOW GRAPH STATS prefixed inputs that previously carried
-    // their own parse-error reproduction are subsumed by this arm.
+    // GRAPH / MATCH / SHOW GRAPH STATS prefixed inputs reach their parse
+    // error through this arm.
     //
     // Non-DDL statements (`None`) include the temporal / audit query functions —
-    // `SELECT <FUNC>(...)` calls that never parse into a typed DDL AST. In the
-    // pgwire router these were recognized by substring after the typed-AST parse
-    // gate and the auth family; recognizing them here, in the `None` branch,
-    // preserves that ordering exactly (any typed DDL whose body contains one of
+    // `SELECT <FUNC>(...)` calls that never parse into a typed DDL AST. They are
+    // recognized by substring after the typed-AST parse gate and the auth
+    // family, in the `None` branch (any typed DDL whose body contains one of
     // the substrings is handled by the typed match above first). A non-match
     // returns `None` so the caller falls through to the SQL planner.
     let stmt = match nodedb_sql::ddl_ast::parse(sql) {
@@ -109,10 +110,8 @@ pub async fn try_dispatch(
             }
 
             // INSERT INTO x { } — object literal syntax; intercept for
-            // trigger/sequence handling. Ported from the pgwire `dsl`
-            // string router, which ran after the typed-AST parse gate —
-            // recognizing it here in the `None` branch preserves that
-            // ordering exactly.
+            // trigger/sequence handling. It runs after the typed-AST parse
+            // gate, in the `None` branch.
             if sql
                 .get(.."INSERT INTO ".len())
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("INSERT INTO "))
@@ -179,15 +178,17 @@ pub async fn try_dispatch(
         // it to the MATCH handler for the Data-Plane overlay merge — mirroring
         // the single-hop `GRAPH NEIGHBORS` path.
         let (txn_id, _) = txn_ctx.sessions.txn_identity(txn_ctx.session_id);
-        return Some(match_ops::match_query(state, identity, database_id, sql, txn_id).await);
+        let read = crate::control::server::graph_dispatch::GraphRead {
+            txn_id,
+            linearizable: txn_ctx.linearizable_reads(),
+        };
+        return Some(match_ops::match_query(state, identity, database_id, sql, read).await);
     }
 
     // Graph-overlay statements (GRAPH INSERT/DELETE EDGE, GRAPH LABEL/UNLABEL,
     // GRAPH TRAVERSE/NEIGHBORS/PATH, GRAPH ALGO, GRAPH RAG FUSION, SHOW GRAPH
-    // STATS) parse into typed `GraphStmt` variants. In the pgwire router these
-    // were dispatched from the typed AST by the `dsl` string router (last).
-    // Recognizing them here on the typed path preserves that: `dispatch_graph`
-    // returns `Some` for the graph-overlay variants and `None` otherwise.
+    // STATS) parse into typed `GraphStmt` variants. `dispatch_graph` returns `Some` for the
+    // graph-overlay variants and `None` otherwise.
     if let NodedbStatement::Graph(_) = &stmt {
         // The graph-overlay handlers thread the session's transaction context
         // through `txn_ctx`: single-hop reads (Neighbors/Hop) resolve the

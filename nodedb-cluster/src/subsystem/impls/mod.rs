@@ -9,4 +9,4 @@ pub mod swim_subsystem;
 pub use decommission_subsystem::DecommissionSubsystem;
 pub use reachability_subsystem::ReachabilitySubsystem;
 pub use rebalancer_subsystem::RebalancerSubsystem;
-pub use swim_subsystem::{SwimSubsystem, SwimSubsystemConfig};
+pub use swim_subsystem::{SwimSubsystem, SwimSubsystemConfig, SwimWiring};

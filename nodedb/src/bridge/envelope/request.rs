@@ -102,6 +102,14 @@ pub struct Request {
     /// before this field existed.
     pub resolved_now_ms: Option<u64>,
 
+    /// HLC wall time, in nanoseconds, at which the write committed, when the
+    /// Control Plane fixed it before dispatch. The Data Plane stamps it on
+    /// every event the write emits, so the event's time is the commit's on
+    /// every path, with or without a WAL record of its own. `None` for reads
+    /// and control ops, and for a write whose events take the commit instant
+    /// of the WAL record they reproduce.
+    pub commit_hlc: Option<u64>,
+
     /// Write-admission decision for this request.
     ///
     /// Every write-class [`PhysicalPlan`] MUST pass the neutral write-admission
@@ -205,7 +213,7 @@ mod tests {
             plan: PhysicalPlan::Document(DocumentOp::PointGet {
                 collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "users"),
                 document_id: "doc-1".into(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: None,
                 pk_bytes: Vec::new(),
                 rls_filters: Vec::new(),
                 system_time: nodedb_types::SystemTimeScope::Current,
@@ -223,6 +231,7 @@ mod tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: Admission::Exempt(ExemptReason::Read),
         }
     }
@@ -277,6 +286,7 @@ mod tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: Admission::Exempt(ExemptReason::Read),
         };
         match req.plan {

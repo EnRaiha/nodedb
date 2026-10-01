@@ -17,7 +17,7 @@ use crate::codec::limits::{
 use crate::codec::tag::{CodecTag, peek_tag};
 use crate::error::{ArrayError, ArrayResult};
 use crate::tile::mbr::TileMBR;
-use crate::tile::sparse_tile::SparseTile;
+use crate::tile::sparse_tile::{RowKind, SparseTile};
 
 const SUPPORTED_PAYLOAD_VERSION: u8 = 1;
 
@@ -82,9 +82,12 @@ pub fn decode_sparse_tile(payload: &[u8]) -> ArrayResult<SparseTile> {
 }
 
 fn decode_raw(body: &[u8]) -> ArrayResult<SparseTile> {
-    zerompk::from_msgpack(body).map_err(|e| ArrayError::SegmentCorruption {
-        detail: format!("raw tile decode: {e}"),
-    })
+    let tile: SparseTile =
+        zerompk::from_msgpack(body).map_err(|e| ArrayError::SegmentCorruption {
+            detail: format!("raw tile decode: {e}"),
+        })?;
+    tile.check_stored_identities()?;
+    Ok(tile)
 }
 
 fn decode_structural(body: &[u8]) -> ArrayResult<SparseTile> {
@@ -125,9 +128,9 @@ fn decode_structural(body: &[u8]) -> ArrayResult<SparseTile> {
         dim_dicts.push(dict);
     }
 
-    // Surrogates.
+    // Surrogates: live rows only, in row order.
     let surr_bytes = read_framed(body, &mut pos)?;
-    let surrogates = decode_surrogates(surr_bytes)?;
+    let live_surrogates = decode_surrogates(surr_bytes)?;
 
     // Row kinds.
     let rk_bytes = read_framed(body, &mut pos)?;
@@ -178,16 +181,17 @@ fn decode_structural(body: &[u8]) -> ArrayResult<SparseTile> {
     let mbr = TileMBR::new(axis_count, attr_count);
 
     // Validate sizes match cell_count.
-    if surrogates.len() != cell_count {
+    if row_kinds.len() != cell_count {
         return Err(ArrayError::SegmentCorruption {
             detail: format!(
-                "structural tile: surrogate count {surr} != cell_count {cell_count}",
-                surr = surrogates.len()
+                "structural tile: row kind count {kinds} != cell_count {cell_count}",
+                kinds = row_kinds.len()
             ),
         });
     }
+    let surrogates = spread_live_surrogates(&row_kinds, live_surrogates)?;
 
-    Ok(SparseTile {
+    let tile = SparseTile {
         dim_dicts,
         attr_cols,
         surrogates,
@@ -195,7 +199,39 @@ fn decode_structural(body: &[u8]) -> ArrayResult<SparseTile> {
         valid_until_ms,
         row_kinds,
         mbr,
-    })
+    };
+    tile.check_stored_identities()?;
+    Ok(tile)
+}
+
+/// Place the live-row surrogate column back onto every row: a live row takes
+/// the next surrogate, a tombstone or erasure row holds none. The column must
+/// hold exactly one surrogate per live row.
+fn spread_live_surrogates(
+    row_kinds: &[u8],
+    live_surrogates: Vec<nodedb_types::Surrogate>,
+) -> ArrayResult<Vec<Option<nodedb_types::Surrogate>>> {
+    let live_count = live_surrogates.len();
+    let mut live = live_surrogates.into_iter();
+    let mut surrogates = Vec::with_capacity(row_kinds.len());
+    for (row, &kind) in row_kinds.iter().enumerate() {
+        if RowKind::from_u8(kind)? == RowKind::Live {
+            let surrogate = live.next().ok_or_else(|| ArrayError::SegmentCorruption {
+                detail: format!(
+                    "structural tile: live row {row} has no surrogate ({live_count} stored)"
+                ),
+            })?;
+            surrogates.push(Some(surrogate));
+        } else {
+            surrogates.push(None);
+        }
+    }
+    if live.next().is_some() {
+        return Err(ArrayError::SegmentCorruption {
+            detail: format!("structural tile: {live_count} surrogates stored for fewer live rows"),
+        });
+    }
+    Ok(surrogates)
 }
 
 #[cfg(test)]
@@ -230,7 +266,7 @@ mod tests {
             b.push_row(SparseRow {
                 coord: &[CoordValue::Int64(i as i64)],
                 attrs: &[CellValue::Int64(i as i64 * 2)],
-                surrogate: Surrogate::ZERO,
+                surrogate: Some(Surrogate::new(i as u32 + 1)),
                 valid_from_ms: i as i64,
                 valid_until_ms: OPEN_UPPER,
                 kind: RowKind::Live,
@@ -293,7 +329,7 @@ mod tests {
             b.push_row(SparseRow {
                 coord: &[CoordValue::Int64(i)],
                 attrs: &[CellValue::Int64(i)],
-                surrogate: Surrogate::ZERO,
+                surrogate: Some(Surrogate::new(i as u32 + 1)),
                 valid_from_ms: 0,
                 valid_until_ms: OPEN_UPPER,
                 kind: RowKind::Live,
@@ -303,7 +339,7 @@ mod tests {
         b.push_row(SparseRow {
             coord: &[CoordValue::Int64(99)],
             attrs: &[],
-            surrogate: Surrogate::ZERO,
+            surrogate: None,
             valid_from_ms: 0,
             valid_until_ms: OPEN_UPPER,
             kind: RowKind::Tombstone,
@@ -312,6 +348,32 @@ mod tests {
         let tile = b.build();
         let out = roundtrip(&tile);
         assert_eq!(out.row_kinds, tile.row_kinds);
+        assert_eq!(out.surrogates, tile.surrogates);
+        assert_eq!(out.surrogates[20], None);
+    }
+
+    /// A structural payload whose live-row surrogate column is one short is
+    /// refused: a live row never decodes without its identity.
+    #[test]
+    fn a_live_row_without_a_stored_surrogate_is_refused() {
+        let kinds = [
+            RowKind::Live.as_u8(),
+            RowKind::Tombstone.as_u8(),
+            RowKind::Live.as_u8(),
+        ];
+        assert!(spread_live_surrogates(&kinds, vec![Surrogate::new(1)]).is_err());
+        assert!(
+            spread_live_surrogates(
+                &kinds,
+                vec![Surrogate::new(1), Surrogate::new(2), Surrogate::new(3)]
+            )
+            .is_err(),
+            "a surrogate left over after the last live row is refused"
+        );
+        assert_eq!(
+            spread_live_surrogates(&kinds, vec![Surrogate::new(1), Surrogate::new(2)]).unwrap(),
+            vec![Some(Surrogate::new(1)), None, Some(Surrogate::new(2))]
+        );
     }
 
     #[test]
@@ -342,7 +404,7 @@ mod tests {
         b.push_row(SparseRow {
             coord: &[CoordValue::Int64(1)],
             attrs: &[CellValue::Int64(10)],
-            surrogate: Surrogate::ZERO,
+            surrogate: Some(Surrogate::new(1)),
             valid_from_ms: 100,
             valid_until_ms: 500,
             kind: RowKind::Live,
@@ -351,7 +413,7 @@ mod tests {
         b.push_row(SparseRow {
             coord: &[CoordValue::Int64(2)],
             attrs: &[CellValue::Int64(20)],
-            surrogate: Surrogate::ZERO,
+            surrogate: Some(Surrogate::new(2)),
             valid_from_ms: 200,
             valid_until_ms: OPEN_UPPER,
             kind: RowKind::Live,
@@ -362,7 +424,7 @@ mod tests {
             b.push_row(SparseRow {
                 coord: &[CoordValue::Int64(i)],
                 attrs: &[CellValue::Int64(i)],
-                surrogate: Surrogate::ZERO,
+                surrogate: Some(Surrogate::new(i as u32)),
                 valid_from_ms: i * 10,
                 valid_until_ms: OPEN_UPPER,
                 kind: RowKind::Live,

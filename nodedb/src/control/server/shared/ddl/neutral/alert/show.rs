@@ -2,14 +2,11 @@
 
 //! Protocol-neutral `SHOW ALERTS` and `SHOW ALERT STATUS ON <name>` DDL handlers.
 //!
-//! Ported from the pgwire `ddl::alert::show` handlers. The registry read, the
-//! hysteresis-state read, the condition/window/status formatting, and the exact
-//! column set are preserved verbatim; only the result construction changed from
-//! pgwire `Response` / `QueryResponse` to the protocol-neutral
-//! [`DdlResult::Rows`] over [`ShapedRows`]. The mixed text/`int8` column OIDs are
-//! reproduced by building `column_types` manually so the RowDescription stays
-//! byte-identical (the `int8` cells are emitted as their decimal text form, the
-//! same bytes the pgwire `DataRowEncoder::encode_field(&i64)` produced).
+//! The registry read, the hysteresis-state read, the condition/window/status
+//! formatting, and the exact column set run here. The result is the
+//! protocol-neutral [`DdlResult::Rows`] over [`ShapedRows`]. The mixed
+//! text/`int8` column OIDs come from building `column_types` manually (the
+//! `int8` cells are emitted as their decimal text form).
 
 use serde_json::{Map, Value as JsonValue};
 

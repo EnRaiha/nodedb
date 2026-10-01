@@ -2,12 +2,9 @@
 
 //! Protocol-neutral `CREATE TRIGGER` DDL handler.
 //!
-//! Ported from the pgwire `ddl::trigger::create` handler. The catalog path
-//! (`propose_and_apply` + `LocalOnly` local registry refresh, the
-//! `emit_trigger_put` definition-sync broadcast, and the `audit_record` call)
-//! is preserved verbatim; only the result construction changed from pgwire
-//! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
-//! [`DdlError`].
+//! The catalog path (`propose_and_apply`, the `emit_trigger_put`
+//! definition-sync broadcast, and the `audit_record` call) runs here. The
+//! result is the protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use crate::control::security::catalog::trigger_types::{
     TriggerEvents, TriggerExecutionMode, TriggerGranularity, TriggerSecurity, TriggerTiming,
@@ -37,7 +34,7 @@ pub struct CreateTriggerRequest<'a> {
 }
 
 /// Handle `CREATE [OR REPLACE] TRIGGER ...` from typed AST fields.
-pub fn create_trigger(
+pub async fn create_trigger(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     req: CreateTriggerRequest<'_>,
@@ -135,13 +132,7 @@ pub fn create_trigger(
     };
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutTrigger(Box::new(stored.clone()));
-    let outcome = super::super::super::catalog::propose_and_apply(state, &entry)?;
-    if outcome.needs_local_apply() {
-        // The local fallback has already applied the durable CatalogEntry.
-        // Mirror the applier's registry and ownership effects through its
-        // post-apply hook rather than writing the registry directly.
-        crate::control::catalog_entry::post_apply::trigger::put(stored.clone(), state);
-    }
+    super::super::super::catalog::propose_and_apply_async(state, &entry).await?;
 
     // Broadcast to connected Lite sessions after the catalog commit is durable.
     emit_trigger_put(state, &stored);
@@ -249,7 +240,7 @@ fn parse_granularity(s: &str) -> TriggerGranularity {
 /// `WriteEvent` that carries a tenant but no user identity — the invoking
 /// session is long gone by the time the body fires. `SECURITY INVOKER` is
 /// therefore not implementable here, and silently storing it while executing as
-/// definer would leave the catalog describing a guarantee that does not exist.
+/// definer will leave the catalog describing a guarantee that does not exist.
 /// An unspecified clause resolves to `DEFINER`, which is what actually happens.
 fn parse_security(s: Option<&str>) -> Result<TriggerSecurity, DdlError> {
     let Some(mode) = s else {

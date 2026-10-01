@@ -12,9 +12,11 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::gateway::dispatcher::{DispatchRouteParams, dispatch_route};
 use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::gateway::{RouteDecision, TaskRoute};
-use crate::control::server::graph_dispatch::match_broadcast::broadcast_match_to_all_cores;
+use crate::control::server::graph_dispatch::match_broadcast::{
+    GraphRead, broadcast_match_to_all_cores,
+};
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId, TxnId, VShardId};
+use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_cluster::distributed_graph::PatternContinuation;
 use nodedb_physical::physical_plan::GraphOp;
 
@@ -38,7 +40,7 @@ struct DispatchCtx<'f> {
     tenant_id: TenantId,
     database_id: DatabaseId,
     deadline_ms: u64,
-    txn_id: Option<TxnId>,
+    read: GraphRead,
     shared_arc: Arc<SharedState>,
     version_set: GatewayVersionSet,
 }
@@ -55,12 +57,12 @@ fn push_dispatch_fut<'f>(
     plan: PhysicalPlan,
     remote_coords: Option<(u64, u64)>,
 ) {
-    let (state, tenant_id, database_id, deadline_ms, txn_id) = (
+    let (state, tenant_id, database_id, deadline_ms, read) = (
         ctx.state,
         ctx.tenant_id,
         ctx.database_id,
         ctx.deadline_ms,
-        ctx.txn_id,
+        ctx.read,
     );
     match remote_coords {
         None => {
@@ -76,7 +78,7 @@ fn push_dispatch_fut<'f>(
                     database_id,
                     plan,
                     TraceId::ZERO,
-                    txn_id,
+                    read,
                 )
                 .await?;
                 Ok::<_, crate::Error>(vec![TaggedShardResult {
@@ -104,7 +106,8 @@ fn push_dispatch_fut<'f>(
                     trace_id: TraceId::ZERO,
                     deadline_ms,
                     version_set: &version_set,
-                    txn_id,
+                    txn_id: read.txn_id,
+                    linearizable: read.linearizable,
                 })
                 .await?
                 .payloads;
@@ -121,7 +124,7 @@ pub(super) async fn dispatch_continuations(
     database_id: DatabaseId,
     query_bytes: &[u8],
     deadline_ms: u64,
-    txn_id: Option<TxnId>,
+    read: GraphRead,
     pending: HashMap<u32, Vec<PatternContinuation>>,
 ) -> crate::Result<Vec<TaggedShardResult>> {
     let shared_arc = gateway_shared(state)?;
@@ -130,7 +133,7 @@ pub(super) async fn dispatch_continuations(
         tenant_id,
         database_id,
         deadline_ms,
-        txn_id,
+        read,
         shared_arc,
         version_set: GatewayVersionSet::from_pairs(Vec::new()),
     };
@@ -152,6 +155,7 @@ pub(super) async fn dispatch_continuations(
                     vshard_id: VShardId::new((vshard_id % VShardId::COUNT as u64) as u32),
                     leader_node: 0,
                     leader_addr: String::new(),
+                    leader_term: 0,
                 });
             }
             RouteDecision::Broadcast { .. } => {
@@ -205,7 +209,7 @@ pub(super) async fn dispatch_resumes(
     database_id: DatabaseId,
     query_bytes: &[u8],
     deadline_ms: u64,
-    txn_id: Option<TxnId>,
+    read: GraphRead,
     pending_resumes: Vec<PendingResume>,
 ) -> crate::Result<Vec<TaggedShardResult>> {
     let shared_arc = gateway_shared(state)?;
@@ -214,7 +218,7 @@ pub(super) async fn dispatch_resumes(
         tenant_id,
         database_id,
         deadline_ms,
-        txn_id,
+        read,
         shared_arc,
         version_set: GatewayVersionSet::from_pairs(Vec::new()),
     };

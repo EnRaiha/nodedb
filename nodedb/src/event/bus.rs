@@ -27,6 +27,20 @@ use super::types::WriteEvent;
 /// Default ring buffer capacity per core (must be power of two).
 const DEFAULT_EVENT_BUS_CAPACITY: usize = 65_536;
 
+/// Whether a test armed fail point `event::bus::drop::<collection>` for
+/// `event`'s collection. The event is then lost as a full ring loses it: its
+/// sequence is spent and the Event Plane recovers it from the WAL.
+#[cfg(feature = "failpoints")]
+fn dropped_by_fail_point(event: &WriteEvent) -> bool {
+    crate::fail_point::eval_fail(&format!("event::bus::drop::{}", event.collection)).is_some()
+}
+
+/// Without the `failpoints` feature no event is dropped here.
+#[cfg(not(feature = "failpoints"))]
+fn dropped_by_fail_point(_event: &WriteEvent) -> bool {
+    false
+}
+
 /// The producer half given to a Data Plane core.
 ///
 /// `Send` at the trait level, but **logically owned by exactly one
@@ -70,7 +84,11 @@ impl EventProducer {
     pub fn emit(&mut self, mut event: WriteEvent) -> bool {
         self.numbering.stamp(&mut event);
         let sequence = event.sequence;
-        let pushed = self.push(event);
+        let pushed = if dropped_by_fail_point(&event) {
+            false
+        } else {
+            self.push(event)
+        };
         // After the push: a reader that sees `sequence` finds the event on
         // the ring, or knows it was dropped.
         self.progress.note_emitted(sequence);
@@ -262,6 +280,7 @@ mod tests {
             valid_time_ms: None,
             user_id: None,
             statement_digest: None,
+            commit_hlc: Some(crate::event::test_utils::test_commit_hlc()),
         }
     }
 

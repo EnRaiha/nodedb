@@ -4,7 +4,6 @@
 //! [`super::restore_tenant`].
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use nodedb_types::{CollectionKey, Surrogate};
 
@@ -29,7 +28,7 @@ use super::super::target::DatabaseTarget;
 /// allocation here reuses it. Every replica binds the identities a re-issued
 /// write carries as it applies the write. Any bind error is fatal.
 pub(super) fn rebind_surrogates(
-    state: &Arc<SharedState>,
+    state: &SharedState,
     target: DatabaseTarget,
     binds: &[SurrogateBindEntry],
 ) -> Result<(), Error> {
@@ -56,7 +55,7 @@ pub(super) fn rebind_surrogates(
 }
 
 pub(super) fn warn_on_tombstoned_restores(
-    state: &Arc<SharedState>,
+    state: &SharedState,
     tenant_id: u64,
     target: DatabaseTarget,
     merged: &TenantDataSnapshot,
@@ -145,6 +144,7 @@ mod collection_name_tests {
     const DEFAULT_TARGET: DatabaseTarget = DatabaseTarget {
         source: DatabaseId::DEFAULT,
         dest: DatabaseId::DEFAULT,
+        restore_id: 0,
     };
 
     #[test]
@@ -179,6 +179,7 @@ mod collection_name_tests {
         let target = DatabaseTarget {
             source: DatabaseId::new(1025),
             dest: DatabaseId::new(1030),
+            restore_id: 0,
         };
         let snap = TenantDataSnapshot {
             documents: vec![("1025:7:1025/users:0000002a".into(), vec![])],

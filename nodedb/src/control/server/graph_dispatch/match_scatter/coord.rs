@@ -10,10 +10,12 @@ use crate::control::gateway::RouteDecision;
 use crate::control::server::graph_dispatch::cluster_resolve::resolve_for_vshard;
 use crate::control::state::SharedState;
 use crate::engine::graph::pattern::executor::{UnresolvedExpansion, VarLenResume, rows_to_msgpack};
-use crate::types::{DatabaseId, TenantId, TxnId, VShardId};
+use crate::types::{DatabaseId, TenantId, VShardId};
 use nodedb_cluster::distributed_graph::{
     DistributedMatchCoordinator, PatternContinuation, ResolvedContinuationArgs, ShardMatchResult,
 };
+
+use crate::control::server::graph_dispatch::match_broadcast::GraphRead;
 
 use super::resume_queue::{PendingResume, resume_seed_key, resume_to_pending};
 use super::round_loop::{dispatch_continuations, dispatch_resumes};
@@ -72,16 +74,18 @@ pub(super) struct TaggedShardResult {
 /// Orchestrate a cross-shard MATCH. Caller guarantees cluster mode
 /// (`cluster_routing.is_some()`); single-node never enters here.
 ///
-/// `txn_id` is threaded onto every LOCAL scatter/resume leg so this node's cores
-/// merge the transaction's staged edge overlay for read-your-own-writes; remote
-/// legs read committed CSR (multi-node overlay forwarding is a separate unit).
+/// `read.txn_id` is threaded onto every LOCAL scatter/resume leg so this node's
+/// cores merge the transaction's staged edge overlay for read-your-own-writes;
+/// remote legs read committed CSR (multi-node overlay forwarding is a separate
+/// unit). `read.linearizable` makes every leg confirm its groups where it is
+/// served.
 pub async fn scatter_match(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     query_bytes: Vec<u8>,
     deadline_ms: u64,
-    txn_id: Option<TxnId>,
+    read: GraphRead,
 ) -> crate::Result<MatchScatterOutcome> {
     // Round budget = the maximum number of hops the pattern can take (summed
     // per-triple `max_hops`), since each round advances every frontier by one
@@ -108,17 +112,17 @@ pub async fn scatter_match(
     let mut resume_rounds: u32 = 0;
     // Latches once the coordinator's hop budget (`max_rounds`) is exhausted with
     // continuations still pending, so the loop stops re-attempting `advance()`
-    // (which would spin) but keeps draining any remaining resume cursors.
+    // (which will spin) but keeps draining any remaining resume cursors.
     let mut continuations_exhausted = false;
 
     // ---- Round 0: scatter the Match plan to local + every remote owner. ----
-    let round0 = scatter_round_zero(
+    let (round0, reads) = scatter_round_zero(
         state,
         tenant_id,
         database_id,
         &query_bytes,
         deadline_ms,
-        txn_id,
+        read,
     )
     .await?;
     for tagged in round0 {
@@ -138,7 +142,7 @@ pub async fn scatter_match(
             if !coordinator.advance() {
                 // Exhausted max_rounds with hops still pending: surface as
                 // partial rather than silently dropping the continuations.
-                // Latch so the loop stops re-attempting `advance()` (it would
+                // Latch so the loop stops re-attempting `advance()` (it will
                 // spin) but still drains any pending resume cursors below.
                 if coordinator.has_pending() {
                     partial = true;
@@ -152,7 +156,7 @@ pub async fn scatter_match(
                     database_id,
                     &query_bytes,
                     deadline_ms,
-                    txn_id,
+                    read,
                     pending,
                 )
                 .await?;
@@ -190,7 +194,7 @@ pub async fn scatter_match(
                 database_id,
                 &query_bytes,
                 deadline_ms,
-                txn_id,
+                read,
                 batch,
             )
             .await?;
@@ -208,6 +212,13 @@ pub async fn scatter_match(
 
     // ---- Dedup + encode. ----
     let rows_payload = dedup_and_encode(&coordinator.completed)?;
+    // Every vShard round 0 read joins the transaction read-set.
+    reads.publish(
+        state,
+        tenant_id,
+        database_id,
+        pattern_collection(database_id, &query_bytes),
+    );
     Ok(MatchScatterOutcome {
         rows_payload,
         partial,
@@ -221,8 +232,8 @@ pub async fn scatter_match(
 /// re-dispatch.
 ///
 /// A truncation that yields a resume cursor is RECOVERABLE (drained across
-/// resume rounds) and is enqueued rather than surfaced — so this no longer
-/// reports a partial. The only surfaced partials come from the coordinator's
+/// resume rounds) and is enqueued rather than surfaced — so this
+/// reports no partial. The only surfaced partials come from the coordinator's
 /// hop budget and the resume-round budget, both handled in `scatter_match`.
 pub(super) fn feed_result(
     state: &SharedState,
@@ -286,6 +297,7 @@ fn frontier_to_continuations(
                     vshard_id: VShardId::new((vshard_id % VShardId::COUNT as u64) as u32),
                     leader_node: 0,
                     leader_addr: String::new(),
+                    leader_term: 0,
                 });
             }
             RouteDecision::Broadcast { .. } => {
@@ -351,6 +363,18 @@ fn dedup_and_encode(rows: &[HashMap<String, String>]) -> crate::Result<Payload> 
     }
     let bytes = rows_to_msgpack(&deduped)?;
     Ok(Payload::from_vec(bytes))
+}
+
+/// The database-qualified collection a serialized `MatchQuery` is scoped to
+/// with `IN '<collection>'`, or `None` for a pattern over every collection.
+fn pattern_collection(database_id: DatabaseId, query_bytes: &[u8]) -> Option<String> {
+    use crate::engine::graph::pattern::ast::MatchQuery;
+    let query: MatchQuery = zerompk::from_msgpack(query_bytes).ok()?;
+    query.collection.map(|bare| {
+        nodedb_types::QualifiedCollection::new(database_id, &bare)
+            .as_str()
+            .to_owned()
+    })
 }
 
 /// Count the total pattern triples across every clause/chain in the serialized

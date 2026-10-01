@@ -98,7 +98,7 @@ pub fn refuse_unprojectable_insert_returning(plan: &PhysicalPlan) -> Result<(), 
 /// empty row set:
 ///
 /// - A **buffered** write performs no engine work at all until COMMIT, so at
-///   statement time there is no stored row to project. Nothing could be
+///   statement time there is no stored row to project. Nothing can be
 ///   returned however the response were shaped.
 /// - A **staged** write does touch the transaction overlay, but every staging
 ///   handler answers with an affected-count payload; the one payload-bearing
@@ -301,7 +301,11 @@ pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
             | GraphOp::Stats { .. }
             | GraphOp::ResolveEdgeDelete(_)
             | GraphOp::BspSuperstep(_)
-            | GraphOp::WccSuperstep(_),
+            | GraphOp::WccSuperstep(_)
+            | GraphOp::NodeEdgeGuard { .. }
+            | GraphOp::NodePresenceGuard { .. }
+            | GraphOp::TruncateEdges { .. }
+            | GraphOp::NodePresenceRead { .. },
         )
         | PhysicalPlan::Text(
             TextOp::Search { .. }
@@ -398,13 +402,13 @@ pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
             | MetaOp::QueryAggregateWatermark { .. }
             | MetaOp::QueryLastValues { .. }
             | MetaOp::QueryLastValue { .. }
+            | MetaOp::VerifyHashChain { .. }
             | MetaOp::CalvinExecuteStatic { .. }
             | MetaOp::CalvinExecutePassive { .. }
             | MetaOp::CalvinExecuteActive { .. }
             | MetaOp::RebuildIndex { .. }
             | MetaOp::PutSynonymGroup { .. }
             | MetaOp::DeleteSynonymGroup { .. }
-            | MetaOp::RenameCollection { .. }
             | MetaOp::StageWrite { .. }
             | MetaOp::DropTxnOverlay { .. }
             | MetaOp::MarkSavepoint { .. }
@@ -414,7 +418,9 @@ pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
             | MetaOp::CalvinDrop { .. }
             | MetaOp::ResolveTxn { .. }
             | MetaOp::CalvinResolve { .. }
-            | MetaOp::ApplyTransactionRedo { .. },
+            | MetaOp::ApplyTransactionRedo { .. }
+            | MetaOp::RestoreRedo(_)
+            | MetaOp::HomeVersions { .. },
         )
         | PhysicalPlan::Array(
             ArrayOp::OpenArray { .. }
@@ -428,7 +434,7 @@ pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
             | ArrayOp::Compact { .. }
             | ArrayOp::SurrogateBitmapScan { .. }
             | ArrayOp::DropArray { .. }
-            | ArrayOp::RestoreArrayDrop { .. }
+            | ArrayOp::RekeyArray { .. }
             | ArrayOp::PurgeArrayDrop { .. },
         )
         | PhysicalPlan::ClusterArray(
@@ -439,8 +445,10 @@ pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
         )
         | PhysicalPlan::ClusterEvent(
             ClusterEventOp::ConsumeStream { .. }
-            | ClusterEventOp::PublishTopic { .. }
-            | ClusterEventOp::TenantWriteMarks { .. },
+            | ClusterEventOp::TenantWriteMarks { .. }
+            | ClusterEventOp::SurrogateBinds { .. }
+            | ClusterEventOp::MetadataApplied { .. }
+            | ClusterEventOp::SurrogateHolders { .. },
         ) => {}
     }
 }
@@ -481,7 +489,7 @@ mod tests {
         let plan = PhysicalPlan::Vector(VectorOp::DirectUpsert {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vectors"),
             field: "emb".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             pk_bytes: Vec::new(),
             vector: Vec::new(),
             payload: Vec::new(),
@@ -544,7 +552,7 @@ mod tests {
             document_id: "a".into(),
             value: Vec::new(),
             if_absent: false,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
             resolved_sum_targets: Vec::new(),

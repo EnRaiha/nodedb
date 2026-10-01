@@ -2,17 +2,15 @@
 
 //! `ALTER FUNCTION ... OWNER TO` DDL handler.
 //!
-//! Ported from the pgwire `ddl::function::alter` handler. The catalog path
-//! (`propose_and_apply` for both OWNER TO and SET (FUEL/MEMORY), plus the
-//! `audit_record` calls) is preserved verbatim; only the result construction
-//! changed from pgwire `Response` / `PgWireError` to the protocol-neutral
-//! [`DdlResult`] / [`DdlError`].
+//! The catalog path (`propose_and_apply_async` for both OWNER TO and SET
+//! (FUEL/MEMORY), plus the `audit_record` calls) runs here. The result is the
+//! protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
-use super::super::super::catalog::propose_and_apply;
+use super::super::super::catalog::propose_and_apply_async;
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::{require_tenant_admin, status};
 
@@ -47,7 +45,7 @@ fn attach_wasm_payload_for_reproposal(
 }
 
 /// Handle `ALTER FUNCTION <name> OWNER TO <new_owner>`
-pub fn alter_function(
+pub async fn alter_function(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -66,7 +64,7 @@ pub fn alter_function(
 
     // ALTER FUNCTION <name> SET (FUEL = N, MEMORY = N)
     if action == "SET" {
-        return alter_function_limits(state, identity, &name, parts);
+        return alter_function_limits(state, identity, &name, parts).await;
     }
 
     // ALTER FUNCTION <name> OWNER TO <new_owner>
@@ -102,7 +100,7 @@ pub fn alter_function(
     // function to the previous owner, silently breaking permission
     // transfer.
     let entry = crate::control::catalog_entry::CatalogEntry::PutFunction(Box::new(func.clone()));
-    propose_and_apply(state, &entry)?;
+    propose_and_apply_async(state, &entry).await?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -115,7 +113,7 @@ pub fn alter_function(
 }
 
 /// Handle `ALTER FUNCTION <name> SET (FUEL = N, MEMORY = N)`
-fn alter_function_limits(
+async fn alter_function_limits(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
@@ -161,7 +159,7 @@ fn alter_function_limits(
 
     attach_wasm_payload_for_reproposal(&mut func, catalog)?;
     let entry = crate::control::catalog_entry::CatalogEntry::PutFunction(Box::new(func.clone()));
-    propose_and_apply(state, &entry)?;
+    propose_and_apply_async(state, &entry).await?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

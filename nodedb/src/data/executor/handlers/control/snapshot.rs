@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Snapshot, checkpoint, WAL append, cancel, range scan, and collection policy handlers.
+//! Checkpoint, WAL append, cancel, range scan, and collection policy handlers.
 
 use sonic_rs;
 use tracing::{debug, info, warn};
@@ -47,6 +47,8 @@ impl CoreLoop {
             .position(|t| t.request_id() == target_request_id);
         if let Some(pos) = pos {
             self.task_queue.remove(pos);
+            // The cancelled task never runs, so its group gets no write set.
+            self.drop_journal_group(target_request_id.as_u64());
         }
         self.response_ok(task)
     }
@@ -256,51 +258,17 @@ impl CoreLoop {
         }
     }
 
-    /// Execute a snapshot creation request: export all engine state as bytes.
-    ///
-    /// Returns the serialized `CoreSnapshot` as the response payload.
-    /// The Control Plane collects these from all cores and writes to disk.
-    pub(in crate::data::executor) fn execute_create_snapshot(
-        &self,
+    /// Execute a coordinated checkpoint and answer with this core's checkpoint
+    /// LSN as 8 little-endian bytes.
+    pub(in crate::data::executor) fn execute_checkpoint(
+        &mut self,
         task: &ExecutionTask,
     ) -> Response {
-        match self.export_snapshot() {
-            Ok(snapshot) => match snapshot.to_bytes() {
-                Ok(bytes) => {
-                    info!(
-                        core = self.core_id,
-                        watermark = snapshot.watermark,
-                        documents = snapshot.sparse_documents.len(),
-                        vectors = snapshot.hnsw_indexes.len(),
-                        size_bytes = bytes.len(),
-                        "snapshot exported"
-                    );
-                    self.response_with_payload(task, bytes)
-                }
-                Err(e) => {
-                    warn!(core = self.core_id, error = %e, "snapshot serialization failed");
-                    self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    )
-                }
-            },
-            Err(e) => {
-                warn!(core = self.core_id, error = %e, "snapshot export failed");
-                self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                )
-            }
-        }
+        let checkpoint_lsn = self.checkpoint_engines();
+        self.response_with_payload(task, checkpoint_lsn.to_le_bytes().to_vec())
     }
 
-    /// Execute a coordinated checkpoint: flush all engine state to disk
-    /// and return this core's checkpoint LSN.
+    /// Flush all engine state to disk and return this core's checkpoint LSN.
     ///
     /// 1. Checkpoint KV collections (hash tables → disk files).
     /// 2. Checkpoint sparse vector indexes (inverted indexes → disk files).
@@ -340,10 +308,7 @@ impl CoreLoop {
     /// that record's only copy. The LSN is `min(floor, every engine's reported
     /// durable LSN)`: a flush that fails clamps the LSN instead of widening the
     /// deletion.
-    pub(in crate::data::executor) fn execute_checkpoint(
-        &mut self,
-        task: &ExecutionTask,
-    ) -> Response {
+    pub(in crate::data::executor) fn checkpoint_engines(&mut self) -> u64 {
         // Every engine on this core whose flush can fail contributes the LSN it
         // is durable through. The checkpoint floor is the ceiling — a record
         // above it can still be on its way to this core — and every
@@ -489,8 +454,6 @@ impl CoreLoop {
             "core checkpoint complete"
         );
 
-        // Return the checkpoint LSN as the response payload.
-        let payload = checkpoint_lsn.to_le_bytes().to_vec();
-        self.response_with_payload(task, payload)
+        checkpoint_lsn
     }
 }

@@ -2,32 +2,27 @@
 
 //! Handler for `CLONE DATABASE <new> FROM <source> [AS OF SYSTEM TIME <ms> | LATEST]`.
 //!
-//! Ported from the pgwire `ddl::database::clone` handler. Source resolution,
-//! the superuser gate (after source resolution so the audit carries the source
-//! db), mirror rejection, `MAX_CLONE_DEPTH` enforcement, duplicate-name check,
-//! as-of LSN resolution, descriptor build, Raft propose / single-node
-//! lineage-then-descriptor write with compensating rollback, shadow-collection
-//! stamping, allocator-hwm flush, and `DatabaseCloned` audit are preserved
-//! verbatim; only the result construction changed from pgwire `Response` to the
-//! protocol-neutral [`DdlResult`].
+//! Source resolution, the superuser gate (after source resolution so the
+//! audit carries the source db), mirror rejection, `MAX_CLONE_DEPTH`
+//! enforcement, duplicate-name check, as-of LSN resolution, descriptor build,
+//! catalog propose (whose apply stamps the shadow collections), and
+//! `DatabaseCloned` audit run here. The result is the protocol-neutral
+//! [`DdlResult`].
 
 use nodedb_sql::ddl_ast::CloneAsOf;
 use nodedb_types::{DatabaseId, MAX_CLONE_DEPTH};
 
 use crate::control::catalog_entry::entry::CatalogEntry;
-use crate::control::catalog_entry::post_apply::custom_type::register_written;
-use crate::control::clone::catalog_copy::copy_database_metadata;
 use crate::control::clone::lsn_resolve::wall_ms_to_lsn;
-use crate::control::metadata_proposer::propose_catalog_entry;
-use crate::control::security::catalog::auth_types::object_type;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
+use crate::control::security::catalog::UNASSIGNED_OID;
 use crate::control::security::catalog::database_types::{
     DatabaseDescriptor, DatabaseStatus, ParentCloneRef,
 };
-use crate::control::security::catalog::{StoredOwner, UNASSIGNED_OID};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::catalog::propose_and_apply;
+use super::super::super::catalog::propose_and_apply_async;
 use super::super::super::result::{DdlError, DdlResult};
 use super::gate::require_superuser;
 use super::support::{ddl_err, status};
@@ -123,19 +118,36 @@ pub async fn clone_database(
     //
     // For `Latest` we use the current WAL frontier as the clone point.
     //
-    // For `SystemTimeMs(t)` we resolve ms → LSN via the `LsnMsAnchor` map
-    // held on `SharedState`.  When the map is populated (WAL anchors have been
-    // replayed or emitted) this is a precise interpolation.  When the map is
-    // empty the WAL frontier is used as the best available approximation,
-    // which is correct for recent timestamps (within the same server session).
+    // For `SystemTimeMs(t)` the clone point is the highest LSN committed by
+    // the end of millisecond `t`, from the WAL's time anchors. A `t` before
+    // the oldest retained anchor is refused. So is a `t` before the source
+    // database existed: it predates the commit of the WAL state the database
+    // was created on.
     let now_ms =
         current_wall_ms().map_err(|e| DdlError::from_error_in_context("clock read failed", &e))?;
     let (as_of_lsn, as_of_ms) = match params.as_of {
         CloneAsOf::Latest => (state.wal.next_lsn(), now_ms),
         CloneAsOf::SystemTimeMs(ms) => {
-            // wall_ms_to_lsn resolves via the LsnMsAnchor map; falls back to
-            // wal.next_lsn() when the map is empty (correct for recent clones).
-            let lsn = wall_ms_to_lsn(state, *ms);
+            let lsn = wall_ms_to_lsn(state, *ms).map_err(|e| {
+                ddl_err(
+                    "22000",
+                    format!("CLONE DATABASE AS OF SYSTEM TIME {ms}: {e}"),
+                )
+            })?;
+            let created = nodedb_types::Lsn::new(source_descriptor.created_at_lsn);
+            if let Some(created_ms) = state.ms_to_lsn_inverse(created)
+                && *ms < created_ms
+            {
+                return Err(ddl_err(
+                    "22000",
+                    format!(
+                        "CLONE DATABASE AS OF SYSTEM TIME {ms}: the time predates database \
+                         '{}', created on the WAL state committed at {created_ms} ms; \
+                         clone it AS OF a later time",
+                        params.source_name
+                    ),
+                ));
+            }
             (lsn, *ms)
         }
     };
@@ -143,7 +155,9 @@ pub async fn clone_database(
     let clone_created_at = state.wal.next_lsn();
 
     // ── Allocate target database id ───────────────────────────────────────────
-    let target_db_id = state.database_registry.alloc_one();
+    let target_db_id = crate::control::database::allocate_database_id(state)
+        .await
+        .map_err(|e| DdlError::from_error_in_context("database id allocation failed", &e))?;
 
     // ── Build descriptor ──────────────────────────────────────────────────────
     let target_descriptor = DatabaseDescriptor {
@@ -169,133 +183,27 @@ pub async fn clone_database(
     };
 
     // ── Propose via Raft ──────────────────────────────────────────────────────
+    // The proposer stamps the incarnation the shadow collections take.
     let entry = CatalogEntry::CloneDatabase {
-        target_descriptor: Box::new(target_descriptor.clone()),
+        target_descriptor: Box::new(target_descriptor),
         source_db_id: source_db_id.as_u64(),
+        incarnation: nodedb_types::Hlc::ZERO,
     };
 
-    let outcome = propose_catalog_entry(state, &entry)
+    // The apply writes the descriptor, stamps a shadow descriptor and an
+    // owner row for every active source collection, copies the source's
+    // database-scoped catalog rows, and writes the lineage edge last.
+    propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("catalog propose failed", &e))?;
-
-    // Single-node fast path (`LocalOnly` means "no Raft, apply directly").
-    //
-    // Order matters for partial-failure safety: write the lineage edge first,
-    // then the descriptor. If lineage succeeds and descriptor fails we roll the
-    // lineage entry back — leaving no partial state. If we reversed the order,
-    // a descriptor-then-lineage failure would create a clone that DROP DATABASE
-    // on the source would not see as a dependent, allowing unsafe drops.
-    if outcome.needs_local_apply() {
-        catalog
-            .add_clone_child(source_db_id, target_db_id)
-            .map_err(|e| DdlError::from_error_in_context("lineage write failed", &e))?;
-
-        if let Err(put_err) = catalog.put_database(&target_descriptor) {
-            // Compensate: remove the lineage edge we just wrote. A failure here
-            // is fatal — surface both errors so on-call can repair the catalog.
-            if let Err(rb_err) = catalog.remove_clone_child(source_db_id, target_db_id) {
-                return Err(DdlError::from_error_in_context(
-                    &format!(
-                        "lineage rollback ALSO failed: {rb_err} — \
-                         catalog left with orphan lineage edge \
-                         (source={source_db_id}, target={target_db_id}); catalog write failed",
-                    ),
-                    &put_err,
-                ));
-            }
-            return Err(DdlError::from_error_in_context(
-                "catalog write failed",
-                &put_err,
-            ));
-        }
-
-        // Stamp every active source collection into the target database with
-        // `cloned_from` set.  This lets the SQL planner resolve collection
-        // names against the clone without knowing about clone indirection;
-        // CoW delegation happens at dispatch time.
-        let source_colls = catalog.load_all_collections(source_db_id).map_err(|e| {
-            DdlError::from_error_in_context("clone: enumerate source collections", &e)
-        })?;
-        let kv_surrogate_ceiling = Some(state.surrogate_assigner.current_hwm());
-        for mut coll in source_colls.into_iter().filter(|c| c.is_active) {
-            coll.database_id = target_db_id;
-            coll.cloned_from = Some(nodedb_types::CloneOrigin {
-                source_database: source_db_id,
-                source_collection: coll.name.clone(),
-                as_of_lsn,
-                clone_created_at,
-                kv_surrogate_ceiling,
-            });
-            coll.clone_status = nodedb_types::CloneStatus::Shadowed;
-            coll.descriptor_version = 0;
-            // Fatal, not a warning: an unstamped descriptor means the clone is
-            // reported as created while one of the source's collections simply
-            // does not resolve in it, and nothing later re-stamps it. Surfacing
-            // the failure is the only way the caller learns the clone is
-            // incomplete.
-            catalog.put_collection(target_db_id, &coll).map_err(|e| {
-                DdlError::from_error_in_context(
-                    &format!(
-                        "clone: stamping shadow descriptor for collection '{}' failed",
-                        coll.name
-                    ),
-                    &e,
-                )
-            })?;
-
-            // The owner row is keyed by database, so the clone needs its own.
-            // Without it the collection resolves but every ownership check
-            // against it reports no owner.
-            let owner = StoredOwner {
-                database_id: target_db_id.as_u64(),
-                object_type: object_type::COLLECTION.to_string(),
-                object_name: coll.name.clone(),
-                tenant_id: coll.tenant_id,
-                owner_username: coll.owner.clone(),
-            };
-            catalog.put_owner(&owner).map_err(|e| {
-                DdlError::from_error_in_context(
-                    &format!(
-                        "clone: stamping owner for collection '{}' failed",
-                        coll.name
-                    ),
-                    &e,
-                )
-            })?;
-        }
-
-        // Copy the source's database-scoped catalog rows: vector index
-        // params, vector models, column statistics, index records, RLS and
-        // redaction policies, triggers, retention policies, alert rules,
-        // continuous aggregates, and streaming materialized views. Schedules
-        // are not copied — see `catalog_copy::copy_scoped_objects`.
-        //
-        // A missing row is fatal, for the same reason an unstamped
-        // descriptor is fatal. The clone reports itself created while it
-        // answers queries the source answers differently, and nothing later
-        // re-copies the row.
-        copy_database_metadata(catalog, source_db_id, target_db_id)
-            .map_err(|e| DdlError::from_error_in_context("clone: copying catalog metadata", &e))?;
-    }
 
     // Synonym groups and custom types travel as proposed entries, not as a
     // catalog copy. Each needs two more effects than a redb write: the
     // in-memory registry SHOW reads, and for a group the FTS backend on every
     // node. A propose runs the applier and both post-apply lanes everywhere,
     // which is the only path that delivers all three.
-    //
-    // Outside the `needs_local_apply` block above on purpose: a propose is the
-    // thing that reaches every node, and on a cluster proposer that branch is
-    // false.
     copy_synonym_groups(state, source_db_id, target_db_id).await?;
-    copy_custom_types(state, source_db_id, target_db_id)?;
-
-    // Flush the allocator hwm so restarts pick up the correct next-id boundary.
-    if state.database_registry.should_flush() {
-        let hwm = state.database_registry.current_hwm();
-        if let Err(e) = catalog.put_database_hwm(hwm) {
-            tracing::warn!("database hwm flush failed after clone: {e}");
-        }
-    }
+    copy_custom_types(state, source_db_id, target_db_id).await?;
 
     state.audit_record_with_db(
         crate::control::security::audit::AuditEvent::DatabaseCloned,
@@ -316,8 +224,7 @@ pub async fn clone_database(
 /// Propose one `PutSynonymGroup` per source group, rewritten to the target.
 ///
 /// A group also lives in each node's FTS backend, which only the post-apply
-/// lane reaches. On the `LocalOnly` path no applier runs, so this installs the
-/// group and registers it here instead.
+/// lane reaches.
 ///
 /// A failed propose is fatal, for the same reason an unstamped descriptor is:
 /// the clone reports itself created while a text query against it expands
@@ -337,12 +244,9 @@ async fn copy_synonym_groups(
     for mut group in groups {
         group.database_id = target.as_u64();
         let entry = CatalogEntry::PutSynonymGroup(Box::new(group.clone()));
-        let outcome = propose_and_apply(state, &entry)
+        propose_and_apply_async(state, &entry)
+            .await
             .map_err(|e| e.in_context(&format!("clone: copying synonym group '{}'", group.name)))?;
-        if outcome.needs_local_apply() {
-            state.synonym_registry.register(group.clone());
-            crate::control::catalog_entry::post_apply::install_synonym_group(group, state).await;
-        }
     }
     Ok(())
 }
@@ -354,9 +258,9 @@ async fn copy_synonym_groups(
 /// two definitions under one identity. The catalog assigns each copy a fresh
 /// OID when the entry applies, identically on every node.
 ///
-/// A failed propose is fatal: the clone would resolve neither a copied
+/// A failed propose is fatal: the clone will resolve neither a copied
 /// descriptor's typed column nor the OID a pgwire client reads back.
-fn copy_custom_types(
+async fn copy_custom_types(
     state: &SharedState,
     source: DatabaseId,
     target: DatabaseId,
@@ -370,20 +274,12 @@ fn copy_custom_types(
         custom_type.database_id = target.as_u64();
         custom_type.oid = UNASSIGNED_OID;
         let entry = CatalogEntry::PutCustomType(Box::new(custom_type.clone()));
-        let outcome = propose_and_apply(state, &entry).map_err(|e| {
+        propose_and_apply_async(state, &entry).await.map_err(|e| {
             e.in_context(&format!(
                 "clone: copying custom type '{}'",
                 custom_type.name
             ))
         })?;
-        if outcome.needs_local_apply() {
-            register_written(
-                custom_type.database_id,
-                custom_type.tenant_id,
-                &custom_type.name,
-                state,
-            );
-        }
     }
     Ok(())
 }

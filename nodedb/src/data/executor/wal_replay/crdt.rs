@@ -8,9 +8,9 @@ impl CoreLoop {
     /// Try to replay one WAL CRDT delta record.
     ///
     /// This single-record entrypoint lets the startup coordinator preserve the
-    /// global LSN order across CRDT delta and intent record classes. The
-    /// established bulk replayer remains the implementation so legacy callers
-    /// retain identical decode, tombstone, fence, and projection semantics.
+    /// global LSN order across CRDT delta and intent record classes. The bulk
+    /// replayer is the implementation, so both entrypoints share one decode,
+    /// tombstone, fence, and projection path.
     pub(in crate::data::executor) fn try_replay_crdt_delta(
         &mut self,
         record: &nodedb_wal::WalRecord,
@@ -28,9 +28,10 @@ impl CoreLoop {
 
     /// Replay WAL CRDT delta records to rebuild CRDT state after crash.
     ///
-    /// Current identity-bearing records rebuild both the authoritative Loro row
-    /// and its sparse document projection; historical payloads without identity
-    /// retain their established Loro-only replay behavior. CRDT records use
+    /// A document delta rebuilds both the authoritative Loro row and its sparse
+    /// document projection under the surrogate the record carries. A snapshot
+    /// import carries no row identity and rebuilds Loro state only. A payload
+    /// that decodes to neither is refused as unapplied. CRDT records use
     /// `RecordType::CrdtDelta`; the payload is a
     /// `CrdtDeltaWalPayload` as written by `append_crdt_delta` for both
     /// `CrdtOp::Apply` and `CrdtOp::ImportSnapshot`. Loro `import` is
@@ -51,6 +52,9 @@ impl CoreLoop {
         let mut replayed = 0usize;
 
         for record in records {
+            if self.replay_halted() {
+                break;
+            }
             if RecordType::from_raw(record.logical_record_type()) != Some(RecordType::CrdtDelta) {
                 continue;
             }
@@ -70,23 +74,19 @@ impl CoreLoop {
 
             // Single self-describing decode. The delta is routed to its
             // per-collection LoroDoc by `payload.collection`.
-            let Ok(payload) = crate::wal::CrdtDeltaWalPayload::decode(&record.payload) else {
-                continue;
+            let payload = match crate::wal::CrdtDeltaWalPayload::decode(&record.payload) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    self.replay_record_unapplied(
+                        "crdt",
+                        "delta_decode",
+                        record.header.lsn,
+                        &error.to_string(),
+                    );
+                    continue;
+                }
             };
-
-            // Every CRDT delta / snapshot-import record written by the current
-            // binary carries its collection. A record with no collection cannot
-            // be routed to a per-collection doc; skip it (a pre-per-collection
-            // record from an earlier dev binary — there is no released data to
-            // preserve).
-            let Some(collection) = payload.collection.as_deref() else {
-                warn!(
-                    core = self.core_id,
-                    tenant = tid.as_u64(),
-                    "CRDT WAL record without collection; skipping (cannot route per-collection)"
-                );
-                continue;
-            };
+            let collection = payload.collection.as_str();
             if tombstones.is_tombstoned(
                 record.header.database_id,
                 tid.as_u64(),
@@ -142,15 +142,21 @@ impl CoreLoop {
                 }
             }
 
-            let projection = match (&payload.document_id, payload.surrogate) {
-                (Some(document_id), Some(surrogate)) => {
+            let projection = match &payload.target {
+                crate::wal::CrdtDeltaTarget::Document {
+                    document_id,
+                    surrogate,
+                } => {
+                    let surrogate = *surrogate;
                     let applied = match self.get_crdt_engine(database_id, tid) {
                         Ok(engine) => match payload.signing {
                             Some(signing) => engine.apply_committed_delta_authenticated(
                                 collection,
                                 &payload.bytes,
-                                nodedb_types::Surrogate::new(surrogate),
-                                document_id,
+                                crate::engine::crdt::tenant_state::ApplyTarget::Document {
+                                    document_id,
+                                    surrogate,
+                                },
                                 payload.peer_id,
                                 crate::engine::crdt::tenant_state::DeltaSigningAdmission {
                                     auth: nodedb_crdt::CrdtAuthContext {
@@ -167,8 +173,10 @@ impl CoreLoop {
                             None => engine.apply_committed_delta_validated(
                                 collection,
                                 &payload.bytes,
-                                nodedb_types::Surrogate::new(surrogate),
-                                document_id,
+                                crate::engine::crdt::tenant_state::ApplyTarget::Document {
+                                    document_id,
+                                    surrogate,
+                                },
                                 payload.peer_id,
                             ),
                         },
@@ -215,13 +223,10 @@ impl CoreLoop {
                                 );
                                 continue;
                             };
-                            let surrogate = nodedb_types::Surrogate::new(surrogate);
                             Some((
                                 document_id.as_str(),
                                 surrogate,
-                                (surrogate != nodedb_types::Surrogate::ZERO)
-                                    .then(|| Self::encode_crdt_row(engine, collection, document_id))
-                                    .flatten(),
+                                Self::encode_crdt_row(engine, collection, document_id),
                             ))
                         }
                         crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Rejected(
@@ -261,16 +266,15 @@ impl CoreLoop {
                         }
                     }
                 }
-                _ => {
-                    // Historical payloads carry no row identity. Preserve their
-                    // established Loro-only replay behavior rather than guessing
-                    // a sparse key from attacker-controlled delta contents.
+                crate::wal::CrdtDeltaTarget::Collection => {
+                    // A per-collection snapshot import binds no row identity.
+                    // It rebuilds Loro state only; each row's projection comes
+                    // from the document records that carry its surrogate.
                     match self.get_crdt_engine(database_id, tid) {
                         Ok(engine) => match engine.apply_committed_delta_validated(
                             collection,
                             &payload.bytes,
-                            nodedb_types::Surrogate::ZERO,
-                            "",
+                            crate::engine::crdt::tenant_state::ApplyTarget::Collection,
                             payload.peer_id,
                         ) {
                             crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Clean {
@@ -279,7 +283,7 @@ impl CoreLoop {
                             crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Rejected(
                                 reason,
                             ) => {
-                                warn!(core = self.core_id, tenant = tid.as_u64(), %collection, %reason, "legacy CRDT WAL delta rejected during replay");
+                                warn!(core = self.core_id, tenant = tid.as_u64(), %collection, %reason, "CRDT WAL snapshot import rejected during replay");
                                 self.store_replayed_dead_letter(database_id, tid, record.header.lsn);
                                 None
                             }
@@ -287,7 +291,7 @@ impl CoreLoop {
                                 if let Some(provenance) = payload.provenance.as_ref() {
                                     self.sync_commit(provenance);
                                 }
-                                warn!(core = self.core_id, tenant = tid.as_u64(), %collection, "legacy CRDT WAL delta malformed during replay");
+                                warn!(core = self.core_id, tenant = tid.as_u64(), %collection, "CRDT WAL snapshot import malformed during replay");
                                 continue;
                             }
                             crate::engine::crdt::tenant_state::ValidatedApplyOutcome::PendingDependencies => {
@@ -295,7 +299,7 @@ impl CoreLoop {
                                 // absent from this collection's document: the row
                                 // did NOT apply. Loud, and not acknowledged as a
                                 // clean replay.
-                                error!(core = self.core_id, tenant = tid.as_u64(), %collection, lsn = record.header.lsn, "legacy CRDT WAL delta depends on operations absent from this collection's document; row not recovered");
+                                error!(core = self.core_id, tenant = tid.as_u64(), %collection, lsn = record.header.lsn, "CRDT WAL snapshot import depends on operations absent from this collection's document; state not recovered");
                                 continue;
                             }
                         },
@@ -336,10 +340,8 @@ impl CoreLoop {
                 self.sync_commit(provenance);
             }
             // Every successfully imported payload changed authoritative Loro
-            // state, including historical payloads that predate sparse-row
-            // identity. Record its exact durable collection floor even when a
-            // legacy record cannot safely reconstruct a surrogate-keyed
-            // projection without inventing cross-engine identity.
+            // state, including a snapshot import that projects no row. Record
+            // its exact durable collection floor either way.
             self.note_replay_write_lsn(
                 record.header.database_id,
                 tid.as_u64(),
@@ -431,11 +433,10 @@ mod crdt_replay_tests {
 
         let wal_payload = crate::wal::CrdtDeltaWalPayload::new(
             snapshot,
-            Some(collection.to_string()),
+            collection.to_string(),
             None,
             None,
-            Some(row_id.to_owned()),
-            Some(1),
+            document_target(row_id, 1),
         );
         let payload = wal_payload.encode().expect("encode payload");
         nodedb_wal::WalRecord::new(nodedb_wal::WalRecordArgs {
@@ -449,6 +450,14 @@ mod crdt_replay_tests {
             preamble_bytes: None,
         })
         .expect("wal record")
+    }
+
+    fn document_target(document_id: &str, surrogate: u32) -> crate::wal::CrdtDeltaTarget {
+        crate::wal::CrdtDeltaTarget::document(
+            document_id.to_owned(),
+            nodedb_types::Surrogate::new(surrogate),
+        )
+        .expect("bound document target")
     }
 
     #[test]
@@ -493,11 +502,10 @@ mod crdt_replay_tests {
             .expect("upsert");
         let payload = crate::wal::CrdtDeltaWalPayload::new(
             state.export_snapshot().expect("snapshot"),
-            Some("secure_notes".into()),
+            "secure_notes".into(),
             Some(provenance.clone()),
             Some([0xee; 32]),
-            Some("doc".into()),
-            Some(1),
+            document_target("doc", 1),
         )
         .with_signing(crate::wal::CrdtDeltaSigning {
             auth_user_id: 42,
@@ -527,36 +535,42 @@ mod crdt_replay_tests {
         ));
     }
 
+    /// The WAL writer's own record for an apply carries the row's surrogate,
+    /// and a restart replay rebuilds the row's projection under that identity.
     #[test]
-    fn replay_legacy_payload_remains_loro_only_and_decodable() {
-        #[derive(zerompk::ToMessagePack, zerompk::FromMessagePack)]
-        struct LegacyPayload {
-            bytes: Vec<u8>,
-            collection: Option<String>,
-            provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
-        }
-
-        let tid = TenantId::new(8);
-        let state = nodedb_crdt::state::CrdtState::new(0).expect("state");
-        state
+    fn a_written_apply_keeps_its_identity_across_replay() {
+        let tid = TenantId::new(12);
+        let db = DatabaseId::DEFAULT;
+        let collection = "notes";
+        let surrogate = nodedb_types::Surrogate::new(4_321);
+        let source = nodedb_crdt::state::CrdtState::new(5).expect("source state");
+        source
             .upsert(
-                "notes",
-                "legacy",
-                &[("body", LoroValue::String("old".into()))],
+                collection,
+                "doc",
+                &[("body", LoroValue::String("kept".into()))],
             )
-            .expect("upsert");
-        let payload = zerompk::to_msgpack_vec(&LegacyPayload {
-            bytes: state.export_snapshot().expect("snapshot"),
-            collection: Some("notes".into()),
+            .expect("write");
+        let plan = nodedb_physical::physical_plan::CrdtOp::Apply {
+            collection: nodedb_types::QualifiedCollection::new(db, collection),
+            document_id: "doc".into(),
+            delta: source.export_snapshot().expect("snapshot"),
+            peer_id: 5,
+            mutation_id: 1,
+            surrogate,
             provenance: None,
-        })
-        .expect("encode legacy");
+            constraint_version_required: 0,
+            expected_frontier_digest: None,
+        };
+        let (_, payload) = crate::control::server::wal_dispatch::encode_crdt_op_record(&plan)
+            .expect("encode")
+            .expect("an apply writes a record");
         let record = nodedb_wal::WalRecord::new(nodedb_wal::WalRecordArgs {
             record_type: RecordType::CrdtDelta as u32,
-            lsn: 9,
+            lsn: 4,
             tenant_id: tid.as_u64(),
             vshard_id: 0,
-            database_id: DatabaseId::DEFAULT.as_u64(),
+            database_id: db.as_u64(),
             payload,
             encryption_key: None,
             preamble_bytes: None,
@@ -566,21 +580,15 @@ mod crdt_replay_tests {
         let mut h = make_core(0);
         h.core
             .replay_crdt_wal(&[record], 1, &nodedb_wal::TombstoneSet::new());
-        let engine = h
-            .core
-            .get_crdt_engine(DatabaseId::DEFAULT, tid)
-            .expect("engine");
-        assert!(engine.row_exists("notes", "legacy"));
-        assert_eq!(
-            h.core.write_index.collection_write_lsn(
-                &crate::data::executor::core_loop::write_index::CollKey {
-                    db: DatabaseId::DEFAULT,
-                    tenant: tid,
-                    collection: Box::from("notes"),
-                }
-            ),
-            Some(crate::types::Lsn::new(9)),
-            "legacy authoritative Loro replay must restore its durable floor"
+
+        let sparse_key = crate::engine::document::store::StorageKey::for_surrogate(surrogate);
+        assert!(
+            h.core
+                .sparse
+                .get(db.as_u64(), tid.as_u64(), collection, &sparse_key)
+                .expect("sparse read")
+                .is_some(),
+            "replay must project the row under the surrogate its record carries"
         );
     }
 
@@ -600,11 +608,10 @@ mod crdt_replay_tests {
         let base_snapshot = source.export_snapshot().expect("base snapshot");
         let base = crate::wal::CrdtDeltaWalPayload::new(
             base_snapshot,
-            Some(collection.into()),
+            collection.into(),
             None,
             None,
-            Some("doc".into()),
-            Some(1),
+            document_target("doc", 1),
         );
 
         let frontier = nodedb_crdt::state::frontier_digest::domain_frontier_digest(
@@ -624,19 +631,17 @@ mod crdt_replay_tests {
         let retry_delta = source.export_updates_since(&base_vv).expect("retry delta");
         let stale = crate::wal::CrdtDeltaWalPayload::new(
             retry_delta.clone(),
-            Some(collection.into()),
+            collection.into(),
             None,
             Some([0xde; 32]),
-            Some("doc".into()),
-            Some(1),
+            document_target("doc", 1),
         );
         let retry = crate::wal::CrdtDeltaWalPayload::new(
             retry_delta,
-            Some(collection.into()),
+            collection.into(),
             None,
             Some(frontier),
-            Some("doc".into()),
-            Some(1),
+            document_target("doc", 1),
         );
         let record = |lsn, payload: crate::wal::CrdtDeltaWalPayload| {
             nodedb_wal::WalRecord::new(nodedb_wal::WalRecordArgs {
@@ -748,7 +753,8 @@ mod crdt_replay_tests {
         );
     }
 
-    /// A `users` row record at `lsn` whose delta sets `email`.
+    /// A `users` row record at `lsn` whose delta sets `email`. The row's
+    /// surrogate is its producing peer, so each row carries its own identity.
     fn email_record(
         tid: TenantId,
         row_id: &str,
@@ -766,11 +772,10 @@ mod crdt_replay_tests {
             .expect("upsert");
         let payload = crate::wal::CrdtDeltaWalPayload::new(
             state.export_snapshot().expect("snapshot"),
-            Some("users".into()),
+            "users".into(),
             None,
             None,
-            Some(row_id.to_owned()),
-            Some(0),
+            document_target(row_id, u32::try_from(peer).expect("peer fits a surrogate")),
         )
         .with_peer_id(peer);
         nodedb_wal::WalRecord::new(nodedb_wal::WalRecordArgs {

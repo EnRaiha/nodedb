@@ -17,10 +17,8 @@
 //! SHOW SCOPE GRANTS
 //! ```
 //!
-//! Ported from the pgwire `ddl::scope_ddl` handlers. The superuser gate,
-//! `scope_defs` / `scope_grants` catalog mutations, and `audit_record` side
-//! effects are preserved verbatim; only the result construction changed from
-//! pgwire `Response` / `QueryResponse` / `Tag` to the protocol-neutral
+//! The superuser gate, `scope_defs` / `scope_grants` catalog mutations, and
+//! `audit_record` side effects run here. The result is the protocol-neutral
 //! [`super::super::result::DdlResult`] over
 //! [`crate::control::server::response_shape::types::ShapedRows`].
 

@@ -23,27 +23,20 @@ use crate::storage::quarantine::QuarantineRegistry;
 use crate::types::{DatabaseId, TenantId};
 
 /// Load the persisted ND-array catalog from redb into the shared in-memory handle.
+///
+/// The catalog is filled while this function owns it, and only then wrapped
+/// in the shared lock. No other thread can reach it before that, so no lock
+/// is taken here.
 pub fn load_array_catalog(
     config: &ServerConfig,
 ) -> crate::control::array_catalog::ArrayCatalogHandle {
-    let array_catalog = ArrayCatalog::handle();
+    let mut array_catalog = ArrayCatalog::new();
     let catalog_path = config.catalog_path();
     match CatalogForRead::open(&catalog_path) {
-        Ok(Some(catalog)) => match catalog.load_all_arrays() {
-            Ok(entries) => {
-                let mut guard = array_catalog
-                    .write()
-                    .expect("array catalog lock poisoned at startup");
-                for entry in entries {
-                    if let Err(e) = guard.register(entry) {
-                        tracing::warn!(error = %e, "failed to register array at startup");
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to load _system.arrays at startup");
-            }
-        },
+        Ok(Some(catalog)) => crate::control::array_catalog::persist::register_loaded(
+            &mut array_catalog,
+            catalog.load_all_arrays(),
+        ),
         // No catalog yet: a genuine fresh start, nothing to seed.
         Ok(None) => {}
         // A catalog EXISTS and could not be read — locked by another handle,
@@ -57,7 +50,7 @@ pub fn load_array_catalog(
             );
         }
     }
-    array_catalog
+    Arc::new(std::sync::RwLock::new(array_catalog))
 }
 
 /// Load every active collection's `CollectionConfig` from the durable
@@ -277,15 +270,16 @@ pub struct SpawnedDataPlaneCores {
     /// Held only to keep the Data Plane core threads alive; never read.
     pub handles: Vec<std::thread::JoinHandle<()>>,
     /// Per-core one-shot that resolves when the core finishes `replay_all_wal`
-    /// (before entering its event loop). Boot awaits every one before opening
-    /// the client gateway.
-    pub replay_done: Vec<tokio::sync::oneshot::Receiver<()>>,
+    /// (before entering its event loop), carrying the replay's outcome. Boot
+    /// awaits every one before opening the client gateway.
+    pub replay_done: Vec<tokio::sync::oneshot::Receiver<crate::Result<()>>>,
 }
 
 /// Shared Arc resources passed to each Data Plane core at spawn time.
 pub struct CoreSharedResources {
     pub governor: Arc<nodedb_mem::MemoryGovernor>,
     pub quiesce: Arc<CollectionQuiesce>,
+    pub event_interest: Arc<crate::event::interest::EventInterest>,
     pub hlc: Arc<nodedb_types::OrdinalClock>,
     pub array_catalog: crate::control::array_catalog::ArrayCatalogHandle,
     pub quarantine_registry: Arc<QuarantineRegistry>,
@@ -322,6 +316,7 @@ pub fn spawn_data_plane_cores(
     let CoreSharedResources {
         governor,
         quiesce,
+        event_interest,
         hlc,
         array_catalog,
         quarantine_registry,
@@ -361,6 +356,7 @@ pub fn spawn_data_plane_cores(
             compaction_config: compaction_cfg.clone(),
             system_metrics: Some(Arc::clone(&system_metrics)),
             event_producer: Some(event_producer),
+            event_interest: Arc::clone(&event_interest),
             governor: Arc::clone(&governor),
             quiesce: Some(Arc::clone(&quiesce)),
             hlc: Arc::clone(&hlc),

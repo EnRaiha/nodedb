@@ -117,10 +117,12 @@ pub(super) fn cluster_err(e: ClusterError) -> Error {
             vshard_id,
             expected_owner_node,
         } => match expected_owner_node {
+            // `WrongOwner` names the owner without a term.
             Some(leader_node) => Error::NotLeader {
                 vshard_id: crate::types::VShardId::new(vshard_id),
                 leader_node,
                 leader_addr: String::new(),
+                leader_term: 0,
             },
             None => Error::NoLeader {
                 vshard_id: crate::types::VShardId::new(vshard_id),
@@ -163,6 +165,7 @@ pub(super) fn cluster_err(e: ClusterError) -> Error {
         | ClusterError::SpatialGather(_)
         | ClusterError::Bm25Gather(_)
         | ClusterError::TsGather(_)
+        | ClusterError::ShufflePush(_)
         | ClusterError::RemoteUntyped { .. }) => Error::Internal {
             detail: format!("array cluster: {other}"),
         },

@@ -13,6 +13,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use futures::{FutureExt, SinkExt, StreamExt};
 use pgwire::api::{ClientInfo, ErrorHandler, PgWireConnectionState};
 use pgwire::error::ErrorInfo;
@@ -36,7 +37,7 @@ pub(crate) enum ConnectionOutcome {
     Panicked,
 }
 
-/// Read the negotiated transport out of the socket pgwire just produced.
+/// Read the negotiated transport out of the socket pgwire produced.
 ///
 /// `MaybeTls` is `#[non_exhaustive]`, so the catch-all arm is required; every
 /// non-TLS arm (plain TCP, Unix socket) is cleartext as far as the policy is
@@ -70,7 +71,7 @@ fn fixed_panic_response() -> PgWireBackendMessage {
 
 macro_rules! recover_from_panic {
     ($socket:expr, $response:expr) => {{
-        // A queued response may already be partially visible to the peer. Do
+        // A queued response can already be partially visible to the peer. Do
         // not append another frame in that case; dropping the connection is
         // the only conservative recovery. The response was allocated before
         // panic-prone dispatch and is consumed at most once.
@@ -96,22 +97,25 @@ macro_rules! recover_from_panic {
 /// escape its connection task.
 ///
 /// Panics before TLS negotiation yields a framed socket cannot be replied to,
-/// so the TCP stream is simply dropped. Once a socket exists, every panic-prone
+/// so the TCP stream is dropped. Once a socket exists, every panic-prone
 /// stage is caught locally and gets one fixed fatal response only if pgwire has
-/// no buffered output that could make the wire stream ambiguous.
-pub(crate) async fn run(
+/// no buffered output that can make the wire stream ambiguous.
+///
+/// The connection future is boxed, once per connection. Every statement path
+/// nests inside it, and unboxed it can overflow the compiler's layout depth
+/// limit in the listener's connection task.
+pub(crate) fn run(
     stream: TcpStream,
     tls_acceptor: Option<pgwire::tokio::TlsAcceptor>,
     factory: Arc<NodeDbPgHandlerFactory>,
     context: PgConnectionContext,
-) -> ConnectionOutcome {
+) -> BoxFuture<'static, ConnectionOutcome> {
     // Session slots are installed for the whole connection, not per statement:
     // a transaction's statements are polled on whichever worker tokio picks,
     // so the DDL buffer must follow the task across every await.
-    crate::control::server::shared::session::conn_scope::scoped(isolate_connection_future(
-        run_inner(stream, tls_acceptor, factory, context),
+    Box::pin(crate::control::server::shared::session::conn_scope::scoped(
+        isolate_connection_future(run_inner(stream, tls_acceptor, factory, context)),
     ))
-    .await
 }
 
 async fn isolate_connection_future<F>(future: F) -> ConnectionOutcome
@@ -153,7 +157,7 @@ async fn run_inner(
     // reachable here, between `negotiate_tls` returning and the framed socket
     // being handed to the message loop. They are stashed in the connection's
     // typed session-extension store — not `metadata`, which the startup
-    // handler fills from client-supplied startup parameters and a client could
+    // handler fills from client-supplied startup parameters and a client can
     // therefore forge — and read back at identity resolution.
     socket
         .session_extensions()

@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::timeseries_checkpoint::schema::write_ts_schema;
 use crate::data::executor::timeseries_checkpoint::stamp::write_ts_stamp;
 use crate::engine::timeseries::columnar_segment::ColumnarSegmentWriter;
 use crate::engine::timeseries::partition_registry::PartitionRegistry;
@@ -89,6 +90,10 @@ impl CoreLoop {
             detail: format!("create partition dir {}: {e}", partition_dir.display()),
         })?;
         write_ts_stamp(&partition_dir, &stamp)?;
+        // The schema outlives the drain below. It lands before the commit
+        // point too, so a restart seeds the memtable with every column a
+        // committed partition's records added.
+        write_ts_schema(&segment_dir, mt.schema())?;
         let ts_kek = self.segment_keks.ts_segment_kek.as_ref();
         let meta = writer
             .write_partition(&partition_name, &view, 0, flush_wal_lsn, ts_kek)

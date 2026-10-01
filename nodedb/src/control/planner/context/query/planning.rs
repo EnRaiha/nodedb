@@ -77,7 +77,7 @@ impl QueryContext {
     /// `returning_items` is the raw text after a DML `RETURNING` keyword. It
     /// resolves here against the planned target: the announced output schema
     /// carries the projection, and every task carries the Data-Plane spec.
-    fn plan_with_nodedb_sql_for_purpose(
+    async fn plan_with_nodedb_sql_for_purpose(
         &self,
         sql: &str,
         tenant_id: crate::types::TenantId,
@@ -90,24 +90,18 @@ impl QueryContext {
         crate::control::planner::descriptor_set::DescriptorVersionSet,
         nodedb_sql::types::PlanCacheEligibility,
     )> {
-        let inputs = match &self.catalog_inputs {
-            Some(i) => i,
-            None => {
-                return Err(crate::Error::PlanError {
-                    detail: "no catalog available for SQL planning".into(),
-                });
-            }
-        };
+        let inputs = &self.catalog_inputs;
         // Fresh adapter per plan call: the adapter's
         // `recorded_versions` field is per-plan state, and
         // two concurrent plans through a shared QueryContext
-        // would otherwise interleave their recorded sets.
+        // will otherwise interleave their recorded sets.
         let catalog = if purpose == PlanningPurpose::Metadata {
             // Metadata requests intentionally do not participate in descriptor
             // lease admission; they only need a stable catalog snapshot for
             // authorization and response shaping.
             crate::control::planner::catalog_adapter::OriginCatalog::new(
                 Arc::clone(&inputs.credentials),
+                inputs.array_catalog.clone(),
                 tenant_id.as_u64(),
                 database_id,
                 inputs.retention_policy_registry.clone(),
@@ -138,43 +132,6 @@ impl QueryContext {
             .collect::<nodedb_sql::Result<_>>()
             .map_err(|error| map_plan_error(error, tenant_id))?;
         let version_set = catalog.take_recorded_versions();
-        let ctx = crate::control::planner::sql_plan_convert::ConvertContext {
-            purpose,
-            retention_registry: self.retention_registry.clone(),
-            array_catalog: self.array_catalog.clone(),
-            credentials: self
-                .catalog_inputs
-                .as_ref()
-                .map(|i| Arc::clone(&i.credentials)),
-            wal: self.wal.clone(),
-            surrogate_assigner: self.surrogate_assigner.clone(),
-            cluster_enabled: self.cluster_enabled,
-            bitemporal_retention_registry: self.bitemporal_retention_registry.clone(),
-            max_vector_dim: self
-                .max_vector_dim
-                .load(std::sync::atomic::Ordering::Relaxed),
-            force_shuffle_join: self
-                .force_shuffle_join
-                .load(std::sync::atomic::Ordering::Relaxed),
-            shuffle_num_parts: self
-                .shuffle_num_parts
-                .load(std::sync::atomic::Ordering::Relaxed) as usize,
-            force_shuffle_agg: self
-                .force_shuffle_agg
-                .load(std::sync::atomic::Ordering::Relaxed),
-            shuffle_agg_num_parts: self
-                .shuffle_agg_num_parts
-                .load(std::sync::atomic::Ordering::Relaxed)
-                as usize,
-            broadcast_threshold_bytes: self
-                .broadcast_threshold_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
-            shuffle_agg_threshold: self
-                .shuffle_agg_threshold
-                .load(std::sync::atomic::Ordering::Relaxed),
-            database_id,
-            tenant_id,
-        };
         let (output_schema, returning) = resolve_returning_and_output_schema(
             &plans,
             returning_items,
@@ -184,8 +141,9 @@ impl QueryContext {
         )?;
         let cache_eligibility =
             crate::control::planner::sql_plan_convert::batch_cache_eligibility(&plans);
-        let mut tasks =
-            crate::control::planner::sql_plan_convert::convert(&plans, tenant_id, &ctx)?;
+        let mut tasks = self
+            .convert_prefetched(&plans, purpose, database_id, tenant_id)
+            .await?;
         // Attached before the tasks leave: RLS injection, caching, expansion,
         // and dispatch all read the plan after this point.
         if let Some(clause) = &returning {
@@ -308,23 +266,22 @@ impl QueryContext {
         nodedb_sql::types::PlanCacheEligibility,
     )> {
         let (mut tasks, output_schema, mut version_set, cache_eligibility) = self
-            .plan_with_nodedb_sql_for_purpose(
-                sql,
-                tenant_id,
-                database_id,
-                purpose,
-                returning_items,
-            )?;
+            .plan_with_nodedb_sql_for_purpose(sql, tenant_id, database_id, purpose, returning_items)
+            .await?;
 
         // Versions read BEFORE injection, never after: injection reads live
         // policy/grant state under its own lock, and a mutation racing in
-        // between would otherwise let a post-injection read stamp a version
+        // between will otherwise let a post-injection read stamp a version
         // newer than what was actually filtered against, making a plan built
         // from stale state compare as fresh forever. A pre-injection read
         // only ever under-states freshness (an extra harmless replan), never
         // over-states it.
-        let permission_tree_version = sec
-            .permission_cache
+        //
+        // The permission tree is read here, after planning's last await, so
+        // no lock is held across a request to a surrogate's collection home.
+        let permission_view = sec.permission_tree.read().await;
+        let permission_cache = permission_view.as_deref();
+        let permission_tree_version = permission_cache
             .map(|c| c.tenant_version(tenant_id.as_u64()))
             .unwrap_or(0);
         let rls_version = sec.rls_store.tenant_version(tenant_id.as_u64());
@@ -341,7 +298,7 @@ impl QueryContext {
         )?;
 
         // Inject permission tree filters (hierarchical ACL).
-        if let Some(cache) = sec.permission_cache {
+        if let Some(cache) = permission_cache {
             crate::control::planner::rls_injection::inject_permission_tree(
                 &mut tasks, cache, sec.auth,
             )?;
@@ -397,14 +354,7 @@ impl QueryContext {
         OutputSchema,
         crate::control::planner::descriptor_set::DescriptorVersionSet,
     )> {
-        let inputs = match &self.catalog_inputs {
-            Some(i) => i,
-            None => {
-                return Err(crate::Error::PlanError {
-                    detail: "no catalog available for SQL planning".into(),
-                });
-            }
-        };
+        let inputs = &self.catalog_inputs;
         // Fresh adapter per plan call: same rationale as
         // `plan_with_nodedb_sql_for_purpose`. Its recorded version set is returned to the
         // caller so parameterized plans participate in descriptor admission.
@@ -431,43 +381,6 @@ impl QueryContext {
             })
             .collect::<nodedb_sql::Result<_>>()
             .map_err(|error| map_plan_error(error, tenant_id))?;
-        let ctx = crate::control::planner::sql_plan_convert::ConvertContext {
-            purpose: PlanningPurpose::Execute,
-            retention_registry: self.retention_registry.clone(),
-            array_catalog: self.array_catalog.clone(),
-            credentials: self
-                .catalog_inputs
-                .as_ref()
-                .map(|i| Arc::clone(&i.credentials)),
-            wal: self.wal.clone(),
-            surrogate_assigner: self.surrogate_assigner.clone(),
-            cluster_enabled: self.cluster_enabled,
-            bitemporal_retention_registry: self.bitemporal_retention_registry.clone(),
-            max_vector_dim: self
-                .max_vector_dim
-                .load(std::sync::atomic::Ordering::Relaxed),
-            force_shuffle_join: self
-                .force_shuffle_join
-                .load(std::sync::atomic::Ordering::Relaxed),
-            shuffle_num_parts: self
-                .shuffle_num_parts
-                .load(std::sync::atomic::Ordering::Relaxed) as usize,
-            force_shuffle_agg: self
-                .force_shuffle_agg
-                .load(std::sync::atomic::Ordering::Relaxed),
-            shuffle_agg_num_parts: self
-                .shuffle_agg_num_parts
-                .load(std::sync::atomic::Ordering::Relaxed)
-                as usize,
-            broadcast_threshold_bytes: self
-                .broadcast_threshold_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
-            shuffle_agg_threshold: self
-                .shuffle_agg_threshold
-                .load(std::sync::atomic::Ordering::Relaxed),
-            database_id,
-            tenant_id,
-        };
         let (output_schema, returning) = resolve_returning_and_output_schema(
             &plans,
             returning_items,
@@ -475,16 +388,19 @@ impl QueryContext {
             database_id,
             tenant_id,
         )?;
-        let mut tasks =
-            crate::control::planner::sql_plan_convert::convert(&plans, tenant_id, &ctx)?;
+        let mut tasks = self
+            .convert_prefetched(&plans, PlanningPurpose::Execute, database_id, tenant_id)
+            .await?;
         if let Some(clause) = &returning {
             attach_returning_spec(&mut tasks, &clause.spec)?;
         }
 
         // Versions read BEFORE injection — see the comment on the sibling
-        // planning path in this file for why a post-injection read is unsafe.
-        let permission_tree_version = sec
-            .permission_cache
+        // planning path in this file for why a post-injection read is unsafe,
+        // and why the permission tree is read only after the last await.
+        let permission_view = sec.permission_tree.read().await;
+        let permission_cache = permission_view.as_deref();
+        let permission_tree_version = permission_cache
             .map(|c| c.tenant_version(tenant_id.as_u64()))
             .unwrap_or(0);
         let rls_version = sec.rls_store.tenant_version(tenant_id.as_u64());
@@ -500,7 +416,7 @@ impl QueryContext {
             sec.redaction_store,
         )?;
 
-        if let Some(cache) = sec.permission_cache {
+        if let Some(cache) = permission_cache {
             crate::control::planner::rls_injection::inject_permission_tree(
                 &mut tasks, cache, sec.auth,
             )?;

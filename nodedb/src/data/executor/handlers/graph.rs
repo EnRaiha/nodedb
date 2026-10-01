@@ -35,6 +35,8 @@ pub(in crate::data::executor) struct GraphHopParams<'a> {
     pub edge_label: &'a Option<String>,
     pub direction: crate::engine::graph::edge_store::Direction,
     pub depth: usize,
+    /// The walk's visit cap ([`CoreLoop::walk_visit_cap`]).
+    pub max_visited: usize,
     pub frontier_bitmap: Option<&'a nodedb_types::SurrogateBitmap>,
 }
 
@@ -49,6 +51,18 @@ pub(in crate::data::executor) struct GraphNeighborsMultiArgs<'a> {
 }
 
 impl CoreLoop {
+    /// The visit cap of a hop, subgraph or path walk: the plan's cap, bounded
+    /// by this core's graph tuning. The cluster walk coordinators
+    /// (`graph_dispatch::bfs`, `graph_dispatch::shortest_path`) bound it the
+    /// same way, so a capped walk answers the same on one core and across a
+    /// cluster.
+    pub(in crate::data::executor) fn walk_visit_cap(
+        &self,
+        options: &crate::engine::graph::traversal_options::GraphTraversalOptions,
+    ) -> usize {
+        options.max_visited.min(self.graph_tuning.max_visited)
+    }
+
     pub(in crate::data::executor) fn execute_graph_hop(
         &self,
         task: &ExecutionTask,
@@ -60,6 +74,7 @@ impl CoreLoop {
             edge_label,
             direction,
             depth,
+            max_visited,
             frontier_bitmap,
         } = params;
         debug!(
@@ -102,7 +117,7 @@ impl CoreLoop {
                     label_filter: edge_label.as_deref(),
                     direction,
                     max_depth: depth,
-                    max_visited: self.graph_tuning.max_visited,
+                    max_visited,
                     frontier_bitmap,
                 },
                 delta.as_ref(),

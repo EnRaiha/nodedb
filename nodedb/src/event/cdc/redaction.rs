@@ -392,6 +392,8 @@ mod tests {
             row_id: "row-1".into(),
             event_time: 0,
             lsn: 10,
+            index: 10,
+            epoch: 0,
             database_id: DatabaseId::DEFAULT,
             tenant_id: 1,
             new_value,
@@ -769,6 +771,7 @@ mod tests {
             owner: "admin".into(),
             created_at: 0,
             subscriber_roles: vec!["support".into()],
+            modification_hlc: nodedb_types::Hlc::ZERO,
         });
 
         let mut subscriber =

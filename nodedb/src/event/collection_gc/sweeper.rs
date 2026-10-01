@@ -121,20 +121,9 @@ async fn adopt_deactivation_time(
 ) {
     let mut patched = coll.clone();
     patched.deactivated_at_ns = now_ns;
-    let entry = CatalogEntry::PutCollection(Box::new(patched.clone()));
-    match crate::control::metadata_proposer::propose_catalog_entry(shared, &entry) {
-        Ok(outcome) => {
-            if outcome.needs_local_apply() {
-                let catalog = shared.credentials.catalog();
-                if let Err(e) = catalog.put_collection(patched.database_id, &patched) {
-                    warn!(
-                        tenant = coll.tenant_id,
-                        collection = %coll.name,
-                        error = %e,
-                        "collection-gc: local apply of adopted deactivated_at_ns failed"
-                    );
-                }
-            }
+    let entry = CatalogEntry::PutCollection(Box::new(patched));
+    match crate::control::metadata_proposer::propose_catalog_entry_async(shared, &entry).await {
+        Ok(_) => {
             debug!(
                 tenant = coll.tenant_id,
                 collection = %coll.name,
@@ -198,43 +187,10 @@ pub async fn sweep_once(shared: &SharedState, retention: Duration) -> crate::Res
                     target_descriptor_version: 0,
                     target_hlc: nodedb_types::Hlc::ZERO,
                 };
-                match crate::control::metadata_proposer::propose_catalog_entry(shared, &entry) {
-                    Ok(outcome) => {
-                        if outcome.needs_local_apply() {
-                            let mut lifecycle = Some(
-                                shared
-                                    .quiesce
-                                    .acquire_lifecycle(
-                                        coll.database_id.as_u64(),
-                                        coll.tenant_id,
-                                        &coll.name,
-                                    )
-                                    .await,
-                            );
-                            let purge_lsn = shared.wal.next_lsn().as_u64();
-                            if let Err(error) = crate::control::server::shared::ddl::neutral::collection::purge::hard_purge_collection(
-                                shared,
-                                coll.database_id.as_u64(),
-                                coll.tenant_id,
-                                &coll.name,
-                                purge_lsn,
-                                true,
-                            )
-                            .await
-                            {
-                                // Disarm only when a durable retry record owns
-                                // the drain; a no-retry failure releases the
-                                // hold via the guard's Drop so the next sweep
-                                // (or a same-name CREATE) is not wedged.
-                                if error.retry_queued && let Some(guard) = lifecycle.take() {
-                                    guard.disarm();
-                                }
-                                return Err(crate::Error::Storage {
-                                    engine: "collection-gc".into(),
-                                    detail: error.error.to_string(),
-                                });
-                            }
-                        }
+                match crate::control::metadata_proposer::propose_catalog_entry_async(shared, &entry)
+                    .await
+                {
+                    Ok(_) => {
                         proposed += 1;
                         debug!(
                             tenant = coll.tenant_id,

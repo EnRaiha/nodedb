@@ -120,7 +120,7 @@ mod tests {
     use crate::schema::ArraySchemaBuilder;
     use crate::schema::attr_spec::{AttrSpec, AttrType};
     use crate::schema::dim_spec::{DimSpec, DimType};
-    use crate::tile::sparse_tile::SparseTileBuilder;
+    use crate::tile::sparse_tile::{SparseRow, SparseTileBuilder};
     use crate::types::cell_value::value::CellValue;
     use crate::types::coord::value::CoordValue;
     use crate::types::domain::{Domain, DomainBound};
@@ -150,15 +150,21 @@ mod tests {
 
     fn sparse_tile(s: &crate::schema::ArraySchema) -> SparseTile {
         let mut b = SparseTileBuilder::new(s);
-        b.push(
+        b.push_row(SparseRow::live(
             &[CoordValue::Int64(1), CoordValue::Int64(2)],
             &[CellValue::Int64(10)],
-        )
+            nodedb_types::Surrogate::new(1),
+            0,
+            nodedb_types::OPEN_UPPER,
+        ))
         .unwrap();
-        b.push(
+        b.push_row(SparseRow::live(
             &[CoordValue::Int64(3), CoordValue::Int64(0)],
             &[CellValue::Int64(20)],
-        )
+            nodedb_types::Surrogate::new(2),
+            0,
+            nodedb_types::OPEN_UPPER,
+        ))
         .unwrap();
         b.build()
     }

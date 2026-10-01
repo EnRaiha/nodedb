@@ -76,3 +76,22 @@ pub fn authorize_sync_task(
         detail: "sync authorization returned no capability".into(),
     })
 }
+
+/// Authorize `plan` for `owner` and propose it. The entry's apply appends the
+/// write's redo record on every replica.
+pub(crate) async fn authorize_and_dispatch(
+    state: &SharedState,
+    identity: Option<&AuthenticatedIdentity>,
+    owner: crate::control::server::dispatch_utils::RecordOwner,
+    plan: PhysicalPlan,
+) -> crate::Result<Vec<u8>> {
+    let authorized = authorize_sync_task(
+        state,
+        identity,
+        owner.tenant_id,
+        owner.database_id,
+        owner.vshard_id,
+        plan,
+    )?;
+    super::response::dispatch_sync_payload(state, authorized).await
+}

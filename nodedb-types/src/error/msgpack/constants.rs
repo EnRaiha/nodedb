@@ -27,7 +27,6 @@
 // |  19 | CollectionDraining        |
 // |  20 | CollectionDeactivated     |
 // |  21 | PlanError                 |
-// |  22 | FanOutExceeded            |
 // |  23 | SqlNotEnabled             |
 // |  24 | AuthorizationDenied       |
 // |  25 | AuthExpired               |
@@ -113,7 +112,6 @@ pub(super) const TAG_DOCUMENT_NOT_FOUND: u16 = 18;
 pub(super) const TAG_COLLECTION_DRAINING: u16 = 19;
 pub(super) const TAG_COLLECTION_DEACTIVATED: u16 = 20;
 pub(super) const TAG_PLAN_ERROR: u16 = 21;
-pub(super) const TAG_FAN_OUT_EXCEEDED: u16 = 22;
 pub(super) const TAG_SQL_NOT_ENABLED: u16 = 23;
 pub(super) const TAG_AUTHORIZATION_DENIED: u16 = 24;
 pub(super) const TAG_AUTH_EXPIRED: u16 = 25;

@@ -202,7 +202,24 @@ impl VShardEnvelope {
         }
         let payload = buf[28..28 + payload_len].to_vec();
 
-        let msg_type = match msg_type_raw {
+        let msg_type = VShardMessageType::from_raw(msg_type_raw)?;
+
+        Some(Self {
+            version,
+            msg_type,
+            source_node,
+            target_node,
+            vshard_id,
+            payload,
+        })
+    }
+}
+
+impl VShardMessageType {
+    /// The variant whose discriminant is `raw`, or `None` for a discriminant
+    /// no variant carries. The one opcode table of the vShard wire format.
+    pub fn from_raw(raw: u16) -> Option<Self> {
+        let msg_type = match raw {
             1 => VShardMessageType::SegmentChunk,
             2 => VShardMessageType::SegmentComplete,
             3 => VShardMessageType::WalTail,
@@ -248,15 +265,7 @@ impl VShardEnvelope {
             89 => VShardMessageType::ArrayShardSurrogateBitmapResp,
             _ => return None,
         };
-
-        Some(Self {
-            version,
-            msg_type,
-            source_node,
-            target_node,
-            vshard_id,
-            payload,
-        })
+        Some(msg_type)
     }
 }
 

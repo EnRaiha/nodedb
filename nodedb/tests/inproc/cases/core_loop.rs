@@ -50,10 +50,6 @@ mod test_range_scan_bitemporal;
 mod test_security_and_isolation;
 #[path = "executor_tests/test_tenant_cache_isolation.rs"]
 mod test_tenant_cache_isolation;
-#[path = "executor_tests/test_tenant_isolation_cdc.rs"]
-mod test_tenant_isolation_cdc;
-#[path = "executor_tests/test_tenant_isolation_cdc_negative.rs"]
-mod test_tenant_isolation_cdc_negative;
 #[path = "executor_tests/test_tenant_isolation_fulltext.rs"]
 mod test_tenant_isolation_fulltext;
 #[path = "executor_tests/test_tenant_isolation_fulltext_negative.rs"]

@@ -42,6 +42,8 @@ fn snapshot_req(term: u64, index: u64, done: bool, data: Vec<u8>) -> InstallSnap
         done,
         group_id: 0,
         total_size: 0,
+        voters: Vec::new(),
+        learners: Vec::new(),
     }
 }
 

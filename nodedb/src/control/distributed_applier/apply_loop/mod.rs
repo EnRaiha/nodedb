@@ -26,16 +26,26 @@
 //! - [`write_dispatch`]: the generic decode + write-funnel enqueue path.
 //! - [`transaction_redo`]: a committed transaction's redo, stamped with its
 //!   Raft entry and applied through the WAL replay arms.
+//! - [`topic_publish`]: a committed durable-topic publication, appended to
+//!   this replica's topic log at the entry's position.
 //! - [`proposal_gate`]: skips a second committed copy of an applied proposal
 //!   and records each applied proposal in the ledger.
+//! - [`snapshot_gate`]: skips an entry an installed snapshot covers, and
+//!   orders each write before a later snapshot restore.
 //! - [`group_watch`]: per-group second-apply detection and backup cut floors.
 //! - [`bookkeeping`]: applied-floor persistence + Raft log compaction trigger.
 //! - [`helpers`]: shared response/result classification helpers.
 //! - [`metadata_floor`]: holds a write until this node's catalog reached the
 //!   one its proposer planned it against.
+//! - [`array_cell_route`]: routes an array cell write to the incarnation its
+//!   proposer wrote against.
+//! - [`collection_route`]: applies a collection write only while each
+//!   collection it names holds the incarnation its proposer planned against.
 
+mod array_cell_route;
 mod bookkeeping;
 mod calvin_read_result;
+mod collection_route;
 mod context;
 mod driver;
 mod group_watch;
@@ -44,7 +54,10 @@ mod lane;
 mod metadata_floor;
 mod pipeline;
 mod proposal_gate;
+mod snapshot_gate;
 mod start;
+mod surrogate_bind;
+mod topic_publish;
 mod transaction_redo;
 mod write_dispatch;
 

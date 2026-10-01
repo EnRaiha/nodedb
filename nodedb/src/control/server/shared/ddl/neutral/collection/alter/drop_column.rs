@@ -3,11 +3,10 @@
 //! `ALTER COLLECTION <name> DROP COLUMN <col>` — remove a column from a
 //! strict-document collection's schema.
 //!
-//! Ported verbatim from the pgwire `ddl::collection::alter::drop_column`
-//! handler; only the result type changed to the protocol-neutral
-//! [`DdlResult`] / [`DdlError`]. The dropped-column bookkeeping
-//! (`dropped_columns` push + version bump), primary-key guard, persist,
-//! and audit are unchanged, as is the `ALTER COLLECTION` command tag.
+//! The result type is the protocol-neutral [`DdlResult`] / [`DdlError`]. The
+//! dropped-column bookkeeping (`dropped_columns` push + version bump),
+//! primary-key guard, persist, and audit run here, and the command tag is
+//! `ALTER COLLECTION`.
 
 use nodedb_types::DatabaseId;
 
@@ -72,7 +71,7 @@ pub(super) async fn alter_collection_drop_column(
     // The embedding-model row is keyed by column name and outlives the column
     // otherwise. A re-added column then inherits the old dimensions and
     // `strict_dimensions`.
-    drop_vector_model_row(state, database_id, tenant_id.as_u64(), name, column_name)?;
+    drop_vector_model_row(state, database_id, tenant_id.as_u64(), name, column_name).await?;
 
     state.audit_record(
         AuditEvent::AdminAction,

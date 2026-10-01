@@ -17,7 +17,6 @@
 //! authorization instead.
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::server::dispatch_utils::MintedRecords;
 use crate::types::TenantId;
 use nodedb_types::CollectionKey;
 
@@ -29,8 +28,6 @@ use nodedb_types::CollectionKey;
 pub(crate) enum SystemReason {
     /// Retention / temporal-purge enforcement on its own timer.
     RetentionEnforcement,
-    /// Backup capture or restore reissue.
-    BackupRestore,
     /// Cluster snapshot build or install.
     ClusterSnapshot,
     /// Applying a committed DDL side-effect to engine state.
@@ -38,8 +35,6 @@ pub(crate) enum SystemReason {
     /// Catalog and version-history maintenance (compaction, checkpoints,
     /// version diffs, synonym and aggregate registration).
     CatalogMaintenance,
-    /// Tenant lifecycle: purge, move, cutover.
-    TenantLifecycle,
     /// Event Plane work dispatched back through the Control Plane (alerts,
     /// scheduled evaluation) — driven by a rule, not by a live session.
     EventPlane,
@@ -55,32 +50,19 @@ impl SystemReason {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::RetentionEnforcement => "retention_enforcement",
-            Self::BackupRestore => "backup_restore",
             Self::ClusterSnapshot => "cluster_snapshot",
             Self::DdlApply => "ddl_apply",
             Self::CatalogMaintenance => "catalog_maintenance",
-            Self::TenantLifecycle => "tenant_lifecycle",
             Self::EventPlane => "event_plane",
             Self::AdmittedContinuation => "admitted_continuation",
         }
     }
 
-    /// The source the task's write events carry into the Event Plane.
-    ///
-    /// A restore re-issues rows whose AFTER triggers fired when they were
-    /// first written, so its writes carry `Restore`. Every other reason
-    /// carries `User`.
+    /// The source the task's write events carry into the Event Plane: `User`
+    /// for every reason. A restore re-issues its rows through data-group
+    /// proposals that carry `Restore`, never through a system task.
     pub(crate) fn event_source(self) -> crate::event::EventSource {
-        match self {
-            Self::BackupRestore => crate::event::EventSource::Restore,
-            Self::RetentionEnforcement
-            | Self::ClusterSnapshot
-            | Self::DdlApply
-            | Self::CatalogMaintenance
-            | Self::TenantLifecycle
-            | Self::EventPlane
-            | Self::AdmittedContinuation => crate::event::EventSource::User,
-        }
+        crate::event::EventSource::User
     }
 }
 
@@ -92,9 +74,6 @@ pub(crate) struct SystemTask<'a> {
     /// task's database.
     pub(super) collection: CollectionKey<'a>,
     pub(super) plan: PhysicalPlan,
-    /// Records the caller appended for this task, under their outcome-floor
-    /// window. `None` when the task appends nothing.
-    pub(super) minted: Option<MintedRecords>,
 }
 
 impl<'a> SystemTask<'a> {
@@ -114,15 +93,7 @@ impl<'a> SystemTask<'a> {
             tenant_id,
             collection,
             plan,
-            minted: None,
         }
-    }
-
-    /// Attach the records the caller appended for this task. The dispatch
-    /// closes their outcome-floor window from the task's outcome.
-    pub(crate) fn with_minted(mut self, minted: MintedRecords) -> Self {
-        self.minted = Some(minted);
-        self
     }
 }
 
@@ -131,17 +102,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_restore_carries_the_restore_source() {
-        assert_eq!(
-            SystemReason::BackupRestore.event_source(),
-            crate::event::EventSource::Restore
-        );
+    fn every_system_task_carries_the_user_source() {
         for reason in [
             SystemReason::RetentionEnforcement,
             SystemReason::ClusterSnapshot,
             SystemReason::DdlApply,
             SystemReason::CatalogMaintenance,
-            SystemReason::TenantLifecycle,
             SystemReason::EventPlane,
             SystemReason::AdmittedContinuation,
         ] {

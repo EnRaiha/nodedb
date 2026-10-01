@@ -17,7 +17,6 @@ use crate::tile::cell_payload::{CELL_GDPR_ERASURE_SENTINEL, CELL_TOMBSTONE_SENTI
 use crate::tile::dense_tile::DenseTile;
 use crate::tile::sparse_tile::{RowKind, SparseTile};
 use crate::types::coord::value::CoordValue;
-use nodedb_types::Surrogate;
 
 /// Extract the encoded `CellPayload` bytes for a specific `coord` from a
 /// `SparseTile`.
@@ -63,19 +62,27 @@ pub fn extract_cell_bytes(tile: &SparseTile, coord: &[CoordValue]) -> ArrayResul
             RowKind::GdprErased => return Ok(Some(CELL_GDPR_ERASURE_SENTINEL.to_vec())),
             RowKind::Live => {}
         }
-        // Live row — build attrs from all attr columns.
+        // Attribute columns hold live rows only: index by the live-row index.
+        let mut live_row = 0usize;
+        for earlier in 0..row {
+            if tile.row_kind(earlier)? == RowKind::Live {
+                live_row += 1;
+            }
+        }
         let attrs: Vec<_> = tile
             .attr_cols
             .iter()
             .map(|col| {
-                col.get(row)
+                col.get(live_row)
                     .cloned()
                     .ok_or_else(|| ArrayError::SegmentCorruption {
-                        detail: format!("extract_cell_bytes: attr col row {row} out of range"),
+                        detail: format!(
+                            "extract_cell_bytes: attr col live row {live_row} out of range"
+                        ),
                     })
             })
             .collect::<ArrayResult<Vec<_>>>()?;
-        let surrogate = tile.surrogates.get(row).copied().unwrap_or(Surrogate::ZERO);
+        let surrogate = tile.live_surrogate(row)?;
         let valid_from_ms =
             tile.valid_from_ms
                 .get(row)
@@ -406,10 +413,13 @@ mod tests {
 
     fn make_sparse(s: &crate::schema::ArraySchema, base: i64) -> SparseTile {
         let mut b = SparseTileBuilder::new(s);
-        b.push(
+        b.push_row(crate::tile::sparse_tile::SparseRow::live(
             &[CoordValue::Int64(base), CoordValue::Int64(base + 1)],
             &[CellValue::Int64(base * 10)],
-        )
+            nodedb_types::Surrogate::new(base as u32 + 1),
+            0,
+            nodedb_types::OPEN_UPPER,
+        ))
         .unwrap();
         b.build()
     }
@@ -537,7 +547,7 @@ mod tests {
         b.push_row(SparseRow {
             coord: &[CoordValue::Int64(1), CoordValue::Int64(2)],
             attrs: &[CellValue::Int64(99)],
-            surrogate: Surrogate::ZERO,
+            surrogate: Some(Surrogate::new(3)),
             valid_from_ms: 100,
             valid_until_ms: 200,
             kind: crate::tile::sparse_tile::RowKind::Live,
@@ -603,7 +613,7 @@ mod tests {
         b.push_row(crate::tile::sparse_tile::SparseRow {
             coord: &[CoordValue::Int64(7), CoordValue::Int64(8)],
             attrs: &[],
-            surrogate: Surrogate::ZERO,
+            surrogate: None,
             valid_from_ms: 0,
             valid_until_ms: nodedb_types::OPEN_UPPER,
             kind: RowKind::Tombstone,
@@ -619,6 +629,41 @@ mod tests {
         assert_eq!(bytes, CELL_TOMBSTONE_SENTINEL);
     }
 
+    /// A live row after a sentinel row reads its own attributes: the
+    /// attribute columns skip sentinel rows.
+    #[test]
+    fn extract_cell_bytes_reads_a_live_row_after_a_sentinel() {
+        use crate::tile::sparse_tile::{RowKind, SparseRow, SparseTileBuilder};
+        use nodedb_types::Surrogate;
+
+        let s = schema();
+        let mut b = SparseTileBuilder::new(&s);
+        b.push_row(SparseRow {
+            coord: &[CoordValue::Int64(1), CoordValue::Int64(1)],
+            attrs: &[],
+            surrogate: None,
+            valid_from_ms: 0,
+            valid_until_ms: nodedb_types::OPEN_UPPER,
+            kind: RowKind::Tombstone,
+        })
+        .unwrap();
+        b.push_row(SparseRow {
+            coord: &[CoordValue::Int64(2), CoordValue::Int64(2)],
+            attrs: &[CellValue::Int64(20)],
+            surrogate: Some(Surrogate::new(9)),
+            valid_from_ms: 5,
+            valid_until_ms: nodedb_types::OPEN_UPPER,
+            kind: RowKind::Live,
+        })
+        .unwrap();
+        let tile = b.build();
+        let coord = vec![CoordValue::Int64(2), CoordValue::Int64(2)];
+        let bytes = extract_cell_bytes(&tile, &coord).unwrap().unwrap();
+        let payload = CellPayload::decode(&bytes).unwrap();
+        assert_eq!(payload.attrs, vec![CellValue::Int64(20)]);
+        assert_eq!(payload.surrogate, Surrogate::new(9));
+    }
+
     #[test]
     fn extract_cell_bytes_returns_erasure_sentinel_for_erased_row() {
         use crate::tile::cell_payload::{CELL_GDPR_ERASURE_SENTINEL, is_cell_gdpr_erasure};
@@ -629,7 +674,7 @@ mod tests {
         b.push_row(crate::tile::sparse_tile::SparseRow {
             coord: &[CoordValue::Int64(4), CoordValue::Int64(5)],
             attrs: &[],
-            surrogate: Surrogate::ZERO,
+            surrogate: None,
             valid_from_ms: 0,
             valid_until_ms: nodedb_types::OPEN_UPPER,
             kind: RowKind::GdprErased,

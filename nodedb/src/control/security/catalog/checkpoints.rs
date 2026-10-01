@@ -200,7 +200,7 @@ impl SystemCatalog {
         Ok(keys)
     }
 
-    /// Count the checkpoints a `delete_checkpoints_before` call would remove.
+    /// Count the checkpoints a `delete_checkpoints_before` call removes.
     ///
     /// The leader reports this to the client before proposing the range delete.
     pub fn count_checkpoints_before(
@@ -302,6 +302,49 @@ impl SystemCatalog {
         }
         write_txn.commit().map_err(|e| catalog_err("commit", e))?;
         Ok(copied.len())
+    }
+
+    /// Remove every checkpoint of one collection, across its documents.
+    /// Returns how many rows went.
+    pub fn delete_checkpoints_for_collection(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+    ) -> crate::Result<usize> {
+        let lower = format!("{database_id}:{tenant_id}:{collection}:");
+        let upper = format!("{database_id}:{tenant_id}:{collection};");
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| catalog_err("write txn", e))?;
+        let removed = {
+            let mut table = write_txn
+                .open_table(CHECKPOINTS)
+                .map_err(|e| catalog_err("open checkpoints", e))?;
+            // A collection name can hold ':', so the range only yields
+            // candidates: the stored collection must match exactly.
+            let mut keys = Vec::new();
+            for entry in table
+                .range(lower.as_str()..upper.as_str())
+                .map_err(|e| catalog_err("range scan checkpoints", e))?
+            {
+                let (key, value) = entry.map_err(|e| catalog_err("iterate checkpoints", e))?;
+                let record: CheckpointRecord = zerompk::from_msgpack(value.value())
+                    .map_err(|e| catalog_err("deserialize checkpoint", e))?;
+                if record.collection == collection {
+                    keys.push(key.value().to_string());
+                }
+            }
+            for key in &keys {
+                table
+                    .remove(key.as_str())
+                    .map_err(|e| catalog_err("remove checkpoint", e))?;
+            }
+            keys.len()
+        };
+        write_txn.commit().map_err(|e| catalog_err("commit", e))?;
+        Ok(removed)
     }
 }
 
@@ -416,5 +459,22 @@ mod tests {
                 .database_id,
             3
         );
+    }
+
+    #[test]
+    fn delete_for_collection_removes_only_that_collection() {
+        let (_dir, catalog) = make_catalog();
+        catalog.put_checkpoint(&record(2, "a", 1)).unwrap();
+        catalog.put_checkpoint(&record(2, "b", 2)).unwrap();
+        catalog.put_checkpoint(&record(3, "a", 1)).unwrap();
+
+        assert_eq!(
+            catalog
+                .delete_checkpoints_for_collection(2, TENANT, COLLECTION)
+                .unwrap(),
+            2
+        );
+        assert!(catalog.list_checkpoints(doc(2), 0).unwrap().is_empty());
+        assert_eq!(catalog.list_checkpoints(doc(3), 0).unwrap().len(), 1);
     }
 }

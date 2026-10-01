@@ -170,11 +170,10 @@ fn pending_groups(statuses: Vec<nodedb_cluster::GroupStatus>) -> Vec<PendingGrou
 /// Hold startup until every locally hosted data group has replayed its retained
 /// Raft log.
 ///
-/// A node with no Raft status source (a deployment with no cluster handle
-/// installed) hosts no data groups and returns immediately.
+/// Refuses when `start_raft` installed no Raft status source.
 pub async fn await_data_group_recovery(shared: &Arc<SharedState>) -> anyhow::Result<()> {
     let Some(status_fn) = shared.raft_status_fn.get() else {
-        return Ok(());
+        anyhow::bail!("data group recovery: no Raft status source: start_raft has not run");
     };
     let status_fn = Arc::clone(status_fn);
     let deadline = Instant::now() + DATA_GROUP_RECOVERY_TIMEOUT;

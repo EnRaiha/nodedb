@@ -2,8 +2,7 @@
 
 //! CSV import for `COPY FROM`.
 //!
-//! Relocated verbatim from the pgwire `ddl::collection::copy_from::csv_import`
-//! module (now deleted). `plan_and_dispatch` returns the protocol-neutral
+//! `plan_and_dispatch` returns the protocol-neutral
 //! [`DdlError`] directly (it is the neutral collection-DML helper), so this
 //! module's own file-read/parse errors are built as `DdlError` at their call
 //! sites to keep one error type end to end.
@@ -101,7 +100,7 @@ pub(super) async fn import_csv(
         };
         // Inject a unique row number as id if the field map has no id.
         // This prevents duplicate-key errors on schemaless collections
-        // where all rows would otherwise receive the same empty-string id.
+        // where all rows will otherwise receive the same empty-string id.
         if !fields.contains_key("id") {
             fields.insert(
                 "id".to_string(),
@@ -122,6 +121,8 @@ pub(super) async fn import_csv(
             ctx.database_id,
             &sql,
             ctx.txn_ctx,
+            // Each row fires its collection's triggers, as an INSERT does.
+            true,
         )
         .await
         .map_err(|e| wrap_row_error(e, *ln, "CSV"))?;

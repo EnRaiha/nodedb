@@ -2,7 +2,10 @@
 
 //! Shaping for DML `RETURNING` responses.
 //!
-//! A `RETURNING` payload is a [`RowsPayload`]: the Data Plane's own column list
+//! A timeseries ingest that rejected rows reports them beside its rows, and
+//! the shaper raises them as the rejected-lines notice.
+//!
+//! A `RETURNING` payload is a `RowsPayload`: the Data Plane's own column list
 //! plus typed `Value` cells. For `RETURNING *` that column list is
 //! derived from the STORED row, so a schemaless collection can carry fields no
 //! catalog column declares — the list is only knowable once the rows exist.
@@ -36,7 +39,7 @@
 
 use nodedb_types::{NativeCell, NdbDateTime, NodeDbError, Value};
 
-use crate::data::executor::response_codec::{RowsPayload, decode_payload_to_json};
+use crate::data::executor::response_codec::{ReturningRowsReply, decode_payload_to_json};
 
 use crate::control::sequence::SequenceAccess;
 
@@ -68,12 +71,12 @@ pub fn shape_returning_rows(
         });
     }
 
-    let rp = match zerompk::from_msgpack::<RowsPayload>(payload) {
+    let rp = match zerompk::from_msgpack::<ReturningRowsReply>(payload) {
         Ok(rp) => rp,
         Err(e) => {
             // Bytes that are not a `RowsPayload` yield no column list at all,
             // so there is none that honours what was announced: a substitute
-            // single-column row would be unparseable to the client that holds
+            // single-column row will be unparseable to the client that holds
             // the RowDescription, which is the very failure this module
             // exists to prevent. Fail the statement instead.
             if announced.is_some() {
@@ -94,9 +97,23 @@ pub fn shape_returning_rows(
         }
     };
 
-    let RowsPayload { columns, rows } = rp;
+    let ReturningRowsReply {
+        columns,
+        rows,
+        rejected,
+    } = rp;
+    // A row set has no place for a rejected row: the rows the ingest
+    // rejected reach the client as the rejected-lines notice.
+    if let Some(rejection) = rejected.filter(|rejection| rejection.lines > 0) {
+        crate::control::server::shared::session::statement_notice::raise(
+            crate::control::server::shared::sql::staging_predicates::rejected_lines_notice(
+                &rejection.collection,
+                rejection.lines,
+            ),
+        );
+    }
     let mut rows = rows_keyed_by_column(&columns, rows);
-    // `RETURNING` delivers stored column values to the client just as a SELECT
+    // `RETURNING` delivers stored column values to the client as a SELECT
     // does, so the same redaction applies — and it runs on the payload's own
     // names, before any projection renames or drops them.
     redact_rows(redaction.as_ref(), &mut rows);
@@ -221,7 +238,7 @@ fn retype_cell(ct: DdlColType, cell: &mut Value) {
 }
 
 /// The announced columns with no rows — a write that matched nothing still
-/// answers with the result set the client was promised, just an empty one.
+/// answers with the result set the client was promised, only an empty one.
 fn empty_announced(schema: &OutputSchema) -> ShapedRows {
     ShapedRows::from_rows(
         schema
@@ -249,9 +266,44 @@ mod tests {
     use super::*;
     use crate::control::server::response_shape::cell::value_to_wire_json;
     use crate::control::server::response_shape::schema::OutputColumn;
+    use crate::control::server::shared::session::{conn_scope, statement_notice};
+    use crate::data::executor::response_codec::{
+        IngestRejection, RejectingRowsPayload, RowsPayload,
+    };
 
     fn text(s: &str) -> Value {
         Value::String(s.to_string())
+    }
+
+    /// A timeseries ingest whose install rejected rows answers them beside
+    /// its row set. The shaper keeps the rows and raises the rejected-lines
+    /// notice. A plain row set raises none.
+    #[tokio::test]
+    async fn rows_an_ingest_rejected_raise_the_rejected_lines_notice() {
+        conn_scope::scoped(async {
+            let rejecting = zerompk::to_msgpack_vec(&RejectingRowsPayload {
+                columns: vec!["value".into()],
+                rows: vec![vec![NativeCell(Value::Float(1.5))]],
+                rejected: IngestRejection {
+                    collection: "metrics".into(),
+                    lines: 2,
+                },
+            })
+            .expect("encode rejecting payload");
+            let shaped = shape_returning_rows(&rejecting, None, None, None).expect("shape");
+            assert_eq!(shaped.rows.len(), 1);
+            let notices = statement_notice::take();
+            assert_eq!(notices.len(), 1);
+            assert!(
+                notices[0].contains("2 line(s)") && notices[0].contains("metrics"),
+                "{notices:?}"
+            );
+
+            let plain = payload(&["id"], &[&[Some("a")]]);
+            shape_returning_rows(&plain, None, None, None).expect("shape");
+            assert!(statement_notice::take().is_empty());
+        })
+        .await;
     }
 
     fn typed_payload(columns: &[&str], rows: Vec<Vec<Value>>) -> Vec<u8> {

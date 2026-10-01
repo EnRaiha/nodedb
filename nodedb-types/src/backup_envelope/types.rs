@@ -10,10 +10,11 @@ pub const MAGIC: &[u8; 4] = b"NDBB";
 /// Plaintext and encrypted envelopes carry the same version. The crypto
 /// block (68 bytes after the header) distinguishes them.
 ///
-/// Version 2 scopes every section body to a database: data sections carry a
+/// Every section body is scoped to a database: data sections carry a
 /// [`DatabaseDataSection`], and the metadata sections name the database of
-/// each entry. A version-1 envelope is refused.
-pub const VERSION: u8 = 2;
+/// each entry. Every envelope carries one `SECTION_ORIGIN_VERIFICATION`
+/// section. An envelope of any other version is refused.
+pub const VERSION: u8 = 3;
 
 /// Header is fixed-size — 52 bytes (48 framed + 4 crc).
 ///
@@ -48,6 +49,14 @@ pub const SECTION_ORIGIN_SURROGATE_PK: u64 = 0xFFFF_FFFF_FFFF_FFF2;
 /// is a msgpack-encoded `Vec<DatabaseBlob>`. Restore reads it first: every
 /// other section names its database by the id recorded here.
 pub const SECTION_ORIGIN_DATABASES: u64 = 0xFFFF_FFFF_FFFF_FFF3;
+/// Section carrying the per-collection row counts and digests restore checks.
+/// The body is a msgpack-encoded `Vec<CollectionVerification>`. Every
+/// envelope carries exactly one.
+pub const SECTION_ORIGIN_VERIFICATION: u64 = 0xFFFF_FFFF_FFFF_FFF4;
+/// Section carrying the catalog row of each of the tenant's arrays. The body
+/// is a msgpack-encoded `Vec<ArrayCatalogBlob>`. The cells travel in the data
+/// sections.
+pub const SECTION_ORIGIN_ARRAY_CATALOG: u64 = 0xFFFF_FFFF_FFFF_FFF5;
 
 /// One database of the backed-up tenant, carried in a
 /// `SECTION_ORIGIN_DATABASES` section.
@@ -89,6 +98,16 @@ pub struct StoredCollectionBlob {
     pub database_id: u64,
     pub name: String,
     /// zerompk-encoded `StoredCollection`.
+    pub bytes: Vec<u8>,
+}
+
+/// One array's catalog row in a `SECTION_ORIGIN_ARRAY_CATALOG` section.
+#[derive(Debug, Clone, PartialEq, Eq, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+pub struct ArrayCatalogBlob {
+    /// Source id of the database the array lives in.
+    pub database_id: u64,
+    pub name: String,
+    /// zerompk-encoded `ArrayCatalogEntry` from the `nodedb` crate.
     pub bytes: Vec<u8>,
 }
 

@@ -243,6 +243,7 @@ mod tests {
             txn_id: None,
             wal_lsn: envelope_lsn.map(Lsn::new),
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: Admission::Admitted,
         })
     }

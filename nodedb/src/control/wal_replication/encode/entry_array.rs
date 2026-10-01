@@ -21,25 +21,25 @@ pub(super) fn array_write(op: &ArrayOp) -> Option<ReplicatedWrite> {
         ArrayOp::Put {
             array_id,
             cells_msgpack,
-            wal_lsn: _,
             provenance,
+            ..
         } => Some(cell_put(&array_id.name, cells_msgpack, provenance)),
         ArrayOp::Delete {
             array_id,
             coords_msgpack,
-            wal_lsn: _,
             provenance,
+            ..
         } => Some(cell_delete(&array_id.name, coords_msgpack, provenance)),
 
         // `Flush` forces a memtable flush of already-committed writes; a follower
-        // rebuilds it from those, so proposing it would be a no-op.
+        // rebuilds it from those, so proposing it is a no-op.
         ArrayOp::Flush { .. } => None,
 
         // Not a write — array DDL and reads.
         ArrayOp::OpenArray { .. }
         | ArrayOp::Compact { .. }
         | ArrayOp::DropArray { .. }
-        | ArrayOp::RestoreArrayDrop { .. }
+        | ArrayOp::RekeyArray { .. }
         | ArrayOp::PurgeArrayDrop { .. }
         | ArrayOp::Slice { .. }
         | ArrayOp::Project { .. }
@@ -60,6 +60,8 @@ fn cell_put(
         array: array.to_owned(),
         cells_msgpack: cells_msgpack.to_vec(),
         provenance: encode_provenance(provenance),
+        // Stamped by the proposer, which reads its array catalog.
+        incarnation: nodedb_types::Hlc::ZERO,
     }
 }
 
@@ -75,5 +77,7 @@ fn cell_delete(
         array: array.to_owned(),
         coords_msgpack: coords_msgpack.to_vec(),
         provenance: encode_provenance(provenance),
+        // Stamped by the proposer, which reads its array catalog.
+        incarnation: nodedb_types::Hlc::ZERO,
     }
 }

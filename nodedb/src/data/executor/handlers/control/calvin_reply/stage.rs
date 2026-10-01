@@ -24,7 +24,7 @@ use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
 use nodedb_types::{Surrogate, Value};
 
 use super::images::{RowLocation, StoredRow, staged_row_bytes};
-use super::reply::{CalvinReply, PostImages};
+use super::reply::{CalvinReply, CalvinStaging, InstalledTimeseries, PostImages};
 use super::target::{ReplyImage, ReturningTarget, RowEngine, returning_target};
 use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
@@ -36,15 +36,17 @@ use crate::data::executor::handlers::transaction::overlay::{
 };
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::timeseries::ilp;
+use crate::engine::timeseries::resolved_ingest::RESOLVED_INGEST_FORMAT;
 use crate::types::{DatabaseId, TenantId, TxnId};
 use crate::util::rmpv_value::rmpv_to_value;
 
 type CollKey = (DatabaseId, TenantId, String);
 
 impl CoreLoop {
-    /// Stage one Calvin plan under `txn_id` and fold its reply into `reply`.
+    /// Stage one Calvin plan under `txn_id` and fold its reply into
+    /// `staging.reply`.
     ///
-    /// A `RETURNING` plan's rows replace `reply`. A later plan without
+    /// A `RETURNING` plan's rows replace the reply. A later plan without
     /// `RETURNING` keeps them, and replaces only an affected count.
     pub(in crate::data::executor) fn stage_calvin_plan(
         &mut self,
@@ -52,27 +54,112 @@ impl CoreLoop {
         txn_id: TxnId,
         tenant_id: TenantId,
         plan: &PhysicalPlan,
-        reply: &mut CalvinReply,
+        staging: &mut CalvinStaging,
     ) -> Result<(), ErrorCode> {
         let tid = tenant_id.as_u64();
+        // Every timeseries ingest becomes one redo sub-record, in plan order,
+        // so its position among them names its install at the flush.
+        let ts_ordinal = staging.ts_ingests;
+        if matches!(plan, PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. })) {
+            staging.ts_ingests += 1;
+        }
         // Every core that stages a plan holds the overlay, even when the plan
         // stages no row. `CalvinResolve` refuses a missing one.
         let marker = self.txn_overlay_mut(txn_id).journal_len();
         let staged = self.stage_calvin_overlay(task, txn_id, tenant_id, plan)?;
+        let staged = owned_edge_count(task.request.vshard_id, plan, staged, staging)?;
+        // A derived plan, such as a graph edge or a guard beside a document
+        // delete, never replaces a count a plan of the statement decided.
+        let derived = crate::control::planner::calvin::write_class::is_derived_side_effect(plan);
+        let count_is_the_statements = staging.user_count;
+        let reply = &mut staging.reply;
         match returning_target(plan) {
+            // A resolved ingest's install decides which rows land and how
+            // they read, so the flush renders them from its own install.
+            Some(target) if is_resolved_ingest(plan) => {
+                *reply = CalvinReply::InstalledTimeseries(InstalledTimeseries {
+                    spec: target.spec.clone(),
+                    rls_filters: target.rls_filters.to_vec(),
+                    collection: target.collection.to_string(),
+                    ordinal: ts_ordinal,
+                });
+            }
             Some(target) => {
                 *reply = self.calvin_returning_reply(task, txn_id, tid, plan, &target, marker)?;
             }
             None => {
                 self.settle_rows_before_later_write(task, txn_id, tid, reply, marker)?;
-                if !reply.has_rows() {
+                // A plan that staged no reply here, such as a TRUNCATE's
+                // edge share, keeps the reply an earlier plan of the slice
+                // decided.
+                if !reply.has_rows() && !staged.is_empty() && !(derived && count_is_the_statements)
+                {
                     *reply = CalvinReply::Count(staged);
+                    staging.user_count |= !derived;
                 }
             }
         }
         Ok(())
     }
+}
 
+/// The count an edge write's staged reply answers on `vshard`.
+///
+/// An edge lives on both endpoint homes, and each home stages it. It counts
+/// once, at its owner: its source endpoint's key home. The other home counts
+/// none. The owned counts of a slice's edge writes add up, so the reply is
+/// every edge this home owns. The coordinator of an edge-only statement sums
+/// every home's reply (`ReplyFold::SumOwnedEdges`). Every edge of a batch
+/// has one owner: the coordinator splits batches by home pair.
+///
+/// Any other plan's reply is returned as staged.
+fn owned_edge_count(
+    vshard: crate::types::VShardId,
+    plan: &PhysicalPlan,
+    staged: Vec<u8>,
+    staging: &mut CalvinStaging,
+) -> Result<Vec<u8>, ErrorCode> {
+    let Some(src) = edge_source(plan) else {
+        return Ok(staged);
+    };
+    if staged.is_empty() {
+        return Ok(staged);
+    }
+    let count = if crate::types::RecordHomes::edge_owner(src) == vshard {
+        crate::control::server::shared::sql::staging_predicates::extract_affected_count(&staged)
+            .ok_or_else(|| ErrorCode::Internal {
+                detail: "a staged edge write answered no affected count".into(),
+            })?
+    } else {
+        0
+    };
+    staging.owned_edges = staging.owned_edges.saturating_add(count);
+    let total = usize::try_from(staging.owned_edges).map_err(|_| ErrorCode::Internal {
+        detail: format!("{} owned edges do not fit a count", staging.owned_edges),
+    })?;
+    crate::data::executor::response_codec::encode_count("affected", total).map_err(|e| {
+        ErrorCode::Internal {
+            detail: format!("calvin edge count reply: {e}"),
+        }
+    })
+}
+
+/// The source endpoint of an edge write, which names its owner home. A
+/// batch names its first edge's: every edge of a batch slice shares it.
+fn edge_source(plan: &PhysicalPlan) -> Option<&str> {
+    use nodedb_physical::physical_plan::GraphOp;
+    match plan {
+        PhysicalPlan::Graph(
+            GraphOp::EdgePut { src_id, .. } | GraphOp::EdgeDelete { src_id, .. },
+        ) => Some(src_id.as_str()),
+        PhysicalPlan::Graph(
+            GraphOp::EdgePutBatch { edges } | GraphOp::EdgeDeleteBatch { edges },
+        ) => edges.first().map(|edge| edge.src_id.as_str()),
+        _ => None,
+    }
+}
+
+impl CoreLoop {
     /// The reply of a `RETURNING` plan whose staging began at journal
     /// position `marker`.
     fn calvin_returning_reply(
@@ -231,8 +318,8 @@ impl CoreLoop {
         }
     }
 
-    /// The `RETURNING` rows of a timeseries ingest: the lines its resolve
-    /// stamps, rendered through the raw-scan row emitter.
+    /// The `RETURNING` rows of an unresolved timeseries ingest: the lines its
+    /// resolve stamps, rendered through the raw-scan row emitter.
     fn calvin_timeseries_rows(
         &self,
         task: &ExecutionTask,
@@ -289,7 +376,7 @@ impl CoreLoop {
         build_rows_payload(target.spec, target.rls_filters, &docs).map_err(ErrorCode::from)
     }
 
-    /// Decide a document or CRDT post-image reply now when a later plan,
+    /// Decide a document or CRDT post-image reply when a later plan,
     /// staged from journal position `marker`, rewrote one of its rows. A base
     /// read after the install would report the later plan's row, so each row
     /// takes the image the `RETURNING` plan staged instead.
@@ -327,7 +414,7 @@ impl CoreLoop {
         let mut rows = Vec::with_capacity(images.rows.len());
         for (identity, surrogate) in &images.rows {
             // The row as the `RETURNING` plan left it: the later plan's prior
-            // value when that plan touched it, else the overlay's value now.
+            // value when that plan touched it, else the overlay's current value.
             let staged = match rewritten(*surrogate) {
                 Some(slot) => slot.before,
                 None => overlay.get(&coll_key, surrogate.as_u32()),
@@ -344,6 +431,15 @@ impl CoreLoop {
         *reply = CalvinReply::Rows(payload);
         Ok(())
     }
+}
+
+/// Whether `plan` is a timeseries ingest resolved to its rows.
+fn is_resolved_ingest(plan: &PhysicalPlan) -> bool {
+    matches!(
+        plan,
+        PhysicalPlan::Timeseries(TimeseriesOp::Ingest { format, .. })
+            if format == RESOLVED_INGEST_FORMAT
+    )
 }
 
 #[cfg(test)]
@@ -450,7 +546,7 @@ mod tests {
         PhysicalPlan::Document(DocumentOp::PointUpdate {
             collection: coll("orders"),
             document_id: id.to_string(),
-            surrogate: Surrogate::new(surrogate),
+            surrogate: Some(Surrogate::new(surrogate)),
             pk_bytes: Vec::new(),
             updates: vec![(
                 "a".to_string(),
@@ -468,7 +564,7 @@ mod tests {
         PhysicalPlan::Document(DocumentOp::PointDelete {
             collection: coll("orders"),
             document_id: id.to_string(),
-            surrogate: Surrogate::new(surrogate),
+            surrogate: Some(Surrogate::new(surrogate)),
             pk_bytes: Vec::new(),
             returning: returning(&["a"]),
             rls_filters: Vec::new(),
@@ -572,6 +668,25 @@ mod tests {
         assert_eq!(returned(&response), vec![text("kept")]);
     }
 
+    /// A derived plan after the statement's own write keeps the statement's
+    /// count. A node delete's guard stages a count of zero.
+    #[test]
+    fn a_derived_plan_keeps_the_statements_count() {
+        let guard = PhysicalPlan::Graph(nodedb_physical::physical_plan::GraphOp::NodeEdgeGuard {
+            collection: coll("orders"),
+            node_id: "o9".into(),
+            expected: Vec::new(),
+        });
+        let response = commit(&[doc_insert("o1", 7, "kept", false, false), guard], |_| {});
+        assert_eq!(response.status, Status::Ok, "{:?}", response.error_code);
+        assert_eq!(
+            crate::control::server::shared::sql::staging_predicates::extract_affected_count(
+                response.payload.as_bytes()
+            ),
+            Some(1)
+        );
+    }
+
     /// A later plan that rewrites a returned row leaves the reply at the row
     /// the RETURNING plan wrote.
     #[test]
@@ -660,16 +775,18 @@ mod tests {
         let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
         // Expires 5 s before the wall clock, 3 s after the epoch instant.
         let value = object(&[("v", text("old"))]);
-        core.kv_engine.put(crate::engine::kv::KvPutParams {
-            database_id: DatabaseId::DEFAULT.as_u64(),
-            tenant_id: TID,
-            collection: "cache",
-            key: b"k",
-            value: &value,
-            ttl_ms: 5_000,
-            now_ms: now - 10_000,
-            surrogate: Surrogate::new(5),
-        });
+        core.kv_engine
+            .put(crate::engine::kv::KvPutParams {
+                database_id: DatabaseId::DEFAULT.as_u64(),
+                tenant_id: TID,
+                collection: "cache",
+                key: b"k",
+                value: &value,
+                ttl_ms: 5_000,
+                now_ms: now - 10_000,
+                surrogate: Surrogate::new(5),
+            })
+            .expect("a bound row writes");
 
         let epoch_ms = i64::try_from(now - 8_000).expect("epoch instant fits i64");
         let response =
@@ -742,6 +859,55 @@ mod tests {
             rls_filters: Vec::new(),
         });
         assert_eq!(returned(&commit(&[plan], |_| {})), vec![text("noted")]);
+    }
+
+    /// A resolved ingest with `RETURNING`, as a submitting node resolves it.
+    fn resolved_ingest(line: &str) -> PhysicalPlan {
+        use crate::data::executor::handlers::timeseries::TsResolveInput;
+        use crate::engine::timeseries::resolved_ingest::{RESOLVED_INGEST_FORMAT, TsDriftPolicy};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (core, _tx, _rx) = make_core_with_dir(dir.path());
+        let lines = vec![line.to_string()];
+        let batch = core
+            .resolve_ts_batch(
+                &make_default_task(),
+                TsResolveInput {
+                    tid: crate::types::TenantId::new(TID),
+                    collection: "cpu",
+                    lines: &lines,
+                    now_ms: 1_000,
+                    drift: TsDriftPolicy::ApplyByName,
+                    needs_images: true,
+                    base: None,
+                },
+            )
+            .expect("resolve");
+        PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            collection: coll("cpu"),
+            payload: batch.to_bytes().expect("encode batch"),
+            format: RESOLVED_INGEST_FORMAT.to_owned(),
+            wal_lsn: None,
+            surrogates: Vec::new(),
+            provenance: None,
+            rls_write_check: RlsWriteCheck::NoPolicyApplies,
+            returning: returning(&["value"]),
+            rls_filters: Vec::new(),
+        })
+    }
+
+    /// Two `RETURNING` ingests into one collection in one transaction. The
+    /// transaction answers its last `RETURNING` plan's rows, and those are
+    /// the rows that plan's own install stored, not the other plan's.
+    #[test]
+    fn each_resolved_ingest_returns_only_its_own_rows() {
+        let first = resolved_ingest("cpu value=7 1000000000");
+        let second = resolved_ingest("cpu value=9 2000000000");
+        assert_eq!(
+            returned(&commit(&[first.clone(), second.clone()], |_| {})),
+            vec![Value::Float(9.0)]
+        );
+        let last_is_first = commit(&[second, first], |_| {});
+        assert_eq!(returned(&last_is_first), vec![Value::Float(7.0)]);
     }
 
     #[test]

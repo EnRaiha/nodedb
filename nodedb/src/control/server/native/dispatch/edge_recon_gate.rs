@@ -10,7 +10,7 @@
 //! the Data Plane — leaving mirrored CSR edges dangling.
 //!
 //! This module exposes a single entry point: [`try_edge_recon_dispatch`], which
-//! implements the same three-guard check as the pgwire `execute.rs` gate and
+//! implements the same two-guard check as the pgwire `execute.rs` gate and
 //! returns the native protocol outcome when the gate fires.
 
 use nodedb_types::protocol::NativeResponse;
@@ -28,14 +28,14 @@ use super::{DispatchCtx, SqlOutcome, error_to_native};
 ///
 /// Returns `Some(outcome)` when the gate fires (the task set contains a
 /// `BulkDelete`/`BulkUpdate` on an edge-bearing collection that is not inside
-/// an explicit transaction block and the Calvin sequencer registry is up). The
+/// an explicit transaction block). The
 /// caller MUST return this outcome immediately — the tasks have been consumed.
 ///
 /// Returns `None` when the gate does not fire; the caller proceeds with the
 /// normal classify/dispatch path.
 ///
 /// A genuine catalog I/O error propagates as `Some(Err-shaped SqlOutcome)` so
-/// the caller surfaces it correctly — misrouting on a real I/O fault would
+/// the caller surfaces it correctly — misrouting on a real I/O fault will
 /// silently skip edge cleanup (dangling edges).
 pub(super) async fn try_edge_recon_dispatch(
     ctx: &DispatchCtx<'_>,
@@ -49,19 +49,14 @@ pub(super) async fn try_edge_recon_dispatch(
     // is identical across both protocol paths.  Edge-bearing predicate writes
     // inside an explicit native transaction block are NOT recon-routed (same
     // limitation as pgwire — buffering a multi-step OLLP inside an explicit txn
-    // would require full two-phase commit across the outer txn boundary).
+    // will require full two-phase commit across the outer txn boundary).
     if ctx.sessions.transaction_state(ctx.peer_addr) == TransactionState::InBlock {
         return EdgeReconResult::NotFired(tasks, authorized);
     }
 
-    // Guard 2: Calvin completion registry available (sequencer is up).
-    if ctx.state.calvin_completion_registry.get().is_none() {
-        return EdgeReconResult::NotFired(tasks, authorized);
-    }
-
-    // Guard 3: at least one BulkDelete/BulkUpdate targets an edge-bearing
+    // Guard 2: at least one BulkDelete/BulkUpdate targets an edge-bearing
     // collection.  A genuine catalog I/O error propagates rather than falling
-    // through — misrouting on a real fault would skip edge cleanup.
+    // through — misrouting on a real fault will skip edge cleanup.
     let (_coll, database_id) =
         match plan_needs_implicit_edge_recon(ctx.state, &tasks, ctx.tenant_id()) {
             Err(e) => return EdgeReconResult::Outcome(resp(error_to_native(seq, &e))),
@@ -75,17 +70,13 @@ pub(super) async fn try_edge_recon_dispatch(
     // drains.
     let plans: Vec<_> = tasks.iter().map(|t| t.plan.clone()).collect();
 
-    // All three guards passed — run the OLLP/Calvin coordinator. This is the
-    // normal multi-shard OLLP path (NOT the contended single-shard route from
-    // `route_write_to_calvin`), so it stays on the strict multi-vshard
-    // dependent `TxClass` builder (`allow_single_vshard: false`).
+    // Both guards passed — run the OLLP/Calvin coordinator.
     let outcome = dispatch_authorized_dependent_edge_recon(
         ctx.state,
         authorized,
         ctx.identity,
         ctx.tenant_id(),
         database_id,
-        false,
     )
     .await;
 

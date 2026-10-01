@@ -4,12 +4,12 @@
 
 use super::super::ast::*;
 use super::super::error::ProceduralError;
-use super::super::tokenizer::Token;
+use super::super::tokenizer::{Token, TokenStream};
 use super::utils::*;
 
 /// Parse a single statement.
 pub(super) fn parse_statement(
-    tokens: &[Token],
+    tokens: &TokenStream<'_>,
     pos: &mut usize,
 ) -> Result<Statement, ProceduralError> {
     match tokens.get(*pos) {
@@ -58,7 +58,7 @@ pub(super) fn parse_statement(
 }
 
 /// `DECLARE name TYPE [:= default];`
-fn parse_declare(tokens: &[Token], pos: &mut usize) -> Result<Statement, ProceduralError> {
+fn parse_declare(tokens: &TokenStream<'_>, pos: &mut usize) -> Result<Statement, ProceduralError> {
     *pos += 1;
     let name = expect_ident(tokens, pos)?;
     let data_type = expect_ident(tokens, pos)?;
@@ -106,7 +106,7 @@ fn is_assignment_ahead(tokens: &[Token], pos: usize) -> bool {
 }
 
 /// `name := expr;` or `NEW.field := expr;`
-fn parse_assign(tokens: &[Token], pos: &mut usize) -> Result<Statement, ProceduralError> {
+fn parse_assign(tokens: &TokenStream<'_>, pos: &mut usize) -> Result<Statement, ProceduralError> {
     // Collect dotted target: `name` or `NEW.field`
     let mut target = expect_ident(tokens, pos)?;
     while let Some(Token::Ident(dot)) = tokens.get(*pos) {
@@ -125,7 +125,7 @@ fn parse_assign(tokens: &[Token], pos: &mut usize) -> Result<Statement, Procedur
 }
 
 /// `IF cond THEN ... [ELSIF cond THEN ...] [ELSE ...] END IF;`
-fn parse_if(tokens: &[Token], pos: &mut usize) -> Result<Statement, ProceduralError> {
+fn parse_if(tokens: &TokenStream<'_>, pos: &mut usize) -> Result<Statement, ProceduralError> {
     *pos += 1;
     let condition = collect_sql_until(tokens, pos, &[Token::Then])?;
     expect_token(tokens, pos, &Token::Then)?;
@@ -162,7 +162,7 @@ fn parse_if(tokens: &[Token], pos: &mut usize) -> Result<Statement, ProceduralEr
 }
 
 /// `WHILE cond LOOP ... END LOOP;`
-fn parse_while(tokens: &[Token], pos: &mut usize) -> Result<Statement, ProceduralError> {
+fn parse_while(tokens: &TokenStream<'_>, pos: &mut usize) -> Result<Statement, ProceduralError> {
     *pos += 1;
     let condition = collect_sql_until(tokens, pos, &[Token::Loop])?;
     expect_token(tokens, pos, &Token::Loop)?;
@@ -173,7 +173,7 @@ fn parse_while(tokens: &[Token], pos: &mut usize) -> Result<Statement, Procedura
 }
 
 /// `FOR var IN [REVERSE] start..end LOOP ... END LOOP;`
-fn parse_for(tokens: &[Token], pos: &mut usize) -> Result<Statement, ProceduralError> {
+fn parse_for(tokens: &TokenStream<'_>, pos: &mut usize) -> Result<Statement, ProceduralError> {
     *pos += 1;
     let var = expect_ident(tokens, pos)?;
     expect_token(tokens, pos, &Token::In)?;
@@ -200,7 +200,7 @@ fn parse_for(tokens: &[Token], pos: &mut usize) -> Result<Statement, ProceduralE
 }
 
 /// `LOOP ... END LOOP;`
-fn parse_loop(tokens: &[Token], pos: &mut usize) -> Result<Statement, ProceduralError> {
+fn parse_loop(tokens: &TokenStream<'_>, pos: &mut usize) -> Result<Statement, ProceduralError> {
     *pos += 1;
     let body = super::parse_statements(tokens, pos)?;
     expect_token(tokens, pos, &Token::EndLoop)?;
@@ -209,7 +209,7 @@ fn parse_loop(tokens: &[Token], pos: &mut usize) -> Result<Statement, Procedural
 }
 
 /// `RETURN expr;`
-fn parse_return(tokens: &[Token], pos: &mut usize) -> Result<Statement, ProceduralError> {
+fn parse_return(tokens: &TokenStream<'_>, pos: &mut usize) -> Result<Statement, ProceduralError> {
     *pos += 1;
     let expr = collect_sql_until(tokens, pos, &[Token::Semicolon])?;
     skip_if(tokens, pos, &Token::Semicolon);
@@ -217,7 +217,10 @@ fn parse_return(tokens: &[Token], pos: &mut usize) -> Result<Statement, Procedur
 }
 
 /// `RETURN QUERY sql;`
-fn parse_return_query(tokens: &[Token], pos: &mut usize) -> Result<Statement, ProceduralError> {
+fn parse_return_query(
+    tokens: &TokenStream<'_>,
+    pos: &mut usize,
+) -> Result<Statement, ProceduralError> {
     *pos += 1;
     let query = collect_raw_sql_until(tokens, pos, &[Token::Semicolon]);
     skip_if(tokens, pos, &Token::Semicolon);
@@ -225,7 +228,7 @@ fn parse_return_query(tokens: &[Token], pos: &mut usize) -> Result<Statement, Pr
 }
 
 /// `RAISE [NOTICE|WARNING|EXCEPTION] 'message';`
-fn parse_raise(tokens: &[Token], pos: &mut usize) -> Result<Statement, ProceduralError> {
+fn parse_raise(tokens: &TokenStream<'_>, pos: &mut usize) -> Result<Statement, ProceduralError> {
     *pos += 1;
     let level = match tokens.get(*pos) {
         Some(Token::Notice) => {
@@ -251,7 +254,7 @@ fn parse_raise(tokens: &[Token], pos: &mut usize) -> Result<Statement, Procedura
 ///
 /// Used for DML (INSERT/UPDATE/DELETE) as well as NodeDB SQL extensions
 /// (PUBLISH TO, etc.) that start with an identifier token.
-fn parse_sql(tokens: &[Token], pos: &mut usize) -> Result<Statement, ProceduralError> {
+fn parse_sql(tokens: &TokenStream<'_>, pos: &mut usize) -> Result<Statement, ProceduralError> {
     let sql = collect_raw_sql_until(tokens, pos, &[Token::Semicolon]);
     skip_if(tokens, pos, &Token::Semicolon);
     Ok(Statement::Sql { sql })

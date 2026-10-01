@@ -37,6 +37,26 @@ use super::key::SinkEventKey;
 const EVENTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("cdc_events");
 /// Keys of the routed events.
 const ROUTED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("cdc_routed");
+/// Per-partition first servable position after a snapshot install.
+const FLOORS: TableDefinition<u32, &[u8]> = TableDefinition::new("cdc_floors");
+
+fn encode_floor(floor: CdcOffset) -> [u8; 24] {
+    let mut out = [0u8; 24];
+    out[..8].copy_from_slice(&floor.epoch.to_le_bytes());
+    out[8..16].copy_from_slice(&floor.index.to_le_bytes());
+    out[16..].copy_from_slice(&floor.sequence.to_le_bytes());
+    out
+}
+
+fn decode_floor(bytes: &[u8]) -> Option<CdcOffset> {
+    let bytes: &[u8; 24] = bytes.try_into().ok()?;
+    let word = |at: usize| {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes[at..at + 8]);
+        u64::from_le_bytes(buf)
+    };
+    Some(CdcOffset::at(word(0), word(8), word(16)))
+}
 
 fn storage(detail: impl std::fmt::Display) -> crate::Error {
     crate::Error::Storage {
@@ -64,20 +84,28 @@ fn stream_prefix((database_id, tenant_id, name): &BufferKey) -> Vec<u8> {
     out
 }
 
-fn event_row(prefix: &[u8], position: CdcOffset) -> Vec<u8> {
-    let mut out = Vec::with_capacity(prefix.len() + 16);
+/// One event's row: its stream prefix, partition, and position. Positions of
+/// different partitions can be equal, so the partition is part of the key.
+fn event_row(prefix: &[u8], partition: u32, position: CdcOffset) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prefix.len() + ROW_SUFFIX_LEN);
     out.extend_from_slice(prefix);
-    out.extend_from_slice(&position.lsn.to_be_bytes());
+    out.extend_from_slice(&partition.to_be_bytes());
+    out.extend_from_slice(&position.epoch.to_be_bytes());
+    out.extend_from_slice(&position.index.to_be_bytes());
     out.extend_from_slice(&position.sequence.to_be_bytes());
     out
 }
+
+/// Bytes an event row carries after its stream prefix: the partition and the
+/// three position words.
+const ROW_SUFFIX_LEN: usize = 4 + 3 * 8;
 
 /// The first and last row a stream can hold.
 fn stream_bounds(key: &BufferKey) -> (Vec<u8>, Vec<u8>) {
     let prefix = stream_prefix(key);
     let mut last = prefix.clone();
-    last.extend_from_slice(&[u8::MAX; 16]);
-    (event_row(&prefix, CdcOffset::ZERO), last)
+    last.extend_from_slice(&[u8::MAX; ROW_SUFFIX_LEN]);
+    (event_row(&prefix, 0, CdcOffset::ZERO), last)
 }
 
 /// The stream a row belongs to.
@@ -116,6 +144,7 @@ impl CdcLedger {
         let mut keys = HashSet::new();
         {
             txn.open_table(EVENTS).map_err(storage)?;
+            txn.open_table(FLOORS).map_err(storage)?;
             let table = txn.open_table(ROUTED).map_err(storage)?;
             for entry in table.iter().map_err(storage)? {
                 let (row, _) = entry.map_err(storage)?;
@@ -164,6 +193,13 @@ impl CdcLedger {
         let mut orphaned: HashSet<BufferKey> = HashSet::new();
         {
             let txn = self.db.begin_read().map_err(storage)?;
+            let floors = txn.open_table(FLOORS).map_err(storage)?;
+            for entry in floors.iter().map_err(storage)? {
+                let (partition, bytes) = entry.map_err(storage)?;
+                let floor = decode_floor(bytes.value())
+                    .ok_or_else(|| storage("an availability floor did not decode"))?;
+                router.availability().raise(partition.value(), floor);
+            }
             let table = txn.open_table(EVENTS).map_err(storage)?;
             for entry in table.iter().map_err(storage)? {
                 let (row, bytes) = entry.map_err(storage)?;
@@ -190,6 +226,28 @@ impl CdcLedger {
                 let (first, last) = stream_bounds(stream);
                 table
                     .retain_in(first.as_slice()..=last.as_slice(), |_, _| false)
+                    .map_err(storage)?;
+            }
+        }
+        txn.commit().map_err(storage)
+    }
+
+    /// Persist availability floors durably, in one transaction. A stored
+    /// floor only rises.
+    pub fn persist_floors(&self, floors: &[(u32, CdcOffset)]) -> crate::Result<()> {
+        let txn = self.db.begin_write().map_err(storage)?;
+        {
+            let mut table = txn.open_table(FLOORS).map_err(storage)?;
+            for (partition, floor) in floors {
+                let stored = table
+                    .get(*partition)
+                    .map_err(storage)?
+                    .and_then(|bytes| decode_floor(bytes.value()));
+                if stored.is_some_and(|stored| stored >= *floor) {
+                    continue;
+                }
+                table
+                    .insert(*partition, encode_floor(*floor).as_slice())
                     .map_err(storage)?;
             }
         }
@@ -248,7 +306,7 @@ impl CdcLedger {
                 let prefix = stream_prefix(stream);
                 let retained: HashMap<Vec<u8>, &Arc<CdcEvent>> = snapshot
                     .iter()
-                    .map(|event| (event_row(&prefix, event.position()), event))
+                    .map(|event| (event_row(&prefix, event.partition, event.position()), event))
                     .collect();
                 let mut persisted: HashSet<Vec<u8>> = HashSet::new();
                 let (first, last) = stream_bounds(stream);
@@ -311,15 +369,45 @@ mod tests {
     fn a_row_names_its_stream_and_rows_of_a_stream_stay_in_its_bounds() {
         let stream: BufferKey = (DatabaseId::new(3), 7, "orders_stream".into());
         let prefix = stream_prefix(&stream);
-        let row = event_row(&prefix, CdcOffset::new(42, 5));
+        let row = event_row(&prefix, 9, CdcOffset::new(42, 5));
         assert_eq!(row_stream(&row), Some(stream.clone()));
         let (first, last) = stream_bounds(&stream);
         assert!(first.as_slice() <= row.as_slice() && row.as_slice() <= last.as_slice());
 
         let other: BufferKey = (DatabaseId::new(3), 7, "orders_stream_2".into());
-        let other_row = event_row(&stream_prefix(&other), CdcOffset::new(1, 0));
+        let other_row = event_row(&stream_prefix(&other), 0, CdcOffset::new(1, 0));
         assert!(
             !(first.as_slice() <= other_row.as_slice() && other_row.as_slice() <= last.as_slice())
         );
+    }
+
+    #[test]
+    fn equal_positions_of_two_partitions_keep_two_rows() {
+        let prefix = stream_prefix(&(DatabaseId::new(3), 7, "orders_stream".into()));
+        let position = CdcOffset::new(55, 2);
+        assert_ne!(
+            event_row(&prefix, 1, position),
+            event_row(&prefix, 2, position)
+        );
+    }
+    #[test]
+    fn floors_persist_rise_only_and_restore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = CdcLedger::open(dir.path()).expect("open ledger");
+        ledger
+            .persist_floors(&[(3, CdcOffset::at(0, 90, 0))])
+            .expect("persist");
+        ledger
+            .persist_floors(&[(3, CdcOffset::at(0, 40, 0)), (5, CdcOffset::at(1, 7, 0))])
+            .expect("persist");
+        drop(ledger);
+        let ledger = CdcLedger::open(dir.path()).expect("reopen ledger");
+        let router = CdcRouter::new(std::sync::Arc::new(crate::event::cdc::StreamRegistry::new()));
+        ledger.restore_into(&router).expect("restore");
+        assert_eq!(
+            router.availability().floor(3),
+            Some(CdcOffset::at(0, 90, 0))
+        );
+        assert_eq!(router.availability().floor(5), Some(CdcOffset::at(1, 7, 0)));
     }
 }

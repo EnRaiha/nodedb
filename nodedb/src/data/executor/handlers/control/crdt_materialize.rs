@@ -150,6 +150,8 @@ impl CoreLoop {
         let database_id = task.request.database_id.as_u64();
         let storage_key = StorageKey::for_surrogate(surrogate);
 
+        // No chain guard: DDL refuses HASH_CHAIN on a CRDT collection, so this
+        // write never reaches a chained row.
         let txn = self.sparse.begin_write()?;
         let outcome = self.apply_point_put(
             &txn,
@@ -163,6 +165,7 @@ impl CoreLoop {
                 index_text,
                 user_roles: &task.request.user_roles,
                 enforce: false,
+                unique: crate::data::executor::enforcement::unique::UniqueJudge::Row,
                 wal_lsn: task.wal_lsn(),
                 resolved_targets: &[],
             },

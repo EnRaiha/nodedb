@@ -43,7 +43,7 @@ pub(super) fn apply_graph(ctx: &PermCtx<'_>, op: &GraphOp) -> crate::Result<()> 
         }
 
         // Refuse: returns bindings with no filter slot; its own `WHERE`
-        // could probe a hidden row's field one predicate at a time.
+        // can probe a hidden row's field one predicate at a time.
         GraphOp::Match { query, .. }
         | GraphOp::MatchContinuation { query, .. }
         | GraphOp::MatchVarLenResume { query, .. } => refuse_match(ctx, query),
@@ -116,6 +116,12 @@ pub(super) fn apply_graph(ctx: &PermCtx<'_>, op: &GraphOp) -> crate::Result<()> 
         // No-op: node labels are keyed by node id alone and name no
         // collection, so this pass has no tree definition to resolve.
         GraphOp::SetNodeLabels { .. } | GraphOp::RemoveNodeLabels { .. } => Ok(()),
+        // No-op: these derive from a document delete or TRUNCATE this pass
+        // already decided on the same collection.
+        GraphOp::NodeEdgeGuard { .. }
+        | GraphOp::NodePresenceGuard { .. }
+        | GraphOp::TruncateEdges { .. }
+        | GraphOp::NodePresenceRead { .. } => Ok(()),
     }
 }
 
@@ -203,6 +209,7 @@ mod tests {
                 mode: None,
                 personalization_vector: None,
             },
+            stage: nodedb_physical::physical_plan::AlgoStage::Local,
         });
         assert_refused(apply(&mut plan, &cache), "docs");
     }

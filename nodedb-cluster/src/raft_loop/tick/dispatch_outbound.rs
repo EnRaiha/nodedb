@@ -21,6 +21,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     pub(super) fn dispatch_outbound_messages(&self, groups: &[(u64, nodedb_raft::Ready)]) {
         let mut ae_batches: BatchMap<u64, Vec<(u64, nodedb_raft::AppendEntriesRequest)>> =
             BatchMap::new();
+        // Keyed by group: a group's vote requests wait for its own disk.
         let mut vote_batches: BatchMap<u64, Vec<(u64, nodedb_raft::RequestVoteRequest)>> =
             BatchMap::new();
         let mut pre_vote_batches: BatchMap<u64, Vec<(u64, nodedb_raft::PreVoteRequest)>> =
@@ -36,9 +37,9 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             }
             for (peer, req) in &group_ready.vote_requests {
                 vote_batches
-                    .entry(*peer)
+                    .entry(*group_id)
                     .or_default()
-                    .push((*group_id, req.clone()));
+                    .push((*peer, req.clone()));
             }
             for (peer, req) in &group_ready.pre_vote_requests {
                 pre_vote_batches
@@ -100,45 +101,26 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             });
         }
 
-        // Dispatch batched RequestVote — one task per peer.
-        for (peer, votes) in vote_batches {
-            let transport = self.transport.clone();
-            let mr = self.multi_raft.clone();
-            let mut shutdown_rx = self.shutdown_watch.subscribe();
-            tokio::spawn(async move {
-                if *shutdown_rx.borrow() {
-                    return;
-                }
-                for (group_id, req) in votes {
-                    tokio::select! {
-                        biased;
-                        _ = shutdown_rx.changed() => return,
-                        rpc = transport.request_vote(peer, req) => {
-                            match rpc {
-                                Ok(resp) => {
-                                    let mut mr =
-                                        mr.lock().unwrap_or_else(|p| p.into_inner());
-                                    if let Err(e) = mr
-                                        .handle_request_vote_response(group_id, peer, &resp)
-                                    {
-                                        debug!(group_id, peer, error = %e, "handle vote response");
-                                    }
-                                    // A higher-term response steps this
-                                    // candidate down to follower; persist
-                                    // that term bump durably.
-                                    if let Err(e) = mr.persist_group_hard_state(group_id) {
-                                        error!(group_id, peer, error = %e, "persist hard state after vote response");
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(group_id, peer, error = %e, "request_vote RPC failed");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            });
+        // Dispatch RequestVote — one task per group, one request per peer.
+        // A vote request leaves only once the candidate's term and self-vote
+        // are durable, so a restart cannot forget them. The group waits for
+        // its own disk, never under the `MultiRaft` lock, and no other
+        // group's election waits with it.
+        if !vote_batches.is_empty() {
+            let tickets: BatchMap<u64, crate::group_disk::DurabilityTicket> = {
+                let mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
+                vote_batches
+                    .keys()
+                    .filter_map(|group_id| {
+                        mr.durability_ticket(*group_id)
+                            .map(|ticket| (*group_id, ticket))
+                    })
+                    .collect()
+            };
+            for (group_id, votes) in vote_batches {
+                let ticket = tickets.get(&group_id).cloned();
+                self.dispatch_group_votes(group_id, ticket, votes);
+            }
         }
 
         // Dispatch batched PreVote — one task per peer. No hard-state persist

@@ -66,7 +66,7 @@ impl SqlCatalog for OriginCatalog {
             // pre-upgrade row the GC sweeper has not yet adopted a time
             // for — see `event::collection_gc::policy::PurgeDecision`,
             // which never purges such a row). Report `u64::MAX` rather
-            // than `0 + retention`, which would falsely tell the caller
+            // than `0 + retention`, which will falsely tell the caller
             // the row is already past its window.
             let retention_expires_at_ns = if stored.deactivated_at_ns == 0 {
                 u64::MAX
@@ -106,18 +106,18 @@ impl SqlCatalog for OriginCatalog {
         }
 
         // Drain observation: if a DDL is currently draining
-        // this descriptor at the version we just read, return
+        // this descriptor at the version we read, return
         // `RetryableSchemaChanged` so the pgwire handler's
         // retry loop re-plans. Without this check the planner
-        // would compile a plan against a version that's about
+        // will compile a plan against a version that's about
         // to be retired, and only the post-plan lease acquisition
-        // would notice — or (worse) it would succeed on first
-        // holder because the drain finished just before the
+        // will notice — or (worse) it will succeed on first
+        // holder because the drain finished right before the
         // refcount check. Catching it here keeps the common case
         // cheap; the acquisition sits inside the same retry unit
         // for the drain that starts after this read.
         //
-        // Leases themselves are NOT acquired here anymore.
+        // Leases themselves are NOT acquired here.
         // The handler calls
         // `SharedState::acquire_plan_lease_scope` after
         // planning finishes (or after a cache hit returns a
@@ -125,12 +125,16 @@ impl SqlCatalog for OriginCatalog {
         // refcounts, performs a single raft acquire per
         // descriptor (on first-holder), and returns a
         // `QueryLeaseScope` the handler holds through execute.
-        if let Some(drain) = &self.drain_tracker
-            && drain.is_draining(&descriptor_id, version)
-        {
-            return Err(SqlCatalogError::RetryableSchemaChanged {
-                descriptor: format!("collection {name}"),
-            });
+        if let Some(drain) = &self.drain_tracker {
+            let owners = drain.draining_owners(&descriptor_id, version);
+            if !owners.is_empty() {
+                return Err(SqlCatalogError::RetryableSchemaChanged {
+                    descriptor: format!(
+                        "collection {name}: {}",
+                        crate::control::lease::drain_owner_list(&owners)
+                    ),
+                });
+            }
         }
 
         let (engine, columns, primary_key) = convert_collection_type(&stored);
@@ -198,7 +202,7 @@ impl SqlCatalog for OriginCatalog {
             .flatten()
             .filter(|stored| stored.is_active)?;
 
-        // A folded regclass literal is a schema dependency just like a scan of
+        // A folded regclass literal is a schema dependency like a scan of
         // the relation. Record it so dropping or altering the target invalidates
         // a cached physical plan that embeds its OID.
         let descriptor_id = DescriptorId::new(
@@ -264,9 +268,13 @@ impl SqlCatalog for OriginCatalog {
             ArrayAttrAst, ArrayAttrType, ArrayDimAst, ArrayDimType, ArrayDomainBound,
         };
 
-        let handle = self.array_catalog.as_ref()?;
         let entry = {
-            let cat = handle.read().ok()?;
+            // A poisoned lock still holds a consistent mirror: every writer
+            // replaces whole entries. Every other reader recovers it too.
+            let cat = self
+                .array_catalog
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             cat.lookup_by_name_in_database(
                 nodedb_types::TenantId::new(self.tenant_id),
                 self.database_id,

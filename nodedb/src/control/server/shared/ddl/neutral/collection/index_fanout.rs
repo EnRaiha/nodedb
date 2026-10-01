@@ -7,7 +7,7 @@
 //! collection's documents are spread across vShards hosted on
 //! multiple nodes, and the local dispatch only populates the
 //! coordinator's vShards. Non-coordinator nodes host rows the
-//! coordinator never sees, so the Ready commit would pass with an
+//! coordinator never sees, so the Ready commit will pass with an
 //! incomplete index — a silent-miss class.
 //!
 //! This module drives the fan-out: after the coordinator's local
@@ -42,7 +42,7 @@ const PEER_BACKFILL_DEADLINE: Duration = Duration::from_secs(120);
 /// key is `23505` as on the single-node path. A transport fault is
 /// `XX000`.
 ///
-/// Single-node clusters (no peers) return `Ok(())` immediately — the
+/// A cluster with no peers returns `Ok(())` immediately — the
 /// coordinator's local dispatch already covered everything.
 /// Inputs to [`backfill_on_peers`]. Mirrors the fields of
 /// `DocumentOp::BackfillIndex` plus the owning tenant — grouped as a
@@ -65,8 +65,8 @@ pub(super) async fn backfill_on_peers(
     args: PeerBackfill<'_>,
 ) -> Result<(), DdlError> {
     let Some(transport) = state.cluster_transport.as_ref() else {
-        // Non-cluster build / single-node without cluster transport:
-        // the local dispatch is the only required step.
+        // No transport is wired, so no peer is reachable: the local
+        // dispatch is the only step.
         return Ok(());
     };
     let Some(topology_lock) = state.cluster_topology.as_ref() else {
@@ -125,6 +125,8 @@ pub(super) async fn backfill_on_peers(
             descriptor_versions: Vec::new(),
             // Index build fan-out is not session-transaction-scoped.
             txn_id: None,
+            vshard_id: None,
+            read_groups: Vec::new(),
         });
         joins.push(tokio::spawn(async move {
             let outcome = transport.send_rpc(node_id, req).await;

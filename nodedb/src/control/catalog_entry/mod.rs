@@ -6,7 +6,7 @@
 //! The `CatalogEntry` enum is the single source of truth for "the set
 //! of mutations a pgwire DDL handler can make to the replicated
 //! catalog". Every DDL handler constructs a `CatalogEntry`, hands it
-//! to [`crate::control::metadata_proposer::propose_catalog_entry`]
+//! to [`crate::control::metadata_proposer::propose_catalog_entry_async`]
 //! which encodes it into an opaque `Vec<u8>` payload inside a
 //! `nodedb_cluster::MetadataEntry::CatalogDdl { payload }`, the raft
 //! log commits it, and on every node the production

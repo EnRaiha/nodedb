@@ -60,6 +60,8 @@ pub mod segmented;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod temporal_purge;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod time_anchors;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod tombstone;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod torn_tail;
@@ -101,6 +103,8 @@ pub use secure_mem::SecureKey;
 pub use segmented::{SegmentedWal, SegmentedWalConfig};
 #[cfg(not(target_arch = "wasm32"))]
 pub use temporal_purge::{TemporalPurgeEngine, TemporalPurgePayload};
+#[cfg(not(target_arch = "wasm32"))]
+pub use time_anchors::TimeAnchors;
 #[cfg(not(target_arch = "wasm32"))]
 pub use tombstone::{CollectionTombstonePayload, MAX_COLLECTION_NAME_LEN};
 #[cfg(not(target_arch = "wasm32"))]

@@ -135,18 +135,20 @@ impl CoreLoop {
                 let plan = PhysicalPlan::Crdt(CrdtOp::DocDelete {
                     collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
                     document_id: document_id.clone().into_string(),
-                    surrogate,
+                    surrogate: Some(surrogate),
                     returning: None,
                     rls_filters: Vec::new(),
                 });
                 let task =
                     Self::replay_task(tid, database_id, vshard, plan, Some(Lsn::new(record_lsn)));
+                // Replay never tombstones the node's edges: the WAL names
+                // every tombstone its own write stamped.
                 let response = self.execute_crdt_doc_delete(
                     &task,
                     crate::data::executor::handlers::control::crdt_doc::CrdtDocDelete {
                         collection: &collection,
                         document_id: document_id.as_str(),
-                        surrogate,
+                        surrogate: Some(surrogate),
                         returning: None,
                         rls_filters: &[],
                     },
@@ -180,6 +182,9 @@ impl CoreLoop {
     ) {
         let mut replayed = 0usize;
         for record in records {
+            if self.replay_halted() {
+                break;
+            }
             if let Some(applied) = self.try_replay_crdt_doc(record, num_cores, tombstones) {
                 replayed += applied;
             }
@@ -266,7 +271,7 @@ mod tests {
         PhysicalPlan::Crdt(CrdtOp::DocDelete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
             document_id: DOCUMENT_ID.to_string(),
-            surrogate: Surrogate::new(SURROGATE),
+            surrogate: Some(Surrogate::new(SURROGATE)),
             returning: None,
             rls_filters: Vec::new(),
         })

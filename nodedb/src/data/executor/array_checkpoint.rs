@@ -274,6 +274,7 @@ mod tests {
                     txn_id: None,
                     wal_lsn: None,
                     resolved_now_ms: None,
+                    commit_hlc: None,
                     admission: crate::bridge::envelope::Admission::Admitted,
                 }))
                 .expect("push request");
@@ -319,6 +320,7 @@ mod tests {
                 cells_msgpack: zerompk::to_msgpack_vec(&cells).expect("encode cells"),
                 wal_lsn,
                 provenance: None,
+                vshard_id: 0,
             });
             assert_eq!(r.status, Status::Ok, "array put: {r:?}");
         }
@@ -527,7 +529,7 @@ mod tests {
             cells: vec![ArrayPutCell {
                 coord: vec![CoordValue::Int64(9), CoordValue::Int64(9)],
                 attrs: vec![CellValue::Int64(40)],
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new(1),
                 system_from_ms: 1,
                 valid_from_ms: 0,
                 valid_until_ms: i64::MAX,
@@ -542,6 +544,10 @@ mod tests {
                 payload,
             }],
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         }
         .to_bytes()
         .expect("encode redo");
@@ -614,7 +620,7 @@ mod tests {
         ArrayPutCell {
             coord: vec![CoordValue::Int64(x), CoordValue::Int64(y)],
             attrs: vec![CellValue::Int64(v)],
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new((x * 100 + y + 1) as u32),
             system_from_ms: sys_ms,
             valid_from_ms: 0,
             valid_until_ms: i64::MAX,
@@ -856,6 +862,8 @@ mod tests {
                 prefix_bits: 8,
                 audit_retain_ms: None,
                 minimum_audit_retain_ms: None,
+                modification_hlc: nodedb_types::Hlc::ZERO,
+                incarnation: nodedb_types::Hlc::ZERO,
             })
             .expect("seed the catalog");
         assert!(

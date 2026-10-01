@@ -15,7 +15,7 @@ use crate::control::planner::sql_plan_convert::value::sql_value_to_string;
 /// edge-bearing gate in `execute.rs`.
 ///
 /// A genuine catalog READ error propagates (misrouting a delete on a real I/O
-/// fault would silently skip edge cleanup → dangling edges). An ABSENT
+/// fault will silently skip edge cleanup → dangling edges). An ABSENT
 /// credential store or catalog, or an absent collection row (`Ok(None)`), is
 /// treated as non-edge-bearing (`Ok(false)`).
 pub(super) fn document_collection_is_edge_bearing(
@@ -33,6 +33,31 @@ pub(super) fn document_collection_is_edge_bearing(
         .get_collection(ctx.database_id, ctx.tenant_id.as_u64(), &bare)?
         .map(|c| c.has_implicit_edges)
         .unwrap_or(false))
+}
+
+/// Returns `true` when `collection` (db-qualified by the caller) is a clone
+/// that still reads through to its source: `Shadowed` or `Materializing`.
+/// Its writes copy rows up one point op at a time, so a write to it keeps
+/// its point form.
+///
+/// A catalog read error propagates. An absent credential store, catalog row,
+/// or clone source is `Ok(false)`.
+pub(super) fn document_collection_is_shadowed_clone(
+    ctx: &ConvertContext,
+    collection: &str,
+) -> crate::Result<bool> {
+    let Some(credentials) = ctx.credentials.as_ref() else {
+        return Ok(false);
+    };
+    let bare =
+        crate::control::target_identity::naming::bare_collection_name(ctx.database_id, collection);
+    Ok(credentials
+        .catalog()
+        .get_collection(ctx.database_id, ctx.tenant_id.as_u64(), &bare)?
+        .is_some_and(|c| {
+            c.cloned_from.is_some()
+                && !matches!(c.clone_status, nodedb_types::CloneStatus::Materialized)
+        }))
 }
 
 /// Effective filter for a PK-pre-resolved write (shared by the columnar UPDATE
@@ -73,7 +98,7 @@ pub(super) fn pk_effective_filter(
 /// `BulkDelete`. Thin wrapper over [`pk_effective_filter`]: serializes the
 /// user's `WHERE` predicate, then defers to the shared synthesis. The DELETE
 /// gate only calls this with a non-empty `target_keys`, so the result is NEVER
-/// an empty filter (which would match ALL rows).
+/// an empty filter (which will match ALL rows).
 pub(super) fn delete_effective_filter(
     filters: &[Filter],
     target_keys: &[SqlValue],

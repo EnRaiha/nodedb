@@ -4,8 +4,11 @@
 //!
 //! Consumes events from the stream's buffer using an internal consumer group
 //! (`_webhook:<stream_name>`), POSTs each event batch to the URL, and commits
-//! offsets on success. Failed deliveries retry with exponential backoff,
-//! then go to the trigger DLQ after max retries.
+//! offsets on success. In a cluster only the node that holds the leader lease
+//! of the stream's owning group delivers. It reads every partition, from its
+//! own buffer and from the members of groups it does not replicate. See
+//! [`crate::event::cdc::sink_owner`] and [`deliver_event`] for the fencing and
+//! idempotency headers. Failed deliveries retry with exponential backoff.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,13 +22,9 @@ use crate::control::security::redaction::RedactionStore;
 use crate::control::state::SharedState;
 use crate::event::cdc::CdcSubscriberScope;
 use crate::event::cdc::event::CdcEvent;
+use crate::event::cdc::sink_owner::{SinkFence, register_sink_groups, sink_lease, webhook_group};
 
 use super::types::WebhookConfig;
-
-/// Internal consumer group name for webhook delivery.
-fn webhook_group_name(stream_name: &str) -> String {
-    format!("_webhook:{stream_name}")
-}
 
 /// Spawn a webhook delivery task for a single stream.
 ///
@@ -38,23 +37,16 @@ pub fn spawn_delivery_task(
     config: WebhookConfig,
     shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
-    let group_name = webhook_group_name(&stream_name);
+    let group_name = webhook_group(&stream_name);
 
-    // Register the internal consumer group (if not already present).
-    if state
-        .group_registry
-        .get(database_id, tenant_id, &stream_name, &group_name)
-        .is_none()
+    // The replicated offset commit names a registered group. Installing the
+    // stream registered it on every node; this covers a stream registered
+    // before its sink task started.
+    if let Some(def) = state
+        .stream_registry
+        .get(database_id, tenant_id, &stream_name)
     {
-        let def = crate::event::cdc::consumer_group::ConsumerGroupDef {
-            database_id,
-            tenant_id,
-            name: group_name.clone(),
-            stream_name: stream_name.clone(),
-            owner: "_system_webhook".into(),
-            created_at: 0,
-        };
-        state.group_registry.register(def);
+        register_sink_groups(&state.group_registry, &def);
     }
 
     tokio::spawn(async move {
@@ -98,7 +90,23 @@ async fn delivery_loop(
             return;
         }
 
-        // Read events from the buffer using the internal consumer group.
+        // Only the lease holder of the stream's owning group delivers.
+        let Some(lease) = sink_lease(&state, database_id, &stream_name) else {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                _ = shutdown.changed() => {}
+            }
+            continue;
+        };
+        let fence = SinkFence {
+            state: &state,
+            database_id,
+            stream_name: &stream_name,
+            lease,
+        };
+
+        // Read every partition after the internal consumer group's offsets:
+        // local ones from this node's buffer, the rest from their members.
         let consume_params = crate::event::cdc::consume::ConsumeParams {
             database_id,
             tenant_id,
@@ -108,7 +116,7 @@ async fn delivery_loop(
             limit: 100, // Batch size per delivery cycle.
         };
 
-        let result = crate::event::cdc::consume::consume_stream(&state, &consume_params);
+        let result = crate::event::cdc::consume::consume_for_sink(&state, &consume_params).await;
 
         match result {
             Ok(consume_result) if !consume_result.events.is_empty() => {
@@ -143,40 +151,46 @@ async fn delivery_loop(
                     store: &state.redaction,
                     subscriber: &mut subscriber,
                     events: &consume_result.events,
+                    fence: &fence,
                 })
                 .await;
 
-                // Commit offsets for the events this cycle finished with.
-                if delivered > 0 {
+                // Commit offsets for the events this cycle finished with, only
+                // while this node still holds the batch's lease. A later owner
+                // redelivers the rest under the same idempotency keys.
+                if delivered > 0 && fence.holds() {
                     // Commit the exact composite position of the last
                     // processed event in each partition, taken from the batch
                     // as consumed: an event withheld by a redaction rule is
                     // finished with too, and must not be redelivered forever.
-                    let delivered_events = &consume_result.events[..delivered];
-                    let mut partition_max = std::collections::HashMap::new();
-                    for event in delivered_events {
-                        let entry = partition_max
-                            .entry(event.partition)
-                            .or_insert(crate::event::cdc::CdcOffset::ZERO);
-                        if event.position() > *entry {
-                            *entry = event.position();
-                        }
-                    }
-                    for (partition_id, offset) in partition_max {
-                        if let Err(e) = state.offset_store.commit_offset(
-                            database_id,
-                            tenant_id,
-                            &stream_name,
-                            &group_name,
+                    // One replicated commit per delivery tick carries every
+                    // partition, so a delivery task on any node resumes here.
+                    let offsets = crate::event::cdc::consume::batch_tails(
+                        &consume_result.events[..delivered],
+                    )
+                    .into_iter()
+                    .map(|(partition_id, offset)| {
+                        crate::event::cdc::consumer_group::PartitionOffset::new(
                             partition_id,
                             offset,
-                        ) {
-                            warn!(
-                                stream = %stream_name,
-                                error = %e,
-                                "failed to commit webhook offset"
-                            );
-                        }
+                        )
+                    })
+                    .collect();
+                    if let Err(e) = crate::control::server::shared::ddl::neutral::consumer_group::commit::commit_group_offsets(
+                        &state,
+                        database_id,
+                        tenant_id,
+                        &stream_name,
+                        &group_name,
+                        offsets,
+                    )
+                    .await
+                    {
+                        warn!(
+                            stream = %stream_name,
+                            error = %e.message,
+                            "failed to commit webhook offset"
+                        );
                     }
                     trace!(
                         stream = %stream_name,
@@ -194,9 +208,6 @@ async fn delivery_loop(
             }
             Ok(_) => {
                 // No events — wait before polling again.
-            }
-            Err(crate::event::cdc::consume::ConsumeError::BufferEmpty(_)) => {
-                // Stream exists but no events yet.
             }
             Err(e) => {
                 warn!(
@@ -223,6 +234,7 @@ struct BatchDelivery<'a> {
     store: &'a RedactionStore,
     subscriber: &'a mut CdcSubscriberScope,
     events: &'a [Arc<CdcEvent>],
+    fence: &'a SinkFence<'a>,
 }
 
 /// POST a batch, redacting each event for the subscriber first.
@@ -231,8 +243,9 @@ struct BatchDelivery<'a> {
 /// is what the offset commit advances over. An event a rule covers but whose
 /// payload could not be rewritten is skipped rather than POSTed in the clear,
 /// and still counts as finished so the cursor moves past it instead of
-/// redelivering it forever. Delivery stops at the first POST failure, so the
-/// next cycle retries from the last committed offset.
+/// redelivering it forever. Delivery stops at the first POST failure, and at
+/// the first POST this node no longer holds the lease for, so the next cycle
+/// or the next owner retries from the last committed offset.
 async fn deliver_batch(delivery: BatchDelivery<'_>) -> usize {
     let BatchDelivery {
         client,
@@ -241,27 +254,55 @@ async fn deliver_batch(delivery: BatchDelivery<'_>) -> usize {
         store,
         subscriber,
         events,
+        fence,
     } = delivery;
     let mut finished = 0usize;
     for event in events {
-        if let Some(event) = subscriber.apply(store, event)
-            && !deliver_event(client, config, &event, stream_name).await
-        {
-            break;
+        if let Some(event) = subscriber.apply(store, event) {
+            let target = DeliveryTarget {
+                client,
+                config,
+                stream_name,
+                fence,
+            };
+            if !deliver_event(&target, &event).await {
+                break;
+            }
         }
         finished += 1;
     }
     finished
 }
 
+/// Where and under which lease one event is POSTed.
+struct DeliveryTarget<'a> {
+    client: &'a reqwest::Client,
+    config: &'a WebhookConfig,
+    stream_name: &'a str,
+    fence: &'a SinkFence<'a>,
+}
+
 /// POST a single event to the webhook URL. Returns true on success.
-/// Retries with exponential backoff on failure.
-async fn deliver_event(
-    client: &reqwest::Client,
-    config: &WebhookConfig,
-    event: &CdcEvent,
-    stream_name: &str,
-) -> bool {
+/// Retries with exponential backoff on failure. Every attempt first checks
+/// that this node still holds the batch's lease, and returns false without
+/// POSTing when it does not.
+///
+/// Every request carries two headers an endpoint uses to apply each event
+/// once:
+/// - `X-Idempotency-Key`: `<partition>:<epoch>:<index>:<sequence>`, the
+///   event's partition and position. Every owner and every retry sends the
+///   same key for the same event, so the endpoint drops a key it has seen.
+/// - `X-Fencing-Token`: the Raft term of the owning group's leader lease the
+///   delivering node holds. It rises with each new owner. An endpoint that
+///   keeps the highest token it accepted rejects a lower one: that request
+///   comes from an owner whose lease a later owner replaced.
+async fn deliver_event(target: &DeliveryTarget<'_>, event: &CdcEvent) -> bool {
+    let DeliveryTarget {
+        client,
+        config,
+        stream_name,
+        fence,
+    } = *target;
     let body = match sonic_rs::to_vec(event) {
         Ok(b) => b,
         Err(e) => {
@@ -275,12 +316,22 @@ async fn deliver_event(
         }
     };
     let idempotency_key = format!("{}:{}", event.partition, event.offset_token());
+    let fencing_token = fence.lease.term.to_string();
 
     for attempt in 0..=config.max_retries {
+        if !fence.holds() {
+            debug!(
+                stream = stream_name,
+                lsn = event.lsn,
+                "webhook delivery stopped: this node no longer holds the sink lease"
+            );
+            return false;
+        }
         let mut request = client
             .post(&config.url)
             .header("Content-Type", "application/json")
             .header("X-Idempotency-Key", &idempotency_key)
+            .header("X-Fencing-Token", &fencing_token)
             .header("X-Event-Sequence", event.sequence.to_string())
             .header("X-Stream-Name", stream_name)
             .header("X-Partition", event.partition.to_string())
@@ -378,7 +429,6 @@ mod tests {
 
     #[test]
     fn webhook_group_name_format() {
-        let name = format!("_webhook:{}", "orders_stream");
-        assert_eq!(name, "_webhook:orders_stream");
+        assert_eq!(webhook_group("orders_stream"), "_webhook:orders_stream");
     }
 }

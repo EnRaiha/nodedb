@@ -88,8 +88,8 @@ pub(super) fn walk(ctx: &PermCtx<'_>, plan: &mut PhysicalPlan) -> crate::Result<
 pub(super) mod test_support {
     use crate::control::security::auth_context::AuthContext;
     use crate::control::security::permission_tree::types::{PermissionGrant, PermissionTreeDef};
-    use crate::control::security::permission_tree::{PermissionCache, resolver};
-    use crate::types::TenantId;
+    use crate::control::security::permission_tree::{PermissionCache, TreeScope, resolver};
+    use crate::types::{DatabaseId, TenantId};
 
     pub(in crate::control::planner::rls_injection::permission_tree) const TENANT: u64 = 1;
 
@@ -97,7 +97,8 @@ pub(super) mod test_support {
     /// spells it: `AuthContext::id` is the numeric user id rendered as text.
     const ALICE: &str = "42";
 
-    /// A cache holding a tree on `collection` over three resources.
+    /// A cache holding a tree on the default database's `collection` over
+    /// three resources.
     ///
     /// `doc_a` is granted to alice at `owner`, so she clears read, write, and
     /// delete. `doc_b` is granted at `viewer`, so she clears read only.
@@ -105,10 +106,18 @@ pub(super) mod test_support {
     pub(in crate::control::planner::rls_injection::permission_tree) fn cache_with_tree(
         collection: &str,
     ) -> PermissionCache {
+        cache_with_tree_in(DatabaseId::DEFAULT, collection)
+    }
+
+    /// [`cache_with_tree`] with the tree and its grants in `database_id`.
+    pub(in crate::control::planner::rls_injection::permission_tree) fn cache_with_tree_in(
+        database_id: DatabaseId,
+        collection: &str,
+    ) -> PermissionCache {
+        let scope = TreeScope::new(database_id, TENANT);
         let mut cache = PermissionCache::new();
         cache.register_tree_def(
-            TENANT,
-            collection,
+            scope.collection(collection),
             PermissionTreeDef {
                 resource_column: "doc_id".into(),
                 graph_index: "resource_tree".into(),
@@ -128,7 +137,7 @@ pub(super) mod test_support {
             ("doc_c", "someone_else", "owner"),
         ] {
             cache.put_grant(
-                TENANT,
+                scope,
                 &PermissionGrant {
                     resource_id: resource.into(),
                     grantee: grantee.into(),
@@ -190,7 +199,7 @@ pub(super) mod test_support {
         cache: &PermissionCache,
         auth: &AuthContext,
     ) -> crate::Result<()> {
-        match super::PermCtx::new(cache, TENANT, auth, nodedb_types::DatabaseId::DEFAULT) {
+        match super::PermCtx::new(cache, TENANT, auth, DatabaseId::DEFAULT) {
             Some(ctx) => super::walk(&ctx, plan),
             None => Ok(()),
         }
@@ -242,7 +251,7 @@ pub(super) mod test_support {
         }
     }
 
-    /// The resource ids alice may read, sorted for comparison.
+    /// The resource ids alice can read, sorted for comparison.
     pub(in crate::control::planner::rls_injection::permission_tree) fn readable() -> Vec<String> {
         vec!["doc_a".to_owned(), "doc_b".to_owned()]
     }
@@ -261,12 +270,15 @@ pub(super) mod test_support {
     #[test]
     fn fixture_separates_the_levels() {
         let cache = cache_with_tree("docs");
-        let def = cache.get_tree_def(TENANT, "docs").expect("tree def");
+        let scope = TreeScope::new(DatabaseId::DEFAULT, TENANT);
+        let def = cache
+            .get_tree_def(&scope.collection("docs"))
+            .expect("tree def");
         let auth = regular_auth();
         let delete = resolver::accessible_resources(
             &cache,
             def,
-            TENANT,
+            scope,
             &auth.id,
             &auth.roles,
             &def.delete_level,
@@ -281,18 +293,22 @@ mod tests {
         ColumnarOp, DocumentOp, ExchangeMode, ExchangeOp, QueryOp,
     };
 
+    use nodedb_physical::physical_task::PhysicalTask;
+
     use super::test_support::{
-        apply, apply_as, apply_without_tree, cache_with_tree, injected_resources, readable, sorted,
-        superuser_auth,
+        TENANT, apply, apply_as, apply_without_tree, cache_with_tree, cache_with_tree_in,
+        injected_resources, readable, regular_auth, sorted, superuser_auth,
     };
     use crate::bridge::envelope::PhysicalPlan;
+    use crate::types::{DatabaseId, TenantId, VShardId};
 
     fn columnar_scan(collection: &str) -> PhysicalPlan {
+        columnar_scan_in(DatabaseId::DEFAULT, collection)
+    }
+
+    fn columnar_scan_in(database_id: DatabaseId, collection: &str) -> PhysicalPlan {
         PhysicalPlan::Columnar(ColumnarOp::Scan {
-            collection: nodedb_types::QualifiedCollection::new(
-                nodedb_types::DatabaseId::DEFAULT,
-                collection,
-            ),
+            collection: nodedb_types::QualifiedCollection::new(database_id, collection),
             projection: Vec::new(),
             limit: 0,
             filters: Vec::new(),
@@ -345,9 +361,8 @@ mod tests {
         }
     }
 
-    /// A columnar scan was not listed before this pass became exhaustive, so
-    /// it returned every row of a governed collection. It is now narrowed to
-    /// the readable subtree.
+    /// A columnar scan over a governed collection narrows to the readable
+    /// subtree instead of returning every row.
     #[test]
     fn columnar_scan_is_narrowed_to_the_readable_subtree() {
         let cache = cache_with_tree("events");
@@ -428,5 +443,65 @@ mod tests {
             }
             other => panic!("plan shape changed: {other:?}"),
         }
+    }
+
+    fn task_in(database_id: DatabaseId, plan: PhysicalPlan) -> PhysicalTask {
+        PhysicalTask {
+            tenant_id: TenantId::new(TENANT),
+            vshard_id: VShardId::new(0),
+            database_id,
+            plan,
+            post_set_op: nodedb_physical::physical_task::PostSetOp::None,
+            txn_id: None,
+        }
+    }
+
+    /// The pass resolves each task's tree in that task's database: a tree in
+    /// one database filters a scan there, and leaves the same collection name
+    /// in the default database and in another database untouched.
+    #[test]
+    fn injection_resolves_trees_in_the_task_database() {
+        let db1 = DatabaseId::new(7);
+        let db2 = DatabaseId::new(8);
+        let cache = cache_with_tree_in(db1, "events");
+        let mut tasks = vec![
+            task_in(db1, columnar_scan_in(db1, "events")),
+            task_in(db2, columnar_scan_in(db2, "events")),
+            task_in(DatabaseId::DEFAULT, columnar_scan("events")),
+        ];
+        let untouched_db2 = tasks[1].plan.clone();
+        let untouched_default = tasks[2].plan.clone();
+
+        super::inject_permission_tree(&mut tasks, &cache, &regular_auth()).expect("inject");
+
+        assert_eq!(scan_subtree(&tasks[0].plan), readable());
+        assert_eq!(tasks[1].plan, untouched_db2);
+        assert_eq!(tasks[2].plan, untouched_default);
+    }
+
+    /// A default-database tree never filters a named database's collection
+    /// of the same name.
+    #[test]
+    fn a_default_database_tree_does_not_apply_in_another_database() {
+        let db = DatabaseId::new(7);
+        let cache = cache_with_tree("events");
+        let mut tasks = vec![task_in(db, columnar_scan_in(db, "events"))];
+        let before = tasks[0].plan.clone();
+
+        super::inject_permission_tree(&mut tasks, &cache, &regular_auth()).expect("inject");
+
+        assert_eq!(tasks[0].plan, before);
+    }
+
+    /// A collection name not qualified for the task's database is refused
+    /// rather than resolved in another database.
+    #[test]
+    fn a_name_qualified_for_another_database_is_refused() {
+        let cache = cache_with_tree_in(DatabaseId::new(7), "events");
+        let mut tasks = vec![task_in(
+            DatabaseId::new(7),
+            columnar_scan_in(DatabaseId::new(8), "events"),
+        )];
+        assert!(super::inject_permission_tree(&mut tasks, &cache, &regular_auth()).is_err());
     }
 }

@@ -2,11 +2,9 @@
 
 //! Protocol-neutral `CREATE API KEY` handler.
 //!
-//! Ported from the pgwire `ddl::apikey::create_api_key` handler. The
-//! permission checks, owner-subset validation, key preparation, catalog
+//! The permission checks, owner-subset validation, key preparation, catalog
 //! propose / single-node fallback, `install_replicated_key`, and `audit_record`
-//! side effects are preserved verbatim; only the result construction changed
-//! from pgwire `Response` / `QueryResponse` to the protocol-neutral
+//! side effects run here. The result is the protocol-neutral
 //! [`DdlResult`] over [`ShapedRows`].
 
 use serde_json::{Map, Value as JsonValue};
@@ -25,7 +23,7 @@ use super::parse::{
 /// CREATE API KEY FOR <user> [EXPIRES <seconds>] [WITH SCOPES ...] [WITH DATABASES (db1, db2)]
 ///
 /// Returns the full API key (shown once). Requires admin or self.
-pub fn create_api_key(
+pub async fn create_api_key(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -124,15 +122,9 @@ pub fn create_api_key(
                 accessible_databases,
             });
     let entry = crate::control::catalog_entry::CatalogEntry::PutApiKey(Box::new(stored.clone()));
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        let catalog = state.credentials.catalog();
-        catalog
-            .put_api_key(&stored)
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        state.api_keys.install_replicated_key(&stored);
-    }
 
     state.audit_record(
         AuditEvent::PrivilegeChange,

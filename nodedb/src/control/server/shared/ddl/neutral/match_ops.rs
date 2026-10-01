@@ -6,7 +6,7 @@
 //! The handler builds [`DdlResult`](super::super::result::DdlResult) directly
 //! and carries no pgwire types. It is dispatched from the neutral router's typed
 //! `GraphStmt::MatchQuery` arm, but re-parses the raw `sql` with the graph
-//! pattern compiler (as the pgwire handler did) to build the physical plan.
+//! pattern compiler to build the physical plan.
 
 use serde_json::{Map, Value as JsonValue};
 
@@ -15,7 +15,7 @@ use crate::control::server::graph_dispatch;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec;
-use crate::types::{DatabaseId, TraceId, TxnId};
+use crate::types::{DatabaseId, TraceId};
 use nodedb_physical::physical_plan::GraphOp;
 
 use super::super::result::{DdlError, DdlResult};
@@ -27,14 +27,14 @@ use super::refuse_gate::RefusingReadGate;
 /// time.
 const MATCH_WHAT: &str = "a pattern match, which returns bindings over graph topology";
 
-/// Returned when a MATCH could not be fully resolved within its expansion
+/// Returned when a MATCH cannot be fully resolved within its expansion
 /// budget — either the cross-shard hop rounds or the variable-length paging
 /// rounds were exhausted with work still pending, or a single-node
 /// variable-length expansion hit its hard cap with no coordinator to drain it.
-/// The result set would be INCOMPLETE, so it is surfaced as a fail-closed error
+/// The result set will be INCOMPLETE, so it is surfaced as a fail-closed error
 /// (SQLSTATE 54001, `program_limit_exceeded`) rather than silently returning a
 /// truncated result the client cannot distinguish from a complete one.
-const MATCH_INCOMPLETE_MESSAGE: &str = "MATCH result incomplete: the pattern exceeded the expansion budget; \
+pub(crate) const MATCH_INCOMPLETE_MESSAGE: &str = "MATCH result incomplete: the pattern exceeded the expansion budget; \
      narrow the pattern or its variable-length `*min..max` bound";
 
 /// Handle a MATCH query.
@@ -46,7 +46,7 @@ pub async fn match_query(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
-    txn_id: Option<TxnId>,
+    read: graph_dispatch::GraphRead,
 ) -> Result<Vec<DdlResult>, DdlError> {
     // Parse the MATCH query.
     let query = crate::engine::graph::pattern::compiler::parse(sql)
@@ -57,13 +57,13 @@ pub async fn match_query(
     // resolved here, on the pattern's own scope.
     //
     // A pattern scoped with `IN '<collection>'` asks the narrow question about
-    // that collection. An unscoped pattern may walk any collection the tenant
-    // holds, so the set it could touch is the set it must be granted: every
+    // that collection. An unscoped pattern can walk any collection the tenant
+    // holds, so the set it can touch is the set it must be granted: every
     // active collection of the database, failing closed on the first denial.
-    // Requiring an explicit `IN` instead would refuse the unscoped form for
+    // Requiring an explicit `IN` instead will refuse the unscoped form for
     // every caller, including one already granted everything the pattern can
-    // reach; this keeps that caller's behavior exactly as it was and refuses
-    // only the caller who would otherwise walk a collection it cannot read.
+    // reach; this keeps that caller's behavior and refuses
+    // only the caller who will otherwise walk a collection it cannot read.
     // The RLS half mirrors it: the narrow question when the pattern names a
     // collection, the tenant-wide one when it names none.
     let gate = RefusingReadGate::for_request(state, identity, database_id);
@@ -144,7 +144,7 @@ pub async fn match_query(
     // Both dispatch shapes below send the same query bytes, so the refusal is
     // applied here, once, before either runs. `query.collection` is already
     // parsed, so the scoped check is used directly rather than re-decoding
-    // `query_bytes` back into a `MatchQuery` just to read it again. The gate's
+    // `query_bytes` back into a `MatchQuery` only to read it again. The gate's
     // own scope is reused so the redaction refusal, the RBAC check, and the RLS
     // refusal all resolve against the same principal.
     crate::control::planner::redaction_refusal::refuse_unredactable_graph_match_scoped(
@@ -173,7 +173,7 @@ pub async fn match_query(
             database_id,
             plan,
             TraceId::ZERO,
-            txn_id,
+            read,
         )
         .await
         {
@@ -207,7 +207,7 @@ pub async fn match_query(
         database_id,
         query_bytes,
         deadline_ms,
-        txn_id,
+        read,
     )
     .await
     {

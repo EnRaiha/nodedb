@@ -127,7 +127,7 @@ impl CoreLoop {
                 })
                 .collect()
         };
-        let new_count = self.kv_engine.batch_put(KvBatchPutParams {
+        let new_count = match self.kv_engine.batch_put(KvBatchPutParams {
             database_id: did,
             tenant_id: tid,
             collection,
@@ -135,7 +135,10 @@ impl CoreLoop {
             ttl_ms,
             now_ms,
             surrogates,
-        });
+        }) {
+            Ok(count) => count,
+            Err(e) => return self.response_error(task, e),
+        };
         // One write event per entry: a batch INSERT fires the same row
         // triggers as the single-row form.
         for ((key, value), prior) in entries.iter().zip(&priors) {

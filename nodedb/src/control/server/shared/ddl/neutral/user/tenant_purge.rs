@@ -15,7 +15,7 @@ use super::reassign_owned::{propose, sweep_grants};
 /// Purge every object owned by the tenant administrator during `DROP TENANT`,
 /// returning the number of owned objects deleted so the caller can record an
 /// accurate audit trail for the destructive teardown.
-pub(super) fn purge_owned_for_tenant_teardown(
+pub(super) async fn purge_owned_for_tenant_teardown(
     state: &SharedState,
     username: &str,
     tenant: TenantId,
@@ -41,72 +41,25 @@ pub(super) fn purge_owned_for_tenant_teardown(
                 tenant,
                 crate::types::DatabaseId::new(owner.database_id),
                 &owner.object_name,
-            )?;
+            )
+            .await?;
             purge_collection_redaction_policies(
                 state,
                 catalog,
                 tenant,
                 crate::types::DatabaseId::new(owner.database_id),
                 &owner.object_name,
-            )?;
+            )
+            .await?;
         }
         let entry = teardown_delete_entry(kind, tenant, &owner);
-        let outcome = propose(state, &entry)?;
-        crate::control::catalog_entry::apply::local::apply_locally_if_needed(
-            state, &entry, outcome,
-        );
-        // A `PurgeCollection` apply only deactivates the catalog row — the
-        // durable owner/collection deletion and storage reclaim are the
-        // post-apply half. On the clustered path the metadata applier schedules
-        // that reclaim on every node; on the local-only path there is no
-        // applier, so drive the same reclaim `drop.rs` runs inline. Without
-        // this the teardown leaves the owner row and never reclaims the
-        // collection's storage. Other owner kinds delete fully in their apply.
-        if kind == OwnerKind::Collection && outcome.needs_local_apply() {
-            let purge_lsn = state.wal.next_lsn().as_u64();
-            let reclaim = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(
-                    crate::control::server::shared::ddl::neutral::collection::purge::hard_purge_collection(
-                        state,
-                        owner.database_id,
-                        tenant.as_u64(),
-                        &owner.object_name,
-                        purge_lsn,
-                        false,
-                    ),
-                )
-            });
-            reclaim.map_err(|failure| {
-                DdlError::from_error_in_context(
-                    &format!(
-                        "tenant teardown collection reclaim failed for '{}'",
-                        owner.object_name
-                    ),
-                    &failure.error,
-                )
-            })?;
-        }
-        if outcome.needs_local_apply() {
-            if kind == OwnerKind::StreamingMaterializedView {
-                state.mv_registry.unregister(
-                    crate::types::DatabaseId::new(owner.database_id),
-                    tenant.as_u64(),
-                    &owner.object_name,
-                );
-            }
-            state.permissions.install_replicated_remove_owner(
-                &owner.object_type,
-                owner.database_id,
-                tenant.as_u64(),
-                &owner.object_name,
-            );
-        }
+        propose(state, &entry).await?;
     }
-    sweep_grants(state, catalog, username)?;
+    sweep_grants(state, catalog, username).await?;
     Ok(purged)
 }
 
-fn purge_collection_rls_policies(
+async fn purge_collection_rls_policies(
     state: &SharedState,
     catalog: &SystemCatalog,
     tenant: TenantId,
@@ -130,27 +83,17 @@ fn purge_collection_rls_policies(
             collection: qualified_collection.clone(),
             name: policy.name.clone(),
         };
-        let outcome = propose(state, &entry)?;
-        crate::control::catalog_entry::apply::local::apply_locally_if_needed(
-            state, &entry, outcome,
-        );
-        if outcome.needs_local_apply() {
-            state.rls.install_replicated_drop_policy(
-                tenant_id,
-                &qualified_collection,
-                &policy.name,
-            );
-        }
+        propose(state, &entry).await?;
     }
     Ok(())
 }
 
 /// Delete every column-redaction policy bound to `collection`.
 ///
-/// The twin of [`purge_collection_rls_policies`]: a policy left behind would
+/// The twin of [`purge_collection_rls_policies`]: a policy left behind will
 /// resurrect against a collection later re-created under the same name, since
 /// its key carries no collection generation.
-fn purge_collection_redaction_policies(
+async fn purge_collection_redaction_policies(
     state: &SharedState,
     catalog: &SystemCatalog,
     tenant: TenantId,
@@ -175,17 +118,7 @@ fn purge_collection_redaction_policies(
             collection: qualified_collection.clone(),
             for_role: for_role.clone(),
         };
-        let outcome = propose(state, &entry)?;
-        crate::control::catalog_entry::apply::local::apply_locally_if_needed(
-            state, &entry, outcome,
-        );
-        if outcome.needs_local_apply() {
-            state.redaction.install_replicated_drop_policy(
-                tenant_id,
-                &qualified_collection,
-                &for_role,
-            );
-        }
+        propose(state, &entry).await?;
     }
     Ok(())
 }
@@ -251,6 +184,7 @@ fn teardown_delete_entry(kind: OwnerKind, tenant: TenantId, owner: &StoredOwner)
             database_id: owner.database_id,
             tenant_id,
             name,
+            target_hlc: nodedb_types::Hlc::ZERO,
         },
         OwnerKind::ContinuousAggregate => CatalogEntry::DeleteContinuousAggregate {
             database_id: owner.database_id,

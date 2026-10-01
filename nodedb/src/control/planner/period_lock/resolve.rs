@@ -112,7 +112,7 @@ pub async fn resolve_period_lock_targets(
         }
 
         // `PointUpdate` carries field assignments rather than a whole row, and
-        // it may rewrite the period column itself — both images need their own
+        // it can rewrite the period column itself — both images need their own
         // resolution, distinctly from the single-value path below.
         if let DocumentOp::PointUpdate {
             document_id,
@@ -122,11 +122,15 @@ pub async fn resolve_period_lock_targets(
             ..
         } = op
         {
+            // A key unbound in its database names no row to rewrite.
+            let Some(surrogate) = *surrogate else {
+                continue;
+            };
             let resolved = resolve_update_period_values(
                 &scope,
                 &collection,
                 document_id,
-                *surrogate,
+                surrogate,
                 updates,
                 &def,
             )
@@ -242,7 +246,7 @@ pub async fn resolve_period_lock_targets_for_bodies(
 /// The gate an orchestrator checks FIRST, alongside
 /// [`source_drives_bindings`](crate::control::planner::materialized_sum::source_drives_bindings):
 /// a target with neither a materialized-sum binding nor a period lock skips
-/// the RESOLVE round trip its statement would otherwise pay for nothing.
+/// the RESOLVE round trip its statement will otherwise pay for nothing.
 pub fn target_declares_period_lock(
     state: &SharedState,
     target_collection: &str,

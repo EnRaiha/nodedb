@@ -5,6 +5,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
@@ -18,7 +19,21 @@ use super::inbound::{InboundCtx, handle_frame};
 use super::outbound::{pump_deliveries, register_channels};
 
 /// Handle one sync session with full RLS, audit, DLQ wired in.
-pub(in crate::control::server::sync) async fn handle_sync_session(
+///
+/// The session future is boxed, once per connection. Every frame path nests
+/// inside it, and unboxed it can overflow the compiler's layout depth limit
+/// in the listener's connection task.
+pub(in crate::control::server::sync) fn handle_sync_session(
+    ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    addr: SocketAddr,
+    session_id: String,
+    state: &SyncListenerState,
+    shared: Option<Arc<SharedState>>,
+) -> BoxFuture<'_, ()> {
+    Box::pin(run_sync_session(ws, addr, session_id, state, shared))
+}
+
+async fn run_sync_session(
     mut ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     addr: SocketAddr,
     session_id: String,
@@ -46,7 +61,7 @@ pub(in crate::control::server::sync) async fn handle_sync_session(
         }
 
         // Await the next inbound message OR a definition-sync frame, whichever
-        // arrives first.  Without this select! the handler would block on
+        // arrives first.  Without this select! the handler will block on
         // ws.next() indefinitely when no client traffic is expected, starving
         // the server-push delivery path.
         let msg_result = if let Some(ref mut rx) = channels.definition_sync_rx {

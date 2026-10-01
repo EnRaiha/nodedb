@@ -36,6 +36,7 @@ mod stage_kv_predicate;
 mod stage_kv_transfer;
 mod stage_kv_ttl;
 mod stage_point_document;
+mod stage_returning;
 mod stage_rls;
 mod stage_spatial;
 mod stage_timeseries;
@@ -47,6 +48,7 @@ mod stage_vector;
 mod stage_vector_targets;
 
 pub(in crate::data::executor) use body::stored_row_identity;
+pub(in crate::data::executor) use constraint::StagedStatement;
 pub(in crate::data::executor) use context::StageCtx;
 pub(in crate::data::executor) use stage_bulk_delete::StageBulkDeleteParams;
 pub(in crate::data::executor) use stage_bulk_update::StageBulkUpdateParams;

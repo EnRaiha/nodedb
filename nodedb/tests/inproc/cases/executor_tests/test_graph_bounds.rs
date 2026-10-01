@@ -28,8 +28,8 @@ fn graph_traversal_bounded_under_adversarial_queries() {
                 label: "LINKS".into(),
                 dst_id: format!("n{i}"),
                 properties: vec![],
-                src_surrogate: nodedb_types::Surrogate::ZERO,
-                dst_surrogate: nodedb_types::Surrogate::ZERO,
+                src_surrogate: doc_surrogate("hub"),
+                dst_surrogate: doc_surrogate(&format!("n{i}")),
             }),
         );
     }
@@ -46,8 +46,8 @@ fn graph_traversal_bounded_under_adversarial_queries() {
                 label: "NEXT".into(),
                 dst_id: format!("c{}", i + 1),
                 properties: vec![],
-                src_surrogate: nodedb_types::Surrogate::ZERO,
-                dst_surrogate: nodedb_types::Surrogate::ZERO,
+                src_surrogate: doc_surrogate(&format!("c{i}")),
+                dst_surrogate: doc_surrogate(&format!("c{}", i + 1)),
             }),
         );
     }

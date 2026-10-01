@@ -42,20 +42,17 @@ pub(super) async fn try_string(
     txn_ctx: &DmlTxnCtx<'_>,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     // Engine-ops SQL functions and DDL. None of these are dispatched from a
-    // typed AST arm — the pgwire engine_ops router recognized all of them by
-    // string prefix from the raw SQL (these keywords do not appear in the DDL
-    // AST grammar, so `ddl_ast::parse` returns `None` for them). Replicate that
-    // exactly here, before the parse gate, so the prefix recognition, guard
-    // ordering, and syntax messages stay byte-identical. The three vector
+    // typed AST arm — the router recognizes all of them by string prefix from
+    // the raw SQL, before the parse gate (these keywords do not appear in the
+    // DDL AST grammar, so `ddl_ast::parse` returns `None` for them). The three vector
     // model / metadata forms (`ALTER COLLECTION … SET VECTOR METADATA ON`,
     // `SHOW VECTOR MODELS`, `SELECT VECTOR_METADATA(…)`) are routed by the
     // string-prefix arms above (alongside the vector-index lifecycle forms).
     //
     // `CREATE TIMESERIES` / `ALTER TIMESERIES` / `REWRITE PARTITIONS` are
     // routed here, but `SHOW PARTITIONS ` is intentionally NOT — it is already
-    // claimed by the consumer-group handler above (which ran before engine_ops
-    // on the pgwire path too), so the timeseries `show_partitions` handler stays
-    // shadowed exactly as it was.
+    // claimed by the consumer-group handler above, so the timeseries
+    // `show_partitions` handler stays shadowed.
 
     // Weighted random selection — anchored to the statement prefix so a
     // doc-object UPSERT body carrying the token never reaches this arm.
@@ -144,16 +141,11 @@ pub(super) async fn try_string(
     // (SHOW PARTITIONS is shadowed by consumer_group above, as noted.)
     if upper.starts_with("CREATE TIMESERIES ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(timeseries::create_timeseries(
-            state,
-            identity,
-            &parts,
-            database_id,
-        ));
+        return Some(timeseries::create_timeseries(state, identity, &parts, database_id).await);
     }
     if upper.starts_with("ALTER TIMESERIES ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(timeseries::alter_timeseries(state, identity, &parts));
+        return Some(timeseries::alter_timeseries(state, identity, &parts).await);
     }
     if upper.starts_with("REWRITE PARTITIONS ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
@@ -181,12 +173,10 @@ pub(super) async fn try_string(
 
     // Materialized views (HTAP). `REFRESH MATERIALIZED VIEW` parses into no typed
     // AST variant, and `SHOW MATERIALIZED VIEWS` parses into a typed
-    // `StreamViewStmt::ShowMaterializedViews` but the pgwire admin router
-    // dispatched it from the raw token slice by string prefix (the `SHOW
+    // `StreamViewStmt::ShowMaterializedViews` but the router dispatches it from
+    // the raw token slice by string prefix, before the parse gate (the `SHOW
     // MATERIALIZED VIEW` prefix, trailing-space-less, captures both the plural
-    // `SHOW MATERIALIZED VIEWS` and the bare-singular input). Replicate both here,
-    // before the parse gate, so the prefix recognition and the `parts`-based name
-    // extraction stay byte-identical. `CREATE` / `DROP MATERIALIZED VIEW` are
+    // `SHOW MATERIALIZED VIEWS` and the bare-singular input). `CREATE` / `DROP MATERIALIZED VIEW` are
     // handled in the typed match below (they parse into typed StreamView variants).
     if upper.starts_with("REFRESH MATERIALIZED VIEW") {
         return Some(
@@ -205,12 +195,10 @@ pub(super) async fn try_string(
 
     // Continuous aggregates (timeseries). `SHOW CONTINUOUS AGGREGATES [FOR
     // <source>]` parses into a typed `StreamViewStmt::ShowContinuousAggregates`
-    // but the pgwire admin router dispatched it from the raw token slice by
-    // string prefix (the `SHOW CONTINUOUS AGGREGATE` prefix, trailing-space-less,
-    // captures both the plural `SHOW CONTINUOUS AGGREGATES` and the bare-singular
-    // input). Replicate that here, before the parse gate, so the prefix
-    // recognition and the `parts`-based `FOR <source>` extraction stay
-    // byte-identical. `CREATE` / `DROP CONTINUOUS AGGREGATE` are handled in the
+    // but the router dispatches it from the raw token slice by string prefix,
+    // before the parse gate (the `SHOW CONTINUOUS AGGREGATE` prefix,
+    // trailing-space-less, captures both the plural `SHOW CONTINUOUS
+    // AGGREGATES` and the bare-singular input). `CREATE` / `DROP CONTINUOUS AGGREGATE` are handled in the
     // typed match below (they parse into typed StreamView variants).
     if upper.starts_with("SHOW CONTINUOUS AGGREGATE") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
@@ -220,12 +208,10 @@ pub(super) async fn try_string(
     }
 
     // CONVERT COLLECTION between storage modes. `CONVERT COLLECTION <name> TO
-    // <target>` parses into no typed AST variant — the pgwire admin router
-    // dispatched it by string prefix from the raw SQL. Replicate that exactly
-    // here, before the parse gate, so the prefix recognition (the
+    // <target>` parses into no typed AST variant — the router dispatches it by
+    // string prefix from the raw SQL, before the parse gate (the
     // `CONVERT COLLECTION ` form plus the broader `CONVERT ... TO ...` form, in
-    // that `||`/`&&` precedence) and the parse / syntax messages stay
-    // byte-identical.
+    // that `||`/`&&` precedence).
     if upper.starts_with("CONVERT COLLECTION ")
         || upper.starts_with("CONVERT ") && upper.contains(" TO ")
     {
@@ -233,13 +219,11 @@ pub(super) async fn try_string(
     }
 
     // Retention policies (timeseries). `SHOW RETENTION POLICIES` parses into a
-    // typed `PolicyStmt::ShowRetentionPolicies`, but the pgwire admin router
-    // dispatched it from the raw token slice by the `SHOW RETENTION POLIC`
-    // prefix (trailing-space-less, captures both the plural `SHOW RETENTION
+    // typed `PolicyStmt::ShowRetentionPolicies`, but the router dispatches it
+    // from the raw token slice by the `SHOW RETENTION POLIC` prefix, before the
+    // parse gate (trailing-space-less, captures both the plural `SHOW RETENTION
     // POLICIES` and the singular `SHOW RETENTION POLICY ON <collection>`).
-    // Replicate that exactly here, before the parse gate, so the prefix
-    // recognition and the `parts`-based `ON <collection>` filter stay
-    // byte-identical. `CREATE` / `ALTER` / `DROP RETENTION POLICY` are handled in
+    // `CREATE` / `ALTER` / `DROP RETENTION POLICY` are handled in
     // the typed match below (they parse into typed Policy variants).
     if upper.starts_with("SHOW RETENTION POLIC") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
@@ -252,15 +236,23 @@ pub(super) async fn try_string(
     }
 
     // DSL extensions (custom SQL-like surfaces). None of these are dispatched
-    // from a typed AST arm — the pgwire dsl router recognized all six by string
-    // prefix from the raw SQL. Replicate that exactly here, before the parse
-    // gate, so the prefix recognition and syntax messages stay byte-identical.
-    // `SEARCH ... USING FUSION` must precede the parse gate because it would
+    // from a typed AST arm — the router recognizes all six by string
+    // prefix from the raw SQL, before the parse gate.
+    // `SEARCH ... USING FUSION` must precede the parse gate because it will
     // otherwise parse into a typed graph statement and be captured by the graph
     // dispatch below. `SEARCH ... USING VECTOR(...)` never reaches here — it is
     // preprocessor-rewritten to a canonical `SELECT ... vector_distance(...)`.
     if upper.starts_with("SEARCH ") && upper.contains("USING FUSION") {
-        return Some(dsl::search_fusion(state, identity, database_id, sql).await);
+        return Some(
+            dsl::search_fusion(
+                state,
+                identity,
+                database_id,
+                sql,
+                txn_ctx.linearizable_reads(),
+            )
+            .await,
+        );
     }
     if upper.starts_with("CREATE VECTOR INDEX ") {
         return Some(dsl::create_vector_index(state, identity, database_id, sql).await);
@@ -272,18 +264,12 @@ pub(super) async fn try_string(
         return Some(dsl::create_search_index(state, identity, database_id, sql).await);
     }
     if upper.starts_with("CREATE SPARSE INDEX ") {
-        return Some(dsl::create_sparse_index(state, identity, database_id, sql));
+        return Some(dsl::create_sparse_index(state, identity, database_id, sql).await);
     }
-    // CREATE SPATIAL INDEX — string-recognized (no typed AST variant); the pgwire
-    // schema string router dispatched it from the raw SQL. Replicate that
-    // exactly here, before the parse gate.
+    // CREATE SPATIAL INDEX — string-recognized (no typed AST variant); the router
+    // dispatches it from the raw SQL, before the parse gate.
     if upper.starts_with("CREATE SPATIAL INDEX ") {
-        return Some(spatial::create_spatial_index(
-            state,
-            identity,
-            database_id,
-            sql,
-        ));
+        return Some(spatial::create_spatial_index(state, identity, database_id, sql).await);
     }
     if upper.starts_with("CRDT MERGE ") {
         if crdt_apply_forbidden_in_transaction(txn_ctx) {
@@ -293,9 +279,8 @@ pub(super) async fn try_string(
         return Some(dsl::crdt_merge(state, identity, database_id, &parts).await);
     }
     // `SELECT crdt_state(...)` / `SELECT crdt_apply(...)` CRDT DSL functions —
-    // string-recognized (they parse into no typed DDL variant). The pgwire dsl
-    // string router recognized both by prefix from the raw SQL; replicate that
-    // exactly here, before the parse gate.
+    // string-recognized (they parse into no typed DDL variant). The router
+    // recognizes both by prefix from the raw SQL, before the parse gate.
     if upper.starts_with("SELECT CRDT_STATE(") || upper.starts_with("SELECT CRDT_STATE (") {
         return Some(crdt_ops::crdt_state(state, identity, database_id, sql).await);
     }
@@ -333,18 +318,18 @@ pub(super) async fn try_string(
     // `DEFINE FIELD …` / `DEFINE EVENT …` / `REMOVE EVENT …` —
     // string-recognized (no typed DDL variant), before the parse gate.
     if upper.starts_with("DEFINE FIELD ") {
-        return Some(field_def::define_field(state, identity, database_id, sql));
+        return Some(field_def::define_field(state, identity, database_id, sql).await);
     }
     if upper.starts_with("DEFINE EVENT ") {
-        return Some(field_def::define_event(state, identity, database_id, sql));
+        return Some(field_def::define_event(state, identity, database_id, sql).await);
     }
     if upper.starts_with("REMOVE EVENT ") {
-        return Some(field_def::remove_event(state, identity, database_id, sql));
+        return Some(field_def::remove_event(state, identity, database_id, sql).await);
     }
 
     // `EXPLAIN TIERS ON <collection> [RANGE …]` — string-recognized (no typed
-    // DDL variant); the pgwire admin string router dispatched it from the raw
-    // token slice. Replicate that exactly here, before the parse gate.
+    // DDL variant); the router dispatches it from the raw token slice, before
+    // the parse gate.
     if upper.starts_with("EXPLAIN TIERS ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(explain_tiers::explain_tiers(

@@ -29,7 +29,9 @@ type HostRaftLoop = nodedb_cluster::RaftLoop<
     crate::control::LocalPlanExecutor,
 >;
 
-/// Async metadata proposer used only by durable bootstrap token state.
+/// Async metadata proposer used only by durable bootstrap token state. Every
+/// entry it proposes carries the leader's stamp, as the host's other
+/// proposals do.
 pub(crate) struct BootstrapMetadataProposer {
     raft_loop: Weak<HostRaftLoop>,
     watchers: Arc<GroupAppliedWatchers>,
@@ -57,7 +59,7 @@ impl nodedb_cluster::decommission::MetadataProposer for BootstrapMetadataPropose
             detail: format!("bootstrap metadata entry: {error}"),
         })?;
         let index = raft_loop
-            .propose_to_metadata_group_via_leader(bytes)
+            .propose_stamped_to_metadata_group_via_leader(bytes)
             .await?;
         let watchers = Arc::clone(&self.watchers);
         let outcome = tokio::task::spawn_blocking(move || {
@@ -281,7 +283,7 @@ impl<B: TokenStateBackend> BootstrapHandler for HostBootstrapHandler<B> {
                 .mark_consumed(&hash, remote_addr, lease, epoch_ms(), recovery_bundle)
                 .await
             {
-                // The proposal result is indeterminate: it may commit after the
+                // The proposal result is indeterminate: it can commit after the
                 // local apply wait times out. Keep the bounded preauthorization
                 // so a later retry can decrypt the Raft-persisted bundle and use
                 // the exact certificate whose token became Consumed.
@@ -318,9 +320,9 @@ impl<B: TokenStateBackend> BootstrapHandler for HostBootstrapHandler<B> {
         remote_addr: SocketAddr,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            // Credential bytes may already be observable when the delivery ACK
+            // Credential bytes can already be observable when the delivery ACK
             // is lost. Keep the bounded enrollment authorization alive until
-            // topology commit or certificate expiry; revoking here would
+            // topology commit or certificate expiry; revoking here will
             // strand a joiner whose token is already durably consumed.
             tracing::warn!(%remote_addr, "bootstrap delivery ACK missing; retaining bounded enrollment authorization");
         })

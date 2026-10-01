@@ -175,6 +175,7 @@ async fn server_main() -> anyhow::Result<()> {
         event_consumers,
         system_metrics,
         quiesce,
+        event_interest,
         array_catalog,
         quarantine_registry,
         maintenance_budget,
@@ -197,12 +198,15 @@ async fn server_main() -> anyhow::Result<()> {
             governor,
             system_metrics: Arc::clone(&system_metrics),
             maintenance_budget,
-            cluster_handle: cluster_handle.as_deref(),
+            cluster_handle: &cluster_handle,
             startup_gate: &startup_gate,
             root_span: &root_span,
         },
     )
     .await?;
+    // Every registry that feeds an Event Plane consumer now exists. The
+    // cores read its consumed collections from here on.
+    event_interest.install(shared.event_interest_sources());
 
     post_open::run(
         &shared,
@@ -226,14 +230,15 @@ async fn server_main() -> anyhow::Result<()> {
         shutdown_rx.clone(),
         shutdown_bus.clone(),
         background::BackgroundLoopsInputs {
-            cluster_handle: cluster_handle.as_deref(),
+            cluster_handle: &cluster_handle,
             wal: Arc::clone(&wal),
             event_consumers,
             watermark_store,
             trigger_dlq,
             num_cores,
         },
-    )?;
+    )
+    .await?;
 
     let listeners::ListenerSetup {
         conn_semaphore,
@@ -246,7 +251,7 @@ async fn server_main() -> anyhow::Result<()> {
         &config,
         cluster_mode_str,
         &shutdown_bus,
-        cluster_handle.clone(),
+        Arc::clone(&cluster_handle),
     )
     .await?;
 

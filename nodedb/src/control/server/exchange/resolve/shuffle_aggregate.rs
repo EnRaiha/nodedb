@@ -25,7 +25,7 @@
 //!    per-group, so a plain concat is the correct finalize. Eligibility forbids a
 //!    global ORDER BY (per-part finalize can't honour a cross-part sort), so the
 //!    cap is order-free — the same arbitrary-but-bounded semantics Gather has with
-//!    no ORDER BY. Consumers receive NO per-part cap (that would silently drop
+//!    no ORDER BY. Consumers receive NO per-part cap (that will silently drop
 //!    rows per part); the cap is applied only here.
 //!
 //! # Plane discipline
@@ -50,10 +50,12 @@ use crate::control::cluster::warm_peers::register_peers_from_topology;
 use crate::control::server::exchange::gather::outcome_to_response;
 use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, Lsn, TenantId, TraceId};
+use crate::types::{DatabaseId, Lsn, TenantId};
 
 use super::exchange::Resolved;
-use super::peers::{distinct_data_node_count, producer_nodes, send_produce};
+use super::peers::{
+    ShuffleRead, distinct_data_node_count, producer_nodes, producer_read_groups, send_produce,
+};
 
 /// Orchestrate a distributed shuffle GROUP BY aggregate.
 ///
@@ -71,8 +73,12 @@ pub async fn resolve_shuffle_aggregate(
     child: PhysicalPlan,
     keys: Vec<String>,
     num_parts: usize,
-    trace_id: TraceId,
+    read: ShuffleRead,
 ) -> crate::Result<Resolved> {
+    let ShuffleRead {
+        trace_id,
+        linearizable,
+    } = read;
     // 1. The child MUST be a root Aggregate — shuffle-aggregate wraps a complete
     //    GROUP BY aggregate.
     let PhysicalPlan::Query(QueryOp::Aggregate {
@@ -103,7 +109,7 @@ pub async fn resolve_shuffle_aggregate(
         });
     }
     // A non-GROUP-BY (scalar) aggregate has a single global group; there is no
-    // key to repartition on, so a shuffle would be pointless. The planner emit
+    // key to repartition on, so a shuffle will be pointless. The planner emit
     // already gates on a non-empty GROUP BY, but reject here too for robustness.
     if group_by.is_empty() {
         return Err(crate::Error::Internal {
@@ -182,6 +188,12 @@ pub async fn resolve_shuffle_aggregate(
     // 4. Producer node set for the source collection (single-vShard-homed → one
     //    leader, but compute generally and dedup).
     let producers = producer_nodes(&routing_snapshot, database_id, collection.as_str())?;
+    let read_groups = producer_read_groups(
+        &routing_snapshot,
+        database_id,
+        collection.as_str(),
+        linearizable,
+    )?;
     let producer_count = producers.len() as u32;
     if producer_count == 0 {
         return Err(crate::Error::Internal {
@@ -190,7 +202,7 @@ pub async fn resolve_shuffle_aggregate(
     }
 
     // Ensure the transport knows every target node's address before dispatching.
-    // (See `register_peers_from_topology` — robust to a peer the transport has
+    // (See `register_peers_from_topology` — tolerant of a peer the transport has
     // not warmed yet.)
     {
         let mut targets: BTreeSet<u64> = BTreeSet::new();
@@ -240,6 +252,7 @@ pub async fn resolve_shuffle_aggregate(
             deadline_remaining_ms,
             trace_id: trace_id.0,
             descriptor_versions: Vec::<DescriptorVersionEntry>::new(),
+            read_groups: read_groups.clone(),
         };
         produce_futures.push(send_produce(transport, node, req));
     }
@@ -263,12 +276,12 @@ pub async fn resolve_shuffle_aggregate(
         })?;
     // Per-part consumers receive NO row cap: each must return ALL of its (disjoint)
     // groups so the coordinator can apply the aggregate's global result cap ONCE
-    // over the union. Pushing `limit` to each part would truncate parts
+    // over the union. Pushing `limit` to each part will truncate parts
     // independently — a silent per-part row drop, and a result that disagrees with
     // the single-node Gather path's GLOBAL cap. The cap is reapplied at step 8.
     // Post-aggregate ORDER BY is restricted to bare output columns by the
     // planner, which is what the shuffle wire form carries. A key that is not
-    // a column would have been rejected at plan time, so none reaches here.
+    // a column is rejected at plan time, so none reaches here.
     let wire_sort_keys: Vec<SortKey> = sort_keys
         .iter()
         .filter_map(|k| {
@@ -325,7 +338,7 @@ pub async fn resolve_shuffle_aggregate(
     // in-transaction distributed aggregate records a sound read-set entry (the
     // aggregate is single-collection, so `record_read_set` attributes it to the
     // right collection). The core-global `watermark_lsn` is NOT threaded through
-    // the shuffle transport and stays `ZERO`; using it as the read version would
+    // the shuffle transport and stays `ZERO`; using it as the read version will
     // skip required aborts (it advances on writes to ANY collection).
     Ok(Resolved::Gathered(
         outcome_to_response(merged, Lsn::ZERO, Lsn::new(max_read_version_lsn)),

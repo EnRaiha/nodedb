@@ -3,8 +3,8 @@
 //! Decode `ReplicatedWrite` variants that produce `PhysicalPlan::Crdt`.
 //!
 //! Every surrogate is rebuilt verbatim from the record; `entry.rs` binds the
-//! whole plan afterwards. A `CrdtApply` carrying `Surrogate::ZERO` (a record
-//! written before the surrogate field existed) allocates there, loudly.
+//! whole plan afterwards. A `CrdtApply` carrying `Surrogate::ZERO` is refused
+//! there: every apply carries the surrogate its coordinator bound.
 
 use super::super::decode_sync_engines;
 use super::super::types::ConstraintChangeOp;
@@ -25,8 +25,7 @@ pub(super) struct ApplyArgs<'a> {
     pub(super) delta_signature: [u8; 32],
     pub(super) signing_required: bool,
     pub(super) authenticated: bool,
-    /// Leader-assigned surrogate carried on the wire. `Surrogate::ZERO`
-    /// means a record written before the surrogate field existed.
+    /// Leader-assigned surrogate carried on the wire.
     pub(super) carried_surrogate: u32,
 }
 
@@ -173,20 +172,20 @@ pub(super) fn list_move(
 
 /// Reconstruct `CrdtOp::DocDelete` from its wire intent. The row's own
 /// top-level `surrogate` is carried across the wire and rebuilt via
-/// `Surrogate::new`.
+/// `Surrogate::new`. `None`: the key is unbound, so no row matches.
 pub(super) fn doc_delete(
     collection: &str,
     document_id: &str,
-    surrogate: u32,
+    surrogate: Option<u32>,
     returning: Option<ReturningSpec>,
     rls_filters: &[u8],
 ) -> PhysicalPlan {
     PhysicalPlan::Crdt(CrdtOp::DocDelete {
         collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         document_id: document_id.to_owned(),
-        surrogate: nodedb_types::Surrogate::new(surrogate),
+        surrogate: surrogate.map(nodedb_types::Surrogate::new),
         // Carried on the record — a replay re-executes this write for the
-        // originating request, not just for the follower's own state.
+        // originating request, not only for the follower's own state.
         returning,
         rls_filters: rls_filters.to_vec(),
     })
@@ -238,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn crdt_apply_legacy_and_fenced_wire_compatibility() {
+    fn crdt_apply_fenced_and_unfenced_wire_shapes() {
         let tenant = TenantId::new(1);
         let vshard = VShardId::new(0);
         let prov = SyncProvenance {
@@ -255,7 +254,7 @@ mod tests {
             delta: vec![0xDE, 0xAD],
             peer_id: 7,
             mutation_id: 0,
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(11),
             provenance: Some(prov.clone()),
             constraint_version_required: 42,
             expected_frontier_digest: Some([42; 32]),
@@ -268,9 +267,9 @@ mod tests {
             ReplicatedWrite::CrdtApplyFenced { .. }
         ));
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Crdt(CrdtOp::Apply {
                 provenance,
@@ -296,39 +295,39 @@ mod tests {
             other => panic!("expected CrdtApply, got {other:?}"),
         }
 
-        // Legacy positional bytes must still decode with no fence.
-        let legacy = ReplicatedEntry::new(
+        // An apply with no provenance encodes as the unfenced shape and
+        // decodes with no fence.
+        let unfenced = ReplicatedEntry::new(
             tenant.as_u64(),
             DatabaseId::DEFAULT.as_u64(),
             vshard.as_u32(),
             ReplicatedWrite::CrdtApply {
                 collection: "docs".into(),
-                document_id: "doc-legacy".into(),
+                document_id: "doc-unfenced".into(),
                 delta: vec![0xBE, 0xEF],
                 peer_id: 8,
                 provenance: None,
                 constraint_version_required: 0,
-                // Pre-migration shape: no surrogate ever assigned.
-                surrogate: 0,
+                surrogate: 12,
             },
         );
-        let legacy_bytes = legacy.to_bytes();
-        let (_, _, decoded_legacy, _) = decode::from_replicated_entry(&legacy_bytes, None)
-            .expect("legacy CrdtApply must decode")
-            .expect("legacy CrdtApply must produce a plan");
-        match decoded_legacy {
+        let unfenced_bytes = unfenced.to_bytes();
+        let (_, _, decoded_unfenced, _) = decode::decode_replicated_entry(&unfenced_bytes)
+            .expect("unfenced CrdtApply must decode")
+            .expect("unfenced CrdtApply must produce a plan");
+        match decoded_unfenced {
             PhysicalPlan::Crdt(CrdtOp::Apply {
                 provenance,
                 expected_frontier_digest,
                 ..
             }) => {
-                assert_eq!(provenance, None, "legacy provenance should remain absent");
+                assert_eq!(provenance, None, "unfenced provenance should remain absent");
                 assert_eq!(
                     expected_frontier_digest, None,
-                    "legacy CrdtApply must decode without a frontier fence"
+                    "unfenced CrdtApply must decode without a frontier fence"
                 );
             }
-            other => panic!("expected legacy CrdtApply, got {other:?}"),
+            other => panic!("expected unfenced CrdtApply, got {other:?}"),
         }
     }
 
@@ -343,15 +342,15 @@ mod tests {
             list_path: "blocks".into(),
             index: 2,
             fields_json: r#"{"type":"text"}"#.into(),
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
         });
         let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
             .expect("encode must not error")
             .expect("CrdtOp::ListInsert should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Crdt(CrdtOp::ListInsert {
                 collection,
@@ -381,15 +380,15 @@ mod tests {
             document_id: "doc-1".into(),
             list_path: "blocks".into(),
             index: 5,
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
         });
         let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
             .expect("encode must not error")
             .expect("CrdtOp::ListDelete should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Crdt(CrdtOp::ListDelete {
                 collection,
@@ -420,15 +419,15 @@ mod tests {
             list_path: "blocks".into(),
             from_index: 3,
             to_index: 1,
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
         });
         let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
             .expect("encode must not error")
             .expect("CrdtOp::ListMove should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Crdt(CrdtOp::ListMove {
                 collection,
@@ -468,8 +467,8 @@ mod tests {
             },
         );
         let bytes = entry.to_bytes();
-        let (_, _, plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
+        let (_, _, plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
             .expect("ConstraintChange(Set) must decode to a plan");
         match plan {
             PhysicalPlan::Crdt(CrdtOp::SetConstraints {
@@ -500,8 +499,8 @@ mod tests {
             },
         );
         let bytes = entry.to_bytes();
-        let (_, _, plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
+        let (_, _, plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
             .expect("ConstraintChange(Drop) must decode to a plan");
         match plan {
             PhysicalPlan::Crdt(CrdtOp::DropConstraints {
@@ -529,9 +528,9 @@ mod tests {
             .expect("encode must not error")
             .expect("CrdtOp::SetConstraints should replicate as a ConstraintChange");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Crdt(CrdtOp::SetConstraints {
                 collection,
@@ -559,9 +558,9 @@ mod tests {
             .expect("encode must not error")
             .expect("CrdtOp::DropConstraints should replicate as a ConstraintChange");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Crdt(CrdtOp::DropConstraints {
                 collection,
@@ -597,9 +596,9 @@ mod tests {
             .expect("encode must not error")
             .expect("CrdtOp::DocUpsert should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Crdt(CrdtOp::DocUpsert {
                 returning,
@@ -647,14 +646,14 @@ mod tests {
     /// `CrdtOp::Apply` decode binds the carried surrogate (first-wins), never
     /// re-derives via the local allocator. Advances the local allocator past
     /// the carried value first, so a divergent fresh `assign()` is distinguishable.
-    #[test]
-    fn crdt_apply_binds_carried_surrogate_not_fresh_allocation() {
+    #[tokio::test]
+    async fn crdt_apply_binds_carried_surrogate_not_fresh_allocation() {
         let tenant = TenantId::new(1);
         let vshard = VShardId::new(0);
         let (_dir, assigner) = open_test_assigner();
 
         // Burn local allocations on unrelated keys so a fresh assign() for
-        // "doc-1" would diverge from the leader-carried value below.
+        // "doc-1" diverges from the leader-carried value below.
         for i in 0..5 {
             assigner
                 .assign(
@@ -662,6 +661,7 @@ mod tests {
                     tenant,
                     format!("burn-{i}").as_bytes(),
                 )
+                .await
                 .expect("burn allocation");
         }
 
@@ -682,7 +682,7 @@ mod tests {
             .expect("CrdtOp::Apply should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
 
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, Some(&assigner))
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, &assigner)
             .expect("from_replicated_entry error")
             .expect("from_replicated_entry returned None");
         match decoded_plan {
@@ -697,7 +697,7 @@ mod tests {
 
         // A second decode of the same entry (replay/retry) must return the
         // identical value, never re-allocate or overwrite.
-        let (_, _, decoded_again, _) = decode::from_replicated_entry(&bytes, Some(&assigner))
+        let (_, _, decoded_again, _) = decode::from_replicated_entry(&bytes, &assigner)
             .expect("from_replicated_entry error")
             .expect("from_replicated_entry returned None");
         match decoded_again {
@@ -712,7 +712,7 @@ mod tests {
 
         assert_eq!(
             assigner
-                .lookup(
+                .lookup_bound(
                     nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "docs"),
                     tenant,
                     b"doc-1"
@@ -723,22 +723,22 @@ mod tests {
         );
     }
 
-    /// A pre-migration `CrdtApply` entry (`surrogate: 0`) has no leader value to
-    /// bind. Decode must resolve via the local allocator, never propagate
-    /// `Surrogate::ZERO` into a fresh document row.
+    /// A `CrdtApply` entry that carries `surrogate: 0` has no coordinator value
+    /// to bind. Decode refuses it instead of allocating a local identity that
+    /// diverges across replicas, and installs nothing in the catalog.
     #[test]
-    fn crdt_apply_legacy_no_surrogate_falls_back_to_local_assign() {
+    fn crdt_apply_without_surrogate_is_refused_not_allocated() {
         let tenant = TenantId::new(1);
         let vshard = VShardId::new(0);
         let (_dir, assigner) = open_test_assigner();
 
-        let legacy = ReplicatedEntry::new(
+        let unbound = ReplicatedEntry::new(
             tenant.as_u64(),
             DatabaseId::DEFAULT.as_u64(),
             vshard.as_u32(),
             ReplicatedWrite::CrdtApply {
                 collection: "docs".into(),
-                document_id: "doc-legacy-2".into(),
+                document_id: "doc-unbound".into(),
                 delta: vec![0x01],
                 peer_id: 3,
                 provenance: None,
@@ -746,20 +746,22 @@ mod tests {
                 surrogate: 0,
             },
         );
-        let bytes = legacy.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, Some(&assigner))
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
-        match decoded_plan {
-            PhysicalPlan::Crdt(CrdtOp::Apply { surrogate, .. }) => {
-                assert_ne!(
-                    surrogate,
-                    Surrogate::ZERO,
-                    "the legacy fallback must still allocate a real identity, not ZERO"
-                );
-            }
-            other => panic!("expected Crdt(Apply), got {other:?}"),
-        }
+        let result = decode::from_replicated_entry(&unbound.to_bytes(), &assigner);
+        assert!(
+            result.is_err(),
+            "a CRDT apply without a surrogate must be refused, got {result:?}"
+        );
+        assert_eq!(
+            assigner
+                .lookup_bound(
+                    nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "docs"),
+                    tenant,
+                    b"doc-unbound"
+                )
+                .expect("catalog lookup"),
+            None,
+            "a refused apply must not install an identity"
+        );
     }
 
     /// `CrdtOp::ListInsert` / `ListDelete` / `ListMove` carry the parent
@@ -783,10 +785,9 @@ mod tests {
         let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &insert_plan)
             .expect("encode must not error")
             .expect("CrdtOp::ListInsert should produce a ReplicatedEntry");
-        let (_, _, decoded_plan, _) =
-            decode::from_replicated_entry(&entry.to_bytes(), Some(&assigner))
-                .expect("from_replicated_entry error")
-                .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&entry.to_bytes(), &assigner)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
         let parent_surrogate = match decoded_plan {
             PhysicalPlan::Crdt(CrdtOp::ListInsert { surrogate, .. }) => {
                 assert_eq!(
@@ -808,10 +809,9 @@ mod tests {
         let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &delete_plan)
             .expect("encode must not error")
             .expect("CrdtOp::ListDelete should produce a ReplicatedEntry");
-        let (_, _, decoded_plan, _) =
-            decode::from_replicated_entry(&entry.to_bytes(), Some(&assigner))
-                .expect("from_replicated_entry error")
-                .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&entry.to_bytes(), &assigner)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Crdt(CrdtOp::ListDelete { surrogate, .. }) => {
                 assert_eq!(
@@ -833,10 +833,9 @@ mod tests {
         let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &move_plan)
             .expect("encode must not error")
             .expect("CrdtOp::ListMove should produce a ReplicatedEntry");
-        let (_, _, decoded_plan, _) =
-            decode::from_replicated_entry(&entry.to_bytes(), Some(&assigner))
-                .expect("from_replicated_entry error")
-                .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&entry.to_bytes(), &assigner)
+            .expect("from_replicated_entry error")
+            .expect("from_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Crdt(CrdtOp::ListMove { surrogate, .. }) => {
                 assert_eq!(

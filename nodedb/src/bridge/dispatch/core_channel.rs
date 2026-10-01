@@ -14,6 +14,7 @@ use crate::data::eventfd::EventFdNotifier;
 use crate::types::Lsn;
 
 use super::dispatcher::{BridgeRequest, BridgeResponse};
+use super::journal::{JournalGroup, WriteSetJournal};
 
 /// A pair of SPSC channels for one Data Plane core, augmented with a
 /// weighted-fair staging queue that enforces per-database fairness before
@@ -66,6 +67,14 @@ pub struct CoreChannel {
     /// the core whose set holds its id; no separate request→core map is
     /// needed.
     pub outstanding: HashSet<u64>,
+
+    /// The record group of each queued request that journals one, by request
+    /// id. The push that hands the request to the core takes its entry.
+    pub journals: HashMap<u64, JournalGroup>,
+
+    /// Origins on this core whose parts are durable. The next push hands
+    /// them to the core, which drops their stored write sets.
+    pub settled_write_sets: Vec<Lsn>,
 }
 
 impl CoreChannel {
@@ -103,9 +112,14 @@ impl CoreChannel {
             };
             let db_id = req.database_id.as_u64();
             let req_id = req.request_id.as_u64();
+            let journal = WriteSetJournal {
+                group: self.journals.remove(&req_id),
+                settled: std::mem::take(&mut self.settled_write_sets),
+            };
             match self.request_tx.try_push(BridgeRequest {
                 inner: req,
                 outcome_floor,
+                journal,
             }) {
                 Ok(()) => {
                     flushed += 1;

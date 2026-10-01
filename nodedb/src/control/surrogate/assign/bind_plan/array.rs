@@ -59,7 +59,7 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut ArrayOp) -> crate::Resu
         | ArrayOp::Compact { .. }
         | ArrayOp::SurrogateBitmapScan { .. }
         | ArrayOp::DropArray { .. }
-        | ArrayOp::RestoreArrayDrop { .. }
+        | ArrayOp::RekeyArray { .. }
         | ArrayOp::PurgeArrayDrop { .. } => Ok(()),
     }
 }

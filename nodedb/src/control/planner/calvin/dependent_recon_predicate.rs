@@ -9,10 +9,13 @@ use crate::control::planner::implicit_edges::{EdgeFieldOverrides, parse_edge_fie
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 
 /// The implicit-edge lifecycle a dependent (OLLP) Calvin task drives, derived
-/// once from the dependent task's plan variant. `Update` carries the SET-clause
-/// overrides (parsed once — they are constant across retries).
+/// once from the dependent task's plan variant. `Delete` carries the column
+/// each deleted row's node identity is read from. `Update` carries the
+/// SET-clause overrides (parsed once — they are constant across retries).
 pub(super) enum EdgeLifecycle {
-    Delete,
+    Delete {
+        declared_primary_key: Option<String>,
+    },
     Update(EdgeFieldOverrides),
 }
 
@@ -53,12 +56,18 @@ pub(super) fn extract_bulk_predicate_info(plan: &PhysicalPlan) -> (String, Vec<u
 }
 
 /// Classify the implicit-edge lifecycle `plan` drives. A `BulkDelete` retracts
-/// the matched edge documents' mirrored edges; a `BulkUpdate` reconciles them
-/// against the SET clause, whose overrides are parsed here once — they are
-/// constant across retries.
+/// the matched edge documents' mirrored edges and the edges incident on each
+/// deleted row's node; a `BulkUpdate` reconciles mirrored edges against the
+/// SET clause, whose overrides are parsed here once — they are constant
+/// across retries.
 pub(super) fn classify_edge_lifecycle(plan: &PhysicalPlan) -> crate::Result<EdgeLifecycle> {
     match plan {
-        PhysicalPlan::Document(DocumentOp::BulkDelete { .. }) => Ok(EdgeLifecycle::Delete),
+        PhysicalPlan::Document(DocumentOp::BulkDelete {
+            declared_primary_key,
+            ..
+        }) => Ok(EdgeLifecycle::Delete {
+            declared_primary_key: declared_primary_key.clone(),
+        }),
         PhysicalPlan::Document(DocumentOp::BulkUpdate { updates, .. }) => {
             Ok(EdgeLifecycle::Update(parse_edge_field_overrides(updates)?))
         }

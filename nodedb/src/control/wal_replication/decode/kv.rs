@@ -56,7 +56,7 @@ pub(super) fn put(
 
 /// Every plan reconstructed here carries `RlsWriteCheck::already_decided_elsewhere()`
 /// — the writing identity isn't available on this node, so re-deciding at
-/// recovery time would make it non-deterministic.
+/// recovery time makes it non-deterministic.
 pub(super) fn delete(
     collection: &str,
     keys: &[Vec<u8>],
@@ -379,33 +379,6 @@ pub(super) fn field_set(
     }))
 }
 
-/// Fields of the `KvTransfer` wire variant, bundled so [`transfer`] stays
-/// under the `too_many_arguments` clippy threshold.
-pub(super) struct TransferFields<'a> {
-    pub(super) collection: &'a str,
-    pub(super) source_key: &'a [u8],
-    pub(super) dest_key: &'a [u8],
-    pub(super) field: &'a str,
-    pub(super) amount: f64,
-    pub(super) debit_surrogate: u32,
-    pub(super) credit_surrogate: u32,
-}
-
-pub(super) fn transfer(f: TransferFields) -> crate::Result<PhysicalPlan> {
-    let debit_surrogate = nodedb_types::Surrogate::new(f.debit_surrogate);
-    let credit_surrogate = nodedb_types::Surrogate::new(f.credit_surrogate);
-    Ok(PhysicalPlan::Kv(KvOp::Transfer {
-        collection: nodedb_types::QualifiedCollection::from_stored(f.collection.to_owned()),
-        source_key: f.source_key.to_vec(),
-        dest_key: f.dest_key.to_vec(),
-        field: f.field.to_owned(),
-        amount: f.amount,
-        debit_surrogate,
-        credit_surrogate,
-        rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
-    }))
-}
-
 /// Reconstruct a `Truncate` plan. Same idempotent-replay contract as
 /// `document::truncate` — no surrogate binding, whole-collection clear.
 pub(super) fn truncate(collection: &str, restart_identity: bool) -> PhysicalPlan {
@@ -413,101 +386,6 @@ pub(super) fn truncate(collection: &str, restart_identity: bool) -> PhysicalPlan
         collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         restart_identity,
     })
-}
-
-/// Reconstruct a resolved KV write plan (`KvOp::ResolvedWrite`). Every `Put`
-/// mutation's surrogate binds against its own `(collection, key)`.
-pub(super) fn resolved_write(
-    mutations: &[super::super::types::KvResolvedMutationWire],
-    response_payload: &[u8],
-) -> crate::Result<PhysicalPlan> {
-    use super::super::types::KvResolvedMutationWire as W;
-    use nodedb_physical::physical_plan::KvResolvedMutation as M;
-
-    let decoded = mutations
-        .iter()
-        .map(|m| -> crate::Result<M> {
-            Ok(match m {
-                W::Put {
-                    collection,
-                    key,
-                    value,
-                    ttl_ms,
-                    expire_at_ms,
-                    surrogate,
-                    precondition,
-                } => M::Put {
-                    collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
-                    key: key.clone(),
-                    value: value.clone(),
-                    ttl_ms: *ttl_ms,
-                    expire_at_ms: *expire_at_ms,
-                    surrogate: nodedb_types::Surrogate::new(*surrogate),
-                    precondition: precondition.clone(),
-                },
-                W::Delete {
-                    collection,
-                    key,
-                    precondition,
-                } => M::Delete {
-                    collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
-                    key: key.clone(),
-                    precondition: precondition.clone(),
-                },
-                W::Expire {
-                    collection,
-                    key,
-                    ttl_ms,
-                    resolved_now_ms,
-                    precondition,
-                } => M::Expire {
-                    collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
-                    key: key.clone(),
-                    ttl_ms: *ttl_ms,
-                    // Stamped from the wire, mirroring the `KvExpire` arm.
-                    resolved_now_ms: *resolved_now_ms,
-                    precondition: precondition.clone(),
-                },
-                W::Persist {
-                    collection,
-                    key,
-                    precondition,
-                } => M::Persist {
-                    collection: nodedb_types::QualifiedCollection::from_stored(collection.clone()),
-                    key: key.clone(),
-                    precondition: precondition.clone(),
-                },
-            })
-        })
-        .collect::<crate::Result<Vec<M>>>()?;
-
-    Ok(PhysicalPlan::Kv(KvOp::ResolvedWrite {
-        mutations: decoded,
-        response_payload: response_payload.to_vec(),
-        // Decided before this entry was proposed — see `delete` for why.
-        rls_write_check: RlsWriteCheck::decided_earlier_in_request(),
-    }))
-}
-
-pub(super) fn transfer_item(
-    source_collection: &str,
-    dest_collection: &str,
-    item_key: &[u8],
-    dest_key: &[u8],
-    surrogate: u32,
-) -> crate::Result<PhysicalPlan> {
-    let surrogate = nodedb_types::Surrogate::new(surrogate);
-    Ok(PhysicalPlan::Kv(KvOp::TransferItem {
-        source_collection: nodedb_types::QualifiedCollection::from_stored(
-            source_collection.to_owned(),
-        ),
-        dest_collection: nodedb_types::QualifiedCollection::from_stored(dest_collection.to_owned()),
-        item_key: item_key.to_vec(),
-        dest_key: dest_key.to_vec(),
-        surrogate,
-        source_rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
-        dest_rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
-    }))
 }
 
 #[cfg(test)]
@@ -548,9 +426,9 @@ mod tests {
             .expect("encode must not error")
             .expect("KvOp::Truncate should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Kv(KvOp::Truncate {
                 collection,
@@ -580,9 +458,9 @@ mod tests {
             .expect("encode must not error")
             .expect("KvOp::RegisterIndex must now produce a ReplicatedEntry (cluster-replicated)");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, resolved_now_ms) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, resolved_now_ms) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         assert_eq!(resolved_now_ms, None, "index DDL carries no TTL instant");
         match decoded_plan {
             PhysicalPlan::Kv(KvOp::RegisterIndex {
@@ -613,9 +491,9 @@ mod tests {
             .expect("encode must not error")
             .expect("KvOp::RegisterIndex must produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Kv(KvOp::RegisterIndex { backfill, .. }) => {
                 assert!(!backfill, "backfill = false must round-trip distinctly");
@@ -639,9 +517,9 @@ mod tests {
             .expect("encode must not error")
             .expect("KvOp::DropIndex must now produce a ReplicatedEntry (cluster-replicated)");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Kv(KvOp::DropIndex { collection, field }) => {
                 assert_eq!(collection.as_str(), "players");
@@ -685,9 +563,9 @@ mod tests {
             let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
                 .expect("encode must not error")
                 .expect("a KV write produces a ReplicatedEntry");
-            let (_, _, decoded, _) = decode::from_replicated_entry(&entry.to_bytes(), None)
-                .expect("from_replicated_entry error")
-                .expect("from_replicated_entry returned None");
+            let (_, _, decoded, _) = decode::decode_replicated_entry(&entry.to_bytes())
+                .expect("decode_replicated_entry error")
+                .expect("decode_replicated_entry returned None");
             match decoded {
                 PhysicalPlan::Kv(KvOp::Put { provenance, .. })
                 | PhysicalPlan::Kv(KvOp::Delete { provenance, .. }) => {
@@ -700,7 +578,7 @@ mod tests {
 
     /// `entry_kv::kv_write` must not drop `KvOp::Put::returning` / `rls_filters`
     /// — the leader re-derives its plan from the committed entry, so a drop here
-    /// loses `RETURNING` for the originating request too, not just followers.
+    /// loses `RETURNING` for the originating request too, not only followers.
     #[test]
     fn kv_put_returning_and_rls_filters_roundtrip() {
         let tenant = TenantId::new(1);
@@ -722,9 +600,9 @@ mod tests {
             .expect("encode must not error")
             .expect("KvOp::Put should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Kv(KvOp::Put {
                 returning,
@@ -773,9 +651,9 @@ mod tests {
             .expect("encode must not error")
             .expect("KvOp::InsertOnConflictUpdate should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
                 returning,

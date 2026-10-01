@@ -9,11 +9,9 @@
 //! SHOW QUOTA FOR AUTH USER 'user_42'
 //! ```
 //!
-//! Ported from the pgwire `ddl::metering_ddl` handlers. The usage-store /
-//! quota-manager / tenant-usage reads, ordering, and the superuser gates are
-//! preserved verbatim; only the result construction changed from pgwire
-//! `Response` / `QueryResponse` to the protocol-neutral `DdlResult` over
-//! `ShapedRows`.
+//! The usage-store / quota-manager / tenant-usage reads, ordering, and the
+//! superuser gates run here. The result is the protocol-neutral `DdlResult`
+//! over `ShapedRows`.
 
 use serde_json::{Map, Value as JsonValue};
 
@@ -25,9 +23,7 @@ use super::super::result::{DdlError, DdlResult};
 
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
 ///
-/// Preserves the exact SQLSTATE / message the pgwire metering handlers
-/// produced (via `sqlstate_error`), so error parity stays byte-identical
-/// after the migration off the pgwire router.
+/// The SQLSTATE and message reach the client unchanged.
 fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
 }

@@ -75,6 +75,7 @@ fn make_req(plan: PhysicalPlan) -> Request {
         txn_id: None,
         wal_lsn: None,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: nodedb::bridge::envelope::Admission::Admitted,
     }
 }

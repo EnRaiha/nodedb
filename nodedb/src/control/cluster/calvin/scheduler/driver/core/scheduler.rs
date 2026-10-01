@@ -173,6 +173,18 @@ pub struct Scheduler {
     pub(in crate::control::cluster::calvin::scheduler::driver::core) intake: IntakeGate,
     /// First halt cause, once set. See [`super::halt`].
     pub(in crate::control::cluster::calvin::scheduler::driver::core) halt: HaltLatch,
+    /// The sequenced txn waiting for this node's metadata apply. See
+    /// [`super::metadata_hold`].
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) metadata_hold:
+        Option<super::metadata_hold::MetadataHold>,
+    /// The multi-part transactions this vShard participates in and has not
+    /// staged yet. See [`super::parts`].
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) parts:
+        super::parts::PartsState,
+    /// Orders flushes against the data group's snapshots. See
+    /// [`super::install_gate`].
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) install_gate:
+        super::install_gate::InstallGate,
 }
 
 /// Parameters for [`Scheduler::new`].
@@ -247,6 +259,7 @@ impl Scheduler {
 
         // A backup's cut waits on every scheduler this node runs.
         shared.calvin.cuts.register(vshard_id);
+        let install_gate = super::install_gate::InstallGate::new(&shared, vshard_id);
 
         let capacity_freed = shared
             .dispatcher
@@ -283,6 +296,9 @@ impl Scheduler {
             capacity_freed,
             intake: IntakeGate::default(),
             halt: HaltLatch::default(),
+            metadata_hold: None,
+            parts: Default::default(),
+            install_gate,
         }
     }
 
@@ -298,7 +314,7 @@ impl Scheduler {
     /// `fully_applied_epoch()` is conservatively seeded to the same sentinel by
     /// recovery (the watermark only advances once the sequencer's re-fan-out
     /// supplies per-epoch expected-position counts) — it does NOT mean "nothing
-    /// left to apply". Naively comparing `u64::MAX >= rebuild_target_epoch` would
+    /// left to apply". Comparing `u64::MAX >= rebuild_target_epoch` will
     /// therefore report caught-up before a single epoch was actually
     /// re-applied. So: sentinel `fully_applied_epoch` is caught-up ONLY when
     /// there is genuinely no rebuild target; otherwise it must NOT be treated as
@@ -322,7 +338,7 @@ impl Scheduler {
     /// `BEGIN` reads `CalvinLocalState::last_applied_epoch` to anchor a
     /// session's cross-shard snapshot version, so it MUST reflect the
     /// FULLY-applied epoch — never an epoch that has only some of its positions
-    /// committed, which would let a session anchor on a torn epoch. `fetch_max`
+    /// committed, which lets a session anchor on a torn epoch. `fetch_max`
     /// keeps it monotonic across all per-vShard schedulers writing the counter.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) fn publish_watermark(
         &mut self,
@@ -338,26 +354,6 @@ impl Scheduler {
         self.report_passed_cuts();
     }
 
-    /// Spawn a bridge task that awaits a single executor response and forwards
-    /// it to the scheduler's fan-in completion channel.
-    ///
-    /// The bridge task is cancel-safe: it holds only a cloned sender and the
-    /// per-request receiver. Dropping the scheduler's `completion_rx` causes
-    /// the bridge's `send` to fail silently, which is fine on shutdown.
-    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn spawn_response_bridge(
-        &self,
-        txn_id: TxnId,
-        request_id: RequestId,
-        mut response_rx: crate::control::ResponseReceiver,
-    ) {
-        let tx = self.completion_tx.clone();
-        tokio::spawn(async move {
-            let result = response_rx.recv().await;
-            // Ignore send error: scheduler has shut down.
-            let _ = tx.send((txn_id, request_id, result)).await;
-        });
-    }
-
     /// Run the scheduler event loop until shutdown is signaled.
     pub async fn run(mut self, mut shutdown: ShutdownReceiver) {
         info!(
@@ -369,7 +365,7 @@ impl Scheduler {
 
         // Low-frequency liveness timer so the top-of-loop stall/barrier sweeps
         // run even on an otherwise-idle vShard. Without it, a dropped verdict
-        // push plus zero further events for this vShard would leave a parked txn
+        // push plus zero further events for this vShard will leave a parked txn
         // never re-probing the durable verdict. A fraction of the stall-warn
         // window re-probes well within it.
         let mut stall_tick = tokio::time::interval(self.config.verdict_stall_warn() / 4);
@@ -394,8 +390,12 @@ impl Scheduler {
 
             self.check_dependent_barrier_timeouts();
             self.check_awaiting_verdict_stalls();
+            self.resume_metadata_hold();
 
-            let intake_open = self.refresh_intake_gate();
+            // Open only once the inputs a closed gate held are processed. A
+            // gate closed for the backlog still takes awaited parts and
+            // releases (see `super::parts_lane`).
+            let intake_open = self.pass_intake_lane();
             if intake_open && catch_up_resume {
                 catch_up_resume = false;
                 stall_tick.reset_immediately();
@@ -443,9 +443,20 @@ impl Scheduler {
                     }
                 }
 
+                _ = tokio::time::sleep(super::metadata_hold::HOLD_POLL),
+                    if self.metadata_hold.is_some() => {
+                    // The next loop pass re-checks the held txn's floor.
+                }
+
                 _ = &mut capacity_notified, if self.resends_deferred() => {
                     // Capacity freed: the next loop pass re-sends deferred
                     // requests in FIFO order.
+                }
+
+                _ = self.install_gate.released(), if self.install_gate.is_waiting() => {
+                    // A snapshot released a group's gate: the waiting flush
+                    // tries again.
+                    self.pump_flush_turn();
                 }
 
                 maybe_txn = self.receiver.recv(), if intake_open => {
@@ -481,13 +492,6 @@ impl Scheduler {
         // Every txn still pending stays unapplied on this replica.
         self.hold_all_redo_records();
     }
-
-    /// Allocate a fresh request ID for a dispatch.
-    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn next_request_id(
-        &self,
-    ) -> RequestId {
-        self.shared.next_request_id()
-    }
 }
 
 // ── `is_caught_up` sentinel handling ─────────────────────────────────────────
@@ -500,8 +504,8 @@ mod tests {
 
     /// A freshly-recovered scheduler (`fully_applied_epoch` still the
     /// `NOT_YET_APPLIED_EPOCH` sentinel) with a REAL, non-zero rebuild target must
-    /// NOT report caught-up. Naively comparing `u64::MAX >= rebuild_target_epoch`
-    /// (the bug) would say "caught up" before a single epoch was re-applied.
+    /// NOT report caught-up. Comparing `u64::MAX >= rebuild_target_epoch`
+    /// will say "caught up" before a single epoch was re-applied.
     #[tokio::test]
     async fn is_caught_up_false_when_fully_applied_is_sentinel_and_target_is_real() {
         let (mut scheduler, _dir) = build_test_scheduler(0);
@@ -541,7 +545,7 @@ mod tests {
     /// seeds `max_applied_epoch` (hence `rebuild_target_epoch`) to
     /// `NOT_YET_APPLIED_EPOCH` too (see `recovery.rs`'s
     /// `greenfield_returns_sentinel_and_empty_tail` test) — this is distinct from
-    /// a real target of epoch 0 (which would report `max_applied_epoch == 0`).
+    /// a real target of epoch 0 (which will report `max_applied_epoch == 0`).
     /// With nothing to rebuild, the scheduler is trivially caught up even though
     /// `fully_applied_epoch` is still the sentinel.
     #[tokio::test]

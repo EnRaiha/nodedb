@@ -6,18 +6,16 @@
 //! therefore runs in the `cluster` test group (max-threads = 1,
 //! threads-required = num-test-threads). They run strictly serially and alone.
 //!
-//! ## Architecture Note: Local Array Catalog
+//! ## Replicated array catalog
 //!
-//! `CREATE ARRAY` writes to the local in-memory `ArrayCatalog` on the
-//! executing node only — it is NOT replicated through Raft (unlike
-//! `CREATE COLLECTION`). As a result, all array queries (ARRAY_SLICE,
-//! ARRAY_AGG, etc.) must be issued on the same node that executed the
-//! `CREATE ARRAY` DDL.
+//! `CREATE ARRAY` proposes a `PutArray` catalog entry through the metadata
+//! group, so every node holds the array. The fixture creates the array on
+//! one node, writes its cells through another, and every test queries from
+//! every node.
 //!
-//! The "distributed" aspect of these tests is that cell data is stored
-//! across multiple vShards on different nodes (Hilbert-partitioned). The
-//! coordinator on the DDL node fans out to peer shards via the array RPC
-//! path and merges the results.
+//! Cells are stored across multiple vShards on different nodes
+//! (Hilbert-partitioned). The coordinator on the querying node fans out to
+//! peer shards via the array RPC path and merges the results.
 //!
 //! Tests:
 //!   1. `cluster_array_slice_spans_multiple_shards` — ARRAY_SLICE fan-out
@@ -27,9 +25,6 @@
 //!      correct per-group sums.
 //!   4. `cluster_array_vector_prefilter_distributed` — fused vector+slice
 //!      query wires end-to-end without error.
-//!   5. `cluster_array_routing_retry_on_owner_change` — stale routing table
-//!      on the coordinator node (poisoned via `force_stale_route_for_test`)
-//!      recovers and the array query succeeds on retry.
 
 use crate::common;
 
@@ -75,10 +70,8 @@ async fn query_named_rows(
 
 /// Spin up a 3-node cluster with a pre-populated genome array.
 ///
-/// Returns `(cluster, leader_idx)` where `leader_idx` is the index into
-/// `cluster.nodes` of the node that executed the `CREATE ARRAY` DDL. All
-/// array queries must be issued on this node because the array catalog is
-/// local (not replicated through Raft).
+/// The array is created on one node and its cells are written and flushed
+/// through another, so the fixture itself depends on the replicated catalog.
 ///
 /// Schema:
 ///   DIMS  (chr INT64 [0..9], pos INT64 [0..99])
@@ -91,12 +84,12 @@ async fn query_named_rows(
 ///   chr=1: pos=10/20/30, qual=10.0/20.0/30.0 → sum=60.0
 ///   chr=2: pos=10/20/30, qual=100.0/200.0/300.0 → sum=600.0
 ///   total qual sum: 666.0
-async fn spawn_cluster_with_genome() -> (TestCluster, usize) {
+async fn spawn_cluster_with_genome() -> TestCluster {
     let cluster = TestCluster::spawn_three()
         .await
         .expect("3-node cluster spawn");
 
-    let leader_idx = cluster
+    let ddl_idx = cluster
         .exec_ddl_on_any_leader(
             "CREATE ARRAY genome \
              DIMS (chr INT64 [0..9], pos INT64 [0..99]) \
@@ -107,8 +100,9 @@ async fn spawn_cluster_with_genome() -> (TestCluster, usize) {
         .await
         .expect("CREATE ARRAY genome");
 
-    // Insert 9 cells from the DDL node (the one with the local array catalog).
-    cluster.nodes[leader_idx]
+    // Write through a node that did not run the DDL.
+    let writer_idx = (ddl_idx + 1) % cluster.nodes.len();
+    cluster.nodes[writer_idx]
         .exec(
             "INSERT INTO ARRAY genome \
              COORDS (0, 10) VALUES (1.0), \
@@ -125,21 +119,29 @@ async fn spawn_cluster_with_genome() -> (TestCluster, usize) {
         .expect("INSERT INTO ARRAY genome");
 
     // Flush so reads exercise the segment-scan path, not just the memtable.
-    cluster.nodes[leader_idx]
+    cluster.nodes[writer_idx]
         .exec("SELECT ARRAY_FLUSH('genome')")
         .await
         .expect("ARRAY_FLUSH");
+    cluster
+        .wait_for_full_apply_convergence(std::time::Duration::from_secs(10))
+        .await;
 
-    (cluster, leader_idx)
+    cluster
 }
 
 // ── Test 1: slice fan-out to peer shards ─────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_array_slice_spans_multiple_shards() {
-    let (cluster, node_idx) = spawn_cluster_with_genome().await;
-    let client = &cluster.nodes[node_idx].client;
+    let cluster = spawn_cluster_with_genome().await;
+    for (node_idx, node) in cluster.nodes.iter().enumerate() {
+        assert_chr1_slice(&node.client, node_idx).await;
+    }
+    cluster.shutdown().await;
+}
 
+async fn assert_chr1_slice(client: &tokio_postgres::Client, node_idx: usize) {
     // Slice chr=1, pos 0..99 — should return exactly the 3 cells for chr=1.
     // ARRAY_SLICE projects one pgwire field per declared column: a
     // `coords` JSON-array column followed by an `attrs` JSON-array column
@@ -153,7 +155,7 @@ async fn cluster_array_slice_spans_multiple_shards() {
     assert_eq!(
         rows.len(),
         3,
-        "expected 3 cells for chr=1, pos 0..99; got {rows:?}"
+        "node {node_idx}: expected 3 cells for chr=1, pos 0..99; got {rows:?}"
     );
 
     let mut quals: Vec<f64> = rows
@@ -175,22 +177,29 @@ async fn cluster_array_slice_spans_multiple_shards() {
     assert_eq!(
         quals,
         vec![10.0, 20.0, 30.0],
-        "chr=1 qual values must be [10.0, 20.0, 30.0]; got {quals:?}"
+        "node {node_idx}: chr=1 qual values must be [10.0, 20.0, 30.0]; got {quals:?}"
     );
-
-    cluster.shutdown().await;
 }
 
 // ── Test 2: agg sum across all shards ────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_array_agg_sum_across_shards() {
-    let (cluster, node_idx) = spawn_cluster_with_genome().await;
-    let client = &cluster.nodes[node_idx].client;
+    let cluster = spawn_cluster_with_genome().await;
+    for (node_idx, node) in cluster.nodes.iter().enumerate() {
+        assert_total_sum(&node.client, node_idx).await;
+    }
+    cluster.shutdown().await;
+}
 
+async fn assert_total_sum(client: &tokio_postgres::Client, node_idx: usize) {
     let rows = query_named_rows(client, "SELECT * FROM ARRAY_AGG('genome', 'qual', 'sum')").await;
 
-    assert_eq!(rows.len(), 1, "scalar agg must return exactly one row");
+    assert_eq!(
+        rows.len(),
+        1,
+        "node {node_idx}: scalar agg must return one row"
+    );
 
     // ARRAY_AGG projects a `result` column carrying the aggregate value.
     let result_text = rows[0]
@@ -202,19 +211,22 @@ async fn cluster_array_agg_sum_across_shards() {
 
     assert!(
         (result - 666.0).abs() < 1e-4,
-        "expected sum=666.0, got {result}"
+        "node {node_idx}: expected sum=666.0, got {result}"
     );
-
-    cluster.shutdown().await;
 }
 
 // ── Test 3: agg grouped by chr dimension ─────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_array_agg_grouped_by_chr() {
-    let (cluster, node_idx) = spawn_cluster_with_genome().await;
-    let client = &cluster.nodes[node_idx].client;
+    let cluster = spawn_cluster_with_genome().await;
+    for (node_idx, node) in cluster.nodes.iter().enumerate() {
+        assert_grouped_sums(&node.client, node_idx).await;
+    }
+    cluster.shutdown().await;
+}
 
+async fn assert_grouped_sums(client: &tokio_postgres::Client, node_idx: usize) {
     let rows = query_named_rows(
         client,
         "SELECT * FROM ARRAY_AGG('genome', 'qual', 'sum', 'chr')",
@@ -224,7 +236,7 @@ async fn cluster_array_agg_grouped_by_chr() {
     assert_eq!(
         rows.len(),
         3,
-        "group-by-chr must return 3 rows (one per chromosome); got {rows:?}"
+        "node {node_idx}: group-by-chr must return 3 rows; got {rows:?}"
     );
 
     // Group-by-key projects two columns: `group` (the dimension value)
@@ -267,15 +279,13 @@ async fn cluster_array_agg_grouped_by_chr() {
         "chr=2 sum must be 600.0, got {}",
         groups[2].1
     );
-
-    cluster.shutdown().await;
 }
 
 // ── Test 4: vector prefilter fused with distributed slice ─────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_array_vector_prefilter_distributed() {
-    let (cluster, node_idx) = spawn_cluster_with_genome().await;
+    let cluster = spawn_cluster_with_genome().await;
 
     // Create a document collection and vector index to back the fused query.
     // DDL must be issued and accepted on any leader.
@@ -290,32 +300,29 @@ async fn cluster_array_vector_prefilter_distributed() {
         .await
         .expect("CREATE VECTOR INDEX");
 
-    // The fused query: ORDER BY vector_distance + JOIN ARRAY_SLICE.
-    // Issued on the DDL node because the array catalog is local there.
-    // The vector index is empty — the assertion is that the query wires
-    // through every distributed layer without error:
+    // The fused query: ORDER BY vector_distance + JOIN ARRAY_SLICE, issued
+    // on every node. The vector index is empty — the assertion is that the
+    // query wires through every distributed layer without error:
     //   planner fusion → convert → ArrayOp::SurrogateBitmapScan (distributed
     //   fan-out to peer shards) + VectorOp::Search with inline_prefilter_plan.
-    let result = cluster.nodes[node_idx]
-        .client
-        .simple_query(
-            "SELECT id FROM genes \
-             JOIN ARRAY_SLICE('genome', '{chr: [1, 1], pos: [0, 99]}') AS s \
-               ON id = s.qual \
-             ORDER BY vector_distance(embedding, [1.0, 0.0, 0.0]) \
-             LIMIT 10",
-        )
-        .await;
-
-    match result {
-        Ok(_) => {}
-        Err(e) => {
+    for (node_idx, node) in cluster.nodes.iter().enumerate() {
+        let result = node
+            .client
+            .simple_query(
+                "SELECT id FROM genes \
+                 JOIN ARRAY_SLICE('genome', '{chr: [1, 1], pos: [0, 99]}') AS s \
+                   ON id = s.qual \
+                 ORDER BY vector_distance(embedding, [1.0, 0.0, 0.0]) \
+                 LIMIT 10",
+            )
+            .await;
+        if let Err(e) = result {
             let msg = format!("{e}");
             // Tolerate empty-index / no-rows errors. Codec panics and planner
             // errors indicate the fused distributed path was never attempted.
             assert!(
                 !msg.contains("codec") && !msg.contains("panic") && !msg.contains("plan error"),
-                "unexpected error from fused distributed array+vector query: {msg}"
+                "node {node_idx}: unexpected error from fused array+vector query: {msg}"
             );
         }
     }

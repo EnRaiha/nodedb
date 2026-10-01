@@ -241,13 +241,10 @@ impl CoreLoop {
 
         // Delete each matching document with full cascade.
         let mut affected = 0u64;
-        // One post-apply `Delete` redo entry per removed row on a vector
-        // collection. The per-row `sparse.delete` above mints no WAL redo of its
-        // own, so a WAL-only restart would replay the row's original `INSERT`
-        // `Put` record back into the HNSW and resurrect its vector. Carrying the
-        // surrogate back lets the Control Plane mint a durable `Delete` redo whose
-        // replay soft-deletes the HNSW node through `apply_point_delete`. Only
-        // populated when the collection has a vector index.
+        // One post-apply `Delete` redo entry per removed row, in commit order,
+        // with the target rows its fold rewrote. The plan carries no
+        // pre-dispatch record, so these entries are the removals' only WAL
+        // record. A refusal after a row landed carries them too.
         let mut write_set: Vec<WriteSetEntry> = Vec::new();
         let mut returned_docs: Vec<nodedb_types::Value> = if returning.is_some() {
             Vec::with_capacity(apply_ids.len())
@@ -265,38 +262,38 @@ impl CoreLoop {
             // will not decode is a different answer: it would silently drop out
             // of RETURNING and, worse, contribute no removed index tuples, so
             // its old secondary-index entries would survive the delete.
-            let pre_delete_doc: Option<serde_json::Value> = if returning.is_some()
-                || !index_paths.is_empty()
-            {
-                match self
-                    .sparse
-                    .get(
-                        task.request.database_id.as_u64(),
-                        tid,
-                        collection,
-                        storage_key,
-                    )
-                    .ok()
-                    .flatten()
-                {
-                    Some(bytes) => {
-                        let identity = storage_key.to_identity();
-                        match returning_doc::from_stored_json(
-                            &bytes,
-                            &identity,
-                            strict_schema.as_ref(),
-                        ) {
-                            Ok(doc) => Some(doc),
-                            Err(e) => {
-                                return self.response_error(task, refusal_after_rows(affected, e));
+            let pre_delete_doc: Option<serde_json::Value> =
+                if returning.is_some() || !index_paths.is_empty() {
+                    match self
+                        .sparse
+                        .get(
+                            task.request.database_id.as_u64(),
+                            tid,
+                            collection,
+                            storage_key,
+                        )
+                        .ok()
+                        .flatten()
+                    {
+                        Some(bytes) => {
+                            let identity = storage_key.to_identity();
+                            match returning_doc::from_stored_json(
+                                &bytes,
+                                &identity,
+                                strict_schema.as_ref(),
+                            ) {
+                                Ok(doc) => Some(doc),
+                                Err(e) => {
+                                    let code = refusal_after_rows(affected, e);
+                                    return self.refusal_with_landed_rows(task, code, write_set);
+                                }
                             }
                         }
+                        None => None,
                     }
-                    None => None,
-                }
-            } else {
-                None
-            };
+                } else {
+                    None
+                };
 
             // The removal and the materialized-sum deltas it owes share ONE
             // transaction, so a debited target row can never outlive a removal
@@ -306,7 +303,10 @@ impl CoreLoop {
             // index diff, and is not widened for this.
             let row_txn = match self.sparse.begin_write() {
                 Ok(txn) => txn,
-                Err(e) => return self.response_error(task, refusal_after_rows(affected, e)),
+                Err(e) => {
+                    let code = refusal_after_rows(affected, e);
+                    return self.refusal_with_landed_rows(task, code, write_set);
+                }
             };
             let deleted_bytes = self
                 .sparse
@@ -342,19 +342,20 @@ impl CoreLoop {
                     Ok(outcome) => target_writes = outcome.target_writes,
                     // Dropping `row_txn` un-committed reverses both the removal
                     // and every target it had already debited.
-                    Err(e) => return self.response_error(task, refusal_after_rows(affected, e)),
+                    Err(e) => {
+                        let code = refusal_after_rows(affected, e);
+                        return self.refusal_with_landed_rows(task, code, write_set);
+                    }
                 }
             }
             if let Err(e) = row_txn.commit() {
-                return self.response_error(
-                    task,
-                    refusal_after_rows(
-                        affected,
-                        ErrorCode::Internal {
-                            detail: format!("bulk delete commit: {e}"),
-                        },
-                    ),
+                let code = refusal_after_rows(
+                    affected,
+                    ErrorCode::Internal {
+                        detail: format!("bulk delete commit: {e}"),
+                    },
                 );
+                return self.refusal_with_landed_rows(task, code, write_set);
             }
             // One durable redo entry per debited target row, naming the TARGET
             // collection: this statement's own redo describes the removed source
@@ -397,35 +398,31 @@ impl CoreLoop {
 
         debug!(core = self.core_id, %collection, affected, "bulk delete complete");
 
+        // Every matched row committed, so an encode error answers with the
+        // rows' entries as well.
         let mut response = if let Some(spec) = returning {
             match returning_rows::build_rows_payload(spec, rls_filters, &returned_docs) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("RETURNING encode: {e}"),
-                        },
-                    );
-                }
+                Err(e) => self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("RETURNING encode: {e}"),
+                    },
+                ),
             }
         } else {
             let result = serde_json::json!({ "affected": affected });
             match response_codec::encode_json_as_msgpack(&result) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
-                }
+                Err(e) => self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: e.to_string(),
+                    },
+                ),
             }
         };
-        if !write_set.is_empty() {
-            response.write_set = write_set;
-        }
+        response.write_set = write_set;
         response
     }
 }

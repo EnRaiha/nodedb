@@ -20,10 +20,10 @@ use crate::circuit_breaker::RetryPolicy;
 use crate::error::{ClusterError, Result};
 use crate::rpc_codec::{self, RaftRpc, TypedClusterError, auth_envelope};
 use crate::transport::config::SNI_HOSTNAME;
+use crate::transport::frame_io::read_envelope;
 use crate::transport::peer_identity_verifier::{
     VerifyOutcome, spki_pin_from_cert_der, verify_peer_identity,
 };
-use crate::transport::server;
 use crate::wire_version::handshake_io::perform_version_handshake_client;
 
 use super::transport::NexarTransport;
@@ -72,8 +72,6 @@ impl NexarTransport {
         rpc: RaftRpc,
         enforce_bootstrap_pin: bool,
     ) -> Result<RaftRpc> {
-        let envelope = self.wrap_outbound(&rpc)?;
-
         let conn = self
             .listener
             .endpoint()
@@ -120,6 +118,8 @@ impl NexarTransport {
             detail: format!("open_bi to {addr}: {e}"),
         })?;
 
+        // Numbered once the stream is open (see `wrap_inner`).
+        let envelope = self.wrap_outbound(&rpc)?;
         send.write_all(&envelope)
             .await
             .map_err(|e| ClusterError::Transport {
@@ -129,8 +129,13 @@ impl NexarTransport {
             detail: format!("finish send to {addr}: {e}"),
         })?;
 
-        let response_envelope = server::read_envelope(&mut recv).await?;
-        self.parse_inbound(&response_envelope, None)
+        let response_envelope = read_envelope(&mut recv).await?;
+        match self.parse_inbound(&response_envelope, None)? {
+            RaftRpc::FrameRefused(refusal) => Err(ClusterError::Transport {
+                detail: format!("{addr} refused the frame: {}", refusal.detail),
+            }),
+            response => Ok(response),
+        }
     }
 
     /// Send an RPC to a peer with retry and circuit breaker.
@@ -176,8 +181,17 @@ impl NexarTransport {
                 tokio::time::sleep(delay).await;
             }
 
-            let envelope = self.wrap_inner(&inner)?;
-            match self.try_send_once(target, &envelope, read_timeout).await {
+            match self.try_send_once(target, &inner, read_timeout).await {
+                Ok(Ok(RaftRpc::FrameRefused(refusal))) => {
+                    // The peer answered: its link and its handler are up.
+                    // Its replay window refused this frame's number, so the
+                    // retry goes out under a fresh one. The breaker does not
+                    // count it, and the connection stays.
+                    self.circuit_breaker.record_success(target);
+                    last_err = Some(ClusterError::Transport {
+                        detail: format!("node {target} refused the frame: {}", refusal.detail),
+                    });
+                }
                 Ok(resp) => {
                     self.circuit_breaker.record_success(target);
                     return resp;
@@ -206,12 +220,13 @@ impl NexarTransport {
     /// expects no response and tolerates loss — no retry or circuit-breaker, so
     /// a dropped frame is the caller's concern to recover from.
     pub async fn send_rpc_oneway(&self, target: u64, rpc: RaftRpc) -> Result<()> {
-        let envelope = self.wrap_outbound(&rpc)?;
+        let inner = rpc_codec::encode(&rpc, &self.auth.epoch)?;
         let conn = self.get_or_connect(target).await?;
         self.verify_connection_target(&conn, target)?;
         let (mut send, _recv) = conn.open_bi().await.map_err(|e| ClusterError::Transport {
             detail: format!("oneway open_bi to node {target}: {e}"),
         })?;
+        let envelope = self.wrap_inner(&inner)?;
         send.write_all(&envelope)
             .await
             .map_err(|e| ClusterError::Transport {
@@ -229,7 +244,7 @@ impl NexarTransport {
     /// responses: opens a bidi stream on the pooled connection, writes the
     /// request envelope (typically a `RaftRpc::ExecuteStreamRequest`), finishes
     /// the send side, and returns a [`Stream`] that loops
-    /// [`server::read_envelope`] until the terminal `RPC_EXECUTE_STREAM_END`
+    /// [`read_envelope`] until the terminal `RPC_EXECUTE_STREAM_END`
     /// frame:
     ///
     /// - `RPC_EXECUTE_STREAM_CHUNK` → yields `Ok((payload, watermark_lsn))`.
@@ -246,7 +261,7 @@ impl NexarTransport {
         target: u64,
         rpc: RaftRpc,
     ) -> Result<impl Stream<Item = Result<(Vec<u8>, u64)>> + Send + use<>> {
-        let envelope = self.wrap_outbound(&rpc)?;
+        let inner = rpc_codec::encode(&rpc, &self.auth.epoch)?;
         let conn = self.get_or_connect(target).await?;
         self.verify_connection_target(&conn, target)?;
 
@@ -254,6 +269,7 @@ impl NexarTransport {
             detail: format!("open_bi (stream) to node {target}: {e}"),
         })?;
 
+        let envelope = self.wrap_inner(&inner)?;
         send.write_all(&envelope)
             .await
             .map_err(|e| ClusterError::Transport {
@@ -273,7 +289,7 @@ impl NexarTransport {
             // server-side `accept_bi` stream is not reset early.
             let _send = send;
             loop {
-                let envelope = server::read_envelope(&mut recv).await?;
+                let envelope = read_envelope(&mut recv).await?;
                 let (fields, inner_frame) =
                     auth_envelope::parse_envelope(&envelope, &auth.mac_key)?;
                 if fields.from_node_id != target {
@@ -302,6 +318,15 @@ impl NexarTransport {
                             }
                         }
                     }
+                    RaftRpc::FrameRefused(refusal) => {
+                        Err(ClusterError::Transport {
+                            detail: format!(
+                                "node {target} refused the stream request: {}",
+                                refusal.detail
+                            ),
+                        })?;
+                        return;
+                    }
                     other => {
                         Err(ClusterError::Transport {
                             detail: format!(
@@ -315,11 +340,13 @@ impl NexarTransport {
         })
     }
 
-    /// Single-attempt RPC send (no retry, no circuit breaker).
+    /// Single-attempt RPC send (no retry, no circuit breaker). `inner` is the
+    /// encoded RPC; it is wrapped in a fresh envelope once the stream is
+    /// open.
     async fn try_send_once(
         &self,
         target: u64,
-        envelope: &[u8],
+        inner: &[u8],
         read_timeout: Duration,
     ) -> std::result::Result<Result<RaftRpc>, ClusterError> {
         let conn = self.get_or_connect(target).await?;
@@ -329,7 +356,8 @@ impl NexarTransport {
             detail: format!("open_bi to node {target}: {e}"),
         })?;
 
-        send.write_all(envelope)
+        let envelope = self.wrap_inner(inner)?;
+        send.write_all(&envelope)
             .await
             .map_err(|e| ClusterError::Transport {
                 detail: format!("write to node {target}: {e}"),
@@ -338,15 +366,14 @@ impl NexarTransport {
             detail: format!("finish send to node {target}: {e}"),
         })?;
 
-        let response_envelope =
-            tokio::time::timeout(read_timeout, server::read_envelope(&mut recv))
-                .await
-                .map_err(|_| ClusterError::Transport {
-                    detail: format!(
-                        "RPC timeout ({}ms) to node {target}",
-                        read_timeout.as_millis()
-                    ),
-                })??;
+        let response_envelope = tokio::time::timeout(read_timeout, read_envelope(&mut recv))
+            .await
+            .map_err(|_| ClusterError::Transport {
+                detail: format!(
+                    "RPC timeout ({}ms) to node {target}",
+                    read_timeout.as_millis()
+                ),
+            })??;
 
         // Envelope / MAC / replay-window / codec errors are not transport
         // errors — return them wrapped in Ok so retry logic doesn't retry
@@ -361,6 +388,11 @@ impl NexarTransport {
     }
 
     /// Wrap an already-encoded inner frame in an authenticated envelope.
+    ///
+    /// Callers wrap once the frame's stream is open, right before the write.
+    /// A number taken earlier would wait out the connect and the stream
+    /// credit while later frames go ahead of it, and reach the peer further
+    /// out of order than its replay window allows.
     fn wrap_inner(&self, inner: &[u8]) -> Result<Vec<u8>> {
         let seq = self.auth.peer_seq_out.next();
         let mut out = Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + inner.len());

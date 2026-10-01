@@ -96,15 +96,15 @@ pub async fn crdt_apply(
 
     let _trace_id = extract_request_id(&headers);
 
-    let surrogate = state
-        .shared
-        .surrogate_assigner
-        .assign(
-            nodedb_types::CollectionKey::from_bare(crate::types::DatabaseId::DEFAULT, &collection),
-            identity.tenant_id,
-            body.doc_id.as_bytes(),
-        )
-        .map_err(ApiError::from)?;
+    let surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
+        &state.shared,
+        nodedb_types::CollectionKey::from_bare(crate::types::DatabaseId::DEFAULT, &collection),
+        identity.tenant_id,
+        body.doc_id.as_bytes(),
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    .map_err(ApiError::from)?;
 
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
         collection: nodedb_types::QualifiedCollection::new(
@@ -149,7 +149,7 @@ pub async fn crdt_apply(
     .ok_or_else(|| ApiError::Internal("authorization returned no capability".into()))?;
 
     // Route through the Raft proposer gate so the delta is quorum-durable under
-    // replication. A local-only dispatch would land it on the receiving node only
+    // replication. A local-only dispatch will land it on the receiving node only
     // — lost to followers and entirely on leader failover. This handler is scoped
     // to the default database (matching its surrogate assignment above).
     let _request = state.shared.tenant_request_guard(identity.tenant_id);
@@ -277,7 +277,7 @@ mod tests {
         let permissions = PermissionStore::new();
         permissions
             .grant(
-                "collection:9:_system.audit_log",
+                "collection:0:9:_system.audit_log",
                 "user:writer",
                 Permission::Write,
                 "admin",
@@ -302,7 +302,7 @@ mod tests {
         let permissions = PermissionStore::new();
         permissions
             .grant(
-                "collection:10:orders",
+                "collection:0:10:orders",
                 "user:writer",
                 Permission::Write,
                 "admin",

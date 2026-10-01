@@ -4,8 +4,9 @@
 
 use tracing::debug;
 
-use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::envelope::{EdgeImage, ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::partial_refusal::refusal_after_partial_apply;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
 
@@ -25,23 +26,49 @@ impl CoreLoop {
     ) -> Response {
         debug!(core = self.core_id, count = edges.len(), "edge put batch");
         let database_id = task.request.database_id.as_u64();
-        // Every endpoint is checked before any edge is written, so a dangling
-        // refusal applies nothing.
-        if let Some(missing_node) = edges.iter().find_map(|edge| {
-            [&edge.src_id, &edge.dst_id]
+        // Every endpoint carries the surrogate its coordinator bound. One
+        // unbound endpoint refuses the batch before any edge is written.
+        if let Some(refusal) = edges.iter().find_map(|edge| {
+            [edge.src_surrogate, edge.dst_surrogate]
                 .into_iter()
-                .find(|node| self.is_node_deleted(database_id, tid, node))
-                .cloned()
+                .find_map(|surrogate| {
+                    crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+                        "graph",
+                        edge.collection.as_str(),
+                        surrogate,
+                    )
+                })
         }) {
+            return self.response_error(task, refusal);
+        }
+        // Every endpoint is checked before any edge is written, so a dangling
+        // refusal applies nothing. A decided ordinal marks committed versions
+        // written again, which the dangling rule never refuses.
+        if self.apply_scope.graph_system_from.is_none()
+            && let Some(missing_node) = edges.iter().find_map(|edge| {
+                [&edge.src_id, &edge.dst_id]
+                    .into_iter()
+                    .find(|node| {
+                        self.is_node_deleted(database_id, tid, edge.collection.as_str(), node)
+                    })
+                    .cloned()
+            })
+        {
             return self.response_error(task, ErrorCode::RejectedDanglingEdge { missing_node });
         }
+        // Each edge's version, at the ordinal decided here, journalled after
+        // apply. An edge that failed after earlier ones landed refuses the
+        // batch with the landed versions, which stay.
+        let mut write_set: Vec<WriteSetEntry> = Vec::with_capacity(edges.len());
         for (idx, edge) in edges.iter().enumerate() {
-            let ord = self
-                .active_graph_system_from
-                .unwrap_or_else(|| self.hlc.next_ordinal());
+            let stamp = match self.graph_write_stamp() {
+                Ok(stamp) => stamp,
+                Err(e) => return self.refusal_with_landed_rows(task, e.into(), write_set),
+            };
+            let ord = stamp.system_from;
             let valid_from_ms = nodedb_types::ordinal_to_ms(ord);
             use crate::engine::graph::edge_store::EdgeRef;
-            match self.edge_store.put_edge_versioned_with_stats(
+            match self.edge_store.put_edge_version_recorded(
                 EdgeRef::new(
                     task.request.database_id,
                     TenantId::new(tid),
@@ -52,36 +79,49 @@ impl CoreLoop {
                 )
                 .with_surrogates(edge.src_surrogate, edge.dst_surrogate),
                 &[],
-                ord,
+                stamp,
                 valid_from_ms,
                 i64::MAX,
                 owns_logical_edge_stats(task, &edge.src_id),
             ) {
-                Ok(()) => {
-                    let partition = self.csr_partition_mut(database_id, tid);
-                    if let Err(e) = partition.add_edge_in_collection(
-                        &edge.src_id,
-                        &edge.label,
-                        &edge.dst_id,
+                Ok(version) => {
+                    // The version is in the edge store from here on.
+                    write_set.push(WriteSetEntry::edge(EdgeImage::Put(
+                        crate::wal::EdgePutRedo {
+                            collection: edge.collection.to_string(),
+                            src_id: edge.src_id.clone(),
+                            label: edge.label.clone(),
+                            dst_id: edge.dst_id.clone(),
+                            properties: Vec::new(),
+                            src_surrogate: edge.src_surrogate.as_u32(),
+                            dst_surrogate: edge.dst_surrogate.as_u32(),
+                            system_from: Some(ord),
+                            applied: (stamp.applied != ord).then_some(stamp.applied),
+                        },
+                    )));
+                    // The CSR follows what the edge resolves to: a version a
+                    // TRUNCATE hides leaves the edge as it was.
+                    if let Err(e) = self.mirror_edge_csr(
+                        database_id,
+                        tid,
+                        (&edge.src_id, &edge.label, &edge.dst_id),
                         edge.collection.as_str(),
+                        version.current.as_deref(),
                     ) {
-                        return self.response_error(
-                            task,
-                            ErrorCode::Internal {
-                                detail: format!("edge {idx} (label interning): {e}"),
-                            },
-                        );
+                        let code = refusal_after_partial_apply(ErrorCode::Internal {
+                            detail: format!("edge {idx} (label interning): {e}"),
+                        });
+                        return self.refusal_with_landed_rows(task, code, write_set);
                     }
+                    let partition = self.csr_partition_mut(database_id, tid);
                     partition.set_node_surrogate(&edge.src_id, edge.src_surrogate);
                     partition.set_node_surrogate(&edge.dst_id, edge.dst_surrogate);
                 }
                 Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("edge {idx}: {e}"),
-                        },
-                    );
+                    let code = ErrorCode::Internal {
+                        detail: format!("edge {idx}: {e}"),
+                    };
+                    return self.refusal_with_landed_rows(task, code, write_set);
                 }
             }
         }
@@ -108,12 +148,16 @@ impl CoreLoop {
                     src_id: &edge.src_id,
                     label: &edge.label,
                     dst_id: &edge.dst_id,
+                    src_surrogate: edge.src_surrogate,
+                    dst_surrogate: edge.dst_surrogate,
                     op: crate::event::WriteOp::Insert,
                     properties: Some(&[]),
                 },
             );
         }
-        self.response_affected(task, edges.len() as u64)
+        let mut response = self.response_affected(task, edges.len() as u64);
+        response.write_set = write_set;
+        response
     }
 }
 
@@ -137,13 +181,27 @@ mod tests {
         }
     }
 
+    /// A node deleted from another collection is not dangling here: a row
+    /// delete scopes the tracker to its own collection.
+    #[test]
+    fn a_node_deleted_in_another_collection_is_not_dangling() {
+        let mut h = make_core();
+        h.core
+            .mark_node_deleted(DatabaseId::DEFAULT.as_u64(), 1, "users", "gone");
+        let task = make_task_with_lsn(9);
+        let resp = h
+            .core
+            .execute_edge_put_batch(&task, 1, &[edge("c", "gone")]);
+        assert_eq!(resp.status, Status::Ok, "{resp:?}");
+    }
+
     /// The funnel cancels the batch's record on a dangling refusal, so the
     /// refusal must leave no edge of the batch behind.
     #[test]
     fn a_dangling_edge_late_in_the_batch_writes_no_edge() {
         let mut h = make_core();
         h.core
-            .mark_node_deleted(DatabaseId::DEFAULT.as_u64(), 1, "gone");
+            .mark_node_deleted(DatabaseId::DEFAULT.as_u64(), 1, "knows", "gone");
         let task = make_task_with_lsn(9);
         let edges = vec![edge("a", "b"), edge("c", "gone")];
 

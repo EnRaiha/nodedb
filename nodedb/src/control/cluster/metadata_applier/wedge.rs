@@ -3,7 +3,7 @@
 //! Classification of a failed metadata host-side apply, and the durable
 //! marker a permanent failure leaves behind.
 //!
-//! The apply loop must never advance its watermark past an entry it could not
+//! The apply loop must never advance its watermark past an entry it cannot
 //! apply — skipping a committed metadata entry is silent divergence from the
 //! quorum. So both a transient and a permanent failure stop the batch. What
 //! they must NOT share is the *story told to operators*:
@@ -17,12 +17,12 @@
 //!   only symptom operators ever see is an unrelated-looking lease timeout on
 //!   every subsequent query.
 
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 /// Whether a failed host-side apply can plausibly succeed on re-delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyFailureClass {
-    /// May clear on its own; halt-and-retry is sufficient.
+    /// Can clear on its own; halt-and-retry is sufficient.
     Transient,
     /// Deterministic in the entry and local state — re-delivery re-fails.
     Permanent,
@@ -39,7 +39,7 @@ impl ApplyFailureClass {
 /// Deliberately an allowlist of the variants that are *provably* a pure
 /// function of the entry plus local persisted state. Everything else is
 /// treated as transient, because the cost of the two mistakes is asymmetric:
-/// calling a transient failure permanent takes a node that would have healed
+/// calling a transient failure permanent takes a node that heals
 /// itself out of rotation, while calling a permanent failure transient only
 /// costs the loud health signal — the watermark halts either way.
 pub fn classify(error: &crate::Error) -> ApplyFailureClass {
@@ -52,12 +52,15 @@ pub fn classify(error: &crate::Error) -> ApplyFailureClass {
         // applier code that ran them; re-delivery replays the same writes
         // and finds the same orphan every time.
         crate::Error::CatalogIntegrityViolation { .. } => ApplyFailureClass::Permanent,
+        // The committed entry carries the row it writes, so an unstamped row
+        // is unstamped on every re-delivery.
+        crate::Error::CollectionUnstamped { .. } => ApplyFailureClass::Permanent,
         // The bytes being encoded/decoded are fixed by the committed entry, so
         // a codec rejection is reproducible.
         crate::Error::Serialization { .. } | crate::Error::Codec { .. } => {
             ApplyFailureClass::Permanent
         }
-        // A committed entry that the host rejects as malformed will be just as
+        // A committed entry that the host rejects as malformed will be as
         // malformed next time.
         crate::Error::BadRequest { .. } | crate::Error::TypeMismatch { .. } => {
             ApplyFailureClass::Permanent
@@ -99,9 +102,7 @@ pub fn classify(error: &crate::Error) -> ApplyFailureClass {
         | crate::Error::CrdtAdmissionTimeout { .. }
         | crate::Error::NoLeader { .. }
         | crate::Error::NotLeader { .. }
-        | crate::Error::FanOutExceeded { .. }
         | crate::Error::CrossCollectionNotColocated { .. }
-        | crate::Error::SourceFrozen { .. }
         | crate::Error::CloneWriteRequiresMaterialize { .. }
         | crate::Error::BackupTenantMismatch { .. }
         | crate::Error::BackupKeyMismatch
@@ -119,10 +120,14 @@ pub fn classify(error: &crate::Error) -> ApplyFailureClass {
         | crate::Error::InvalidLimitValue { .. }
         | crate::Error::RetryableSchemaChanged { .. }
         | crate::Error::RetryableLeaderChange { .. }
+        | crate::Error::CommittedResultUnavailable { .. }
+        | crate::Error::ProposalOutcomeUnknown { .. }
         | crate::Error::GroupQuorumUnavailable { .. }
         | crate::Error::GroupMarksUnavailable { .. }
+        | crate::Error::BackupCaptureMoved { .. }
         | crate::Error::MetadataLeaderUnavailable
         | crate::Error::AuthorizationStateBehind { .. }
+        | crate::Error::LinearizableReadRefused { .. }
         | crate::Error::ExecutionLimitExceeded { .. }
         | crate::Error::LimitExceeded { .. }
         | crate::Error::Wal(_)
@@ -139,6 +144,8 @@ pub fn classify(error: &crate::Error) -> ApplyFailureClass {
         | crate::Error::Encryption { .. }
         | crate::Error::Bridge { .. }
         | crate::Error::VersionCompat { .. }
+        | crate::Error::RestoreTargetNotEmpty { .. }
+        | crate::Error::RestoreVerificationFailed { .. }
         | crate::Error::Internal { .. }
         | crate::Error::Shaping(_)
         | crate::Error::Ddl(_)
@@ -171,9 +178,9 @@ pub fn classify(error: &crate::Error) -> ApplyFailureClass {
 }
 
 /// What the applier recorded when it stopped on a permanent failure.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WedgeReport {
-    /// Raft index of the entry that could not be applied.
+    /// Raft index of the entry that cannot be applied.
     pub raft_index: u64,
     /// Highest index whose state is guaranteed visible — one below the stall.
     pub last_applied_watermark: u64,
@@ -183,34 +190,56 @@ pub struct WedgeReport {
     pub error: String,
 }
 
-/// Node-wide marker set once when the metadata applier stops on a permanent
-/// failure. Read by the readiness probe so a wedged node stops reporting
-/// itself healthy.
+/// Node-wide marker set when the metadata applier stops on a permanent
+/// failure, or when a cut barrier's floor write keeps failing. Read by the
+/// readiness probe so a wedged node stops reporting itself healthy.
 ///
-/// First writer wins: the applier retries the same entry on every re-delivery
-/// and would otherwise overwrite the original cause with an identical copy on
-/// every tick. There is no clear path — the applier only resumes if the entry
-/// applies, and if it applies the process has already made progress past the
-/// point this marker describes, so operator intervention is required either
-/// way.
+/// First writer wins: a stalled apply retries the same step and will
+/// otherwise overwrite the original cause with an identical copy on every
+/// attempt. The metadata applier never clears its report: its entry cannot
+/// apply on re-delivery, so operator intervention is required. A floor write
+/// that later succeeds clears its own report through [`Self::clear`]. A clear
+/// never removes a report another writer recorded.
 #[derive(Debug, Default)]
 pub struct MetadataApplyWedge {
-    report: OnceLock<WedgeReport>,
+    report: Mutex<Option<WedgeReport>>,
 }
 
 impl MetadataApplyWedge {
-    /// Record the first permanent failure. Later calls are ignored.
-    pub fn record(&self, report: WedgeReport) {
-        let _ = self.report.set(report);
+    /// Record `report` unless a report is already held. Returns whether this
+    /// call recorded it.
+    pub fn record(&self, report: WedgeReport) -> bool {
+        let mut held = self.report.lock().unwrap_or_else(|p| p.into_inner());
+        if held.is_some() {
+            return false;
+        }
+        *held = Some(report);
+        true
     }
 
-    /// The recorded failure, if this node's metadata applier is wedged.
-    pub fn report(&self) -> Option<&WedgeReport> {
-        self.report.get()
+    /// Remove the held report if it equals `report`. Returns whether it did.
+    pub fn clear(&self, report: &WedgeReport) -> bool {
+        let mut held = self.report.lock().unwrap_or_else(|p| p.into_inner());
+        if held.as_ref() != Some(report) {
+            return false;
+        }
+        *held = None;
+        true
+    }
+
+    /// The recorded failure, if this node is wedged.
+    pub fn report(&self) -> Option<WedgeReport> {
+        self.report
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     pub fn is_wedged(&self) -> bool {
-        self.report.get().is_some()
+        self.report
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
     }
 }
 
@@ -263,8 +292,31 @@ mod tests {
         });
         assert!(wedge.is_wedged());
         assert_eq!(
-            wedge.report().map(|report| report.error.as_str()),
-            Some("first")
+            wedge.report().map(|report| report.error),
+            Some("first".to_string())
         );
+    }
+
+    #[test]
+    fn a_clear_removes_only_its_own_report() {
+        let wedge = MetadataApplyWedge::default();
+        let applier = WedgeReport {
+            raft_index: 3,
+            last_applied_watermark: 2,
+            entry_kind: "DdlPrepared".into(),
+            error: "applier".into(),
+        };
+        let floor = WedgeReport {
+            raft_index: 9,
+            last_applied_watermark: 8,
+            entry_kind: "CutBarrier".into(),
+            error: "floor".into(),
+        };
+        assert!(wedge.record(applier.clone()));
+        assert!(!wedge.record(floor.clone()));
+        assert!(!wedge.clear(&floor));
+        assert_eq!(wedge.report(), Some(applier.clone()));
+        assert!(wedge.clear(&applier));
+        assert!(!wedge.is_wedged());
     }
 }

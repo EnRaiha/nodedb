@@ -4,9 +4,9 @@
 //!
 //! The one apply path for a committed redo record. The data-group apply loop
 //! runs it for every committed `TransactionRedo` entry on every replica, the
-//! proposer included; a node with no Raft runs it for its own commit. Either
-//! way the write funnel appends the record to this node's WAL and dispatches
-//! it to the owning core, and the fsync completes before the result returns.
+//! proposer included. The write funnel appends the record to this node's WAL
+//! and dispatches it to the owning core, and the fsync completes before the
+//! result returns.
 
 use crate::control::server::dispatch_utils::{
     ChangeFeedOwner, PendingWrite, SubmitOutcome, SubmitWrite, WalDurability, WriteOrdering,
@@ -15,6 +15,7 @@ use crate::control::server::dispatch_utils::{
 use crate::control::state::SharedState;
 use crate::control::surrogate::bind_carried_identities;
 use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use crate::wal::{PublishPosition, RedoPublish};
 
 use super::payload::TransactionRedoPayload;
 
@@ -26,34 +27,50 @@ pub struct RedoTarget {
     pub vshard_id: VShardId,
 }
 
-/// Bind the redo's identities, then append and apply it on this node.
-///
-/// `apply_key` is the idempotency key of the Raft entry the redo comes from,
-/// `0` on a node with no Raft. The redo record's header carries it.
-/// `commit_hlc` is the entry's commit stamp, `None` on a node with no Raft,
-/// where the append here is the commit. The outcome carries the Data Plane's
-/// response verbatim, including an error status.
-pub(crate) async fn apply_transaction_redo(
+/// Record the cross-shard key a redo carries once the redo installed. The
+/// same record in the WAL restores it after a crash between the two, and a
+/// failed store write still answers for the key in memory until then.
+pub(crate) fn record_cross_shard_key(
     state: &SharedState,
-    target: RedoTarget,
     payload: &TransactionRedoPayload,
-    apply_key: u64,
-    commit_hlc: Option<u64>,
-) -> crate::Result<SubmitOutcome> {
-    enqueue_transaction_redo(state, target, payload, apply_key, commit_hlc)
-        .await?
-        .finish(state)
-        .await
+    outcome: &SubmitOutcome,
+) {
+    if outcome.response.status != crate::bridge::envelope::Status::Ok {
+        return;
+    }
+    if let (Some(key), Some(dedup)) = (
+        payload.redo.cross_shard_applied.as_ref(),
+        state.cross_shard_dedup.get(),
+    ) && let Err(error) = dedup.record_applied(key)
+    {
+        tracing::error!(
+            source_vshard = key.source_vshard,
+            source_lsn = key.source_lsn,
+            origin = %key.origin,
+            error = %error,
+            "cross-shard dedup key held in memory only; the WAL restores it on restart"
+        );
+    }
 }
 
 /// Bind the redo's identities, then append it and enqueue it on its core.
 /// [`PendingWrite::finish`] collects the outcome.
+///
+/// `apply_key` is the idempotency key of the Raft entry the redo comes from.
+/// The redo record's header carries it. `commit_hlc` is the entry's commit
+/// stamp. `change_position` is the Raft log position of the entry. The redo's
+/// `PUBLISH TO` messages are stamped with it before the record is appended,
+/// so each message's event names its position on every replica and after a
+/// WAL replay. `change_feed` names the feed that carries the redo's row
+/// changes: the entry's group.
 pub(crate) async fn enqueue_transaction_redo(
     state: &SharedState,
     target: RedoTarget,
     payload: &TransactionRedoPayload,
     apply_key: u64,
     commit_hlc: Option<u64>,
+    change_position: Option<crate::event::cdc::position::ReplicatedPosition>,
+    change_feed: ChangeFeedOwner,
 ) -> crate::Result<PendingWrite> {
     bind_carried_identities(
         &state.surrogate_assigner,
@@ -61,7 +78,22 @@ pub(crate) async fn enqueue_transaction_redo(
         target.tenant_id,
         &payload.identities,
     )?;
-    let plan = payload.apply_plan()?;
+    let plan = match change_position {
+        Some(position) if !payload.redo.publishes.is_empty() => {
+            let mut stamped = payload.clone();
+            RedoPublish::stamp_all(
+                &mut stamped.redo.publishes,
+                PublishPosition {
+                    partition: target.vshard_id.as_u32(),
+                    epoch: position.epoch,
+                    index: position.log_index,
+                    base: 0,
+                },
+            );
+            stamped.apply_plan()?
+        }
+        _ => payload.apply_plan()?,
+    };
     enqueue_write(
         state,
         SubmitWrite {
@@ -79,13 +111,14 @@ pub(crate) async fn enqueue_transaction_redo(
                 now_override: None,
                 apply_key,
                 commit_hlc,
+                change_position,
             },
-            // Raft fixed the order; a node with no Raft already validated the
-            // commit and holds no gate for it.
+            // Raft fixed the order.
             ordering: WriteOrdering::AlreadyOrdered,
-            // A committed transaction publishes no Control-Plane change event;
-            // its rows reach subscribers through the Data Plane's events.
-            change_feed: ChangeFeedOwner::Unowned,
+            // A committed transaction publishes its rows like autocommit
+            // writes do, at the commit's position. A rolled-back transaction
+            // never reaches this apply, so it publishes nothing.
+            change_feed,
         },
     )
     .await

@@ -4,10 +4,12 @@
 //! that covers the same surface.
 
 use nodedb::control::security::audit::AuditEvent;
+use nodedb::control::security::audit::NoopAuditEmitter;
 use nodedb::control::security::identity::{AuthMethod, AuthenticatedIdentity, Permission, Role};
-use nodedb::types::TenantId;
+use nodedb::types::{DatabaseId, TenantId};
 use nodedb_test_support::pgwire_auth_helpers::{
-    assert_readonly_denied, ddl_err, ddl_ok, make_state, make_state_with_catalog, superuser,
+    assert_readonly_denied, ddl_err, ddl_ok, ddl_ok_in, make_state, make_state_with_catalog,
+    superuser,
 };
 
 #[tokio::test]
@@ -417,5 +419,46 @@ async fn alter_role_unknown_subcommand_rejected_cleanly() {
     assert!(
         err.to_uppercase().contains("FROBNICATE"),
         "error must name the unrecognized token, not silently reroute to SET INHERIT: {err}"
+    );
+}
+
+/// A collection GRANT issued in one database binds that database only. The
+/// same collection name in another database of the tenant stays closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn collection_grant_does_not_open_another_database() {
+    let state = make_state();
+    let su = superuser();
+    ddl_ok(&state, &su, "CREATE USER dora WITH PASSWORD 'pass'").await;
+    let granted = DatabaseId::new(1024);
+    ddl_ok_in(&state, &su, "GRANT READ ON orders TO dora", granted).await;
+
+    // The grant lands in the granting admin's tenant.
+    let dora = AuthenticatedIdentity::new_regular(
+        60,
+        "dora",
+        su.tenant_id,
+        AuthMethod::Trust,
+        Vec::new(),
+        None,
+        AuthenticatedIdentity::default_database_set(false),
+    );
+    let check = |database_id| {
+        state.permissions.check(
+            &dora,
+            Permission::Read,
+            database_id,
+            "orders",
+            &state.roles,
+            &NoopAuditEmitter,
+        )
+    };
+    assert!(check(granted), "the grant opens its own database");
+    assert!(
+        !check(DatabaseId::new(1025)),
+        "the grant must not open db 1025"
+    );
+    assert!(
+        !check(DatabaseId::DEFAULT),
+        "the grant must not open default"
     );
 }

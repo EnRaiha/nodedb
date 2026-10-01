@@ -2,8 +2,11 @@
 
 //! Proposing a new cluster generation on metadata-group leadership acquisition.
 
+use crate::catalog::ClusterCatalog;
+use crate::cluster_epoch::ClusterEpochState;
+use crate::error::Result;
 use crate::forward::PlanExecutor;
-use crate::metadata_group::codec::{decode_entry, encode_entry};
+use crate::metadata_group::codec::encode_entry;
 use crate::metadata_group::entry::MetadataEntry;
 use crate::raft_loop::loop_core::{CommitApplier, RaftLoop};
 
@@ -57,57 +60,82 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
 }
 
 impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
-    /// Advance this node's applied epoch for every committed
-    /// [`MetadataEntry::ClusterEpochBump`] in `pairs`.
+    /// Adopt the epoch bumps `entry` carries, committed at `index`.
     ///
-    /// Applying the entry is the moment the generation becomes this node's
-    /// own: before it, the number was something a peer asserted; after it,
-    /// this node has processed the same committed fact everyone else has and
-    /// may stamp it outbound.
+    /// The caller runs this only after every earlier entry of the batch has
+    /// applied, so no epoch lands ahead of an entry the applier stopped at.
     ///
-    /// Entries that fail to decode are skipped rather than fatal — they belong
-    /// to variants this node's build does not know, and the epoch is not among
-    /// them.
-    pub(super) fn adopt_committed_cluster_epochs(&self, pairs: &[(u64, Vec<u8>)]) {
-        for (index, data) in pairs {
-            let Ok(entry) = decode_entry(data) else {
-                continue;
-            };
-            self.adopt_entry_epoch(&entry, *index);
-        }
+    /// The epoch is persisted to the catalog, so the adoption runs on a
+    /// blocking thread and the metadata lane awaits it.
+    pub(super) async fn adopt_cluster_epoch(
+        &self,
+        entry: &MetadataEntry,
+        index: u64,
+    ) -> Result<()> {
+        let state = std::sync::Arc::clone(&self.cluster_epoch);
+        let catalog = self.catalog.clone();
+        let node_id = self.node_id;
+        let entry = entry.clone();
+        tokio::task::spawn_blocking(move || {
+            adopt_entry_epoch(&state, catalog.as_deref(), node_id, &entry, index)
+        })
+        .await
+        .map_err(|e| crate::error::ClusterError::Storage {
+            detail: format!("cluster epoch adoption task at log index {index}: {e}"),
+        })?
     }
+}
 
-    /// Recurse into batches so a bump packed inside one still lands.
-    fn adopt_entry_epoch(&self, entry: &MetadataEntry, index: u64) {
-        match entry {
-            MetadataEntry::ClusterEpochBump { epoch } => {
-                self.cluster_epoch.advance_applied(*epoch);
-                if let Some(catalog) = self.catalog.as_ref()
-                    && let Err(e) = crate::cluster_epoch::persist_applied_epoch(catalog, *epoch)
-                {
-                    tracing::warn!(
-                        node = self.node_id,
-                        epoch = *epoch,
-                        error = %e,
-                        "applied the cluster epoch but could not persist it; \
-                         it is re-learned from the log after a restart"
-                    );
+/// Whether `entry` carries a [`MetadataEntry::ClusterEpochBump`], directly or
+/// nested in a batch or a prepared DDL.
+pub(super) fn carries_epoch(entry: &MetadataEntry) -> bool {
+    match entry {
+        MetadataEntry::ClusterEpochBump { .. } => true,
+        MetadataEntry::Batch { entries } => entries.iter().any(carries_epoch),
+        MetadataEntry::DdlPrepared { entry, .. } => carries_epoch(entry),
+        _ => false,
+    }
+}
+
+/// Adopt every epoch bump `entry` carries.
+///
+/// Applying the entry is the moment the generation becomes this node's own:
+/// before it, the number was something a peer asserted. The epoch is persisted
+/// before the in-memory mark advances, so the applied mark is always durable.
+/// A bump at or below the applied mark is already durable and is not written.
+fn adopt_entry_epoch(
+    state: &ClusterEpochState,
+    catalog: Option<&ClusterCatalog>,
+    node_id: u64,
+    entry: &MetadataEntry,
+    index: u64,
+) -> Result<()> {
+    match entry {
+        MetadataEntry::ClusterEpochBump { epoch } => {
+            if *epoch > state.applied() {
+                if let Some(catalog) = catalog {
+                    crate::cluster_epoch::persist_applied_epoch(catalog, *epoch)?;
                 }
-                tracing::info!(
-                    node = self.node_id,
-                    epoch = *epoch,
-                    log_index = index,
-                    "applied cluster epoch"
-                );
+                state.advance_applied(*epoch);
             }
-            MetadataEntry::Batch { entries } => {
-                for sub in entries {
-                    self.adopt_entry_epoch(sub, index);
-                }
-            }
-            MetadataEntry::DdlPrepared { entry, .. } => self.adopt_entry_epoch(entry, index),
-            _ => {}
+            tracing::info!(
+                node = node_id,
+                epoch = *epoch,
+                log_index = index,
+                "applied cluster epoch"
+            );
+            Ok(())
         }
+        MetadataEntry::Batch { entries } => {
+            for sub in entries {
+                adopt_entry_epoch(state, catalog, node_id, sub, index)?;
+            }
+            Ok(())
+        }
+        MetadataEntry::DdlPrepared { entry, .. } => {
+            adopt_entry_epoch(state, catalog, node_id, entry, index)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -122,8 +150,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster_epoch::ClusterEpochState;
-    use crate::metadata_group::codec::encode_entry;
+    use crate::metadata_group::codec::decode_entry;
 
     /// Two nodes in one process must hold independent generations. A single
     /// process-wide counter would alias them and no disagreement could ever be
@@ -184,5 +211,51 @@ mod tests {
             }
         }
         assert_eq!(found, Some(8), "a nested bump must be reachable");
+    }
+
+    fn bump(epoch: u64) -> MetadataEntry {
+        MetadataEntry::ClusterEpochBump { epoch }
+    }
+
+    /// A failed epoch persist leaves the in-memory mark and the stored epoch
+    /// where they were. The retry persists and advances.
+    #[test]
+    fn epoch_persist_error_does_not_advance() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ClusterCatalog::open(&dir.path().join("cluster.redb")).unwrap();
+        let state = ClusterEpochState::new(1);
+
+        adopt_entry_epoch(&state, Some(&catalog), 1, &bump(2), 10).unwrap();
+        catalog.fail_next_epoch_write_for_test();
+        assert!(adopt_entry_epoch(&state, Some(&catalog), 1, &bump(3), 11).is_err());
+        assert_eq!(state.applied(), 2);
+        assert_eq!(catalog.load_cluster_epoch().unwrap(), Some(2));
+
+        adopt_entry_epoch(&state, Some(&catalog), 1, &bump(3), 11).unwrap();
+        assert_eq!(state.applied(), 3);
+        assert_eq!(catalog.load_cluster_epoch().unwrap(), Some(3));
+    }
+
+    /// Replaying an older bump never lowers the persisted epoch.
+    #[test]
+    fn replayed_older_bump_keeps_the_persisted_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ClusterCatalog::open(&dir.path().join("cluster.redb")).unwrap();
+        let state = ClusterEpochState::new(0);
+        adopt_entry_epoch(&state, Some(&catalog), 1, &bump(7), 5).unwrap();
+        adopt_entry_epoch(&state, Some(&catalog), 1, &bump(3), 2).unwrap();
+        assert_eq!(state.applied(), 7);
+        assert_eq!(catalog.load_cluster_epoch().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn nested_bumps_are_detected() {
+        let batch = MetadataEntry::Batch {
+            entries: vec![MetadataEntry::CatalogDdl { payload: vec![] }, bump(4)],
+        };
+        assert!(carries_epoch(&batch));
+        assert!(!carries_epoch(&MetadataEntry::CatalogDdl {
+            payload: vec![]
+        }));
     }
 }

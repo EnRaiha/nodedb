@@ -71,6 +71,12 @@ pub struct OriginSnapshotStore {
     db: Arc<Database>,
 }
 
+impl crate::storage::RedbBacked for OriginSnapshotStore {
+    fn redb_database(&self) -> &redb::Database {
+        &self.db
+    }
+}
+
 impl OriginSnapshotStore {
     /// Open or create the snapshot database at `{data_dir}/array_sync/snapshots.redb`.
     pub fn open(data_dir: &Path) -> crate::Result<Arc<Self>> {

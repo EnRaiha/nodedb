@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Graph serializer for transaction resolve. Turns staged edge post-images
-//! into the same WAL sub-record shapes the autocommit path produces, plus
-//! the two endpoint surrogates a redo put needs but the overlay doesn't
-//! carry (`entry.rs` collects those from the plan nodes). Overlay entries
+//! into the same WAL sub-record shapes the autocommit path produces. Each
+//! edge put and delete carries its two endpoint surrogates, which the overlay
+//! does not hold (`entry.rs` collects them from the plan nodes). Overlay entries
 //! are `HashMap`/`HashSet`-keyed, so they're sorted before emitting so
 //! replicas produce identical ops.
 
@@ -13,10 +13,13 @@ use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
 use nodedb_wal::record::RecordType;
 
 use crate::control::server::wal_dispatch::encode_graph_node_label_payload;
+use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::transaction::overlay::{
     GraphCollKey, GraphTxnOverlay, NodeLabelDelta,
 };
 use crate::wal::RedoSubRecord;
+
+use super::edge_ordinal::EdgeOrdinals;
 
 /// Edge identity key: `(collection, src_id, label, dst_id)`. Scoped by
 /// collection because `entry.rs` collects surrogates for every touched
@@ -26,13 +29,15 @@ pub(super) type EdgeIdentityKey = (String, String, String, String);
 /// Append the redo sub-records for every graph edge post-image staged in
 /// `overlay` for `coll_key` to `ops`, in deterministic edge-identity order.
 /// `edge_surrogates` maps identity to the `(src, dst)` surrogate pair
-/// `entry.rs` collected from the plan nodes — the overlay carries none.
+/// `entry.rs` collected from the plan nodes — the overlay carries none. A
+/// staged edge with no bound pair is refused. `ordinals` names each
+/// version's system-time ordinal.
 pub(super) fn serialize_graph_collection(
     overlay: &GraphTxnOverlay,
     coll_key: &GraphCollKey,
     collection: &str,
     edge_surrogates: &BTreeMap<EdgeIdentityKey, (u32, u32)>,
-    system_from: i64,
+    ordinals: &EdgeOrdinals<'_>,
     ops: &mut Vec<RedoSubRecord>,
 ) -> crate::Result<()> {
     let mut puts: BTreeMap<(String, String, String), Vec<u8>> = BTreeMap::new();
@@ -55,24 +60,19 @@ pub(super) fn serialize_graph_collection(
             label.clone(),
             dst.clone(),
         );
-        let (src_surrogate, dst_surrogate) = edge_surrogates
-            .get(&identity_key)
-            .copied()
-            .ok_or_else(|| crate::Error::Internal {
-                detail: format!(
-                    "graph resolve: staged edge put '{collection}'/'{src}'-'{label}'->'{dst}' \
-                         has no bound endpoint surrogates"
-                ),
-            })?;
+        let (src_surrogate, dst_surrogate) =
+            bound_endpoints(edge_surrogates, &identity_key, "put")?;
+        let stamp = ordinals.for_edge(collection, &src, &label, &dst)?;
         let payload = zerompk::to_msgpack_vec(&crate::wal::EdgePutRedo {
             collection: collection.to_string(),
-            src_id: src.clone(),
-            label: label.clone(),
-            dst_id: dst.clone(),
-            properties: properties.clone(),
+            src_id: src,
+            label,
+            dst_id: dst,
+            properties,
             src_surrogate,
             dst_surrogate,
-            system_from: Some(system_from),
+            system_from: Some(stamp.system_from),
+            applied: (stamp.applied != stamp.system_from).then_some(stamp.applied),
         })
         .map_err(|e| crate::Error::Serialization {
             format: "msgpack".into(),
@@ -85,12 +85,24 @@ pub(super) fn serialize_graph_collection(
     }
 
     for (src, label, dst) in deletes {
+        let identity_key = (
+            collection.to_string(),
+            src.clone(),
+            label.clone(),
+            dst.clone(),
+        );
+        let (src_surrogate, dst_surrogate) =
+            bound_endpoints(edge_surrogates, &identity_key, "delete")?;
+        let stamp = ordinals.for_edge(collection, &src, &label, &dst)?;
         let payload = zerompk::to_msgpack_vec(&crate::wal::EdgeDeleteRedo {
             collection: collection.to_string(),
-            src_id: src.clone(),
-            label: label.clone(),
-            dst_id: dst.clone(),
-            system_from: Some(system_from),
+            src_id: src,
+            label,
+            dst_id: dst,
+            src_surrogate,
+            dst_surrogate,
+            system_from: Some(stamp.system_from),
+            applied: (stamp.applied != stamp.system_from).then_some(stamp.applied),
         })
         .map_err(|e| crate::Error::Serialization {
             format: "msgpack".into(),
@@ -102,6 +114,33 @@ pub(super) fn serialize_graph_collection(
         });
     }
     Ok(())
+}
+
+/// The bound `(src, dst)` surrogate pair of a staged edge. Refuses an edge the
+/// plan nodes named no pair for, and a pair holding `Surrogate::ZERO`.
+fn bound_endpoints(
+    edge_surrogates: &BTreeMap<EdgeIdentityKey, (u32, u32)>,
+    identity_key: &EdgeIdentityKey,
+    verb: &str,
+) -> crate::Result<(u32, u32)> {
+    let unbound = || {
+        let (collection, src, label, dst) = identity_key;
+        crate::Error::Internal {
+            detail: format!(
+                "graph resolve: staged edge {verb} '{collection}'/'{src}'-'{label}'->'{dst}' \
+                 has no bound endpoint surrogates"
+            ),
+        }
+    };
+    let (src, dst) = edge_surrogates
+        .get(identity_key)
+        .copied()
+        .ok_or_else(unbound)?;
+    let zero = nodedb_types::Surrogate::ZERO.as_u32();
+    if src == zero || dst == zero {
+        return Err(unbound());
+    }
+    Ok((src, dst))
 }
 
 /// Append the redo sub-records for every staged node-label delta in
@@ -196,15 +235,41 @@ pub(super) fn classify_graph_op(
             Ok(())
         }
 
-        // Edge delete: the redo delete tuple carries no surrogate, so only
-        // the collection is needed to walk the overlay's tombstone set.
-        GraphOp::EdgeDelete { collection, .. } => {
+        // Edge delete: the redo delete carries both endpoint surrogates like
+        // a put, so they are collected from the plan node the same way.
+        GraphOp::EdgeDelete {
+            collection,
+            src_id,
+            label,
+            dst_id,
+            src_surrogate,
+            dst_surrogate,
+            ..
+        } => {
             collections.insert(collection.to_string());
+            edge_surrogates.insert(
+                (
+                    collection.to_string(),
+                    src_id.clone(),
+                    label.clone(),
+                    dst_id.clone(),
+                ),
+                (src_surrogate.as_u32(), dst_surrogate.as_u32()),
+            );
             Ok(())
         }
         GraphOp::EdgeDeleteBatch { edges } => {
             for edge in edges {
                 collections.insert(edge.collection.to_string());
+                edge_surrogates.insert(
+                    (
+                        edge.collection.to_string(),
+                        edge.src_id.clone(),
+                        edge.label.clone(),
+                        edge.dst_id.clone(),
+                    ),
+                    (edge.src_surrogate.as_u32(), edge.dst_surrogate.as_u32()),
+                );
             }
             Ok(())
         }
@@ -226,11 +291,62 @@ pub(super) fn classify_graph_op(
         | GraphOp::WccSuperstep(_)
         | GraphOp::TemporalNeighbors { .. }
         | GraphOp::TemporalAlgorithm { .. }
-        | GraphOp::Stats { .. } => Ok(()),
+        | GraphOp::Stats { .. }
+        | GraphOp::NodePresenceRead { .. } => Ok(()),
 
         // Node-label deltas live under the fixed sentinel key, not a
         // per-collection post-image — nothing to collect here.
         GraphOp::SetNodeLabels { .. } | GraphOp::RemoveNodeLabels { .. } => Ok(()),
+
+        // A guard writes nothing. A Calvin transaction checks it when it
+        // stages, and a session COMMIT checks it before its resolve
+        // (`execute_resolve_session_txn`).
+        GraphOp::NodeEdgeGuard { .. } | GraphOp::NodePresenceGuard { .. } => Ok(()),
+
+        // Stages nothing: `serialize_truncated_edges` writes the share's cut.
+        GraphOp::TruncateEdges { .. } => Ok(()),
+    }
+}
+
+impl CoreLoop {
+    /// Append one cut sub-record per TRUNCATE share among `plans`, at the
+    /// Calvin transaction's ordinal.
+    ///
+    /// The cut reads no stored edge: every read hides the collection's
+    /// versions applied below it. Its effect is the same whatever this core
+    /// applied before or after it, so a core that holds several vShards, or
+    /// both homes of an edge, reaches the state every other replica does.
+    /// Every share of one TRUNCATE records the same cut.
+    pub(super) fn serialize_truncated_edges(
+        &self,
+        plans: &[PhysicalPlan],
+        ops: &mut Vec<RedoSubRecord>,
+    ) -> crate::Result<()> {
+        for plan in plans {
+            let PhysicalPlan::Graph(GraphOp::TruncateEdges { collection, .. }) = plan else {
+                continue;
+            };
+            let cut =
+                self.apply_scope
+                    .calvin_txn_ordinal
+                    .ok_or_else(|| crate::Error::Internal {
+                        detail: "a TRUNCATE edge share resolved outside a Calvin transaction"
+                            .into(),
+                    })?;
+            let payload = zerompk::to_msgpack_vec(&crate::wal::EdgeCutRedo {
+                collection: collection.as_str().to_string(),
+                cut,
+            })
+            .map_err(|e| crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("graph resolve truncate cut: {e}"),
+            })?;
+            ops.push(RedoSubRecord {
+                record_type: RecordType::GraphEdgeCut as u32,
+                payload,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -273,8 +389,15 @@ mod tests {
         );
 
         let mut ops = Vec::new();
-        serialize_graph_collection(&overlay, &coll_key("g"), "g", &surrogates, 123, &mut ops)
-            .expect("serialize edge put");
+        serialize_graph_collection(
+            &overlay,
+            &coll_key("g"),
+            "g",
+            &surrogates,
+            &EdgeOrdinals::fixed(123),
+            &mut ops,
+        )
+        .expect("serialize edge put");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].record_type, RecordType::Put as u32);
 
@@ -297,8 +420,14 @@ mod tests {
 
         let surrogates = BTreeMap::new();
         let mut ops = Vec::new();
-        let result =
-            serialize_graph_collection(&overlay, &coll_key("g"), "g", &surrogates, 123, &mut ops);
+        let result = serialize_graph_collection(
+            &overlay,
+            &coll_key("g"),
+            "g",
+            &surrogates,
+            &EdgeOrdinals::fixed(123),
+            &mut ops,
+        );
         assert!(
             result.is_err(),
             "a staged put with no matching plan-carried surrogates must error, not invent one"
@@ -310,10 +439,26 @@ mod tests {
         let mut overlay = GraphTxnOverlay::new();
         overlay.stage_edge_delete(coll_key("g"), "a", "knows", "b");
 
-        let surrogates = BTreeMap::new();
+        let mut surrogates = BTreeMap::new();
+        surrogates.insert(
+            (
+                "g".to_string(),
+                "a".to_string(),
+                "knows".to_string(),
+                "b".to_string(),
+            ),
+            (10u32, 20u32),
+        );
         let mut ops = Vec::new();
-        serialize_graph_collection(&overlay, &coll_key("g"), "g", &surrogates, 123, &mut ops)
-            .expect("serialize edge delete");
+        serialize_graph_collection(
+            &overlay,
+            &coll_key("g"),
+            "g",
+            &surrogates,
+            &EdgeOrdinals::fixed(123),
+            &mut ops,
+        )
+        .expect("serialize edge delete");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].record_type, RecordType::Delete as u32);
 
@@ -323,11 +468,41 @@ mod tests {
         assert_eq!(decoded.src_id, "a");
         assert_eq!(decoded.label, "knows");
         assert_eq!(decoded.dst_id, "b");
+        assert_eq!(decoded.src_surrogate, 10);
+        assert_eq!(decoded.dst_surrogate, 20);
         assert_eq!(
             decoded.system_from,
             Some(123),
             "delete must carry the frozen system-time ordinal for deterministic replay"
         );
+    }
+
+    /// A staged delete whose plan named no pair, or an unbound one, is refused.
+    #[test]
+    fn edge_delete_without_bound_surrogates_is_typed_error() {
+        let mut overlay = GraphTxnOverlay::new();
+        overlay.stage_edge_delete(coll_key("g"), "a", "knows", "b");
+        let key = (
+            "g".to_string(),
+            "a".to_string(),
+            "knows".to_string(),
+            "b".to_string(),
+        );
+        for surrogates in [
+            BTreeMap::new(),
+            BTreeMap::from([(key.clone(), (10u32, 0u32))]),
+        ] {
+            let mut ops = Vec::new();
+            let result = serialize_graph_collection(
+                &overlay,
+                &coll_key("g"),
+                "g",
+                &surrogates,
+                &EdgeOrdinals::fixed(123),
+                &mut ops,
+            );
+            assert!(result.is_err(), "an unbound staged delete must be refused");
+        }
     }
 
     #[test]
@@ -351,8 +526,15 @@ mod tests {
         }
 
         let mut ops = Vec::new();
-        serialize_graph_collection(&overlay, &coll_key("g"), "g", &surrogates, 123, &mut ops)
-            .expect("serialize");
+        serialize_graph_collection(
+            &overlay,
+            &coll_key("g"),
+            "g",
+            &surrogates,
+            &EdgeOrdinals::fixed(123),
+            &mut ops,
+        )
+        .expect("serialize");
         let srcs: Vec<String> = ops
             .iter()
             .map(|op| {

@@ -22,7 +22,7 @@ use crate::data::executor::checkpoint_encoding::{dec_component, enc_component};
 use crate::types::TenantId;
 
 /// Filename of the manifest that names the live generation.
-pub(super) const SPARSE_VECTOR_CKPT_MANIFEST: &str = "MANIFEST";
+pub(crate) const SPARSE_VECTOR_CKPT_MANIFEST: &str = "MANIFEST";
 
 /// Canonical path for a core's sparse-vector checkpoint directory.
 ///

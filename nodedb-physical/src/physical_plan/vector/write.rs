@@ -41,8 +41,8 @@ pub enum VectorDirectWriteIntent {
     zerompk::FromMessagePack,
 )]
 pub enum VectorWriteTargets {
-    /// Surrogates the Control Plane resolved from primary-key equalities.
-    /// `Surrogate::ZERO` is a key with no binding; it matches no row.
+    /// Surrogates the Control Plane resolved from primary-key equalities. A
+    /// key with no binding contributes no entry.
     Surrogates(Vec<Surrogate>),
     /// Serialized `Vec<ScanFilter>` the Data Plane evaluates against every
     /// payload sidecar row. Empty bytes match every row.

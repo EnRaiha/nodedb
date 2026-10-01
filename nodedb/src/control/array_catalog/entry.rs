@@ -39,7 +39,7 @@ pub struct ArrayCatalogEntry {
     /// Existing rows without this field deserialize to 8.
     #[serde(default = "default_prefix_bits")]
     pub prefix_bits: u8,
-    /// Bitemporal audit retention window in milliseconds. Compaction may
+    /// Bitemporal audit retention window in milliseconds. Compaction can
     /// discard superseded tile versions older than `now - audit_retain_ms`.
     /// `None` means retain all versions forever (default, non-bitemporal).
     #[serde(default)]
@@ -49,4 +49,22 @@ pub struct ArrayCatalogEntry {
     /// value. `None` means no floor (default).
     #[serde(default)]
     pub minimum_audit_retain_ms: Option<u64>,
+    /// Stamped at propose time on every replicated put. Fences a replayed
+    /// delete to the incarnation it targeted.
+    #[serde(default)]
+    pub modification_hlc: nodedb_types::Hlc,
+    /// The `modification_hlc` of the `PutArray` that created the array. ALTER
+    /// and MOVE TENANT keep it, so it names one array wherever the array
+    /// lives. `Hlc::ZERO` on a row no proposer stamped.
+    #[serde(default)]
+    pub incarnation: nodedb_types::Hlc,
+}
+
+/// The target of a MOVE TENANT array rekey.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+pub struct ArrayMove {
+    /// The database the array moves to.
+    pub target_db_id: u64,
+    /// The moved tenant. With the source database it names the move's drain.
+    pub mover_tenant_id: u64,
 }

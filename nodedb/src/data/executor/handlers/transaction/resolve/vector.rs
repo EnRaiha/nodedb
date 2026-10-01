@@ -11,11 +11,12 @@
 //! (`control::server::wal_dispatch::vector`) so producer and replay never
 //! drift:
 //!
-//! * `Insert` → `RecordType::VectorPut`, the 7-element
-//!   `(collection, vector, dim, field_name, doc_id_compat, surrogate, provenance)`
+//! * `Insert` → `RecordType::VectorPut`, the 6-element
+//!   `(collection, vector, dim, field_name, surrogate, provenance)`
 //!   shape carrying the row's cross-engine surrogate identity.
-//! * `BatchInsert` → `RecordType::VectorPut`, the 3-element
-//!   `(collection, vectors, dim)` headless-batch shape.
+//! * `BatchInsert` → `RecordType::VectorPut`, the 4-element
+//!   `(collection, vectors, dim, surrogates)` shape carrying each vector's
+//!   surrogate identity.
 //! * `Delete` → `RecordType::VectorDelete`, `(collection, vector_id, None)`.
 //! * `DeleteBySurrogate` → `RecordType::VectorDelete`,
 //!   `(collection, surrogate, field_name, provenance)`.
@@ -109,9 +110,10 @@ pub(super) fn serialize_vector_op(
             collection,
             vectors,
             dim,
-            surrogates: _,
+            surrogates,
         } => {
-            let payload = encode_vector_batch_put_payload(collection.as_str(), vectors, *dim)?;
+            let payload =
+                encode_vector_batch_put_payload(collection.as_str(), vectors, *dim, surrogates)?;
             ops.push(RedoSubRecord {
                 record_type: RecordType::VectorPut as u32,
                 payload,
@@ -275,10 +277,12 @@ pub(super) fn serialize_vector_op(
         VectorOp::ResolveDirectWrite(_) => Ok(()),
         // Multi-vector (ColBERT-style) insert, replayed via
         // `replay_multi_vector_put`.
+        // The record carries the bound surrogate. Replay needs no key.
         VectorOp::MultiVectorInsert {
             collection,
             field_name,
             document_surrogate,
+            pk_bytes: _,
             vectors,
             count,
             dim,

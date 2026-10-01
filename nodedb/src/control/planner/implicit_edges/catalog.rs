@@ -21,20 +21,22 @@ use crate::types::{DatabaseId, TenantId};
 ///
 /// The flag is committed via the REPLICATED metadata path
 /// (`propose_catalog_entry` → `CatalogEntry::PutCollection`), exactly like
-/// CREATE/ALTER COLLECTION. A bare local `put_collection` would only update the
-/// proposing node's catalog, so a DELETE coordinated on a different node would
-/// not observe the flag and would skip implicit-edge cleanup — the bug this
-/// routing gate exists to prevent. The `LocalOnly` single-node path
-/// bypasses the applier, so it writes through locally (mirrors the DDL handlers).
+/// CREATE/ALTER COLLECTION. A bare local `put_collection` will only update the
+/// proposing node's catalog, so a DELETE coordinated on a different node will
+/// not observe the flag and will skip implicit-edge cleanup. The replicated
+/// path prevents that.
 pub async fn mark_collection_edge_bearing(
     state: &SharedState,
     database_id: DatabaseId,
     tenant_id: TenantId,
     collection: &str,
 ) -> crate::Result<()> {
+    // Callers pass the plan's database-qualified name or the bare DDL name.
+    // The catalog keys collections by the bare name.
+    let bare =
+        crate::control::target_identity::naming::bare_collection_name(database_id, collection);
     let catalog = state.credentials.catalog();
-    let Some(mut coll) = catalog.get_collection(database_id, tenant_id.as_u64(), collection)?
-    else {
+    let Some(mut coll) = catalog.get_collection(database_id, tenant_id.as_u64(), &bare)? else {
         // Collection row absent — don't fail the write over flag bookkeeping.
         return Ok(());
     };
@@ -44,12 +46,7 @@ pub async fn mark_collection_edge_bearing(
     }
     coll.has_implicit_edges = true;
 
-    let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll.clone()));
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)?;
-    if outcome.needs_local_apply() {
-        // Single-node path: the metadata applier's post-apply hook is bypassed,
-        // so write through to the local catalog directly.
-        catalog.put_collection(database_id, &coll)?;
-    }
+    let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll));
+    crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry).await?;
     Ok(())
 }

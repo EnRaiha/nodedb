@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Redo sub-record encoders for restored document rows and graph edges.
+//! Redo sub-record encoders for restored document rows.
 //!
 //! Each encoder writes the exact payload shape the transaction resolver emits
 //! and the replay arms decode, so a restored row installs through the same
@@ -10,13 +10,15 @@
 //!   `(sys_from_ms, valid_from_ms, valid_until_ms)` for a version of a
 //!   `bitemporal=true` collection;
 //! * document delete: `(collection, document_id, prov, surrogate, sys_from_ms)`,
-//!   a tombstone version of a `bitemporal=true` collection;
-//! * edge put and delete: [`EdgePutRedo`] and [`EdgeDeleteRedo`].
+//!   a tombstone version of a `bitemporal=true` collection.
+//!
+//! A restored edge version travels typed, and its transaction's resolve
+//! encodes it with the transaction's ordinal as its applied ordinal.
 
 use nodedb_types::sync::wire::SyncProvenance;
 use nodedb_wal::record::RecordType;
 
-use crate::wal::{EdgeDeleteRedo, EdgePutRedo, RedoSubRecord};
+use crate::wal::RedoSubRecord;
 
 /// The system and valid time a document version was stored at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,22 +79,6 @@ pub(super) fn document_tombstone(
     Ok(RedoSubRecord {
         record_type: RecordType::Delete as u32,
         payload,
-    })
-}
-
-/// One edge version put at its original `system_from`.
-pub(super) fn edge_put(put: &EdgePutRedo) -> crate::Result<RedoSubRecord> {
-    Ok(RedoSubRecord {
-        record_type: RecordType::Put as u32,
-        payload: zerompk::to_msgpack_vec(put).map_err(|e| encode_error("edge put", e))?,
-    })
-}
-
-/// One edge tombstone at its original `system_from`.
-pub(super) fn edge_delete(delete: &EdgeDeleteRedo) -> crate::Result<RedoSubRecord> {
-    Ok(RedoSubRecord {
-        record_type: RecordType::Delete as u32,
-        payload: zerompk::to_msgpack_vec(delete).map_err(|e| encode_error("edge delete", e))?,
     })
 }
 

@@ -16,7 +16,7 @@ use crate::engine::document::store::RowIdentity;
 /// the body. A row with no content key renders the same decimal identity.
 ///
 /// Both forms come from [`RowIdentity::for_surrogate`], the same formatter
-/// `assign_target_surrogate` binds a freshly minted row under.
+/// `keyless_target_surrogate` binds a freshly minted row under.
 pub(crate) fn derive_document_id(
     target_pk: &TargetPk,
     body: &[u8],

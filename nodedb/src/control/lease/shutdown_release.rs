@@ -33,8 +33,7 @@ use crate::control::state::SharedState;
 pub const DEFAULT_SHUTDOWN_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Release every lease this node currently holds in the
-/// metadata cache. No-op in single-node mode (no metadata raft
-/// handle) and on empty lease sets.
+/// metadata cache. No-op on an empty lease set.
 ///
 /// Returns once the release raft entry has been applied locally
 /// (via `release_descriptor_leases`'s internal wait), or once
@@ -49,29 +48,16 @@ pub async fn release_all_local_leases(shared: Arc<SharedState>, deadline: Durati
     }
     let count = descriptor_ids.len();
 
-    // Bound the release call by `deadline`. `release_descriptor_leases`
-    // is sync and uses `block_in_place + wait_for` internally, so
-    // we run it via `spawn_blocking` to release the async runtime.
-    let release_shared = Arc::clone(&shared);
-    let release_task = tokio::task::spawn_blocking(move || {
-        release_shared.release_descriptor_leases(descriptor_ids)
-    });
-
-    match timeout(deadline, release_task).await {
-        Ok(Ok(Ok(()))) => {
+    // Bound the release call by `deadline`.
+    match timeout(deadline, shared.release_descriptor_leases(descriptor_ids)).await {
+        Ok(Ok(())) => {
             tracing::info!(count, "shutdown release: released {count} local leases");
         }
-        Ok(Ok(Err(e))) => {
+        Ok(Err(e)) => {
             tracing::warn!(
                 error = %e,
                 count,
                 "shutdown release: propose failed, leases will drain via TTL"
-            );
-        }
-        Ok(Err(join_err)) => {
-            tracing::warn!(
-                error = %join_err,
-                "shutdown release: spawn_blocking task panicked"
             );
         }
         Err(_) => {

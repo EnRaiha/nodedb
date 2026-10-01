@@ -95,7 +95,6 @@ pub(crate) fn build_vector_primary_insert_plan(
         })?;
 
         result_rows.push(VectorPrimaryRow {
-            surrogate: nodedb_types::Surrogate::ZERO,
             vector,
             payload_fields,
         });

@@ -10,10 +10,11 @@
 #![deny(clippy::wildcard_enum_match_arm)]
 
 use nodedb_physical::physical_plan::{
-    ArrayOp, ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, PhysicalPlan, TimeseriesOp, VectorOp,
+    ArrayOp, ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, MetaOp, PhysicalPlan, TimeseriesOp,
+    VectorOp,
 };
 
-use crate::types::{DatabaseId, VShardId};
+use crate::types::{DatabaseId, RecordHomes, VShardId};
 use nodedb_types::{CollectionKey, QualifiedCollection};
 
 /// Where a `PhysicalPlan` routes for Calvin cross-shard scheduling purposes.
@@ -33,7 +34,7 @@ pub(crate) enum PlanRouting {
     /// Calvin-scheduled write txn is itself a bug.
     NotAWrite,
     /// A write whose vshard cannot be determined from the plan alone. Named
-    /// so the caller's error states WHY, not just that routing failed.
+    /// so the caller's error states WHY, not only that routing failed.
     Unroutable(&'static str),
 }
 
@@ -46,10 +47,23 @@ pub(crate) fn homes_versioned_read(
     database_id: DatabaseId,
     vshard_id: u32,
 ) -> bool {
-    reads.iter().any(|entry| {
-        CollectionKey::from_qualified_str(database_id, &entry.collection)
-            .is_ok_and(|key| key.vshard().as_u32() == vshard_id)
-    })
+    reads
+        .iter()
+        .any(|entry| versioned_read_homes_on(entry, database_id, vshard_id))
+}
+
+/// Whether `vshard_id` validates `entry`: its `home_vshard` when set, else
+/// its collection's vShard.
+pub(crate) fn versioned_read_homes_on(
+    entry: &nodedb_types::calvin::VersionedReadEntry,
+    database_id: DatabaseId,
+    vshard_id: u32,
+) -> bool {
+    match entry.home_vshard {
+        Some(home) => home == vshard_id,
+        None => CollectionKey::from_qualified_str(database_id, &entry.collection)
+            .is_ok_and(|key| key.vshard().as_u32() == vshard_id),
+    }
 }
 
 /// Route a collection-homed write to the vShard of its canonical key. The
@@ -92,10 +106,15 @@ pub(crate) fn plan_vshard_in_database(plan: &PhysicalPlan, database_id: Database
             PlanRouting::ControlPlaneOnly
         }
         // Reads / query operators / metadata ops: `is_write_plan` already
-        // excludes every variant of these four families upstream.
+        // excludes every variant of these four families upstream, except a
+        // RESTORE batch.
         PhysicalPlan::Text(_) => PlanRouting::NotAWrite,
         PhysicalPlan::Spatial(_) => PlanRouting::NotAWrite,
         PhysicalPlan::Query(_) => PlanRouting::NotAWrite,
+        // A RESTORE batch runs on the vShard it names.
+        PhysicalPlan::Meta(MetaOp::RestoreRedo(batch)) => {
+            PlanRouting::Vshards(vec![VShardId::new(batch.vshard)])
+        }
         PhysicalPlan::Meta(_) => PlanRouting::NotAWrite,
     }
 }
@@ -131,7 +150,7 @@ fn document_routing(op: &DocumentOp, database_id: DatabaseId) -> PlanRouting {
         DocumentOp::Merge { .. } | DocumentOp::UpdateFromJoin { .. } => PlanRouting::Unroutable(
             "cross-collection write: source/target co-location is not enforced",
         ),
-        // Read-only: it reports what the wrapped write would do and mutates
+        // Read-only: it reports what the wrapped write will do and mutates
         // nothing.
         DocumentOp::ResolveWrite(_)
         | DocumentOp::PointGet { .. }
@@ -176,13 +195,13 @@ fn kv_routing(op: &KvOp, database_id: DatabaseId) -> PlanRouting {
         KvOp::TransferItem { .. } => PlanRouting::Unroutable(
             "cross-collection write: source/target co-location is not enforced",
         ),
-        // A resolved write carries per-mutation collections and may span two
+        // A resolved write carries per-mutation collections and can span two
         // (a resolved `TransferItem`), so the plan alone does not name one
         // home — same gap as `TransferItem` above.
         KvOp::ResolvedWrite { .. } => PlanRouting::Unroutable(
             "resolved KV write: mutations may span collections with no co-location guarantee",
         ),
-        // Read-only: it reports what a write would do and mutates nothing.
+        // Read-only: it reports what a write will do and mutates nothing.
         KvOp::ResolveWrite(_)
         | KvOp::Get { .. }
         | KvOp::Scan { .. }
@@ -224,7 +243,7 @@ fn vector_routing(op: &VectorOp, database_id: DatabaseId) -> PlanRouting {
         VectorOp::ResolvedDirectWrite { .. } => PlanRouting::Unroutable(
             "resolved governed vector write: proposed directly by the write-resolve orchestrator",
         ),
-        // Read-only: it reports what the wrapped write would do and mutates
+        // Read-only: it reports what the wrapped write will do and mutates
         // nothing.
         VectorOp::ResolveDirectWrite(_)
         | VectorOp::Search { .. }
@@ -245,22 +264,15 @@ fn graph_routing(op: &GraphOp) -> PlanRouting {
         // Edge plans are key-homed (dual-homed across endpoints), not
         // collection-homed: route to from_key(src) ∪ from_key(dst).
         GraphOp::EdgePut { src_id, dst_id, .. } | GraphOp::EdgeDelete { src_id, dst_id, .. } => {
-            let src_vshard = VShardId::from_key(src_id.as_bytes());
-            let dst_vshard = VShardId::from_key(dst_id.as_bytes());
-            if src_vshard.as_u32() == dst_vshard.as_u32() {
-                PlanRouting::Vshards(vec![src_vshard])
-            } else {
-                PlanRouting::Vshards(vec![src_vshard, dst_vshard])
-            }
+            PlanRouting::Vshards(RecordHomes::edge(src_id, dst_id).iter().collect())
         }
         // A batch is the union of its edges' homes, under the same key-homing
         // rule as the single-edge plans above.
         GraphOp::EdgePutBatch { edges } | GraphOp::EdgeDeleteBatch { edges } => {
             let mut vshards: Vec<VShardId> = Vec::new();
             for edge in edges {
-                for endpoint in [edge.src_id.as_bytes(), edge.dst_id.as_bytes()] {
-                    let vshard = VShardId::from_key(endpoint);
-                    if !vshards.iter().any(|v| v.as_u32() == vshard.as_u32()) {
+                for vshard in RecordHomes::edge(&edge.src_id, &edge.dst_id).iter() {
+                    if !vshards.contains(&vshard) {
                         vshards.push(vshard);
                     }
                 }
@@ -276,8 +288,17 @@ fn graph_routing(op: &GraphOp) -> PlanRouting {
         }
         // Node-label writes are key-homed on `node_id`, the same mechanism the
         // edge plans use for their endpoints.
-        GraphOp::SetNodeLabels { node_id, .. } | GraphOp::RemoveNodeLabels { node_id, .. } => {
+        // A node delete's guard runs on the node's key home, which holds
+        // every edge incident on the node.
+        GraphOp::SetNodeLabels { node_id, .. }
+        | GraphOp::RemoveNodeLabels { node_id, .. }
+        | GraphOp::NodeEdgeGuard { node_id, .. } => {
             PlanRouting::Vshards(vec![VShardId::from_key(node_id.as_bytes())])
+        }
+        // A TRUNCATE's edge share and a CRDT delete's presence guard run on
+        // the vShard they name.
+        GraphOp::TruncateEdges { vshard, .. } | GraphOp::NodePresenceGuard { vshard, .. } => {
+            PlanRouting::Vshards(vec![VShardId::new(*vshard)])
         }
         // Read-only: it decides the wrapped delete's policy and mutates nothing.
         GraphOp::ResolveEdgeDelete(_)
@@ -295,7 +316,8 @@ fn graph_routing(op: &GraphOp) -> PlanRouting {
         | GraphOp::WccSuperstep(_)
         | GraphOp::TemporalNeighbors { .. }
         | GraphOp::TemporalAlgorithm { .. }
-        | GraphOp::Stats { .. } => PlanRouting::NotAWrite,
+        | GraphOp::Stats { .. }
+        | GraphOp::NodePresenceRead { .. } => PlanRouting::NotAWrite,
     }
 }
 
@@ -304,7 +326,7 @@ fn timeseries_routing(op: &TimeseriesOp, database_id: DatabaseId) -> PlanRouting
         TimeseriesOp::Ingest { collection, .. } | TimeseriesOp::Truncate { collection, .. } => {
             collection_routing(database_id, collection)
         }
-        // Read-only: it reports the lines the wrapped ingest would store and
+        // Read-only: it reports the lines the wrapped ingest will store and
         // mutates nothing.
         TimeseriesOp::ResolveIngest(_) | TimeseriesOp::Scan { .. } => PlanRouting::NotAWrite,
     }
@@ -351,19 +373,20 @@ fn crdt_routing(op: &CrdtOp, database_id: DatabaseId) -> PlanRouting {
 
 fn array_routing(op: &ArrayOp) -> PlanRouting {
     match op {
-        // Array writes are tile-partitioned; tile->vshard needs catalog
-        // tile_extents not present on the plan. `Flush` is a write per
-        // `is_write_plan` (whole-memtable, not per-cell) but is likewise
-        // keyed only by `ArrayId`, with no collection/tile vshard on the op.
-        ArrayOp::Put { .. } | ArrayOp::Delete { .. } | ArrayOp::Flush { .. } => {
-            PlanRouting::Unroutable(
-                "array writes are tile-partitioned; tile->vshard needs catalog tile_extents not present on the plan",
-            )
+        // A cell write names the vShard its cells' tiles live on.
+        ArrayOp::Put { vshard_id, .. } | ArrayOp::Delete { vshard_id, .. } => {
+            PlanRouting::Vshards(vec![VShardId::new(*vshard_id)])
         }
+        // A flush writes every tile of the array on a node, and a
+        // transaction never stages one.
+        ArrayOp::Flush { .. } => PlanRouting::Unroutable(
+            "an array flush writes every tile of the array on a node, and runs outside a \
+             transaction",
+        ),
         ArrayOp::OpenArray { .. }
         | ArrayOp::Compact { .. }
         | ArrayOp::DropArray { .. }
-        | ArrayOp::RestoreArrayDrop { .. }
+        | ArrayOp::RekeyArray { .. }
         | ArrayOp::PurgeArrayDrop { .. }
         | ArrayOp::Slice { .. }
         | ArrayOp::Project { .. }
@@ -687,14 +710,28 @@ mod tests {
     }
 
     #[test]
-    fn array_put_is_unroutable() {
-        let plan = PhysicalPlan::Array(ArrayOp::Put {
+    fn array_cell_writes_route_to_their_tile_vshard() {
+        let put = PhysicalPlan::Array(ArrayOp::Put {
             array_id: ArrayId::new(TenantId::new(1), "genome"),
             cells_msgpack: Vec::new(),
             wal_lsn: 0,
             provenance: None,
+            vshard_id: 77,
         });
-        assert!(matches!(plan_vshard(&plan), PlanRouting::Unroutable(_)));
+        assert_eq!(vshards_of(&put), vec![77]);
+        let delete = PhysicalPlan::Array(ArrayOp::Delete {
+            array_id: ArrayId::new(TenantId::new(1), "genome"),
+            coords_msgpack: Vec::new(),
+            wal_lsn: 0,
+            provenance: None,
+            vshard_id: 12,
+        });
+        assert_eq!(vshards_of(&delete), vec![12]);
+        let flush = PhysicalPlan::Array(ArrayOp::Flush {
+            array_id: ArrayId::new(TenantId::new(1), "genome"),
+            wal_lsn: 0,
+        });
+        assert!(matches!(plan_vshard(&flush), PlanRouting::Unroutable(_)));
     }
 
     #[test]

@@ -361,47 +361,55 @@ async fn strict_bulk_delete_sees_row_staged_earlier_in_txn_case() {
     strict_bulk_delete_sees_row_staged_earlier_in_txn("bu_st_ov_del").await;
 }
 
-/// A predicate `UPDATE ... RETURNING` inside a transaction is REFUSED, naming
-/// the limitation.
+/// A predicate `UPDATE ... RETURNING` inside a transaction stages its matched
+/// rows and answers with their staged post-images and the real `UPDATE n`
+/// tag. A ROLLBACK discards them.
 ///
-/// Succeeding with the real `UPDATE n` tag and zero data rows would give a
-/// caller that asked for rows silence, precisely the failure this
-/// clause exists to remove. The write is staged into the per-transaction
-/// overlay, and staging answers with a count rather than a row image, while
-/// COMMIT answers with one tag for the whole transaction; so there is no point
-/// at which the rows could be surfaced. Refusing says so instead of pretending
-/// the statement matched nothing.
-///
-/// The refusal is verb-agnostic — it fires for any row-returning plan — so the
-/// non-RETURNING form of the same statement is asserted alongside to pin that
-/// staging itself is untouched.
-async fn bulk_update_returning_in_txn_is_refused(engine: &str, coll: &str) {
+/// The same statement without the clause stages and reports the same count,
+/// and its COMMIT persists the rows.
+async fn bulk_update_returning_in_txn_answers_staged_rows(engine: &str, coll: &str) {
     let server = TestServer::start().await;
     setup(&server, coll, engine).await;
 
     server.exec("BEGIN").await.unwrap();
 
-    let error = server
+    let msgs = server
         .client
         .simple_query(&format!(
             "UPDATE {coll} SET n = 7 WHERE n = 1 RETURNING id, n"
         ))
         .await
-        .expect_err("in-tx UPDATE ... RETURNING must be refused, not answered with no rows");
-    let message = error
-        .as_db_error()
-        .map(|db| db.message().to_string())
-        .unwrap_or_else(|| error.to_string());
-    assert!(
-        message.contains("RETURNING") && message.contains("transaction"),
-        "{engine}: the refusal must name the clause and the limitation, got: {message}"
+        .expect("in-tx UPDATE ... RETURNING answers at the statement");
+    let mut returned: Vec<String> = msgs
+        .iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(row) => Some(format!(
+                "{}={}",
+                row.get(0).unwrap_or(""),
+                row.get(1).unwrap_or("")
+            )),
+            _ => None,
+        })
+        .collect();
+    returned.sort();
+    assert_eq!(
+        returned,
+        vec!["a=7".to_string(), "b=7".to_string()],
+        "{engine}: in-tx UPDATE ... RETURNING answers every matched row's staged post-image"
+    );
+    assert_eq!(
+        command_count(&msgs),
+        Some(2),
+        "{engine}: in-tx UPDATE ... RETURNING reports the real matched-row count"
     );
 
     server.client.simple_query("ROLLBACK").await.unwrap();
+    assert_eq!(
+        scan_ints(&server, &format!("SELECT n FROM {coll} WHERE n = 7")).await,
+        Vec::<i64>::new(),
+        "{engine}: ROLLBACK discards the rows the statement answered with"
+    );
 
-    // The same statement without the clause still stages and still reports its
-    // real matched-row count: the refusal is about the projection, not about
-    // predicate DML in a transaction.
     server.exec("BEGIN").await.unwrap();
     let msgs = server
         .client
@@ -427,8 +435,8 @@ async fn bulk_update_returning_in_txn_is_refused(engine: &str, coll: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bulk_update_returning_in_txn_is_refused_case() {
-    bulk_update_returning_in_txn_is_refused("document_schemaless", "bu_ret_ov_upd").await;
+async fn bulk_update_returning_in_txn_answers_staged_rows_case() {
+    bulk_update_returning_in_txn_answers_staged_rows("document_schemaless", "bu_ret_ov_upd").await;
 }
 
 /// Sorted `id=n` pairs of the whole collection in the session's database.

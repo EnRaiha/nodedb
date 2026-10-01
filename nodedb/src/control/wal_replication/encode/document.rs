@@ -105,7 +105,7 @@ pub(super) fn point_insert(
 pub(super) fn point_delete(
     collection: &str,
     document_id: &str,
-    surrogate: u32,
+    surrogate: Option<u32>,
     resolved_sum_targets: &[ResolvedSumTarget],
     returning: Option<Vec<u8>>,
     rls_filters: &[u8],
@@ -125,7 +125,7 @@ pub(super) fn point_update(
     collection: &str,
     document_id: &str,
     updates: &[(String, UpdateValue)],
-    surrogate: u32,
+    surrogate: Option<u32>,
     resolved_sum_targets: &[ResolvedSumTarget],
     returning: WireReturning<'_>,
     declared_primary_key: Option<&str>,

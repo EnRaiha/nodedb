@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! WAL record header: fixed 55-byte prefix + constants.
+//! WAL record header: fixed 63-byte prefix + constants.
 
 use crate::error::{Result, WalError};
 
@@ -9,23 +9,9 @@ pub const WAL_MAGIC: u32 = 0x5359_4E57; // "SYNW"
 
 /// Current WAL format version.
 ///
-/// v2 introduces bitemporal record layout: `LsnMsAnchor` records (type 102)
-/// provide stable LSN↔wall-clock interpolation, and engine-level writers emit
-/// `system_from_ms` in versioned keys.
-///
-/// v3 introduces the 16-byte segment preamble (`WALP` magic) written at offset
-/// 0 of every WAL segment file.
-///
-/// v4 widens `record_type` u16→u32 and `vshard_id` u16→u32, adds 16 reserved
-/// bytes (covered by CRC32C) before the checksum, and bumps `HEADER_SIZE` to
-/// 50 bytes. Pre-release — no v1/v2/v3 readers supported.
-///
-/// v1 is the initial shipped format with 54-byte headers (u64 tenant_id,
-/// u16 vshard_id, u32 payload_len, u16 reserved, u32 crc32c).
-///
-/// v2 adds the one-byte event source at offset 50 and grows the header to
-/// 55 bytes. A v1 record does not open.
-pub const WAL_FORMAT_VERSION: u16 = 2;
+/// Every record header carries this version. The header layout is the one
+/// [`HEADER_SIZE`] describes. A record with any other version does not open.
+pub const WAL_FORMAT_VERSION: u16 = 3;
 
 /// Maximum WAL record payload size (64 MiB). Distinct from cluster RPC's limit.
 pub const MAX_WAL_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
@@ -35,13 +21,10 @@ pub const MAX_WAL_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
 /// Layout (all little-endian):
 ///   magic(4) | format_version(2) | record_type(4) | lsn(8) | tenant_id(8)
 ///   | vshard_id(4) | payload_len(4) | database_id(8) | apply_key(8)
-///   | event_source(1) | crc32c(4)
+///   | event_source(1) | commit_hlc(8) | crc32c(4)
 ///
-/// `database_id` occupies bytes 34–41 (previously part of the 16-byte reserved
-/// field). `apply_key` occupies bytes 42–49. Bytes 34–41 were zero-filled in
-/// prior records, so `database_id == 0` maps to `DatabaseId(0)` (the default
-/// database), preserving backward compatibility without a format-version bump.
-pub const HEADER_SIZE: usize = 55;
+/// `database_id` occupies bytes 34–41. `apply_key` occupies bytes 42–49.
+pub const HEADER_SIZE: usize = 63;
 
 /// The event source of a record that carries no row write. Replay rebuilds
 /// no write event from it. A write record carries the code of the source its
@@ -49,15 +32,14 @@ pub const HEADER_SIZE: usize = 55;
 pub const NO_EVENT_SOURCE: u8 = 0;
 
 /// Bit 14 in `record_type` signals the payload is AES-256-GCM encrypted.
-/// Separate from bit 15 (required flag). Both bits keep their positions;
-/// the type is now u32 so the constants are widened accordingly.
+/// Separate from bit 15 (required flag).
 pub const ENCRYPTED_FLAG: u32 = 0x0000_4000;
 
 /// Bit 15: required-flag. Records with this bit set and an unknown type
 /// must not be silently skipped.
 pub const REQUIRED_FLAG: u32 = 0x0000_8000;
 
-/// WAL record header (fixed 55 bytes).
+/// WAL record header (fixed 63 bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordHeader {
     pub magic: u32,
@@ -67,11 +49,8 @@ pub struct RecordHeader {
     pub tenant_id: u64,
     pub vshard_id: u32,
     pub payload_len: u32,
-    /// Database scope for this record. Stored as a raw `u64`; callers convert
-    /// to/from `DatabaseId`. Pre-Tier-2 records had zeros here, so `0` maps to
-    /// `DatabaseId(0)` (the default database) — fully backward compatible.
-    ///
-    /// Occupies bytes 34–41 of the on-disk header (previously part of reserved).
+    /// Database scope for this record, as the raw `u64` of a `DatabaseId`.
+    /// Decoded exactly as written. Covered by CRC32C. Occupies bytes 34–41.
     pub database_id: u64,
     /// The idempotency key of the replicated proposal whose apply appended
     /// this record, `0` for a record no proposal apply appended. The record
@@ -83,6 +62,13 @@ pub struct RecordHeader {
     /// code. [`NO_EVENT_SOURCE`] for a record that carries no row write.
     /// Covered by CRC32C. Occupies byte 50.
     pub event_source: u8,
+    /// HLC wall time, in nanoseconds, at which the write this record belongs
+    /// to committed, or the proposer's stamp of the metadata entry whose
+    /// apply appended it. `0` for a record that belongs to neither: a cluster
+    /// restore judges such a record by its WAL position, never by a clock. A
+    /// restore keeps a record with a nonzero value only when it is below the
+    /// restore point's watermark. Covered by CRC32C. Occupies bytes 51–58.
+    pub commit_hlc: u64,
     pub crc32c: u32,
 }
 
@@ -99,7 +85,8 @@ impl RecordHeader {
         buf[34..42].copy_from_slice(&self.database_id.to_le_bytes());
         buf[42..50].copy_from_slice(&self.apply_key.to_le_bytes());
         buf[50] = self.event_source;
-        buf[51..55].copy_from_slice(&self.crc32c.to_le_bytes());
+        buf[51..59].copy_from_slice(&self.commit_hlc.to_le_bytes());
+        buf[59..63].copy_from_slice(&self.crc32c.to_le_bytes());
         buf
     }
 
@@ -123,7 +110,10 @@ impl RecordHeader {
                 buf[42], buf[43], buf[44], buf[45], buf[46], buf[47], buf[48], buf[49],
             ]),
             event_source: buf[50],
-            crc32c: u32::from_le_bytes([buf[51], buf[52], buf[53], buf[54]]),
+            commit_hlc: u64::from_le_bytes([
+                buf[51], buf[52], buf[53], buf[54], buf[55], buf[56], buf[57], buf[58],
+            ]),
+            crc32c: u32::from_le_bytes([buf[59], buf[60], buf[61], buf[62]]),
         }
     }
 
@@ -188,6 +178,7 @@ mod tests {
             database_id: 0,
             apply_key: 0,
             event_source: NO_EVENT_SOURCE,
+            commit_hlc: 0,
             crc32c: 0xDEAD_BEEF,
         }
     }
@@ -200,11 +191,11 @@ mod tests {
     }
 
     #[test]
-    fn header_golden_55_bytes_exact_offsets() {
+    fn header_golden_63_bytes_exact_offsets() {
         // magic at 0..4, format_version at 4..6, record_type at 6..10,
         // lsn at 10..18, tenant_id at 18..26, vshard_id at 26..30,
         // payload_len at 30..34, database_id at 34..42, apply_key at 42..50,
-        // event_source at 50, crc32c at 51..55.
+        // event_source at 50, commit_hlc at 51..59, crc32c at 59..63.
         let header = RecordHeader {
             magic: WAL_MAGIC,
             format_version: WAL_FORMAT_VERSION,
@@ -216,10 +207,11 @@ mod tests {
             database_id: 0xABCD_0000_1234_5678,
             apply_key: 0,
             event_source: NO_EVENT_SOURCE,
+            commit_hlc: 0,
             crc32c: 0x1234_5678,
         };
         let b = header.to_bytes();
-        assert_eq!(b.len(), 55);
+        assert_eq!(b.len(), 63);
         // magic
         assert_eq!(&b[0..4], &WAL_MAGIC.to_le_bytes());
         // format_version
@@ -240,8 +232,10 @@ mod tests {
         assert_eq!(&b[42..50], &[0u8; 8]);
         // event_source
         assert_eq!(b[50], NO_EVENT_SOURCE);
+        // commit_hlc — zero
+        assert_eq!(&b[51..59], &[0u8; 8]);
         // crc32c
-        assert_eq!(&b[51..55], &0x1234_5678u32.to_le_bytes());
+        assert_eq!(&b[59..63], &0x1234_5678u32.to_le_bytes());
     }
 
     #[test]
@@ -258,6 +252,7 @@ mod tests {
             database_id: 7,
             apply_key: 0,
             event_source: NO_EVENT_SOURCE,
+            commit_hlc: 0,
             crc32c: 0,
         };
         let bytes = header.to_bytes();
@@ -266,16 +261,27 @@ mod tests {
     }
 
     #[test]
-    fn pre_tier2_zero_database_id_compat() {
-        // A record written before Tier 2 has zeros at bytes 34..42.
-        // from_bytes must decode that as database_id == 0 (the default database).
-        let mut raw = [0u8; HEADER_SIZE];
-        raw[0..4].copy_from_slice(&WAL_MAGIC.to_le_bytes());
-        raw[4..6].copy_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
-        raw[6..10].copy_from_slice(&1u32.to_le_bytes()); // record_type
-        // bytes 34..50 stay zero (pre-Tier-2 reserved field)
+    fn commit_hlc_roundtrip() {
+        let header = RecordHeader {
+            commit_hlc: 1_700_000_000_123_456_789,
+            ..make_header(1, 0)
+        };
+        let decoded = RecordHeader::from_bytes(&header.to_bytes());
+        assert_eq!(decoded.commit_hlc, 1_700_000_000_123_456_789);
+        assert_eq!(decoded, header);
+    }
+
+    #[test]
+    fn database_id_decodes_from_its_own_bytes() {
+        // Bytes 34..42 alone decide `database_id`. The neighbouring fields
+        // are all ones, so a misplaced read would show.
+        let mut raw = [0xFFu8; HEADER_SIZE];
+        raw[34..42].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         let decoded = RecordHeader::from_bytes(&raw);
-        assert_eq!(decoded.database_id, 0);
+        assert_eq!(decoded.database_id, 0x0102_0304_0506_0708);
+        assert_eq!(decoded.payload_len, u32::MAX);
+        assert_eq!(decoded.apply_key, u64::MAX);
+        assert_eq!(RecordHeader::from_bytes(&decoded.to_bytes()), decoded);
     }
 
     #[test]
@@ -293,6 +299,7 @@ mod tests {
             database_id: 0,
             apply_key: 0,
             event_source: NO_EVENT_SOURCE,
+            commit_hlc: 0,
             crc32c: 0,
         };
         let bytes = header.to_bytes();
@@ -334,13 +341,13 @@ mod tests {
     }
 
     #[test]
-    fn version_4_rejected() {
-        // Regression: bumping from v4 to v5 — a v4 header must be rejected.
+    fn older_version_rejected() {
         let mut header = make_header(0, 0);
-        header.format_version = 4;
+        header.format_version = WAL_FORMAT_VERSION - 1;
         assert!(matches!(
             header.validate(0),
-            Err(WalError::UnsupportedVersion { version: 4, .. })
+            Err(WalError::UnsupportedVersion { version, .. })
+                if version == WAL_FORMAT_VERSION - 1
         ));
     }
 

@@ -2,6 +2,8 @@
 
 //! `RequestVote` request and response handlers.
 
+use std::time::Instant;
+
 use tracing::debug;
 
 use crate::message::{RequestVoteRequest, RequestVoteResponse};
@@ -15,7 +17,40 @@ impl<S: LogStorage> RaftNode<S> {
     /// Learners and observers never grant votes: by definition they are not
     /// members of the voting set for this term, and granting a vote could
     /// let an incorrect quorum form.
+    ///
+    /// While a leader reached this node within `election_timeout_min`, or
+    /// within `election_timeout_max` of boot, a voter refuses every vote but a
+    /// transfer vote, and does not adopt the candidate's term. The leader
+    /// lease depends on this refusal (see [`crate::node::leader_lease`]).
     pub fn handle_request_vote(&mut self, req: &RequestVoteRequest) -> RequestVoteResponse {
+        self.handle_request_vote_at(req, Instant::now())
+    }
+
+    /// [`Self::handle_request_vote`] with the vote-refusal window measured
+    /// at `now`.
+    pub fn handle_request_vote_at(
+        &mut self,
+        req: &RequestVoteRequest,
+        now: Instant,
+    ) -> RequestVoteResponse {
+        let is_voter = matches!(
+            self.role,
+            NodeRole::Follower | NodeRole::Candidate | NodeRole::Leader
+        );
+        if is_voter && !req.transfer && self.vote_refusal_active(now) {
+            debug!(
+                node = self.config.node_id,
+                group = self.config.group_id,
+                candidate = req.candidate_id,
+                term = req.term,
+                "refused vote: leader still live"
+            );
+            return RequestVoteResponse {
+                term: self.hard_state.current_term,
+                vote_granted: false,
+            };
+        }
+
         if req.term > self.hard_state.current_term {
             self.become_follower(req.term);
         }
@@ -115,6 +150,7 @@ mod tests {
     fn vote_grant_and_reject() {
         let config = test_config(1, vec![2, 3]);
         let mut node = RaftNode::new(config, MemStorage::new());
+        node.expire_boot_vote_fence();
 
         let req = RequestVoteRequest {
             term: 1,
@@ -122,6 +158,7 @@ mod tests {
             last_log_index: 0,
             last_log_term: 0,
             group_id: 1,
+            transfer: false,
         };
         let resp = node.handle_request_vote(&req);
         assert!(resp.vote_granted);
@@ -132,6 +169,7 @@ mod tests {
             last_log_index: 0,
             last_log_term: 0,
             group_id: 1,
+            transfer: false,
         };
         let resp2 = node.handle_request_vote(&req2);
         assert!(!resp2.vote_granted);
@@ -150,6 +188,7 @@ mod tests {
             last_log_index: 10,
             last_log_term: 4,
             group_id: 1,
+            transfer: false,
         };
         let resp = node.handle_request_vote(&req);
         assert!(
@@ -193,6 +232,8 @@ mod tests {
         let mut node1 = RaftNode::new(config1, MemStorage::new());
         let mut node2 = RaftNode::new(config2, MemStorage::new());
         let mut node3 = RaftNode::new(config3, MemStorage::new());
+        node2.expire_boot_vote_fence();
+        node3.expire_boot_vote_fence();
 
         force_election(&mut node1);
         assert_eq!(node1.role(), NodeRole::Candidate);
@@ -221,6 +262,7 @@ mod tests {
             last_log_index: 100,
             last_log_term: 9,
             group_id: 1,
+            transfer: false,
         };
         let resp = obs.handle_request_vote(&req);
         assert!(!resp.vote_granted, "observer must never grant a vote");

@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-#![allow(dead_code, unused_imports)] // Not every test file uses every helper.
-
 //! Multi-node in-process cluster harness for nodedb-crate integration tests.
 //!
 //! One `TestClusterNode` owns a full NodeDB server stack: temp data dir,
@@ -19,10 +17,13 @@
 
 pub mod cluster;
 pub mod node;
+pub mod pitr;
 pub mod retriable;
+pub mod shared_steps;
 pub mod wait;
 
-pub use cluster::TestCluster;
+pub use cluster::{StoppedCluster, StoppedNodeInfo, TestCluster};
 pub use node::TestClusterNode;
+pub use pitr::PitrStorage;
 pub use retriable::{is_no_serving_leader, read_once_a_leader_exists};
-pub use wait::{wait_for, wait_for_async};
+pub use wait::{wait_for, wait_for_async, wait_for_report};

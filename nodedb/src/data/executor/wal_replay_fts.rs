@@ -76,6 +76,7 @@ impl CoreLoop {
                 txn_id: None,
                 wal_lsn: None,
                 resolved_now_ms: None,
+                commit_hlc: None,
                 admission: crate::bridge::envelope::Admission::Exempt(
                     crate::bridge::envelope::ExemptReason::AlreadyOrdered,
                 ),
@@ -104,6 +105,9 @@ impl CoreLoop {
         let mut skipped = 0usize;
 
         for record in records {
+            if self.replay_halted() {
+                break;
+            }
             let logical_type = record.logical_record_type();
             let record_type = RecordType::from_raw(logical_type);
 
@@ -262,21 +266,24 @@ impl CoreLoop {
                     continue;
                 }
 
-                let surrogate = match u32::from_str_radix(&payload.doc_id, 16) {
-                    Ok(raw) => Surrogate::new(raw),
-                    Err(e) => {
-                        self.replay_record_unapplied(
-                            "fts",
-                            "doc_id",
-                            record_lsn,
-                            &format!(
-                                "doc_id '{}' is not the hex surrogate the index path writes: {e}",
-                                payload.doc_id
-                            ),
-                        );
-                        skipped += 1;
-                        continue;
-                    }
+                // An absent id is a delete of a key its home never bound.
+                let surrogate = match payload.doc_id.as_deref() {
+                    None => None,
+                    Some(doc_id) => match u32::from_str_radix(doc_id, 16) {
+                        Ok(raw) => Some(Surrogate::new(raw)),
+                        Err(e) => {
+                            self.replay_record_unapplied(
+                                "fts",
+                                "doc_id",
+                                record_lsn,
+                                &format!(
+                                    "doc_id '{doc_id}' is not the hex surrogate the delete path writes: {e}"
+                                ),
+                            );
+                            skipped += 1;
+                            continue;
+                        }
+                    },
                 };
 
                 let prov = payload.provenance.clone();
@@ -284,13 +291,19 @@ impl CoreLoop {
                     continue;
                 }
                 if self.recording_redo_undo() {
-                    let captured = self.capture_fts_doc_undo(
-                        database_id,
-                        tenant_id,
-                        &payload.collection,
-                        surrogate,
-                        Some(&prov),
-                    );
+                    let captured = match surrogate {
+                        Some(surrogate) => self.capture_fts_doc_undo(
+                            database_id,
+                            tenant_id,
+                            &payload.collection,
+                            surrogate,
+                            Some(&prov),
+                        ),
+                        None => Ok(self
+                            .capture_sync_hwm_undo(Some(&prov))
+                            .into_iter()
+                            .collect()),
+                    };
                     if !self.record_redo_capture(captured) {
                         skipped += 1;
                         continue;
@@ -436,10 +449,13 @@ mod tests {
     }
 
     fn delete_record(lsn: u64) -> nodedb_wal::WalRecord {
-        let payload =
-            FtsDeletePayload::new(local_provenance(), COLLECTION, format!("{SURROGATE:08x}"))
-                .to_bytes()
-                .expect("encode FtsDeletePayload");
+        let payload = FtsDeletePayload::new(
+            local_provenance(),
+            COLLECTION,
+            Some(format!("{SURROGATE:08x}")),
+        )
+        .to_bytes()
+        .expect("encode FtsDeletePayload");
         wal_record(RecordType::FtsDelete, lsn, payload)
     }
 

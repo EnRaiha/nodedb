@@ -7,10 +7,6 @@ pub mod append;
 pub mod encode;
 
 pub(crate) use append::wal_append_vector_op;
-pub use append::{
-    VectorDeleteWalArgs, VectorPutWalArgs, wal_append_vector_delete_by_surrogate,
-    wal_append_vector_put,
-};
 pub(crate) use encode::{
     VectorDirectDeleteRecord, VectorDirectTruncateRecord, VectorDirectUpdateRecord,
     VectorDirectUpsertRecord, encode_multi_vector_delete_payload, encode_multi_vector_put_payload,

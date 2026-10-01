@@ -240,13 +240,13 @@ pub enum RecordType {
     /// Collection hard-delete tombstone.
     CollectionTombstoned = 101 | 0x8000,
 
-    /// LSN ↔ wall-clock anchor for bitemporal `system_from_ms` interpolation.
-    /// Emitted periodically by the WAL writer. Payload: `LsnMsAnchorPayload`
-    /// (fixed 16 bytes, little-endian: `[lsn: u64, wall_ms: i64]`).
+    /// Commit time of the group-commit batch it closes. The writer appends
+    /// one per batch, and its header LSN is the batch's last LSN. Payload:
+    /// `TimeAnchorPayload` (8 bytes, little-endian HLC wall ns).
     ///
-    /// Not required: a replay that skips these records produces a slightly
-    /// coarser interpolation table but does not corrupt state.
-    LsnMsAnchor = 102,
+    /// Not required: a replay that skips these records maps times to LSNs more
+    /// coarsely but does not corrupt state.
+    TimeAnchor = 102,
 
     /// Bitemporal version purge — drops one or more *superseded* row
     /// versions (those with finite `_ts_valid_until`) once
@@ -359,6 +359,70 @@ pub enum RecordType {
     /// Required: skipping this record re-applies a duplicate proposal, which
     /// double-counts every non-idempotent effect (a timeseries append).
     ProposalApplied = 62 | 0x8000,
+
+    /// Names the replicated log position of one Raft data-group entry this
+    /// node applied. Payload: `apply_key`, `group_id`, `log_index`, and the
+    /// vShard's partition epoch, each a little-endian `u64` (32 bytes). The
+    /// header's `apply_key` is `0`.
+    ///
+    /// Appended just before the records the entry's apply writes, which
+    /// carry the payload's `apply_key` in their headers. Change-data-capture
+    /// recovery reads it to give every replica's change events the same
+    /// position. Never replayed into any engine.
+    ///
+    /// Not required: skipping it loses no engine state.
+    ChangePosition = 63,
+
+    /// One Raft group's place at a cluster restore point, on this node.
+    /// Payload: `RestorePointPayload` (restore point id, watermark HLC, group
+    /// id, the group's log index and term at the point, the sequencer's next
+    /// epoch, and the group's vShards). The header's `commit_hlc` is the
+    /// point's watermark. A cluster point-in-time restore reads it. Never
+    /// replayed into any engine.
+    ///
+    /// Not required: skipping it loses no engine state.
+    RestorePoint = 64,
+
+    /// Graph engine: the edge tombstones one document delete's node cascade
+    /// wrote. Payload: the node and every edge it tombstoned, each with its
+    /// tombstone's ordinal (see `wal::redo::NodeCascadeRedo`). It is a
+    /// sub-record of a `WriteGroup` part, never a record of its own. Replay
+    /// writes exactly these tombstones at exactly these ordinals, and the
+    /// document delete it follows cascades nothing on replay.
+    ///
+    /// Required: skipping it leaves every cascaded edge live after replay.
+    GraphNodeCascade = 65 | 0x8000,
+
+    /// A Raft snapshot install replaced the state of one data group on this
+    /// node with rows no WAL record carries. Payload: the group id, a
+    /// little-endian `u64`. A point-in-time restore to any LSN at or after this
+    /// record must start from a base taken after it. Never replayed into any
+    /// engine.
+    ///
+    /// Required: a restore that skipped it would replay the WAL across the
+    /// install onto a base that lacks the installed rows.
+    SnapshotInstalled = 66 | 0x8000,
+
+    /// One record of a write's record group: the group's opening record, or
+    /// one part of the rows the write stored after apply. Payload: the group
+    /// descriptor and the part's engine-native sub-records (see
+    /// `wal::redo::WriteGroupRecord`). Replay applies the sub-records in
+    /// order, as it applies a `TransactionRedo` record's. A point-in-time
+    /// restore keeps a group only whole: a group with a part above its target,
+    /// or a part missing, is dropped entire.
+    ///
+    /// Required: skipping it drops the rows a write stored.
+    WriteGroup = 67 | 0x8000,
+
+    /// Graph engine: one TRUNCATE share's cut of an edge collection. Payload:
+    /// the collection and the ordinal of the TRUNCATE's Calvin transaction
+    /// (see `wal::redo::EdgeCutRedo`). It is a sub-record of a
+    /// `TransactionRedo` record, never a record of its own. It writes no edge
+    /// version: every read hides the collection's versions applied below the
+    /// cut.
+    ///
+    /// Required: skipping it leaves every truncated edge live after replay.
+    GraphEdgeCut = 68 | 0x8000,
 }
 
 impl RecordType {
@@ -402,7 +466,7 @@ impl RecordType {
             x if x == 42 | 0x8000 => Some(Self::ArrayFlush),
             x if x == 100 | 0x8000 => Some(Self::Checkpoint),
             x if x == 101 | 0x8000 => Some(Self::CollectionTombstoned),
-            102 => Some(Self::LsnMsAnchor),
+            102 => Some(Self::TimeAnchor),
             x if x == 103 | 0x8000 => Some(Self::TemporalPurge),
             x if x == 110 | 0x8000 => Some(Self::CalvinApplied),
             x if x == 53 | 0x8000 => Some(Self::SyncSeqAdvance),
@@ -414,6 +478,12 @@ impl RecordType {
             x if x == 60 | 0x8000 => Some(Self::GraphNodeLabelRemove),
             x if x == 61 | 0x8000 => Some(Self::WriteAborted),
             x if x == 62 | 0x8000 => Some(Self::ProposalApplied),
+            63 => Some(Self::ChangePosition),
+            64 => Some(Self::RestorePoint),
+            x if x == 65 | 0x8000 => Some(Self::GraphNodeCascade),
+            x if x == 66 | 0x8000 => Some(Self::SnapshotInstalled),
+            x if x == 67 | 0x8000 => Some(Self::WriteGroup),
+            x if x == 68 | 0x8000 => Some(Self::GraphEdgeCut),
             _ => None,
         }
     }
@@ -431,7 +501,8 @@ mod tests {
         assert!(!RecordType::is_required(RecordType::Noop as u32));
         assert!(!RecordType::is_required(RecordType::TimeseriesBatch as u32));
         assert!(!RecordType::is_required(RecordType::LogBatch as u32));
-        assert!(!RecordType::is_required(RecordType::LsnMsAnchor as u32));
+        assert!(!RecordType::is_required(RecordType::TimeAnchor as u32));
+        assert!(!RecordType::is_required(RecordType::ChangePosition as u32));
         assert!(RecordType::is_required(RecordType::TemporalPurge as u32));
         assert!(RecordType::is_required(RecordType::SyncSeqAdvance as u32));
         assert!(RecordType::is_required(RecordType::FtsIndex as u32));
@@ -487,7 +558,7 @@ mod tests {
             RecordType::SurrogateBind,
             RecordType::Checkpoint,
             RecordType::CollectionTombstoned,
-            RecordType::LsnMsAnchor,
+            RecordType::TimeAnchor,
             RecordType::TemporalPurge,
             RecordType::CalvinApplied,
             RecordType::SyncSeqAdvance,
@@ -499,6 +570,12 @@ mod tests {
             RecordType::GraphNodeLabelRemove,
             RecordType::WriteAborted,
             RecordType::ProposalApplied,
+            RecordType::ChangePosition,
+            RecordType::RestorePoint,
+            RecordType::GraphNodeCascade,
+            RecordType::SnapshotInstalled,
+            RecordType::WriteGroup,
+            RecordType::GraphEdgeCut,
         ] {
             assert_eq!(RecordType::from_raw(ty as u32), Some(ty));
         }

@@ -9,6 +9,8 @@
 //! - [`durability`]: Applied-index durability floor and log compaction.
 //! - [`internal`]: Internal state transitions (elections, replication,
 //!   commit advancement) and timeout math.
+//! - [`leader_lease`]: Serving a linearizable read from the leader's commit
+//!   index without a quorum round, and the vote refusal that makes it safe.
 //! - [`membership`]: Dynamic configuration changes — add/remove voters,
 //!   add/remove/promote learners.
 //! - [`quorum_contact`]: Check-quorum — tracking when a majority last
@@ -25,7 +27,9 @@ pub mod config;
 pub mod core;
 pub mod durability;
 mod internal;
+pub mod leader_lease;
 pub mod membership;
+pub mod peer_contact;
 pub mod quorum_contact;
 pub mod read_index;
 pub mod rpc;

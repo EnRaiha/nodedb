@@ -2,12 +2,9 @@
 
 //! Protocol-neutral `CREATE USER` DDL handler.
 //!
-//! Ported from the pgwire `ddl::user::create` handler. All non-return logic
-//! (tenant-admin gate, IF NOT EXISTS short-circuit, tenant-selector
-//! resolution, `prepare_user`, catalog propose + single-node `LocalOnly`
-//! fallback, cluster-mode `get_user` truncation retry, `install_replicated_user`,
-//! and `audit_record`) is preserved verbatim; only the result construction
-//! changed from pgwire `Response` / `PgWireError` to [`DdlResult`] / [`DdlError`].
+//! The tenant-admin gate, IF NOT EXISTS short-circuit, tenant-selector
+//! resolution, `prepare_user`, catalog propose, the post-apply role check,
+//! and `audit_record` run here. The result is [`DdlResult`] / [`DdlError`].
 
 use nodedb_sql::ddl_ast::TenantSelector;
 
@@ -40,7 +37,7 @@ fn resolve_tenant_selector(
 
 /// CREATE USER [IF NOT EXISTS] <name> WITH PASSWORD '<password>' [ROLE <role>]
 /// [TENANT <id> | TENANT '<name>']
-pub fn create_user(
+pub async fn create_user(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     username: &str,
@@ -88,7 +85,7 @@ pub fn create_user(
         identity.tenant_id
     };
 
-    // A role that is neither built in nor defined in the tenant would leave
+    // A role that is neither built in nor defined in the tenant will leave
     // the user with no permissions: refuse it by name.
     super::super::role_checks::check_user_roles(state, std::slice::from_ref(&role), tenant_id)?;
 
@@ -101,28 +98,13 @@ pub fn create_user(
         .prepare_new_user(username, password, tenant_id, vec![role.clone()])
         .map_err(|e| DdlError::new("42710", e.to_string()))?;
 
-    let entry = crate::control::catalog_entry::CatalogEntry::PutUser(Box::new(stored.clone()));
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let entry = crate::control::catalog_entry::CatalogEntry::PutUser(Box::new(stored));
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        // Single-node / no-cluster fallback: install into the
-        // in-memory cache so subsequent reads see the user.
-        // Persist to redb when a catalog is wired up — the
-        // catalog write is best-effort durability, not a gate
-        // on the cache update. Test fixtures (and any future
-        // fully-in-memory deployment) can run without a redb
-        // catalog and still get correct read-after-write.
-        {
-            let catalog = state.credentials.catalog();
-            catalog
-                .put_user(&stored)
-                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        }
-        // CREATE USER: no open sessions exist for a brand-new user.
-        state.credentials.install_replicated_user(&stored, None);
-    } else if outcome.is_replicated() {
-        // Cluster mode: `propose_catalog_entry` waits for the entry to apply
-        // on THIS node, and the synchronous post_apply
+    if outcome.is_durable() {
+        // `propose_catalog_entry_async` returns once the entry applied on THIS
+        // node, and the synchronous post_apply
         // (`install_replicated_user`) runs before the applied-index watermark
         // bumps. So a committed entry is visible now. A missing user means
         // the applier skipped the entry because its role was dropped first,

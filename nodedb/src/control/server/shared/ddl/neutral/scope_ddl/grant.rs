@@ -22,18 +22,24 @@ use super::support::{err, status};
 /// The replication itself lives with the rest of the scope-grant apply path so
 /// the expiry sweep and the DDL handlers cannot drift apart; this wrapper only
 /// translates the error into what pgwire reports.
-fn propose_scope_grant(state: &SharedState, stored: &StoredScopeGrant) -> Result<(), DdlError> {
-    propose_grant(state, stored).map_err(|e| DdlError::from_error(&e))
+async fn propose_scope_grant(
+    state: &SharedState,
+    stored: &StoredScopeGrant,
+) -> Result<(), DdlError> {
+    propose_grant(state, stored)
+        .await
+        .map_err(|e| DdlError::from_error(&e))
 }
 
 /// Replicate a scope-grant removal. Same dual path as [`propose_scope_grant`].
-fn propose_scope_revoke(
+async fn propose_scope_revoke(
     state: &SharedState,
     scope_name: &str,
     grantee_type: &str,
     grantee_id: &str,
 ) -> Result<(), DdlError> {
     propose_revoke(state, scope_name, grantee_type, grantee_id)
+        .await
         .map_err(|e| DdlError::from_error(&e))
 }
 
@@ -45,7 +51,7 @@ fn propose_scope_revoke(
 ///
 /// The expiry clauses retire the grant on a wall clock; the condition
 /// clauses leave it granted but decide, per request, whether it applies.
-pub fn grant_scope(
+pub async fn grant_scope(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -93,7 +99,7 @@ pub fn grant_scope(
             conditions,
         })
         .map_err(|e| DdlError::from_error(&e))?;
-    propose_scope_grant(state, &stored)?;
+    propose_scope_grant(state, &stored).await?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -109,7 +115,7 @@ pub fn grant_scope(
 }
 
 /// REVOKE SCOPE '<scope>' FROM <ORG|USER|ROLE> '<id>'
-pub fn revoke_scope(
+pub async fn revoke_scope(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -127,7 +133,7 @@ pub fn revoke_scope(
     let grantee_type = parts[4].to_lowercase();
     let grantee_id = parts[5].trim_matches('\'');
 
-    propose_scope_revoke(state, scope_name, &grantee_type, grantee_id)?;
+    propose_scope_revoke(state, scope_name, &grantee_type, grantee_id).await?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -140,7 +146,7 @@ pub fn revoke_scope(
 }
 
 /// RENEW SCOPE '<scope>' FOR <ORG|USER> '<id>' EXTEND BY <duration>
-pub fn renew_scope(
+pub async fn renew_scope(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -173,7 +179,7 @@ pub fn renew_scope(
         RenewOutcome::NotFound => return Err(err("42704", "scope grant not found")),
         // Nothing to move: a permanent grant has no deadline to extend.
         RenewOutcome::AlreadyPermanent => {}
-        RenewOutcome::Extend(stored) => propose_scope_grant(state, &stored)?,
+        RenewOutcome::Extend(stored) => propose_scope_grant(state, &stored).await?,
     }
 
     state.audit_record(
@@ -240,7 +246,7 @@ pub fn show_scope_grants(
                 }),
             );
             // An operator debugging "why isn't this grant applying?" needs
-            // to see the conditions attached to it, not just its expiry.
+            // to see the conditions attached to it, not only its expiry.
             row.insert(
                 "conditions".to_string(),
                 JsonValue::String(render_conditions(&g.conditions)),

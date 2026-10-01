@@ -40,16 +40,32 @@ pub struct CellPayload {
 }
 
 impl CellPayload {
+    /// Encode a live cell. A live cell always holds a bound surrogate, so a
+    /// payload that carries `Surrogate::ZERO` is refused.
     pub fn encode(&self) -> ArrayResult<Vec<u8>> {
+        self.check_bound()?;
         zerompk::to_msgpack_vec(self).map_err(|e| ArrayError::SegmentCorruption {
             detail: format!("encode CellPayload: {e}"),
         })
     }
 
+    /// Decode a live cell, refusing one that carries `Surrogate::ZERO`.
     pub fn decode(bytes: &[u8]) -> ArrayResult<Self> {
-        zerompk::from_msgpack(bytes).map_err(|e| ArrayError::SegmentCorruption {
-            detail: format!("decode CellPayload: {e}"),
-        })
+        let payload: Self =
+            zerompk::from_msgpack(bytes).map_err(|e| ArrayError::SegmentCorruption {
+                detail: format!("decode CellPayload: {e}"),
+            })?;
+        payload.check_bound()?;
+        Ok(payload)
+    }
+
+    fn check_bound(&self) -> ArrayResult<()> {
+        if self.surrogate == Surrogate::ZERO {
+            return Err(ArrayError::SegmentCorruption {
+                detail: "live cell payload carries Surrogate::ZERO, which names no row".into(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -78,8 +94,17 @@ mod tests {
             valid_from_ms: 1_000,
             valid_until_ms: OPEN_UPPER,
             attrs: vec![CellValue::Int64(42)],
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(7),
         }
+    }
+
+    #[test]
+    fn a_payload_under_zero_is_refused() {
+        let mut p = sample_payload();
+        p.surrogate = Surrogate::ZERO;
+        assert!(p.encode().is_err());
+        let raw = zerompk::to_msgpack_vec(&p).unwrap();
+        assert!(CellPayload::decode(&raw).is_err());
     }
 
     #[test]
@@ -90,7 +115,7 @@ mod tests {
         assert_eq!(decoded.valid_from_ms, 1_000);
         assert_eq!(decoded.valid_until_ms, OPEN_UPPER);
         assert_eq!(decoded.attrs, vec![CellValue::Int64(42)]);
-        assert_eq!(decoded.surrogate, Surrogate::ZERO);
+        assert_eq!(decoded.surrogate, Surrogate::new(7));
     }
 
     #[test]

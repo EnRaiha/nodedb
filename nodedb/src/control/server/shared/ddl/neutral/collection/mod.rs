@@ -31,7 +31,7 @@ pub use dml::{insert_document, upsert_document};
 pub use drop::{DropCollectionRequest, drop_collection};
 pub use index::{CreateIndexRequest, DropIndexRequest, create_index, drop_index};
 pub use register::{
-    dispatch_register_by_name, dispatch_register_for_sum_sources, dispatch_register_from_stored,
+    dispatch_register_for_sum_sources, dispatch_register_from_stored, register_proposed_collection,
 };
 pub use show_indexes::show_indexes;
 pub use undrop::undrop_collection;

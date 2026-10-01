@@ -2,17 +2,18 @@
 
 //! Protocol-neutral `COMMIT OFFSET` DDL handler.
 //!
-//! Ported from the pgwire `ddl::consumer_group::commit` handler. The two-form
-//! token parsing, the group-existence checks, the per-partition tail-tracker
-//! batch-commit path (NOT a full buffer scan — preserved
-//! verbatim), and the `OffsetRegression` error mapping are preserved verbatim;
-//! only the result construction changed from pgwire `Response` / `PgWireError`
-//! to the protocol-neutral [`DdlResult`] / [`DdlError`].
+//! The two-form token parsing, the group-existence checks, the
+//! per-partition tail-tracker batch-commit path (NOT a full buffer scan),
+//! and the `OffsetRegression` error mapping run here. The result is the
+//! protocol-neutral [`DdlResult`] / [`DdlError`].
 //!
 //! Syntax:
-//! - `COMMIT OFFSET PARTITION <p> AT <lsn>:<sequence> ON <stream> CONSUMER GROUP <name>`
-//!   (a bare `<lsn>` is legacy compatibility and acknowledges the whole LSN)
+//! - `COMMIT OFFSET PARTITION <p> AT <epoch>:<index>:<sequence> ON <stream> CONSUMER GROUP <name>`
+//!   (a bare `<index>` acknowledges every event of that write)
 //! - `COMMIT OFFSETS ON <stream> CONSUMER GROUP <name>` (batch: commit all at latest)
+//!
+//! A commit is a replicated catalog entry: every node raises its offset
+//! store on apply, so a consumer that moves to another node resumes from it.
 
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
@@ -20,11 +21,14 @@ use crate::control::server::shared::authorization::authorize_collection;
 use crate::control::server::shared::ddl::sql_parse::{parse_ident_token, parse_stream_ident_token};
 use crate::control::state::SharedState;
 use crate::event::cdc::CdcOffset;
+use crate::event::cdc::consumer_group::ConsumerGroupDef;
+use crate::event::cdc::consumer_group::types::PartitionOffset;
 use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::status;
 use super::identity::canonical_stream_name;
+use super::replicate::propose_commit_offsets;
 
 fn authorize_offset_commit(
     state: &SharedState,
@@ -57,7 +61,7 @@ fn authorize_offset_commit(
     .map_err(|error| DdlError::new("42501", error.to_string()))
 }
 
-fn migrate_legacy_group(
+async fn migrate_legacy_group(
     state: &SharedState,
     database_id: DatabaseId,
     tenant_id: u64,
@@ -71,10 +75,11 @@ fn migrate_legacy_group(
         stream_name,
         group_name,
     )
+    .await
     .map(|_| ())
 }
 
-/// Handle `COMMIT OFFSET PARTITION <p> AT <lsn>:<sequence> ON <stream> CONSUMER GROUP <name>`.
+/// Handle `COMMIT OFFSET PARTITION <p> AT <epoch>:<index>:<sequence> ON <stream> CONSUMER GROUP <name>`.
 pub async fn commit_offset(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -83,7 +88,7 @@ pub async fn commit_offset(
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
 
-    // Single partition: COMMIT OFFSET PARTITION <p> AT <lsn>:<sequence> ON <stream> CONSUMER GROUP <name>
+    // Single partition: COMMIT OFFSET PARTITION <p> AT <epoch>:<index>:<sequence> ON <stream> CONSUMER GROUP <name>
     // parts: [COMMIT, OFFSET, PARTITION, <p>, AT, <offset>, ON, <stream>, CONSUMER, GROUP, <name>]
     // indices:  0       1       2         3   4    5     6     7        8         9      10
     if parts.len() >= 11
@@ -131,35 +136,34 @@ pub async fn commit_offset(
             Some(lock) => Some(lock.lock_owned().await),
             None => None,
         };
-        migrate_legacy_group(state, database_id, tenant_id, &stream_name, &group_name)?;
+        migrate_legacy_group(state, database_id, tenant_id, &stream_name, &group_name).await?;
 
-        // Verify group exists.
-        if state
-            .group_registry
-            .get(database_id, tenant_id, &stream_name, &group_name)
-            .is_none()
-        {
-            return Err(DdlError::new(
-                "42704",
-                format!("consumer group '{group_name}' does not exist on stream '{stream_name}'"),
-            ));
-        }
-
-        state
-            .offset_store
-            .commit_offset(
-                database_id,
-                tenant_id,
-                &stream_name,
-                &group_name,
+        let def = registered_group(state, database_id, tenant_id, &stream_name, &group_name)?;
+        let current = state.offset_store.get_offset(
+            database_id,
+            tenant_id,
+            &stream_name,
+            &group_name,
+            partition_id,
+        );
+        if offset < current {
+            let regression = crate::Error::OffsetRegression {
+                stream: stream_name,
+                group: group_name,
                 partition_id,
-                offset,
-            )
-            .map_err(|e| match e {
-                crate::Error::OffsetRegression { .. } => DdlError::new("22023", e.to_string()),
-                // Any other error keeps the class the SQLSTATE table gives it.
-                other => DdlError::from_error_in_context("offset commit", &other),
-            })?;
+                offsets: Box::new(crate::error::RegressedOffsets {
+                    current,
+                    attempted: offset,
+                }),
+            };
+            return Err(DdlError::new("22023", regression.to_string()));
+        }
+        propose_commit_offsets(
+            state,
+            &def,
+            vec![PartitionOffset::new(partition_id, offset)],
+        )
+        .await?;
 
         return Ok(status("COMMIT OFFSET"));
     }
@@ -202,52 +206,35 @@ pub async fn commit_offset(
             Some(lock) => Some(lock.lock_owned().await),
             None => None,
         };
-        migrate_legacy_group(state, database_id, tenant_id, &stream_name, &group_name)?;
+        migrate_legacy_group(state, database_id, tenant_id, &stream_name, &group_name).await?;
 
-        if state
-            .group_registry
-            .get(database_id, tenant_id, &stream_name, &group_name)
-            .is_none()
-        {
-            return Err(DdlError::new(
-                "42704",
-                format!("consumer group '{group_name}' does not exist on stream '{stream_name}'"),
-            ));
-        }
+        let def = registered_group(state, database_id, tenant_id, &stream_name, &group_name)?;
 
         // Use the buffer's per-partition tail tracker — NOT a full
         // buffer scan. A scan is O(N) and silently
         // misses partitions whose events have been evicted by retention.
-        if let Some(buffer) = state
+        // Every replica positions events alike, so this node's tails name
+        // the same events on every node.
+        let raised: Vec<PartitionOffset> = state
             .cdc_router
             .get_buffer(database_id, tenant_id, &stream_name)
-        {
-            for (partition_id, offset) in buffer.partition_tails() {
-                // Skip partitions whose committed offset already meets
-                // or exceeds the current tail — commit_offset rejects
-                // regressions and we want idempotent auto-commit.
-                let current = state.offset_store.get_offset(
-                    database_id,
-                    tenant_id,
-                    &stream_name,
-                    &group_name,
-                    partition_id,
-                );
-                if offset <= current {
-                    continue;
-                }
-                state
-                    .offset_store
-                    .commit_offset(
+            .map(|buffer| buffer.partition_tails())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(partition_id, offset)| {
+                *offset
+                    > state.offset_store.get_offset(
                         database_id,
                         tenant_id,
                         &stream_name,
                         &group_name,
-                        partition_id,
-                        offset,
+                        *partition_id,
                     )
-                    .map_err(|e| DdlError::from_error_in_context("offset commit", &e))?;
-            }
+            })
+            .map(|(partition_id, offset)| PartitionOffset::new(partition_id, offset))
+            .collect();
+        if !raised.is_empty() {
+            propose_commit_offsets(state, &def, raised).await?;
         }
 
         return Ok(status("COMMIT OFFSETS"));
@@ -255,7 +242,41 @@ pub async fn commit_offset(
 
     Err(DdlError::new(
         "42601",
-        "expected COMMIT OFFSET PARTITION <p> AT <lsn>:<sequence> ON <stream> CONSUMER GROUP <name>, \
-         or COMMIT OFFSETS ON <stream> CONSUMER GROUP <name>; bare <lsn> is legacy whole-LSN acknowledgement",
+        "expected COMMIT OFFSET PARTITION <p> AT <epoch>:<index>:<sequence> ON <stream> CONSUMER GROUP <name>, \
+         or COMMIT OFFSETS ON <stream> CONSUMER GROUP <name>; a bare <index> acknowledges every event of that write",
     ))
+}
+
+/// The registered definition of a consumer group, or `42704` when none is.
+fn registered_group(
+    state: &SharedState,
+    database_id: DatabaseId,
+    tenant_id: u64,
+    stream_name: &str,
+    group_name: &str,
+) -> Result<ConsumerGroupDef, DdlError> {
+    state
+        .group_registry
+        .get(database_id, tenant_id, stream_name, group_name)
+        .ok_or_else(|| {
+            DdlError::new(
+                "42704",
+                format!("consumer group '{group_name}' does not exist on stream '{stream_name}'"),
+            )
+        })
+}
+
+/// Commit `offsets` for a group through the replicated catalog, raising each
+/// partition on every node. A partition already at or past its offset keeps
+/// its position. Deferred `COMMIT OFFSET` inside a transaction flushes here.
+pub async fn commit_group_offsets(
+    state: &SharedState,
+    database_id: DatabaseId,
+    tenant_id: u64,
+    stream_name: &str,
+    group_name: &str,
+    offsets: Vec<PartitionOffset>,
+) -> Result<(), DdlError> {
+    let def = registered_group(state, database_id, tenant_id, stream_name, group_name)?;
+    propose_commit_offsets(state, &def, offsets).await
 }

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Post-commit cascade for one bulk-deleted row: inverted index, secondary
-//! indexes, graph edges, vector index, doc cache, write-version tracking,
-//! and the Event Plane emit.
+//! indexes, deleted-node bookkeeping, vector index, doc cache, write-version
+//! tracking, and the Event Plane emit.
 //!
 //! Runs AFTER the row's own transaction committed, so none of this reverses
 //! on failure — each step logs and continues rather than aborting a
@@ -103,14 +103,10 @@ impl CoreLoop {
             crate::diag::orphaned_index_entry_after_delete(&e, collection, "secondary");
             warn!(core = self.core_id, %collection, %doc_id, error = %e, "bulk delete: secondary index cascade failed");
         }
-        // Cascade: graph edges. The graph keys a row's node by its client key.
-        // On an error neither edge store changed: the edges stay in both,
-        // and the dangling-edge sweep retries them.
-        if let Err(e) = self.cascade_node_edges(database_id, tid, row_identity.as_str()) {
-            crate::diag::orphaned_index_entry_after_delete(&e, collection, "graph_edge");
-            warn!(core = self.core_id, %doc_id, error = %e, "bulk delete: edge cascade failed");
-        }
-        self.mark_node_deleted(database_id, tid, row_identity.as_str());
+        // The row's graph node keeps its edges here: the delete's own
+        // transaction tombstones them with `EdgeDelete` tasks. The node is
+        // recorded deleted for edge referential integrity.
+        self.mark_node_deleted(database_id, tid, collection, row_identity.as_str());
         // Cascade: secondary HNSW vector index. The put path indexed
         // this row's vectors under its surrogate; the delete must
         // soft-delete those nodes and drop the reverse-map entry, or the
@@ -140,19 +136,12 @@ impl CoreLoop {
                 lsn,
             );
         }
-        // Carry the surrogate back for a post-apply `Delete` redo so
-        // the removed vector node does not resurrect on a WAL-only
-        // restart. Gated on `has_vectors` — a non-vector collection
-        // pays nothing. A delete carries no post-image body.
-        if has_vectors {
-            write_set.push(WriteSetEntry {
-                surrogate: row_surrogate.as_u32(),
-                identity: row_identity.clone(),
-                is_delete: true,
-                value: Vec::new(),
-                collection: None,
-            });
-        }
+        // The removal, journalled after apply: the plan carries no
+        // pre-dispatch record of it. A delete carries no post-image body.
+        write_set.push(WriteSetEntry::delete(
+            row_surrogate.as_u32(),
+            row_identity.clone(),
+        ));
         // Emit a delete event per affected row to the Event Plane, so
         // AFTER-DELETE triggers and CDC/change-stream consumers see
         // each row a bulk DELETE removed — mirroring

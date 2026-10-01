@@ -21,12 +21,14 @@ impl NodeDbPgHandler {
     ///
     /// In cluster mode, writes propose to Raft first and execute only after
     /// quorum commit; reads bypass Raft. `identity` must be passed for every
-    /// externally derived task.
+    /// externally derived task. `linearizable` makes a read confirm each group
+    /// it observes where it is served.
     pub(in crate::control::server::pgwire::handler) async fn dispatch_authorized_task(
         &self,
         task: PhysicalTask,
         user_id: Option<Arc<str>>,
         identity: &AuthenticatedIdentity,
+        linearizable: bool,
     ) -> crate::Result<Response> {
         let mut shard_watermarks = Vec::new();
         let mut distributed_reads = Vec::new();
@@ -34,6 +36,7 @@ impl NodeDbPgHandler {
             task,
             user_id,
             identity,
+            linearizable,
             &mut shard_watermarks,
             &mut distributed_reads,
         )
@@ -48,6 +51,7 @@ impl NodeDbPgHandler {
         task: PhysicalTask,
         user_id: Option<Arc<str>>,
         identity: &AuthenticatedIdentity,
+        linearizable: bool,
     ) -> crate::Result<(Response, Vec<(VShardId, Lsn)>, Vec<DistributedReadCapture>)> {
         let mut shard_watermarks = Vec::new();
         let mut distributed_reads = Vec::new();
@@ -56,6 +60,7 @@ impl NodeDbPgHandler {
                 task,
                 user_id,
                 identity,
+                linearizable,
                 &mut shard_watermarks,
                 &mut distributed_reads,
             )

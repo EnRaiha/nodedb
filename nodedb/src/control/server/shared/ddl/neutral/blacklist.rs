@@ -15,11 +15,9 @@
 //! the system catalog and reloaded at boot, so without a removal command an
 //! operator who bans a range has no way back short of editing storage.
 //!
-//! Ported from the pgwire `ddl::blacklist_ddl` handlers. The superuser gate,
-//! blacklist-registry mutations, `WITH KILL SESSIONS` session termination, and
-//! `audit_record` side effects are preserved verbatim; only the result
-//! construction changed from pgwire `Response` / `QueryResponse` / `Tag` to the
-//! protocol-neutral [`DdlResult`] over [`ShapedRows`].
+//! The superuser gate, blacklist-registry mutations, `WITH KILL SESSIONS`
+//! session termination, and `audit_record` side effects run here. The result
+//! is the protocol-neutral [`DdlResult`] over [`ShapedRows`].
 
 use serde_json::{Map, Value as JsonValue};
 
@@ -29,8 +27,7 @@ use crate::control::state::SharedState;
 
 use super::super::result::{DdlError, DdlResult};
 
-/// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
-/// the pgwire handlers produced.
+/// Construct a [`DdlError`] from a SQLSTATE code and a message.
 fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
 }

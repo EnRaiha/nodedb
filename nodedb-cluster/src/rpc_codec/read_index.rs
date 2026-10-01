@@ -24,11 +24,12 @@ pub struct ReadIndexRequest {
 /// The leader's answer to a [`ReadIndexRequest`].
 #[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ReadIndexOutcome {
-    /// A quorum confirmed the leader. Reads may be served at `read_index`.
-    Confirmed { read_index: u64 },
+    /// A quorum confirmed the leader at `term`. Reads may be served at
+    /// `read_index`.
+    Confirmed { read_index: u64, term: u64 },
     /// The receiver does not lead the group. `leader_hint` names the leader
-    /// it knows of.
-    NotLeader { leader_hint: Option<u64> },
+    /// it knows of at `term`, its own term for the group.
+    NotLeader { leader_hint: Option<u64>, term: u64 },
     /// The receiver leads the group, but no quorum answered in time.
     Timeout { waited_ms: u64 },
 }
@@ -111,11 +112,18 @@ mod tests {
     #[test]
     fn every_outcome_survives_the_wire() {
         for outcome in [
-            ReadIndexOutcome::Confirmed { read_index: 42 },
+            ReadIndexOutcome::Confirmed {
+                read_index: 42,
+                term: 3,
+            },
             ReadIndexOutcome::NotLeader {
                 leader_hint: Some(3),
+                term: 6,
             },
-            ReadIndexOutcome::NotLeader { leader_hint: None },
+            ReadIndexOutcome::NotLeader {
+                leader_hint: None,
+                term: 6,
+            },
             ReadIndexOutcome::Timeout { waited_ms: 750 },
         ] {
             let rpc = roundtrip(RaftRpc::ReadIndexResponse(ReadIndexResponse {

@@ -67,6 +67,11 @@ impl CoreLoop {
             rls_filters,
             resolved_sum_targets,
         } = params;
+        if let Some(refusal) = crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+            "document", collection, surrogate,
+        ) {
+            return self.response_error(task, refusal);
+        }
         debug!(
             core = self.core_id,
             %collection,
@@ -108,8 +113,8 @@ impl CoreLoop {
         let bitemporal = self.is_bitemporal(database_id, tid, collection);
         // Computed once for the whole statement: the schemaless half of this
         // check is an unindexed `vector_params` scan, so it must not be paid
-        // per branch. Gates the live HNSW re-index + the post-apply redo
-        // write-set below; a non-vector collection pays neither.
+        // per branch. Gates the overwrite branch's removal of the prior HNSW
+        // node; a non-vector collection pays nothing.
         let has_vectors = self.collection_has_vectors(database_id, tid, collection);
         let key = nodedb_types::StorageKey::for_surrogate(surrogate);
         let existing = if bitemporal {
@@ -152,7 +157,6 @@ impl CoreLoop {
                     rls_filters,
                     database_id,
                     hook_ctx: &hook_ctx,
-                    has_vectors,
                     strict_schema: strict_schema.as_ref(),
                 },
             ),

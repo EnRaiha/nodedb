@@ -9,11 +9,17 @@
 //! takes an appender, so no append can read a key another caller set and no
 //! caller has a key to clear.
 //!
-//! A row-write record (Put, Delete, TransactionRedo, graph node-label) also
+//! A row-write record (Put, Delete, TransactionRedo, WriteGroup,
+//! TimeseriesBatch, graph node-label) also
 //! carries the event source its write ran with, so WAL replay rebuilds the
 //! event the live write emitted. The caller names the source with
 //! [`WalAppender::with_event_source`]. A row-write append from an appender
 //! with no source is refused: no row write is stored without one.
+//!
+//! Every record carries a commit HLC. A record that belongs to a write
+//! carries the write's commit instant, which the caller names with
+//! [`WalAppender::with_commit_hlc`]. Every other record carries the node's HLC
+//! at its append.
 
 use std::sync::Mutex;
 
@@ -58,6 +64,9 @@ pub struct WalAppender<'a> {
     /// The event source code row-write records carry.
     /// `nodedb_wal::NO_EVENT_SOURCE` until the caller names one.
     event_source: u8,
+    /// The commit HLC every record carries. `None` stamps each record with the
+    /// node's HLC at its append.
+    commit_hlc: Option<u64>,
     /// Collects every record this appender writes, when set.
     sink: Option<&'a dyn AppendSink>,
 }
@@ -71,6 +80,7 @@ impl WalManager {
             wal: self,
             apply_key,
             event_source: nodedb_wal::NO_EVENT_SOURCE,
+            commit_hlc: None,
             sink: None,
         }
     }
@@ -86,6 +96,7 @@ impl WalManager {
             wal: self,
             apply_key,
             event_source: nodedb_wal::NO_EVENT_SOURCE,
+            commit_hlc: None,
             sink: Some(sink),
         }
     }
@@ -105,6 +116,30 @@ impl WalAppender<'_> {
         }
     }
 
+    /// This appender, with every record carrying `commit_hlc`: the HLC wall
+    /// time, in nanoseconds, the write the records belong to committed at.
+    pub fn with_commit_hlc(self, commit_hlc: u64) -> Self {
+        Self {
+            commit_hlc: Some(commit_hlc),
+            ..self
+        }
+    }
+
+    /// The largest payload one record takes (see
+    /// [`WalManager::max_payload`]).
+    pub fn max_payload(&self) -> usize {
+        self.wal.max_payload()
+    }
+
+    /// The commit HLC the next record carries: its write's, else the stamp
+    /// of the metadata entry this task applies, else `0`. A cluster restore
+    /// judges a record with `0` by its WAL position, never by a clock.
+    fn record_hlc(&self) -> u64 {
+        self.commit_hlc
+            .or_else(super::effect_stamp::effect_stamp)
+            .unwrap_or(0)
+    }
+
     /// Append one record of `record_type` that carries no row write.
     pub(super) fn append_record(
         &self,
@@ -120,6 +155,7 @@ impl WalAppender<'_> {
             vshard_id: vshard_id.as_u32(),
             database_id: database_id.as_u64(),
             event_source: nodedb_wal::NO_EVENT_SOURCE,
+            commit_hlc: self.record_hlc(),
         };
         self.append_target(target, tenant_id, vshard_id, database_id, payload)
     }
@@ -148,6 +184,7 @@ impl WalAppender<'_> {
             vshard_id: vshard_id.as_u32(),
             database_id: database_id.as_u64(),
             event_source: self.event_source,
+            commit_hlc: self.record_hlc(),
         };
         self.append_target(target, tenant_id, vshard_id, database_id, payload)
     }
@@ -208,6 +245,41 @@ mod tests {
             .map(|record| record.apply_key())
             .collect();
         assert_eq!(keys, vec![0xAB, NO_APPLY_KEY, 0xAB]);
+    }
+
+    #[tokio::test]
+    async fn a_record_carries_its_write_hlc_or_its_metadata_entry_stamp_or_zero() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = WalManager::open_for_testing(&dir.path().join("wal")).expect("open wal");
+        let (t, v, db) = (TenantId::new(1), VShardId::new(0), DatabaseId::DEFAULT);
+        let appender = || {
+            wal.appender(NO_APPLY_KEY)
+                .with_event_source(crate::event::EventSource::User)
+        };
+        appender()
+            .with_commit_hlc(77)
+            .append_put(t, v, db, b"stamped")
+            .expect("append");
+        super::super::effect_stamp::with_effect_stamp(Some(55), async {
+            appender().append_put(t, v, db, b"effect").expect("append");
+            appender()
+                .with_commit_hlc(66)
+                .append_put(t, v, db, b"own stamp wins")
+                .expect("append");
+        })
+        .await;
+        appender()
+            .append_put(t, v, db, b"unstamped")
+            .expect("append");
+        wal.sync().expect("sync");
+
+        let hlcs: Vec<u64> = wal
+            .replay()
+            .expect("replay")
+            .iter()
+            .map(|record| record.header.commit_hlc)
+            .collect();
+        assert_eq!(hlcs, [77, 55, 66, 0]);
     }
 
     #[test]

@@ -2,11 +2,9 @@
 
 //! Handler for `SHOW DATABASE LINEAGE FOR <name>`.
 //!
-//! Ported from the pgwire `ddl::database::show_lineage` handler. The tenant-admin
-//! gate, bounded `parent_clone` chain walk, and per-ancestor row rendering are
-//! preserved verbatim; only the result construction changed from pgwire
-//! `QueryResponse` to the protocol-neutral [`DdlResult`] over `ShapedRows`.
-//! Every column is a `text_field` in the original, so all columns stay `Text`.
+//! The tenant-admin gate, bounded `parent_clone` chain walk, and per-ancestor
+//! row rendering run here. The result is the protocol-neutral [`DdlResult`]
+//! over `ShapedRows`. Every column is `Text`.
 
 use serde_json::{Map, Value as JsonValue};
 

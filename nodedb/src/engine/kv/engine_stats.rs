@@ -240,8 +240,7 @@ impl KvEngine {
 
 #[cfg(test)]
 mod tests {
-    use nodedb_types::Surrogate;
-
+    use crate::engine::kv::test_support::row_surrogate;
     use crate::engine::kv::{KvPutParams, RegisterIndexParams};
 
     use super::*;
@@ -277,8 +276,9 @@ mod tests {
             value: b"data",
             ttl_ms: 5000,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"s1"),
+        })
+        .expect("a bound row writes");
         assert!(e.get(0, 1, "sess", b"s1", n).is_some());
 
         // Still alive at t+4999.
@@ -311,8 +311,9 @@ mod tests {
                 value: &[0; 32],
                 ttl_ms: 0,
                 now_ms: n,
-                surrogate: Surrogate::ZERO,
-            });
+                surrogate: row_surrogate(&i.to_be_bytes()),
+            })
+            .expect("a bound row writes");
         }
         assert_eq!(e.total_entries(), 10);
         assert_eq!(e.collection_len(0, 1, "c"), 10);
@@ -353,8 +354,9 @@ mod tests {
             value: &mp_obj(&[("region", "us")]),
             ttl_ms: 5000,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"s1"),
+        })
+        .expect("a bound row writes");
         assert_eq!(e.index_lookup_eq(0, 1, "sess", "region", b"us").len(), 1);
 
         let reaped = e.tick_expiry(n + 5000);
@@ -397,8 +399,9 @@ mod tests {
             value: &mp_obj(&[("region", "us"), ("status", "active")]),
             ttl_ms: 5000,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"s1"),
+        })
+        .expect("a bound row writes");
 
         let ci_fields = vec!["region".to_string(), "status".to_string()];
         let hits = |e: &KvEngine| -> usize {
@@ -451,8 +454,9 @@ mod tests {
                 value: &mp_obj(&[("region", "us")]),
                 ttl_ms: 5000,
                 now_ms: n,
-                surrogate: Surrogate::ZERO,
-            });
+                surrogate: row_surrogate(&i.to_be_bytes()),
+            })
+            .expect("a bound row writes");
         }
         assert!(
             e.stats().is_rehashing,

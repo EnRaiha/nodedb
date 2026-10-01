@@ -3,20 +3,17 @@
 //! `CREATE TENANT [IF NOT EXISTS] <name> [ID <id>] [WITH ADMIN <user>]`
 //! handler.
 //!
-//! Ported from the pgwire `ddl::tenant::create` handler verbatim: the
-//! superuser gate (inline, no audit on denial — distinct from
-//! `neutral::database::gate::require_superuser`, which does audit), the
+//! The handler runs the superuser gate (inline, no audit on denial — distinct
+//! from `neutral::database::gate::require_superuser`, which does audit), the
 //! `CatalogEntry::PutTenant` propose / single-node fallback, the auto-created
-//! `tenant_admin` user, and the `TenantCreated` audit record are all
-//! preserved. Only the result construction changed from pgwire `Response` to
+//! `tenant_admin` user, and the `TenantCreated` audit record. The result is
 //! the protocol-neutral [`DdlResult`].
 
 use crate::control::catalog_entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::catalog::StoredTenant;
 use crate::control::security::identity::{AuthenticatedIdentity, Role};
-use crate::control::security::tenant::TenantQuota;
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
@@ -74,7 +71,7 @@ pub(super) fn default_admin_username(tenant_name: &str) -> String {
 /// Creates a tenant with default quotas. Only superuser can create tenants.
 /// `name` is for display; the numeric ID is what's used internally. With
 /// `IF NOT EXISTS`, re-creating an existing tenant is a no-op success.
-pub fn create_tenant(
+pub async fn create_tenant(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -100,7 +97,7 @@ pub fn create_tenant(
 
     // Tenant names are unique. A duplicate is a no-op success under
     // `IF NOT EXISTS` and an error otherwise — never a second tenant id
-    // sharing the name, which would make the name ambiguous for every
+    // sharing the name, which makes the name ambiguous for every
     // by-name lookup (ownership fallback, admin provisioning, DROP TENANT)
     // and silently strand the older tenant's objects.
     if state
@@ -162,8 +159,7 @@ pub fn create_tenant(
                 .to_le_bytes(),
         );
         let hash = hasher.finalize();
-        let hex: String = hash.iter().take(12).map(|b| format!("{b:02x}")).collect();
-        format!("ndb_{hex}")
+        format!("ndb_{}", hex::encode(&hash[..12]))
     };
     let admin = state
         .credentials
@@ -179,23 +175,9 @@ pub fn create_tenant(
         tenant: Box::new(stored.clone()),
         admin: Box::new(admin.clone()),
     };
-    let outcome = propose_catalog_entry(state, &entry)
+    propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        state
-            .credentials
-            .catalog()
-            .put_tenant_with_admin(&stored, &admin)
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        state.credentials.install_replicated_user(&admin, None);
-        let mut tenants = match state.tenants.lock() {
-            Ok(t) => t,
-            Err(p) => p.into_inner(),
-        };
-        if !tenants.has_quota(tenant_id) {
-            tenants.set_quota(tenant_id, TenantQuota::default());
-        }
-    }
 
     let catalog = state.credentials.catalog();
     let tenant_applied = catalog

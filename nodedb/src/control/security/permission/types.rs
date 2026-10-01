@@ -4,12 +4,12 @@
 //! permission module.
 
 use crate::control::security::identity::Permission;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 
 /// A permission grant record (in-memory).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Grant {
-    /// Target: "cluster", "tenant:1", "collection:1:users"
+    /// Target: "cluster", "tenant:1", "collection:0:1:users"
     pub target: String,
     /// Grantee: role name or "user:username"
     pub grantee: String,
@@ -26,20 +26,66 @@ pub struct OwnerRecord {
     pub owner_username: String,
 }
 
-/// Build a `collection:{tenant}:{name}` target string for grants
-/// and ownership lookups.
-pub fn collection_target(tenant_id: TenantId, collection: &str) -> String {
-    format!("collection:{}:{}", tenant_id.as_u64(), collection)
+/// Build a `collection:{database}:{tenant}:{name}` grant target. A grant
+/// binds one database: a same-name collection in another database is a
+/// different target.
+pub fn collection_target(database_id: DatabaseId, tenant_id: TenantId, collection: &str) -> String {
+    scoped_target("collection", database_id, tenant_id, collection)
 }
 
-/// Build a `function:{tenant}:{name}` target string.
-pub fn function_target(tenant_id: TenantId, function_name: &str) -> String {
-    format!("function:{}:{}", tenant_id.as_u64(), function_name)
+/// Build a `function:{database}:{tenant}:{name}` grant target.
+pub fn function_target(
+    database_id: DatabaseId,
+    tenant_id: TenantId,
+    function_name: &str,
+) -> String {
+    scoped_target("function", database_id, tenant_id, function_name)
 }
 
-/// Build a `procedure:{tenant}:{name}` target string.
-pub fn procedure_target(tenant_id: TenantId, procedure_name: &str) -> String {
-    format!("procedure:{}:{}", tenant_id.as_u64(), procedure_name)
+/// Build a `procedure:{database}:{tenant}:{name}` grant target.
+pub fn procedure_target(
+    database_id: DatabaseId,
+    tenant_id: TenantId,
+    procedure_name: &str,
+) -> String {
+    scoped_target("procedure", database_id, tenant_id, procedure_name)
+}
+
+fn scoped_target(kind: &str, database_id: DatabaseId, tenant_id: TenantId, name: &str) -> String {
+    format!(
+        "{kind}:{}:{}:{name}",
+        database_id.as_u64(),
+        tenant_id.as_u64()
+    )
+}
+
+/// A database-scoped grant target split into its parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopedTarget<'a> {
+    /// `collection`, `function`, or `procedure`.
+    pub kind: &'a str,
+    pub database_id: u64,
+    pub tenant_id: u64,
+    pub name: &'a str,
+}
+
+/// Split a target built by [`collection_target`], [`function_target`], or
+/// [`procedure_target`]. `None` for every other target shape.
+pub fn parse_scoped_target(target: &str) -> Option<ScopedTarget<'_>> {
+    let mut parts = target.splitn(4, ':');
+    let kind = parts.next()?;
+    if !matches!(kind, "collection" | "function" | "procedure") {
+        return None;
+    }
+    let database_id = parts.next()?.parse().ok()?;
+    let tenant_id = parts.next()?.parse().ok()?;
+    let name = parts.next()?;
+    Some(ScopedTarget {
+        kind,
+        database_id,
+        tenant_id,
+        name,
+    })
 }
 
 /// Build a `tenant:{id}` target string for tenant-scoped grants — a

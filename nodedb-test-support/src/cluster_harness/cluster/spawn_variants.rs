@@ -165,6 +165,26 @@ impl TestCluster {
         .await
     }
 
+    /// [`Self::spawn_three_with_compaction_threshold_and_rf`] with
+    /// `num_cores` Data-Plane cores per node, including any learner added
+    /// later. A snapshot install then has to place each row on its owning
+    /// core.
+    pub async fn spawn_three_with_compaction_threshold_rf_and_cores(
+        threshold: u64,
+        replication_factor: usize,
+        num_cores: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_three_inner(
+            fast_cluster_tuning(),
+            nodedb_types::config::tuning::GraphTuning::default(),
+            nodedb_types::config::tuning::QueryTuning::default(),
+            num_cores,
+            Some(threshold),
+            replication_factor,
+        )
+        .await
+    }
+
     /// Spawn a 3-node cluster whose data groups each place
     /// `replication_factor` of the three nodes. With a factor below 3 some
     /// node replicates no copy of a group, so a test can act on a node that
@@ -177,6 +197,41 @@ impl TestCluster {
         Self::spawn_three_inner(
             fast_cluster_tuning(),
             nodedb_types::config::tuning::GraphTuning::default(),
+            nodedb_types::config::tuning::QueryTuning::default(),
+            1,
+            None,
+            replication_factor,
+        )
+        .await
+    }
+
+    /// [`Self::spawn_three_with_replication_factor`] with `num_cores`
+    /// Data-Plane cores per node, so the vShards one node leads spread over
+    /// several cores.
+    pub async fn spawn_three_with_replication_factor_and_cores(
+        replication_factor: usize,
+        num_cores: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_three_inner(
+            fast_cluster_tuning(),
+            nodedb_types::config::tuning::GraphTuning::default(),
+            nodedb_types::config::tuning::QueryTuning::default(),
+            num_cores,
+            None,
+            replication_factor,
+        )
+        .await
+    }
+
+    /// [`Self::spawn_three_with_replication_factor`] with `graph_tuning` on
+    /// every node's cores and Control Plane.
+    pub async fn spawn_three_with_replication_factor_and_graph_tuning(
+        replication_factor: usize,
+        graph_tuning: nodedb_types::config::tuning::GraphTuning,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_three_inner(
+            fast_cluster_tuning(),
+            graph_tuning,
             nodedb_types::config::tuning::QueryTuning::default(),
             1,
             None,

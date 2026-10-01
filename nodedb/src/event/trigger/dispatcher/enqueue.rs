@@ -2,7 +2,9 @@
 
 //! Turning a fire pass's outcomes into retry records.
 //!
-//! One failed trigger becomes one [`FailedAction`]. A pass that was refused
+//! One failed trigger becomes one [`FailedAction`]. A body that committed
+//! owes nothing more: its cross-node writes committed with it as outbox
+//! messages. A pass that was refused
 //! outright — currently only a cascade-depth stop — becomes none: re-running
 //! it would hit the same depth, so it is reported and dropped rather than
 //! retried until it exhausts its attempts.
@@ -138,5 +140,55 @@ fn report_refused(source: &ActionSource<'_>, report: &FireReport, scope: &str) -
             true
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::control::trigger::fire_common::TriggerOutcome;
+
+    fn source() -> ActionSource<'static> {
+        ActionSource {
+            database_id: DatabaseId::DEFAULT,
+            tenant_id: 1,
+            collection: "orders",
+            row_id: "o1",
+            operation: "INSERT",
+            source_lsn: 100,
+            source_sequence: 7,
+            source_vshard: 3,
+            cascade_depth: 0,
+        }
+    }
+
+    fn due(queue: &mut ActionRetryQueue) -> Vec<FailedAction> {
+        // The first retry is due after the 100ms base backoff.
+        std::thread::sleep(Duration::from_millis(150));
+        queue.drain_due().0
+    }
+
+    /// A body that failed is retried as a re-run of the trigger.
+    #[test]
+    fn failed_body_retries_the_trigger() {
+        let report = FireReport::from_outcomes(vec![TriggerOutcome {
+            trigger_name: "audit".into(),
+            error: Some(crate::Error::BadRequest {
+                detail: "body failed".into(),
+            }),
+        }]);
+        let mut queue = ActionRetryQueue::in_memory();
+        record_row_failures(&source(), report, None, None, &mut queue);
+
+        let ready = due(&mut queue);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(
+            ready[0].key.action,
+            ActionId::TriggerRow {
+                trigger_name: "audit".into()
+            }
+        );
     }
 }

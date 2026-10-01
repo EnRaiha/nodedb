@@ -136,6 +136,8 @@ fn array_catalog_hydrates_registry_at_startup() {
         prefix_bits: 8,
         audit_retain_ms: Some(86_400_000),
         minimum_audit_retain_ms: Some(3_600_000),
+        modification_hlc: nodedb_types::Hlc::ZERO,
+        incarnation: nodedb_types::Hlc::ZERO,
     };
 
     let catalog = ArrayCatalog::handle();

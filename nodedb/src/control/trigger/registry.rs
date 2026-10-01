@@ -6,9 +6,14 @@
 //! Queried by the trigger fire logic on every DML operation.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
-use crate::control::security::catalog::trigger_types::StoredTrigger;
+use crate::control::security::catalog::trigger_types::{
+    StoredTrigger, TriggerExecutionMode, TriggerTiming,
+};
+use crate::event::interest::{Interest, InterestSlice};
+
+type TriggerMap = HashMap<(nodedb_types::DatabaseId, u64, String), Vec<StoredTrigger>>;
 
 /// In-memory trigger registry for fast lookup during DML.
 ///
@@ -16,7 +21,10 @@ use crate::control::security::catalog::trigger_types::StoredTrigger;
 /// Thread-safe (RwLock) — reads are concurrent, writes are exclusive.
 pub struct TriggerRegistry {
     /// (database_id, tenant_id, collection_name) → sorted list of triggers.
-    by_collection: RwLock<HashMap<(nodedb_types::DatabaseId, u64, String), Vec<StoredTrigger>>>,
+    by_collection: RwLock<TriggerMap>,
+    /// Collections with an enabled trigger the Event Plane fires,
+    /// republished after every change.
+    interest: Arc<InterestSlice>,
 }
 
 impl Default for TriggerRegistry {
@@ -29,7 +37,31 @@ impl TriggerRegistry {
     pub fn new() -> Self {
         Self {
             by_collection: RwLock::new(HashMap::new()),
+            interest: InterestSlice::new(),
         }
+    }
+
+    /// The collections whose write events a trigger of this registry reads.
+    pub fn interest(&self) -> Arc<InterestSlice> {
+        Arc::clone(&self.interest)
+    }
+
+    /// Republish the collections with an enabled AFTER trigger the Event
+    /// Plane fires. A SYNC trigger fires in the Control Plane write path and
+    /// reads no write event.
+    fn publish_interest(&self, map: &TriggerMap) {
+        let mut interest = Interest::default();
+        for ((database_id, _, collection), triggers) in map {
+            let fired_from_events = triggers.iter().any(|t| {
+                t.enabled
+                    && t.timing == TriggerTiming::After
+                    && t.execution_mode != TriggerExecutionMode::Sync
+            });
+            if fired_from_events {
+                interest.insert(*database_id, collection);
+            }
+        }
+        self.interest.publish(interest);
     }
 
     /// Load all triggers (all tenants) from the catalog on startup.
@@ -59,6 +91,7 @@ impl TriggerRegistry {
         for list in map.values_mut() {
             list.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
         }
+        self.publish_interest(&map);
         let count: usize = map.values().map(|v| v.len()).sum();
         tracing::info!(triggers = count, "loaded triggers from catalog");
     }
@@ -95,6 +128,7 @@ impl TriggerRegistry {
         for list in map.values_mut() {
             list.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
         }
+        self.publish_interest(&map);
     }
 
     /// Register a new trigger (called by CREATE TRIGGER DDL).
@@ -103,7 +137,7 @@ impl TriggerRegistry {
             Ok(m) => m,
             Err(p) => p.into_inner(),
         };
-        // CREATE OR REPLACE may move a trigger between collections. Remove
+        // CREATE OR REPLACE can move a trigger between collections. Remove
         // the database-scoped identity from every collection before indexing
         // the replacement so it cannot fire from its former collection.
         for list in map.values_mut() {
@@ -121,6 +155,7 @@ impl TriggerRegistry {
         let list = map.entry(key).or_default();
         list.push(trigger);
         list.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+        self.publish_interest(&map);
     }
 
     /// Unregister a trigger (called by DROP TRIGGER DDL).
@@ -134,6 +169,7 @@ impl TriggerRegistry {
                 !(t.database_id == database_id && t.tenant_id == tenant_id && t.name == name)
             });
         }
+        self.publish_interest(&map);
     }
 
     /// Enable or disable a trigger.
@@ -155,6 +191,7 @@ impl TriggerRegistry {
                 }
             }
         }
+        self.publish_interest(&map);
     }
 
     /// Get all enabled triggers for a (database, tenant, collection) matching an event.
@@ -203,6 +240,7 @@ impl TriggerRegistry {
         for list in map.values_mut() {
             list.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
         }
+        self.publish_interest(&map);
     }
 
     /// Deterministic snapshot of every trigger across every
@@ -416,5 +454,37 @@ mod tests {
         );
         assert_eq!(reg.list_for_tenant(DatabaseId::DEFAULT, 1).len(), 1);
         assert_eq!(reg.list_for_tenant(DatabaseId::new(2), 1).len(), 1);
+    }
+
+    #[test]
+    fn only_event_plane_triggers_consume_write_events() {
+        let reg = TriggerRegistry::new();
+        let interest = reg.interest();
+        reg.register(sample("before", "checked", TriggerTiming::Before, true));
+        let mut sync = sample("sync", "synced", TriggerTiming::After, true);
+        sync.execution_mode = TriggerExecutionMode::Sync;
+        reg.register(sync);
+        let mut deferred = sample("deferred", "deferred", TriggerTiming::After, true);
+        deferred.execution_mode = TriggerExecutionMode::Deferred;
+        reg.register(deferred);
+        reg.register(sample("after", "metrics", TriggerTiming::After, true));
+
+        assert!(interest.contains(DatabaseId::DEFAULT, "metrics"));
+        assert!(interest.contains(DatabaseId::DEFAULT, "deferred"));
+        assert!(!interest.contains(DatabaseId::DEFAULT, "checked"));
+        assert!(!interest.contains(DatabaseId::DEFAULT, "synced"));
+    }
+
+    #[test]
+    fn a_disabled_or_dropped_trigger_consumes_nothing() {
+        let reg = TriggerRegistry::new();
+        let interest = reg.interest();
+        reg.register(sample("after", "metrics", TriggerTiming::After, true));
+        reg.set_enabled(DatabaseId::DEFAULT, 1, "after", false);
+        assert!(!interest.contains(DatabaseId::DEFAULT, "metrics"));
+        reg.set_enabled(DatabaseId::DEFAULT, 1, "after", true);
+        assert!(interest.contains(DatabaseId::DEFAULT, "metrics"));
+        reg.unregister(DatabaseId::DEFAULT, 1, "after");
+        assert!(!interest.contains(DatabaseId::DEFAULT, "metrics"));
     }
 }

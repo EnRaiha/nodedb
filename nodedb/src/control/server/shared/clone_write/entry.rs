@@ -5,7 +5,7 @@
 //! of those protocols claims is refused outright on a `Shadowed`/
 //! `Materializing` clone (see [`refuse_unsupported_clone_write`]).
 
-use nodedb_types::{CloneStatus, CollectionType, TenantId};
+use nodedb_types::{CloneStatus, CollectionType, Lsn, TenantId};
 
 use crate::bridge::envelope::Response;
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -15,7 +15,8 @@ use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::{DocumentOp, KvOp, PhysicalPlan};
 use nodedb_physical::physical_task::PhysicalTask;
 
-use super::util::{strip_db_prefix, write_err};
+use super::util::{strip_db_prefix, synthetic_affected_response, write_err};
+use crate::types::TxnId;
 
 /// Outcome of write-path clone interception.
 pub(in crate::control::server) enum CloneWriteOutcome {
@@ -23,6 +24,29 @@ pub(in crate::control::server) enum CloneWriteOutcome {
     Passthrough,
     /// The write was fully handled by the clone path. Caller uses this response.
     Handled(Response),
+}
+
+/// Outcome of clone interception for a write inside a transaction.
+pub(in crate::control::server) enum TxnCloneWriteOutcome {
+    /// Stage the write, retargeted when a copy-up moved its row.
+    Passthrough,
+    /// The copy-on-write answered the write: it stages nothing. Its
+    /// tombstones commit with the transaction.
+    Handled(Response),
+    /// Stage the write, which now names only the rows the clone's target
+    /// holds, and add `hidden` to its count: the source-only rows the
+    /// copy-on-write's tombstones hid.
+    Narrowed { hidden: u64 },
+}
+
+/// One copy-on-write step, before the caller's mode decides how the write
+/// applies.
+enum CloneStep {
+    Passthrough,
+    Handled(Response),
+    /// A KV delete on a shadowed clone: its tombstones are recorded, and the
+    /// keys the target holds still need removing.
+    KvDelete(super::kv::KvCloneDelete),
 }
 
 /// Intercept a single write task for a cloned collection.
@@ -35,6 +59,59 @@ pub(in crate::control::server) async fn maybe_intercept_clone_write(
     identity: &AuthenticatedIdentity,
     tenant_id: TenantId,
 ) -> crate::Result<CloneWriteOutcome> {
+    match intercept(state, task, identity, tenant_id, None).await? {
+        CloneStep::Passthrough => Ok(CloneWriteOutcome::Passthrough),
+        CloneStep::Handled(resp) => Ok(CloneWriteOutcome::Handled(resp)),
+        CloneStep::KvDelete(delete) => Ok(CloneWriteOutcome::Handled(
+            super::kv::apply_kv_clone_delete(state, task, delete).await?,
+        )),
+    }
+}
+
+/// Intercept a single write task for a cloned collection inside transaction
+/// `txn_id`, before the write stages.
+///
+/// The probes read the transaction's overlay. The tombstones and copy-up
+/// mappings are catalog entries: the connection's transaction buffers them
+/// (`cow_entry::replicate_async`), so they commit with the write and a rollback
+/// drops them. A copy-up's target row is an exact copy of its source row, so
+/// it applies at once: a rolled-back transaction leaves the clone reading the
+/// same row. A KV delete stages its removal of the target's rows instead of
+/// applying it.
+pub(in crate::control::server) async fn maybe_intercept_clone_write_in_txn(
+    state: &SharedState,
+    task: &mut PhysicalTask,
+    identity: &AuthenticatedIdentity,
+    tenant_id: TenantId,
+    txn_id: TxnId,
+) -> crate::Result<TxnCloneWriteOutcome> {
+    match intercept(state, task, identity, tenant_id, Some(txn_id)).await? {
+        CloneStep::Passthrough => Ok(TxnCloneWriteOutcome::Passthrough),
+        CloneStep::Handled(resp) => Ok(TxnCloneWriteOutcome::Handled(resp)),
+        CloneStep::KvDelete(delete) => match delete.narrowed {
+            None => Ok(TxnCloneWriteOutcome::Handled(synthetic_affected_response(
+                state.next_request_id(),
+                Lsn::new(0),
+                delete.source_only_hidden,
+            ))),
+            Some(narrowed) => {
+                task.plan = *narrowed;
+                Ok(TxnCloneWriteOutcome::Narrowed {
+                    hidden: delete.source_only_hidden,
+                })
+            }
+        },
+    }
+}
+
+/// Route a write by plan shape to its engine's copy-on-write protocol.
+async fn intercept(
+    state: &SharedState,
+    task: &mut PhysicalTask,
+    identity: &AuthenticatedIdentity,
+    tenant_id: TenantId,
+    txn_id: Option<TxnId>,
+) -> crate::Result<CloneStep> {
     // Classify first: the shape check borrows the plan, and the document
     // arm needs it mutably (a copy-up retargets the plan's surrogate).
     enum Shape {
@@ -62,18 +139,28 @@ pub(in crate::control::server) async fn maybe_intercept_clone_write(
         ) => Shape::KvInsert,
         _ => Shape::None,
     };
-    match shape {
+    let outcome = match shape {
         Shape::Document => {
-            super::document::intercept_doc_clone_write(state, task, identity, tenant_id).await
+            super::document::intercept_doc_clone_write(state, task, identity, tenant_id, txn_id)
+                .await?
         }
         Shape::KvMutate => {
-            super::kv::intercept_kv_clone_write(state, task, identity, tenant_id).await
+            return super::kv::intercept_kv_clone_write(state, task, identity, tenant_id, txn_id)
+                .await
+                .map(|step| match step {
+                    super::kv::KvCloneStep::Passthrough => CloneStep::Passthrough,
+                    super::kv::KvCloneStep::Delete(delete) => CloneStep::KvDelete(delete),
+                });
         }
         Shape::KvInsert => {
-            super::kv_insert::intercept_kv_clone_insert(state, task, tenant_id).await
+            super::kv_insert::intercept_kv_clone_insert(state, task, tenant_id).await?
         }
-        Shape::None => refuse_unsupported_clone_write(state, task, tenant_id),
-    }
+        Shape::None => refuse_unsupported_clone_write(state, task, tenant_id)?,
+    };
+    Ok(match outcome {
+        CloneWriteOutcome::Passthrough => CloneStep::Passthrough,
+        CloneWriteOutcome::Handled(resp) => CloneStep::Handled(resp),
+    })
 }
 
 /// Refuse a write shape none of `document`/`kv`/`kv_insert` claims when it

@@ -8,9 +8,12 @@
 
 pub mod alert_rule;
 pub mod api_key;
+pub mod array;
 pub mod auth_user;
+pub mod backup_schedule;
 pub mod change_stream;
 pub mod checkpoint;
+pub mod clone_cow;
 pub mod collection;
 pub mod column_stats;
 pub mod consumer_group;
@@ -20,7 +23,6 @@ pub mod database;
 mod dispatch;
 pub mod function;
 pub mod index_registry;
-pub mod local;
 pub mod materialized_view;
 pub mod oidc_provider;
 pub mod outcome;

@@ -12,7 +12,9 @@
 //!    all messages targeting the same peer (see [`super::dispatch_outbound`]).
 //! 3. **Dispatch RequestVote**: same batching strategy.
 //! 4. **Apply committed entries**: feed them to the user-supplied
-//!    `CommitApplier`. Conf-change entries are detected and applied to
+//!    `CommitApplier`, or hand group 0's entries to the metadata lane, which
+//!    applies them off the tick (see [`super::metadata_lane`]). The tick
+//!    never waits for an apply. Conf-change entries are detected and applied to
 //!    `MultiRaft` before the user applier sees them (see
 //!    [`super::apply_committed`]).
 //! 5. **Install snapshots**: send `InstallSnapshot` RPCs to peers that
@@ -34,6 +36,11 @@
 //! 9. **Remove leaving learners**: for each group this node leads that has an
 //!    authored placement set, propose `RemoveLearner` for non-voting learners
 //!    not in the placement. Inert while placement is `None` (bootstrap window).
+//! 10. **Unmount left groups**: drop the replica of a data group this node
+//!     was removed from and is not placed in (see [`super::super::group_unmount`]).
+//! 11. **Throttled passes**: placement reconcile, leader balance (see
+//!     [`super::super::leader_balance`]), the unhosted-group leader probe
+//!     (see [`super::leader_probe`]), orphan snapshot GC, and lease GC.
 
 use tracing::{debug, error};
 
@@ -67,7 +74,7 @@ const LEASE_GC_TICK_INTERVAL: u64 = 200;
 impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// Execute a single tick: drive Raft, dispatch outbound messages,
     /// apply commits, promote caught-up learners.
-    pub(in crate::raft_loop) fn do_tick(&self) {
+    pub(in crate::raft_loop) async fn do_tick(&self) {
         // Tick under lock and extract Ready. `tick` durably persists any
         // HardState staged this tick (election term bump + self-vote) before
         // returning the vote requests it carries. A persist failure is a
@@ -81,13 +88,18 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                 Err(e) => {
                     error!(
                         error = %e,
-                        "raft tick failed to persist hard state durably; \
+                        "raft tick failed to stage hard state; \
                          skipping message/vote dispatch for this tick"
                     );
                     return;
                 }
             }
         };
+
+        // Every leader change this node's Raft saw since the last tick,
+        // including its own election and a leader learned from an
+        // AppendEntries or heartbeat, reaches the routing table's leader hint.
+        self.sync_leader_hints();
 
         // Dispatch outgoing messages and persist log/HardState first (even if
         // ready looks "empty" we still want to run the learner-promotion step
@@ -98,6 +110,9 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             // Apply committed entries and conf-changes, then dispatch any
             // needed install-snapshot RPCs, per group.
             for (group_id, group_ready) in ready.groups {
+                if let Some(err) = &group_ready.committed_read_error {
+                    self.surface_committed_read_error(group_id, err);
+                }
                 if !group_ready.committed_entries.is_empty() {
                     self.apply_group_commits(group_id, &group_ready);
                 }
@@ -145,6 +160,15 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         // while placement is None (bootstrap window — guard is inside the fn).
         self.converge_leaving_learners();
 
+        // Drop the replica of every data group this node has left, once its
+        // own removal applied. A node outside a group's placement then hosts
+        // no replica of it.
+        self.unmount_left_groups();
+
+        // Record the tick each data group's leadership arrived. The leader
+        // balance holds a failover win for a while from there.
+        self.note_led_groups();
+
         // Placement reconcile is throttled well above the tick rate: SetPlacement
         // is a normal metadata entry (not a conf-change), so Raft would not dedup
         // per-tick re-proposals before they commit. Running ~1s apart lets each
@@ -154,6 +178,16 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if tick.is_multiple_of(PLACEMENT_RECONCILE_TICK_INTERVAL) {
             self.reconcile_placement();
+        }
+        // Move each data group's leadership to its preferred leader. The
+        // bootstrap node leads every group otherwise.
+        if tick.is_multiple_of(super::super::leader_balance::LEADER_BALANCE_TICK_INTERVAL) {
+            self.balance_leadership();
+        }
+        // Find the leader of an unhosted data group whose hint names none.
+        let probe_interval = super::leader_probe::LEADER_PROBE_TICK_INTERVAL;
+        if tick.is_multiple_of(probe_interval) {
+            self.probe_unhosted_leaders(tick / probe_interval);
         }
         if tick.is_multiple_of(ORPHAN_PARTIAL_GC_TICK_INTERVAL)
             && let Some(ref dir) = self.data_dir

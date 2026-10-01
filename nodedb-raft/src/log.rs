@@ -110,6 +110,8 @@ impl<S: LogStorage> RaftLog<S> {
     /// resend them, and they would disappear on restart. Mutating memory only
     /// after storage has accepted the write makes that state unreachable: a
     /// failed persist leaves `last_index()` covering exactly what is on disk.
+    /// Storage that stages writes accepts them at once; its caller then makes
+    /// them durable before the response leaves.
     pub fn append_entries(&mut self, _prev_index: u64, entries: &[LogEntry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -166,17 +168,43 @@ impl<S: LogStorage> RaftLog<S> {
     }
 
     /// Apply a snapshot: discard all entries up to `last_included_index`.
-    pub fn apply_snapshot(&mut self, last_included_index: u64, last_included_term: u64) {
-        // Remove entries already covered by the snapshot.
-        if last_included_index > self.snapshot_index {
-            let new_start = last_included_index + 1;
-            self.entries.retain(|e| e.index >= new_start);
-            self.snapshot_index = last_included_index;
-            self.snapshot_term = last_included_term;
-            let _ = self
-                .storage
-                .compact(last_included_index, last_included_term);
+    ///
+    /// Storage compacts first. A storage error leaves the in-memory log
+    /// untouched, so memory never claims a boundary storage does not hold.
+    pub fn apply_snapshot(
+        &mut self,
+        last_included_index: u64,
+        last_included_term: u64,
+    ) -> Result<()> {
+        if last_included_index <= self.snapshot_index {
+            return Ok(());
         }
+        self.storage
+            .compact(last_included_index, last_included_term)?;
+        let new_start = last_included_index + 1;
+        self.entries.retain(|e| e.index >= new_start);
+        self.snapshot_index = last_included_index;
+        self.snapshot_term = last_included_term;
+        Ok(())
+    }
+
+    /// The last index of this log that storage holds durably.
+    ///
+    /// Storage whose writes are durable on return holds the whole log. Storage
+    /// that stages writes reports its last durable entry `(index, term)`. That
+    /// entry counts only when this log holds the same entry: Raft logs that
+    /// agree on one entry agree on every entry before it. A durable entry this
+    /// log no longer holds, or holds at another term, means a truncation is
+    /// still on its way to disk. The durable prefix is then not known past the
+    /// snapshot boundary, and the smaller of the two answers.
+    pub fn stable_index(&self) -> u64 {
+        let Some((index, term)) = self.storage.stable_through() else {
+            return self.last_index();
+        };
+        if index <= self.last_index() && self.term_at(index) == Some(term) {
+            return index;
+        }
+        index.min(self.snapshot_index)
     }
 
     pub fn snapshot_index(&self) -> u64 {
@@ -266,7 +294,7 @@ mod tests {
             log.append(make_entry(1, i)).unwrap();
         }
 
-        log.apply_snapshot(5, 1);
+        log.apply_snapshot(5, 1).unwrap();
         assert_eq!(log.snapshot_index(), 5);
         assert_eq!(log.last_index(), 10);
         // Compacted entries are gone.

@@ -44,7 +44,7 @@ fn classify(plan: &PhysicalPlan) -> Option<(&str, Vec<&[u8]>)> {
     }
 }
 
-/// Hide the source rows an insert into a clone would otherwise duplicate.
+/// Hide the source rows an insert into a clone will otherwise duplicate.
 pub(super) async fn intercept_kv_clone_insert(
     state: &SharedState,
     task: &PhysicalTask,
@@ -75,11 +75,13 @@ pub(super) async fn intercept_kv_clone_insert(
     for key in keys {
         let kv_key = String::from_utf8_lossy(key).into_owned();
         perform_kv_clone_tombstone(KvTombstoneParams {
+            tenant_id,
             state,
             target_db_id: db_id,
             target_collection: coll_name,
             kv_key,
         })
+        .await
         .map_err(|e| write_err(format!("clone kv insert tombstone: {e}")))?;
     }
 

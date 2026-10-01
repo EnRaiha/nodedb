@@ -3,7 +3,7 @@
 //! Round-0 scatter: local broadcast + one remote dispatch per distinct
 //! non-local group leader, issued concurrently.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use futures::future::join_all;
 
@@ -13,36 +13,56 @@ use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::gateway::{RouteDecision, TaskRoute};
 use crate::control::server::graph_dispatch::cluster_resolve::gateway_shared;
 use crate::control::server::graph_dispatch::match_broadcast::{
-    broadcast_match_to_all_cores, unwrap_match_envelope,
+    GraphRead, broadcast_match_to_all_cores, unwrap_match_envelope,
 };
+use crate::control::server::graph_dispatch::shard_reads::ShardReadLog;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId, TxnId, VShardId};
+use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::GraphOp;
 
 use super::coord::{TaggedShardResult, decode_rows};
 
-/// A distinct remote owner node and one vShard it owns (used as the dispatch
-/// target for the round-0 remote `Match`).
+/// A distinct remote owner node, one vShard it owns (the dispatch target for
+/// the round-0 remote `Match`), and every vShard it leads.
 pub(super) struct RemoteOwner {
     pub(super) node_id: u64,
     pub(super) vshard_id: u64,
+    pub(super) vshards: Vec<u32>,
+}
+
+/// Who leads each data vShard, from one routing snapshot: the vShards this
+/// node leads, and one entry per remote leader.
+struct RoundZeroOwners {
+    local_vshards: Vec<u32>,
+    remote: Vec<RemoteOwner>,
 }
 
 /// Round-0 scatter: local broadcast + one remote dispatch per distinct
 /// non-local group leader, all issued concurrently.
+///
+/// Every leg walks every vShard its node leads, so round 0 reads every vShard
+/// of the graph. A MATCH result depends on every one of them: an edge written
+/// to any vShard can add a match. The returned log notes each vShard under the
+/// leg it was dispatched to, at the watermark that leg served, from the same
+/// routing snapshot that picked the legs. Later rounds read vShards round 0
+/// already noted.
 pub(super) async fn scatter_round_zero(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     query_bytes: &[u8],
     deadline_ms: u64,
-    txn_id: Option<TxnId>,
-) -> crate::Result<Vec<TaggedShardResult>> {
+    read: GraphRead,
+) -> crate::Result<(Vec<TaggedShardResult>, ShardReadLog)> {
+    let GraphRead {
+        txn_id,
+        linearizable,
+    } = read;
     // Local cores: fan to all and unwrap each `{rows, frontier}` envelope. The
     // active `txn_id` is threaded onto this LOCAL leg so each core merges the
     // transaction's staged edge overlay for read-your-own-writes; with the
     // fixed-hop overlay merge un-gated in cluster mode, a bound zero-degree
-    // source still emits its cross-shard frontier. The same `txn_id` is now
+    // source still emits its cross-shard frontier. The same `txn_id` is
     // forwarded to remote owners below so their leg can resolve the transaction's
     // staged overlay; the staging/forwarding of that overlay to the leader is a
     // separate unit, so the forwarded id is inert until that lands.
@@ -57,11 +77,14 @@ pub(super) async fn scatter_round_zero(
         database_id,
         local_plan,
         TraceId::ZERO,
-        txn_id,
+        read,
     );
 
     // Remote owners: one batched dispatch per distinct non-local group leader.
-    let remote_owners = distinct_remote_owners(state)?;
+    let RoundZeroOwners {
+        local_vshards,
+        remote: remote_owners,
+    } = round_zero_owners(state)?;
     let shared_arc = gateway_shared(state)?;
     let version_set = GatewayVersionSet::from_pairs(Vec::new());
     let remote_futs = remote_owners.into_iter().map(|owner| {
@@ -80,9 +103,10 @@ pub(super) async fn scatter_round_zero(
         };
         let version_set = version_set.clone();
         let node_id = owner.node_id;
+        let leg_vshards = owner.vshards;
         let shared_arc = shared_arc.clone();
         Box::pin(async move {
-            let payloads = dispatch_route(DispatchRouteParams {
+            let outcome = dispatch_route(DispatchRouteParams {
                 route,
                 shared: &shared_arc,
                 tenant_id,
@@ -91,10 +115,12 @@ pub(super) async fn scatter_round_zero(
                 deadline_ms,
                 version_set: &version_set,
                 txn_id,
+                linearizable,
             })
-            .await?
-            .payloads;
-            collect_remote_envelopes(node_id, payloads)
+            .await?;
+            let mut log = ShardReadLog::new();
+            log.note_leg(leg_vshards, &outcome.shard_watermarks, node_id);
+            Ok::<_, crate::Error>((collect_remote_envelopes(node_id, outcome.payloads)?, log))
         })
     });
 
@@ -103,7 +129,9 @@ pub(super) async fn scatter_round_zero(
         futures::future::join(local_fut, join_all(remote_futs)).await;
 
     let mut out: Vec<TaggedShardResult> = Vec::new();
+    let mut log = ShardReadLog::new();
     let local_outcome = local_outcome?;
+    log.note(local_vshards, local_outcome.watermark_lsn, state.node_id);
     out.push(TaggedShardResult {
         emitting_node: state.node_id,
         rows: decode_rows(&local_outcome.rows_payload)?,
@@ -111,18 +139,25 @@ pub(super) async fn scatter_round_zero(
         resume: local_outcome.resume,
     });
     for res in remote_results {
-        out.extend(res?);
+        let (tagged, leg_log) = res?;
+        out.extend(tagged);
+        log.merge(leg_log);
     }
-    Ok(out)
+    Ok((out, log))
 }
 
 /// Enumerate the distinct non-local data-group leaders, each paired with one
-/// vShard the group owns. The metadata group (0) holds no vShards and is
-/// skipped. Resolution uses LIVE Raft leadership where available so a stale
-/// routing hint cannot misdirect the scatter.
-fn distinct_remote_owners(state: &SharedState) -> crate::Result<Vec<RemoteOwner>> {
+/// vShard the group owns and every vShard it leads, and the vShards this node
+/// leads. The metadata group (0) holds no vShards and is skipped. Resolution
+/// uses LIVE Raft leadership where available so a stale routing hint cannot
+/// misdirect the scatter.
+fn round_zero_owners(state: &SharedState) -> crate::Result<RoundZeroOwners> {
+    let mut owners = RoundZeroOwners {
+        local_vshards: Vec::new(),
+        remote: Vec::new(),
+    };
     let Some(routing_lock) = state.cluster_routing.as_ref() else {
-        return Ok(Vec::new());
+        return Ok(owners);
     };
     let routing = routing_lock.read().unwrap_or_else(|p| p.into_inner());
 
@@ -136,8 +171,7 @@ fn distinct_remote_owners(state: &SharedState) -> crate::Result<Vec<RemoteOwner>
             .unwrap_or(0)
     };
 
-    let mut seen: HashSet<u64> = HashSet::new();
-    let mut owners = Vec::new();
+    let mut remote_index: HashMap<u64, usize> = HashMap::new();
     for group_id in routing.group_ids() {
         // Skip the metadata group — it owns no vShards.
         if group_id == 0 {
@@ -155,6 +189,7 @@ fn distinct_remote_owners(state: &SharedState) -> crate::Result<Vec<RemoteOwner>
         if leader == state.node_id {
             // This group is LOCAL — already covered by the local
             // `broadcast_match_to_all_cores`; skip from the remote-owner set.
+            owners.local_vshards.extend(vshards);
             continue;
         }
         if leader == 0 {
@@ -165,13 +200,19 @@ fn distinct_remote_owners(state: &SharedState) -> crate::Result<Vec<RemoteOwner>
                 vshard_id: VShardId::new(vshard_id),
                 leader_node: 0,
                 leader_addr: String::new(),
+                leader_term: 0,
             });
         }
-        if seen.insert(leader) {
-            owners.push(RemoteOwner {
-                node_id: leader,
-                vshard_id: vshard_id as u64,
-            });
+        match remote_index.get(&leader) {
+            Some(&index) => owners.remote[index].vshards.extend(vshards),
+            None => {
+                remote_index.insert(leader, owners.remote.len());
+                owners.remote.push(RemoteOwner {
+                    node_id: leader,
+                    vshard_id: vshard_id as u64,
+                    vshards,
+                });
+            }
         }
     }
     Ok(owners)

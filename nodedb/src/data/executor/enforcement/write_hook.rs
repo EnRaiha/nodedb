@@ -192,12 +192,14 @@ pub(in crate::data::executor) fn target_write_set(
 ) -> Vec<crate::bridge::envelope::WriteSetEntry> {
     targets
         .iter()
-        .map(|target| crate::bridge::envelope::WriteSetEntry {
-            surrogate: target.surrogate.as_u32(),
-            identity: target.identity.clone(),
-            is_delete: false,
-            value: target.body.clone(),
-            collection: Some(target.collection.clone()),
+        .map(|target| {
+            crate::data::executor::core_loop::redo_image::submitted_row_image(
+                target.surrogate.as_u32(),
+                target.identity.clone(),
+                target.body.clone(),
+                target.outcome.bitemporal_sys_from_ms,
+            )
+            .in_collection(target.collection.clone())
         })
         .collect()
 }

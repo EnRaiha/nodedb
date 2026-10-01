@@ -8,8 +8,7 @@ use super::binder::IdentityBinder;
 
 pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut CrdtOp) -> crate::Result<()> {
     match op {
-        // A delta apply creates the document on first sight, so it is the one
-        // op that may still allocate for a pre-surrogate entry.
+        // Every document-level op carries the surrogate its coordinator bound.
         CrdtOp::Apply {
             collection,
             document_id,
@@ -21,18 +20,8 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut CrdtOp) -> crate::Resul
             document_id,
             surrogate,
             ..
-        } => binder.resolve_or_assign_in_place(
-            binder.plan_key(collection.as_str())?,
-            document_id,
-            surrogate,
-        ),
-        CrdtOp::DocUpsert {
-            collection,
-            document_id,
-            surrogate,
-            ..
         }
-        | CrdtOp::DocDelete {
+        | CrdtOp::DocUpsert {
             collection,
             document_id,
             surrogate,
@@ -62,6 +51,18 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut CrdtOp) -> crate::Resul
             surrogate,
             ..
         } => binder.resolve_in_place(
+            binder.plan_key(collection.as_str())?,
+            document_id.as_bytes(),
+            surrogate,
+        ),
+        // A delete removes a row it never creates: a key its coordinator
+        // found unbound stays unbound unless the catalog binds it.
+        CrdtOp::DocDelete {
+            collection,
+            document_id,
+            surrogate,
+            ..
+        } => binder.resolve_existing_in_place(
             binder.plan_key(collection.as_str())?,
             document_id.as_bytes(),
             surrogate,

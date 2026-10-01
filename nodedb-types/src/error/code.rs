@@ -79,7 +79,6 @@ error_codes! {
 
     // Query (1200–1299)
     PLAN_ERROR = 1200;
-    FAN_OUT_EXCEEDED = 1201;
     SQL_NOT_ENABLED = 1202;
     /// A function call names no registered scalar/aggregate/window function.
     UNDEFINED_FUNCTION = 1203;

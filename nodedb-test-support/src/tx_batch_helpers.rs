@@ -2,7 +2,6 @@
 
 //! Plan builders and a single-core commit driver shared by the transaction
 //! cross-engine tests.
-#![allow(dead_code)]
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -62,6 +61,7 @@ pub fn make_request(plan: PhysicalPlan) -> Request {
         txn_id: None,
         wal_lsn: None,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: nodedb::bridge::envelope::Admission::Admitted,
     }
 }
@@ -114,7 +114,7 @@ pub fn doc_put(collection: &str, doc_id: &str, val: &[u8]) -> PhysicalPlan {
         collection: qualify(collection),
         document_id: doc_id.into(),
         value: val.to_vec(),
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: crate::kv_rows::kv_row_surrogate(doc_id.as_bytes()),
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
@@ -129,7 +129,7 @@ pub fn doc_get(collection: &str, doc_id: &str) -> PhysicalPlan {
         rls_filters: Vec::new(),
         system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: Some(crate::kv_rows::kv_row_surrogate(doc_id.as_bytes())),
         pk_bytes: Vec::new(),
     })
 }
@@ -140,7 +140,7 @@ pub fn doc_conflict(collection: &str, doc_id: &str) -> PhysicalPlan {
         collection: qualify(collection),
         document_id: doc_id.into(),
         value: b"conflict".to_vec(),
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: crate::kv_rows::kv_row_surrogate(doc_id.as_bytes()),
         if_absent: false,
         returning: None,
         rls_filters: Vec::new(),
@@ -156,8 +156,8 @@ pub fn edge_put(collection: &str, src: &str, dst: &str) -> PhysicalPlan {
         label: "REL".into(),
         dst_id: dst.into(),
         properties: Vec::new(),
-        src_surrogate: nodedb_types::Surrogate::ZERO,
-        dst_surrogate: nodedb_types::Surrogate::ZERO,
+        src_surrogate: crate::kv_rows::kv_row_surrogate(src.as_bytes()),
+        dst_surrogate: crate::kv_rows::kv_row_surrogate(dst.as_bytes()),
     })
 }
 
@@ -177,7 +177,7 @@ pub fn kv_put(key: &[u8], value: &[u8]) -> PhysicalPlan {
         key: key.to_vec(),
         value: value.to_vec(),
         ttl_ms: 0,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: crate::kv_rows::kv_row_surrogate(key),
         returning: None,
         rls_filters: Vec::new(),
         provenance: None,
@@ -281,20 +281,6 @@ pub fn timeseries_scan(collection: &str) -> PhysicalPlan {
     })
 }
 
-pub fn crdt_apply(collection: &str, doc_id: &str) -> PhysicalPlan {
-    PhysicalPlan::Crdt(CrdtOp::Apply {
-        collection: qualify(collection),
-        document_id: doc_id.into(),
-        delta: vec![0u8; 8],
-        peer_id: 1,
-        mutation_id: 42,
-        surrogate: nodedb_types::Surrogate::ZERO,
-        provenance: None,
-        constraint_version_required: 0,
-        expected_frontier_digest: None,
-    })
-}
-
 /// A vector-primary direct insert of a 3-dimensional vector.
 pub fn vector_direct_insert(collection: &str, surrogate: u32) -> PhysicalPlan {
     let mut payload = std::collections::HashMap::new();
@@ -365,24 +351,6 @@ pub fn assert_kv_absent(
     assert!(
         is_absent,
         "KV key {key:?} must be absent after rollback; status={:?} payload_len={}",
-        r.status,
-        r.payload.len()
-    );
-}
-
-/// Assert that a document is absent (NotFound or empty payload).
-pub fn assert_doc_absent(
-    core: &mut CoreLoop,
-    tx: &mut Producer<BridgeRequest>,
-    rx: &mut Consumer<BridgeResponse>,
-    collection: &str,
-    doc_id: &str,
-) {
-    let r = send_raw(core, tx, rx, doc_get(collection, doc_id));
-    let is_absent = r.status == Status::Error || r.payload.is_empty() || r.payload.len() <= 3;
-    assert!(
-        is_absent,
-        "doc {collection}/{doc_id} must be absent after rollback; status={:?} payload_len={}",
         r.status,
         r.payload.len()
     );

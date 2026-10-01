@@ -11,7 +11,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::planner::calvin::{
     TxnDispatchPosition, dispatch_authorized_dependent_edge_recon,
-    dispatch_authorized_tasks_to_calvin, is_dependent_predicate,
+    dispatch_authorized_tasks_to_calvin, is_edge_recon_plan,
 };
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::RequestAuthScope;
@@ -33,8 +33,8 @@ use super::super::core::NodeDbPgHandler;
 ///
 /// `rows: None` — a task yields either a tag contribution or its rows, which
 /// the fold takes once for the statement's single result set; counting rows
-/// here would mean reaching into that fold. `meter_dispatch` charges one unit
-/// for `None`, correct for the write that just committed.
+/// here will mean reaching into that fold. `meter_dispatch` charges one unit
+/// for `None`, correct for the write that committed.
 fn meter_calvin_task(
     state: &crate::control::state::SharedState,
     identity: &AuthenticatedIdentity,
@@ -92,37 +92,23 @@ impl NodeDbPgHandler {
             .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
-        // Presence guard preserved from the inlined implementation: BOTH the
-        // static and OLLP paths require the completion registry to be wired, so
-        // an absent registry rejects either path with `SequencerUnavailable`
-        // here, before any classification or scan. The OLLP body re-fetches the
-        // registry itself; this check keeps the static path's rejection
-        // behaviour byte-identical.
-        if self.state.calvin_completion_registry.get().is_none() {
-            let (severity, code, message) = error_to_sqlstate(&crate::Error::SequencerUnavailable);
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                severity.to_owned(),
-                code.to_owned(),
-                message,
-            ))));
-        }
-
-        let dependent_task = tasks.iter().find(|t| is_dependent_predicate(&t.plan));
+        // A dependent predicate, or a TRUNCATE, takes the edge recon path.
+        let dependent_task = tasks.iter().find(|t| is_edge_recon_plan(&t.plan));
 
         // Static (non-OLLP) Calvin path: build the TxClass and route the
         // submit-and-await to the SEQUENCER-GROUP leader via
-        // `submit_calvin_routed`. Submitting to the LOCAL inbox here is the
-        // silent-loss bug this fix addresses: only the sequencer leader's service
+        // `submit_calvin_routed`. Only the sequencer leader's service
         // assigns and only its registry receives the replicated completion ack,
-        // so a submit on a non-leader coordinator never completes. Routing fixes
-        // that for cross-shard document writes from any coordinator.
+        // so a submit to the LOCAL inbox on a non-leader coordinator never
+        // completes. Routing serves cross-shard document writes from any
+        // coordinator.
         //
         // The OLLP (dependent-predicate) path below is COORDINATOR-OWNED: this
         // handler runs `run_dependent_with_retry`, which owns the
         // submit → await-assignment → await-completion loop and, on a post-exec
         // predicate-drift mismatch, runs a FRESH pre-execution reconnaissance
         // before resubmitting (the scheduler releases the aborted attempt's
-        // locks and only signals the mismatch back — it no longer re-submits a
+        // locks and only signals the mismatch back — it never re-submits a
         // stale prediction). The submit step ROUTES to the sequencer-group leader
         // via `submit_calvin_routed_assign` (returning the leader-assigned
         // assignment) while the completion is awaited on this coordinator's local
@@ -207,10 +193,6 @@ impl NodeDbPgHandler {
         // write (if any). `tasks` is cloned into the recon call so the original
         // list survives to shape the per-task responses afterwards: a RETURNING
         // task emits its rows, every other task its command tag.
-        // Normal multi-shard OLLP dispatch (NOT the contended single-shard
-        // route from `route_write_to_calvin`), so it stays on the strict
-        // multi-vshard dependent `TxClass` builder (`allow_single_vshard:
-        // false`).
         let authorized = self.authorize_tasks(identity, &tasks)?;
         let outcome = dispatch_authorized_dependent_edge_recon(
             &self.state,
@@ -218,7 +200,6 @@ impl NodeDbPgHandler {
             identity,
             tenant_id,
             database_id,
-            false,
         )
         .await
         .map_err(|e| {

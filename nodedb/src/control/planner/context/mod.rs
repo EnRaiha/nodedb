@@ -12,5 +12,5 @@ pub mod security;
 pub mod system_security;
 
 pub use query::{PlanSqlWithRlsParams, QueryContext, SYSTEM_FUNCTION_NAMES};
-pub use security::PlanSecurityContext;
+pub use security::{PermissionTreeSource, PlanSecurityContext};
 pub use system_security::SystemPlanSecurity;

@@ -14,7 +14,6 @@ use nodedb_physical::physical_plan::{
     ColumnarOp, CrdtOp, DocumentOp, GraphOp, SpatialOp, TextOp, TimeseriesOp, VectorOp,
     VectorWriteTargets,
 };
-use nodedb_types::Surrogate;
 
 impl CoreLoop {
     /// Record the version of every key written by a committed transaction
@@ -135,12 +134,16 @@ impl CoreLoop {
                 collection,
                 surrogate,
                 ..
-            }
-            | DocumentOp::PointDelete {
+            } => (collection.as_str(), *surrogate),
+            // A delete of a key unbound in this database wrote no row.
+            DocumentOp::PointDelete {
                 collection,
                 surrogate,
                 ..
-            } => (collection.as_str(), *surrogate),
+            } => match surrogate {
+                Some(surrogate) => (collection.as_str(), *surrogate),
+                None => return,
+            },
             // Whole-collection mutation: key set is every row, so only the
             // collection floor applies.
             DocumentOp::Truncate { collection, .. } => {
@@ -212,8 +215,18 @@ impl CoreLoop {
                 collection,
                 surrogate,
                 ..
+            } => {
+                self.note_write_lsn(
+                    db,
+                    tenant,
+                    collection.as_str(),
+                    Some(KeyRepr::Surrogate(surrogate.as_u32())),
+                    lsn,
+                );
             }
-            | VectorOp::DeleteBySurrogate {
+            // An unbound delete names no row: it records the collection
+            // floor only.
+            VectorOp::DeleteBySurrogate {
                 collection,
                 surrogate,
                 ..
@@ -222,7 +235,7 @@ impl CoreLoop {
                     db,
                     tenant,
                     collection.as_str(),
-                    Some(KeyRepr::Surrogate(surrogate.as_u32())),
+                    surrogate.map(|s| KeyRepr::Surrogate(s.as_u32())),
                     lsn,
                 );
             }
@@ -249,20 +262,18 @@ impl CoreLoop {
                 surrogates,
                 ..
             } => {
-                let mut any_surrogate_recorded = false;
+                // Every vector of a batch carries its bound surrogate. An
+                // empty batch records the collection floor only.
                 for s in surrogates {
-                    if *s != Surrogate::ZERO {
-                        self.note_write_lsn(
-                            db,
-                            tenant,
-                            collection.as_str(),
-                            Some(KeyRepr::Surrogate(s.as_u32())),
-                            lsn,
-                        );
-                        any_surrogate_recorded = true;
-                    }
+                    self.note_write_lsn(
+                        db,
+                        tenant,
+                        collection.as_str(),
+                        Some(KeyRepr::Surrogate(s.as_u32())),
+                        lsn,
+                    );
                 }
-                if !any_surrogate_recorded {
+                if surrogates.is_empty() {
                     self.note_write_lsn(db, tenant, collection.as_str(), None, lsn);
                 }
             }
@@ -413,6 +424,13 @@ impl CoreLoop {
             // Distributed algorithm supersteps: compute passes over an
             // in-memory CSR snapshot, no key written.
             GraphOp::BspSuperstep(_) | GraphOp::WccSuperstep(_) => {}
+            // A node delete's guards write nothing. A TRUNCATE's edge
+            // tombstones record their versions as each delete applies.
+            GraphOp::NodeEdgeGuard { .. }
+            | GraphOp::NodePresenceGuard { .. }
+            | GraphOp::TruncateEdges { .. } => {}
+            // A read of stored documents writes no key.
+            GraphOp::NodePresenceRead { .. } => {}
         }
     }
 }

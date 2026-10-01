@@ -23,8 +23,7 @@ pub(super) async fn try_typed(
     txn_ctx: &DmlTxnCtx<'_>,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     match stmt {
-        // `COPY <collection> FROM '<path>' [WITH (...)]` bulk import. Ported
-        // from the pgwire `ast::async_ops::try_dispatch_async` typed arm.
+        // `COPY <collection> FROM '<path>' [WITH (...)]` bulk import.
         NodedbStatement::Misc(MiscStmt::CopyFromFile {
             collection,
             path,
@@ -48,8 +47,7 @@ pub(super) async fn try_typed(
             .await,
         ),
 
-        // `COPY <source> TO '<path>' [WITH (...)]` bulk export. Ported from
-        // the pgwire `ast::async_ops::try_dispatch_async` typed arm.
+        // `COPY <source> TO '<path>' [WITH (...)]` bulk export.
         NodedbStatement::Misc(MiscStmt::CopyToFile {
             source,
             path,

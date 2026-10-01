@@ -121,10 +121,30 @@ fn spatial_checkpoint_writes_are_durable() {
 
 #[test]
 fn snapshot_executor_checkpoint_writes_are_durable() {
-    // Both `restore_vector_checkpoints` and `restore_crdt_checkpoints` write
-    // checkpoint files that the normal startup path later loads — they share
-    // the same power-loss exposure as the live checkpoint writers.
-    assert_durable_checkpoint_writer("nodedb/src/storage/snapshot_executor.rs");
+    // Snapshot restore writes every captured checkpoint file that the normal
+    // startup path later loads, so it shares the power-loss exposure of the
+    // live checkpoint writers. `RestoreWriter` in `snapshot_files.rs` is the
+    // one write site: it calls the durable helper. Every restore module
+    // writes through it and never touches a file directly.
+    assert_durable_checkpoint_writer("nodedb/src/storage/snapshot_files.rs");
+    for rel in [
+        "nodedb/src/storage/snapshot_executor.rs",
+        "nodedb/src/ctl/restore/execute.rs",
+    ] {
+        let full = read(rel);
+        // Test fixtures below `#[cfg(test)]` stage files on purpose.
+        let src = full.split("#[cfg(test)]").next().unwrap_or_default();
+        assert!(
+            src.contains("RestoreWriter"),
+            "{rel} must write restored files through RestoreWriter, whose \
+             writes go through atomic_write_fsync."
+        );
+        assert!(
+            !src.contains("fs::write(") && !src.contains("fs::rename("),
+            "{rel} writes a restored file directly. Route it through \
+             RestoreWriter so the file and its directory are fsynced."
+        );
+    }
 }
 
 #[test]

@@ -27,8 +27,11 @@ use nodedb_wal::record::RecordType;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::engine::timeseries::ilp;
+use crate::engine::timeseries::resolved_ingest::{RESOLVED_INGEST_FORMAT, ResolvedTsBatch};
 use crate::types::{DatabaseId, TenantId};
 use crate::wal::decode_batch_record;
+
+use super::admission;
 
 /// `(database, tenant, collection)`.
 pub(in crate::data::executor) type TsKey = (DatabaseId, TenantId, String);
@@ -44,6 +47,9 @@ pub(in crate::data::executor) struct TsRecordLoad {
     /// Every ILP line the record writes, one per line, for the tag-headroom
     /// test. Empty for a sample batch, which carries no tags.
     pub ilp: String,
+    /// Every resolved batch the record writes, encoded, for the tag-headroom
+    /// test.
+    pub resolved: Vec<Vec<u8>>,
 }
 
 /// Every timeseries collection the record at `records[start]` writes on
@@ -96,6 +102,17 @@ pub(in crate::data::executor) fn ts_record_loads(
 /// Add one sub-record's rows to `load`, decoded the way the replay arm
 /// decodes them (`replay_timeseries_payload`).
 fn add_payload(load: &mut TsRecordLoad, payload: &[u8], format: Option<&str>) {
+    if format == Some(RESOLVED_INGEST_FORMAT) {
+        // A batch that does not decode fails its install, which reports it.
+        if let Ok(batch) = ResolvedTsBatch::from_bytes(payload) {
+            load.rows = load.rows.saturating_add(batch.rows.len());
+            load.bytes = load
+                .bytes
+                .saturating_add(usize::try_from(batch.resolved_bytes).unwrap_or(usize::MAX));
+            load.resolved.push(payload.to_vec());
+        }
+        return;
+    }
     load.bytes = load.bytes.saturating_add(payload.len());
     let lines: Vec<String> = match format {
         Some("ilp-msgpack") => zerompk::from_msgpack::<Vec<String>>(payload).unwrap_or_default(),
@@ -226,7 +243,8 @@ impl CoreLoop {
                 .map(|batch| batch.into_lines())
                 .unwrap_or_default();
             let fits = resident.saturating_add(load.bytes) < soft_limit
-                && !self.ts_ingest_needs_flush(key, &lines);
+                && !self.ts_ingest_needs_flush(key, &lines)
+                && self.resolved_tags_fit(key, &load.resolved);
             if fits {
                 continue;
             }
@@ -234,6 +252,24 @@ impl CoreLoop {
             self.flush_ts_collection(key.1, key.0, &key.2, now_ms)?;
         }
         Ok(())
+    }
+
+    /// Whether the tag dictionaries of `key`'s memtable hold every tag of
+    /// every encoded resolved batch in `resolved`.
+    fn resolved_tags_fit(&self, key: &TsKey, resolved: &[Vec<u8>]) -> bool {
+        let Some(mt) = self.columnar_memtables.get(key) else {
+            return true;
+        };
+        resolved.iter().all(|payload| {
+            ResolvedTsBatch::from_bytes(payload).is_ok_and(|batch| {
+                admission::rows_have_tag_headroom(
+                    mt,
+                    &batch.columns,
+                    &batch.rows,
+                    self.ts_tuning.max_tag_cardinality,
+                )
+            })
+        })
     }
 
     /// After restart replay applied a whole record: flush each collection it
@@ -263,14 +299,16 @@ mod tests {
     fn record(lsn: u64, collection: &str, lines: &[&str]) -> WalRecord {
         let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         let resolved = zerompk::to_msgpack_vec(&lines).expect("encode lines");
-        let payload =
-            crate::control::server::wal_dispatch::encode_timeseries_batch_payload_with_format(
+        let payload = crate::control::server::wal_dispatch::encode_timeseries_ingest_payload(
+            crate::control::server::wal_dispatch::TimeseriesIngestRecord {
                 collection,
-                &resolved,
-                None,
-                "ilp-msgpack",
-            )
-            .expect("encode sub-record");
+                payload: &resolved,
+                provenance: None,
+                format: "ilp-msgpack",
+                default_timestamp_ms: 0,
+            },
+        )
+        .expect("encode sub-record");
         WalRecord::new(WalRecordArgs {
             record_type: RecordType::TimeseriesBatch as u32,
             lsn,
@@ -302,6 +340,62 @@ mod tests {
         assert!(loads[&m].bytes > 0);
     }
 
+    /// A resolved sub-record weighs the rows it carries and the bytes its
+    /// resolve measured, and keeps its batch for the tag-headroom test.
+    #[test]
+    fn a_resolved_sub_record_loads_its_rows_and_resolved_bytes() {
+        let batch = ResolvedTsBatch {
+            measurement: "m".to_string(),
+            columns: Vec::new(),
+            timestamp_idx: 0,
+            drift: crate::engine::timeseries::resolved_ingest::TsDriftPolicy::ApplyByName,
+            now_ms: 0,
+            resolved_bytes: 4_096,
+            emits_events: false,
+            rows: vec![
+                crate::engine::timeseries::resolved_ingest::ResolvedTsRow {
+                    line: 0,
+                    tags: Vec::new(),
+                    timestamp_ms: 1,
+                    values: Vec::new(),
+                    absent: Vec::new(),
+                    image: Vec::new(),
+                };
+                3
+            ],
+            rejected: 0,
+            first_rejection: None,
+        };
+        let encoded = batch.to_bytes().expect("encode batch");
+        let payload = crate::control::server::wal_dispatch::encode_timeseries_ingest_payload(
+            crate::control::server::wal_dispatch::TimeseriesIngestRecord {
+                collection: "m",
+                payload: &encoded,
+                provenance: None,
+                format: RESOLVED_INGEST_FORMAT,
+                default_timestamp_ms: 0,
+            },
+        )
+        .expect("encode sub-record");
+        let record = WalRecord::new(WalRecordArgs {
+            record_type: RecordType::TimeseriesBatch as u32,
+            lsn: 9,
+            tenant_id: 1,
+            vshard_id: 0,
+            database_id: 0,
+            payload,
+            encryption_key: None,
+            preamble_bytes: None,
+        })
+        .expect("wal record");
+
+        let loads = ts_record_loads(&[record], 0, 1, 0);
+        let m = (DatabaseId::new(0), TenantId::new(1), "m".to_string());
+        assert_eq!(loads[&m].rows, 3);
+        assert_eq!(loads[&m].bytes, 4_096);
+        assert_eq!(loads[&m].resolved, vec![encoded]);
+    }
+
     // ── One record installs as one unit ──────────────────────────────────────
 
     use crate::bridge::envelope::Status;
@@ -327,11 +421,14 @@ mod tests {
                 RedoSubRecord {
                     record_type: RecordType::TimeseriesBatch as u32,
                     payload:
-                        crate::control::server::wal_dispatch::encode_timeseries_batch_payload_with_format(
-                            COLL,
-                            &resolved,
-                            None,
-                            "ilp-msgpack",
+                        crate::control::server::wal_dispatch::encode_timeseries_ingest_payload(
+                            crate::control::server::wal_dispatch::TimeseriesIngestRecord {
+                                collection: COLL,
+                                payload: &resolved,
+                                provenance: None,
+                                format: "ilp-msgpack",
+                                default_timestamp_ms: 0,
+                            },
                         )
                         .expect("encode sub-record"),
                 }
@@ -341,6 +438,10 @@ mod tests {
             version: 1,
             ops,
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         }
         .to_bytes()
         .expect("encode redo")
@@ -363,7 +464,7 @@ mod tests {
     fn install(core: &mut CoreLoop, lsn: u64, redo: &[u8]) {
         let mut task = make_default_task();
         task.wal_lsn = Some(Lsn::new(lsn));
-        let response = core.install_committed_redo(
+        let response = core.execute_apply_transaction_redo(
             &task,
             1,
             CommittedRedo {

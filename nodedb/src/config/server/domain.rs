@@ -31,7 +31,7 @@ fn reject(field: &str, value: impl std::fmt::Display, expected: &str) -> crate::
     }
 }
 
-fn positive_u64(value: u64, field: &str) -> crate::Result<()> {
+pub(super) fn positive_u64(value: u64, field: &str) -> crate::Result<()> {
     if value == 0 {
         return Err(reject(field, value, "a positive integer"));
     }
@@ -65,6 +65,12 @@ pub(super) fn validate_domain(config: &ServerConfig) -> crate::Result<()> {
         config.checkpoint.wal_segment_target_mb,
         "checkpoint.wal_segment_target_mb",
     )?;
+    positive_u64(
+        config.checkpoint.wal_archive_interval_secs,
+        "checkpoint.wal_archive_interval_secs",
+    )?;
+    super::pitr::validate_pitr(config)?;
+    super::backup::validate_backup(config)?;
 
     let ts = &config.tuning.timeseries;
     positive_usize(

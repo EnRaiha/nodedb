@@ -25,6 +25,45 @@ pub struct DeltaSigningAdmission {
     pub preverified: bool,
 }
 
+/// What a validated delta apply writes into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyTarget<'a> {
+    /// One document's delta, under the row's bound surrogate. The caller
+    /// refuses `Surrogate::ZERO` before it builds this target. A delta that
+    /// writes any other row is refused as malformed.
+    Document {
+        document_id: &'a str,
+        surrogate: Surrogate,
+    },
+    /// A per-collection snapshot import. It can write any row of the
+    /// collection and binds no row identity.
+    Collection,
+}
+
+impl ApplyTarget<'_> {
+    /// Whether a delta applied to this target can write `row`.
+    fn admits_row(&self, row: &str) -> bool {
+        match self {
+            Self::Document { document_id, .. } => row == *document_id,
+            Self::Collection => true,
+        }
+    }
+
+    /// The identity `row` validates under: the document's surrogate for a
+    /// document target. A snapshot import names no row identity, and the
+    /// validator's change record carries `Surrogate::ZERO` for it. The
+    /// validator never reads that field.
+    fn validation_surrogate(&self, row: &str) -> Surrogate {
+        match self {
+            Self::Document {
+                document_id,
+                surrogate,
+            } if row == *document_id => *surrogate,
+            Self::Document { .. } | Self::Collection => Surrogate::ZERO,
+        }
+    }
+}
+
 /// Outcome of applying and validating one peer delta.
 #[derive(Debug)]
 pub enum ValidatedApplyOutcome {
@@ -75,22 +114,20 @@ impl TenantCrdtEngine {
     /// routed to the DLQ without mutating authoritative state, and a corrupt
     /// blob returns [`ValidatedApplyOutcome::Malformed`].
     ///
-    /// `surrogate` / `document_id` bind the sender's claimed target row so its
-    /// UNIQUE / FK probes reference the correct cross-engine identity; other
-    /// rows the delta happened to touch are validated with `Surrogate::ZERO`.
+    /// `target` names what the delta writes. A document target binds the
+    /// sender's claimed row, so its UNIQUE / FK probes reference the correct
+    /// cross-engine identity. A snapshot import targets the whole collection.
     pub fn apply_committed_delta_validated(
         &mut self,
         collection: &str,
         delta: &[u8],
-        surrogate: Surrogate,
-        document_id: &str,
+        target: ApplyTarget<'_>,
         peer_id: u64,
     ) -> ValidatedApplyOutcome {
         self.apply_committed_delta_authenticated(
             collection,
             delta,
-            surrogate,
-            document_id,
+            target,
             peer_id,
             DeltaSigningAdmission {
                 auth: nodedb_crdt::CrdtAuthContext::default(),
@@ -105,8 +142,7 @@ impl TenantCrdtEngine {
         &mut self,
         collection: &str,
         delta: &[u8],
-        surrogate: Surrogate,
-        document_id: &str,
+        target: ApplyTarget<'_>,
         peer_id: u64,
         admission: DeltaSigningAdmission,
     ) -> ValidatedApplyOutcome {
@@ -144,9 +180,10 @@ impl TenantCrdtEngine {
             Ok(write_set) => write_set,
             Err(_) => return ValidatedApplyOutcome::Malformed,
         };
-        if write_set.iter().any(|(written, row)| {
-            written != collection || (!document_id.is_empty() && row != document_id)
-        }) {
+        if write_set
+            .iter()
+            .any(|(written, row)| written != collection || !target.admits_row(row))
+        {
             return ValidatedApplyOutcome::Malformed;
         }
 
@@ -154,11 +191,7 @@ impl TenantCrdtEngine {
         // previous state available for a no-fail rollback on rejection.
         let previous = self.collections.insert(collection.to_owned(), candidate);
         for (coll, row) in &write_set {
-            let sg = if row.as_str() == document_id {
-                surrogate
-            } else {
-                Surrogate::ZERO
-            };
+            let sg = target.validation_surrogate(row);
             let violation = match self.validate_committed_row(coll, row, sg) {
                 ValidationOutcome::Accepted => continue,
                 ValidationOutcome::Rejected(violations) => match violations.into_iter().next() {
@@ -396,9 +429,8 @@ fn violation_to_type(violation: &Violation) -> ViolationType {
         CompensationHint::CreateReferencedRow { ref_key, .. } => ViolationType::ForeignKeyMissing {
             referenced_id: ref_key.clone(),
         },
-        CompensationHint::ProvideRequiredField { field } => ViolationType::SchemaViolation {
+        CompensationHint::ProvideRequiredField { field } => ViolationType::NotNullViolation {
             field: field.clone(),
-            reason: "required field missing".into(),
         },
         CompensationHint::DeleteThenRetry { .. } | CompensationHint::ManualIntervention { .. } => {
             ViolationType::ConstraintViolation {
@@ -453,13 +485,46 @@ mod tests {
         let outcome = engine.apply_committed_delta_validated(
             "users",
             &delta,
-            nodedb_types::Surrogate::ZERO,
-            "a",
+            ApplyTarget::Document {
+                document_id: "a",
+                surrogate: nodedb_types::Surrogate::new(1),
+            },
             2,
         );
         assert!(matches!(outcome, ValidatedApplyOutcome::Clean { .. }));
         assert!(engine.row_exists("users", "a"));
         assert_eq!(engine.dlq_len(), 0);
+    }
+
+    /// A snapshot import targets the collection: it writes every row it
+    /// carries, where a document target refuses the same bytes.
+    #[test]
+    fn a_collection_target_imports_every_row_a_document_target_refuses() {
+        let state = CrdtState::new(9).unwrap();
+        for (row, email) in [("a", "a@y.com"), ("b", "b@y.com")] {
+            state
+                .upsert("users", row, &[("email", LoroValue::String(email.into()))])
+                .unwrap();
+        }
+        let snapshot = state.export_snapshot().unwrap();
+
+        let mut engine = unique_engine();
+        let refused = engine.apply_committed_delta_validated(
+            "users",
+            &snapshot,
+            ApplyTarget::Document {
+                document_id: "a",
+                surrogate: nodedb_types::Surrogate::new(1),
+            },
+            9,
+        );
+        assert!(matches!(refused, ValidatedApplyOutcome::Malformed));
+        assert!(!engine.row_exists("users", "a"));
+
+        let imported =
+            engine.apply_committed_delta_validated("users", &snapshot, ApplyTarget::Collection, 9);
+        assert!(matches!(imported, ValidatedApplyOutcome::Clean { .. }));
+        assert!(engine.row_exists("users", "a") && engine.row_exists("users", "b"));
     }
 
     /// A multi-row frame is rejected before its detached candidate can replace
@@ -489,8 +554,10 @@ mod tests {
         let outcome = engine.apply_committed_delta_validated(
             "users",
             &delta,
-            nodedb_types::Surrogate::ZERO,
-            "a",
+            ApplyTarget::Document {
+                document_id: "a",
+                surrogate: nodedb_types::Surrogate::new(2),
+            },
             7,
         );
         assert!(matches!(outcome, ValidatedApplyOutcome::Malformed));
@@ -546,8 +613,10 @@ mod tests {
         let first = engine.apply_committed_delta_validated(
             "users",
             &delta_u1,
-            nodedb_types::Surrogate::ZERO,
-            "u1",
+            ApplyTarget::Document {
+                document_id: "u1",
+                surrogate: nodedb_types::Surrogate::new(3),
+            },
             11,
         );
         assert!(matches!(first, ValidatedApplyOutcome::Clean { .. }));
@@ -558,8 +627,10 @@ mod tests {
         let second = engine.apply_committed_delta_validated(
             "users",
             &delta_u2,
-            nodedb_types::Surrogate::ZERO,
-            "u2",
+            ApplyTarget::Document {
+                document_id: "u2",
+                surrogate: nodedb_types::Surrogate::new(4),
+            },
             11,
         );
 
@@ -625,15 +696,19 @@ mod tests {
         engine.apply_committed_delta_validated(
             "users",
             &delta_a,
-            nodedb_types::Surrogate::ZERO,
-            "a",
+            ApplyTarget::Document {
+                document_id: "a",
+                surrogate: nodedb_types::Surrogate::new(5),
+            },
             12,
         );
         let outcome = engine.apply_committed_delta_validated(
             "users",
             &delta_b,
-            nodedb_types::Surrogate::ZERO,
-            "b",
+            ApplyTarget::Document {
+                document_id: "b",
+                surrogate: nodedb_types::Surrogate::new(6),
+            },
             12,
         );
 
@@ -666,8 +741,10 @@ mod tests {
         let first = engine.apply_committed_delta_validated(
             "users",
             &delta_a,
-            nodedb_types::Surrogate::ZERO,
-            "a",
+            ApplyTarget::Document {
+                document_id: "a",
+                surrogate: nodedb_types::Surrogate::new(7),
+            },
             1,
         );
         match first {
@@ -682,8 +759,10 @@ mod tests {
         let second = engine.apply_committed_delta_validated(
             "users",
             &delta_b,
-            nodedb_types::Surrogate::ZERO,
-            "b",
+            ApplyTarget::Document {
+                document_id: "b",
+                surrogate: nodedb_types::Surrogate::new(8),
+            },
             1,
         );
         match second {
@@ -716,8 +795,10 @@ mod tests {
         match engine.apply_committed_delta_validated(
             "users",
             &delta,
-            nodedb_types::Surrogate::ZERO,
-            "solo",
+            ApplyTarget::Document {
+                document_id: "solo",
+                surrogate: nodedb_types::Surrogate::new(9),
+            },
             4,
         ) {
             ValidatedApplyOutcome::Clean {
@@ -740,8 +821,10 @@ mod tests {
         let clean = engine.apply_committed_delta_validated(
             "users",
             &delta_a,
-            nodedb_types::Surrogate::ZERO,
-            "a",
+            ApplyTarget::Document {
+                document_id: "a",
+                surrogate: nodedb_types::Surrogate::new(10),
+            },
             2,
         );
         assert!(matches!(clean, ValidatedApplyOutcome::Clean { .. }));
@@ -751,8 +834,10 @@ mod tests {
         let outcome = engine.apply_committed_delta_validated(
             "users",
             &delta_b,
-            nodedb_types::Surrogate::ZERO,
-            "b",
+            ApplyTarget::Document {
+                document_id: "b",
+                surrogate: nodedb_types::Surrogate::new(11),
+            },
             3,
         );
         match outcome {
@@ -786,16 +871,20 @@ mod tests {
         engine.apply_committed_delta_validated(
             "users",
             &delta_a,
-            nodedb_types::Surrogate::ZERO,
-            "a",
+            ApplyTarget::Document {
+                document_id: "a",
+                surrogate: nodedb_types::Surrogate::new(12),
+            },
             2,
         );
         let delta_seed = row_delta(9, "seed", "seed@y.com", "S");
         engine.apply_committed_delta_validated(
             "users",
             &delta_seed,
-            nodedb_types::Surrogate::ZERO,
-            "seed",
+            ApplyTarget::Document {
+                document_id: "seed",
+                surrogate: nodedb_types::Surrogate::new(13),
+            },
             9,
         );
         assert_eq!(engine.apply_candidate_count(), 1, "candidate is retained");
@@ -814,8 +903,10 @@ mod tests {
         let outcome = engine.apply_committed_delta_validated(
             "users",
             &delta_b,
-            nodedb_types::Surrogate::ZERO,
-            "b",
+            ApplyTarget::Document {
+                document_id: "b",
+                surrogate: nodedb_types::Surrogate::new(14),
+            },
             3,
         );
 
@@ -838,8 +929,10 @@ mod tests {
         engine.apply_committed_delta_validated(
             "users",
             &seed,
-            nodedb_types::Surrogate::ZERO,
-            "a",
+            ApplyTarget::Document {
+                document_id: "a",
+                surrogate: nodedb_types::Surrogate::new(15),
+            },
             2,
         );
 
@@ -848,8 +941,10 @@ mod tests {
         let rejected = engine.apply_committed_delta_validated(
             "users",
             &dup,
-            nodedb_types::Surrogate::ZERO,
-            "b",
+            ApplyTarget::Document {
+                document_id: "b",
+                surrogate: nodedb_types::Surrogate::new(16),
+            },
             3,
         );
         assert!(matches!(rejected, ValidatedApplyOutcome::Rejected(_)));
@@ -864,8 +959,10 @@ mod tests {
         let outcome = engine.apply_committed_delta_validated(
             "users",
             &next,
-            nodedb_types::Surrogate::ZERO,
-            "c",
+            ApplyTarget::Document {
+                document_id: "c",
+                surrogate: nodedb_types::Surrogate::new(17),
+            },
             4,
         );
         assert!(matches!(outcome, ValidatedApplyOutcome::Clean { .. }));
@@ -892,8 +989,10 @@ mod tests {
             let outcome = engine.apply_committed_delta_validated(
                 "users",
                 &delta,
-                nodedb_types::Surrogate::ZERO,
-                &format!("r{i}"),
+                ApplyTarget::Document {
+                    document_id: &format!("r{i}"),
+                    surrogate: nodedb_types::Surrogate::new(18),
+                },
                 10 + i,
             );
             assert!(
@@ -925,8 +1024,10 @@ mod tests {
         engine.apply_committed_delta_validated(
             "users",
             &delta,
-            nodedb_types::Surrogate::ZERO,
-            "a",
+            ApplyTarget::Document {
+                document_id: "a",
+                surrogate: nodedb_types::Surrogate::new(19),
+            },
             5,
         );
 
@@ -945,8 +1046,10 @@ mod tests {
         let outcome = engine.apply_committed_delta_validated(
             "users",
             b"not a valid loro snapshot",
-            nodedb_types::Surrogate::ZERO,
-            "z",
+            ApplyTarget::Document {
+                document_id: "z",
+                surrogate: nodedb_types::Surrogate::new(20),
+            },
             9,
         );
         assert!(matches!(outcome, ValidatedApplyOutcome::Malformed));
@@ -988,9 +1091,8 @@ mod tests {
             violation_to_type(&violation_with(CompensationHint::ProvideRequiredField {
                 field: "name".into(),
             })),
-            ViolationType::SchemaViolation {
+            ViolationType::NotNullViolation {
                 field: "name".into(),
-                reason: "required field missing".into(),
             }
         );
         assert_eq!(

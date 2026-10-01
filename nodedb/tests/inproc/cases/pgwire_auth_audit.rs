@@ -9,33 +9,9 @@ use nodedb::bridge::dispatch::Dispatcher;
 use nodedb::control::security::audit::AuditEvent;
 use nodedb::control::state::SharedState;
 use nodedb::types::TenantId;
-use nodedb_test_support::pgwire_auth_helpers::{ddl_ok, make_state, superuser};
-
-/// Helper: open a catalog-backed SharedState in a temp dir.
-fn open_with_catalog() -> (Arc<SharedState>, tempfile::TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let wal_path = dir.path().join("test.wal");
-    let wal = Arc::new(nodedb::wal::WalManager::open_for_testing(&wal_path).unwrap());
-    let (dispatcher, _sides) = Dispatcher::new(1, 64);
-    let catalog_path = dir.path().join("system.redb");
-    let auth_config = nodedb::config::auth::AuthConfig::default();
-    let state = SharedState::open(
-        nodedb::control::state::DataPlaneHandles {
-            dispatcher,
-            quiesce: nodedb::bridge::quiesce::CollectionQuiesce::new(),
-            array_catalog: nodedb::control::array_catalog::ArrayCatalog::handle(),
-            system_metrics: std::sync::Arc::new(nodedb::control::metrics::SystemMetrics::new()),
-        },
-        wal,
-        &catalog_path,
-        &auth_config,
-        nodedb_types::config::TuningConfig::default(),
-        false,
-        nodedb::data::executor::core_loop::test_governor(),
-    )
-    .unwrap();
-    (state, dir)
-}
+use nodedb_test_support::pgwire_auth_helpers::{
+    ddl_ok, make_state, make_state_with_catalog, superuser,
+};
 
 #[tokio::test]
 async fn audit_records_create_and_drop() {
@@ -196,7 +172,7 @@ async fn audit_sequence_survives_restart() {
 /// database_id populated in the in-memory audit log.
 #[tokio::test]
 async fn create_database_emits_database_created_event() {
-    let (state, _dir) = open_with_catalog();
+    let state = make_state_with_catalog();
     let su = superuser();
     ddl_ok(&state, &su, "CREATE DATABASE audit_created_db").await;
 
@@ -221,7 +197,7 @@ async fn create_database_emits_database_created_event() {
 /// back the descriptor from the catalog shows `audit_dml = Writes`.
 #[tokio::test]
 async fn alter_set_audit_dml_persists() {
-    let (state, _dir) = open_with_catalog();
+    let state = make_state_with_catalog();
     let su = superuser();
     ddl_ok(&state, &su, "CREATE DATABASE dml_audit_db").await;
     ddl_ok(
@@ -267,7 +243,7 @@ async fn alter_set_audit_dml_persists() {
 async fn show_audit_in_database_filters() {
     use nodedb_types::AuditDmlMode;
 
-    let (state, _dir) = open_with_catalog();
+    let state = make_state_with_catalog();
     let su = superuser();
 
     // Create two databases and emit one audit entry each.

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Undo of one graph edge write: a put, a delete, or one edge of a node-delete
-//! cascade.
+//! Undo of one graph edge write: a put or a delete.
 //!
 //! The write adds one version to the bitemporal edge store. The undo removes
 //! that version, so no read at any system time sees the rolled-back write, as
@@ -27,9 +26,6 @@ pub(in crate::data::executor) struct EdgeWriteUndo {
     pub version: EdgeVersionWrite,
     /// The CSR state the write found.
     pub csr: EdgeCsrPrior,
-    /// Whether the write dropped the endpoints' durable identity bindings. A
-    /// node-delete cascade does. The undo binds them again from the CSR.
-    pub rebind_endpoints: bool,
 }
 
 /// The CSR state one edge write found.
@@ -69,7 +65,6 @@ impl EdgeTarget<'_> {
             dst_id: self.dst_id.to_string(),
             version,
             csr,
-            rebind_endpoints: false,
         }
     }
 }
@@ -124,7 +119,6 @@ impl CoreLoop {
             dst_id,
             version,
             csr,
-            rebind_endpoints,
         } = undo;
         let core = self.core_id;
         let fail = |detail: String| {
@@ -146,21 +140,6 @@ impl CoreLoop {
                 &version,
             )
             .map_err(|e| fail(format!("removing the version of {edge_name}: {e}")))?;
-
-        if rebind_endpoints {
-            let bindings: Vec<(&str, u32)> = match self.csr_partition(database_id, tid) {
-                Some(p) => [src_id.as_str(), dst_id.as_str()]
-                    .into_iter()
-                    .filter_map(|node| p.node_surrogate(node).map(|s| (node, s.as_u32())))
-                    .collect(),
-                None => Vec::new(),
-            };
-            for (node, raw) in bindings {
-                self.edge_store
-                    .bind_node_surrogate(database, tenant, node, raw)
-                    .map_err(|e| fail(format!("binding node '{node}' again: {e}")))?;
-            }
-        }
 
         let partition = self.csr_partition_mut(database_id, tid);
         partition
@@ -223,7 +202,7 @@ mod tests {
             .put_edge_version_recorded(
                 edge(src, dst).with_surrogates(Surrogate::new(10), Surrogate::new(20)),
                 props,
-                ord,
+                crate::engine::graph::edge_store::VersionStamp::at(ord),
                 ord,
                 i64::MAX,
                 true,
@@ -310,7 +289,11 @@ mod tests {
         let csr = core.capture_edge_csr(&target);
         let tombstone = core
             .edge_store
-            .soft_delete_edge_recorded(edge("alice", "bob"), 200, true)
+            .soft_delete_edge_recorded(
+                edge("alice", "bob"),
+                crate::engine::graph::edge_store::VersionStamp::at(200),
+                true,
+            )
             .expect("tombstone");
         core.csr_partition_mut(DB, TID)
             .remove_edge_in_collection("alice", "KNOWS", "bob", "c");
@@ -322,61 +305,6 @@ mod tests {
             core.csr_partition(DB, TID)
                 .map(|p| p.neighbors("alice", None, Direction::Out)),
             Some(vec![("KNOWS".to_string(), "bob".to_string())])
-        );
-    }
-
-    /// A rolled-back node delete puts back every edge the cascade tombstoned
-    /// and the binding it dropped, in the edge store and in the CSR.
-    #[test]
-    fn a_rolled_back_node_delete_cascade_restores_edges_and_bindings() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
-        let _seed = put(&mut core, "alice", "bob", &weighted(2.5), 100);
-
-        core.csr_partition_mut(DB, TID).remove_node_edges("alice");
-        let removed = core
-            .edge_store
-            .delete_edges_for_node(DB, tenant(), "alice", 200)
-            .expect("cascade");
-        assert_eq!(removed.len(), 1);
-        for (idx, restore) in removed.into_iter().enumerate() {
-            let weight = extract_weight_from_properties(&restore.old_properties);
-            let mut undo = EdgeTarget {
-                database_id: DB,
-                tid: TID,
-                collection: &restore.collection,
-                src_id: &restore.src,
-                label: &restore.label,
-                dst_id: &restore.dst,
-            }
-            .undo(
-                restore.tombstone.clone(),
-                EdgeCsrPrior {
-                    weight: Some(weight),
-                    ..EdgeCsrPrior::default()
-                },
-            );
-            undo.rebind_endpoints = true;
-            core.apply_undo_edge_write(idx, undo).expect("undo cascade");
-        }
-
-        assert_eq!(resolve(&core, "alice", "bob", 250), Some(weighted(2.5)));
-        assert_eq!(
-            core.csr_partition(DB, TID)
-                .and_then(|p| p.edge_weight_in_collection("alice", "KNOWS", "bob", "c")),
-            Some(2.5)
-        );
-        let mut bindings: Vec<(String, u32)> = core
-            .edge_store
-            .scan_all_node_surrogates()
-            .expect("scan bindings")
-            .into_iter()
-            .map(|record| (record.2, record.3))
-            .collect();
-        bindings.sort();
-        assert_eq!(
-            bindings,
-            vec![("alice".to_string(), 10), ("bob".to_string(), 20)]
         );
     }
 }

@@ -140,7 +140,7 @@ mod tests {
         PhysicalPlan::Document(DocumentOp::PointDelete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
             document_id: "e1".into(),
-            surrogate: Surrogate::new(1),
+            surrogate: Some(Surrogate::new(1)),
             pk_bytes: b"e1".to_vec(),
             returning: None,
             rls_filters: Vec::new(),
@@ -164,7 +164,7 @@ mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::PointDelete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
             document_id: "n1".into(),
-            surrogate: Surrogate::new(1),
+            surrogate: Some(Surrogate::new(1)),
             pk_bytes: b"n1".to_vec(),
             returning: None,
             rls_filters: Vec::new(),

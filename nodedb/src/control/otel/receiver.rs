@@ -110,8 +110,13 @@ pub async fn receive_metrics(
                 }
                 let payload = lines.join("\n");
 
+                // A stored count below the lines sent is the lines the
+                // resolve rejected.
                 match ingest_ilp(&state, &identity, &peer_addr, &payload).await {
-                    Ok(n) => accepted += n,
+                    Ok(n) => {
+                        accepted += n;
+                        rejected += (lines.len() as u64).saturating_sub(n);
+                    }
                     Err(_) => rejected += lines.len() as u64,
                 }
             }

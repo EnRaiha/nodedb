@@ -36,6 +36,19 @@ impl SparseEngine {
         predicate: &dyn Fn(&StorageKey, &[u8]) -> bool,
         stop: &dyn Fn() -> bool,
     ) -> crate::Result<Vec<(StorageKey, Vec<u8>)>> {
+        self.versioned_scan_as_of_after(params, None, predicate, stop)
+    }
+
+    /// [`Self::versioned_scan_as_of`] over the doc ids after `after` only, in
+    /// doc-id order. A paginated reader passes the last doc id of its
+    /// previous page, so each page starts where the last one stopped.
+    pub fn versioned_scan_as_of_after(
+        &self,
+        params: VersionedScanParams<'_>,
+        after: Option<&StorageKey>,
+        predicate: &dyn Fn(&StorageKey, &[u8]) -> bool,
+        stop: &dyn Fn() -> bool,
+    ) -> crate::Result<Vec<(StorageKey, Vec<u8>)>> {
         let VersionedScanParams {
             database_id,
             tenant,
@@ -46,13 +59,19 @@ impl SparseEngine {
         } = params;
         let lo = coll_prefix(database_id, tenant, coll);
         let hi = coll_prefix_end(database_id, tenant, coll);
+        // Every version key of `after` is `{lo}{after}\x00{sys_from}`, so
+        // `\x01` after the id is the first key past all of them.
+        let start = match after {
+            Some(after) => format!("{lo}{after}\x01"),
+            None => lo.clone(),
+        };
         let cutoff_key = sys_cutoff_ms.map(format_sys_from);
         let txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
         let t = txn
             .open_table(DOCUMENTS_VERSIONED)
             .map_err(|e| redb_err("open table", e))?;
         let range = t
-            .range(lo.as_str()..hi.as_str())
+            .range(start.as_str()..hi.as_str())
             .map_err(|e| redb_err("range", e))?;
 
         // Group entries by doc_id; keep the newest-in-window per group.

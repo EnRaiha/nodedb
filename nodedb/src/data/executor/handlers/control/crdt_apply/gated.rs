@@ -148,6 +148,20 @@ impl CoreLoop {
                 prov,
             );
         }
+        // A delta names a bound document. One carrying `Surrogate::ZERO` is
+        // refused before any state change.
+        if surrogate == Surrogate::ZERO {
+            return self.sync_reject_response(
+                task,
+                ViolationType::ConstraintViolation {
+                    detail: format!(
+                        "a CRDT sync delta into {collection} carries no surrogate; nothing was \
+                         applied"
+                    ),
+                },
+                prov,
+            );
+        }
 
         // Borrow the engine in a nested block so the &mut borrow is dropped
         // before sync_commit takes &mut self for sync_hwm.
@@ -178,8 +192,10 @@ impl CoreLoop {
                 let applied = engine.apply_committed_delta_authenticated(
                     collection,
                     delta,
-                    surrogate,
-                    document_id,
+                    crate::engine::crdt::tenant_state::ApplyTarget::Document {
+                        document_id,
+                        surrogate,
+                    },
                     peer_id,
                     DeltaSigningAdmission {
                         auth: nodedb_crdt::CrdtAuthContext {
@@ -206,7 +222,7 @@ impl CoreLoop {
                         ..
                     }
                 );
-                let mat = if advanced && surrogate != Surrogate::ZERO {
+                let mat = if advanced {
                     Self::encode_crdt_row(engine, collection, document_id)
                 } else {
                     None

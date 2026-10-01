@@ -21,6 +21,7 @@
 //!   and is the single place where future breaking schema
 //!   changes land as explicit `v{N} → v{N+1}` arms.
 
+pub mod boot_epoch;
 pub mod cluster_settings;
 pub mod core;
 pub mod ghosts;

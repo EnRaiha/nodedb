@@ -57,8 +57,8 @@ fn stage_edge_put(collection: &str, src: &str, label: &str, dst: &str) -> Physic
             label: label.into(),
             dst_id: dst.into(),
             properties: Vec::new(),
-            src_surrogate: nodedb_types::Surrogate::ZERO,
-            dst_surrogate: nodedb_types::Surrogate::ZERO,
+            src_surrogate: doc_surrogate(src),
+            dst_surrogate: doc_surrogate(dst),
         })),
     })
 }
@@ -73,8 +73,8 @@ fn stage_edge_delete(collection: &str, src: &str, label: &str, dst: &str) -> Phy
             src_id: src.into(),
             label: label.into(),
             dst_id: dst.into(),
-            src_surrogate: nodedb_types::Surrogate::ZERO,
-            dst_surrogate: nodedb_types::Surrogate::ZERO,
+            src_surrogate: doc_surrogate(src),
+            dst_surrogate: doc_surrogate(dst),
             rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         })),
     })
@@ -207,8 +207,8 @@ fn rollback_to_savepoint_restores_cross_set_cleared_tombstone() {
             label: "knows".into(),
             dst_id: "y".into(),
             properties: Vec::new(),
-            src_surrogate: nodedb_types::Surrogate::ZERO,
-            dst_surrogate: nodedb_types::Surrogate::ZERO,
+            src_surrogate: doc_surrogate("x"),
+            dst_surrogate: doc_surrogate("y"),
         }),
     );
 
@@ -294,7 +294,7 @@ fn one_savepoint_reverts_value_and_graph_overlays_together() {
             key: b"k".to_vec(),
             value: b"v".to_vec(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"k".as_ref()),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -338,10 +338,15 @@ fn one_savepoint_reverts_value_and_graph_overlays_together() {
         PhysicalPlan::Meta(MetaOp::MarkSavepoint { txn_id }),
     );
     let (value_marker, graph_marker, array_marker) = parse_markers(resp.payload.as_ref());
+    // The value marker is the value journal's length. The journal also holds
+    // the row-source tags a savepoint rollback reverts: the edge put's
+    // staging tag and its row tag, then the EXPIRE's staging tag for `c`,
+    // then the EXPIRE's TTL delta.
     assert_eq!(
         (value_marker, graph_marker, array_marker),
-        (1, 1, 0),
-        "one value + one graph mutation staged, no array mutation"
+        (4, 1, 0),
+        "three tag entries + one value mutation journalled, one graph mutation staged, \
+         no array mutation"
     );
 
     // Stage more of BOTH after the savepoint: another edge and a PERSIST that

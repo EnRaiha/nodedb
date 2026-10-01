@@ -41,7 +41,7 @@ pub(crate) async fn handle_graph_match(
     }
 
     let mut plan =
-        match super::plan_builder::build_plan(ctx, OpCode::GraphMatch, fields, &collection) {
+        match super::plan_builder::build_plan(ctx, OpCode::GraphMatch, fields, &collection).await {
             Ok(plan) => plan,
             Err(error) => return error_to_native_with_sqlstate(seq, "42601", &error),
         };
@@ -88,6 +88,20 @@ pub(crate) async fn handle_graph_match(
         return error_to_native_with_sqlstate(seq, "53400", &e);
     }
     let _request = ctx.state.tenant_request_guard(tenant_id);
+
+    // In a cluster the pattern crosses every node's partitions: it runs
+    // through the cross-shard MATCH scatter, as the SQL surface's MATCH does.
+    if ctx.state.cluster_routing.is_some() {
+        let native = match_across_shards(ctx, seq, vshard_id, &plan, txn_id).await;
+        if native.status != nodedb_types::protocol::ResponseStatus::Error
+            && let Some(info) = &plan_metering_info
+        {
+            let rows = native.rows.as_ref().map(|rows| rows.len() as u64);
+            meter_dispatch(ctx.state, &ctx.scope, info, rows);
+        }
+        return native;
+    }
+
     let raw = dispatch_authorized_single_task(ctx, tenant_id, vshard_id, plan, txn_id).await;
 
     let response = match raw {
@@ -145,4 +159,71 @@ pub(crate) async fn handle_graph_match(
         meter_dispatch(ctx.state, &ctx.scope, info, rows);
     }
     native
+}
+
+/// Run a native MATCH across every node's partitions through
+/// `graph_dispatch::scatter_match`. The rows come back as the bare array a
+/// local MATCH yields once its envelope is unwrapped. A result the scatter
+/// cannot finish is refused with `54001`, never returned partial. The
+/// scatter notes every vShard it read, and the session loop records them into
+/// the transaction read-set (`session::graph_reads`).
+async fn match_across_shards(
+    ctx: &DispatchCtx<'_>,
+    seq: u64,
+    vshard_id: crate::types::VShardId,
+    plan: &crate::bridge::envelope::PhysicalPlan,
+    txn_id: Option<crate::types::TxnId>,
+) -> NativeResponse {
+    let crate::bridge::envelope::PhysicalPlan::Graph(
+        nodedb_physical::physical_plan::GraphOp::Match { query, .. },
+    ) = plan
+    else {
+        return error_to_native(
+            seq,
+            &crate::Error::Internal {
+                detail: "a native MATCH built a plan that is not a MATCH".into(),
+            },
+        );
+    };
+    let task = nodedb_physical::physical_task::PhysicalTask {
+        tenant_id: ctx.tenant_id(),
+        vshard_id,
+        database_id: ctx.database_id(),
+        plan: plan.clone(),
+        post_set_op: nodedb_physical::physical_task::PostSetOp::None,
+        txn_id,
+    };
+    if let Err(error) = super::sql_gateway::authorize_native_task(ctx, &task) {
+        return error_to_native(seq, &error);
+    }
+    let outcome = crate::control::server::graph_dispatch::scatter_match(
+        ctx.state,
+        ctx.tenant_id(),
+        ctx.database_id(),
+        query.clone(),
+        crate::control::gateway::dispatcher::statement_deadline_ms(ctx.state),
+        crate::control::server::graph_dispatch::GraphRead {
+            txn_id,
+            // The native protocol has no read-consistency setting.
+            linearizable: true,
+        },
+    )
+    .await;
+    match outcome {
+        Ok(outcome) if outcome.partial => error_to_native_with_sqlstate(
+            seq,
+            "54001",
+            &crate::Error::BadRequest {
+                detail: crate::control::server::shared::ddl::neutral::match_ops::MATCH_INCOMPLETE_MESSAGE
+                    .into(),
+            },
+        ),
+        Ok(outcome) => data_plane_response_to_native(
+            ctx,
+            seq,
+            plan,
+            &crate::control::server::dispatch_utils::ok_payload_response(outcome.rows_payload),
+        ),
+        Err(error) => error_to_native(seq, &error),
+    }
 }

@@ -11,6 +11,7 @@ mod calvin_e2e_ollp;
 mod calvin_e2e_pgwire;
 mod calvin_sequencer_failover;
 mod cluster_join;
+mod cluster_join_build_id_mismatch;
 mod cluster_join_idempotent;
 mod cluster_join_leader_crash;
 mod cluster_join_race;

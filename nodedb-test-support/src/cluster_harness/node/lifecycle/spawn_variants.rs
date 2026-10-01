@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use nodedb_types::config::tuning::ClusterTransportTuning;
 
-use crate::cluster_harness::cluster::ClusterSpawnConfig;
+use crate::cluster_harness::cluster::{ClusterSpawnConfig, DEFAULT_NUM_GROUPS};
 
 use super::types::TestClusterNode;
 
@@ -103,18 +103,22 @@ impl TestClusterNode {
             num_cores,
             log_compaction_threshold: None,
             replication_factor: 3,
+            num_groups: DEFAULT_NUM_GROUPS,
             single_node_calvin: false,
+            backup_storage: None,
+            pitr: None,
+            node_timeseries_tuning: std::collections::HashMap::new(),
         };
         Self::spawn_with_full_config(node_id, seed_nodes, &config).await
     }
 
-    /// Spawn a standalone node with the flag-gated single-node Calvin stack
-    /// (`server.single_node_calvin = true`), exercising the same
-    /// `init_single_node_calvin` synthesis the production standalone boot uses.
+    /// Spawn a node with the single-node Calvin stack, exercising the same
+    /// `init_single_node_calvin` synthesis production boot runs when
+    /// `[cluster]` is absent.
     ///
     /// The node stands up its own sequencer Raft group and per-vShard
-    /// schedulers, so `calvin_available` becomes true and a cross-vShard
-    /// transaction traverses the deterministic Calvin path — all on one node.
+    /// schedulers, so a cross-vShard transaction traverses the deterministic
+    /// Calvin path — all on one node.
     /// `num_cores` should be `>= 2` so distinct vShards map to distinct cores.
     pub async fn spawn_single_node_calvin(
         num_cores: usize,
@@ -157,7 +161,11 @@ impl TestClusterNode {
             num_cores,
             log_compaction_threshold: None,
             replication_factor: 1,
+            num_groups: DEFAULT_NUM_GROUPS,
             single_node_calvin: true,
+            backup_storage: None,
+            pitr: None,
+            node_timeseries_tuning: std::collections::HashMap::new(),
         };
         Self::spawn_with_full_config_at(1, vec![], &config, data_dir_path, None).await
     }

@@ -45,7 +45,9 @@ impl Gateway {
         ctx: &QueryContext,
         checked: CloneCheckedTask,
     ) -> Result<ResultStream, Error> {
-        let plan = authorized_plan_for_context(ctx, checked)?;
+        // Every streamed plan is an unordered scan (`streamable_gather_child`),
+        // so it carries no write lease to hold for the stream's lifetime.
+        let (plan, _lease) = authorized_plan_for_context(ctx, checked)?;
         self.execute_stream_internal(ctx, plan).await
     }
 
@@ -85,6 +87,7 @@ impl Gateway {
                 let tenant_id = ctx.tenant_id;
                 let database_id = ctx.database_id;
                 let trace_id = ctx.trace_id;
+                let linearizable = ctx.linearizable;
                 let version_set = version_set_for_route.clone();
                 async move {
                     let decision = {
@@ -127,6 +130,7 @@ impl Gateway {
                         trace_id,
                         deadline_ms,
                         version_set: &version_set,
+                        linearizable,
                     })
                     .await
                 }

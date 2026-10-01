@@ -88,6 +88,13 @@ pub struct StoredCollection {
     /// applier at commit time. Strictly monotonic per descriptor.
     #[msgpack(default)]
     pub modification_hlc: Hlc,
+    /// The collection's identity across ALTER, UNDROP and MOVE TENANT: the
+    /// `modification_hlc` of the put that created it. A drop and a same-name
+    /// create start a new one. Every replicated write carries the incarnation
+    /// it was planned against, and a replica applies it only while the
+    /// collection still holds it.
+    #[msgpack(default)]
+    pub incarnation: Hlc,
     /// Optional field type declarations. Empty = schemaless.
     #[msgpack(default)]
     pub fields: Vec<(String, String)>,
@@ -134,7 +141,7 @@ pub struct StoredCollection {
     /// Type guard field constraints for schemaless collections.
     #[msgpack(default)]
     pub type_guards: Vec<nodedb_types::TypeGuardFieldDef>,
-    /// General CHECK constraints (Control Plane enforcement, may contain subqueries).
+    /// General CHECK constraints (Control Plane enforcement, can contain subqueries).
     #[msgpack(default)]
     pub check_constraints: Vec<CheckConstraintDef>,
     /// Materialized sum definitions.
@@ -189,8 +196,8 @@ pub struct StoredCollection {
     /// Defaults to `CollectionHomed` on deserialization so catalog entries
     /// written before this field was added continue to behave correctly —
     /// every pre-existing collection is collection-homed, making `default`
-    /// the safe zero-migration value (unlike a surrogate where a default would
-    /// be wrong). No wire-version bump is required.
+    /// the safe zero-migration value (unlike a surrogate where a default is
+    /// wrong). No wire-version bump is required.
     #[msgpack(default)]
     pub partition_strategy: nodedb_types::PartitionStrategy,
     /// Best-effort estimate of this collection's on-core data size in
@@ -248,7 +255,7 @@ pub struct StoredCollection {
     pub has_implicit_edges: bool,
 
     /// Declared `PRIMARY KEY` column name from the `CREATE COLLECTION` /
-    /// `CREATE TABLE` column list, when one was present. May differ from
+    /// `CREATE TABLE` column list, when one was present. Can differ from
     /// the built-in `id` field on schemaless document collections (which
     /// otherwise always uses `id` as its document key). `None` means no
     /// PRIMARY KEY was declared and the engine falls back to its default
@@ -294,6 +301,7 @@ impl StoredCollection {
             constraint_version: 0,
             crdt_signing_required: false,
             modification_hlc: Hlc::ZERO,
+            incarnation: Hlc::ZERO,
             fields: Vec::new(),
             field_defs: Vec::new(),
             event_defs: Vec::new(),
@@ -330,6 +338,21 @@ impl StoredCollection {
             has_implicit_edges: false,
             declared_primary_key: None,
             deactivated_at_ns: 0,
+        }
+    }
+
+    /// A collection a test fixture writes straight to the catalog, stamped as
+    /// the proposer stamps a create: a fresh incarnation and descriptor
+    /// version 1. Each call names a new incarnation.
+    #[cfg(test)]
+    pub fn stamped_for_test(tenant_id: u64, name: &str, owner: &str) -> Self {
+        static CLOCK: std::sync::OnceLock<nodedb_types::HlcClock> = std::sync::OnceLock::new();
+        let hlc = CLOCK.get_or_init(nodedb_types::HlcClock::new).now();
+        Self {
+            descriptor_version: 1,
+            modification_hlc: hlc,
+            incarnation: hlc,
+            ..Self::new(tenant_id, name, owner)
         }
     }
 

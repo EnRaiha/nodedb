@@ -5,7 +5,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::control::change_stream::{ChangeCursor, LiveSubscriptionSet, ReplayStart};
+use crate::control::change_stream::{ChangeCursor, CursorStep, LiveSubscriptionSet, ReplayStart};
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::shared::authorization::authorize_collection;
@@ -158,23 +158,29 @@ pub(super) async fn process_message(
             );
             let sub_id = sub.id;
             let live_tx = live_tx.clone();
+            // The subscription receives exactly the events past its start.
+            let mut cursor = sub.start_cursor().clone();
             live_set.spawn_task(async move {
-                let mut last_cursor = None;
                 loop {
                     match sub.recv_sequenced().await {
-                        Ok(event) => {
-                            if !advance_live_cursor(&mut last_cursor, event.cursor()) {
-                                let _ = live_tx.send(serde_json::json!({"method":"reset_required","params":{"subscription_id":sub_id,"reason":"change stream epoch changed"}}).to_string()).await;
+                        Ok(event) => match cursor.accept(&event) {
+                            CursorStep::Deliver => {
+                                if live_tx
+                                    .send(format_sequenced_live_notification(
+                                        sub_id, &event, &cursor,
+                                    ))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            CursorStep::Skip => {}
+                            CursorStep::Reset => {
+                                let _ = live_tx.send(serde_json::json!({"method":"reset_required","params":{"subscription_id":sub_id,"reason":"change feed gap"}}).to_string()).await;
                                 break;
                             }
-                            if live_tx
-                                .send(format_sequenced_live_notification(sub_id, &event))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
+                        },
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             let _ = live_tx.send(serde_json::json!({"method":"reset_required","params":{"subscription_id":sub_id,"reason":"change stream lagged"}}).to_string()).await;
                             break;
@@ -189,16 +195,6 @@ pub(super) async fn process_message(
             error_response(id, &format!("unknown method: {method}")),
             false,
         ),
-    }
-}
-
-fn advance_live_cursor(last_cursor: &mut Option<ChangeCursor>, cursor: ChangeCursor) -> bool {
-    match *last_cursor {
-        Some(previous) if !cursor.is_after_in_same_epoch(previous) => false,
-        _ => {
-            *last_cursor = Some(cursor);
-            true
-        }
     }
 }
 
@@ -262,12 +258,13 @@ async fn resume_auth(
     let start = cursor
         .map(ReplayStart::Cursor)
         .unwrap_or(ReplayStart::Timestamp(0));
+    // The ring is bounded, so the replay returns every event it holds.
     let snapshot = match shared.change_stream.query_changes_in_database(
         identity.tenant_id,
         database_id,
         None,
         start,
-        10_000,
+        usize::MAX,
     ) {
         Ok(snapshot) => snapshot,
         Err(_) => {
@@ -282,7 +279,8 @@ async fn resume_auth(
     };
     let emitter = ArcAuditEmitter(Arc::clone(&shared.audit));
     let mut replayed = 0usize;
-    for event in &snapshot.events {
+    for change in &snapshot.events {
+        let event = &change.event;
         if authorize_collection(
             identity,
             database_id,
@@ -295,7 +293,7 @@ async fn resume_auth(
         .is_ok()
         {
             if live_tx
-                .send(format_resume_notification(event))
+                .send(format_resume_notification(event, &change.cursor))
                 .await
                 .is_err()
             {
@@ -304,23 +302,26 @@ async fn resume_auth(
             replayed += 1;
         }
     }
-    let snapshot_cursor = snapshot.snapshot_cursor;
+    let snapshot_cursor = snapshot.cursor.to_string();
+    let mut cursor = snapshot.cursor;
     let live_tx = live_tx.clone();
     let shared = Arc::clone(&shared);
     let identity = identity.clone();
     resume_set.spawn_task(async move {
         loop {
             match subscription.recv_sequenced().await {
-                Ok(event) => {
-                    if !event.cursor().same_epoch(snapshot_cursor) {
-                        let _ = live_tx.send(serde_json::json!({"method":"reset_required","params":{"reason":"change stream epoch changed"}}).to_string()).await;
+                Ok(event) => match cursor.accept(&event) {
+                    CursorStep::Deliver => {
+                        let emitter = ArcAuditEmitter(Arc::clone(&shared.audit));
+                        if authorize_collection(&identity, database_id, &event.collection, Permission::Read, &shared.permissions, &shared.roles, &emitter).is_ok()
+                            && live_tx.send(format_resume_notification(&event, &cursor)).await.is_err() { break; }
+                    }
+                    CursorStep::Skip => {}
+                    CursorStep::Reset => {
+                        let _ = live_tx.send(serde_json::json!({"method":"reset_required","params":{"reason":"change feed gap"}}).to_string()).await;
                         break;
                     }
-                    if !event.cursor().is_after_in_same_epoch(snapshot_cursor) { continue; }
-                    let emitter = ArcAuditEmitter(Arc::clone(&shared.audit));
-                    if authorize_collection(&identity, database_id, &event.collection, Permission::Read, &shared.permissions, &shared.roles, &emitter).is_ok()
-                        && live_tx.send(format_resume_notification(&event)).await.is_err() { break; }
-                }
+                },
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     let _ = live_tx.send(serde_json::json!({"method":"reset_required","params":{"reason":"change stream lagged"}}).to_string()).await;
                     break;
@@ -329,21 +330,6 @@ async fn resume_auth(
             }
         }
     });
-    let response = serde_json::json!({"id": id, "result": {"session_id": session_id, "replayed": replayed, "snapshot_cursor": snapshot_cursor.to_string()}}).to_string();
+    let response = serde_json::json!({"id": id, "result": {"session_id": session_id, "replayed": replayed, "snapshot_cursor": snapshot_cursor}}).to_string();
     (response, true)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn live_cursor_requires_reset_after_epoch_rotation() {
-        let mut last = None;
-        assert!(advance_live_cursor(
-            &mut last,
-            ChangeCursor::new(u128::MAX, u64::MAX)
-        ));
-        assert!(!advance_live_cursor(&mut last, ChangeCursor::new(1, 1)));
-    }
 }

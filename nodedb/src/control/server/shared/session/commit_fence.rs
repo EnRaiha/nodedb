@@ -22,12 +22,20 @@ use super::store::SessionStore;
 /// planned against with the catalog as it stands now.
 ///
 /// Returns `Some(AbortReason::SchemaChanged)` when the catalog has moved on,
-/// which aborts the COMMIT before any durable write.
+/// or when this node lost a lease the buffered statements hold. Either aborts
+/// the COMMIT before any durable write.
 pub(super) fn check_buffered_descriptors(
     catalog: &SystemCatalog,
     sessions: &SessionStore,
     session_id: SessionId,
 ) -> Option<AbortReason> {
+    // A lease this node lost while the block was open: other nodes can have
+    // committed a DDL this node's catalog has not applied yet.
+    if let Some(revoked) = sessions.tx_lease_revoked(session_id) {
+        return Some(AbortReason::SchemaChanged {
+            detail: revoked.to_string(),
+        });
+    }
     let holds = sessions.tx_descriptor_versions(session_id);
     check_descriptor_holds(catalog, &holds)
         .err()
@@ -49,7 +57,7 @@ mod tests {
     fn catalog_with(collections: &[(&str, u64)]) -> SystemCatalog {
         let catalog = SystemCatalog::open_in_memory().expect("in-memory catalog");
         for (name, version) in collections {
-            let mut stored = StoredCollection::new(TENANT, name, "owner");
+            let mut stored = StoredCollection::stamped_for_test(TENANT, name, "owner");
             stored.descriptor_version = *version;
             catalog
                 .put_collection(DatabaseId::DEFAULT, &stored)

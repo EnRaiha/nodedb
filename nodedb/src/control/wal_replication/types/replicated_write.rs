@@ -46,7 +46,7 @@ pub enum ReplicatedWrite {
         /// `None` if pre-dating this field or no RETURNING clause.
         #[serde(default)]
         returning: Option<Vec<u8>>,
-        /// Read filters gating what `returning` may show back.
+        /// Read filters gating what `returning` can show back.
         #[serde(default)]
         rls_filters: Vec<u8>,
     },
@@ -78,7 +78,8 @@ pub enum ReplicatedWrite {
     PointDelete {
         collection: String,
         document_id: String,
-        surrogate: u32,
+        /// `None` when the key is unbound in its database: no row matches.
+        surrogate: Option<u32>,
         /// See `PointPut::resolved_sum_targets`.
         #[serde(default)]
         resolved_sum_targets: Vec<(String, u32)>,
@@ -96,7 +97,8 @@ pub enum ReplicatedWrite {
         collection: String,
         document_id: String,
         updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
-        surrogate: u32,
+        /// `None` when the key is unbound in its database: no row matches.
+        surrogate: Option<u32>,
         /// See `PointPut::resolved_sum_targets`.
         #[serde(default)]
         resolved_sum_targets: Vec<(String, u32)>,
@@ -208,6 +210,8 @@ pub enum ReplicatedWrite {
         collection: String,
         field_name: String,
         document_surrogate: u32,
+        #[serde(default)]
+        pk_bytes: Option<Vec<u8>>,
         vectors: Vec<f32>,
         count: usize,
         dim: usize,
@@ -219,7 +223,8 @@ pub enum ReplicatedWrite {
     },
     DeleteBySurrogate {
         collection: String,
-        surrogate: u32,
+        /// The row's bound surrogate. `None` when the key's home binds none.
+        surrogate: Option<u32>,
         field_name: String,
         /// Sync provenance encoded as zerompk bytes.
         #[serde(default)]
@@ -290,7 +295,7 @@ pub enum ReplicatedWrite {
         /// RETURNING projection spec (`ReturningSpec`), msgpack-encoded.
         #[serde(default)]
         returning: Option<Vec<u8>>,
-        /// Read filters (`Vec<ScanFilter>`) gating what `returning` may show.
+        /// Read filters (`Vec<ScanFilter>`) gating what `returning` can show.
         #[serde(default)]
         rls_filters: Vec<u8>,
     },
@@ -310,7 +315,7 @@ pub enum ReplicatedWrite {
         /// RETURNING projection spec (`ReturningSpec`), msgpack-encoded.
         #[serde(default)]
         returning: Option<Vec<u8>>,
-        /// Read filters (`Vec<ScanFilter>`) gating what `returning` may show.
+        /// Read filters (`Vec<ScanFilter>`) gating what `returning` can show.
         #[serde(default)]
         rls_filters: Vec<u8>,
     },
@@ -325,8 +330,9 @@ pub enum ReplicatedWrite {
     },
     FtsDelete {
         collection: String,
-        /// Leader-assigned global surrogate for the document.
-        surrogate: u32,
+        /// Leader-assigned global surrogate for the document. `None` when the
+        /// key's home binds none.
+        surrogate: Option<u32>,
         /// Sync provenance encoded as zerompk bytes.
         #[serde(default)]
         provenance: Option<Vec<u8>>,
@@ -344,8 +350,9 @@ pub enum ReplicatedWrite {
     SpatialDelete {
         collection: String,
         field: String,
-        /// Leader-assigned global surrogate for the row.
-        surrogate: u32,
+        /// Leader-assigned global surrogate for the row. `None` when the
+        /// key's home binds none.
+        surrogate: Option<u32>,
         /// Sync provenance encoded as zerompk bytes.
         #[serde(default)]
         provenance: Option<Vec<u8>>,
@@ -586,9 +593,16 @@ pub enum ReplicatedWrite {
     ArrayOp {
         array: String,
         op_bytes: Vec<u8>,
+        /// The bound surrogate of a put's cell, assigned at the array's home
+        /// by the proposer. `None` for a delete or erasure, which names a
+        /// coordinate and creates no row.
+        cell_surrogate: Option<u32>,
         schema_hlc_bytes: [u8; 18],
         #[serde(default)]
         provenance: Option<Vec<u8>>,
+        /// See `ArrayCellPut::incarnation`.
+        #[serde(default)]
+        incarnation: nodedb_types::Hlc,
     },
     ArraySchema {
         array: String,
@@ -687,7 +701,8 @@ pub enum ReplicatedWrite {
     CrdtDocDelete {
         collection: String,
         document_id: String,
-        surrogate: u32,
+        /// `None` when the key is unbound in its database: no row matches.
+        surrogate: Option<u32>,
         /// See `ReplicatedWrite::PointPut::returning`.
         #[serde(default)]
         returning: Option<Vec<u8>>,
@@ -735,12 +750,19 @@ pub enum ReplicatedWrite {
         cells_msgpack: Vec<u8>,
         #[serde(default)]
         provenance: Option<Vec<u8>>,
+        /// The array incarnation the proposer wrote against. A replica
+        /// routes the write to that incarnation wherever it lives.
+        #[serde(default)]
+        incarnation: nodedb_types::Hlc,
     },
     ArrayCellDelete {
         array: String,
         coords_msgpack: Vec<u8>,
         #[serde(default)]
         provenance: Option<Vec<u8>>,
+        /// See `ArrayCellPut::incarnation`.
+        #[serde(default)]
+        incarnation: nodedb_types::Hlc,
     },
 
     /// Fenced CRDT apply.
@@ -840,7 +862,7 @@ pub enum ReplicatedWrite {
 
     /// Resolved form of a state-dependent KV write on a write-policy
     /// collection: mutations and reply, already decided, not an operation to
-    /// re-derive. `mutations` may span two collections for `TransferItem`.
+    /// re-derive. `mutations` can span two collections for `TransferItem`.
     KvResolvedWrite {
         mutations: Vec<KvResolvedMutationWire>,
         /// Statement reply decided at resolve time; every replica returns it
@@ -881,7 +903,7 @@ pub enum ReplicatedWrite {
     /// Resolved form of a deferred document write (`PointUpdate`,
     /// `PointDelete`, `Upsert`, `BulkUpdate`, `BulkDelete`) on a write-policy
     /// collection: mutations and reply, already decided against the live
-    /// writing identity, not a predicate a follower could re-judge.
+    /// writing identity, not a predicate a follower can re-judge.
     DocumentResolvedWrite {
         mutations: Vec<DocumentResolvedMutationWire>,
         /// Statement reply decided at resolve time; every replica returns it
@@ -935,7 +957,7 @@ pub enum ReplicatedWrite {
     /// Resolved form of a vector-primary `DELETE` / `UPDATE` /
     /// conflict-patching `UPSERT` on a write-policy collection: row
     /// mutations and reply, already decided against the live writing
-    /// identity, not a predicate a follower could re-judge. Surrogates are
+    /// identity, not a predicate a follower can re-judge. Surrogates are
     /// the leader's; an `Upsert` mutation carries the key it binds to.
     VectorResolvedDirectWrite {
         collection: String,
@@ -1030,6 +1052,37 @@ pub enum ReplicatedWrite {
     /// watermark, so a restore of that backup refuses it.
     CutBarrier {
         hlc: u64,
+        /// The cluster restore point this cut takes, `0` for a backup's cut.
+        /// Every replica that applies the barrier records the group's place
+        /// at the point in its WAL.
+        restore_point: u64,
+        /// A database backup's capture request. The group's leader snapshots
+        /// the request's tenants when it applies the first barrier of the
+        /// request, before it applies the next entry.
+        #[serde(default)]
+        capture: Option<nodedb_physical::physical_plan::CutCaptureRequest>,
+    },
+    /// One message published to a durable topic whose home vShard is this
+    /// entry's vShard. Every replica appends it to its topic log at apply, in
+    /// Raft log order, so every replica assigns it the same sequence and
+    /// position, and a consumer reads the topic from any replica.
+    TopicPublish {
+        topic: String,
+        payload: String,
+        /// Wall-clock milliseconds the proposer resolved. Every replica
+        /// stores this value.
+        event_time: u64,
+        /// The committed transaction message this entry delivers. A topic
+        /// appends one message per origin.
+        origin: Option<crate::event::topic::types::PublishOrigin>,
+    },
+    /// Keys the leader of this entry's vShard binds to surrogates: the vShard
+    /// is each key's collection home, the one place a key's surrogate is
+    /// minted. Every replica binds them first-wins in Raft log order, so a
+    /// bind and a write that carries the same key resolve alike on every
+    /// replica, and the binding survives a change of leader.
+    SurrogateBind {
+        identities: Vec<ReplicatedIdentity>,
     },
 }
 
@@ -1110,7 +1163,7 @@ mod tests {
             ReplicatedWrite::PointDelete {
                 collection: "c".into(),
                 document_id: "d".into(),
-                surrogate: 1,
+                surrogate: Some(1),
                 resolved_sum_targets: Vec::new(),
                 resolved_sum_target_bindings: Vec::new(),
                 returning: None,
@@ -1164,8 +1217,10 @@ mod tests {
             ReplicatedWrite::ArrayOp {
                 array: "genome".into(),
                 op_bytes: vec![0xde, 0xad],
+                cell_surrogate: Some(12),
                 schema_hlc_bytes: [0u8; 18],
                 provenance: None,
+                incarnation: nodedb_types::Hlc::new(5, 0),
             },
             ReplicatedWrite::ArraySchema {
                 array: "genome".into(),

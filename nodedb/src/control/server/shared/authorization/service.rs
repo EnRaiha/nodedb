@@ -19,7 +19,7 @@ use super::capability::{AuthorizedCollection, AuthorizedTaskSet};
 use super::error::AuthorizationError;
 use super::requirements::{AuthorizationRequirement, plan_requirements};
 
-/// Ensure an identity may select `database_id`.
+/// Ensure an identity can select `database_id`.
 pub fn authorize_database(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -427,7 +427,7 @@ mod tests {
         let roles = RoleStore::new();
         permissions
             .grant(
-                "collection:9:orders",
+                "collection:0:9:orders",
                 "user:reader",
                 Permission::Read,
                 "admin",

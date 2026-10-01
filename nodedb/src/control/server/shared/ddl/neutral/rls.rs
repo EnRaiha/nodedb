@@ -2,17 +2,15 @@
 
 //! Protocol-neutral RLS policy DDL — CREATE / DROP / SHOW.
 //!
-//! Ported from the pgwire `ddl::rls` handlers. All non-return logic
-//! (permission checks, predicate compilation, duplicate pre-checks, catalog
-//! proposes, in-memory `RlsPolicyStore` install/drop, `audit_record`, tenant
-//! scoping, and the token-based `parts` parsing for DROP / SHOW) is preserved
-//! verbatim; only the result construction changed from pgwire `Response` /
-//! `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
+//! The permission checks, predicate compilation, duplicate pre-checks,
+//! catalog proposes, in-memory `RlsPolicyStore` install/drop, `audit_record`,
+//! tenant scoping, and the token-based `parts` parsing for DROP / SHOW run
+//! here. The result is the protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use serde_json::{Map, Value as JsonValue};
 
 use crate::control::catalog_entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::planner::sql_plan_convert::convert::db_qualified;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::catalog::StoredRlsPolicy;
@@ -119,7 +117,7 @@ fn status(command: &str) -> Vec<DdlResult> {
 
 /// Resolve and authorize the tenant scope for RLS administration.
 ///
-/// Tenant administrators may manage only their authenticated tenant. An
+/// Tenant administrators can manage only their authenticated tenant. An
 /// explicit cross-tenant target is reserved for superusers.
 fn authorize_rls_scope(
     identity: &AuthenticatedIdentity,
@@ -148,7 +146,7 @@ fn authorize_rls_scope(
 ///
 /// All fields are pre-parsed by the `nodedb-sql` AST layer; this handler
 /// only performs predicate compilation and catalog mutation.
-pub fn create_rls_policy(
+pub async fn create_rls_policy(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     req: &CreateRlsPolicyRequest<'_>,
@@ -231,18 +229,10 @@ pub fn create_rls_policy(
     let stored = StoredRlsPolicy::from_runtime(&policy, database_id, predicate_raw)
         .map_err(|e| DdlError::from_error_in_context("rls serialize", &e))?;
 
-    let entry = CatalogEntry::PutRlsPolicy(Box::new(stored.clone()));
-    let outcome = propose_catalog_entry(state, &entry)
+    let entry = CatalogEntry::PutRlsPolicy(Box::new(stored));
+    propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        {
-            let catalog = state.credentials.catalog();
-            catalog
-                .put_rls_policy(&stored)
-                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        }
-        state.rls.install_replicated_policy(policy);
-    }
 
     let mode_str = if is_restrictive { " RESTRICTIVE" } else { "" };
     state.audit_record(
@@ -259,7 +249,7 @@ pub fn create_rls_policy(
 }
 
 /// `DROP RLS POLICY <name> ON <collection> [TENANT <id>]`.
-pub fn drop_rls_policy(
+pub async fn drop_rls_policy(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -289,19 +279,9 @@ pub fn drop_rls_policy(
         collection: qualified_collection.clone(),
         name: name.to_string(),
     };
-    let outcome = propose_catalog_entry(state, &entry)
+    propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        {
-            let catalog = state.credentials.catalog();
-            catalog
-                .delete_rls_policy(tenant_id, &qualified_collection, name)
-                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        }
-        state
-            .rls
-            .install_replicated_drop_policy(tenant_id, &qualified_collection, name);
-    }
 
     state.audit_record(
         AuditEvent::AdminAction,

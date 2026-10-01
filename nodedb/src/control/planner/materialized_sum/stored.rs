@@ -11,7 +11,7 @@
 //! resolves from the plan; the one the row is leaving is readable only from
 //! the stored image.
 //!
-//! [`recon_point_row`] is the only plan-time source read: two readers could
+//! [`recon_point_row`] is the only plan-time source read: two readers can
 //! disagree about where a collection lives, and the Data Plane never
 //! resolves this itself (the pk→surrogate map is catalog state, off-limits
 //! cross-plane). [`binding_join_keys`](crate::query::binding_join_keys)
@@ -73,12 +73,14 @@ pub(super) struct StoredRowScope<'a> {
 
 /// What reading the stored row produced: the write's pre-/post-image pairs
 /// and the version they were read at — from the SAME read that resolved
-/// the join values, so a re-read would fold a different snapshot.
+/// the join values, so a re-read will fold a different snapshot.
 pub(super) struct StoredImages {
     /// One pair per row this write touches — at most one, for a point shape.
     pub images: Vec<(Option<serde_json::Value>, Option<serde_json::Value>)>,
     /// The source collection's write floor at read time.
     pub read_version_lsn: Lsn,
+    /// The node that served the read, whose WAL numbers `read_version_lsn`.
+    pub served_by: u64,
 }
 
 /// The stored row an op rewrites or removes, or `None` for every op that
@@ -89,16 +91,17 @@ pub(super) struct StoredImages {
 /// by construction, so there's no pre-image to read.
 pub(super) fn stored_row_scope(op: &DocumentOp) -> Option<StoredRowScope<'_>> {
     match op {
+        // A key unbound in its database names no stored row.
         DocumentOp::PointUpdate {
             collection,
             document_id,
             surrogate,
             updates,
             ..
-        } => Some(StoredRowScope {
+        } => surrogate.map(|surrogate| StoredRowScope {
             collection: collection.as_str(),
             document_id: document_id.as_str(),
-            surrogate: *surrogate,
+            surrogate,
             updates: updates.as_slice(),
             post_image: PostImage::Assigned,
         }),
@@ -109,10 +112,10 @@ pub(super) fn stored_row_scope(op: &DocumentOp) -> Option<StoredRowScope<'_>> {
             document_id,
             surrogate,
             ..
-        } => Some(StoredRowScope {
+        } => surrogate.map(|surrogate| StoredRowScope {
             collection: collection.as_str(),
             document_id: document_id.as_str(),
-            surrogate: *surrogate,
+            surrogate,
             updates: &[],
             post_image: PostImage::Removed,
         }),
@@ -207,6 +210,7 @@ pub(super) async fn extend_with_stored_row(
     let outcome = StoredImages {
         images: images_of(scope, read.rows.as_ref())?,
         read_version_lsn: read.read_version_lsn,
+        served_by: read.served_by,
     };
 
     if read.rows.is_none() {
@@ -220,7 +224,7 @@ pub(super) async fn extend_with_stored_row(
     // read off the images the deltas will be folded from rather than re-derived
     // from the assignments: the two shapes that carry a body form their
     // post-image from the body as well as from the assignments, and a
-    // re-derivation that saw only the assignments would resolve a target the
+    // re-derivation that saw only the assignments will resolve a target the
     // fold never addresses — or miss the one it does.
     let mut rows: Vec<serde_json::Value> = Vec::with_capacity(outcome.images.len() * 2);
     for (old, new) in &outcome.images {
@@ -320,7 +324,7 @@ mod tests {
         DocumentOp::PointDelete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
             document_id: "e1".to_string(),
-            surrogate: ROW,
+            surrogate: Some(ROW),
             pk_bytes: b"e1".to_vec(),
             returning: None,
             rls_filters: Vec::new(),
@@ -333,7 +337,7 @@ mod tests {
         DocumentOp::PointUpdate {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
             document_id: "e1".to_string(),
-            surrogate: ROW,
+            surrogate: Some(ROW),
             pk_bytes: b"e1".to_vec(),
             updates: assignments(),
             returning: None,

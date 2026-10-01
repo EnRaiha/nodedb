@@ -2,55 +2,100 @@
 
 //! Webhook manager: spawns and stops delivery tasks per stream.
 //!
-//! On startup, scans all change streams with webhook config and spawns
-//! delivery tasks. On CREATE/DROP CHANGE STREAM with webhook config,
-//! dynamically starts/stops tasks.
+//! Every node runs a delivery task for every registered change stream with
+//! a webhook: a reconciler matches the tasks to the stream registry once per
+//! second, so a stream a peer created, or one that survives a restart, gets
+//! its task. Only the lease holder of the stream's owning group delivers;
+//! see [`crate::event::cdc::sink_owner`].
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use tokio::sync::watch;
 use tracing::{debug, info};
 
 use crate::control::state::SharedState;
+use crate::event::sink_tasks::{SinkTaskKey as TaskKey, SinkTasks};
 use crate::types::DatabaseId;
 
 use super::delivery::spawn_delivery_task;
-
-type TaskKey = (DatabaseId, u64, String);
-
-struct ManagerState {
-    tasks: HashMap<TaskKey, tokio::task::JoinHandle<()>>,
-    draining: bool,
-}
 
 /// Manages webhook delivery tasks for all webhook-enabled streams.
 pub struct WebhookManager {
     /// Running delivery tasks and admission state, guarded together so a drain
     /// cannot race a newly accepted task.
-    state: Mutex<ManagerState>,
+    state: Mutex<SinkTasks>,
     /// Shared shutdown receiver (cloned for each task).
     shutdown_rx: watch::Receiver<bool>,
-    /// Shared state reference, set once after SharedState construction.
-    shared_state: OnceLock<Arc<SharedState>>,
+    /// Back-reference to the `SharedState` that owns this manager, set once
+    /// after construction. It is `Weak`: a strong one forms a cycle that
+    /// keeps `SharedState`, its redb files, and its QUIC endpoint alive after
+    /// shutdown.
+    shared_state: OnceLock<Weak<SharedState>>,
 }
 
 impl WebhookManager {
     pub fn new(shutdown_rx: watch::Receiver<bool>) -> Self {
         Self {
-            state: Mutex::new(ManagerState {
-                tasks: HashMap::new(),
-                draining: false,
-            }),
+            state: Mutex::new(SinkTasks::default()),
             shutdown_rx,
             shared_state: OnceLock::new(),
         }
     }
 
-    /// Set the shared state reference (called once during startup).
-    pub fn set_state(&self, state: Arc<SharedState>) {
-        let _ = self.shared_state.set(state);
+    /// Set the shared state reference (called once during startup), and
+    /// start the reconciler.
+    pub fn set_state(&self, state: &Arc<SharedState>) {
+        if self.shared_state.set(Arc::downgrade(state)).is_err() {
+            return;
+        }
+        spawn_reconciler(state, |state| state.webhook_manager.reconcile());
+    }
+
+    /// Start a task for every registered stream with a webhook, and stop the
+    /// task of every stream no longer registered.
+    pub fn reconcile(&self) {
+        let Some(state) = self.shared_state.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let streams: Vec<_> = state
+            .stream_registry
+            .list_all()
+            .into_iter()
+            .filter(|def| def.webhook.is_configured())
+            .collect();
+        let registered: std::collections::HashSet<TaskKey> = streams
+            .iter()
+            .map(|def| (def.database_id, def.tenant_id, def.name.clone()))
+            .collect();
+        let stale: Vec<TaskKey> = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .tasks
+            .keys()
+            .filter(|key| !registered.contains(*key))
+            .cloned()
+            .collect();
+        for (database_id, tenant_id, name) in stale {
+            self.stop_task(database_id, tenant_id, &name);
+        }
+        for def in streams {
+            let running = self
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .tasks
+                .contains_key(&(def.database_id, def.tenant_id, def.name.clone()));
+            if !running {
+                self.start_task(
+                    def.database_id,
+                    def.tenant_id,
+                    &def.name,
+                    def.webhook.clone(),
+                );
+            }
+        }
     }
 
     /// Start a delivery task for a specific stream.
@@ -74,10 +119,10 @@ impl WebhookManager {
                 return false;
             }
         }
-        let state = match self.shared_state.get() {
-            Some(state) => Arc::clone(state),
+        let state = match self.shared_state.get().and_then(Weak::upgrade) {
+            Some(state) => state,
             None => {
-                tracing::warn!("webhook manager: state not set, cannot start task");
+                tracing::warn!("webhook manager: state not set or dropped, cannot start task");
                 return false;
             }
         };
@@ -127,27 +172,10 @@ impl WebhookManager {
         }
     }
 
-    /// Stop admitting delivery tasks, then join those already admitted.
-    ///
-    /// Tasks get until `deadline` to complete naturally. Any remaining tasks
-    /// are aborted and joined after that deadline. Handles are removed from the
-    /// map before awaiting, so stop/drop paths cannot await them a second time.
+    /// Stop admitting delivery tasks, then join those already admitted. See
+    /// [`crate::event::sink_tasks::shutdown_and_join`].
     pub async fn shutdown_and_join(&self, deadline: Duration) {
-        let tasks = {
-            let mut manager = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            manager.draining = true;
-            std::mem::take(&mut manager.tasks)
-        };
-        let deadline_at = tokio::time::Instant::now() + deadline;
-        for (_, mut handle) in tasks {
-            if tokio::time::timeout_at(deadline_at, &mut handle)
-                .await
-                .is_err()
-            {
-                handle.abort();
-                let _ = handle.await;
-            }
-        }
+        crate::event::sink_tasks::shutdown_and_join(&self.state, deadline).await;
         debug!("webhook manager delivery tasks drained");
     }
 
@@ -170,6 +198,31 @@ impl Drop for WebhookManager {
         }
         debug!("webhook manager dropped, all delivery tasks aborted");
     }
+}
+
+/// Run `reconcile` once per second while `state` lives and the node runs.
+pub(crate) fn spawn_reconciler(state: &Arc<SharedState>, reconcile: fn(&SharedState)) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let weak = Arc::downgrade(state);
+    let mut shutdown = state.shutdown.raw_receiver();
+    runtime.spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => {}
+            }
+            if *shutdown.borrow() {
+                return;
+            }
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            reconcile(&state);
+        }
+    });
 }
 
 #[cfg(test)]

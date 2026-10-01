@@ -5,7 +5,8 @@
 //! One instance per node. Owns the membership list (shared via `Arc`),
 //! the probe scheduler, the suspicion timer, the inflight-probe registry,
 //! and the async transport. Drives a `tokio::select!` loop over four
-//! arms: probe tick, inbound datagram, suspicion expiry, shutdown.
+//! arms: shutdown, the probe round in flight, probe tick, and inbound
+//! datagram. Suspicion expiry runs at the start of each probe round.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use crate::swim::subscriber::MembershipSubscriber;
 use crate::swim::wire::{Ack, Ping, PingReq, ProbeId, SwimMessage};
 
 use super::probe_round::{InflightProbes, ProbeOutcome, ProbeRound};
+use super::round_slot::RoundSlot;
 use super::scheduler::ProbeScheduler;
 use super::suspicion::SuspicionTimer;
 use super::transport::Transport;
@@ -210,23 +212,31 @@ impl FailureDetector {
         ProbeId::new(self.probe_counter.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Main loop. Returns when `shutdown` receives `true`.
+    /// Main loop. Returns when `shutdown` receives `true` or its sender is
+    /// gone.
+    ///
+    /// A probe round waits for acks that only the inbound arm reads. The
+    /// round is therefore polled as its own arm, never awaited inline, and
+    /// the inbound arm runs while it waits. A tick starts a round only when
+    /// none is in flight.
     pub async fn run(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
         let mut tick = interval(self.cfg.probe_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Consume the first immediate tick so the first probe aligns
         // with a full interval from start.
         tick.tick().await;
+        let mut round = RoundSlot::default();
         loop {
             tokio::select! {
                 biased;
                 changed = shutdown.changed() => {
-                    if changed.is_ok() && *shutdown.borrow() {
+                    if changed.is_err() || *shutdown.borrow() {
                         break;
                     }
                 }
-                _ = tick.tick() => {
-                    self.on_tick().await;
+                () = round.finished() => {}
+                _ = tick.tick(), if round.is_idle() => {
+                    round.start(self.on_tick());
                 }
                 recv = self.transport.recv() => {
                     match recv {
@@ -600,6 +610,92 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_millis(200), h_a).await;
         let _ = tokio::time::timeout(Duration::from_millis(200), h_b).await;
         let _ = tokio::time::timeout(Duration::from_millis(200), h_c).await;
+    }
+
+    /// Every state change one detector reports.
+    #[derive(Default)]
+    struct Verdicts(std::sync::Mutex<Vec<(NodeId, MemberState)>>);
+
+    impl MembershipSubscriber for Verdicts {
+        fn on_state_change(&self, node_id: &NodeId, _old: Option<MemberState>, new: MemberState) {
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((node_id.clone(), new));
+        }
+    }
+
+    /// Live peers ack every probe within the probe timeout, so no detector
+    /// ever suspects one. An ack reaches the round that waits for it while
+    /// the round still waits. No false verdict means no refutation, so no
+    /// local incarnation moves.
+    ///
+    /// `sleep` rather than `advance`: the paused clock moves only once every
+    /// task is idle, so each ping and its ack are delivered before any probe
+    /// timeout can fire.
+    #[tokio::test(start_paused = true)]
+    async fn live_peers_that_ack_in_time_are_never_suspected() {
+        let fab = TransportFabric::new();
+        let nodes = [("a", 7200u16), ("b", 7201), ("c", 7202)];
+        let mut running = Vec::new();
+        for (id, port) in nodes {
+            let transport: Arc<dyn Transport> = Arc::new(fab.bind(addr(port)).await);
+            let list = Arc::new(MembershipList::new_local(
+                NodeId::try_new(id).expect("test fixture"),
+                addr(port),
+                Incarnation::ZERO,
+            ));
+            for (peer_id, peer_port) in nodes.iter().filter(|(peer, _)| *peer != id) {
+                list.apply(&MemberUpdate {
+                    node_id: NodeId::try_new(*peer_id).expect("test fixture"),
+                    addr: addr(*peer_port).to_string(),
+                    state: MemberState::Alive,
+                    incarnation: Incarnation::ZERO,
+                });
+            }
+            let verdicts = Arc::new(Verdicts::default());
+            let detector = Arc::new(FailureDetector::with_subscribers(
+                cfg(),
+                list,
+                transport,
+                ProbeScheduler::with_seed(u64::from(port)),
+                vec![Arc::clone(&verdicts) as Arc<dyn MembershipSubscriber>],
+            ));
+            let (tx, rx) = watch::channel(false);
+            let handle = tokio::spawn({
+                let detector = Arc::clone(&detector);
+                async move { detector.run(rx).await }
+            });
+            running.push((id, detector, verdicts, tx, handle));
+        }
+
+        // Thirty probe intervals: every node probes each peer many times.
+        tokio::time::sleep(cfg().probe_interval * 30).await;
+
+        for (id, detector, verdicts, _, _) in &running {
+            let seen = verdicts.0.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            assert!(
+                seen.iter().all(|(_, state)| *state == MemberState::Alive),
+                "{id} reported a false verdict on a live peer: {seen:?}"
+            );
+            for (peer, _) in nodes.iter().filter(|(peer, _)| peer != id) {
+                let member = detector
+                    .membership
+                    .get(&NodeId::try_new(*peer).expect("test fixture"))
+                    .expect("peer in list");
+                assert_eq!(member.state, MemberState::Alive, "{id} sees {peer}");
+            }
+            assert_eq!(
+                *detector.local_incarnation.lock().await,
+                Incarnation::ZERO,
+                "{id} refuted a suspicion no live peer should have raised"
+            );
+        }
+
+        for (_, _, _, tx, handle) in running {
+            let _ = tx.send(true);
+            let _ = tokio::time::timeout(Duration::from_millis(200), handle).await;
+        }
     }
 
     #[tokio::test(start_paused = true)]

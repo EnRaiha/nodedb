@@ -92,3 +92,75 @@ pub(in crate::data::executor) fn crdt_rejection(
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::error::{ErrorCode as PublicCode, sqlstate};
+
+    use super::*;
+    use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
+    use crate::error_from_data_plane::data_plane_code_to_public;
+
+    /// Every violation the validator emits reaches pgwire with its own
+    /// constraint or permission SQLSTATE, and the native client with a
+    /// classified code. None degrades to an internal error.
+    #[test]
+    fn each_validator_violation_keeps_its_client_class() {
+        let cases = [
+            (
+                ViolationType::UniqueViolation {
+                    field: "email".into(),
+                    value: "x@y.com".into(),
+                },
+                sqlstate::UNIQUE_VIOLATION,
+                PublicCode::CONSTRAINT_VIOLATION,
+            ),
+            (
+                ViolationType::ForeignKeyMissing {
+                    referenced_id: "org:1".into(),
+                },
+                sqlstate::FOREIGN_KEY_VIOLATION,
+                PublicCode::CONSTRAINT_VIOLATION,
+            ),
+            (
+                ViolationType::NotNullViolation {
+                    field: "email".into(),
+                },
+                sqlstate::NOT_NULL_VIOLATION,
+                PublicCode::CONSTRAINT_VIOLATION,
+            ),
+            (
+                ViolationType::SchemaViolation {
+                    field: "email".into(),
+                    reason: "expected a string".into(),
+                },
+                sqlstate::INTEGRITY_CONSTRAINT_VIOLATION,
+                PublicCode::CONSTRAINT_VIOLATION,
+            ),
+            (
+                ViolationType::ConstraintViolation {
+                    detail: "check: amount > 0".into(),
+                },
+                sqlstate::INTEGRITY_CONSTRAINT_VIOLATION,
+                PublicCode::CONSTRAINT_VIOLATION,
+            ),
+            (
+                ViolationType::RlsPolicyViolation {
+                    policy_name: "own_rows".into(),
+                },
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                PublicCode::AUTHORIZATION_DENIED,
+            ),
+        ];
+        for (violation, expected_sqlstate, expected_public) in cases {
+            let code = crdt_rejection("users", "b", &violation);
+            let (_, state, _) = error_code_to_sqlstate(&code);
+            assert_eq!(state, expected_sqlstate, "sqlstate for {violation}");
+            assert_eq!(
+                data_plane_code_to_public(code).code(),
+                expected_public,
+                "public code for {violation}"
+            );
+        }
+    }
+}

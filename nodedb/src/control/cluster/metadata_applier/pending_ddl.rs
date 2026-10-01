@@ -4,8 +4,9 @@
 //! `DdlPendingCancel`.
 //!
 //! Applies the entries `ddl_flush::begin_commit` / `finalize_pending` propose
-//! at COMMIT, and the ones `metadata_proposer::acquire_ddl_prepare_lease`
-//! proposes to reclaim a dead owner's stranded record. Finalize and cancel
+//! at COMMIT, and the cancel `metadata_proposer::ddl_reclaim` proposes for a
+//! reclaimed owner's stranded record. Propose and finalize apply only while
+//! their token owns the DDL preparation lease. Finalize and cancel
 //! are idempotent: applying either twice, or applying either for a token
 //! with no pending record, is a no-op. Raft replay relies on exactly that
 //! shape.
@@ -16,6 +17,7 @@ use nodedb_cluster::{MetadataEntry, PendingDdlObject};
 use nodedb_types::Hlc;
 
 use crate::control::catalog_entry;
+use crate::control::security::catalog::StoredPendingReclaim;
 
 use super::types::MetadataCommitApplier;
 
@@ -23,18 +25,27 @@ impl MetadataCommitApplier {
     /// `DdlPendingPropose`: insert the pending record. Re-delivery of the
     /// same propose overwrites with an identical record, so no ordering
     /// hazard exists.
+    ///
+    /// Applies only while `token` owns the preparation lease. An owner whose
+    /// lease the metadata leader reclaimed reserves nothing: its propose is a
+    /// deterministic no-op on every replica, and the proposer sees no record.
     pub(super) fn apply_ddl_pending_propose(
         &self,
         token: u64,
         objects: &[PendingDdlObject],
         proposed_at: Hlc,
     ) -> Result<(), crate::Error> {
-        let Some(shared) = self.shared.get().and_then(std::sync::Weak::upgrade) else {
+        let shared = self.shared_state()?;
+        if !crate::control::metadata_proposer::ddl_owner::owns_ddl_lease(&shared, token) {
+            debug!(
+                token,
+                "pending DDL propose: token does not own the lease, no-op"
+            );
             return Ok(());
-        };
+        }
         // `proposed_at` is the only remote HLC observation the metadata group
         // carries — every other `Hlc` on a `MetadataEntry` is a future
-        // deadline, and folding one would jump this node's clock forward.
+        // deadline, and folding one will jump this node's clock forward.
         //
         // The entry is already committed, so a refused fold must not stop the
         // apply: refusing to move the clock IS the protection. Applying still
@@ -48,6 +59,13 @@ impl MetadataCommitApplier {
                 "refusing to fold a proposer's HLC: {skew}"
             );
         }
+        self.credentials.catalog().put_pending_ddl(
+            &crate::control::security::catalog::StoredPendingDdl {
+                token,
+                objects: objects.to_vec(),
+                proposed_at,
+            },
+        )?;
         shared
             .pending_ddl
             .insert(token, objects.to_vec(), proposed_at);
@@ -58,22 +76,36 @@ impl MetadataCommitApplier {
     /// effects, then drop the pending record. The record is peeked rather
     /// than removed up front, so a mid-replay failure leaves it in place
     /// for the next re-delivery instead of silently skipping the rest.
-    pub(super) fn apply_ddl_pending_finalize(
+    ///
+    /// Applies only while `token` owns the preparation lease. A finalize
+    /// that applies records `token` in `metadata_ddl_applied_token`, which
+    /// is how its proposer learns the objects landed.
+    pub(super) async fn apply_ddl_pending_finalize(
         &self,
         token: u64,
         raft_index: u64,
     ) -> Result<(), crate::Error> {
-        let Some(shared) = self.shared.get().and_then(std::sync::Weak::upgrade) else {
-            return Ok(());
-        };
+        let shared = self.shared_state()?;
         let Some(record) = shared.pending_ddl.get(token) else {
             debug!(token, "pending DDL finalize: no pending record, no-op");
             return Ok(());
         };
-        for object in &record.objects {
-            self.apply_host_side_effects(object_entry(object), raft_index)?;
+        if !crate::control::metadata_proposer::ddl_owner::owns_ddl_lease(&shared, token) {
+            debug!(
+                token,
+                "pending DDL finalize: token does not own the lease, no-op"
+            );
+            return Ok(());
         }
+        for object in &record.objects {
+            self.apply_host_side_effects(object_entry(object), raft_index)
+                .await?;
+        }
+        self.credentials.catalog().remove_pending_ddl(token)?;
         shared.pending_ddl.take(token);
+        shared
+            .metadata_ddl_applied_token
+            .store(token, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -83,14 +115,15 @@ impl MetadataCommitApplier {
     /// statement time, independent of buffering, so an abandoned create
     /// still needs the same `UnregisterCollection` teardown a real purge
     /// uses. A name with any committed row keeps its engine.
-    /// The dispatch is spawned rather than awaited inline — apply
-    /// runs on the raft loop task, and blocking here would deadlock the
-    /// applied-index watcher (same reasoning as the `TopologyChange::Leave`
-    /// lease-GC spawn in `dispatch.rs`).
+    ///
+    /// Each teardown is queued as a durable `_system.pending_reclaim` row
+    /// before the record is dropped, so a crash before the teardown finishes
+    /// leaves it to the boot drain. The dispatch is spawned rather than
+    /// awaited inline — apply runs on the raft loop task, and blocking here
+    /// will deadlock the applied-index watcher (same reasoning as the
+    /// `TopologyChange::Leave` lease-GC spawn in `dispatch.rs`).
     pub(super) fn apply_ddl_pending_cancel(&self, token: u64) -> Result<(), crate::Error> {
-        let Some(shared) = self.shared.get().and_then(std::sync::Weak::upgrade) else {
-            return Ok(());
-        };
+        let shared = self.shared_state()?;
         let Some(record) = shared.pending_ddl.get(token) else {
             debug!(token, "pending DDL cancel: no pending record, no-op");
             return Ok(());
@@ -116,26 +149,31 @@ impl MetadataCommitApplier {
                 );
             }
         }
+        let queued = queue_teardowns(
+            catalog,
+            teardown,
+            shared.wal.next_lsn().as_u64(),
+            crate::control::lease::wall_now_ns(),
+        )?;
+        // A same-name CREATE waits on the pending-reclaim path's hold until
+        // the teardown finishes. A re-delivered cancel finds it already held.
+        for entry in &queued {
+            shared.quiesce.ensure_reclaim_hold(&entry.owner());
+        }
+        catalog.remove_pending_ddl(token)?;
         shared.pending_ddl.take(token);
-        for CreatedCollection {
-            database_id,
-            tenant_id,
-            name,
-        } in teardown
-        {
+        for entry in queued {
             let shared = std::sync::Arc::clone(&shared);
             tokio::spawn(async move {
-                let purge_lsn = shared.wal.next_lsn().as_u64();
-                if let Err(error) = crate::control::server::shared::ddl::neutral::collection::purge::dispatch_unregister_collection(
-                    &shared, database_id, tenant_id, &name, purge_lsn,
-                )
-                .await
+                if let Err(error) =
+                    crate::event::collection_gc::pending_reclaim::retry_one(&shared, &entry).await
                 {
                     tracing::warn!(
-                        collection = %name,
-                        tenant = tenant_id,
+                        collection = %entry.name,
+                        tenant = entry.tenant_id,
                         error = %error,
-                        "pending DDL cancel: Data Plane teardown failed"
+                        "pending DDL cancel: Data Plane teardown failed; the pending-reclaim \
+                         worker retries it"
                     );
                 }
             });
@@ -149,6 +187,41 @@ struct CreatedCollection {
     database_id: u64,
     tenant_id: u64,
     name: String,
+    /// The create's own clock, the incarnation the teardown reclaims.
+    hlc: Hlc,
+}
+
+/// Record one durable pending-reclaim row per teardown. The boot drain and the
+/// pending-reclaim worker finish any teardown these rows still name.
+fn queue_teardowns(
+    catalog: &crate::control::security::catalog::SystemCatalog,
+    teardown: Vec<CreatedCollection>,
+    purge_lsn: u64,
+    enqueued_at_ns: u64,
+) -> crate::Result<Vec<StoredPendingReclaim>> {
+    let mut queued = Vec::with_capacity(teardown.len());
+    for CreatedCollection {
+        database_id,
+        tenant_id,
+        name,
+        hlc,
+    } in teardown
+    {
+        let entry = StoredPendingReclaim {
+            database_id,
+            tenant_id,
+            name,
+            purge_lsn,
+            enqueued_at_ns,
+            last_error: String::new(),
+            attempts: 0,
+            target_hlc: Some(hlc),
+            cancelled_create: true,
+        };
+        catalog.enqueue_pending_reclaim(&entry)?;
+        queued.push(entry);
+    }
+    Ok(queued)
 }
 
 /// Whether the engine registered under `target`'s name still belongs to the
@@ -189,6 +262,7 @@ fn created_collection_target(entry: &MetadataEntry) -> Option<CreatedCollection>
         | catalog_entry::CatalogEntry::PutCollectionIfAbsent(stored) => Some(CreatedCollection {
             database_id: stored.database_id.as_u64(),
             tenant_id: stored.tenant_id,
+            hlc: stored.modification_hlc,
             name: stored.name,
         }),
         _ => None,
@@ -210,6 +284,7 @@ mod tests {
             database_id: DatabaseId::DEFAULT.as_u64(),
             tenant_id: 1,
             name: "orders".to_string(),
+            hlc: Hlc::new(10, 0),
         }
     }
 
@@ -220,8 +295,7 @@ mod tests {
     }
 
     fn seed(store: &CredentialStore, hlc: Hlc) {
-        let mut row = StoredCollection::new(1, "orders", "tester");
-        row.descriptor_version = 1;
+        let mut row = StoredCollection::stamped_for_test(1, "orders", "tester");
         row.modification_hlc = hlc;
         store
             .catalog()
@@ -242,6 +316,28 @@ mod tests {
     fn cancel_tears_down_when_no_row_holds_the_name() {
         let (store, _tmp) = open();
         assert!(cancel_owns_engine(&target(), store.catalog()).expect("read"));
+    }
+
+    /// The cancel records the teardown durably before it spawns the dispatch,
+    /// so the boot drain finishes a teardown a crash interrupted.
+    #[test]
+    fn cancel_queues_a_durable_reclaim_for_each_teardown() {
+        let (store, _tmp) = open();
+        let queued =
+            queue_teardowns(store.catalog(), vec![target()], 42, 7).expect("queue teardown");
+        assert_eq!(queued.len(), 1);
+
+        let rows = store
+            .catalog()
+            .load_pending_reclaim_queue()
+            .expect("load queue");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].database_id, DatabaseId::DEFAULT.as_u64());
+        assert_eq!(rows[0].tenant_id, 1);
+        assert_eq!(rows[0].name, "orders");
+        assert_eq!(rows[0].purge_lsn, 42);
+        assert_eq!(rows[0].target_hlc, Some(Hlc::new(10, 0)));
+        assert!(rows[0].cancelled_create);
     }
 
     /// A committed row at the create's own clock means the create was

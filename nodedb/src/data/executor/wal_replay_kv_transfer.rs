@@ -118,26 +118,51 @@ impl CoreLoop {
             }
         };
 
-        self.kv_engine.put(crate::engine::kv::KvPutParams {
-            database_id: p.database_id,
-            tenant_id: p.tenant_id,
-            collection: p.collection,
-            key: p.source_key,
-            value: &computed.new_source,
-            ttl_ms: 0,
-            now_ms: p.now_ms,
-            surrogate: nodedb_types::Surrogate::new(p.debit_surrogate),
-        });
-        self.kv_engine.put(crate::engine::kv::KvPutParams {
-            database_id: p.database_id,
-            tenant_id: p.tenant_id,
-            collection: p.collection,
-            key: p.dest_key,
-            value: &computed.new_dest,
-            ttl_ms: 0,
-            now_ms: p.now_ms,
-            surrogate: nodedb_types::Surrogate::new(p.credit_surrogate),
-        });
+        // Both rows are bound before either is written, so a replayed
+        // transfer cannot half-apply.
+        let writes = [
+            (
+                p.source_key,
+                computed.new_source.as_slice(),
+                p.debit_surrogate,
+            ),
+            (p.dest_key, computed.new_dest.as_slice(), p.credit_surrogate),
+        ];
+        for (_, _, surrogate) in writes {
+            let checked = crate::engine::kv::UnboundKvWrite::check(
+                p.collection,
+                nodedb_types::Surrogate::new(surrogate),
+            );
+            if let Err(e) = checked {
+                self.replay_record_unapplied(
+                    "kv",
+                    "transfer_identity",
+                    p.record_lsn,
+                    &e.to_string(),
+                );
+                return 0;
+            }
+        }
+        for (key, value, surrogate) in writes {
+            if let Err(e) = self.kv_engine.put(crate::engine::kv::KvPutParams {
+                database_id: p.database_id,
+                tenant_id: p.tenant_id,
+                collection: p.collection,
+                key,
+                value,
+                ttl_ms: 0,
+                now_ms: p.now_ms,
+                surrogate: nodedb_types::Surrogate::new(surrogate),
+            }) {
+                self.replay_record_unapplied(
+                    "kv",
+                    "transfer_identity",
+                    p.record_lsn,
+                    &e.to_string(),
+                );
+                return 0;
+            }
+        }
         self.note_replay_write_lsn(
             p.database_id,
             p.tenant_id,
@@ -183,6 +208,17 @@ impl CoreLoop {
             return (0, 0);
         };
 
+        // The moved row is bound before the source row is deleted.
+        let surrogate = nodedb_types::Surrogate::new(p.surrogate);
+        if let Err(e) = crate::engine::kv::UnboundKvWrite::check(p.dest_collection, surrogate) {
+            self.replay_record_unapplied(
+                "kv",
+                "transfer_item_identity",
+                p.record_lsn,
+                &e.to_string(),
+            );
+            return (0, 0);
+        }
         self.kv_engine.delete(
             p.database_id,
             p.tenant_id,
@@ -190,7 +226,7 @@ impl CoreLoop {
             &[p.item_key.to_vec()],
             p.now_ms,
         );
-        self.kv_engine.put(crate::engine::kv::KvPutParams {
+        if let Err(e) = self.kv_engine.put(crate::engine::kv::KvPutParams {
             database_id: p.database_id,
             tenant_id: p.tenant_id,
             collection: p.dest_collection,
@@ -198,8 +234,16 @@ impl CoreLoop {
             value: &item_data,
             ttl_ms: 0,
             now_ms: p.now_ms,
-            surrogate: nodedb_types::Surrogate::new(p.surrogate),
-        });
+            surrogate,
+        }) {
+            self.replay_record_unapplied(
+                "kv",
+                "transfer_item_identity",
+                p.record_lsn,
+                &e.to_string(),
+            );
+            return (0, 0);
+        }
 
         self.note_replay_write_lsn(
             p.database_id,

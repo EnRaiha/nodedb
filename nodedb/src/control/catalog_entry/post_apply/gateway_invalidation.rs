@@ -47,6 +47,7 @@ use crate::control::state::SharedState;
 /// | PutRetentionPolicy / DeleteRetentionPolicy | ✅ yes   | `auto_tier` rewrites a timeseries scan onto tier aggregates, so the policy is baked into the plan |
 /// | PutAlertRule / DeleteAlertRule          | ❌ no       | alert rules drive their own eval loop and never enter a PhysicalPlan |
 /// | Topic / consumer-group variants         | ❌ no       | Event Plane delivery identities that never enter a PhysicalPlan |
+/// | PutArray / DeleteArray                  | ✅ yes      | array schema and routing prefix are baked into the plan |
 pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &Arc<SharedState>) {
     let Some(inv) = shared.gateway_invalidator.get() else {
         return;
@@ -156,7 +157,7 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
             // does not directly modify any PhysicalPlan. The `materialized_sum_sources`
             // field in DocumentOp::Register is set at collection-register time
             // (driven by PutCollection), not updated independently by
-            // PutMaterializedView. Any schema change that would affect plans
+            // PutMaterializedView. Any schema change that affects plans
             // cascades through PutCollection instead.
         }
         CatalogEntry::DeleteMaterializedView { .. } => {
@@ -232,7 +233,7 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
         }
         CatalogEntry::DeleteIndexRecord { collection, .. } => {
             // A cached plan still holding an IndexLookup against the dropped
-            // index would read an index the engine no longer has.
+            // index reads an index the engine no longer has.
             inv.invalidate(collection, 0);
         }
 
@@ -315,9 +316,13 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
         | CatalogEntry::DeleteTopicWithConsumerGroups { .. }
         | CatalogEntry::PutConsumerGroupIfAbsent(_)
         | CatalogEntry::DeleteConsumerGroup { .. }
-        | CatalogEntry::MigrateConsumerGroupStream { .. } => {
+        | CatalogEntry::MigrateConsumerGroupStream { .. }
+        | CatalogEntry::CommitConsumerOffsets(_) => {
             // no-op: topics and consumer groups are Event Plane delivery
             // identities and never enter a query plan.
+        }
+        CatalogEntry::PutBackupScheduleMark(_) => {
+            // no-op: a backup schedule mark never enters a query plan.
         }
         CatalogEntry::PutCheckpoint(_)
         | CatalogEntry::DeleteCheckpoint { .. }
@@ -331,6 +336,23 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
         | CatalogEntry::DeleteVectorIndexParams { .. } => {
             // no-op: vector build parameters are read by the Data Plane index,
             // never by a cached plan.
+        }
+        CatalogEntry::PutCloneCopyup { .. }
+        | CatalogEntry::PutCloneTombstone { .. }
+        | CatalogEntry::PutKvCloneTombstone { .. } => {
+            // no-op: a clone read consults these rows at execution, never
+            // through a cached plan.
+        }
+        CatalogEntry::PutCloneSourceDrain(_) | CatalogEntry::DeleteCloneSourceDrain { .. } => {
+            // no-op: drain claims reach no plan.
+        }
+        CatalogEntry::PutArray(stored) => {
+            // An array plan carries its schema and routing prefix. Version 0
+            // evicts every cached plan over the name.
+            inv.invalidate(&stored.name, 0);
+        }
+        CatalogEntry::DeleteArray { name, .. } => {
+            inv.invalidate(name, 0);
         }
         CatalogEntry::PutColumnStats(rows) => {
             // The join and aggregate cost models read these rows, so a cached
@@ -492,8 +514,8 @@ mod tests {
     // We test each Delete* variant directly (simple { tenant_id, name } shape) and
     // rely on the compiler's exhaustiveness check for the corresponding Put* arm.
     // The Put* variants for complex nested types (StoredTrigger, StoredFunction,
-    // etc.) are covered by the same `// no-op` arm; constructing them would
-    // require pages of boilerplate without adding behavioral coverage.
+    // etc.) are covered by the same `// no-op` arm; constructing them
+    // requires pages of boilerplate without adding behavioral coverage.
 
     fn assert_noop(
         shared: &Arc<SharedState>,
@@ -615,6 +637,7 @@ mod tests {
                 database_id: crate::types::DatabaseId::DEFAULT.as_u64(),
                 tenant_id: 1,
                 name: "stream".into(),
+                target_hlc: nodedb_types::Hlc::ZERO,
             },
             "DeleteChangeStream",
         );

@@ -416,16 +416,18 @@ mod tests {
     }
 
     fn seed(core: &mut CoreLoop, collection: &str, key: &[u8], value: &[u8]) {
-        core.kv_engine.put(crate::engine::kv::KvPutParams {
-            database_id: did(),
-            tenant_id: TID,
-            collection,
-            key,
-            value,
-            ttl_ms: 0,
-            now_ms: crate::engine::kv::current_ms(),
-            surrogate: Surrogate::new(1),
-        });
+        core.kv_engine
+            .put(crate::engine::kv::KvPutParams {
+                database_id: did(),
+                tenant_id: TID,
+                collection,
+                key,
+                value,
+                ttl_ms: 0,
+                now_ms: crate::engine::kv::current_ms(),
+                surrogate: crate::engine::kv::test_support::row_surrogate(key),
+            })
+            .expect("a bound row writes");
     }
 
     fn stored(core: &CoreLoop, collection: &str, key: &[u8]) -> Option<Vec<u8>> {

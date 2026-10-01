@@ -2,12 +2,9 @@
 
 //! Protocol-neutral `CREATE CHANGE STREAM` DDL handler.
 //!
-//! Ported from the pgwire `ddl::change_stream::create` handler. All non-return
-//! logic (WITH-clause parsing, `ChangeStreamDef` build, `propose_and_apply` +
-//! `LocalOnly` local registry refresh, webhook / kafka task startup, and
-//! the `audit_record` call) is preserved verbatim; only the result construction
-//! changed from pgwire `Response` / `PgWireError` to the protocol-neutral
-//! [`DdlResult`] / [`DdlError`].
+//! The WITH-clause parsing, `ChangeStreamDef` build, `propose_and_apply`,
+//! webhook / kafka task startup, and the `audit_record` call run here.
+//! The result is the protocol-neutral [`DdlResult`] / [`DdlError`].
 //!
 //! Syntax:
 //! ```sql
@@ -24,14 +21,14 @@ use crate::event::cdc::stream_def::{
 use crate::event::webhook::WebhookConfig;
 use crate::types::DatabaseId;
 
-use super::super::super::catalog::propose_and_apply;
+use super::super::super::catalog::propose_and_apply_async;
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::{require_tenant_admin, status};
 
 /// Handle `CREATE CHANGE STREAM <name> ON <collection> [WITH (...)]`
 ///
 /// `with_clause_raw` is the raw text inside the outer `WITH (...)` parens, or empty.
-pub fn create_change_stream(
+pub async fn create_change_stream(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -134,8 +131,8 @@ pub fn create_change_stream(
         .as_secs();
 
     // Capture the creating principal's roles onto the subscription record.
-    // The webhook and Kafka delivery tasks this stream may own run on the
-    // Event Plane, where no request identity exists and none may be resolved
+    // The webhook and Kafka delivery tasks this stream can own run on the
+    // Event Plane, where no request identity exists and none can be resolved
     // across the Data→Event bus, so the scope their column redaction is keyed
     // on has to be resolved here and carried by the definition itself.
     let subscriber_roles =
@@ -159,17 +156,15 @@ pub fn create_change_stream(
         owner: identity.username.clone(),
         created_at: now,
         subscriber_roles,
+        modification_hlc: nodedb_types::Hlc::ZERO,
     };
 
     let has_webhook = def.webhook.is_configured();
     let webhook_config = def.webhook.clone();
     let kafka_config = def.kafka.clone();
 
-    let entry = crate::control::catalog_entry::CatalogEntry::PutChangeStream(Box::new(def.clone()));
-    let outcome = propose_and_apply(state, &entry)?;
-    if outcome.needs_local_apply() {
-        state.stream_registry.register(def.clone());
-    }
+    let entry = crate::control::catalog_entry::CatalogEntry::PutChangeStream(Box::new(def));
+    propose_and_apply_async(state, &entry).await?;
 
     if has_webhook {
         state

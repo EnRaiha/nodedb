@@ -408,7 +408,7 @@ mod tests {
     /// Seed one source collection carrying a vector index, a vector model row,
     /// and column statistics.
     fn seed_source(catalog: &SystemCatalog) {
-        let mut coll = StoredCollection::new(TENANT, "chunks", "cloner");
+        let mut coll = StoredCollection::stamped_for_test(TENANT, "chunks", "cloner");
         coll.database_id = SOURCE;
         catalog
             .put_collection(SOURCE, &coll)

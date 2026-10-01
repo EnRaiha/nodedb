@@ -68,7 +68,8 @@ pub async fn drop_consumer_group(
         tenant_id,
         &stream_name,
         &group_name,
-    )?;
+    )
+    .await?;
 
     if state
         .group_registry
@@ -83,7 +84,8 @@ pub async fn drop_consumer_group(
 
     // The entry carries the registry teardown and the committed-offset delete
     // to every node; the offset store is node-local and no entry can hold it.
-    super::replicate::propose_delete(state, database_id, tenant_id, &stream_name, &group_name)?;
+    super::replicate::propose_delete(state, database_id, tenant_id, &stream_name, &group_name)
+        .await?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

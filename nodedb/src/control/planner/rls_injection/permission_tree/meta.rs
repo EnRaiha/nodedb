@@ -24,6 +24,14 @@ pub(super) fn apply_meta(ctx: &PermCtx<'_>, op: &mut MetaOp) -> crate::Result<()
             )
         }
 
+        // Refuse: hash-chain verification recomputes every link from every
+        // stored row, including the ones outside the subtree.
+        MetaOp::VerifyHashChain { collection } => ctx.refuse_if_tree(
+            collection,
+            "hash-chain verification reads every stored row, which the subtree filter cannot be \
+             evaluated against",
+        ),
+
         // Refuse: a byte-size estimate is derived from every stored row of the
         // collection, including the ones outside the subtree, and carries no
         // resource column to filter on. `name` is a bare collection name —
@@ -95,14 +103,15 @@ pub(super) fn apply_meta(ctx: &PermCtx<'_>, op: &mut MetaOp) -> crate::Result<()
         | MetaOp::RebuildIndex { .. }
         | MetaOp::PutSynonymGroup { .. }
         | MetaOp::DeleteSynonymGroup { .. }
-        | MetaOp::RenameCollection { .. }
         | MetaOp::DropTxnOverlay { .. }
         | MetaOp::MarkSavepoint { .. }
         | MetaOp::RollbackToSavepoint { .. }
         | MetaOp::CalvinFlush { .. }
         | MetaOp::CalvinDrop { .. }
         | MetaOp::CalvinResolve { .. }
-        | MetaOp::ApplyTransactionRedo { .. } => Ok(()),
+        | MetaOp::ApplyTransactionRedo { .. }
+        | MetaOp::RestoreRedo(_)
+        | MetaOp::HomeVersions { .. } => Ok(()),
     }
 }
 
@@ -138,6 +147,8 @@ mod tests {
         let mut plan = PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot {
             tenant_id: 1,
             cut_watermark: None,
+            cut_capture: None,
+            arrays: false,
         });
         assert!(matches!(
             apply(&mut plan, &cache),

@@ -219,16 +219,26 @@ mod tests {
             .expect_err("a corrupt index file must fail the load, not skip it");
     }
 
-    /// A bare `VectorPut` record (collection, vector, dim) at `lsn`.
+    /// An unfielded single-insert `VectorPut` record at `lsn`, its vector bound
+    /// to a surrogate numbered after the LSN.
     fn vector_put(lsn: u64, vector: Vec<f32>) -> nodedb_wal::WalRecord {
         let dim = vector.len();
+        let payload = crate::control::server::wal_dispatch::encode_vector_put_payload(
+            "emb",
+            &vector,
+            dim,
+            "",
+            nodedb_types::Surrogate::new(lsn as u32),
+            None,
+        )
+        .expect("encode put");
         nodedb_wal::WalRecord::new(nodedb_wal::record::WalRecordArgs {
             record_type: nodedb_wal::record::RecordType::VectorPut as u32,
             lsn,
             tenant_id: 1,
             vshard_id: 0,
             database_id: 0,
-            payload: zerompk::to_msgpack_vec(&("emb", vector, dim)).expect("encode put"),
+            payload,
             encryption_key: None,
             preamble_bytes: None,
         })

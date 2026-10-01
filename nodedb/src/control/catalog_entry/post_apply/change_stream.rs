@@ -24,6 +24,8 @@ pub fn put(stored: ChangeStreamDef, shared: Arc<SharedState>) {
         &stored.owner,
         &shared,
     );
+    // The sink groups exist before any offset commit of theirs applies.
+    crate::event::cdc::sink_owner::register_sink_groups(&shared.group_registry, &stored);
     shared.stream_registry.register(stored);
 }
 
@@ -42,9 +44,9 @@ pub fn delete(database_id: u64, tenant_id: u64, name: String, shared: Arc<Shared
     // 3. Cascade consumer-group teardown. Every group scoped to this
     //    stream must have its in-memory registry entry dropped AND
     //    its persisted offset state wiped — otherwise a `CREATE
-    //    CHANGE STREAM` with the same name after a drop would
-    //    resume from a stale consumer-group offset and silently
-    //    skip real events.
+    //    CHANGE STREAM` with the same name after a drop
+    //    resumes from a stale consumer-group offset and silently
+    //    skips real events.
     let database_id = crate::types::DatabaseId::new(database_id);
     let groups = shared
         .group_registry

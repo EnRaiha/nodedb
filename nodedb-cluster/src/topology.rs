@@ -5,6 +5,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+use crate::rpc_codec::JoinNodeInfo;
+
 /// Wire format version carried on every `NodeInfo`. Re-exported from
 /// `nodedb_types::wire_version`, which is the single source of truth
 /// shared with `nodedb::version` and any other crate that needs to
@@ -128,6 +130,10 @@ pub struct NodeInfo {
     /// transmitted its identity fields.
     #[serde(default = "default_spki_pin")]
     pub spki_pin: Option<[u8; 32]>,
+    /// Bound UDP address of this node's SWIM failure detector. Peers seed
+    /// SWIM from it. `None` for a node that runs no SWIM detector.
+    #[serde(default)]
+    pub swim_addr: Option<String>,
 }
 
 impl NodeInfo {
@@ -143,6 +149,7 @@ impl NodeInfo {
             wire_version: CLUSTER_WIRE_FORMAT_VERSION,
             spiffe_id: None,
             spki_pin: None,
+            swim_addr: None,
         }
     }
 
@@ -166,8 +173,57 @@ impl NodeInfo {
         self
     }
 
+    /// Set the SWIM address this node advertises. Builder-style.
+    pub fn with_swim_addr(mut self, swim_addr: Option<SocketAddr>) -> Self {
+        self.swim_addr = swim_addr.map(|a| a.to_string());
+        self
+    }
+
     pub fn socket_addr(&self) -> Option<SocketAddr> {
         self.addr.parse().ok()
+    }
+
+    /// The advertised SWIM address, if present and parseable.
+    pub fn swim_socket_addr(&self) -> Option<SocketAddr> {
+        self.swim_addr.as_deref().and_then(|a| a.parse().ok())
+    }
+
+    /// Wire form carried in join responses and topology updates.
+    pub fn to_wire(&self) -> JoinNodeInfo {
+        JoinNodeInfo {
+            node_id: self.node_id,
+            addr: self.addr.clone(),
+            state: self.state.as_u8(),
+            raft_groups: self.raft_groups.clone(),
+            wire_version: self.wire_version,
+            spiffe_id: self.spiffe_id.clone(),
+            spki_pin: self.spki_pin.map(|arr| arr.to_vec()),
+            swim_addr: self.swim_addr.clone(),
+        }
+    }
+
+    /// Rebuild a `NodeInfo` from its wire form.
+    ///
+    /// An unknown state reads as `Active`. An unparseable address keeps the
+    /// unspecified address, so the entry stays visible but unroutable. A pin
+    /// that is not 32 bytes is dropped.
+    pub fn from_wire(node: &JoinNodeInfo) -> Self {
+        let state = NodeState::from_u8(node.state).unwrap_or(NodeState::Active);
+        let spki_pin: Option<[u8; 32]> = node
+            .spki_pin
+            .as_deref()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok());
+        let addr = node
+            .addr
+            .parse()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+        let mut info = NodeInfo::new(node.node_id, addr, state)
+            .with_wire_version(node.wire_version)
+            .with_spiffe_id(node.spiffe_id.clone())
+            .with_spki_pin(spki_pin);
+        info.raft_groups = node.raft_groups.clone();
+        info.swim_addr = node.swim_addr.clone();
+        info
     }
 }
 
@@ -250,6 +306,12 @@ impl ClusterTopology {
 
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Take the version of a topology adopted wholesale from a peer, so the
+    /// next version comparison sees the two as equal.
+    pub(crate) fn adopt_version(&mut self, version: u64) {
+        self.version = version;
     }
 
     pub fn contains(&self, node_id: u64) -> bool {

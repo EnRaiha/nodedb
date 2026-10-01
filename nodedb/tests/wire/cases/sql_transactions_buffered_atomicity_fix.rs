@@ -13,9 +13,8 @@
 //! until COMMIT (read-your-own-writes is lost for the buffered ops). Array
 //! writes are the exception: `ArrayOp::{Put, Delete}` stages into
 //! `ArrayTxnOverlay` at statement time, so a same-transaction read sees it
-//! (`array_insert_in_txn_visible_to_same_txn_read` below, on a standalone
-//! server; the full contract lives in `sql_transactions_array_overlay.rs`
-//! and, for the cluster wrapper, `sql_transactions_cluster_array_overlay.rs`).
+//! (`array_insert_in_txn_visible_to_same_txn_read` below; the full contract
+//! lives in `sql_transactions_cluster_array_overlay.rs`).
 //!
 //! `CrdtOp` and `VectorOp` flipped variants have no direct SQL entry point on
 //! the existing pgwire surface, so the fix is pinned via the Array and
@@ -23,18 +22,15 @@
 //! COMMIT-replay path.
 //!
 //! `INSERT INTO ARRAY` / `DELETE FROM ARRAY` do not plan as `ArrayOp` on the
-//! default `TestServer::start()`. Whenever a cluster topology exists -- which
-//! that server has, since `server.single_node_calvin` defaults on --
+//! default `TestServer::start()`. Every server runs a cluster topology, so
 //! `plan_sql()` emits the Control-Plane routing wrapper
 //! `ClusterArrayOp::{Put, Delete}` instead (`array_convert/dml.rs`, gated on
 //! `ctx.cluster_enabled`). The wrapper has no Data-Plane handler, so the
 //! staging gate reshapes it into one `ArrayOp::{Put, Delete}` per owning
 //! vShard (`session::txn_expand`), buffers every per-shard task, and stages
 //! each into its shard's overlay (`session::array_fanout_stage`); COMMIT
-//! replays the buffered tasks. The atomicity cases below therefore exercise
-//! the wrapper end to end. The read-your-own-writes case uses
-//! `TestServer::start_standalone()`, where the planner emits the single-node
-//! `ArrayOp` form.
+//! replays the buffered tasks. Every case below therefore exercises the
+//! wrapper end to end.
 
 use crate::harness::TestServer;
 
@@ -132,13 +128,13 @@ async fn array_delete_rollback_restores_cell() {
     );
 }
 
-/// On a standalone server the single-node `ArrayOp::Put` stages into
-/// `ArrayTxnOverlay` at statement time, so a read later in the SAME
-/// transaction observes the cell before COMMIT, ROLLBACK removes it, and a
-/// base cell committed before BEGIN survives.
+/// Each per-shard `ArrayOp::Put` stages into its shard's `ArrayTxnOverlay`
+/// at statement time, so a read later in the SAME transaction observes the
+/// cell before COMMIT, ROLLBACK removes it, and a base cell committed before
+/// BEGIN survives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn array_insert_in_txn_visible_to_same_txn_read() {
-    let server = TestServer::start_standalone().await;
+    let server = TestServer::start().await;
     setup_array(&server, "arr_atomic_ryow").await;
     server
         .exec("INSERT INTO ARRAY arr_atomic_ryow COORDS (5, 5) VALUES (2.0)")

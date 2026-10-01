@@ -2,13 +2,10 @@
 
 //! Handler for `SHOW DATABASE MIRROR STATUS [FOR <name>]`.
 //!
-//! Ported from the pgwire `ddl::database::mirror::show` handler. The tenant-admin
-//! gate, catalog list, mirror-only filtering, `FOR <name>` filter, status /
-//! mode / lag rendering, `mirror_lag` fallback reads, and the not-found error
-//! for a specific name are preserved verbatim; only the result construction
-//! changed from pgwire `QueryResponse` to the protocol-neutral [`DdlResult`]
-//! over `ShapedRows`. Every column is a `text_field` in the original, so all
-//! columns stay `Text`.
+//! The tenant-admin gate, catalog list, mirror-only filtering, `FOR <name>`
+//! filter, status / mode / lag rendering, `mirror_lag` fallback reads, and
+//! the not-found error for a specific name run here. The result is the
+//! protocol-neutral [`DdlResult`] over `ShapedRows`. Every column is `Text`.
 
 use serde_json::{Map, Value as JsonValue};
 

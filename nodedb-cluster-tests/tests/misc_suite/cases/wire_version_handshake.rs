@@ -36,6 +36,8 @@ impl RaftRpcHandler for EchoHandler {
                     term: req.term,
                     success: true,
                     last_log_index: req.prev_log_index,
+                    round: req.round,
+                    needs_snapshot: false,
                 }))
             }
             other => Err(ClusterError::Transport {
@@ -337,6 +339,8 @@ fn sample_append(term: u64) -> AppendEntriesRequest {
         entries: vec![],
         leader_commit: 0,
         group_id: 0,
+        round: 1,
+        replicated_floor: 0,
     }
 }
 
@@ -441,6 +445,7 @@ fn handshake_capabilities_roundtrip() {
     let hs = VersionHandshake {
         range: (r.min.0, r.max.0),
         capabilities: caps,
+        build_id: "test-build".to_owned(),
     };
     let bytes = zerompk::to_msgpack_vec(&hs).unwrap();
     let decoded: VersionHandshake = zerompk::from_msgpack(&bytes).unwrap();
@@ -455,6 +460,7 @@ fn ack_capabilities_roundtrip() {
     let ack = VersionHandshakeAck {
         agreed: 2,
         capabilities: caps,
+        build_id: "test-build".to_owned(),
     };
     let bytes = zerompk::to_msgpack_vec(&ack).unwrap();
     let decoded: VersionHandshakeAck = zerompk::from_msgpack(&bytes).unwrap();
@@ -469,6 +475,7 @@ fn capabilities_non_zero_accepted_in_negotiation() {
     let hs = VersionHandshake {
         range: (r.min.0, r.max.0),
         capabilities: u64::MAX,
+        build_id: "test-build".to_owned(),
     };
     let bytes = zerompk::to_msgpack_vec(&hs).unwrap();
     let decoded: VersionHandshake = zerompk::from_msgpack(&bytes).unwrap();
@@ -571,6 +578,7 @@ async fn handshake_rejects_incompatible_versions() {
                 let ack = VersionHandshakeAck {
                     agreed: u16::MAX,
                     capabilities: 0,
+                    build_id: "fake-server-build".to_owned(),
                 };
                 let payload = zerompk::to_msgpack_vec(&ack).unwrap();
                 write_framed_raw(&mut send, &payload).await;
@@ -623,8 +631,10 @@ fn handle_join_request_rejects_incompatible_wire_version() {
         node_id: 2,
         listen_addr: "10.0.0.2:9400".into(),
         wire_version: 0,
+        build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
         spiffe_id: None,
         spki_pin: None,
+        swim_addr: None,
     };
 
     let resp = handle_join_request(&req, &mut topology, &routing, 42);
@@ -674,6 +684,7 @@ async fn mismatch_does_not_dispatch_rpc() {
             let hs = VersionHandshake {
                 range: (u16::MAX - 1, u16::MAX),
                 capabilities: 0,
+                build_id: "raw-client-build".to_owned(),
             };
             let payload = zerompk::to_msgpack_vec(&hs).unwrap();
             write_framed_raw(&mut send, &payload).await;
@@ -709,6 +720,7 @@ async fn mismatch_closes_quic_connection_with_app_error() {
             let hs = VersionHandshake {
                 range: (u16::MAX - 1, u16::MAX),
                 capabilities: 0,
+                build_id: "raw-client-build".to_owned(),
             };
             let payload = zerompk::to_msgpack_vec(&hs).unwrap();
             write_framed_raw(&mut send, &payload).await;

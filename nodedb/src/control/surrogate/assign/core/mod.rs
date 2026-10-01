@@ -14,12 +14,14 @@
 //! advance past a non-durable hwm.
 //!
 //! The cross-node HiLo reservation path (multi-node batch reservation +
-//! the background refill loop that keeps the blocking metadata-Raft
-//! round-trip OFF this hot path) lives in the sibling
-//! [`super::cluster_reserve`] module.
+//! the background refill loop that keeps the metadata-Raft round-trip OFF
+//! this hot path) lives in the sibling [`super::cluster_reserve`] module.
 
 mod assign_ops;
+mod draw;
 mod flush;
+mod home;
 mod types;
 
+pub use home::HomeSurrogateAuthority;
 pub use types::{SurrogateAssigner, SurrogateRegistryHandle};

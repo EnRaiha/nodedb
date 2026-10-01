@@ -10,7 +10,7 @@ use super::super::DispatchCtx;
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::VectorOp;
 
-pub(crate) fn build_search(
+pub(crate) async fn build_search(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -49,7 +49,7 @@ pub(crate) fn build_search(
     }))
 }
 
-pub(crate) fn build_batch_insert(
+pub(crate) async fn build_batch_insert(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -74,10 +74,14 @@ pub(crate) fn build_batch_insert(
     let assigner = &ctx.state.surrogate_assigner;
     let mut surrogates = Vec::with_capacity(vectors.len());
     for _ in &vectors {
-        surrogates.push(assigner.assign_anonymous(
-            nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-            ctx.tenant_id(),
-        )?);
+        surrogates.push(
+            assigner
+                .assign_anonymous(
+                    nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
+                    ctx.tenant_id(),
+                )
+                .await?,
+        );
     }
 
     Ok(PhysicalPlan::Vector(VectorOp::BatchInsert {
@@ -88,7 +92,7 @@ pub(crate) fn build_batch_insert(
     }))
 }
 
-pub(crate) fn build_insert(
+pub(crate) async fn build_insert(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -107,18 +111,16 @@ pub(crate) fn build_insert(
     let assigner = &ctx.state.surrogate_assigner;
     let (surrogate, pk_bytes) = match fields.document_id.as_deref() {
         Some(pk) if !pk.is_empty() => (
-            assigner.assign(
-                nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-                ctx.tenant_id(),
-                pk.as_bytes(),
-            )?,
+            super::helpers::assign_surrogate(ctx, collection, pk.as_bytes()).await?,
             Some(pk.as_bytes().to_vec()),
         ),
         _ => (
-            assigner.assign_anonymous(
-                nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-                ctx.tenant_id(),
-            )?,
+            assigner
+                .assign_anonymous(
+                    nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
+                    ctx.tenant_id(),
+                )
+                .await?,
             None,
         ),
     };
@@ -134,7 +136,7 @@ pub(crate) fn build_insert(
     }))
 }
 
-pub(crate) fn build_multi_search(
+pub(crate) async fn build_multi_search(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -158,7 +160,7 @@ pub(crate) fn build_multi_search(
     }))
 }
 
-pub(crate) fn build_delete(
+pub(crate) async fn build_delete(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,

@@ -50,7 +50,7 @@ pub async fn propose_calvin_read_result(
             values: values_payload,
         },
     );
-    let data = entry.to_bytes();
+    let data = entry.encode()?;
     raft_proposer(vshard_id, data)?;
     Ok(())
 }

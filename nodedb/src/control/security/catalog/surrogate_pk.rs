@@ -24,10 +24,9 @@
 use nodedb_types::{CollectionKey, DatabaseId, Surrogate, TenantId};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
-#[allow(unused_imports)] // SURROGATE_PK_REV_LEGACY is used only in #[cfg(test)] helpers
 use super::types::{
-    SURROGATE_PK_LEGACY, SURROGATE_PK_REV_LEGACY, SURROGATE_PK_REV_V2, SURROGATE_PK_REV_V3,
-    SURROGATE_PK_V2, SURROGATE_PK_V3, SystemCatalog, catalog_err,
+    SURROGATE_PK_LEGACY, SURROGATE_PK_REV_V2, SURROGATE_PK_REV_V3, SURROGATE_PK_V2,
+    SURROGATE_PK_V3, SystemCatalog, catalog_err,
 };
 
 impl SystemCatalog {

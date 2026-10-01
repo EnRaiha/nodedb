@@ -10,7 +10,7 @@ use super::catalog::mark_collection_edge_bearing;
 use super::extract::{extract_edge, weight_properties};
 use crate::control::server::surrogate_exchange::assign_surrogate_routed;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, RecordHomes, TenantId, TraceId};
 
 /// Scan the current document-write tasks for `_from` / `_to` documents and
 /// append a `GraphOp::EdgePut` task per implicit edge.
@@ -25,7 +25,7 @@ use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 /// is derived from a `DocumentOp` write on the same collection, that write was
 /// already decided against the collection's write policy before this runs, and
 /// a denial there fails the statement before any mirror is derived. Deciding
-/// the mirror as well would refuse every governed document insert on the
+/// the mirror as well will refuse every governed document insert on the
 /// strength of its own edge, whose property object holds a weight and none of
 /// the columns a policy names.
 pub async fn append_implicit_edge_tasks(
@@ -79,17 +79,17 @@ pub async fn append_implicit_edge_tasks(
     }
 
     for edge in edges {
-        let vsrc = VShardId::from_key(edge.src.as_bytes());
-        let vdst = VShardId::from_key(edge.dst.as_bytes());
+        // The write routes to the source endpoint's home. Both endpoints'
+        // surrogates come from the collection home, where every key of the
+        // collection is minted.
+        let vsrc = RecordHomes::edge(&edge.src, &edge.dst).owner();
 
         // `edge.collection` is the plan's database-qualified name.
         let key = nodedb_types::CollectionKey::from_qualified_str(database_id, &edge.collection)?;
         let src_surrogate =
-            assign_surrogate_routed(state, vsrc, key, tenant_id, edge.src.as_bytes(), trace_id)
-                .await?;
+            assign_surrogate_routed(state, key, tenant_id, edge.src.as_bytes(), trace_id).await?;
         let dst_surrogate =
-            assign_surrogate_routed(state, vdst, key, tenant_id, edge.dst.as_bytes(), trace_id)
-                .await?;
+            assign_surrogate_routed(state, key, tenant_id, edge.dst.as_bytes(), trace_id).await?;
 
         let properties = match edge.weight {
             Some(w) => weight_properties(w),

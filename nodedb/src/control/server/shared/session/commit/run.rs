@@ -15,7 +15,6 @@ use crate::control::state::SharedState;
 use super::super::commit_calvin;
 use super::super::commit_fence;
 use super::super::connection::SessionId;
-use super::super::ddl_buffer::DdlBuffer;
 use super::super::ddl_compensate;
 use super::super::ddl_flush::{self, DdlCommitPlan};
 use super::super::outcome::{AbortReason, CommitOutcome, TxnDataPlane};
@@ -23,20 +22,24 @@ use super::super::overlay_drop::drop_txn_overlay;
 use super::super::reservation_release;
 use super::super::store::SessionStore;
 use super::conflict::si_conflict_abort;
+use super::homed_reads::homed_read_abort;
 use super::metering::meter_committed_buffered_writes;
 use super::restart_identity::restart_truncated_identities;
-use super::single_shard::dispatch_single_shard;
+use super::single_shard::{commit_publishes, dispatch_single_shard};
 
 /// Reverse whatever `begin_commit` already finalized to the catalog before a
 /// dispatch failure that follows it. Called on every abort path reachable
 /// after `finalize_pending` — the caller still aborts either way, since the
 /// durable batch never dispatched; a compensation failure is surfaced in the
 /// trace alongside the original failure rather than swallowed.
-fn compensate_finalized_ddl(state: &SharedState, compensation: &Option<Vec<PendingDdlObject>>) {
+async fn compensate_finalized_ddl(
+    state: &SharedState,
+    compensation: &Option<Vec<PendingDdlObject>>,
+) {
     let Some(objects) = compensation else {
         return;
     };
-    if let Err(error) = ddl_compensate::compensate_finalized(state, objects) {
+    if let Err(error) = ddl_compensate::compensate_finalized(state, objects).await {
         tracing::error!(
             %error,
             "commit compensation failed: this transaction's finalized DDL may still be \
@@ -45,27 +48,25 @@ fn compensate_finalized_ddl(state: &SharedState, compensation: &Option<Vec<Pendi
     }
 }
 
-/// Reserve (and, for the replicated shape, finalize) this connection's
-/// buffered DDL. Called once no matter which dispatch shape follows, always
-/// after the fence check appropriate to that shape and always before any
-/// buffered DML dispatches — see `ddl_flush`'s module doc for why.
+/// Reserve and finalize this connection's buffered DDL through the metadata
+/// group. Called once no matter which dispatch shape follows, always after
+/// the fence check appropriate to that shape and always before any buffered
+/// DML dispatches — see `ddl_flush`'s module doc for why.
 ///
-/// Returns the single-node buffer to apply with `flush_local` after dispatch
-/// (unchanged single-node behavior), and the replicated shape's reserved
-/// objects to compensate if dispatch later fails. `Err` aborts the whole
-/// COMMIT before anything durable happens.
-fn begin_ddl(
+/// Returns the reserved objects to compensate if dispatch later fails, or
+/// `None` when nothing was buffered. `Err` aborts the whole COMMIT before
+/// anything durable happens.
+async fn begin_ddl(
     state: &SharedState,
     sessions: &SessionStore,
     session_id: SessionId,
-) -> crate::Result<(Option<DdlBuffer>, Option<Vec<PendingDdlObject>>)> {
-    match ddl_flush::begin_commit(state, sessions, session_id)? {
-        DdlCommitPlan::None => Ok((None, None)),
-        DdlCommitPlan::Local(buffered) => Ok((Some(buffered), None)),
+) -> crate::Result<Option<Vec<PendingDdlObject>>> {
+    match ddl_flush::begin_commit(state, sessions, session_id).await? {
+        DdlCommitPlan::None => Ok(None),
         DdlCommitPlan::Pending(handle) => {
             let objects = handle.objects().to_vec();
-            ddl_flush::finalize_pending(state, handle)?;
-            Ok((None, Some(objects)))
+            ddl_flush::finalize_pending(state, handle).await?;
+            Ok(Some(objects))
         }
     }
 }
@@ -82,6 +83,9 @@ pub async fn run_commit(
     state: &SharedState,
     dp: &impl TxnDataPlane,
 ) -> CommitOutcome {
+    // A graph read made earlier in the same request as this COMMIT is still
+    // pending in the connection scope. It joins the read-set before validation.
+    super::super::graph_reads::record_pending(sessions, session_id);
     let read_set = sessions.take_read_set(session_id);
     // The engine side effects this transaction's index DDL deferred. They run
     // once its catalog entries landed, below. An abort before then drops them
@@ -100,6 +104,14 @@ pub async fn run_commit(
     // buffered batch is flushed to Calvin as the COMMIT finalization (see
     // `run_commit_calvin`), then `sessions.commit` below drains the buffer.
     let buffered = sessions.buffered_tasks(session_id);
+    // The lines the statements reported rejected, to compare with COMMIT's.
+    let ts_preview = super::ts_rejections::preview_by_collection(
+        &buffered,
+        &sessions.ts_preview_rejected(session_id),
+    );
+    // The messages the transaction's trigger bodies published. They commit in
+    // its redo record, and the Event Plane delivers them from there.
+    let publishes = sessions.take_pending_publishes(session_id);
     let tenant_id = identity.tenant_id;
     // The interactive-COMMIT read-set widens dispatch classification: a txn that
     // writes shard X but read shard Y participates in {X, Y} and must route
@@ -121,21 +133,15 @@ pub async fn run_commit(
     // concrete point ops — no raw `Merge` / `UpdateFromJoin` / `InsertSelect`
     // plan remains to expand here, and COMMIT invokes no expander at all.
 
-    // Buffered transactional DDL, decided (and, for the replicated shape,
-    // finalized to the catalog) before any buffered DML dispatches — see
-    // `ddl_flush`'s module doc for why finalize must precede dispatch.
-    // `ddl_local_buffer` carries a single-node buffer forward to the same
-    // post-dispatch point `flush_local` always ran at (unchanged single-node
-    // behavior). The replicated shape's reserved objects are handled inline
-    // in each branch below, not hoisted here: only the buffered-DML branch
-    // dispatches anything afterward that could fail in a way compensation
-    // would undo.
-    let ddl_local_buffer: Option<DdlBuffer>;
-
+    // Buffered transactional DDL is finalized to the catalog before any
+    // buffered DML dispatches — see `ddl_flush`'s module doc for why finalize
+    // must precede dispatch. The reserved objects are handled inline in each
+    // branch below, not hoisted here: only the buffered-DML branch dispatches
+    // anything afterward that can fail in a way compensation will undo.
     if buffered.is_empty() {
         // Read-only interactive transaction: no writes to classify, but it can
         // still serialization-conflict against concurrent writers. Run the
-        // single-shard SI validation only — classifying an empty buffer would
+        // single-shard SI validation only — classifying an empty buffer will
         // misread a lone cross-shard READ as `MultiShard` and wrongly reject it.
         if let Some(outcome) =
             si_conflict_abort(sessions, session_id, state, &read_set, &written_collections)
@@ -144,9 +150,14 @@ pub async fn run_commit(
             reservation_release::release_and_rollback(state, sessions, session_id).await;
             return outcome;
         }
-        // No buffered DML for this DDL to race, so finalize (or stash) it here,
+        // SI skips homed reads (the vShards a cross-shard graph read observed).
+        // Each is checked on its home vShard instead.
+        if let Some(outcome) = homed_read_abort(state, sessions, session_id, &read_set).await {
+            return outcome;
+        }
+        // No buffered DML for this DDL to race, so finalize it here,
         // symmetrically with the buffered branch below.
-        let (local, _finalized_objects) = match begin_ddl(state, sessions, session_id) {
+        let ddl_compensation = match begin_ddl(state, sessions, session_id).await {
             Ok(result) => result,
             Err(error) => {
                 reservation_release::release_and_rollback(state, sessions, session_id).await;
@@ -155,13 +166,17 @@ pub async fn run_commit(
                 };
             }
         };
-        // Nothing dispatches after this in the empty-buffer path — the
-        // function's remaining steps (metering, session drain, offset/GAP_FREE
-        // finalize, `flush_local`, field-inference merge) cannot report a
-        // buffered-DML dispatch failure, so a replicated finalize here has
-        // nothing left to compensate. Discard the reserved objects rather
-        // than tracking them for a compensation call that would never fire.
-        ddl_local_buffer = local;
+        // A transaction whose bodies published with no buffered write (an
+        // INSTEAD OF body that replaced every write) commits its messages in
+        // a redo record of their own. Nothing else dispatches in this path:
+        // the remaining steps (metering, session drain, offset/GAP_FREE
+        // finalize, field-inference merge) report no dispatch failure for a
+        // finalize to compensate.
+        if let Some(reason) = commit_publishes(state, tenant_id, publishes).await {
+            compensate_finalized_ddl(state, &ddl_compensation).await;
+            reservation_release::release_and_rollback(state, sessions, session_id).await;
+            return CommitOutcome::Aborted { reason };
+        }
     } else {
         // Every buffered write was planned at STATEMENT time and is dispatched
         // only now, so the catalog has had the whole open block to move on.
@@ -176,11 +191,11 @@ pub async fn run_commit(
             reservation_release::release_and_rollback(state, sessions, session_id).await;
             return CommitOutcome::Aborted { reason };
         }
-        // Reserve (and, for the replicated shape, finalize) the buffered DDL
-        // BEFORE dispatching any buffered DML: a crash after this point leaves
-        // a real, cataloged, empty, droppable collection rather than rows
-        // durable in a collection with no catalog row anywhere.
-        let (local, ddl_compensation) = match begin_ddl(state, sessions, session_id) {
+        // Reserve and finalize the buffered DDL BEFORE dispatching any
+        // buffered DML: a crash after this point leaves a real, cataloged,
+        // empty, droppable collection rather than rows durable in a
+        // collection with no catalog row anywhere.
+        let ddl_compensation = match begin_ddl(state, sessions, session_id).await {
             Ok(result) => result,
             Err(error) => {
                 reservation_release::release_and_rollback(state, sessions, session_id).await;
@@ -189,7 +204,6 @@ pub async fn run_commit(
                 };
             }
         };
-        ddl_local_buffer = local;
         match classify_dispatch(&buffered, &read_vshards) {
             DispatchClass::MultiShard { .. } => {
                 // Flush the buffered cross-shard batch through Calvin's durable
@@ -199,11 +213,22 @@ pub async fn run_commit(
                 // and returns a serialization abort (SQLSTATE 40001) on an ABORT
                 // verdict.
                 if let Some(reason) = commit_calvin::run_commit_calvin(
-                    sessions, session_id, state, &buffered, tenant_id, &read_set,
+                    sessions,
+                    session_id,
+                    state,
+                    commit_calvin::CalvinCommit {
+                        buffered: &buffered,
+                        tenant_id,
+                        reads: &read_set,
+                        event_source: dp.event_source(),
+                        publishes: &publishes,
+                        applied_key: dp.applied_key().zip(dp.applied_key_vshard()),
+                        ts_preview: &ts_preview,
+                    },
                 )
                 .await
                 {
-                    compensate_finalized_ddl(state, &ddl_compensation);
+                    compensate_finalized_ddl(state, &ddl_compensation).await;
                     reservation_release::release_and_rollback(state, sessions, session_id).await;
                     return CommitOutcome::Aborted { reason };
                 }
@@ -214,19 +239,35 @@ pub async fn run_commit(
                         state,
                         vshard_id.as_u32(),
                     );
-                if !matches!(leader, RouteDecision::Local) {
+                if !matches!(leader, RouteDecision::Local)
+                    || crate::control::planner::calvin::writes_edges(&buffered)
+                {
                     // The interactive transaction WAL record belongs to this
                     // coordinator and cannot be forwarded as a bare remote
                     // Data-Plane LSN. Route a non-local single-shard commit
                     // through Calvin's replicated Vote/Verdict barrier instead;
                     // this gives it the same leader routing, OCC, durability,
                     // and apply ordering as any multi-participant commit.
+                    // A commit that writes an edge takes it too: every edge
+                    // version takes a Calvin ordinal, so it orders against a
+                    // TRUNCATE's cut on every replica.
                     if let Some(reason) = commit_calvin::run_commit_calvin(
-                        sessions, session_id, state, &buffered, tenant_id, &read_set,
+                        sessions,
+                        session_id,
+                        state,
+                        commit_calvin::CalvinCommit {
+                            buffered: &buffered,
+                            tenant_id,
+                            reads: &read_set,
+                            event_source: dp.event_source(),
+                            publishes: &publishes,
+                            applied_key: dp.applied_key().zip(dp.applied_key_vshard()),
+                            ts_preview: &ts_preview,
+                        },
                     )
                     .await
                     {
-                        compensate_finalized_ddl(state, &ddl_compensation);
+                        compensate_finalized_ddl(state, &ddl_compensation).await;
                         reservation_release::release_and_rollback(state, sessions, session_id)
                             .await;
                         return CommitOutcome::Aborted { reason };
@@ -239,15 +280,29 @@ pub async fn run_commit(
                         &read_set,
                         &written_collections,
                     ) {
-                        compensate_finalized_ddl(state, &ddl_compensation);
+                        compensate_finalized_ddl(state, &ddl_compensation).await;
                         reservation_release::release_and_rollback(state, sessions, session_id)
                             .await;
                         return outcome;
                     }
-                    if let Some(reason) =
-                        dispatch_single_shard(state, dp, &buffered, tenant_id, vshard_id).await
+                    if let Some(outcome) =
+                        homed_read_abort(state, sessions, session_id, &read_set).await
                     {
-                        compensate_finalized_ddl(state, &ddl_compensation);
+                        compensate_finalized_ddl(state, &ddl_compensation).await;
+                        return outcome;
+                    }
+                    if let Some(reason) = dispatch_single_shard(
+                        state,
+                        dp,
+                        &buffered,
+                        tenant_id,
+                        vshard_id,
+                        publishes,
+                        &ts_preview,
+                    )
+                    .await
+                    {
+                        compensate_finalized_ddl(state, &ddl_compensation).await;
                         reservation_release::release_and_rollback(state, sessions, session_id)
                             .await;
                         return CommitOutcome::Aborted { reason };
@@ -258,16 +313,16 @@ pub async fn run_commit(
     }
 
     // Every abort branch above has already returned, so every buffered write
-    // just durably committed. Meter the non-stageable ("Buffered") writes now
+    // durably committed. Meter the non-stageable ("Buffered") writes now
     // — this is the first point their dispatch has actually happened. A
     // stageable ("Staged") write was already metered at STATEMENT time
     // (`staging_gate::stage_write`, when it applied to the per-transaction
     // overlay), and is re-identified and skipped here by the exact same
     // `is_stageable_write` predicate `route_in_tx_write` uses to route it —
-    // metering it again here would double-bill it, since it is buffered for
+    // metering it again here will double-bill it, since it is buffered for
     // durable replay same as a non-stageable write. `buffered` still holds
     // the peeked (not yet drained) task list, so this reads the same tasks
-    // `dispatch_single_shard` / `run_commit_calvin` just replayed above.
+    // `dispatch_single_shard` / `run_commit_calvin` replayed above.
     meter_committed_buffered_writes(state, identity, &buffered);
 
     // A staged `TRUNCATE ... RESTART IDENTITY` resets its sequences only
@@ -329,22 +384,29 @@ pub async fn run_commit(
         }
     }
 
-    // Flush pending offset commits (deferred from COMMIT OFFSET inside transaction).
+    // Flush pending offset commits (deferred from COMMIT OFFSET inside
+    // transaction) through the replicated catalog, so every node holds them.
     let pending_offsets = sessions.take_pending_offsets(session_id);
     for pending_offset in pending_offsets {
-        if let Err(e) = state.offset_store.commit_offset(
-            pending_offset.database_id,
-            pending_offset.tenant_id,
-            &pending_offset.stream,
-            &pending_offset.group,
-            pending_offset.partition_id,
-            pending_offset.offset,
-        ) {
+        if let Err(e) =
+            crate::control::server::shared::ddl::neutral::consumer_group::commit::commit_group_offsets(
+                state,
+                pending_offset.database_id,
+                pending_offset.tenant_id,
+                &pending_offset.stream,
+                &pending_offset.group,
+                vec![crate::event::cdc::consumer_group::types::PartitionOffset::new(
+                    pending_offset.partition_id,
+                    pending_offset.offset,
+                )],
+            )
+            .await
+        {
             tracing::warn!(
                 stream = %pending_offset.stream,
                 group = %pending_offset.group,
                 partition = pending_offset.partition_id,
-                error = %e,
+                error = %e.message,
                 "failed to commit deferred offset"
             );
         }
@@ -371,25 +433,15 @@ pub async fn run_commit(
     }
 
     // The durable batch has flushed, so these holds have no remaining job.
-    // Released BEFORE the two flushes below: each proposes a descriptor version
-    // bump, which drains every lease at the prior version — including one this
-    // committing session still owns, which would never drain.
+    // Released BEFORE the field-inference merge below: it proposes a
+    // descriptor version bump, which drains every lease at the prior version —
+    // including one this committing session still owns, which will never
+    // drain.
     drop(lease_scopes);
-
-    // Single-node shape only: the replicated shape's DDL was already
-    // finalized to the catalog above, before dispatch. Unchanged single-node
-    // behavior — apply the buffer this connection stashed earlier, still at
-    // the same post-dispatch point `flush_local` has always run at, since
-    // there is no cross-node visibility problem in this shape to close.
-    if let Some(buffered) = ddl_local_buffer
-        && let Some(reason) = ddl_flush::flush_local(state, buffered)
-    {
-        return CommitOutcome::Aborted { reason };
-    }
 
     // Index DDL's engine work follows its catalog entries: backfills, index
     // teardown, analyzer bindings and sorted-index trees. A failure after the
-    // catalog landed reports as an abort, as a failed `flush_local` does.
+    // catalog landed reports as an abort.
     if let Err(error) =
         crate::control::server::shared::ddl::neutral::deferred_effects::run_deferred_effects(
             state,
@@ -404,7 +456,7 @@ pub async fn run_commit(
 
     // Record the schema fields this transaction's writes inferred, deferred
     // from statement time (`staging_gate`-buffered writes are planned against
-    // the descriptor version a statement-time bump would invalidate). The
+    // the descriptor version a statement-time bump will invalidate). The
     // transaction is already durable, so a failure here is logged, not raised:
     // the projection is rebuildable and the next write re-supplies the fields.
     for pending in sessions.take_pending_field_inference(session_id) {
@@ -414,7 +466,9 @@ pub async fn run_commit(
             pending.tenant_id,
             &pending.collection,
             &pending.fields,
-        ) {
+        )
+        .await
+        {
             tracing::warn!(
                 collection = %pending.collection,
                 error = %error,

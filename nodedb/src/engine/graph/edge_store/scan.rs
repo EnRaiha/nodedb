@@ -2,7 +2,7 @@
 
 //! Current-state scan + Ceiling-backed lookups and raw insert (snapshot restore).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use nodedb_types::{DatabaseId, TenantId};
 use redb::{ReadableDatabase, ReadableTable};
@@ -10,18 +10,33 @@ use redb::{ReadableDatabase, ReadableTable};
 use super::store::{
     BaseKey, EDGES, Edge, EdgeRecord, EdgeStore, REVERSE_EDGES, TenantBaseKey, redb_err,
 };
+use super::temporal::visibility::{
+    EDGE_APPLIED, EDGE_CUTS, cut_key, parse_cut_key, read_visibility,
+};
 use super::temporal::{
     EdgeRef, EdgeValuePayload, is_sentinel, parse_versioned_edge_key, versioned_edge_key,
 };
 
+/// A tenant's edge records in one database, as a snapshot captures them.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TenantEdgeScan {
+    /// Every forward version no TRUNCATE hides from a current read, as
+    /// `(versioned key, raw value)`. A backup carries these alone.
+    pub visible: Vec<(String, Vec<u8>)>,
+    /// Every forward version a TRUNCATE hides from a current read. A read
+    /// as of an earlier system time can still reach one, so a Raft snapshot
+    /// carries them with the cuts and applied ordinals.
+    pub hidden: Vec<(String, Vec<u8>)>,
+    /// Every cut, as `(collection, ordinal)`.
+    pub cuts: Vec<(String, i64)>,
+    /// Every applied ordinal, under its version's forward versioned key.
+    pub applied: Vec<(String, i64)>,
+}
+
 impl EdgeStore {
-    /// Scan every raw forward record belonging to a tenant
-    /// (versioned composite key + raw value bytes). Used by snapshot export.
-    pub fn scan_edges_for_tenant(
-        &self,
-        db: u64,
-        tid: TenantId,
-    ) -> crate::Result<Vec<(String, Vec<u8>)>> {
+    /// Scan every forward record, cut and applied ordinal belonging to a
+    /// tenant. Used by snapshot export.
+    pub fn scan_edges_for_tenant(&self, db: u64, tid: TenantId) -> crate::Result<TenantEdgeScan> {
         let t = tid.as_u64();
         let read_txn = self
             .db
@@ -30,16 +45,48 @@ impl EdgeStore {
         let table = read_txn
             .open_table(EDGES)
             .map_err(|e| redb_err("open edges", e))?;
+        let mut visibility = read_visibility(&read_txn)?;
 
-        let mut results = Vec::new();
+        let mut scan = TenantEdgeScan::default();
         let range = table
             .range((db, t, "")..(db, t + 1, ""))
             .map_err(|e| redb_err("edge range", e))?;
         for entry in range {
-            let entry = entry.map_err(|e| redb_err("edge entry", e))?;
-            results.push((entry.0.value().2.to_string(), entry.1.value().to_vec()));
+            let (key, value) = entry.map_err(|e| redb_err("edge entry", e))?;
+            let composite = key.value().2;
+            let record = (composite.to_string(), value.value().to_vec());
+            let hidden = match parse_versioned_edge_key(composite) {
+                Some((coll, _, _, _, sys)) => {
+                    visibility.hidden(db, t, coll, composite, sys, i64::MAX)?
+                }
+                None => false,
+            };
+            if hidden {
+                scan.hidden.push(record);
+            } else {
+                scan.visible.push(record);
+            }
         }
-        Ok(results)
+        for entry in visibility
+            .cuts
+            .range((db, t, "")..(db, t + 1, ""))
+            .map_err(|e| redb_err("edge cut range", e))?
+        {
+            let (key, _) = entry.map_err(|e| redb_err("edge cut entry", e))?;
+            if let Some((collection, cut)) = parse_cut_key(key.value().2) {
+                scan.cuts.push((collection.to_string(), cut));
+            }
+        }
+        for entry in visibility
+            .applied
+            .range((db, t, "")..(db, t + 1, ""))
+            .map_err(|e| redb_err("edge applied range", e))?
+        {
+            let (key, applied) = entry.map_err(|e| redb_err("edge applied entry", e))?;
+            scan.applied
+                .push((key.value().2.to_string(), applied.value()));
+        }
+        Ok(scan)
     }
 
     /// Scan every forward edge across all tenants in current-state,
@@ -59,17 +106,18 @@ impl EdgeStore {
         let table = read_txn
             .open_table(EDGES)
             .map_err(|e| redb_err("open edges", e))?;
+        let mut visibility = read_visibility(&read_txn)?;
 
-        let mut latest: HashMap<TenantBaseKey, (i64, Vec<u8>)> = HashMap::new();
-        let mut tombstoned: HashSet<TenantBaseKey> = HashSet::new();
-
+        // Keys sort by base, then by system time ascending, so the last
+        // visible version seen for a base is its newest.
+        let mut latest: HashMap<TenantBaseKey, Vec<u8>> = HashMap::new();
         for entry in table.iter().map_err(|e| redb_err("iter", e))? {
             let (k, v) = entry.map_err(|e| redb_err("iter entry", e))?;
             let (db, t, composite) = k.value();
             let Some((coll, src, label, dst, sys)) = parse_versioned_edge_key(composite) else {
                 continue;
             };
-            if sys > cutoff {
+            if sys > cutoff || visibility.hidden(db, t, coll, composite, sys, cutoff)? {
                 continue;
             }
             let base: TenantBaseKey = (
@@ -80,33 +128,14 @@ impl EdgeStore {
                 label.to_string(),
                 dst.to_string(),
             );
-            let bytes = v.value();
-            if is_sentinel(bytes) {
-                match latest.get(&base) {
-                    Some((cur_sys, _)) if *cur_sys > sys => {}
-                    _ => {
-                        latest.remove(&base);
-                        tombstoned.insert(base);
-                    }
-                }
-                continue;
-            }
-            if tombstoned.contains(&base) {
-                continue;
-            }
-            match latest.get(&base) {
-                Some((cur_sys, _)) if *cur_sys >= sys => {}
-                _ => match EdgeValuePayload::decode(bytes) {
-                    Ok(payload) => {
-                        latest.insert(base, (sys, payload.properties));
-                    }
-                    Err(_) => continue,
-                },
-            }
+            latest.insert(base, v.value().to_vec());
         }
 
         let mut out = Vec::with_capacity(latest.len());
-        for ((db, t, coll, src, label, dst), (_sys, props)) in latest {
+        for ((db, t, coll, src, label, dst), bytes) in latest {
+            if is_sentinel(&bytes) {
+                continue;
+            }
             out.push((
                 DatabaseId::new(db),
                 TenantId::new(t),
@@ -114,7 +143,7 @@ impl EdgeStore {
                 src,
                 label,
                 dst,
-                props,
+                EdgeValuePayload::decode(&bytes)?.properties,
             ));
         }
         Ok(out)
@@ -162,6 +191,65 @@ impl EdgeStore {
         Ok(())
     }
 
+    /// Insert a raw cut of `collection` at `cut` (for snapshot restore). The
+    /// snapshot's versions install with [`Self::put_edge_raw`], and the cuts
+    /// and applied ordinals with them, so every read resolves as it did on
+    /// the snapshot's source.
+    pub fn put_edge_cut_raw(
+        &self,
+        db: u64,
+        tid: TenantId,
+        collection: &str,
+        cut: i64,
+    ) -> crate::Result<()> {
+        let key = cut_key(collection, cut)?;
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| redb_err("begin_write", e))?;
+        {
+            let mut cuts = write_txn
+                .open_table(EDGE_CUTS)
+                .map_err(|e| redb_err("open edge_cuts", e))?;
+            cuts.insert((db, tid.as_u64(), key.as_str()), ())
+                .map_err(|e| redb_err("insert edge cut", e))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| redb_err("commit edge cut", e))
+    }
+
+    /// Insert a raw applied ordinal for the version under `composite_key`
+    /// (for snapshot restore). See [`Self::put_edge_cut_raw`].
+    pub fn put_edge_applied_raw(
+        &self,
+        db: u64,
+        tid: TenantId,
+        composite_key: &str,
+        applied: i64,
+    ) -> crate::Result<()> {
+        if parse_versioned_edge_key(composite_key).is_none() {
+            return Err(crate::Error::BadRequest {
+                detail: format!("put_edge_applied_raw: malformed versioned key {composite_key:?}"),
+            });
+        }
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| redb_err("begin_write", e))?;
+        {
+            let mut table = write_txn
+                .open_table(EDGE_APPLIED)
+                .map_err(|e| redb_err("open edge_applied", e))?;
+            table
+                .insert((db, tid.as_u64(), composite_key), applied)
+                .map_err(|e| redb_err("insert edge applied ordinal", e))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| redb_err("commit edge applied ordinal", e))
+    }
+
     /// Get an edge's current-state properties. `None` if no live version.
     pub fn get_edge(
         &self,
@@ -200,6 +288,7 @@ impl EdgeStore {
         let table = read_txn
             .open_table(EDGES)
             .map_err(|e| redb_err("open edges", e))?;
+        let mut visibility = read_visibility(&read_txn)?;
 
         let mut latest: HashMap<BaseKey, (i64, Vec<u8>)> = HashMap::new();
 
@@ -216,6 +305,9 @@ impl EdgeStore {
             let Some((coll, src, label, dst, sys)) = parse_versioned_edge_key(composite) else {
                 continue;
             };
+            if visibility.hidden(db, t, coll, composite, sys, i64::MAX)? {
+                continue;
+            }
             let base = (
                 coll.to_string(),
                 src.to_string(),
@@ -239,11 +331,8 @@ impl EdgeStore {
             if is_sentinel(&bytes) {
                 continue;
             }
-            let Ok(payload) = EdgeValuePayload::decode(&bytes) else {
-                continue;
-            };
             let mut edge = make_edge(&coll, &src, &label, &dst);
-            edge.properties = payload.properties;
+            edge.properties = EdgeValuePayload::decode(&bytes)?.properties;
             edges.push(edge);
         }
         Ok(edges)

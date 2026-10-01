@@ -16,15 +16,22 @@
 //!   proper voter / learner / promotion semantics.
 //! - [`membership`]: learner catch-up / promotion helpers
 //!   (`commit_index_for`, `ready_learners`, etc.) driven by the tick loop.
+//! - [`membership_sync`]: set a group's voters and learners from routing
+//!   after a snapshot install.
 //! - [`read_index`]: leadership confirmation for linearizable reads.
 
 pub mod conf_change;
 pub mod core;
 pub mod membership;
+pub mod membership_sync;
+pub mod mount;
+pub mod peer_contact;
 pub mod proposals;
 pub mod read_index;
 pub mod rpc_dispatch;
 pub mod status;
 
-pub use core::{MultiRaft, MultiRaftReady};
+pub use core::{MultiRaft, MultiRaftReady, SnapshotRequirement};
+pub use mount::{GroupMountSpec, OpenedGroup};
+pub use peer_contact::PeerAckSample;
 pub use status::{GroupMembership, GroupStatus};

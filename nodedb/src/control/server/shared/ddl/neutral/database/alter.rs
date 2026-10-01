@@ -2,12 +2,10 @@
 
 //! Handler for `ALTER DATABASE <name> <operation>`.
 //!
-//! Ported from the pgwire `ddl::database::alter` handler. Every per-operation
-//! privilege gate, catalog read/write, Raft propose / single-node fallback,
-//! live-cache / enforcement-component update, and audit record is preserved
-//! verbatim; only the result construction changed from pgwire `Response` to the
-//! protocol-neutral [`DdlResult`]. `MATERIALIZE` and `PROMOTE` delegate to the
-//! `materialize` / `mirror::promote` handlers exactly as before.
+//! Every per-operation privilege gate, catalog read, catalog propose,
+//! live-cache / enforcement-component update, and audit record runs here.
+//! The result is the protocol-neutral [`DdlResult`]. `MATERIALIZE` and
+//! `PROMOTE` delegate to the `materialize` / `mirror::promote` handlers.
 
 use nodedb_sql::ddl_ast::AlterDatabaseOperation;
 use nodedb_types::QuotaRecord;
@@ -17,14 +15,14 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::super::replicate::propose_and_apply;
+use super::super::replicate::propose_and_apply_async;
 use super::gate::{require_cluster_admin, require_database_owner};
 use super::support::{ddl_err, status};
 
 /// Handle `ALTER DATABASE <name> <operation>`.
 ///
 /// Required role varies by operation (see per-arm gates below).
-pub fn alter_database(
+pub async fn alter_database(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
@@ -67,15 +65,11 @@ pub fn alter_database(
                 }
             }
             descriptor.name = new_name.clone();
-            propose_and_apply(
+            propose_and_apply_async(
                 state,
                 &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
-                || {
-                    catalog
-                        .put_database(&descriptor)
-                        .map_err(|e| DdlError::from_error_in_context("catalog write failed", &e))
-                },
-            )?;
+            )
+            .await?;
 
             state.audit_record_with_db(
                 crate::control::security::audit::AuditEvent::DatabaseRenamed,
@@ -113,22 +107,14 @@ pub fn alter_database(
 
             // Replicated: every node writes the row and installs the quota in
             // its live enforcement components via post-apply.
-            propose_and_apply(
+            propose_and_apply_async(
                 state,
                 &CatalogEntry::PutDatabaseQuota {
                     db_id: db_id.as_u64(),
                     record: Box::new(record.clone()),
                 },
-                || {
-                    catalog
-                        .write_database_quota(db_id, &record)
-                        .map_err(|e| DdlError::from_error(&e))?;
-                    crate::control::catalog_entry::post_apply::quota::put_database(
-                        db_id, &record, state,
-                    );
-                    Ok(())
-                },
-            )?;
+            )
+            .await?;
 
             state.audit_record_with_db(
                 crate::control::security::audit::AuditEvent::DatabaseQuotaChanged,
@@ -171,15 +157,11 @@ pub fn alter_database(
             )?;
             // Update the descriptor's `audit_dml` field and persist it.
             descriptor.audit_dml = *mode;
-            propose_and_apply(
+            propose_and_apply_async(
                 state,
                 &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
-                || {
-                    catalog
-                        .put_database(&descriptor)
-                        .map_err(|e| DdlError::from_error_in_context("catalog write failed", &e))
-                },
-            )?;
+            )
+            .await?;
 
             // Update live cache so the Event Plane consumer sees the new mode
             // without a restart.
@@ -204,15 +186,11 @@ pub fn alter_database(
             )?;
             let before = descriptor.idle_session_timeout_secs;
             descriptor.idle_session_timeout_secs = *secs;
-            propose_and_apply(
+            propose_and_apply_async(
                 state,
                 &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
-                || {
-                    catalog
-                        .put_database(&descriptor)
-                        .map_err(|e| DdlError::from_error_in_context("catalog write failed", &e))
-                },
-            )?;
+            )
+            .await?;
 
             // Update the live idle-timeout cache so the sweep loop sees the
             // new value immediately without a restart.
@@ -228,11 +206,11 @@ pub fn alter_database(
         }
 
         AlterDatabaseOperation::Materialize => {
-            return super::materialize::alter_database_materialize(state, identity, name);
+            return super::materialize::alter_database_materialize(state, identity, name).await;
         }
 
         AlterDatabaseOperation::Promote => {
-            return super::mirror::promote::promote_database(state, identity, name);
+            return super::mirror::promote::promote_database(state, identity, name).await;
         }
     }
 

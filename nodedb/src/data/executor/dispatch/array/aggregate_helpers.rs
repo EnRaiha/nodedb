@@ -91,11 +91,10 @@ pub(super) fn apply_surrogate_filter(
         }
         let attr_row = live_idx;
         live_idx += 1;
-        let sur = tile
-            .surrogates
-            .get(row)
-            .copied()
-            .unwrap_or(nodedb_types::Surrogate::ZERO);
+        // A stored live row always holds its bound surrogate.
+        let sur = tile.live_surrogate(row).map_err(|e| ErrorCode::Internal {
+            detail: format!("array surrogate filter: {e}"),
+        })?;
         if !f.contains(sur) {
             continue;
         }
@@ -111,14 +110,13 @@ pub(super) fn apply_surrogate_filter(
             .get(row)
             .copied()
             .unwrap_or(nodedb_types::OPEN_UPPER);
-        b.push_row(SparseRow {
-            coord: &coord,
-            attrs: &attrs,
-            surrogate: sur,
+        b.push_row(SparseRow::live(
+            &coord,
+            &attrs,
+            sur,
             valid_from_ms,
             valid_until_ms,
-            kind: RowKind::Live,
-        })
+        ))
         .map_err(|e| ErrorCode::Internal {
             detail: format!("array surrogate filter: {e}"),
         })?;

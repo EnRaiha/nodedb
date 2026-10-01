@@ -26,23 +26,16 @@ use super::CatalogEntry;
 ///   times out, which presents as a database that starts cleanly and fails
 ///   every query.
 ///
-/// `LocalOnly` means no metadata raft handle (single-node or mixed-version
-/// compat mode); the applier is bypassed there, so the caller's record is
-/// written through locally — mirroring the DDL handlers.
-pub fn persist_collection_replicated(
+/// The apply re-registers the collection on every Data Plane core of this
+/// node, and this call awaits that register. A buffered entry applies
+/// nothing until COMMIT. The returned outcome tells the caller which of the
+/// two happened.
+pub async fn persist_collection_replicated(
     state: &SharedState,
-    database_id: DatabaseId,
     coll: &StoredCollection,
-) -> crate::Result<()> {
+) -> crate::Result<crate::control::propose_outcome::ProposeOutcome> {
     let entry = CatalogEntry::PutCollection(Box::new(coll.clone()));
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)?;
-    if outcome.needs_local_apply() {
-        state
-            .credentials
-            .catalog()
-            .put_collection(database_id, coll)?;
-    }
-    Ok(())
+    crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry).await
 }
 
 /// Union ingest-inferred fields into a collection's schema projection and
@@ -55,7 +48,7 @@ pub fn persist_collection_replicated(
 ///
 /// The schema projection is rebuildable control-plane state, but the record it
 /// lives in is not: it is the replicated collection descriptor. Writing the
-/// merged fields straight to local redb would satisfy the projection and break
+/// merged fields straight to local redb satisfies the projection and breaks
 /// the descriptor — see the divergence and wedged-apply-loop reasoning on
 /// [`persist_collection_replicated`]. Going through the proposer instead makes
 /// the merge a real descriptor version, which is both replicated to every node
@@ -68,20 +61,24 @@ pub fn persist_collection_replicated(
 /// carrying the dropped field merges it again. Trading that for a descriptor
 /// that is byte-stable at a given version is the right side of the deal — the
 /// alternative loses the whole node.
-pub fn merge_collection_fields_replicated(
+pub async fn merge_collection_fields_replicated(
     state: &SharedState,
     database_id: DatabaseId,
     tenant_id: u64,
     name: &str,
     inferred_fields: &[(String, String)],
 ) -> crate::Result<bool> {
-    let catalog = state.credentials.catalog();
-    let Some(mut coll) = catalog.get_collection(database_id, tenant_id, name)? else {
+    let Some(mut coll) =
+        state
+            .credentials
+            .catalog()
+            .get_collection(database_id, tenant_id, name)?
+    else {
         return Ok(false);
     };
     if !crate::control::security::catalog::merge_inferred_fields(&mut coll, inferred_fields) {
         return Ok(false);
     }
-    persist_collection_replicated(state, database_id, &coll)?;
+    persist_collection_replicated(state, &coll).await?;
     Ok(true)
 }

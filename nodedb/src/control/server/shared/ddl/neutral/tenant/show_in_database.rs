@@ -3,13 +3,10 @@
 //! Handlers for `SHOW TENANT QUOTA FOR <name> IN DATABASE <db>` and
 //! `SHOW TENANT USAGE FOR <name> IN DATABASE <db>`.
 //!
-//! Ported verbatim from the pgwire `ddl::tenant::show_in_database` handlers.
-//! Both are 100% `text_field` schemas in the original, so every column stays
+//! Both handlers use all-text schemas, so every column is
 //! `DdlColType::Text` via [`super::support::text_rows`]. `require_tenant_admin`
-//! is byte-identical to the pgwire gate used here originally, so it is reused
-//! from `neutral::database::gate` rather than duplicated. `format_percent` is
-//! reused from `neutral::database::show_usage`, matching the repoint already
-//! done at the call site before this migration.
+//! is reused from `neutral::database::gate`, and `format_percent` from
+//! `neutral::database::show_usage`.
 
 use serde_json::{Map, Value as JsonValue};
 

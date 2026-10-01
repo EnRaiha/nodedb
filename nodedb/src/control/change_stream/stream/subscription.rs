@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::types::{DatabaseId, TenantId};
 
-use super::{ChangeEvent, SequencedChangeEvent};
+use super::{ChangeCursor, ChangeEvent, SequencedChangeEvent};
 
 /// A filtered, bounded change-stream subscription.
 pub struct Subscription {
@@ -18,6 +18,9 @@ pub struct Subscription {
     pub(super) sequenced_receiver: tokio::sync::broadcast::Receiver<SequencedChangeEvent>,
     pub(super) database_filter: Option<DatabaseId>,
     pub(super) active_counter: Arc<AtomicU64>,
+    /// The stream's head when the subscription opened: it receives exactly
+    /// the events past this cursor.
+    pub(super) start: ChangeCursor,
 }
 
 impl Drop for Subscription {
@@ -27,6 +30,11 @@ impl Drop for Subscription {
 }
 
 impl Subscription {
+    /// The cursor a consumer of this subscription starts from.
+    pub fn start_cursor(&self) -> &ChangeCursor {
+        &self.start
+    }
+
     pub async fn recv_sequenced(
         &mut self,
     ) -> Result<SequencedChangeEvent, tokio::sync::broadcast::error::RecvError> {

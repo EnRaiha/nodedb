@@ -14,9 +14,9 @@
 //! 3. Schema-gate: reject if the array is unknown or the op's schema HLC is
 //!    ahead of the local registry.
 //! 4. Build `ReplicatedWrite::ArrayOp` and serialize to a `ReplicatedEntry`.
-//! 5. `raft_proposer(vshard_id, bytes)` — propose to the Raft group that
-//!    owns the destination vShard.
-//! 6. Await Raft commit via `ProposeTracker`.
+//! 5. The async Raft proposer proposes to the Raft group that owns the
+//!    destination vShard, forwarding to its leader.
+//! 6. Await the Raft commit and this node's apply.
 //! 7. On commit: `distributed_applier` decodes the entry, dispatches it to
 //!    the Data Plane, calls `record_applied`.
 //!
@@ -70,7 +70,7 @@ pub enum InboundOutcome {
     Applied,
     /// The op was already present; no state was changed (idempotent replay).
     Idempotent,
-    /// The op was rejected; the caller should send `ArrayRejectMsg` back.
+    /// The op was rejected; the caller sends `ArrayRejectMsg` back.
     Rejected(ApplyRejection),
     /// A snapshot chunk was buffered; more chunks are expected.
     SnapshotPartial { received: u32, total: u32 },
@@ -80,7 +80,7 @@ pub enum InboundOutcome {
     SchemaImported,
     /// An ack was recorded into the ack-vector (GC frontier tracking).
     AckRecorded,
-    /// A catchup request was received and logged (serving deferred to Phase H).
+    /// A catchup request was received and logged (serving is not part of this outcome).
     CatchupRequested,
 }
 
@@ -126,7 +126,7 @@ impl OriginArrayInbound {
 
     /// The tenant this inbound engine is bound to. `pub(crate)` so the sync
     /// session builder's guard test can assert the session tenant was threaded
-    /// through (see `session_handler::array`), not just the sibling propose
+    /// through (see `session_handler::array`), not only the sibling propose
     /// path.
     pub(crate) fn tenant_id(&self) -> TenantId {
         self.tenant_id
@@ -137,10 +137,6 @@ impl OriginArrayInbound {
     /// inbound array authorization, Raft entry, and Data-Plane task.
     pub(crate) fn database_id(&self) -> DatabaseId {
         self.database_id
-    }
-
-    pub(super) fn identity(&self) -> &crate::control::security::identity::AuthenticatedIdentity {
-        &self.identity
     }
 
     pub(super) fn authorize_array(
@@ -173,16 +169,8 @@ impl OriginArrayInbound {
         })
     }
 
-    pub(super) fn engine(&self) -> &Arc<OriginApplyEngine> {
-        &self.engine
-    }
-
     pub(super) fn schemas(&self) -> &Arc<OriginSchemaRegistry> {
         &self.schemas
-    }
-
-    pub(super) fn apply_observer(&self) -> Option<&Arc<dyn ArrayApplyObserver>> {
-        self.apply_observer.as_ref()
     }
 }
 
@@ -307,7 +295,8 @@ impl OriginArrayInbound {
     /// Import an array schema CRDT snapshot from a Lite peer.
     ///
     /// Proposes the schema through Raft so it is applied atomically on all
-    /// replicas. Returns `SchemaImported` on successful commit.
+    /// replicas of its data group, then puts the array in the replicated
+    /// catalog. Returns `SchemaImported` once both committed.
     pub async fn handle_schema(
         &self,
         msg: &ArraySchemaSyncMsg,
@@ -319,52 +308,6 @@ impl OriginArrayInbound {
             remote_hlc,
             crate::control::security::identity::Permission::Write,
         )?;
-
-        // In single-node mode (no raft_proposer) fall back to direct import.
-        if self.shared.raft_proposer.get().is_none() {
-            let _authorized_scope = authorization.into_scope();
-            if let Err(e) = self.schemas.import_snapshot_in_database(
-                self.database_id,
-                self.tenant_id.as_u64(),
-                &msg.array,
-                &msg.snapshot_payload,
-                remote_hlc,
-            ) {
-                warn!(array = %msg.array, error = %e, "array_inbound: schema import failed");
-                return Err(Some(build_reject(
-                    &msg.array,
-                    remote_hlc,
-                    ArrayRejectReason::EngineRejected,
-                    format!("schema import error: {e}"),
-                )));
-            }
-            // Single-node has no Raft applier to register the array_catalog
-            // entry, so this direct-import path must do it itself — mirrors
-            // `raft_apply::apply_array_schema`'s post-import registration.
-            // Without this, the array is importable but never openable by
-            // the Data Plane and never visible to `SHOW COLLECTIONS`.
-            //
-            // Unlike the Raft-apply path, this path's `Result` is still live
-            // and reaches the sync sender, so a registration failure is
-            // propagated rather than swallowed: reporting `SchemaImported`
-            // while the array stays unregistered would be a silent
-            // catalog-visibility inconsistency.
-            if let Err(e) = super::catalog_register::register_array_catalog_entry(
-                &self.shared,
-                self.tenant_id,
-                self.database_id,
-                &msg.array,
-            ) {
-                warn!(array = %msg.array, error = %e, "array_inbound: catalog registration failed");
-                return Err(Some(build_reject(
-                    &msg.array,
-                    remote_hlc,
-                    ArrayRejectReason::EngineRejected,
-                    format!("catalog registration error: {e}"),
-                )));
-            }
-            return Ok(InboundOutcome::SchemaImported);
-        }
 
         let vshard_id = VShardId::new(array_vshard_for_name(&msg.array));
         let write = ReplicatedWrite::ArraySchema {
@@ -379,20 +322,15 @@ impl OriginArrayInbound {
             write,
         );
 
-        match self
-            .propose_and_await(entry, &msg.array, remote_hlc, authorization)
-            .await
-        {
-            Ok(()) => Ok(InboundOutcome::SchemaImported),
-            Err(Some(r)) => Err(Some(r)),
-            Err(None) => Err(None),
-        }
+        self.propose_and_await(entry, &msg.array, remote_hlc, authorization)
+            .await?;
+        self.register_in_catalog(msg, remote_hlc).await?;
+        Ok(InboundOutcome::SchemaImported)
     }
 
     // ─── Internal helpers ─────────────────────────────────────────────────────
 
-    /// Validate a decoded op, then route it through Raft (or directly to the
-    /// Data Plane in single-node mode) before returning.
+    /// Validate a decoded op, then route it through Raft before returning.
     ///
     /// # Fast-path idempotency
     ///
@@ -462,23 +400,21 @@ impl OriginArrayInbound {
             return Ok(InboundOutcome::Idempotent);
         }
 
-        // 4. In single-node mode (no raft_proposer): apply directly to the
-        //    Data Plane, matching the pre-Raft behaviour. This path is only
-        //    exercised when the cluster stack has not been started (development,
-        //    single-node Origin, unit tests without a raft setup).
-        if self.shared.raft_proposer.get().is_none() {
-            return self.apply_op_direct(op, provenance, authorization).await;
-        }
-
-        // 5. Multi-node path: propose through Raft.
+        // 4. Propose through Raft. A put's cell surrogate is
+        //    bound here, at the array's home, and every replica binds the same
+        //    one when the entry applies.
+        let cell_surrogate = self.cell_surrogate(&op).await?;
         let hlc_bytes = op.header.hlc.to_bytes();
         let write = ReplicatedWrite::ArrayOp {
             array: op.header.array.clone(),
             op_bytes: raw_op_bytes.to_vec(),
+            cell_surrogate: cell_surrogate.map(nodedb_types::Surrogate::as_u32),
             schema_hlc_bytes: hlc_bytes,
             provenance: provenance
                 .as_ref()
                 .and_then(|p| zerompk::to_msgpack_vec(p).ok()),
+            // Stamped with the floor, below.
+            incarnation: nodedb_types::Hlc::ZERO,
         };
         let vshard = self.vshard_for_op(&op);
         let entry = ReplicatedEntry::new(

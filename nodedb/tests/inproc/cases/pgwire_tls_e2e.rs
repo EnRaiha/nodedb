@@ -207,7 +207,7 @@ async fn pgwire_tls_ssl_request_and_select_1() {
 
     let (shutdown_bus, _) =
         nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&state.shutdown));
-    let shared_pg = Arc::clone(&state);
+    let shared_pg = Arc::clone(&*state);
     let test_startup_gate = Arc::clone(&state.startup);
     let bus_pg = shutdown_bus.clone();
 

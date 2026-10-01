@@ -114,7 +114,8 @@ impl CoreLoop {
     }
 
     /// Per-collection read-version LSN for `task`'s plan (distinct from the
-    /// core-global `watermark`). On a write response this is the POST-write
+    /// core-global `watermark`). A graph read scoped to one collection reports
+    /// that collection's version: its edges are the collection's rows. On a write response this is the POST-write
     /// version. A resolved KV write's version is the max across its
     /// mutations, which may span two collections.
     pub(in crate::data::executor) fn read_version_lsn(
@@ -133,6 +134,7 @@ impl CoreLoop {
         }
         task.plan()
             .collection()
+            .or_else(|| graph_read_collection(task.plan()))
             .map(|c| self.collection_read_version(task, c))
             .unwrap_or(crate::types::Lsn::ZERO)
     }
@@ -234,6 +236,23 @@ impl CoreLoop {
         for engine in self.crdt_engines.values_mut() {
             engine.clear_apply_candidates();
         }
+    }
+}
+
+/// The collection a collection-scoped graph read walks. Graph plans report no
+/// collection to routing (an edge homes on its endpoints), but a scoped read
+/// still observes that one collection's edges.
+fn graph_read_collection(plan: &crate::bridge::envelope::PhysicalPlan) -> Option<&str> {
+    use nodedb_physical::physical_plan::GraphOp;
+    match plan {
+        crate::bridge::envelope::PhysicalPlan::Graph(
+            GraphOp::Hop { collection, .. }
+            | GraphOp::Neighbors { collection, .. }
+            | GraphOp::NeighborsMulti { collection, .. }
+            | GraphOp::Path { collection, .. }
+            | GraphOp::Subgraph { collection, .. },
+        ) => collection.as_ref().map(|c| c.as_str()),
+        _ => None,
     }
 }
 

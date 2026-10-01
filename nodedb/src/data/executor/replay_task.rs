@@ -39,6 +39,7 @@ impl CoreLoop {
                 txn_id: None,
                 wal_lsn,
                 resolved_now_ms: None,
+                commit_hlc: None,
                 admission: crate::bridge::envelope::Admission::Exempt(
                     crate::bridge::envelope::ExemptReason::AlreadyOrdered,
                 ),

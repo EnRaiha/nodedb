@@ -6,4 +6,4 @@ mod reply;
 mod stage;
 mod target;
 
-pub(in crate::data::executor) use reply::CalvinReply;
+pub(in crate::data::executor) use reply::{CalvinReply, CalvinStaging};

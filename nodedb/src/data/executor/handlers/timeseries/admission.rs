@@ -95,6 +95,45 @@ pub(super) fn has_tag_headroom(
     true
 }
 
+/// Whether every symbol column's dictionary can absorb the distinct values
+/// `rows` store, their values in the order of `columns`. The resolved-row
+/// form of [`has_tag_headroom`], with the same upper-bound shortcut.
+pub(super) fn rows_have_tag_headroom(
+    memtable: &ColumnarMemtable,
+    columns: &[(String, ColumnType)],
+    rows: &[crate::engine::timeseries::resolved_ingest::ResolvedTsRow],
+    max_tag_cardinality: u32,
+) -> bool {
+    use crate::engine::timeseries::columnar_memtable::ColumnValue;
+    let ceiling = max_tag_cardinality as usize;
+    for (idx, (col_name, col_type)) in memtable.schema().columns.iter().enumerate() {
+        if *col_type != ColumnType::Symbol {
+            continue;
+        }
+        let Some(dict) = memtable.symbol_dict(idx) else {
+            continue;
+        };
+        if dict.len().saturating_add(rows.len()) <= ceiling {
+            continue;
+        }
+        let Some(position) = columns.iter().position(|(name, _)| name == col_name) else {
+            continue;
+        };
+        let mut fresh: HashSet<&str> = HashSet::new();
+        for row in rows {
+            if let Some(ColumnValue::Symbol(value)) = row.values.get(position)
+                && dict.get_id(value).is_none()
+            {
+                fresh.insert(value.as_str());
+            }
+        }
+        if dict.len().saturating_add(fresh.len()) > ceiling {
+            return false;
+        }
+    }
+    true
+}
+
 /// Whether some symbol column in `symbol_columns` receives more distinct
 /// values from `lines` than `max_tag_cardinality` allows.
 ///

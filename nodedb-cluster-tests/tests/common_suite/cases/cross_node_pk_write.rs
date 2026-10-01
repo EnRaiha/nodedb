@@ -7,8 +7,7 @@
 //!
 //! This 3-node test cluster runs replication factor 3: EVERY node is a voter of
 //! every data group and locally binds surrogates for every committed write.
-//! There is NO "non-member" coordinator that has to ship `Surrogate::ZERO` for
-//! these keys — every node resolves pk → surrogate from its own local catalog.
+//! Every node resolves pk → surrogate from its own local catalog.
 //! A point WRITE (UPDATE / DELETE by PK) issued anywhere routes via Raft
 //! propose → apply and lands on all three replicas.
 //!
@@ -21,11 +20,12 @@
 //!      before any read-back.
 //!
 //!  (b) NO GHOST / PHANTOM POLLUTION: a PK that is only ever DELETEd or only
-//!      ever READ (never INSERTed) must NEVER acquire a surrogate binding. On
-//!      apply, the `decode.rs` `bind_or_lookup` path re-resolves a carried
-//!      ZERO surrogate READ-ONLY and NEVER binds ZERO, so a missing pk stays
-//!      unbound. A subsequent INSERT of that pk therefore allocates a FRESH
-//!      surrogate and resolves correctly — no `pk → ZERO` phantom corrupts it.
+//!      ever READ (never INSERTed) must NEVER acquire a surrogate binding. A
+//!      delete of an unbound pk carries no surrogate (`None`), and the apply
+//!      path resolves it READ-ONLY, so a missing pk stays unbound. A write
+//!      that carries `Surrogate::ZERO` is refused outright. A subsequent
+//!      INSERT of that pk therefore allocates a FRESH surrogate and resolves
+//!      correctly.
 //!
 //! ## Test shape
 //!
@@ -37,9 +37,9 @@
 //!     gone on every node, and that all three members agree.
 //!  4. GHOST/PHANTOM (the anti-pollution regression):
 //!       - DELETE a key that was NEVER inserted, from every node (each delete
-//!         resolves to an unbound key → ZERO; apply must NOT bind it), then
-//!         INSERT that key and assert it reads back as its real value on every
-//!         node. A phantom `ghost → ZERO` binding would corrupt this read.
+//!         carries no surrogate; apply must NOT bind one), then INSERT that
+//!         key and assert it reads back as its real value on every node. A
+//!         phantom binding for `ghost` corrupts this read.
 //!       - Assert a never-written, never-deleted pk returns no row on every
 //!         node — proof that merely reading/deleting an absent key created no
 //!         spurious binding.
@@ -296,9 +296,9 @@ async fn cross_node_pk_write_converges_and_does_not_pollute() {
 
     // --- ANTI-POLLUTION (ghost) regression — load-bearing ----------------
     // DELETE a key that was NEVER inserted, from EVERY node. Each delete
-    // resolves to an unbound key (ZERO carry); apply must re-resolve READ-ONLY
-    // and NEVER bind `ghost → ZERO`. The delete is a correct no-op either way,
-    // but a phantom ZERO binding here would corrupt the INSERT below.
+    // resolves to an unbound key and carries no surrogate; apply resolves it
+    // READ-ONLY and binds nothing. The delete is a correct no-op either way,
+    // but a phantom binding here corrupts the INSERT below.
     for (idx, node) in cluster.nodes.iter().enumerate() {
         exec_dml(
             &node.client,
@@ -313,11 +313,10 @@ async fn cross_node_pk_write_converges_and_does_not_pollute() {
         .wait_for_full_apply_convergence(Duration::from_secs(15))
         .await;
 
-    // INSERT the ghost key. With pollution, a phantom `ghost → ZERO` binding
-    // wins (first-wins) and the row lands under surrogate ZERO → the read
-    // resolves wrong/empty. With the correct apply path no binding was ever
-    // written, so the INSERT allocates a fresh surrogate and resolves on all
-    // replicas. All members must agree.
+    // INSERT the ghost key. With pollution, a phantom binding for `ghost`
+    // wins (first-wins) and the read resolves wrong or empty. With the
+    // correct apply path no binding was ever written, so the INSERT allocates
+    // a fresh surrogate and resolves on all replicas. All members must agree.
     cluster.nodes[0]
         .client
         .simple_query("INSERT INTO xn_pk_w (id, payload) VALUES ('ghost', 'ghost-val')")
@@ -333,7 +332,7 @@ async fn cross_node_pk_write_converges_and_does_not_pollute() {
         "xn_pk_w",
         "ghost",
         Some("ghost-val"),
-        "ghost no-op DELETE + INSERT (a phantom `ghost → ZERO` binding would corrupt this)",
+        "ghost no-op DELETE + INSERT (a phantom `ghost` binding would corrupt this)",
     )
     .await;
 

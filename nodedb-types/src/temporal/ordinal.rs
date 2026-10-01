@@ -86,6 +86,26 @@ pub fn ordinal_to_ms(ordinal: i64) -> i64 {
     ordinal / NANOS_PER_MS
 }
 
+/// The most positions one sequencer epoch can hold. Each position of an
+/// epoch owns one nanosecond of the epoch's millisecond, so a larger epoch
+/// would spill ordinals into the next millisecond.
+pub const MAX_POSITIONS_PER_EPOCH: usize = NANOS_PER_MS as usize;
+
+/// The system-time ordinal of the Calvin transaction at `position` of the
+/// epoch created at `epoch_system_ms`.
+///
+/// Every participant and every replica computes it from the replicated
+/// batch alone, so all of them stamp the transaction's versions alike.
+/// The sequencer mints strictly increasing epoch milliseconds and caps an
+/// epoch at [`MAX_POSITIONS_PER_EPOCH`] positions, so the ordinal is
+/// strictly increasing in `(epoch, position)`.
+pub fn calvin_txn_ordinal(epoch_system_ms: i64, position: u32) -> i64 {
+    epoch_system_ms
+        .max(0)
+        .saturating_mul(NANOS_PER_MS)
+        .saturating_add(i64::from(position))
+}
+
 fn wall_now_ns() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -162,6 +182,20 @@ mod tests {
         // The *next* ms's lower bound is strictly greater than this upper.
         let next_lower = (ms + 1).saturating_mul(NANOS_PER_MS);
         assert!(next_lower > upper);
+    }
+
+    #[test]
+    fn calvin_txn_ordinal_orders_by_epoch_then_position() {
+        let first = calvin_txn_ordinal(1_700_000_000_000, 0);
+        let later_position = calvin_txn_ordinal(1_700_000_000_000, 7);
+        let last_position = calvin_txn_ordinal(
+            1_700_000_000_000,
+            u32::try_from(MAX_POSITIONS_PER_EPOCH - 1).expect("cap fits u32"),
+        );
+        let next_epoch = calvin_txn_ordinal(1_700_000_000_001, 0);
+        assert!(first < later_position);
+        assert!(last_position < next_epoch);
+        assert_eq!(ordinal_to_ms(last_position), 1_700_000_000_000);
     }
 
     #[test]

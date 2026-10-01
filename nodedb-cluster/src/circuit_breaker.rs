@@ -55,6 +55,8 @@ struct PeerBreaker {
     state: CircuitState,
     consecutive_failures: u32,
     last_state_change: Instant,
+    /// When the half-open probe went out. `None` when none is out.
+    probe_since: Option<Instant>,
 }
 
 impl PeerBreaker {
@@ -63,6 +65,7 @@ impl PeerBreaker {
             state: CircuitState::Closed,
             consecutive_failures: 0,
             last_state_change: Instant::now(),
+            probe_since: None,
         }
     }
 }
@@ -82,22 +85,38 @@ impl CircuitBreaker {
     pub fn check(&self, peer: u64) -> Result<()> {
         let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
         let breaker = peers.entry(peer).or_insert_with(PeerBreaker::new);
+        let now = Instant::now();
+        let refused = ClusterError::CircuitOpen {
+            node_id: peer,
+            failures: breaker.consecutive_failures,
+        };
 
+        // An open circuit refuses until its cooldown passes, then turns
+        // half-open and lets exactly one probe through; other requests are
+        // refused while it is out. A probe that never reports, because its
+        // caller was dropped, stops counting after one cooldown, and the next
+        // request goes out as the probe instead. So the circuit can always
+        // recover.
         match breaker.state {
             CircuitState::Closed => Ok(()),
-            CircuitState::HalfOpen => Ok(()), // Allow probe.
-            CircuitState::Open => {
-                // Check if cooldown has expired → transition to HalfOpen.
-                if breaker.last_state_change.elapsed() >= self.config.cooldown {
-                    breaker.state = CircuitState::HalfOpen;
-                    breaker.last_state_change = Instant::now();
-                    Ok(())
-                } else {
-                    Err(ClusterError::CircuitOpen {
-                        node_id: peer,
-                        failures: breaker.consecutive_failures,
-                    })
+            CircuitState::HalfOpen => {
+                let probe_out = breaker.probe_since.is_some_and(|since| {
+                    now.saturating_duration_since(since) < self.config.cooldown
+                });
+                if probe_out {
+                    return Err(refused);
                 }
+                breaker.probe_since = Some(now);
+                Ok(())
+            }
+            CircuitState::Open => {
+                if now.saturating_duration_since(breaker.last_state_change) < self.config.cooldown {
+                    return Err(refused);
+                }
+                breaker.state = CircuitState::HalfOpen;
+                breaker.last_state_change = now;
+                breaker.probe_since = Some(now);
+                Ok(())
             }
         }
     }
@@ -107,6 +126,7 @@ impl CircuitBreaker {
         let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
         let breaker = peers.entry(peer).or_insert_with(PeerBreaker::new);
         breaker.consecutive_failures = 0;
+        breaker.probe_since = None;
         if breaker.state != CircuitState::Closed {
             breaker.state = CircuitState::Closed;
             breaker.last_state_change = Instant::now();
@@ -130,11 +150,13 @@ impl CircuitBreaker {
                 // Probe failed → back to Open.
                 breaker.state = CircuitState::Open;
                 breaker.last_state_change = Instant::now();
+                breaker.probe_since = None;
             }
-            CircuitState::Open => {
-                // Already open — refresh the timestamp to extend cooldown.
-                breaker.last_state_change = Instant::now();
-            }
+            // A request that went out before the circuit opened and failed
+            // since leaves the cooldown as it is. Restarting the cooldown on
+            // every late failure would keep the circuit open for as long as
+            // old requests keep failing.
+            CircuitState::Open => {}
         }
     }
 
@@ -293,6 +315,7 @@ impl RetryPolicy {
             | ClusterError::SpatialGather(_)
             | ClusterError::Bm25Gather(_)
             | ClusterError::TsGather(_)
+            | ClusterError::ShufflePush(_)
             | ClusterError::RemoteUntyped { .. }
             | ClusterError::ShardExecution { .. } => false,
         }
@@ -346,6 +369,39 @@ mod tests {
 
         // Check should transition to HalfOpen and allow the probe.
         cb.check(1).unwrap();
+        assert_eq!(cb.state(1), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn half_open_lets_one_probe_through_until_it_reports_or_expires() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_millis(500),
+        });
+        cb.record_failure(1);
+        std::thread::sleep(Duration::from_millis(550));
+        cb.check(1).expect("the probe goes out");
+        assert!(cb.check(1).is_err(), "a second request waits for the probe");
+        // The probe never reports: after one cooldown the next request probes.
+        std::thread::sleep(Duration::from_millis(550));
+        cb.check(1).expect("a lost probe is replaced");
+        cb.record_success(1);
+        assert_eq!(cb.state(1), CircuitState::Closed);
+    }
+
+    #[test]
+    fn late_failures_do_not_extend_an_open_circuit() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_millis(400),
+        });
+        cb.record_failure(1);
+        std::thread::sleep(Duration::from_millis(300));
+        // A request sent before the circuit opened fails now.
+        cb.record_failure(1);
+        std::thread::sleep(Duration::from_millis(150));
+        cb.check(1)
+            .expect("the cooldown ran from the opening failure");
         assert_eq!(cb.state(1), CircuitState::HalfOpen);
     }
 

@@ -50,6 +50,7 @@ pub enum ReplicatedEventSource {
     CrdtSync,
     Deferred,
     Restore,
+    ImplicitClient,
 }
 
 impl From<EventSource> for ReplicatedEventSource {
@@ -61,6 +62,7 @@ impl From<EventSource> for ReplicatedEventSource {
             EventSource::CrdtSync => Self::CrdtSync,
             EventSource::Deferred => Self::Deferred,
             EventSource::Restore => Self::Restore,
+            EventSource::ImplicitClient => Self::ImplicitClient,
         }
     }
 }
@@ -74,6 +76,7 @@ impl From<ReplicatedEventSource> for EventSource {
             ReplicatedEventSource::CrdtSync => Self::CrdtSync,
             ReplicatedEventSource::Deferred => Self::Deferred,
             ReplicatedEventSource::Restore => Self::Restore,
+            ReplicatedEventSource::ImplicitClient => Self::ImplicitClient,
         }
     }
 }

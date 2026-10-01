@@ -16,11 +16,11 @@ use crate::wal::{CrdtDeltaWalPayload, CrdtDocOpWalRecord, CrdtListOpWalRecord};
 /// decode or names none.
 fn crdt_record_collection(record: &nodedb_wal::WalRecord) -> Option<String> {
     match RecordType::from_raw(record.logical_record_type())? {
-        RecordType::CrdtDelta => {
+        RecordType::CrdtDelta => Some(
             CrdtDeltaWalPayload::decode(&record.payload)
                 .ok()?
-                .collection
-        }
+                .collection,
+        ),
         RecordType::CrdtListOp => {
             match zerompk::from_msgpack::<CrdtListOpWalRecord>(&record.payload).ok()? {
                 CrdtListOpWalRecord::Insert { collection, .. }
@@ -102,6 +102,9 @@ impl CoreLoop {
         crdt_records.sort_by_key(|(original_index, record)| (record.header.lsn, *original_index));
 
         for (_, record) in crdt_records {
+            if self.replay_halted() {
+                break;
+            }
             if self.applying_committed_redo() && !self.redo_crdt_prelude(record) {
                 continue;
             }

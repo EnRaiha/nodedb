@@ -12,9 +12,9 @@ use crate::control::server::set_op_merge::{
 };
 use crate::control::state::SharedState;
 
-use super::dispatch::ResolveCtx;
 use super::entry::Resolved;
 use super::post_process_arm::{ChildRows, materialize_child_rows, provider_scan_of_rows};
+use crate::control::server::exchange::read_scope::ReadScope;
 
 /// Resolve a `QueryOp::SetOp` node.
 ///
@@ -30,7 +30,7 @@ use super::post_process_arm::{ChildRows, materialize_child_rows, provider_scan_o
 /// aggregate supplies its own tail over these rows.
 pub(super) async fn resolve_set_op(
     state: &SharedState,
-    ctx: ResolveCtx,
+    ctx: ReadScope,
     captures: &mut Vec<DistributedReadCapture>,
     inputs: Vec<PhysicalPlan>,
     op: SetOpKind,

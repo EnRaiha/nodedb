@@ -68,6 +68,14 @@ impl CrossShardRetryQueue {
         self.queue.push_back(entry);
     }
 
+    /// Keep an exhausted entry the DLQ refused. The attempt count is not
+    /// changed, so the entry drains as exhausted again after `MAX_BACKOFF`
+    /// and is offered to the DLQ once more.
+    pub fn hold_exhausted(&mut self, mut entry: RetryEntry) {
+        entry.next_retry_at = Instant::now() + MAX_BACKOFF;
+        self.queue.push_back(entry);
+    }
+
     /// Drain entries that are due for retry, respecting volume bounds.
     ///
     /// Returns `(ready_for_retry, exhausted_for_dlq)`.
@@ -156,6 +164,7 @@ mod tests {
             source_vshard: 3,
             source_lsn: lsn,
             source_sequence: lsn,
+            origin: String::new(),
             cascade_depth: 0,
             source_collection: collection.into(),
             target_vshard: 7,

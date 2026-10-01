@@ -183,6 +183,9 @@ pub struct LeaderState {
     /// timed: leadership is confirmed by a quorum of these rising after a
     /// heartbeat round.
     pub ack_count: Vec<(u64, u64)>,
+    /// Peers whose latest `AppendEntries` response asked for a snapshot.
+    /// Such a peer holds no state to lead from.
+    pub awaiting_snapshot: std::collections::HashSet<u64>,
 }
 
 impl LeaderState {
@@ -192,6 +195,7 @@ impl LeaderState {
             next_index: peers.iter().map(|&id| (id, last_log_index + 1)).collect(),
             match_index: peers.iter().map(|&id| (id, 0)).collect(),
             ack_count: peers.iter().map(|&id| (id, 0)).collect(),
+            awaiting_snapshot: std::collections::HashSet::new(),
             observer_states: observers
                 .iter()
                 .map(|&id| {
@@ -250,6 +254,7 @@ impl LeaderState {
         self.next_index.retain(|&(id, _)| id != peer);
         self.match_index.retain(|&(id, _)| id != peer);
         self.ack_count.retain(|&(id, _)| id != peer);
+        self.awaiting_snapshot.remove(&peer);
     }
 
     /// Responses received from `peer` in this term.

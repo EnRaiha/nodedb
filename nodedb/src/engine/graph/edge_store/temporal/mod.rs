@@ -20,14 +20,17 @@
 //! [`GDPR_ERASURE_SENTINEL`] `0xFE`). Sentinels never collide with fixarray
 //! prefixes (`0x90..=0x9f`).
 
+pub mod cut;
 pub mod keys;
 pub mod payload;
 pub mod purge;
 pub mod query;
 pub mod read;
 pub mod revert;
+pub mod visibility;
 pub mod write;
 
+pub use cut::{EdgeCutInstall, EdgeFlip};
 pub use keys::{
     EdgeRef, GDPR_ERASURE_SENTINEL, SYSTEM_TIME_WIDTH, TOMBSTONE_SENTINEL, edge_version_prefix,
     is_gdpr_erasure, is_sentinel, is_tombstone, parse_versioned_edge_key, versioned_edge_key,
@@ -35,3 +38,4 @@ pub use keys::{
 pub use payload::EdgeValuePayload;
 pub use query::NeighborsAsOfParams;
 pub use revert::{EdgeCountChange, EdgeVersionWrite};
+pub use write::VersionStamp;

@@ -9,19 +9,17 @@
 //! REVOKE ALL ON DATABASE <name> FROM <user>;
 //! ```
 //!
-//! Ported from the pgwire `ddl::grant::database_permission` handlers. All
-//! non-return logic (tenant-admin gate, catalog resolution of the database id
-//! and grantee user record, `ALL` privilege expansion, catalog propose +
-//! single-node fallback, and `audit_record`) is preserved verbatim; only the
-//! result construction changed from pgwire `Response` / `PgWireError` to the
-//! protocol-neutral [`DdlResult`] / [`DdlError`].
+//! The tenant-admin gate, catalog resolution of the database id and grantee
+//! user record, `ALL` privilege expansion, catalog propose + single-node
+//! fallback, and `audit_record` run here. The result is the protocol-neutral
+//! [`DdlResult`] / [`DdlError`].
 //!
 //! Grants are stored in `_system.database_grants`. They are also reflected
 //! into the user's `accessible_databases` set — new grants add the database
 //! to the set; all privileges revoked removes it.
 
 use crate::control::catalog_entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -32,7 +30,7 @@ use super::support::{require_tenant_admin, status};
 /// Handle `GRANT <privilege> ON DATABASE <name> TO <user>`.
 ///
 /// Accepted privileges: `ALL`, `CREATE COLLECTION`, `SELECT`.
-pub fn grant_database(
+pub async fn grant_database(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     privilege: &str,
@@ -60,7 +58,7 @@ pub fn grant_database(
     };
 
     for priv_name in &privileges {
-        let outcome = propose_catalog_entry(
+        propose_catalog_entry_async(
             state,
             &CatalogEntry::PutDatabaseGrant {
                 db_id: db_id.as_u64(),
@@ -68,13 +66,8 @@ pub fn grant_database(
                 privilege: priv_name.to_string(),
             },
         )
+        .await
         .map_err(|e| DdlError::from_error_in_context("catalog propose", &e))?;
-
-        if outcome.needs_local_apply() {
-            catalog
-                .put_database_grant(db_id, user_record.user_id, priv_name)
-                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        }
     }
 
     state.audit_record(
@@ -88,7 +81,7 @@ pub fn grant_database(
 }
 
 /// Handle `REVOKE <privilege> ON DATABASE <name> FROM <user>`.
-pub fn revoke_database(
+pub async fn revoke_database(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     privilege: &str,
@@ -114,7 +107,7 @@ pub fn revoke_database(
     };
 
     for priv_name in &privileges {
-        let outcome = propose_catalog_entry(
+        propose_catalog_entry_async(
             state,
             &CatalogEntry::DeleteDatabaseGrant {
                 db_id: db_id.as_u64(),
@@ -122,13 +115,8 @@ pub fn revoke_database(
                 privilege: priv_name.to_string(),
             },
         )
+        .await
         .map_err(|e| DdlError::from_error_in_context("catalog propose", &e))?;
-
-        if outcome.needs_local_apply() {
-            catalog
-                .delete_database_grant(db_id, user_record.user_id, priv_name)
-                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        }
     }
 
     state.audit_record(

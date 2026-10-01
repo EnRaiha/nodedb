@@ -105,7 +105,7 @@ mod tests {
             key: b"k".to_vec(),
             value: b"v".to_vec(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -117,7 +117,7 @@ mod tests {
         PhysicalPlan::Document(DocumentOp::PointGet {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             document_id: "d".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -144,6 +144,7 @@ mod tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission,
         }
     }
@@ -232,7 +233,7 @@ mod tests {
             dest_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "dst"),
             item_key: b"item".to_vec(),
             dest_key: b"item".to_vec(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             source_rls_write_check: source,
             dest_rls_write_check: dest,
         })

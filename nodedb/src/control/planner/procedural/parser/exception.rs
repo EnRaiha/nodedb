@@ -4,7 +4,7 @@
 
 use super::super::ast::*;
 use super::super::error::ProceduralError;
-use super::super::tokenizer::Token;
+use super::super::tokenizer::{Token, TokenStream};
 use super::statements::parse_statement;
 
 /// Parse `EXCEPTION WHEN <condition> THEN <statements> [WHEN ...] ...`
@@ -12,7 +12,7 @@ use super::statements::parse_statement;
 /// Called when the parser encounters Token::Exception inside a BEGIN block.
 /// Parses one or more WHEN handlers until END is reached.
 pub(super) fn parse_exception_handlers(
-    tokens: &[Token],
+    tokens: &TokenStream<'_>,
     pos: &mut usize,
 ) -> Result<Vec<ExceptionHandler>, ProceduralError> {
     *pos += 1; // skip EXCEPTION
@@ -77,11 +77,16 @@ fn parse_exception_condition(
 }
 
 fn parse_exception_body(
-    tokens: &[Token],
+    tokens: &TokenStream<'_>,
     pos: &mut usize,
 ) -> Result<Vec<Statement>, ProceduralError> {
     let mut stmts = Vec::new();
     while *pos < tokens.len() {
+        // A comment between statements belongs to none of them.
+        if tokens[*pos].is_comment() {
+            *pos += 1;
+            continue;
+        }
         match tokens.get(*pos) {
             Some(Token::End) => break,
             Some(Token::Ident(w)) if w.to_uppercase() == "WHEN" => break,

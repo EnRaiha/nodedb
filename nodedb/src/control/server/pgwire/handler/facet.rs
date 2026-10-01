@@ -61,7 +61,7 @@ pub(super) async fn execute_facet_counts_sql(
     };
 
     let resp = handler
-        .dispatch_authorized_task(task, None, identity)
+        .dispatch_authorized_task(task, None, identity, strong_read(handler, session_id))
         .await
         .map_err(|error| {
             let (severity, code, message) = error_to_sqlstate(&error);
@@ -124,7 +124,7 @@ pub(super) async fn execute_search_with_facets_sql(
     };
 
     let facet_resp = handler
-        .dispatch_authorized_task(facet_task, None, identity)
+        .dispatch_authorized_task(facet_task, None, identity, strong_read(handler, session_id))
         .await
         .map_err(|error| {
             let (severity, code, message) = error_to_sqlstate(&error);
@@ -173,6 +173,14 @@ struct SearchWithFacetsArgs {
 }
 
 /// Parse `SELECT FACET_COUNTS(collection => 'name', filter => 'pred', fields => ['a','b'])`.
+/// Whether the session's reads must be linearizable.
+fn strong_read(handler: &NodeDbPgHandler, session_id: SessionId) -> bool {
+    handler
+        .sessions
+        .read_consistency(session_id)
+        .requires_leader()
+}
+
 fn parse_facet_counts_args(sql: &str) -> PgWireResult<FacetCountsArgs> {
     let collection = extract_named_string_arg(sql, "collection")
         .ok_or_else(|| syntax_error("FACET_COUNTS requires collection => 'name' argument"))?;

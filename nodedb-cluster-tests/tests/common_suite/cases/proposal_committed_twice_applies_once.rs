@@ -104,6 +104,7 @@ async fn a_proposal_committed_twice_moves_the_counter_once() {
                         TenantId::new(TENANT),
                         b"ctr",
                     )
+                    .await
                     .expect("the seeded key has a surrogate");
                 let plan = PhysicalPlan::Kv(KvOp::Incr {
                     collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, COLL),
@@ -122,7 +123,7 @@ async fn a_proposal_committed_twice_moves_the_counter_once() {
                     to_replicated_entry(TenantId::new(TENANT), DatabaseId::DEFAULT, vshard, &write)
                         .expect("encode the proposal")
                         .expect("KV_INCR encodes to a replicated entry");
-                let bytes = entry.to_bytes();
+                let bytes = entry.encode().expect("encode the proposal bytes");
                 entry_bytes = Some(bytes.clone());
                 bytes
             }

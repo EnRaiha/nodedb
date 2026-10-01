@@ -157,5 +157,7 @@ fn requeue_take_sqlstate(error: &crate::event::trigger::RequeueTakeError) -> &'s
         E::NotFound { .. } => "42704",
         // The object exists but is not in a state this action accepts.
         E::AlreadyResolved { .. } => "55000",
+        // redb refused the write. The entry stays unresolved in the DLQ.
+        E::Persist { .. } => "58030",
     }
 }

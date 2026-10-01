@@ -3,12 +3,9 @@
 //! Protocol-neutral `REVOKE API KEY` / `LIST API KEYS` / `SHOW API KEYS`
 //! handlers.
 //!
-//! Ported from the pgwire `ddl::apikey::revoke_api_key` / `list_api_keys`
-//! handlers. The ownership checks, local pre-check, catalog propose /
-//! single-node fallback, `revoke_key`, and `audit_record` side effects are
-//! preserved verbatim; only the result construction changed from pgwire
-//! `Response` / `QueryResponse` / `Tag` to the protocol-neutral [`DdlResult`]
-//! over [`ShapedRows`].
+//! The ownership checks, local pre-check, catalog propose /
+//! single-node fallback, `revoke_key`, and `audit_record` side effects run
+//! here. The result is the protocol-neutral [`DdlResult`] over [`ShapedRows`].
 
 use serde_json::{Map, Value as JsonValue};
 
@@ -22,7 +19,7 @@ use super::super::auth_support::require_tenant_admin;
 use super::parse::err;
 
 /// REVOKE API KEY <key_id>
-pub fn revoke_api_key(
+pub async fn revoke_api_key(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -53,35 +50,20 @@ pub fn revoke_api_key(
     let entry = crate::control::catalog_entry::CatalogEntry::RevokeApiKey {
         key_id: key_id.to_string(),
     };
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    let revoked = if outcome.needs_local_apply() {
-        let catalog = state.credentials.catalog();
-        state
-            .api_keys
-            .revoke_key(key_id, Some(catalog))
-            .map_err(|e| DdlError::from_error(&e))?
-    } else {
-        // Cluster mode: trust the committed log index — the
-        // in-memory cache update runs in a spawned tokio task and
-        // may not be visible yet.
-        true
-    };
 
-    if revoked {
-        state.audit_record(
-            AuditEvent::PrivilegeChange,
-            Some(identity.tenant_id),
-            &identity.username,
-            &format!("revoked API key '{key_id}'"),
-        );
-        Ok(vec![DdlResult::Status {
-            command: "REVOKE API KEY".to_string(),
-            rows_affected: None,
-        }])
-    } else {
-        Err(err("42704", format!("API key '{key_id}' not found")))
-    }
+    state.audit_record(
+        AuditEvent::PrivilegeChange,
+        Some(identity.tenant_id),
+        &identity.username,
+        &format!("revoked API key '{key_id}'"),
+    );
+    Ok(vec![DdlResult::Status {
+        command: "REVOKE API KEY".to_string(),
+        rows_affected: None,
+    }])
 }
 
 /// LIST API KEYS [FOR <user>] / SHOW API KEYS [FOR <user>]

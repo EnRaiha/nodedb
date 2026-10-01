@@ -82,7 +82,7 @@ impl MintedRecords {
 
     /// Hold an existing record at `lsn` that is sent to a core again.
     /// Refused, with the reason, when its outcome is final or a live or held
-    /// window carries it to one: a second apply would land below the floor,
+    /// window carries it to one: a second apply will land below the floor,
     /// or apply the record twice.
     pub(crate) fn resend(floor: &Arc<OutcomeFloor>, lsn: Lsn) -> Result<Self, ResendRefusal> {
         let window = floor.open_existing(lsn)?;
@@ -141,13 +141,9 @@ impl MintedRecords {
         self.sent.store(true, Ordering::Release);
     }
 
-    /// The highest appended or resent LSN, or `None` when there is none.
-    pub(crate) fn highest(&self) -> Option<Lsn> {
-        self.recorded()
-            .iter()
-            .map(|record| record.lsn)
-            .chain(self.resent)
-            .max()
+    /// The highest LSN appended under this window, `None` before any append.
+    pub(crate) fn last_lsn(&self) -> Option<Lsn> {
+        self.recorded().iter().map(|record| record.lsn).max()
     }
 
     /// Every appended LSN, in append order.
@@ -466,7 +462,6 @@ mod tests {
         let first = append(&wal, &minted, b"a");
         let second = append(&wal, &minted, b"b");
         assert_eq!(minted.lsns(), vec![first, second]);
-        assert_eq!(minted.highest(), Some(second));
         minted.cancel(&wal, owner(), 0).await.expect("cancel");
         assert!(
             wal.durable_through() > second.as_u64(),

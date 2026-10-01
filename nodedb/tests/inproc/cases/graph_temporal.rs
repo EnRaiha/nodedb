@@ -146,7 +146,7 @@ fn gdpr_erase_distinct_from_soft_delete() {
     );
     // But the raw export still shows the erasure marker — audit preservation.
     let raw = store.scan_edges_for_tenant(0, T).unwrap();
-    let found = raw.iter().any(|(_k, v)| v == &[0xFEu8]);
+    let found = raw.visible.iter().any(|(_k, v)| v == &[0xFEu8]);
     assert!(found, "GDPR erasure marker must persist in storage");
 }
 
@@ -298,8 +298,10 @@ fn valid_time_filter_selects_applicable_version() {
     );
 }
 
+/// A node cascade an older WAL journalled tombstones exactly the edges it
+/// names, at their journalled ordinal, and history before it stays readable.
 #[test]
-fn delete_edges_for_node_cascades_tombstones() {
+fn a_journalled_node_cascade_tombstones_its_edges() {
     let (store, _dir) = open_store();
 
     for (n, (src, dst)) in [("alice", "bob"), ("alice", "carol"), ("dave", "alice")]
@@ -328,8 +330,19 @@ fn delete_edges_for_node_cascades_tombstones() {
         )
         .unwrap();
 
+    let cascaded: Vec<nodedb::wal::CascadedEdge> =
+        [("alice", "bob"), ("alice", "carol"), ("dave", "alice")]
+            .into_iter()
+            .map(|(src, dst)| nodedb::wal::CascadedEdge {
+                collection: COLL.to_string(),
+                src: src.to_string(),
+                label: "KNOWS".to_string(),
+                dst: dst.to_string(),
+                system_from: 1_000,
+            })
+            .collect();
     store
-        .delete_edges_for_node(DB.as_u64(), T, "alice", 1_000)
+        .apply_node_cascade(DB.as_u64(), T, "alice", &cascaded)
         .unwrap();
 
     assert!(

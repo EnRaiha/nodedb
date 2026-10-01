@@ -95,17 +95,22 @@ async fn drain_forces_plan_retry_surfacing_typed_error() {
     let shared = Arc::clone(&leader.shared);
     let drain_id = coll_id("retry_me");
     let drain_id_clone = drain_id.clone();
-    tokio::task::spawn_blocking(move || {
+    tokio::spawn(async move {
         let now_hlc = shared.hlc_clock.now();
         let expires_at = nodedb_types::Hlc::new(now_hlc.wall_ns.saturating_add(60_000_000_000), 0);
         let entry = nodedb_cluster::MetadataEntry::DescriptorDrainStart {
             descriptor_id: drain_id_clone,
             up_to_version: 1,
             expires_at,
+            proposer_node_id: shared.node_id,
+            owner: nodedb_cluster::DrainOwner::Ddl,
         };
         let raw = nodedb_cluster::encode_entry(&entry).expect("encode");
         let handle = shared.metadata_raft.get().expect("handle");
-        handle.propose(raw).expect("propose drain start");
+        handle
+            .propose_async(raw)
+            .await
+            .expect("propose drain start");
     })
     .await
     .expect("join");
@@ -132,13 +137,14 @@ async fn drain_forces_plan_retry_surfacing_typed_error() {
     // cluster (not that there are any) aren't affected.
     let cleanup_shared = Arc::clone(&leader.shared);
     let cleanup_id = drain_id.clone();
-    tokio::task::spawn_blocking(move || {
+    tokio::spawn(async move {
         let entry = nodedb_cluster::MetadataEntry::DescriptorDrainEnd {
             descriptor_id: cleanup_id,
+            owner: nodedb_cluster::DrainOwner::Ddl,
         };
         let raw = nodedb_cluster::encode_entry(&entry).expect("encode");
         let handle = cleanup_shared.metadata_raft.get().expect("handle");
-        handle.propose(raw).expect("propose drain end");
+        handle.propose_async(raw).await.expect("propose drain end");
     })
     .await
     .expect("join");
@@ -168,17 +174,22 @@ async fn drain_cleared_mid_retry_succeeds() {
     // Install drain.
     let shared = Arc::clone(&leader.shared);
     let dstart = drain_id.clone();
-    tokio::task::spawn_blocking(move || {
+    tokio::spawn(async move {
         let now_hlc = shared.hlc_clock.now();
         let expires_at = nodedb_types::Hlc::new(now_hlc.wall_ns.saturating_add(60_000_000_000), 0);
         let entry = nodedb_cluster::MetadataEntry::DescriptorDrainStart {
             descriptor_id: dstart,
             up_to_version: 1,
             expires_at,
+            proposer_node_id: shared.node_id,
+            owner: nodedb_cluster::DrainOwner::Ddl,
         };
         let raw = nodedb_cluster::encode_entry(&entry).expect("encode");
         let handle = shared.metadata_raft.get().expect("handle");
-        handle.propose(raw).expect("propose drain start");
+        handle
+            .propose_async(raw)
+            .await
+            .expect("propose drain start");
     })
     .await
     .expect("join");
@@ -194,13 +205,14 @@ async fn drain_cleared_mid_retry_succeeds() {
     let dend = drain_id.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        tokio::task::spawn_blocking(move || {
+        tokio::spawn(async move {
             let entry = nodedb_cluster::MetadataEntry::DescriptorDrainEnd {
                 descriptor_id: dend,
+                owner: nodedb_cluster::DrainOwner::Ddl,
             };
             let raw = nodedb_cluster::encode_entry(&entry).expect("encode");
             let handle = cleanup_shared.metadata_raft.get().expect("handle");
-            handle.propose(raw).expect("propose drain end");
+            handle.propose_async(raw).await.expect("propose drain end");
         })
         .await
         .expect("join");

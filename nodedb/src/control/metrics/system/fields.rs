@@ -22,6 +22,46 @@ pub struct SystemMetrics {
     pub wal_segment_count: AtomicU64,
     pub wal_segment_bytes: AtomicU64,
 
+    // ── WAL archive ──
+    pub wal_archive_segments_total: AtomicU64,
+    pub wal_archive_bytes_total: AtomicU64,
+    pub wal_archive_failures_total: AtomicU64,
+    /// Bytes of local WAL the archive does not hold, active segment included.
+    pub wal_archive_rpo_gap_bytes: AtomicU64,
+    /// Seconds since the lowest unarchived local segment was created.
+    pub wal_archive_rpo_gap_seconds: AtomicU64,
+
+    // ── PITR base snapshots ──
+    /// Unix seconds when the last base snapshot completed. 0 before the first.
+    pub pitr_base_last_success_timestamp_seconds: AtomicU64,
+    /// Base snapshots this node life holds after retention.
+    pub pitr_base_snapshots: AtomicU64,
+    /// Unix seconds when the last base snapshot run failed. 0 before the first.
+    pub pitr_base_last_failure_timestamp_seconds: AtomicU64,
+    pub pitr_base_failures_total: AtomicU64,
+    /// Archived WAL segments deleted because no kept base needs them.
+    pub pitr_wal_segments_collected_total: AtomicU64,
+    /// Snapshot chunks put to the store because no stored chunk matched.
+    pub pitr_base_chunks_uploaded_total: AtomicU64,
+    pub pitr_base_chunk_bytes_uploaded_total: AtomicU64,
+    /// Distinct snapshot chunks a base reused from the store.
+    pub pitr_base_chunks_reused_total: AtomicU64,
+    /// Snapshot chunks deleted because no kept base lists them.
+    pub pitr_base_chunks_collected_total: AtomicU64,
+
+    // ── Scheduled logical backups ──
+    pub backup_schedule_runs_total: AtomicU64,
+    pub backup_schedule_failures_total: AtomicU64,
+    /// Unix seconds when the last scheduled backup completed. 0 before the first.
+    pub backup_schedule_last_success_timestamp_seconds: AtomicU64,
+    /// Unix seconds when the last scheduled backup failed. 0 before the first.
+    pub backup_schedule_last_failure_timestamp_seconds: AtomicU64,
+    /// Backup envelopes deleted by `keep` retention.
+    pub backup_schedule_envelopes_deleted_total: AtomicU64,
+    /// Scheduler ticks skipped because the schedule mark read was not
+    /// confirmed.
+    pub backup_schedule_ticks_skipped_total: AtomicU64,
+
     // ── Raft / replication ──
     pub raft_apply_lag: AtomicU64,
     pub raft_commit_index: AtomicU64,
@@ -67,7 +107,7 @@ pub struct SystemMetrics {
     pub vector_builds_started: AtomicU64,
     /// HNSW builds installed on their core.
     pub vector_builds_completed: AtomicU64,
-    /// HNSW builds that failed or could not be read.
+    /// HNSW builds that failed or were unreadable.
     pub vector_builds_failed: AtomicU64,
     /// Times a core found its builder queue full and kept the job waiting.
     pub vector_builds_deferred: AtomicU64,
@@ -142,12 +182,15 @@ pub struct SystemMetrics {
     pub active_subscriptions: AtomicU64,
     pub active_listen_channels: AtomicU64,
     pub change_events_delivered: AtomicU64,
-    /// Global CDC drop counter (sum across all streams). Kept for backward
-    /// compatibility with existing dashboards that query this name without labels.
+    /// Global CDC drop counter (sum across all streams). Dashboards query
+    /// this name without labels.
     pub change_events_dropped: AtomicU64,
     /// Per-stream CDC drop counters. Key: `(tenant_id, stream_name)`.
     /// Rendered as `nodedb_cdc_events_dropped_total{tenant="<id>",stream="<name>"}`.
     pub cdc_events_dropped_by_stream: RwLock<HashMap<(u64, String), u64>>,
+    /// Committed transaction messages not delivered because their topic was
+    /// dropped after the transaction committed.
+    pub committed_publishes_dropped: AtomicU64,
 
     // ── Backpressure ──
     /// Per-engine Critical-pressure fire count.

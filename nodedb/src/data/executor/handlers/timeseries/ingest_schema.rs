@@ -19,7 +19,10 @@ impl CoreLoop {
     /// A collection created through DDL declares its columns and its
     /// `TIME_KEY`; that declaration is the schema, so the time key keeps its
     /// name and position and every declared column exists from the first row
-    /// on. Only a collection with no declaration — raw ILP protocol ingest
+    /// on. A tag or field the declaration does not name follows the declared
+    /// columns, as `evolve_schema` adds it to an existing memtable. Without
+    /// it, the first batch into a declared collection drops every undeclared
+    /// value. Only a collection with no declaration — raw ILP protocol ingest
     /// into a measurement that was never created — falls back to inferring a
     /// shape from the batch itself.
     ///
@@ -52,9 +55,10 @@ impl CoreLoop {
         collection: &str,
         lines: &[ilp::IlpLine<'_>],
     ) -> crate::engine::timeseries::columnar_memtable::ColumnarSchema {
-        if let Some(schema) =
+        if let Some(mut schema) =
             self.declared_ts_memtable_schema(task.request.database_id, tid, collection)
         {
+            extend_with_undeclared(&mut schema, lines);
             return schema;
         }
         // Falling back is correct for an undeclared measurement and a silent
@@ -102,16 +106,59 @@ impl CoreLoop {
                 columns.extend(ilp_ingest::new_columns(schema, lines));
                 columns
             }
-            None => {
-                self.declared_ts_memtable_schema(database_id, tid, collection)
-                    .unwrap_or_else(|| ilp_ingest::infer_schema(lines))
-                    .columns
-            }
+            None => match self.declared_ts_memtable_schema(database_id, tid, collection) {
+                Some(mut schema) => {
+                    extend_with_undeclared(&mut schema, lines);
+                    schema.columns
+                }
+                None => ilp_ingest::infer_schema(lines).columns,
+            },
         };
         columns
             .into_iter()
             .filter(|(_, col_type)| *col_type == ColumnType::Symbol)
             .map(|(name, _)| name)
             .collect()
+    }
+}
+
+/// Append to a declared `schema` the columns `lines` name that it does not
+/// hold, typed and ordered as `evolve_schema` adds them to a live memtable.
+fn extend_with_undeclared(
+    schema: &mut crate::engine::timeseries::columnar_memtable::ColumnarSchema,
+    lines: &[ilp::IlpLine<'_>],
+) {
+    for (name, column_type) in ilp_ingest::new_columns(schema, lines) {
+        schema.columns.push((name, column_type));
+        schema.codecs.push(nodedb_codec::ColumnCodec::Auto);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::timeseries::columnar_memtable::{ColumnarSchema, TimeKind};
+
+    #[test]
+    fn a_declared_schema_takes_the_undeclared_columns_of_its_first_batch() {
+        let mut schema = ColumnarSchema {
+            columns: vec![("ts".into(), ColumnType::Timestamp(TimeKind::Millis))],
+            timestamp_idx: 0,
+            codecs: vec![nodedb_codec::ColumnCodec::Auto],
+        };
+        let parsed = ilp::parse_batch("m,host=a value=\"a\",n=2i 1000000000")
+            .expect("parse line")
+            .into_lines();
+        extend_with_undeclared(&mut schema, &parsed);
+        assert_eq!(
+            schema.columns,
+            vec![
+                ("ts".into(), ColumnType::Timestamp(TimeKind::Millis)),
+                ("host".into(), ColumnType::Symbol),
+                ("value".into(), ColumnType::Symbol),
+                ("n".into(), ColumnType::Int64),
+            ]
+        );
+        assert_eq!(schema.codecs.len(), schema.columns.len());
     }
 }

@@ -48,18 +48,31 @@ pub(super) fn compensation_hint_for_dispatch_error(e: &crate::Error) -> Compensa
         | crate::Error::CrdtAdmissionTimeout { .. }
         | crate::Error::NoLeader { .. }
         | crate::Error::NotLeader { .. }
-        | crate::Error::SourceFrozen { .. }
         | crate::Error::RetryableSchemaChanged { .. }
         | crate::Error::RetryableLeaderChange { .. }
         | crate::Error::GroupQuorumUnavailable { .. }
         | crate::Error::GroupMarksUnavailable { .. }
+        | crate::Error::BackupCaptureMoved { .. }
         | crate::Error::MetadataLeaderUnavailable
         | crate::Error::AuthorizationStateBehind { .. }
+        | crate::Error::LinearizableReadRefused { .. }
         | crate::Error::DispatchCapacity { .. }
         | crate::Error::MemoryExhausted { .. }
         | crate::Error::Backpressure { .. }
         | crate::Error::SequencerUnavailable
         | crate::Error::StaleReadNotLeader { .. } => CompensationHint::Retry { retry_after_ms: 0 },
+        // The write committed but its verdict is gone. Never re-pushed: the
+        // same bytes will apply twice. The detail names the committed index.
+        other @ crate::Error::CommittedResultUnavailable { .. } => CompensationHint::Custom {
+            constraint: "committed_result_unavailable".into(),
+            detail: other.to_string(),
+        },
+        // The write committed or was overwritten, and nothing here says which.
+        // Never re-pushed: a committed write will apply twice.
+        other @ crate::Error::ProposalOutcomeUnknown { .. } => CompensationHint::Custom {
+            constraint: "proposal_outcome_unknown".into(),
+            detail: other.to_string(),
+        },
         // Refused on its merits, or a fault the same bytes reproduce.
         other @ (crate::Error::TxnOverlayMemoryExceeded { .. }
         | crate::Error::OffsetRegression { .. }
@@ -84,7 +97,6 @@ pub(super) fn compensation_hint_for_dispatch_error(e: &crate::Error) -> Compensa
         | crate::Error::CrdtApplyRequiresAdmission
         | crate::Error::CrdtApplyForbiddenInTransaction
         | crate::Error::NotInTransactionBlock { .. }
-        | crate::Error::FanOutExceeded { .. }
         | crate::Error::CrossCollectionNotColocated { .. }
         | crate::Error::CloneWriteRequiresMaterialize { .. }
         | crate::Error::BadRequest { .. }
@@ -117,12 +129,15 @@ pub(super) fn compensation_hint_for_dispatch_error(e: &crate::Error) -> Compensa
         | crate::Error::Encryption { .. }
         | crate::Error::Bridge { .. }
         | crate::Error::VersionCompat { .. }
+        | crate::Error::RestoreTargetNotEmpty { .. }
+        | crate::Error::RestoreVerificationFailed { .. }
         | crate::Error::Internal { .. }
         | crate::Error::Shaping(_)
         | crate::Error::RemoteTyped { .. }
         | crate::Error::Ddl(_)
         | crate::Error::DescriptorVersionAnomaly { .. }
         | crate::Error::CollectionPurgeRowMissing { .. }
+        | crate::Error::CollectionUnstamped { .. }
         | crate::Error::CatalogIntegrityViolation { .. }
         | crate::Error::Promql(_)
         | crate::Error::DependentObjectsExist { .. }
@@ -178,7 +193,6 @@ fn compensation_hint_for_code(code: &ErrorCode) -> CompensationHint {
         other @ (ErrorCode::SyncRejected { .. }
         | ErrorCode::SyncNotApplied { .. }
         | ErrorCode::NotFound
-        | ErrorCode::FanOutExceeded
         | ErrorCode::RejectedDanglingEdge { .. }
         | ErrorCode::DuplicateWrite
         | ErrorCode::AppendOnlyViolation { .. }

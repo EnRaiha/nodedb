@@ -4,7 +4,8 @@
 //!
 //! `shape_response_materialized` is the canonical SELECT-read shaping used by
 //! every protocol entrypoint. It performs the full per-payload shaping order
-//! (`apply_kv_wrap` -> `translate_search_response` -> decode -> scan-envelope
+//! (`apply_kv_wrap` -> `apply_walk_wrap` -> `translate_search_response` ->
+//! decode -> scan-envelope
 //! unwrap -> optional SELECT-list projection) as a single call, producing an
 //! already-shaped, already-projected [`ShapeOutcome`]. Every SELECT-read
 //! producer — pgwire's non-streaming dispatch, native's dispatch loop — calls
@@ -32,6 +33,7 @@ use super::super::request::MaterializedShapeRequest;
 use super::super::returning::shape_returning_rows;
 use super::super::schema::OutputSchema;
 use super::super::types::{PlanKind, ShapedRows};
+use super::super::walk::apply_walk_wrap;
 use super::array_slice::shape_array_slice;
 use super::kernel::{empty_shaped, shape_decoded_rows, single_result_row};
 
@@ -76,9 +78,9 @@ pub fn shape_response_materialized(
         | PlanKind::MultiRow => {}
     }
 
-    // Seam-1 order, exactly as pgwire's `dispatch_task_loop` applies it
-    // (apply_kv_wrap -> translate_search_response) before any decode/shape step.
-    let wrapped = apply_kv_wrap(plan, payload);
+    // The plan-dependent transforms run before any decode or shape step:
+    // KV wrap, then walk wrap, then search translation.
+    let wrapped = apply_walk_wrap(plan, &apply_kv_wrap(plan, payload))?;
     let translated = translate_search_response(&wrapped, plan, state, database_id, tenant_id);
 
     let shaped = match plan_kind {

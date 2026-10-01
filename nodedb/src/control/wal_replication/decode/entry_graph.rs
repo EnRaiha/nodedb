@@ -11,6 +11,23 @@ use super::super::types::ReplicatedWrite;
 use super::graph;
 use crate::bridge::envelope::PhysicalPlan;
 
+/// The edge write `write` carries, rebuilt as a plan, or `None` for any
+/// other write. Every edge write runs as a Calvin transaction
+/// (`planner::calvin::edge_sequencing`), so the propose seams hand it there.
+pub fn edge_write_plan(write: &ReplicatedWrite) -> crate::Result<Option<PhysicalPlan>> {
+    if matches!(
+        write,
+        ReplicatedWrite::EdgePut { .. }
+            | ReplicatedWrite::EdgeDelete { .. }
+            | ReplicatedWrite::EdgePutBatch { .. }
+            | ReplicatedWrite::EdgeDeleteBatch { .. }
+    ) {
+        decode_arm(write).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<PhysicalPlan> {
     match write {
         ReplicatedWrite::EdgePut {

@@ -30,7 +30,7 @@ fn kv_put(key: &[u8], value: &[u8]) -> PhysicalPlan {
         key: key.to_vec(),
         value: value.to_vec(),
         ttl_ms: 0,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(key),
         returning: None,
         rls_filters: Vec::new(),
         provenance: None,
@@ -54,7 +54,7 @@ fn doc_put_conflict_seed(coll: &str) -> PhysicalPlan {
         collection: nodedb_types::QualifiedCollection::new(nodedb_types::DatabaseId::DEFAULT, coll),
         document_id: "conflict_doc".into(),
         value: b"seed".to_vec(),
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: doc_surrogate("conflict_doc"),
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
@@ -67,7 +67,7 @@ fn doc_insert_conflict(coll: &str) -> PhysicalPlan {
         collection: nodedb_types::QualifiedCollection::new(nodedb_types::DatabaseId::DEFAULT, coll),
         document_id: "conflict_doc".into(),
         value: b"conflict".to_vec(),
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: doc_surrogate("conflict_doc"),
         if_absent: false,
         returning: None,
         rls_filters: Vec::new(),
@@ -83,7 +83,7 @@ fn doc_get(coll: &str, doc_id: &str) -> PhysicalPlan {
         rls_filters: Vec::new(),
         system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: Some(doc_surrogate(doc_id)),
         pk_bytes: Vec::new(),
     })
 }
@@ -242,7 +242,10 @@ fn rollback_matrix_kv_batch_put_then_doc_fail() {
                     (b"k_b".to_vec(), b"b_new".to_vec()),
                 ],
                 ttl_ms: 0,
-                surrogates: vec![nodedb_types::Surrogate::ZERO; 2],
+                surrogates: [b"k_a".as_slice(), b"k_b".as_slice()]
+                    .into_iter()
+                    .map(nodedb_test_support::kv_rows::kv_row_surrogate)
+                    .collect(),
                 returning: None,
                 rls_filters: Vec::new(),
             }),

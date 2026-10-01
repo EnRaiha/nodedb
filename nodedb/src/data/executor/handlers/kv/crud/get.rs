@@ -80,21 +80,11 @@ impl CoreLoop {
         let fetched = match surrogate_ceiling {
             Some(ceiling) => {
                 // Clone-delegated read: drop the row when its binding was
-                // allocated AFTER the clone's AS-OF surrogate ceiling.
-                // `Surrogate::ZERO` means the entry was created via an
-                // internal RMW path that did not bind an identity; treat
-                // it as pre-clone (visible) — internal rows do not
-                // originate from user post-clone writes.
+                // allocated AFTER the clone's AS-OF surrogate ceiling. Every
+                // stored entry holds a bound surrogate.
                 self.kv_engine
                     .get_with_surrogate(did, tid, collection, key, now_ms)
-                    .and_then(|(value, surrogate)| {
-                        let s = surrogate.as_u32();
-                        if s != 0 && s > ceiling {
-                            None
-                        } else {
-                            Some(value)
-                        }
-                    })
+                    .and_then(|(value, surrogate)| (surrogate.as_u32() <= ceiling).then_some(value))
             }
             None => self.kv_engine.get(did, tid, collection, key, now_ms),
         };

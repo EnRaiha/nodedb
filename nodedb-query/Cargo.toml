@@ -24,5 +24,6 @@ sonic-rs = { workspace = true }
 rust_decimal = { workspace = true }
 rust-stemmers = { workspace = true }
 unicode-normalization = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]

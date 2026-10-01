@@ -15,7 +15,7 @@
 //!
 //! The OLLP (dependent-predicate) variant is intentionally NOT handled here: it
 //! is still tied to the local `OllpOrchestrator` and completion registry and is
-//! not yet leader-routed. Callers that may carry a dependent predicate must
+//! not yet leader-routed. Callers that can carry a dependent predicate must
 //! route that case through their own OLLP path.
 
 use crate::bridge::envelope::Response;
@@ -26,25 +26,37 @@ use crate::control::planner::calvin::{
 use crate::control::server::shared::authorization::AuthorizedTaskSet;
 use crate::control::server::shared::session::read_set::ReadSetEntry;
 use crate::control::state::SharedState;
+use crate::event::EventSource;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
 
-/// Submit an externally authorized strict atomic static Calvin task set.
-pub async fn dispatch_authorized_strict_atomic_tasks_to_calvin(
-    state: &SharedState,
-    authorized: AuthorizedTaskSet,
-    tenant_id: TenantId,
-    position: TxnDispatchPosition,
-    reads: &[ReadSetEntry],
-    lock_owner: Option<nodedb_cluster::calvin::types::TxnIdWire>,
-) -> crate::Result<Option<Response>> {
-    let tasks: Vec<PhysicalTask> = authorized
-        .into_tasks()
-        .into_iter()
-        .map(|task| task.into_physical_task())
-        .collect();
-    dispatch_strict_atomic_tasks_to_calvin(state, &tasks, tenant_id, position, reads, lock_owner)
-        .await
+/// The sources a Calvin transaction's writes commit under.
+#[derive(Debug, Clone)]
+pub(crate) struct TxnProvenance {
+    /// The transaction's own source.
+    pub event_source: EventSource,
+    /// Indexes into the task set of the tasks a trigger body buffered. Their
+    /// rows commit under `Trigger`.
+    pub body_tasks: Vec<u32>,
+    /// The messages the transaction's trigger bodies published, as
+    /// [`crate::wal::RedoPublish::encode_all`] wrote them. Empty for none.
+    pub publishes: Vec<u8>,
+    /// The encoded dedup key of the cross-shard request the transaction
+    /// applies, with the vShard the request addresses. `None` for any other
+    /// transaction.
+    pub applied_key: Option<(Vec<u8>, u32)>,
+}
+
+impl TxnProvenance {
+    /// A client transaction no trigger body joined.
+    pub(crate) fn client() -> Self {
+        Self {
+            event_source: EventSource::User,
+            body_tasks: Vec::new(),
+            publishes: Vec::new(),
+            applied_key: None,
+        }
+    }
 }
 
 /// Submit one trusted internal strict atomic static Calvin task set.
@@ -60,6 +72,8 @@ pub async fn dispatch_authorized_strict_atomic_tasks_to_calvin(
 /// On success, `Some(Response)` means the scheduler retained a materialized
 /// applied primary response; `None` means no response was retained. This is not
 /// an affected-row envelope and callers must apply their own operation semantics.
+///
+/// Every participant stamps `provenance` on the transaction's writes.
 pub(crate) async fn dispatch_strict_atomic_tasks_to_calvin(
     state: &SharedState,
     tasks: &[PhysicalTask],
@@ -67,12 +81,18 @@ pub(crate) async fn dispatch_strict_atomic_tasks_to_calvin(
     position: TxnDispatchPosition,
     reads: &[ReadSetEntry],
     lock_owner: Option<nodedb_cluster::calvin::types::TxnIdWire>,
+    provenance: TxnProvenance,
 ) -> crate::Result<Option<Response>> {
+    let resolved = crate::control::write_resolve::resolve_tasks_for_log(state, tasks).await?;
+    let tasks = resolved.as_deref().unwrap_or(tasks);
     let mut tx_class = admit_strict_atomic_tasks(tasks, tenant_id, position, reads)?;
-    if state.sequencer_inbox.get().is_none() {
-        return Err(crate::Error::SequencerUnavailable);
-    }
     tx_class.set_lock_owner(lock_owner);
+    tx_class.set_event_source(provenance.event_source.wal_code());
+    tx_class.set_body_plans(provenance.body_tasks);
+    tx_class.set_publishes(provenance.publishes);
+    if let Some((applied_key, vshard)) = provenance.applied_key {
+        tx_class.set_applied_key(applied_key, vshard);
+    }
     submit_calvin_routed(state, tx_class).await
 }
 
@@ -149,7 +169,7 @@ pub async fn dispatch_authorized_tasks_to_calvin(
 
 /// Drive the legacy trusted-internal strict Calvin multi-shard path for `tasks`.
 ///
-/// This compatibility API preserves its historical multi-shard-only contract.
+/// This API serves multi-shard dispatch only.
 /// Its strict branch delegates to [`dispatch_strict_atomic_tasks_to_calvin`],
 /// while best-effort remains rejected because this helper has no non-atomic
 /// dispatch implementation.
@@ -167,7 +187,13 @@ pub(crate) async fn dispatch_tasks_to_calvin(
         DispatchClass::MultiShard { .. } => {
             admit_legacy_multi_shard_dispatch(cross_shard_mode, position)?;
             dispatch_strict_atomic_tasks_to_calvin(
-                state, tasks, tenant_id, position, reads, lock_owner,
+                state,
+                tasks,
+                tenant_id,
+                position,
+                reads,
+                lock_owner,
+                TxnProvenance::client(),
             )
             .await
         }
@@ -221,6 +247,8 @@ mod tests {
             read_lsn: Lsn::new(1),
             read_version_lsn: Lsn::new(1),
             origin: ReadOrigin::Session,
+            home: None,
+            home_node: 0,
         }
     }
 

@@ -4,15 +4,11 @@
 
 use serde_json::{Map, Value as JsonValue};
 
-use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::broadcast;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec;
 use crate::engine::graph::algo::GraphAlgorithm;
-use crate::types::TraceId;
-use nodedb_physical::physical_plan::GraphOp;
 use nodedb_types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
@@ -43,6 +39,9 @@ pub struct AlgoRequest<'a> {
     pub direction: Option<String>,
     pub mode: Option<String>,
     pub personalization: Option<String>,
+    /// The session reads linearizably: each node the algorithm reads on
+    /// confirms its groups first.
+    pub linearizable: bool,
 }
 
 pub async fn algo(
@@ -64,10 +63,11 @@ pub async fn algo(
         direction,
         mode,
         personalization,
+        linearizable,
     } = request;
     let algorithm = resolve_algorithm(algorithm_name)?;
 
-    // Every dispatch shape below — the single-node broadcast and both cluster
+    // Every dispatch shape below — the gathered run and both cluster BSP
     // coordinators — reaches the Data Plane without a single plan for the
     // planner's authorization and RLS passes to inspect, so both are resolved
     // here. The result is a rank / component id / count derived from every edge
@@ -96,57 +96,20 @@ pub async fn algo(
 
     let tenant_id = identity.tenant_id;
 
-    // Cluster PageRank / WCC route through their distributed coordinators: graph
-    // edges are Raft-homed on `from_key(src)` and each core's CSR is partitioned,
-    // so a single-node `broadcast_to_all_cores` would only see the coordinator's
-    // local partitions. Each coordinator runs its per-shard primitive
-    // (`GraphOp::BspSuperstep` for PageRank, `GraphOp::WccSuperstep` for WCC)
-    // across every shard and assembles the result into the SAME `AlgoResultBatch`
-    // payload the single-node path produces, so `algo_payload_to_rows`
-    // renders identical output.
-    //
-    // Single-node (`cluster_routing.is_none()`) and every other algorithm keep
-    // the existing `broadcast_to_all_cores` path byte-identical — only
-    // cluster-mode PageRank and WCC diverge here.
-    if state.cluster_routing.is_some()
-        && matches!(algorithm, GraphAlgorithm::PageRank | GraphAlgorithm::Wcc)
+    // The algorithm reads every partition of the collection's graph, on every
+    // node that leads a data group (`graph_dispatch::whole_graph`).
+    match crate::control::server::graph_dispatch::run_graph_algo(
+        state,
+        tenant_id,
+        database_id,
+        algorithm,
+        params,
+        None,
+        linearizable,
+    )
+    .await
     {
-        let deadline_ms = state.tuning.network.default_deadline_secs * 1_000;
-        let result = match algorithm {
-            GraphAlgorithm::PageRank => {
-                crate::control::server::graph_dispatch::run_bsp_pagerank(
-                    state,
-                    tenant_id,
-                    database_id,
-                    params,
-                    deadline_ms,
-                )
-                .await
-            }
-            _ => {
-                // Wcc — the outer guard guarantees this.
-                crate::control::server::graph_dispatch::run_bsp_wcc(
-                    state,
-                    tenant_id,
-                    database_id,
-                    params,
-                    deadline_ms,
-                )
-                .await
-            }
-        };
-        return match result {
-            Ok(payload) => Ok(algo_payload_to_rows(&payload, algorithm)?),
-            Err(e) => Err(DdlError::from_error(&e)),
-        };
-    }
-
-    let plan = PhysicalPlan::Graph(GraphOp::Algo { algorithm, params });
-
-    match broadcast::broadcast_to_all_cores(state, tenant_id, database_id, plan, TraceId::ZERO)
-        .await
-    {
-        Ok(resp) => Ok(algo_payload_to_rows(&resp.payload, algorithm)?),
+        Ok(payload) => Ok(algo_payload_to_rows(&payload, algorithm)?),
         Err(e) => Err(DdlError::from_error(&e)),
     }
 }
@@ -219,11 +182,10 @@ fn clamp_opt(
 /// Render an algorithm result payload into a protocol-neutral row set.
 ///
 /// Every column is emitted as `Text` with its cell pre-rendered to the exact
-/// string the pgwire handler wrote (all algorithm result columns used
-/// `text_field`): `Text` → the raw string, `Float64` → `format!("{v}")` or the
+/// string (all algorithm result columns are text): `Text` → the raw string, `Float64` → `format!("{v}")` or the
 /// literal `Infinity` for a non-representable/non-finite score, `Int64` →
 /// decimal or `0`. Pre-rendering keeps the wire bytes byte-identical (a native
-/// float path would change both the column OID and the `Infinity` fallback).
+/// float path will change both the column OID and the `Infinity` fallback).
 fn algo_payload_to_rows(
     payload: &crate::bridge::envelope::Payload,
     algorithm: GraphAlgorithm,

@@ -26,6 +26,7 @@ pub mod dissemination;
 pub mod error;
 pub mod incarnation;
 pub mod incarnation_store;
+pub mod listen_addr;
 pub mod member;
 pub mod membership;
 pub mod subscriber;
@@ -39,6 +40,7 @@ pub use detector::{
 pub use dissemination::{DisseminationQueue, PendingUpdate, apply_and_disseminate};
 pub use error::SwimError;
 pub use incarnation::Incarnation;
+pub use listen_addr::{bind_swim_listener, default_swim_addr};
 pub use member::{Member, MemberState};
 pub use membership::{MembershipList, MembershipSnapshot, merge_update};
 pub use subscriber::MembershipSubscriber;

@@ -63,7 +63,7 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
         ),
         // Nothing applied and the identical statement is expected to succeed
         // later, so drivers get the same class they already retry on rather
-        // than a check violation they would surface as permanent.
+        // than a check violation they will surface as permanent.
         ErrorCode::RetryableRefusal { reason } => (
             "ERROR",
             sqlstate::SERIALIZATION_FAILURE,
@@ -83,11 +83,6 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
             "ERROR",
             sqlstate::SERIALIZATION_FAILURE,
             "write conflict, retry".into(),
-        ),
-        ErrorCode::FanOutExceeded => (
-            "ERROR",
-            sqlstate::STATEMENT_TOO_COMPLEX,
-            "fan-out limit exceeded".into(),
         ),
         ErrorCode::ResourcesExhausted => (
             "ERROR",
@@ -252,7 +247,7 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
                  shard state is unknown — restart required"
             ),
         ),
-        // OllpRetryRequired is an internal scheduler signal and should not
+        // OllpRetryRequired is an internal scheduler signal and must not
         // reach the pgwire layer as a user-visible error. If it does, surface
         // it as a serialization failure so clients retry automatically.
         ErrorCode::OllpRetryRequired => (

@@ -25,6 +25,7 @@ const PENDING_ACTIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pen
 /// Durable set of actions awaiting retry.
 pub struct ActionStore {
     db: Database,
+    path: std::path::PathBuf,
 }
 
 impl ActionStore {
@@ -48,9 +49,14 @@ impl ActionStore {
         let path = dir.join(format!("action_retry_core{core_id}.redb"));
         let db = Database::create(&path)
             .map_err(|e| storage_error(format!("open action retry db {}: {e}", path.display())))?;
-        let store = Self { db };
+        let store = Self { db, path };
         store.ensure_table()?;
         Ok(store)
+    }
+
+    /// A consistent image of the store file, for a physical snapshot.
+    pub fn image(&self) -> crate::Result<Vec<u8>> {
+        crate::storage::snapshot_files::read_redb_image(&self.db, &self.path)
     }
 
     /// Create the table so a first read on an empty database does not fail.
@@ -131,5 +137,52 @@ fn storage_error(detail: String) -> crate::Error {
     crate::Error::Storage {
         engine: "event_plane".into(),
         detail,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::action::record::{ActionContext, ActionId, ActionKey, ActionPayload};
+
+    fn action(name: &str) -> FailedAction {
+        FailedAction {
+            key: ActionKey {
+                source_lsn: 1,
+                source_sequence: 1,
+                source_vshard: 1,
+                action: ActionId::TriggerRow {
+                    trigger_name: name.into(),
+                },
+            },
+            payload: ActionPayload::TriggerStatement {
+                operation: "INSERT".into(),
+            },
+            context: ActionContext {
+                database_id: nodedb_types::DatabaseId::DEFAULT,
+                tenant_id: 1,
+                collection: "orders".into(),
+                row_id: String::new(),
+                cascade_depth: 0,
+            },
+            attempts: 0,
+            last_error: String::new(),
+        }
+    }
+
+    #[test]
+    fn remove_forgets_only_the_named_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ActionStore::open(dir.path(), 0).unwrap();
+        let done = action("done");
+        let kept = action("kept");
+        store.put(&done).unwrap();
+        store.put(&kept).unwrap();
+
+        store.remove(&done.key).unwrap();
+
+        let pending = store.load_all().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].key, kept.key);
     }
 }

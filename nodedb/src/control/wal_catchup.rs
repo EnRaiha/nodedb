@@ -3,7 +3,7 @@
 //! WAL catch-up task for timeseries ingest.
 //!
 //! During sustained high-throughput ILP ingest, the SPSC bridge between
-//! Control Plane and Data Plane may drop batches under backpressure.
+//! Control Plane and Data Plane can drop batches under backpressure.
 //! Those batches are durable in WAL but invisible to queries because
 //! they never reached the Data Plane memtable.
 //!
@@ -19,6 +19,9 @@ use tracing::{debug, info};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::state::SharedState;
+use crate::engine::timeseries::resolved_ingest::{
+    RESOLVED_INGEST_FORMAT, ResolvedTsBatch, TsDriftPolicy,
+};
 use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::TimeseriesOp;
 use nodedb_types::{Lsn, RlsWriteCheck};
@@ -32,7 +35,7 @@ const PAGE_SIZE: usize = 512;
 /// Runs on the Tokio runtime (Control Plane). Periodically reads unflushed
 /// WAL TimeseriesBatch records and dispatches them to the Data Plane.
 ///
-/// `initial_lsn` should be `wal.next_lsn()` after startup WAL replay —
+/// `initial_lsn` must be `wal.next_lsn()` after startup WAL replay —
 /// everything before that has already been replayed.
 pub fn spawn_wal_catchup_task(
     shared: Arc<SharedState>,
@@ -93,7 +96,7 @@ enum Resend {
 /// Decide whether the record at `lsn` is sent again.
 ///
 /// A record at or below the outcome floor, or one whose last owner closed,
-/// has a final outcome: sending it again would apply it twice or below a
+/// has a final outcome: sending it again applies it twice or below a
 /// published watermark. A record a window still owns is left for that
 /// window.
 fn plan_resend(floor: &Arc<crate::bridge::dispatch::OutcomeFloor>, lsn: Lsn) -> Resend {
@@ -126,9 +129,9 @@ async fn run_catchup_cycle(shared: &SharedState) -> CatchupResult {
     {
         Ok(r) => r,
         // The cursor points below the earliest LSN the WAL still retains, so
-        // the batches in between were truncated before this task could
-        // re-dispatch them. It cannot get them back, but leaving the cursor
-        // where it is would wedge the task on the same failure forever and
+        // the batches in between were truncated before this task
+        // re-dispatched them. It cannot get them back, but leaving the cursor
+        // where it is wedges the task on the same failure forever and
         // strand every batch above the floor as well. Re-anchor to the floor
         // and say plainly what was skipped — the WAL layer has already filed a
         // report at the detection site.
@@ -159,8 +162,8 @@ async fn run_catchup_cycle(shared: &SharedState) -> CatchupResult {
     }
 
     // A batch the Data Plane refused after its record was appended carries a
-    // `WriteAborted` marker naming it; re-dispatching such a record here would
-    // ingest a write the client was told was rejected. Unlike restart replay,
+    // `WriteAborted` marker naming it; re-dispatching such a record here
+    // ingests a write the client was told was rejected. Unlike restart replay,
     // this reader is paginated, so a marker that lands in a LATER page cannot
     // gate its record in this one — that record is still excluded from restart
     // replay, which is where a refused write becomes durable state.
@@ -217,10 +220,15 @@ async fn run_catchup_cycle(shared: &SharedState) -> CatchupResult {
         let database_id = DatabaseId::new(record.header.database_id);
         let vshard_id = VShardId::new(record.header.vshard_id);
         let format = decoded.format.unwrap_or_else(|| "ilp".to_string());
+        let payload = if format == RESOLVED_INGEST_FORMAT {
+            installs_by_name(decoded.payload)
+        } else {
+            decoded.payload
+        };
 
         let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
             collection: nodedb_types::QualifiedCollection::from_stored(decoded.collection),
-            payload: decoded.payload,
+            payload,
             format,
             wal_lsn: Some(record.header.lsn),
             // Re-derived on the engine side during apply (record carries
@@ -236,7 +244,7 @@ async fn run_catchup_cycle(shared: &SharedState) -> CatchupResult {
 
         // Dispatch to Data Plane — do NOT re-append to WAL (already there).
         // Untimed rows take the instant the record carries.
-        match crate::control::server::dispatch_utils::dispatch_trusted_internal_write_to_data_plane(
+        match crate::control::server::dispatch_utils::dispatch_replayed_write_to_data_plane(
             shared,
             crate::control::server::dispatch_utils::WriteDispatch {
                 tenant_id,
@@ -285,6 +293,16 @@ async fn run_catchup_cycle(shared: &SharedState) -> CatchupResult {
     }
 }
 
+/// The encoded resolved batch `payload`, set to install by column name. The
+/// record is already logged, so its re-dispatched install never refuses,
+/// whatever drift policy its live install named. A payload that does not
+/// decode passes through, and its install reports it.
+fn installs_by_name(payload: Vec<u8>) -> Vec<u8> {
+    ResolvedTsBatch::from_bytes(&payload)
+        .and_then(|batch| batch.with_drift(TsDriftPolicy::ApplyByName).to_bytes())
+        .unwrap_or(payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +322,30 @@ mod tests {
             Resend::Send(minted) => minted.settle(),
             Resend::Skip | Resend::Wait => panic!("a free record above the floor is sent"),
         }
+    }
+
+    /// A logged record a live install resolved under `Refuse` re-dispatches
+    /// under `ApplyByName`, so its install never refuses.
+    #[test]
+    fn a_redispatched_resolved_record_installs_by_name() {
+        let batch = ResolvedTsBatch {
+            measurement: "metrics".to_string(),
+            columns: Vec::new(),
+            timestamp_idx: 0,
+            drift: TsDriftPolicy::Refuse,
+            now_ms: 1_000,
+            resolved_bytes: 0,
+            emits_events: false,
+            rows: Vec::new(),
+            rejected: 0,
+            first_rejection: None,
+        };
+        let payload = batch.to_bytes().expect("encode batch");
+        let redispatched =
+            ResolvedTsBatch::from_bytes(&installs_by_name(payload)).expect("decode batch");
+        assert_eq!(redispatched, batch.with_drift(TsDriftPolicy::ApplyByName));
+
+        let garbage = vec![0xc1];
+        assert_eq!(installs_by_name(garbage.clone()), garbage);
     }
 }

@@ -8,8 +8,8 @@
 //! The store is deliberately read-only with respect to durable state: it is
 //! seeded once from the catalog by [`ScopeGrantStore::open`] and thereafter
 //! mutated only by the replicated installers in [`super::replication`]. A
-//! scope grant that reached redb without passing through raft would authorize
-//! on one node and be invisible on every other, so this store offers no way to
+//! scope grant that reached redb without passing through raft authorizes
+//! on one node and is invisible on every other, so this store offers no way to
 //! write one.
 
 use std::collections::{HashMap, HashSet};
@@ -37,32 +37,16 @@ impl ScopeGrantStore {
 
     /// Seed the in-memory map from the catalog at startup.
     pub fn open(catalog: &SystemCatalog) -> crate::Result<Self> {
-        let stored = catalog.load_all_scope_grants()?;
-        let mut grants = HashMap::with_capacity(stored.len());
-        for s in &stored {
-            // A grant whose stored conditions cannot be decoded is dropped,
-            // not loaded unconditionally: an unreadable restriction has to
-            // deny, never widen.
-            match ScopeGrant::from_stored(s) {
-                Ok(grant) => {
-                    let key = grant_key(&s.scope_name, &s.grantee_type, &s.grantee_id);
-                    grants.insert(key, grant);
-                }
-                Err(e) => warn!(
-                    scope = %s.scope_name,
-                    grantee_type = %s.grantee_type,
-                    grantee_id = %s.grantee_id,
-                    error = %e,
-                    "scope grant dropped at load: conditions could not be decoded"
-                ),
-            }
-        }
-        if !grants.is_empty() {
-            info!(count = grants.len(), "scope grants loaded from catalog");
-        }
         Ok(Self {
-            grants: RwLock::new(grants),
+            grants: RwLock::new(load_grants(catalog)?),
         })
+    }
+
+    /// Replace the in-memory map with the catalog's grants.
+    pub fn reload_from_catalog(&self, catalog: &SystemCatalog) -> crate::Result<()> {
+        let grants = load_grants(catalog)?;
+        *self.grants.write().unwrap_or_else(|p| p.into_inner()) = grants;
+        Ok(())
     }
 
     /// Get all effective scope names granted to a specific grantee.
@@ -171,4 +155,32 @@ impl Default for ScopeGrantStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Every decodable grant in `catalog`, keyed by grant key.
+fn load_grants(catalog: &SystemCatalog) -> crate::Result<HashMap<String, ScopeGrant>> {
+    let stored = catalog.load_all_scope_grants()?;
+    let mut grants = HashMap::with_capacity(stored.len());
+    for s in &stored {
+        // A grant whose stored conditions cannot be decoded is dropped,
+        // not loaded unconditionally: an unreadable restriction has to
+        // deny, never widen.
+        match ScopeGrant::from_stored(s) {
+            Ok(grant) => {
+                let key = grant_key(&s.scope_name, &s.grantee_type, &s.grantee_id);
+                grants.insert(key, grant);
+            }
+            Err(e) => warn!(
+                scope = %s.scope_name,
+                grantee_type = %s.grantee_type,
+                grantee_id = %s.grantee_id,
+                error = %e,
+                "scope grant dropped at load: conditions could not be decoded"
+            ),
+        }
+    }
+    if !grants.is_empty() {
+        info!(count = grants.len(), "scope grants loaded from catalog");
+    }
+    Ok(grants)
 }

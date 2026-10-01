@@ -9,8 +9,10 @@
 use std::collections::VecDeque;
 use std::path::Path;
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::TableDefinition;
 use tracing::warn;
+
+use crate::event::redb_store::RedbStore;
 
 /// redb table: entry_id (u64) → MessagePack-serialized DlqEntry.
 const CROSS_SHARD_DLQ: TableDefinition<u64, &[u8]> = TableDefinition::new("cross_shard_dlq");
@@ -39,6 +41,9 @@ pub struct CrossShardDlqEntry {
     pub source_lsn: u64,
     /// Source sequence number.
     pub source_sequence: u64,
+    /// Body that emitted the request; with the source position it is the
+    /// receiver's dedup key.
+    pub origin: String,
     /// Last error message from the target.
     pub error: String,
     /// Total retry attempts before DLQ.
@@ -59,67 +64,54 @@ pub struct DlqEnqueueParams {
     pub target_node: u64,
     pub source_lsn: u64,
     pub source_sequence: u64,
+    pub origin: String,
     pub error: String,
     pub retry_count: u32,
 }
 
 /// Cross-shard Dead Letter Queue backed by redb.
+///
+/// Every mutation writes redb first and changes the in-memory index only
+/// after the write commits, so the index never holds a change redb refused.
 pub struct CrossShardDlq {
-    db: Database,
-    /// In-memory index for fast listing.
+    store: RedbStore<CrossShardDlqEntry>,
+    /// In-memory index for fast listing. Mirrors redb.
     entries: VecDeque<CrossShardDlqEntry>,
     next_entry_id: u64,
     max_entries: usize,
 }
 
+impl crate::storage::RedbBacked for CrossShardDlq {
+    fn redb_database(&self) -> &redb::Database {
+        self.store.redb_database()
+    }
+}
+
 impl CrossShardDlq {
-    /// Open or create the cross-shard DLQ store.
+    /// Open or create the cross-shard DLQ at
+    /// `{data_dir}/event_plane/cross_shard_dlq.redb`.
     pub fn open(data_dir: &Path) -> crate::Result<Self> {
-        let dir = data_dir.join("event_plane");
-        std::fs::create_dir_all(&dir).map_err(|e| crate::Error::Storage {
-            engine: "event_plane".into(),
-            detail: format!("create dir {}: {e}", dir.display()),
-        })?;
-
-        let path = dir.join("cross_shard_dlq.redb");
-        let db = Database::create(&path).map_err(|e| crate::Error::Storage {
-            engine: "event_plane".into(),
-            detail: format!("open cross_shard_dlq db {}: {e}", path.display()),
-        })?;
-
-        // Ensure table exists and load existing entries.
-        {
-            let txn = db.begin_write().map_err(|e| crate::Error::Storage {
-                engine: "event_plane".into(),
-                detail: format!("begin_write: {e}"),
-            })?;
-            txn.open_table(CROSS_SHARD_DLQ)
-                .map_err(|e| crate::Error::Storage {
-                    engine: "event_plane".into(),
-                    detail: format!("open_table: {e}"),
-                })?;
-            txn.commit().map_err(|e| crate::Error::Storage {
-                engine: "event_plane".into(),
-                detail: format!("commit: {e}"),
-            })?;
-        }
-
-        let entries = Self::load_entries(&db)?;
-        let next_entry_id = entries.back().map_or(1, |e| e.entry_id + 1);
-
+        let store = RedbStore::open(
+            data_dir,
+            "cross_shard_dlq.redb",
+            CROSS_SHARD_DLQ,
+            "cross-shard DLQ",
+        )?;
+        let loaded = store.load()?;
         Ok(Self {
-            db,
-            entries,
-            next_entry_id,
+            store,
+            entries: loaded.records,
+            next_entry_id: loaded.next_key,
             max_entries: DEFAULT_MAX_ENTRIES,
         })
     }
 
     /// Enqueue a failed cross-shard write.
+    ///
+    /// At capacity the oldest entries are removed in the same redb
+    /// transaction that writes the new one. On error nothing changes.
     pub fn enqueue(&mut self, params: DlqEnqueueParams) -> crate::Result<u64> {
         let entry_id = self.next_entry_id;
-        self.next_entry_id += 1;
-
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -135,27 +127,33 @@ impl CrossShardDlq {
             target_node: params.target_node,
             source_lsn: params.source_lsn,
             source_sequence: params.source_sequence,
+            origin: params.origin,
             error: params.error,
             retry_count: params.retry_count,
             created_at: now,
             resolved: false,
         };
 
-        self.write_to_redb(&entry)?;
-        self.entries.push_back(entry);
+        let evict_count = (self.entries.len() + 1).saturating_sub(self.max_entries);
+        let evicted: Vec<u64> = self
+            .entries
+            .iter()
+            .take(evict_count)
+            .map(|e| e.entry_id)
+            .collect();
+        self.store.put_evicting(entry_id, &entry, &evicted)?;
 
-        // Evict oldest if over capacity.
-        while self.entries.len() > self.max_entries {
-            if let Some(evicted) = self.entries.pop_front() {
+        self.next_entry_id += 1;
+        for _ in 0..evict_count {
+            if let Some(old) = self.entries.pop_front() {
                 warn!(
-                    entry_id = evicted.entry_id,
-                    collection = %evicted.source_collection,
+                    entry_id = old.entry_id,
+                    collection = %old.source_collection,
                     "cross-shard DLQ capacity exceeded, evicting oldest entry"
                 );
-                self.delete_from_redb(evicted.entry_id);
             }
         }
-
+        self.entries.push_back(entry);
         Ok(entry_id)
     }
 
@@ -180,15 +178,17 @@ impl CrossShardDlq {
             .collect()
     }
 
-    /// Mark an entry as resolved (successfully replayed).
-    pub fn resolve(&mut self, entry_id: u64) -> bool {
+    /// Mark an entry as resolved (successfully replayed). Returns `Ok(false)`
+    /// when no entry has `entry_id`. On error the entry stays unresolved.
+    pub fn resolve(&mut self, entry_id: u64) -> crate::Result<bool> {
         let Some(entry) = self.entries.iter_mut().find(|e| e.entry_id == entry_id) else {
-            return false;
+            return Ok(false);
         };
+        let mut updated = entry.clone();
+        updated.resolved = true;
+        self.store.put(entry_id, &updated)?;
         entry.resolved = true;
-        let cloned = entry.clone();
-        let _ = self.write_to_redb(&cloned);
-        true
+        Ok(true)
     }
 
     /// Number of entries (including resolved).
@@ -207,91 +207,29 @@ impl CrossShardDlq {
 
     /// Get entries ready for replay (unresolved, for a collection, since a time).
     /// Returns owned clones suitable for async replay.
+    ///
+    /// An entry older than [`super::dedup::DLQ_REPLAY_WINDOW_MS`] is never a
+    /// candidate: its receiver can have pruned the dedup key, so a replay
+    /// applies the write twice.
     pub fn replay_candidates(
         &self,
         collection: &str,
         since_epoch_ms: u64,
     ) -> Vec<CrossShardDlqEntry> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let oldest = now.saturating_sub(super::dedup::DLQ_REPLAY_WINDOW_MS);
         self.entries
             .iter()
             .filter(|e| {
-                !e.resolved && e.source_collection == collection && e.created_at >= since_epoch_ms
+                !e.resolved
+                    && e.source_collection == collection
+                    && e.created_at >= since_epoch_ms.max(oldest)
             })
             .cloned()
             .collect()
-    }
-
-    fn write_to_redb(&self, entry: &CrossShardDlqEntry) -> crate::Result<()> {
-        let bytes = zerompk::to_msgpack_vec(entry).map_err(|e| crate::Error::Serialization {
-            format: "msgpack".into(),
-            detail: format!("cross_shard_dlq: {e}"),
-        })?;
-
-        let txn = self.db.begin_write().map_err(|e| crate::Error::Storage {
-            engine: "event_plane".into(),
-            detail: format!("begin_write: {e}"),
-        })?;
-        {
-            let mut table = txn
-                .open_table(CROSS_SHARD_DLQ)
-                .map_err(|e| crate::Error::Storage {
-                    engine: "event_plane".into(),
-                    detail: format!("open_table: {e}"),
-                })?;
-            table
-                .insert(entry.entry_id, bytes.as_slice())
-                .map_err(|e| crate::Error::Storage {
-                    engine: "event_plane".into(),
-                    detail: format!("insert: {e}"),
-                })?;
-        }
-        txn.commit().map_err(|e| crate::Error::Storage {
-            engine: "event_plane".into(),
-            detail: format!("commit: {e}"),
-        })?;
-        Ok(())
-    }
-
-    fn delete_from_redb(&self, entry_id: u64) {
-        if let Ok(txn) = self.db.begin_write() {
-            if let Ok(mut table) = txn.open_table(CROSS_SHARD_DLQ) {
-                let _ = table.remove(entry_id);
-            }
-            let _ = txn.commit();
-        }
-    }
-
-    fn load_entries(db: &Database) -> crate::Result<VecDeque<CrossShardDlqEntry>> {
-        let txn = db.begin_read().map_err(|e| crate::Error::Storage {
-            engine: "event_plane".into(),
-            detail: format!("begin_read: {e}"),
-        })?;
-        let table = txn
-            .open_table(CROSS_SHARD_DLQ)
-            .map_err(|e| crate::Error::Storage {
-                engine: "event_plane".into(),
-                detail: format!("open_table: {e}"),
-            })?;
-
-        let mut entries = VecDeque::new();
-        let iter = table.iter().map_err(|e| crate::Error::Storage {
-            engine: "event_plane".into(),
-            detail: format!("iter: {e}"),
-        })?;
-        for result in iter {
-            let guard = result.map_err(|e| crate::Error::Storage {
-                engine: "event_plane".into(),
-                detail: format!("entry: {e}"),
-            })?;
-            let value_bytes: &[u8] = guard.1.value();
-            match zerompk::from_msgpack::<CrossShardDlqEntry>(value_bytes) {
-                Ok(entry) => entries.push_back(entry),
-                Err(e) => {
-                    warn!(error = %e, "skipping corrupt cross-shard DLQ entry");
-                }
-            }
-        }
-        Ok(entries)
     }
 }
 
@@ -309,6 +247,7 @@ mod tests {
             target_node: 2,
             source_lsn: lsn,
             source_sequence: lsn,
+            origin: "trigger/1/audit".into(),
             error: "shard unavailable".into(),
             retry_count: 5,
         }
@@ -335,7 +274,7 @@ mod tests {
         let mut dlq = CrossShardDlq::open(dir.path()).unwrap();
 
         let id = dlq.enqueue(make_params("orders", 100)).unwrap();
-        assert!(dlq.resolve(id));
+        assert!(dlq.resolve(id).unwrap());
         assert_eq!(dlq.unresolved_count(), 0);
         assert_eq!(dlq.len(), 1); // Still present, just resolved.
     }
@@ -366,6 +305,17 @@ mod tests {
         // All candidates (since epoch 0).
         let candidates = dlq.replay_candidates("orders", 0);
         assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn entries_past_the_replay_window_are_not_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dlq = CrossShardDlq::open(dir.path()).unwrap();
+        dlq.enqueue(make_params("orders", 100)).unwrap();
+        for entry in dlq.entries.iter_mut() {
+            entry.created_at = 0;
+        }
+        assert!(dlq.replay_candidates("orders", 0).is_empty());
     }
 
     #[test]

@@ -154,6 +154,19 @@ mod tests {
         (dir, state)
     }
 
+    /// An insert into `orders` by `tenant` at `lsn`.
+    fn order_event(lsn: u64, tenant: u64, document: &str) -> ChangeEvent {
+        ChangeEvent {
+            lsn: Lsn::new(lsn),
+            tenant_id: TenantId::new(tenant),
+            collection: "orders".into(),
+            document_id: RowIdentity::from_user_key(document),
+            operation: ChangeOperation::Insert,
+            timestamp_ms: 1,
+            after: None,
+        }
+    }
+
     fn identity(tenant_id: TenantId, roles: Vec<Role>) -> AuthenticatedIdentity {
         AuthenticatedIdentity::new_regular(
             42,
@@ -169,15 +182,12 @@ mod tests {
     #[tokio::test]
     async fn show_changes_denies_custom_role_without_collection_read_grant() {
         let (_dir, state) = test_state();
-        state.change_stream.publish(ChangeEvent {
-            lsn: Lsn::new(1),
-            tenant_id: TenantId::new(1),
-            collection: "orders".into(),
-            document_id: RowIdentity::from_user_key("hidden-order"),
-            operation: ChangeOperation::Insert,
-            timestamp_ms: 1,
-            after: None,
-        });
+        state.change_stream.settle_entry(
+            1,
+            1,
+            DatabaseId::DEFAULT,
+            vec![order_event(1, 1, "hidden-order")],
+        );
         let identity = identity(TenantId::new(1), vec![Role::Custom("auditor".into())]);
 
         let error = show_changes(
@@ -195,21 +205,15 @@ mod tests {
     async fn show_changes_isolates_events_by_selected_database() {
         let (_dir, state) = test_state();
         let second_database = DatabaseId::new(9);
-        for (database_id, lsn, document_id) in [
-            (DatabaseId::DEFAULT, Lsn::new(1), "default-database-order"),
-            (second_database, Lsn::new(2), "second-database-order"),
+        for (index, database_id, document_id) in [
+            (1, DatabaseId::DEFAULT, "default-database-order"),
+            (2, second_database, "second-database-order"),
         ] {
-            state.change_stream.publish_in_database(
+            state.change_stream.settle_entry(
+                1,
+                index,
                 database_id,
-                ChangeEvent {
-                    lsn,
-                    tenant_id: TenantId::new(1),
-                    collection: "orders".into(),
-                    document_id: RowIdentity::from_user_key(document_id),
-                    operation: ChangeOperation::Insert,
-                    timestamp_ms: 1,
-                    after: None,
-                },
+                vec![order_event(index, 1, document_id)],
             );
         }
         let mut identity = identity(TenantId::new(1), vec![Role::ReadOnly]);
@@ -248,24 +252,18 @@ mod tests {
     #[tokio::test]
     async fn show_changes_returns_only_callers_tenant_events_from_shared_ring_buffer() {
         let (_dir, state) = test_state();
-        state.change_stream.publish(ChangeEvent {
-            lsn: Lsn::new(1),
-            tenant_id: TenantId::new(1),
-            collection: "orders".into(),
-            document_id: RowIdentity::from_user_key("tenant-1-order"),
-            operation: ChangeOperation::Insert,
-            timestamp_ms: 1,
-            after: None,
-        });
-        state.change_stream.publish(ChangeEvent {
-            lsn: Lsn::new(2),
-            tenant_id: TenantId::new(2),
-            collection: "orders".into(),
-            document_id: RowIdentity::from_user_key("tenant-2-order"),
-            operation: ChangeOperation::Insert,
-            timestamp_ms: 1,
-            after: None,
-        });
+        state.change_stream.settle_entry(
+            1,
+            1,
+            DatabaseId::DEFAULT,
+            vec![order_event(1, 1, "tenant-1-order")],
+        );
+        state.change_stream.settle_entry(
+            1,
+            2,
+            DatabaseId::DEFAULT,
+            vec![order_event(2, 2, "tenant-2-order")],
+        );
         let identity = identity(TenantId::new(1), vec![Role::ReadOnly]);
 
         let mut results = show_changes(

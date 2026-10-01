@@ -3,10 +3,8 @@
 //! `SHOW PARTITIONS FOR <name>`
 //!
 //! Reachability note: the `SHOW PARTITIONS ` prefix is claimed by the
-//! consumer-group handler earlier in the neutral router (mirroring the pgwire
-//! streaming router, which ran before engine_ops), so this handler is shadowed
-//! for that prefix exactly as it was on the pgwire path. It is ported here to
-//! preserve the engine_ops handler set verbatim.
+//! consumer-group handler earlier in the neutral router, so this handler is
+//! shadowed for that prefix.
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};

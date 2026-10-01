@@ -4,12 +4,11 @@
 //!
 //! Decodes `SpatialInsertMsg` / `SpatialDeleteMsg` from a Lite client,
 //! deserialises the geometry, allocates a surrogate for the document ID,
-//! appends a WAL record on the Control Plane, dispatches
-//! `SpatialOp::Insert` / `SpatialOp::Delete` to the Data Plane through
-//! the idempotency gate, and returns an ACK frame.
+//! proposes `SpatialOp::Insert` / `SpatialOp::Delete` through Raft (the
+//! replicated apply journals the write and runs the idempotency gate), and
+//! returns an ACK frame.
 //!
-//! Handler methods live in `spatial_session.rs` to keep both files under
-//! the 500-line limit.
+//! Handler methods live in `spatial_session.rs`.
 //!
 //! Structural pattern mirrors `vector_handler.rs`.
 
@@ -52,24 +51,36 @@ pub trait SpatialDispatcher: Send + Sync {
     ) -> crate::Result<Vec<u8>>;
 
     /// Remove a document's geometry from the R-tree on the Data Plane.
+    /// `None` names a key its home never bound: the delete removes nothing
+    /// and still commits the producer's sequence.
     async fn dispatch_delete(
         &self,
         tenant_id: TenantId,
         vshard: VShardId,
         collection: String,
         field: String,
-        surrogate: Surrogate,
+        surrogate: Option<Surrogate>,
         provenance: nodedb_types::sync::wire::SyncProvenance,
     ) -> crate::Result<Vec<u8>>;
 
     /// Assign a stable surrogate for `(collection, doc_id)`.
-    fn assign_surrogate(
+    async fn assign_surrogate(
         &self,
         database_id: DatabaseId,
         tenant_id: TenantId,
         collection: &str,
         doc_id: &str,
     ) -> crate::Result<Surrogate>;
+
+    /// The surrogate `(collection, doc_id)` is bound to at the collection's
+    /// home, or `None` when the home binds none. Never binds.
+    async fn lookup_surrogate(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: TenantId,
+        collection: &str,
+        doc_id: &str,
+    ) -> crate::Result<Option<Surrogate>>;
 }
 
 // ── SharedState adapter ──────────────────────────────────────────────────────
@@ -91,8 +102,6 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
         provenance: nodedb_types::sync::wire::SyncProvenance,
     ) -> crate::Result<Vec<u8>> {
         use crate::bridge::envelope::PhysicalPlan;
-        use crate::control::server::wal_dispatch::wal_append_spatial_put;
-        use crate::control::server::wal_dispatch_fts_spatial::encode_spatial_put_payload;
         use nodedb_physical::physical_plan::SpatialOp;
 
         let prov = provenance;
@@ -111,21 +120,11 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
             database_id,
             &collection,
         )?;
-        let spatial_put_payload =
-            encode_spatial_put_payload(&collection, &field, surrogate, &geometry, &prov)?;
         let owner = RecordOwner {
             tenant_id,
             database_id,
             vshard_id: vshard,
         };
-        // The record's outcome-floor window opens before the append and
-        // closes from the dispatch's outcome.
-        let (minted, _) = super::raft_dispatch::append_under_window(self.shared, owner, |wal| {
-            wal_append_spatial_put(wal, tenant_id, vshard, database_id, &spatial_put_payload)
-                .map(Some)
-        })
-        .await?;
-
         let plan = PhysicalPlan::Spatial(SpatialOp::Insert {
             collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
             field,
@@ -134,14 +133,7 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
             provenance: Some(prov),
         });
 
-        super::raft_dispatch::authorize_and_dispatch_minted(
-            self.shared,
-            self.identity,
-            owner,
-            plan,
-            minted,
-        )
-        .await
+        super::raft_dispatch::authorize_and_dispatch(self.shared, self.identity, owner, plan).await
     }
 
     async fn dispatch_delete(
@@ -150,12 +142,10 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
         vshard: VShardId,
         collection: String,
         field: String,
-        surrogate: Surrogate,
+        surrogate: Option<Surrogate>,
         provenance: nodedb_types::sync::wire::SyncProvenance,
     ) -> crate::Result<Vec<u8>> {
         use crate::bridge::envelope::PhysicalPlan;
-        use crate::control::server::wal_dispatch::wal_append_spatial_delete;
-        use crate::control::server::wal_dispatch_fts_spatial::encode_spatial_delete_payload;
         use nodedb_physical::physical_plan::SpatialOp;
 
         let prov = provenance;
@@ -168,21 +158,11 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
             &collection,
         )?;
 
-        let spatial_delete_payload =
-            encode_spatial_delete_payload(&collection, &field, surrogate, &prov);
         let owner = RecordOwner {
             tenant_id,
             database_id,
             vshard_id: vshard,
         };
-        // The record's outcome-floor window opens before the append and
-        // closes from the dispatch's outcome.
-        let (minted, _) = super::raft_dispatch::append_under_window(self.shared, owner, |wal| {
-            wal_append_spatial_delete(wal, tenant_id, vshard, database_id, &spatial_delete_payload)
-                .map(Some)
-        })
-        .await?;
-
         let plan = PhysicalPlan::Spatial(SpatialOp::Delete {
             collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
             field,
@@ -190,28 +170,41 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
             provenance: Some(prov),
         });
 
-        super::raft_dispatch::authorize_and_dispatch_minted(
-            self.shared,
-            self.identity,
-            owner,
-            plan,
-            minted,
-        )
-        .await
+        super::raft_dispatch::authorize_and_dispatch(self.shared, self.identity, owner, plan).await
     }
 
-    fn assign_surrogate(
+    async fn assign_surrogate(
         &self,
         database_id: DatabaseId,
         tenant_id: TenantId,
         collection: &str,
         doc_id: &str,
     ) -> crate::Result<Surrogate> {
-        self.shared.surrogate_assigner.assign(
+        crate::control::server::surrogate_exchange::assign_surrogate_routed(
+            self.shared,
             nodedb_types::CollectionKey::from_bare(database_id, collection),
             tenant_id,
             doc_id.as_bytes(),
+            crate::types::TraceId::ZERO,
         )
+        .await
+    }
+
+    async fn lookup_surrogate(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: TenantId,
+        collection: &str,
+        doc_id: &str,
+    ) -> crate::Result<Option<Surrogate>> {
+        crate::control::server::surrogate_exchange::lookup_surrogate_routed(
+            self.shared,
+            nodedb_types::CollectionKey::from_bare(database_id, collection),
+            tenant_id,
+            doc_id.as_bytes(),
+            crate::types::TraceId::ZERO,
+        )
+        .await
     }
 }
 
@@ -238,20 +231,34 @@ impl SpatialDispatcher for NoOpSpatialDispatcher {
         _vshard: VShardId,
         _collection: String,
         _field: String,
-        _surrogate: Surrogate,
+        _surrogate: Option<Surrogate>,
         _provenance: nodedb_types::sync::wire::SyncProvenance,
     ) -> crate::Result<Vec<u8>> {
         Err(super::raft_dispatch::noop_dispatch_error("spatial delete"))
     }
 
-    fn assign_surrogate(
+    async fn assign_surrogate(
         &self,
         _database_id: DatabaseId,
         _tenant_id: TenantId,
         _collection: &str,
         _doc_id: &str,
     ) -> crate::Result<Surrogate> {
-        Ok(Surrogate::ZERO)
+        Err(super::raft_dispatch::noop_dispatch_error(
+            "spatial surrogate assignment",
+        ))
+    }
+
+    async fn lookup_surrogate(
+        &self,
+        _database_id: DatabaseId,
+        _tenant_id: TenantId,
+        _collection: &str,
+        _doc_id: &str,
+    ) -> crate::Result<Option<Surrogate>> {
+        Err(super::raft_dispatch::noop_dispatch_error(
+            "spatial surrogate lookup",
+        ))
     }
 }
 
@@ -271,6 +278,12 @@ mod tests {
         insert_calls: MockCallLog,
         delete_calls: MockCallLog,
         result: crate::Result<()>,
+        /// The home's binding every lookup answers.
+        bound: Option<Surrogate>,
+        /// The doc ids `assign_surrogate` was called for.
+        assigned: Arc<Mutex<Vec<String>>>,
+        /// The surrogate each `dispatch_delete` carried.
+        deleted: Arc<Mutex<Vec<Option<Surrogate>>>>,
     }
 
     impl MockDispatcher {
@@ -282,6 +295,9 @@ mod tests {
                     insert_calls: inserts.clone(),
                     delete_calls: deletes.clone(),
                     result: Ok(()),
+                    bound: None,
+                    assigned: Arc::default(),
+                    deleted: Arc::default(),
                 },
                 inserts,
                 deletes,
@@ -295,6 +311,9 @@ mod tests {
                 result: Err(crate::Error::Internal {
                     detail: "mock failure".to_string(),
                 }),
+                bound: None,
+                assigned: Arc::default(),
+                deleted: Arc::default(),
             }
         }
     }
@@ -322,10 +341,11 @@ mod tests {
             _vshard: VShardId,
             collection: String,
             field: String,
-            _surrogate: Surrogate,
+            surrogate: Option<Surrogate>,
             provenance: nodedb_types::sync::wire::SyncProvenance,
         ) -> crate::Result<Vec<u8>> {
             let seq = provenance.seq;
+            self.deleted.lock().unwrap().push(surrogate);
             self.delete_calls
                 .lock()
                 .unwrap()
@@ -333,14 +353,25 @@ mod tests {
             super::super::test_support::mock_applied_ack(&self.result, seq)
         }
 
-        fn assign_surrogate(
+        async fn assign_surrogate(
+            &self,
+            _database_id: DatabaseId,
+            _tenant_id: TenantId,
+            _collection: &str,
+            doc_id: &str,
+        ) -> crate::Result<Surrogate> {
+            self.assigned.lock().unwrap().push(doc_id.to_string());
+            Ok(Surrogate::new(1))
+        }
+
+        async fn lookup_surrogate(
             &self,
             _database_id: DatabaseId,
             _tenant_id: TenantId,
             _collection: &str,
             _doc_id: &str,
-        ) -> crate::Result<Surrogate> {
-            Ok(Surrogate::ZERO)
+        ) -> crate::Result<Option<Surrogate>> {
+            Ok(self.bound)
         }
     }
 
@@ -471,5 +502,40 @@ mod tests {
         assert!(!ack.accepted);
         assert!(ack.reject_reason.is_some());
         assert!(inserts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_of_an_unbound_key_looks_up_and_binds_nothing() {
+        let mut session = make_session();
+        session.authenticated = true;
+        let (mock, _, deletes) = MockDispatcher::ok();
+
+        let frame = session
+            .handle_spatial_delete(&make_delete_msg("places", "loc", "d1"), &mock)
+            .await;
+        let ack: SpatialDeleteAckMsg = frame.unwrap().decode_body().unwrap();
+        assert!(ack.accepted);
+        assert_eq!(deletes.lock().unwrap().len(), 1);
+        assert_eq!(*mock.deleted.lock().unwrap(), vec![None]);
+        assert!(
+            mock.assigned.lock().unwrap().is_empty(),
+            "a delete must never bind its key"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_of_a_bound_key_carries_the_home_surrogate() {
+        let mut session = make_session();
+        session.authenticated = true;
+        let (mut mock, _, _) = MockDispatcher::ok();
+        mock.bound = Some(Surrogate::new(7));
+
+        let frame = session
+            .handle_spatial_delete(&make_delete_msg("places", "loc", "d1"), &mock)
+            .await;
+        let ack: SpatialDeleteAckMsg = frame.unwrap().decode_body().unwrap();
+        assert!(ack.accepted);
+        assert_eq!(*mock.deleted.lock().unwrap(), vec![Some(Surrogate::new(7))]);
+        assert!(mock.assigned.lock().unwrap().is_empty());
     }
 }

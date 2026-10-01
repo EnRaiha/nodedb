@@ -171,7 +171,7 @@ mod tests {
         let mk = |row: &str, coll: &str, email: &str| ProposedChange {
             collection: coll.into(),
             row_id: row.into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             fields: vec![("email".into(), LoroValue::String(email.into()))],
         };
 

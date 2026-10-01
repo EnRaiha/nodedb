@@ -14,16 +14,15 @@
 
 use std::sync::Arc;
 
-use tracing::warn;
-
 use crate::control::security::catalog::trigger_types::TriggerExecutionMode;
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
+use super::enqueue::{ActionSource, record_row_failures};
 use super::identity::trigger_identity;
-use crate::event::action::{
-    ActionContext, ActionId, ActionKey, ActionPayload, ActionRetryQueue, FailedAction,
-};
+use crate::control::planner::procedural::executor::core::CrossShardOrigin;
+use crate::control::trigger::batch::collector::RowSource;
+use crate::event::action::ActionRetryQueue;
 
 pub async fn dispatch_trigger_batch(
     batch: &crate::control::trigger::batch::collector::TriggerBatch,
@@ -100,6 +99,11 @@ pub async fn dispatch_trigger_batch(
             let bindings =
                 when_filter::build_row_bindings(row, &batch.collection, &batch.operation);
 
+            let position = row.source.unwrap_or(RowSource {
+                lsn: 0,
+                sequence: 0,
+                vshard: 0,
+            });
             let report = fire_common::fire_triggers(fire_common::FireTriggersParams {
                 state,
                 identity: &identity,
@@ -108,53 +112,34 @@ pub async fn dispatch_trigger_batch(
                 triggers: std::slice::from_ref(trigger),
                 bindings: &bindings,
                 cascade_depth: 0,
-                // The batch dispatch path does not carry per-row source
-                // LSN/sequence/vShard (TriggerBatch aggregates rows and drops
-                // that context), and it is not wired into the production
-                // consumer loop. Cross-shard origination is therefore not
-                // available here; see the tracked follow-up.
-                cross_shard_origin: None,
+                cross_shard_origin: row.source.map(|source| CrossShardOrigin {
+                    source_lsn: source.lsn,
+                    source_sequence: source.sequence,
+                    source_vshard: source.vshard,
+                    source_collection: batch.collection.clone(),
+                }),
                 on_error: fire_common::FireErrorPolicy::Abort,
+                joined: None,
             })
             .await;
 
-            if let Err(e) = report.into_result() {
-                warn!(
-                    trigger = %trigger.name,
-                    collection = %batch.collection,
-                    row_id = %row.row_id,
-                    error = %e,
-                    "batch trigger fire failed, enqueuing row for retry"
-                );
-                retry_queue.enqueue(FailedAction {
-                    key: ActionKey {
-                        // The batch path does not carry per-row source
-                        // LSN/sequence/vShard (see cross_shard_origin note
-                        // above); it is not wired into the production consumer
-                        // loop.
-                        source_lsn: 0,
-                        source_sequence: 0,
-                        source_vshard: 0,
-                        action: ActionId::TriggerRow {
-                            trigger_name: trigger.name.clone(),
-                        },
-                    },
-                    payload: ActionPayload::TriggerRow {
-                        operation: batch.operation.clone(),
-                        new_fields: row.new_fields().cloned(),
-                        old_fields: row.old_fields().cloned(),
-                    },
-                    context: ActionContext {
-                        database_id: batch.database_id,
-                        tenant_id: batch.tenant_id,
-                        collection: batch.collection.clone(),
-                        row_id: row.row_id.clone(),
-                        cascade_depth: 0,
-                    },
-                    attempts: 0,
-                    last_error: e.to_string(),
-                });
-            }
+            record_row_failures(
+                &ActionSource {
+                    database_id: batch.database_id,
+                    tenant_id: batch.tenant_id,
+                    collection: &batch.collection,
+                    row_id: &row.row_id,
+                    operation: &batch.operation,
+                    source_lsn: position.lsn,
+                    source_sequence: position.sequence,
+                    source_vshard: position.vshard,
+                    cascade_depth: 0,
+                },
+                report,
+                row.new_fields(),
+                row.old_fields(),
+                retry_queue,
+            );
         }
     }
 }

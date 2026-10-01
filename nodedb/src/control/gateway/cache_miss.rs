@@ -4,7 +4,7 @@
 //!
 //! When the planner returns `Error::RetryableSchemaChanged { descriptor }`,
 //! the gateway:
-//! 1. Fetches a fresh descriptor lease via the Phase B.3 lease machinery.
+//! 1. Fetches a fresh descriptor lease via the descriptor lease machinery.
 //! 2. Calls the supplied `plan_fn` once more to re-plan against fresh state.
 //! 3. Proceeds to dispatch with the new plan.
 //!
@@ -22,7 +22,7 @@ use crate::control::state::SharedState;
 ///
 /// `plan_fn` — closure that produces a `PhysicalPlan` or an error. Called
 /// at most twice. On the second call the lease for the affected descriptor
-/// has been refreshed so the catalog adapter should return a fresh version.
+/// has been refreshed so the catalog adapter returns a fresh version.
 ///
 /// `database_id` and `tenant_id` — used when acquiring the descriptor lease.
 pub async fn plan_with_cache_miss_retry<F, P>(
@@ -52,20 +52,12 @@ where
 
 /// Acquire (or renew) the lease for a descriptor, forcing the catalog adapter
 /// to re-read from the replicated metadata store.
-///
-/// In single-node mode (no metadata raft handle) this is a no-op — the
-/// catalog is always fresh.
 async fn refresh_descriptor_lease(
     shared: &SharedState,
     database_id: nodedb_types::DatabaseId,
     tenant_id: u64,
     descriptor: &str,
 ) -> Result<(), Error> {
-    if shared.metadata_raft.get().is_none() {
-        // Single-node: no lease infrastructure, catalog always fresh.
-        return Ok(());
-    }
-
     let descriptor_id = nodedb_cluster::DescriptorId::new(
         database_id.as_u64(),
         tenant_id,
@@ -89,12 +81,7 @@ async fn refresh_descriptor_lease(
         });
     };
 
-    // `acquire_lease` is synchronous (parks on a Condvar internally) and
-    // must be wrapped in `block_in_place` so the Tokio reactor is not
-    // starved while the raft propose + apply happens.
-    tokio::task::block_in_place(|| {
-        acquire_lease(shared, descriptor_id, version, DEFAULT_LEASE_DURATION)
-    })?;
+    acquire_lease(shared, descriptor_id, version, DEFAULT_LEASE_DURATION).await?;
 
     Ok(())
 }
@@ -135,10 +122,7 @@ mod tests {
     fn ok_path_calls_plan_fn_once() {
         let call_count = std::cell::Cell::new(0usize);
         let rt = tokio::runtime::Runtime::new().unwrap();
-        // We can't build a real SharedState here — test the logic path
-        // without a raft handle (single-node branch).
-        //
-        // Use a mock approach: test the retry branches directly.
+        // Test the retry branches directly, with no SharedState.
         let mut attempts = 0usize;
         let result: Result<PhysicalPlan, Error> = rt.block_on(async {
             // Simulate plan_with_cache_miss_retry with an always-ok plan_fn.

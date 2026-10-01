@@ -13,7 +13,7 @@ use super::super::handler::{dispatch_kv, dispatch_kv_write};
 use super::super::payload::payload_json;
 use super::super::redaction::resp_redaction;
 use super::super::session::RespSession;
-use super::surrogate::resp_kv_surrogate;
+use super::surrogate::resp_kv_surrogates;
 use crate::control::server::response_shape::redaction::redact_stored_value_bytes;
 
 pub(in crate::control::server::resp) async fn handle_mget(
@@ -92,15 +92,12 @@ pub(in crate::control::server::resp) async fn handle_mset(
         .map(|pair| (pair[0].clone(), pair[1].clone()))
         .collect();
 
-    // Assign each entry's stable cross-engine surrogate the same way SET
-    // (`handle_set`) does per key -- otherwise MSET rows would land with
-    // `Surrogate::ZERO` and be invisible to any surrogate-keyed cross-engine
-    // read/join.
-    let surrogates = match entries
-        .iter()
-        .map(|(key, _value)| resp_kv_surrogate(state, session, key))
-        .collect::<Result<Vec<_>, RespValue>>()
-    {
+    // Every entry's stable cross-engine surrogate, resolved in one batch the
+    // way SET (`handle_set`) resolves one key. A row left at
+    // `Surrogate::ZERO` is invisible to any surrogate-keyed cross-engine read
+    // or join.
+    let keys: Vec<&[u8]> = entries.iter().map(|(key, _value)| key.as_slice()).collect();
+    let surrogates = match resp_kv_surrogates(state, session, &keys).await {
         Ok(s) => s,
         Err(e) => return e,
     };

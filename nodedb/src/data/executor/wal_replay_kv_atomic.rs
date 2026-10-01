@@ -22,7 +22,6 @@ use tracing::warn;
 
 use super::core_loop::CoreLoop;
 use crate::data::executor::core_loop::write_index::KeyRepr;
-use crate::data::executor::replay_abort::abort_replay;
 use crate::engine::kv::{AtomicError, AtomicKeyCtx};
 
 impl CoreLoop {
@@ -218,18 +217,31 @@ impl CoreLoop {
             // whichever identity happens to be connected at restart. Every
             // record it disagreed with would be dropped, leaving a hole in the
             // replayed suffix that no later read can tell apart from data
-            // never written. So it takes the same exit every other unapplyable
+            // never written. So it takes the same halt every other unapplyable
             // committed record takes, which files a forensic report first.
-            Err(AtomicError::Rejected(error)) => abort_replay(
-                "kv",
-                "incr_float_admission",
-                self.core_id,
-                record_lsn,
-                &format!(
-                    "the RLS write gate refused a committed float increment on \
-                     '{collection}': {error}"
-                ),
-            ),
+            Err(AtomicError::Rejected(error)) => {
+                self.replay_record_unapplied(
+                    "kv",
+                    "incr_float_admission",
+                    record_lsn,
+                    &format!(
+                        "the RLS write gate refused a committed float increment on \
+                         '{collection}': {error}"
+                    ),
+                );
+                Some(0)
+            }
+            // The record carries no bound surrogate, so the row cannot be
+            // installed under an identity.
+            Err(AtomicError::Unbound(error)) => {
+                self.replay_record_unapplied(
+                    "kv",
+                    "incr_float_identity",
+                    record_lsn,
+                    &error.to_string(),
+                );
+                Some(0)
+            }
         }
     }
 
@@ -290,9 +302,9 @@ impl CoreLoop {
     /// the same way and wrote nothing, so replay skips it. A refusal by the
     /// write gate cannot happen here: replay hands the engine `admit_any`.
     /// Reaching it means a redo path re-decides writes that were already
-    /// admitted, so replay stops and files a forensic report.
+    /// admitted, so replay halts and files a forensic report.
     fn replay_swap_error(
-        &self,
+        &mut self,
         op: &'static str,
         collection: &str,
         key: &[u8],
@@ -302,13 +314,21 @@ impl CoreLoop {
         let detail = match error {
             AtomicError::TypeMismatch { detail } | AtomicError::Encode { detail } => detail,
             AtomicError::Counter(fault) => fault.message().to_string(),
-            AtomicError::Rejected(error) => abort_replay(
-                "kv",
-                "swap_admission",
-                self.core_id,
-                record_lsn,
-                &format!("the RLS write gate refused a committed {op} on '{collection}': {error}"),
-            ),
+            AtomicError::Rejected(error) => {
+                self.replay_record_unapplied(
+                    "kv",
+                    "swap_admission",
+                    record_lsn,
+                    &format!(
+                        "the RLS write gate refused a committed {op} on '{collection}': {error}"
+                    ),
+                );
+                return;
+            }
+            AtomicError::Unbound(error) => {
+                self.replay_record_unapplied("kv", "swap_identity", record_lsn, &error.to_string());
+                return;
+            }
         };
         warn!(
             core = self.core_id,

@@ -25,20 +25,19 @@ impl CoreLoop {
         tenant_id: u64,
         snapshot_bytes: &[u8],
         replace_mode: bool,
-        // Carried for symmetry with the applier; the per-collection list below
-        // drives the actual clear. The applier populates this from the catalog.
-        _clear_vshards: &[u32],
-        collections_to_clear: &[(u64, u64, String)],
+        collections_to_clear: &[nodedb_physical::physical_plan::SnapshotClearTarget],
+        group_vshards: &[u32],
     ) -> Response {
         info!(core = self.core_id, tenant_id, "restoring tenant snapshot");
+
+        // A data-group install replaces the edges with an endpoint home in
+        // the group, whatever collection homes them, and no other edge.
+        let group_install = !group_vshards.is_empty();
 
         // Clear-then-install: drop stale state for the listed collections before
         // installing, so keys deleted before the snapshot index and dropped
         // collections do not linger on a lagging follower. Empty list = no-op.
-        // Each entry is `(database_id, tenant_id, collection)`, the collection
-        // named as the Data Plane stores it: database-qualified outside the
-        // default database.
-        for (db_raw, tid_raw, coll) in collections_to_clear {
+        for target in collections_to_clear {
             // Preserve the collection definition: clear-then-install replaces row
             // data from the snapshot, but the snapshot does not carry the schema,
             // so the reinstalled rows must land in the still-defined collection.
@@ -46,18 +45,20 @@ impl CoreLoop {
             // rather than install the snapshot over rows that survived — those
             // would linger as un-owned data on this follower.
             if let Err(e) = self.clear_collection_all_engines(
-                nodedb_types::DatabaseId::new(*db_raw),
-                crate::types::TenantId::new(*tid_raw),
-                coll,
+                nodedb_types::DatabaseId::new(target.database_id),
+                crate::types::TenantId::new(target.tenant_id),
+                &target.collection,
                 true,
-                // Single-core clear-then-install: reclaim this collection's
-                // shared L1 files here (no concurrent-core race to avoid).
-                true,
+                target.reclaim_l1_files,
+                !group_install,
             ) {
                 return self.response_error(
                     task,
                     ErrorCode::Internal {
-                        detail: format!("clear-then-install purge failed for '{coll}': {e}"),
+                        detail: format!(
+                            "clear-then-install purge failed for '{}': {e}",
+                            target.collection
+                        ),
                     },
                 );
             }
@@ -70,6 +71,30 @@ impl CoreLoop {
                     task,
                     ErrorCode::Internal {
                         detail: format!("malformed tenant snapshot: {e}"),
+                    },
+                );
+            }
+        };
+
+        // Arrays: the group's vShards take the snapshot's cell versions.
+        if let Err(e) = self.install_group_arrays(group_vshards, &snap.arrays) {
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("restore: array install failed: {e}"),
+                },
+            );
+        }
+
+        // Edges: the group's vShards take the snapshot's edge versions.
+        let group_set: std::collections::HashSet<u32> = group_vshards.iter().copied().collect();
+        let edges_purged = match self.edge_store.purge_homed(&group_set) {
+            Ok(purged) => purged,
+            Err(e) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("restore: clearing the group's edges failed: {e}"),
                     },
                 );
             }
@@ -96,7 +121,7 @@ impl CoreLoop {
             );
         }
 
-        let mut edges_written = 0u64;
+        let edges_written: u64;
         let mut vectors_written = 0u64;
         let mut kv_written = 0u64;
         let mut crdt_written = 0u64;
@@ -105,12 +130,17 @@ impl CoreLoop {
 
         {
             // Restore graph edges. Keys are the versioned form
-            // `"{collection}\x00{src}\x00{label}\x00{dst}\x00{system_from:020}"`;
-            // tenant is supplied from context.
-            let tid = crate::types::TenantId::new(tenant_id);
-            let database_id = task.request.database_id.as_u64();
-            for (key, props) in &snap.edges {
-                if let Err(e) = self.edge_store.put_edge_raw(database_id, tid, key, props) {
+            // `"{collection}\x00{src}\x00{label}\x00{dst}\x00{system_from:020}"`.
+            // The plain sections take the tenant from context. The sections
+            // of a merged Raft snapshot carry their own database and tenant:
+            // the dispatch context is the default database and tenant 0.
+            edges_written = match self.install_snapshot_edges(
+                task.request.database_id.as_u64(),
+                tenant_id,
+                &snap,
+            ) {
+                Ok(versions) => versions,
+                Err(e) => {
                     return self.response_error(
                         task,
                         ErrorCode::Internal {
@@ -118,32 +148,13 @@ impl CoreLoop {
                         },
                     );
                 }
-                edges_written += 1;
-            }
-            // Restore the database- and tenant-aware edges of the merged Raft
-            // snapshot. The edge key carries neither, so each entry carries its
-            // owning database and tenant — install it under THOSE rather than
-            // the dispatch context (the default database and tenant 0 for the
-            // merged group snapshot). Shares `edges_written` with the loop above
-            // so the CSR rebuild below runs if EITHER source installed edges.
-            for (db_raw, tid_raw, key, props) in &snap.tenant_edges {
-                let edge_tid = crate::types::TenantId::new(*tid_raw);
-                if let Err(e) = self.edge_store.put_edge_raw(*db_raw, edge_tid, key, props) {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("restore: tenant edge install failed: {e}"),
-                        },
-                    );
-                }
-                edges_written += 1;
-            }
+            };
             // Rebuild CSR from restored edges. A rebuild failure is fatal to the
             // whole restore: leaving the stale CSR in place would make graph
             // traversals silently return wrong results over the just-installed
             // edges — the same silent-corruption class the durable-section
             // failures above treat as fatal.
-            if edges_written > 0 {
+            if edges_written > 0 || edges_purged > 0 {
                 match crate::engine::graph::csr::rebuild::rebuild_sharded_from_store(
                     &self.edge_store,
                     Arc::clone(&self.governor),
@@ -236,11 +247,18 @@ impl CoreLoop {
                     };
                 let count = vectors.len() as u64;
                 let (database_id, vector_tid, coll_key) = parse_vector_snapshot_key(key, tenant_id);
+                let multi_documents: std::collections::HashSet<nodedb_types::Surrogate> = snap
+                    .vector_multi_documents
+                    .iter()
+                    .filter(|(members_key, _)| members_key == key)
+                    .flat_map(|(_, documents)| documents.iter().copied())
+                    .collect();
                 if let Err(e) = self.restore_vector_collection(
                     database_id,
                     vector_tid,
                     coll_key,
                     vectors,
+                    &multi_documents,
                     replace_mode,
                 ) {
                     return self.response_error(task, e);
@@ -248,55 +266,22 @@ impl CoreLoop {
                 vectors_written += count;
             }
 
-            // Vectors installed above land only in the in-memory
-            // `vector_collections` map with no WAL record — the Raft
-            // install-snapshot path (`replace_mode`) never re-issues them as
-            // live writes (they are already Raft-committed; re-proposing
-            // would be circular), so its only durability contract is Raft's
-            // own fsynced `.snap` file plus this local checkpoint. Without a
-            // synchronous checkpoint here, a crash before the next periodic
-            // `checkpoint_vector_indexes()` run (every 5 minutes) would lose
-            // the just-installed vectors. A failed checkpoint fails the
-            // install, so the snapshot is installed again rather than left
-            // memory-only.
-            if vectors_written > 0 {
-                match self.checkpoint_vector_indexes() {
-                    Ok(outcome) => {
-                        info!(
-                            core = self.core_id,
-                            tenant_id,
-                            files_written = outcome.files_written,
-                            "vector snapshot install checkpointed synchronously"
-                        );
-                    }
-                    Err(e) => {
-                        return self.response_error(
-                            task,
-                            ErrorCode::Internal {
-                                detail: format!(
-                                    "restore: vector checkpoint after the install failed: {e}"
-                                ),
-                            },
-                        );
-                    }
-                }
-            }
-
             // Restore KV tables, each under the database and tenant its key names.
             for (table_key, bytes) in &snap.kv_tables {
-                let entries: Vec<(Vec<u8>, Vec<u8>, u64)> = match zerompk::from_msgpack(bytes) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        return self.response_error(
-                            task,
-                            ErrorCode::Internal {
-                                detail: format!(
-                                    "restore: KV table '{table_key}' does not decode: {e}"
-                                ),
-                            },
-                        );
-                    }
-                };
+                let entries: Vec<crate::engine::kv::hash_table::KvSnapshotRow> =
+                    match zerompk::from_msgpack(bytes) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            return self.response_error(
+                                task,
+                                ErrorCode::Internal {
+                                    detail: format!(
+                                        "restore: KV table '{table_key}' does not decode: {e}"
+                                    ),
+                                },
+                            );
+                        }
+                    };
                 let count = entries.len() as u64;
                 if let Err(e) = self.restore_kv_table(table_key, entries) {
                     return self.response_error(task, e);
@@ -393,6 +378,18 @@ impl CoreLoop {
             }
         }
 
+        // The install wrote no WAL record, so it is durable only once every
+        // memory-only engine is checkpointed. A failed checkpoint fails the
+        // install, so it is never acknowledged memory-only.
+        if let Err(e) = self.persist_snapshot_install() {
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("restore: checkpoint after the install failed: {e}"),
+                },
+            );
+        }
+
         info!(
             tenant_id,
             docs_written,
@@ -482,10 +479,10 @@ mod tests {
 
     /// The Raft install-snapshot path (`replace_mode = true`) installs
     /// vectors straight into the in-memory-only `vector_collections` map with
-    /// no WAL record. Its only durability contract is Raft's own fsynced
-    /// `.snap` file plus an immediate local checkpoint — this proves the
-    /// checkpoint happens SYNCHRONOUSLY within the restore call, not on the
-    /// next periodic (5-minute) timer tick.
+    /// no WAL record. Its only durable copy is the checkpoint the install
+    /// takes before it answers — this proves the checkpoint happens
+    /// SYNCHRONOUSLY within the restore call, not on the next periodic
+    /// (5-minute) timer tick.
     #[test]
     fn raft_install_checkpoints_vectors_synchronously() {
         let dir = TempDir::new().expect("tempdir");
@@ -547,6 +544,158 @@ mod tests {
             restored.len(),
             1,
             "the restored collection must contain the one vector"
+        );
+    }
+
+    /// A tenant snapshot whose KV section holds `rows` in collection `kvt`,
+    /// with the task a Raft install dispatches it under.
+    fn kv_snapshot(
+        rows: Vec<crate::engine::kv::hash_table::KvSnapshotRow>,
+    ) -> (Vec<u8>, crate::data::executor::task::ExecutionTask) {
+        let snap = crate::types::TenantDataSnapshot {
+            kv_tables: vec![(
+                "0:0:kvt".to_string(),
+                zerompk::to_msgpack_vec(&rows).expect("encode entries"),
+            )],
+            ..Default::default()
+        };
+        let bytes = zerompk::to_msgpack_vec(&snap).expect("encode snapshot");
+        let task = CoreLoop::replay_vector_task(
+            crate::types::TenantId::new(0),
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "kvt")
+                .vshard(),
+            PhysicalPlan::Meta(MetaOp::WalAppend {
+                payload: Vec::new(),
+            }),
+        );
+        (bytes, task)
+    }
+
+    /// A KV row installed by a Raft snapshot keeps the surrogate the snapshot
+    /// carries, so a cross-engine lookup by surrogate finds it.
+    #[test]
+    fn a_snapshot_installed_kv_row_is_found_under_its_surrogate() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut core = open_core(dir.path());
+        let (bytes, task) = kv_snapshot(vec![(b"alice".to_vec(), b"v".to_vec(), 0, 4242)]);
+
+        let response = core.execute_restore_tenant_snapshot(&task, 0, &bytes, true, &[], &[]);
+        assert_eq!(response.status, Status::Ok, "restore must succeed");
+        assert_eq!(
+            core.kv_engine
+                .key_for_surrogate(0, 0, "kvt", nodedb_types::Surrogate::new(4242)),
+            Some(b"alice".to_vec())
+        );
+    }
+
+    /// A snapshot KV row that carries no surrogate fails the install instead
+    /// of installing a row no identity reaches.
+    #[test]
+    fn a_snapshot_kv_row_without_a_surrogate_fails_the_install() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut core = open_core(dir.path());
+        let (bytes, task) = kv_snapshot(vec![(b"alice".to_vec(), b"v".to_vec(), 0, 0)]);
+
+        let response = core.execute_restore_tenant_snapshot(&task, 0, &bytes, true, &[], &[]);
+        assert_eq!(response.status, Status::Error);
+        assert_eq!(core.kv_engine.get(0, 0, "kvt", b"alice", 0), None);
+    }
+
+    /// KV has no store behind it and the install writes no WAL record, so a
+    /// reopened core with no WAL must find the installed row in the KV
+    /// checkpoint the install took before it answered.
+    #[test]
+    fn raft_install_checkpoints_kv_synchronously() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut core = open_core(dir.path());
+        let (bytes, task) = kv_snapshot(vec![(b"k1".to_vec(), b"v1".to_vec(), 0, 11)]);
+
+        let response = core.execute_restore_tenant_snapshot(&task, 0, &bytes, true, &[], &[]);
+        assert_eq!(response.status, Status::Ok, "restore must succeed");
+
+        drop(core);
+        let mut reopened = open_core(dir.path());
+        reopened.load_kv_checkpoints().expect("load KV checkpoints");
+        assert_eq!(
+            reopened.kv_engine.get(0, 0, "kvt", b"k1", 0),
+            Some(b"v1".to_vec()),
+            "the installed KV row must survive a restart with no WAL"
+        );
+    }
+
+    /// A one-vector multi-vector document installs as a multi-vector
+    /// document, so a later `MultiVectorDelete` finds and removes it.
+    #[test]
+    fn a_one_vector_multi_vector_document_installs_as_multi_vector() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut core = open_core(dir.path());
+        let single = nodedb_types::Surrogate::new(1);
+        let document = nodedb_types::Surrogate::new(9);
+        let vectors: Vec<(u32, Vec<f32>, Option<nodedb_types::Surrogate>)> = vec![
+            (0, vec![1.0, 0.0], Some(single)),
+            (1, vec![0.0, 1.0], Some(document)),
+        ];
+        let snap = crate::types::TenantDataSnapshot {
+            vectors: vec![(
+                "0:0:emb".to_string(),
+                zerompk::to_msgpack_vec(&vectors).expect("encode vectors"),
+            )],
+            vector_multi_documents: vec![("0:0:emb".to_string(), vec![document])],
+            ..Default::default()
+        };
+        let bytes = zerompk::to_msgpack_vec(&snap).expect("encode snapshot");
+        let task = CoreLoop::replay_vector_task(
+            crate::types::TenantId::new(0),
+            nodedb_types::DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(nodedb_types::DatabaseId::DEFAULT, "emb")
+                .vshard(),
+            PhysicalPlan::Meta(MetaOp::WalAppend {
+                payload: Vec::new(),
+            }),
+        );
+        let response = core.execute_restore_tenant_snapshot(&task, 0, &bytes, true, &[], &[]);
+        assert_eq!(response.status, Status::Ok, "restore must succeed");
+
+        let key = CoreLoop::vector_index_key(0, 0, "emb", "");
+        let installed = core.vector_collections.get(&key).expect("index installed");
+        assert_eq!(installed.multi_vector_documents(), vec![document]);
+        assert_eq!(installed.live_count(), 2);
+
+        let deleted = core.execute_multi_vector_delete(&task, 0, "emb", "", document);
+        assert_eq!(deleted.status, Status::Ok);
+        let remaining = core
+            .vector_collections
+            .get(&key)
+            .map(|coll| coll.live_count());
+        assert_eq!(
+            remaining,
+            Some(1),
+            "the delete removes the one-vector document and keeps the single row"
+        );
+    }
+
+    /// Every stored vector is bound, so a snapshot vector without a surrogate
+    /// fails the restore instead of installing an unbound row.
+    #[test]
+    fn a_snapshot_vector_without_a_surrogate_fails_the_restore() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut core = open_core(dir.path());
+        let vectors: Vec<(u32, Vec<f32>, Option<nodedb_types::Surrogate>)> =
+            vec![(0, vec![1.0, 0.0], None)];
+        let result = core.restore_vector_collection(
+            0,
+            0,
+            "emb",
+            vectors,
+            &std::collections::HashSet::new(),
+            true,
+        );
+        assert!(result.is_err(), "an unbound snapshot vector is refused");
+        let key = CoreLoop::vector_index_key(0, 0, "emb", "");
+        assert!(
+            !core.vector_collections.contains_key(&key),
+            "a refused restore installs no collection"
         );
     }
 }

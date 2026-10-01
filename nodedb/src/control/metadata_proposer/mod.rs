@@ -1,38 +1,56 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Synchronous `propose-and-wait-for-local-apply` helper for
-//! replicated catalog DDL.
+//! `propose-and-wait-for-local-apply` helpers for replicated catalog DDL.
 //!
-//! The sole entry point pgwire DDL handlers use to write a
-//! [`crate::control::catalog_entry::CatalogEntry`] through the metadata raft group (group 0). It is
-//! deliberately sync — pgwire DDL handlers are not async, and
-//! `tokio::task::block_in_place`-style wrapping keeps the blocking
-//! wait from starving the tokio runtime.
+//! The sole entry point DDL handlers use to write a
+//! [`crate::control::catalog_entry::CatalogEntry`] through the metadata raft
+//! group (group 0): `propose_catalog_entry_async` and
+//! `propose_catalog_batch_async`. Both run on any runtime flavor. Every wait
+//! is awaited: the preparation lock and lease, the descriptor drain, the
+//! metadata commit's apply, and the authorization barrier.
+//!
+//! A preparation lease dropped unreleased, as when its proposer's future is
+//! cancelled, hands its release to the background lease releaser. A release
+//! that never applies ends when the metadata leader reclaims the lease: at
+//! once when its owner left, once its owner is dead past the grace, and after
+//! the lease time when its owner is alive but stuck.
+//!
+//! Every node runs a metadata raft group, a one-node cluster included.
+//! `start_raft` installs its handle before any listener opens. A state with
+//! no handle refuses the propose with a typed error. No caller writes the
+//! catalog itself.
 //!
 //! Semantics:
 //!
-//! 1. If no cluster is configured (`shared.metadata_raft` not
-//!    installed), returns `ProposeOutcome::LocalOnly`. The caller's
-//!    single-node direct-write path stays authoritative.
-//! 2. If this node is the metadata-group leader, proposes the
-//!    entry, blocks until its local applied watermark reaches the
-//!    assigned log index (5s default timeout), and returns the
+//! 1. If this node is the metadata-group leader, proposes the entry, waits
+//!    until its local applied watermark reaches the assigned log index for
+//!    as long as the apply moves (a 5s stall ends the wait), and returns the
 //!    log index on success.
-//! 3. If this node is NOT the leader, returns
+//! 2. If this node is NOT the leader, returns
 //!    `Error::Config { detail: "metadata propose: not leader ..." }`.
 //!    Gateway-side redirection will make this transparent.
 
 pub mod catalog;
+pub mod catalog_batch;
+pub mod ddl_owner;
 pub mod ddl_prepare;
+pub(crate) mod ddl_reclaim;
 pub mod handle;
 pub mod replicated_entries;
 pub mod timeouts;
+pub(crate) mod wait;
 
-pub use catalog::{propose_catalog_entry, propose_catalog_entry_with_timeout};
-pub(crate) use ddl_prepare::{DdlPrepareGuard, acquire_ddl_prepare_lease, lock_ddl_preparation};
-pub use handle::{MetadataRaftHandle, RaftLoopProposerHandle};
+pub use catalog::propose_catalog_entry_async;
+pub use catalog_batch::{BatchOutcome, CatalogBatch, propose_catalog_batch_async};
+pub use ddl_owner::DdlPrepareOwner;
+pub(crate) use ddl_prepare::{
+    DdlPrepareLease, acquire_ddl_prepare_lease_async, lock_ddl_preparation_async,
+    release_ddl_prepare_token,
+};
+pub use handle::{MetadataRaftHandle, ProposeFuture, RaftLoopProposerHandle};
 pub use replicated_entries::{
-    propose_surrogate_hwm, propose_surrogate_reserve, propose_sync_peer_bind,
-    propose_sync_producer_fence, propose_sync_producer_register,
+    propose_cursor_commit, propose_cursor_commit_audited, propose_database_id_reserve,
+    propose_restore_point, propose_surrogate_hwm, propose_surrogate_reserve,
+    propose_sync_peer_bind, propose_sync_producer_fence, propose_sync_producer_register,
 };
 pub use timeouts::{DEFAULT_DRAIN_TIMEOUT, DEFAULT_PROPOSE_TIMEOUT};

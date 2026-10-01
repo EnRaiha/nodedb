@@ -1,47 +1,43 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! A replicated SQL write must raise EXACTLY ONE Control-Plane change event
-//! per subscriber.
+//! The Control-Plane change stream serves every replicated write once, at
+//! the same position, on every node.
 //!
-//! ## The bug this guards against
+//! Every replica of a data group publishes the group's writes as its apply
+//! loop settles them, in log order, at their log positions. So:
 //!
-//! A Raft-replicated write is submitted to the local Data Plane independently
-//! by EVERY replica's apply loop. If the change event were published from that
-//! apply site, a replication factor of N would publish N events AND fan out N
-//! cluster-wide NOTIFY broadcasts, one from each replica. `deliver_remote_notify`
-//! forwards every NOTIFY straight to local subscribers and there is no dedup on
-//! either side, so each subscriber would silently see the same write repeated —
-//! no error, no warning, just duplicated CDC. The event is therefore published
-//! once, by the node that handled the write (`dispatch_replicated_write`), after
-//! commit + apply; replicas publish nothing.
+//! - one write raises exactly one event per node: the node that proposed the
+//!   write publishes nothing of its own;
+//! - every node gives the event the same partition and position;
+//! - a cursor taken on one node resumes on another at the next event.
 //!
 //! ## Test shape
 //!
-//! Bring up 3 nodes, subscribe on ALL of them, do ONE INSERT through one node,
-//! and assert every node's subscription yields exactly one event: one
-//! `recv_filtered` succeeds and a second one TIMES OUT.
+//! Bring up 3 nodes, subscribe on ALL of them, do ONE INSERT through one
+//! node, and assert every node's subscription yields exactly one event at
+//! one shared position: one `recv_sequenced` succeeds and a second one
+//! TIMES OUT. Then page the stream on one node and resume the cursor on
+//! another, and on every node after the whole cluster restarts.
 //!
-//! `ChangeStream::events_published()` is deliberately NOT used as the counter —
-//! `deliver_remote_notify` sends straight to subscribers without touching it,
-//! so a NOTIFY storm would not move it. Counting what a subscriber actually
-//! receives is the only measure that sees the failure.
+//! `ChangeStream::events_published()` is deliberately NOT used as the
+//! counter. Counting what a subscriber receives is what a client sees.
 
 use crate::common;
-use common::cluster_harness::TestCluster;
+use common::cluster_harness::{TestCluster, TestClusterNode};
 
 use std::time::Duration;
 
-use nodedb::control::change_stream::{ChangeOperation, Subscription};
+use nodedb::control::change_stream::{ChangeOperation, ReplaySnapshot, ReplayStart, Subscription};
+use nodedb_types::{DatabaseId, TenantId};
 
 const COLLECTION: &str = "cdc_once";
 
-/// How long to wait for the write's event to reach a node. Generous: on the
-/// two non-origin nodes it travels as a QUIC NOTIFY.
+/// How long to wait for the write's event to reach a node.
 const ARRIVAL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long to wait to prove NO second event follows. A duplicate from a
-/// replica's apply loop is published in the same apply round as the original,
-/// so it arrives well within this window.
+/// How long to wait to prove NO second event follows. A duplicate is
+/// published in the same apply round as the original, so it arrives well
+/// within this window.
 const NO_DUPLICATE_WINDOW: Duration = Duration::from_secs(3);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -83,8 +79,9 @@ async fn replicated_write_publishes_exactly_one_change_event_per_node() {
         .wait_for_full_apply_convergence(Duration::from_secs(15))
         .await;
 
+    let mut positions = Vec::new();
     for (idx, sub) in subs.iter_mut().enumerate() {
-        let event = match tokio::time::timeout(ARRIVAL_TIMEOUT, sub.recv_filtered()).await {
+        let event = match tokio::time::timeout(ARRIVAL_TIMEOUT, sub.recv_sequenced()).await {
             Ok(Ok(e)) => e,
             Ok(Err(e)) => panic!("node {idx}: change stream closed: {e}"),
             Err(_) => panic!("node {idx}: the replicated INSERT published no change event"),
@@ -95,6 +92,7 @@ async fn replicated_write_publishes_exactly_one_change_event_per_node() {
             ChangeOperation::Insert,
             "node {idx}: wrong operation kind"
         );
+        positions.push((event.partition(), event.position()));
 
         // The publish-once guard: a second event for the same write means the
         // apply loop published per replica.
@@ -102,14 +100,140 @@ async fn replicated_write_publishes_exactly_one_change_event_per_node() {
             Err(_) => {}
             Ok(Ok(dup)) => panic!(
                 "node {idx}: one INSERT produced a SECOND change event \
-                 ({:?} on {} doc {}) — the write is being published once per \
-                 replica instead of once by the node that handled it",
+                 ({:?} on {} doc {})",
                 dup.operation, dup.collection, dup.document_id
             ),
             Ok(Err(e)) => panic!("node {idx}: change stream closed: {e}"),
         }
     }
 
+    assert!(
+        positions.windows(2).all(|pair| pair[0] == pair[1]),
+        "every node must give the write one shared position: {positions:?}"
+    );
+
     drop(subs);
+    cluster.shutdown().await;
+}
+
+/// Rows the cursor tests write.
+const ROWS: usize = 4;
+
+/// Replay `node`'s change stream of [`COLLECTION`].
+fn replay(node: &TestClusterNode, start: ReplayStart, limit: usize) -> ReplaySnapshot {
+    node.shared
+        .change_stream
+        .query_changes_in_database(
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
+            Some(COLLECTION),
+            start,
+            limit,
+        )
+        .unwrap_or_else(|e| panic!("node {}: replay refused: {e:?}", node.node_id))
+}
+
+/// A 3-node cluster whose [`COLLECTION`] took [`ROWS`] writes through node 0,
+/// once every node holds every write's event.
+async fn cluster_with_rows() -> TestCluster {
+    let cluster = TestCluster::spawn_three()
+        .await
+        .expect("spawn 3-node cluster");
+    cluster
+        .exec_ddl_on_any_leader(&format!(
+            "CREATE COLLECTION {COLLECTION} \
+             (id TEXT PRIMARY KEY, payload TEXT) WITH (engine='document_strict')"
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("CREATE COLLECTION {COLLECTION}: {e}"));
+    for row in 0..ROWS {
+        cluster.nodes[0]
+            .client
+            .simple_query(&format!(
+                "INSERT INTO {COLLECTION} (id, payload) VALUES ('row-{row}', 'payload-{row}')"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("insert row-{row}: {e}"));
+    }
+    cluster
+        .wait_for_full_apply_convergence(Duration::from_secs(15))
+        .await;
+    let deadline = std::time::Instant::now() + ARRIVAL_TIMEOUT;
+    while cluster
+        .nodes
+        .iter()
+        .any(|node| replay(node, ReplayStart::Timestamp(0), ROWS).events.len() < ROWS)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "every node must hold every write's event"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    cluster
+}
+
+/// The sorted document ids of two replays.
+fn documents(first: &ReplaySnapshot, rest: &ReplaySnapshot) -> Vec<String> {
+    let mut documents: Vec<String> = first
+        .events
+        .iter()
+        .chain(rest.events.iter())
+        .map(|change| change.document_id.as_str().to_owned())
+        .collect();
+    documents.sort();
+    documents
+}
+
+fn every_row() -> Vec<String> {
+    (0..ROWS).map(|row| format!("row-{row}")).collect()
+}
+
+/// A cursor from one node's replay resumes on another node at the next
+/// event, and no event is served twice or skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_cursor_from_one_node_resumes_on_another() {
+    let cluster = cluster_with_rows().await;
+    let first = replay(&cluster.nodes[0], ReplayStart::Timestamp(0), 2);
+    assert!(first.has_more);
+    let rest = replay(
+        &cluster.nodes[1],
+        ReplayStart::Cursor(first.cursor.clone()),
+        ROWS,
+    );
+    assert_eq!(
+        documents(&first, &rest),
+        every_row(),
+        "the cursor from node 0 must resume on node 1 with exactly the remaining events"
+    );
+    cluster.shutdown().await;
+}
+
+/// A cursor taken before every node restarts resumes after the restart at
+/// the next event, with no reset: each node rebuilds its feeds from its
+/// journal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_cursor_resumes_after_the_cluster_restarts() {
+    let cluster = cluster_with_rows().await;
+    let first = replay(&cluster.nodes[0], ReplayStart::Timestamp(0), 2);
+    assert!(first.has_more);
+
+    let cluster = cluster.restart_all().await.expect("restart the cluster");
+    for node in &cluster.nodes {
+        // A refused cursor panics in `replay`: the restart must not reset it.
+        let deadline = std::time::Instant::now() + ARRIVAL_TIMEOUT;
+        let mut rest = replay(node, ReplayStart::Cursor(first.cursor.clone()), ROWS);
+        while rest.events.len() < ROWS - first.events.len() && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            rest = replay(node, ReplayStart::Cursor(first.cursor.clone()), ROWS);
+        }
+        assert_eq!(
+            documents(&first, &rest),
+            every_row(),
+            "node {} must resume the pre-restart cursor with exactly the remaining events",
+            node.node_id
+        );
+    }
     cluster.shutdown().await;
 }

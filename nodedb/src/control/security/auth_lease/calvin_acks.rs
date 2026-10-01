@@ -138,7 +138,7 @@ mod tests {
             }])
             .expect("save");
 
-        let recovered = recover_applied(&wal, &catalog, 7).expect("recover");
+        let recovered = recover_applied(&wal, &catalog, 7, None).expect("recover");
         let mirrors = AppliedMirrors::default();
         mirrors.register(7, recovered.fully_applied_epoch, &recovered.applied_tail);
 

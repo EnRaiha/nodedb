@@ -68,7 +68,7 @@ pub(in crate::data::executor::handlers::control::calvin) mod test_support {
         let plan = PhysicalPlan::Document(DocumentOp::PointGet {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
             document_id: "y".into(),
-            surrogate: Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -92,6 +92,7 @@ pub(in crate::data::executor::handlers::control::calvin) mod test_support {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: Admission::Exempt(ExemptReason::Read),
         };
         ExecutionTask::new(request)
@@ -103,7 +104,7 @@ pub(in crate::data::executor::handlers::control::calvin) mod test_support {
     ) -> Vec<u8> {
         let mut obj = std::collections::HashMap::new();
         obj.insert(field.to_string(), Value::String(val.into()));
-        zerompk::to_msgpack_vec(&Value::Object(obj)).unwrap()
+        nodedb_types::value_to_msgpack(&Value::Object(obj)).unwrap()
     }
 
     pub(in crate::data::executor::handlers::control::calvin) fn point_insert_plan(

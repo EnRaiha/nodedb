@@ -7,31 +7,25 @@
 //! `RetentionPolicyRegistry`. A policy created on one node enforces on all.
 
 use crate::control::catalog_entry::entry::CatalogEntry;
-use crate::control::catalog_entry::post_apply::retention_policy as post_apply;
 use crate::control::state::SharedState;
 use crate::engine::timeseries::retention_policy::RetentionPolicyDef;
 
 use super::super::super::result::DdlError;
-use super::super::replicate::propose_and_apply;
+use super::super::replicate::propose_and_apply_async;
 
 /// Propose the full policy record. CREATE and ALTER both re-put the row.
 ///
 /// The leader validates before proposing, so apply never rejects.
-pub(super) fn propose_put(state: &SharedState, def: &RetentionPolicyDef) -> Result<(), DdlError> {
+pub(super) async fn propose_put(
+    state: &SharedState,
+    def: &RetentionPolicyDef,
+) -> Result<(), DdlError> {
     let entry = CatalogEntry::PutRetentionPolicy(Box::new(def.clone()));
-    propose_and_apply(state, &entry, || {
-        state
-            .credentials
-            .catalog()
-            .put_retention_policy(def)
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        post_apply::put(def, state);
-        Ok(())
-    })
+    propose_and_apply_async(state, &entry).await
 }
 
 /// Propose removal of the policy row and the registry entry on every node.
-pub(super) fn propose_delete(
+pub(super) async fn propose_delete(
     state: &SharedState,
     def: &RetentionPolicyDef,
 ) -> Result<(), DdlError> {
@@ -41,13 +35,5 @@ pub(super) fn propose_delete(
         name: def.name.clone(),
         collection: def.collection.clone(),
     };
-    propose_and_apply(state, &entry, || {
-        state
-            .credentials
-            .catalog()
-            .delete_retention_policy(def.database_id, def.tenant_id, &def.name)
-            .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))?;
-        post_apply::delete(def.database_id, def.tenant_id, &def.name, state);
-        Ok(())
-    })
+    propose_and_apply_async(state, &entry).await
 }

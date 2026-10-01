@@ -60,8 +60,8 @@ fn synthetic_kv_surrogate(key: &[u8]) -> u32 {
         hash ^= u32::from(b);
         hash = hash.wrapping_mul(0x0100_0193);
     }
-    // 0 is reserved elsewhere (`Surrogate::ZERO`) to mean "unresolved /
-    // absent"; remap the vanishingly unlikely zero hash away from it.
+    // `Surrogate::ZERO` names no row; remap the vanishingly unlikely zero
+    // hash away from it.
     if hash == 0 { 1 } else { hash }
 }
 

@@ -32,6 +32,7 @@ pub(crate) fn kv_counter_shape(
 ) -> crate::Result<KvCounterShape> {
     let catalog = OriginCatalog::new(
         Arc::clone(&state.credentials),
+        state.array_catalog.clone(),
         tenant_id.as_u64(),
         database_id,
         Some(Arc::clone(&state.retention_policy_registry)),

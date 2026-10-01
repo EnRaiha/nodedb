@@ -2,48 +2,31 @@
 
 //! `SHOW GRAPH STATS` handler.
 //!
-//! Reads persistent graph-stats counters from every Data-Plane core via
-//! `broadcast_to_all_cores`, aggregates the per-core
+//! Reads graph-stats counters from every core of one node per data group
+//! (`graph_dispatch::scatter_to_graph_owners`), aggregates the per-core
 //! [`CollectionStats`](crate::engine::graph::edge_store::stats::CollectionStats)
 //! payloads, and emits a protocol-neutral result row set.
 //!
-//! Aggregation rules:
-//! - `edge_count`: summed across cores (each core holds a disjoint partition).
-//! - `distinct_node_count`: summed across cores. Per-core CSR partitions are
-//!   hash-disjoint by node id, so the cross-core sum equals the global distinct
-//!   count — no double-count.
-//! - `distinct_label_count`: re-derived from the merged `labels` vec rather than
-//!   summed (labels are NOT partition-disjoint — the same label name can appear
-//!   in multiple cores).
-//! - `labels`: merged by name; counts summed; output is sorted ascending by name.
+//! Every read asks for the exact logical edges, so aggregation is an identity
+//! union. An edge that two cores or two nodes hold (both endpoint homes, or a
+//! replica) counts once:
+//! - `edge_count`, `distinct_node_count` and `labels` are re-derived from the
+//!   union of `(src, label, dst)` edges.
+//! - `distinct_label_count` is the number of merged labels.
+//! - `labels` is sorted ascending by name.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use nodedb_types::DatabaseId;
 use nodedb_types::diagnostic::DiagnosticLayer;
 use serde_json::{Map, Value as JsonValue};
 use tracing::info_span;
 
-/// Total number of `SHOW GRAPH STATS` calls served since process start.
-/// Read by the metrics endpoint via [`graph_stats_calls_total`].
-static GRAPH_STATS_CALLS: AtomicU64 = AtomicU64::new(0);
-
-/// Counter for observability. Mirrors the `broadcast_call_count()` style
-/// used elsewhere in the Control Plane. Exposed for metrics endpoints
-/// and test harnesses to assert call counts.
-#[allow(dead_code)]
-pub fn graph_stats_calls_total() -> u64 {
-    GRAPH_STATS_CALLS.load(Ordering::Relaxed)
-}
-
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::broadcast::broadcast_to_all_cores;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 use crate::engine::graph::edge_store::stats::CollectionStats;
-use crate::types::TraceId;
 use nodedb_physical::physical_plan::GraphOp;
 
 use super::super::super::result::{DdlError, DdlResult};
@@ -64,8 +47,8 @@ pub async fn show_graph_stats(
     collection: Option<String>,
     verbose: bool,
     as_of: Option<i64>,
+    linearizable: bool,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    GRAPH_STATS_CALLS.fetch_add(1, Ordering::Relaxed);
     let scope = if collection.is_some() {
         "collection"
     } else {
@@ -81,13 +64,13 @@ pub async fn show_graph_stats(
         as_of = ?as_of,
     );
 
-    // The counters reach the Data Plane through `broadcast_to_all_cores`, which
+    // The counters reach the Data Plane through `scatter_to_graph_owners`, which
     // never runs the planner's authorization or RLS passes, so both are
     // resolved here. A counter carries no row for a filter to apply to, and it
     // counts the edges of rows a policy hides, so a read policy refuses. The
     // tenant-wide form names no collection to ask the narrow question about, so
     // it asks the tenant-wide one — and narrows its rows to the collections the
-    // caller may actually read, below.
+    // caller can actually read, below.
     let gate = RefusingReadGate::for_request(state, identity, database_id);
     match collection.as_deref() {
         Some(name) => gate.gate_collection(name, STATS_WHAT)?,
@@ -108,7 +91,7 @@ pub async fn show_graph_stats(
 
     // Exact logical-edge scans are required even for current-time reads:
     // source-owned summaries cannot deduplicate a destination shared by edges
-    // from different source vShards, and mixed legacy/current collections may
+    // from different source vShards, and mixed legacy/current collections can
     // have no summary row at all. Identity union below is the correctness path.
     let plan = PhysicalPlan::Graph(GraphOp::Stats {
         collection: collection
@@ -117,12 +100,32 @@ pub async fn show_graph_stats(
         as_of: as_of.or(Some(i64::MAX)),
     });
 
-    let resp = broadcast_to_all_cores(state, identity.tenant_id, database_id, plan, TraceId::ZERO)
-        .await
-        .map_err(|e| DdlError::from_error_in_context("graph stats dispatch failed", &e))?;
+    // A collection's edges spread over every data group. The stats read goes
+    // to one node per group, and every one of its cores answers
+    // (`graph_dispatch::whole_graph`). A linearizable read is confirmed on each
+    // node that serves it.
+    let payloads = crate::control::server::graph_dispatch::scatter_to_graph_owners(
+        state,
+        identity.tenant_id,
+        database_id,
+        plan,
+        linearizable,
+        collection.as_deref().map(|name| {
+            nodedb_types::QualifiedCollection::new(database_id, name)
+                .as_str()
+                .to_owned()
+        }),
+    )
+    .await
+    .map_err(|e| DdlError::from_error_in_context("graph stats dispatch failed", &e))?;
 
-    let merged: Vec<CollectionStats> = decode_merged_stats(resp.payload.as_bytes())
-        .map_err(|e| DdlError::from_error_in_context("graph stats decode failed", &e))?;
+    let mut merged: Vec<CollectionStats> = Vec::new();
+    for payload in &payloads {
+        merged.extend(
+            decode_merged_stats(payload.as_bytes())
+                .map_err(|e| DdlError::from_error_in_context("graph stats decode failed", &e))?,
+        );
+    }
 
     let aggregated = aggregate_by_collection(merged);
 
@@ -149,7 +152,7 @@ pub async fn show_graph_stats(
     }
 }
 
-/// Decode the merged msgpack array produced by `broadcast_to_all_cores`.
+/// Decode one node's merged msgpack array of per-core stats.
 fn decode_merged_stats(payload: &[u8]) -> crate::Result<Vec<CollectionStats>> {
     if payload.is_empty() {
         return Ok(Vec::new());

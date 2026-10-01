@@ -2,17 +2,37 @@
 
 //! Read placement questions answered from a group hosted on this node.
 //!
-//! Every call is non-blocking. The read-index probe is taken under the
-//! coordinator lock and confirmed under a later one, so the caller polls
-//! between ticks instead of holding the lock while a quorum answers.
+//! Every call is non-blocking. A leader holding a valid lease answers at once.
+//! Otherwise the read-index probe is taken under the coordinator lock and
+//! confirmed under a later one, so the caller polls between ticks instead of
+//! holding the lock while a quorum answers.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nodedb_raft::{ReadIndexProbe, ReadIndexStatus};
 
 use crate::multi_raft::core::MultiRaft;
 
 impl MultiRaft {
+    /// The read index `group_id` can serve now under its leader lease.
+    ///
+    /// `None` when the group is not hosted here or holds no valid lease. The
+    /// caller then runs a read-index probe.
+    pub fn lease_read_index(&self, group_id: u64) -> Option<u64> {
+        self.groups.get(&group_id)?.lease_read_index(Instant::now())
+    }
+
+    /// The term of this node's valid leader lease on `group_id`.
+    ///
+    /// `None` when the group is not hosted here or holds no valid lease. A
+    /// later leader of the group leads at a higher term, so the term fences
+    /// work a previous leaseholder started.
+    pub fn lease_term(&self, group_id: u64) -> Option<u64> {
+        let node = self.groups.get(&group_id)?;
+        node.lease_read_index(Instant::now())?;
+        Some(node.current_term())
+    }
+
     /// Begin a linearizable read on `group_id`.
     ///
     /// `None` when the group is not hosted here or this node does not lead
@@ -59,6 +79,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut mr = coordinator(&dir);
         assert!(mr.start_read_index(7).is_none());
+        assert!(mr.lease_read_index(7).is_none());
+    }
+
+    #[test]
+    fn a_follower_holds_no_lease() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut mr = coordinator(&dir);
+        mr.add_group(7, vec![1, 2, 3]).expect("add group");
+        assert!(mr.lease_read_index(7).is_none());
+        assert!(mr.lease_term(7).is_none());
     }
 
     #[test]

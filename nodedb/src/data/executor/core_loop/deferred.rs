@@ -3,10 +3,10 @@
 //! Deferred trigger events of a committed transaction.
 //!
 //! The redo install collects the document writes of a committed record and,
-//! once the record settled, emits them as WriteEvents. A client transaction's
-//! rows carry `EventSource::Deferred`, so the Event Plane fires DEFERRED-mode
-//! triggers. Rows of any other source keep that source, so a trigger's own
-//! transaction and a restore fire no DEFERRED trigger (see
+//! once the record settled, emits them as WriteEvents. Each write carries the
+//! source the install resolved for it: a client transaction's rows carry
+//! `EventSource::Deferred`, so the Event Plane fires DEFERRED-mode triggers,
+//! and a trigger body's rows carry `Trigger` (see
 //! [`EventSource::committed_row_source`]).
 
 use std::sync::Arc;
@@ -20,6 +20,8 @@ pub(in crate::data::executor) struct DeferredWrite {
     pub collection: String,
     pub op: WriteOp,
     pub identity: RowIdentity,
+    /// The source the row's event carries.
+    pub source: EventSource,
     pub new_value: Option<Vec<u8>>,
     pub old_value: Option<Vec<u8>>,
 }
@@ -28,30 +30,27 @@ impl CoreLoop {
     /// Emit the document-row events of a committed transaction.
     ///
     /// Called after a committed redo record installed and settled. Each
-    /// write is emitted as a WriteEvent whose source is the
-    /// [`EventSource::committed_row_source`] of the record's `record_source`.
+    /// write is emitted as a WriteEvent under its own source, dated by the
+    /// transaction's `commit_hlc`.
     pub(in crate::data::executor) fn emit_deferred_events(
         &mut self,
         writes: Vec<DeferredWrite>,
-        record_source: EventSource,
         database_id: crate::types::DatabaseId,
         tenant_id: crate::types::TenantId,
         vshard_id: crate::types::VShardId,
+        commit_hlc: Option<u64>,
     ) {
-        let source = record_source.committed_row_source();
-        let producer = match self.event_producer.as_mut() {
-            Some(p) => p,
-            None => return,
-        };
+        if self.events.producer.is_none() {
+            return;
+        }
 
         for write in writes {
-            self.event_sequence += 1;
-
             let (system_time_ms, valid_time_ms) = crate::event::bitemporal_extract::extract_stamps(
                 write.new_value.as_deref().or(write.old_value.as_deref()),
             );
             let event = WriteEvent {
-                sequence: self.event_sequence,
+                // `send_write_event` numbers it.
+                sequence: 0,
                 collection: Arc::from(write.collection.as_str()),
                 op: write.op,
                 row_id: RowId::row(write.identity),
@@ -62,16 +61,17 @@ impl CoreLoop {
                 database_id,
                 tenant_id,
                 vshard_id,
-                source,
+                source: write.source,
                 new_value: write.new_value.map(|v| Arc::from(v.as_slice())),
                 old_value: write.old_value.map(|v| Arc::from(v.as_slice())),
                 system_time_ms,
                 valid_time_ms,
                 user_id: None,
                 statement_digest: None,
+                commit_hlc,
             };
 
-            producer.emit(event);
+            self.send_write_event(event);
         }
     }
 }

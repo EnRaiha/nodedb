@@ -7,6 +7,8 @@
 //! that engine's own per-op WAL record uses. This module turns each
 //! `TransactionRedo` back into a set of per-op [`WalRecord`]s and feeds them to
 //! the SAME per-engine replay paths the standalone (autocommit) records use.
+//! A `WriteGroup` record, one write's rows journalled after apply, carries
+//! sub-records of the same shapes and reconstitutes the same way.
 //!
 //! ## Why reconstitute rather than apply a blob
 //!
@@ -55,7 +57,7 @@ use std::borrow::Cow;
 use nodedb_wal::WalRecord;
 use nodedb_wal::record::{RecordType, WalRecordArgs};
 
-use super::RedoRecord;
+use super::{RedoRecord, WriteGroupRecord};
 use crate::data::executor::core_loop::CoreLoop;
 
 /// Reconstitute every sub-record of every `TransactionRedo` record into a flat,
@@ -77,25 +79,38 @@ use crate::data::executor::core_loop::CoreLoop;
 /// enclosing record was already decrypted when the WAL was read into memory, so
 /// its sub-payloads are cleartext and these records never touch disk.
 ///
+/// A `WriteGroup` record reconstitutes the same way: its sub-records are the
+/// rows one write stored, in the shapes the standalone records use. Each
+/// sub-record takes the LSN of its group's origin, the LSN the write ran at
+/// on its core. Replay then applies a write's rows at the write's place in
+/// the order, wherever its parts sit in the WAL: a part boot journals at the
+/// tail never lands over a later write to the same row.
+///
 /// Also returns the materialized-sum targets every Calvin record's stamp
 /// carries, keyed by the record's LSN.
-fn reconstitute_with_folds(records: &[WalRecord]) -> crate::Result<(Vec<WalRecord>, RedoFolds)> {
-    let mut out = Vec::new();
-    let mut folds = RedoFolds::new();
+fn reconstitute_with_folds(records: &[WalRecord]) -> crate::Result<Reconstituted> {
+    let mut out = Reconstituted::default();
     for record in records {
-        if RecordType::from_raw(record.logical_record_type()) != Some(RecordType::TransactionRedo) {
-            continue;
-        }
-        let redo = RedoRecord::from_bytes(&record.payload)?;
-        if let Some(stamp) = redo.calvin_stamp
-            && !stamp.sum_targets.is_empty()
-        {
-            folds.insert(record.header.lsn, stamp.sum_targets);
-        }
-        for sub in redo.ops {
-            out.push(WalRecord::new(WalRecordArgs {
+        let (lsn, ops) = match RecordType::from_raw(record.logical_record_type()) {
+            Some(RecordType::TransactionRedo) => {
+                let redo = RedoRecord::from_bytes(&record.payload)?;
+                if let Some(stamp) = redo.calvin_stamp
+                    && !stamp.sum_targets.is_empty()
+                {
+                    out.folds.insert(record.header.lsn, stamp.sum_targets);
+                }
+                (record.header.lsn, redo.ops)
+            }
+            Some(RecordType::WriteGroup) => {
+                let group = WriteGroupRecord::from_bytes(&record.payload)?;
+                (group.group.origin_at(record.header.lsn), group.ops)
+            }
+            _ => continue,
+        };
+        for sub in ops {
+            out.ops.push(WalRecord::new(WalRecordArgs {
                 record_type: sub.record_type,
-                lsn: record.header.lsn,
+                lsn,
                 tenant_id: record.header.tenant_id,
                 vshard_id: record.header.vshard_id,
                 database_id: record.header.database_id,
@@ -105,7 +120,15 @@ fn reconstitute_with_folds(records: &[WalRecord]) -> crate::Result<(Vec<WalRecor
             })?);
         }
     }
-    Ok((out, folds))
+    Ok(out)
+}
+
+/// What [`reconstitute_with_folds`] rebuilt from a stream.
+#[derive(Default)]
+struct Reconstituted {
+    /// Every sub-record, at its enclosing record's header identity.
+    ops: Vec<WalRecord>,
+    folds: RedoFolds,
 }
 
 /// Materialized-sum targets per redo record LSN.
@@ -153,16 +176,17 @@ impl CoreLoop {
     /// `MultiVectorPut` / `MultiVectorDelete` sub-records the vector resolver
     /// emits — rebuilds any index from them.
     ///
-    /// Two arms take the STANDALONE slice rather than the merged one, at the
-    /// exact positions they have always occupied so their ordering against the
-    /// merged arms is unchanged:
+    /// The document arm replays standalone records and redo sub-records alike
+    /// from the merged stream. `apply_point_put` re-indexes a row's secondary
+    /// vectors inline, gated by the vector checkpoint's stamp, so no separate
+    /// pass indexes document vectors. It runs after `replay_vector_wal`, so the
+    /// `VectorParams` records emitted by `CREATE VECTOR INDEX` have registered
+    /// per-collection index params before a document row re-indexes.
     ///
-    /// * `replay_document_vector_wal` — redo document puts rebuild their
-    ///   secondary vector index inline inside `replay_document_redo`, so
-    ///   feeding it the merged stream would index them a second time.
-    /// * `replay_graph_node_label_wal` — its redo counterpart is
-    ///   `replay_graph_node_labels_redo` below; handing both the merged stream
-    ///   would apply every label delta twice.
+    /// One arm takes the STANDALONE slice rather than the merged one:
+    /// `replay_graph_node_label_wal`, whose redo counterpart is
+    /// `replay_graph_node_labels_redo` below; handing both the merged stream
+    /// applies every label delta twice.
     ///
     /// Returns `Err` when a committed redo group cannot be reconstituted; that
     /// is unrecoverable data loss, not a skippable record, and recovery must
@@ -174,7 +198,10 @@ impl CoreLoop {
         num_cores: usize,
         tombstones: &nodedb_wal::TombstoneSet,
     ) -> crate::Result<()> {
-        let (redo_ops, folds) = reconstitute_with_folds(records)?;
+        let Reconstituted {
+            ops: redo_ops,
+            folds,
+        } = reconstitute_with_folds(records)?;
         let ordered = merge_by_lsn(records, &redo_ops);
         // A committed-redo apply folds from its open scope. Restart replay
         // folds from each Calvin record's stamp.
@@ -183,10 +210,13 @@ impl CoreLoop {
         self.replay_vector_wal(&ordered, num_cores, tombstones);
         crate::fail_point!("replay::between_engine_passes");
         self.replay_vector_extended_wal(&ordered, num_cores, tombstones);
-        // Runs after `replay_vector_wal` so the `VectorParams` records emitted
-        // by `CREATE VECTOR INDEX` have registered per-collection index params
-        // before secondary vector indexes are rebuilt from document `Put`s.
-        self.replay_document_vector_wal(records, num_cores, tombstones);
+        // Every document row the WAL names, standalone and redo alike, in LSN
+        // order. A Calvin record's rows fold into their sum targets at the
+        // record's LSN, so the fold scope closes right after this arm.
+        self.replay_document_redo(&ordered, num_cores, tombstones);
+        if restart {
+            self.end_replay_folds();
+        }
         self.replay_kv_wal(&ordered, num_cores, tombstones);
         self.replay_timeseries_wal(&ordered, num_cores, tombstones);
         self.replay_array_wal(&ordered, num_cores, tombstones);
@@ -203,20 +233,11 @@ impl CoreLoop {
 
         crate::fail_point!("replay::between_standalone_and_redo");
 
-        // Document and graph have no standalone replay — they survive today via
-        // redb's synchronous commit at apply time. Under write-ahead-then-install
-        // a crash between append and install loses them, so redo replays them.
-        // These three arms take the reconstituted sub-records ALONE rather than
-        // the merged stream: a standalone document `Put` is already installed in
-        // redb, and re-applying it here would rebuild its secondary vector index
-        // a second time on top of `replay_document_vector_wal`'s pass.
-        // `apply_point_put` rebuilds any secondary vector index inline, so no
-        // separate `replay_document_vector_wal` pass is needed for redo puts.
-        self.replay_document_redo(&redo_ops, num_cores, tombstones);
-        if restart {
-            self.end_replay_folds();
-        }
-        self.replay_graph_redo(&redo_ops, num_cores, tombstones);
+        // Every graph edge version the WAL names, standalone and redo alike, in
+        // LSN order. The edges' CSR is rebuilt from the `EdgeStore` at open, so
+        // a restart re-applies versions it already holds at their exact keys,
+        // and a point-in-time restore applies the versions its base lacks.
+        self.replay_graph_redo(&ordered, num_cores, tombstones);
         // Node-label deltas staged inside a transaction resolve to the same
         // `GraphNodeLabelSet` / `GraphNodeLabelRemove` sub-record shape the
         // autocommit path produces (`resolve/graph.rs`'s
@@ -252,7 +273,7 @@ mod tests {
 
     /// The reconstituted records alone, without the fold targets.
     fn reconstitute_redo_records(records: &[WalRecord]) -> crate::Result<Vec<WalRecord>> {
-        Ok(super::reconstitute_with_folds(records)?.0)
+        Ok(super::reconstitute_with_folds(records)?.ops)
     }
 
     fn redo_wal_record(lsn: u64, tenant_id: u64, vshard_id: u32, record: &RedoRecord) -> WalRecord {
@@ -284,6 +305,10 @@ mod tests {
                 },
             ],
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         };
         let outer = redo_wal_record(77, 9, 3, &redo);
 
@@ -359,6 +384,10 @@ mod tests {
                 payload: vec![0xAA],
             }],
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         };
         // The transaction committed at LSN 50; an autocommit overwrote the same
         // key at LSN 100.
@@ -402,6 +431,10 @@ mod tests {
                 },
             ],
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         };
         let standalone = vec![redo_wal_record(7, 0, 0, &redo)];
         let redo_ops = reconstitute_redo_records(&standalone).expect("well-formed redo");
@@ -425,6 +458,10 @@ mod tests {
                 payload: vec![9],
             }],
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         };
         let standalone = vec![
             put_wal_record(1, vec![1]),

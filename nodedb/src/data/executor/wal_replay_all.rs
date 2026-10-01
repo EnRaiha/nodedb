@@ -17,8 +17,8 @@
 //! * `replay::between_engine_passes` — one engine's pass complete, the next
 //!   not started.
 //! * `replay::kv_mid_pass` — part way through a single engine's records.
-//! * `replay::between_standalone_and_redo` — every engine arm done, the
-//!   redo-only document / graph arms not yet run.
+//! * `replay::between_standalone_and_redo` — every engine arm done but the
+//!   graph edge arm.
 //! * `replay::before_sync_hwm_pass` — every engine arm is done but the sync
 //!   idempotency gate has not been rebuilt.
 
@@ -26,18 +26,24 @@ use nodedb_wal::{TombstoneSet, WalRecord};
 use tracing::{error, info};
 
 use super::core_loop::CoreLoop;
+use super::core_loop::fail_stop::FailStopCause;
 
 impl CoreLoop {
     /// Replay every WAL record class into this core's engines, in the exact
     /// order restart correctness requires. No-op when `records` is empty.
+    ///
+    /// `Err` when replay cannot bring the core to the state the WAL holds: a
+    /// redo group that does not reconstitute, a committed record an arm
+    /// cannot apply, or a sync HWM stream that does not decode. The core
+    /// applied nothing past the failure, and the caller must not serve it.
     pub fn replay_all_wal(
         &mut self,
         records: &[WalRecord],
         num_cores: usize,
         tombstones: &TombstoneSet,
-    ) {
+    ) -> crate::Result<()> {
         if records.is_empty() {
-            return;
+            return Ok(());
         }
         let core_id = self.core_id;
 
@@ -72,7 +78,12 @@ impl CoreLoop {
                 "StartupError: committed-transaction redo replay failed — \
                  refusing to start with an incompletely replayed WAL"
             );
-            std::process::exit(1);
+            self.fail_stop_core(FailStopCause::ReplayRecordUnapplied, &e.to_string());
+            return Err(e);
+        }
+        // A committed record an arm cannot apply halts every arm there.
+        if let Some(e) = self.replay_halt_error() {
+            return Err(e);
         }
 
         crate::fail_point!("replay::before_sync_hwm_pass");
@@ -90,6 +101,7 @@ impl CoreLoop {
                     );
                 }
                 self.install_sync_hwm_maps(maps);
+                Ok(())
             }
             Err(e) => {
                 error!(
@@ -98,7 +110,8 @@ impl CoreLoop {
                     "StartupError: sync HWM WAL replay failed — \
                      refusing to start with a partially-recovered idempotency gate"
                 );
-                std::process::exit(1);
+                self.fail_stop_core(FailStopCause::ReplayRecordUnapplied, &e.to_string());
+                Err(e)
             }
         }
     }
@@ -156,7 +169,8 @@ mod tests {
         let (mut core, _req, _resp) = make_core_with_dir(dir.path());
         let records = vec![kv_put_record(40, b"a"), kv_put_record(77, b"b")];
 
-        core.replay_all_wal(&records, 1, &TombstoneSet::new());
+        core.replay_all_wal(&records, 1, &TombstoneSet::new())
+            .expect("replay");
 
         assert_eq!(core.floors.applied_prefix.outcome_floor(), Lsn::new(77));
         let stamp = core.floors.applied_prefix.stamp().expect("exact stamp");
@@ -164,11 +178,73 @@ mod tests {
         assert!(stamp.applied_above.is_empty());
     }
 
+    fn timeseries_record(lsn: u64, payload: Vec<u8>) -> WalRecord {
+        WalRecord::new(WalRecordArgs {
+            record_type: RecordType::TimeseriesBatch as u32,
+            lsn,
+            tenant_id: TID,
+            vshard_id: 0,
+            database_id: 0,
+            payload,
+            encryption_key: None,
+            preamble_bytes: None,
+        })
+        .expect("build record")
+    }
+
+    /// A committed record replay cannot apply halts replay without exiting
+    /// the process: the core fail-stops, no later record of the pass
+    /// applies, and the caller gets the error.
+    #[test]
+    fn an_unapplyable_record_halts_replay_and_returns_its_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        let undecodable = zerompk::to_msgpack_vec(&(
+            "timeseries".to_string(),
+            "metrics".to_string(),
+            b"metrics value=1i".to_vec(),
+            None::<nodedb_types::sync::wire::SyncProvenance>,
+            "ilp".to_string(),
+        ))
+        .expect("encode five-element tuple");
+        let later = crate::control::server::wal_dispatch::encode_timeseries_ingest_payload(
+            crate::control::server::wal_dispatch::TimeseriesIngestRecord {
+                collection: "later",
+                payload: b"later value=2i",
+                provenance: None,
+                format: "ilp",
+                default_timestamp_ms: 1_700_000_000_000,
+            },
+        )
+        .expect("encode ingest record");
+        let records = vec![
+            timeseries_record(10, undecodable),
+            timeseries_record(20, later),
+        ];
+
+        let error = core
+            .replay_all_wal(&records, 1, &TombstoneSet::new())
+            .expect_err("an unapplyable committed record fails replay");
+        assert!(error.to_string().contains("lsn 10"), "{error}");
+        assert!(core.is_fail_stopped(), "the core serves no holed state");
+        assert!(
+            !core
+                .columnar_memtables
+                .keys()
+                .any(|(_, _, collection)| collection == "later"),
+            "no record after the halt applies"
+        );
+    }
+
     fn redo_bytes(op: RedoSubRecord) -> Vec<u8> {
         RedoRecord {
             version: 1,
             ops: vec![op],
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         }
         .to_bytes()
         .expect("encode redo")
@@ -281,11 +357,13 @@ mod tests {
 
         let (mut restored, _req, _resp) = make_core_with_dir(dir.path());
         restored.load_kv_checkpoints().expect("load");
-        restored.replay_all_wal(
-            &[redo_record(20, &a), redo_record(30, &b)],
-            1,
-            &TombstoneSet::new(),
-        );
+        restored
+            .replay_all_wal(
+                &[redo_record(20, &a), redo_record(30, &b)],
+                1,
+                &TombstoneSet::new(),
+            )
+            .expect("replay");
         let now = crate::engine::kv::current_ms();
         let expected: [(&[u8], &[u8]); 2] = [(b"a", b"held"), (b"b", b"applied")];
         for (key, value) in expected {
@@ -332,11 +410,13 @@ mod tests {
             vec![2],
             "the checkpoint holds B and not A"
         );
-        restored.replay_all_wal(
-            &[redo_record(20, &a), redo_record(30, &b)],
-            1,
-            &TombstoneSet::new(),
-        );
+        restored
+            .replay_all_wal(
+                &[redo_record(20, &a), redo_record(30, &b)],
+                1,
+                &TombstoneSet::new(),
+            )
+            .expect("replay");
         assert_eq!(
             columnar_ids(&restored),
             live,

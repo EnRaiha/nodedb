@@ -4,9 +4,7 @@ use nodedb_types::{DatabaseId, TenantId};
 use redb::{ReadableDatabase, ReadableTable};
 
 use super::store::{Direction, Edge, EdgeStore, REVERSE_EDGES, redb_err};
-use super::temporal::{
-    EdgeRef, EdgeValuePayload, is_sentinel, parse_versioned_edge_key, versioned_edge_key,
-};
+use super::temporal::{EdgeRef, parse_versioned_edge_key};
 
 impl EdgeStore {
     /// Outbound neighbors of a node within the caller's database, tenant and
@@ -41,8 +39,9 @@ impl EdgeStore {
     /// Inbound neighbors of a node within the caller's tenant and
     /// collection, current-state only.
     ///
-    /// Scans the reverse index (dst-first versioned keys), dedupes by base,
-    /// and drops bases whose latest reverse entry is a sentinel.
+    /// Scans the reverse index (dst-first versioned keys) for the bases that
+    /// have a version, and resolves each through the forward index, which
+    /// skips the versions a TRUNCATE hides.
     pub fn neighbors_in(
         &self,
         db: u64,
@@ -51,7 +50,7 @@ impl EdgeStore {
         dst: &str,
         label_filter: Option<&str>,
     ) -> crate::Result<Vec<Edge>> {
-        use std::collections::HashMap;
+        use std::collections::BTreeSet;
 
         let prefix = match label_filter {
             Some(label) => format!("{collection}\x00{dst}\x00{label}\x00"),
@@ -69,43 +68,31 @@ impl EdgeStore {
 
         // In the reverse index the key is `{coll}\x00{dst}\x00{label}\x00{src}\x00{sys}`.
         // So the parsed tuple's "src" position IS the original dst, and the
-        // "dst" position IS the original src. We track versions by the
-        // logical base `(coll, src, label, dst)` i.e. after the swap.
-        let mut latest: HashMap<(String, String, String), (i64, bool)> = HashMap::new();
+        // "dst" position IS the original src. We track bases by the logical
+        // `(label, src, dst)`, i.e. after the swap.
+        let mut bases: BTreeSet<(String, String, String)> = BTreeSet::new();
         let range = table
             .range((db, t, prefix.as_str())..)
             .map_err(|e| redb_err("range", e))?;
         for entry in range {
-            let (key, val) = entry.map_err(|e| redb_err("iter", e))?;
+            let (key, _) = entry.map_err(|e| redb_err("iter", e))?;
             let (kd, kt, composite) = key.value();
             if kd != db || kt != t || !composite.starts_with(&prefix) {
                 break;
             }
-            let Some((_coll, _rev_dst, rev_label, rev_src, sys)) =
+            let Some((_coll, _rev_dst, rev_label, rev_src, _sys)) =
                 parse_versioned_edge_key(composite)
             else {
                 continue;
             };
-            // Logical src (the neighbor we want) and label form the base.
-            let base = (rev_label.to_string(), rev_src.to_string(), dst.to_string());
-            let is_sent = is_sentinel(val.value());
-            latest
-                .entry(base)
-                .and_modify(|(cur, cur_sent)| {
-                    if sys > *cur {
-                        *cur = sys;
-                        *cur_sent = is_sent;
-                    }
-                })
-                .or_insert((sys, is_sent));
+            bases.insert((rev_label.to_string(), rev_src.to_string(), dst.to_string()));
         }
+        drop(table);
+        drop(read_txn);
 
-        // Live bases only — load properties from forward table's Ceiling.
-        let mut edges = Vec::with_capacity(latest.len());
-        for ((label, src_id, dst_id), (_sys, is_sent)) in latest {
-            if is_sent {
-                continue;
-            }
+        // The forward Ceiling decides each base: live, ended or hidden.
+        let mut edges = Vec::with_capacity(bases.len());
+        for (label, src_id, dst_id) in bases {
             let Some(props) = self.ceiling_resolve_edge(
                 EdgeRef::new(
                     DatabaseId::new(db),
@@ -181,12 +168,4 @@ impl EdgeStore {
             .neighbors_in(db, tid, collection, dst, label_filter)?
             .len())
     }
-}
-
-// Keep `versioned_edge_key` / `EdgeValuePayload` referenced in case a future
-// tier inlines them here instead of routing through `scan_edges_with_prefix`.
-#[allow(dead_code)]
-fn _keep_temporal_helpers_referenced() {
-    let _ = versioned_edge_key;
-    let _: fn(_, _, _) -> _ = EdgeValuePayload::new;
 }

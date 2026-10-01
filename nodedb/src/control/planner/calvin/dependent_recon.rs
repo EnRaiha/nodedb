@@ -8,32 +8,36 @@
 //!
 //! - [`plan_needs_implicit_edge_recon`] — the detection gate: given a task set,
 //!   return the collection + database of the first dependent-predicate task
-//!   (`BulkUpdate`/`BulkDelete`) whose target collection `has_implicit_edges`,
-//!   else `None`. It does NOT check the not-in-txn-block or registry-available
-//!   guards — those are per-protocol / session-state concerns and stay at the
-//!   call sites.
+//!   (`BulkUpdate`/`BulkDelete`), CRDT document delete or TRUNCATE whose
+//!   target collection `has_implicit_edges`, else `None`. It does NOT check
+//!   the not-in-txn-block or registry-available guards — those are
+//!   per-protocol / session-state concerns and stay at the call sites.
 //! - [`dispatch_dependent_edge_recon`] — the OLLP orchestration body: pre-exec
-//!   recon scan → derive mirrored EdgeDelete/EdgePut tasks → atomic Calvin
-//!   submit → OLLP drift-retry loop. It returns a protocol-neutral
+//!   recon scan → derive mirrored EdgeDelete/EdgePut tasks, and for a delete
+//!   the node guards and incident-edge deletes → atomic Calvin submit → OLLP
+//!   drift-retry loop. It returns a protocol-neutral
 //!   [`DependentReconOutcome`]; each protocol synthesises its own command tags
 //!   from the original task list AFTER this returns `Ok`.
 
 use crate::Error;
 use crate::control::cluster::calvin::executor::ollp::error::OllpError;
-use crate::control::planner::calvin::preexec::{PreexecScan, run_preexec_scan};
-use crate::control::planner::calvin::tx_class::collection_name_from_plan;
+use crate::control::planner::calvin::preexec::PreexecScan;
 use crate::control::planner::calvin::{
-    DependentOutcome, DependentRetryArgs, build_dependent_tx_class,
-    build_single_vshard_dependent_tx_class, is_dependent_predicate, predicate_class_for_filters,
-    run_dependent_with_retry, submit_calvin_routed_assign,
+    DependentOutcome, DependentRetryArgs, build_single_vshard_dependent_tx_class,
+    is_dependent_predicate, predicate_class_for_filters, run_dependent_with_retry,
+    submit_calvin_routed_assign,
 };
 use crate::control::planner::implicit_edges::{
     EdgeUpdateCtx, append_implicit_edge_delete_tasks, append_implicit_edge_update_tasks,
 };
-use crate::control::state::{CalvinApplyResult, SharedState};
+use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId};
 use nodedb_physical::physical_plan::OllpPredictedEdge;
 
+use super::dependent_recon_finish::finish_committed;
+use super::dependent_recon_node_edges::{
+    NodeDeletePlan, node_delete_tasks, planned_edge_deletes, reconnoitre,
+};
 use super::dependent_recon_plan::{inject_ollp_predicted_edges, inject_ollp_surrogates};
 use super::dependent_recon_predicate::{
     EdgeLifecycle, classify_edge_lifecycle, extract_bulk_predicate_info,
@@ -56,15 +60,15 @@ pub struct DependentReconOutcome {
     pub apply_result: Option<crate::bridge::envelope::Response>,
 }
 
-/// Detect whether `tasks` carry a dependent predicate on an implicit-edge-
-/// bearing collection, requiring the OLLP/Calvin recon path.
+/// Detect whether `tasks` carry a dependent predicate or a TRUNCATE on an
+/// implicit-edge-bearing collection, requiring the edge recon path.
 ///
 /// Returns `Some((collection, database_id))` of the FIRST dependent-predicate
-/// task (`BulkUpdate`/`BulkDelete`) whose target collection has
+/// task (`BulkUpdate`/`BulkDelete`) or TRUNCATE whose target collection has
 /// `has_implicit_edges` set in the catalog, else `None`.
 ///
 /// A genuine catalog READ error propagates as a typed [`crate::Error`]:
-/// misrouting a delete on a real I/O fault would silently skip edge cleanup
+/// misrouting a delete on a real I/O fault will silently skip edge cleanup
 /// (dangling edges). An ABSENT catalog (`None`) or absent collection row
 /// (`Ok(None)`) is treated as non-edge-bearing and yields `None`.
 ///
@@ -76,15 +80,25 @@ pub fn plan_needs_implicit_edge_recon(
     tasks: &[PhysicalTask],
     tenant_id: TenantId,
 ) -> crate::Result<Option<(String, DatabaseId)>> {
-    let Some(dep_task) = tasks.iter().find(|t| is_dependent_predicate(&t.plan)) else {
+    let Some(dep_task) = tasks.iter().find(|t| is_edge_recon_plan(&t.plan)) else {
         return Ok(None);
     };
-    let coll = collection_name_from_plan(&dep_task.plan);
+    // Every edge recon plan names its database-qualified collection.
+    let coll = dep_task
+        .plan
+        .collection()
+        .ok_or_else(|| Error::Internal {
+            detail: "internal invariant break: an edge recon plan names no collection".into(),
+        })?
+        .to_owned();
     let db = dep_task.database_id;
     let edge_bearing = {
+        // The plan names the collection database-qualified. The catalog keys
+        // collections by the bare name.
+        let bare = crate::control::target_identity::naming::bare_collection_name(db, &coll);
         let catalog = state.credentials.catalog();
         catalog
-            .get_collection(db, tenant_id.as_u64(), &coll)?
+            .get_collection(db, tenant_id.as_u64(), &bare)?
             .map(|c| c.has_implicit_edges)
             .unwrap_or(false)
     };
@@ -93,6 +107,15 @@ pub fn plan_needs_implicit_edge_recon(
     } else {
         Ok(None)
     }
+}
+
+/// Whether `plan` takes the edge recon path when its collection is
+/// edge-bearing: a dependent predicate write, a CRDT document delete, or a
+/// TRUNCATE.
+pub fn is_edge_recon_plan(plan: &nodedb_physical::physical_plan::PhysicalPlan) -> bool {
+    is_dependent_predicate(plan)
+        || super::dependent_recon_crdt::is_crdt_doc_delete(plan)
+        || super::edge_truncate::is_truncate(plan)
 }
 
 /// Drive the implicit-edge OLLP/Calvin reconnaissance dispatch for `tasks`.
@@ -104,12 +127,16 @@ pub fn plan_needs_implicit_edge_recon(
 ///    reconciles them against the SET clause — overrides parsed ONCE here as
 ///    they are constant across retries).
 /// 2. Runs an initial pre-execution reconnaissance scan to predict the matched
-///    surrogate set + the implicit edges of any matched edge documents.
+///    surrogate set + the implicit edges of any matched edge documents. A
+///    delete also reads each matched row's node identity and the node's
+///    incident edges in the collection.
 /// 3. Submits a Calvin transaction (routed to the sequencer-group leader via
 ///    `submit_calvin_routed_assign`) that mirrors the doc write together with
-///    the derived EdgeDelete/EdgePut tasks, ATOMICALLY.
-/// 4. On a POST-EXEC predicate-drift mismatch, re-scans (FRESH reconnaissance)
-///    and resubmits, via [`run_dependent_with_retry`].
+///    the derived EdgeDelete/EdgePut tasks, ATOMICALLY. A delete adds one
+///    `NodeEdgeGuard` per node and one `EdgeDelete` per incident edge.
+/// 4. On a POST-EXEC predicate-drift mismatch or a guard's drift abort,
+///    re-scans (FRESH reconnaissance) and resubmits, via
+///    [`run_dependent_with_retry`].
 ///
 /// Returns a protocol-neutral [`DependentReconOutcome`]; the caller synthesises
 /// its own per-task command tags from the original task list. All errors are
@@ -118,39 +145,24 @@ pub fn plan_needs_implicit_edge_recon(
 /// `database_id` is supplied by the caller (it comes from the detection gate,
 /// [`plan_needs_implicit_edge_recon`]) so it does not have to be re-derived.
 ///
-/// `allow_single_vshard` selects the participant floor of the `TxClass` this
-/// builds: `false` (the normal multi-shard OLLP callers — the pgwire and
-/// native predicate-dispatch gates) uses the strict
-/// [`build_dependent_tx_class`], which rejects a write set that collapses to
-/// one vshard. `true` is the explicit opt-in used ONLY by the contended
-/// single-collection predicate-write routing path
-/// (`route_write_to_calvin`'s dependent-predicate branch, reached when the
-/// write-admission gate returns `RouteToCalvin`): it uses
-/// [`build_single_vshard_dependent_tx_class`] so a single-collection
-/// `BulkUpdate`/`BulkDelete` that legitimately resolves to one vshard
-/// sequences through the scheduler instead of being rejected.
+/// The `TxClass` this builds accepts a write set on one vShard
+/// ([`build_single_vshard_dependent_tx_class`]). A delete whose row, node
+/// guard and edges all home on one vShard is a legitimate one-vShard
+/// transaction, and so is a contended single-collection predicate write
+/// routed here by the write-admission gate.
 pub async fn dispatch_authorized_dependent_edge_recon(
     state: &SharedState,
     authorized: crate::control::server::shared::authorization::AuthorizedTaskSet,
     identity: &crate::control::security::identity::AuthenticatedIdentity,
     tenant_id: TenantId,
     database_id: DatabaseId,
-    allow_single_vshard: bool,
 ) -> crate::Result<DependentReconOutcome> {
     let tasks = authorized
         .into_tasks()
         .into_iter()
         .map(|task| task.into_physical_task())
         .collect();
-    dispatch_dependent_edge_recon_inner(
-        state,
-        tasks,
-        Some(identity),
-        tenant_id,
-        database_id,
-        allow_single_vshard,
-    )
-    .await
+    dispatch_dependent_edge_recon_inner(state, tasks, Some(identity), tenant_id, database_id).await
 }
 
 pub(crate) async fn dispatch_dependent_edge_recon(
@@ -158,17 +170,8 @@ pub(crate) async fn dispatch_dependent_edge_recon(
     tasks: Vec<PhysicalTask>,
     tenant_id: TenantId,
     database_id: DatabaseId,
-    allow_single_vshard: bool,
 ) -> crate::Result<DependentReconOutcome> {
-    dispatch_dependent_edge_recon_inner(
-        state,
-        tasks,
-        None,
-        tenant_id,
-        database_id,
-        allow_single_vshard,
-    )
-    .await
+    dispatch_dependent_edge_recon_inner(state, tasks, None, tenant_id, database_id).await
 }
 
 async fn dispatch_dependent_edge_recon_inner(
@@ -177,8 +180,31 @@ async fn dispatch_dependent_edge_recon_inner(
     identity: Option<&crate::control::security::identity::AuthenticatedIdentity>,
     tenant_id: TenantId,
     database_id: DatabaseId,
-    allow_single_vshard: bool,
 ) -> crate::Result<DependentReconOutcome> {
+    // A TRUNCATE empties the collection and tombstones its edges on every
+    // vShard, in one transaction.
+    if let Some(truncated) =
+        super::edge_truncate::dispatch_truncate(state, &tasks, identity, tenant_id).await?
+    {
+        return Ok(DependentReconOutcome {
+            tasks_dispatched: tasks.len() as u64,
+            apply_result: truncated.apply_result,
+        });
+    }
+    // A CRDT document delete tombstones its node's edges in its transaction.
+    if !tasks.iter().any(|t| is_dependent_predicate(&t.plan))
+        && let Some(outcome) = super::dependent_recon_crdt::dispatch_crdt_doc_deletes(
+            state,
+            &tasks,
+            identity,
+            tenant_id,
+            database_id,
+        )
+        .await?
+    {
+        return Ok(outcome);
+    }
+
     let orchestrator = state.ollp_orchestrator.get();
     let registry = state
         .calvin_completion_registry
@@ -205,12 +231,13 @@ async fn dispatch_dependent_edge_recon_inner(
     let edge_mode = classify_edge_lifecycle(&dep_task.plan)?;
 
     // Initial reconnaissance — the first prediction the loop submits.
-    let initial_predicted = run_preexec_scan(
+    let initial_predicted = reconnoitre(
         state,
         tenant_id,
         database_id,
         &dep_collection,
         dep_filter_bytes.clone(),
+        &edge_mode,
     )
     .await?;
 
@@ -226,6 +253,7 @@ async fn dispatch_dependent_edge_recon_inner(
     let submit = |predicted: &PreexecScan| {
         let surrogates = predicted.surrogates.clone();
         let edges = predicted.edges.clone();
+        let node_edges = predicted.node_edges.clone();
         let tasks = &tasks;
         let dep_collection = &dep_collection;
         let edge_mode = &edge_mode;
@@ -262,8 +290,11 @@ async fn dispatch_dependent_edge_recon_inner(
                 .collect();
 
             let mut edge_tasks: Vec<PhysicalTask> = Vec::new();
+            // Node-delete guards run before every other task of the
+            // transaction, so each compares the edges the transaction found.
+            let mut guard_tasks: Vec<PhysicalTask> = Vec::new();
             match edge_mode {
-                EdgeLifecycle::Delete => {
+                EdgeLifecycle::Delete { .. } => {
                     append_implicit_edge_delete_tasks(
                         state,
                         &mut edge_tasks,
@@ -275,6 +306,23 @@ async fn dispatch_dependent_edge_recon_inner(
                     )
                     .await
                     .map_err(|e| OllpError::Terminal(Box::new(e)))?;
+                    // Each deleted row is a graph node: its incident edges in
+                    // this collection are tombstoned in this transaction.
+                    let (guards, deletes) = node_delete_tasks(
+                        state,
+                        tenant_id,
+                        database_id,
+                        NodeDeletePlan {
+                            collection: dep_collection,
+                            guarded: &node_edges,
+                            deleted: &node_edges,
+                            already_deleted: &planned_edge_deletes(&edge_tasks),
+                        },
+                    )
+                    .await
+                    .map_err(|e| OllpError::Terminal(Box::new(e)))?;
+                    guard_tasks = guards;
+                    edge_tasks.extend(deletes);
                 }
                 EdgeLifecycle::Update(overrides) => {
                     append_implicit_edge_update_tasks(
@@ -295,7 +343,8 @@ async fn dispatch_dependent_edge_recon_inner(
                 }
             }
 
-            let mut submission_tasks: Vec<PhysicalTask> = tasks.to_vec();
+            let mut submission_tasks: Vec<PhysicalTask> = guard_tasks;
+            submission_tasks.extend(tasks.iter().cloned());
             submission_tasks.extend(edge_tasks);
             if let Some(identity) = identity {
                 let emitter = crate::control::security::audit::ArcAuditEmitter(
@@ -328,31 +377,22 @@ async fn dispatch_dependent_edge_recon_inner(
                             // only touch the original BulkUpdate/BulkDelete
                             // doc tasks (no-ops on any other plan); the
                             // edge-delete tasks are appended AFTER, so they
-                            // are untouched. The tx_builder may run more than
+                            // are untouched. The tx_builder can run more than
                             // once, so clone the predicted sets per task.
                             inject_ollp_surrogates(&mut t.plan, surrogates.clone());
                             inject_ollp_predicted_edges(&mut t.plan, predicted_edges.clone());
                             t
                         })
                         .collect();
-                    let built = if allow_single_vshard {
-                        build_single_vshard_dependent_tx_class(
-                            &modified_tasks,
-                            tenant_id,
-                            dep_collection,
-                            &surrogates,
-                            &[],
-                        )
-                    } else {
-                        build_dependent_tx_class(
-                            &modified_tasks,
-                            tenant_id,
-                            dep_collection,
-                            &surrogates,
-                            &[],
-                        )
-                    };
-                    built.map_err(|e| OllpError::Terminal(Box::new(e)))
+                    let tx_class = build_single_vshard_dependent_tx_class(
+                        &modified_tasks,
+                        tenant_id,
+                        dep_collection,
+                        &surrogates,
+                        &[],
+                    )
+                    .map_err(|e| OllpError::Terminal(Box::new(e)))?;
+                    Ok(tx_class)
                 },
                 // Retryable: a routed submit races a leader change. The cause
                 // travels so exhaustion names it instead of claiming drift.
@@ -366,18 +406,19 @@ async fn dispatch_dependent_edge_recon_inner(
         }
     };
 
-    // `rescan`: FRESH reconnaissance on each post-exec mismatch.
+    // `rescan`: FRESH reconnaissance on each post-exec mismatch or drift.
     let rescan = || {
-        run_preexec_scan(
+        reconnoitre(
             state,
             tenant_id,
             database_id,
             &dep_collection,
             dep_filter_bytes.clone(),
+            &edge_mode,
         )
     };
 
-    let completed_txn = match run_dependent_with_retry(DependentRetryArgs {
+    let (completed_txn, ack_results) = match run_dependent_with_retry(DependentRetryArgs {
         registry,
         orchestrator: orc,
         predicate_class_hash: pred_class,
@@ -389,7 +430,10 @@ async fn dispatch_dependent_edge_recon_inner(
     })
     .await?
     {
-        DependentOutcome::Committed(txn_id) => txn_id,
+        DependentOutcome::Committed {
+            txn_id,
+            ack_results,
+        } => (txn_id, ack_results),
         // The predicate matched no rows and nothing else in the batch writes,
         // so no entry was sequenced. The statement reports zero rows affected.
         DependentOutcome::NoOp => {
@@ -399,50 +443,5 @@ async fn dispatch_dependent_edge_recon_inner(
             });
         }
     };
-
-    // A write to a permission-tree source is acknowledged only once it binds
-    // every node. Tree sources live in the default database.
-    let sources = state.authorization_fence.sources();
-    let binds_authorization = database_id == crate::types::DatabaseId::DEFAULT
-        && tasks.iter().any(|task| {
-            task.plan
-                .named_collections()
-                .iter()
-                .any(|collection| sources.is_source_collection(collection))
-        });
-    if binds_authorization {
-        crate::control::security::auth_lease::calvin_write_barrier(state).await?;
-    }
-
-    // Completion fired: the scheduler deposited the applied Response (with any
-    // RETURNING rows) into the sidecar before proposing the ack that woke the
-    // retry loop, so the entry is present now if this write carried RETURNING.
-    // Drain it (removing the entry) for the caller to shape into DATA-ROWs; a
-    // `Conflict` (>1 RETURNING participant) fails loudly rather than returning a
-    // partial cross-shard union.
-    let drained = state
-        .calvin
-        .apply_results
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(&completed_txn);
-    let apply_result = match drained {
-        Some(CalvinApplyResult::Single { response, .. }) => {
-            // An installed txn whose reply failed to render deposits it as an
-            // error for the statement.
-            crate::control::local_dispatch::reject_data_plane_error(&response)?;
-            Some(response)
-        }
-        Some(CalvinApplyResult::Conflict) => {
-            return Err(Error::Internal {
-                detail: "multi-participant cross-shard RETURNING not supported".to_owned(),
-            });
-        }
-        None => None,
-    };
-
-    Ok(DependentReconOutcome {
-        tasks_dispatched: tasks.len() as u64,
-        apply_result,
-    })
+    finish_committed(state, &tasks, completed_txn, &ack_results).await
 }

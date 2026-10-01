@@ -26,4 +26,8 @@ pub use resolver::{EngineWriteResolver, WriteResolveContext};
 pub use run::{MAX_WRITE_RESOLVE_RETRIES, run_authorized_write_resolve, run_write_resolve};
 pub use select::resolver_for_plan;
 pub use timeseries::TimeseriesWriteResolver;
+pub(crate) use timeseries::{
+    carries_applied_ingest_counts, is_unresolved_ingest, rejected_lines, resolve_for_log,
+    resolve_ingest_plan, resolve_tasks_for_log, resolved_ingest_counts,
+};
 pub use vector::VectorWriteResolver;

@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex};
 
 use nodedb_types::DatabaseId;
 
-use crate::control::maintenance::{MaintenanceOutcome, with_budget};
+use crate::control::maintenance::MaintenanceOutcome;
+use crate::control::maintenance::wrapper::with_budget_async;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
@@ -199,8 +200,8 @@ pub fn record_and_maybe_analyze(
     };
     let identity = identity.clone();
     let collection = collection.to_string();
-    tokio::task::spawn_blocking(move || {
-        run_budgeted_analyze(&guard.owner, &identity, database_id, &collection);
+    tokio::spawn(async move {
+        run_budgeted_analyze(&guard.owner, &identity, database_id, &collection).await;
         // `guard` drops here and releases the slot.
     });
 }
@@ -234,21 +235,20 @@ fn last_analyzed_row_count(
 }
 
 /// Run ANALYZE under the database's maintenance budget and log the outcome.
-///
-/// Runs on a `spawn_blocking` thread, so the budget lease stays inside one
-/// synchronous scope and never crosses an await.
-fn run_budgeted_analyze(
+/// The budget lease covers the whole awaited ANALYZE.
+async fn run_budgeted_analyze(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     collection: &str,
 ) {
-    let outcome = with_budget(
+    let outcome = with_budget_async(
         &state.maintenance_budget,
         database_id,
         ANALYZE_ESTIMATED_SECS,
-        || blocking_analyze(state, identity, database_id, collection),
-    );
+        analyze(state, identity, database_id, collection),
+    )
+    .await;
     match outcome {
         MaintenanceOutcome::Deferred => tracing::debug!(
             %collection,
@@ -264,25 +264,17 @@ fn run_budgeted_analyze(
     }
 }
 
-/// Drive the async `handle_analyze` to completion from a blocking thread.
-fn blocking_analyze(
+/// Run ANALYZE on `collection`.
+async fn analyze(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     collection: &str,
 ) -> Result<(), DdlError> {
-    let handle = tokio::runtime::Handle::try_current().map_err(|error| {
-        DdlError::internal(format!("auto-ANALYZE needs a Tokio runtime: {error}"))
-    })?;
     // `handle_analyze` reads the collection name off the second whitespace
     // token and lowercases it, so the bare name is what it expects.
     let sql = format!("ANALYZE {collection}");
-    handle.block_on(super::analyze::handle_analyze(
-        state,
-        identity,
-        &sql,
-        database_id,
-    ))?;
+    super::analyze::handle_analyze(state, identity, &sql, database_id).await?;
     Ok(())
 }
 

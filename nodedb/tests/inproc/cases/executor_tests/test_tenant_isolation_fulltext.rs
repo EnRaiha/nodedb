@@ -39,7 +39,7 @@ fn fulltext_search_isolated() {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "articles"),
                 document_id: id.to_string(),
                 value: val.as_bytes().to_vec(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: doc_surrogate(id),
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),

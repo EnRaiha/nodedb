@@ -1,25 +1,26 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! CDC change-event publishing for dispatched writes: turning the metadata
-//! [`super::extract`] derived from a plan into `ChangeEvent`s on the local
-//! change stream plus the cluster-wide NOTIFY fan-out.
+//! [`super::extract`] derived from a plan into `ChangeEvent`s on the
+//! change stream, at the position of the write in its partition's feed.
+
+use std::sync::Arc;
 
 use crate::bridge::envelope::{PhysicalPlan, Response};
+use crate::control::change_stream::{ChangeEvent, ChangePartition, ChangeRun, PositionedChange};
 use crate::control::state::SharedState;
+use crate::event::cdc::CdcOffset;
 use crate::types::{DatabaseId, TenantId};
-use nodedb_physical::physical_plan::ClusterArrayOp;
 
-use super::extract::{WriteChangeMeta, cluster_array_change_meta, extract_write_metadata};
+use super::extract::{WriteChangeMeta, extract_write_metadata};
 
-/// Current wall-clock time as milliseconds since Unix epoch.
-///
-/// Returns 0 if the system clock is before the epoch (should never happen
-/// on correctly configured systems).
-fn current_timestamp_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+const NANOS_PER_MS: u64 = 1_000_000;
+
+/// The change-event timestamp of a write that committed at `commit_hlc`
+/// (HLC wall time, nanoseconds). Every replica reads the same commit HLC
+/// from the committed entry, so every node stamps the same value.
+fn commit_timestamp_ms(commit_hlc: u64) -> u64 {
+    commit_hlc / NANOS_PER_MS
 }
 
 /// Check if a timeseries collection has CDC enabled.
@@ -49,58 +50,53 @@ fn is_timeseries_cdc_enabled(
     true
 }
 
-/// Publish a change event (and cluster-wide NOTIFY) for a successful write.
+/// The change event of one row change, or `None` when its collection
+/// publishes none: a timeseries collection publishes only with `cdc`
+/// enabled.
 ///
-/// CDC opt-in check for timeseries: skip publishing unless `cdc_enabled`.
-/// Document collections always publish (backward compatible).
-fn publish_change_event(
+/// The plan names the collection database-qualified. The event names it
+/// bare, as the catalog and every subscriber filter do; its database travels
+/// beside it.
+fn change_event(
     shared: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     change_meta: WriteChangeMeta,
     lsn: nodedb_types::Lsn,
-) {
-    let (collection, document_id, op) = change_meta;
+    commit_hlc: u64,
+) -> Option<ChangeEvent> {
+    let (qualified, document_id, op) = change_meta;
+    let collection = match nodedb_types::CollectionKey::from_qualified_str(database_id, &qualified)
+    {
+        Ok(key) => key.name().to_owned(),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                collection = %qualified,
+                "a row change names a collection outside its database; it publishes no event"
+            );
+            return None;
+        }
+    };
     if !is_timeseries_cdc_enabled(shared, database_id, tenant_id, &collection) {
-        return;
+        return None;
     }
-
-    use crate::control::change_stream::ChangeEvent;
-    let event = ChangeEvent {
+    Some(ChangeEvent {
         lsn,
         tenant_id,
         collection,
         document_id,
         operation: op,
-        timestamp_ms: current_timestamp_ms(),
+        timestamp_ms: commit_timestamp_ms(commit_hlc),
         after: None,
-    };
-
-    // Cluster-wide NOTIFY: broadcast to all peers via QUIC.
-    if let (Some(transport), Some(topology)) = (&shared.cluster_transport, &shared.cluster_topology)
-    {
-        use std::sync::atomic::Ordering;
-        static NOTIFY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let seq = NOTIFY_SEQ.fetch_add(1, Ordering::Relaxed);
-        crate::control::change_stream::broadcast_notify_to_cluster(
-            database_id,
-            &event,
-            shared.node_id,
-            seq,
-            transport,
-            topology,
-        );
-    }
-
-    shared.change_stream.publish_in_database(database_id, event);
+    })
 }
 
 /// The Control-Plane change events one write plan yields.
 ///
 /// Extraction is split from publishing because the write funnel consumes the
 /// plan — it moves into the `Request` — long before the `Response` the event's
-/// LSN comes from exists. A caller that still owns its plan at publish time
-/// uses [`publish_origin_change_events`] and never names this type.
+/// LSN comes from exists.
 pub(crate) struct WriteChangeSet {
     /// One tuple per logical row change — see `extract_write_metadata`.
     metas: Vec<WriteChangeMeta>,
@@ -115,91 +111,167 @@ pub(crate) fn extract_write_change_set(plan: &PhysicalPlan, tenant_id: TenantId)
     }
 }
 
-/// Publish an already-extracted change set at an explicit LSN. Almost every
-/// write plan yields exactly one event; a handful of multi-row /
-/// multi-collection ops yield more than one, and reads / DDL / index
-/// maintenance yield none.
-pub(crate) fn publish_change_set_with_lsn(
+/// The change events of a committed transaction's redo record `redo`: one per
+/// row it installs. A Calvin commit publishes these, as the data-group apply
+/// of a `TransactionRedo` entry does.
+pub(crate) fn redo_change_set(redo: &[u8]) -> WriteChangeSet {
+    WriteChangeSet {
+        metas: super::redo::redo_change_meta(redo),
+    }
+}
+
+fn change_events(
     shared: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     change_set: WriteChangeSet,
     lsn: nodedb_types::Lsn,
-) {
-    let WriteChangeSet { metas } = change_set;
-    for meta in metas {
-        publish_change_event(shared, tenant_id, database_id, meta, lsn);
+    commit_hlc: u64,
+) -> Vec<ChangeEvent> {
+    change_set
+        .metas
+        .into_iter()
+        .filter_map(|meta| change_event(shared, tenant_id, database_id, meta, lsn, commit_hlc))
+        .collect()
+}
+
+impl WriteChangeSet {
+    /// Whether the write yields no change event.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.metas.is_empty()
     }
 }
 
-/// Publish an already-extracted change set, taking the LSN from a Data-Plane
-/// [`Response`]'s watermark.
-pub(crate) fn publish_change_set(
-    shared: &SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
+/// A replicated write's change set, staged under its data-group entry once
+/// the write applied.
+pub(crate) struct PendingChanges {
     change_set: WriteChangeSet,
-    response: &Response,
-) {
-    publish_change_set_with_lsn(
-        shared,
-        tenant_id,
-        database_id,
-        change_set,
-        response.watermark_lsn,
-    );
+    /// The data group of the committed entry the write applies.
+    group_id: u64,
+    /// The entry's log index in its group.
+    log_index: u64,
+    /// HLC wall time, in nanoseconds, at which the write committed.
+    commit_hlc: u64,
 }
 
-/// Publish the Control-Plane change event(s) for a write this node originated
-/// and has already had committed and applied.
-///
-/// The cluster Raft path cannot let the write funnel own its change feed: the
-/// proposing node never reaches `submit_write` — it proposes, and every
-/// replica's apply loop submits the committed entry independently. Publishing
-/// from the apply loop would emit one event per replica plus a full NOTIFY
-/// fan-out from each, so a subscriber would see the write once per replica. The
-/// proposing node is the one node that handled the write exactly once, so it is
-/// the one that publishes.
-pub(crate) fn publish_origin_change_events(
-    shared: &SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    plan: &PhysicalPlan,
-    response: &Response,
-) {
-    publish_change_set(
-        shared,
-        tenant_id,
-        database_id,
-        extract_write_change_set(plan, tenant_id),
-        response,
-    );
+impl PendingChanges {
+    /// Staged under the data-group entry `(group_id, log_index)` once it
+    /// applies, and published when the apply loop settles the entry in log
+    /// order ([`publish_settled_changes`]).
+    pub(crate) fn staged(change_set: WriteChangeSet, group_id: u64, log_index: u64) -> Self {
+        Self {
+            change_set,
+            group_id,
+            log_index,
+            commit_hlc: 0,
+        }
+    }
+
+    /// Stamp the write's commit HLC, which dates its events. A replicated
+    /// write takes the HLC its proposer stamped on the entry.
+    pub(crate) fn committed_at(mut self, commit_hlc: u64) -> Self {
+        self.commit_hlc = commit_hlc;
+        self
+    }
+
+    /// Stage the write's events, at the LSN of its Data-Plane [`Response`],
+    /// under its entry. Almost every write plan yields exactly one event; a
+    /// handful of multi-row / multi-collection ops yield more than one, and
+    /// reads / DDL / index maintenance yield none.
+    pub(crate) fn publish(
+        self,
+        shared: &SharedState,
+        tenant_id: TenantId,
+        database_id: DatabaseId,
+        response: &Response,
+    ) {
+        let events = change_events(
+            shared,
+            tenant_id,
+            database_id,
+            self.change_set,
+            response.watermark_lsn,
+            self.commit_hlc,
+        );
+        shared
+            .change_stream
+            .stage(self.group_id, self.log_index, database_id, events);
+    }
 }
 
-/// Publish the Control-Plane change event(s) for a `ClusterArray` write.
+/// Publish the staged changes of `group_id`'s entries `first..=last`, which
+/// the apply loop settled in log order, and forward them to the nodes that
+/// do not replicate the group when this node leads it.
 ///
-/// `ClusterArrayOp` never reaches the SPSC bridge / Data-Plane `Response`
-/// path (see `PhysicalPlan::ClusterArray`'s own doc comment) — the coordinator
-/// dispatch loop in `routing/cluster_array.rs` executes the op directly via
-/// `ClusterArrayExecutor` and has no `Response::watermark_lsn` to read, so it
-/// calls this entry point with the `wal_lsn` the op itself carries (allocated
-/// by the Control Plane for the write) instead of going through
-/// [`publish_origin_change_events`].
-pub(crate) fn publish_cluster_array_change_events(
-    shared: &SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    op: &ClusterArrayOp,
-    lsn: u64,
+/// Every replica publishes the group's writes at their log positions, so
+/// every node serves the same feed.
+pub(crate) fn publish_settled_changes(
+    shared: &Arc<SharedState>,
+    group_id: u64,
+    first: u64,
+    last: u64,
 ) {
-    let change_set = WriteChangeSet {
-        metas: cluster_array_change_meta(op),
-    };
-    publish_change_set_with_lsn(
-        shared,
+    shared.change_stream.settle_group(group_id, first, last);
+    shared
+        .change_stream
+        .forward(shared, ChangePartition::Group(group_id));
+}
+
+/// Publish the changes of the Calvin transaction at `(sequencer_epoch,
+/// position)` that vShard `vshard` applied, and forward them when this node
+/// leads the vShard's data group.
+///
+/// Every replica's scheduler applies the vShard's transactions in sequencer
+/// order, so every replica publishes them at the same positions.
+pub(crate) fn publish_calvin_change_sets(
+    shared: &Arc<SharedState>,
+    calvin: CalvinApply,
+    change_sets: Vec<WriteChangeSet>,
+    lsn: nodedb_types::Lsn,
+) {
+    let CalvinApply {
         tenant_id,
         database_id,
-        change_set,
-        nodedb_types::Lsn::new(lsn),
-    );
+        vshard,
+        sequencer_epoch,
+        position,
+        commit_hlc,
+    } = calvin;
+    let base = u64::from(position);
+    let changes: Vec<PositionedChange> = change_sets
+        .into_iter()
+        .flat_map(|change_set| {
+            change_events(shared, tenant_id, database_id, change_set, lsn, commit_hlc)
+        })
+        .enumerate()
+        .map(|(ordinal, event)| PositionedChange {
+            position: CdcOffset::data_event_in(0, sequencer_epoch, base, ordinal as u64 + 1),
+            database_id,
+            event,
+        })
+        .collect();
+    if changes.is_empty() {
+        return;
+    }
+    shared.change_stream.publish_run(ChangeRun {
+        partition: ChangePartition::Calvin(vshard),
+        after: None,
+        through: CdcOffset::data_event_in(0, sequencer_epoch, base, u64::MAX).correction(),
+        changes,
+    });
+    shared
+        .change_stream
+        .forward(shared, ChangePartition::Calvin(vshard));
+}
+
+/// The Calvin transaction a published change set belongs to.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CalvinApply {
+    pub tenant_id: TenantId,
+    pub database_id: DatabaseId,
+    pub vshard: u32,
+    pub sequencer_epoch: u64,
+    pub position: u32,
+    /// The transaction's commit HLC, which every replica derives alike.
+    pub commit_hlc: u64,
 }

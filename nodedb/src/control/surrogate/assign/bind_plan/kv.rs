@@ -68,7 +68,7 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut KvOp) -> crate::Result<
             surrogates,
             ..
         } => {
-            // `zip` would truncate silently; a row with no identity is a
+            // `zip` truncates silently; a row with no identity is a
             // malformed plan, refused here.
             if entries.len() != surrogates.len() {
                 return Err(crate::Error::Serialization {
@@ -132,7 +132,8 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut KvOp) -> crate::Result<
                         surrogate,
                     )?,
                     // Named by key; the row's identity was bound when it was put.
-                    KvResolvedMutation::Delete { .. }
+                    KvResolvedMutation::Rewrite { .. }
+                    | KvResolvedMutation::Delete { .. }
                     | KvResolvedMutation::Expire { .. }
                     | KvResolvedMutation::Persist { .. } => {}
                 }

@@ -49,6 +49,12 @@ pub(super) fn refuse_graph_op(op: &GraphOp, ctx: &RefusalCtx<'_>) -> crate::Resu
         | GraphOp::WccSuperstep(_)
         | GraphOp::SetNodeLabels { .. }
         | GraphOp::RemoveNodeLabels { .. }
+        | GraphOp::NodeEdgeGuard { .. }
+        | GraphOp::NodePresenceGuard { .. }
+        | GraphOp::TruncateEdges { .. }
+        // A delete's planner reads which ids are stored. It returns no
+        // column to the client.
+        | GraphOp::NodePresenceRead { .. }
         | GraphOp::Stats { .. } => Ok(()),
     }
 }
@@ -85,8 +91,8 @@ pub(super) fn refuse_match(ctx: &RefusalCtx<'_>, query: &[u8]) -> crate::Result<
 /// Refuse a pattern match already known to be scoped (or not) to `collection`.
 ///
 /// Shares the fail-closed fallback with [`refuse_match`] for a caller that
-/// already holds the decoded `MatchQuery` and would otherwise have to
-/// re-serialize it just to decode it back here.
+/// already holds the decoded `MatchQuery` and will otherwise have to
+/// re-serialize it only to decode it back here.
 pub(super) fn refuse_match_scoped(
     ctx: &RefusalCtx<'_>,
     collection: Option<&str>,

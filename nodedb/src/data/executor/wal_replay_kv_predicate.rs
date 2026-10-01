@@ -69,18 +69,20 @@ impl CoreLoop {
                     continue;
                 }
             };
-            self.kv_engine.put(crate::engine::kv::KvPutParams {
-                database_id,
-                tenant_id,
-                collection: &collection,
-                key: &key,
-                value: &computed.new_value,
-                ttl_ms: 0,
-                now_ms,
-                // The row exists, so `ZERO` leaves its bound identity alone —
-                // the same surrogate the live merge preserved.
-                surrogate: nodedb_types::Surrogate::ZERO,
-            });
+            // The row exists and keeps its bound identity, the same surrogate
+            // the live merge preserved.
+            self.kv_engine.rewrite_with_absolute_expiry(
+                crate::engine::kv::KvRewriteParams {
+                    database_id,
+                    tenant_id,
+                    collection: &collection,
+                    key: &key,
+                    value: &computed.new_value,
+                    ttl_ms: 0,
+                    now_ms,
+                },
+                crate::engine::kv::entry::NO_EXPIRY,
+            );
             written += 1;
         }
         // The key set is resolved at replay time rather than carried, so the

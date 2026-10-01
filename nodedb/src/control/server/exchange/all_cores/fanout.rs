@@ -3,66 +3,25 @@
 //! Shared per-core fan-out primitive for graph BSP/WCC superstep plans and
 //! single-blob Meta ops (tenant snapshot, restore result). Used by every
 //! single-blob merge path (`dispatch::single_blob_gather`, `snapshot`, `bsp`,
-//! `wcc`).
+//! `wcc`). Every core must answer: see `exchange::core_outcome`.
 
 use futures::future::join_all;
 
-use crate::bridge::envelope::{Response, Status};
+use crate::bridge::envelope::Response;
+use crate::control::server::exchange::core_outcome::{
+    CoreOutcome, classify_core_response, require_every_core,
+};
 use crate::control::server::exchange::gather::eager_dispatch_to_all_cores;
 use crate::control::server::shared::session::statement_deadline;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId, TxnId};
+use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
-
-/// One core's outcome: its response, `None` for a `NotFound` refusal, or the
-/// typed error that stopped it.
-type CoreOutcome = crate::Result<Option<Response>>;
-
-/// Shared per-core fan for a BSP/WCC superstep plan: dispatch to every local
-/// core, gather bounded responses, drop `NotFound`/empty-CSR cores.
-///
-/// A core that fails is dropped while any other core answers. The call fails
-/// only when no core answers.
-pub(super) async fn gather_graph_op_all_cores(
-    state: &SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    plan: PhysicalPlan,
-    trace_id: TraceId,
-    txn_id: Option<TxnId>,
-    label: &'static str,
-) -> crate::Result<Vec<Response>> {
-    let outcomes =
-        dispatch_all_cores(state, tenant_id, database_id, plan, trace_id, txn_id, label).await?;
-    let mut out = Vec::with_capacity(outcomes.len());
-    // First error seen across cores, kept as a TYPED error: a core cut short by
-    // the statement's deadline reports the deadline, and a constraint refusal
-    // keeps its own SQLSTATE.
-    let mut first_error: Option<crate::Error> = None;
-    for outcome in outcomes {
-        match outcome {
-            Ok(Some(resp)) => out.push(resp),
-            Ok(None) => {}
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-    }
-    if out.is_empty()
-        && let Some(error) = first_error
-    {
-        return Err(error);
-    }
-    Ok(out)
-}
 
 /// Fan `plan` to every local core and require every core to answer.
 ///
-/// Each core holds only the state its own vShards home to. A merge that
-/// dropped a failed core returns that core's state as absent, so the first
-/// core error fails the whole call. A `NotFound` refusal contributes nothing.
+/// The first core error fails the whole call with that core's typed error. A
+/// `NotFound` refusal contributes nothing. An empty payload is kept as an
+/// answer.
 pub(super) async fn gather_every_core(
     state: &SharedState,
     tenant_id: TenantId,
@@ -71,15 +30,8 @@ pub(super) async fn gather_every_core(
     trace_id: TraceId,
     label: &'static str,
 ) -> crate::Result<Vec<Response>> {
-    let outcomes =
-        dispatch_all_cores(state, tenant_id, database_id, plan, trace_id, None, label).await?;
-    let mut out = Vec::with_capacity(outcomes.len());
-    for outcome in outcomes {
-        if let Some(resp) = outcome? {
-            out.push(resp);
-        }
-    }
-    Ok(out)
+    let outcomes = dispatch_all_cores(state, tenant_id, database_id, plan, trace_id, label).await?;
+    require_every_core(outcomes)
 }
 
 /// Dispatch `plan` to every local core and collect each core's outcome.
@@ -92,9 +44,8 @@ async fn dispatch_all_cores(
     database_id: DatabaseId,
     plan: PhysicalPlan,
     trace_id: TraceId,
-    txn_id: Option<TxnId>,
     label: &'static str,
-) -> crate::Result<Vec<CoreOutcome>> {
+) -> crate::Result<Vec<CoreOutcome<Response>>> {
     // Shared broadcast call counter (parity with gather_all_cores).
     crate::control::server::broadcast::broadcast_call_count_increment();
 
@@ -113,13 +64,19 @@ async fn dispatch_all_cores(
     // Eager dispatch: register + dispatch to each core before awaiting any response.
     // Scope owned_vshards to `vshard % num_cores == core_id` — see doc above.
     let receivers =
-        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, txn_id, |core_id| {
+        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, None, |core_id| {
             let mut core_plan = plan.clone();
             match &mut core_plan {
                 PhysicalPlan::Graph(g) => match g {
+                    // A core receives only the contributions to the nodes it
+                    // owns: its handler refuses any other.
                     GraphOp::BspSuperstep(bsp) => {
                         bsp.owned_vshards
                             .retain(|v| (*v as usize) % num_cores == core_id);
+                        bsp.incoming_contributions.retain(|(name, _)| {
+                            (VShardId::from_key(name.as_bytes()).as_u32() as usize) % num_cores
+                                == core_id
+                        });
                     }
                     GraphOp::WccSuperstep(wcc) => {
                         wcc.owned_vshards
@@ -146,7 +103,11 @@ async fn dispatch_all_cores(
                     | GraphOp::RemoveNodeLabels { .. }
                     | GraphOp::TemporalNeighbors { .. }
                     | GraphOp::TemporalAlgorithm { .. }
-                    | GraphOp::Stats { .. } => {}
+                    | GraphOp::Stats { .. }
+                    | GraphOp::NodeEdgeGuard { .. }
+                    | GraphOp::NodePresenceGuard { .. }
+                    | GraphOp::TruncateEdges { .. }
+                    | GraphOp::NodePresenceRead { .. } => {}
                 },
                 // Non-graph plans fanned verbatim. Exhaustive (no `_ =>`) to force a decision.
                 PhysicalPlan::Vector(_)
@@ -184,16 +145,5 @@ async fn dispatch_all_cores(
 
     let results: Vec<crate::Result<Response>> = join_all(response_futures).await;
 
-    Ok(results
-        .into_iter()
-        .map(|result| {
-            let resp = result?;
-            if resp.status == Status::Error {
-                // `NotFound` is an empty slice on this core, not an error.
-                crate::control::local_dispatch::reject_data_plane_error(&resp)?;
-                return Ok(None);
-            }
-            Ok(Some(resp))
-        })
-        .collect())
+    Ok(results.into_iter().map(classify_core_response).collect())
 }

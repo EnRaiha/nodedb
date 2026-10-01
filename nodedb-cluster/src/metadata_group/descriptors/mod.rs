@@ -7,7 +7,9 @@
 //! deliberately opaque to them.
 
 pub mod common;
+pub mod drain_owner;
 pub mod lease;
 
 pub use common::{DescriptorHeader, DescriptorId, DescriptorKind};
+pub use drain_owner::DrainOwner;
 pub use lease::DescriptorLease;

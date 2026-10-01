@@ -10,17 +10,26 @@
 //! | High     | `High`              | 4 slots                |
 //! | Low      | `Normal`,`Background`| 2 slots               |
 //!
-//! **Drain algorithm.** Each call to [`PriorityQueues::drain_batch`] pulls at
-//! most `budget` tasks total using the 8:4:2 ratio.  Empty tiers donate their
-//! unused slots to the next lower tier so no cycle is wasted when, e.g.,
-//! Critical is empty.
+//! **Drain algorithm.** Each call to [`PriorityQueues::pop_next`] pulls one
+//! task using the 8:4:2 ratio. Empty tiers donate their unused slots to the
+//! next lower tier so no cycle is wasted when, e.g., Critical is empty.
 //!
 //! **Starvation prevention.** Because lower-priority work always gets at least
 //! 2 slots *and* inherits unused upper-tier slots, it can never be permanently
 //! starved even under sustained Critical load.
+//!
+//! **Snapshot barriers.** Every task carries its arrival sequence on this
+//! core. A tenant snapshot is a barrier: it runs only after every task that
+//! arrived before it, in any tier, and every task that arrived after it waits,
+//! in any tier, until it has run. The dispatcher keeps each database's
+//! requests in dispatch order on the ring, and a snapshot reads only its own
+//! database, so the snapshot sees exactly the writes of its database
+//! dispatched before it.
 
 use std::collections::VecDeque;
 use std::time::Instant;
+
+use nodedb_physical::physical_plan::{MetaOp, PhysicalPlan};
 
 use crate::bridge::envelope::Priority;
 use crate::data::executor::task::ExecutionTask;
@@ -30,6 +39,10 @@ const BUDGET_CRITICAL: usize = 8;
 const BUDGET_HIGH: usize = 4;
 const BUDGET_LOW: usize = 2;
 
+/// The first arrival sequence. A task put back at the front of the queue
+/// takes a sequence below every queued one, so the sequence starts high.
+const FIRST_SEQUENCE: u64 = 1 << 62;
+
 /// A task held in the priority queue alongside its enqueue timestamp.
 ///
 /// The timestamp is used to record IO wait latency in `IoMetrics`.
@@ -38,13 +51,42 @@ pub struct QueuedTask {
     /// Nanosecond timestamp (from `Instant`) captured when the task was
     /// pushed.  Used by the IO metrics path to compute wait time.
     pub enqueued_at: Instant,
+    /// Arrival sequence on this core. Each tier holds its tasks in rising
+    /// sequence.
+    seq: u64,
 }
 
 impl QueuedTask {
-    fn new(task: ExecutionTask) -> Self {
+    fn new(task: ExecutionTask, seq: u64) -> Self {
         Self {
             task,
             enqueued_at: Instant::now(),
+            seq,
+        }
+    }
+}
+
+/// Whether `task` is a barrier: a tenant snapshot.
+fn is_barrier(task: &ExecutionTask) -> bool {
+    matches!(
+        task.request.plan,
+        PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot { .. })
+    )
+}
+
+#[derive(Clone, Copy)]
+enum Tier {
+    Critical,
+    High,
+    Low,
+}
+
+impl Tier {
+    fn of(task: &ExecutionTask) -> Self {
+        match task.request.priority {
+            Priority::Critical => Self::Critical,
+            Priority::High => Self::High,
+            Priority::Normal | Priority::Background => Self::Low,
         }
     }
 }
@@ -59,6 +101,10 @@ pub struct PriorityQueues {
     high: VecDeque<QueuedTask>,
     /// `Normal` and `Background` priority tasks (merged low tier).
     low: VecDeque<QueuedTask>,
+    /// The sequence the next pushed task takes.
+    next_seq: u64,
+    /// The sequences of queued barriers, rising.
+    barriers: VecDeque<u64>,
 }
 
 impl PriorityQueues {
@@ -68,17 +114,81 @@ impl PriorityQueues {
             critical: VecDeque::new(),
             high: VecDeque::new(),
             low: VecDeque::new(),
+            next_seq: FIRST_SEQUENCE,
+            barriers: VecDeque::new(),
+        }
+    }
+
+    fn tier(&self, tier: Tier) -> &VecDeque<QueuedTask> {
+        match tier {
+            Tier::Critical => &self.critical,
+            Tier::High => &self.high,
+            Tier::Low => &self.low,
+        }
+    }
+
+    fn tier_mut(&mut self, tier: Tier) -> &mut VecDeque<QueuedTask> {
+        match tier {
+            Tier::Critical => &mut self.critical,
+            Tier::High => &mut self.high,
+            Tier::Low => &mut self.low,
+        }
+    }
+
+    /// Whether the front task of `tier` can run now. Before the first queued
+    /// barrier every task can. The barrier itself can once no task that
+    /// arrived before it is queued. A task after it cannot.
+    fn front_runs(&self, tier: Tier) -> bool {
+        let Some(front) = self.tier(tier).front() else {
+            return false;
+        };
+        let Some(&barrier) = self.barriers.front() else {
+            return true;
+        };
+        if front.seq < barrier {
+            return true;
+        }
+        front.seq == barrier
+            && [Tier::Critical, Tier::High, Tier::Low]
+                .iter()
+                .all(|&other| self.tier(other).front().is_none_or(|t| t.seq >= barrier))
+    }
+
+    /// Pop the front task of `tier` when it can run.
+    fn pop_tier(&mut self, tier: Tier) -> Option<QueuedTask> {
+        if !self.front_runs(tier) {
+            return None;
+        }
+        let queued = self.tier_mut(tier).pop_front()?;
+        if self.barriers.front() == Some(&queued.seq) {
+            self.barriers.pop_front();
+        }
+        Some(queued)
+    }
+
+    /// Queue `task` at `seq` on its tier: at the back when `front` is false.
+    fn insert(&mut self, task: ExecutionTask, seq: u64, front: bool) {
+        let tier = Tier::of(&task);
+        if is_barrier(&task) {
+            if front {
+                self.barriers.push_front(seq);
+            } else {
+                self.barriers.push_back(seq);
+            }
+        }
+        let queued = QueuedTask::new(task, seq);
+        if front {
+            self.tier_mut(tier).push_front(queued);
+        } else {
+            self.tier_mut(tier).push_back(queued);
         }
     }
 
     /// Enqueue a task at the appropriate tier.
     pub fn push(&mut self, task: ExecutionTask) {
-        let queued = QueuedTask::new(task);
-        match queued.task.request.priority {
-            Priority::Critical => self.critical.push_back(queued),
-            Priority::High => self.high.push_back(queued),
-            Priority::Normal | Priority::Background => self.low.push_back(queued),
-        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.insert(task, seq, false);
     }
 
     /// Total tasks across all tiers.
@@ -106,32 +216,27 @@ impl PriorityQueues {
         self.low.len()
     }
 
-    /// Peek at the front task without removing it.
+    /// Peek at the front task that can run, without removing it.
     ///
-    /// Returns the highest-priority available task (Critical → High → Low).
-    /// Used by `poll_write_batch` to decide whether to start a batch.
+    /// Returns the highest-priority task that can run (Critical → High →
+    /// Low). Used by `poll_write_batch` to decide whether to start a batch.
     pub fn front(&self) -> Option<&ExecutionTask> {
-        if let Some(qt) = self.critical.front() {
-            return Some(&qt.task);
-        }
-        if let Some(qt) = self.high.front() {
-            return Some(&qt.task);
-        }
-        self.low.front().map(|qt| &qt.task)
+        [Tier::Critical, Tier::High, Tier::Low]
+            .into_iter()
+            .find(|&tier| self.front_runs(tier))
+            .and_then(|tier| self.tier(tier).front())
+            .map(|qt| &qt.task)
     }
 
-    /// Remove and return the highest-priority front task without applying the
-    /// drain ratio.
+    /// Remove and return the highest-priority task that can run, without
+    /// applying the drain ratio.
     ///
     /// Used by `poll_write_batch` when collecting a write-coalesce batch.
     pub fn pop_front(&mut self) -> Option<ExecutionTask> {
-        if let Some(qt) = self.critical.pop_front() {
-            return Some(qt.task);
-        }
-        if let Some(qt) = self.high.pop_front() {
-            return Some(qt.task);
-        }
-        self.low.pop_front().map(|qt| qt.task)
+        self.pop_tier(Tier::Critical)
+            .or_else(|| self.pop_tier(Tier::High))
+            .or_else(|| self.pop_tier(Tier::Low))
+            .map(|qt| qt.task)
     }
 
     /// Iterate over all tasks across all tiers in priority order (Critical → High → Low).
@@ -151,27 +256,30 @@ impl PriorityQueues {
     pub fn remove(&mut self, pos: usize) {
         let crit_len = self.critical.len();
         let high_len = self.high.len();
-        if pos < crit_len {
-            self.critical.remove(pos);
+        let removed = if pos < crit_len {
+            self.critical.remove(pos)
         } else if pos < crit_len + high_len {
-            self.high.remove(pos - crit_len);
+            self.high.remove(pos - crit_len)
         } else {
-            self.low.remove(pos - crit_len - high_len);
+            self.low.remove(pos - crit_len - high_len)
+        };
+        if let Some(removed) = removed {
+            self.barriers.retain(|&seq| seq != removed.seq);
         }
     }
 
-    /// Push a task back to the front of its priority tier.
+    /// Push a task back to the front of the queue.
     ///
     /// Used by `poll_write_batch` to return tasks that could not be batched.
-    /// The task is re-inserted at the *front* of its tier so it is the next
-    /// candidate for that tier.
+    /// The task takes a sequence below every queued task, so it is the next
+    /// candidate for its tier and stays ahead of every barrier.
     pub fn push_front(&mut self, task: ExecutionTask) {
-        let queued = QueuedTask::new(task);
-        match queued.task.request.priority {
-            Priority::Critical => self.critical.push_front(queued),
-            Priority::High => self.high.push_front(queued),
-            Priority::Normal | Priority::Background => self.low.push_front(queued),
-        }
+        let lowest = [Tier::Critical, Tier::High, Tier::Low]
+            .into_iter()
+            .filter_map(|tier| self.tier(tier).front().map(|t| t.seq))
+            .min()
+            .unwrap_or(self.next_seq);
+        self.insert(task, lowest - 1, true);
     }
 
     /// Pop the next task according to the 8:4:2 drain ratio.
@@ -179,7 +287,8 @@ impl PriorityQueues {
     /// Each call to `pop_next` pulls one task from whichever tier has
     /// remaining budget in the current cycle.  Once a tier's budget for the
     /// cycle is exhausted the next lower tier is tried; if *that* is also
-    /// exhausted or empty the remaining budget cascades further down.
+    /// exhausted or empty the remaining budget cascades further down. A tier
+    /// whose front task waits behind a barrier counts as empty.
     ///
     /// Cycle state is maintained via the mutable `cycle` counter passed by
     /// the caller (reset to 0 to start a new cycle).  The cycle counter
@@ -195,32 +304,14 @@ impl PriorityQueues {
 
         let pos = *cycle % CYCLE_LEN;
 
-        // Determine preferred tier based on cycle position.
-        let preferred = if pos < BUDGET_CRITICAL {
-            TierPref::Critical
+        let order = if pos < BUDGET_CRITICAL {
+            [Tier::Critical, Tier::High, Tier::Low]
         } else if pos < BUDGET_CRITICAL + BUDGET_HIGH {
-            TierPref::High
+            [Tier::High, Tier::Critical, Tier::Low]
         } else {
-            TierPref::Low
+            [Tier::Low, Tier::High, Tier::Critical]
         };
-
-        let task = match preferred {
-            TierPref::Critical => self
-                .critical
-                .pop_front()
-                .or_else(|| self.high.pop_front())
-                .or_else(|| self.low.pop_front()),
-            TierPref::High => self
-                .high
-                .pop_front()
-                .or_else(|| self.critical.pop_front())
-                .or_else(|| self.low.pop_front()),
-            TierPref::Low => self
-                .low
-                .pop_front()
-                .or_else(|| self.high.pop_front())
-                .or_else(|| self.critical.pop_front()),
-        };
+        let task = order.into_iter().find_map(|tier| self.pop_tier(tier));
 
         if task.is_some() {
             *cycle = cycle.wrapping_add(1);
@@ -234,12 +325,6 @@ impl Default for PriorityQueues {
     fn default() -> Self {
         Self::new()
     }
-}
-
-enum TierPref {
-    Critical,
-    High,
-    Low,
 }
 
 #[cfg(test)]
@@ -273,6 +358,7 @@ mod tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: crate::bridge::envelope::Admission::Exempt(
                 crate::bridge::envelope::ExemptReason::Read,
             ),
@@ -361,5 +447,95 @@ mod tests {
             drained += 1;
         }
         assert_eq!(drained, 16);
+    }
+
+    fn snapshot_task() -> ExecutionTask {
+        let mut task = make_task(Priority::Normal);
+        task.request.plan = PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot {
+            tenant_id: 1,
+            cut_watermark: None,
+            cut_capture: None,
+            arrays: false,
+        });
+        task
+    }
+
+    fn tagged(priority: Priority, id: u64) -> ExecutionTask {
+        let mut task = make_task(priority);
+        task.request.request_id = RequestId::new(id);
+        task
+    }
+
+    fn drain_ids(q: &mut PriorityQueues) -> Vec<u64> {
+        let mut cycle = 0usize;
+        let mut ids = Vec::new();
+        while let Some(qt) = q.pop_next(&mut cycle) {
+            ids.push(qt.task.request_id().as_u64());
+        }
+        ids
+    }
+
+    /// A High write that arrived before a tenant snapshot runs before it, and
+    /// one that arrived after it runs after it, whatever the tier ratio does.
+    #[test]
+    fn a_snapshot_is_a_barrier_across_tiers() {
+        let mut q = PriorityQueues::new();
+        q.push(tagged(Priority::High, 1));
+        q.push(tagged(Priority::Normal, 2));
+        let mut snapshot = snapshot_task();
+        snapshot.request.request_id = RequestId::new(3);
+        q.push(snapshot);
+        q.push(tagged(Priority::High, 4));
+        q.push(tagged(Priority::Critical, 5));
+        q.push(tagged(Priority::Normal, 6));
+
+        let ids = drain_ids(&mut q);
+        let at = |id: u64| ids.iter().position(|&x| x == id).expect("drained");
+        assert!(at(1) < at(3), "the earlier High write is visible: {ids:?}");
+        assert!(
+            at(2) < at(3),
+            "the earlier Normal write is visible: {ids:?}"
+        );
+        for later in [4, 5, 6] {
+            assert!(at(3) < at(later), "a later write waits: {ids:?}");
+        }
+        assert_eq!(ids.len(), 6);
+    }
+
+    /// `pop_front` and `front` honor the barrier, and a task put back stays
+    /// ahead of it.
+    #[test]
+    fn pop_front_honors_the_barrier_and_push_front_stays_ahead() {
+        let mut q = PriorityQueues::new();
+        q.push(tagged(Priority::Normal, 1));
+        let mut snapshot = snapshot_task();
+        snapshot.request.request_id = RequestId::new(2);
+        q.push(snapshot);
+        q.push(tagged(Priority::Critical, 3));
+
+        assert_eq!(q.front().map(|t| t.request_id().as_u64()), Some(1));
+        let first = q.pop_front().expect("the earlier write");
+        assert_eq!(first.request_id().as_u64(), 1);
+        q.push_front(first);
+        let order: Vec<u64> = std::iter::from_fn(|| q.pop_front())
+            .map(|t| t.request_id().as_u64())
+            .collect();
+        assert_eq!(order, [1, 2, 3]);
+    }
+
+    /// A cancelled snapshot releases the tasks behind it.
+    #[test]
+    fn a_removed_barrier_releases_later_tasks() {
+        let mut q = PriorityQueues::new();
+        let mut snapshot = snapshot_task();
+        snapshot.request.request_id = RequestId::new(1);
+        q.push(snapshot);
+        q.push(tagged(Priority::High, 2));
+        let pos = q
+            .iter()
+            .position(|t| t.request_id().as_u64() == 1)
+            .expect("queued");
+        q.remove(pos);
+        assert_eq!(drain_ids(&mut q), [2]);
     }
 }

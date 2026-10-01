@@ -51,18 +51,11 @@ async fn background_sweep_materializes_clone_without_ddl() {
         .await
         .expect("CLONE DATABASE");
 
-    // The sweep dispatches through SPSC and uses `Handle::block_on`
-    // internally, so it must run via `spawn_blocking`, mirroring the
-    // production background loop.
-    let shared = server.shared.clone();
-    tokio::task::spawn_blocking(move || {
-        let cancel = AtomicBool::new(false);
-        let catalog = shared.credentials.catalog();
-        run_scheduled_sweep(&shared, catalog, &cancel)
-    })
-    .await
-    .expect("spawn_blocking join")
-    .expect("run_scheduled_sweep must succeed");
+    // The sweep is awaited, as the production background loop awaits it.
+    let cancel = AtomicBool::new(false);
+    run_scheduled_sweep(&server.shared, server.shared.credentials.catalog(), &cancel)
+        .await
+        .expect("run_scheduled_sweep must succeed");
 
     let catalog = server.shared.credentials.catalog();
     let db_id = catalog

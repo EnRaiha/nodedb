@@ -23,4 +23,4 @@ mod types;
 
 pub use dispatch_capacity::DispatchCapacityScope;
 pub use ollp::OllpExhaustedCause;
-pub use types::{Error, Result};
+pub use types::{Error, RegressedOffsets, Result};

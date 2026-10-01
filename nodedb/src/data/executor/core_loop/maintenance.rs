@@ -229,52 +229,6 @@ impl CoreLoop {
         }
         out
     }
-
-    /// Sweep dangling edges: detect edges whose source or destination
-    /// node has been deleted (tracked per-tenant in `deleted_nodes`).
-    ///
-    /// Called periodically from the idle loop. Removes dangling edges
-    /// from the tenant's CSR partition and from the tenant-scoped
-    /// edge store. Returns the total number of edges removed.
-    pub fn sweep_dangling_edges(&mut self) -> usize {
-        if self.deleted_nodes.is_empty() {
-            return 0;
-        }
-        let mut removed = 0;
-        // Copy (database, tenant, node) tuples so we can mutate `self.csr`
-        // and `self.edge_store` without borrowing the map during
-        // iteration.
-        let work: Vec<(nodedb_types::DatabaseId, crate::types::TenantId, String)> = self
-            .deleted_nodes
-            .iter()
-            .flat_map(|((db, tid), set)| set.iter().map(move |n| (*db, *tid, n.clone())))
-            .collect();
-        let swept_nodes = work.len();
-        for (db, tid, node) in &work {
-            // On an error neither store changed, so the edges stay in both
-            // and the next sweep retries them.
-            match self.cascade_node_edges(db.as_u64(), tid.as_u64(), node) {
-                Ok(edges) => removed += edges.len(),
-                Err(e) => tracing::warn!(
-                    core = self.core_id,
-                    db = db.as_u64(),
-                    tid = tid.as_u64(),
-                    node = %node,
-                    error = %e,
-                    "sweep: failed to delete edges from store"
-                ),
-            }
-        }
-        if removed > 0 {
-            tracing::info!(
-                core = self.core_id,
-                removed,
-                deleted_nodes = swept_nodes,
-                "dangling edge sweep complete"
-            );
-        }
-        removed
-    }
 }
 
 /// Lowercase `v` iff `case_insensitive` — used so COLLATE NOCASE indexes

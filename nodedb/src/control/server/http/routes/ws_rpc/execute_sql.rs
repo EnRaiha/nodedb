@@ -10,6 +10,7 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::response_shape::redaction::{QueryRedaction, redact_decoded_value};
 use crate::control::server::shared::authorization::authorize_database;
+use crate::control::server::shared::cluster_array_dispatch::{is_cluster_array, run_cluster_array};
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::plan_admission::{
     PlanAdmissionRequest, plan_authorize_and_admit,
@@ -20,8 +21,9 @@ use crate::types::{DatabaseId, TraceId};
 
 /// Execute SQL and return result as JSON.
 ///
-/// Routes through the gateway when available; falls back to local SPSC
-/// dispatch on single-node boot before the gateway is initialised.
+/// A Control-Plane orchestrated task (array DDL, a cluster array op,
+/// `INSERT ... SELECT`) runs here. Every other task routes through the
+/// gateway.
 pub async fn execute_sql(
     shared: &Arc<SharedState>,
     query_ctx: &crate::control::planner::context::QueryContext,
@@ -63,206 +65,60 @@ pub async fn execute_sql(
     })
     .await?;
     let tasks = admission.tasks;
-    let _lease_scope = admission.lease_scope;
+    let lease_scope = admission.lease_scope;
 
-    let _request = shared.tenant_request_guard(tenant_id);
+    // A statement admitted under a lease this node then loses ends with a
+    // retryable error: a read mid-flight, a write only before dispatch.
+    lease_scope.check_not_revoked()?;
+    let read_only = tasks
+        .iter()
+        .all(|task| !crate::control::server::shared::write_admission::plan_is_write(&task.plan));
+    let body = async {
+        let _request = shared.tenant_request_guard(tenant_id);
 
-    // Resolved once and reused at every decode site — orchestrated rows and plain
-    // dispatch rows must be redacted by the same policy snapshot.
-    let redaction =
-        QueryRedaction::for_plans(tenant_id, scope.auth(), tasks.iter().map(|t| &t.plan));
+        // Resolved once and reused at every decode site — orchestrated rows and plain
+        // dispatch rows must be redacted by the same policy snapshot.
+        let redaction =
+            QueryRedaction::for_plans(tenant_id, scope.auth(), tasks.iter().map(|t| &t.plan));
 
-    let mut results = Vec::new();
-    // Checked once, not per task: keeps per-task extraction a no-op when metering
-    // is disabled (the default).
-    let metering_enabled = shared.metering_config.enabled;
-    for task in tasks {
-        // Extracted before `task.plan` is cloned/moved; `results.len()` gives this
-        // task's row-count baseline for the delta metered below.
-        let plan_metering_info = metering_enabled.then(|| PlanMeteringInfo::extract(&task.plan));
-        // A spent hard quota refuses the task before it runs; charging below is
-        // success-path only and never refuses.
-        if let Some(info) = &plan_metering_info {
-            admit_quota_for_dispatch(shared, &scope, info)?;
-        }
-        let rows_before = results.len();
-
-        // `INSERT ... SELECT` orchestrates on the Control Plane, never dispatched
-        // to the Data Plane as a single op, and is never a clone-write shape.
-        if let crate::bridge::envelope::PhysicalPlan::Document(
-            nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. },
-        ) = &task.plan
-        {
-            let authorized_task = authorize_ws_rpc_task(shared, identity, &task)?;
-            match crate::control::insert_select::run_authorized_insert_select(
-                shared,
-                authorized_task,
-            )
-            .await
-            {
-                Ok(resp) => {
-                    let payload = resp.payload.to_vec();
-                    if !payload.is_empty() {
-                        let json =
-                            crate::data::executor::response_codec::decode_payload_to_json(&payload);
-                        match sonic_rs::from_str::<serde_json::Value>(&json) {
-                            Ok(mut v) => {
-                                redact_decoded_value(Some(&redaction), &shared.redaction, &mut v);
-                                results.push(v);
-                            }
-                            Err(_) => results.push(serde_json::Value::String(json)),
-                        }
-                    }
-                }
-                Err(e) => return Err(e),
+        let mut results = Vec::new();
+        // Checked once, not per task: keeps per-task extraction a no-op when metering
+        // is disabled (the default).
+        let metering_enabled = shared.metering_config.enabled;
+        for task in tasks {
+            // Extracted before `task.plan` is cloned/moved; `results.len()` gives this
+            // task's row-count baseline for the delta metered below.
+            let plan_metering_info =
+                metering_enabled.then(|| PlanMeteringInfo::extract(&task.plan));
+            // A spent hard quota refuses the task before it runs; charging below is
+            // success-path only and never refuses.
+            if let Some(info) = &plan_metering_info {
+                admit_quota_for_dispatch(shared, &scope, info)?;
             }
-            meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
-            continue;
-        }
+            let rows_before = results.len();
 
-        // Autocommit `MERGE` orchestrates on the Control Plane, never dispatched
-        // to the Data Plane as a single op.
-        if let crate::bridge::envelope::PhysicalPlan::Document(
-            nodedb_physical::physical_plan::DocumentOp::Merge {
-                target_collection: _,
-                source_collection: _,
-                source_alias: _,
-                target_join_col: _,
-                source_join_col: _,
-                clauses: _,
-                returning: _,
-                resolved_inserts: None,
-                resolved_insert_identities: _,
-                source_rows: _,
-                rls_filters: _,
-                rls_write_check: _,
-                resolved_sum_targets: _,
-                declared_primary_key: _,
-            },
-        ) = &task.plan
-        {
-            let authorized_task = authorize_ws_rpc_task(shared, identity, &task)?;
-            match crate::control::merge_orchestrator::run_authorized_merge(shared, authorized_task)
-                .await
-            {
-                Ok(resp) => {
-                    let payload = resp.payload.to_vec();
-                    if !payload.is_empty() {
-                        let json =
-                            crate::data::executor::response_codec::decode_payload_to_json(&payload);
-                        match sonic_rs::from_str::<serde_json::Value>(&json) {
-                            Ok(mut v) => {
-                                redact_decoded_value(Some(&redaction), &shared.redaction, &mut v);
-                                results.push(v);
-                            }
-                            Err(_) => results.push(serde_json::Value::String(json)),
-                        }
-                    }
+            // Array DDL proposes a replicated catalog entry, never a core task.
+            if crate::control::array_catalog::ddl::is_array_ddl(&task.plan) {
+                let authorized_task = authorize_ws_rpc_task(shared, identity, &task)?;
+                let resp = crate::control::array_catalog::ddl::run_authorized_array_ddl(
+                    shared,
+                    authorized_task,
+                )
+                .await?;
+                let json =
+                    crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);
+                match sonic_rs::from_str::<serde_json::Value>(&json) {
+                    Ok(value) => results.push(value),
+                    Err(_) => results.push(serde_json::Value::String(json)),
                 }
-                Err(e) => return Err(e),
+                continue;
             }
-            meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
-            continue;
-        }
 
-        // Autocommit `UPDATE ... FROM <source>` scans the source on its own core and
-        // ships it into the plan, never dispatched as a single op.
-        if let crate::bridge::envelope::PhysicalPlan::Document(
-            nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
-                target_collection: _,
-                source_collection: _,
-                source_alias: _,
-                target_join_col: _,
-                source_join_col: _,
-                updates: _,
-                target_filters: _,
-                returning: _,
-                source_rows: None,
-                rls_filters: _,
-                rls_write_check: _,
-                resolved_sum_targets: _,
-                declared_primary_key: _,
-            },
-        ) = &task.plan
-        {
-            let authorized_task = authorize_ws_rpc_task(shared, identity, &task)?;
-            match crate::control::update_from_join_orchestrator::run_authorized_update_from_join(
-                shared,
-                authorized_task,
-            )
-            .await
-            {
-                Ok(resp) => {
-                    let payload = resp.payload.to_vec();
-                    if !payload.is_empty() {
-                        let json =
-                            crate::data::executor::response_codec::decode_payload_to_json(&payload);
-                        match sonic_rs::from_str::<serde_json::Value>(&json) {
-                            Ok(mut v) => {
-                                redact_decoded_value(Some(&redaction), &shared.redaction, &mut v);
-                                results.push(v);
-                            }
-                            Err(_) => results.push(serde_json::Value::String(json)),
-                        }
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-            meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
-            continue;
-        }
-
-        // A governed columnar predicate UPDATE/DELETE resolves to a concrete row set
-        // before proposing; local (non-Raft) path skips this.
-        if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&task.plan)
-            && shared.async_raft_proposer().is_some()
-        {
-            let authorized_task = authorize_ws_rpc_task(shared, identity, &task)?;
-            match crate::control::write_resolve::run_authorized_write_resolve(
-                shared,
-                authorized_task,
-                resolver,
-            )
-            .await
-            {
-                Ok(resp) => {
-                    let payload = resp.payload.to_vec();
-                    if !payload.is_empty() {
-                        let json =
-                            crate::data::executor::response_codec::decode_payload_to_json(&payload);
-                        match sonic_rs::from_str::<serde_json::Value>(&json) {
-                            Ok(mut v) => {
-                                redact_decoded_value(Some(&redaction), &shared.redaction, &mut v);
-                                results.push(v);
-                            }
-                            Err(_) => results.push(serde_json::Value::String(json)),
-                        }
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-            meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
-            continue;
-        }
-
-        // Clone CoW write-path interception, then authorization, run once per
-        // task before dispatch — same protocol-neutral gate every transport runs.
-        let emitter = crate::control::security::audit::ArcAuditEmitter(Arc::clone(&shared.audit));
-        let checked = match crate::control::server::shared::clone_write::intercept_and_authorize(
-            crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
-                state: shared,
-                task,
-                identity,
-                tenant_id,
-                permissions: &shared.permissions,
-                roles: &shared.roles,
-                emitter: &emitter,
-            },
-        )
-        .await?
-        {
-            crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(resp) => {
-                let payload = resp.payload.to_vec();
+            // A cluster array op runs through this node's array coordinator,
+            // which routes it to the shards that own its cells.
+            if is_cluster_array(&task.plan) {
+                let authorized_task = authorize_ws_rpc_task(shared, identity, &task)?;
+                let payload = run_cluster_array(shared, authorized_task).await?;
                 if !payload.is_empty() {
                     let json =
                         crate::data::executor::response_codec::decode_payload_to_json(&payload);
@@ -277,62 +133,286 @@ pub async fn execute_sql(
                 meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
                 continue;
             }
-            crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(checked) => {
-                checked
-            }
-        };
 
-        // WebSocket RPC has no session transaction (no BEGIN / COMMIT), so
-        // every task is autocommit and forwards with no transaction id.
-        let payloads: crate::Result<Vec<Vec<u8>>> = match shared.gateway.get() {
-            Some(gw) => {
-                let gw_ctx = QueryContext {
-                    tenant_id: checked.tenant_id(),
-                    trace_id,
-                    database_id: checked.database_id(),
-                    txn_id: None,
-                };
-                gw.execute(&gw_ctx, checked).await
-            }
-            None => {
-                // Single-node boot: gateway not yet initialised — dispatch
-                // locally. A write takes the durable route, a read the read route.
-                crate::control::server::dispatch_utils::dispatch_authorized_task_by_class(
-                    shared, checked, trace_id,
+            // `INSERT ... SELECT` orchestrates on the Control Plane, never dispatched
+            // to the Data Plane as a single op, and is never a clone-write shape.
+            if let crate::bridge::envelope::PhysicalPlan::Document(
+                nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. },
+            ) = &task.plan
+            {
+                let authorized_task = authorize_ws_rpc_task(shared, identity, &task)?;
+                match crate::control::insert_select::run_authorized_insert_select(
+                    shared,
+                    authorized_task,
                 )
                 .await
-                .map(|r| vec![r.payload.to_vec()])
-            }
-        };
-
-        match payloads {
-            Ok(vecs) => {
-                for payload in vecs {
-                    if !payload.is_empty() {
-                        let json =
-                            crate::data::executor::response_codec::decode_payload_to_json(&payload);
-                        match sonic_rs::from_str::<serde_json::Value>(&json) {
-                            Ok(mut v) => {
-                                redact_decoded_value(Some(&redaction), &shared.redaction, &mut v);
-                                results.push(v);
+                {
+                    Ok(resp) => {
+                        let payload = resp.payload.to_vec();
+                        if !payload.is_empty() {
+                            let json =
+                                crate::data::executor::response_codec::decode_payload_to_json(
+                                    &payload,
+                                );
+                            match sonic_rs::from_str::<serde_json::Value>(&json) {
+                                Ok(mut v) => {
+                                    redact_decoded_value(
+                                        Some(&redaction),
+                                        &shared.redaction,
+                                        &mut v,
+                                    );
+                                    results.push(v);
+                                }
+                                Err(_) => results.push(serde_json::Value::String(json)),
                             }
-                            Err(_) => results.push(serde_json::Value::String(json)),
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+                meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
+                continue;
+            }
+
+            // Autocommit `MERGE` orchestrates on the Control Plane, never dispatched
+            // to the Data Plane as a single op.
+            if let crate::bridge::envelope::PhysicalPlan::Document(
+                nodedb_physical::physical_plan::DocumentOp::Merge {
+                    target_collection: _,
+                    source_collection: _,
+                    source_alias: _,
+                    target_join_col: _,
+                    source_join_col: _,
+                    clauses: _,
+                    returning: _,
+                    resolved_inserts: None,
+                    resolved_insert_identities: _,
+                    source_rows: _,
+                    rls_filters: _,
+                    rls_write_check: _,
+                    resolved_sum_targets: _,
+                    declared_primary_key: _,
+                },
+            ) = &task.plan
+            {
+                let authorized_task = authorize_ws_rpc_task(shared, identity, &task)?;
+                match crate::control::merge_orchestrator::run_authorized_merge(
+                    shared,
+                    authorized_task,
+                )
+                .await
+                {
+                    Ok(resp) => {
+                        let payload = resp.payload.to_vec();
+                        if !payload.is_empty() {
+                            let json =
+                                crate::data::executor::response_codec::decode_payload_to_json(
+                                    &payload,
+                                );
+                            match sonic_rs::from_str::<serde_json::Value>(&json) {
+                                Ok(mut v) => {
+                                    redact_decoded_value(
+                                        Some(&redaction),
+                                        &shared.redaction,
+                                        &mut v,
+                                    );
+                                    results.push(v);
+                                }
+                                Err(_) => results.push(serde_json::Value::String(json)),
+                            }
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+                meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
+                continue;
+            }
+
+            // Autocommit `UPDATE ... FROM <source>` scans the source on its own core and
+            // ships it into the plan, never dispatched as a single op.
+            if let crate::bridge::envelope::PhysicalPlan::Document(
+                nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
+                    target_collection: _,
+                    source_collection: _,
+                    source_alias: _,
+                    target_join_col: _,
+                    source_join_col: _,
+                    updates: _,
+                    target_filters: _,
+                    returning: _,
+                    source_rows: None,
+                    rls_filters: _,
+                    rls_write_check: _,
+                    resolved_sum_targets: _,
+                    declared_primary_key: _,
+                },
+            ) = &task.plan
+            {
+                let authorized_task = authorize_ws_rpc_task(shared, identity, &task)?;
+                match crate::control::update_from_join_orchestrator::run_authorized_update_from_join(
+                    shared,
+                    authorized_task,
+                )
+                .await
+                {
+                    Ok(resp) => {
+                        let payload = resp.payload.to_vec();
+                        if !payload.is_empty() {
+                            let json =
+                                crate::data::executor::response_codec::decode_payload_to_json(&payload);
+                            match sonic_rs::from_str::<serde_json::Value>(&json) {
+                                Ok(mut v) => {
+                                    redact_decoded_value(Some(&redaction), &shared.redaction, &mut v);
+                                    results.push(v);
+                                }
+                                Err(_) => results.push(serde_json::Value::String(json)),
+                            }
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+                meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
+                continue;
+            }
+
+            // A governed columnar predicate UPDATE/DELETE resolves to a concrete row set
+            // before proposing.
+            if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&task.plan) {
+                let authorized_task = authorize_ws_rpc_task(shared, identity, &task)?;
+                match crate::control::write_resolve::run_authorized_write_resolve(
+                    shared,
+                    authorized_task,
+                    resolver,
+                )
+                .await
+                {
+                    Ok(resp) => {
+                        let payload = resp.payload.to_vec();
+                        if !payload.is_empty() {
+                            let json =
+                                crate::data::executor::response_codec::decode_payload_to_json(
+                                    &payload,
+                                );
+                            match sonic_rs::from_str::<serde_json::Value>(&json) {
+                                Ok(mut v) => {
+                                    redact_decoded_value(
+                                        Some(&redaction),
+                                        &shared.redaction,
+                                        &mut v,
+                                    );
+                                    results.push(v);
+                                }
+                                Err(_) => results.push(serde_json::Value::String(json)),
+                            }
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+                meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
+                continue;
+            }
+
+            // Clone CoW write-path interception, then authorization, run once per
+            // task before dispatch — same protocol-neutral gate every transport runs.
+            let emitter =
+                crate::control::security::audit::ArcAuditEmitter(Arc::clone(&shared.audit));
+            let checked =
+                match crate::control::server::shared::clone_write::intercept_and_authorize(
+                    crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
+                        state: shared,
+                        task,
+                        identity,
+                        tenant_id,
+                        permissions: &shared.permissions,
+                        roles: &shared.roles,
+                        emitter: &emitter,
+                    },
+                )
+                .await?
+                {
+                    crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(
+                        resp,
+                    ) => {
+                        let payload = resp.payload.to_vec();
+                        if !payload.is_empty() {
+                            let json =
+                                crate::data::executor::response_codec::decode_payload_to_json(
+                                    &payload,
+                                );
+                            match sonic_rs::from_str::<serde_json::Value>(&json) {
+                                Ok(mut v) => {
+                                    redact_decoded_value(
+                                        Some(&redaction),
+                                        &shared.redaction,
+                                        &mut v,
+                                    );
+                                    results.push(v);
+                                }
+                                Err(_) => results.push(serde_json::Value::String(json)),
+                            }
+                        }
+                        meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
+                        continue;
+                    }
+                    crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(
+                        checked,
+                    ) => checked,
+                };
+
+            // WebSocket RPC has no session transaction (no BEGIN / COMMIT), so
+            // every task is autocommit and forwards with no transaction id.
+            let gw_ctx = QueryContext {
+                tenant_id: checked.tenant_id(),
+                trace_id,
+                database_id: checked.database_id(),
+                txn_id: None,
+                linearizable: true,
+            };
+            let payloads: crate::Result<Vec<Vec<u8>>> = match shared.installed_gateway() {
+                Ok(gateway) => gateway.execute(&gw_ctx, checked).await,
+                Err(error) => Err(error),
+            };
+
+            match payloads {
+                Ok(vecs) => {
+                    for payload in vecs {
+                        if !payload.is_empty() {
+                            let json =
+                                crate::data::executor::response_codec::decode_payload_to_json(
+                                    &payload,
+                                );
+                            match sonic_rs::from_str::<serde_json::Value>(&json) {
+                                Ok(mut v) => {
+                                    redact_decoded_value(
+                                        Some(&redaction),
+                                        &shared.redaction,
+                                        &mut v,
+                                    );
+                                    results.push(v);
+                                }
+                                Err(_) => results.push(serde_json::Value::String(json)),
+                            }
                         }
                     }
                 }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
+            meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
         }
-        meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
-    }
 
-    match results.len() {
-        0 => Ok(serde_json::Value::Null),
-        1 => Ok(results
-            .into_iter()
-            .next()
-            .unwrap_or(serde_json::Value::Null)),
-        _ => Ok(serde_json::Value::Array(results)),
+        let outcome: crate::Result<serde_json::Value> = match results.len() {
+            0 => Ok(serde_json::Value::Null),
+            1 => Ok(results
+                .into_iter()
+                .next()
+                .unwrap_or(serde_json::Value::Null)),
+            _ => Ok(serde_json::Value::Array(results)),
+        };
+        outcome
+    };
+    if read_only {
+        lease_scope.guard(body).await?
+    } else {
+        body.await
     }
 }
 
@@ -416,7 +496,7 @@ mod tests {
 
     /// Guards `peer_addr` against regressing to a hardcoded placeholder: a
     /// non-IP value can't be parsed by `normalize_peer_ip`, so `check_ip`
-    /// would silently match nothing and let a blacklisted client through.
+    /// will silently match nothing and let a blacklisted client through.
     #[tokio::test]
     async fn blacklisted_peer_ip_is_rejected() {
         let (state, _dir) = test_state().await;
@@ -426,7 +506,7 @@ mod tests {
             .blacklist_ip("203.0.113.0/24", "test ban", "admin", 0)
             .expect("blacklist CIDR range");
 
-        let query_ctx = PlannerQueryContext::new();
+        let query_ctx = PlannerQueryContext::for_state(&state);
         let trace_id = TraceId::generate();
 
         let result = execute_sql(
@@ -460,7 +540,7 @@ mod tests {
             .blacklist_ip("203.0.113.0/24", "test ban", "admin", 0)
             .expect("blacklist CIDR range");
 
-        let query_ctx = PlannerQueryContext::new();
+        let query_ctx = PlannerQueryContext::for_state(&state);
         let trace_id = TraceId::generate();
 
         let result = execute_sql(
@@ -509,7 +589,7 @@ mod tests {
         let identity = regular_identity(9201);
         let scope = scope_for(&identity, &state);
         // `Some(...)` regardless of config, to prove `meter_dispatch`'s own
-        // enabled-check protects this call, not just the caller's gate.
+        // enabled-check protects this call, not only the caller's gate.
         let info = Some(PlanMeteringInfo::extract(&kv_get_plan()));
         let results = vec![serde_json::Value::Null; 3];
 

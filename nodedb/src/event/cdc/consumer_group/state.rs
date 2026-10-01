@@ -9,9 +9,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use tracing::debug;
+use redb::{Database, TableDefinition};
 
+use super::codec::{encode_offset, offset_key};
 use super::types::PartitionOffset;
 use crate::event::cdc::offset::CdcOffset;
 use crate::types::DatabaseId;
@@ -19,6 +19,10 @@ use crate::types::DatabaseId;
 /// redb table: `v2:{database}:{tenant}:{len}:{stream}:{len}:{group}:{partition}`
 /// → 16-byte LE composite offset.
 const OFFSETS: TableDefinition<&str, &[u8]> = TableDefinition::new("consumer_offsets");
+
+mod image;
+
+pub use image::OffsetImageRead;
 
 /// Cache key: (database_id, tenant_id, stream_name, group_name).
 type GroupKey = (DatabaseId, u64, String, String);
@@ -38,6 +42,12 @@ pub struct OffsetStore {
     /// Used to compute `evicted_since_last_poll` in `PollResponse`.
     /// Not persisted — resets to 0 on restart, giving one cycle with delta=0.
     eviction_baselines: std::sync::RwLock<HashMap<GroupKey, u64>>,
+}
+
+impl crate::storage::RedbBacked for OffsetStore {
+    fn redb_database(&self) -> &redb::Database {
+        &self.db
+    }
 }
 
 impl OffsetStore {
@@ -71,42 +81,7 @@ impl OffsetStore {
             })?;
         }
 
-        // Load all offsets into cache.
-        let mut cache: HashMap<GroupKey, HashMap<u32, CdcOffset>> = HashMap::new();
-        {
-            let txn = db.begin_read().map_err(|e| crate::Error::Storage {
-                engine: "event_plane".into(),
-                detail: format!("begin_read: {e}"),
-            })?;
-            let table = txn.open_table(OFFSETS).map_err(|e| crate::Error::Storage {
-                engine: "event_plane".into(),
-                detail: format!("open_table: {e}"),
-            })?;
-            let mut range = table.range(..).map_err(|e| crate::Error::Storage {
-                engine: "event_plane".into(),
-                detail: format!("range: {e}"),
-            })?;
-            while let Some(Ok((key_guard, value_guard))) = range.next() {
-                let key_str: &str = key_guard.value();
-                let bytes: &[u8] = value_guard.value();
-                let Some(offset) = decode_offset(bytes) else {
-                    continue;
-                };
-                if let Some((database_id, tenant, stream, group, partition)) =
-                    parse_offset_key(key_str)
-                {
-                    cache
-                        .entry((database_id, tenant, stream, group))
-                        .or_default()
-                        .insert(partition, offset);
-                }
-            }
-        }
-
-        let total: usize = cache.values().map(|m| m.len()).sum();
-        if total > 0 {
-            debug!(offsets = total, "loaded consumer offsets from redb");
-        }
+        let cache = image::load_cache(&db)?;
 
         Ok(Self {
             db,
@@ -119,7 +94,7 @@ impl OffsetStore {
     /// Commit an offset for a specific partition.
     ///
     /// Rejects lexicographic regressions: the position must be >= the current
-    /// `(lsn, sequence)` for this `(tenant, stream, group, partition)`. A
+    /// `(index, sequence)` for this `(tenant, stream, group, partition)`. A
     /// regressing commit would redeliver acknowledged events. Re-committing
     /// the same position is accepted for idempotent retries.
     ///
@@ -157,10 +132,10 @@ impl OffsetStore {
                     stream: stream.to_string(),
                     group: group.to_string(),
                     partition_id,
-                    current_lsn: current.lsn,
-                    current_sequence: current.sequence,
-                    attempted_lsn: offset.lsn,
-                    attempted_sequence: offset.sequence,
+                    offsets: Box::new(crate::error::RegressedOffsets {
+                        current,
+                        attempted: offset,
+                    }),
                 });
             }
         }
@@ -202,6 +177,76 @@ impl OffsetStore {
             .or_default()
             .insert(partition_id, offset);
 
+        Ok(())
+    }
+
+    /// Raise committed offsets to `offsets` in one durable transaction.
+    ///
+    /// A partition already at or past its new position keeps its position,
+    /// so a replayed or reordered commit never moves a cursor backward. The
+    /// replicated `COMMIT OFFSET` applies through this on every node, where
+    /// refusing a committed entry diverges the node from the quorum.
+    pub fn advance_offsets(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        stream: &str,
+        group: &str,
+        offsets: &[PartitionOffset],
+    ) -> crate::Result<()> {
+        let _mutation_guard = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let group_key = (
+            database_id,
+            tenant_id,
+            stream.to_string(),
+            group.to_string(),
+        );
+        let raised: Vec<PartitionOffset> = {
+            let cache = self.cache.read().unwrap_or_else(|p| p.into_inner());
+            let current = cache.get(&group_key);
+            offsets
+                .iter()
+                .filter(|offset| {
+                    current
+                        .and_then(|partitions| partitions.get(&offset.partition_id))
+                        .is_none_or(|current| offset.committed_offset > *current)
+                })
+                .copied()
+                .collect()
+        };
+        if raised.is_empty() {
+            return Ok(());
+        }
+
+        let storage = |detail: String| crate::Error::Storage {
+            engine: "event_plane".into(),
+            detail,
+        };
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| storage(format!("begin_write: {e}")))?;
+        {
+            let mut table = txn
+                .open_table(OFFSETS)
+                .map_err(|e| storage(format!("open_table: {e}")))?;
+            for offset in &raised {
+                let key = offset_key(database_id, tenant_id, stream, group, offset.partition_id);
+                table
+                    .insert(
+                        key.as_str(),
+                        encode_offset(offset.committed_offset).as_slice(),
+                    )
+                    .map_err(|e| storage(format!("insert: {e}")))?;
+            }
+        }
+        txn.commit().map_err(|e| storage(format!("commit: {e}")))?;
+
+        let mut cache = self.cache.write().unwrap_or_else(|p| p.into_inner());
+        let partitions = cache.entry(group_key).or_default();
+        for offset in raised {
+            partitions.insert(offset.partition_id, offset.committed_offset);
+        }
         Ok(())
     }
 
@@ -408,77 +453,10 @@ impl OffsetStore {
     }
 }
 
-/// Decode persisted offsets. Historical 8-byte values acknowledge a whole LSN;
-/// current values are two little-endian u64s.
-fn decode_offset(bytes: &[u8]) -> Option<CdcOffset> {
-    match bytes.len() {
-        8 => {
-            let mut lsn = [0; 8];
-            lsn.copy_from_slice(bytes);
-            Some(CdcOffset::legacy_lsn(u64::from_le_bytes(lsn)))
-        }
-        16 => {
-            let mut lsn = [0; 8];
-            let mut sequence = [0; 8];
-            lsn.copy_from_slice(&bytes[..8]);
-            sequence.copy_from_slice(&bytes[8..]);
-            Some(CdcOffset::new(
-                u64::from_le_bytes(lsn),
-                u64::from_le_bytes(sequence),
-            ))
-        }
-        _ => None,
-    }
-}
-
-fn encode_offset(offset: CdcOffset) -> [u8; 16] {
-    let mut bytes = [0; 16];
-    bytes[..8].copy_from_slice(&offset.lsn.to_le_bytes());
-    bytes[8..].copy_from_slice(&offset.sequence.to_le_bytes());
-    bytes
-}
-
-/// Versioned, length-prefixed key encoding. The lengths make stream and group
-/// names containing delimiters unambiguous.
-fn offset_key(
-    database_id: DatabaseId,
-    tenant_id: u64,
-    stream: &str,
-    group: &str,
-    partition_id: u32,
-) -> String {
-    format!(
-        "v2:{}:{tenant_id}:{}:{stream}:{}:{group}:{partition_id}",
-        database_id.as_u64(),
-        stream.len(),
-        group.len()
-    )
-}
-
-/// Decode a key written by [`offset_key`].
-fn parse_offset_key(key: &str) -> Option<(DatabaseId, u64, String, String, u32)> {
-    let rest = key.strip_prefix("v2:")?;
-    let (database_id, rest) = rest.split_once(':')?;
-    let (tenant_id, rest) = rest.split_once(':')?;
-    let (stream_len, rest) = rest.split_once(':')?;
-    let stream_len: usize = stream_len.parse().ok()?;
-    let stream = rest.get(..stream_len)?.to_string();
-    let rest = rest.get(stream_len..)?.strip_prefix(':')?;
-    let (group_len, rest) = rest.split_once(':')?;
-    let group_len: usize = group_len.parse().ok()?;
-    let group = rest.get(..group_len)?.to_string();
-    let partition = rest.get(group_len..)?.strip_prefix(':')?.parse().ok()?;
-    Some((
-        DatabaseId::new(database_id.parse().ok()?),
-        tenant_id.parse().ok()?,
-        stream,
-        group,
-        partition,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
+    use redb::{ReadableDatabase, ReadableTable};
+
     use super::*;
 
     #[test]
@@ -524,9 +502,9 @@ mod tests {
         let offsets = store.get_all_offsets(database_id, 1, "s", "g");
         assert_eq!(offsets.len(), 2);
         assert_eq!(offsets[0].partition_id, 0); // Sorted.
-        assert_eq!(offsets[0].committed_offset, CdcOffset::legacy_lsn(100));
+        assert_eq!(offsets[0].committed_offset, CdcOffset::whole_index(100));
         assert_eq!(offsets[1].partition_id, 2);
-        assert_eq!(offsets[1].committed_offset, CdcOffset::legacy_lsn(200));
+        assert_eq!(offsets[1].committed_offset, CdcOffset::whole_index(200));
     }
 
     #[test]
@@ -637,8 +615,8 @@ mod tests {
         );
     }
 
-    /// A subsequent commit with an LSN strictly less than the currently
-    /// committed LSN must be rejected — otherwise the next poll will
+    /// A subsequent commit with a position strictly less than the currently
+    /// committed position must be rejected — otherwise the next poll will
     /// redeliver already-acknowledged events and break exactly-once
     /// semantics downstream.
     #[test]
@@ -693,30 +671,6 @@ mod tests {
         );
     }
 
-    /// Committing the same LSN that is already stored must succeed
-    /// (idempotent retry) — only strict regressions are rejected.
-    #[test]
-    fn legacy_offset_value_decodes_as_whole_lsn_acknowledgement() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = OffsetStore::open(dir.path()).unwrap();
-        let key = offset_key(DatabaseId::new(7), 1, "s", "g", 0);
-        let txn = store.db.begin_write().unwrap();
-        {
-            let mut table = txn.open_table(OFFSETS).unwrap();
-            table
-                .insert(key.as_str(), 50u64.to_le_bytes().as_slice())
-                .unwrap();
-        }
-        txn.commit().unwrap();
-        drop(store);
-
-        let store = OffsetStore::open(dir.path()).unwrap();
-        assert_eq!(
-            store.get_offset(DatabaseId::new(7), 1, "s", "g", 0),
-            CdcOffset::legacy_lsn(50)
-        );
-    }
-
     #[test]
     fn composite_offset_persists_and_rejects_sibling_regression() {
         let dir = tempfile::tempdir().unwrap();
@@ -729,7 +683,7 @@ mod tests {
         let key = offset_key(database_id, 1, "s", "g", 0);
         let txn = store.db.begin_read().unwrap();
         let table = txn.open_table(OFFSETS).unwrap();
-        assert_eq!(table.get(key.as_str()).unwrap().unwrap().value().len(), 16);
+        assert_eq!(table.get(key.as_str()).unwrap().unwrap().value().len(), 24);
         assert!(
             store
                 .commit_offset(database_id, 1, "s", "g", 0, CdcOffset::new(100, 1))
@@ -737,8 +691,10 @@ mod tests {
         );
     }
 
+    /// Committing the position already stored succeeds (idempotent retry).
+    /// Only strict regressions are rejected.
     #[test]
-    fn commit_offset_same_lsn_is_idempotent() {
+    fn commit_offset_same_index_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let store = OffsetStore::open(dir.path()).unwrap();
 
@@ -748,7 +704,50 @@ mod tests {
             .unwrap();
         store
             .commit_offset(database_id, 1, "s", "g", 0, 500)
-            .expect("re-committing the same LSN must be accepted");
+            .expect("re-committing the same index must be accepted");
         assert_eq!(store.get_offset(database_id, 1, "s", "g", 0), 500);
+    }
+
+    #[test]
+    fn advance_offsets_raises_and_never_regresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OffsetStore::open(dir.path()).unwrap();
+        let database_id = DatabaseId::new(7);
+        store
+            .advance_offsets(
+                database_id,
+                1,
+                "s",
+                "g",
+                &[
+                    PartitionOffset::new(0, CdcOffset::new(10, 4)),
+                    PartitionOffset::new(1, CdcOffset::new(3, 2)),
+                ],
+            )
+            .unwrap();
+        // A replayed older commit leaves partition 0 alone and raises 1.
+        store
+            .advance_offsets(
+                database_id,
+                1,
+                "s",
+                "g",
+                &[
+                    PartitionOffset::new(0, CdcOffset::new(9, 8)),
+                    PartitionOffset::new(1, CdcOffset::new(5, 2)),
+                ],
+            )
+            .unwrap();
+        drop(store);
+
+        let store = OffsetStore::open(dir.path()).unwrap();
+        assert_eq!(
+            store.get_offset(database_id, 1, "s", "g", 0),
+            CdcOffset::new(10, 4)
+        );
+        assert_eq!(
+            store.get_offset(database_id, 1, "s", "g", 1),
+            CdcOffset::new(5, 2)
+        );
     }
 }

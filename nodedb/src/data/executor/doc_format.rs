@@ -22,19 +22,51 @@ fn looks_like_msgpack_map(first: u8) -> bool {
     (0x80..=0x8F).contains(&first) || first == 0xDE || first == 0xDF
 }
 
-/// Convert a document byte blob to `serde_json::Value`. Auto-detects
-/// MessagePack or JSON; a stray suffix or two concatenated documents fail
-/// rather than silently decode the leading value. Binary Tuple is NOT
-/// auto-detected — strict collections must use `binary_tuple_to_json()`.
+/// True when the first byte marks a MessagePack array header: the outer
+/// `[tag, payload]` of a tagged `nodedb_types::Value`.
+fn looks_like_msgpack_array(first: u8) -> bool {
+    (0x90..=0x9F).contains(&first) || first == 0xDC || first == 0xDD
+}
+
+/// Decode a tagged `nodedb_types::Value` body. Only an object is a document,
+/// as [`canonicalize_document_for_storage`] accepts it.
+fn decode_tagged_object(bytes: &[u8]) -> crate::Result<nodedb_types::Value> {
+    match zerompk::from_msgpack::<nodedb_types::Value>(bytes) {
+        Ok(value @ nodedb_types::Value::Object(_)) => Ok(value),
+        Ok(other) => Err(decode_err(
+            "msgpack",
+            format!(
+                "a tagged value body is a document only as an object, got {}",
+                other.type_name()
+            ),
+        )),
+        Err(e) => Err(decode_err("msgpack", e)),
+    }
+}
+
+/// Convert a document byte blob to `serde_json::Value`. The first byte picks
+/// the decoder:
+///
+/// - A MessagePack map header: a standard map, the stored form.
+/// - A MessagePack array header: a tagged `nodedb_types::Value` object, an
+///   input form the write path canonicalizes.
+/// - Anything else: JSON, the body the native protocol's document put sends.
+///
+/// No header byte of the first two classes can begin JSON, so a failure there
+/// is reported as a MessagePack error, never retried as JSON. A stray suffix
+/// or two concatenated documents fail rather than silently decode the leading
+/// value. Binary Tuple is NOT auto-detected — strict collections must use
+/// `binary_tuple_to_json()`.
 pub(super) fn decode_document(bytes: &[u8]) -> crate::Result<serde_json::Value> {
     if bytes.is_empty() {
         return Err(decode_err("document", "empty body"));
     }
 
-    // Those header bytes cannot begin JSON, so a msgpack decode failure is
-    // reported directly rather than falling back to a JSON re-guess.
     if looks_like_msgpack_map(bytes[0]) {
         return nodedb_types::json_from_msgpack(bytes).map_err(|e| decode_err("msgpack", e));
+    }
+    if looks_like_msgpack_array(bytes[0]) {
+        return decode_tagged_object(bytes).map(serde_json::Value::from);
     }
 
     sonic_rs::from_slice(bytes).map_err(|e| decode_err("json", e))
@@ -73,6 +105,9 @@ pub(super) fn decode_document_value(bytes: &[u8]) -> crate::Result<nodedb_types:
 
     if looks_like_msgpack_map(bytes[0]) {
         return nodedb_types::value_from_msgpack(bytes).map_err(|e| decode_err("msgpack", e));
+    }
+    if looks_like_msgpack_array(bytes[0]) {
+        return decode_tagged_object(bytes);
     }
 
     // JSON input boundary: parse then convert.

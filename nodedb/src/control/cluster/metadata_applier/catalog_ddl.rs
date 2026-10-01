@@ -2,8 +2,8 @@
 
 //! `CatalogDdl` / `CatalogDdlAudited` host-side effects: decode the
 //! opaque payload as a `CatalogEntry`, write through to `SystemCatalog`
-//! redb, run synchronous post-apply side effects, emit the DDL audit
-//! record, and spawn async post-apply side effects.
+//! redb, run synchronous post-apply side effects, run the post-apply
+//! dispatch, and emit the DDL audit record.
 
 use tracing::{debug, warn};
 
@@ -12,10 +12,13 @@ use nodedb_cluster::MetadataEntry;
 use crate::control::catalog_entry;
 
 use super::audit::emit_ddl_audit;
+use crate::control::state::SharedState;
+
 use super::types::MetadataCommitApplier;
 
 impl MetadataCommitApplier {
-    /// Release the descriptor drain a `Put*` DDL installed.
+    /// Release the descriptor drain a `Put*` DDL installed, and no drain
+    /// another owner holds on the same descriptor.
     ///
     /// A drain is proposed *before* the DDL and is meant to end when that DDL
     /// concludes. Concluding includes the outcomes that write nothing — an
@@ -24,24 +27,25 @@ impl MetadataCommitApplier {
     /// catalog changed, so every path that finishes handling the entry must
     /// clear it.
     ///
-    /// Missing one of those paths does not fail loudly: the drain simply
+    /// Missing one of those paths does not fail loudly: the drain
     /// survives, and `is_draining` then rejects every plan for that
     /// descriptor as a retryable schema change with no error explaining
     /// why. The drain has no self-healing wall-clock expiry (see
     /// `lease::drain`) — the only backstop is the proposer's own wait
     /// loop timing out and proposing `DescriptorDrainEnd` explicitly, so
     /// every code path here must clear the drain it opened.
-    fn clear_implicit_drain(&self, stamped: &catalog_entry::CatalogEntry) {
-        if let Some(weak) = self.shared.get()
-            && let Some(shared) = weak.upgrade()
-            && let Some(drained_id) =
-                crate::control::lease::descriptor_id_for_implicit_clear(stamped)
-        {
-            shared.lease_drain.install_end(&drained_id);
-        }
+    ///
+    /// The drain rows go first, so a crash after them never leaves a drain
+    /// that boot will seed back.
+    fn clear_implicit_drain(
+        &self,
+        shared: &SharedState,
+        stamped: &catalog_entry::CatalogEntry,
+    ) -> Result<(), crate::Error> {
+        crate::control::lease::clear_implicit_drains(shared, stamped)
     }
 
-    pub(super) fn apply_catalog_ddl(
+    pub(super) async fn apply_catalog_ddl(
         &self,
         entry: &MetadataEntry,
         raft_index: u64,
@@ -75,6 +79,23 @@ impl MetadataCommitApplier {
                 return Ok(());
             }
         };
+        let shared = self.shared_state()?;
+
+        // Holds back one node's apply of backup schedule marks with a
+        // transient error, so a test can make that node's catalog lag the
+        // metadata group. Raft re-delivers the entry once it is cleared.
+        #[cfg(feature = "failpoints")]
+        if matches!(
+            stamped,
+            catalog_entry::CatalogEntry::PutBackupScheduleMark(_)
+        ) {
+            nodedb_types::fail_point_err!(&backup_mark_fail_point(shared.node_id), |detail| {
+                crate::Error::Storage {
+                    engine: "catalog".into(),
+                    detail,
+                }
+            });
+        }
 
         // Descriptor versions (and the constraint_version /
         // modification_hlc that travel with them) are frozen at PROPOSE
@@ -88,8 +109,9 @@ impl MetadataCommitApplier {
         // node's local prior. Historical entries encountered during a full-log
         // replay are acknowledged without overwriting newer state or repeating
         // post-apply side effects. Forward gaps and same-version divergent
-        // payloads remain loud typed errors. A version of `0` (compat mode /
-        // unit tests) is applied without version fencing.
+        // payloads remain loud typed errors. A version of `0` (unit-test
+        // fixtures that bypass the proposer) is applied without version
+        // fencing.
         if matches!(
             catalog_entry::descriptor_validate::validate(&stamped, catalog)?,
             catalog_entry::descriptor_validate::ValidationOutcome::AlreadyApplied
@@ -102,7 +124,7 @@ impl MetadataCommitApplier {
             // changed nothing — release it, or every read of the descriptor
             // stays rejected indefinitely (no wall-clock expiry backstops
             // this path; see `lease::drain`).
-            self.clear_implicit_drain(&stamped);
+            self.clear_implicit_drain(&shared, &stamped)?;
             return Ok(());
         }
 
@@ -113,7 +135,7 @@ impl MetadataCommitApplier {
             // descriptor that already exists) still concludes its DDL. So
             // does a refused entry: every node refuses it at this position,
             // and the proposer reports the refusal to its client.
-            self.clear_implicit_drain(&stamped);
+            self.clear_implicit_drain(&shared, &stamped)?;
             return Ok(());
         }
         // Implicit drain clear: if the entry is a `Put*` for one
@@ -122,10 +144,8 @@ impl MetadataCommitApplier {
         // entry from every node's host tracker. Happens before
         // post_apply so a subsequent `acquire_lease` fired from
         // post_apply doesn't see a stale drain.
-        if let Some(weak) = self.shared.get()
-            && let Some(shared) = weak.upgrade()
         {
-            self.clear_implicit_drain(&stamped);
+            self.clear_implicit_drain(&shared, &stamped)?;
             // Run synchronous post-apply side effects INLINE so every
             // in-memory cache update (install_replicated_user,
             // install_replicated_owner, etc.) is visible before the
@@ -133,21 +153,30 @@ impl MetadataCommitApplier {
             // moving past `last` is guaranteed to see the sync side
             // effects of every entry up to `last`.
             //
-            // `PutCollection` Register dispatch runs synchronously
-            // (block_in_place) inside spawn_post_apply_async_side_effects
-            // and IS part of the applied-index contract: the watcher
-            // only bumps after doc_configs is populated on every core,
-            // so subsequent scans always find the schema.
+            // The awaited post-apply lane is part of the same contract:
+            // `PutCollection`'s Register dispatch completes on every core
+            // before the entry counts as applied, so a later scan always
+            // finds the schema.
             catalog_entry::post_apply::apply_post_apply_side_effects_sync(&stamped, &shared);
 
-            // Emit a DdlChange audit record on every replica.
-            // Executed BEFORE spawning async post-apply side effects
-            // so the audit entry lands synchronously with the rest of
-            // the commit.
-            emit_ddl_audit(&shared, raft_index, &stamped, audit.as_ref());
+            // A reclaim that failed with no durable retry returns `Err`. The
+            // batch stops here and the re-delivered entry retries the reclaim.
+            catalog_entry::post_apply::run_post_apply_async_side_effects(
+                stamped.clone(),
+                std::sync::Arc::clone(&shared),
+            )
+            .await?;
 
-            catalog_entry::post_apply::spawn_post_apply_async_side_effects(stamped, shared);
+            // Emit a DdlChange audit record on every replica, once the entry
+            // fully applied, so a re-delivered entry is audited once.
+            emit_ddl_audit(&shared, raft_index, &stamped, audit.as_ref());
         }
         Ok(())
     }
+}
+
+/// The fail point that holds back node `node_id`'s apply of backup schedule
+/// marks.
+pub fn backup_mark_fail_point(node_id: u64) -> String {
+    format!("backup_schedule::mark_apply::node{node_id}")
 }

@@ -61,6 +61,20 @@ impl MultiRaft {
         })
     }
 
+    /// Every hosted group's live leader as this node's Raft knows it, with
+    /// the term it knows it at: `(group_id, leader_id, term)`.
+    ///
+    /// `leader_id` is this node when it leads, or the leader whose contact
+    /// is fresher than `election_timeout_min`. It is `0` otherwise, as during
+    /// an election or once a crashed leader's contact went stale.
+    pub fn observed_leaders(&self) -> Vec<(u64, u64, u64)> {
+        let now = std::time::Instant::now();
+        self.groups
+            .iter()
+            .map(|(&group_id, node)| (group_id, node.live_leader(now), node.current_term()))
+            .collect()
+    }
+
     /// Snapshot of all Raft group states for observability.
     pub fn group_statuses(&self) -> Vec<GroupStatus> {
         let mut statuses = Vec::with_capacity(self.groups.len());

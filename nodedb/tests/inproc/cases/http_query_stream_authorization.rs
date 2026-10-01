@@ -165,7 +165,7 @@ async fn query_stream_rejects_join_when_only_one_collection_is_granted() {
     srv.shared
         .permissions
         .grant(
-            &collection_target(TenantId::new(1), "granted_join_rows"),
+            &collection_target(DatabaseId::DEFAULT, TenantId::new(1), "granted_join_rows"),
             &format!("user:{username}"),
             Permission::Read,
             "nodedb",
@@ -297,7 +297,11 @@ async fn change_stream_consumption_requires_read_on_its_source_collection() {
     srv.shared
         .permissions
         .grant(
-            &collection_target(TenantId::new(1), "protected_stream_rows"),
+            &collection_target(
+                DatabaseId::DEFAULT,
+                TenantId::new(1),
+                "protected_stream_rows",
+            ),
             &format!("user:{username}"),
             Permission::Read,
             "nodedb",

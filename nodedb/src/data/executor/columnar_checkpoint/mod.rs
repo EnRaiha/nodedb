@@ -123,3 +123,5 @@ mod load;
 mod manifest;
 mod paths;
 mod write;
+
+pub(crate) use paths::{COLUMNAR_CKPT_MANIFEST, columnar_ckpt_dir, columnar_ckpt_gen_dir};

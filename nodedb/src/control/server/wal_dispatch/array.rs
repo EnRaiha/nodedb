@@ -30,8 +30,8 @@ pub(super) fn wal_append_array_op(
         ArrayOp::Put {
             array_id,
             cells_msgpack,
-            wal_lsn: _,
             provenance,
+            ..
         } => {
             let cells = zerompk::from_msgpack::<Vec<ArrayPutCell>>(cells_msgpack).map_err(|e| {
                 crate::Error::Serialization {
@@ -54,8 +54,8 @@ pub(super) fn wal_append_array_op(
         ArrayOp::Delete {
             array_id,
             coords_msgpack,
-            wal_lsn: _,
             provenance,
+            ..
         } => {
             let cells =
                 zerompk::from_msgpack::<Vec<ArrayDeleteCell>>(coords_msgpack).map_err(|e| {
@@ -87,7 +87,7 @@ pub(super) fn wal_append_array_op(
         | ArrayOp::Aggregate { .. }
         | ArrayOp::Elementwise { .. }
         | ArrayOp::DropArray { .. }
-        | ArrayOp::RestoreArrayDrop { .. }
+        | ArrayOp::RekeyArray { .. }
         | ArrayOp::PurgeArrayDrop { .. } => None,
         // DurableElsewhere — the flushed / compacted segment is rebuilt on replay
         // from the already-durable Put/Delete WAL records; Flush and Compact only
@@ -126,6 +126,7 @@ mod tests {
             cells_msgpack: zerompk::to_msgpack_vec(&cells).expect("encode cells"),
             wal_lsn: 0,
             provenance: None,
+            vshard_id: 0,
         });
 
         let outcome = super::super::wal_append_if_write(

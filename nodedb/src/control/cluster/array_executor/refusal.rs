@@ -92,9 +92,7 @@ pub(super) fn execution_error(context: &str, error: crate::Error) -> ClusterErro
         | crate::Error::CrdtApplyForbiddenInTransaction
         | crate::Error::NotInTransactionBlock { .. }
         | crate::Error::CrdtAdmissionTimeout { .. }
-        | crate::Error::FanOutExceeded { .. }
         | crate::Error::CrossCollectionNotColocated { .. }
-        | crate::Error::SourceFrozen { .. }
         | crate::Error::CloneWriteRequiresMaterialize { .. }
         | crate::Error::BadRequest { .. }
         | crate::Error::BackupTenantMismatch { .. }
@@ -113,10 +111,14 @@ pub(super) fn execution_error(context: &str, error: crate::Error) -> ClusterErro
         | crate::Error::InvalidLimitValue { .. }
         | crate::Error::RetryableSchemaChanged { .. }
         | crate::Error::RetryableLeaderChange { .. }
+        | crate::Error::CommittedResultUnavailable { .. }
+        | crate::Error::ProposalOutcomeUnknown { .. }
         | crate::Error::GroupQuorumUnavailable { .. }
         | crate::Error::GroupMarksUnavailable { .. }
+        | crate::Error::BackupCaptureMoved { .. }
         | crate::Error::MetadataLeaderUnavailable
         | crate::Error::AuthorizationStateBehind { .. }
+        | crate::Error::LinearizableReadRefused { .. }
         | crate::Error::ExecutionLimitExceeded { .. }
         | crate::Error::LimitExceeded { .. }
         | crate::Error::Wal(_)
@@ -134,12 +136,15 @@ pub(super) fn execution_error(context: &str, error: crate::Error) -> ClusterErro
         | crate::Error::Encryption { .. }
         | crate::Error::Bridge { .. }
         | crate::Error::VersionCompat { .. }
+        | crate::Error::RestoreTargetNotEmpty { .. }
+        | crate::Error::RestoreVerificationFailed { .. }
         | crate::Error::Internal { .. }
         | crate::Error::Shaping(_)
         | crate::Error::Ddl(_)
         | crate::Error::RemoteTyped { .. }
         | crate::Error::DescriptorVersionAnomaly { .. }
         | crate::Error::CollectionPurgeRowMissing { .. }
+        | crate::Error::CollectionUnstamped { .. }
         | crate::Error::CatalogIntegrityViolation { .. }
         | crate::Error::Promql(_)
         | crate::Error::DependentObjectsExist { .. }
@@ -240,6 +245,7 @@ mod tests {
             vshard_id: crate::types::VShardId::new(9),
             leader_node: 4,
             leader_addr: "10.0.0.4:9000".into(),
+            leader_term: 2,
         };
         assert!(matches!(
             execution_error("array put raft propose", error),

@@ -135,6 +135,11 @@ impl CoreLoop {
             provenance,
         } = params;
         debug!(core = self.core_id, %collection, dim, "vector insert");
+        if let Some(refusal) =
+            super::unbound_surrogate::refuse_unbound("vector", collection, surrogate)
+        {
+            return self.response_error(task, refusal);
+        }
 
         // ── Sync idempotency gate (Data-Plane side) ──────────────────────────
         if let Some(prov) = provenance {
@@ -228,13 +233,8 @@ impl CoreLoop {
                 self.checkpoint_coordinator.mark_dirty("vector", 1);
                 // Record this write's version so cross-shard OCC read-set
                 // validation (predicate reads always record the collection
-                // floor) sees this insert. `ZERO` means no surrogate binding
-                // was made (headless insert) — floor-only.
-                if surrogate == Surrogate::ZERO {
-                    self.note_collection_write_lsn(task, collection);
-                } else {
-                    self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
-                }
+                // floor) sees this insert.
+                self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
                 self.response_ok(task)
             }
             Err(err) => self.response_error(task, err),
@@ -246,6 +246,8 @@ impl CoreLoop {
     /// Resolves `surrogate → HNSW node_id` via `surrogate_to_local`, then
     /// delegates to the standard delete path.  If the surrogate is not
     /// present in any index for `collection`, the op is a no-op (idempotent).
+    /// `None` names a key its home never bound: the delete removes nothing and
+    /// still commits the producer's sequence.
     ///
     /// When `provenance` is `Some`, the sync idempotency gate runs first:
     /// non-Apply outcomes return `SyncAckResult` via `response_with_payload`
@@ -259,7 +261,7 @@ impl CoreLoop {
         task: &ExecutionTask,
         tid: u64,
         collection: &str,
-        surrogate: Surrogate,
+        surrogate: Option<Surrogate>,
         field_name: &str,
         provenance: Option<&SyncProvenance>,
     ) -> Response {
@@ -284,9 +286,8 @@ impl CoreLoop {
                 }
             }
             // Apply branch: run the delete, then commit.
-            let response = self.execute_vector_delete_by_surrogate_inner(
-                task, tid, collection, surrogate, field_name,
-            );
+            let response =
+                self.execute_vector_delete_target(task, tid, collection, surrogate, field_name);
             if response.status == crate::bridge::envelope::Status::Ok {
                 let prov_copy = SyncProvenance {
                     producer_id,
@@ -301,8 +302,25 @@ impl CoreLoop {
             return response;
         }
 
-        // Non-sync path: behave exactly as before.
-        self.execute_vector_delete_by_surrogate_inner(task, tid, collection, surrogate, field_name)
+        // Non-sync path: no gate.
+        self.execute_vector_delete_target(task, tid, collection, surrogate, field_name)
+    }
+
+    /// Delete the bound row, or nothing for a key its home never bound.
+    fn execute_vector_delete_target(
+        &mut self,
+        task: &ExecutionTask,
+        tid: u64,
+        collection: &str,
+        surrogate: Option<Surrogate>,
+        field_name: &str,
+    ) -> Response {
+        match surrogate {
+            Some(surrogate) => self.execute_vector_delete_by_surrogate_inner(
+                task, tid, collection, surrogate, field_name,
+            ),
+            None => self.response_ok(task),
+        }
     }
 
     /// Inner delete-by-surrogate logic shared by the sync and non-sync paths.
@@ -351,7 +369,8 @@ impl CoreLoop {
                 response
             }
             None => {
-                // Surrogate not present — idempotent.
+                // No node binds `surrogate`: a key never inserted here.
+                // Idempotent.
                 self.response_ok(task)
             }
         }
@@ -433,6 +452,7 @@ mod tests {
             txn_id: None,
             wal_lsn: Some(Lsn::new(lsn)),
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: crate::bridge::envelope::Admission::Exempt(
                 crate::bridge::envelope::ExemptReason::Read,
             ),
@@ -482,5 +502,101 @@ mod tests {
             "vector insert must advance the collection write-version floor \
              (predicate reads validate against the floor)"
         );
+    }
+
+    fn vector_prov(seq: u64) -> SyncProvenance {
+        SyncProvenance {
+            producer_id: 7,
+            epoch: 1,
+            stream_id: 42,
+            seq,
+        }
+    }
+
+    /// Two bound vectors in `docs`.
+    fn insert_bound(core: &mut CoreLoop, task: &ExecutionTask) {
+        for surrogate in [Surrogate::new(42), Surrogate::new(43)] {
+            let response = core.execute_vector_insert(VectorInsertParams {
+                task,
+                tid: 1,
+                collection: "docs",
+                vector: &[1.0, 2.0, 3.0],
+                dim: 3,
+                field_name: "",
+                surrogate,
+                provenance: None,
+            });
+            assert_eq!(response.status, crate::bridge::envelope::Status::Ok);
+        }
+    }
+
+    fn docs_live_count(core: &CoreLoop) -> usize {
+        let key = CoreLoop::vector_index_key(DatabaseId::DEFAULT.as_u64(), 1, "docs", "");
+        core.vector_collections
+            .get(&key)
+            .map(|collection| collection.live_count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn an_insert_without_a_surrogate_is_refused() {
+        let mut h = make_core();
+        let task = make_task_with_lsn(11);
+        let response = h.core.execute_vector_insert(VectorInsertParams {
+            task: &task,
+            tid: 1,
+            collection: "docs",
+            vector: &[1.0, 2.0, 3.0],
+            dim: 3,
+            field_name: "",
+            surrogate: Surrogate::ZERO,
+            provenance: None,
+        });
+        assert!(matches!(
+            response.error_code.as_deref(),
+            Some(ErrorCode::RejectedPrevalidation { .. })
+        ));
+        assert_eq!(docs_live_count(&h.core), 0, "nothing is stored");
+    }
+
+    #[test]
+    fn unbound_delete_with_provenance_commits_the_sequence_and_removes_nothing() {
+        let mut h = make_core();
+        let task = make_task_with_lsn(11);
+        insert_bound(&mut h.core, &task);
+        assert_eq!(docs_live_count(&h.core), 2);
+
+        let prov = vector_prov(1);
+        let response =
+            h.core
+                .execute_vector_delete_by_surrogate(&task, 1, "docs", None, "", Some(&prov));
+        assert_eq!(response.status, crate::bridge::envelope::Status::Ok);
+        let ack: nodedb_types::sync::wire::SyncAckResult =
+            zerompk::from_msgpack(&response.payload).expect("sync ack");
+        assert_eq!(
+            ack.outcome,
+            nodedb_types::sync::wire::SyncOutcome::Ack(AckStatus::Applied)
+        );
+        assert_eq!(ack.applied_seq, 1);
+        assert_eq!(h.core.sync_hwm_value(7, 42), 1, "the sequence commits");
+        assert_eq!(
+            docs_live_count(&h.core),
+            2,
+            "an unbound delete removes no vector"
+        );
+    }
+
+    #[test]
+    fn unbound_delete_without_provenance_is_ok_and_changes_nothing() {
+        let mut h = make_core();
+        let task = make_task_with_lsn(11);
+        insert_bound(&mut h.core, &task);
+
+        let response = h
+            .core
+            .execute_vector_delete_by_surrogate(&task, 1, "docs", None, "", None);
+        assert_eq!(response.status, crate::bridge::envelope::Status::Ok);
+        assert!(response.payload.is_empty());
+        assert_eq!(docs_live_count(&h.core), 2);
     }
 }

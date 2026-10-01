@@ -4,4 +4,4 @@ mod api;
 mod probing;
 mod types;
 
-pub use types::{EntryMeta, KvExportEntry, KvHashTable};
+pub use types::{EntryMeta, KvExportEntry, KvHashTable, KvSnapshotRow};

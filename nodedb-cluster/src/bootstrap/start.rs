@@ -32,7 +32,7 @@ use crate::subsystem::context::BootstrapCtx;
 use crate::subsystem::health::ClusterHealth;
 use crate::subsystem::{
     DecommissionSubsystem, ReachabilitySubsystem, RebalancerSubsystem, RunningCluster,
-    SubsystemRegistry, SwimSubsystem, SwimSubsystemConfig,
+    SubsystemRegistry, SwimSubsystem, SwimSubsystemConfig, SwimWiring,
 };
 use crate::swim::config::SwimConfig;
 use crate::swim::incarnation::Incarnation;
@@ -51,7 +51,8 @@ use super::restart::restart;
 /// and the `BootstrapCtx` is assembled. The four subsystems are:
 ///
 /// 1. `SwimSubsystem` (root, `deps = []`) — failure detector with
-///    `RoutingLivenessHook` attached before the UDP socket opens.
+///    `RoutingLivenessHook` and the host's `swim.subscribers` attached
+///    before the first probe.
 ///    `RoutingLivenessHook` is NOT its own subsystem; it is wired
 ///    inside `SwimSubsystem::start()` as a SWIM subscriber.
 ///
@@ -73,6 +74,7 @@ pub fn register_default_subsystems(
     ctx: &BootstrapCtx,
     executor: Arc<MigrationExecutor>,
     catalog: &Arc<ClusterCatalog>,
+    swim: SwimWiring,
 ) -> crate::error::Result<()> {
     // Fast-restart rejoin safety: resume SWIM above the last persisted
     // incarnation. A node that crashed while peers held `Dead(A, N)`
@@ -97,14 +99,6 @@ pub fn register_default_subsystems(
                 detail: format!("node_id is not a valid ID: {e}"),
             }
         })?,
-        // Use the explicit SWIM UDP addr if set; otherwise let the OS
-        // pick an ephemeral port by binding to port 0 on the listen addr.
-        swim_addr: config.swim_udp_addr.unwrap_or_else(|| {
-            let mut a = config.listen_addr;
-            a.set_port(0);
-            a
-        }),
-        seeds: config.seed_nodes.clone(),
         incarnation_store: Some(Arc::new(CatalogIncarnationStore::new(catalog))),
     };
 
@@ -112,7 +106,8 @@ pub fn register_default_subsystems(
         swim_cfg,
         Arc::clone(&ctx.routing),
         Arc::clone(&ctx.topology),
-        vec![],
+        swim.transport,
+        swim.subscribers,
     )));
 
     registry.register(Arc::new(ReachabilitySubsystem::new(
@@ -187,6 +182,15 @@ pub async fn start_cluster(
     Ok(cluster_state)
 }
 
+/// The shared cluster handles every default subsystem runs on.
+pub struct SubsystemHandles {
+    pub topology: Arc<std::sync::RwLock<crate::topology::ClusterTopology>>,
+    pub routing: Arc<std::sync::RwLock<crate::routing::RoutingTable>>,
+    pub transport: Arc<NexarTransport>,
+    /// The `RaftLoop`'s own `MultiRaft` handle.
+    pub raft_multi_raft: Arc<std::sync::Mutex<crate::multi_raft::MultiRaft>>,
+}
+
 /// Spawn the default cluster subsystems sharing `raft_multi_raft` with
 /// the running [`crate::raft_loop::RaftLoop`].
 ///
@@ -196,19 +200,30 @@ pub async fn start_cluster(
 /// subsystems use the same `Arc<Mutex<MultiRaft>>` the loop owns —
 /// no double-ownership, no orphan Arcs blocking shutdown.
 ///
+/// `swim` carries the SWIM socket bound before [`start_cluster`] and the
+/// host's subscribers, which join the routing hook before the first probe.
+///
 /// The returned [`RunningCluster`] keeps subsystem background tasks
 /// alive; dropping it signals all of them to shut down. The host
 /// **must** call [`RunningCluster::shutdown_all`] explicitly during
 /// orderly shutdown so subsystems release their `MultiRaft` Arc
 /// before the loop exits.
+///
+/// `migration_tracker` receives the state of every migration the
+/// rebalancer's executor runs.
 pub async fn start_cluster_subsystems(
     config: &ClusterConfig,
-    topology: Arc<std::sync::RwLock<crate::topology::ClusterTopology>>,
-    routing: Arc<std::sync::RwLock<crate::routing::RoutingTable>>,
-    transport: Arc<NexarTransport>,
-    raft_multi_raft: Arc<std::sync::Mutex<crate::multi_raft::MultiRaft>>,
+    handles: SubsystemHandles,
     catalog: &Arc<ClusterCatalog>,
+    swim: SwimWiring,
+    migration_tracker: Arc<crate::migration_executor::MigrationTracker>,
 ) -> Result<RunningCluster> {
+    let SubsystemHandles {
+        topology,
+        routing,
+        transport,
+        raft_multi_raft,
+    } = handles;
     let health = ClusterHealth::new();
     let (decommission_signal, _) = tokio::sync::watch::channel(false);
     let ctx = BootstrapCtx::new(
@@ -220,15 +235,18 @@ pub async fn start_cluster_subsystems(
         decommission_signal,
     );
 
-    let executor = Arc::new(MigrationExecutor::new(
-        Arc::clone(&raft_multi_raft),
-        Arc::clone(&routing),
-        Arc::clone(&topology),
-        Arc::clone(&transport),
-    ));
+    let executor = Arc::new(
+        MigrationExecutor::new(
+            Arc::clone(&raft_multi_raft),
+            Arc::clone(&routing),
+            Arc::clone(&topology),
+            Arc::clone(&transport),
+        )
+        .with_tracker(migration_tracker),
+    );
 
     let mut registry = SubsystemRegistry::new();
-    register_default_subsystems(&mut registry, config, &ctx, executor, catalog)?;
+    register_default_subsystems(&mut registry, config, &ctx, executor, catalog, swim)?;
 
     registry
         .start_all(&ctx)

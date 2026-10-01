@@ -157,10 +157,11 @@ pub(crate) struct TimeseriesIngestRecord<'a> {
     pub default_timestamp_ms: i64,
 }
 
-/// Encode an autocommit timeseries ingest's `TimeseriesBatch` WAL record: the
-/// six-element tuple `("timeseries", collection, payload, provenance, format,
-/// default_timestamp_ms)`. Replay stamps untimed rows with the carried
-/// instant, so they store the rows the live apply stored.
+/// Encode a timeseries ingest's `TimeseriesBatch` WAL record or redo
+/// sub-record: the six-element tuple `("timeseries", collection, payload,
+/// provenance, format, default_timestamp_ms)`. Every timeseries ingest record
+/// takes this shape. Replay stamps untimed rows with the carried instant, so
+/// they store the rows the live apply stored.
 pub(crate) fn encode_timeseries_ingest_payload(
     record: TimeseriesIngestRecord<'_>,
 ) -> crate::Result<Vec<u8>> {
@@ -182,22 +183,6 @@ pub(crate) fn encode_timeseries_ingest_payload(
     .map_err(|e| crate::Error::Serialization {
         format: "msgpack".into(),
         detail: format!("wal timeseries ingest: {e}"),
-    })
-}
-
-/// Encode the format-preserving 5-element timeseries WAL/redo tuple. The format
-/// field is required because payload bytes alone can't distinguish ILP from row MessagePack.
-pub(crate) fn encode_timeseries_batch_payload_with_format(
-    collection: &str,
-    payload: &[u8],
-    provenance: Option<&nodedb_types::sync::wire::SyncProvenance>,
-    format: &str,
-) -> crate::Result<Vec<u8>> {
-    zerompk::to_msgpack_vec(&("timeseries", collection, payload, provenance, format)).map_err(|e| {
-        crate::Error::Serialization {
-            format: "msgpack".into(),
-            detail: format!("wal timeseries batch with format: {e}"),
-        }
     })
 }
 
@@ -239,54 +224,6 @@ pub(crate) fn encode_columnar_batch_payload(
         format: "msgpack".into(),
         detail: format!("wal columnar batch: {e}"),
     })
-}
-
-/// Stable routing and collection scope for a timeseries WAL append. Keeps these
-/// fields together so callers can't mix the authenticated scope with another's payload.
-pub(crate) struct TimeseriesWalAppendContext<'a> {
-    pub tenant_id: TenantId,
-    pub vshard_id: VShardId,
-    pub database_id: DatabaseId,
-    pub collection: &'a str,
-}
-
-/// Append a timeseries batch to WAL and return the assigned LSN. Used by the ILP
-/// listener and sync handler for dedup tracking and `flush_wal_lsn`.
-/// Returns `None` if WAL is bypassed.
-pub(crate) fn wal_append_timeseries(
-    wal: WalAppender<'_>,
-    context: TimeseriesWalAppendContext<'_>,
-    payload: &[u8],
-    provenance: Option<&nodedb_types::sync::wire::SyncProvenance>,
-    credentials: Option<&CredentialStore>,
-) -> crate::Result<Option<nodedb_types::Lsn>> {
-    let TimeseriesWalAppendContext {
-        tenant_id,
-        vshard_id,
-        database_id,
-        collection,
-    } = context;
-    // WAL bypass check.
-    if let Some(creds) = credentials
-        && let Ok(Some(coll)) =
-            creds
-                .catalog()
-                .get_collection(database_id, tenant_id.as_u64(), collection)
-        && let Some(config) = coll.get_timeseries_config()
-        && config.get("wal").and_then(|v| v.as_str()) == Some("false")
-    {
-        return Ok(None);
-    }
-
-    let wal_payload = encode_timeseries_ingest_payload(TimeseriesIngestRecord {
-        collection,
-        payload,
-        provenance,
-        format: "ilp",
-        default_timestamp_ms: i64::try_from(crate::engine::kv::current_ms()).unwrap_or(i64::MAX),
-    })?;
-    let lsn = wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?;
-    Ok(Some(lsn))
 }
 
 /// Encode the payload of a `TimeseriesBatch` WAL record for a columnar
@@ -355,46 +292,6 @@ pub(crate) fn encode_columnar_resolved_dml_payload(
         format: "msgpack".into(),
         detail: format!("wal columnar resolved dml: {e}"),
     })
-}
-
-/// Record-level fields for a columnar WAL append. Groups collection identity,
-/// row payload, provenance, and surrogates, reducing [`wal_append_columnar`]'s argument count.
-pub struct ColumnarWalAppendArgs<'a> {
-    pub collection: &'a str,
-    pub payload: &'a [u8],
-    pub provenance: Option<&'a nodedb_types::sync::wire::SyncProvenance>,
-    /// Per-row surrogates index-aligned with `payload` rows. Pass an empty
-    /// slice when the caller does not carry surrogate identity (e.g. the
-    /// sync/CRDT path).
-    pub surrogates: &'a [nodedb_types::Surrogate],
-}
-
-/// Append a columnar batch to WAL and return the assigned LSN. Mirrors
-/// `wal_append_timeseries` but encodes `ColumnarWalRecord` so replay restores
-/// per-row surrogates. Always returns `Some` — columnar has no `wal=false`.
-pub fn wal_append_columnar(
-    wal: WalAppender<'_>,
-    tenant_id: TenantId,
-    vshard_id: VShardId,
-    database_id: DatabaseId,
-    args: ColumnarWalAppendArgs<'_>,
-) -> crate::Result<Option<nodedb_types::Lsn>> {
-    let ColumnarWalAppendArgs {
-        collection,
-        payload,
-        provenance,
-        surrogates,
-    } = args;
-    // The sync path applies a plain insert: an existing row is replaced.
-    let wal_payload = encode_columnar_batch_payload(ColumnarBatchRecord {
-        collection,
-        payload,
-        provenance,
-        surrogates,
-        conflict_policy: &crate::wal::ColumnarConflictPolicy::replace(),
-    })?;
-    let lsn = wal.append_timeseries_batch(tenant_id, vshard_id, database_id, &wal_payload)?;
-    Ok(Some(lsn))
 }
 
 #[cfg(test)]
@@ -499,8 +396,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = open_wal(dir.path());
         let credentials = CredentialStore::new().expect("in-memory credential store");
-        let mut collection =
-            crate::control::security::catalog::StoredCollection::new(1, "metrics", "owner");
+        let mut collection = crate::control::security::catalog::StoredCollection::stamped_for_test(
+            1, "metrics", "owner",
+        );
         collection.timeseries_config = Some(r#"{"wal":"false"}"#.to_string());
         credentials
             .catalog()

@@ -17,7 +17,7 @@
 //! routed point read for the point shapes and [`super::recon`] scans the
 //! predicate for the bulk ones, both so the join values can be resolved at all.
 //! Those images are folded HERE, in the same pass, from the same read: a second
-//! pass would fold a different snapshot, and two snapshots is two totals.
+//! pass will fold a different snapshot, and two snapshots is two totals.
 //!
 //! # Deferral is the ABSENCE of a resolution
 //!
@@ -31,7 +31,7 @@
 //! homed on the target's vShard and dual-homed with the source write through
 //! Calvin.
 //!
-//! Nothing is added to the source op to say so. A marker field would have to be
+//! Nothing is added to the source op to say so. A marker field will have to be
 //! spelled on seven more plan variants and seven more replicated-write
 //! variants, and every one of them is a place the marker and the appended task
 //! can disagree. The resolution IS the marker: the plane-neutral
@@ -91,6 +91,9 @@ pub(super) struct SettleInput<'a> {
     pub source_row: Option<Surrogate>,
     /// Version the images were read at.
     pub read_version_lsn: Lsn,
+    /// The node that served the image read. `read_version_lsn` is a position
+    /// in its WAL, so only that node's commit vote can find the read current.
+    pub served_by: u64,
 }
 
 /// What settling produced.
@@ -102,7 +105,7 @@ pub(super) struct Settlement {
     /// — that removal is the whole of the deferral signal.
     ///
     /// Keyed on the PAIR, never on the value: two bindings of one source can
-    /// share a join column, and shipping one binding's value would otherwise
+    /// share a join column, and shipping one binding's value will otherwise
     /// strip the other binding's resolution and silently drop its delta.
     pub shipped: Vec<SumTargetKey>,
     /// Read-set entries covering the images the deltas were folded from.
@@ -132,7 +135,7 @@ impl Settlement {
 /// [`MaterializedSumTargetNotFound`](crate::Error::MaterializedSumTargetNotFound):
 /// the row addresses a target that does not exist, and failing the statement is
 /// what the resolution pass itself does with the same finding. Shipping nothing
-/// instead would leave the stored total short of the `SUM(...)` over the source
+/// instead will leave the stored total short of the `SUM(...)` over the source
 /// rows.
 pub(super) fn settle_cross_shard_images(
     bindings: &[MaterializedSumBinding],
@@ -160,8 +163,8 @@ pub(super) fn settle_cross_shard_images(
         }
         for (join_value, delta) in crate::query::coalesce_binding_deltas(folded) {
             // A zero net delta leaves the stored total unchanged, so the
-            // read-modify-write on the target would rewrite the row
-            // byte-for-byte. Shipping a task for it would also make an
+            // read-modify-write on the target will rewrite the row
+            // byte-for-byte. Shipping a task for it will also make an
             // otherwise single-shard statement multi-shard for nothing. The
             // join value is still recorded as shipped: the source core must not
             // apply it either, and applying nothing is what it does when the
@@ -203,7 +206,7 @@ pub(super) fn settle_cross_shard_images(
 /// Everything one appended balance task needs.
 pub(super) struct BalanceTaskSpec<'a> {
     /// Inherited from the source write: the balance belongs to the same
-    /// statement, and a task that lost the transaction would commit on its own.
+    /// statement, and a task that lost the transaction will commit on its own.
     pub txn_id: Option<TxnId>,
     pub database_id: DatabaseId,
     pub tenant_id: TenantId,
@@ -274,10 +277,12 @@ fn image_read_entry(
         // A DERIVATION read, never a read-your-own-write. The image was read
         // from committed base state before this transaction existed, and the
         // delta shipped to the target rests entirely on it; the statement writes
-        // the source collection too, so an entry marked `Session` here would be
-        // dropped by the own-write exclusion and the fold would never be
+        // the source collection too, so an entry marked `Session` here will be
+        // dropped by the own-write exclusion and the fold will never be
         // validated against a concurrent writer.
         origin: ReadOrigin::PlanDerivation,
+        home: None,
+        home_node: input.served_by,
     }
 }
 
@@ -288,8 +293,8 @@ fn image_read_entry(
 /// The removal is the deferral signal, so it has to be exact in both
 /// directions: a pair left behind is applied twice, and a pair removed that a
 /// co-resident binding still addresses is a delta dropped on the floor. Matching
-/// on the join value alone would do both at once when a source drives two
-/// bindings that share a join column — the cross-shard one's shipment would
+/// on the join value alone will do both at once when a source drives two
+/// bindings that share a join column — the cross-shard one's shipment will
 /// strip the co-resident one's entry.
 pub(super) fn omit_shipped(
     resolved: &mut Vec<ResolvedSumTarget>,
@@ -393,6 +398,7 @@ mod tests {
             images: &images,
             source_row: Some(Surrogate::new(11)),
             read_version_lsn: Lsn::new(42),
+            served_by: 7,
         };
         let settlement = settle_cross_shard_images(
             &[binding(&target)],
@@ -428,6 +434,7 @@ mod tests {
             images: &images,
             source_row: Some(Surrogate::new(11)),
             read_version_lsn: Lsn::new(42),
+            served_by: 7,
         };
         let settlement = settle_cross_shard_images(
             &[binding(&target)],
@@ -468,6 +475,7 @@ mod tests {
             images: &images,
             source_row: Some(Surrogate::new(11)),
             read_version_lsn: Lsn::new(42),
+            served_by: 7,
         };
         let settlement = settle_cross_shard_images(
             &[binding(&target)],
@@ -482,7 +490,7 @@ mod tests {
     }
 
     /// A net-zero UPDATE ships no task — and STILL defers, because the source
-    /// core applying its own non-zero halves would double-count them.
+    /// core applying its own non-zero halves will double-count them.
     #[test]
     fn a_net_zero_update_defers_without_shipping() {
         let (source, target) = cross_shard_pair();
@@ -492,6 +500,7 @@ mod tests {
             images: &images,
             source_row: Some(Surrogate::new(11)),
             read_version_lsn: Lsn::new(42),
+            served_by: 7,
         };
         let settlement = settle_cross_shard_images(
             &[binding(&target)],
@@ -520,6 +529,7 @@ mod tests {
             images: &images,
             source_row: Some(Surrogate::new(11)),
             read_version_lsn: Lsn::new(42),
+            served_by: 7,
         };
         // A binding whose target IS the source collection is co-resident by
         // construction, whatever the hash function does.
@@ -549,6 +559,7 @@ mod tests {
             images: &images,
             source_row: Some(Surrogate::new(11)),
             read_version_lsn: Lsn::new(42),
+            served_by: 7,
         };
         let settlement = settle_cross_shard_images(
             &[binding(&target)],
@@ -568,6 +579,11 @@ mod tests {
             }
         );
         assert_eq!(settlement.reads[0].read_version_lsn, Lsn::new(42));
+        assert_eq!(
+            settlement.reads[0].home_node, 7,
+            "the entry names the node that served the image read; `0` makes \
+             every commit vote treat the read as changed"
+        );
     }
 
     /// A predicate-shaped settlement observes the whole collection, so its
@@ -582,6 +598,7 @@ mod tests {
             images: &images,
             source_row: None,
             read_version_lsn: Lsn::new(42),
+            served_by: 7,
         };
         let settlement = settle_cross_shard_images(
             &[binding(&target)],
@@ -616,8 +633,8 @@ mod tests {
     /// resolution of a SIBLING binding that reads the same join column into a
     /// different target.
     ///
-    /// Keyed on the join value alone, the shipment below would remove both
-    /// entries and the co-resident target's delta would be dropped: no error,
+    /// Keyed on the join value alone, the shipment below will remove both
+    /// entries and the co-resident target's delta will be dropped: no error,
     /// a total silently short by the row's whole value.
     #[test]
     fn shipping_one_target_leaves_a_sibling_targets_resolution_intact() {

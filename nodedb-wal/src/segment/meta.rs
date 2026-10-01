@@ -58,10 +58,10 @@ pub fn segment_path(wal_dir: &Path, first_lsn: u64) -> PathBuf {
     wal_dir.join(segment_filename(first_lsn))
 }
 
-/// Parse the first_lsn from a segment filename.
+/// Parse the first_lsn from a segment filename built by [`segment_filename`].
 ///
 /// Returns `None` if the filename doesn't match the expected pattern.
-pub(crate) fn parse_segment_filename(filename: &str) -> Option<u64> {
+pub fn parse_segment_filename(filename: &str) -> Option<u64> {
     let stem = filename.strip_prefix(SEGMENT_PREFIX)?;
     let lsn_str = stem.strip_suffix(&format!(".{SEGMENT_EXTENSION}"))?;
     lsn_str.parse::<u64>().ok()
@@ -88,6 +88,13 @@ mod tests {
             parse_segment_filename("wal-00000000000000000999.seg"),
             Some(999)
         );
+    }
+
+    #[test]
+    fn parse_segment_filename_round_trips_real_names() {
+        for lsn in [0, 1, 999, 1 << 40, u64::MAX - 1, u64::MAX] {
+            assert_eq!(parse_segment_filename(&segment_filename(lsn)), Some(lsn));
+        }
     }
 
     #[test]

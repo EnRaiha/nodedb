@@ -76,7 +76,7 @@ pub(super) fn build_test_scheduler(vshard_id: u32) -> (Scheduler, tempfile::Temp
         sequencer_state_machine,
         // A freshly-built scheduler has applied nothing, so its watermark is the
         // not-yet-applied sentinel (matching `read_applied_recovery` for a clean
-        // node). Hardcoding `0` here would instead claim epoch 0 is fully applied,
+        // node). Hardcoding `0` here will instead claim epoch 0 is fully applied,
         // making the exactly-once gate (`AppliedGate::is_applied`) short-circuit
         // every epoch-0 replay before it reaches the lock table — silently
         // defeating the end-to-end drain tests below.
@@ -198,6 +198,8 @@ pub(super) fn make_validate_only_txn(epoch: u64, position: u32) -> SequencedTxn 
         collection: "test_coll".to_string(),
         key: ReadKeyIdent::Point(KeyRepr::Surrogate(1)),
         read_lsn: Lsn::ZERO,
+        home_vshard: None,
+        served_by: 0,
     }]);
     let tx_class = TxClass::new_single_vshard(
         ReadWriteSet::new(vec![]),
@@ -273,7 +275,7 @@ fn filler_request(request_id: RequestId, tenant_id: TenantId) -> Request {
         plan: PhysicalPlan::Document(DocumentOp::PointGet {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "filler"),
             document_id: "d".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -292,6 +294,7 @@ fn filler_request(request_id: RequestId, tenant_id: TenantId) -> Request {
         txn_id: None,
         wal_lsn: None,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: Admission::Exempt(ExemptReason::Read),
     }
 }
@@ -433,6 +436,10 @@ pub(super) fn staged_pending(txn: SequencedTxn, txn_id: TxnId) -> PendingTxn {
         redo_records: None,
         flush_scope: crate::control::cluster::calvin::scheduler::driver::types::FlushScope::default(
         ),
+        superseded: false,
+        gates: Vec::new(),
+        ungated: false,
+        install_permit: None,
     }
 }
 

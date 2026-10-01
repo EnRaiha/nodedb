@@ -176,7 +176,7 @@ mod tests {
     fn put(v: i64) -> StagedCellPut {
         StagedCellPut {
             attrs: vec![CellValue::Int64(v)],
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
             system_from_ms: 0,
             valid_from_ms: 0,
             valid_until_ms: i64::MAX,

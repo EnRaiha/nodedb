@@ -80,6 +80,11 @@ impl CoreLoop {
             geometry,
             provenance,
         } = args;
+        if let Some(refusal) =
+            super::unbound_surrogate::refuse_unbound("spatial", collection, surrogate)
+        {
+            return self.response_error(task, refusal);
+        }
         let doc_id = StorageKey::for_surrogate(surrogate).to_string();
 
         debug!(
@@ -209,7 +214,9 @@ impl CoreLoop {
     /// document store on behalf of a Lite client.
     ///
     /// Keyed by the same hex-encoded surrogate used at insert time. A delete
-    /// of a non-existent surrogate is a no-op (idempotent).
+    /// of a non-existent surrogate is a no-op (idempotent). `None` names a
+    /// key its home never bound: the delete removes nothing and still
+    /// commits the producer's sequence.
     ///
     /// Fails fast if the sparse store delete returns an error (other than
     /// "not found", which the sparse engine surfaces as `Ok`).
@@ -219,20 +226,9 @@ impl CoreLoop {
         tid: u64,
         collection: &str,
         field: &str,
-        surrogate: Surrogate,
+        surrogate: Option<Surrogate>,
         provenance: Option<&SyncProvenance>,
     ) -> Response {
-        let doc_id = StorageKey::for_surrogate(surrogate).to_string();
-
-        debug!(
-            core = self.core_id,
-            %collection,
-            %field,
-            doc_id = %doc_id,
-            surrogate = surrogate.as_u32(),
-            "spatial sync: delete geometry"
-        );
-
         // ── Idempotency gate ────────────────────────────────────────────────
         if let Some(prov) = provenance {
             match self.sync_admit(prov) {
@@ -247,6 +243,24 @@ impl CoreLoop {
                 }
             }
         }
+
+        let Some(surrogate) = surrogate else {
+            if let Some(prov) = provenance {
+                self.sync_commit(prov);
+                return self.sync_ack_response(task, AckStatus::Applied, prov.seq);
+            }
+            return self.response_ok(task);
+        };
+
+        let doc_id = StorageKey::for_surrogate(surrogate).to_string();
+        debug!(
+            core = self.core_id,
+            %collection,
+            %field,
+            doc_id = %doc_id,
+            surrogate = surrogate.as_u32(),
+            "spatial sync: delete geometry"
+        );
 
         let storage_key = nodedb_types::StorageKey::for_surrogate(surrogate);
         if let Err(e) = self.sparse.delete(
@@ -365,5 +379,104 @@ pub(in crate::data::executor) fn geometry_to_value(geometry: &Geometry) -> noded
             },
             Err(_) => Value::Null,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::sync::wire::{SyncAckResult, SyncOutcome};
+
+    use super::*;
+    use crate::bridge::envelope::Status;
+    use crate::data::executor::core_loop::tests::{make_core_with_dir, make_default_task};
+
+    const TID: u64 = 1;
+
+    fn prov(seq: u64) -> SyncProvenance {
+        SyncProvenance {
+            producer_id: 7,
+            epoch: 1,
+            stream_id: 42,
+            seq,
+        }
+    }
+
+    fn assert_applied(response: &Response, seq: u64) {
+        assert_eq!(response.status, Status::Ok);
+        let ack: SyncAckResult = zerompk::from_msgpack(&response.payload).expect("sync ack");
+        assert_eq!(ack.outcome, SyncOutcome::Ack(AckStatus::Applied));
+        assert_eq!(ack.applied_seq, seq);
+    }
+
+    fn insert(core: &mut CoreLoop, task: &ExecutionTask, surrogate: Surrogate) -> Response {
+        core.execute_spatial_insert(SpatialInsertExec {
+            task,
+            tid: TID,
+            collection: "places",
+            field: "loc",
+            surrogate,
+            geometry: &Geometry::point(10.0, 20.0),
+            provenance: None,
+        })
+    }
+
+    /// One geometry under a bound surrogate.
+    fn insert_geometries(core: &mut CoreLoop, task: &ExecutionTask) {
+        assert_eq!(insert(core, task, Surrogate::new(5)).status, Status::Ok);
+    }
+
+    /// The indexed entry count and the doc-map size of `places.loc`.
+    fn spatial_state(core: &CoreLoop) -> (usize, usize) {
+        let key = (
+            nodedb_types::DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            "places".to_string(),
+            "loc".to_string(),
+        );
+        let indexed = core.spatial_indexes.get(&key).map_or(0, RTree::len);
+        (indexed, core.spatial_doc_map.len())
+    }
+
+    #[test]
+    fn an_insert_without_a_surrogate_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        let task = make_default_task();
+
+        let response = insert(&mut core, &task, Surrogate::ZERO);
+        assert!(matches!(
+            response.error_code.as_deref(),
+            Some(crate::bridge::envelope::ErrorCode::RejectedPrevalidation { .. })
+        ));
+        assert_eq!(spatial_state(&core), (0, 0), "nothing is stored");
+    }
+
+    #[test]
+    fn unbound_delete_with_provenance_commits_the_sequence_and_removes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        let task = make_default_task();
+        insert_geometries(&mut core, &task);
+        let before = spatial_state(&core);
+
+        let response =
+            core.execute_spatial_delete(&task, TID, "places", "loc", None, Some(&prov(1)));
+        assert_applied(&response, 1);
+        assert_eq!(core.sync_hwm_value(7, 42), 1, "the sequence commits");
+        assert_eq!(spatial_state(&core), before, "no geometry is removed");
+    }
+
+    #[test]
+    fn unbound_delete_without_provenance_is_ok_and_removes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        let task = make_default_task();
+        insert_geometries(&mut core, &task);
+        let before = spatial_state(&core);
+
+        let response = core.execute_spatial_delete(&task, TID, "places", "loc", None, None);
+        assert_eq!(response.status, Status::Ok);
+        assert!(response.payload.is_empty());
+        assert_eq!(spatial_state(&core), before);
     }
 }

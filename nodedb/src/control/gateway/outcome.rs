@@ -14,6 +14,10 @@ use crate::types::{Lsn, RequestId, VShardId};
 
 use super::core::{Gateway, QueryContext, authorized_plan_for_context};
 
+/// A gateway execution's payloads, per-shard read watermarks, and
+/// read-version LSN, as [`GatewayOutcome::into_parts`] returns them.
+pub type GatewayParts = (Vec<Vec<u8>>, Vec<(VShardId, Lsn)>, Lsn);
+
 /// Everything one gateway execution observed across its routes.
 pub struct GatewayOutcome {
     /// One payload, fused when several routes answered.
@@ -30,7 +34,7 @@ pub struct GatewayOutcome {
 
 impl GatewayOutcome {
     /// Payloads, per-shard watermarks, and read-version LSN.
-    pub fn into_parts(self) -> (Vec<Vec<u8>>, Vec<(VShardId, Lsn)>, Lsn) {
+    pub fn into_parts(self) -> GatewayParts {
         (self.payloads, self.shard_watermarks, self.read_version_lsn)
     }
 
@@ -73,7 +77,7 @@ impl Gateway {
         ctx: &QueryContext,
         checked: CloneCheckedTask,
     ) -> Result<Response, Error> {
-        let plan = authorized_plan_for_context(ctx, checked)?;
+        let (plan, _lease) = authorized_plan_for_context(ctx, checked)?;
         match self.execute_plan_outcome(ctx, plan).await {
             Ok(outcome) => Ok(outcome.into_response()),
             // A remote leaseholder returns its `NotFound` verdict as a typed

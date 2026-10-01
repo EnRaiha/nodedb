@@ -3,7 +3,7 @@
 //! Calvin dispatch classification and routing for cross-shard writes.
 //!
 //! This module is the single chokepoint for deciding whether a set of
-//! [`PhysicalTask`]s should be dispatched via:
+//! [`PhysicalTask`]s must be dispatched via:
 //!
 //! - The single-shard fast path (existing path, no Calvin involvement).
 //! - Calvin static dispatch (all write keys known upfront).
@@ -15,7 +15,7 @@
 //!
 //! # Note on predicate_class
 //!
-//! The ideal implementation of `predicate_class` would serialize the `Filter`
+//! The ideal implementation of `predicate_class` will serialize the `Filter`
 //! AST via zerompk and normalize bound parameter values to their type tags.
 //! However, `nodedb_sql::types::Filter` does not derive `zerompk::ToMessagePack`
 //! or `zerompk::FromMessagePack`. As a declared fallback, `predicate_class`
@@ -81,18 +81,21 @@ pub fn is_dependent_predicate(plan: &PhysicalPlan) -> bool {
 /// `TxClass` read_set's participants. An entry carries the plan's
 /// database-qualified name, so it is de-qualified into a [`CollectionKey`]
 /// before hashing. Each read retains its session database so classification
-/// and the database-scoped transaction class agree. A read with no extractable
-/// collection contributes nothing.
+/// and the database-scoped transaction class agree. An entry homed on a vShard
+/// (a cross-shard graph read) contributes that vShard, with or without a
+/// collection. An unhomed read with no extractable collection contributes
+/// nothing.
 pub fn read_vshards_of(reads: &[ReadSetEntry]) -> crate::Result<BTreeSet<u32>> {
     reads
         .iter()
-        .filter(|e| !e.collection.is_empty())
-        .map(|e| {
-            Ok(
+        .filter(|e| e.home.is_some() || !e.collection.is_empty())
+        .map(|e| match e.home {
+            Some(home) => Ok(home.as_u32()),
+            None => Ok(
                 CollectionKey::from_qualified_str(e.database_id, &e.collection)?
                     .vshard()
                     .as_u32(),
-            )
+            ),
         })
         .collect()
 }
@@ -132,7 +135,7 @@ pub fn classify_dispatch(tasks: &[PhysicalTask], read_vshards: &BTreeSet<u32>) -
         },
         1 => DispatchClass::SingleShard {
             // The single vShard is a write shard whenever any write ran (the
-            // common case: `last_vshard` is set). It could instead be a lone
+            // common case: `last_vshard` is set). It can instead be a lone
             // read shard with no writes — unreachable via the COMMIT path, which
             // only classifies a non-empty write buffer — so the `unwrap_or_else`
             // is a defensive fallback upholding the no-panic contract.
@@ -378,10 +381,9 @@ mod tests {
 
     #[test]
     fn classify_dispatch_multi_shard_counts_newly_widened_crdt_apply_write() {
-        // Before the `is_write_plan` widening, `CrdtOp::Apply` was misclassified
-        // as a read: `classify_dispatch` would have counted zero write vshards
-        // for this pair and returned `SingleShard`, silently dropping Calvin's
-        // cross-shard atomicity for a real two-vshard CRDT write.
+        // `CrdtOp::Apply` is a write: `classify_dispatch` counts both write
+        // vshards for this pair, so a two-vshard CRDT write keeps Calvin's
+        // cross-shard atomicity.
         let tasks = vec![crdt_apply_task(3), crdt_apply_task(7)];
         let class = classify_dispatch(&tasks, &BTreeSet::new());
         match class {
@@ -443,7 +445,7 @@ mod tests {
     fn classify_dispatch_read_widened_multi_shard() {
         // A single-WRITE-shard batch (shard 5) that READS shard 8 classifies as
         // MultiShard{5,8}: the read vShard widens the participant set exactly as a
-        // write vShard would.
+        // write vShard does.
         let tasks = vec![doc_insert_task(5)];
         let read_vshards: BTreeSet<u32> = [8u32].into_iter().collect();
         let class = classify_dispatch(&tasks, &read_vshards);
@@ -489,7 +491,7 @@ mod tests {
         // WHY this must stay `MultiShard`: only the `MultiShard` branch of COMMIT
         // flushes through the Calvin barrier (`run_commit_calvin`), which validates
         // B's read slice on B's OWNING node using the real per-shard `read_lsn`. If a
-        // foreign read failed to widen the class, COMMIT would take the `SingleShard`
+        // foreign read failed to widen the class, COMMIT will take the `SingleShard`
         // branch and run only the local-WAL `si_conflict_abort`, which never sees a
         // stale read on the remote owner — silently committing a non-serializable
         // cross-node transaction. This test guarantees a future refactor of
@@ -513,6 +515,8 @@ mod tests {
             read_lsn: Lsn::new(1),
             read_version_lsn: Lsn::ZERO,
             origin: ReadOrigin::Session,
+            home: None,
+            home_node: 0,
         };
 
         // The homing step under test: a foreign-collection read must home to a

@@ -2,11 +2,9 @@
 
 //! Protocol-neutral `ALTER SCHEDULE` DDL handler.
 //!
-//! Ported from the pgwire `ddl::schedule::alter` handler. The registry lookup,
-//! the `propose_and_apply` catalog write, and the in-memory registry update are
-//! preserved verbatim; only the result construction changed from pgwire
-//! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
-//! [`DdlError`].
+//! The registry lookup, the `propose_and_apply` catalog write, and the
+//! in-memory registry update run here. The result is the protocol-neutral
+//! [`DdlResult`] / [`DdlError`].
 //!
 //! Supports: ENABLE, DISABLE, SET CRON 'expr'.
 
@@ -21,7 +19,7 @@ use super::super::auth_support::status;
 ///
 /// `name`, `action`, and `cron_expr` come from the typed
 /// `AutomationStmt::AlterSchedule` variant.
-pub fn alter_schedule(
+pub async fn alter_schedule(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: crate::types::DatabaseId,
@@ -72,7 +70,7 @@ pub fn alter_schedule(
     // OWNERS row. The earlier direct `catalog.put_schedule(&def)`
     // call did neither — divergence on replicas, orphan on disk.
     let entry = crate::control::catalog_entry::CatalogEntry::PutSchedule(Box::new(def.clone()));
-    super::super::super::catalog::propose_and_apply(state, &entry)?;
+    super::super::super::catalog::propose_and_apply_async(state, &entry).await?;
 
     // Update in-memory registry.
     state.schedule_registry.update(def);

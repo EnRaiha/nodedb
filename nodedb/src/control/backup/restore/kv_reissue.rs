@@ -2,11 +2,10 @@
 
 //! Durable re-issue of restored KV rows.
 //!
-//! The per-node snapshot install puts a KV row straight into the target
-//! node's memtable, with no WAL record and no Raft entry: only that node holds
-//! it, and it is gone after a restart. RESTORE re-issues each row as a
-//! `KvOp::Put` instead, so every replica of the collection's group applies it
-//! and its WAL makes it durable.
+//! RESTORE re-issues each captured KV row as a `KvOp::Put`. Every replica of
+//! the collection's group applies it, and its WAL makes it durable. The put
+//! binds a destination surrogate. The captured surrogate belongs to the
+//! source database, so RESTORE ignores it.
 
 use nodedb_physical::physical_plan::KvOp;
 
@@ -17,9 +16,10 @@ use crate::types::TenantId;
 
 use super::target::DatabaseTarget;
 
-/// One restored KV table's rows: `(key, value, expire_at_ms)`, the shape the
-/// KV snapshot captures. `expire_at_ms` is `0` for a row with no TTL.
-type KvRows = Vec<(Vec<u8>, Vec<u8>, u64)>;
+/// One restored KV table's rows, in the shape the KV snapshot captures. The
+/// carried surrogate is the source database's identity. RESTORE ignores it
+/// and binds each row in the destination catalog.
+type KvRows = Vec<crate::engine::kv::hash_table::KvSnapshotRow>;
 
 /// The TTL a restored row keeps at `now_ms`: `Some(0)` for no TTL, the time
 /// left for a row that has not expired, `None` for a row already expired.
@@ -59,13 +59,23 @@ pub(in crate::control::backup::restore) async fn reissue_kv_tables(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        for (key, value, expire_at_ms) in rows {
-            let Some(ttl_ms) = remaining_ttl_ms(expire_at_ms, now_ms) else {
-                continue;
-            };
-            let surrogate = state
-                .surrogate_assigner
-                .assign(name.key(target.dest), tenant, &key)?;
+        let live: Vec<(Vec<u8>, Vec<u8>, u64)> = rows
+            .into_iter()
+            .filter_map(|(key, value, expire_at_ms, _source_surrogate)| {
+                remaining_ttl_ms(expire_at_ms, now_ms).map(|ttl_ms| (key, value, ttl_ms))
+            })
+            .collect();
+        // Every live row's surrogate in one batch at the table's home.
+        let keys: Vec<&[u8]> = live.iter().map(|(key, _, _)| key.as_slice()).collect();
+        let surrogates = crate::control::server::surrogate_exchange::assign_surrogates_routed(
+            state,
+            name.key(target.dest),
+            tenant,
+            &keys,
+            crate::types::TraceId::ZERO,
+        )
+        .await?;
+        for ((key, value, ttl_ms), surrogate) in live.into_iter().zip(surrogates) {
             let plan = PhysicalPlan::Kv(KvOp::Put {
                 collection: name.stored.clone(),
                 key,
@@ -76,8 +86,7 @@ pub(in crate::control::backup::restore) async fn reissue_kv_tables(
                 rls_filters: Vec::new(),
                 provenance: None,
             });
-            super::durable::reissue_plan_durably(state, tenant, target.dest, &name.bare, plan)
-                .await?;
+            super::durable::reissue_plan_durably(state, tenant, target, &name.bare, plan).await?;
             reissued += 1;
         }
     }

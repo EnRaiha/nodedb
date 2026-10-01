@@ -4,8 +4,8 @@
 //!
 //! Thin pgwire shim over the protocol-neutral commit orchestrator in
 //! `control/server/shared/session/commit.rs`: builds the pgwire Data-Plane
-//! dispatch seam (keeping the materialize-freeze gate), drives `run_commit`,
-//! and shapes the neutral [`CommitOutcome`] into a pgwire tag or error.
+//! dispatch seam, drives `run_commit`, and shapes the neutral
+//! [`CommitOutcome`] into a pgwire tag or error.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -27,9 +27,7 @@ use super::errors::calvin_cancelled_error;
 
 /// pgwire Data-Plane dispatch seam for the neutral transaction orchestrator.
 ///
-/// Wraps `dispatch_task_no_wal`, preserving its materialize-freeze gate so a
-/// transaction that began before a clone freeze cannot COMMIT writes during the
-/// freeze window.
+/// Wraps `dispatch_task_no_wal`.
 pub(in crate::control::server::pgwire::handler) struct PgwireTxnDp<'a> {
     pub(in crate::control::server::pgwire::handler) handler: &'a NodeDbPgHandler,
 }

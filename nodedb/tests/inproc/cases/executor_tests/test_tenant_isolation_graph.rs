@@ -27,8 +27,8 @@ fn graph_neighbors_isolated() {
                 label: "FOLLOWS".into(),
                 dst_id: format!("node_{}", i + 1),
                 properties: vec![],
-                src_surrogate: nodedb_types::Surrogate::ZERO,
-                dst_surrogate: nodedb_types::Surrogate::ZERO,
+                src_surrogate: doc_surrogate(&format!("node_{i}")),
+                dst_surrogate: doc_surrogate(&format!("node_{}", i + 1)),
             }),
         );
     }

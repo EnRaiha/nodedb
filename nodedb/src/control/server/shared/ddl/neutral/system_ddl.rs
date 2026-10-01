@@ -9,11 +9,9 @@
 //! Currently supported fields:
 //! - `deactivated_collection_retention_days` (u32)
 //!
-//! Ported from the pgwire `ddl::system_ddl` handler; the superuser gate,
-//! token parsing, retention-settings write, and audit side effect are
-//! preserved verbatim. Only the result construction changed from pgwire
-//! `Response` / `Tag` to the protocol-neutral [`DdlResult`]; the SQLSTATE codes
-//! and messages are unchanged.
+//! The superuser gate, token parsing, retention-settings write, and audit side
+//! effect run here. The result is the protocol-neutral [`DdlResult`] with its
+//! SQLSTATE codes and messages.
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -21,8 +19,7 @@ use crate::control::state::SharedState;
 
 use super::super::result::{DdlError, DdlResult};
 
-/// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
-/// the pgwire handler produced.
+/// Construct a [`DdlError`] from a SQLSTATE code and a message.
 fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
 }

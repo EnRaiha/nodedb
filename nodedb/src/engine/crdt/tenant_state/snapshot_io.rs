@@ -51,8 +51,7 @@ impl TenantCrdtEngine {
         match self.apply_committed_delta_validated(
             collection,
             bytes,
-            nodedb_types::Surrogate::ZERO,
-            "",
+            super::ApplyTarget::Collection,
             0,
         ) {
             super::ValidatedApplyOutcome::Clean { .. } => Ok(()),

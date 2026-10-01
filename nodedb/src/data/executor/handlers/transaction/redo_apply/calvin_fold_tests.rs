@@ -85,6 +85,10 @@ fn calvin_redo() -> Vec<u8> {
             collections: vec![SOURCE.to_string()],
             sum_targets: sum_targets(),
         }),
+        cross_shard_applied: None,
+        row_sources: Vec::new(),
+        publishes: Vec::new(),
+        row_changes: Vec::new(),
     }
     .to_bytes()
     .expect("encode redo")
@@ -115,7 +119,7 @@ fn restart_replay_folds_a_calvin_record_to_the_live_total() {
     let (mut live, _live_ends) = core_with_sum(live_dir.path());
     let mut task = make_default_task();
     task.wal_lsn = Some(Lsn::new(LSN));
-    let response = live.install_committed_redo(
+    let response = live.execute_apply_transaction_redo(
         &task,
         TID,
         CommittedRedo {

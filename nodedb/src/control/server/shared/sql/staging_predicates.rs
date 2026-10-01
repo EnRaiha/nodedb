@@ -65,6 +65,11 @@ pub fn stageable_write_shape(plan: &PhysicalPlan) -> Option<StagedWriteShape> {
         }
         PhysicalPlan::Document(DocumentOp::Upsert { .. }) => Some(StagedWriteShape::Upsert),
         PhysicalPlan::Document(DocumentOp::Truncate { .. }) => Some(StagedWriteShape::Truncate),
+        // A materialized-sum move on another shard's target row: a
+        // read-modify-write of one row, staged as its post-image.
+        PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta { .. }) => {
+            Some(StagedWriteShape::Update)
+        }
         PhysicalPlan::Document(_) => None,
 
         PhysicalPlan::Kv(op) => kv_write_shape(op),
@@ -221,6 +226,44 @@ pub fn is_stageable_write(plan: &PhysicalPlan) -> bool {
     stageable_write_shape(plan).is_some()
 }
 
+/// Whether `plan` is a stageable write that answers its `RETURNING` clause
+/// from the rows it stages: a Document point write, `UPSERT`, or predicate
+/// `UPDATE` / `DELETE` carrying a spec. Its stage handler replies with the
+/// affected count and the projected rows together.
+pub fn stages_returning(plan: &PhysicalPlan) -> bool {
+    matches!(
+        plan,
+        PhysicalPlan::Document(
+            DocumentOp::PointInsert {
+                returning: Some(_),
+                ..
+            } | DocumentOp::PointPut {
+                returning: Some(_),
+                ..
+            } | DocumentOp::PointUpdate {
+                returning: Some(_),
+                ..
+            } | DocumentOp::PointDelete {
+                returning: Some(_),
+                ..
+            } | DocumentOp::Upsert {
+                returning: Some(_),
+                ..
+            } | DocumentOp::BulkUpdate {
+                returning: Some(_),
+                ollp_predicted_surrogates: None,
+                ollp_predicted_edges: None,
+                ..
+            } | DocumentOp::BulkDelete {
+                returning: Some(_),
+                ollp_predicted_surrogates: None,
+                ollp_predicted_edges: None,
+                ..
+            }
+        )
+    )
+}
+
 /// Extract affected row count from a JSON or MessagePack payload. Looks for
 /// `"affected"`, `"truncated"`, `"inserted"`, `"accepted"`, or `"deleted"` — every
 /// name a write emits must appear here. `None` is never a licence to default.
@@ -237,6 +280,39 @@ pub fn extract_affected_count(payload: &[u8]) -> Option<u64> {
         .or_else(|| v.get("accepted"))
         .or_else(|| v.get("deleted"))
         .and_then(|n| n.as_u64())
+}
+
+/// The `"rejected"` line count a timeseries ingest response carries. `0` for
+/// a payload that carries none.
+pub fn extract_rejected_count(payload: &[u8]) -> u64 {
+    if payload.is_empty() {
+        return 0;
+    }
+    nodedb_types::json_from_msgpack(payload)
+        .ok()
+        .or_else(|| sonic_rs::from_slice::<serde_json::Value>(payload).ok())
+        .and_then(|v| v.get("rejected").and_then(|n| n.as_u64()))
+        .unwrap_or(0)
+}
+
+/// The collection and `"rejected"` line count of a timeseries ingest answer
+/// whose resolve rejected a line. `None` for every other payload.
+pub fn extract_ingest_rejections(payload: &[u8]) -> Option<(String, u64)> {
+    if payload.is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = nodedb_types::json_from_msgpack(payload)
+        .ok()
+        .or_else(|| sonic_rs::from_slice(payload).ok())?;
+    let rejected = v.get("rejected").and_then(|n| n.as_u64())?;
+    let collection = v.get("collection").and_then(|c| c.as_str())?;
+    (rejected > 0).then(|| (collection.to_owned(), rejected))
+}
+
+/// The client notice for `rejected` lines of timeseries collection
+/// `collection` that a statement did not store.
+pub fn rejected_lines_notice(collection: &str, rejected: u64) -> String {
+    format!("{rejected} line(s) of timeseries collection '{collection}' were rejected")
 }
 
 /// The affected-row count a DML response must carry, or a typed error. A
@@ -340,6 +416,17 @@ mod tests {
         assert_eq!(extract_kv_conflict_op(&payload), None);
     }
 
+    #[test]
+    fn extract_rejected_count_reads_a_staged_ingest_answer() {
+        let payload =
+            nodedb_types::json_to_msgpack(&serde_json::json!({"affected": 1, "rejected": 2}))
+                .unwrap();
+        assert_eq!(extract_affected_count(&payload), Some(1));
+        assert_eq!(extract_rejected_count(&payload), 2);
+        let bare = nodedb_types::json_to_msgpack(&serde_json::json!({"affected": 1})).unwrap();
+        assert_eq!(extract_rejected_count(&bare), 0);
+    }
+
     fn kv_plan(op: KvOp) -> PhysicalPlan {
         PhysicalPlan::Kv(op)
     }
@@ -357,7 +444,7 @@ mod tests {
         let point_update = PhysicalPlan::Document(DocumentOp::PointUpdate {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             document_id: "d".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             updates: Vec::new(),
             returning: ret(),
@@ -378,7 +465,7 @@ mod tests {
         let point_delete = PhysicalPlan::Document(DocumentOp::PointDelete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             document_id: "d".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             returning: ret(),
             rls_filters: Vec::new(),
@@ -440,7 +527,7 @@ mod tests {
             key: b"k".to_vec(),
             delta: 1,
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             shape: nodedb_physical::physical_plan::KvCounterShape::Raw,
         })));
@@ -448,7 +535,7 @@ mod tests {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             key: b"k".to_vec(),
             delta: "1".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             shape: nodedb_physical::physical_plan::KvCounterShape::Raw,
         })));
@@ -457,14 +544,14 @@ mod tests {
             key: b"k".to_vec(),
             expected: vec![],
             new_value: b"v".to_vec(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         })));
         assert!(is_stageable_write(&kv_plan(KvOp::GetSet {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             key: b"k".to_vec(),
             new_value: b"v".to_vec(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             rls_filters: Vec::new(),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         })));
@@ -472,7 +559,7 @@ mod tests {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             entries: vec![(b"k".to_vec(), b"v".to_vec())],
             ttl_ms: 0,
-            surrogates: vec![nodedb_types::Surrogate::ZERO],
+            surrogates: vec![nodedb_types::Surrogate::new(1)],
             returning: None,
             rls_filters: Vec::new(),
         })));
@@ -487,7 +574,7 @@ mod tests {
                 key: b"k".to_vec(),
                 delta: 1,
                 ttl_ms: 0,
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new(1),
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 shape: nodedb_physical::physical_plan::KvCounterShape::Raw,
             },
@@ -495,7 +582,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: b"k".to_vec(),
                 delta: "1".into(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new(1),
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 shape: nodedb_physical::physical_plan::KvCounterShape::Raw,
             },
@@ -504,14 +591,14 @@ mod tests {
                 key: b"k".to_vec(),
                 expected: vec![],
                 new_value: b"v".to_vec(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new(1),
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             },
             KvOp::GetSet {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: b"k".to_vec(),
                 new_value: b"v".to_vec(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new(1),
                 rls_filters: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             },
@@ -532,7 +619,7 @@ mod tests {
             key: b"k".to_vec(),
             value: Vec::new(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -550,7 +637,7 @@ mod tests {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             entries: vec![(b"k".to_vec(), b"v".to_vec())],
             ttl_ms: 0,
-            surrogates: vec![nodedb_types::Surrogate::ZERO],
+            surrogates: vec![nodedb_types::Surrogate::new(1)],
             returning: None,
             rls_filters: Vec::new(),
         };
@@ -569,6 +656,7 @@ mod tests {
             cells_msgpack: Vec::new(),
             wal_lsn: 0,
             provenance: None,
+            vshard_id: 0,
         });
         assert!(is_stageable_write(&put));
         assert!(!is_point_write(&put));
@@ -584,6 +672,7 @@ mod tests {
             coords_msgpack: Vec::new(),
             wal_lsn: 0,
             provenance: None,
+            vshard_id: 0,
         });
         assert!(is_stageable_write(&delete));
         assert_eq!(
@@ -604,7 +693,7 @@ mod tests {
         PhysicalPlan::Vector(VectorOp::DirectUpsert {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "v"),
             field: "vec".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             pk_bytes: b"r1".to_vec(),
             vector: vec![1.0, 0.0],
             payload: Vec::new(),
@@ -623,7 +712,7 @@ mod tests {
         let insert = PhysicalPlan::Vector(VectorOp::DirectInsert {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "v"),
             field: "vec".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             pk_bytes: b"r1".to_vec(),
             vector: vec![1.0, 0.0],
             payload: Vec::new(),
@@ -645,7 +734,7 @@ mod tests {
         let if_absent = PhysicalPlan::Vector(VectorOp::DirectInsertIfAbsent {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "v"),
             field: "vec".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             pk_bytes: b"r1".to_vec(),
             vector: vec![1.0, 0.0],
             payload: Vec::new(),
@@ -819,6 +908,23 @@ mod tests {
     }
 
     #[test]
+    fn a_balance_move_stages_as_an_update() {
+        let plan = PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
+            document_id: "a1".into(),
+            surrogate: nodedb_types::Surrogate::new(1),
+            column: "balance".into(),
+            delta: "5".into(),
+            join_column: "id".into(),
+            join_value: "a1".into(),
+            declared_primary_key: None,
+        });
+        assert!(is_stageable_write(&plan));
+        assert_eq!(stageable_write_shape(&plan), Some(StagedWriteShape::Update));
+        assert!(!is_point_write(&plan));
+    }
+
+    #[test]
     fn document_truncate_stages_as_truncate_with_a_bare_tag() {
         let plan = PhysicalPlan::Document(DocumentOp::Truncate {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
@@ -930,7 +1036,7 @@ mod tests {
         let plan = PhysicalPlan::Crdt(CrdtOp::DocDelete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
             document_id: "a".into(),
-            surrogate: nodedb_types::Surrogate(7),
+            surrogate: Some(nodedb_types::Surrogate(7)),
             returning: None,
             rls_filters: Vec::new(),
         });

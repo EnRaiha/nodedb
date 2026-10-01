@@ -6,14 +6,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use nodedb_types::backup_envelope::{
-    DatabaseDataSection, Envelope, SECTION_ORIGIN_CATALOG_ROWS, SECTION_ORIGIN_DATABASES,
-    SECTION_ORIGIN_SOURCE_TOMBSTONES, SECTION_ORIGIN_SURROGATE_PK, Section, SourceTombstoneEntry,
-    StoredCollectionBlob, SurrogateBindBlob,
+    DatabaseDataSection, Envelope, SECTION_ORIGIN_ARRAY_CATALOG, SECTION_ORIGIN_CATALOG_ROWS,
+    SECTION_ORIGIN_DATABASES, SECTION_ORIGIN_SOURCE_TOMBSTONES, SECTION_ORIGIN_SURROGATE_PK,
+    SECTION_ORIGIN_VERIFICATION, Section, SourceTombstoneEntry, StoredCollectionBlob,
+    SurrogateBindBlob,
 };
 
 use crate::Error;
 use crate::control::catalog_entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::security::catalog::StoredCollection;
 use crate::control::state::SharedState;
 use crate::types::{SurrogateBindEntry, TenantDataSnapshot};
@@ -70,7 +71,10 @@ pub(super) fn merge_sections(
 
 /// Concatenate every section of `snap` onto `into`. Each source node holds
 /// disjoint vShards, so the sections never overlap.
-fn append_snapshot(into: &mut TenantDataSnapshot, snap: TenantDataSnapshot) {
+pub(in crate::control::backup) fn append_snapshot(
+    into: &mut TenantDataSnapshot,
+    snap: TenantDataSnapshot,
+) {
     // Destructure exhaustively so a new field fails to compile here rather
     // than being dropped from the restore.
     let TenantDataSnapshot {
@@ -89,10 +93,34 @@ fn append_snapshot(into: &mut TenantDataSnapshot, snap: TenantDataSnapshot) {
         surrogate_pk,
         tenant_edges,
         group_write_marks,
+        group_proposal_keys,
+        group_proposal_keys_complete_from,
         documents_versioned,
         indexes_versioned,
+        vector_multi_documents,
+        arrays,
+        metadata_floor,
+        // A backup carries no cut: it serves Raft installs only.
+        group_cut_index: _,
+        // A backup carries no lane state: the destination fires and
+        // delivers its own writes.
+        group_event_lane: _,
+        // A backup carries no Calvin cut: the restore re-applies its rows
+        // as new writes on the destination.
+        group_calvin: _,
+        // A backup carries visible edge versions only. The restore re-applies
+        // them at its own ordinal, so the source's cuts, hidden versions and
+        // applied ordinals never reach the destination.
+        edge_hidden: _,
+        edge_cuts: _,
+        edge_applied: _,
+        tenant_edge_cuts: _,
+        tenant_edge_applied: _,
     } = snap;
     into.documents.extend(documents);
+    // Several nodes can list one index's members; the re-issue reads the
+    // union.
+    into.vector_multi_documents.extend(vector_multi_documents);
     into.indexes.extend(indexes);
     into.documents_versioned.extend(documents_versioned);
     into.indexes_versioned.extend(indexes_versioned);
@@ -109,18 +137,28 @@ fn append_snapshot(into: &mut TenantDataSnapshot, snap: TenantDataSnapshot) {
     into.flushed_ts_segments.extend(flushed_ts_segments);
     into.columnar_engines.extend(columnar_engines);
     into.surrogate_pk.extend(surrogate_pk);
+    into.arrays.extend(arrays);
     into.tenant_edges.extend(tenant_edges);
     // A backup carries no marks: the guard reads the destination's marks.
     into.group_write_marks.extend(group_write_marks);
+    // A backup carries no proposal keys: they serve Raft installs only.
+    into.group_proposal_keys.extend(group_proposal_keys);
+    into.group_proposal_keys_complete_from = into
+        .group_proposal_keys_complete_from
+        .max(group_proposal_keys_complete_from);
+    // A backup carries no floor: it serves Raft installs only.
+    into.metadata_floor = into.metadata_floor.max(metadata_floor);
 }
 
 pub(super) fn is_metadata_section(section: &Section) -> bool {
     matches!(
         section.origin_node_id,
         SECTION_ORIGIN_CATALOG_ROWS
+            | SECTION_ORIGIN_ARRAY_CATALOG
             | SECTION_ORIGIN_SOURCE_TOMBSTONES
             | SECTION_ORIGIN_SURROGATE_PK
             | SECTION_ORIGIN_DATABASES
+            | SECTION_ORIGIN_VERIFICATION
     )
 }
 
@@ -138,15 +176,14 @@ pub(super) fn is_metadata_section(section: &Section) -> bool {
 /// Returns every collection written to the catalog, in section order. The
 /// caller registers each one with this node's Data Plane before any restored
 /// row is installed or reissued: a catalog row alone leaves `doc_configs`
-/// without the collection's declaration, and a reissued timeseries row would
-/// then be ingested into an inferred shape.
-pub(super) fn apply_metadata_sections(
+/// without the collection's declaration, and a reissued timeseries row
+/// is then ingested into an inferred shape.
+pub(super) async fn apply_metadata_sections(
     state: &Arc<SharedState>,
     tenant_id: u64,
     env: &Envelope,
     databases: &DatabaseMap,
 ) -> Result<Vec<StoredCollection>, Error> {
-    let catalog = state.credentials.catalog();
     let mut restored: Vec<StoredCollection> = Vec::new();
 
     for section in &env.sections {
@@ -168,22 +205,15 @@ pub(super) fn apply_metadata_sections(
                             }
                         })?;
                     coll.database_id = databases.target(blob.database_id)?.dest;
-                    // Propose the collection through the metadata Raft
-                    // group so every node's applier (`catalog_entry::
-                    // apply::collection::put`) writes the row — mirroring
-                    // CREATE COLLECTION and DROP COLLECTION. The proposer
-                    // blocks on its local applied-index watcher, so on the
-                    // cluster path it has already applied the put via the
-                    // same applier — we must NOT also put locally (double-put).
+                    // The source cluster's incarnation names nothing here: an
+                    // existing collection keeps its own, a new one gets one.
+                    coll.incarnation = nodedb_types::Hlc::ZERO;
+                    // Propose the collection so every node's applier
+                    // (`catalog_entry::apply::collection::put`) writes the
+                    // row — mirroring CREATE COLLECTION and DROP COLLECTION.
+                    // The proposer returns once this node applied it.
                     let entry = CatalogEntry::PutCollection(Box::new(coll.clone()));
-                    if propose_catalog_entry(state, &entry)?.needs_local_apply() {
-                        // Single-node / no-cluster fallback: apply the
-                        // catalog mutation directly, matching what the
-                        // applier would have done on a clustered deployment.
-                        // A failure here is FATAL — the collection would be
-                        // unqueryable otherwise.
-                        catalog.put_collection(coll.database_id, &coll)?;
-                    }
+                    propose_catalog_entry_async(state, &entry).await?;
                     restored.push(coll);
                 }
             }
@@ -205,18 +235,7 @@ pub(super) fn apply_metadata_sections(
                         collection: t.collection.clone(),
                         purge_lsn: t.purge_lsn,
                     };
-                    if propose_catalog_entry(state, &entry)?.needs_local_apply() {
-                        // Single-node / no-cluster fallback: apply directly,
-                        // matching the applier. A failure here is FATAL — a
-                        // silently-skipped tombstone means purged writes resurrect
-                        // on restart.
-                        catalog.record_wal_tombstone(
-                            database_id,
-                            tenant_id,
-                            &t.collection,
-                            t.purge_lsn,
-                        )?;
-                    }
+                    propose_catalog_entry_async(state, &entry).await?;
                 }
             }
             _ => {}

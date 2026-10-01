@@ -19,6 +19,33 @@ const FIRST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 /// Longest wait between two re-proposals.
 const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// Stamp this node's metadata floor on `entry`: the catalog the write was
+/// planned against, including the batch being applied now (see
+/// `AppliedIndexWatcher::floor`). Every replica applies the entry only once
+/// its own metadata apply reached this index. Every proposal of a
+/// user-collection write stamps it before encoding.
+pub(crate) fn stamp_metadata_floor(state: &SharedState, entry: &mut ReplicatedEntry) {
+    entry.metadata_floor = state
+        .applied_index_watcher(nodedb_cluster::METADATA_GROUP_ID)
+        .floor();
+}
+
+/// Stamp the incarnation this node's catalog holds for each collection
+/// `entry` names. A collection with no catalog row stays `Hlc::ZERO`, and a
+/// replica applies its write by key alone.
+pub(crate) fn stamp_collection_incarnations(
+    state: &SharedState,
+    entry: &mut ReplicatedEntry,
+) -> crate::Result<()> {
+    let catalog = state.credentials.catalog();
+    let database_id = crate::types::DatabaseId::new(entry.database_id);
+    for named in &mut entry.incarnations {
+        named.incarnation =
+            catalog.incarnation_of(database_id, entry.tenant_id, &named.collection)?;
+    }
+    Ok(())
+}
+
 /// Propose `entry` via `proposer` and return the Data Plane apply payload bytes
 /// together with the write's per-collection version (as an
 /// [`crate::types::Lsn`]): the written collection's `coll_write_lsn` after the
@@ -26,6 +53,10 @@ const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 /// entry's redo record. `Lsn::ZERO` when the write's plan names no single user
 /// collection. See [`AsyncRaftProposer`] for why this is a WAL LSN and never the
 /// Raft log index.
+///
+/// An edge write is not proposed. It runs as a Calvin transaction
+/// (`planner::calvin::edge_sequencing`), and its applied payload and read
+/// version come back the same way.
 ///
 /// Re-proposes the same payload until the statement deadline while the group
 /// has no leader to take it:
@@ -43,16 +74,21 @@ pub(crate) async fn propose_replicated_entry(
     proposer: &Arc<AsyncRaftProposer>,
     mut entry: ReplicatedEntry,
 ) -> crate::Result<(Vec<u8>, crate::types::Lsn)> {
+    // An edge write runs as a Calvin transaction, never as a data-group
+    // entry, so every edge version of a collection takes a Calvin ordinal.
+    if let Some(response) =
+        crate::control::planner::calvin::sequence_replicated_edge_write(state, &entry).await?
+    {
+        return Ok((response.payload.to_vec(), response.read_version_lsn));
+    }
     // The write's commit instant. Stamped once, before the first propose, so
     // every re-proposal and every replica's apply carries the same value.
     entry.write_hlc = state.hlc_clock.now().wall_ns;
-    // The catalog this write was planned against: every replica applies it
-    // only once its own metadata apply reached this index.
-    entry.metadata_floor = state
-        .applied_index_watcher(nodedb_cluster::METADATA_GROUP_ID)
-        .current();
+    stamp_metadata_floor(state, &mut entry);
+    crate::control::array_catalog::cell_route::stamp_incarnation(state, &mut entry);
+    stamp_collection_incarnations(state, &mut entry)?;
     let idempotency_key = entry.idempotency_key;
-    let data = entry.to_bytes();
+    let data = entry.encode()?;
     let vshard_id = entry.vshard_id;
 
     // The statement deadline. Every attempt, and each attempt's wait for the

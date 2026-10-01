@@ -9,6 +9,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -175,7 +176,19 @@ impl RespListener {
 }
 
 /// Handle a single RESP connection.
-async fn handle_connection(
+///
+/// The connection future is boxed, once per connection. Every command path
+/// nests inside it, and unboxed it can overflow the compiler's layout depth
+/// limit in the listener's connection task.
+fn handle_connection(
+    stream: ConnStream,
+    peer: SocketAddr,
+    state: &SharedState,
+) -> BoxFuture<'_, crate::Result<()>> {
+    Box::pin(serve_connection(stream, peer, state))
+}
+
+async fn serve_connection(
     mut stream: ConnStream,
     peer: SocketAddr,
     state: &SharedState,

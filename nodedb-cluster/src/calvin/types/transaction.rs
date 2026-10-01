@@ -2,104 +2,18 @@
 
 //! Calvin transaction class types.
 //!
-//! Provides [`ReadWriteSet`] and [`TxClass`] — the core transaction
-//! representation submitted to the sequencer.
+//! Provides [`TxClass`] — the core transaction representation submitted to
+//! the sequencer — over the [`ReadWriteSet`] key sets.
 
 use nodedb_types::TenantId;
-use nodedb_types::id::{CollectionKey, DatabaseId, VShardId};
+use nodedb_types::id::{DatabaseId, VShardId};
 use serde::{Deserialize, Serialize};
 
 use crate::error::CalvinError;
 
 use super::lock_wire::TxnIdWire;
-use super::primitives::{DependentReadSpec, EngineKeySet, VersionedReadSet};
-
-// ── ReadWriteSet ──────────────────────────────────────────────────────────────
-
-/// A set of keys spanning one or more engines, forming either the read set
-/// or the write set of a Calvin transaction.
-///
-/// Cross-engine atomic transactions — e.g. a Document+Vector insert that must
-/// land atomically — require all affected engines to appear in a single
-/// `ReadWriteSet`. Decomposing by engine would break atomicity.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    zerompk::ToMessagePack,
-    zerompk::FromMessagePack,
-)]
-pub struct ReadWriteSet(pub Vec<EngineKeySet>);
-
-impl ReadWriteSet {
-    pub fn new(sets: Vec<EngineKeySet>) -> Self {
-        Self(sets)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.iter().all(|s| s.is_empty())
-    }
-
-    /// Derive the set of vShards participating in this read/write set.
-    ///
-    /// For Document/Vector/KV entries the vshard is derived from the
-    /// collection name (collection-level routing, consistent with the
-    /// per-vshard Raft groups that own each collection). KV collections
-    /// are also assigned a single vshard at creation time.
-    ///
-    /// For Edge entries the participating vShards are the edge's
-    /// `home_vshards` (the `from_key(src)` / `from_key(dst)` key-hashed
-    /// homes), NOT the collection name: a graph edge is dual-homed across
-    /// its two endpoint vShards so it can be written atomically to both.
-    ///
-    /// This derivation is re-run on decode rather than serialized, so the
-    /// serialized bytes remain deterministic regardless of how `VShardId`
-    /// is computed.
-    pub fn participating_vshards(&self) -> Result<Vec<VShardId>, CalvinError> {
-        self.participating_vshards_in_database(DatabaseId::DEFAULT)
-    }
-
-    /// Derive participants using database-scoped collection homes.
-    ///
-    /// Key-set collection names are database-qualified, because the Data
-    /// Plane reads storage by them. Each one is de-qualified into a
-    /// [`CollectionKey`] before hashing, so the participant set matches the
-    /// vShard every other path homes the collection to.
-    pub fn participating_vshards_in_database(
-        &self,
-        database_id: DatabaseId,
-    ) -> Result<Vec<VShardId>, CalvinError> {
-        let mut seen = std::collections::HashSet::new();
-        let mut result = Vec::new();
-        for engine_set in &self.0 {
-            match engine_set {
-                EngineKeySet::Edge { home_vshards, .. } => {
-                    for &home in home_vshards.as_slice() {
-                        let vshard = VShardId::new(home);
-                        if seen.insert(vshard.as_u32()) {
-                            result.push(vshard);
-                        }
-                    }
-                }
-                EngineKeySet::Document { .. }
-                | EngineKeySet::Vector { .. }
-                | EngineKeySet::Kv { .. } => {
-                    let vshard =
-                        CollectionKey::from_qualified_str(database_id, engine_set.collection())?
-                            .vshard();
-                    if seen.insert(vshard.as_u32()) {
-                        result.push(vshard);
-                    }
-                }
-            }
-        }
-        result.sort_by_key(|v| v.as_u32());
-        Ok(result)
-    }
-}
+use super::primitives::{DependentReadSpec, VersionedReadSet};
+use super::read_write_set::ReadWriteSet;
 
 // ── TxClass ───────────────────────────────────────────────────────────────────
 
@@ -174,6 +88,64 @@ pub struct TxClass {
     #[serde(default)]
     #[msgpack(default)]
     pub lock_owner: Option<TxnIdWire>,
+    /// The metadata-group index the coordinator had applied when it planned
+    /// the transaction. Every replica's scheduler runs the transaction only
+    /// once its own metadata apply reached this index, so it never writes a
+    /// collection this node has not registered yet. `0` holds nothing.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub metadata_floor: u64,
+    /// WAL event-source code every participant stamps on the transaction's
+    /// writes, so a server-run body's writes fire no triggers. `0` is the
+    /// client default.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub event_source: u8,
+    /// Indexes into `plans` of the plans a trigger body buffered. Every
+    /// participant commits their rows under the trigger source, so they fire
+    /// no trigger. Empty for a transaction no body joined.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub body_plans: Vec<u32>,
+    /// Opaque msgpack-encoded `PUBLISH TO` messages the transaction's trigger
+    /// bodies sent, decoded by the `nodedb` crate. The participant named by
+    /// [`TxClass::publish_vshard`] commits them in its redo record. Empty for
+    /// a transaction that published nothing.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub publishes: Vec<u8>,
+    /// Opaque msgpack-encoded dedup key of the cross-shard trigger request
+    /// the transaction applies, decoded by the `nodedb` crate. The participant
+    /// named by [`TxClass::applied_key_home`] writes it into its redo record,
+    /// so the key is durable exactly when the request's writes are. Empty
+    /// for every other transaction.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub applied_key: Vec<u8>,
+    /// The vShard the cross-shard request addresses.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub applied_key_vshard: u32,
+    /// Every user collection the plans name, with the incarnation the
+    /// coordinator's catalog held when it planned the transaction. A
+    /// participant whose catalog no longer holds one votes abort, so the
+    /// transaction never lands in a same-name recreate.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub incarnations: Vec<CalvinIncarnation>,
+    /// The plan manifest when the plans travel as parts (see
+    /// [`super::multi_part`]). `plans` is empty then. `None` for a
+    /// transaction whose plans ride its own sequencer entry.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub multi_part: Option<super::multi_part::MultiPartPlans>,
+    /// The RESTORE that re-issues the transaction's writes. Every participant
+    /// raises the tenant's restore mark under it instead of the user write
+    /// mark, so a retry of the same RESTORE finds only its own marks. `0` for
+    /// every other transaction.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub restore_id: u64,
     /// Cached participating-vshard set. Re-derived on decode; not serialized.
     #[serde(skip)]
     #[msgpack(ignore)]
@@ -227,7 +199,7 @@ impl TxClass {
         dependent_reads: Option<DependentReadSpec>,
         versioned_reads: VersionedReadSet,
     ) -> Result<Self, CalvinError> {
-        Self::new_checked(
+        Self::unchecked(
             read_set,
             write_set,
             plans,
@@ -235,8 +207,8 @@ impl TxClass {
             database_id,
             dependent_reads,
             versioned_reads,
-            false,
         )
+        .checked(false)
     }
 
     /// Construct a validated transaction class that is permitted to resolve to a
@@ -284,7 +256,7 @@ impl TxClass {
         dependent_reads: Option<DependentReadSpec>,
         versioned_reads: VersionedReadSet,
     ) -> Result<Self, CalvinError> {
-        Self::new_checked(
+        Self::unchecked(
             read_set,
             write_set,
             plans,
@@ -292,15 +264,12 @@ impl TxClass {
             database_id,
             dependent_reads,
             versioned_reads,
-            true,
         )
+        .checked(true)
     }
 
-    /// Shared construction body. `allow_single_vshard` relaxes the participant
-    /// floor from 2 (multi-vshard) to 1 (single-vshard opt-in); an empty write
-    /// set and a zero-participant write set are rejected on both paths.
-    #[allow(clippy::too_many_arguments)] // shared validation for both constructor modes
-    fn new_checked(
+    /// The class the constructors validate, with no participants derived yet.
+    fn unchecked(
         read_set: ReadWriteSet,
         write_set: ReadWriteSet,
         plans: Vec<u8>,
@@ -308,55 +277,8 @@ impl TxClass {
         database_id: DatabaseId,
         dependent_reads: Option<DependentReadSpec>,
         versioned_reads: VersionedReadSet,
-        allow_single_vshard: bool,
-    ) -> Result<Self, CalvinError> {
-        if write_set.is_empty() {
-            return Err(CalvinError::EmptyWriteSet);
-        }
-        let mut participating_vshards = write_set.participating_vshards_in_database(database_id)?;
-        let min_participants = if allow_single_vshard { 1 } else { 2 };
-        // The participant FLOOR is computed from the WRITE set ONLY, and BEFORE
-        // the read-set union below: a txn that writes a single shard but reads N
-        // additional shards is a legitimate single-write-shard txn and must not
-        // trip the `>= 2` floor.
-        if participating_vshards.len() < min_participants {
-            let vshard = participating_vshards
-                .first()
-                .map(|v| v.as_u32())
-                .unwrap_or(0);
-            return Err(CalvinError::SingleVshardTxn { vshard });
-        }
-        // Union the read set's participating vShards: a shard that is only READ
-        // (never written) still participates so it can validate the read at the
-        // commit serialization point. This union MUST be applied identically in
-        // `new_checked` and `restore_derived` — `participating_vshards` is
-        // `#[serde(skip)]` and re-derived on decode, so an encoded and a decoded
-        // `TxClass` would disagree on their participant set if the two diverged.
-        for v in read_set.participating_vshards_in_database(database_id)? {
-            if !participating_vshards
-                .iter()
-                .any(|e| e.as_u32() == v.as_u32())
-            {
-                participating_vshards.push(v);
-            }
-        }
-        // Extend participating_vshards with passive vshards from dependent_reads.
-        if let Some(ref spec) = dependent_reads {
-            for &passive_vshard in spec.passive_reads.keys() {
-                let v = VShardId::new(passive_vshard);
-                if !participating_vshards
-                    .iter()
-                    .any(|e| e.as_u32() == passive_vshard)
-                {
-                    participating_vshards.push(v);
-                }
-            }
-        }
-        // Stable ordering across encode/decode (participants ride the Raft log):
-        // one final sort after ALL unions (write floor + read + passive), kept in
-        // lockstep with `restore_derived`.
-        participating_vshards.sort_by_key(|v| v.as_u32());
-        Ok(Self {
+    ) -> Self {
+        Self {
             read_set,
             write_set,
             plans,
@@ -365,8 +287,64 @@ impl TxClass {
             dependent_reads,
             versioned_reads,
             lock_owner: None,
-            participating_vshards,
-        })
+            metadata_floor: 0,
+            event_source: 0,
+            body_plans: Vec::new(),
+            publishes: Vec::new(),
+            applied_key: Vec::new(),
+            applied_key_vshard: 0,
+            incarnations: Vec::new(),
+            multi_part: None,
+            restore_id: 0,
+            participating_vshards: Vec::new(),
+        }
+    }
+
+    /// Shared construction body. `allow_single_vshard` relaxes the participant
+    /// floor from 2 (multi-vshard) to 1 (single-vshard opt-in); an empty write
+    /// set and a zero-participant write set are rejected on both paths.
+    fn checked(mut self, allow_single_vshard: bool) -> Result<Self, CalvinError> {
+        if self.write_set.is_empty() {
+            return Err(CalvinError::EmptyWriteSet);
+        }
+        let write_vshards = self
+            .write_set
+            .participating_vshards_in_database(self.database_id)?;
+        let min_participants = if allow_single_vshard { 1 } else { 2 };
+        // The participant FLOOR is computed from the WRITE set ONLY, and BEFORE
+        // the read-set union: a txn that writes a single shard but reads N
+        // additional shards is a legitimate single-write-shard txn and must not
+        // trip the `>= 2` floor.
+        if write_vshards.len() < min_participants {
+            let vshard = write_vshards.first().map(|v| v.as_u32()).unwrap_or(0);
+            return Err(CalvinError::SingleVshardTxn { vshard });
+        }
+        self.participating_vshards = self.union_participants(write_vshards)?;
+        Ok(self)
+    }
+
+    /// `write_vshards` joined with the read set's vShards and the passive
+    /// dependent-read vShards, sorted by id and deduplicated.
+    ///
+    /// A shard that is only READ still participates, so it can validate the
+    /// read at the commit serialization point. `participating_vshards` is
+    /// `#[serde(skip)]` and re-derived on decode, so construction and
+    /// [`Self::restore_derived`] both derive it here. No caller reads the
+    /// unsorted order. The sorted order is stable across encode and decode.
+    fn union_participants(
+        &self,
+        mut participants: Vec<VShardId>,
+    ) -> Result<Vec<VShardId>, CalvinError> {
+        participants.extend(
+            self.read_set
+                .participating_vshards_in_database(self.database_id)?,
+        );
+        if let Some(spec) = &self.dependent_reads {
+            participants.extend(spec.passive_reads.keys().map(|&v| VShardId::new(v)));
+        }
+        participants.sort_unstable_by_key(|v| v.as_u32());
+        participants.dedup_by_key(|v| v.as_u32());
+        Ok(participants)
     }
 
     /// Ergonomic constructor for dependent-read Calvin transactions.
@@ -407,30 +385,10 @@ impl TxClass {
     /// class, so a failure here means the decoded bytes are not a class any
     /// constructor built.
     pub fn restore_derived(&mut self) -> Result<(), CalvinError> {
-        let mut vshards = self
+        let write_vshards = self
             .write_set
             .participating_vshards_in_database(self.database_id)?;
-        // Union the read set's participating vShards — MUST match `new_checked`'s
-        // union exactly so a decoded `TxClass` derives the identical participant
-        // set the encoder computed (participants are not serialized).
-        for v in self
-            .read_set
-            .participating_vshards_in_database(self.database_id)?
-        {
-            if !vshards.iter().any(|e| e.as_u32() == v.as_u32()) {
-                vshards.push(v);
-            }
-        }
-        if let Some(ref spec) = self.dependent_reads {
-            for &passive_vshard in spec.passive_reads.keys() {
-                if !vshards.iter().any(|e| e.as_u32() == passive_vshard) {
-                    vshards.push(VShardId::new(passive_vshard));
-                }
-            }
-        }
-        // Final stable sort after all unions — lockstep with `new_checked`.
-        vshards.sort_by_key(|v| v.as_u32());
-        self.participating_vshards = vshards;
+        self.participating_vshards = self.union_participants(write_vshards)?;
         Ok(())
     }
 
@@ -438,14 +396,104 @@ impl TxClass {
     pub fn set_lock_owner(&mut self, owner: Option<TxnIdWire>) {
         self.lock_owner = owner;
     }
+
+    /// Set the WAL event-source code the transaction's writes carry.
+    pub fn set_event_source(&mut self, code: u8) {
+        self.event_source = code;
+    }
+
+    /// Mark the transaction as the re-issue of RESTORE `restore_id`.
+    pub fn set_restore_id(&mut self, restore_id: u64) {
+        self.restore_id = restore_id;
+    }
+
+    /// Set the indexes into `plans` of the plans a trigger body buffered.
+    pub fn set_body_plans(&mut self, body_plans: Vec<u32>) {
+        self.body_plans = body_plans;
+    }
+
+    /// Set the encoded messages the transaction's trigger bodies published.
+    pub fn set_publishes(&mut self, publishes: Vec<u8>) {
+        self.publishes = publishes;
+    }
+
+    /// The participant whose redo record carries the transaction's messages:
+    /// the lowest vShard the transaction writes. Every write participant
+    /// resolves a redo record, so this one always commits them. `None` when
+    /// the write set names no vShard.
+    ///
+    /// Fails when a write-set collection name lacks the qualifier of the
+    /// class's database. Construction rejects such a class.
+    pub fn publish_vshard(&self) -> Result<Option<u32>, CalvinError> {
+        Ok(self.write_vshards()?.into_iter().min())
+    }
+
+    /// Set the encoded dedup key of the cross-shard request the transaction
+    /// applies, and the vShard the request addresses.
+    pub fn set_applied_key(&mut self, applied_key: Vec<u8>, vshard: u32) {
+        self.applied_key = applied_key;
+        self.applied_key_vshard = vshard;
+    }
+
+    /// The participant whose redo record carries the applied key: the vShard
+    /// the request addresses when the transaction writes it, else the lowest
+    /// vShard it writes. `None` for a transaction with no applied key.
+    ///
+    /// Fails as [`Self::publish_vshard`] does.
+    pub fn applied_key_home(&self) -> Result<Option<u32>, CalvinError> {
+        if self.applied_key.is_empty() {
+            return Ok(None);
+        }
+        let writes = self.write_vshards()?;
+        if writes.contains(&self.applied_key_vshard) {
+            return Ok(Some(self.applied_key_vshard));
+        }
+        Ok(writes.into_iter().min())
+    }
+
+    /// Every vShard of the class's database the write set names.
+    fn write_vshards(&self) -> Result<Vec<u32>, CalvinError> {
+        Ok(self
+            .write_set
+            .participating_vshards_in_database(self.database_id)?
+            .into_iter()
+            .map(|vshard| vshard.as_u32())
+            .collect())
+    }
+
+    /// Set the collections the plans name, with their planned incarnations.
+    pub fn set_incarnations(&mut self, incarnations: Vec<CalvinIncarnation>) {
+        self.incarnations = incarnations;
+    }
+}
+
+/// A user collection a Calvin transaction names, and the incarnation its
+/// coordinator planned against.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct CalvinIncarnation {
+    /// The collection as the plans name it: database-qualified outside the
+    /// default database.
+    pub collection: String,
+    pub incarnation: nodedb_types::Hlc,
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::primitives::{
-        EngineTag, PassiveReadKey, ReadKeyIdent, SortedVec, VersionedReadEntry, VersionedReadSet,
+        EngineKeySet, EngineTag, PassiveReadKey, ReadKeyIdent, SortedVec, VersionedReadEntry,
+        VersionedReadSet,
     };
     use super::*;
+    use nodedb_types::id::CollectionKey;
     use nodedb_types::{KeyRepr, Lsn};
 
     fn doc_set(collection: &str, surrogates: Vec<u32>) -> EngineKeySet {
@@ -717,12 +765,16 @@ mod tests {
                 collection: "kv_col".to_owned(),
                 key: ReadKeyIdent::Point(KeyRepr::KvKey(Box::from(&b"k1"[..]))),
                 read_lsn: Lsn::new(7),
+                home_vshard: None,
+                served_by: 0,
             },
             VersionedReadEntry {
                 engine: EngineTag::Document,
                 collection: "doc_col".to_owned(),
                 key: ReadKeyIdent::Predicate,
                 read_lsn: Lsn::new(11),
+                home_vshard: None,
+                served_by: 0,
             },
         ])
     }
@@ -825,6 +877,131 @@ mod tests {
         assert_eq!(decoded.database_id, DatabaseId::DEFAULT);
         assert_eq!(decoded.plans, vec![0x01, 0x02]);
         assert_eq!(decoded.participating_vshards().len(), 2);
+        assert_eq!(decoded.metadata_floor, 0, "a legacy class holds nothing");
+        assert_eq!(decoded.event_source, 0, "a legacy class is a client's");
+        assert!(decoded.body_plans.is_empty());
+        assert!(decoded.publishes.is_empty());
+        assert_eq!(decoded.restore_id, 0, "a legacy class re-issues no RESTORE");
+    }
+
+    /// The event-source code survives the codec, so every participant stamps
+    /// the same source on the transaction's writes.
+    #[test]
+    fn event_source_roundtrips_through_the_codec() {
+        let mut tx = TxClass::new(
+            ReadWriteSet::new(vec![]),
+            two_home_write_set(),
+            vec![0x01],
+            TenantId::new(3),
+            None,
+            VersionedReadSet::default(),
+        )
+        .expect("valid TxClass");
+        assert_eq!(tx.event_source, 0);
+        tx.set_event_source(2);
+        tx.set_body_plans(vec![1]);
+        tx.set_restore_id(77);
+        let bytes = zerompk::to_msgpack_vec(&tx).expect("encode");
+        let decoded: TxClass = zerompk::from_msgpack(&bytes).expect("decode");
+        assert_eq!(decoded.event_source, 2);
+        assert_eq!(decoded.body_plans, vec![1]);
+        assert_eq!(
+            decoded.restore_id, 77,
+            "every participant raises the restore's mark"
+        );
+    }
+
+    /// The published messages survive the codec, and one participant, the
+    /// lowest write vShard, carries them.
+    #[test]
+    fn publishes_roundtrip_and_name_the_lowest_write_vshard() {
+        let mut tx = TxClass::new(
+            ReadWriteSet::new(vec![]),
+            two_home_write_set(),
+            vec![0x01],
+            TenantId::new(3),
+            None,
+            VersionedReadSet::default(),
+        )
+        .expect("valid TxClass");
+        assert!(tx.publishes.is_empty());
+        tx.set_publishes(vec![0x91, 0xa1, 0x61]);
+        let bytes = zerompk::to_msgpack_vec(&tx).expect("encode");
+        let mut decoded: TxClass = zerompk::from_msgpack(&bytes).expect("decode");
+        decoded.restore_derived().expect("restore derived");
+        assert_eq!(decoded.publishes, vec![0x91, 0xa1, 0x61]);
+        let lowest = decoded
+            .participating_vshards()
+            .iter()
+            .map(|vshard| vshard.as_u32())
+            .min();
+        assert!(lowest.is_some());
+        assert_eq!(decoded.publish_vshard(), Ok(lowest));
+    }
+
+    /// A class whose write set lacks its database's qualifier cannot name a
+    /// write vShard. Both homes report the error instead of `None`.
+    #[test]
+    fn redo_homes_report_an_underivable_write_set() {
+        let mut tx = make_tx_class(multi_vshard_write_set());
+        tx.set_applied_key(vec![0x80], 0);
+        // The bare document collection names carry no `9/` qualifier.
+        tx.database_id = DatabaseId::new(9);
+        assert!(tx.publish_vshard().is_err());
+        assert!(tx.applied_key_home().is_err());
+    }
+
+    /// The applied key rides the vShard its request addresses when the
+    /// transaction writes it, else the lowest write vShard.
+    #[test]
+    fn applied_key_home_prefers_the_addressed_vshard() {
+        let mut tx = TxClass::new(
+            ReadWriteSet::new(vec![]),
+            two_home_write_set(),
+            vec![0x01],
+            TenantId::new(3),
+            None,
+            VersionedReadSet::default(),
+        )
+        .expect("valid TxClass");
+        assert_eq!(tx.applied_key_home(), Ok(None), "no key, no home");
+        let mut homes: Vec<u32> = tx
+            .participating_vshards()
+            .iter()
+            .map(|vshard| vshard.as_u32())
+            .collect();
+        homes.sort_unstable();
+        let (lowest, highest) = (homes[0], homes[homes.len() - 1]);
+        tx.set_applied_key(vec![0x80], highest);
+        let bytes = zerompk::to_msgpack_vec(&tx).expect("encode");
+        let mut decoded: TxClass = zerompk::from_msgpack(&bytes).expect("decode");
+        decoded.restore_derived().expect("restore derived");
+        assert_eq!(decoded.applied_key, vec![0x80]);
+        assert_eq!(decoded.applied_key_home(), Ok(Some(highest)));
+        let unwritten = (0..u32::MAX)
+            .find(|vshard| !homes.contains(vshard))
+            .unwrap_or(u32::MAX);
+        decoded.set_applied_key(vec![0x80], unwritten);
+        assert_eq!(decoded.applied_key_home(), Ok(Some(lowest)));
+    }
+
+    /// The metadata floor survives the codec, so every replica waits for the
+    /// catalog the coordinator planned against.
+    #[test]
+    fn metadata_floor_roundtrips_through_the_codec() {
+        let mut tx = TxClass::new(
+            ReadWriteSet::new(vec![]),
+            two_home_write_set(),
+            vec![0x01],
+            TenantId::new(3),
+            None,
+            VersionedReadSet::default(),
+        )
+        .expect("valid TxClass");
+        tx.metadata_floor = 42;
+        let bytes = zerompk::to_msgpack_vec(&tx).expect("encode");
+        let decoded: TxClass = zerompk::from_msgpack(&bytes).expect("decode");
+        assert_eq!(decoded.metadata_floor, 42);
     }
 
     /// Find two distinct string keys whose `from_key` vShards differ.
@@ -1010,7 +1187,7 @@ mod tests {
         assert_eq!(
             tx.participating_vshards(),
             decoded.participating_vshards(),
-            "restore_derived must reproduce new_checked's read∪write participants"
+            "restore_derived must reproduce the constructor's read∪write participants"
         );
     }
 

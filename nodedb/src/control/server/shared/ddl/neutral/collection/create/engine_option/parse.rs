@@ -4,9 +4,7 @@
 //! engine-name suggestions for the deprecated `TYPE <keyword>` axis.
 //!
 //! `parse_engine_option` has no production caller today (the typed-AST path
-//! uses `validate_engine_name` instead) — it is kept, with its test suite,
-//! exactly as it was on the pgwire side; only the error envelope changed from
-//! `PgWireResult` to `Result<_, DdlError>`.
+//! uses `validate_engine_name` instead). Errors use `Result<_, DdlError>`.
 
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 

@@ -5,11 +5,8 @@
 //! SQL type mapping, identifier validation, parameter parsing, and
 //! utility functions used by both CREATE and DROP handlers.
 //!
-//! Ported verbatim from the pgwire `ddl::function::parse` helpers; only the
-//! error type changed from pgwire `PgWireError` to the protocol-neutral
-//! [`DdlError`]. `find_matching_paren` is inlined here (the pgwire helper
-//! delegated to the pgwire-private `ddl::parse_utils`) to keep this family
-//! self-contained.
+//! Parse errors are the protocol-neutral [`DdlError`]. `find_matching_paren`
+//! is inlined here to keep this family self-contained.
 
 use arrow::datatypes::DataType;
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;

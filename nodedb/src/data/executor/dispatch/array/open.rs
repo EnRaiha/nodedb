@@ -68,6 +68,8 @@ impl CoreLoop {
                     prefix_bits,
                     audit_retain_ms: None,
                     minimum_audit_retain_ms: None,
+                    modification_hlc: nodedb_types::Hlc::ZERO,
+                    incarnation: nodedb_types::Hlc::ZERO,
                 };
                 let mut cat = match self.array_catalog.write() {
                     Ok(guard) => guard,
@@ -108,12 +110,10 @@ impl CoreLoop {
             }
         };
 
-        // CREATE authorization requires that neither durable nor in-memory
-        // catalog contained this identity before its transition was installed.
-        // Therefore a deterministic tombstone here can only be the unpurged
-        // residue of an already-finalized prior DROP; remove it before opening
-        // the replacement store. An incomplete DROP still has catalog state
-        // and is rejected by `apply_authorized_ddl` before it can dispatch.
+        // A `PutArray` is proposed only for an identity the committed catalog
+        // lacks, and its `DeleteArray` removed the row before staging the
+        // drop. A tombstone here is therefore the unpurged residue of a prior
+        // incarnation; remove it before opening the replacement store.
         if let Err(e) = self.array_engine.purge_finalized_drop_before_open(array_id) {
             return self.response_error(
                 task,

@@ -124,10 +124,8 @@ impl MetadataCache {
             }
             // Drain state is host-side (lives in
             // `nodedb::control::lease::DescriptorDrainTracker`);
-            // the cluster-side cache only tracks lease state
-            // directly. These no-op arms keep the exhaustive
-            // match coverage so adding new variants is a
-            // compile-time error here too.
+            // the cluster-side cache only folds the drain expiry into
+            // `last_applied_hlc`.
             MetadataEntry::DescriptorDrainStart { expires_at, .. } => {
                 if *expires_at > self.last_applied_hlc {
                     self.last_applied_hlc = *expires_at;
@@ -135,7 +133,7 @@ impl MetadataCache {
             }
             MetadataEntry::DescriptorDrainEnd { .. } => {}
             MetadataEntry::DdlPrepareAcquire { .. } | MetadataEntry::DdlPrepareRelease { .. } => {
-                // Host-side ephemeral coordination state; replay rebuilds it.
+                // Host-side state: the production applier persists the owner.
             }
             MetadataEntry::DdlPrepared { .. } => {
                 // The host-side applier unwraps and fences this entry. The cache
@@ -144,10 +142,9 @@ impl MetadataCache {
             MetadataEntry::DdlPendingPropose { .. }
             | MetadataEntry::DdlPendingFinalize { .. }
             | MetadataEntry::DdlPendingCancel { .. } => {
-                // Host-side only: the production applier owns the pending-DDL
-                // table (`nodedb::control::pending_ddl::PendingDdlTable`),
-                // rebuilt entirely by replay. The cluster cache has no state
-                // to track beyond `applied_index`.
+                // Host-side only: the production applier owns and persists
+                // the pending-DDL table. The cluster cache has no state to
+                // track beyond `applied_index`.
             }
             MetadataEntry::CaTrustChange { .. } => {
                 // CA trust mutations are host-side only: the production
@@ -181,6 +178,12 @@ impl MetadataCache {
             }
             MetadataEntry::EnrollmentPreauthorization { .. }
             | MetadataEntry::EnrollmentPreauthorizationRevoke { .. } => {}
+            // Host-side only: the production applier advances the database
+            // high-watermark and hands the id to the requesting node.
+            MetadataEntry::DatabaseIdReserve { .. } => {}
+            // Host-side only: the production applier records the point and
+            // cuts every group this node hosts.
+            MetadataEntry::RestorePoint { .. } => {}
             MetadataEntry::JoinTokenTransition { .. } => {
                 // Token lifecycle transitions are enforced by the bootstrap-
                 // listener handler at apply time. The cluster cache records
@@ -198,6 +201,8 @@ impl MetadataCache {
             // has no migration state to track beyond applied_index.
             MetadataEntry::MigrationCheckpoint { .. } => {}
             MetadataEntry::MigrationAbort { .. } => {}
+            // Advances the archive frontier only.
+            MetadataEntry::ArchiveMark => {}
         }
     }
 }
@@ -295,6 +300,8 @@ fn apply_compensation(
             rt.remove_group_member(*group_id, *peer_id);
         }
         Compensation::RestoreLeaderHint { group_id, peer_id } => {
+            // The compensation carries no term. It never replaces a hint a
+            // Raft observation or redirect wrote since.
             rt.set_leader(*group_id, *peer_id);
         }
         Compensation::RemoveGhostStub { vshard_id: _ } => {

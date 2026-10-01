@@ -18,6 +18,7 @@ use crate::control::shutdown::ShutdownReceiver;
 use crate::control::state::SharedState;
 
 use super::coverage::confirmed_coverage;
+use super::holder::RenewAttempt;
 use super::leadership::{metadata_leader, send_to_leader};
 use super::timing::LeaseTiming;
 
@@ -51,13 +52,25 @@ async fn renew_round(state: &SharedState, timing: LeaseTiming, confirmed: &mut V
         }
         Err(error) => {
             tracing::warn!(%error, "authorization lease: coverage could not be computed");
+            record(
+                state,
+                RenewAttempt::CoverageFailed {
+                    error: error.to_string(),
+                },
+            );
         }
     }
+}
+
+/// Record how this round ended, so a refusal to plan can name it.
+fn record(state: &SharedState, attempt: RenewAttempt) {
+    state.authorization_fence.holder().record_attempt(attempt);
 }
 
 /// Send one renewal and install a granted lease.
 async fn renew_once(state: &SharedState, timing: LeaseTiming, coverage: &[GroupCoverage]) {
     let Some((leader_id, _)) = metadata_leader(state).filter(|(leader, _)| *leader != 0) else {
+        record(state, RenewAttempt::NoLeader);
         return;
     };
     let request = AuthLeaseRenewRequest {
@@ -68,7 +81,10 @@ async fn renew_once(state: &SharedState, timing: LeaseTiming, coverage: &[GroupC
     let response = if leader_id == state.node_id {
         match state.authorization_fence.leader() {
             Some(service) => service.renew_lease(request).await,
-            None => return,
+            None => {
+                record(state, RenewAttempt::NoLeaderService);
+                return;
+            }
         }
     } else {
         match send_to_leader(
@@ -85,21 +101,31 @@ async fn renew_once(state: &SharedState, timing: LeaseTiming, coverage: &[GroupC
                     leader_id,
                     "authorization lease: unexpected renewal reply {other:?}"
                 );
+                record(state, RenewAttempt::UnexpectedReply { leader_id });
                 return;
             }
             Err(error) => {
                 tracing::debug!(%error, "authorization lease: renewal not delivered");
+                record(
+                    state,
+                    RenewAttempt::NotDelivered {
+                        leader_id,
+                        error: error.to_string(),
+                    },
+                );
                 return;
             }
         }
     };
-    install(state, timing, sent_at, response);
+    install(state, timing, sent_at, leader_id, coverage, response);
 }
 
 fn install(
     state: &SharedState,
     timing: LeaseTiming,
     sent_at: Instant,
+    leader_id: u64,
+    coverage: &[GroupCoverage],
     response: AuthLeaseRenewResponse,
 ) {
     match response.outcome {
@@ -109,14 +135,30 @@ fn install(
                 .authorization_fence
                 .holder()
                 .install(timing.holder_expiry(sent_at, granted));
+            record(state, RenewAttempt::Granted { leader_id });
         }
         AuthLeaseRenewOutcome::Withheld => {
             tracing::debug!("authorization lease: renewal withheld until coverage catches up");
+            record(
+                state,
+                RenewAttempt::Withheld {
+                    leader_id,
+                    coverage: coverage.to_vec(),
+                },
+            );
         }
-        AuthLeaseRenewOutcome::NotLeader { leader_hint } => {
+        AuthLeaseRenewOutcome::NotLeader { leader_hint, term } => {
             tracing::debug!(
                 ?leader_hint,
+                term,
                 "authorization lease: renewal reached a non-leader"
+            );
+            record(
+                state,
+                RenewAttempt::NotLeader {
+                    leader_id,
+                    leader_hint,
+                },
             );
         }
     }

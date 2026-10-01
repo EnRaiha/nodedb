@@ -24,7 +24,6 @@ use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::exchange::gather::gather_all_cores_stream_authorized;
 use crate::control::server::exchange::streamable::streamable_gather_child;
 use crate::control::server::response_shape::cell::row_to_wire_json;
 use crate::control::server::response_shape::compose::shape_decoded_rows;
@@ -48,8 +47,8 @@ use super::super::auth::AppState;
 /// shaper does not carry, so the materialized path answers instead.
 ///
 /// Returns `Ok(Some((stream, limit)))` when eligible, `Ok(None)` when the
-/// caller should fall back to the materialized path, or `Err` when the
-/// stream could not be opened.
+/// caller must fall back to the materialized path, or `Err` when the
+/// stream cannot be opened.
 pub(super) async fn try_open_stream(
     state: &AppState,
     tasks: &[PhysicalTask],
@@ -98,17 +97,15 @@ pub(super) async fn try_open_stream(
         }
     };
 
-    let stream = if let Some(gw) = state.shared.gateway.get() {
-        let ctx = QueryContext {
-            tenant_id: task.tenant_id,
-            trace_id,
-            database_id,
-            txn_id: None,
-        };
-        gw.execute_stream(&ctx, checked_child).await
-    } else {
-        gather_all_cores_stream_authorized(&state.shared, checked_child.into_authorized(), trace_id)
-    }?;
+    let gateway = state.shared.installed_gateway()?;
+    let ctx = QueryContext {
+        tenant_id: task.tenant_id,
+        trace_id,
+        database_id,
+        txn_id: None,
+        linearizable: true,
+    };
+    let stream = gateway.execute_stream(&ctx, checked_child).await?;
 
     Ok(Some((stream, limit)))
 }
@@ -120,7 +117,7 @@ pub(super) struct NdjsonBody {
     pub limit: usize,
     pub projection: Option<OutputSchema>,
     /// The statement's redaction inputs, resolved ONCE before the first batch
-    /// is pulled. Re-resolving per batch would risk the first NDJSON lines
+    /// is pulled. Re-resolving per batch will risk the first NDJSON lines
     /// going out unredacted.
     pub redaction: Option<QueryRedaction>,
     /// Owned so the body, which outlives the handler frame, can reach the
@@ -155,9 +152,9 @@ pub(super) fn ndjson_body_stream(
         // The body owns this scope for its complete polling lifetime. Dropping
         // the body on completion or client disconnect releases descriptors only
         // after the ResultStream is no longer reachable.
-        let _lease_scope = lease_scope;
+        let lease_scope = lease_scope;
         // Owned by this generator for its whole polling lifetime, exactly
-        // like `_lease_scope` above — whether the stream runs to completion,
+        // like `lease_scope` above — whether the stream runs to completion,
         // ends on a mid-stream error, or is dropped early by a disconnected
         // client, this guard's `Drop` fires and bills exactly the rows
         // accumulated into it via `add_rows` below, never more.
@@ -165,7 +162,13 @@ pub(super) fn ndjson_body_stream(
         let mut emitted: usize = 0;
         let mut batches = stream;
         while emitted < limit {
-            let batch = match batches.next().await {
+            // A lease this node loses mid-stream ends the body with a
+            // retryable error line rather than rows from a stale descriptor.
+            let next = lease_scope
+                .guard(batches.next())
+                .await
+                .unwrap_or_else(|revoked| Some(Err(revoked)));
+            let batch = match next {
                 None => break,
                 Some(Ok(b)) => b,
                 Some(Err(e)) => {
@@ -348,7 +351,7 @@ mod tests {
 
     /// The streaming metering contract: a client that disconnects mid-stream
     /// must be billed for exactly the rows it received, never for the rows a
-    /// full scan would have produced. Polls only 3 of 2000 available rows,
+    /// full scan will produce. Polls only 3 of 2000 available rows,
     /// then drops the stream without reaching the end of the generator —
     /// exactly what happens when axum drops a response body because the
     /// connected client went away.
@@ -408,7 +411,7 @@ mod tests {
         // The stream (and the guard it owns) must be dropped before draining,
         // which is what a client disconnecting mid-response does. `pin_mut!`
         // shadows the binding with a `Pin<&mut _>`, so `drop`ping that name
-        // would only release the borrow and leave the stream — and its
+        // will only release the borrow and leave the stream — and its
         // pending row count — alive until end of scope. An inner block drops
         // the real value.
         {

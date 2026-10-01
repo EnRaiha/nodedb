@@ -13,14 +13,14 @@ use crate::control::security::catalog::{
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::super::super::catalog::propose_and_apply;
+use super::super::super::catalog::propose_and_apply_async;
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::{require_tenant_admin, status};
 use super::create::emit_function_put;
 use super::parse::parse_function_header;
 
 /// Handle `CREATE [OR REPLACE] FUNCTION ... LANGUAGE WASM AS '<base64>'`
-pub fn create_wasm_function(
+pub async fn create_wasm_function(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
@@ -83,10 +83,7 @@ pub fn create_wasm_function(
     };
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutFunction(Box::new(stored.clone()));
-    let outcome = propose_and_apply(state, &entry)?;
-    if outcome.needs_local_apply() {
-        crate::control::catalog_entry::post_apply::function::put(stored.clone(), state);
-    }
+    propose_and_apply_async(state, &entry).await?;
     emit_function_put(state, &stored);
 
     state.audit_record(

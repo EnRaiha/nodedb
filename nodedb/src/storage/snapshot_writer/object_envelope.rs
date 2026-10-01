@@ -14,59 +14,58 @@ use crate::types::Lsn;
 /// limit because object-store reads are fully buffered.
 pub(super) const MAX_SNAPSHOT_OBJECT_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Room reserved in every object for the context, footer, preamble, and tag.
+/// A chunk payload of at most `MAX_SNAPSHOT_OBJECT_BYTES - CHUNK_HEADROOM`
+/// always fits one object.
+pub(super) const CHUNK_HEADROOM: u64 = 64 * 1024;
+
 pub(super) const SNAPSHOT_MANIFEST_KIND: u8 = 0;
-pub(super) const SNAPSHOT_CORE_KIND: u8 = 1;
+/// A content-addressed chunk. Its context name is the chunk id.
+pub(super) const SNAPSHOT_CHUNK_KIND: u8 = 1;
 
 const SNAPSHOT_CONTEXT_MAGIC: [u8; 4] = *b"SNCT";
-const SNAPSHOT_CONTEXT_VERSION: u8 = 1;
-const SNAPSHOT_CONTEXT_FIXED_BYTES: usize = 4 + 1 + 1 + 2 + 8;
+const SNAPSHOT_CONTEXT_VERSION: u8 = 3;
+const SNAPSHOT_CONTEXT_FIXED_BYTES: usize = 4 + 1 + 1 + 2;
 
-fn snapshot_context(prefix: &str, kind: u8, core_id: Option<usize>) -> crate::Result<Vec<u8>> {
-    let core_id = match (kind, core_id) {
-        (SNAPSHOT_MANIFEST_KIND, None) => u64::MAX,
-        (SNAPSHOT_CORE_KIND, Some(core_id)) => {
-            u64::try_from(core_id).map_err(|_| crate::Error::Storage {
-                engine: "snapshot".into(),
-                detail: "core ID does not fit snapshot context".into(),
-            })?
-        }
-        _ => {
-            return Err(crate::Error::Storage {
-                engine: "snapshot".into(),
-                detail: "invalid snapshot object context".into(),
-            });
-        }
-    };
-    let prefix_len = u16::try_from(prefix.len()).map_err(|_| crate::Error::Storage {
-        engine: "snapshot".into(),
-        detail: "snapshot prefix is too long for object context".into(),
-    })?;
-    let capacity = SNAPSHOT_CONTEXT_FIXED_BYTES
-        .checked_add(prefix.len())
-        .ok_or_else(|| crate::Error::Storage {
+/// What one object is, bound into its authenticated payload so an object
+/// moved to another name or kind fails to open.
+///
+/// A manifest's name is its snapshot prefix. A chunk's name is its id: the
+/// chunk is shared by every base that lists it, so its context names no base.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ObjectContext<'a> {
+    pub name: &'a str,
+    pub kind: u8,
+}
+
+fn context_bytes(ctx: ObjectContext<'_>) -> crate::Result<Vec<u8>> {
+    if !matches!(ctx.kind, SNAPSHOT_MANIFEST_KIND | SNAPSHOT_CHUNK_KIND) {
+        return Err(crate::Error::Storage {
             engine: "snapshot".into(),
-            detail: "snapshot object context length overflow".into(),
-        })?;
-    let mut context = Vec::with_capacity(capacity);
+            detail: format!("invalid snapshot object kind {}", ctx.kind),
+        });
+    }
+    let name_len = u16::try_from(ctx.name.len()).map_err(|_| crate::Error::Storage {
+        engine: "snapshot".into(),
+        detail: "snapshot object name is too long for object context".into(),
+    })?;
+    let mut context = Vec::with_capacity(SNAPSHOT_CONTEXT_FIXED_BYTES + ctx.name.len());
     context.extend_from_slice(&SNAPSHOT_CONTEXT_MAGIC);
     context.push(SNAPSHOT_CONTEXT_VERSION);
-    context.push(kind);
-    context.extend_from_slice(&prefix_len.to_le_bytes());
-    context.extend_from_slice(&core_id.to_le_bytes());
-    context.extend_from_slice(prefix.as_bytes());
+    context.push(ctx.kind);
+    context.extend_from_slice(&name_len.to_le_bytes());
+    context.extend_from_slice(ctx.name.as_bytes());
     Ok(context)
 }
 
 pub(super) fn encrypt_snapshot_object(
     bytes: &[u8],
-    prefix: &str,
-    kind: u8,
-    core_id: Option<usize>,
+    ctx: ObjectContext<'_>,
     node_name: &str,
     watermark: u64,
     key: &WalEncryptionKey,
 ) -> crate::Result<Vec<u8>> {
-    let context = snapshot_context(prefix, kind, core_id)?;
+    let context = context_bytes(ctx)?;
     let payload_len =
         context
             .len()
@@ -101,12 +100,10 @@ pub(super) fn encrypt_snapshot_object(
 
 pub(super) fn decrypt_snapshot_object(
     raw: &[u8],
-    prefix: &str,
-    kind: u8,
-    core_id: Option<usize>,
+    ctx: ObjectContext<'_>,
     key: &WalEncryptionKey,
 ) -> crate::Result<Vec<u8>> {
-    let expected_context = snapshot_context(prefix, kind, core_id)?;
+    let expected_context = context_bytes(ctx)?;
     let payload = decrypt_untrusted_segment_bytes(raw, key)?;
     let content = payload
         .strip_prefix(expected_context.as_slice())

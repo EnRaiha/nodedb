@@ -31,35 +31,12 @@ pub struct KvEntry {
     /// `0` = no expiry.
     pub expire_at_ms: u64,
     /// Stable global row identity assigned by the Control-Plane allocator.
-    /// `Surrogate::ZERO` means "unbound" — set on entries created via
-    /// internal RMW paths (atomic ops, transfer item-create) where the
-    /// owning op variant does not yet carry a surrogate.
+    /// Never `Surrogate::ZERO`: `KvEngine` refuses an unbound write, so every
+    /// stored entry is bound.
     pub surrogate: Surrogate,
 }
 
 impl KvEntry {
-    /// Create an entry with an inline value and optional TTL.
-    pub fn inline(hash: u64, key: Vec<u8>, data: Vec<u8>, expire_at_ms: u64) -> Self {
-        Self {
-            hash,
-            key,
-            value: KvValue::Inline(data),
-            expire_at_ms,
-            surrogate: Surrogate::ZERO,
-        }
-    }
-
-    /// Create an entry with an overflow value and optional TTL.
-    pub fn overflow(hash: u64, key: Vec<u8>, index: u32, len: u32, expire_at_ms: u64) -> Self {
-        Self {
-            hash,
-            key,
-            value: KvValue::Overflow { index, len },
-            expire_at_ms,
-            surrogate: Surrogate::ZERO,
-        }
-    }
-
     /// Whether this key has a TTL set (regardless of whether it has already expired).
     ///
     /// To check if a key is still accessible, use [`is_expired`](Self::is_expired).
@@ -115,9 +92,25 @@ pub enum KvValue {
 mod tests {
     use super::*;
 
+    /// A bound entry holding `value` under `key`.
+    fn entry(hash: u64, key: &[u8], value: KvValue, expire_at_ms: u64) -> KvEntry {
+        KvEntry {
+            hash,
+            key: key.to_vec(),
+            value,
+            expire_at_ms,
+            surrogate: Surrogate::new(1),
+        }
+    }
+
     #[test]
     fn entry_inline_creation() {
-        let entry = KvEntry::inline(12345, b"mykey".to_vec(), b"myvalue".to_vec(), NO_EXPIRY);
+        let entry = entry(
+            12345,
+            b"mykey",
+            KvValue::Inline(b"myvalue".to_vec()),
+            NO_EXPIRY,
+        );
         assert_eq!(entry.hash, 12345);
         assert_eq!(entry.key, b"mykey");
         assert_eq!(entry.inline_value(), Some(b"myvalue".as_slice()));
@@ -127,7 +120,7 @@ mod tests {
 
     #[test]
     fn entry_with_ttl() {
-        let entry = KvEntry::inline(1, b"k".to_vec(), b"v".to_vec(), 5000);
+        let entry = entry(1, b"k", KvValue::Inline(b"v".to_vec()), 5000);
         assert!(entry.has_ttl());
         assert!(!entry.is_expired(4999));
         assert!(entry.is_expired(5000));
@@ -136,7 +129,15 @@ mod tests {
 
     #[test]
     fn entry_overflow() {
-        let entry = KvEntry::overflow(1, b"k".to_vec(), 0, 1024, NO_EXPIRY);
+        let entry = entry(
+            1,
+            b"k",
+            KvValue::Overflow {
+                index: 0,
+                len: 1024,
+            },
+            NO_EXPIRY,
+        );
         assert!(entry.inline_value().is_none());
         assert!(!entry.has_ttl());
         match &entry.value {
@@ -150,7 +151,7 @@ mod tests {
 
     #[test]
     fn mem_size_is_reasonable() {
-        let entry = KvEntry::inline(1, b"key".to_vec(), b"val".to_vec(), NO_EXPIRY);
+        let entry = entry(1, b"key", KvValue::Inline(b"val".to_vec()), NO_EXPIRY);
         let size = entry.mem_size();
         // 56 fixed + 3 key + 3 value = 62
         assert_eq!(size, 62);

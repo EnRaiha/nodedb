@@ -100,11 +100,11 @@ pub enum TimeseriesOp {
         rls_filters: Vec<u8>,
     },
 
-    /// Read-only resolve pass for a governed [`TimeseriesOp::Ingest`]: a
-    /// follower can't judge a live predicate, so this normalizes the payload
-    /// into stamped ILP lines (memtable schema is Data-Plane-only, so
-    /// normalization must happen here) and decides the policy without writing.
-    ResolveIngest(Box<TimeseriesOp>),
+    /// Read-only resolve pass for a [`TimeseriesOp::Ingest`]: it normalizes
+    /// the payload into stamped ILP lines (memtable schema is Data-Plane-only,
+    /// so normalization must happen here), decides the policy, and resolves
+    /// the lines to the rows they store, without writing.
+    ResolveIngest(Box<TimeseriesResolve>),
 
     /// `TRUNCATE` of a timeseries collection: the memtable, every on-disk
     /// partition, the series catalog, and the last-value cache. Reports the
@@ -116,4 +116,24 @@ pub enum TimeseriesOp {
         #[serde(default)]
         restart_identity: bool,
     },
+}
+
+/// What a [`TimeseriesOp::ResolveIngest`] resolves.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct TimeseriesResolve {
+    /// The ingest to resolve.
+    pub ingest: TimeseriesOp,
+    /// The encoded schema an earlier ingest of the same transaction into
+    /// the same collection resolved to. The ingest resolves against it, not
+    /// against the live schema. `None` resolves against the live schema.
+    #[serde(default)]
+    pub base: Option<Vec<u8>>,
 }

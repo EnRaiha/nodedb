@@ -2,12 +2,10 @@
 
 //! `DROP PROCEDURE [IF EXISTS]` DDL handler.
 //!
-//! Ported from the pgwire `ddl::procedure::drop` handler. The catalog path
-//! (existence pre-check so `IF EXISTS` on a missing procedure never touches
-//! raft, `propose_catalog_entry` + `LocalOnly` local-delete fallback, Lite
-//! definition-sync broadcast, and the `audit_record` call) is preserved
-//! verbatim; only the result construction changed from pgwire `Response` /
-//! `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
+//! The catalog path (existence pre-check so `IF EXISTS` on a missing
+//! procedure never touches raft, `propose_catalog_entry_async`, Lite
+//! definition-sync broadcast, and the `audit_record` call) runs here. The
+//! result is the protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
@@ -17,7 +15,7 @@ use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::{require_tenant_admin, status};
 
 /// Handle `DROP PROCEDURE [IF EXISTS] <name>`
-pub fn drop_procedure(
+pub async fn drop_procedure(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -77,13 +75,9 @@ pub fn drop_procedure(
         target_descriptor_version: 0,
         target_hlc: nodedb_types::Hlc::ZERO,
     };
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        let _ = catalog
-            .delete_procedure_in_database(database_id, tenant_id, &name)
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-    }
 
     // Broadcast deletion to connected Lite sessions.
     {

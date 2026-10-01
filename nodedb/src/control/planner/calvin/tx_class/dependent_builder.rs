@@ -10,20 +10,18 @@
 //! [`TxClass::new_dependent`]; that is a distinct mechanism for passive
 //! vshards to broadcast reads to active participants before they write). This
 //! builder is write-set-identity construction only, exactly like
-//! `build_static_tx_class`, just sourced from a pre-exec-scan surrogate
+//! `build_static_tx_class`, sourced from a pre-exec-scan surrogate
 //! prediction instead of statically-known plan fields.
 
 use crate::Error;
 use crate::control::server::shared::session::read_set::ReadSetEntry;
-use crate::types::VShardId;
-use nodedb_cluster::calvin::types::{EngineKeySet, ReadWriteSet, SortedVec, TxClass};
-use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
+use nodedb_cluster::calvin::types::{ReadWriteSet, TxClass};
+use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_physical::physical_task::PhysicalTask;
 use nodedb_types::{DatabaseId, TenantId};
 
-use super::shared::{
-    collection_name_from_plan, read_set_from, surrogate_from_plan, versioned_reads_from,
-};
+use super::shared::{read_set_from, versioned_reads_from};
+use super::write_keys::task_write_keys;
 
 /// Build a **multi-vshard** `TxClass` for a dependent-read (OLLP) transaction.
 ///
@@ -106,8 +104,6 @@ fn build_dependent_tx_class_impl(
     reads: &[ReadSetEntry],
     allow_single_vshard: bool,
 ) -> crate::Result<Option<TxClass>> {
-    use std::collections::BTreeMap;
-
     let database_id = tasks
         .first()
         .map_or(DatabaseId::DEFAULT, |task| task.database_id);
@@ -119,91 +115,14 @@ fn build_dependent_tx_class_impl(
         });
     }
 
-    // Accumulate per-collection surrogate sets. The OLLP collection uses the
-    // predicted surrogates; all other tasks use static key extraction.
-    let mut doc_surrogates: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-    // Graph edges (appended implicit-edge deletes) route by from_key(src)/
-    // from_key(dst), NOT by collection — mirror `build_static_tx_class`'s edge
-    // handling so an `EdgeDelete` appended to a dependent txn is classified as
-    // an `EngineKeySet::Edge` (and dual-homed/locked) rather than misrouted as a
-    // document write via `surrogate_from_plan`.
-    let mut edge_pairs: BTreeMap<String, Vec<(u32, u32)>> = BTreeMap::new();
-    let mut edge_homes: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    // Every other task's keys, extracted as `build_static_tx_class` extracts
+    // them. The OLLP collection's rows are the ones reconnaissance
+    // predicted, in place of the collection key its predicate write locks.
+    let mut keys = task_write_keys(tasks)?;
+    keys.drop_documents(collection);
+    keys.rows(collection, predicted_surrogates.iter().copied());
 
-    // Seed with the OLLP collection's predicted surrogates.
-    doc_surrogates
-        .entry(collection.to_owned())
-        .or_default()
-        .extend_from_slice(predicted_surrogates);
-
-    // Add static surrogates for all non-OLLP tasks.
-    for task in tasks {
-        // Edges first: collect surrogate-pair identity + from_key routing homes,
-        // then skip the doc-surrogate path. EdgePut/EdgeDelete share identity
-        // fields so both produce an `EngineKeySet::Edge`.
-        if let PhysicalPlan::Graph(
-            GraphOp::EdgePut {
-                collection: edge_coll,
-                src_id,
-                dst_id,
-                src_surrogate,
-                dst_surrogate,
-                ..
-            }
-            | GraphOp::EdgeDelete {
-                collection: edge_coll,
-                src_id,
-                dst_id,
-                src_surrogate,
-                dst_surrogate,
-                ..
-            },
-        ) = &task.plan
-        {
-            edge_pairs
-                .entry(edge_coll.to_string())
-                .or_default()
-                .push((src_surrogate.as_u32(), dst_surrogate.as_u32()));
-            let homes = edge_homes.entry(edge_coll.to_string()).or_default();
-            homes.push(VShardId::from_key(src_id.as_bytes()).as_u32());
-            homes.push(VShardId::from_key(dst_id.as_bytes()).as_u32());
-            continue;
-        }
-
-        let coll = collection_name_from_plan(&task.plan);
-        if coll.is_empty() || coll == collection {
-            continue;
-        }
-        let surrogate = surrogate_from_plan(&task.plan);
-        doc_surrogates.entry(coll).or_default().push(surrogate);
-    }
-
-    let mut write_sets: Vec<EngineKeySet> = doc_surrogates
-        .into_iter()
-        .map(|(coll, surrogates)| EngineKeySet::Document {
-            collection: coll,
-            surrogates: SortedVec::new(surrogates),
-        })
-        .collect();
-    // Emit one Edge keyset per edge collection, with the SAME missing-homes-is-
-    // hard-error guard `build_static_tx_class` uses: `edge_pairs` and
-    // `edge_homes` are populated in lockstep, so a missing homes entry is an
-    // invariant violation, not an empty-participant write.
-    for (edge_coll, pairs) in edge_pairs {
-        let homes = edge_homes.remove(&edge_coll).ok_or_else(|| Error::Internal {
-            detail: format!(
-                "build_dependent_tx_class invariant violated: no edge_homes for collection {edge_coll}"
-            ),
-        })?;
-        write_sets.push(EngineKeySet::Edge {
-            collection: edge_coll,
-            edges: SortedVec::new(pairs),
-            home_vshards: SortedVec::new(homes),
-        });
-    }
-    write_sets.sort_by(|a, b| a.collection().cmp(b.collection()));
-
-    let write_set = ReadWriteSet::new(write_sets);
+    let write_set = ReadWriteSet::new(keys.into_key_sets());
     // A predicate that matched no rows, in a batch whose other tasks write
     // nothing either, decides an empty write set: there is no state change to
     // sequence, so no Calvin entry is proposed. `TxClass` rejects an empty
@@ -257,7 +176,7 @@ fn build_dependent_tx_class_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::DatabaseId;
+    use crate::types::{DatabaseId, VShardId};
     use nodedb_physical::physical_plan::DocumentOp;
 
     fn bulk_delete_task(collection: &str) -> PhysicalTask {
@@ -311,7 +230,7 @@ mod tests {
     fn zero_match_predicate_builds_no_tx_class() {
         // A predicate matching no rows decides an empty write set: nothing to
         // sequence, so the builder reports "no transaction" rather than an
-        // error the retry loop would mistake for predicate drift.
+        // error the retry loop will mistake for predicate drift.
         let tasks = vec![bulk_delete_task("users")];
         let built =
             build_single_vshard_dependent_tx_class(&tasks, TenantId::new(1), "users", &[], &[])

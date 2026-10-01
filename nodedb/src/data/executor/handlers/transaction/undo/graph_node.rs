@@ -2,9 +2,9 @@
 
 //! Deleted-node-tracker undo entry application logic.
 //!
-//! The PointDelete cascade records a deleted document's node id in the
-//! in-memory `deleted_nodes` set so a subsequent `EdgePut` to that node is
-//! rejected as dangling. This tracker is IN-MEMORY, so an aborted redb write
+//! A row delete records a deleted document's node id in the in-memory
+//! `deleted_nodes` set so a subsequent `EdgePut` of the same collection to
+//! that node is rejected as dangling. This tracker is IN-MEMORY, so an aborted redb write
 //! transaction does NOT reverse it — a rolled-back tx DELETE must explicitly
 //! un-mark the node (mirroring the vector/spatial/stats undo paths, which
 //! reverse in-memory side-effects an aborted redb txn leaves behind).
@@ -33,9 +33,10 @@ impl CoreLoop {
             UndoEntry::MarkNodeDeleted {
                 database_id,
                 tid,
+                collection,
                 node_id,
             } => {
-                self.unmark_node_deleted(database_id, tid, &node_id);
+                self.unmark_node_deleted(database_id, tid, &collection, &node_id);
                 Ok(())
             }
             _ => unreachable!("apply_undo_mark_node called with non-mark-node entry"),
@@ -166,7 +167,7 @@ mod tests {
         use nodedb_types::Value;
         let mut obj = std::collections::HashMap::new();
         obj.insert("status".to_string(), Value::String("active".into()));
-        zerompk::to_msgpack_vec(&Value::Object(obj)).unwrap()
+        nodedb_types::value_to_msgpack(&Value::Object(obj)).unwrap()
     }
 
     /// Autocommit PUT via `apply_point_put` inside a self-owned redb txn (mirrors
@@ -189,6 +190,7 @@ mod tests {
                 index_text: true,
                 user_roles: &[],
                 enforce: true,
+                unique: crate::data::executor::enforcement::unique::UniqueJudge::Row,
                 wal_lsn: None,
             },
         )
@@ -201,15 +203,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut core, _t, _r) = make_core_with_dir(dir.path());
         assert!(
-            core.mark_node_deleted(DB, TID, PK),
+            core.mark_node_deleted(DB, TID, COLL, PK),
             "first mark newly inserts"
         );
         assert!(
-            !core.mark_node_deleted(DB, TID, PK),
+            !core.mark_node_deleted(DB, TID, COLL, PK),
             "second mark is a no-op (already present)"
         );
-        core.unmark_node_deleted(DB, TID, PK);
-        assert!(!core.is_node_deleted(DB, TID, PK));
+        assert!(
+            !core.is_node_deleted(DB, TID, "other", PK),
+            "the mark scopes to the row's collection"
+        );
+        core.unmark_node_deleted(DB, TID, COLL, PK);
+        assert!(!core.is_node_deleted(DB, TID, COLL, PK));
     }
 
     /// A tx DELETE of a document whose node a PRIOR committed op already tombstoned
@@ -222,8 +228,8 @@ mod tests {
         autocommit_put(&mut core);
 
         // A prior committed op already marked this node deleted.
-        assert!(core.mark_node_deleted(DB, TID, PK));
-        assert!(core.is_node_deleted(DB, TID, PK));
+        assert!(core.mark_node_deleted(DB, TID, COLL, PK));
+        assert!(core.is_node_deleted(DB, TID, COLL, PK));
 
         let undo_log =
             core.install_with_undo_for_test(TID, 20, vec![doc_delete_sub_record(COLL, PK, 1)]);
@@ -240,7 +246,7 @@ mod tests {
             .expect("rollback must succeed");
 
         assert!(
-            core.is_node_deleted(DB, TID, PK),
+            core.is_node_deleted(DB, TID, COLL, PK),
             "pre-existing node tombstone must survive rollback"
         );
     }
@@ -255,7 +261,7 @@ mod tests {
 
         // The destination node is soft-deleted, so the edge insert is rejected by
         // `execute_edge_put`'s dangling-endpoint validation BEFORE any store write.
-        core.mark_node_deleted(DB, TID, "bob");
+        core.mark_node_deleted(DB, TID, "c", "bob");
 
         let task = make_default_task();
         let mut undo_log: Vec<UndoEntry> = Vec::new();
@@ -268,8 +274,8 @@ mod tests {
                 label: "KNOWS",
                 dst_id: "bob",
                 properties: b"p1",
-                src_surrogate: nodedb_types::Surrogate::ZERO,
-                dst_surrogate: nodedb_types::Surrogate::ZERO,
+                src_surrogate: nodedb_types::Surrogate::new(1),
+                dst_surrogate: nodedb_types::Surrogate::new(2),
             },
             Some(&mut undo_log),
         );

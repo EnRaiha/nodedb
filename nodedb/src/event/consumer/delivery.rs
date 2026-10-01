@@ -115,6 +115,7 @@ mod tests {
             valid_time_ms: None,
             user_id: None,
             statement_digest: None,
+            commit_hlc: Some(crate::event::test_utils::test_commit_hlc()),
         }
     }
 

@@ -232,10 +232,16 @@ fn write_targets(
     if target_keys.is_empty() {
         return Ok(VectorWriteTargets::Predicate(serialize_filters(filters)?));
     }
+    let pk_all: Vec<Vec<u8>> = target_keys
+        .iter()
+        .map(|key| sql_value_to_string(key).into_bytes())
+        .collect();
+    // A key unbound in this database names no row, so it targets nothing.
     let mut surrogates: Vec<Surrogate> = Vec::with_capacity(target_keys.len());
-    for key in target_keys {
-        let pk_bytes = sql_value_to_string(key).into_bytes();
-        surrogates.push(ctx.surrogate_for_existing_pk(collection, &pk_bytes)?);
+    for pk_bytes in &pk_all {
+        if let Some(surrogate) = ctx.surrogate_for_existing_pk(collection, pk_bytes)? {
+            surrogates.push(surrogate);
+        }
     }
     Ok(VectorWriteTargets::Surrogates(surrogates))
 }
@@ -360,7 +366,8 @@ mod tests {
             array_catalog: None,
             credentials: None,
             wal: None,
-            surrogate_assigner: None,
+            surrogate_assigner:
+                crate::control::planner::sql_plan_convert::test_support::test_assigner(),
             cluster_enabled: false,
             bitemporal_retention_registry: None,
             max_vector_dim,
@@ -370,6 +377,7 @@ mod tests {
             shuffle_agg_num_parts: 0,
             broadcast_threshold_bytes: 8 * 1024 * 1024,
             shuffle_agg_threshold: 10_000,
+            prefetched: Default::default(),
             database_id: crate::types::DatabaseId::DEFAULT,
             tenant_id: crate::types::TenantId::new(0),
         }
@@ -379,7 +387,6 @@ mod tests {
         let mut payload_fields = std::collections::HashMap::new();
         payload_fields.insert("id".to_string(), SqlValue::String(id.to_string()));
         VectorPrimaryRow {
-            surrogate: nodedb_types::Surrogate::ZERO,
             vector: vec![0.0f32; dim],
             payload_fields,
         }

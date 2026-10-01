@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+mod backup;
+mod backup_storage;
 mod checkpoint;
 mod cluster;
 mod cold_storage;
@@ -10,6 +12,7 @@ mod env_expand;
 mod log_format;
 mod observability;
 mod paths;
+mod pitr;
 mod ports;
 mod retention;
 pub mod scheduler;
@@ -19,6 +22,8 @@ mod snapshot_storage;
 mod test_support;
 mod tls;
 
+pub use backup::{BackupScheduleSettings, BackupSettings};
+pub use backup_storage::BackupStorageSettings;
 pub use checkpoint::CheckpointSettings;
 pub use cluster::{ClusterSettings, TlsPaths};
 pub use cold_storage::ColdStorageSettings;
@@ -29,6 +34,7 @@ pub use observability::{
     ObservabilityConfig, OtlpConfig, OtlpExportConfig, OtlpReceiverConfig, PromqlConfig,
     validate_feature_availability,
 };
+pub use pitr::{PitrSettings, missing_cold_storage};
 pub use ports::{DEFAULT_SYNC_PORT, PortsConfig};
 pub use retention::RetentionSettings;
 pub use scheduler::{CronTimezone, SchedulerConfig};

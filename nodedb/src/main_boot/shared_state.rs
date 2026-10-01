@@ -25,7 +25,7 @@ pub(crate) struct SharedStateInputs<'a> {
     pub(crate) governor: Arc<nodedb_mem::governor::MemoryGovernor>,
     pub(crate) system_metrics: Arc<nodedb::control::metrics::SystemMetrics>,
     pub(crate) maintenance_budget: Arc<nodedb::control::maintenance::MaintenanceBudgetTracker>,
-    pub(crate) cluster_handle: Option<&'a ClusterHandle>,
+    pub(crate) cluster_handle: &'a ClusterHandle,
     pub(crate) startup_gate: &'a Arc<StartupGate>,
     pub(crate) root_span: &'a tracing::Span,
 }

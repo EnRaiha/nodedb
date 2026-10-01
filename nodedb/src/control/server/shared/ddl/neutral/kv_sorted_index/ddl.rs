@@ -32,7 +32,7 @@ use super::parse::{ddl_err, parse_key_column, parse_sort_columns, parse_window_c
 /// Building the index reads every row of the collection into the order-stat
 /// tree, so the caller must be allowed to read it, and a read policy makes the
 /// index underivable: it is shared by every reader, so one principal's
-/// filtered view would answer other principals' `TOPK` from rows that were
+/// filtered view will answer other principals' `TOPK` from rows that were
 /// never indexed.
 const CREATE_WHAT: &str =
     "CREATE SORTED INDEX, which backfills the index from every row of the collection";
@@ -150,7 +150,8 @@ pub async fn create_sorted_index(
             collection: &collection,
             fields,
         },
-    )?;
+    )
+    .await?;
 
     // Ownership record backs authorization for a later DROP.
     crate::control::server::shared::ddl::owner::propose_owner(
@@ -160,7 +161,8 @@ pub async fn create_sorted_index(
         tenant_id,
         &index_name,
         &identity.username,
-    )?;
+    )
+    .await?;
 
     if in_transaction {
         let deferred = ddl_buffer::defer_effect(DeferredDdlEffect::SortedIndexRegister {
@@ -248,14 +250,15 @@ pub async fn drop_sorted_index(
         drop_in_engine(state, &target, &index_name).await?;
     }
 
-    propose_delete_index_record(state, database_id, tenant_id, &index_name, &collection)?;
+    propose_delete_index_record(state, database_id, tenant_id, &index_name, &collection).await?;
     crate::control::server::shared::ddl::owner::propose_delete_owner(
         state,
         IndexKind::Sorted.owner_object_type(),
         database_id.as_u64(),
         tenant_id,
         &index_name,
-    )?;
+    )
+    .await?;
 
     if in_transaction
         && !ddl_buffer::defer_effect(DeferredDdlEffect::SortedIndexDrop {

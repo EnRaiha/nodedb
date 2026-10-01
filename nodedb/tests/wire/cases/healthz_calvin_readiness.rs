@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! `/healthz` must not report ready before a cross-shard write can be
-//! sequenced. The real binary defaults `single_node_calvin = true`
-//! (`config/server/section.rs`), so a standalone server always runs a Calvin
+//! sequenced. A server with no `[cluster]` always runs the single-node Calvin
 //! sequencer, and `submit_calvin_routed`
 //! (`control/planner/calvin/submit.rs`) refuses a submit with "no sequencer
 //! leader elected yet" until the sequencer group elects one. A client that

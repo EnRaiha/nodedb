@@ -11,7 +11,7 @@ use super::super::super::result::{DdlError, DdlResult};
 use super::helpers::{ddl_err, parse_column_defs, parse_with_clause};
 
 /// CREATE TIMESERIES <name> [WITH (key = 'value', ...)]
-pub fn create_timeseries(
+pub async fn create_timeseries(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -70,6 +70,7 @@ pub fn create_timeseries(
         constraint_version: 0,
         crdt_signing_required: false,
         modification_hlc: nodedb_types::Hlc::ZERO,
+        incarnation: nodedb_types::Hlc::ZERO,
         fields,
         field_defs: Vec::new(),
         event_defs: Vec::new(),
@@ -105,7 +106,8 @@ pub fn create_timeseries(
         declared_primary_key: None,
     };
 
-    crate::control::catalog_entry::persist_collection_replicated(state, database_id, &coll)
+    crate::control::catalog_entry::persist_collection_replicated(state, &coll)
+        .await
         .map_err(|e| DdlError::from_error(&e))?;
 
     // Initialize partition registry for this timeseries collection.

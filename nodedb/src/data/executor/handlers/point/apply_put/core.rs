@@ -11,9 +11,12 @@ use tracing::warn;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 
+use crate::data::executor::enforcement::unique::{
+    PostImage, UniqueJudge, UniqueScope, check_unique_post_state,
+};
+
 use super::enforce::PutEnforcement;
 use super::types::{PointPutOutcome, PointPutParams};
-use super::unique::{UniqueCheck, check_unique_constraints};
 
 impl CoreLoop {
     /// Apply a PointPut within an externally-owned WriteTransaction. Stores
@@ -42,6 +45,7 @@ impl CoreLoop {
             index_text,
             user_roles,
             enforce,
+            unique,
             wal_lsn,
             resolved_targets,
         } = params;
@@ -51,12 +55,12 @@ impl CoreLoop {
             collection.to_string(),
         );
 
-        // A stamp in `active_bitemporal_stamps` (WAL redo replay) forces the
+        // A stamp in `apply_scope.bitemporal_stamps` (WAL redo replay) forces the
         // versioned branch at the EXACT redo stamp, independent of
         // `doc_configs` (empty during replay); absent an override, derive
         // bitemporality from config and mint a fresh stamp.
         let (bitemporal, sys_from_ms, valid_from_ms, valid_until_ms) =
-            match self.active_bitemporal_stamps.get(&surrogate.as_u32()) {
+            match self.apply_scope.bitemporal_stamps.get(&surrogate.as_u32()) {
                 Some(stamp) => (
                     true,
                     stamp.sys_from_ms,
@@ -212,9 +216,8 @@ impl CoreLoop {
 
         // Secondary index extraction into the caller's write txn — the
         // non-_in_txn variant would deadlock since `execute_point_put`
-        // already owns the only writer. UNIQUE enforcement runs first,
-        // reading via a separate MVCC read txn that can't see our own writes
-        // — exactly the semantics "does another row already hold this value" needs.
+        // already owns the only writer. A `Row` UNIQUE probe runs first,
+        // through a separate MVCC read txn that sees the committed index only.
         let mut bitemporal_index_tuples: Vec<(String, String)> = Vec::new();
         let mut secondary_index_added: Vec<(String, String)> = Vec::new();
         let mut secondary_index_removed: Vec<(String, String)> = Vec::new();
@@ -223,23 +226,36 @@ impl CoreLoop {
             crate::types::TenantId::new(tid),
             collection.to_string(),
         );
-        // A body that isn't a document yields no index values, same outcome
-        // as running the check and finding none.
-        if let Some(config) = self.doc_configs.get(&config_key)
-            && let Ok(doc) = doc_format::decode_document(value)
-        {
-            let paths = config.index_paths.clone();
-            // Must run in both autocommit and transactional paths.
-            check_unique_constraints(UniqueCheck {
-                sparse: &self.sparse,
-                database_id,
-                tid,
-                collection,
-                doc: &doc,
-                document_id: &storage_key,
-                paths: &paths,
-                bitemporal,
-            })?;
+        // A collection with index paths indexes the body, and judges its
+        // UNIQUE claims. A body that does not decode fails the write: skipping
+        // it stores a row its indexes do not describe and whose claims
+        // no one judged.
+        let indexed = match self.doc_configs.get(&config_key) {
+            Some(config) if !config.index_paths.is_empty() => Some((
+                config.index_paths.clone(),
+                doc_format::decode_document(value)?,
+            )),
+            _ => None,
+        };
+        if let Some((paths, doc)) = indexed {
+            if unique == UniqueJudge::Row {
+                check_unique_post_state(
+                    &UniqueScope {
+                        sparse: &self.sparse,
+                        database_id,
+                        tid,
+                        collection,
+                        paths: &paths,
+                        bitemporal,
+                        base_visible: true,
+                    },
+                    &[PostImage {
+                        surrogate: storage_key.surrogate().as_u32(),
+                        doc: Some(&doc),
+                        judged: true,
+                    }],
+                )?;
+            }
             if bitemporal {
                 // Keyed at the same `sys_from_ms` as the primary version row,
                 // so one `bitemporal_sys_from_ms` in the undo entry reverses both.
@@ -331,6 +347,7 @@ mod tests {
     use crate::bridge::envelope::{Priority, Request, Status};
     use crate::data::executor::core_loop::CoreLoop;
     use crate::data::executor::core_loop::tests::make_core_with_dir;
+    use crate::data::executor::enforcement::unique::UniqueJudge;
     use crate::data::executor::handlers::point::apply_put::PointPutParams;
     use crate::data::executor::handlers::point::put::PointPutExec;
     use crate::data::executor::task::ExecutionTask;
@@ -396,6 +413,7 @@ mod tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: crate::bridge::envelope::Admission::Admitted,
         })
     }
@@ -507,6 +525,7 @@ mod tests {
                 index_text: true,
                 user_roles: &[],
                 enforce: true,
+                unique: UniqueJudge::Row,
                 wal_lsn: None,
                 resolved_targets: &[],
             },
@@ -548,6 +567,7 @@ mod tests {
                 index_text: false,
                 user_roles: &[],
                 enforce: true,
+                unique: UniqueJudge::Row,
                 wal_lsn: None,
                 resolved_targets: &[],
             },

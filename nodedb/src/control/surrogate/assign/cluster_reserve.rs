@@ -5,16 +5,14 @@
 //! Each node reserves a disjoint `[start, end)` batch from the
 //! metadata-Raft-replicated global watermark `G` and hands those out
 //! locally (lock-free) until the batch drains, then reserves another.
-//! [`SurrogateAssigner::run_refill_loop`] owns the blocking reservation
-//! round-trip off the latency-critical `assign` insert path; the
-//! synchronous [`ensure_batch`] refill is a rare liveness safety net.
+//! [`SurrogateAssigner::run_refill_loop`] owns every reservation
+//! round-trip. A draw that finds the batch empty awaits
+//! [`SurrogateAssigner::await_reserved_batch`] and never blocks its worker.
 //!
 //! Which path a node uses (`Local` `alloc_one` vs `Cluster` HiLo
 //! reservation) is decided once, at process start, by
 //! [`SurrogateRegistry`]'s static mode — never inferred here from live
 //! topology.
-//!
-//! [`ensure_batch`]: SurrogateAssigner::ensure_batch
 
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
@@ -53,8 +51,8 @@ impl SurrogateAssigner {
     /// - `Local`: `alloc_one`. Returns `Ok(Some(s))` or propagates
     ///   `Exhausted`.
     /// - `Cluster`: `try_alloc_reserved`. `Ok(Some(s))` when the batch has
-    ///   capacity; `Ok(None)` when it is empty — the caller must drop the
-    ///   lock and call `ensure_batch`. `ClusterCounter` has no `alloc_one`,
+    ///   capacity; `Ok(None)` when it is empty — the caller drops the
+    ///   lock and awaits `await_reserved_batch`. `ClusterCounter` has no `alloc_one`,
     ///   so `G` can only ever advance via `SurrogateReserve` apply.
     pub(super) fn alloc_locked(
         &self,
@@ -77,7 +75,7 @@ impl SurrogateAssigner {
     /// metadata-Raft round-trip off the hot `assign` path in steady state.
     ///
     /// Called under the registry write guard (so the `remaining_reserved`
-    /// read is consistent with the draw that just happened). `Notify` is
+    /// read is consistent with the draw that happened). `Notify` is
     /// non-blocking and coalescing — a nudge while the refiller is already
     /// reserving is remembered as a single pending permit.
     pub(super) fn nudge_refill_if_low(&self, registry: &SurrogateRegistry) {
@@ -90,8 +88,8 @@ impl SurrogateAssigner {
     }
 
     /// Background reservation loop. Owns ALL eager + threshold batch
-    /// reservation so the latency-critical `assign` path never blocks on the
-    /// metadata-Raft round-trip in the common case.
+    /// reservation. A draw never runs the metadata-Raft round-trip itself: it
+    /// awaits the batch this loop installs.
     ///
     /// Spawned once per node by `start_raft`. Self-gates on the
     /// registry's static `Cluster` mode, so it is a cheap no-op on a
@@ -101,10 +99,10 @@ impl SurrogateAssigner {
     ///      batch is ready before any insert arrives.
     ///   2. Then waits on `refill_notify`, woken by the hot path when a draw
     ///      fails or the batch dips below the low-watermark, and tops the
-    ///      batch back up via the existing blocking `ensure_batch` mechanics.
+    ///      batch back up by awaiting `reserve_batch`.
     ///
-    /// The blocking wait inside `ensure_batch` is acceptable HERE because this
-    /// runs on a dedicated background task, not the insert path. Transient
+    /// The reservation runs on a dedicated background task, not the insert
+    /// path. Transient
     /// failures (leader not yet elected at startup) are retried with a short
     /// backoff; the loop never panics and exits cleanly when `shared`'s weak
     /// upgrade fails (shutdown).
@@ -127,7 +125,7 @@ impl SurrogateAssigner {
             // Self-gate + low-watermark check in one registry read:
             // `Local`-mode nodes have no background batch to maintain;
             // `Cluster`-mode nodes skip until the batch is genuinely low
-            // (coalesced nudges may wake us after it's already full again).
+            // (coalesced nudges can wake us after it's already full again).
             let remaining = {
                 let guard = self.registry.read().unwrap_or_else(|p| p.into_inner());
                 match guard.mode() {
@@ -143,7 +141,7 @@ impl SurrogateAssigner {
             // failures (e.g. leader-not-ready at startup) with a small
             // backoff so the eager first batch lands as soon as the metadata
             // group is up; never panic.
-            match self.ensure_batch() {
+            match self.reserve_batch().await {
                 Ok(()) => {}
                 Err(e) => {
                     tracing::debug!(error = %e, "surrogate background reservation failed; retrying");
@@ -163,16 +161,14 @@ impl SurrogateAssigner {
     /// AND the apply-time completion signal (the oneshot the applier
     /// fires once it has carved + installed the batch). On return the
     /// node's reserved batch is non-empty (unless another waiter drained
-    /// it first, in which case the caller's retry simply reserves again).
+    /// it first, in which case the caller's retry reserves again).
     ///
-    /// Driven primarily by the background [`run_refill_loop`], where the
-    /// blocking propose+wait is off the insert path; `assign` only calls it
-    /// as a rare safety-net fallback. MUST be called WITHOUT the registry
-    /// write lock held — it does a Raft propose+wait whose apply handler
-    /// needs registry (read) access.
+    /// Driven only by the background [`run_refill_loop`], which awaits it off
+    /// the insert path. MUST be called WITHOUT the registry write lock held — it does a Raft
+    /// propose+wait whose apply handler needs registry (read) access.
     ///
     /// [`run_refill_loop`]: SurrogateAssigner::run_refill_loop
-    pub(super) fn ensure_batch(&self) -> crate::Result<()> {
+    pub(super) async fn reserve_batch(&self) -> crate::Result<()> {
         let shared =
             self.shared
                 .get()
@@ -182,13 +178,10 @@ impl SurrogateAssigner {
                 })?;
 
         // Serialize reservations across this node so a burst of empty-
-        // batch allocators doesn't over-reserve. Block synchronously on
-        // the async gate — `assign` is a sync API called within the tokio
-        // runtime (same contract as the existing propose path).
-        let handle = tokio::runtime::Handle::current();
-        let _gate = tokio::task::block_in_place(|| handle.block_on(self.reserve_gate.lock()));
+        // batch allocators doesn't over-reserve.
+        let _gate = self.reserve_gate.lock().await;
 
-        // After acquiring the gate, another reservation may have already
+        // After acquiring the gate, another reservation can have already
         // refilled the batch. Re-check before proposing to avoid wasting
         // a batch.
         {
@@ -215,7 +208,8 @@ impl SurrogateAssigner {
             shared.node_id,
             request_id,
             RESERVE_BATCH_SIZE,
-        );
+        )
+        .await;
         if let Err(e) = propose_result {
             // Drop the dangling oneshot so the map doesn't leak.
             if let Ok(mut pending) = self.pending_reservations.lock() {
@@ -230,9 +224,7 @@ impl SurrogateAssigner {
         // carved + installed the batch on this node. Bound the wait so a
         // lost apply (e.g. leadership churn) surfaces as a typed error
         // rather than hanging the allocation forever.
-        let wait = tokio::task::block_in_place(|| {
-            handle.block_on(async { tokio::time::timeout(RESERVE_WAIT_TIMEOUT, rx).await })
-        });
+        let wait = tokio::time::timeout(RESERVE_WAIT_TIMEOUT, rx).await;
         match wait {
             Ok(Ok((_start, _end))) => Ok(()),
             Ok(Err(_recv_err)) => {
@@ -255,6 +247,59 @@ impl SurrogateAssigner {
         }
     }
 
+    /// Wait until this node's reserved batch has room, without blocking the
+    /// runtime. The background refill loop reserves the batch, and
+    /// `complete_reservation` wakes this wait once it installs it. Fails
+    /// after `RESERVE_WAIT_TIMEOUT`.
+    ///
+    /// A `Local`-mode registry never runs empty, so the wait returns at once.
+    pub(super) async fn await_reserved_batch(&self) -> crate::Result<()> {
+        let wait = async {
+            loop {
+                // Registered before the check, so an install between the
+                // check and the await still wakes this wait.
+                let installed = self.batch_ready.notified();
+                tokio::pin!(installed);
+                installed.as_mut().enable();
+                if self.has_reserved_room() {
+                    return;
+                }
+                self.refill_notify.notify_one();
+                installed.await;
+            }
+        };
+        tokio::time::timeout(RESERVE_WAIT_TIMEOUT, wait)
+            .await
+            .map_err(|_| crate::Error::Internal {
+                detail: "surrogate reserve: timed out waiting for the refill loop to install a \
+                         batch"
+                    .into(),
+            })
+    }
+
+    /// Whether a draw from this node's registry can succeed now.
+    fn has_reserved_room(&self) -> bool {
+        let guard = self.registry.read().unwrap_or_else(|p| p.into_inner());
+        match guard.mode() {
+            SurrogateRegistryMode::Local(_) => true,
+            SurrogateRegistryMode::Cluster(cluster) => cluster.has_reserved(),
+        }
+    }
+
+    /// Register a waiter for `request_id`, as a reservation in flight does.
+    #[cfg(test)]
+    pub(crate) fn await_reservation_for_test(
+        &self,
+        request_id: u64,
+    ) -> oneshot::Receiver<(u32, u32)> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_reservations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(request_id, tx);
+        rx
+    }
+
     /// Called by the metadata applier on the owning node once a
     /// `SurrogateReserve` entry has carved the range `[start, end)`.
     ///
@@ -266,13 +311,13 @@ impl SurrogateAssigner {
     ///
     ///   - Live reservation: install the batch via `set_reserved_batch`
     ///     (BEFORE waking the waiter, so the woken allocator observes a
-    ///     non-empty batch), then fire the oneshot to unblock `ensure_batch`.
+    ///     non-empty batch), then fire the oneshot to unblock `reserve_batch`.
     ///   - No waiter (replay of a historical reservation, or a request that
     ///     already timed out): NO-OP. We must NOT install the batch — on
-    ///     replay the node may have already (partly) consumed its pre-crash
-    ///     batch, so re-installing `[start, end)` would hand those surrogates
+    ///     replay the node can have already (partly) consumed its pre-crash
+    ///     batch, so re-installing `[start, end)` hands those surrogates
     ///     out AGAIN. The global watermark `G` was already advanced
-    ///     deterministically in the applier; the node simply reserves a fresh
+    ///     deterministically in the applier; the node reserves a fresh
     ///     batch on its next allocation (the pre-crash tail is abandoned,
     ///     which is the declared gap-tolerant design).
     ///
@@ -290,8 +335,9 @@ impl SurrogateAssigner {
             {
                 cluster.set_reserved_batch(start, end);
             }
-            // Receiver may have already gone (timeout); ignore send error.
+            // Receiver can have already gone (timeout); ignore send error.
             let _ = tx.send((start, end));
+            self.batch_ready.notify_waiters();
         }
         // No pending waiter → replay or timed-out request: do NOT install a
         // stale batch (see method doc). `G` was already advanced in the

@@ -44,7 +44,7 @@ pub fn audit_dml_event(
 ) {
     // Only User-sourced writes are subject to DML auditing.
     match event.source {
-        EventSource::User => {}
+        EventSource::User | EventSource::ImplicitClient => {}
         // A restored row is not client DML. The RESTORE statement itself is
         // the audited action.
         EventSource::Trigger
@@ -54,14 +54,14 @@ pub fn audit_dml_event(
         | EventSource::Restore => return,
     }
 
-    // Only data-modifying ops (not Heartbeat).
+    // Only data-modifying ops (not Heartbeat or Publish).
     match event.op {
         WriteOp::Insert
         | WriteOp::Update
         | WriteOp::Delete
         | WriteOp::BulkInsert { .. }
         | WriteOp::BulkDelete { .. } => {}
-        WriteOp::Heartbeat => return,
+        WriteOp::Heartbeat | WriteOp::Publish => return,
     }
 
     // The Data Plane propagates the request database with every write; do not
@@ -135,6 +135,7 @@ mod tests {
             valid_time_ms: None,
             user_id: Some(Arc::from("alice")),
             statement_digest: None,
+            commit_hlc: Some(crate::event::test_utils::test_commit_hlc()),
         }
     }
 
@@ -151,7 +152,7 @@ mod tests {
         // test the routing logic directly by inspecting the guard clauses.
         let event = minimal_event(EventSource::Trigger, WriteOp::Insert);
         match event.source {
-            EventSource::User => panic!("should not be User"),
+            EventSource::User | EventSource::ImplicitClient => panic!("should not be User"),
             EventSource::Trigger
             | EventSource::RaftFollower
             | EventSource::CrdtSync
@@ -166,6 +167,7 @@ mod tests {
         let event = minimal_event(EventSource::User, WriteOp::Heartbeat);
         match event.op {
             WriteOp::Heartbeat => {} // expected
+            WriteOp::Publish => panic!("a heartbeat is not a publish"),
             WriteOp::Insert
             | WriteOp::Update
             | WriteOp::Delete

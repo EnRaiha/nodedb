@@ -22,7 +22,10 @@ fn batch_put_entries(ctx: &mut TestCtx, collection: &str, count: usize) {
             (key, value)
         })
         .collect();
-    let surrogates = vec![nodedb_types::Surrogate::ZERO; entries.len()];
+    let surrogates = entries
+        .iter()
+        .map(|(key, _)| nodedb_test_support::kv_rows::kv_row_surrogate(key))
+        .collect();
     send_ok(
         &mut ctx.core,
         &mut ctx.tx,

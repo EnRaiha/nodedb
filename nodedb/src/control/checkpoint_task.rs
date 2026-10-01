@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! The checkpoint manager's background task: a periodic cycle plus one final
-//! cycle at shutdown.
+//! The checkpoint manager's background task: a periodic cycle, a shorter WAL
+//! archive tick when cold storage is configured, and one final cycle at
+//! shutdown.
 
 use std::sync::Arc;
 
@@ -11,11 +12,14 @@ use super::checkpoint_manager::{
     CheckpointCycleInputs, CheckpointManagerConfig, run_checkpoint_cycle,
 };
 use super::startup::StartupPhase;
+use crate::wal::archiver::WalArchiver;
 
 /// Spawn the checkpoint manager as a background Tokio task.
 ///
 /// Runs `run_checkpoint_cycle` at the configured interval, and one final cycle
-/// when the shutdown bus enters `DrainingControlPlane`.
+/// when the shutdown bus enters `DrainingControlPlane`. The task owns the WAL
+/// archiver: it archives every sealed segment each archive tick, and each
+/// checkpoint cycle archives again before it truncates.
 ///
 /// The phase is load-bearing. The final cycle dispatches a checkpoint request
 /// to every Data Plane core and waits for the answers, so it must complete
@@ -44,7 +48,7 @@ pub fn spawn_checkpoint_task(
                 warn!(%error, "checkpoint manager not started: startup did not complete");
             }),
             // The WAL on disk is intact, so restart replay covers what a final
-            // cycle would have made redundant.
+            // cycle makes redundant.
             _ = guard.await_signal() => {
                 info!("shutdown before startup completed: no final checkpoint");
                 Err(())
@@ -55,14 +59,33 @@ pub fn spawn_checkpoint_task(
             return;
         }
         info!(
-            interval_secs = config.interval.as_secs(),
+            interval_secs = config.interval().as_secs(),
+            archive_interval_secs = config.archive_interval().as_secs(),
             "checkpoint manager started"
         );
+
+        let mut archiver = shared.cold_storage.clone().map(|cold| {
+            WalArchiver::new(
+                shared.node_id,
+                shared.data_dir.clone(),
+                cold,
+                shared.system_metrics.clone(),
+            )
+        });
+        let mut checkpoint_tick = delayed_interval(config.interval());
+        let mut archive_tick = delayed_interval(config.archive_interval());
 
         loop {
             let mut draining = false;
             tokio::select! {
-                _ = tokio::time::sleep(config.interval) => {}
+                _ = checkpoint_tick.tick() => {}
+                _ = archive_tick.tick(), if archiver.is_some() => {
+                    if let Some(archiver) = archiver.as_mut() {
+                        archiver.tick(&shared.wal).await;
+                        archiver.sweep_stale_markers().await;
+                    }
+                    continue;
+                }
                 _ = guard.await_signal() => { draining = true; }
             }
 
@@ -79,7 +102,7 @@ pub fn spawn_checkpoint_task(
                     watermark_store: &watermark_store,
                     num_cores,
                     timeout: budget,
-                    cold_storage: shared.cold_storage.clone(),
+                    archiver: archiver.as_mut(),
                     catalog: Some(shared.credentials.catalog()),
                     calvin_mirrors: Some(shared.authorization_fence.calvin_mirrors()),
                 });
@@ -101,12 +124,20 @@ pub fn spawn_checkpoint_task(
                 wal: &shared.wal,
                 watermark_store: &watermark_store,
                 num_cores,
-                timeout: config.core_timeout,
-                cold_storage: shared.cold_storage.clone(),
+                timeout: config.core_timeout(),
+                archiver: archiver.as_mut(),
                 catalog: Some(shared.credentials.catalog()),
                 calvin_mirrors: Some(shared.authorization_fence.calvin_mirrors()),
             })
             .await;
         }
     })
+}
+
+/// An interval whose first tick is one `period` away, and which delays rather
+/// than bursts after a slow cycle.
+fn delayed_interval(period: std::time::Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
 }

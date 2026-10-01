@@ -2,11 +2,9 @@
 
 //! Protocol-neutral `SHOW TRIGGERS` DDL handler.
 //!
-//! Ported from the pgwire `ddl::trigger::show` handler. The registry read,
-//! `sort_key` ordering, optional `ON <collection>` filter, and the exact
-//! column set / per-column text encoding are preserved verbatim; only the
-//! result construction changed from pgwire `Response` / `QueryResponse` to the
-//! protocol-neutral [`DdlResult::Rows`] over [`ShapedRows`].
+//! The registry read, `sort_key` ordering, optional `ON <collection>` filter,
+//! and the exact column set / per-column text encoding run here. The result is
+//! the protocol-neutral [`DdlResult::Rows`] over [`ShapedRows`].
 
 use serde_json::{Map, Value as JsonValue};
 

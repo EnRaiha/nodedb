@@ -13,9 +13,9 @@
 //!    unlink-equivalent action (the reclaim handler) runs.
 //! 4. The drain is collection-scoped — other collections / tenants
 //!    are unaffected.
-//! 5. After `forget`, the state is reset and new scans are accepted
-//!    again (relevant when a `DROP ... CASCADE` partially fails and
-//!    the purge is retried).
+//! 5. Once the drain hold is released, the state is reset and new
+//!    scans are accepted (relevant when a `DROP ... CASCADE`
+//!    partially fails and the purge is retried).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +29,7 @@ const DB: u64 = 0;
 async fn drain_blocks_until_in_flight_scan_completes() {
     let q = CollectionQuiesce::new();
     let guard = q.try_start_scan(DB, 1, "users").unwrap();
-    q.begin_drain(DB, 1, "users");
+    let _hold = q.begin_drain(DB, 1, "users");
 
     // Draining flag is observable.
     assert!(q.is_draining(DB, 1, "users"));
@@ -71,7 +71,7 @@ async fn drain_is_scoped_to_one_collection() {
     // Hold a scan on a sibling collection that must not be drained.
     let _sibling_guard = q.try_start_scan(DB, 1, "orders").unwrap();
 
-    q.begin_drain(DB, 1, "users");
+    let _hold = q.begin_drain(DB, 1, "users");
     // Immediately drainable because no scans were open on "users".
     timeout(Duration::from_secs(1), q.wait_until_drained(DB, 1, "users"))
         .await
@@ -86,11 +86,11 @@ async fn drain_is_scoped_to_one_collection() {
 }
 
 #[tokio::test]
-async fn forget_resets_state_for_retry_semantics() {
+async fn release_resets_state_for_retry_semantics() {
     let q = CollectionQuiesce::new();
-    q.begin_drain(DB, 1, "users");
+    let hold = q.begin_drain(DB, 1, "users");
     q.wait_until_drained(DB, 1, "users").await;
-    q.forget(DB, 1, "users");
+    hold.release();
 
     assert!(!q.is_draining(DB, 1, "users"));
     assert!(q.try_start_scan(DB, 1, "users").is_ok());
@@ -103,7 +103,7 @@ async fn concurrent_releases_all_unblock_the_drain() {
     let guards: Vec<_> = (0..5)
         .map(|_| q.try_start_scan(DB, 1, "users").unwrap())
         .collect();
-    q.begin_drain(DB, 1, "users");
+    let _hold = q.begin_drain(DB, 1, "users");
 
     let q_clone = Arc::clone(&q);
     let drain = tokio::spawn(async move { q_clone.wait_until_drained(DB, 1, "users").await });
@@ -127,11 +127,11 @@ async fn concurrent_releases_all_unblock_the_drain() {
 }
 
 #[tokio::test]
-async fn begin_drain_is_idempotent() {
+async fn every_hold_keeps_the_drain() {
     let q = CollectionQuiesce::new();
-    q.begin_drain(DB, 1, "users");
-    q.begin_drain(DB, 1, "users");
-    q.begin_drain(DB, 1, "users");
+    let _first = q.begin_drain(DB, 1, "users");
+    let _second = q.begin_drain(DB, 1, "users");
+    let _third = q.begin_drain(DB, 1, "users");
     assert!(q.is_draining(DB, 1, "users"));
     assert_eq!(
         q.try_start_scan(DB, 1, "users").unwrap_err(),

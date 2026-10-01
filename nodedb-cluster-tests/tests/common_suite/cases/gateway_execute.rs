@@ -34,6 +34,7 @@ fn test_ctx() -> QueryContext {
         trace_id: nodedb_types::TraceId::ZERO,
         database_id: nodedb_types::id::DatabaseId::DEFAULT,
         txn_id: None,
+        linearizable: false,
     }
 }
 
@@ -73,7 +74,7 @@ async fn gateway_execute_kv_put_get_single_node() {
         key: b"smoke-key".to_vec(),
         value: mp_string("smoke-value"),
         ttl_ms: 0,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"smoke-key".as_ref()),
         returning: None,
         rls_filters: Vec::new(),
         provenance: None,

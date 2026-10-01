@@ -293,8 +293,9 @@ impl Default for ColumnarMemtableConfig {
     }
 }
 
-/// Value types for `ingest_row()`.
-#[derive(Debug, Clone)]
+/// Value types for `ingest_row()`. A resolved timeseries ingest records its
+/// rows in this form.
+#[derive(Debug, Clone, PartialEq, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub enum ColumnValue {
     Timestamp(i64),
     Float64(f64),

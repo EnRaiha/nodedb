@@ -7,8 +7,10 @@ use nodedb_types::{
     QualifiedCollection, RlsWriteCheck, Surrogate, SurrogateBitmap, SystemTimeScope,
 };
 
+use super::algo_stage::AlgoStage;
 use super::batch_edge::BatchEdge;
 use super::bsp::BspSuperstepPlan;
+use super::rag_stage::RagStage;
 use super::wcc::WccSuperstepPlan;
 
 /// Graph engine physical operations.
@@ -178,12 +180,16 @@ pub enum GraphOp {
         bm25_query: Option<String>,
         /// Document field scored by BM25. Required when `bm25_query` is set.
         bm25_field: Option<String>,
+        /// Which part of the fusion the core runs.
+        stage: RagStage,
     },
 
     /// Graph algorithm execution (PageRank, WCC, SSSP, etc.).
     Algo {
         algorithm: GraphAlgorithm,
         params: AlgoParams,
+        /// Where the algorithm reads its graph from.
+        stage: AlgoStage,
     },
 
     /// Graph pattern matching (MATCH clause execution).
@@ -302,5 +308,62 @@ pub enum GraphOp {
     Stats {
         collection: Option<QualifiedCollection>,
         as_of: Option<i64>,
+    },
+
+    /// Guard a node delete on the node's key home, `from_key(node_id)`,
+    /// which holds every edge incident on the node.
+    ///
+    /// The live edges of `collection` with `node_id` as source or
+    /// destination must be exactly `expected`. Any other state answers
+    /// `OllpRetryRequired` and the transaction writes nothing. The planner
+    /// reads the edges, deletes each one in the same transaction, and this
+    /// guard proves that no edge appeared or vanished in between. The guard
+    /// itself writes nothing.
+    NodeEdgeGuard {
+        collection: QualifiedCollection,
+        node_id: String,
+        expected: Vec<BatchEdge>,
+    },
+
+    /// A CRDT document delete's presence guard on the collection's vShard
+    /// `vshard`. It runs only inside a Calvin transaction.
+    ///
+    /// It holds only when every id in `present` is a stored document of
+    /// `collection` and no id in `absent` is. Any other state answers
+    /// `OllpRetryRequired`, and the transaction writes nothing. The planner
+    /// tombstones the edges of the present documents' nodes only, and this
+    /// guard proves no document appeared or vanished since
+    /// [`GraphOp::NodePresenceRead`] read them.
+    NodePresenceGuard {
+        collection: QualifiedCollection,
+        vshard: u32,
+        present: Vec<String>,
+        absent: Vec<String>,
+    },
+
+    /// Tombstone every live edge of `collection` with a home on `vshard`
+    /// whose newest version is below the transaction's ordinal.
+    ///
+    /// TRUNCATE of an edge-bearing collection is one Calvin transaction: the
+    /// rows' truncate on the collection's vShard, and one copy of this on
+    /// every vShard. The copy stages nothing. Its resolve runs at the
+    /// transaction's turn on `vshard`, reads the collection's live edges
+    /// there, and tombstones each one at the transaction's ordinal, which
+    /// every participant shares. So both homes of an edge stamp one key, an
+    /// edge sequenced before the TRUNCATE is gone, and one sequenced after
+    /// it stays.
+    TruncateEdges {
+        collection: QualifiedCollection,
+        vshard: u32,
+    },
+
+    /// The stored CRDT documents of `collection` among `ids`, read on the
+    /// collection's vShard `vshard`. The answer is a msgpack array of the
+    /// stored ids. A CRDT document delete's planner reads it before it
+    /// builds the [`GraphOp::NodePresenceGuard`]. It writes nothing.
+    NodePresenceRead {
+        collection: QualifiedCollection,
+        vshard: u32,
+        ids: Vec<String>,
     },
 }

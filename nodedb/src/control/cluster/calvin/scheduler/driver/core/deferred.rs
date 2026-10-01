@@ -18,7 +18,7 @@ use nodedb_physical::physical_plan::meta::MetaOp;
 
 use super::halt::{HaltReason, HaltStep};
 use super::scheduler::Scheduler;
-use crate::bridge::dispatch::DispatchRefusal;
+use crate::bridge::dispatch::{DispatchRefusal, JournalGroup};
 use crate::bridge::envelope::Request;
 use crate::control::cluster::calvin::scheduler::lock_manager::TxnId;
 use crate::types::RequestId;
@@ -57,6 +57,8 @@ pub(in crate::control::cluster::calvin::scheduler::driver::core) struct Deferred
     txn_id: TxnId,
     step: DispatchStep,
     request: Request,
+    /// The record group the request's write set journals into.
+    journal: Option<JournalGroup>,
 }
 
 /// FIFO of requests refused at capacity, in refusal order.
@@ -85,7 +87,19 @@ impl Scheduler {
         step: DispatchStep,
         request: Request,
     ) -> DispatchOutcome {
-        match self.send_once(txn_id, step, request) {
+        self.dispatch_sequenced_journalled(txn_id, step, request, None)
+    }
+
+    /// [`Self::dispatch_sequenced`] for a request whose write set journals
+    /// into `journal`.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn dispatch_sequenced_journalled(
+        &mut self,
+        txn_id: TxnId,
+        step: DispatchStep,
+        request: Request,
+        journal: Option<JournalGroup>,
+    ) -> DispatchOutcome {
+        match self.send_once(txn_id, step, request, journal) {
             Attempt::Sent => DispatchOutcome::Sent,
             Attempt::Capacity(parked) => {
                 self.deferred.push_back(*parked);
@@ -112,6 +126,14 @@ impl Scheduler {
         self.has_deferred_dispatch() && !self.is_apply_halted()
     }
 
+    /// Whether a refused request of `txn_id` waits for capacity.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn has_parked_dispatch(
+        &self,
+        txn_id: TxnId,
+    ) -> bool {
+        self.deferred.iter().any(|parked| parked.txn_id == txn_id)
+    }
+
     /// Number of refused requests waiting for capacity.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) fn deferred_dispatch_len(
         &self,
@@ -132,6 +154,7 @@ impl Scheduler {
                 txn_id,
                 step,
                 mut request,
+                journal,
             } = parked;
             if step != DispatchStep::WriteVersionRecord && !self.pending.contains_key(&txn_id) {
                 tracing::error!(
@@ -144,7 +167,7 @@ impl Scheduler {
                 continue;
             }
             self.refresh_deferred_request(step, &mut request);
-            match self.send_once(txn_id, step, request) {
+            match self.send_once(txn_id, step, request, journal) {
                 Attempt::Sent => {}
                 Attempt::Capacity(parked) => {
                     self.deferred.push_front(*parked);
@@ -201,7 +224,13 @@ impl Scheduler {
     }
 
     /// One send attempt: register, dispatch, and cancel on refusal.
-    fn send_once(&mut self, txn_id: TxnId, step: DispatchStep, request: Request) -> Attempt {
+    fn send_once(
+        &mut self,
+        txn_id: TxnId,
+        step: DispatchStep,
+        request: Request,
+        journal: Option<JournalGroup>,
+    ) -> Attempt {
         // A crash test holds one collection's flush here: the redo record is
         // appended and no core holds the flush. The flush waits in the
         // re-send queue, as at capacity, so the scheduler keeps running.
@@ -217,13 +246,16 @@ impl Scheduler {
                 txn_id,
                 step,
                 request,
+                journal,
             }));
         }
         let request_id = request.request_id;
         let resp_rx = self.shared.tracker.register(request_id);
         let result = match self.shared.dispatcher.lock() {
-            Ok(mut dispatcher) => dispatcher.try_dispatch(request),
-            Err(poisoned) => poisoned.into_inner().try_dispatch(request),
+            Ok(mut dispatcher) => dispatcher.try_dispatch_journalled(request, journal.clone()),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .try_dispatch_journalled(request, journal.clone()),
         };
         let refusal = match result {
             Ok(()) => {
@@ -249,6 +281,7 @@ impl Scheduler {
                     txn_id,
                     step,
                     request,
+                    journal,
                 }))
             }
             other => Attempt::Failed(other),
@@ -341,8 +374,10 @@ mod tests {
         begin_data_plane_drain(&scheduler.shared);
         let txn_id = TxnId::new(3, 0);
 
-        scheduler.process_scheduler_input(SchedulerInput::Txn(make_validate_only_txn(3, 0)));
-        scheduler.process_scheduler_input(SchedulerInput::Txn(make_validate_only_txn(4, 0)));
+        scheduler
+            .process_scheduler_input(SchedulerInput::Txn(Box::new(make_validate_only_txn(3, 0))));
+        scheduler
+            .process_scheduler_input(SchedulerInput::Txn(Box::new(make_validate_only_txn(4, 0))));
 
         assert!(
             !scheduler.applied.is_applied(3, 0),
@@ -377,7 +412,8 @@ mod tests {
         let shared = Arc::clone(&scheduler.shared);
         fill_tenant_inflight(&shared, &mut data_side, TenantId::new(1));
         let txn_id = TxnId::new(3, 0);
-        scheduler.process_scheduler_input(SchedulerInput::Txn(make_validate_only_txn(3, 0)));
+        scheduler
+            .process_scheduler_input(SchedulerInput::Txn(Box::new(make_validate_only_txn(3, 0))));
         assert!(scheduler.has_deferred_dispatch(), "the stage parks");
 
         begin_data_plane_drain(&shared);

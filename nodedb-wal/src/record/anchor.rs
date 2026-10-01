@@ -1,61 +1,42 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! LSN ↔ wall-clock anchor payload.
+//! Time-anchor payload.
 //!
-//! Anchors are written periodically to the WAL so that, during replay, the
-//! bitemporal subsystem can reconstruct a stable `system_from_ms` for every
-//! LSN via interpolation between the nearest surrounding anchors.
-//!
-//! Payload layout (fixed 16 bytes, little-endian):
-//!
-//! ```text
-//! ┌─────────┬────────────┐
-//! │ lsn u64 │ wall_ms i64│
-//! └─────────┴────────────┘
-//! ```
+//! The writer appends one `TimeAnchor` record to every group-commit batch. The
+//! record's header LSN is the batch's last LSN. The payload is the HLC wall
+//! time the batch committed at: 8 bytes, little-endian nanoseconds since the
+//! Unix epoch.
 
 use crate::error::{Result, WalError};
 
-/// Size of an anchor payload on disk.
-pub const ANCHOR_PAYLOAD_SIZE: usize = 16;
+/// Size of a time-anchor payload on disk.
+pub const TIME_ANCHOR_PAYLOAD_SIZE: usize = 8;
 
-/// LSN ↔ wall-clock milliseconds anchor.
+/// Commit time of the batch a `TimeAnchor` record closes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LsnMsAnchorPayload {
-    /// WAL LSN at which this anchor was written.
-    pub lsn: u64,
-    /// Wall-clock milliseconds since Unix epoch at write time.
-    pub wall_ms: i64,
+pub struct TimeAnchorPayload {
+    /// HLC wall component, in nanoseconds since the Unix epoch.
+    pub hlc_wall_ns: u64,
 }
 
-impl LsnMsAnchorPayload {
-    pub const fn new(lsn: u64, wall_ms: i64) -> Self {
-        Self { lsn, wall_ms }
+impl TimeAnchorPayload {
+    pub const fn new(hlc_wall_ns: u64) -> Self {
+        Self { hlc_wall_ns }
     }
 
-    pub fn to_bytes(&self) -> [u8; ANCHOR_PAYLOAD_SIZE] {
-        let mut buf = [0u8; ANCHOR_PAYLOAD_SIZE];
-        buf[0..8].copy_from_slice(&self.lsn.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.wall_ms.to_le_bytes());
-        buf
+    pub fn to_bytes(&self) -> [u8; TIME_ANCHOR_PAYLOAD_SIZE] {
+        self.hlc_wall_ns.to_le_bytes()
     }
 
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
-        if buf.len() != ANCHOR_PAYLOAD_SIZE {
-            return Err(WalError::InvalidPayload {
+        let bytes: [u8; TIME_ANCHOR_PAYLOAD_SIZE] =
+            buf.try_into().map_err(|_| WalError::InvalidPayload {
                 detail: format!(
-                    "LsnMsAnchor payload must be {ANCHOR_PAYLOAD_SIZE} bytes, got {}",
+                    "TimeAnchor payload must be {TIME_ANCHOR_PAYLOAD_SIZE} bytes, got {}",
                     buf.len()
                 ),
-            });
-        }
-        let lsn = u64::from_le_bytes([
-            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-        ]);
-        let wall_ms = i64::from_le_bytes([
-            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-        ]);
-        Ok(Self { lsn, wall_ms })
+            })?;
+        Ok(Self::new(u64::from_le_bytes(bytes)))
     }
 }
 
@@ -65,22 +46,14 @@ mod tests {
 
     #[test]
     fn anchor_roundtrip() {
-        let anchor = LsnMsAnchorPayload::new(12_345, 1_700_000_000_000);
+        let anchor = TimeAnchorPayload::new(1_700_000_000_000_000_123);
         let bytes = anchor.to_bytes();
-        assert_eq!(LsnMsAnchorPayload::from_bytes(&bytes).unwrap(), anchor);
-    }
-
-    #[test]
-    fn anchor_negative_wall_ms() {
-        // Wall-clock predates epoch — rare but permitted by i64 encoding.
-        let anchor = LsnMsAnchorPayload::new(0, -1);
-        let bytes = anchor.to_bytes();
-        assert_eq!(LsnMsAnchorPayload::from_bytes(&bytes).unwrap(), anchor);
+        assert_eq!(TimeAnchorPayload::from_bytes(&bytes).unwrap(), anchor);
     }
 
     #[test]
     fn anchor_wrong_size_rejected() {
-        assert!(LsnMsAnchorPayload::from_bytes(&[0u8; 15]).is_err());
-        assert!(LsnMsAnchorPayload::from_bytes(&[0u8; 17]).is_err());
+        assert!(TimeAnchorPayload::from_bytes(&[0u8; 7]).is_err());
+        assert!(TimeAnchorPayload::from_bytes(&[0u8; 9]).is_err());
     }
 }

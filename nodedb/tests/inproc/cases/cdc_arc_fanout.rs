@@ -44,6 +44,7 @@ fn stream_def(name: &str, collection: &str) -> ChangeStreamDef {
         owner: "admin".into(),
         created_at: 0,
         subscriber_roles: Vec::new(),
+        modification_hlc: nodedb_types::Hlc::ZERO,
     }
 }
 
@@ -69,6 +70,11 @@ fn write_event(seq: u64) -> WriteEvent {
         valid_time_ms: None,
         user_id: None,
         statement_digest: None,
+        // The write committed now, so the event stays in age retention.
+        commit_hlc: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok()),
     }
 }
 
@@ -119,6 +125,8 @@ fn buffer_composite_read_shares_event_allocation_across_polls() {
         // always past that cutoff under a real clock.
         event_time: u64::MAX,
         lsn: 10,
+        index: 10,
+        epoch: 0,
         database_id: DatabaseId::new(7),
         tenant_id: 1,
         new_value: Some(serde_json::json!({"id": 1, "pad": "y".repeat(2048)})),
@@ -166,6 +174,8 @@ fn buffer_partition_read_shares_event_allocation() {
         // always past that cutoff under a real clock.
         event_time: u64::MAX,
         lsn: 10,
+        index: 10,
+        epoch: 0,
         database_id: DatabaseId::new(7),
         tenant_id: 1,
         new_value: Some(serde_json::json!({"id": 1})),

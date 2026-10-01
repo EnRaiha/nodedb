@@ -2,9 +2,6 @@
 
 //! Parsed request struct shared by `CREATE COLLECTION` and `CREATE TABLE`.
 //!
-//! Relocated verbatim from the pgwire
-//! `pgwire::ddl::collection::create::request` module (now deleted). The
-//! pgwire typed-AST router (`router/ast/async_ops.rs`) does not call this:
 //! `CreateCollection` / `CreateTable` are handled by the neutral router
 //! directly.
 

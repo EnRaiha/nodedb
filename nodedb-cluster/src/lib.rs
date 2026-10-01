@@ -42,8 +42,10 @@ pub mod forward;
 pub mod ghost;
 #[doc(hidden)]
 pub mod ghost_sweeper;
+pub mod group_disk;
 pub mod health;
 pub mod install_snapshot;
+pub mod lease_liveness;
 pub mod lifecycle;
 pub mod lifecycle_state;
 pub mod loop_metrics;
@@ -54,6 +56,7 @@ pub mod migration_executor;
 pub mod mirror;
 pub mod multi_raft;
 pub mod quic_transport;
+pub mod raft_bootstrap;
 pub mod raft_loop;
 pub mod raft_storage;
 pub mod rdma_transport;
@@ -65,6 +68,7 @@ pub mod rebalance_scheduler;
 pub mod rebalancer;
 pub mod routing;
 pub mod routing_liveness;
+pub mod routing_membership;
 pub mod rpc_codec;
 pub mod shard_split;
 pub mod subsystem;
@@ -78,7 +82,8 @@ pub mod wire_version;
 
 pub use applied_watcher::{AppliedIndexWatcher, GroupAppliedWatchers, WaitOutcome};
 pub use bootstrap::{
-    ClusterConfig, ClusterState, JoinRetryPolicy, start_cluster, start_cluster_subsystems,
+    ClusterConfig, ClusterState, JoinRetryPolicy, SubsystemHandles, start_cluster,
+    start_cluster_subsystems,
 };
 #[doc(hidden)]
 pub use calvin::{EngineKeySet, EpochBatch, ReadWriteSet, SequencedTxn, SortedVec, TxClass};
@@ -100,6 +105,10 @@ pub use error::{
 pub use forward::{ChunkSink, NoopPlanExecutor, PlanExecutor};
 pub use ghost::{GhostStub, GhostTable};
 pub use health::{HealthConfig, HealthMonitor};
+pub use lease_liveness::{
+    DEAD_HOLDER_LEASE_GRACE, DEAD_HOLDER_RAFT_SILENCE, LEASE_CLOCK_SKEW, LEASE_SELF_FENCE_WINDOW,
+    LeaseHolderLiveness, LeaseNow,
+};
 pub use lifecycle_state::{ClusterLifecycleState, ClusterLifecycleTracker};
 pub use loop_metrics::{LoopMetrics, LoopMetricsRegistry};
 pub use migration::{MigrationPhase, MigrationState};
@@ -108,7 +117,8 @@ pub use migration_executor::{
 };
 pub use multi_raft::{GroupStatus, MultiRaft};
 pub use raft_loop::{
-    AssignRemoteSurrogate, AuthLeaseService, CalvinSubmit, CalvinSubmitInbox, CommitApplier,
+    ApplyPermit, AssignRemoteSurrogate, AuthLeaseService, BuiltGroupSnapshot, CalvinSubmit,
+    CalvinSubmitInbox, CommitApplier, GroupApplyGates, InstallPermit, MetadataSnapshotCapture,
     RaftLoop, ReleaseReservation, ReserveRead, ShuffleAggregator, ShuffleConsumer, ShuffleProducer,
     ShuffleReceiver, SnapshotApplier, SnapshotBuilder, SnapshotQuarantineHook,
     VShardEnvelopeHandler,
@@ -128,8 +138,9 @@ pub use routing_liveness::{NodeIdResolver, RoutingLivenessHook};
 pub use rpc_codec::{
     AssignSurrogateRequest, AssignSurrogateResponse, AuthBarrierOutcome, AuthBarrierRequest,
     AuthBarrierResponse, AuthLeaseRenewOutcome, AuthLeaseRenewRequest, AuthLeaseRenewResponse,
-    DataPlaneErrorCode, GroupCoverage, JoinKeyPair, MacKey, PartNodeEntry, RaftRpc,
-    ReleaseReservationRequest, ReleaseReservationResponse, ReserveReadRequest, ReserveReadResponse,
+    CalvinPartsRequest, CalvinPartsResponse, DataPlaneErrorCode, GroupCoverage, JoinKeyPair,
+    MAX_PARTS_BATCH_BYTES, MacKey, PartNodeEntry, RaftRpc, ReleaseReservationRequest,
+    ReleaseReservationResponse, ReserveReadRequest, ReserveReadResponse,
     ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
     ShuffleConsumeResponse, ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushChunk,
     ShufflePushEnd, ShufflePushRequest, SortKey, SubmitCalvinInboxRequest,
@@ -152,12 +163,12 @@ pub use cross_shard_txn::{
 };
 pub use metadata_group::entry::JoinTokenTransitionKind;
 pub use metadata_group::{
-    CacheApplier, Compensation, DescriptorHeader, DescriptorId, DescriptorKind, DescriptorLease,
-    DescriptorState, METADATA_GROUP_ID, MetadataApplier, MetadataCache, MetadataEntry,
-    MigrationCheckpointPayload, MigrationId, MigrationPhaseTag, NoopMetadataApplier,
-    PendingDdlObject, PersistedMigrationCheckpoint, RoutingChange, SharedMigrationStateTable,
-    TopologyChange, apply_migration_abort, apply_migration_checkpoint, decode_entry, encode_entry,
-    new_shared,
+    CacheApplier, CommittedMetadata, Compensation, DescriptorHeader, DescriptorId, DescriptorKind,
+    DescriptorLease, DescriptorState, DrainOwner, METADATA_GROUP_ID, MetadataApplier,
+    MetadataCache, MetadataEntry, MetadataPayload, MigrationCheckpointPayload, MigrationId,
+    MigrationPhaseTag, NoopMetadataApplier, PendingDdlObject, PersistedMigrationCheckpoint,
+    RoutingChange, SharedMigrationStateTable, TopologyChange, apply_migration_abort,
+    apply_migration_checkpoint, decode_entry, encode_entry, entry_stamp, new_shared, stamp_entry,
 };
 pub use migration_executor::recover_in_flight_migrations;
 pub use quic_transport::{QuicTransport, QuicTransportConfig};
@@ -172,12 +183,12 @@ pub use rebalance_scheduler::{NodeMetrics, RebalanceScheduler, RebalanceTrigger,
 pub use shard_split::{SplitPlan, SplitStrategy, plan_graph_split, plan_vector_split};
 pub use subsystem::{
     BootstrapCtx, BootstrapError, ClusterHealth, ClusterSubsystem, RunningCluster, ShutdownError,
-    SubsystemHandle, SubsystemHealth, SubsystemRegistry, TopoError, topo_sort,
+    SubsystemHandle, SubsystemHealth, SubsystemRegistry, SwimWiring, TopoError, topo_sort,
 };
 pub use swim::bootstrap::spawn_with_subscribers as spawn_swim_with_subscribers;
 pub use swim::{
     Incarnation, Member, MemberState, MembershipList, MembershipSubscriber, SwimConfig, SwimError,
-    SwimHandle, UdpTransport, spawn as spawn_swim,
+    SwimHandle, UdpTransport, bind_swim_listener, default_swim_addr, spawn as spawn_swim,
 };
 
 pub use auth::{

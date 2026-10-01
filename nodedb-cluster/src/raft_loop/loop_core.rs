@@ -8,9 +8,7 @@
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
-
-use tracing::debug;
+use std::time::Duration;
 
 use nodedb_raft::message::LogEntry;
 
@@ -85,6 +83,9 @@ pub struct RaftLoop<A: CommitApplier, P: PlanExecutor = NoopPlanExecutor> {
     /// from the join flow. When `None`, persistence is skipped — useful
     /// for unit tests that don't care about durability.
     pub(super) catalog: Option<Arc<ClusterCatalog>>,
+    /// The single writer of the routing table to `catalog`, off the async
+    /// threads. Set with the catalog. `None` saves nothing.
+    pub(super) routing_persister: Option<Arc<super::routing_persist::RoutingPersister>>,
     /// Cooperative shutdown signal observed by every detached
     /// `tokio::spawn` task in [`super::tick`]. `run()` flips it on
     /// its own shutdown, and [`Self::begin_shutdown`] provides a
@@ -249,8 +250,8 @@ pub struct RaftLoop<A: CommitApplier, P: PlanExecutor = NoopPlanExecutor> {
     ///
     /// When set (by the `nodedb` binary via `with_snapshot_applier`), the
     /// install-snapshot finalize path applies the received per-group snapshot to
-    /// the local Data-Plane state machine AFTER the atomic `.partial`→`.snap`
-    /// rename and BEFORE advancing Raft. Cluster-only tests leave this `None`,
+    /// the local Data-Plane state machine AFTER staging it and BEFORE advancing
+    /// Raft. Cluster-only tests leave this `None`,
     /// which makes the follower advance Raft without restoring engine state
     /// (correct for the empty bootstrap stub shipped by those tests).
     pub(super) snapshot_applier: Option<Arc<dyn SnapshotApplier>>,
@@ -274,16 +275,15 @@ pub struct RaftLoop<A: CommitApplier, P: PlanExecutor = NoopPlanExecutor> {
     /// Orphan partial-snapshot max age for the GC sweeper (seconds).
     pub(super) orphan_partial_max_age_secs: u64,
 
-    /// Cluster replication factor (target voters per group), loaded once from
-    /// `ClusterSettings` at startup; immutable for the loop's lifetime. Used
-    /// to cap voter promotion at min(RF, N). Defaults to 1 (single-node, no
-    /// extra replicas) when not overridden via `with_replication_factor`.
+    /// Target voters per group, loaded from `ClusterSettings` at startup.
+    /// Defaults to 1 when not overridden via `with_replication_factor`.
     pub(super) replication_factor: u32,
 
-    /// Monotonic tick counter; throttles periodic maintenance (placement
-    /// reconcile) to a coarse cadence off the 10ms tick. `AtomicU64` because
-    /// [`super::tick::do_tick`] runs against `&self`.
+    /// Monotonic tick counter. It throttles periodic maintenance off the
+    /// 10ms tick. `AtomicU64` because `do_tick` runs against `&self`.
     pub(super) tick_count: std::sync::atomic::AtomicU64,
+    /// Samples and in-flight markers the periodic tick phases carry.
+    pub(super) tick_state: Arc<super::tick_state::TickState>,
 
     /// Notification channel for kicking placement reconcile immediately
     /// when a node joins, instead of waiting up to ~1 s for the throttled
@@ -296,16 +296,20 @@ pub struct RaftLoop<A: CommitApplier, P: PlanExecutor = NoopPlanExecutor> {
     /// periodic lease-GC sweep can read committed lease state directly.
     /// `None` in cluster-only tests that don't wire it.
     pub(super) metadata_cache: Option<Arc<RwLock<MetadataCache>>>,
+    /// SWIM Dead records and Raft contact samples for the lease-GC sweep.
+    pub(super) lease_holder_liveness: Arc<crate::lease_liveness::LeaseHolderLiveness>,
 }
 
 impl<A: CommitApplier> RaftLoop<A> {
     pub fn new(
-        multi_raft: MultiRaft,
+        mut multi_raft: MultiRaft,
         transport: Arc<NexarTransport>,
         topology: Arc<RwLock<ClusterTopology>>,
         applier: A,
     ) -> Self {
         let node_id = multi_raft.node_id();
+        let group_watchers = Arc::new(GroupAppliedWatchers::new());
+        multi_raft.set_applied_watchers(Arc::clone(&group_watchers));
         // Share the transport's epoch state rather than making a second one:
         // the generation this node applies and the generation it stamps must
         // be the same fact.
@@ -323,10 +327,11 @@ impl<A: CommitApplier> RaftLoop<A> {
             tick_interval: DEFAULT_TICK_INTERVAL,
             vshard_handler: None,
             catalog: None,
+            routing_persister: None,
             shutdown_watch,
             ready_watch,
             loop_metrics: LoopMetrics::new("raft_tick_loop"),
-            group_watchers: Arc::new(GroupAppliedWatchers::new()),
+            group_watchers,
             prev_metadata_leader: std::sync::atomic::AtomicBool::new(false),
             cluster_epoch,
             snapshot_quarantine_hook: None,
@@ -348,8 +353,10 @@ impl<A: CommitApplier> RaftLoop<A> {
             orphan_partial_max_age_secs: 300,
             replication_factor: 1,
             tick_count: std::sync::atomic::AtomicU64::new(0),
+            tick_state: Arc::new(super::tick_state::TickState::new()),
             reconcile_notify: tokio::sync::Notify::new(),
             metadata_cache: None,
+            lease_holder_liveness: Arc::new(crate::lease_liveness::LeaseHolderLiveness::new()),
         }
     }
 }
@@ -420,65 +427,6 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         self.replication_factor
     }
 
-    /// Run the event loop until shutdown.
-    ///
-    /// This drives Raft elections, heartbeats, and message dispatch.
-    /// Call [`NexarTransport::serve`] separately with `Arc<Self>` as the handler.
-    ///
-    /// When the externally-supplied `shutdown` receiver fires,
-    /// the loop also propagates the signal to the internal
-    /// cooperative-shutdown channel so every detached task
-    /// spawned inside `do_tick` exits promptly and drops its
-    /// `Arc<Mutex<MultiRaft>>` clone.
-    pub async fn run(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        let mut interval = tokio::time::interval(self.tick_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        self.loop_metrics.set_up(true);
-
-        // Startup GC sweep: remove orphaned partial-snapshot files from
-        // previous runs that did not complete.
-        if let Some(ref dir) = self.data_dir {
-            match crate::install_snapshot::gc::sweep_orphans(dir, self.orphan_partial_max_age_secs)
-            {
-                Ok((removed, errs)) => {
-                    if removed > 0 {
-                        tracing::info!(removed, "startup: removed orphaned partial snapshot files");
-                    }
-                    for e in errs {
-                        tracing::warn!(error = %e, "startup: partial snapshot GC error");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "startup: failed to sweep partial snapshot directory");
-                }
-            }
-        }
-
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let started = Instant::now();
-                    self.do_tick();
-                    self.loop_metrics.observe(started.elapsed());
-                }
-                _ = self.reconcile_notify.notified() => {
-                    if *shutdown.borrow() {
-                        return;
-                    }
-                    self.reconcile_placement();
-                }
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
-                        debug!("raft loop shutting down");
-                        self.begin_shutdown();
-                        break;
-                    }
-                }
-            }
-        }
-        self.loop_metrics.set_up(false);
-    }
-
     /// Returns the inner multi-raft handle. Exposed for tests and for
     /// the host crate's metadata proposer so it can hold a second
     /// reference to the same underlying mutex without pulling the
@@ -540,11 +488,15 @@ mod tests {
         applied: Arc<AtomicU64>,
     }
 
+    #[async_trait::async_trait]
     impl MetadataApplier for CountingMetadataApplier {
-        fn apply(&self, entries: &[(u64, Vec<u8>)]) -> u64 {
+        async fn apply_decoded(
+            &self,
+            entries: &[crate::metadata_group::CommittedMetadata<'_>],
+        ) -> u64 {
             self.applied
                 .fetch_add(entries.len() as u64, Ordering::Relaxed);
-            entries.last().map(|(idx, _)| *idx).unwrap_or(0)
+            entries.last().map_or(0, |e| e.index)
         }
     }
 
@@ -688,6 +640,18 @@ mod tests {
         mr3.add_group(0, vec![1, 2]).unwrap();
         mr3.add_group(1, vec![1, 2]).unwrap();
 
+        // Nodes 2 and 3 keep the production election timeouts so node 1
+        // campaigns first. A node refuses every vote until its boot fence,
+        // `election_timeout_max` after it starts, passes: that is the whole
+        // wait of this test. These nodes start fresh and vote at once.
+        for node in mr2
+            .groups_mut()
+            .values_mut()
+            .chain(mr3.groups_mut().values_mut())
+        {
+            node.expire_boot_vote_fence();
+        }
+
         let a1 = CountingApplier::new();
         let m1 = a1.metadata_applier();
         let a2 = CountingApplier::new();
@@ -763,5 +727,163 @@ mod tests {
         }
 
         shutdown_tx.send(true).unwrap();
+    }
+
+    /// Metadata applier whose effects count as durable. Records every
+    /// delivered index and stops before `halt_at`.
+    struct DurableRecordingMetadataApplier {
+        delivered: Arc<Mutex<Vec<u64>>>,
+        halt_at: Option<u64>,
+    }
+
+    #[async_trait::async_trait]
+    impl MetadataApplier for DurableRecordingMetadataApplier {
+        async fn apply_decoded(
+            &self,
+            entries: &[crate::metadata_group::CommittedMetadata<'_>],
+        ) -> u64 {
+            let mut delivered = self.delivered.lock().unwrap_or_else(|p| p.into_inner());
+            let mut last = 0;
+            for committed in entries {
+                if Some(committed.index) == self.halt_at {
+                    break;
+                }
+                delivered.push(committed.index);
+                last = committed.index;
+            }
+            last
+        }
+
+        fn durable_effects(&self) -> bool {
+            true
+        }
+    }
+
+    /// Open group 0 over `dir`, retrying while a previous session still
+    /// holds the log file.
+    async fn open_metadata_group(dir: &std::path::Path) -> MultiRaft {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut mr = MultiRaft::new(1, RoutingTable::uniform(1, &[1], 1), dir.to_path_buf());
+            match mr.add_group(0, vec![]) {
+                Ok(()) => return mr,
+                Err(e) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "group 0 log never released: {e}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+    }
+
+    /// One node session over `dir`: propose `proposals` metadata entries,
+    /// wait for their delivery, shut down. Returns the delivered indices.
+    async fn metadata_session(
+        dir: &std::path::Path,
+        proposals: usize,
+        halt_at: Option<u64>,
+    ) -> Vec<u64> {
+        let mut mr = open_metadata_group(dir).await;
+        for node in mr.groups_mut().values_mut() {
+            node.election_deadline_override(Instant::now() - Duration::from_millis(1));
+        }
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let applier = Arc::new(DurableRecordingMetadataApplier {
+            delivered: Arc::clone(&delivered),
+            halt_at,
+        });
+        let topo = Arc::new(RwLock::new(ClusterTopology::new()));
+        let raft_loop = Arc::new(
+            RaftLoop::new(mr, make_transport(1), topo, CountingApplier::new())
+                .with_metadata_applier(applier),
+        );
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let rl = Arc::clone(&raft_loop);
+        let run = tokio::spawn(async move { rl.run(shutdown_rx).await });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut last_proposed = 0;
+        let mut proposed = 0;
+        while proposed < proposals {
+            assert!(tokio::time::Instant::now() < deadline, "no metadata leader");
+            match raft_loop.propose_to_metadata_group(b"entry".to_vec()) {
+                Ok(index) => {
+                    last_proposed = index;
+                    proposed += 1;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        let target = halt_at.map_or(last_proposed, |k| k - 1);
+        loop {
+            let reached = delivered
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .any(|index| *index >= target);
+            if reached {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "delivery stalled");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Let the ticks that follow retry the halted entry.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        shutdown_tx.send(true).unwrap();
+        raft_loop.begin_shutdown();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), run)
+                .await
+                .is_ok(),
+            "raft loop did not stop"
+        );
+        drop(raft_loop);
+        delivered.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// A durable-effects applier's delivered index becomes group 0's applied
+    /// floor. After a restart only entries above the floor are delivered.
+    #[tokio::test]
+    async fn restart_delivers_only_entries_above_the_metadata_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = metadata_session(dir.path(), 3, None).await;
+        let floor = open_metadata_group(dir.path())
+            .await
+            .last_applied(0)
+            .unwrap_or(0);
+        assert_eq!(
+            Some(&floor),
+            first.iter().max(),
+            "floor = highest delivered"
+        );
+
+        let second = metadata_session(dir.path(), 2, None).await;
+        assert!(!second.is_empty());
+        assert!(
+            second.iter().all(|index| *index > floor),
+            "restart re-delivered an entry at or below floor {floor}: {second:?}"
+        );
+    }
+
+    /// An applier that halts at entry k keeps the floor below k.
+    #[tokio::test]
+    async fn applier_halt_keeps_the_floor_below_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        metadata_session(dir.path(), 1, None).await;
+        let base = open_metadata_group(dir.path())
+            .await
+            .last_applied(0)
+            .unwrap_or(0);
+        let halt_at = base + 3;
+        let delivered = metadata_session(dir.path(), 4, Some(halt_at)).await;
+        assert!(delivered.iter().all(|index| *index < halt_at));
+        let floor = open_metadata_group(dir.path())
+            .await
+            .last_applied(0)
+            .unwrap_or(0);
+        assert_eq!(floor, halt_at - 1);
     }
 }

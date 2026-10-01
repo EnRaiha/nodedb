@@ -136,6 +136,36 @@ impl WalAppender<'_> {
         .map(Some)
     }
 
+    /// Append a `SnapshotInstalled` record: a Raft snapshot install replaced
+    /// the state of data group `group_id` on this node.
+    pub fn append_snapshot_installed(&self, group_id: u64) -> crate::Result<Lsn> {
+        self.append_record(
+            RecordType::SnapshotInstalled,
+            TenantId::new(0),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            &group_id.to_le_bytes(),
+        )
+    }
+
+    /// Append a `ChangePosition` marker. `payload` names a Raft entry's
+    /// proposal key and its replicated log position.
+    pub fn append_change_position(
+        &self,
+        tenant_id: TenantId,
+        vshard_id: VShardId,
+        database_id: DatabaseId,
+        payload: &[u8],
+    ) -> crate::Result<Lsn> {
+        self.append_record(
+            RecordType::ChangePosition,
+            tenant_id,
+            vshard_id,
+            database_id,
+            payload,
+        )
+    }
+
     /// Append a `SyncSeqAdvance` watermark record. Emitted by the Data Plane sync
     /// handler after durably applying an ingest message, to make the per-stream
     /// high-watermark crash-recoverable.

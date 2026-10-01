@@ -8,13 +8,12 @@
 
 /// Encode the payload of a `VectorPut` WAL record for a single insert.
 ///
-/// Produces the 7-element shape
-/// `(collection, vector, dim, field_name, doc_id_compat, surrogate_u32, provenance)`
-/// — the canonical vector-insert encoding. `doc_id_compat` is always `None`
-/// (a compatibility slot for pre-surrogate follower decoders). This is the ONE
-/// encoder for the shape: both the autocommit `VectorOp::Insert` arm in
-/// `wal_append_if_write_with_creds`, the sync `wal_append_vector_put`, and the
-/// transaction-resolve serializer call it so producer and replay never drift.
+/// Produces the 6-element shape
+/// `(collection, vector, dim, field_name, surrogate_u32, provenance)` — the
+/// canonical vector-insert encoding. This is the ONE encoder for the shape:
+/// the autocommit `VectorOp::Insert` arm in `wal_append_if_write_with_creds`
+/// and the transaction-resolve serializer call it so producer and replay
+/// never drift.
 pub(crate) fn encode_vector_put_payload(
     collection: &str,
     vector: &[f32],
@@ -23,13 +22,11 @@ pub(crate) fn encode_vector_put_payload(
     surrogate: nodedb_types::Surrogate,
     provenance: Option<&nodedb_types::sync::wire::SyncProvenance>,
 ) -> crate::Result<Vec<u8>> {
-    let doc_id_compat: Option<String> = None;
     zerompk::to_msgpack_vec(&(
         collection,
         vector,
         dim,
         field_name,
-        doc_id_compat,
         surrogate.as_u32(),
         provenance,
     ))
@@ -39,27 +36,30 @@ pub(crate) fn encode_vector_put_payload(
     })
 }
 
-/// Encode the payload of a `VectorPut` WAL record for a headless batch insert.
+/// Encode the payload of a `VectorPut` WAL record for a batch insert.
 ///
-/// Produces the 3-element shape `(collection, vectors, dim)` that the batch arm
-/// of `replay_vector_wal` decodes. Batch inserts carry no per-vector surrogate
-/// on this shape (mirrors the autocommit `VectorOp::BatchInsert` arm).
+/// Produces the 4-element shape `(collection, vectors, dim, surrogates_u32)`
+/// that the batch arm of `replay_vector_wal` decodes. `surrogates[i]` is the
+/// identity of `vectors[i]`, so replay rebinds every vector it installs.
 pub(crate) fn encode_vector_batch_put_payload(
     collection: &str,
     vectors: &[Vec<f32>],
     dim: usize,
+    surrogates: &[nodedb_types::Surrogate],
 ) -> crate::Result<Vec<u8>> {
-    zerompk::to_msgpack_vec(&(collection, vectors, dim)).map_err(|e| crate::Error::Serialization {
-        format: "msgpack".into(),
-        detail: format!("wal vector batch insert: {e}"),
+    let surrogates: Vec<u32> = surrogates.iter().map(|s| s.as_u32()).collect();
+    zerompk::to_msgpack_vec(&(collection, vectors, dim, surrogates)).map_err(|e| {
+        crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("wal vector batch insert: {e}"),
+        }
     })
 }
 
 /// Encode the payload of a `VectorDelete` WAL record for a delete-by-node-id.
 ///
 /// Produces the 3-element shape `(collection, vector_id, provenance)` with
-/// `provenance = None`, matching the autocommit `VectorOp::Delete` arm. The
-/// legacy 2-element decoder still parses the leading fields.
+/// `provenance = None`, matching the autocommit `VectorOp::Delete` arm.
 pub(crate) fn encode_vector_delete_payload(
     collection: &str,
     vector_id: u32,
@@ -75,21 +75,23 @@ pub(crate) fn encode_vector_delete_payload(
 
 /// Encode the payload of a `VectorDelete` WAL record for a delete-by-surrogate.
 ///
-/// Produces the 4-element shape `(collection, surrogate_u32, field_name,
-/// provenance)` the surrogate-aware arm of `replay_vector_wal` decodes,
-/// routing to `execute_vector_delete_by_surrogate`.
+/// Produces the 4-element shape `(collection, Option<surrogate_u32>,
+/// field_name, provenance)` the surrogate-aware arm of `replay_vector_wal`
+/// decodes, routing to `execute_vector_delete_by_surrogate`. `None` names a
+/// key its home never bound.
 pub(crate) fn encode_vector_delete_by_surrogate_payload(
     collection: &str,
-    surrogate: nodedb_types::Surrogate,
+    surrogate: Option<nodedb_types::Surrogate>,
     field_name: &str,
     provenance: Option<&nodedb_types::sync::wire::SyncProvenance>,
 ) -> crate::Result<Vec<u8>> {
-    zerompk::to_msgpack_vec(&(collection, surrogate.as_u32(), field_name, provenance)).map_err(
-        |e| crate::Error::Serialization {
+    let surrogate = surrogate.map(|s| s.as_u32());
+    zerompk::to_msgpack_vec(&(collection, surrogate, field_name, provenance)).map_err(|e| {
+        crate::Error::Serialization {
             format: "msgpack".into(),
             detail: format!("wal vector delete by surrogate: {e}"),
-        },
-    )
+        }
+    })
 }
 
 /// Encode the payload of a `VectorDirectUpsert` WAL record.

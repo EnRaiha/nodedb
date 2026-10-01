@@ -10,6 +10,7 @@
 use nodedb_types::Surrogate;
 
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::enforcement::chain_guard::ChainIntent;
 use crate::data::executor::handlers::generated;
 use crate::data::executor::{doc_format, strict_format};
 use crate::types::{DatabaseId, TenantId};
@@ -55,6 +56,19 @@ impl CoreLoop {
             valid_until_ms,
         } = input;
 
+        // A HASH_CHAIN row a write re-applies keeps its durable bytes, so no
+        // expression is evaluated a second time.
+        let intent = self
+            .chain_intents
+            .get(&(config_key.clone(), surrogate.as_u32()));
+        if let Some(ChainIntent::Keep { stored }) = intent {
+            return self.kept_stored_body(config_key, stored);
+        }
+        let link_after = match intent {
+            Some(ChainIntent::Link { head }) => Some(head),
+            _ => None,
+        };
+
         // Evaluate generated columns before encoding.
         let value = if let Some(config) = self.doc_configs.get(config_key)
             && !config.enforcement.generated_columns.is_empty()
@@ -89,6 +103,28 @@ impl CoreLoop {
         let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
             config.storage_mode
         else {
+            let value = match link_after {
+                Some(head) => {
+                    // A chained row carries its identity inside the linked
+                    // contents: a minted row gets `id` from its surrogate here,
+                    // as a strict row gets `_rowid` below. A copy under a new
+                    // surrogate then keeps both its id and its link.
+                    // A body that is not an object is left for the link to
+                    // refuse.
+                    let value = if nodedb_query::msgpack_scan::map_header(&value, 0).is_some() {
+                        nodedb_query::msgpack_scan::inject_str_field(
+                            &value,
+                            nodedb_types::DEFAULT_IDENTITY_COLUMN,
+                            &surrogate.as_u32().to_string(),
+                        )
+                    } else {
+                        value
+                    };
+                    let encode = |body: &[u8]| -> crate::Result<Vec<u8>> { Ok(body.to_vec()) };
+                    self.link_value(config, &value, head, &encode)?
+                }
+                None => value,
+            };
             return Ok(StoredBody {
                 stored: value.clone(),
                 value,
@@ -114,18 +150,25 @@ impl CoreLoop {
         let value = value_with_rowid.unwrap_or(value);
 
         let collection = &config_key.2;
-        let stored = if bitemporal && schema.bitemporal {
-            strict_format::bytes_to_binary_tuple_bitemporal(
-                &value,
-                schema,
-                sys_from_ms,
-                valid_from_ms,
-                valid_until_ms,
-                collection,
-            )
-        } else {
-            strict_format::bytes_to_binary_tuple(&value, schema, collection)
-        }?;
+        let encode = |body: &[u8]| {
+            if bitemporal && schema.bitemporal {
+                strict_format::bytes_to_binary_tuple_bitemporal(
+                    body,
+                    schema,
+                    sys_from_ms,
+                    valid_from_ms,
+                    valid_until_ms,
+                    collection,
+                )
+            } else {
+                strict_format::bytes_to_binary_tuple(body, schema, collection)
+            }
+        };
+        let value = match link_after {
+            Some(head) => self.link_value(config, &value, head, &encode)?,
+            None => value,
+        };
+        let stored = encode(&value)?;
 
         Ok(StoredBody { value, stored })
     }

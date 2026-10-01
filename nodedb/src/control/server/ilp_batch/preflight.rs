@@ -168,7 +168,7 @@ mod tests {
     }
 
     fn grant_write(permissions: &PermissionStore, collection: &str) {
-        let target = format!("collection:9:{collection}");
+        let target = format!("collection:7:9:{collection}");
         permissions
             .grant(&target, "user:ingester", Permission::Write, "admin", None)
             .expect("in-memory grant succeeds");
@@ -286,7 +286,7 @@ mod tests {
         let permissions = PermissionStore::new();
         permissions
             .grant(
-                "collection:9:cpu",
+                "collection:7:9:cpu",
                 "user:ingester",
                 Permission::Read,
                 "admin",
@@ -331,7 +331,7 @@ mod tests {
         let permissions = PermissionStore::new();
         permissions
             .grant(
-                "collection:10:cpu",
+                "collection:7:10:cpu",
                 "user:ingester",
                 Permission::Write,
                 "admin",

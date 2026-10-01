@@ -34,7 +34,7 @@ pub async fn wire_state(
     shared: &mut Arc<SharedState>,
     config: &ServerConfig,
     startup_gate: &Arc<StartupGate>,
-    cluster_handle: Option<&ClusterHandle>,
+    cluster_handle: &ClusterHandle,
     components: SharedStateComponents,
     root_span: &tracing::Span,
 ) -> anyhow::Result<()> {
@@ -46,13 +46,15 @@ pub async fn wire_state(
     // Install startup gate. `/healthz` and the HTTP startup gate read it, so
     // a state left on the test helpers' pre-fired gate would report ready
     // and open every route during boot.
-    Arc::get_mut(shared)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "startup gate: SharedState is already shared before the gate was installed"
-            )
-        })?
-        .startup = Arc::clone(startup_gate);
+    //
+    // The data directory is installed with it, before any step below reads
+    // `state.data_dir`: the restore-generation seal and the PITR node life
+    // read their files from it.
+    let state = Arc::get_mut(shared).ok_or_else(|| {
+        anyhow::anyhow!("startup gate: SharedState is already shared before the gate was installed")
+    })?;
+    state.startup = Arc::clone(startup_gate);
+    state.data_dir = config.server.data_dir.clone();
 
     // Replay surrogate WAL records.
     // Note: wal_records are not passed here — caller must handle surrogate replay
@@ -63,39 +65,16 @@ pub async fn wire_state(
         state.quarantine_registry = Arc::clone(&quarantine_registry);
     }
 
-    // Wire cluster handles.
-    if let Some(handle) = cluster_handle
-        && let Some(state) = Arc::get_mut(shared)
+    // Wire cluster handles. Every server runs one: a real cluster, or the
+    // synthesized one-node cluster when `[cluster]` is absent.
     {
-        state.node_id = handle.node_id;
-        state.cluster_topology = Some(Arc::clone(&handle.topology));
-        state.cluster_routing = Some(Arc::clone(&handle.routing));
-        state.cluster_transport = Some(Arc::clone(&handle.transport));
-        state.metadata_cache = Arc::clone(&handle.metadata_cache);
-        state.group_watchers = Arc::clone(&handle.group_watchers);
-
-        // Wire the cross-shard event SENDER subsystem (cluster mode only). This
-        // is what lets a trigger body writing to a remote-homed collection be
-        // dispatched to the owning node instead of being silently mis-written
-        // to the local core. The dispatcher's background drain task is spawned
-        // later by the Event Plane (`spawn_dispatcher_task`), which injects the
-        // transport from `cluster_transport`; its spawn gate requires the
-        // dispatcher, metrics, and DLQ to be `Some` — set here. The RECEIVER
-        // builds its OWN HWM store at Raft group setup (rooted under the node's
-        // own data_dir), so the SharedState `hwm_store` stays `None`.
-        let cross_shard_metrics = Arc::new(crate::event::cross_shard::CrossShardMetrics::new());
-        state.cross_shard_dispatcher = Some(Arc::new(
-            crate::event::cross_shard::CrossShardDispatcher::new(
-                handle.node_id,
-                Arc::clone(&cross_shard_metrics),
-            ),
-        ));
-        state.cross_shard_dlq = Some(Arc::new(std::sync::Mutex::new(
-            crate::event::cross_shard::CrossShardDlq::open(&config.server.data_dir)?,
-        )));
-        state.cross_shard_metrics = Some(cross_shard_metrics);
-
-        root_span.record("node_id", handle.node_id);
+        let state = Arc::get_mut(shared).ok_or_else(|| {
+            anyhow::anyhow!(
+                "cluster wiring: SharedState is already shared before the cluster handle was installed"
+            )
+        })?;
+        wire_cluster_handle(state, cluster_handle, &config.server.data_dir)?;
+        root_span.record("node_id", cluster_handle.node_id);
     }
 
     // Initialise JWKS registry.
@@ -113,7 +92,7 @@ pub async fn wire_state(
         );
     }
 
-    // Initialise cold storage (L2 tiering).
+    // Initialise cold storage (L2 tiering and the WAL archive).
     if let Some(ref cold_settings) = config.cold_storage {
         let cold_config = cold_settings.to_cold_storage_config();
         match crate::storage::cold::ColdStorage::new(cold_config) {
@@ -127,10 +106,21 @@ pub async fn wire_state(
                     );
                 }
             }
+            // With PITR on, truncation without an archive deletes segments
+            // recovery needs, so a cold store that cannot open stops the boot.
+            Err(e) if config.pitr.enabled => {
+                return Err(crate::Error::Config {
+                    detail: format!("pitr.enabled = true but [cold_storage] failed to open: {e}"),
+                }
+                .into());
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "cold storage init failed, tiering disabled");
             }
         }
+    }
+    if config.pitr.enabled && shared.cold_storage.is_none() {
+        return Err(crate::config::server::missing_cold_storage().into());
     }
 
     // Initialise snapshot storage.
@@ -155,6 +145,14 @@ pub async fn wire_state(
                 std::process::exit(1);
             }
         }
+    }
+
+    // A cluster restore's generation, sealed before any Raft group starts.
+    crate::control::pitr::seal_restored_generation(shared).await?;
+
+    // PITR: this node life, and the base catalog rebuilt from snapshot storage.
+    if config.pitr.enabled {
+        crate::control::pitr::wire_pitr(shared, Arc::clone(&cluster_handle.catalog)).await?;
     }
 
     // Initialise quarantine storage.
@@ -190,6 +188,18 @@ pub async fn wire_state(
     // ALTER DATABASE SET QUOTA updates live caps immediately).
     if let Some(state) = Arc::get_mut(shared) {
         state.maintenance_budget = Arc::clone(&maintenance_budget);
+    }
+
+    // Object-store access for BACKUP / RESTORE DATABASE.
+    if let Some(settings) = &config.backup_storage
+        && let Some(state) = Arc::get_mut(shared)
+    {
+        state.backup_storage = Some(Arc::new(settings.clone()));
+    }
+    if !config.backup.schedule.is_empty()
+        && let Some(state) = Arc::get_mut(shared)
+    {
+        state.backup_schedules = config.backup.schedule.clone();
     }
 
     // Load and wire backup KEK.
@@ -246,20 +256,23 @@ pub async fn wire_state(
             crate::control::trace_export::TraceExporter::disabled()
         };
         state.debug_endpoints_enabled = config.observability.debug_endpoints_enabled;
-        state.data_dir = config.server.data_dir.clone();
         state.scheduler_config = config.scheduler.clone();
     }
 
     // The gateway's weak back-reference outlives this call, so every
     // `Arc::get_mut` install above must run BEFORE it: one placed after
     // it no-ops.
-    install_gateway(shared);
+    install_gateway(shared)?;
 
     // Hydrate bitemporal retention registry from array catalog.
     {
-        let guard = array_catalog
-            .read()
-            .expect("array catalog lock poisoned at startup");
+        // The Data Plane cores already share this lock. A core that panicked
+        // while holding it leaves it poisoned.
+        let guard = array_catalog.read().map_err(|_| crate::Error::Internal {
+            detail: "array catalog lock is poisoned; array bitemporal retention \
+                     cannot be seeded at startup"
+                .into(),
+        })?;
         for entry in guard.all_entries() {
             if let Some(audit_ms) = entry.audit_retain_ms {
                 if audit_ms < 0 {
@@ -270,13 +283,11 @@ pub async fn wire_state(
                     audit_retain_ms: audit_ms as u64,
                     minimum_audit_retain_ms: entry.minimum_audit_retain_ms.unwrap_or(0),
                 };
+                // Keyed by the array's own identity, as the `PutArray`
+                // post-apply registers it.
                 if let Err(e) = shared.bitemporal_retention_registry.register(
-                    // The array catalog is global (not database-scoped), so its
-                    // bitemporal retention is registered under the default
-                    // database. Per-database array isolation is a separate
-                    // initiative.
-                    crate::types::DatabaseId::DEFAULT,
-                    crate::types::TenantId::new(0),
+                    entry.array_id.database_id,
+                    entry.array_id.tenant_id,
                     entry.name.clone(),
                     crate::engine::bitemporal::BitemporalEngineKind::Array,
                     retention,
@@ -294,6 +305,46 @@ pub async fn wire_state(
     Ok(())
 }
 
+/// Wire `handle`, the node's cluster handle, into `state` before the state
+/// is shared: node id, topology, routing, transport, the metadata cache, the
+/// group apply watchers, and the cross-shard event sender.
+///
+/// Every host runs this before `start_raft`: boot for a real cluster and for
+/// the synthesized one-node cluster, and every in-process test host.
+///
+/// The cross-shard event SENDER lets a trigger body writing to a
+/// remote-homed collection reach the owning node instead of being
+/// mis-written to the local core. The Event Plane spawns the dispatcher's
+/// drain task (`spawn_dispatcher_task`), which injects the transport from
+/// `cluster_transport`. Its spawn gate requires the dispatcher, metrics, and
+/// DLQ this sets. Raft group setup opens the dedup store under `data_dir`.
+pub fn wire_cluster_handle(
+    state: &mut SharedState,
+    handle: &ClusterHandle,
+    data_dir: &std::path::Path,
+) -> crate::Result<()> {
+    state.node_id = handle.node_id;
+    state.cluster_topology = Some(Arc::clone(&handle.topology));
+    state.cluster_routing = Some(Arc::clone(&handle.routing));
+    state.cluster_transport = Some(Arc::clone(&handle.transport));
+    state.metadata_cache = Arc::clone(&handle.metadata_cache);
+    state.group_watchers = Arc::clone(&handle.group_watchers);
+    state.migration_tracker = Some(Arc::clone(&handle.migration_tracker));
+
+    let cross_shard_metrics = Arc::new(crate::event::cross_shard::CrossShardMetrics::new());
+    state.cross_shard_dispatcher = Some(Arc::new(
+        crate::event::cross_shard::CrossShardDispatcher::new(
+            handle.node_id,
+            Arc::clone(&cross_shard_metrics),
+        ),
+    ));
+    state.cross_shard_dlq = Some(Arc::new(std::sync::Mutex::new(
+        crate::event::cross_shard::CrossShardDlq::open(data_dir)?,
+    )));
+    state.cross_shard_metrics = Some(cross_shard_metrics);
+    Ok(())
+}
+
 /// Construct and install the gateway and the DDL plan-cache invalidator.
 ///
 /// `Gateway` holds a `Weak<SharedState>` back-reference to its own
@@ -303,11 +354,23 @@ pub async fn wire_state(
 ///
 /// Every `Arc::get_mut` install on `shared` must run before this call.
 /// A later `get_mut` sees the weak reference and no-ops.
-pub fn install_gateway(shared: &Arc<SharedState>) {
+///
+/// A second call is a wiring bug and returns `Error::Internal`.
+pub fn install_gateway(shared: &Arc<SharedState>) -> crate::Result<()> {
     let gateway = Arc::new(crate::control::gateway::Gateway::new(Arc::clone(shared)));
     let invalidator = Arc::new(crate::control::gateway::PlanCacheInvalidator::new(
         &gateway.plan_cache,
     ));
-    let _ = shared.gateway.set(gateway);
-    let _ = shared.gateway_invalidator.set(invalidator);
+    let already = |what: &str| crate::Error::Internal {
+        detail: format!("{what} is already installed; install_gateway ran twice"),
+    };
+    shared
+        .gateway
+        .set(gateway)
+        .map_err(|_| already("gateway"))?;
+    shared
+        .gateway_invalidator
+        .set(invalidator)
+        .map_err(|_| already("gateway plan-cache invalidator"))?;
+    Ok(())
 }

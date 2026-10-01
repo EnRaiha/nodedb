@@ -50,3 +50,5 @@ mod format;
 mod load;
 mod paths;
 mod write;
+
+pub(crate) use paths::{sync_hwm_ckpt_dir, sync_hwm_ckpt_state_path};

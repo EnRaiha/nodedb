@@ -2,11 +2,9 @@
 
 //! Collection-specific async post-apply dispatchers.
 //!
-//! Runs on **every node** (via `spawn_post_apply_async_side_effects`
-//! in `apply_replicated`). Each node's local Data Plane observes
-//! catalog mutations symmetrically.
-
-use std::sync::Arc;
+//! Runs on **every node**: the metadata applier awaits
+//! `run_post_apply_async_side_effects`. Each node's local Data Plane
+//! observes catalog mutations symmetrically.
 
 use tracing::{debug, warn};
 
@@ -15,8 +13,24 @@ use crate::control::security::catalog::{StoredCollection, StoredL2CleanupEntry};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
 
-pub async fn put_async(stored: StoredCollection, shared: Arc<SharedState>) {
-    collection::put_async(stored, shared).await;
+/// Register `stored` on every local Data Plane core. `Err` means a core did
+/// not acknowledge the Register.
+pub async fn put_async(stored: &StoredCollection, shared: &SharedState) -> crate::Result<()> {
+    collection::put_async(stored, shared).await
+}
+
+/// Register every shadow collection a `CloneDatabase` entry stamped into
+/// `target` on every local Data Plane core.
+///
+/// The clone writes its shadow descriptors straight into the catalog, so no
+/// `PutCollection` entry registers them. An unregistered strict shadow stores
+/// a copied-up or materialized row as MessagePack, and a scan that decodes it
+/// as a Binary Tuple once the collection registers matches nothing.
+pub async fn clone_shadows_async(target: DatabaseId, shared: &SharedState) -> crate::Result<()> {
+    for stored in collection::clone_shadows(target, shared)? {
+        collection::put_async(&stored, shared).await?;
+    }
+    Ok(())
 }
 
 /// Failure outcome of [`reclaim_collection_storage`].
@@ -32,7 +46,7 @@ pub async fn put_async(stored: StoredCollection, shared: Arc<SharedState>) {
 ///   writes failed before any record was queued, or queuing the record itself
 ///   failed). The holder must let its guard `Drop` release the in-memory drain
 ///   so a same-name CREATE can re-acquire the lifecycle and self-heal off the
-///   durable inactive catalog row. Leaking the drain here would wedge every
+///   durable inactive catalog row. Leaking the drain here wedges every
 ///   future same-name CREATE (and the GC sweeper) until the node restarts.
 #[derive(Debug)]
 pub(crate) struct ReclaimFailure {
@@ -79,16 +93,31 @@ pub(crate) async fn reclaim_collection_storage(
     purge_lsn: u64,
     drain_already_held: bool,
 ) -> Result<(), ReclaimFailure> {
+    // No replicated write reaches a core under this key while its storage
+    // goes: the write routes under the key's gate held shared.
+    let _gate =
+        crate::control::write_gate::exclusive(crate::control::write_gate::GateKey::Collection {
+            database_id,
+            tenant_id,
+            name: name.to_string(),
+        })
+        .await;
     // 1. Persist to redb (every node has its own catalog). A failure here
     // leaves no durable retry owner, so it is a `no_retry` failure: the caller
     // releases its lifecycle guard rather than leaking the drain.
+    crate::fail_point_err!("collection_reclaim::before_tombstone", |detail: String| {
+        ReclaimFailure::no_retry(crate::Error::Storage {
+            engine: "catalog".into(),
+            detail,
+        })
+    });
     let catalog = shared.credentials.catalog();
     catalog
         .record_wal_tombstone(database_id, tenant_id, name, purge_lsn)
         .map_err(ReclaimFailure::no_retry)?;
 
     // 1b. Drop the collection's column-redaction policies. Their key carries
-    // no collection generation, so a survivor would re-attach to a same-name
+    // no collection generation, so a survivor re-attaches to a same-name
     // collection created later and redact columns nobody protected.
     crate::control::catalog_entry::post_apply::redaction::purge_for_collection(
         shared,
@@ -151,13 +180,9 @@ pub(crate) async fn reclaim_collection_storage(
     //    files while a scan is touching an mmap page faults the
     //    whole TPC reactor — drain ordering is a correctness, not
     //    performance, requirement.
-    if !drain_already_held {
-        shared.quiesce.begin_drain(database_id, tenant_id, name);
-    }
-    shared
-        .quiesce
-        .wait_until_drained(database_id, tenant_id, name)
-        .await;
+    let hold =
+        (!drain_already_held).then(|| shared.quiesce.begin_drain(database_id, tenant_id, name));
+    wait_drained_reporting_progress(shared, database_id, tenant_id, name).await;
 
     // 4. Reclaim on local Data Plane. RESULT-CHECKED: the redb +
     //    versioned engine purge is correctness-critical (the catalog
@@ -186,13 +211,13 @@ pub(crate) async fn reclaim_collection_storage(
 
     match purge_result {
         Err(e) => {
-            // Keep the lifecycle drain marker set ONLY when a durable retry
-            // record is persisted: a worker then owns the retry and releases
-            // the drain via `forget`. A same-name CREATE waits until that
-            // retry succeeds, because engine keys are name-scoped. If recording
-            // the durable entry itself fails there is no owner to release the
-            // drain, so this is a `no_retry` failure and the caller must let
-            // its guard release the in-memory hold.
+            // Keep the drain ONLY when a durable retry record is persisted:
+            // the hold passes to the pending-reclaim path, which releases it
+            // when the retry succeeds. A same-name CREATE waits until then,
+            // because engine keys are name-scoped. If recording the durable
+            // entry itself fails there is no owner, so this is a `no_retry`
+            // failure: this hold drops here, and the caller's guard releases
+            // its own.
             match record_pending_reclaim(
                 shared,
                 database_id,
@@ -201,7 +226,12 @@ pub(crate) async fn reclaim_collection_storage(
                 purge_lsn,
                 &e.to_string(),
             ) {
-                Ok(()) => Err(ReclaimFailure::retry_queued(e)),
+                Ok(()) => {
+                    if let Some(hold) = hold {
+                        hold.hand_to_reclaim();
+                    }
+                    Err(ReclaimFailure::retry_queued(e))
+                }
                 Err(record_error) => Err(ReclaimFailure::no_retry(crate::Error::Storage {
                     engine: "pending-reclaim".into(),
                     detail: format!(
@@ -212,7 +242,7 @@ pub(crate) async fn reclaim_collection_storage(
         }
         Ok(()) => {
             // Broadcast only after every core reclaimed the old incarnation.
-            // Saturated per-session channels may drop the notification; offline
+            // Saturated per-session channels can drop the notification; offline
             // replay remains the fallback.
             shared.crdt_sync_delivery.broadcast_collection_purged(
                 tenant_id,
@@ -221,16 +251,22 @@ pub(crate) async fn reclaim_collection_storage(
                 purge_lsn,
             );
 
-            // A prior failed attempt may have left a durable entry; a
-            // succeeding purge clears it, then releases CREATE waiters.
+            // A prior failed attempt can leave a durable entry; a
+            // succeeding purge clears it and the hold that entry owned.
+            // This call's own hold drops on return.
             shared
                 .credentials
                 .catalog()
                 .remove_pending_reclaim(database_id, tenant_id, name)
                 .map_err(ReclaimFailure::no_retry)?;
-            if !drain_already_held {
-                shared.quiesce.forget(database_id, tenant_id, name);
-            }
+            shared
+                .quiesce
+                .release_reclaim_hold(&crate::bridge::quiesce::ReclaimOwner::new(
+                    database_id,
+                    tenant_id,
+                    name,
+                ));
+            drop(hold);
             debug!(
                 collection = %name,
                 tenant = tenant_id,
@@ -242,11 +278,126 @@ pub(crate) async fn reclaim_collection_storage(
     }
 }
 
+/// How often a quiesce drain checks for closed scans.
+const DRAIN_PROGRESS_TICK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Wait until every open scan of the collection closes. Each closed scan
+/// counts as apply progress, so a proposer waiting on this purge keeps
+/// waiting while scans close and times out only when none does.
+///
+/// A draining collection admits no new scan, so the open count only falls.
+async fn wait_drained_reporting_progress(
+    shared: &SharedState,
+    database_id: u64,
+    tenant_id: u64,
+    name: &str,
+) {
+    let drained = shared
+        .quiesce
+        .wait_until_drained(database_id, tenant_id, name);
+    tokio::pin!(drained);
+    let mut open = shared.quiesce.open_scans(database_id, tenant_id, name);
+    loop {
+        tokio::select! {
+            () = &mut drained => return,
+            () = tokio::time::sleep(DRAIN_PROGRESS_TICK) => {
+                let now = shared.quiesce.open_scans(database_id, tenant_id, name);
+                if now < open {
+                    shared
+                        .metadata_apply_progress
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+                }
+                open = now;
+            }
+        }
+    }
+}
+
+/// Clear this node's storage under `name` before a new incarnation of the
+/// collection registers there.
+///
+/// Data Plane storage is keyed by `(database, tenant, name)`, so rows an
+/// earlier incarnation left behind read as the new incarnation's. That
+/// happens when a reclaim was dropped or never ran on this node. Both
+/// tombstone surfaces are written first, so WAL replay skips the earlier
+/// incarnation's records too.
+///
+/// It runs on every new incarnation. No local state proves the node never
+/// held the name: WAL tombstones are collected once the WAL truncates past
+/// them, and a cancelled create or a dropped retry leaves none. Clearing an
+/// empty prefix costs one round-trip per core.
+///
+/// A pending reclaim for the name is covered by this clear, so its row goes
+/// and the pending-reclaim path's hold on the name is released.
+///
+/// No write to the new incarnation precedes the clear on any node. Every
+/// data-group entry and every Calvin transaction carries the proposer's
+/// applied metadata index, and a replica holds it until its own metadata
+/// watcher reaches that index. A data-group snapshot carries its builder's
+/// applied metadata index, and its install waits the same way. The watcher bumps only after the applier,
+/// this clear included, returned.
+pub(crate) async fn clear_before_recreate(
+    shared: &SharedState,
+    database_id: u64,
+    tenant_id: u64,
+    name: &str,
+) -> crate::Result<()> {
+    let catalog = shared.credentials.catalog();
+    let purge_lsn = shared.wal.next_lsn().as_u64();
+    catalog.record_wal_tombstone(database_id, tenant_id, name, purge_lsn)?;
+    shared
+        .wal
+        .appender(crate::wal::manager::NO_APPLY_KEY)
+        .append_collection_tombstone(
+            TenantId::new(tenant_id),
+            DatabaseId::new(database_id),
+            name,
+            purge_lsn,
+        )?;
+    // Scans of the earlier incarnation must release before its segments go.
+    let hold = shared.quiesce.begin_drain(database_id, tenant_id, name);
+    shared
+        .quiesce
+        .wait_until_drained(database_id, tenant_id, name)
+        .await;
+    let cleared =
+        crate::control::server::shared::ddl::neutral::collection::purge::dispatch_unregister_collection(
+            shared, database_id, tenant_id, name, purge_lsn,
+        )
+        .await;
+    hold.release();
+    cleared?;
+
+    let owed = catalog
+        .load_pending_reclaim_queue()?
+        .into_iter()
+        .any(|entry| {
+            entry.database_id == database_id && entry.tenant_id == tenant_id && entry.name == name
+        });
+    if owed {
+        catalog.remove_pending_reclaim(database_id, tenant_id, name)?;
+    }
+    shared
+        .quiesce
+        .release_reclaim_hold(&crate::bridge::quiesce::ReclaimOwner::new(
+            database_id,
+            tenant_id,
+            name,
+        ));
+    debug!(
+        collection = %name,
+        tenant = tenant_id,
+        purge_lsn,
+        owed,
+        "catalog_entry: storage under the name cleared before the new incarnation registers"
+    );
+    Ok(())
+}
+
 /// Persist a durable `_system.pending_reclaim` entry so the failed
 /// engine purge is retried at-least-once by the pending-reclaim worker
-/// and the boot-time drain, instead of being lost to a warn log. This
-/// is the whole point of the fix: NEVER warn-and-forget a failed
-/// engine purge.
+/// and the boot-time drain, instead of being lost to a warn log. A failed
+/// engine purge is never warn-and-forget.
 fn record_pending_reclaim(
     shared: &SharedState,
     database_id: u64,
@@ -260,6 +411,11 @@ fn record_pending_reclaim(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
+    // The row `prepare_purge` left inactive names the incarnation the retry
+    // owns. A retry never touches a later row under the same name.
+    let target_hlc = catalog
+        .get_committed_collection(DatabaseId::new(database_id), tenant_id, name)?
+        .map(|row| row.modification_hlc);
     let entry = crate::control::security::catalog::StoredPendingReclaim {
         database_id,
         tenant_id,
@@ -268,6 +424,8 @@ fn record_pending_reclaim(
         enqueued_at_ns: now_ns,
         last_error: last_error.to_string(),
         attempts: 0,
+        target_hlc,
+        cancelled_create: false,
     };
     catalog.enqueue_pending_reclaim(&entry)?;
     warn!(

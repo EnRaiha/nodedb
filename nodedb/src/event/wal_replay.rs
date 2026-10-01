@@ -9,11 +9,11 @@
 //! Each WAL record type has a known payload format (see `wal_dispatch.rs`):
 //! - `Put`: `(collection, document_id, value)` for documents,
 //!   `("kv_put", collection, key, value, ttl_ms, expire_at_ms, surrogate)` for
-//!   KV (two shorter pre-surrogate arities also decode),
-//!   `(collection, src_id, label, dst_id, properties)` for graph edges
+//!   KV, a map-encoded `EdgePutRedo` carrying both endpoint surrogates for
+//!   graph edges
 //! - `Delete`: `(collection, document_id)` for documents,
-//!   `("kv_delete", collection, keys)` for KV,
-//!   `(collection, src_id, label, dst_id)` for graph edges
+//!   `("kv_delete", collection, keys)` for KV, a map-encoded `EdgeDeleteRedo`
+//!   carrying both endpoint surrogates for graph edges
 //! - `GraphNodeLabelSet` / `GraphNodeLabelRemove`: `(node_id, labels)` — surface
 //!   on the nameable `__graph_node_labels__` CDC stream
 //! - `VectorPut`: `(collection, vector, dim)` — not a document write event
@@ -32,12 +32,16 @@ use nodedb_wal::record::RecordType;
 use tracing::{error, trace, warn};
 
 use crate::event::types::{EventSource, WriteEvent};
+use crate::event::wal_replay_kind::{RowRecord, row_kind};
 use crate::event::wal_replay_parse::{
-    parse_delete_record, parse_graph_node_label_record, parse_put_record,
+    is_edge_record, parse_delete_record, parse_graph_node_label_record, parse_put_record,
 };
 use crate::event::wal_replay_scope::{ReplayScope, RowSources};
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use crate::wal::WalManager;
+
+use crate::engine::timeseries::install_outcome::TsOutcomeIndex;
+use std::path::Path;
 
 /// Replay WAL records from `from_lsn` forward and convert to WriteEvents.
 ///
@@ -46,15 +50,28 @@ use crate::wal::WalManager;
 ///
 /// `base_sequence` is the starting sequence number for the replayed events
 /// (continues from the consumer's last known sequence).
+///
+/// `outcome_dir` is the timeseries install-outcome store of `core_id`
+/// (`install_outcome`). A by-name timeseries install rebuilds exactly the
+/// events its outcome names.
 pub fn replay_wal_to_events(
     wal: &WalManager,
     from_lsn: Lsn,
     core_id: usize,
     num_cores: usize,
     base_sequence: u64,
+    outcome_dir: &Path,
 ) -> crate::Result<Vec<WriteEvent>> {
     let records = wal.replay_from(from_lsn)?;
-    convert_records_to_events(&records, from_lsn, core_id, num_cores, base_sequence)
+    let outcomes = TsOutcomeIndex::load(outcome_dir)?;
+    convert_records_to_events(
+        &records,
+        from_lsn,
+        core_id,
+        num_cores,
+        base_sequence,
+        &outcomes,
+    )
 }
 
 /// Replay WAL records using mmap (tier-2 catchup path).
@@ -68,9 +85,18 @@ pub fn replay_wal_mmap(
     core_id: usize,
     num_cores: usize,
     base_sequence: u64,
+    outcome_dir: &Path,
 ) -> crate::Result<Vec<WriteEvent>> {
     let records = wal.replay_mmap_from(from_lsn)?;
-    convert_records_to_events(&records, from_lsn, core_id, num_cores, base_sequence)
+    let outcomes = TsOutcomeIndex::load(outcome_dir)?;
+    convert_records_to_events(
+        &records,
+        from_lsn,
+        core_id,
+        num_cores,
+        base_sequence,
+        &outcomes,
+    )
 }
 
 /// Convert WAL records to WriteEvents, filtering by core affinity.
@@ -80,6 +106,7 @@ fn convert_records_to_events(
     core_id: usize,
     num_cores: usize,
     base_sequence: u64,
+    outcomes: &TsOutcomeIndex,
 ) -> crate::Result<Vec<WriteEvent>> {
     let mut events = Vec::new();
     let mut sequence = base_sequence;
@@ -105,7 +132,7 @@ fn convert_records_to_events(
         // `TransactionRedo` (Calvin cross-shard commit) decomposes into one event
         // per write sub-op. Raw Put/Delete records still yield at most one.
         // Numbered before the tombstone filter, as the producer numbered them.
-        let mut record_events = record_to_events(record, &mut sequence);
+        let mut record_events = record_events(record, outcomes, &mut sequence);
         for event in &mut record_events {
             numbering.stamp(event);
         }
@@ -139,141 +166,43 @@ fn convert_records_to_events(
 /// cross-shard commit — decomposes into one event per write sub-op, so triggers,
 /// CDC, and change streams fire on restart exactly as they did on the forward
 /// path.
-fn record_to_events(record: &WalRecord, sequence: &mut u64) -> Vec<WriteEvent> {
+fn record_events(
+    record: &WalRecord,
+    outcomes: &TsOutcomeIndex,
+    sequence: &mut u64,
+) -> Vec<WriteEvent> {
     let Some(record_type) = RecordType::from_raw(record.logical_record_type()) else {
         return Vec::new();
     };
     match row_kind(record_type) {
-        Some(kind) => row_record_events(record, kind, sequence),
+        Some(kind) => row_record_events(record, kind, outcomes, sequence),
         None => Vec::new(),
     }
 }
 
-/// The row-write kind of a record type. `None` for a type that carries no
-/// row write the forward path emits an event for.
-fn row_kind(record_type: RecordType) -> Option<RowRecord> {
-    match record_type {
-        RecordType::Put => Some(RowRecord::Put),
-        RecordType::Delete => Some(RowRecord::Delete),
-        // A Calvin cross-shard or single-shard commit is durable as a
-        // `TransactionRedo` whose sub-ops carry each engine's own per-op
-        // payload. Decompose it into the same WriteEvents the forward path
-        // emitted, so the effect (triggers/CDC) is not lost on replay. Every
-        // emitted event's `lsn` is this redo record's WAL LSN — the Event-Plane
-        // watermark keys on it to dedup against the forward-path event.
-        RecordType::TransactionRedo => Some(RowRecord::Redo),
-        // Graph node-label mutations carry no natural collection (they are
-        // tenant-wide), so they surface on the nameable `__graph_node_labels__`
-        // CDC stream. The forward-path emit (Data Plane `SetNodeLabels` /
-        // `RemoveNodeLabels`) produces the same `(collection, row_id, op, value)`
-        // shape, so replayed events dedup against forward events on LSN.
-        RecordType::GraphNodeLabelSet => Some(RowRecord::LabelSet),
-        RecordType::GraphNodeLabelRemove => Some(RowRecord::LabelRemove),
-        // `CalvinApplied` is a payload-free applied-marker: it records that a
-        // sequencer `(epoch, position)` was applied, but carries no writes. Its
-        // base writes, if any, ride a separate `TransactionRedo`; a pure-read or
-        // CRDT-only commit has no base WriteEvents at all (CRDT effects ride
-        // `CrdtDelta` records). Nothing to emit.
-        RecordType::CalvinApplied => None,
-        // The records below carry NO forward-path Data-Plane WriteEvent, so
-        // there is nothing for replay to reconstruct. `record_to_events`
-        // reconstructs exactly the forward WriteEvent stream the Data Plane
-        // emits (Document / KV / Graph — see
-        // `data::executor::core_loop::event_emit`), keyed on LSN so replayed
-        // events dedup against forward ones. Emitting a WriteEvent for a record
-        // the forward path never emitted would fire triggers / audit /
-        // CRDT-sync / CDC on WAL replay and snapshot-catchup but NOT on the live
-        // write — a recovery-divergence bug. Each group states why it has no
-        // forward WriteEvent.
-        //
-        // Vector / CRDT records replay through their own Data-Plane paths and
-        // never rode the WriteEvent stream. Infra records (Checkpoint,
-        // Surrogate*, tombstone, anchors, sync HWM, Noop, …) are not row writes.
-        RecordType::VectorPut
-        | RecordType::VectorDelete
-        | RecordType::VectorParams
-        | RecordType::VectorIndexDrop
-        | RecordType::VectorDirectUpsert
-        | RecordType::VectorDirectDelete
-        | RecordType::VectorDirectUpdate
-        | RecordType::VectorDirectTruncate
-        | RecordType::VectorResolvedDirectWrite
-        | RecordType::MultiVectorPut
-        | RecordType::MultiVectorDelete
-        | RecordType::CrdtDelta
-        // CrdtListOp: position-based list-op intent, replayed by
-        // `data::executor::wal_replay::crdt_list`, not the Event Plane's
-        // WriteEvent stream.
-        | RecordType::CrdtListOp
-        // CrdtDocOp: document-row intent, replayed by
-        // `data::executor::wal_replay::crdt_doc`, not the Event Plane's
-        // WriteEvent stream.
-        | RecordType::CrdtDocOp
-        | RecordType::LogBatch
-        | RecordType::Transaction
-        | RecordType::SurrogateAlloc
-        | RecordType::SurrogateBind
-        | RecordType::Checkpoint
-        | RecordType::CollectionTombstoned
-        | RecordType::LsnMsAnchor
-        | RecordType::TemporalPurge
-        // SyncSeqAdvance: emitted by the sync layer; replay HWM reconstruction
-        // is wired in the idempotency replay pass, not the Event Plane.
-        | RecordType::SyncSeqAdvance
-        | RecordType::Noop
-        // Timeseries: the `TimeseriesBatch` payload is an opaque compressed
-        // samples blob, not a per-row `(collection, row_id, value)`. Its forward
-        // CDC rides the Control-Plane change stream (`publish_origin_change_events`,
-        // opt-in per collection), never the Data-Plane WriteEvent stream — so
-        // there is no forward WriteEvent to reconstruct.
-        | RecordType::TimeseriesBatch
-        // Columnar-family truncate: whole-collection clear with no per-row
-        // identity; its forward CDC rides the Control-Plane change stream
-        // (`extract_write_metadata`, keyed `(collection, "*", Delete)`).
-        | RecordType::ColumnarTruncate
-        | RecordType::TimeseriesTruncate
-        // Array: `ArrayPut` / `ArrayDelete` cells decode per-cell, but the forward
-        // path emits no Data-Plane WriteEvent — array CDC rides the Control-Plane
-        // change stream (`extract_write_metadata`, keyed `(array_name, "*", op)`).
-        // `ArrayFlush` only reorganizes on-disk tiles (no logical cell).
-        | RecordType::ArrayPut
-        | RecordType::ArrayDelete
-        | RecordType::ArrayFlush
-        // FTS / Spatial / Sparse-vector: secondary index overlays over a
-        // Document/Columnar row that already publishes its own change event on the
-        // forward path. The index write emits no separate WriteEvent — one here
-        // would double-publish the underlying row (and the spatial geometry blob is
-        // zerompk-tagged, not a standard-msgpack pass-through value anyway).
-        | RecordType::FtsIndex
-        | RecordType::FtsDelete
-        | RecordType::SpatialPut
-        | RecordType::SpatialDelete
-        | RecordType::SparseVectorPut
-        | RecordType::SparseVectorDelete
-        // WriteAborted names a refused write; the record it names has already
-        // been dropped from this stream by the replay-source filter (see
-        // `WalManager::replay_from`). The marker itself is not a row write.
-        | RecordType::WriteAborted
-        // ProposalApplied marks a Raft proposal as applied; it writes no row.
-        | RecordType::ProposalApplied => None,
-    }
-}
-
-/// A record type that carries row writes.
-#[derive(Debug, Clone, Copy)]
-enum RowRecord {
-    Put,
-    Delete,
-    Redo,
-    LabelSet,
-    LabelRemove,
+/// [`record_events`] with an empty install-outcome store.
+#[cfg(test)]
+fn record_to_events(record: &WalRecord, sequence: &mut u64) -> Vec<WriteEvent> {
+    record_events(record, &TsOutcomeIndex::default(), sequence)
 }
 
 /// The events of one row-write record.
 ///
 /// Every row write stores the source its write ran with. A record without one
 /// cannot say whether its triggers may fire, so it rebuilds no event.
-fn row_record_events(record: &WalRecord, kind: RowRecord, sequence: &mut u64) -> Vec<WriteEvent> {
+///
+/// A raw edge record is an autocommit edge write's pre-dispatch record. The
+/// edge version its write group journals rebuilds the write's event, at the
+/// ordinal the live write used, so the raw record rebuilds none.
+fn row_record_events(
+    record: &WalRecord,
+    kind: RowRecord,
+    outcomes: &TsOutcomeIndex,
+    sequence: &mut u64,
+) -> Vec<WriteEvent> {
+    if matches!(kind, RowRecord::Put | RowRecord::Delete) && is_edge_record(&record.payload) {
+        return Vec::new();
+    }
     let Some(source) = EventSource::from_wal_code(record.event_source()) else {
         error!(
             lsn = record.header.lsn,
@@ -285,9 +214,12 @@ fn row_record_events(record: &WalRecord, kind: RowRecord, sequence: &mut u64) ->
     };
     let sources = match kind {
         RowRecord::Redo => RowSources::committed_redo(source),
-        RowRecord::Put | RowRecord::Delete | RowRecord::LabelSet | RowRecord::LabelRemove => {
-            RowSources::uniform(source)
-        }
+        RowRecord::Put
+        | RowRecord::Delete
+        | RowRecord::Group
+        | RowRecord::LabelSet
+        | RowRecord::LabelRemove
+        | RowRecord::Timeseries => RowSources::uniform(source),
     };
     let scope = ReplayScope {
         tenant_id: TenantId::new(record.header.tenant_id),
@@ -297,32 +229,50 @@ fn row_record_events(record: &WalRecord, kind: RowRecord, sequence: &mut u64) ->
         vshard_id: VShardId::new(record.header.vshard_id),
         lsn: Lsn::new(record.header.lsn),
         sources,
+        commit_hlc: (record.header.commit_hlc != 0).then_some(record.header.commit_hlc),
     };
     match kind {
-        RowRecord::Redo => decompose_redo_to_events(&record.payload, &scope, sequence),
-        RowRecord::Put | RowRecord::Delete | RowRecord::LabelSet | RowRecord::LabelRemove => {
-            single_row_events(kind, &record.payload, &scope, sequence)
+        RowRecord::Redo => decompose_redo_to_events(&record.payload, &scope, outcomes, sequence),
+        RowRecord::Group => crate::event::wal_replay_group::group_record_events(
+            &record.payload,
+            &scope,
+            outcomes,
+            sequence,
+        ),
+        RowRecord::Put
+        | RowRecord::Delete
+        | RowRecord::LabelSet
+        | RowRecord::LabelRemove
+        | RowRecord::Timeseries => {
+            single_row_events(kind, &record.payload, &scope, outcomes, sequence)
         }
     }
 }
 
-/// The event of one single-row payload of `kind`. A redo payload carries no
-/// single row.
-fn single_row_events(
+/// The events of one payload of `kind` that is not a redo record: one row, or
+/// a timeseries ingest's rows. A redo payload is decomposed by the caller.
+pub(super) fn single_row_events(
     kind: RowRecord,
     payload: &[u8],
     scope: &ReplayScope,
+    outcomes: &TsOutcomeIndex,
     sequence: &mut u64,
 ) -> Vec<WriteEvent> {
+    if let RowRecord::Timeseries = kind {
+        return crate::event::wal_replay_timeseries::replayed_timeseries_events(
+            payload, scope, outcomes, sequence,
+        );
+    }
     let event = match kind {
+        RowRecord::Timeseries => None,
         RowRecord::Put => parse_put_record(payload, scope, sequence),
         RowRecord::Delete => parse_delete_record(payload, scope, sequence),
         RowRecord::LabelSet => parse_graph_node_label_record(payload, true, scope, sequence),
         RowRecord::LabelRemove => parse_graph_node_label_record(payload, false, scope, sequence),
-        RowRecord::Redo => {
+        RowRecord::Redo | RowRecord::Group => {
             warn!(
                 lsn = scope.lsn.as_u64(),
-                "WAL replay: a redo sub-record is itself a redo; skipped"
+                "WAL replay: a sub-record is itself a redo or group record; skipped"
             );
             None
         }
@@ -345,6 +295,7 @@ fn single_row_events(
 fn decompose_redo_to_events(
     payload: &[u8],
     scope: &ReplayScope,
+    outcomes: &TsOutcomeIndex,
     sequence: &mut u64,
 ) -> Vec<WriteEvent> {
     let redo = match crate::wal::RedoRecord::from_bytes(payload) {
@@ -359,16 +310,86 @@ fn decompose_redo_to_events(
         }
     };
 
+    // A row the record lists in its row sources (a trigger body's write)
+    // carries that source, as the live install emits it.
+    let rows = crate::wal::RowSourceIndex::new(&redo.row_sources);
     let mut events = Vec::new();
     for sub in redo.ops {
         let Some(record_type) = RecordType::from_raw(sub.record_type) else {
             continue;
         };
         if let Some(kind) = row_kind(record_type) {
-            events.extend(single_row_events(kind, &sub.payload, scope, sequence));
+            events.extend(single_row_events(
+                kind,
+                &sub.payload,
+                scope,
+                outcomes,
+                sequence,
+            ));
         }
     }
+    apply_committed_row_metadata(&mut events, &rows, &redo.row_changes, scope);
+    // The messages the transaction's bodies published follow its rows, as
+    // the install emits them.
+    events.extend(crate::event::topic::committed::replayed_publish_events(
+        &redo.publishes,
+        scope,
+        sequence,
+    ));
     events
+}
+
+/// Give the events of a committed transaction's rows their net kinds and
+/// sources.
+///
+/// A record that names its rows gives each one its net kind: a put of a
+/// committed row is an update, and a row the transaction inserted and
+/// deleted emits nothing, as the live install emits them. A row listed in
+/// `rows` carries its listed source.
+pub(super) fn apply_committed_row_metadata(
+    events: &mut Vec<WriteEvent>,
+    rows: &crate::wal::RowSourceIndex,
+    changes: &[crate::wal::RedoRowChange],
+    scope: &ReplayScope,
+) {
+    if !changes.is_empty() {
+        apply_net_kinds(events, changes);
+    }
+    if !rows.is_empty() {
+        for event in events.iter_mut() {
+            if let Some(listed) = rows.source_of(&event.collection, event.row_id.as_str()) {
+                event.source = scope.sources.other.committed_row_override(listed);
+            }
+        }
+    }
+}
+
+/// Rewrite `events` to the net kinds `changes` name.
+fn apply_net_kinds(events: &mut Vec<WriteEvent>, changes: &[crate::wal::RedoRowChange]) {
+    use crate::event::types::WriteOp;
+    use crate::wal::RedoRowKind;
+    let kinds: std::collections::HashMap<(&str, &str), RedoRowKind> = changes
+        .iter()
+        .map(|change| {
+            (
+                (change.collection.as_str(), change.row.as_str()),
+                change.kind,
+            )
+        })
+        .collect();
+    events.retain_mut(|event| {
+        if !event.op.is_data_event() {
+            return true;
+        }
+        match kinds.get(&(event.collection.as_ref(), event.row_id.as_str())) {
+            Some(RedoRowKind::NoChange) => false,
+            Some(RedoRowKind::Update) if matches!(event.op, WriteOp::Insert) => {
+                event.op = WriteOp::Update;
+                true
+            }
+            _ => true,
+        }
+    });
 }
 
 #[cfg(test)]
@@ -409,8 +430,16 @@ mod tests {
 
     #[test]
     fn parse_kv_put() {
-        let payload =
-            zerompk::to_msgpack_vec(&("kv_put", "cache", b"key1", b"val1", 0u64)).unwrap();
+        let payload = zerompk::to_msgpack_vec(&(
+            "kv_put",
+            "cache",
+            b"key1",
+            b"val1",
+            0u64,
+            None::<u64>,
+            1u32,
+        ))
+        .unwrap();
         let record = make_record(RecordType::Put, &payload, 1, 0, 102);
         let mut seq = 0u64;
         let event = one_event(&record, &mut seq);
@@ -501,6 +530,52 @@ mod tests {
         assert_eq!(seq, 1);
     }
 
+    /// A resolved redo record names each row's net kind: a put of a
+    /// committed row replays as an update, and a row the transaction
+    /// inserted and deleted replays as nothing.
+    #[test]
+    fn a_resolved_redo_replays_net_kinds() {
+        use crate::wal::{RedoRecord, RedoRowChange, RedoRowKind, RedoSubRecord};
+
+        let put = |id: &str| RedoSubRecord {
+            record_type: RecordType::Put as u32,
+            payload: zerompk::to_msgpack_vec(&("orders", id, b"doc-value")).unwrap(),
+        };
+        let change = |id: &str, kind| RedoRowChange {
+            collection: "orders".into(),
+            row: id.into(),
+            kind,
+        };
+        let redo = RedoRecord {
+            version: 1,
+            ops: vec![put("o1"), put("o2")],
+            calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: vec![
+                change("o1", RedoRowKind::Update),
+                change("o2", RedoRowKind::NoChange),
+            ],
+        };
+        let record = make_record(
+            RecordType::TransactionRedo,
+            &redo.to_bytes().unwrap(),
+            7,
+            0,
+            310,
+        );
+        let mut seq = 0u64;
+        let events = record_to_events(&record, &mut seq);
+        assert_eq!(
+            events.len(),
+            1,
+            "the inserted-then-deleted row replays nothing"
+        );
+        assert_eq!(events[0].row_id.as_str(), "o1");
+        assert_eq!(events[0].op, WriteOp::Update);
+    }
+
     /// A `TransactionRedo` (Calvin cross-shard commit) with two write sub-ops —
     /// a document Put and a KV Put — decomposes into two WriteEvents, both
     /// carrying the redo record's WAL LSN (the watermark-dedup key), with the
@@ -510,7 +585,9 @@ mod tests {
         use crate::wal::{RedoRecord, RedoSubRecord};
 
         let doc_payload = zerompk::to_msgpack_vec(&("orders", "order-9", b"doc-value")).unwrap();
-        let kv_payload = zerompk::to_msgpack_vec(&("kv_put", "cache", b"k9", b"v9", 0u64)).unwrap();
+        let kv_payload =
+            zerompk::to_msgpack_vec(&("kv_put", "cache", b"k9", b"v9", 0u64, None::<u64>, 9u32))
+                .unwrap();
         let redo = RedoRecord {
             version: 1,
             ops: vec![
@@ -524,6 +601,10 @@ mod tests {
                 },
             ],
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         };
         let record = make_record(
             RecordType::TransactionRedo,
@@ -555,6 +636,53 @@ mod tests {
         assert_eq!(seq, 2);
     }
 
+    /// An implicit statement transaction's client row replays as `User`, and
+    /// a body row it lists in its row sources replays as `Trigger`, in the
+    /// same collection.
+    #[test]
+    fn transaction_redo_row_sources_override_body_rows() {
+        use crate::wal::{RedoRecord, RedoRowSource, RedoSubRecord};
+
+        let client = zerompk::to_msgpack_vec(&("orders", "o-client", b"c")).unwrap();
+        let body = zerompk::to_msgpack_vec(&("orders", "o-body", b"b")).unwrap();
+        let redo = RedoRecord {
+            version: 1,
+            ops: vec![
+                RedoSubRecord {
+                    record_type: RecordType::Put as u32,
+                    payload: client,
+                },
+                RedoSubRecord {
+                    record_type: RecordType::Put as u32,
+                    payload: body,
+                },
+            ],
+            calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: vec![RedoRowSource {
+                collection: "orders".into(),
+                event_source: EventSource::Trigger.wal_code(),
+                rows: vec!["o-body".into()],
+            }],
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
+        };
+        let record = make_sourced_record(
+            RecordType::TransactionRedo,
+            &redo.to_bytes().unwrap(),
+            310,
+            Some(EventSource::ImplicitClient),
+        );
+
+        let mut seq = 0u64;
+        let events = record_to_events(&record, &mut seq);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].row_id.as_str(), "o-client");
+        assert_eq!(events[0].source, EventSource::User, "fires ASYNC triggers");
+        assert_eq!(events[1].row_id.as_str(), "o-body");
+        assert_eq!(events[1].source, EventSource::Trigger, "fires no trigger");
+    }
+
     /// A redo whose write sub-op is preceded by a non-event sub-op (VectorPut,
     /// which has no Event-Plane mapping) still emits the write event, and the
     /// non-event sub-op is skipped without consuming a sequence number.
@@ -577,6 +705,10 @@ mod tests {
                 },
             ],
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         };
         let record = make_record(
             RecordType::TransactionRedo,
@@ -614,15 +746,84 @@ mod tests {
         assert_eq!(seq, 0);
     }
 
+    /// An edge put record `knows: a -KNOWS-> b` as its writer encodes it.
+    fn edge_put_payload(properties: &[u8], src: u32, dst: u32) -> Vec<u8> {
+        zerompk::to_msgpack_vec(&crate::wal::EdgePutRedo {
+            collection: "knows".into(),
+            src_id: "a".into(),
+            label: "KNOWS".into(),
+            dst_id: "b".into(),
+            properties: properties.to_vec(),
+            src_surrogate: src,
+            dst_surrogate: dst,
+            system_from: None,
+            applied: None,
+        })
+        .expect("encode edge put")
+    }
+
+    /// An edge delete record `knows: a -KNOWS-> b` as its writer encodes it.
+    fn edge_delete_payload(src: u32, dst: u32) -> Vec<u8> {
+        zerompk::to_msgpack_vec(&crate::wal::EdgeDeleteRedo {
+            collection: "knows".into(),
+            src_id: "a".into(),
+            label: "KNOWS".into(),
+            dst_id: "b".into(),
+            src_surrogate: src,
+            dst_surrogate: dst,
+            system_from: None,
+            applied: None,
+        })
+        .expect("encode edge delete")
+    }
+
+    /// An edge record without both endpoint surrogates builds no event, and
+    /// neither does the retired positional edge tuple.
+    #[test]
+    fn identity_less_edge_records_are_refused() {
+        let mut seq = 0u64;
+        let refused = [
+            make_record(RecordType::Put, &edge_put_payload(b"", 0, 2), 3, 0, 402),
+            make_record(RecordType::Delete, &edge_delete_payload(1, 0), 3, 0, 403),
+            make_record(
+                RecordType::Put,
+                &zerompk::to_msgpack_vec(&("knows", "a", "KNOWS", "b", b"".to_vec()))
+                    .expect("encode"),
+                3,
+                0,
+                404,
+            ),
+            make_record(
+                RecordType::Delete,
+                &zerompk::to_msgpack_vec(&("knows", "a", "KNOWS", "b")).expect("encode"),
+                3,
+                0,
+                405,
+            ),
+        ];
+        for record in &refused {
+            assert!(record_to_events(record, &mut seq).is_empty());
+        }
+        assert_eq!(seq, 0, "a refused edge record consumes no sequence");
+    }
+
     #[test]
     fn graph_edge_put_replays_as_insert_event() {
-        // Forward WAL shape for an edge put: (collection, src, label, dst, props).
         let props = b"weight=1".to_vec();
-        let payload =
-            zerompk::to_msgpack_vec(&("knows", "a", "KNOWS", "b", &props)).expect("encode");
-        let record = make_record(RecordType::Put, &payload, 3, 0, 400);
+        let payload = edge_put_payload(&props, 1, 2);
         let mut seq = 0u64;
+        assert!(
+            record_to_events(&make_record(RecordType::Put, &payload, 3, 0, 399), &mut seq)
+                .is_empty(),
+            "the pre-dispatch record rebuilds no event: the version does"
+        );
+        let record = group_part(RecordType::Put, payload, 400, 399);
         let event = one_event(&record, &mut seq);
+        assert_eq!(
+            event.record,
+            Some(crate::event::types::RecordPosition::first(Lsn::new(399))),
+            "the event names the write's origin"
+        );
         assert_eq!(
             event.collection.as_ref(),
             "knows",
@@ -640,13 +841,42 @@ mod tests {
             Some(props.as_slice()),
             "edge properties surface as new_value"
         );
+        assert_edge_endpoints(&event, 1, 2);
+    }
+
+    /// A tenant-3 write-group part at `lsn` carrying one sub-record, of the
+    /// write whose origin is `origin`.
+    fn group_part(rt: RecordType, payload: Vec<u8>, lsn: u64, origin: u64) -> WalRecord {
+        let record = crate::wal::WriteGroupRecord {
+            group: crate::wal::WriteGroup::part_of(origin, 1, 1),
+            ops: vec![crate::wal::RedoSubRecord {
+                record_type: rt as u32,
+                payload,
+            }],
+            redo: None,
+        };
+        make_record(
+            RecordType::WriteGroup,
+            &record.to_bytes().expect("encode group"),
+            3,
+            0,
+            lsn,
+        )
+    }
+
+    /// The event names the edge's endpoints by the record's surrogates.
+    fn assert_edge_endpoints(event: &WriteEvent, src: u32, dst: u32) {
+        let crate::event::types::RowId::Edge(edge) = &event.row_id else {
+            panic!("an edge record replays as an edge row");
+        };
+        assert_eq!(edge.src_surrogate(), nodedb_types::Surrogate::new(src));
+        assert_eq!(edge.dst_surrogate(), nodedb_types::Surrogate::new(dst));
     }
 
     #[test]
     fn graph_edge_delete_replays_as_delete_event() {
-        // Forward WAL shape for an edge delete: (collection, src, label, dst).
-        let payload = zerompk::to_msgpack_vec(&("knows", "a", "KNOWS", "b")).expect("encode");
-        let record = make_record(RecordType::Delete, &payload, 3, 0, 401);
+        let payload = edge_delete_payload(1, 2);
+        let record = group_part(RecordType::Delete, payload, 401, 398);
         let mut seq = 0u64;
         let event = one_event(&record, &mut seq);
         assert_eq!(event.collection.as_ref(), "knows");
@@ -656,6 +886,7 @@ mod tests {
         );
         assert_eq!(event.op, WriteOp::Delete);
         assert!(event.new_value.is_none() && event.old_value.is_none());
+        assert_edge_endpoints(&event, 1, 2);
     }
 
     #[test]
@@ -720,9 +951,7 @@ mod tests {
     fn transaction_redo_decomposes_graph_edge_put() {
         use crate::wal::{RedoRecord, RedoSubRecord};
 
-        let props = b"p".to_vec();
-        let edge_payload =
-            zerompk::to_msgpack_vec(&("knows", "a", "KNOWS", "b", &props)).expect("encode");
+        let edge_payload = edge_put_payload(b"p", 1, 2);
         let redo = RedoRecord {
             version: 1,
             ops: vec![RedoSubRecord {
@@ -730,6 +959,10 @@ mod tests {
                 payload: edge_payload,
             }],
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         };
         let record = make_record(
             RecordType::TransactionRedo,
@@ -752,19 +985,20 @@ mod tests {
 
     // ── Index-engine / batch-engine replay guards ────────────────────────────
     //
-    // Timeseries, Array, FTS, Spatial, and Sparse-vector writes emit NO
-    // Data-Plane WriteEvent on the forward path (their CDC, where it exists,
-    // rides the Control-Plane change stream, not the WAL→WriteEvent replay
-    // stream — see the `record_to_events` arms). `record_to_events`
-    // reconstructs exactly the forward stream, so a WELL-FORMED record of each
-    // of these types must yield zero events and consume no sequence. These
-    // tests use realistic payloads (not garbage) so they prove a deliberate
-    // skip, not an incidental decode failure, and guard against a future change
-    // reintroducing the recovery-divergence bug (events firing on replay but
-    // not on the live write).
+    // Array, FTS, Spatial, and Sparse-vector writes emit NO Data-Plane
+    // WriteEvent on the forward path (their CDC, where it exists, rides the
+    // Control-Plane change stream, not the WAL→WriteEvent replay stream — see
+    // the `record_to_events` arms). A timeseries ingest emits only the images
+    // its resolved rows carry. `record_to_events` reconstructs exactly the
+    // forward stream, so a WELL-FORMED record of each of these types that the
+    // forward path emitted nothing for must yield zero events and consume no
+    // sequence. These tests use realistic payloads (not garbage) so they prove
+    // a deliberate skip, not an incidental decode failure, and guard against a
+    // future change reintroducing the recovery-divergence bug (events firing
+    // on replay but not on the live write).
 
     #[test]
-    fn timeseries_batch_replays_no_write_event() {
+    fn a_timeseries_batch_without_resolved_rows_replays_no_write_event() {
         let prov: Option<SyncProvenance> = None;
         let payload = zerompk::to_msgpack_vec(&("timeseries", "metrics", vec![1u8, 2, 3], prov))
             .expect("enc");
@@ -820,7 +1054,7 @@ mod tests {
         let mut seq = 0u64;
         assert!(record_to_events(&idx_record, &mut seq).is_empty());
 
-        let del = FtsDeletePayload::new(prov, "articles", "doc-1")
+        let del = FtsDeletePayload::new(prov, "articles", Some("doc-1".to_string()))
             .to_bytes()
             .expect("enc del");
         let del_record = make_record(RecordType::FtsDelete, &del, 1, 0, 704);
@@ -845,7 +1079,7 @@ mod tests {
         let mut seq = 0u64;
         assert!(record_to_events(&put_record, &mut seq).is_empty());
 
-        let del = SpatialDeletePayload::new(prov, "places", "loc", "poi-1")
+        let del = SpatialDeletePayload::new(prov, "places", "loc", Some("poi-1".to_string()))
             .to_bytes()
             .expect("enc del");
         let del_record = make_record(RecordType::SpatialDelete, &del, 1, 0, 706);
@@ -886,6 +1120,10 @@ mod tests {
                 payload: sparse_payload,
             }],
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         };
         let record = make_record(
             RecordType::TransactionRedo,
@@ -947,6 +1185,7 @@ mod tests {
             nodedb_wal::RecordStamp {
                 apply_key: 0,
                 event_source: source.map_or(nodedb_wal::NO_EVENT_SOURCE, EventSource::wal_code),
+                commit_hlc: 0,
             },
         )
         .unwrap()
@@ -984,7 +1223,9 @@ mod tests {
         use crate::wal::{RedoRecord, RedoSubRecord};
 
         let doc = zerompk::to_msgpack_vec(&("orders", "order-9", b"doc")).unwrap();
-        let kv = zerompk::to_msgpack_vec(&("kv_put", "cache", b"k9", b"v9", 0u64)).unwrap();
+        let kv =
+            zerompk::to_msgpack_vec(&("kv_put", "cache", b"k9", b"v9", 0u64, None::<u64>, 9u32))
+                .unwrap();
         let redo = RedoRecord {
             version: 1,
             ops: vec![
@@ -998,6 +1239,10 @@ mod tests {
                 },
             ],
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         };
         let bytes = redo.to_bytes().unwrap();
         for (source, document, other) in [
@@ -1024,5 +1269,48 @@ mod tests {
             );
             assert_eq!(events[1].source, other, "KV row of a {source} redo");
         }
+    }
+
+    /// A committed redo's publishes replay as one publish event each, after
+    /// its rows, on the record's LSN.
+    #[test]
+    fn a_redo_replays_its_publishes_after_its_rows() {
+        use crate::wal::{RedoPublish, RedoRecord, RedoSubRecord};
+
+        let doc = zerompk::to_msgpack_vec(&("orders", "order-1", b"doc")).unwrap();
+        let redo = RedoRecord {
+            version: 1,
+            ops: vec![RedoSubRecord {
+                record_type: RecordType::Put as u32,
+                payload: doc,
+            }],
+            calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: vec![RedoPublish {
+                owner: "trigger/1/notify".into(),
+                database_id: 1,
+                tenant_id: 1,
+                topic: "orders_feed".into(),
+                payload: "created".into(),
+                metadata_floor: 0,
+                position: None,
+            }],
+            row_changes: Vec::new(),
+        };
+        let record = make_sourced_record(
+            RecordType::TransactionRedo,
+            &redo.to_bytes().unwrap(),
+            410,
+            Some(EventSource::ImplicitClient),
+        );
+        let mut seq = 0u64;
+        let events = record_to_events(&record, &mut seq);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].row_id.as_str(), "order-1");
+        assert_eq!(events[1].op, WriteOp::Publish);
+        assert_eq!(events[1].collection.as_ref(), "topic:orders_feed");
+        assert_eq!(events[1].lsn, Lsn::new(410));
+        assert_eq!(seq, 2);
     }
 }

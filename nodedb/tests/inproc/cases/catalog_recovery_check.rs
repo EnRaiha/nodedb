@@ -104,6 +104,7 @@ fn make_stream_def(tenant_id: u64, name: &str) -> nodedb::event::cdc::stream_def
         owner: "admin".to_string(),
         created_at: 0,
         subscriber_roles: Vec::new(),
+        modification_hlc: nodedb_types::Hlc::ZERO,
     }
 }
 
@@ -120,6 +121,7 @@ fn make_consumer_group(
         stream_name: stream.to_string(),
         owner: "admin".to_string(),
         created_at: 0,
+        modification_hlc: nodedb_types::Hlc::ZERO,
     }
 }
 

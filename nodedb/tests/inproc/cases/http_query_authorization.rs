@@ -278,7 +278,7 @@ async fn crdt_apply_rejects_ungranted_custom_role_before_surrogate_assignment() 
     assert_eq!(
         srv.shared
             .surrogate_assigner
-            .lookup(
+            .lookup_bound(
                 nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, collection),
                 TenantId::new(1),
                 doc_id.as_bytes(),
@@ -392,7 +392,7 @@ async fn query_honors_explicit_collection_grant_for_custom_role() {
     srv.shared
         .permissions
         .grant(
-            &collection_target(TenantId::new(1), "granted_rows"),
+            &collection_target(DatabaseId::DEFAULT, TenantId::new(1), "granted_rows"),
             &format!("user:{username}"),
             Permission::Read,
             "nodedb",

@@ -38,7 +38,13 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             if active_nodes.is_empty() {
                 return;
             }
-            let data_group_ids: Vec<u64> = mr
+            // Every data group of the routing view, hosted here or not. With a
+            // replication factor below the node count this node hosts only
+            // some groups. A group left out would keep its placement through
+            // every topology change, and never take a joining node.
+            let routing = mr.routing();
+            let routing = routing.read().unwrap_or_else(|p| p.into_inner());
+            let data_group_ids: Vec<u64> = routing
                 .group_ids()
                 .into_iter()
                 .filter(|g| {
@@ -51,8 +57,6 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                 &data_group_ids,
                 self.replication_factor(),
             );
-            let routing = mr.routing();
-            let routing = routing.read().unwrap_or_else(|p| p.into_inner());
             crate::rebalancer::placement::compute_placement_changes(&routing, &target)
         };
 
@@ -70,7 +74,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                     continue;
                 }
             };
-            match self.propose_to_metadata_group(bytes) {
+            match self.propose_stamped_to_metadata_group(&bytes) {
                 Ok(idx) => {
                     debug!(
                         group_id,

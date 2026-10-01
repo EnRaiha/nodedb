@@ -10,12 +10,29 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nodedb_cluster::rpc_codec::{ExecuteResponse, TypedClusterError};
+use nodedb_physical::physical_plan::{ClusterEventOp, PhysicalPlan};
 
 use crate::control::backup::restore::guard::{encode_marks, local_tenant_marks};
 use crate::control::security::auth_fence::cluster::hosts_group;
 use crate::control::state::SharedState;
 
 use super::support::execution_error_to_typed;
+
+/// The answer to `plan` when it is a tenant write-mark request, else `None`.
+pub(super) async fn answer_marks_plan(
+    state: &Arc<SharedState>,
+    plan: &PhysicalPlan,
+    budget: Duration,
+) -> Option<ExecuteResponse> {
+    let PhysicalPlan::ClusterEvent(ClusterEventOp::TenantWriteMarks {
+        tenant_id,
+        group_ids,
+    }) = plan
+    else {
+        return None;
+    };
+    Some(answer_tenant_marks(state, *tenant_id, group_ids, budget).await)
+}
 
 /// This node's marks of `tenant_id` in `group_ids`, encoded for the wire.
 ///
@@ -35,6 +52,8 @@ pub(super) async fn answer_tenant_marks(
             group_id,
             leader_node_id: replica_hint(state, group_id),
             leader_addr: None,
+            // The hint names a replica, not a leader this node observed, so
+            // it carries no term and never moves a termed routing hint.
             term: 0,
         });
     }

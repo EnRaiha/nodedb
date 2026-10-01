@@ -45,6 +45,9 @@ impl CoreLoop {
         entry: UndoEntry,
     ) -> Result<(), (usize, String)> {
         match entry {
+            UndoEntry::ChainHead { collection, prior } => {
+                self.undo_chain_hash(did, tid, &collection, entry_index, Some(prior))
+            }
             UndoEntry::PutDocument { .. } | UndoEntry::DeleteDocument { .. } => {
                 self.apply_undo_document(did, tid, entry_index, entry)
             }
@@ -55,6 +58,7 @@ impl CoreLoop {
                 self.apply_undo_spatial(entry_index, entry)
             }
             UndoEntry::EdgeWrite(undo) => self.apply_undo_edge_write(entry_index, *undo),
+            UndoEntry::EdgeCut(undo) => self.apply_undo_edge_cut(entry_index, *undo),
             UndoEntry::KvPut { .. }
             | UndoEntry::KvDelete { .. }
             | UndoEntry::KvTtl { .. }
@@ -347,7 +351,7 @@ mod tests {
                 Value::Float(3.0),
             ]),
         );
-        zerompk::to_msgpack_vec(&Value::Object(obj)).unwrap()
+        nodedb_types::value_to_msgpack(&Value::Object(obj)).unwrap()
     }
 
     fn row_key() -> String {
@@ -462,6 +466,7 @@ mod tests {
                 index_text: true,
                 user_roles: &[],
                 enforce: true,
+                unique: crate::data::executor::enforcement::unique::UniqueJudge::Row,
                 wal_lsn: None,
             },
         )
@@ -622,13 +627,15 @@ mod tests {
             !fts_searchable(&b),
             "text must be unsearchable after delete"
         );
+        // The row's node keeps its edges: the Control Plane tombstones them
+        // with `EdgeDelete` tasks of the delete's own transaction.
         assert_eq!(edge_present(&mut a), edge_present(&mut b));
-        assert!(!edge_present(&mut b));
+        assert!(edge_present(&mut b));
         assert_eq!(
-            a.is_node_deleted(DB, TID, PK),
-            b.is_node_deleted(DB, TID, PK)
+            a.is_node_deleted(DB, TID, COLL, PK),
+            b.is_node_deleted(DB, TID, COLL, PK)
         );
-        assert!(b.is_node_deleted(DB, TID, PK));
+        assert!(b.is_node_deleted(DB, TID, COLL, PK));
     }
 
     #[test]
@@ -645,15 +652,16 @@ mod tests {
         assert!(vector_searchable(&core));
         assert!(fts_searchable(&core));
         assert!(edge_present(&mut core));
-        assert!(!core.is_node_deleted(DB, TID, PK));
+        assert!(!core.is_node_deleted(DB, TID, COLL, PK));
 
         let undo_log =
             core.install_with_undo_for_test(TID, 20, vec![doc_delete_sub_record(COLL, PK, 1)]);
-        // Mid-tx: the delete cascaded.
+        // Mid-tx: the delete cascaded to the row's indexes, not its edges.
+        assert!(edge_present(&mut core));
         assert!(!spatial_entry_present(&core));
         assert!(!vector_searchable(&core));
         assert!(!fts_searchable(&core));
-        assert!(core.is_node_deleted(DB, TID, PK));
+        assert!(core.is_node_deleted(DB, TID, COLL, PK));
 
         core.rollback_undo_log(DB, TID, undo_log)
             .expect("rollback must succeed");
@@ -674,10 +682,10 @@ mod tests {
         );
         assert!(
             edge_present(&mut core),
-            "graph edge must be restored in both stores after delete-rollback"
+            "graph edge must be live in both stores after delete-rollback"
         );
         assert!(
-            !core.is_node_deleted(DB, TID, PK),
+            !core.is_node_deleted(DB, TID, COLL, PK),
             "deleted-node tombstone must be un-marked after delete-rollback"
         );
         assert!(

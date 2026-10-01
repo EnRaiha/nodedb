@@ -17,7 +17,7 @@ use crate::types::{DatabaseId, Lsn, TenantId, TraceId, TxnId, VShardId};
 pub(crate) enum WalDurability {
     /// The funnel appends the redo itself — under the write-admission guard,
     /// immediately before the enqueue — and stamps the minted LSN onto the
-    /// `Request`. Minting the LSN after admission and just before the enqueue
+    /// `Request`. Minting the LSN after admission and right before the enqueue
     /// is what makes WAL-LSN order equal dispatcher-enqueue order per key; the
     /// strict-FIFO per-database WFQ then makes apply order follow enqueue
     /// order, so restart replay (in LSN order) cannot diverge from live state.
@@ -31,10 +31,16 @@ pub(crate) enum WalDurability {
     /// committed upstream: the proposer's stamp on a replicated entry. `None`
     /// when this append is the commit, so the funnel stamps the instant of the
     /// append itself.
+    ///
+    /// `change_position` is the Raft log position of the data-group entry this
+    /// write applies, `None` for a write no entry carries. The funnel makes it
+    /// durable ahead of the redo and records it for the CDC router, so every
+    /// replica positions the write's change events alike.
     AppendHere {
         now_override: Option<u64>,
         apply_key: u64,
         commit_hlc: Option<u64>,
+        change_position: Option<crate::event::cdc::position::ReplicatedPosition>,
     },
     /// The caller already recorded this write's durability elsewhere — COMMIT's
     /// single `Transaction` record, the procedural batch flush, a trigger /
@@ -82,49 +88,35 @@ pub(crate) enum WriteOrdering {
     Gate,
     /// Ordering was decided upstream and must not be re-decided. The Raft data
     /// group committed this entry at a fixed log index and every replica
-    /// applies it in exactly that order; re-entering the gate could route it
+    /// applies it in exactly that order; re-entering the gate can route it
     /// back through Calvin or block it behind a lock it does not need.
     AlreadyOrdered,
 }
 
 /// Who owns emitting this write's Control-Plane change event.
 pub(crate) enum ChangeFeedOwner {
-    /// The funnel extracts the write's change metadata from the plan and
-    /// publishes it once the apply succeeds. This is the route for every write
-    /// this node both handles and applies itself — the autocommit / internal
-    /// funnel, the pgwire SQL path's local dispatch, and the array executor's
-    /// single-node write — and it is what carries those writes to `/cdc` and
-    /// WS-RPC subscribers.
-    Funnel,
-    /// The funnel emits no change event for this write, because the node that
-    /// handled the write already emitted it.
-    ///
-    /// This is the route for a submit that applies a Raft-committed entry (the
-    /// data-group apply loop and the array apply path). Those run on EVERY
-    /// replica: publishing here would emit one event per replica, each with its
-    /// own cluster-wide NOTIFY fan-out to every peer, and no dedup exists on
-    /// either side — a subscriber would silently see the write once per
-    /// replica, multiplied again by the fan-out. The proposing node handled the
-    /// write exactly once and publishes there instead, after commit + apply
-    /// (see `publish_origin_change_events`).
+    /// The write applies on this node alone, outside any replicated entry:
+    /// a staged write inside a transaction, or a plan with no replicated
+    /// form. It has no position on any feed, so the funnel refuses one that
+    /// yields change events.
+    LocalApply,
+    /// The write applies the committed data-group entry at `(group_id,
+    /// log_index)`. Every replica applies it, and every replica stages its
+    /// change events under that entry once the apply succeeds. The apply
+    /// loop publishes them when it settles the entry in log order, so every
+    /// replica emits the group's feed at the same positions.
+    Replicated { group_id: u64, log_index: u64 },
+    /// The funnel emits no change event for this write: its rows reach
+    /// subscribers another way.
     Unowned,
 }
 
-/// What [`super::submit_write`] produced: the Data Plane's answer, and the LSN of the
-/// record that reproduces this write on replay.
+/// What [`super::submit_write`] produced: the Data Plane's answer.
 pub(crate) struct SubmitOutcome {
     /// The Data Plane's `Response` verbatim — including one whose `status` is
     /// `Error`. Callers that need an error status surfaced as a typed error
     /// check `status` themselves.
     pub response: Response,
-    /// The forward write's redo LSN: minted here for `AppendHere`, echoed from
-    /// the caller for `CallerSupplied`. `None` when this write mints no record
-    /// of its own — a read / control op, a plan whose variant appends nothing
-    /// (an array `Flush` reorganizes tiles already durable via their `Put`
-    /// records), or a Calvin-routed write whose durability the scheduler owns.
-    /// It is NOT a "no durability" signal, and no caller may substitute a
-    /// fabricated LSN for it.
-    pub wal_lsn: Option<Lsn>,
 }
 
 /// Inputs for [`super::submit_write`].

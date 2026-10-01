@@ -10,11 +10,9 @@
 //! distributed apply loop (opening the array + dispatching to its local Data
 //! Plane) and binds each cell's carried surrogate to its coord tuple.
 //!
-//! The array catalog is per-node (local `CREATE ARRAY`, not Raft-replicated),
-//! and a follower's `ensure_array_open` on apply needs that catalog — so the
-//! `CREATE ARRAY` DDL runs on ALL three nodes (each registers an identical
-//! catalog), mirroring how `array_raft_replication.rs` registers the schema on
-//! every node before driving the sync path.
+//! `CREATE ARRAY` replicates through the metadata group, so the DDL runs once.
+//! Every node applies the catalog entry, which a follower's
+//! `ensure_array_open` needs on apply.
 //!
 //! ## What is proven
 //!
@@ -113,14 +111,12 @@ async fn cluster_array_cell_write_replicates_to_all_replicas() {
         .await
         .expect("spawn 3-node cluster");
 
-    // The array catalog is local-only, so register it on EVERY node — each
-    // follower needs it to `ensure_array_open` when applying the replicated
-    // cell write.
-    for (idx, node) in cluster.nodes.iter().enumerate() {
-        node.exec(CREATE_ARRAY_DDL)
-            .await
-            .unwrap_or_else(|e| panic!("CREATE ARRAY on node {idx}: {e}"));
-    }
+    // CREATE ARRAY replicates through the metadata group. Every node applies
+    // the catalog entry and opens the array before a cell write reaches it.
+    cluster
+        .exec_ddl_on_any_leader(CREATE_ARRAY_DDL)
+        .await
+        .unwrap_or_else(|e| panic!("CREATE ARRAY: {e}"));
 
     // Insert two cells via node 0. In a cluster this routes through the array
     // coordinator → per-shard owner → Raft propose to the owning data group.

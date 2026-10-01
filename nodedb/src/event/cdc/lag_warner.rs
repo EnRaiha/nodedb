@@ -93,7 +93,7 @@ impl CdcLagWarner {
     /// the threshold.
     ///
     /// No-op when `drops == 0`.
-    pub fn record_drops(&self, tenant_id: u64, stream_name: &str, drops: u64, oldest_lsn: u64) {
+    pub fn record_drops(&self, tenant_id: u64, stream_name: &str, drops: u64, oldest_index: u64) {
         if drops == 0 {
             return;
         }
@@ -112,7 +112,7 @@ impl CdcLagWarner {
                 stream = stream_name,
                 dropped_in_window = rate,
                 threshold = self.threshold,
-                oldest_available_lsn = oldest_lsn,
+                oldest_available_index = oldest_index,
                 "CDC stream drop rate exceeded threshold: lagging consumers may miss events"
             );
         }

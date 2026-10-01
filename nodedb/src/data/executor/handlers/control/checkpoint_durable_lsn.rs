@@ -558,7 +558,7 @@ mod tests {
                 vec![crate::engine::array::wal::ArrayPutCell {
                     coord: vec![CoordValue::Int64(1)],
                     attrs: vec![CellValue::Int64(7)],
-                    surrogate: nodedb_types::Surrogate::ZERO,
+                    surrogate: nodedb_types::Surrogate::new(1),
                     system_from_ms: 1,
                     valid_from_ms: 0,
                     valid_until_ms: i64::MAX,

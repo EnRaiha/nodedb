@@ -38,9 +38,11 @@ impl KvEngine {
             None => return (Vec::new(), Vec::new()),
         };
 
+        // Every stored entry holds a bound surrogate, so the ceiling alone
+        // decides visibility.
         let surrogate_visible = |s: u32| -> bool {
             match surrogate_ceiling {
-                Some(c) => s == 0 || s <= c,
+                Some(c) => s <= c,
                 None => true,
             }
         };
@@ -150,9 +152,11 @@ impl KvEngine {
             None => return Ok(()),
         };
 
+        // Every stored entry holds a bound surrogate, so the ceiling alone
+        // decides visibility.
         let surrogate_visible = |s: u32| -> bool {
             match surrogate_ceiling {
-                Some(c) => s == 0 || s <= c,
+                Some(c) => s <= c,
                 None => true,
             }
         };
@@ -216,8 +220,7 @@ impl KvEngine {
 
 #[cfg(test)]
 mod tests {
-    use nodedb_types::Surrogate;
-
+    use crate::engine::kv::test_support::row_surrogate;
     use crate::engine::kv::{KvPutParams, RegisterIndexParams};
 
     use super::*;
@@ -268,8 +271,9 @@ mod tests {
                 value: &[i * 10],
                 ttl_ms: 0,
                 now_ms: n,
-                surrogate: Surrogate::ZERO,
-            });
+                surrogate: row_surrogate(&[i]),
+            })
+            .expect("a bound row writes");
         }
 
         let (materialized, _next) = e.scan(scan_params("c", usize::MAX, n));
@@ -298,8 +302,9 @@ mod tests {
                 value: &[i * 10],
                 ttl_ms: 0,
                 now_ms: n,
-                surrogate: Surrogate::ZERO,
-            });
+                surrogate: row_surrogate(&[i]),
+            })
+            .expect("a bound row writes");
         }
 
         let (materialized, _next) = e.scan(scan_params("c", 3, n));
@@ -336,8 +341,9 @@ mod tests {
             value: &mp_obj(&[("region", "us-east")]),
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"s1"),
+        })
+        .expect("a bound row writes");
         e.put(KvPutParams {
             database_id: 0,
             tenant_id: 1,
@@ -346,8 +352,9 @@ mod tests {
             value: &mp_obj(&[("region", "us-east")]),
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"s2"),
+        })
+        .expect("a bound row writes");
         e.put(KvPutParams {
             database_id: 0,
             tenant_id: 1,
@@ -356,8 +363,9 @@ mod tests {
             value: &mp_obj(&[("region", "eu-west")]),
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"s3"),
+        })
+        .expect("a bound row writes");
 
         let indexed_params = || KvScanParams {
             filter_field: Some("region"),
@@ -388,8 +396,9 @@ mod tests {
             value: b"v1",
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"k1"),
+        })
+        .expect("a bound row writes");
         e.put(KvPutParams {
             database_id: 0,
             tenant_id: 1,
@@ -398,8 +407,9 @@ mod tests {
             value: b"v2",
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"k2"),
+        })
+        .expect("a bound row writes");
 
         let mut seen = 0usize;
         let result = e.scan_for_each(scan_params("c", usize::MAX, n), |_k, _v| {

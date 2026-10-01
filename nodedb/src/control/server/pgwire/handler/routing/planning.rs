@@ -187,13 +187,13 @@ impl NodeDbPgHandler {
             tenant_id,
             database_id,
             scope.auth(),
+            self.sessions.tx_id(session_id),
         )
         .await
         .map_err(StatementSetupError::from)?;
 
         // Validate enum-typed column values for INSERT/UPDATE before planning.
         self.enforce_enum_labels_if_needed(&clean_sql, tenant_id, database_id)
-            .await
             .map_err(StatementSetupError::from)?;
 
         // Cache key isn't session-knob-scoped, so bypass entirely under a strategy
@@ -236,7 +236,6 @@ impl NodeDbPgHandler {
         };
 
         let (tasks, output_schema, versions) = if !params.is_empty() {
-            let perm_cache = self.state.permission_cache.read().await;
             let sec = crate::control::planner::context::PlanSecurityContext {
                 identity,
                 auth: scope.auth(),
@@ -244,7 +243,9 @@ impl NodeDbPgHandler {
                 redaction_store: &self.state.redaction,
                 permissions: &self.state.permissions,
                 roles: &self.state.roles,
-                permission_cache: Some(&*perm_cache),
+                permission_tree: crate::control::planner::context::PermissionTreeSource::Live(
+                    &self.state.permission_cache,
+                ),
             };
             let (tasks, output_schema, versions) = self
                 .query_ctx
@@ -271,7 +272,6 @@ impl NodeDbPgHandler {
             (tasks, output_schema, versions)
         } else {
             let (planned, output_schema, versions, cache_eligibility) = {
-                let perm_cache = self.state.permission_cache.read().await;
                 let sec = crate::control::planner::context::PlanSecurityContext {
                     identity,
                     auth: scope.auth(),
@@ -279,7 +279,9 @@ impl NodeDbPgHandler {
                     redaction_store: &self.state.redaction,
                     permissions: &self.state.permissions,
                     roles: &self.state.roles,
-                    permission_cache: Some(&*perm_cache),
+                    permission_tree: crate::control::planner::context::PermissionTreeSource::Live(
+                        &self.state.permission_cache,
+                    ),
                 };
                 self.query_ctx
                     .plan_sql_with_rls_and_versions(
@@ -294,7 +296,7 @@ impl NodeDbPgHandler {
             };
 
             // Strategy overrides aren't in the cache key: caching a resolved PK→surrogate
-            // binding would preserve stale row identity across later writes.
+            // binding will preserve stale row identity across later writes.
             if !bypass_cache && cache_eligibility.is_cacheable() {
                 self.sessions.put_cached_plan(
                     session_id,

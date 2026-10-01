@@ -3,8 +3,8 @@
 //! Stable `kind()` label for every [`CatalogEntry`] variant.
 //!
 //! Kept out of `entry.rs` so the enum definition stays a pure type
-//! declaration: the label table grows one line per variant and would
-//! otherwise push the definition file past its size budget.
+//! declaration: the label table grows one line per variant and
+//! pushes the definition file past its size budget when kept inline.
 
 use super::entry::CatalogEntry;
 
@@ -93,7 +93,16 @@ impl CatalogEntry {
             Self::DeleteVectorModel { .. } => "delete_vector_model",
             Self::PutVectorIndexParams(_) => "put_vector_index_params",
             Self::PutColumnStats(_) => "put_column_stats",
+            Self::PutCloneCopyup { .. } => "put_clone_copyup",
+            Self::PutCloneTombstone { .. } => "put_clone_tombstone",
+            Self::PutKvCloneTombstone { .. } => "put_kv_clone_tombstone",
+            Self::PutCloneSourceDrain(_) => "put_clone_source_drain",
+            Self::DeleteCloneSourceDrain { .. } => "delete_clone_source_drain",
+            Self::PutArray(_) => "put_array",
+            Self::DeleteArray { .. } => "delete_array",
             Self::DeleteVectorIndexParams { .. } => "delete_vector_index_params",
+            Self::CommitConsumerOffsets(_) => "commit_consumer_offsets",
+            Self::PutBackupScheduleMark(_) => "put_backup_schedule_mark",
         }
     }
 }

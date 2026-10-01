@@ -556,6 +556,7 @@ mod tests {
                 txn_id: None,
                 wal_lsn: Some(Lsn::new(lsn)),
                 resolved_now_ms: None,
+                commit_hlc: None,
                 admission: Admission::Exempt(ExemptReason::AlreadyOrdered),
             },
             Some(Lsn::new(lsn)),
@@ -775,7 +776,7 @@ mod tests {
             .entry(index_key.clone())
             .or_insert_with(|| nodedb_vector::VectorCollection::new(2, Default::default()));
         let vector_id = coll
-            .insert_with_surrogate(vec![1.0, 2.0], nodedb_types::Surrogate::ZERO)
+            .insert_with_surrogate(vec![1.0, 2.0], nodedb_types::Surrogate::new(1))
             .unwrap();
 
         // Seed as though the forward `apply_point_put_vector_indexes` insert had
@@ -816,7 +817,7 @@ mod tests {
             .entry(index_key.clone())
             .or_insert_with(|| nodedb_vector::VectorCollection::new(2, Default::default()));
         let vector_id = coll
-            .insert_with_surrogate(vec![3.0, 4.0], nodedb_types::Surrogate::ZERO)
+            .insert_with_surrogate(vec![3.0, 4.0], nodedb_types::Surrogate::new(1))
             .unwrap();
         coll.delete(vector_id);
 

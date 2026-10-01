@@ -3,28 +3,24 @@
 //! Document operation dispatch.
 
 use crate::bridge::envelope::Response;
-use nodedb_mem;
 use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_types::SystemTimeScope;
 
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::document::read::materialize_scan::DocumentMaterializeScan;
 use crate::data::executor::task::ExecutionTask;
 
-use super::document_admit::{doc_scan_mode, is_document_write};
+use super::document_admit::{DOCUMENT_WRITE_ENGINES, doc_scan_mode, is_document_write};
 
 impl CoreLoop {
     pub(super) fn dispatch_document(&mut self, task: &ExecutionTask, op: &DocumentOp) -> Response {
         let tid = task.request.tenant_id.as_u64();
         // Pressure guard for write operations.
         if is_document_write(op) {
-            if let Some(r) =
-                self.check_engine_pressure(task, nodedb_mem::EngineId::DocumentSchemaless)
-            {
-                return r;
-            }
-            // FTS indexing is a side effect of every document write.
-            if let Some(r) = self.check_engine_pressure(task, nodedb_mem::EngineId::Fts) {
-                return r;
+            for engine in DOCUMENT_WRITE_ENGINES {
+                if let Some(r) = self.check_engine_pressure(task, engine) {
+                    return r;
+                }
             }
         }
         match op {
@@ -461,13 +457,17 @@ impl CoreLoop {
                 cursor,
                 count,
                 system_as_of_ms,
+                raw_bodies,
             } => self.execute_document_materialize_scan(
                 task,
-                tid,
-                collection.as_str(),
-                cursor,
-                *count,
-                *system_as_of_ms,
+                DocumentMaterializeScan {
+                    tid,
+                    collection: collection.as_str(),
+                    cursor,
+                    count: *count,
+                    system_as_of_ms: *system_as_of_ms,
+                    raw_bodies: *raw_bodies,
+                },
             ),
 
             DocumentOp::ApplyBalanceDelta {

@@ -29,11 +29,11 @@ pub struct EdgeRef<'a> {
     pub src: &'a str,
     pub label: &'a str,
     pub dst: &'a str,
-    /// Global identity of `src`, or [`Surrogate::ZERO`] when the caller has
-    /// none to record (delete and erase paths, which change no binding).
-    pub src_surrogate: Surrogate,
-    /// Global identity of `dst`. Same `ZERO` convention as `src_surrogate`.
-    pub dst_surrogate: Surrogate,
+    /// Global identity of `src`, or `None` when the caller has none to record
+    /// (delete and erase paths, which change no binding).
+    pub src_surrogate: Option<Surrogate>,
+    /// Global identity of `dst`, with the same `None` convention.
+    pub dst_surrogate: Option<Surrogate>,
 }
 
 impl<'a> EdgeRef<'a> {
@@ -55,16 +55,16 @@ impl<'a> EdgeRef<'a> {
             src,
             label,
             dst,
-            src_surrogate: Surrogate::ZERO,
-            dst_surrogate: Surrogate::ZERO,
+            src_surrogate: None,
+            dst_surrogate: None,
         }
     }
 
     /// Attach the endpoints' global identities, so the write persists them
     /// alongside the edge and a rebuild can restore them.
     pub const fn with_surrogates(mut self, src: Surrogate, dst: Surrogate) -> Self {
-        self.src_surrogate = src;
-        self.dst_surrogate = dst;
+        self.src_surrogate = Some(src);
+        self.dst_surrogate = Some(dst);
         self
     }
 
@@ -213,15 +213,15 @@ mod tests {
             .with_surrogates(Surrogate::new(10), Surrogate::new(20));
         let r = e.reversed();
         assert_eq!(r.src, "b");
-        assert_eq!(r.src_surrogate, Surrogate::new(20));
+        assert_eq!(r.src_surrogate, Some(Surrogate::new(20)));
         assert_eq!(r.dst, "a");
-        assert_eq!(r.dst_surrogate, Surrogate::new(10));
+        assert_eq!(r.dst_surrogate, Some(Surrogate::new(10)));
     }
 
     #[test]
     fn edge_ref_without_surrogates_records_no_binding() {
         let e = EdgeRef::new(DatabaseId::DEFAULT, TenantId::new(1), "c", "a", "L", "b");
-        assert_eq!(e.src_surrogate, Surrogate::ZERO);
-        assert_eq!(e.dst_surrogate, Surrogate::ZERO);
+        assert_eq!(e.src_surrogate, None);
+        assert_eq!(e.dst_surrogate, None);
     }
 }

@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use tracing::info;
 
 use nodedb_types::config::tuning::WalTuning;
+use nodedb_wal::TimeAnchors;
 use nodedb_wal::segmented::{SegmentedWal, SegmentedWalConfig};
 use nodedb_wal::writer::WalWriterConfig;
 
@@ -45,6 +46,9 @@ pub struct WalManager {
     /// Wakes `wait_durable` followers when `durable_lsn` advances (or a leader's
     /// fsync fails, so they re-attempt and observe the same error).
     pub(super) durable_notify: tokio::sync::Notify,
+    /// Commit-time anchors of this WAL, stamped from the node's HLC. The writer
+    /// records one per fsynced batch. Replay records the persisted ones.
+    pub(super) time_anchors: Arc<TimeAnchors>,
 }
 
 impl WalManager {
@@ -70,6 +74,17 @@ impl WalManager {
     /// which prevents `SIGNED_DELTAS` from being enabled.
     pub fn crdt_signing_root(&self) -> crate::Result<Option<[u8; 32]>> {
         Ok(self.crdt_signing_root)
+    }
+
+    /// This WAL's commit-time anchors.
+    pub fn time_anchors(&self) -> &Arc<TimeAnchors> {
+        &self.time_anchors
+    }
+
+    /// The node's HLC. Anchors are stamped from it, so every commit stamp it
+    /// issues orders against anchor times.
+    pub fn hlc_clock(&self) -> Arc<nodedb_types::HlcClock> {
+        Arc::clone(self.time_anchors.clock())
     }
 
     /// Open or create a segmented WAL at the given path.
@@ -114,6 +129,8 @@ impl WalManager {
                 alignment: tuning.alignment,
                 use_direct_io: tuning.direct_io,
                 dwb_mode: None,
+                // `open_internal` installs the manager's anchors.
+                time_anchors: None,
             },
         )
     }
@@ -122,9 +139,11 @@ impl WalManager {
     pub(super) fn open_internal(
         path: &Path,
         segment_target_size: u64,
-        writer_config: WalWriterConfig,
+        mut writer_config: WalWriterConfig,
     ) -> crate::Result<Self> {
         let wal_dir = path.to_path_buf();
+        let time_anchors = Arc::new(TimeAnchors::new(Arc::new(nodedb_types::HlcClock::new())));
+        writer_config.time_anchors = Some(Arc::clone(&time_anchors));
 
         let effective_target = if segment_target_size > 0 {
             segment_target_size
@@ -140,6 +159,11 @@ impl WalManager {
         };
 
         let wal = SegmentedWal::open(config).map_err(crate::Error::Wal)?;
+        // A new log has nothing to replay. Anchor its empty state now, so a
+        // time after open resolves to LSN 0 instead of an error.
+        if wal.next_lsn() == 1 {
+            time_anchors.cover_recovered(0);
+        }
 
         // `direct_io` is logged because a WAL running buffered is a weaker
         // durability posture than the default, and the log is the only place
@@ -172,6 +196,7 @@ impl WalManager {
             durable_lsn: AtomicU64::new(0),
             commit_lock: tokio::sync::Mutex::new(()),
             durable_notify: tokio::sync::Notify::new(),
+            time_anchors,
         })
     }
 

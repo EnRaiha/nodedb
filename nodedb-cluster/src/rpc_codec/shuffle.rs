@@ -109,6 +109,9 @@ pub struct ShuffleProduceRequest {
     pub deadline_remaining_ms: u64,
     pub trace_id: [u8; 16],
     pub descriptor_versions: Vec<DescriptorVersionEntry>,
+    /// Raft groups the producer confirms before its scan, as a linearizable
+    /// read leg (see `ExecuteRequest::read_groups`). Empty otherwise.
+    pub read_groups: Vec<u64>,
 }
 
 /// Terminal reply to a [`ShuffleProduceRequest`].
@@ -589,6 +592,7 @@ mod tests {
                 collection: "orders".into(),
                 version: 11,
             }],
+            read_groups: vec![3, 8],
         };
         let decoded = roundtrip_produce_req(req.clone());
         assert_eq!(decoded.shuffle_id, req.shuffle_id);
@@ -607,6 +611,7 @@ mod tests {
         assert_eq!(decoded.descriptor_versions.len(), 1);
         assert_eq!(decoded.descriptor_versions[0].collection, "orders");
         assert_eq!(decoded.descriptor_versions[0].version, 11);
+        assert_eq!(decoded.read_groups, vec![3, 8]);
     }
 
     #[test]
@@ -624,6 +629,7 @@ mod tests {
             deadline_remaining_ms: 1000,
             trace_id: [0u8; 16],
             descriptor_versions: vec![],
+            read_groups: vec![],
         };
         let decoded = roundtrip_produce_req(req);
         assert!(decoded.keys.is_empty());

@@ -8,7 +8,7 @@
 //! Every step here assumes standard msgpack bodies carrying an `id` field —
 //! `MaterializeScan` already normalized a strict source's Binary Tuple and
 //! injected the row's storage-key identity on the Data Plane. Never re-add
-//! a Control-Plane decode here; it would silently corrupt the filter, PK
+//! a Control-Plane decode here; it silently corrupts the filter, PK
 //! extraction, and target write.
 
 use nodedb_types::{DatabaseId, Surrogate, TenantId};
@@ -17,7 +17,7 @@ use crate::bridge::expr_eval::ComputedColumn;
 use crate::bridge::scan_filter::ScanFilter;
 use crate::control::state::SharedState;
 use crate::control::target_identity::{
-    TargetPk, assign_target_surrogate, bare_collection_name, resolve_target_pk,
+    TargetPk, assign_target_surrogates, bare_collection_name, resolve_target_pk,
 };
 use crate::engine::document::store::StorageKey;
 
@@ -91,7 +91,7 @@ pub(crate) fn resolve_copy_spec(
 /// bounds the total copied-row count across pages (the SELECT `LIMIT`) and is
 /// decremented per emitted row. Returns the concrete
 /// `(target_doc_id, msgpack_value, fresh_surrogate)` to write.
-pub(crate) fn assign_page_rows(
+pub(crate) async fn assign_page_rows(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
@@ -100,7 +100,7 @@ pub(crate) fn assign_page_rows(
     entries: Vec<(String, u32, Vec<u8>)>,
     remaining: &mut usize,
 ) -> crate::Result<Vec<(String, Vec<u8>, Surrogate)>> {
-    let mut out = Vec::with_capacity(entries.len());
+    let mut shaped: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
     for (_source_doc_id, _source_surrogate, value) in entries {
         if *remaining == 0 {
             break;
@@ -117,21 +117,30 @@ pub(crate) fn assign_page_rows(
         } else {
             shape_row(&value, &spec.column_map)?
         };
-        let surrogate = assign_target_surrogate(
-            state,
-            nodedb_types::CollectionKey::from_qualified_str(database_id, target_collection)?,
-            tenant_id,
-            &spec.target_pk,
-            &value,
-        )?;
-        out.push((
-            StorageKey::for_surrogate(surrogate).to_string(),
-            value,
-            surrogate,
-        ));
+        shaped.push(value);
         *remaining -= 1;
     }
-    Ok(out)
+    // Every copied row's surrogate in one batch at the target's home.
+    let bodies: Vec<&[u8]> = shaped.iter().map(Vec::as_slice).collect();
+    let surrogates = assign_target_surrogates(
+        state,
+        nodedb_types::CollectionKey::from_qualified_str(database_id, target_collection)?,
+        tenant_id,
+        &spec.target_pk,
+        &bodies,
+    )
+    .await?;
+    Ok(shaped
+        .into_iter()
+        .zip(surrogates)
+        .map(|(value, surrogate)| {
+            (
+                StorageKey::for_surrogate(surrogate).to_string(),
+                value,
+                surrogate,
+            )
+        })
+        .collect())
 }
 
 /// Evaluate each `(target_column, expression)` pair against the source row and

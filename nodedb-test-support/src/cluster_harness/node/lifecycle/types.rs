@@ -56,12 +56,10 @@ pub struct TestClusterNode {
     pub(in crate::cluster_harness::node) _poller_handle: Option<tokio::task::JoinHandle<()>>,
     pub(in crate::cluster_harness::node) _core_handles: Vec<tokio::task::JoinHandle<()>>,
     pub(in crate::cluster_harness::node) _event_plane: Option<EventPlane>,
-    /// `LeaseRenewalLoop::spawn`'s `JoinHandle` — previously bound to a local
-    /// (`_lease_renewal`) and dropped/detached when `spawn_with_full_config_at`
-    /// returned. Retained here so `graceful_shutdown_wal_only` can abort+await
-    /// it, releasing its `Arc<SharedState>` clone before returning. `None` on
-    /// single-node clusters that never wire `metadata_raft`
-    /// (`LeaseRenewalLoop::spawn` returns `None` in that case).
+    /// `LeaseRenewalLoop::spawn`'s `JoinHandle`, retained so
+    /// `graceful_shutdown_wal_only` can abort+await it, releasing its
+    /// `Arc<SharedState>` clone before returning. `Option` so shutdown can
+    /// `.take()` it without violating the `Drop` impl.
     pub(in crate::cluster_harness::node) _lease_renewal_handle: Option<tokio::task::JoinHandle<()>>,
     /// Cluster subsystem tasks (SWIM, reachability, decommission,
     /// rebalancer) started by `start_raft` and stashed on the

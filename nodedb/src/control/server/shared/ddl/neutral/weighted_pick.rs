@@ -95,7 +95,7 @@ pub async fn weighted_pick(
     // row-filtered here — a pick is a read of every row in the collection. The
     // weight a row is drawn with, and reported with, is the stored weight
     // column, so a redaction rule on it is refused rather than masked: a masked
-    // weight would change which row is drawn, not just how it prints.
+    // weight will change which row is drawn, not only how it prints.
     let gate = CollectionReadGate::open(state, identity, DatabaseId::DEFAULT, &collection)?;
     gate.refuse_if_field_redacted(&collection, &weight_col, "the sampling weight")?;
 
@@ -163,19 +163,18 @@ pub async fn weighted_pick(
         let audit_value = nodedb_types::json_to_msgpack(&audit_entry)
             .map_err(|e| DdlError::internal(format!("WEIGHTED_PICK: audit entry encode: {e}")))?;
         let audit_key_bytes = audit_key.into_bytes();
-        let audit_surrogate = state
-            .surrogate_assigner
-            .assign(
-                nodedb_types::CollectionKey::from_bare(
-                    crate::types::DatabaseId::DEFAULT,
-                    "_system_random_audit",
-                ),
-                tenant_id,
-                &audit_key_bytes,
-            )
-            .map_err(|e| {
-                DdlError::from_error_in_context("WEIGHTED_PICK: audit surrogate bind", &e)
-            })?;
+        let audit_surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
+            state,
+            nodedb_types::CollectionKey::from_bare(
+                crate::types::DatabaseId::DEFAULT,
+                "_system_random_audit",
+            ),
+            tenant_id,
+            &audit_key_bytes,
+            crate::types::TraceId::ZERO,
+        )
+        .await
+        .map_err(|e| DdlError::from_error_in_context("WEIGHTED_PICK: audit surrogate bind", &e))?;
         let audit_plan = PhysicalPlan::Kv(KvOp::Put {
             collection: nodedb_types::QualifiedCollection::new(
                 DatabaseId::DEFAULT,

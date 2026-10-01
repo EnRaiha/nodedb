@@ -17,9 +17,7 @@ pub(super) fn status(command: &str) -> Vec<DdlResult> {
 
 /// Require that the identity is superuser or tenant_admin.
 ///
-/// Folded in verbatim from the pgwire `require_tenant_admin` helper: it does
-/// NOT emit an audit record on denial and returns SQLSTATE 42501 with the
-/// identical message.
+/// It does NOT emit an audit record on denial and returns SQLSTATE 42501.
 pub(super) fn require_tenant_admin(
     identity: &AuthenticatedIdentity,
     action: &str,

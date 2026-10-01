@@ -6,6 +6,7 @@ mod dispatched_lsns;
 mod dispatcher;
 mod drain;
 mod enqueue;
+mod journal;
 mod outcome_floor;
 mod refusal;
 mod response_poll;
@@ -18,5 +19,6 @@ pub use dispatcher::{
     DefaultPriorityResolver, Dispatcher,
 };
 pub use drain::CorePending;
+pub use journal::{JournalGroup, WriteSetJournal};
 pub use outcome_floor::{OutcomeFloor, ResendRefusal, StuckFloor, WriteWindow};
 pub use refusal::DispatchRefusal;

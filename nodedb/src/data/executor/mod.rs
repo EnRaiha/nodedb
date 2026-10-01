@@ -2,6 +2,8 @@
 
 mod applied_prefix;
 pub(crate) mod array_checkpoint;
+#[cfg(test)]
+mod cascade_journal_tests;
 pub(crate) mod checkpoint_decode_error;
 pub(crate) mod checkpoint_encoding;
 pub(crate) mod checkpoint_outcome;
@@ -25,7 +27,7 @@ pub mod response_codec;
 mod row_shape;
 mod scan_normalize;
 mod scan_versioned;
-mod snapshot;
+pub(crate) mod snapshot;
 mod sparse_body_format;
 mod sparse_vector_checkpoint;
 mod spatial_checkpoint;
@@ -42,7 +44,6 @@ mod wal_replay_all;
 mod wal_replay_columnar_dml;
 mod wal_replay_columnar_image;
 mod wal_replay_columnar_truncate;
-mod wal_replay_document_vector;
 mod wal_replay_fts;
 mod wal_replay_graph_labels;
 mod wal_replay_kv_atomic;
@@ -56,7 +57,11 @@ mod wal_replay_kv_sorted_index;
 mod wal_replay_kv_transfer;
 mod wal_replay_kv_ttl;
 mod wal_replay_redo_document;
+mod wal_replay_redo_document_apply;
 mod wal_replay_redo_graph;
+mod wal_replay_redo_graph_cut;
+#[cfg(test)]
+mod wal_replay_row_image_tests;
 mod wal_replay_spatial;
 mod wal_replay_vector;
 mod wal_replay_vector_delete;
@@ -68,3 +73,5 @@ mod wal_replay_vector_redo;
 mod wal_replay_vector_resolved;
 mod wal_replay_vector_sparse;
 mod wal_replay_vector_task;
+#[cfg(test)]
+mod write_set_crash_tests;

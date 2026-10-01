@@ -4,7 +4,7 @@
 
 use super::super::ast::*;
 use super::super::error::ProceduralError;
-use super::super::tokenizer::Token;
+use super::super::tokenizer::{Token, TokenStream};
 use super::exception;
 use super::statements;
 use super::utils::*;
@@ -37,12 +37,17 @@ pub fn parse_block(input: &str) -> Result<ProceduralBlock, ProceduralError> {
 
 /// Parse a sequence of statements until we hit END, ELSE, ELSIF, EXCEPTION, or end of tokens.
 pub(crate) fn parse_statements(
-    tokens: &[Token],
+    tokens: &TokenStream<'_>,
     pos: &mut usize,
 ) -> Result<Vec<Statement>, ProceduralError> {
     let mut stmts = Vec::new();
 
     while *pos < tokens.len() {
+        // A comment between statements belongs to none of them.
+        if tokens[*pos].is_comment() {
+            *pos += 1;
+            continue;
+        }
         match tokens.get(*pos) {
             Some(
                 Token::End

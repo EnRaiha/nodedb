@@ -16,8 +16,9 @@
 //! few document shapes that appends anything on the forward path at all:
 //! `PointUpdate`, `Upsert`, `BulkUpdate`, `BulkDelete`, `Merge` and
 //! `UpdateFromJoin` journal NOTHING before dispatch (see
-//! `wal_dispatch::document`) — their redo is minted after apply and only on
-//! success — so a refusal on those leaves no record to resurrect.
+//! `wal_dispatch::document`). Their redo is minted after apply and names only
+//! the rows that reached storage, so a refusal on those leaves no record of a
+//! refused row to resurrect.
 //!
 //! What each engine loses if the record replays differs, and each test asserts
 //! the thing its engine actually loses:
@@ -25,13 +26,11 @@
 //! * **Key-value** — the rows live only in an in-memory hash table, so WAL
 //!   replay is their sole recovery path and a replayed delete removes the row
 //!   outright.
-//! * **Document** — the row is shielded by redb's synchronous commit at apply
-//!   time, but its secondary vector index is not: that HNSW has no durable
-//!   backing of its own and `CoreLoop::replay_document_vector_wal` rebuilds it
-//!   from these very records, its delete arm dropping the vector node named by
-//!   each `Delete`. A replayed refused delete therefore strips the vector of a
-//!   row storage still holds — readable by primary key, vanished from vector
-//!   search, and only after a restart.
+//! * **Document** — WAL replay applies every document record through the
+//!   write path, and a replayed `Delete` removes the row, its secondary index
+//!   entries and its vector node. A replayed refused delete therefore removes
+//!   a row the server refused to remove, and strips it from vector search,
+//!   only after a restart.
 //!
 //! The restart is a real one: `graceful_shutdown` releases every WAL and redb
 //! handle and `open_on_path` reopens the same directory, so the engines come
@@ -231,9 +230,8 @@ async fn rls_refused_document_delete_is_not_replayed_into_the_vector_index() {
         "a refused delete must leave the stored row in place"
     );
 
-    // Without the abort record, replay feeds the refused `Delete` to
-    // `replay_document_vector_wal`, which drops this row's vector node and
-    // hands the x-axis to `x_anchor`.
+    // Without the abort record, replay applies the refused `Delete`, which
+    // drops this row's vector node and hands the x-axis to `x_anchor`.
     assert_eq!(
         nearest(&srv2, "refused_vec", X_AXIS).await,
         "r_theirs",

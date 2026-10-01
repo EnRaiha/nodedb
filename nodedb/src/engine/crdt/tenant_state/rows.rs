@@ -123,7 +123,7 @@ mod tests {
         let change = ProposedChange {
             collection: "users".into(),
             row_id: "u1".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             fields: vec![("name".into(), LoroValue::String("Alice".into()))],
         };
         engine

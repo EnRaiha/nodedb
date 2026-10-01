@@ -154,7 +154,7 @@ async fn mark_ready(state: &SharedState, build: &SecondaryIndexBuild) -> Result<
                 idx.state = IndexBuildState::Ready;
             }
         }
-        commit_collection_mutation(state, &ready_coll, build.database_id).await?;
+        commit_collection_mutation(state, &ready_coll).await?;
     }
     Ok(())
 }
