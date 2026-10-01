@@ -16,12 +16,17 @@ use crate::types::DatabaseId;
 /// Preflighted raw ILP lines for one canonical measurement.
 ///
 /// `raw_lines` preserve physical source order; map iteration canonicalizes
-/// measurement order. `catalog_fields` is a rebuildable control-plane projection
-/// of the authoritative timeseries-engine schema.
+/// measurement order. `catalog_time_column` and `catalog_fields` are a
+/// rebuildable control-plane projection of the authoritative timeseries-engine
+/// schema.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct IlpMeasurementBatch {
     pub(super) measurement: String,
     pub(super) raw_lines: Vec<String>,
+    /// The column inference names for the line timestamp. The catalog merge
+    /// drops it for a collection whose declared time key carries that time.
+    pub(super) catalog_time_column: Option<(String, String)>,
+    /// The inferred tag and field columns, in inference order.
     pub(super) catalog_fields: Vec<(String, String)>,
 }
 
@@ -75,14 +80,20 @@ pub(super) fn preflight_ilp_batch(
         let parsed_group = crate::engine::timeseries::ilp::parse_batch(&grouped_source)
             .map_err(|_| IlpPreflightFailure::Parse)?;
         let schema = crate::engine::timeseries::ilp_ingest::infer_schema(parsed_group.lines());
-        let catalog_fields = schema
-            .columns
-            .iter()
-            .map(|(name, ty)| (name.clone(), ty.ddl_type_name().to_owned()))
-            .collect();
+        let mut catalog_time_column = None;
+        let mut catalog_fields = Vec::with_capacity(schema.columns.len());
+        for (index, (name, ty)) in schema.columns.iter().enumerate() {
+            let projected = (name.clone(), ty.ddl_type_name().to_owned());
+            if index == schema.timestamp_idx {
+                catalog_time_column = Some(projected);
+            } else {
+                catalog_fields.push(projected);
+            }
+        }
         groups.push(IlpMeasurementBatch {
             measurement,
             raw_lines,
+            catalog_time_column,
             catalog_fields,
         });
     }
@@ -202,6 +213,30 @@ mod tests {
         assert_eq!(groups[0].raw_lines, vec!["cpu value=2i"]);
         assert_eq!(groups[1].measurement, "mem");
         assert_eq!(groups[1].raw_lines, vec!["mem value=1i", "mem value=3i"]);
+    }
+
+    /// The line timestamp is projected apart from the tag and field columns.
+    /// A tag or field that happens to be called `timestamp` stays a field.
+    #[test]
+    fn projection_holds_the_inferred_time_column_apart_from_fields() {
+        let permissions = PermissionStore::new();
+        grant_write(&permissions, "cpu");
+
+        let groups = preflight("cpu,host=a value=1i,timestamp=2i 1000\n", &permissions)
+            .expect("the measurement is writable");
+
+        assert_eq!(
+            groups[0].catalog_time_column,
+            Some(("timestamp".to_owned(), "TIMESTAMP".to_owned()))
+        );
+        assert_eq!(
+            groups[0].catalog_fields,
+            vec![
+                ("host".to_owned(), "VARCHAR".to_owned()),
+                ("value".to_owned(), "BIGINT".to_owned()),
+                ("timestamp".to_owned(), "BIGINT".to_owned()),
+            ]
+        );
     }
 
     #[test]

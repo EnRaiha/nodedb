@@ -9,6 +9,8 @@ use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::lease::QueryLeaseScope;
+use crate::control::metadata_proposer::DEFAULT_DRAIN_TIMEOUT;
 use crate::control::planner::calvin::{
     TxnDispatchPosition, TxnProvenance, dispatch_strict_atomic_tasks_to_calvin,
 };
@@ -17,7 +19,9 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::ClientRequestScope;
 use crate::control::server::ilp_auth::AuthenticatedIlpContext;
 use crate::control::server::shared::authorization::authorize_task_set;
+use crate::control::server::shared::clone_write::write_lease;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
+use crate::control::server::shared::retry::retry_through_drain;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::TimeseriesOp;
@@ -143,6 +147,7 @@ fn spawn_schema_projection_merge(
                 database_id,
                 tenant_id.as_u64(),
                 &group.measurement,
+                group.catalog_time_column.as_ref(),
                 &group.catalog_fields,
             )
             .await
@@ -215,18 +220,7 @@ async fn flush_ilp_batch_inner(
             .map_err(crate::Error::from)?;
     // The leases gate the batch on a drained collection and live until the
     // batch's Calvin write commits.
-    let mut leases = Vec::with_capacity(tasks.len());
-    for task in &tasks {
-        leases.push(
-            crate::control::server::shared::clone_write::write_lease(
-                state,
-                task.tenant_id,
-                task.database_id,
-                &task.plan,
-            )
-            .await?,
-        );
-    }
+    let _leases = acquire_batch_write_leases(state, &tasks).await?;
 
     // Each measurement resolves to the rows it stores before the batch is
     // sequenced. The lines a resolve rejected never land, so the batch
@@ -287,6 +281,35 @@ async fn flush_ilp_batch_inner(
     // is synchronous and slow, so it runs off this task entirely.
     spawn_schema_projection_merge(state, database_id, tenant_id, groups);
     Ok(total_rows.saturating_sub(rejected))
+}
+
+/// Take the descriptor write lease of every task in the batch.
+///
+/// A collection under drain refuses its lease as `RetryableSchemaChanged`.
+/// The refusal comes before anything is sequenced, so the whole acquisition
+/// is retried until the drain ends. An ILP client gets no ack and cannot
+/// retry, so the flush waits as long as a DDL drain can last. Each attempt
+/// reads the descriptor version afresh and reuses the same tasks, so a retry
+/// never stages a row twice. A failed attempt drops every lease it took. The
+/// Calvin submission stays outside this unit, because its outcome can be
+/// ambiguous.
+async fn acquire_batch_write_leases(
+    state: &SharedState,
+    tasks: &[PhysicalTask],
+) -> crate::Result<Vec<QueryLeaseScope>> {
+    retry_through_drain(
+        &state.lease_drain,
+        DEFAULT_DRAIN_TIMEOUT,
+        move || async move {
+            let mut leases = Vec::with_capacity(tasks.len());
+            for task in tasks {
+                leases
+                    .push(write_lease(state, task.tenant_id, task.database_id, &task.plan).await?);
+            }
+            Ok::<_, crate::Error>(leases)
+        },
+    )
+    .await
 }
 
 /// The lines the batch did not store. Each measurement's resolve rejected
@@ -620,6 +643,98 @@ mod tests {
         assert_eq!(rejection_reason(&error), "denied by risk policy");
     }
 
+    /// A flush that meets a descriptor drain waits it out. It takes its lease
+    /// at the version the draining DDL commits, so the batch still reaches
+    /// Calvin and the connection survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_leases_retry_through_a_descriptor_drain() {
+        use crate::control::security::catalog::StoredCollection;
+        use nodedb_cluster::{DescriptorId, DescriptorKind, DrainOwner};
+
+        let cluster = crate::control::cluster::test_one_node::boot().await;
+        let state = Arc::clone(&cluster.state);
+        let database_id = DatabaseId::DEFAULT;
+        let mut collection = StoredCollection::stamped_for_test(9, "cpu", "admin");
+        collection.database_id = database_id;
+        collection.collection_type = nodedb_types::CollectionType::timeseries("ts", "1h");
+        collection.fields = vec![
+            ("ts".to_owned(), "BIGINT TIME_KEY".to_owned()),
+            ("value".to_owned(), "BIGINT".to_owned()),
+        ];
+        crate::control::catalog_entry::apply::collection::put(
+            &collection,
+            state.credentials.catalog(),
+        )
+        .expect("store the collection at version 1");
+        let descriptor =
+            DescriptorId::new(database_id.as_u64(), 9, DescriptorKind::Collection, "cpu");
+        {
+            let _gate = state
+                .lease_admission_gate
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.lease_drain.install_start(
+                descriptor.clone(),
+                DrainOwner::Ddl,
+                1,
+                nodedb_types::Hlc::new(u64::MAX, 0),
+                state.node_id,
+            );
+        }
+        let groups = vec![super::IlpMeasurementBatch {
+            measurement: "cpu".into(),
+            raw_lines: vec!["cpu value=1i 1000".into()],
+            catalog_time_column: None,
+            catalog_fields: Vec::new(),
+        }];
+        let tasks =
+            super::build_ilp_calvin_tasks(TenantId::new(9), database_id, &groups).expect("tasks");
+
+        let refused = crate::control::server::shared::clone_write::write_lease(
+            &state,
+            tasks[0].tenant_id,
+            tasks[0].database_id,
+            &tasks[0].plan,
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(crate::Error::RetryableSchemaChanged { .. })),
+            "one attempt is refused while the drain holds"
+        );
+
+        // The DDL commits version 2 and ends its drain while the flush waits.
+        let mut altered = collection.clone();
+        altered.descriptor_version = 2;
+        let ddl = {
+            let state = Arc::clone(&state);
+            let descriptor = descriptor.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                crate::control::catalog_entry::apply::collection::put(
+                    &altered,
+                    state.credentials.catalog(),
+                )
+                .expect("store the collection at version 2");
+                state.lease_drain.install_end(&descriptor, &DrainOwner::Ddl);
+                state.lease_drain.settle();
+            })
+        };
+
+        let leases = super::acquire_batch_write_leases(&state, &tasks)
+            .await
+            .expect("the batch takes its leases once the drain ends");
+        ddl.await.expect("the DDL task completes");
+        assert_eq!(leases.len(), tasks.len());
+        let held = state
+            .lookup_lease_for_self(&descriptor)
+            .expect("the batch holds the collection's lease");
+        assert_eq!(held.version, 2, "the lease pins the committed version");
+
+        drop(leases);
+        drop(state);
+        cluster.shutdown().await;
+    }
+
     #[test]
     fn schema_projection_slot_admits_exactly_one_merge_at_a_time() {
         // The bound that keeps ingest from queueing merge tasks behind a
@@ -644,11 +759,13 @@ mod tests {
             super::IlpMeasurementBatch {
                 measurement: "cpu".into(),
                 raw_lines: vec!["cpu value=1i".into(), "cpu value=2i".into()],
+                catalog_time_column: None,
                 catalog_fields: Vec::new(),
             },
             super::IlpMeasurementBatch {
                 measurement: "mem".into(),
                 raw_lines: vec!["mem value=3i".into()],
+                catalog_time_column: None,
                 catalog_fields: Vec::new(),
             },
         ];

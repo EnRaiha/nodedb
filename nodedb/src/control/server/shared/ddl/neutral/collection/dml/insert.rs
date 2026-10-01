@@ -255,6 +255,7 @@ async fn insert_parsed(
                 pending.database_id,
                 pending.tenant_id,
                 &pending.collection,
+                None,
                 &pending.fields,
             )
             .await

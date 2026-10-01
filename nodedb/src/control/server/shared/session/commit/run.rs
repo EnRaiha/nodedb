@@ -465,6 +465,7 @@ pub async fn run_commit(
             pending.database_id,
             pending.tenant_id,
             &pending.collection,
+            None,
             &pending.fields,
         )
         .await

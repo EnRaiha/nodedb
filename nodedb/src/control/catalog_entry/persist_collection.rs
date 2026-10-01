@@ -41,6 +41,10 @@ pub async fn persist_collection_replicated(
 /// Union ingest-inferred fields into a collection's schema projection and
 /// persist the result through the replicated metadata path.
 ///
+/// `time_column` is the column a timeseries ingest inferred for the row
+/// time. [`crate::control::security::catalog::merge_inferred_fields`] decides
+/// whether the collection's projection takes it.
+///
 /// Returns `true` when the projection changed and a new descriptor version was
 /// proposed, `false` when the collection is absent or already carries every
 /// inferred field (the overwhelmingly common case on a steady ingest stream —
@@ -66,6 +70,7 @@ pub async fn merge_collection_fields_replicated(
     database_id: DatabaseId,
     tenant_id: u64,
     name: &str,
+    time_column: Option<&(String, String)>,
     inferred_fields: &[(String, String)],
 ) -> crate::Result<bool> {
     let Some(mut coll) =
@@ -76,7 +81,11 @@ pub async fn merge_collection_fields_replicated(
     else {
         return Ok(false);
     };
-    if !crate::control::security::catalog::merge_inferred_fields(&mut coll, inferred_fields) {
+    if !crate::control::security::catalog::merge_inferred_fields(
+        &mut coll,
+        time_column,
+        inferred_fields,
+    ) {
         return Ok(false);
     }
     persist_collection_replicated(state, &coll).await?;

@@ -16,6 +16,11 @@ use super::types::{COLLECTIONS, StoredCollection, SystemCatalog, catalog_err};
 /// appended. Bitemporal collections always expose their reserved BIGINT
 /// fields exactly once. Returns `true` when the projection changed.
 ///
+/// `time_column` is the column an ingest inferred for the row time. A
+/// timeseries collection whose declared time key names one of its fields
+/// stores the row time in that field. Its projection therefore never gains
+/// the inferred time column. Every other collection takes it as a field.
+///
 /// Deliberately pure: a collection descriptor is replicated catalog state, so
 /// the merged record has to reach storage through the replicated metadata path
 /// (see `catalog_entry::persist_collection`) rather than a local write. Mutating
@@ -24,10 +29,12 @@ use super::types::{COLLECTIONS, StoredCollection, SystemCatalog, catalog_err};
 /// replaying that entry after a restart wedges the metadata applier.
 pub fn merge_inferred_fields(
     collection: &mut StoredCollection,
+    time_column: Option<&(String, String)>,
     inferred_fields: &[(String, String)],
 ) -> bool {
+    let time_column = time_column.filter(|_| !declares_time_key_field(collection));
     let mut changed = false;
-    for (field, field_type) in inferred_fields {
+    for (field, field_type) in time_column.into_iter().chain(inferred_fields) {
         // Reserved bitemporal columns are schema-owned. Never let an ingest
         // projection supply their type or add a duplicate; normalization below
         // owns them entirely.
@@ -73,6 +80,20 @@ pub fn merge_inferred_fields(
         }
     }
     changed
+}
+
+/// Whether a timeseries collection's declared time key names one of its
+/// fields. The Data Plane then builds its memtable from that declaration and
+/// writes each row's time into that field.
+fn declares_time_key_field(collection: &StoredCollection) -> bool {
+    let nodedb_types::CollectionType::Columnar(nodedb_types::ColumnarProfile::Timeseries {
+        time_key,
+        ..
+    }) = &collection.collection_type
+    else {
+        return false;
+    };
+    collection.fields.iter().any(|(field, _)| field == time_key)
 }
 
 impl SystemCatalog {
@@ -514,15 +535,18 @@ mod tests {
 
         assert!(merge_inferred_fields(
             &mut coll,
+            None,
             &[("first".to_owned(), "BIGINT".to_owned())]
         ));
         assert!(merge_inferred_fields(
             &mut coll,
+            None,
             &[("second".to_owned(), "FLOAT".to_owned())]
         ));
         // A known name never re-types an existing column, and reports no change.
         assert!(!merge_inferred_fields(
             &mut coll,
+            None,
             &[("first".to_owned(), "BOOLEAN".to_owned())]
         ));
 
@@ -536,6 +560,103 @@ mod tests {
         );
     }
 
+    fn ilp_time_column() -> (String, String) {
+        ("timestamp".to_owned(), "TIMESTAMP".to_owned())
+    }
+
+    /// A collection declared with `ts BIGINT TIME_KEY` stores the ILP line
+    /// time in `ts`. The inferred `timestamp` column must not reach its
+    /// projection, or every flush proposes a new descriptor version.
+    #[test]
+    fn merge_skips_the_inferred_time_column_for_a_declared_time_key() {
+        let mut coll = make_coll(1, "crash_ilp_ts_bulk");
+        coll.collection_type = CollectionType::timeseries("ts", "1h");
+        coll.fields = vec![
+            ("ts".to_owned(), "BIGINT TIME_KEY".to_owned()),
+            ("value".to_owned(), "BIGINT".to_owned()),
+        ];
+
+        assert!(
+            !merge_inferred_fields(
+                &mut coll,
+                Some(&ilp_time_column()),
+                &[("value".to_owned(), "BIGINT".to_owned())]
+            ),
+            "an ILP batch carrying only declared fields changes nothing"
+        );
+        assert!(
+            merge_inferred_fields(
+                &mut coll,
+                Some(&ilp_time_column()),
+                &[
+                    ("host".to_owned(), "VARCHAR".to_owned()),
+                    ("value".to_owned(), "BIGINT".to_owned()),
+                    ("load".to_owned(), "FLOAT".to_owned()),
+                ]
+            ),
+            "a new tag and a new field still reach the projection"
+        );
+        assert_eq!(
+            coll.fields,
+            vec![
+                ("ts".to_owned(), "BIGINT TIME_KEY".to_owned()),
+                ("value".to_owned(), "BIGINT".to_owned()),
+                ("host".to_owned(), "VARCHAR".to_owned()),
+                ("load".to_owned(), "FLOAT".to_owned()),
+            ]
+        );
+    }
+
+    /// A field literally called `timestamp` is a field, not the line time.
+    /// It reaches the projection of a collection with a declared time key.
+    #[test]
+    fn merge_keeps_a_field_named_timestamp_for_a_declared_time_key() {
+        let mut coll = make_coll(1, "metrics");
+        coll.collection_type = CollectionType::timeseries("ts", "1h");
+        coll.fields = vec![("ts".to_owned(), "TIMESTAMP".to_owned())];
+
+        assert!(merge_inferred_fields(
+            &mut coll,
+            Some(&ilp_time_column()),
+            &[("timestamp".to_owned(), "BIGINT".to_owned())]
+        ));
+        assert_eq!(
+            coll.fields,
+            vec![
+                ("ts".to_owned(), "TIMESTAMP".to_owned()),
+                ("timestamp".to_owned(), "BIGINT".to_owned()),
+            ]
+        );
+    }
+
+    /// With no declared time key among its fields, the Data Plane infers the
+    /// schema and stores the line time under the inferred name. The
+    /// projection follows it.
+    #[test]
+    fn merge_adds_the_inferred_time_column_without_a_declared_time_key() {
+        let mut undeclared = make_coll(1, "events");
+        assert!(merge_inferred_fields(
+            &mut undeclared,
+            Some(&ilp_time_column()),
+            &[("value".to_owned(), "FLOAT".to_owned())]
+        ));
+        assert_eq!(
+            undeclared.fields,
+            vec![ilp_time_column(), ("value".to_owned(), "FLOAT".to_owned())]
+        );
+
+        // A time key absent from the field list resolves no declaration, so
+        // the Data Plane infers here too.
+        let mut unresolved = make_coll(1, "cpu");
+        unresolved.collection_type = CollectionType::timeseries("ts", "1h");
+        assert!(merge_inferred_fields(
+            &mut unresolved,
+            Some(&ilp_time_column()),
+            &[]
+        ));
+        assert_eq!(unresolved.fields, vec![ilp_time_column()]);
+    }
+
     #[test]
     fn merge_inferred_fields_adds_bitemporal_reserved_fields_once() {
         let mut coll = make_coll(1, "audit");
@@ -544,9 +665,10 @@ mod tests {
 
         assert!(merge_inferred_fields(
             &mut coll,
+            None,
             &[("value".to_owned(), "FLOAT".to_owned())]
         ));
-        assert!(!merge_inferred_fields(&mut coll, &[]));
+        assert!(!merge_inferred_fields(&mut coll, None, &[]));
         for reserved in [TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL] {
             assert_eq!(
                 coll.fields
@@ -570,6 +692,7 @@ mod tests {
 
         assert!(merge_inferred_fields(
             &mut coll,
+            None,
             &[
                 (TS_VALID_FROM.to_owned(), "VARCHAR".to_owned()),
                 (TS_VALID_UNTIL.to_owned(), "BOOLEAN".to_owned()),
