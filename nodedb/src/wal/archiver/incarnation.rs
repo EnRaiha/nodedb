@@ -36,7 +36,17 @@ impl Incarnation {
 /// Read the incarnation from `data_dir`, or mint and persist one when the
 /// directory has none. A file that exists but does not parse is an error:
 /// replacing it orphans every object archived under the old id.
+///
+/// An empty `data_dir` names a node with no data directory. Such a node keeps
+/// no WAL to archive, so it is refused rather than resolved against the
+/// process's working directory.
 pub fn load_or_mint_incarnation(data_dir: &Path) -> crate::Result<Incarnation> {
+    if data_dir.as_os_str().is_empty() {
+        return Err(crate::Error::Storage {
+            engine: "wal_archive".into(),
+            detail: "WAL archiving needs a data directory; this node has none".into(),
+        });
+    }
     let path = data_dir.join(INCARNATION_FILE);
     match std::fs::read_to_string(&path) {
         Ok(raw) => Incarnation::parse(&raw).ok_or_else(|| crate::Error::Storage {
@@ -93,5 +103,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(INCARNATION_FILE), b"not-hex").unwrap();
         assert!(load_or_mint_incarnation(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_node_with_no_data_directory_writes_no_incarnation() {
+        assert!(load_or_mint_incarnation(std::path::Path::new("")).is_err());
+        assert!(!std::path::Path::new(INCARNATION_FILE).exists());
     }
 }
