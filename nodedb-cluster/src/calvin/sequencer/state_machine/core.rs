@@ -230,14 +230,30 @@ impl SequencerStateMachine {
     /// Register (or replace) the output sender for a vshard.
     ///
     /// Call this when a scheduler subscribes for a vshard hosted on this node.
+    ///
+    /// A new scheduler starts with no catch-up armed. Its spawn arms the one
+    /// it needs, so an arm a former scheduler left behind is dropped here.
     pub fn set_vshard_sender(&mut self, vshard: u32, sender: mpsc::Sender<SchedulerInput>) {
         self.vshard_senders.insert(vshard, sender);
+        self.drop_catch_up(vshard);
     }
 
     /// Remove the output sender for a vshard (e.g. when a vshard is migrated
     /// away from this node).
+    ///
+    /// Its catch-up goes with it. No scheduler here will replay it, so an arm
+    /// left behind would hold sequencer compaction down forever.
     pub fn remove_vshard_sender(&mut self, vshard: u32) {
         self.vshard_senders.remove(&vshard);
+        self.drop_catch_up(vshard);
+    }
+
+    /// Forget `vshard`'s armed catch-up.
+    fn drop_catch_up(&self, vshard: u32) {
+        self.catch_up_from
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&vshard);
     }
 
     /// The highest epoch number that has been committed and applied on this
@@ -377,17 +393,21 @@ impl SequencerStateMachine {
         map.get(&vshard).map_or(next, |range| range.from)
     }
 
-    /// The smallest armed catch-up index across ALL vShards, or `None` when no
-    /// catch-up is pending.
+    /// The smallest armed catch-up index across the hosted vShards, or `None`
+    /// when no catch-up is pending.
     ///
     /// The sequencer-group log compactor floors its compaction index at this
     /// value so a dropped/undelivered fan-out is always replayable from the
     /// retained log — the hold-down the scheduler-side drain's `LogCompacted`
-    /// arm depends on. Only hosted vShards ever arm a catch-up, so this never
-    /// pins compaction on a vShard this node does not serve.
+    /// arm depends on. Only a vShard with a registered sender counts. A
+    /// scheduler that is exiting can arm after its sender is gone, and that
+    /// arm must never pin compaction on a vShard this node does not serve.
     pub fn min_catch_up_from(&self) -> Option<u64> {
         let map = self.catch_up_from.lock().unwrap_or_else(|p| p.into_inner());
-        map.values().map(|range| range.from).min()
+        map.iter()
+            .filter(|(vshard, _)| self.vshard_senders.contains_key(vshard))
+            .map(|(_, range)| range.from)
+            .min()
     }
 }
 

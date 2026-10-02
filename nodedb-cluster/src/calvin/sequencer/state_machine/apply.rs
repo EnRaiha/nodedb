@@ -1229,7 +1229,13 @@ mod tests {
     /// across all vShards, so no replica's replay range is compacted away.
     #[test]
     fn min_catch_up_from_is_lowest_armed_index_across_vshards() {
-        let senders = HashMap::new();
+        let mut senders = HashMap::new();
+        let mut receivers = Vec::new();
+        for vshard in 1..=3 {
+            let (tx, rx) = mpsc::channel(4);
+            senders.insert(vshard, tx);
+            receivers.push(rx);
+        }
         let sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new_detached());
         assert_eq!(sm.min_catch_up_from(), None);
 
@@ -1245,6 +1251,40 @@ mod tests {
         sm.clear_catch_up_up_to(1, 30);
         sm.clear_catch_up_up_to(3, 25);
         assert_eq!(sm.min_catch_up_from(), None);
+    }
+
+    /// A vShard that leaves this node takes its catch-up with it. Its armed
+    /// index never holds sequencer compaction down afterward.
+    #[test]
+    fn a_retired_vshard_releases_the_compaction_floor() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut sm = SequencerStateMachine::new(
+            HashMap::from([(7, tx)]),
+            CalvinCompletionRegistry::new_detached(),
+        );
+        sm.arm_catch_up_from(7, 1);
+        assert_eq!(sm.min_catch_up_from(), Some(1));
+
+        sm.remove_vshard_sender(7);
+        assert_eq!(sm.min_catch_up_from(), None);
+        assert_eq!(sm.peek_catch_up_from(7), None);
+    }
+
+    /// An exiting scheduler can arm after its sender is gone. That arm never
+    /// counts toward the floor, and a new scheduler for the vShard starts
+    /// with no arm from the old one.
+    #[test]
+    fn an_arm_without_a_sender_never_holds_the_floor() {
+        let mut sm =
+            SequencerStateMachine::new(HashMap::new(), CalvinCompletionRegistry::new_detached());
+        sm.arm_catch_up_past_applied(9);
+        assert_eq!(sm.min_catch_up_from(), None);
+
+        let (tx, _rx) = mpsc::channel(4);
+        sm.set_vshard_sender(9, tx);
+        assert_eq!(sm.peek_catch_up_from(9), None);
+        sm.arm_catch_up_from(9, 40);
+        assert_eq!(sm.min_catch_up_from(), Some(40));
     }
 
     #[test]
