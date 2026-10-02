@@ -1271,20 +1271,33 @@ mod tests {
     }
 
     /// An exiting scheduler can arm after its sender is gone. That arm never
-    /// counts toward the floor, and a new scheduler for the vShard starts
-    /// with no arm from the old one.
+    /// counts toward the floor while no sender is registered.
     #[test]
     fn an_arm_without_a_sender_never_holds_the_floor() {
         let mut sm =
             SequencerStateMachine::new(HashMap::new(), CalvinCompletionRegistry::new_detached());
-        sm.arm_catch_up_past_applied(9);
+        sm.arm_catch_up_from(9, 40);
         assert_eq!(sm.min_catch_up_from(), None);
 
         let (tx, _rx) = mpsc::channel(4);
         sm.set_vshard_sender(9, tx);
-        assert_eq!(sm.peek_catch_up_from(9), None);
-        sm.arm_catch_up_from(9, 40);
         assert_eq!(sm.min_catch_up_from(), Some(40));
+    }
+
+    /// Replacing a vShard's sender keeps its pending catch-up. Only a vShard
+    /// that leaves this node drops it.
+    #[test]
+    fn a_replaced_sender_keeps_the_pending_catch_up() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut sm = SequencerStateMachine::new(
+            HashMap::from([(5, tx)]),
+            CalvinCompletionRegistry::new_detached(),
+        );
+        sm.arm_catch_up_from(5, 12);
+        let (tx2, _rx2) = mpsc::channel(4);
+        sm.set_vshard_sender(5, tx2);
+        assert_eq!(sm.peek_catch_up_from(5), Some(12));
+        assert_eq!(sm.min_catch_up_from(), Some(12));
     }
 
     #[test]

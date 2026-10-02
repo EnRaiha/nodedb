@@ -230,12 +230,8 @@ impl SequencerStateMachine {
     /// Register (or replace) the output sender for a vshard.
     ///
     /// Call this when a scheduler subscribes for a vshard hosted on this node.
-    ///
-    /// A new scheduler starts with no catch-up armed. Its spawn arms the one
-    /// it needs, so an arm a former scheduler left behind is dropped here.
     pub fn set_vshard_sender(&mut self, vshard: u32, sender: mpsc::Sender<SchedulerInput>) {
         self.vshard_senders.insert(vshard, sender);
-        self.drop_catch_up(vshard);
     }
 
     /// Remove the output sender for a vshard (e.g. when a vshard is migrated
