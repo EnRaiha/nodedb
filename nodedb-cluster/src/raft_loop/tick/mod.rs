@@ -16,6 +16,8 @@
 //!   off the tick.
 //! - [`leader_probe`]: find the leader of a data group this node does not
 //!   host when its hint names none.
+//! - [`peer_batch`]: send one peer's per-group messages in order, past a
+//!   refusal and up to a link failure.
 
 mod apply_committed;
 mod core;
@@ -25,5 +27,6 @@ mod leader_hints;
 mod leader_probe;
 mod metadata_apply;
 pub mod metadata_lane;
+mod peer_batch;
 mod snapshot_dispatch;
 mod vote_dispatch;

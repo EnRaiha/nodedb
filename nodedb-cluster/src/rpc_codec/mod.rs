@@ -26,6 +26,7 @@ pub mod peer_seq;
 pub mod raft_msgs;
 pub mod raft_rpc;
 pub mod read_index;
+pub mod request_refusal;
 pub mod reservation;
 pub mod shard_error;
 pub mod shuffle;
@@ -64,6 +65,7 @@ pub use metadata::{MetadataProposeRequest, MetadataProposeResponse};
 pub use peer_seq::{BOOT_EPOCH_SHIFT, PeerSeqSender, PeerSeqWindow, REPLAY_WINDOW};
 pub use raft_rpc::{RaftRpc, decode, encode, frame_size};
 pub use read_index::{ReadIndexOutcome, ReadIndexRequest, ReadIndexResponse};
+pub use request_refusal::{RefusalReason, RequestRefusal};
 pub use reservation::{
     ReleaseReservationRequest, ReleaseReservationResponse, ReserveReadRequest, ReserveReadResponse,
 };

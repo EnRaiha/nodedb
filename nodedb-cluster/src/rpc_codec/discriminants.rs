@@ -163,6 +163,9 @@ pub const RPC_LEADER_STATUS_RESP: u8 = 57;
 /// The answer to a request frame the receiver's replay window refused. The
 /// sender retries the request under a fresh sequence number.
 pub const RPC_FRAME_REFUSAL: u8 = 58;
+/// The answer to a request whose handler failed. It carries the typed
+/// reason, so the sender learns the peer is up and refused this request.
+pub const RPC_REQUEST_REFUSAL: u8 = 59;
 
 // VShardMessageType discriminants for distributed array ops (u16, range 80-89).
 // These mirror `crate::wire::VShardMessageType` repr values and are declared

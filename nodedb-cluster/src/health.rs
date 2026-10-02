@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::catalog::ClusterCatalog;
+use crate::error::ClusterError;
 use crate::loop_metrics::LoopMetrics;
 use crate::rpc_codec::{PingRequest, PongResponse, RaftRpc, TopologyAck, TopologyUpdate};
 use crate::topology::{ClusterTopology, NodeInfo, NodeState};
@@ -141,8 +142,10 @@ impl HealthMonitor {
                 sender_id: self.node_id,
                 topology_version: topo_version,
             });
+            // The ping is the peer's recovery probe. An open circuit still
+            // lets it through, and its answer closes the circuit.
             handles.push(tokio::spawn(async move {
-                let result = transport.send_rpc(peer_id, ping).await;
+                let result = transport.send_probe_rpc(peer_id, ping).await;
                 (peer_id, addr, result)
             }));
         }
@@ -154,17 +157,14 @@ impl HealthMonitor {
                 Err(_) => continue, // JoinError — task panicked, skip.
             };
 
-            match result {
-                Ok(RaftRpc::Pong(pong)) => {
+            match classify_ping(result) {
+                PingOutcome::Pong(pong) => {
                     topology_changed |= self.handle_pong(peer_id, &pong);
                 }
-                Ok(_) => {
-                    // Unexpected response type — count as failure.
+                PingOutcome::Failed => {
                     topology_changed |= self.record_ping_failure(peer_id);
                 }
-                Err(_) => {
-                    topology_changed |= self.record_ping_failure(peer_id);
-                }
+                PingOutcome::NotSent => {}
             }
         }
 
@@ -262,6 +262,26 @@ impl HealthMonitor {
             .filter(|n| n.node_id != self.node_id && n.state != NodeState::Decommissioned)
             .filter_map(|n| n.socket_addr().map(|addr| (n.node_id, addr)))
             .collect()
+    }
+}
+
+/// What one ping says about the peer.
+#[derive(Debug)]
+enum PingOutcome {
+    /// The peer answered.
+    Pong(PongResponse),
+    /// The ping failed, or the peer answered with something else.
+    Failed,
+    /// This node's circuit breaker refused the ping before it left. That
+    /// says nothing about the peer, so it is not a ping failure.
+    NotSent,
+}
+
+fn classify_ping(result: crate::error::Result<RaftRpc>) -> PingOutcome {
+    match result {
+        Ok(RaftRpc::Pong(pong)) => PingOutcome::Pong(pong),
+        Err(ClusterError::CircuitOpen { .. }) => PingOutcome::NotSent,
+        Ok(_) | Err(_) => PingOutcome::Failed,
     }
 }
 
@@ -553,6 +573,33 @@ mod tests {
 
         let t = topo.read().unwrap();
         assert_eq!(t.get_node(2).unwrap().state, NodeState::Active);
+    }
+
+    #[test]
+    fn an_open_circuit_is_not_a_ping_failure() {
+        let refused = Err(ClusterError::CircuitOpen {
+            node_id: 2,
+            failures: 5,
+        });
+        assert!(matches!(classify_ping(refused), PingOutcome::NotSent));
+    }
+
+    #[test]
+    fn a_link_failure_or_a_wrong_reply_is_a_ping_failure() {
+        let lost = Err(ClusterError::Transport {
+            detail: "connection lost".into(),
+        });
+        assert!(matches!(classify_ping(lost), PingOutcome::Failed));
+        let wrong = Ok(RaftRpc::TopologyAck(TopologyAck {
+            responder_id: 2,
+            accepted_version: 1,
+        }));
+        assert!(matches!(classify_ping(wrong), PingOutcome::Failed));
+        let pong = Ok(RaftRpc::Pong(PongResponse {
+            responder_id: 2,
+            topology_version: 1,
+        }));
+        assert!(matches!(classify_ping(pong), PingOutcome::Pong(_)));
     }
 
     /// A pushed topology carrying a stale SWIM address for this node keeps

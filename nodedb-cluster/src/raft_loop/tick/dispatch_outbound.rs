@@ -14,6 +14,7 @@ use nodedb_raft::transport::RaftTransport;
 use crate::forward::PlanExecutor;
 
 use super::super::loop_core::{CommitApplier, RaftLoop};
+use super::peer_batch::drive_peer_batch;
 
 impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// Batch and dispatch AppendEntries / RequestVote / TimeoutNow messages
@@ -70,34 +71,25 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                 if *shutdown_rx.borrow() {
                     return;
                 }
-                for (group_id, req) in messages {
-                    tokio::select! {
-                        biased;
-                        _ = shutdown_rx.changed() => return,
-                        rpc = transport.append_entries(peer, req) => {
-                            match rpc {
-                                Ok(resp) => {
-                                    let mut mr =
-                                        mr.lock().unwrap_or_else(|p| p.into_inner());
-                                    if let Err(e) = mr
-                                        .handle_append_entries_response(group_id, peer, &resp)
-                                    {
-                                        debug!(group_id, peer, error = %e, "handle ae response");
-                                    }
-                                    // A response can bump the term (step
-                                    // down to follower); persist it durably.
-                                    if let Err(e) = mr.persist_group_hard_state(group_id) {
-                                        error!(group_id, peer, error = %e, "persist hard state after ae response");
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(group_id, peer, error = %e, "append_entries RPC failed");
-                                    break; // Peer is down — skip remaining groups.
-                                }
-                            }
+                drive_peer_batch(
+                    peer,
+                    "append_entries",
+                    messages,
+                    &mut shutdown_rx,
+                    |req| transport.send_append_entries(peer, req),
+                    |group_id, resp| {
+                        let mut mr = mr.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Err(e) = mr.handle_append_entries_response(group_id, peer, &resp) {
+                            debug!(group_id, peer, error = %e, "handle ae response");
                         }
-                    }
-                }
+                        // A response can bump the term and step this node
+                        // down to follower. Persist that durably.
+                        if let Err(e) = mr.persist_group_hard_state(group_id) {
+                            error!(group_id, peer, error = %e, "persist hard state after ae response");
+                        }
+                    },
+                )
+                .await;
             });
         }
 
@@ -135,40 +127,28 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                 if *shutdown_rx.borrow() {
                     return;
                 }
-                for (group_id, req) in probes {
-                    tokio::select! {
-                        biased;
-                        _ = shutdown_rx.changed() => return,
-                        rpc = transport.pre_vote(peer, req) => {
-                            match rpc {
-                                Ok(resp) => {
-                                    let mut mr =
-                                        mr.lock().unwrap_or_else(|p| p.into_inner());
-                                    if let Err(e) = mr
-                                        .handle_pre_vote_response(group_id, peer, &resp)
-                                    {
-                                        debug!(group_id, peer, error = %e, "handle pre-vote response");
-                                    }
-                                    // A pre-vote grants nothing and persists
-                                    // nothing, but a higher-term response
-                                    // still steps this node down — that term
-                                    // bump must be durable before it acts on
-                                    // it. Cheap otherwise: the persist is
-                                    // skipped when nothing changed.
-                                    if let Err(e) = mr.persist_group_hard_state(group_id) {
-                                        error!(group_id, peer, error = %e, "persist hard state after pre-vote response");
-                                    }
-                                }
-                                Err(e) => {
-                                    // Treat as "no grant" and move on — a failed
-                                    // peer must not abort the round for the rest.
-                                    warn!(group_id, peer, error = %e, "pre_vote RPC failed");
-                                    break; // Peer is down — skip remaining groups.
-                                }
-                            }
+                drive_peer_batch(
+                    peer,
+                    "pre_vote",
+                    probes,
+                    &mut shutdown_rx,
+                    |req| transport.send_pre_vote(peer, req),
+                    |group_id, resp| {
+                        let mut mr = mr.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Err(e) = mr.handle_pre_vote_response(group_id, peer, &resp) {
+                            debug!(group_id, peer, error = %e, "handle pre-vote response");
                         }
-                    }
-                }
+                        // A pre-vote grants nothing and persists nothing, but
+                        // a higher-term response still steps this node down —
+                        // that term bump must be durable before it acts on
+                        // it. Cheap otherwise: the persist is skipped when
+                        // nothing changed.
+                        if let Err(e) = mr.persist_group_hard_state(group_id) {
+                            error!(group_id, peer, error = %e, "persist hard state after pre-vote response");
+                        }
+                    },
+                )
+                .await;
             });
         }
 

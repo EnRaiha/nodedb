@@ -16,9 +16,57 @@ use crate::rpc_codec::RaftRpc;
 
 use super::transport::NexarTransport;
 
+/// Map a send error onto the Raft transport's error type.
+///
+/// A group the peer does not host stays typed. Every other error crosses as
+/// a transport error with its message.
 fn to_raft_err(e: ClusterError) -> nodedb_raft::RaftError {
-    nodedb_raft::RaftError::Transport {
-        detail: e.to_string(),
+    match e {
+        ClusterError::Raft(e) => e,
+        ClusterError::GroupNotFound { group_id } => {
+            nodedb_raft::RaftError::GroupNotFound { group_id }
+        }
+        other => nodedb_raft::RaftError::Transport {
+            detail: other.to_string(),
+        },
+    }
+}
+
+/// The error for a reply of the wrong type.
+fn unexpected_reply(expected: &str, reply: RaftRpc) -> ClusterError {
+    ClusterError::Codec {
+        detail: format!("expected {expected}, got {reply:?}"),
+    }
+}
+
+impl NexarTransport {
+    /// Send AppendEntries and keep the typed cluster error.
+    ///
+    /// The tick loop tells a link failure from a refusal by this error.
+    pub async fn send_append_entries(
+        &self,
+        target: u64,
+        req: AppendEntriesRequest,
+    ) -> crate::error::Result<AppendEntriesResponse> {
+        match self
+            .send_rpc(target, RaftRpc::AppendEntriesRequest(req))
+            .await?
+        {
+            RaftRpc::AppendEntriesResponse(r) => Ok(r),
+            other => Err(unexpected_reply("AppendEntriesResponse", other)),
+        }
+    }
+
+    /// Send a PreVote probe and keep the typed cluster error.
+    pub async fn send_pre_vote(
+        &self,
+        target: u64,
+        req: PreVoteRequest,
+    ) -> crate::error::Result<PreVoteResponse> {
+        match self.send_rpc(target, RaftRpc::PreVoteRequest(req)).await? {
+            RaftRpc::PreVoteResponse(r) => Ok(r),
+            other => Err(unexpected_reply("PreVoteResponse", other)),
+        }
     }
 }
 
@@ -28,16 +76,9 @@ impl RaftTransport for NexarTransport {
         target: u64,
         req: AppendEntriesRequest,
     ) -> nodedb_raft::Result<AppendEntriesResponse> {
-        let resp = self
-            .send_rpc(target, RaftRpc::AppendEntriesRequest(req))
+        self.send_append_entries(target, req)
             .await
-            .map_err(to_raft_err)?;
-        match resp {
-            RaftRpc::AppendEntriesResponse(r) => Ok(r),
-            other => Err(nodedb_raft::RaftError::Transport {
-                detail: format!("expected AppendEntriesResponse, got {other:?}"),
-            }),
-        }
+            .map_err(to_raft_err)
     }
 
     async fn request_vote(
@@ -62,16 +103,7 @@ impl RaftTransport for NexarTransport {
         target: u64,
         req: PreVoteRequest,
     ) -> nodedb_raft::Result<PreVoteResponse> {
-        let resp = self
-            .send_rpc(target, RaftRpc::PreVoteRequest(req))
-            .await
-            .map_err(to_raft_err)?;
-        match resp {
-            RaftRpc::PreVoteResponse(r) => Ok(r),
-            other => Err(nodedb_raft::RaftError::Transport {
-                detail: format!("expected PreVoteResponse, got {other:?}"),
-            }),
-        }
+        self.send_pre_vote(target, req).await.map_err(to_raft_err)
     }
 
     async fn install_snapshot(

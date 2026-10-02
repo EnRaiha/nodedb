@@ -8,8 +8,8 @@
 //! the peer has recovered. This module closes that blind spot:
 //!
 //! - [`ReachabilityDriver`] periodically walks the breaker's open set
-//!   and sends a lightweight probe RPC to each peer via the existing
-//!   `send_rpc` path, which drives the normal HalfOpen → Closed /
+//!   and sends a lightweight probe RPC to each peer via the
+//!   `send_probe_rpc` path, which drives the HalfOpen → Closed /
 //!   HalfOpen → Open transitions.
 //! - [`ReachabilityProber`] is the injection seam: production wraps
 //!   [`crate::transport::NexarTransport`], tests use a mock.

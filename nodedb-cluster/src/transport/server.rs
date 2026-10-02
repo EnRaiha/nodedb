@@ -19,7 +19,8 @@
 //! 4. decodes the inner frame and dispatches to the handler,
 //! 5. wraps the handler's response in its own authenticated envelope
 //!    with `from_node_id = local_node_id` and a fresh outbound seq for
-//!    the caller's id.
+//!    the caller's id. A handler error is answered with a typed
+//!    `RequestRefused` frame in place of the response.
 //!
 //! # Cooperative shutdown
 //!
@@ -40,7 +41,8 @@ use tracing::{debug, warn};
 use crate::error::{ClusterError, Result};
 use crate::forward::ChunkSink;
 use crate::rpc_codec::{
-    self, ExecuteStreamChunk, ExecuteStreamEnd, FrameRefusal, RaftRpc, auth_envelope,
+    self, ExecuteStreamChunk, ExecuteStreamEnd, FrameRefusal, RaftRpc, RequestRefusal,
+    auth_envelope,
 };
 use crate::transport::auth_context::AuthContext;
 use crate::transport::peer_identity_store::PeerIdentityStore;
@@ -318,7 +320,18 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore + ?Sized>(
                 Some(req) => req,
             };
 
-        let response = handler.handle_rpc(request).await?;
+        // A handler error is answered with a typed `RequestRefused`, never a
+        // dropped stream. The MAC verified, so the sender is genuine and its
+        // link is up. The sender reads a dropped stream as a link failure.
+        let outcome = handler.handle_rpc(request).await;
+        if let Err(e) = &outcome {
+            debug!(
+                from_node_id = fields.from_node_id,
+                error = %e,
+                "raft RPC refused by the handler"
+            );
+        }
+        let response = reply_for(outcome);
 
         // 5. Wrap the response in its own envelope. `from = local_node_id`,
         //    `seq = next outbound seq scoped to the caller`.
@@ -329,6 +342,15 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore + ?Sized>(
         biased;
         _ = shutdown.changed() => Ok(()),
         result = work => result,
+    }
+}
+
+/// The frame that answers a one-shot request: the handler's response, or a
+/// typed refusal carrying its error.
+fn reply_for(outcome: Result<RaftRpc>) -> RaftRpc {
+    match outcome {
+        Ok(response) => response,
+        Err(error) => RaftRpc::RequestRefused(RequestRefusal::from(error)),
     }
 }
 
@@ -349,7 +371,28 @@ fn validate_join_sender(request: &RaftRpc, authenticated_node_id: u64) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc_codec::JoinRequest;
+    use crate::rpc_codec::{JoinRequest, RefusalReason};
+
+    #[test]
+    fn a_handler_error_is_answered_with_a_typed_refusal() {
+        let reply = reply_for(Err(ClusterError::GroupNotFound { group_id: 4 }));
+        match reply {
+            RaftRpc::RequestRefused(refusal) => assert!(matches!(
+                refusal.reason,
+                RefusalReason::GroupNotHosted { group_id: 4 }
+            )),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_handler_response_is_answered_as_is() {
+        let pong = RaftRpc::Pong(crate::rpc_codec::PongResponse {
+            responder_id: 1,
+            topology_version: 3,
+        });
+        assert!(matches!(reply_for(Ok(pong)), RaftRpc::Pong(_)));
+    }
 
     #[test]
     fn join_request_must_match_authenticated_sender() {

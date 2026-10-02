@@ -248,3 +248,47 @@ pub enum ClusterError {
         detail: String,
     },
 }
+
+impl ClusterError {
+    /// Whether the error means the link to the peer failed.
+    ///
+    /// A link failure counts against the peer's circuit breaker and ends a
+    /// batch of sends to that peer. Every other error is an answer: the peer
+    /// is up, and the next request to it can still succeed.
+    pub fn is_link_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport { .. } | Self::CircuitOpen { .. } | Self::NodeUnreachable { .. }
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_link_errors_are_link_failures() {
+        assert!(
+            ClusterError::Transport {
+                detail: "reset".into()
+            }
+            .is_link_failure()
+        );
+        assert!(
+            ClusterError::CircuitOpen {
+                node_id: 1,
+                failures: 5
+            }
+            .is_link_failure()
+        );
+        assert!(ClusterError::NodeUnreachable { node_id: 1 }.is_link_failure());
+        assert!(!ClusterError::GroupNotFound { group_id: 4 }.is_link_failure());
+        assert!(
+            !ClusterError::RemoteUntyped {
+                detail: "refused".into()
+            }
+            .is_link_failure()
+        );
+    }
+}

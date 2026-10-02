@@ -177,7 +177,7 @@ pub async fn fan_out(
 
     for &shard_id in &params.shard_ids {
         // Circuit-breaker gate: treat shard_id as the peer identifier.
-        circuit_breaker.check(shard_id as u64)?;
+        let admission = circuit_breaker.check(shard_id as u64)?;
 
         let env = VShardEnvelope::new(
             msg_type_from_opcode(opcode)?,
@@ -192,8 +192,8 @@ pub async fn fan_out(
 
         futs.push(async move {
             match call_with_wrong_owner_retry(&dispatch, env, timeout_ms).await {
-                Ok(resp) => Ok((cb_shard, resp.payload)),
-                Err(e) => Err((cb_shard, e)),
+                Ok(resp) => Ok((cb_shard, admission, resp.payload)),
+                Err(e) => Err((cb_shard, admission, e)),
             }
         });
     }
@@ -201,13 +201,13 @@ pub async fn fan_out(
     let mut results = Vec::with_capacity(params.shard_ids.len());
     while let Some(outcome) = futs.next().await {
         match outcome {
-            Ok((shard_id, payload)) => {
-                circuit_breaker.record_success(shard_id as u64);
+            Ok((shard_id, admission, payload)) => {
+                circuit_breaker.record_success(shard_id as u64, admission);
                 results.push((shard_id, payload));
             }
-            Err((shard_id, e)) => {
+            Err((shard_id, admission, e)) => {
                 if counts_against_breaker(&e) {
-                    circuit_breaker.record_failure(shard_id as u64);
+                    circuit_breaker.record_failure(shard_id as u64, admission);
                 }
                 return Err(e);
             }
@@ -235,7 +235,7 @@ pub async fn fan_out_partitioned(
     let mut futs = futures::stream::FuturesUnordered::new();
 
     for (shard_id, payload) in per_shard {
-        circuit_breaker.check(*shard_id as u64)?;
+        let admission = circuit_breaker.check(*shard_id as u64)?;
 
         let env = VShardEnvelope::new(
             msg_type_from_opcode(opcode)?,
@@ -250,8 +250,8 @@ pub async fn fan_out_partitioned(
 
         futs.push(async move {
             match call_with_wrong_owner_retry(&dispatch, env, timeout_ms).await {
-                Ok(resp) => Ok((cb_shard, resp.payload)),
-                Err(e) => Err((cb_shard, e)),
+                Ok(resp) => Ok((cb_shard, admission, resp.payload)),
+                Err(e) => Err((cb_shard, admission, e)),
             }
         });
     }
@@ -259,13 +259,13 @@ pub async fn fan_out_partitioned(
     let mut results = Vec::with_capacity(per_shard.len());
     while let Some(outcome) = futs.next().await {
         match outcome {
-            Ok((shard_id, payload)) => {
-                circuit_breaker.record_success(shard_id as u64);
+            Ok((shard_id, admission, payload)) => {
+                circuit_breaker.record_success(shard_id as u64, admission);
                 results.push((shard_id, payload));
             }
-            Err((shard_id, e)) => {
+            Err((shard_id, admission, e)) => {
                 if counts_against_breaker(&e) {
-                    circuit_breaker.record_failure(shard_id as u64);
+                    circuit_breaker.record_failure(shard_id as u64, admission);
                 }
                 return Err(e);
             }
@@ -469,7 +469,7 @@ mod tests {
             cooldown: Duration::from_secs(60),
         });
         // Trip the breaker for shard 0.
-        cb.record_failure(0);
+        cb.record_failure(0, crate::circuit_breaker::Admission::Normal);
 
         let params = FanOutParams {
             shard_ids: vec![0],

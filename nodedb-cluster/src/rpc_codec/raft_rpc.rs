@@ -26,6 +26,7 @@ use super::header::HEADER_SIZE;
 use super::leader_status::{LeaderStatusRequest, LeaderStatusResponse};
 use super::metadata::{MetadataProposeRequest, MetadataProposeResponse};
 use super::read_index::{ReadIndexRequest, ReadIndexResponse};
+use super::request_refusal::RequestRefusal;
 use super::reservation::{
     ReleaseReservationRequest, ReleaseReservationResponse, ReserveReadRequest, ReserveReadResponse,
 };
@@ -38,7 +39,8 @@ use super::surrogate::{AssignSurrogateRequest, AssignSurrogateResponse};
 use super::vshard::VShardRefusal;
 use super::{
     auth_lease, calvin_parts, calvin_submit, cluster_mgmt, data_propose, execute, frame_refusal,
-    leader_status, metadata, raft_msgs, read_index, reservation, shuffle, surrogate, vshard,
+    leader_status, metadata, raft_msgs, read_index, request_refusal, reservation, shuffle,
+    surrogate, vshard,
 };
 use crate::error::{ClusterError, Result};
 use crate::wire_version::{unwrap_bytes_versioned, wrap_bytes_versioned};
@@ -175,6 +177,8 @@ pub enum RaftRpc {
     VShardRefusal(VShardRefusal),
     // Answer to a request frame the receiver's replay window refused.
     FrameRefused(FrameRefusal),
+    // Answer to a request whose handler failed. It carries the typed reason.
+    RequestRefused(RequestRefusal),
 }
 
 /// Encode a [`RaftRpc`] into a framed binary message stamped with `epoch`.
@@ -256,6 +260,7 @@ pub fn encode(rpc: &RaftRpc, epoch: &crate::cluster_epoch::ClusterEpochState) ->
         RaftRpc::AuthBarrierResponse(m) => auth_lease::encode_barrier_resp(m, &mut out),
         RaftRpc::VShardRefusal(m) => vshard::encode_vshard_refusal(m, &mut out),
         RaftRpc::FrameRefused(m) => frame_refusal::encode_frame_refusal(m, &mut out),
+        RaftRpc::RequestRefused(m) => request_refusal::encode_request_refusal(m, &mut out),
     }?;
     super::header::stamp_epoch(&mut out, epoch)?;
     Ok(out)
@@ -363,6 +368,7 @@ pub fn decode(data: &[u8], epoch: &crate::cluster_epoch::ClusterEpochState) -> R
         RPC_AUTH_BARRIER_RESP => auth_lease::decode_barrier_resp(payload),
         RPC_VSHARD_REFUSAL => vshard::decode_vshard_refusal(payload),
         RPC_FRAME_REFUSAL => frame_refusal::decode_frame_refusal(payload),
+        RPC_REQUEST_REFUSAL => request_refusal::decode_request_refusal(payload),
         _ => Err(ClusterError::Codec {
             detail: format!("unknown rpc_type: {rpc_type}"),
         }),
