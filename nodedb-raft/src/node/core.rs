@@ -109,13 +109,13 @@ pub struct RaftNode<S: LogStorage> {
     /// that measure, and a fully caught-up follower in an idle cluster looks
     /// stale. Heartbeats refresh this even when nothing is being written.
     pub(super) leader_contact: Option<LeaderContact>,
-    /// Send time of the latest request a quorum of voters answered, or the
+    /// Latest instant by which a quorum of voters answered this term, or the
     /// election win before any. `None` off the leader path. Drives
     /// check-quorum step-down (see [`super::quorum_contact`]).
     pub(super) last_quorum_contact: Option<Instant>,
-    /// Per-voter highest lease round acknowledged in the current term (see
-    /// [`super::leader_lease`]). Cleared on step-down.
-    pub(super) quorum_window: Vec<(u64, u64)>,
+    /// Per-voter highest lease round acknowledged in the current term, and
+    /// when the latest answer arrived. Cleared on step-down.
+    pub(super) quorum_window: Vec<super::quorum_contact::VoterAck>,
     /// Leader-lease rounds and anchor (see [`super::leader_lease`]).
     pub(super) lease: LeaseState,
     /// Until this instant the node refuses every vote but a transfer vote.
@@ -128,11 +128,6 @@ pub struct RaftNode<S: LogStorage> {
     /// An outside bound on compaction: the log never discards an entry above
     /// it. An archiver that must copy entries before they go raises it.
     pub(super) compaction_ceiling: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
-    /// The term of this node's last campaign started by `TimeoutNow`, or 0.
-    pub(super) transfer_campaign_term: u64,
-    /// Whether this node's current leadership came from an election against
-    /// other voters that no transfer started: a failover or a partition heal.
-    pub(super) contested_win: bool,
     /// Whether this follower holds no state it can resume the log from. It
     /// then refuses every `AppendEntries` with `needs_snapshot`, and its
     /// leader sends a snapshot instead. The driver sets and clears it.
@@ -186,8 +181,6 @@ impl<S: LogStorage> RaftNode<S> {
             lease: LeaseState::new(),
             boot_vote_fence: now + config.election_timeout_max,
             compaction_ceiling: None,
-            transfer_campaign_term: 0,
-            contested_win: false,
             snapshot_required: false,
             replicated_floor: 0,
             config,

@@ -150,29 +150,7 @@ enum Target {
 }
 
 fn target_of(state: &SharedState, vshard: u32) -> Target {
-    let routing = state
-        .cluster_routing
-        .as_ref()
-        .map(|lock| lock.read().unwrap_or_else(|p| p.into_inner()));
-    let statuses: Vec<nodedb_cluster::GroupStatus> =
-        state.raft_status_fn.get().map(|f| f()).unwrap_or_default();
-    let live = |group_id: u64| -> u64 {
-        statuses
-            .iter()
-            .find(|status| status.group_id == group_id)
-            .map_or(0, |status| status.leader_id)
-    };
-    let live_lookup: Option<&dyn Fn(u64) -> u64> = if state.raft_status_fn.get().is_some() {
-        Some(&live)
-    } else {
-        None
-    };
-    match crate::control::gateway::router::resolve_decision(
-        vshard,
-        state.node_id,
-        routing.as_deref(),
-        live_lookup,
-    ) {
+    match crate::control::gateway::live_leaders::resolve_live_decision(state, vshard) {
         crate::control::gateway::RouteDecision::Local => Target::Here,
         crate::control::gateway::RouteDecision::Remote { node_id, .. } => Target::Node(node_id),
         _ => Target::Unknown,

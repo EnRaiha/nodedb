@@ -163,8 +163,6 @@ impl<S: LogStorage> RaftNode<S> {
     pub(super) fn become_leader(&mut self) {
         self.role = NodeRole::Leader;
         self.leader_id = self.config.node_id;
-        self.contested_win = !self.config.peers.is_empty()
-            && self.transfer_campaign_term != self.hard_state.current_term;
 
         // Leader tracks voter peers, learner peers, and observer peers for
         // replication. Only voters count toward the commit quorum (see

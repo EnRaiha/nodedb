@@ -409,38 +409,49 @@ impl Scheduler {
                     break;
                 }
 
+                // A closed channel below means this node retired the vShard or
+                // started a new scheduler for it. A closed receiver yields at
+                // once on every poll, so the loop must leave rather than spin.
                 maybe_completion = self.completion_rx.recv() => {
-                    if let Some((txn_id, request_id, resp_opt)) = maybe_completion {
-                        // Awaited in the arm: the loop takes no other input
-                        // until this completion, its durability wait included,
-                        // is fully handled.
-                        self.handle_completion(txn_id, request_id, resp_opt).await;
-                    }
+                    let Some((txn_id, request_id, resp_opt)) = maybe_completion else {
+                        self.log_superseded("completion");
+                        break;
+                    };
+                    // Awaited in the arm: the loop takes no other input
+                    // until this completion, its durability wait included,
+                    // is fully handled.
+                    self.handle_completion(txn_id, request_id, resp_opt).await;
                 }
 
                 maybe_verdict = self.verdict_rx.recv() => {
-                    if let Some(signal) = maybe_verdict {
-                        // A durable global verdict landed: resume the matching
-                        // parked txn into its flush (commit) or drop (abort).
-                        self.handle_verdict_signal(signal);
-                    }
+                    let Some(signal) = maybe_verdict else {
+                        self.log_superseded("verdict");
+                        break;
+                    };
+                    // A durable global verdict landed: resume the matching
+                    // parked txn into its flush (commit) or drop (abort).
+                    self.handle_verdict_signal(signal);
                 }
 
                 maybe_event = self.read_result_rx.recv() => {
-                    if let Some(event) = maybe_event {
-                        self.handle_read_result(event);
-                    }
+                    let Some(event) = maybe_event else {
+                        self.log_superseded("read result");
+                        break;
+                    };
+                    self.handle_read_result(event);
                 }
 
                 maybe_promoted = self.promotion_rx.recv() => {
-                    if let Some(promoted) = maybe_promoted {
-                        // A fast-path write-admission guard released an uncontended
-                        // key that one of this scheduler's txns had queued behind;
-                        // `release` already promoted it to holder. Run the normal
-                        // promotion -> dispatch path so it stops being a stalled
-                        // holder in `blocked` and actually executes.
-                        self.dispatch_promoted(promoted);
-                    }
+                    let Some(promoted) = maybe_promoted else {
+                        self.log_superseded("promotion");
+                        break;
+                    };
+                    // A fast-path write-admission guard released an uncontended
+                    // key that one of this scheduler's txns had queued behind;
+                    // `release` already promoted it to holder. Run the normal
+                    // promotion -> dispatch path so it stops being a stalled
+                    // holder in `blocked` and actually executes.
+                    self.dispatch_promoted(promoted);
                 }
 
                 _ = tokio::time::sleep(super::metadata_hold::HOLD_POLL),
@@ -492,6 +503,15 @@ impl Scheduler {
         // Every txn still pending stays unapplied on this replica.
         self.hold_all_redo_records();
     }
+
+    /// Log that a scheduler channel closed and the loop exits.
+    fn log_superseded(&self, channel: &str) {
+        info!(
+            vshard_id = self.vshard_id,
+            channel,
+            "calvin scheduler: a channel closed; the vShard left this node or a new scheduler took it"
+        );
+    }
 }
 
 // ── `is_caught_up` sentinel handling ─────────────────────────────────────────
@@ -500,7 +520,21 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    use crate::control::cluster::calvin::scheduler::driver::core::test_support::build_test_scheduler;
+    use crate::control::cluster::calvin::scheduler::driver::core::test_support::{
+        build_test_scheduler, spawn_scheduler_loop,
+    };
+
+    /// Retiring a vShard drops its verdict sender. The scheduler then leaves
+    /// its loop. A closed receiver is always ready, so a loop that ignored the
+    /// close would spin and starve the runtime.
+    #[tokio::test]
+    async fn a_closed_verdict_channel_ends_the_loop() {
+        let (scheduler, _dir) = build_test_scheduler(0);
+        let registry = Arc::clone(&scheduler.registry);
+        let running = spawn_scheduler_loop(scheduler);
+        registry.unregister_verdict_signal_sender(0);
+        assert!(running.exits_unprompted().await);
+    }
 
     /// A freshly-recovered scheduler (`fully_applied_epoch` still the
     /// `NOT_YET_APPLIED_EPOCH` sentinel) with a REAL, non-zero rebuild target must

@@ -234,11 +234,10 @@ pub async fn run_commit(
                 }
             }
             DispatchClass::SingleShard { vshard: vshard_id } => {
-                let leader =
-                    crate::control::server::graph_dispatch::cluster_resolve::resolve_for_vshard(
-                        state,
-                        vshard_id.as_u32(),
-                    );
+                let leader = crate::control::gateway::live_leaders::resolve_live_decision(
+                    state,
+                    vshard_id.as_u32(),
+                );
                 if !matches!(leader, RouteDecision::Local)
                     || crate::control::planner::calvin::writes_edges(&buffered)
                 {

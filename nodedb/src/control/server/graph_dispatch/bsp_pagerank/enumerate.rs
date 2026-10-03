@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 
+use crate::control::gateway::live_leaders::LiveLeaders;
 use crate::control::state::SharedState;
 use crate::types::VShardId;
 
@@ -75,17 +76,9 @@ pub(in crate::control::server::graph_dispatch) fn enumerate_shards(
             vshard_owner: HashMap::new(),
         });
     };
+    // Raft snapshot first, routing guard second: see `LiveLeaders`.
+    let live = LiveLeaders::snapshot(state);
     let routing = routing_lock.read().unwrap_or_else(|p| p.into_inner());
-
-    let raft_snapshot: Vec<nodedb_cluster::GroupStatus> =
-        state.raft_status_fn.get().map(|f| f()).unwrap_or_default();
-    let live_leader = |group_id: u64| -> u64 {
-        raft_snapshot
-            .iter()
-            .find(|gs| gs.group_id == group_id)
-            .map(|gs| gs.leader_id)
-            .unwrap_or(0)
-    };
 
     // Accumulate each owner node's full vShard set (union over the data groups it
     // leads), preserving first-seen node order, and build the vShard → owner map.
@@ -103,7 +96,7 @@ pub(in crate::control::server::graph_dispatch) fn enumerate_shards(
             continue;
         }
         // Prefer live Raft leadership; fall back to the routing-table hint.
-        let mut leader = live_leader(group_id);
+        let mut leader = live.leader_of(group_id);
         if leader == 0 {
             leader = routing.group_info(group_id).map(|g| g.leader).unwrap_or(0);
         }

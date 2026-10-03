@@ -9,13 +9,14 @@
 
 use crate::bridge::envelope::{Payload, PhysicalPlan};
 use crate::control::gateway::dispatcher::{DispatchRouteParams, dispatch_route};
+use crate::control::gateway::live_leaders::resolve_live_decision;
 use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::gateway::{RouteDecision, TaskRoute};
 use crate::control::server::payload_merge::merge_msgpack_arrays;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, TxnId, VShardId};
 
-use super::cluster_resolve::{gateway_shared, resolve_for_vshard};
+use super::cluster_resolve::gateway_shared;
 use super::shard_reads::ShardReadLog;
 
 /// Run `plan`, a one-hop read of `node_key`, on the leader of the node's key
@@ -70,7 +71,7 @@ pub async fn read_on_vshard(
     } = at;
     let collection = plan_collection(&plan);
     let mut reads = ShardReadLog::new();
-    let payload = match resolve_for_vshard(state, vshard_id) {
+    let payload = match resolve_live_decision(state, vshard_id) {
         RouteDecision::Local => {
             if linearizable {
                 super::read_groups::confirm_graph_read(state, database_id, &plan).await?;

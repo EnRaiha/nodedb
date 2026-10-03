@@ -20,7 +20,8 @@ use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_cluster::distributed_graph::PatternContinuation;
 use nodedb_physical::physical_plan::GraphOp;
 
-use crate::control::server::graph_dispatch::cluster_resolve::{gateway_shared, resolve_for_vshard};
+use crate::control::gateway::live_leaders::resolve_live_decision;
+use crate::control::server::graph_dispatch::cluster_resolve::gateway_shared;
 
 use super::coord::{TaggedShardResult, decode_rows};
 use super::resume_queue::PendingResume;
@@ -142,9 +143,9 @@ pub(super) async fn dispatch_continuations(
     for (target_shard, conts) in pending {
         // Resolve once per target shard, not once per continuation: every
         // continuation targeting the same vShard gets the same routing
-        // decision, and `resolve_for_vshard` acquires a routing-table read
-        // lock on each call.
-        let decision = resolve_for_vshard(state, target_shard);
+        // decision, and `resolve_live_decision` takes a Raft snapshot and a
+        // routing-table read lock on each call.
+        let decision = resolve_live_decision(state, target_shard);
 
         // Extract the remote node coordinates (Copy-able u64 fields) so the
         // inner loop can reuse them without re-acquiring the routing lock.

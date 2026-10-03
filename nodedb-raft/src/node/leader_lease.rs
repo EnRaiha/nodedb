@@ -14,7 +14,9 @@
 //!
 //! The anchor is the send time of the request, never the arrival time of the
 //! response. The follower opened its refusal window when it processed the
-//! request, and the response can arrive much later.
+//! request, and the response can arrive much later. Check-quorum dates the
+//! same answers at their arrival (see [`super::quorum_contact`]). That date
+//! only keeps the leader in its role and never extends the lease.
 //!
 //! Each `AppendEntries` carries a round number, and the follower echoes it. The
 //! leader keeps `round -> sent_at` for the rounds no quorum has covered yet, and
@@ -26,6 +28,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::node::core::RaftNode;
+use crate::node::quorum_contact::VoterAck;
 use crate::state::NodeRole;
 use crate::storage::LogStorage;
 
@@ -155,26 +158,30 @@ impl<S: LogStorage> RaftNode<S> {
         self.lease.stamp(Instant::now())
     }
 
-    /// Record that voter `peer` answered `round`. Rounds from an earlier term
-    /// are ignored: the follower answered a request of a leadership that no
-    /// longer exists.
-    pub(super) fn record_lease_ack(&mut self, peer: u64, round: u64) {
+    /// Record that voter `peer` answered `round`, in an answer that arrived at
+    /// `now`. Rounds from an earlier term are ignored: the follower answered
+    /// a request of a leadership that no longer exists.
+    pub(super) fn record_lease_ack(&mut self, peer: u64, round: u64, now: Instant) {
         if !self.lease.is_current(round) {
             return;
         }
-        match self.quorum_window.iter_mut().find(|(id, _)| *id == peer) {
-            Some(entry) => entry.1 = entry.1.max(round),
-            None => self.quorum_window.push((peer, round)),
+        match self.quorum_window.iter_mut().find(|ack| ack.peer == peer) {
+            Some(ack) => {
+                ack.round = ack.round.max(round);
+                ack.arrived = ack.arrived.max(now);
+            }
+            None => self.quorum_window.push(VoterAck {
+                peer,
+                round,
+                arrived: now,
+            }),
         }
     }
 
     /// Highest round `peer` has acknowledged in this term.
     fn acked_round(&self, peer: u64) -> u64 {
-        self.quorum_window
-            .iter()
-            .find(|&&(id, _)| id == peer)
-            .map(|&(_, round)| round)
-            .unwrap_or(UNTRACKED_ROUND)
+        self.voter_ack(peer)
+            .map_or(UNTRACKED_ROUND, |ack| ack.round)
     }
 
     /// Settle the highest round a quorum of voters has acknowledged, and

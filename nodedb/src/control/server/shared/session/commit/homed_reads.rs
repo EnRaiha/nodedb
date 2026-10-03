@@ -33,10 +33,11 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::gateway::dispatcher::{
     DispatchRouteParams, dispatch_route, statement_deadline_ms,
 };
+use crate::control::gateway::live_leaders::resolve_live_decision;
 use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::gateway::{RouteDecision, TaskRoute};
 use crate::control::server::exchange::all_cores::execute_plan_all_local_cores;
-use crate::control::server::graph_dispatch::cluster_resolve::{gateway_shared, resolve_for_vshard};
+use crate::control::server::graph_dispatch::cluster_resolve::gateway_shared;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId, VShardId};
 
@@ -241,7 +242,7 @@ async fn homed_reads_changed(
 
 /// The node leading `vshard`, by live Raft leadership where known.
 fn leader_of(state: &SharedState, vshard: VShardId) -> crate::Result<Leader> {
-    match resolve_for_vshard(state, vshard.as_u32()) {
+    match resolve_live_decision(state, vshard.as_u32()) {
         RouteDecision::Local => Ok(Leader::Local),
         RouteDecision::Remote { node_id, .. } => Ok(Leader::Remote(node_id)),
         RouteDecision::LeaderUnknown { .. } => Err(crate::Error::NotLeader {

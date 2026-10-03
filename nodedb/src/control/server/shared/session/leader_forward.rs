@@ -37,8 +37,9 @@ use crate::bridge::envelope::{Payload, PhysicalPlan, Response};
 use crate::control::gateway::dispatcher::{
     DispatchRouteParams, dispatch_route, statement_deadline_ms,
 };
+use crate::control::gateway::live_leaders::resolve_live_decision;
 use crate::control::gateway::{GatewayVersionSet, RouteDecision, TaskRoute};
-use crate::control::server::graph_dispatch::cluster_resolve::{gateway_shared, resolve_for_vshard};
+use crate::control::server::graph_dispatch::cluster_resolve::gateway_shared;
 use crate::control::server::shared::write_admission::bare_ok_response;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, RequestId, TenantId, TraceId};
@@ -48,7 +49,7 @@ use nodedb_physical::physical_task::PhysicalTask;
 /// leadership (falling back to the routing-table hint), so a staging choke point
 /// can branch between its existing local dispatch and a remote forward.
 pub(crate) fn resolve_leader(task: &PhysicalTask, state: &SharedState) -> RouteDecision {
-    resolve_for_vshard(state, task.vshard_id.as_u32())
+    resolve_live_decision(state, task.vshard_id.as_u32())
 }
 
 /// Forward an already-wrapped staging control op (`MetaOp::StageWrite` /

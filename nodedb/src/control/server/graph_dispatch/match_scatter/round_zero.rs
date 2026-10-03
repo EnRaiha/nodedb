@@ -9,6 +9,7 @@ use futures::future::join_all;
 
 use crate::bridge::envelope::{Payload, PhysicalPlan};
 use crate::control::gateway::dispatcher::{DispatchRouteParams, dispatch_route};
+use crate::control::gateway::live_leaders::LiveLeaders;
 use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::gateway::{RouteDecision, TaskRoute};
 use crate::control::server::graph_dispatch::cluster_resolve::gateway_shared;
@@ -159,17 +160,9 @@ fn round_zero_owners(state: &SharedState) -> crate::Result<RoundZeroOwners> {
     let Some(routing_lock) = state.cluster_routing.as_ref() else {
         return Ok(owners);
     };
+    // Raft snapshot first, routing guard second: see `LiveLeaders`.
+    let live = LiveLeaders::snapshot(state);
     let routing = routing_lock.read().unwrap_or_else(|p| p.into_inner());
-
-    let raft_snapshot: Vec<nodedb_cluster::GroupStatus> =
-        state.raft_status_fn.get().map(|f| f()).unwrap_or_default();
-    let live_leader = |group_id: u64| -> u64 {
-        raft_snapshot
-            .iter()
-            .find(|gs| gs.group_id == group_id)
-            .map(|gs| gs.leader_id)
-            .unwrap_or(0)
-    };
 
     let mut remote_index: HashMap<u64, usize> = HashMap::new();
     for group_id in routing.group_ids() {
@@ -182,7 +175,7 @@ fn round_zero_owners(state: &SharedState) -> crate::Result<RoundZeroOwners> {
             continue;
         };
         // Prefer live Raft leadership; fall back to the routing-table hint.
-        let mut leader = live_leader(group_id);
+        let mut leader = live.leader_of(group_id);
         if leader == 0 {
             leader = routing.group_info(group_id).map(|g| g.leader).unwrap_or(0);
         }

@@ -23,6 +23,16 @@ pub const VSHARD_COUNT: u32 = VShardId::COUNT;
 /// - A shard migration completes (Phase 3 atomic cut-over)
 /// - A Raft group membership changes
 /// - A node joins or decommissions
+///
+/// # Lock order
+///
+/// The shared `Arc<RwLock<RoutingTable>>` ranks below the `MultiRaft` mutex.
+/// Take the `MultiRaft` lock first, then the routing guard.
+/// Never call into `MultiRaft` while holding a routing guard.
+/// That bans `group_statuses`, `raft_status_fn`, and any `multi_raft.lock()` path.
+/// `MultiRaft` reads routing under its own lock, so the nested call re-reads routing.
+/// A queued writer blocks that nested read, and the node deadlocks.
+/// Take the Raft status first, then the routing guard.
 #[derive(
     Debug,
     Clone,

@@ -165,10 +165,6 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         // no replica of it.
         self.unmount_left_groups();
 
-        // Record the tick each data group's leadership arrived. The leader
-        // balance holds a failover win for a while from there.
-        self.note_led_groups();
-
         // Placement reconcile is throttled well above the tick rate: SetPlacement
         // is a normal metadata entry (not a conf-change), so Raft would not dedup
         // per-tick re-proposals before they commit. Running ~1s apart lets each
@@ -181,8 +177,9 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         }
         // Move each data group's leadership to its preferred leader. The
         // bootstrap node leads every group otherwise.
-        if tick.is_multiple_of(super::super::leader_balance::LEADER_BALANCE_TICK_INTERVAL) {
-            self.balance_leadership();
+        let balance_interval = super::super::leader_balance::LEADER_BALANCE_TICK_INTERVAL;
+        if tick.is_multiple_of(balance_interval) {
+            self.balance_leadership(tick / balance_interval);
         }
         // Find the leader of an unhosted data group whose hint names none.
         let probe_interval = super::leader_probe::LEADER_PROBE_TICK_INTERVAL;

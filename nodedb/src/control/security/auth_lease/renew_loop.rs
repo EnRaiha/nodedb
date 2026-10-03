@@ -8,7 +8,7 @@
 //! extends nothing, so the lease lapses unless a later renewal succeeds.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nodedb_cluster::{
     AuthLeaseRenewOutcome, AuthLeaseRenewRequest, AuthLeaseRenewResponse, GroupCoverage, RaftRpc,
@@ -91,7 +91,7 @@ async fn renew_once(state: &SharedState, timing: LeaseTiming, coverage: &[GroupC
             state,
             leader_id,
             RaftRpc::AuthLeaseRenewRequest(request),
-            timing.lease,
+            timing.rpc_read_timeout(Duration::ZERO),
         )
         .await
         {
@@ -130,7 +130,7 @@ fn install(
 ) {
     match response.outcome {
         AuthLeaseRenewOutcome::Granted { lease_ms } => {
-            let granted = std::time::Duration::from_millis(lease_ms);
+            let granted = Duration::from_millis(lease_ms);
             state
                 .authorization_fence
                 .holder()

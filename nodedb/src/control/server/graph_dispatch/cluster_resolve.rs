@@ -1,58 +1,21 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Shared cluster-routing helpers for graph scatter paths (`match_scatter` and
-//! `bsp_pagerank`): resolve a vShard to a live `RouteDecision`, and fetch the
+//! Shared cluster-dispatch helpers for graph scatter paths (`match_scatter` and
+//! `bsp_pagerank`): dispatch a superstep to one owner node, and fetch the
 //! gateway `Arc<SharedState>` used for remote dispatch.
 //!
-//! Both helpers resolve against LIVE Raft leadership where available so a stale
-//! routing-table hint cannot misdirect a scatter. Factored here so the MATCH
-//! scatter and the BSP PageRank coordinator share one implementation instead of
-//! duplicating the routing-lock + live-leader plumbing.
+//! vShard resolution against live Raft leadership lives in
+//! `crate::control::gateway::live_leaders`.
 
 use std::sync::Arc;
 
 use crate::bridge::envelope::{Payload, PhysicalPlan};
 use crate::control::gateway::dispatcher::{DispatchRouteParams, dispatch_route};
-use crate::control::gateway::router::resolve_decision;
 use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::gateway::{RouteDecision, TaskRoute};
 use crate::control::server::exchange::execute_plan_all_local_cores;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId};
-
-/// Resolve a vShard to a `RouteDecision` against live Raft leadership, falling
-/// back to the routing-table hint when no live snapshot is available.
-///
-/// `pub(crate)` so the in-transaction staging choke points
-/// (`session::leader_forward`) can resolve a staged write's / overlay drop's
-/// target leader with the same live-leader semantics the graph scatter uses,
-/// instead of duplicating the routing-lock + live-leader plumbing.
-pub(crate) fn resolve_for_vshard(state: &SharedState, vshard_id: u32) -> RouteDecision {
-    let routing_guard = state
-        .cluster_routing
-        .as_ref()
-        .map(|rw| rw.read().unwrap_or_else(|p| p.into_inner()));
-    let raft_snapshot: Vec<nodedb_cluster::GroupStatus> =
-        state.raft_status_fn.get().map(|f| f()).unwrap_or_default();
-    let live_leader = move |group_id: u64| -> u64 {
-        raft_snapshot
-            .iter()
-            .find(|gs| gs.group_id == group_id)
-            .map(|gs| gs.leader_id)
-            .unwrap_or(0)
-    };
-    let live_lookup: Option<&dyn Fn(u64) -> u64> = if state.raft_status_fn.get().is_some() {
-        Some(&live_leader)
-    } else {
-        None
-    };
-    resolve_decision(
-        vshard_id,
-        state.node_id,
-        routing_guard.as_deref(),
-        live_lookup,
-    )
-}
 
 /// Parameters for [`dispatch_superstep_to_node`].
 pub(in crate::control::server::graph_dispatch) struct DispatchSuperstepParams<'a> {

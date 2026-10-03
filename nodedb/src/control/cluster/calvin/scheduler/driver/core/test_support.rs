@@ -387,6 +387,14 @@ impl RunningScheduler {
         &self.input_tx
     }
 
+    /// Whether the loop exits by itself, with no shutdown signal, within
+    /// [`DATA_PLANE_WAIT`].
+    pub(super) async fn exits_unprompted(self) -> bool {
+        tokio::time::timeout(DATA_PLANE_WAIT, self.handle)
+            .await
+            .is_ok_and(|joined| joined.is_ok())
+    }
+
     /// Signal shutdown and wait for the loop to exit.
     pub(super) async fn stop(self) {
         self.shutdown.signal();

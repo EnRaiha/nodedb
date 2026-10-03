@@ -123,8 +123,8 @@ impl MultiRaft {
     /// changed since the last persist. Runs under the `MultiRaft` lock and
     /// never waits on disk. Before an RPC reply that granted a vote or bumped
     /// the term leaves this node, the caller awaits the group's
-    /// [`MultiRaft::durability_ticket`], so a restart cannot forget the vote
-    /// and let two leaders form.
+    /// [`MultiRaft::reply_ticket`], so a restart cannot forget the vote and
+    /// let two leaders form.
     ///
     /// No-op when the group is not mounted on this node.
     pub fn persist_group_hard_state(&mut self, group_id: u64) -> Result<()> {
@@ -132,6 +132,27 @@ impl MultiRaft {
             node.persist_hard_state_if_dirty()?;
         }
         Ok(())
+    }
+
+    /// The sequence number of the last write `group_id` staged, or 0 when the
+    /// group is not mounted. A reply handler reads it before its Raft call
+    /// and passes it to [`Self::reply_ticket`].
+    pub fn staged_through(&self, group_id: u64) -> u64 {
+        self.groups
+            .get(&group_id)
+            .map_or(0, |node| node.storage().staged_through())
+    }
+
+    /// A ticket for the writes a reply depends on: the group's latest hard
+    /// state, and every write staged after `mark` when there is one. `None`
+    /// when those are durable or the group is not mounted. Writes the apply
+    /// loop staged before `mark` hold no reply back.
+    pub fn reply_ticket(
+        &self,
+        group_id: u64,
+        mark: u64,
+    ) -> Option<crate::group_disk::DurabilityTicket> {
+        self.groups.get(&group_id)?.storage().reply_ticket(mark)
     }
 
     /// Get the current term and snapshot metadata for a group (for building

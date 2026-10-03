@@ -428,11 +428,10 @@ impl TestClusterNode {
         // The node plans permission-checked statements only under an
         // authorization lease, as a production node opens its gateway only
         // once it holds one.
-        if let Some(timing) = shared.authorization_fence.timing() {
+        if shared.authorization_fence.timing().is_some() {
             nodedb::control::security::auth_lease::await_planning_admitted(
                 &shared,
                 Duration::from_secs(15),
-                timing.renew_every,
             )
             .await
             .map_err(|e| format!("node {node_id}: {e}"))?;

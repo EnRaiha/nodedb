@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use nodedb_cluster::GroupCoverage;
+use tokio::sync::watch;
 
 /// How this node's last renewal round ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +96,9 @@ impl std::fmt::Display for RenewAttempt {
 pub struct LeaseHolder {
     valid_until: Mutex<Option<Instant>>,
     last_attempt: Mutex<RenewAttempt>,
+    /// Renewal rounds ended so far. A planning path that found the lease
+    /// lapsed waits on it for the next round.
+    rounds: watch::Sender<u64>,
 }
 
 impl Default for LeaseHolder {
@@ -102,14 +106,23 @@ impl Default for LeaseHolder {
         Self {
             valid_until: Mutex::new(None),
             last_attempt: Mutex::new(RenewAttempt::NotAttempted),
+            rounds: watch::Sender::new(0),
         }
     }
 }
 
 impl LeaseHolder {
-    /// Record how the latest renewal round ended.
+    /// Record how the latest renewal round ended, and wake every wait for
+    /// the round. A grant is installed before its round is recorded.
     pub fn record_attempt(&self, attempt: RenewAttempt) {
         *self.last_attempt.lock().unwrap_or_else(|p| p.into_inner()) = attempt;
+        self.rounds
+            .send_modify(|rounds| *rounds = rounds.wrapping_add(1));
+    }
+
+    /// A receiver that sees each renewal round recorded after this call.
+    pub fn subscribe_rounds(&self) -> watch::Receiver<u64> {
+        self.rounds.subscribe()
     }
 
     /// How the latest renewal round ended.
@@ -163,6 +176,18 @@ mod tests {
         // The leader's lease still runs at 100ms, but the holder's has ended.
         assert!(!holder.is_valid_at(sent_at + Duration::from_millis(100)));
         assert!(!holder.is_valid_at(sent_at + timing.lease));
+    }
+
+    #[tokio::test]
+    async fn a_recorded_round_wakes_a_subscriber() {
+        let holder = LeaseHolder::default();
+        let mut rounds = holder.subscribe_rounds();
+        assert!(!rounds.has_changed().expect("sender alive"));
+        holder.record_attempt(RenewAttempt::Granted { leader_id: 1 });
+        tokio::time::timeout(Duration::from_secs(1), rounds.changed())
+            .await
+            .expect("woken")
+            .expect("sender alive");
     }
 
     #[test]

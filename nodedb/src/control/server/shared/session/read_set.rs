@@ -160,8 +160,7 @@ pub(crate) fn serving_node(state: &SharedState, vshard: u32) -> u64 {
     if state.cluster_routing.is_none() {
         return state.node_id;
     }
-    match crate::control::server::graph_dispatch::cluster_resolve::resolve_for_vshard(state, vshard)
-    {
+    match crate::control::gateway::live_leaders::resolve_live_decision(state, vshard) {
         crate::control::gateway::RouteDecision::Local => state.node_id,
         _ => 0,
     }

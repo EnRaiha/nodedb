@@ -36,6 +36,9 @@ pub struct MultiRaft {
     /// conf-changes applied here (via `apply_conf_change`) write THROUGH to
     /// the one table the query/data plane reads. Raft is the convergence
     /// mechanism on every applying node (leader and follower).
+    ///
+    /// Lock order: this struct's mutex first, then this routing guard.
+    /// See the lock-order section on [`RoutingTable`].
     pub(super) routing: Arc<RwLock<RoutingTable>>,
     /// Default election timeout range.
     pub(super) election_timeout_min: Duration,

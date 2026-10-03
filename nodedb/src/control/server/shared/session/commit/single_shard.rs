@@ -90,10 +90,7 @@ pub(super) async fn dispatch_single_shard(
     // side-effect-free and retryable: the retry sees the vShard is non-local
     // and routes through Calvin's replicated barrier.
     if !matches!(
-        crate::control::server::graph_dispatch::cluster_resolve::resolve_for_vshard(
-            state,
-            vshard_id.as_u32(),
-        ),
+        crate::control::gateway::live_leaders::resolve_live_decision(state, vshard_id.as_u32()),
         RouteDecision::Local
     ) {
         return Some(AbortReason::Serialization);

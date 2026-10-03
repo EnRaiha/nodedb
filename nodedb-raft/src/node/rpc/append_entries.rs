@@ -88,28 +88,52 @@ impl<S: LogStorage> RaftNode<S> {
             }
         }
 
-        if let Err(e) = self.log.append_entries(req.prev_log_index, &req.entries) {
-            warn!(group = self.config.group_id, error = %e, "append_entries failed");
-            return AppendEntriesResponse {
-                term: self.hard_state.current_term,
-                success: false,
-                last_log_index: self.log.last_index(),
-                round: req.round,
-                needs_snapshot: false,
-            };
-        }
+        let wrote = match self.log.append_entries(req.prev_log_index, &req.entries) {
+            Ok(wrote) => wrote,
+            Err(e) => {
+                warn!(group = self.config.group_id, error = %e, "append_entries failed");
+                return AppendEntriesResponse {
+                    term: self.hard_state.current_term,
+                    success: false,
+                    last_log_index: self.log.last_index(),
+                    round: req.round,
+                    needs_snapshot: false,
+                };
+            }
+        };
 
-        if req.leader_commit > self.volatile.commit_index {
-            self.volatile.commit_index = req.leader_commit.min(self.log.last_index());
+        // The last entry this log now shares with the leader. Entries past it
+        // can be a stale suffix of an earlier term.
+        let matched = req.entries.last().map_or(req.prev_log_index, |e| e.index);
+        let commit = req.leader_commit.min(matched);
+        if commit > self.volatile.commit_index {
+            self.volatile.commit_index = commit;
             self.collect_committed_entries();
         }
 
         AppendEntriesResponse {
             term: self.hard_state.current_term,
             success: true,
-            last_log_index: self.log.last_index(),
+            last_log_index: self.claimable_match(matched, wrote),
             round: req.round,
             needs_snapshot: false,
+        }
+    }
+
+    /// The match index a success reply claims, from the last entry shared
+    /// with the leader.
+    ///
+    /// The leader counts the claim as entries durable on this node. When the
+    /// request took a storage write, the caller makes every write staged so
+    /// far durable before the reply leaves. Every held entry is then durable,
+    /// so the claim is `matched`. Otherwise the reply waits on no disk write,
+    /// and the claim stops at the durable prefix. A later round reports the
+    /// rest once the disk holds it.
+    fn claimable_match(&self, matched: u64, wrote: bool) -> u64 {
+        if wrote {
+            matched
+        } else {
+            matched.min(self.log.stable_index())
         }
     }
 
@@ -179,9 +203,13 @@ impl<S: LogStorage> RaftNode<S> {
 
         // Same signal drives check-quorum and the lease. A rejection counts:
         // the follower recorded this leader's contact before its log check.
+        // The lease settles at the round's send time. Check-quorum dates the
+        // answer at its arrival.
         if peer_is_voter && resp.term == self.hard_state.current_term {
-            self.record_lease_ack(peer, resp.round);
-            self.refresh_quorum_contact(std::time::Instant::now());
+            let now = std::time::Instant::now();
+            self.record_lease_ack(peer, resp.round, now);
+            self.settle_lease();
+            self.refresh_quorum_contact(now);
         }
         let leader = match self.leader_state.as_mut() {
             Some(ls) => ls,
@@ -730,5 +758,137 @@ mod tests {
             "source must commit without observer ack (observer crash)"
         );
         let _ = ready;
+    }
+
+    /// Storage that takes every write at once and reports a durable prefix
+    /// the test sets.
+    #[derive(Default)]
+    struct StagingStorage {
+        inner: MemStorage,
+        stable: (u64, u64),
+    }
+
+    impl crate::storage::LogStorage for StagingStorage {
+        fn append(&mut self, entries: &[LogEntry]) -> crate::error::Result<()> {
+            self.inner.append(entries)
+        }
+        fn truncate(&mut self, index: u64) -> crate::error::Result<()> {
+            self.inner.truncate(index)
+        }
+        fn load_entries_after(&self, snapshot_index: u64) -> crate::error::Result<Vec<LogEntry>> {
+            self.inner.load_entries_after(snapshot_index)
+        }
+        fn compact(&mut self, index: u64, term: u64) -> crate::error::Result<()> {
+            self.inner.compact(index, term)
+        }
+        fn snapshot_metadata(&self) -> (u64, u64) {
+            self.inner.snapshot_metadata()
+        }
+        fn save_hard_state(&mut self, state: &crate::state::HardState) -> crate::error::Result<()> {
+            self.inner.save_hard_state(state)
+        }
+        fn load_hard_state(&self) -> crate::error::Result<crate::state::HardState> {
+            self.inner.load_hard_state()
+        }
+        fn save_applied_index(&mut self, index: u64) -> crate::error::Result<()> {
+            self.inner.save_applied_index(index)
+        }
+        fn load_applied_index(&self) -> crate::error::Result<u64> {
+            self.inner.load_applied_index()
+        }
+        fn stable_through(&self) -> Option<(u64, u64)> {
+            Some(self.stable)
+        }
+    }
+
+    fn entry(term: u64, index: u64) -> LogEntry {
+        LogEntry {
+            term,
+            index,
+            data: vec![index as u8],
+        }
+    }
+
+    fn append_request(
+        term: u64,
+        prev: (u64, u64),
+        entries: Vec<LogEntry>,
+        leader_commit: u64,
+    ) -> AppendEntriesRequest {
+        AppendEntriesRequest {
+            term,
+            leader_id: 2,
+            prev_log_index: prev.0,
+            prev_log_term: prev.1,
+            entries,
+            leader_commit,
+            group_id: 1,
+            round: 1,
+            replicated_floor: 0,
+        }
+    }
+
+    /// A request that writes entries claims them: its caller makes them
+    /// durable before the reply leaves. A resend of the same range writes
+    /// nothing and waits on no disk, so it claims only the durable prefix.
+    #[test]
+    fn a_reply_without_a_write_claims_only_the_durable_prefix() {
+        let mut node = RaftNode::new(test_config(1, vec![2, 3]), StagingStorage::default());
+        let req = append_request(1, (0, 0), vec![entry(1, 1), entry(1, 2)], 0);
+
+        let resp = node.handle_append_entries(&req);
+        assert!(resp.success);
+        assert_eq!(resp.last_log_index, 2, "the written entries are claimed");
+
+        let resp = node.handle_append_entries(&req);
+        assert!(resp.success);
+        assert_eq!(resp.last_log_index, 0, "nothing is durable yet");
+
+        node.log.storage_mut().stable = (1, 1);
+        let heartbeat = append_request(1, (2, 1), vec![], 0);
+        let resp = node.handle_append_entries(&heartbeat);
+        assert!(resp.success);
+        assert_eq!(
+            resp.last_log_index, 1,
+            "the claim stops at the durable entry"
+        );
+
+        node.log.storage_mut().stable = (2, 1);
+        let resp = node.handle_append_entries(&heartbeat);
+        assert_eq!(resp.last_log_index, 2);
+    }
+
+    /// Entries past the request's last entry can be a stale suffix of an
+    /// earlier term. A success reply never claims them, and the follower
+    /// never commits them.
+    #[test]
+    fn a_reply_never_claims_a_stale_suffix() {
+        let mut node = RaftNode::new(test_config(1, vec![2, 3]), MemStorage::new());
+        let old = append_request(1, (0, 0), vec![entry(1, 1), entry(1, 2), entry(1, 3)], 0);
+        assert!(node.handle_append_entries(&old).success);
+
+        // A leader of term 2 shares only entry 1 with this log.
+        let heartbeat = append_request(2, (1, 1), vec![], 3);
+        let resp = node.handle_append_entries(&heartbeat);
+        assert!(resp.success);
+        assert_eq!(
+            resp.last_log_index, 1,
+            "entries 2 and 3 are not the leader's"
+        );
+        assert_eq!(node.commit_index(), 1);
+    }
+
+    /// A reordered request that matches less of the log never pulls the
+    /// commit index back.
+    #[test]
+    fn a_reordered_request_never_lowers_the_commit_index() {
+        let mut node = RaftNode::new(test_config(1, vec![2, 3]), MemStorage::new());
+        let full = append_request(1, (0, 0), vec![entry(1, 1), entry(1, 2), entry(1, 3)], 3);
+        assert!(node.handle_append_entries(&full).success);
+        assert_eq!(node.commit_index(), 3);
+
+        let late = append_request(1, (0, 0), vec![entry(1, 1)], 4);
+        assert!(node.handle_append_entries(&late).success);
+        assert_eq!(node.commit_index(), 3);
     }
 }

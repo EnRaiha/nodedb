@@ -8,6 +8,17 @@
 //! or reset connection. Every answer the peer sends counts as a success, a
 //! typed refusal included. A refusal goes back to the caller as its typed
 //! error and is not resent.
+//!
+//! A link failure drops the pooled connection only when the connection
+//! itself failed. Other sends share that connection, so one stream's
+//! failure must not cut them off. The connection fails when:
+//! - it is closed, lost or reset;
+//! - it reached a node other than the target;
+//! - a read timed out and the peer sent nothing on it during the wait.
+//!
+//! A live peer acknowledges the request within its ACK delay. A read that
+//! times out on a connection that received datagrams meanwhile is a slow
+//! handler, and the connection stays pooled.
 
 use std::time::Duration;
 
@@ -30,14 +41,33 @@ enum Attempt {
     /// retry goes out under a fresh sequence number.
     FrameRefused(ClusterError),
     /// The link to the peer failed.
-    LinkFailed(ClusterError),
+    LinkFailed(LinkFailure),
+}
+
+/// A link failure, and the pooled connection it condemns.
+#[derive(Debug)]
+struct LinkFailure {
+    error: ClusterError,
+    /// Stable id of the connection to drop from the pool. `None` when no
+    /// connection was obtained or the connection still works.
+    condemned: Option<usize>,
+}
+
+impl LinkFailure {
+    /// A failure that leaves the pool as it is.
+    fn keep_connection(error: ClusterError) -> Self {
+        Self {
+            error,
+            condemned: None,
+        }
+    }
 }
 
 /// Sort the outcome of one send into an [`Attempt`].
 ///
 /// The outer error is a link failure. The inner result is what the peer
 /// sent back, or why its reply is unreadable.
-fn classify(target: u64, sent: Result<Result<RaftRpc>>) -> Attempt {
+fn classify(target: u64, sent: std::result::Result<Result<RaftRpc>, LinkFailure>) -> Attempt {
     match sent {
         Err(link) => Attempt::LinkFailed(link),
         Ok(Ok(RaftRpc::FrameRefused(refusal))) => Attempt::FrameRefused(ClusterError::Transport {
@@ -94,8 +124,10 @@ impl NexarTransport {
             match self.attempt(target, &inner, read_timeout, admission).await {
                 Attempt::Answered(answer) => return answer,
                 Attempt::FrameRefused(e) => last_err = Some(e),
-                Attempt::LinkFailed(e) if RetryPolicy::is_retryable(&e) => last_err = Some(e),
-                Attempt::LinkFailed(e) => return Err(e),
+                Attempt::LinkFailed(failure) if RetryPolicy::is_retryable(&failure.error) => {
+                    last_err = Some(failure.error)
+                }
+                Attempt::LinkFailed(failure) => return Err(failure.error),
             }
         }
 
@@ -119,14 +151,15 @@ impl NexarTransport {
             .await
         {
             Attempt::Answered(answer) => answer,
-            Attempt::FrameRefused(e) | Attempt::LinkFailed(e) => Err(e),
+            Attempt::FrameRefused(e) => Err(e),
+            Attempt::LinkFailed(failure) => Err(failure.error),
         }
     }
 
     /// One attempt, recorded on the circuit breaker under `admission`.
     ///
-    /// A link failure also evicts the cached connection, so the next attempt
-    /// dials a fresh one.
+    /// A link failure that condemns the pooled connection also evicts it, so
+    /// the next attempt dials a fresh one.
     async fn attempt(
         &self,
         target: u64,
@@ -139,9 +172,11 @@ impl NexarTransport {
             self.try_send_once(target, inner, read_timeout).await,
         );
         match &outcome {
-            Attempt::LinkFailed(_) => {
+            Attempt::LinkFailed(failure) => {
                 self.circuit_breaker.record_failure(target, admission);
-                self.evict_peer(target);
+                if let Some(stable_id) = failure.condemned {
+                    self.evict_connection(target, stable_id);
+                }
             }
             Attempt::Answered(_) | Attempt::FrameRefused(_) => {
                 self.circuit_breaker.record_success(target, admission);
@@ -163,33 +198,73 @@ impl NexarTransport {
         target: u64,
         inner: &[u8],
         read_timeout: Duration,
-    ) -> Result<Result<RaftRpc>> {
-        let conn = self.get_or_connect(target).await?;
-        self.verify_connection_target(&conn, target)?;
+    ) -> std::result::Result<Result<RaftRpc>, LinkFailure> {
+        let conn = self
+            .get_or_connect(target)
+            .await
+            .map_err(LinkFailure::keep_connection)?;
+        let stable_id = conn.stable_id();
+        if let Err(error) = self.verify_connection_target(&conn, target) {
+            return Err(LinkFailure {
+                error,
+                condemned: Some(stable_id),
+            });
+        }
+        let received_before = received_datagrams(&conn);
+        self.exchange(&conn, target, inner, read_timeout)
+            .await
+            .map_err(|failure| {
+                let (error, timed_out) = match failure {
+                    StreamFailure::ReadTimeout(error) => (error, true),
+                    StreamFailure::Other(error) => (error, false),
+                };
+                let heard = received_datagrams(&conn) > received_before;
+                let broken = condemns_connection(timed_out, conn.close_reason().is_some(), heard);
+                LinkFailure {
+                    error,
+                    condemned: broken.then_some(stable_id),
+                }
+            })
+    }
 
-        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| ClusterError::Transport {
-            detail: format!("open_bi to node {target}: {e}"),
+    /// Send one request on its own stream of `conn` and read the reply.
+    async fn exchange(
+        &self,
+        conn: &quinn::Connection,
+        target: u64,
+        inner: &[u8],
+        read_timeout: Duration,
+    ) -> std::result::Result<Result<RaftRpc>, StreamFailure> {
+        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| {
+            StreamFailure::Other(ClusterError::Transport {
+                detail: format!("open_bi to node {target}: {e}"),
+            })
         })?;
 
-        let envelope = self.wrap_inner(inner)?;
-        send.write_all(&envelope)
-            .await
-            .map_err(|e| ClusterError::Transport {
+        let envelope = self.wrap_inner(inner).map_err(StreamFailure::Other)?;
+        send.write_all(&envelope).await.map_err(|e| {
+            StreamFailure::Other(ClusterError::Transport {
                 detail: format!("write to node {target}: {e}"),
-            })?;
-        send.finish().map_err(|e| ClusterError::Transport {
-            detail: format!("finish send to node {target}: {e}"),
+            })
+        })?;
+        send.finish().map_err(|e| {
+            StreamFailure::Other(ClusterError::Transport {
+                detail: format!("finish send to node {target}: {e}"),
+            })
         })?;
 
         let response_envelope =
             tokio::time::timeout(read_timeout, read_envelope_or_finish(&mut recv))
                 .await
-                .map_err(|_| ClusterError::Transport {
-                    detail: format!(
-                        "RPC timeout ({}ms) to node {target}",
-                        read_timeout.as_millis()
-                    ),
-                })??;
+                .map_err(|_| {
+                    StreamFailure::ReadTimeout(ClusterError::Transport {
+                        detail: format!(
+                            "RPC timeout ({}ms) to node {target}",
+                            read_timeout.as_millis()
+                        ),
+                    })
+                })?
+                .map_err(StreamFailure::Other)?;
         let Some(response_envelope) = response_envelope else {
             return Ok(Err(ClusterError::RemoteUntyped {
                 detail: format!("node {target} finished the stream without a reply"),
@@ -203,10 +278,82 @@ impl NexarTransport {
     }
 }
 
+/// How one stream on a pooled connection failed.
+#[derive(Debug)]
+enum StreamFailure {
+    /// The reply did not arrive within the read timeout.
+    ReadTimeout(ClusterError),
+    /// Opening, writing or reading the stream failed.
+    Other(ClusterError),
+}
+
+/// Whether a stream failure condemns its connection.
+///
+/// `closed` holds when the connection is closed, lost or reset. `heard`
+/// holds when the connection received a datagram since the stream opened.
+/// Any other stream failure leaves the connection to the sends sharing it.
+fn condemns_connection(timed_out: bool, closed: bool, heard: bool) -> bool {
+    closed || (timed_out && !heard)
+}
+
+/// UDP datagrams `conn` received so far.
+fn received_datagrams(conn: &quinn::Connection) -> u64 {
+    conn.stats().udp_rx.datagrams
+}
+
 #[cfg(test)]
 mod tests {
+    use nodedb_raft::message::RequestVoteRequest;
+
+    use super::super::transport::tests::{STALL, STALLED_GROUP, serve_echo};
     use super::*;
     use crate::rpc_codec::{FrameRefusal, PongResponse, RequestRefusal};
+
+    #[test]
+    fn only_a_closed_or_silent_connection_is_condemned() {
+        // A closed connection is condemned whatever failed on it.
+        assert!(condemns_connection(false, true, true));
+        assert!(condemns_connection(true, true, true));
+        // A read timeout with no datagram during the wait: the peer is gone.
+        assert!(condemns_connection(true, false, false));
+        // A read timeout while the peer kept acknowledging: a slow handler.
+        assert!(!condemns_connection(true, false, true));
+        // A stream reset or refused write on an open connection.
+        assert!(!condemns_connection(false, false, false));
+        assert!(!condemns_connection(false, false, true));
+    }
+
+    /// A handler slower than the caller's read timeout counts against the
+    /// breaker, but the connection other sends share stays pooled.
+    #[tokio::test]
+    async fn a_read_timeout_on_a_live_connection_keeps_it_pooled() {
+        let (_server, client, _shutdown) = serve_echo().await;
+        client.warm_peer(1).await.expect("warm");
+        let pooled = client.peer_connection_stable_id(1).expect("pooled");
+        let vote = RaftRpc::RequestVoteRequest(RequestVoteRequest {
+            term: 1,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+            group_id: STALLED_GROUP,
+            transfer: false,
+        });
+        let inner = rpc_codec::encode(&vote, &client.auth.epoch).expect("encode");
+        let read_timeout = STALL / 4;
+
+        let outcome = client
+            .attempt(1, &inner, read_timeout, Admission::Normal)
+            .await;
+
+        match outcome {
+            Attempt::LinkFailed(LinkFailure {
+                condemned: None, ..
+            }) => {}
+            other => panic!("expected a kept connection, got {other:?}"),
+        }
+        assert_eq!(client.peer_connection_stable_id(1), Some(pooled));
+        assert_eq!(client.circuit_breaker().failure_count(1), 1);
+    }
 
     #[test]
     fn a_typed_refusal_is_a_final_answer() {
@@ -232,9 +379,9 @@ mod tests {
 
     #[test]
     fn only_the_outer_error_is_a_link_failure() {
-        let link = ClusterError::Transport {
+        let link = LinkFailure::keep_connection(ClusterError::Transport {
             detail: "connection lost".into(),
-        };
+        });
         assert!(matches!(classify(1, Err(link)), Attempt::LinkFailed(_)));
 
         let unreadable = ClusterError::Codec {

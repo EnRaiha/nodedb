@@ -185,6 +185,9 @@ impl TestCluster {
         }
         for replica in &replicas {
             let node = replica.node_id;
+            // Raft status locks `MultiRaft`, which reads routing under that lock.
+            // It must be read before this routing guard is taken.
+            let raft = raft_leader(replica, group_id);
             let routing = replica
                 .shared
                 .cluster_routing
@@ -205,7 +208,6 @@ impl TestCluster {
                     info.learners
                 ));
             }
-            let raft = raft_leader(replica, group_id);
             if raft != leader || info.leader != leader {
                 return Err(format!(
                     "node {node}: raft leader {raft}, hint ({}, term {}), replica {} names {leader}",

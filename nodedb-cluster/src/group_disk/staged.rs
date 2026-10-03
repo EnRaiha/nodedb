@@ -62,6 +62,18 @@ impl StagedLogStorage {
     pub fn ticket(&self) -> Option<DurabilityTicket> {
         DurabilityTicket::for_staged(&self.disk)
     }
+
+    /// The sequence number of the last staged write. A caller reads it
+    /// before a Raft call and passes it to [`Self::reply_ticket`].
+    pub fn staged_through(&self) -> u64 {
+        self.disk.staged_through()
+    }
+
+    /// A ticket for the writes a reply built after `mark` depends on, or
+    /// `None` when they are durable. See [`DurabilityTicket::for_reply`].
+    pub fn reply_ticket(&self, mark: u64) -> Option<DurabilityTicket> {
+        DurabilityTicket::for_reply(&self.disk, mark)
+    }
 }
 
 impl Drop for StagedLogStorage {

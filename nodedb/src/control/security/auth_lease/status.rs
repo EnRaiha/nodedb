@@ -80,26 +80,66 @@ pub(crate) fn lease_status_of(
     }
 }
 
-/// Wait until this node can plan permission-checked statements, polling
-/// every `poll`, or refuse once `timeout` passes.
-pub async fn await_planning_admitted(
-    state: &SharedState,
-    timeout: Duration,
-    poll: Duration,
-) -> crate::Result<()> {
-    let deadline = Instant::now() + timeout;
-    while !lease_status(state, Instant::now()).admits_planning() {
-        if Instant::now() >= deadline {
-            return Err(crate::Error::AuthorizationStateBehind {
-                detail: format!(
-                    "no authorization lease was granted within {timeout:?}; last renewal: {}",
-                    state.authorization_fence.holder().last_attempt()
-                ),
-            });
-        }
-        tokio::time::sleep(poll).await;
+/// Wait until this node can plan permission-checked statements, or refuse
+/// once `timeout` passes.
+pub async fn await_planning_admitted(state: &SharedState, timeout: Duration) -> crate::Result<()> {
+    if planning_admitted_within(state, timeout).await {
+        return Ok(());
     }
-    Ok(())
+    Err(crate::Error::AuthorizationStateBehind {
+        detail: format!(
+            "no authorization lease was granted within {timeout:?}; last renewal: {}",
+            state.authorization_fence.holder().last_attempt()
+        ),
+    })
+}
+
+/// Wait at most `within` until this node can plan permission-checked
+/// statements, and return whether it can. Each renewal round wakes the
+/// wait, so it ends as soon as a round grants a lease.
+pub async fn planning_admitted_within(state: &SharedState, within: Duration) -> bool {
+    admitted_within(
+        &state.authorization_fence,
+        || sole_voter_term(state),
+        state.node_id,
+        within,
+    )
+    .await
+}
+
+/// [`planning_admitted_within`] for node `node_id` behind `fence`.
+pub(crate) async fn admitted_within(
+    fence: &AuthorizationFence,
+    sole_voter_term: impl Fn() -> Option<u64>,
+    node_id: u64,
+    within: Duration,
+) -> bool {
+    let admitted =
+        || lease_status_of(fence, &sole_voter_term, node_id, Instant::now()).admits_planning();
+    if admitted() {
+        return true;
+    }
+    let deadline = tokio::time::Instant::now() + within;
+    // Subscribed before the next check, so no round between the two is missed.
+    let mut rounds = fence.holder().subscribe_rounds();
+    loop {
+        if admitted() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::select! {
+            changed = rounds.changed() => {
+                // The holder lives as long as `fence`, so its sender does too.
+                // Without one, only the deadline is left to wait for.
+                if changed.is_err() {
+                    tokio::time::sleep_until(deadline).await;
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+    }
 }
 
 /// Append the lease gauges. A single node holds no lease and emits none.
@@ -290,6 +330,45 @@ mod tests {
             .edit_table(TERM, starved, |table| table.observe_sole_voter(false));
         let status = lease_status_of(&fence, || Some(TERM), NODE, starved);
         assert!(!status.admits_planning());
+    }
+
+    /// A lease that lapsed while a round ran long admits planning as soon as
+    /// that round grants it, well before the wait's bound.
+    #[tokio::test]
+    async fn a_lapsed_lease_admits_once_the_next_round_grants() {
+        let fence = Arc::new(fence());
+        assert!(fence.install_timing(timing()));
+        let within = Duration::from_secs(10);
+        let renewer = Arc::clone(&fence);
+        let round = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            renewer
+                .holder()
+                .install(Instant::now() + Duration::from_secs(5));
+            renewer.holder().record_attempt(
+                crate::control::security::auth_lease::RenewAttempt::Granted { leader_id: NODE },
+            );
+        });
+
+        let started = Instant::now();
+        assert!(admitted_within(&fence, || None, NODE, within).await);
+        assert!(started.elapsed() < within / 2, "woken by the round");
+        round.await.expect("round");
+    }
+
+    /// Without a granting round the wait ends at the grace and refuses.
+    #[tokio::test]
+    async fn a_lapsed_lease_refuses_after_the_grace() {
+        let fence = fence();
+        assert!(fence.install_timing(timing()));
+        let grace = Duration::from_millis(50);
+        fence
+            .holder()
+            .record_attempt(crate::control::security::auth_lease::RenewAttempt::NoLeader);
+
+        let started = Instant::now();
+        assert!(!admitted_within(&fence, || None, NODE, grace).await);
+        assert!(started.elapsed() >= grace);
     }
 
     /// A pin belongs to the leadership term that granted it.

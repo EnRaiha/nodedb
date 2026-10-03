@@ -60,6 +60,8 @@ struct Queue {
     ops: VecDeque<(u64, StorageOp)>,
     /// The sequence number of the last staged write.
     staged_through: u64,
+    /// The sequence number of the last staged hard state, or 0.
+    hard_state_seq: u64,
     closed: bool,
 }
 
@@ -113,6 +115,9 @@ impl GroupDisk {
         let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
         queue.staged_through += 1;
         let seq = queue.staged_through;
+        if matches!(op, StorageOp::HardState(_)) {
+            queue.hard_state_seq = seq;
+        }
         queue.ops.push_back((seq, op));
         self.work.notify_one();
     }
@@ -123,6 +128,13 @@ impl GroupDisk {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .staged_through
+    }
+
+    /// The sequence numbers of the last staged write and of the last staged
+    /// hard state, read together.
+    pub(super) fn staged_marks(&self) -> (u64, u64) {
+        let queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
+        (queue.staged_through, queue.hard_state_seq)
     }
 
     /// How far the disk has come.

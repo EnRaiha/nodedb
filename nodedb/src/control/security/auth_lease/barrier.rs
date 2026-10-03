@@ -62,7 +62,7 @@ pub async fn authorization_barrier(
                 state,
                 leader_id,
                 RaftRpc::AuthBarrierRequest(request),
-                remaining + timing.lease,
+                timing.rpc_read_timeout(remaining),
             )
             .await
             {

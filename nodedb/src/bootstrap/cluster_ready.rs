@@ -269,11 +269,10 @@ pub async fn await_cluster_ready(
     // once the first lease is granted, so the first statements are not
     // refused.
     let admitted = match crate::control::security::auth_lease::barrier::lease_timing(shared) {
-        Ok(timing) => {
+        Ok(_) => {
             crate::control::security::auth_lease::await_planning_admitted(
                 shared,
                 RAFT_READY_STALL_TIMEOUT,
-                timing.renew_every,
             )
             .await
         }

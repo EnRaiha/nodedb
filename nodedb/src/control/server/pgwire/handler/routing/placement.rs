@@ -73,6 +73,18 @@ enum TaskGroup {
     },
 }
 
+/// One task's routing facts, copied out of the routing table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoutedTask {
+    group_id: u64,
+    /// The routing table's leader hint for the group.
+    leader: u64,
+    /// This node is a voter of the group.
+    is_member: bool,
+    /// This node holds a replica of the group, as a voter or a learner.
+    hosts_replica: bool,
+}
+
 /// Decide how a single task's group must be served, given plain facts
 /// about it — no routing-table or gate lookups, so this is unit-testable in
 /// isolation from `SharedState`.
@@ -200,30 +212,49 @@ impl NodeDbPgHandler {
         let Some(routing) = self.state.cluster_routing.as_ref() else {
             return TaskPlacement::Local;
         };
-        let routing = routing.read().unwrap_or_else(|p| p.into_inner());
         let my_node = self.state.node_id;
+        // Routing facts are copied out under a short guard. The staleness
+        // gate locks `MultiRaft`, so it runs only after the guard drops.
+        let routed: Vec<Option<RoutedTask>> = {
+            let routing = routing.read().unwrap_or_else(|p| p.into_inner());
+            tasks
+                .iter()
+                .map(|task| {
+                    let group_id = routing.group_for_vshard(task.vshard_id.as_u32()).ok()?;
+                    let info = routing.group_info(group_id)?;
+                    let is_member = info.members.contains(&my_node);
+                    Some(RoutedTask {
+                        group_id,
+                        leader: info.leader,
+                        is_member,
+                        hosts_replica: is_member || info.learners.contains(&my_node),
+                    })
+                })
+                .collect()
+        };
 
-        let groups = tasks.iter().map(|task| {
-            let Ok(group_id) = routing.group_for_vshard(task.vshard_id.as_u32()) else {
+        let groups = routed.into_iter().map(|routed| {
+            let Some(RoutedTask {
+                group_id,
+                leader,
+                is_member,
+                hosts_replica,
+            }) = routed
+            else {
                 return TaskGroup::Unmapped;
             };
-            let Some(info) = routing.group_info(group_id) else {
-                return TaskGroup::Unmapped;
-            };
-            let is_member = info.members.contains(&my_node);
             // Only cheap when consistency carries no bound: `max_staleness()`
             // returns `None` and the gate is never touched.
             let replica_fresh = self.replica_satisfies(group_id, consistency);
-            let hosts_replica = is_member || info.learners.contains(&my_node);
             // A node with no replica of the group has nothing to run locally:
             // a read will see none of its rows, and a proposal will wait for
             // an apply that never reaches this node. With no leader to forward
             // to, the task waits for one.
-            let placement = if !hosts_replica && (info.leader == 0 || info.leader == my_node) {
+            let placement = if !hosts_replica && (leader == 0 || leader == my_node) {
                 GroupPlacement::NoLeader
             } else {
                 placement_for_group(
-                    info.leader,
+                    leader,
                     my_node,
                     is_member,
                     consistency,

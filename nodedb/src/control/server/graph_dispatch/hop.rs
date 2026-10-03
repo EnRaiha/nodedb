@@ -27,7 +27,7 @@
 //! fully-attributed for BOTH the local-shard and remote-shard portions.
 //!
 //! Ownership is resolved against LIVE Raft leadership (via
-//! [`resolve_decision`] with a live-leader lookup), not the cached routing
+//! [`LiveLeaders::resolve`]), not the cached routing
 //! table, so a stale routing hint cannot misroute a frontier node.
 
 use std::collections::HashMap;
@@ -38,7 +38,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::gateway::dispatcher::{
     DispatchRouteParams, dispatch_route, statement_deadline_ms,
 };
-use crate::control::gateway::router::resolve_decision;
+use crate::control::gateway::live_leaders::LiveLeaders;
 use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::gateway::{RouteDecision, TaskRoute};
 use crate::control::state::SharedState;
@@ -202,7 +202,7 @@ struct RemoteOwnerBatch {
 /// remote-owned subsets grouped by `(owner node, vShard)`.
 ///
 /// Ownership is resolved against LIVE Raft leadership via
-/// [`resolve_decision`] with a live-leader lookup, so a stale routing hint
+/// [`LiveLeaders::resolve`], so a stale routing hint
 /// cannot misroute a frontier node. A node whose owning vShard currently has
 /// no known leader (`LeaderUnknown`) is a hard error — we never silently
 /// degrade to a local-only expansion that will return a partial set.
@@ -210,24 +210,12 @@ fn partition_frontier_by_owner(
     shared: &SharedState,
     frontier: &[String],
 ) -> crate::Result<(Vec<String>, Vec<RemoteOwnerBatch>)> {
+    // Raft snapshot first, routing guard second: see `LiveLeaders`.
+    let live = LiveLeaders::snapshot(shared);
     let routing_guard = shared
         .cluster_routing
         .as_ref()
         .map(|rw| rw.read().unwrap_or_else(|p| p.into_inner()));
-    let raft_snapshot: Vec<nodedb_cluster::GroupStatus> =
-        shared.raft_status_fn.get().map(|f| f()).unwrap_or_default();
-    let live_leader = move |group_id: u64| -> u64 {
-        raft_snapshot
-            .iter()
-            .find(|gs| gs.group_id == group_id)
-            .map(|gs| gs.leader_id)
-            .unwrap_or(0)
-    };
-    let live_lookup: Option<&dyn Fn(u64) -> u64> = if shared.raft_status_fn.get().is_some() {
-        Some(&live_leader)
-    } else {
-        None
-    };
 
     let mut local: Vec<String> = Vec::new();
     // Group remote nodes by owning vShard so each owner gets one batched plan.
@@ -235,12 +223,7 @@ fn partition_frontier_by_owner(
 
     for node in frontier {
         let vshard_id = VShardId::from_key(node.as_bytes()).as_u32();
-        let decision = resolve_decision(
-            vshard_id,
-            shared.node_id,
-            routing_guard.as_deref(),
-            live_lookup,
-        );
+        let decision = live.resolve(vshard_id, shared.node_id, routing_guard.as_deref());
         match decision {
             RouteDecision::Local => local.push(node.clone()),
             RouteDecision::Remote {

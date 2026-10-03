@@ -16,5 +16,5 @@ pub use barrier::{authorization_barrier, calvin_write_barrier};
 pub use calvin_acks::CalvinAckCoverage;
 pub use holder::{LeaseHolder, RenewAttempt};
 pub use service::LeaderLeaseService;
-pub use status::{LeaseStatus, await_planning_admitted, lease_status};
+pub use status::{LeaseStatus, await_planning_admitted, lease_status, planning_admitted_within};
 pub use timing::LeaseTiming;

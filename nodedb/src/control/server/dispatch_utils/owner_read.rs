@@ -26,6 +26,7 @@ use crate::control::cluster::linearizable_read::{
 };
 use crate::control::gateway::RouteDecision;
 use crate::control::gateway::core::QueryContext;
+use crate::control::gateway::live_leaders::resolve_live_decision;
 use crate::control::security::identity::{Permission, required_permission};
 use crate::control::server::payload_merge::merge_msgpack_arrays;
 use crate::control::state::SharedState;
@@ -223,31 +224,8 @@ pub(crate) async fn prepare_local_pass(
 
 /// Whether live Raft names this node the leader of `vshard_id`'s group.
 fn leads_vshard(shared: &SharedState, vshard_id: VShardId) -> bool {
-    let routing = shared
-        .cluster_routing
-        .as_ref()
-        .map(|lock| lock.read().unwrap_or_else(|p| p.into_inner()));
-    let raft_snapshot: Vec<nodedb_cluster::GroupStatus> =
-        shared.raft_status_fn.get().map(|f| f()).unwrap_or_default();
-    let live_leader = |group_id: u64| -> u64 {
-        raft_snapshot
-            .iter()
-            .find(|status| status.group_id == group_id)
-            .map(|status| status.leader_id)
-            .unwrap_or(0)
-    };
-    let live_lookup: Option<&dyn Fn(u64) -> u64> = if shared.raft_status_fn.get().is_some() {
-        Some(&live_leader)
-    } else {
-        None
-    };
     matches!(
-        crate::control::gateway::router::resolve_decision(
-            vshard_id.as_u32(),
-            shared.node_id,
-            routing.as_deref(),
-            live_lookup,
-        ),
+        resolve_live_decision(shared, vshard_id.as_u32()),
         RouteDecision::Local
     )
 }

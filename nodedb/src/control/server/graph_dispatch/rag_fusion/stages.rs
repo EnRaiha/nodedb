@@ -16,9 +16,10 @@ use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId};
 
-use super::super::cluster_resolve::{gateway_shared, resolve_for_vshard};
+use super::super::cluster_resolve::gateway_shared;
 use super::super::shard_reads::ShardReadLog;
 use super::super::whole_graph::scatter_to_graph_owners;
+use crate::control::gateway::live_leaders::resolve_live_decision;
 
 /// `plan`, a RAG fusion, set to run `stage`.
 pub(super) fn with_stage(plan: &PhysicalPlan, stage: RagStage) -> PhysicalPlan {
@@ -60,7 +61,7 @@ pub(super) async fn export_legs(
         linearizable,
     } = scope;
     let shared = gateway_shared(state)?;
-    let decision = resolve_for_vshard(state, vshard);
+    let decision = resolve_live_decision(state, vshard);
     let served_by = match decision {
         crate::control::gateway::RouteDecision::Remote { node_id, .. } => node_id,
         _ => state.node_id,

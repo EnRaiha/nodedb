@@ -82,8 +82,10 @@ pub struct AppendEntriesResponse {
     pub term: u64,
     /// True if follower contained entry matching prev_log_index and prev_log_term.
     pub success: bool,
-    /// Optimization: on rejection, the follower's last log index.
-    /// Allows leader to skip back faster than decrementing one-by-one.
+    /// On success, the last entry the follower shares with the leader and
+    /// holds durably. The leader takes it as the follower's match index.
+    /// On rejection, the follower's last log index, so the leader skips back
+    /// faster than one entry at a time.
     pub last_log_index: u64,
     /// `round` of the request this answers.
     pub round: u64,

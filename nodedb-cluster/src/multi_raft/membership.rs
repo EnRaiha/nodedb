@@ -88,14 +88,6 @@ impl MultiRaft {
         self.groups.get(&group_id)?.peer_ack_count(peer)
     }
 
-    /// Whether this node leads `group_id` by an election against other
-    /// voters that no leadership transfer started.
-    pub fn leads_by_contested_election(&self, group_id: u64) -> bool {
-        self.groups
-            .get(&group_id)
-            .is_some_and(|node| node.leads_by_contested_election())
-    }
-
     /// Whether `peer` holds every entry this leader has committed in
     /// `group_id`, and did not ask for a snapshot last. `false` when this
     /// node does not lead the group.

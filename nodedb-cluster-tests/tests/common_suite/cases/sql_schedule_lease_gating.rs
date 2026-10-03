@@ -10,6 +10,8 @@
 //! - While one node holds the lease, only that node records runs.
 //! - Once that node is cut off from both peers, its lease lapses and it
 //!   records no further run. A peer takes the lease and records runs.
+//! - The leader balancer can move the lease between the live peers, so
+//!   either peer can fire. No two nodes ever fire the same minute.
 //!
 //! The test waits on minute boundaries, so it runs for a few minutes.
 
@@ -26,8 +28,8 @@ const CONVERGE: Duration = Duration::from_secs(30);
 const FIRE_WAIT: Duration = Duration::from_secs(150);
 const STEP: Duration = Duration::from_millis(250);
 
-/// Runs `node` recorded for the schedule.
-fn runs(node: &TestClusterNode) -> usize {
+/// The minute of each run `node` recorded for the schedule.
+fn run_minutes(node: &TestClusterNode) -> Vec<u64> {
     let Some(def) = node
         .shared
         .schedule_registry
@@ -35,12 +37,19 @@ fn runs(node: &TestClusterNode) -> usize {
         .into_iter()
         .find(|def| def.name == SCHEDULE)
     else {
-        return 0;
+        return Vec::new();
     };
     node.shared
         .job_history
         .last_runs(def.database_id, def.tenant_id, SCHEDULE, 100)
-        .len()
+        .iter()
+        .map(|run| run.started_at / 60_000)
+        .collect()
+}
+
+/// Runs `node` recorded for the schedule.
+fn runs(node: &TestClusterNode) -> usize {
+    run_minutes(node).len()
 }
 
 /// Cut `node_id` off from every other node, both ways.
@@ -144,38 +153,25 @@ async fn a_cross_collection_schedule_fires_only_on_the_lease_holder() {
             == 1
     })
     .await;
-    let second = peers
-        .iter()
-        .find(|node| holds_vshard0_lease(node))
-        .map(|node| node.node_id)
-        .expect("the new holder");
 
-    // The new holder fires. The cut-off node, through the same minute
-    // boundaries, fires nothing more.
-    wait_for(
-        "the new lease holder fires the schedule",
-        FIRE_WAIT,
-        STEP,
-        || {
-            peers
-                .iter()
-                .any(|node| node.node_id == second && runs(node) > 0)
-        },
-    )
+    // A peer fires. The cut-off node, through the same minute boundaries,
+    // fires nothing more.
+    wait_for("a peer fires the schedule", FIRE_WAIT, STEP, || {
+        peers.iter().any(|node| runs(node) > 0)
+    })
     .await;
     assert_eq!(
         runs(cut_off),
         lapsed_runs,
         "a node without its lease fires nothing"
     );
-    for node in peers.iter().filter(|node| node.node_id != second) {
-        assert_eq!(
-            runs(node),
-            0,
-            "node {} holds no lease and fires nothing",
-            node.node_id
-        );
-    }
+
+    // One coordinator fires each minute, whichever peer holds the lease.
+    let mut minutes: Vec<u64> = cluster.nodes.iter().flat_map(run_minutes).collect();
+    let fired = minutes.len();
+    minutes.sort_unstable();
+    minutes.dedup();
+    assert_eq!(minutes.len(), fired, "two nodes fired the same minute");
 
     cluster.shutdown().await;
 }

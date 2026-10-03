@@ -15,7 +15,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use crate::control::gateway::RouteDecision;
-use crate::control::server::graph_dispatch::cluster_resolve::resolve_for_vshard;
+use crate::control::gateway::live_leaders::resolve_live_decision;
 use crate::control::state::SharedState;
 use crate::engine::graph::pattern::executor::VarLenResume;
 use crate::types::VShardId;
@@ -86,7 +86,7 @@ pub(super) fn resume_to_pending(
         return Ok(None);
     };
     let target_vshard = VShardId::from_key(node_name.as_bytes()).as_u32();
-    let remote_coords = match resolve_for_vshard(state, target_vshard) {
+    let remote_coords = match resolve_live_decision(state, target_vshard) {
         RouteDecision::Local => None,
         RouteDecision::Remote { node_id, vshard_id } => Some((node_id, vshard_id)),
         RouteDecision::LeaderUnknown { vshard_id } => {
@@ -99,7 +99,7 @@ pub(super) fn resume_to_pending(
         }
         RouteDecision::Broadcast { .. } => {
             return Err(crate::Error::Internal {
-                detail: "match scatter: resolve_for_vshard returned Broadcast for a \
+                detail: "match scatter: resolve_live_decision returned Broadcast for a \
                          single vShard"
                     .into(),
             });

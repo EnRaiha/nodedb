@@ -51,13 +51,6 @@ impl<S: LogStorage> RaftNode<S> {
             .is_some_and(|leader| leader.awaiting_snapshot.contains(&peer))
     }
 
-    /// Whether this node leads by an election against other voters that no
-    /// leadership transfer started: a failover or a partition heal. A
-    /// bootstrap self-election and a transfer target's win are not.
-    pub fn leads_by_contested_election(&self) -> bool {
-        self.role == NodeRole::Leader && self.contested_win
-    }
-
     /// The leader this node names at `now`, when it has proof the leader is
     /// live: this node leads, or the leader reached it within
     /// `election_timeout_min`. `0` otherwise.
@@ -148,41 +141,6 @@ mod tests {
         node.become_follower(node.current_term());
         assert_eq!(node.leader_id(), 0);
         assert_eq!(node.live_leader(std::time::Instant::now()), 0);
-    }
-
-    #[test]
-    fn an_election_against_peers_is_contested_and_a_lone_or_transfer_win_is_not() {
-        let mut lone = RaftNode::new(test_config(1, vec![]), MemStorage::new());
-        force_election(&mut lone);
-        assert_eq!(lone.role(), NodeRole::Leader);
-        assert!(!lone.leads_by_contested_election());
-
-        let mut contested = RaftNode::new(test_config(1, vec![2, 3]), MemStorage::new());
-        force_election(&mut contested);
-        let _ = contested.take_ready();
-        contested.handle_request_vote_response(
-            2,
-            &RequestVoteResponse {
-                term: 1,
-                vote_granted: true,
-            },
-        );
-        assert_eq!(contested.role(), NodeRole::Leader);
-        assert!(contested.leads_by_contested_election());
-
-        let mut target = RaftNode::new(test_config(1, vec![2, 3]), MemStorage::new());
-        target.transfer_campaign_term = 1;
-        force_election(&mut target);
-        let _ = target.take_ready();
-        target.handle_request_vote_response(
-            2,
-            &RequestVoteResponse {
-                term: 1,
-                vote_granted: true,
-            },
-        );
-        assert_eq!(target.role(), NodeRole::Leader);
-        assert!(!target.leads_by_contested_election());
     }
 
     /// The leader's floor is the lowest voter's committed match. A voter

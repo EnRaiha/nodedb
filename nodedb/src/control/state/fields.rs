@@ -100,6 +100,9 @@ pub struct SharedState {
     pub cluster_topology: Option<Arc<RwLock<nodedb_cluster::ClusterTopology>>>,
     /// Cluster routing table. Boot wires it from the cluster handle; `None`
     /// only on a state no boot wired.
+    ///
+    /// Never call `raft_status_fn` or any `MultiRaft` path while holding this guard.
+    /// Take the Raft status first, then this guard. `LiveLeaders::snapshot` does that.
     pub cluster_routing: Option<Arc<RwLock<nodedb_cluster::RoutingTable>>>,
     /// Cluster transport for forwarding requests. Boot wires it from the
     /// cluster handle; `None` only on a state no boot wired.
@@ -173,6 +176,9 @@ pub struct SharedState {
     /// This node's cluster-epoch state. Set once by `start_raft`.
     pub cluster_epoch: OnceLock<Arc<nodedb_cluster::ClusterEpochState>>,
     /// Query Raft group statuses for observability. Set by `start_raft`.
+    ///
+    /// Locks `MultiRaft`, which then reads `cluster_routing`.
+    /// Never call it while holding a `cluster_routing` guard.
     pub raft_status_fn:
         std::sync::OnceLock<Arc<dyn Fn() -> Vec<nodedb_cluster::GroupStatus> + Send + Sync>>,
     /// Cluster observability handle. Set once by `start_raft`.

@@ -16,18 +16,24 @@ use super::membership::TOPOLOGY_GROUP_ID;
 
 impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// The leader counts a successful answer as this node holding the
-    /// entries durably. So the entries and any term bump are durable before
-    /// the answer leaves, and a restart cannot lose or forget them. The disk
-    /// write runs without the `MultiRaft` lock.
+    /// claimed entries durably. The answer waits only for what it claims:
+    /// - the latest term and vote, whoever staged them
+    /// - the entries and truncations this request staged, with every write
+    ///   staged before them
+    ///
+    /// A request that staged no entries claims only the durable prefix. It
+    /// never waits on writes the apply loop staged. The disk wait runs
+    /// without the `MultiRaft` lock.
     pub(super) async fn handle_append_entries_rpc(
         &self,
         req: AppendEntriesRequest,
     ) -> Result<RaftRpc> {
         let (resp, ticket) = {
             let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
+            let mark = mr.staged_through(req.group_id);
             let resp = mr.handle_append_entries(&req)?;
             mr.persist_group_hard_state(req.group_id)?;
-            (resp, mr.durability_ticket(req.group_id))
+            (resp, mr.reply_ticket(req.group_id, mark))
         };
         if let Some(ticket) = ticket {
             ticket.durable().await?;
@@ -35,15 +41,17 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         Ok(RaftRpc::AppendEntriesResponse(resp))
     }
 
-    /// `voted_for` and `current_term` are durable before the grant leaves
-    /// this node, so a restart cannot double-vote. The disk write runs
-    /// without the `MultiRaft` lock.
+    /// `voted_for` and `current_term` are durable before the answer leaves
+    /// this node, so a restart cannot double-vote. A repeated request that
+    /// staged nothing still waits for a vote an earlier one staged. The disk
+    /// wait runs without the `MultiRaft` lock.
     pub(super) async fn handle_request_vote_rpc(&self, req: RequestVoteRequest) -> Result<RaftRpc> {
         let (resp, ticket) = {
             let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
+            let mark = mr.staged_through(req.group_id);
             let resp = mr.handle_request_vote(&req)?;
             mr.persist_group_hard_state(req.group_id)?;
-            (resp, mr.durability_ticket(req.group_id))
+            (resp, mr.reply_ticket(req.group_id, mark))
         };
         if let Some(ticket) = ticket {
             ticket.durable().await?;

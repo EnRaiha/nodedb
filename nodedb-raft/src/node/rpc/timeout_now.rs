@@ -32,7 +32,6 @@ impl<S: LogStorage> RaftNode<S> {
         {
             self.start_election();
             let term = self.hard_state.current_term;
-            self.transfer_campaign_term = term;
             for (_, vote) in self.ready.vote_requests.iter_mut() {
                 if vote.term == term {
                     vote.transfer = true;

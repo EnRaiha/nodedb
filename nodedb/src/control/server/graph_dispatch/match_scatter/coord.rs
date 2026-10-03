@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::bridge::envelope::Payload;
 use crate::control::gateway::RouteDecision;
-use crate::control::server::graph_dispatch::cluster_resolve::resolve_for_vshard;
+use crate::control::gateway::live_leaders::resolve_live_decision;
 use crate::control::state::SharedState;
 use crate::engine::graph::pattern::executor::{UnresolvedExpansion, VarLenResume, rows_to_msgpack};
 use crate::types::{DatabaseId, TenantId, VShardId};
@@ -288,7 +288,7 @@ fn frontier_to_continuations(
     let mut out = Vec::new();
     for entry in frontier {
         let target_vshard = VShardId::from_key(entry.node_name.as_bytes()).as_u32();
-        let decision = resolve_for_vshard(state, target_vshard);
+        let decision = resolve_live_decision(state, target_vshard);
         let owner_node = match decision {
             RouteDecision::Local => state.node_id,
             RouteDecision::Remote { node_id, .. } => node_id,

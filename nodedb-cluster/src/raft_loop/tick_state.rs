@@ -6,22 +6,20 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use nodedb_raft::LogEntry;
 use tokio::sync::mpsc;
+
+use super::leader_balance::{PeerHealth, PeerSample};
 
 /// Samples, records and in-flight markers of the leader-balance and
 /// leader-probe phases, and the metadata lane's sender. Every mutex is a
 /// leaf lock: no other lock is taken while one is held.
 #[derive(Debug, Default)]
 pub struct TickState {
-    /// `(group_id, peer) -> AppendEntries responses` the leader had counted
-    /// from `peer` at the previous balance pass.
-    ack_samples: Mutex<HashMap<(u64, u64), u64>>,
-    /// `group_id -> when this node was first seen leading it` for each
-    /// group it leads now.
-    led_since: Mutex<HashMap<u64, Instant>>,
+    /// `(group_id, peer) -> health record` of each preferred leader the
+    /// balance sampled within the last few passes.
+    peer_health: Mutex<HashMap<(u64, u64), PeerHealth>>,
     /// Groups with a leader probe in flight.
     probes_in_flight: Mutex<HashSet<u64>>,
     /// Groups whose mount is opening their disk.
@@ -67,54 +65,29 @@ impl TickState {
             .remove(&group_id);
     }
 
-    /// Record `now` as the start of this node's leadership of `group_id`
-    /// when the group has no record yet.
-    pub(super) fn note_led(&self, group_id: u64, now: Instant) {
-        self.led_since
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .entry(group_id)
-            .or_insert(now);
-    }
-
-    /// How long this node has led `group_id` at `now`. Zero for a group
-    /// with no record.
-    pub(super) fn led_for(&self, group_id: u64, now: Instant) -> Duration {
-        self.led_since
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&group_id)
-            .map_or(Duration::ZERO, |since| {
-                now.saturating_duration_since(*since)
-            })
-    }
-
-    /// Record `count` responses from `peer` in `group_id`, and return
-    /// whether the count rose since the previous pass. A peer that answers
-    /// no heartbeat between two passes is not live.
-    pub(super) fn peer_answered_since_last_pass(
+    /// Record the balance pass `pass` sample of `peer` in `group_id`, and
+    /// return the peer's updated health record.
+    pub(super) fn observe_peer_health(
         &self,
         group_id: u64,
         peer: u64,
-        count: u64,
-    ) -> bool {
-        let mut samples = self.ack_samples.lock().unwrap_or_else(|p| p.into_inner());
-        let previous = samples.insert((group_id, peer), count);
-        previous.is_some_and(|previous| count > previous)
+        sample: PeerSample,
+        pass: u64,
+    ) -> PeerHealth {
+        let mut records = self.peer_health.lock().unwrap_or_else(|p| p.into_inner());
+        let previous = records.get(&(group_id, peer)).copied();
+        let next = PeerHealth::next(previous, sample, pass);
+        records.insert((group_id, peer), next);
+        next
     }
 
-    /// Forget every sample and record of a group this node no longer leads.
-    /// The maps stay bounded by the groups it leads and their voters, and a
-    /// node that leads a group again starts a new record.
-    pub(super) fn retain_led(&self, leading: &HashSet<u64>) {
-        self.ack_samples
+    /// Forget every record too old to count at balance pass `pass`. The map
+    /// stays bounded by the groups this node led recently and their voters.
+    pub(super) fn forget_stale_peer_health(&self, pass: u64) {
+        self.peer_health
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .retain(|(group_id, _), _| leading.contains(group_id));
-        self.led_since
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .retain(|group_id, _| leading.contains(group_id));
+            .retain(|_, record| record.is_current(pass));
     }
 
     /// Mark a probe of `group_id` in flight. Returns `false` when one is.
@@ -193,6 +166,7 @@ impl TickState {
 
 #[cfg(test)]
 mod tests {
+    use super::super::leader_balance::{PEER_HEALTH_GAP_PASSES, PREFERRED_HEALTHY_PASSES};
     use super::*;
 
     fn entry(index: u64) -> LogEntry {
@@ -203,35 +177,40 @@ mod tests {
         }
     }
 
+    fn healthy(term: u64, acks: u64) -> PeerSample {
+        PeerSample {
+            term,
+            acks,
+            caught_up: true,
+        }
+    }
+
     #[test]
-    fn a_peer_is_live_only_when_its_count_rose_since_the_last_pass() {
+    fn a_peer_record_carries_from_pass_to_pass() {
         let state = TickState::new();
+        let first = state.observe_peer_health(1, 2, healthy(1, 5), 0);
+        assert!(!first.earned_leadership(), "no earlier pass");
+        let mut last = first;
+        for pass in 1..=u64::from(PREFERRED_HEALTHY_PASSES) {
+            last = state.observe_peer_health(1, 2, healthy(1, 5 + pass), pass);
+        }
+        assert!(last.earned_leadership());
+        // Another group's record is separate.
         assert!(
-            !state.peer_answered_since_last_pass(1, 2, 5),
-            "no earlier pass"
-        );
-        assert!(
-            !state.peer_answered_since_last_pass(1, 2, 5),
-            "no new response"
-        );
-        assert!(state.peer_answered_since_last_pass(1, 2, 9));
-        state.retain_led(&HashSet::new());
-        assert!(
-            !state.peer_answered_since_last_pass(1, 2, 12),
-            "samples dropped"
+            !state
+                .observe_peer_health(3, 2, healthy(1, 100), 5)
+                .earned_leadership()
         );
     }
 
     #[test]
-    fn leadership_time_counts_from_the_first_sight() {
+    fn stale_peer_records_are_forgotten() {
         let state = TickState::new();
-        let start = Instant::now();
-        state.note_led(1, start);
-        state.note_led(1, start + Duration::from_secs(5));
-        let later = start + Duration::from_secs(3);
-        assert_eq!(state.led_for(1, later), Duration::from_secs(3));
-        state.retain_led(&HashSet::new());
-        assert_eq!(state.led_for(1, later), Duration::ZERO);
+        state.observe_peer_health(1, 2, healthy(1, 5), 0);
+        state.forget_stale_peer_health(PEER_HEALTH_GAP_PASSES);
+        assert_eq!(state.peer_health.lock().unwrap().len(), 1);
+        state.forget_stale_peer_health(PEER_HEALTH_GAP_PASSES + 1);
+        assert!(state.peer_health.lock().unwrap().is_empty());
     }
 
     #[test]

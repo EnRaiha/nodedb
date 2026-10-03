@@ -26,7 +26,8 @@ use crate::transport::topology_identity_store::TopologyIdentityStore;
 /// Resilience features:
 /// - **Retry**: Transient transport failures are retried with exponential backoff.
 /// - **Circuit breaker**: Peers with consecutive failures are fast-failed until cooldown.
-/// - **Connection eviction**: Stale connections are evicted on failure and re-established on retry.
+/// - **Connection eviction**: A connection that failed is evicted and re-established on retry.
+/// - **Single-flight dial**: Concurrent sends to one peer share one dial.
 ///
 /// [`RaftTransport`]: nodedb_raft::transport::RaftTransport
 /// [`serve`]: Self::serve
@@ -38,6 +39,8 @@ pub struct NexarTransport {
     pub(super) peers: RwLock<HashMap<u64, quinn::Connection>>,
     /// Known peer addresses for connection establishment.
     pub(super) peer_addrs: RwLock<HashMap<u64, SocketAddr>>,
+    /// Per-peer gates that make dials single-flight. See [`super::pool`].
+    pub(super) dial_gates: super::pool::DialGates,
     pub(super) rpc_timeout: Duration,
     pub(super) circuit_breaker: Arc<CircuitBreaker>,
     pub(super) retry_policy: RetryPolicy,
@@ -220,6 +223,7 @@ impl NexarTransport {
             client_config,
             peers: RwLock::new(HashMap::new()),
             peer_addrs: RwLock::new(HashMap::new()),
+            dial_gates: super::pool::DialGates::default(),
             rpc_timeout,
             circuit_breaker: Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())),
             retry_policy: RetryPolicy::default(),
@@ -415,7 +419,7 @@ pub struct TransportPeerSnapshot {
 /// Unit tests for [`NexarTransport`]: end-to-end RPC roundtrips, concurrent
 /// fan-out, connection reuse, and unreachable-peer errors.
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
@@ -437,6 +441,12 @@ mod tests {
 
     /// The group `EchoHandler` does not host.
     const UNHOSTED_GROUP: u64 = 404;
+
+    /// The group whose vote requests `EchoHandler` answers after [`STALL`].
+    pub(crate) const STALLED_GROUP: u64 = 503;
+
+    /// How long `EchoHandler` holds a vote request of [`STALLED_GROUP`].
+    pub(crate) const STALL: Duration = Duration::from_secs(2);
 
     /// AppendEntries requests `EchoHandler` refused for `UNHOSTED_GROUP`.
     static UNHOSTED_APPENDS: AtomicU32 = AtomicU32::new(0);
@@ -461,6 +471,13 @@ mod tests {
                         last_log_index: req.prev_log_index + req.entries.len() as u64,
                         round: req.round,
                         needs_snapshot: false,
+                    }))
+                }
+                RaftRpc::RequestVoteRequest(req) if req.group_id == STALLED_GROUP => {
+                    tokio::time::sleep(STALL).await;
+                    Ok(RaftRpc::RequestVoteResponse(RequestVoteResponse {
+                        term: req.term,
+                        vote_granted: true,
                     }))
                 }
                 RaftRpc::RequestVoteRequest(req) => {
@@ -619,7 +636,7 @@ mod tests {
         );
     }
 
-    fn make_transport(node_id: u64) -> NexarTransport {
+    pub(crate) fn make_transport(node_id: u64) -> NexarTransport {
         NexarTransport::new(
             node_id,
             "127.0.0.1:0".parse().unwrap(),
@@ -928,7 +945,7 @@ mod tests {
     }
 
     /// Start `EchoHandler` on node 1 and a client on node 2 that knows it.
-    async fn serve_echo() -> (
+    pub(crate) async fn serve_echo() -> (
         Arc<NexarTransport>,
         Arc<NexarTransport>,
         tokio::sync::watch::Sender<bool>,

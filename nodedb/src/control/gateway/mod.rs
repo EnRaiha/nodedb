@@ -11,6 +11,7 @@ pub mod error_map;
 pub mod fuser;
 pub mod invalidation;
 pub mod key_extractor;
+pub mod live_leaders;
 pub mod lowered_plan;
 pub mod outcome;
 pub mod plan_cache;
