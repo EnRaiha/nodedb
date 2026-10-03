@@ -3,11 +3,9 @@
 //! Protocol-neutral DDL handlers for type guard field constraints on
 //! schemaless collections.
 //!
-//! Ported from the pgwire `ddl::typeguard::handlers`. All catalog logic
-//! (get/put collection, schemaless check, duplicate pre-checks, `type_guards`
-//! mutation, `schema_version.bump()`) is preserved verbatim; only the result
-//! construction changed from pgwire `Response` / `PgWireError` to the
-//! protocol-neutral [`DdlResult`] / [`DdlError`].
+//! The get/put collection, schemaless check, duplicate pre-checks,
+//! `type_guards` mutation, and `schema_version.bump()` run here. The result is
+//! the protocol-neutral [`DdlResult`] / [`DdlError`].
 //!
 //! Syntax:
 //! ```sql
@@ -55,7 +53,7 @@ fn status(command: &str) -> Vec<DdlResult> {
 // ── CREATE TYPEGUARD ──────────────────────────────────────────────────────────
 
 /// Handle `CREATE [OR REPLACE] TYPEGUARD ON <collection> ( field TYPE [REQUIRED] [CHECK (expr)], ... )`.
-pub fn create_typeguard(
+pub async fn create_typeguard(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
@@ -100,7 +98,8 @@ pub fn create_typeguard(
     }
 
     coll.type_guards = guards;
-    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, &coll)
+        .await
         .map_err(|e| DdlError::from_error(&e))?;
 
     state.schema_version.bump();
@@ -111,7 +110,7 @@ pub fn create_typeguard(
 // ── ALTER TYPEGUARD ───────────────────────────────────────────────────────────
 
 /// Handle `ALTER TYPEGUARD ON <collection> ADD field TYPE [REQUIRED] [CHECK (expr)]`.
-pub fn alter_typeguard_add(
+pub async fn alter_typeguard_add(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
@@ -152,7 +151,8 @@ pub fn alter_typeguard_add(
     }
 
     coll.type_guards.push(guard);
-    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, &coll)
+        .await
         .map_err(|e| DdlError::from_error(&e))?;
 
     state.schema_version.bump();
@@ -161,7 +161,7 @@ pub fn alter_typeguard_add(
 }
 
 /// Handle `ALTER TYPEGUARD ON <collection> DROP field`.
-pub fn alter_typeguard_drop(
+pub async fn alter_typeguard_drop(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
@@ -194,7 +194,8 @@ pub fn alter_typeguard_drop(
         ));
     }
 
-    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, &coll)
+        .await
         .map_err(|e| DdlError::from_error(&e))?;
 
     state.schema_version.bump();
@@ -203,16 +204,16 @@ pub fn alter_typeguard_drop(
 }
 
 /// Dispatch `ALTER TYPEGUARD ON <collection> ADD|DROP ...`.
-pub fn alter_typeguard(
+pub async fn alter_typeguard(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let upper = sql.to_uppercase();
     if upper.contains(" ADD ") {
-        alter_typeguard_add(state, identity, sql)
+        alter_typeguard_add(state, identity, sql).await
     } else if upper.contains(" DROP ") {
-        alter_typeguard_drop(state, identity, sql)
+        alter_typeguard_drop(state, identity, sql).await
     } else {
         Err(err(
             "42601",
@@ -224,7 +225,7 @@ pub fn alter_typeguard(
 // ── DROP TYPEGUARD ────────────────────────────────────────────────────────────
 
 /// Handle `DROP TYPEGUARD [IF EXISTS] ON <collection>`.
-pub fn drop_typeguard(
+pub async fn drop_typeguard(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
@@ -253,7 +254,8 @@ pub fn drop_typeguard(
     }
 
     coll.type_guards.clear();
-    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, &coll)
+        .await
         .map_err(|e| DdlError::from_error(&e))?;
 
     state.schema_version.bump();

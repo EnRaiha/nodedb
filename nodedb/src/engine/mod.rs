@@ -4,6 +4,7 @@ pub mod array;
 pub mod bitemporal;
 pub mod crdt;
 pub mod document;
+pub mod durability_gate;
 pub mod graph;
 pub mod kv;
 pub mod random;

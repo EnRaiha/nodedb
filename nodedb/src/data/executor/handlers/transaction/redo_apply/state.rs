@@ -68,7 +68,7 @@ impl RedoApplyState {
 impl crate::data::executor::core_loop::CoreLoop {
     /// Arm restart replay with the sum targets each Calvin record carries.
     /// Returns whether this is restart replay: a committed-redo apply folds
-    /// from its open scope instead, and leaves `folds` unused.
+    /// from its open scope instead, and leaves them unused.
     pub(crate) fn begin_replay_folds(&mut self, folds: HashMap<u64, Vec<RedoSumTargets>>) -> bool {
         let restart = self.redo_apply.scope.is_none();
         if restart {
@@ -134,11 +134,25 @@ pub(in crate::data::executor) struct RedoApplyScope {
     /// Timeseries collections the install ingested into, settled once it
     /// succeeded.
     pub(in crate::data::executor) timeseries_written: Vec<CollectionKey>,
+    /// What each resolved timeseries batch the install stored, in install
+    /// order. The apply answers their counts.
+    pub(in crate::data::executor) ts_installs: Vec<TsInstalled>,
     /// Events the install's writes raised, sent once it succeeded.
     pub(in crate::data::executor) pending_events: Vec<crate::event::WriteEvent>,
     /// Write versions the install's writes produced, published once the
     /// record settled.
     pub(in crate::data::executor) write_versions: Vec<DeferredWriteVersion>,
+    /// Who committed the record: a restore's document puts carry their
+    /// source chain link, which the install relinks instead of refusing.
+    pub(in crate::data::executor) origin: nodedb_physical::physical_plan::RedoOrigin,
+}
+
+/// What one resolved timeseries batch a committed redo install stored.
+pub(in crate::data::executor) struct TsInstalled {
+    pub count: crate::engine::timeseries::install_counts::TsInstallCount,
+    /// The image of each landed row as a scan reads it, in row order. Empty
+    /// when the batch carried no images.
+    pub images: Vec<Vec<u8>>,
 }
 
 /// One write version an install pass holds back until the record settles.
@@ -173,9 +187,20 @@ impl RedoApplyScope {
             arrays_written: Vec::new(),
             columnar_written: Vec::new(),
             timeseries_written: Vec::new(),
+            ts_installs: Vec::new(),
             pending_events: Vec::new(),
             write_versions: Vec::new(),
+            origin: nodedb_physical::physical_plan::RedoOrigin::Commit,
         }
+    }
+
+    /// The scope of a record `origin` committed.
+    pub(in crate::data::executor) fn with_origin(
+        mut self,
+        origin: nodedb_physical::physical_plan::RedoOrigin,
+    ) -> Self {
+        self.origin = origin;
+        self
     }
 
     /// Hold back one write version until the record settles. The validate

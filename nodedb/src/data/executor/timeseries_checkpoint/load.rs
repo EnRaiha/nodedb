@@ -16,10 +16,14 @@
 //! committed partition, and silently dropping it would under-restore the
 //! collection while its stamp says its records need no replay. The same holds
 //! for a stamp file that is present but does not decode.
+//!
+//! It also seeds each collection's empty memtable with its flushed schema
+//! (`schema.rs`), under the same rule for a file that does not decode.
 
 use tracing::info;
 
 use crate::data::executor::core_loop::CoreLoop;
+use crate::engine::timeseries::columnar_memtable::{ColumnarMemtable, ColumnarMemtableConfig};
 use crate::engine::timeseries::partition_registry::{PartitionEntry, PartitionRegistry};
 use crate::types::{DatabaseId, TenantId};
 
@@ -100,6 +104,16 @@ impl CoreLoop {
             None => stamp,
         };
         self.ts_replay_stamps.insert(key.clone(), merged);
+        // The memtable a flush drained kept its schema. An empty memtable
+        // with the flushed schema restores that state, so a record replayed
+        // or applied next meets the schema every other replica holds.
+        if !self.columnar_memtables.contains_key(&key)
+            && let Some(schema) = super::schema::read_ts_schema(&ts_dir)?
+        {
+            let config = ColumnarMemtableConfig::from_tuning(&self.ts_tuning);
+            self.columnar_memtables
+                .insert(key.clone(), ColumnarMemtable::new(schema, config));
+        }
         if registry.partition_count() > 0 {
             info!(
                 collection,
@@ -157,15 +171,42 @@ fn enumerate_ts_collections(ts_root: &std::path::Path) -> Vec<(DatabaseId, Tenan
                 {
                     continue;
                 }
-                out.push((
-                    DatabaseId::new(database_id),
-                    TenantId::new(tenant_id),
-                    collection,
-                ));
+                // A non-default database qualifies its collections as
+                // `{database_id}/{name}`, so their directories sit one level
+                // deeper, under the database id.
+                let database = DatabaseId::new(database_id);
+                if database != DatabaseId::DEFAULT && collection == database_id.to_string() {
+                    for name in qualified_collections(&coll_dir.path()) {
+                        out.push((
+                            database,
+                            TenantId::new(tenant_id),
+                            nodedb_types::QualifiedCollection::new(database, &name)
+                                .as_str()
+                                .to_string(),
+                        ));
+                    }
+                    continue;
+                }
+                out.push((database, TenantId::new(tenant_id), collection));
             }
         }
     }
     out
+}
+
+/// The bare names of the collection directories under `dir`, the directory a
+/// non-default database's qualified collections live in. Aside directories
+/// of a truncate are skipped.
+fn qualified_collections(dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| !crate::data::executor::handlers::timeseries::is_truncating_leftover(name))
+        .collect()
 }
 
 /// Build a registry from every committed partition directory under `ts_dir`.
@@ -281,6 +322,27 @@ mod tests {
                 (DatabaseId::new(0), TenantId::new(1), "metrics".to_string()),
                 (DatabaseId::new(0), TenantId::new(2), "events".to_string()),
             ]
+        );
+    }
+
+    /// A non-default database's collection directory sits under its database
+    /// id, and enumerates under its qualified name.
+    #[test]
+    fn enumerate_yields_qualified_collections_of_a_non_default_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ts_root = dir.path().join("ts");
+        let qualified = ts_root.join("1025").join("1").join("1025");
+        std::fs::create_dir_all(qualified.join("metrics")).expect("mkdir");
+        std::fs::create_dir_all(qualified.join("metrics.truncating-9")).expect("mkdir");
+
+        let found = enumerate_ts_collections(&ts_root);
+        assert_eq!(
+            found,
+            vec![(
+                DatabaseId::new(1025),
+                TenantId::new(1),
+                "1025/metrics".to_string()
+            )]
         );
     }
 

@@ -106,7 +106,14 @@ pub(in crate::data::executor) enum UndoEntry {
         /// mutated it. Outer `None` = op didn't touch the chain (no-op on undo);
         /// `Some(None)` = no prior entry (genesis insert → remove key on undo);
         /// `Some(Some(prev))` = restore the key to `prev` on undo.
-        chain_hash_prior: Option<Option<String>>,
+        chain_hash_prior: Option<Option<crate::types::hash_chain::ChainHead>>,
+    },
+    /// Put a collection's hash-chain head back to `prior`, the head before a
+    /// write that linked rows without its own document undo entry. `None` =
+    /// no head before (genesis).
+    ChainHead {
+        collection: String,
+        prior: Option<crate::types::hash_chain::ChainHead>,
     },
     /// Undo a PointDelete by re-inserting the document.
     DeleteDocument {
@@ -131,7 +138,7 @@ pub(in crate::data::executor) enum UndoEntry {
         secondary_index_tuples: Vec<(String, String)>,
         /// Pre-image of `chain_hashes[(tenant, collection)]` before this op
         /// mutated it (see [`UndoEntry::PutDocument`] for semantics).
-        chain_hash_prior: Option<Option<String>>,
+        chain_hash_prior: Option<Option<crate::types::hash_chain::ChainHead>>,
     },
     /// Undo a VectorInsert by soft-deleting the inserted vector and removing
     /// the stale forward-insert `vector_doc_map` entry it created — mirroring
@@ -189,6 +196,9 @@ pub(in crate::data::executor) enum UndoEntry {
     /// Undo a graph edge write: remove the version it added and put the CSR
     /// back.
     EdgeWrite(Box<super::edge_write::EdgeWriteUndo>),
+    /// Undo a TRUNCATE share's edge cut: remove the cut it recorded and put
+    /// the CSR back.
+    EdgeCut(Box<super::edge_cut::EdgeCutUndo>),
     /// Undo a KV write (Put / Insert / InsertIfAbsent / InsertOnConflictUpdate /
     /// FieldSet / Incr / IncrFloat / Cas / GetSet) by reinstating the key's
     /// prior state.
@@ -228,8 +238,8 @@ pub(in crate::data::executor) enum UndoEntry {
     /// Undo a `mark_node_deleted` by removing the node from the in-memory
     /// deleted-nodes set (edge referential-integrity tracker).
     ///
-    /// The delete cascade records a deleted document's node id so a later
-    /// `EdgePut` to it is rejected as dangling. This tracker is IN-MEMORY, so
+    /// A delete records a deleted document's node id so a later `EdgePut`
+    /// of the same collection to it is rejected as dangling. This tracker is IN-MEMORY, so
     /// an aborted redb txn does not reverse it — a rolled-back tx DELETE must
     /// explicitly un-mark the node. Pushed ONLY when the forward mark newly
     /// inserted the node (`mark_node_deleted` returned `true`); a node a prior
@@ -240,6 +250,8 @@ pub(in crate::data::executor) enum UndoEntry {
     MarkNodeDeleted {
         database_id: u64,
         tid: u64,
+        /// The collection of the deleted row, which scopes the mark.
+        collection: String,
         node_id: String,
     },
     /// Undo a CRDT write by putting the collection's Loro document back.

@@ -161,5 +161,6 @@ where
         kind,
         affected,
         payload: Vec::new(),
+        returning_rows: Vec::new(),
     })
 }

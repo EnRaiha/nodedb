@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Integration tests for Phase L cluster transport security.
+//! Integration tests for cluster transport security.
 //!
 //! These tests exercise the full Raft-over-QUIC and SWIM-over-UDP paths
-//! end-to-end against the security properties L.1 / L.2 / L.3 / L.5 are
-//! supposed to enforce:
+//! end-to-end against the security properties the transports enforce:
 //!
-//! - **Raft mTLS (L.1):** transports built with different `TlsCredentials`
+//! - **Raft mTLS:** transports built with different `TlsCredentials`
 //!   (distinct CAs) cannot handshake and outbound RPCs fail. Mixing mTLS
 //!   and Insecure modes likewise fails.
-//! - **Raft frame MAC + anti-replay (L.2):** a forged request arriving
+//! - **Raft frame MAC + anti-replay:** a forged request arriving
 //!   on an authenticated QUIC stream with the wrong cluster MAC key is
 //!   rejected; a replayed frame from a captured envelope is rejected by
 //!   the per-peer seq window.
-//! - **SWIM UDP MAC (L.3):** a datagram signed with the wrong cluster
+//! - **SWIM UDP MAC:** a datagram signed with the wrong cluster
 //!   key is rejected; a datagram with a spoofed source address is
 //!   rejected.
 //! - **Counter observability:** `insecure_transport_count()` bumps for
@@ -65,6 +64,8 @@ impl RaftRpcHandler for EchoHandler {
                     term: req.term,
                     success: true,
                     last_log_index: req.prev_log_index + req.entries.len() as u64,
+                    round: req.round,
+                    needs_snapshot: false,
                 }))
             }
             RaftRpc::RequestVoteRequest(req) => {
@@ -202,6 +203,8 @@ fn sample_append(term: u64) -> AppendEntriesRequest {
         entries: vec![],
         leader_commit: 0,
         group_id: 0,
+        round: 1,
+        replicated_floor: 0,
     }
 }
 
@@ -258,7 +261,7 @@ fn install_shared_identity(nodes: &[(u64, [u8; 32])], transports: &[&Arc<NexarTr
     }
 }
 
-/// L.1: two transports under the same cluster CA can talk. Baseline.
+/// Raft mTLS: two transports under the same cluster CA can talk. Baseline.
 #[tokio::test]
 async fn l1_same_ca_mtls_connects() {
     let (ca, server_creds) = generate_node_credentials("nodedb").unwrap();
@@ -291,7 +294,7 @@ async fn l1_same_ca_mtls_connects() {
     assert_eq!(resp.term, 7);
 }
 
-/// L.1: transports under *different* CAs cannot handshake.
+/// Raft mTLS: transports under *different* CAs cannot handshake.
 #[tokio::test]
 async fn l1_different_ca_mtls_rejects_handshake() {
     let (_ca_a, server_creds) = generate_node_credentials("nodedb").unwrap();
@@ -335,7 +338,7 @@ async fn l1_different_ca_mtls_rejects_handshake() {
     );
 }
 
-/// L.1: Insecure server + mTLS client cannot handshake (server presents a
+/// Raft mTLS: Insecure server + mTLS client cannot handshake (server presents a
 /// self-signed cert not signed by the client's CA).
 #[tokio::test]
 async fn l1_insecure_server_rejected_by_mtls_client() {
@@ -371,7 +374,7 @@ async fn l1_insecure_server_rejected_by_mtls_client() {
     );
 }
 
-/// L.2: two transports sharing a CA but different MAC keys can complete
+/// Frame MAC: two transports sharing a CA but different MAC keys can complete
 /// the TLS handshake, but RPCs fail at the envelope MAC layer.
 #[tokio::test]
 async fn l2_mismatched_mac_key_rejects_rpcs() {
@@ -424,7 +427,7 @@ async fn l2_mismatched_mac_key_rejects_rpcs() {
     );
 }
 
-/// L.2: the per-peer sequence window rejects a replayed envelope.
+/// Anti-replay: the per-peer sequence window rejects a replayed envelope.
 /// Covered thoroughly by unit tests in `rpc_codec::peer_seq`; this
 /// integration test guards the wiring — a real bidi QUIC handshake
 /// producing many successful roundtrips must keep strictly-monotonic
@@ -463,7 +466,7 @@ async fn l2_many_sequential_rpcs_all_accepted() {
     }
 }
 
-/// L.3: two SWIM UDP transports with different cluster MAC keys. A ping
+/// SWIM UDP MAC: two SWIM UDP transports with different cluster MAC keys. A ping
 /// from the first is silently dropped by the second; the recv future
 /// errors with `SwimError::Decode { detail: "... MAC verification failed" }`.
 #[tokio::test]
@@ -502,7 +505,7 @@ async fn l3_swim_rejects_mismatched_mac_key() {
     assert!(err.to_string().contains("MAC verification failed"));
 }
 
-/// L.5 / observability: every `Insecure` construction bumps the counter.
+/// Observability: every `Insecure` construction bumps the counter.
 #[tokio::test]
 async fn observability_insecure_counter_monotonic() {
     let _guard = insecure_counter_guard().lock().await;

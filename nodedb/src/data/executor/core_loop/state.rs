@@ -156,21 +156,19 @@ pub struct CoreLoop {
     /// vShards that are paused for write operations (during Phase 3 migration cutover).
     pub(in crate::data::executor) paused_vshards: std::collections::HashSet<crate::types::VShardId>,
 
-    /// Nodes explicitly deleted via PointDelete cascade, keyed per
-    /// `(database, tenant)`. Used for edge referential integrity — an
-    /// `EdgePut` to a deleted node is rejected with `RejectedDanglingEdge`.
-    /// Cleared periodically or on compaction. Entries are raw user-visible
-    /// node names, structurally tenant-partitioned like every graph concern.
-    pub(in crate::data::executor) deleted_nodes:
-        HashMap<(nodedb_types::DatabaseId, TenantId), std::collections::HashSet<String>>,
+    /// Nodes whose rows a delete removed, keyed per `(database, tenant)`,
+    /// then by collection. Used for edge referential integrity — an
+    /// `EdgePut` of the same collection to a deleted node is rejected with
+    /// `RejectedDanglingEdge`. Cleared periodically or on compaction.
+    /// Entries are raw user-visible node names, structurally
+    /// tenant-partitioned like every graph concern.
+    pub(in crate::data::executor) deleted_nodes: HashMap<
+        (nodedb_types::DatabaseId, TenantId),
+        HashMap<String, std::collections::HashSet<String>>,
+    >,
 
-    /// Idempotency key deduplication: maps processed idempotency keys to
-    /// whether they succeeded (true) or failed (false). Uses `VecDeque`
-    /// for FIFO eviction order alongside `HashMap` for O(1) lookup.
-    /// Bounded to 16,384 entries.
-    pub(in crate::data::executor) idempotency_cache: HashMap<u64, bool>,
-    /// FIFO order of idempotency keys for correct eviction (oldest first).
-    pub(in crate::data::executor) idempotency_order: std::collections::VecDeque<u64>,
+    /// Whether each recent idempotency key succeeded.
+    pub(in crate::data::executor) idempotency: super::idempotency::IdempotencyCache,
 
     /// Per-stream sync high-watermark: the last `seq` durably applied for each
     /// `(producer_id, stream_id)` pair. Populated from WAL replay on startup;
@@ -328,9 +326,18 @@ pub struct CoreLoop {
     pub(in crate::data::executor) doc_configs:
         HashMap<(DatabaseId, TenantId, String), crate::engine::document::store::CollectionConfig>,
 
-    /// Per-collection last chain hash for HASH_CHAIN collections.
-    /// Maps (TenantId, collection) → last SHA-256 hash.
-    pub(in crate::data::executor) chain_hashes: HashMap<(DatabaseId, TenantId, String), String>,
+    /// Per-collection chain head of every HASH_CHAIN collection: the last
+    /// link's install-order position and hash.
+    pub(in crate::data::executor) chain_hashes:
+        HashMap<(DatabaseId, TenantId, String), crate::types::hash_chain::ChainHead>,
+
+    /// The chain link each in-flight write of a HASH_CHAIN row asks
+    /// `build_stored_body` to write, keyed by collection and row surrogate.
+    /// `ChainGuard` sets an entry before the write and clears it after.
+    pub(in crate::data::executor) chain_intents: HashMap<
+        ((DatabaseId, TenantId, String), u32),
+        crate::data::executor::enforcement::chain_guard::ChainIntent,
+    >,
 
     /// Query execution tuning parameters (sort run size, stream chunk size, etc.).
     /// Set at core spawn time from config; never changed at runtime.
@@ -391,13 +398,8 @@ pub struct CoreLoop {
     /// Shared system metrics — Arc is safe for `!Send` since all fields are atomic.
     pub(in crate::data::executor) metrics: Option<Arc<crate::control::metrics::SystemMetrics>>,
 
-    /// Event bus producer: emits WriteEvents to the Event Plane.
-    /// One per core, `!Send` once pinned. `None` if Event Plane is disabled.
-    pub(in crate::data::executor) event_producer: Option<crate::event::bus::EventProducer>,
-
-    /// Monotonic sequence counter for events emitted by this core.
-    /// Incremented on every successful event emission.
-    pub(in crate::data::executor) event_sequence: u64,
+    /// The event bus producer, its sequence, and the collections it emits for.
+    pub(in crate::data::executor) events: super::event_outlet::EventOutlet,
 
     /// Shared collection-scoped scan-quiesce registry.
     ///
@@ -462,25 +464,20 @@ pub struct CoreLoop {
     pub(in crate::data::executor) txn_created_columnar_engines:
         HashMap<crate::types::TxnId, std::collections::HashSet<(DatabaseId, TenantId, String)>>,
 
+    /// Timeseries collections a staged transaction resolved an ingest into,
+    /// with the transactions that hold each. From its resolve until its
+    /// overlay drops, a transaction's install must find the schema its rows
+    /// were resolved against, so an autocommit ingest that can refuse into
+    /// a held collection refuses and resolves again.
+    pub(in crate::data::executor) ts_resolve_holds:
+        HashMap<(DatabaseId, TenantId, String), std::collections::HashSet<crate::types::TxnId>>,
+
     /// Per-core last-write-LSN version index (per key + per collection),
     /// advanced by every committed write-apply. Type + GC in `write_index.rs`.
     pub(in crate::data::executor) write_index: super::write_index::WriteVersionIndex,
 
-    /// Scratch map (surrogate → resolve-time bitemporal stamp) consulted ONLY
-    /// by `apply_point_put` and `apply_point_delete`. Populated right before a
-    /// bitemporal document apply scope — from a committing transaction's
-    /// overlay sidecar (commit-time install) or a decoded stamped redo put or
-    /// delete sub-record (WAL replay, committed-redo apply) — and cleared right
-    /// after. When a surrogate has an entry, the put or tombstone is forced
-    /// onto the versioned store at the carried system time rather than a fresh
-    /// one, so every apply of the record agrees on the version key even when
-    /// `doc_configs` is empty (the real replay-time boot state).
-    pub(in crate::data::executor) active_bitemporal_stamps:
-        HashMap<u32, crate::data::executor::handlers::transaction::overlay::BitemporalStamp>,
-
-    /// Transaction-resolved graph system-time ordinal used for every edge
-    /// mutation in the current live apply/replay scope.
-    pub(in crate::data::executor) active_graph_system_from: Option<i64>,
+    /// The version keys the current record's apply forces.
+    pub(in crate::data::executor) apply_scope: super::apply_scope::ApplyScope,
 
     /// Staged Calvin transactions, the writes waiting on them, and the
     /// executing transaction's leader flag.
@@ -491,4 +488,6 @@ pub struct CoreLoop {
         crate::data::executor::handlers::transaction::redo_apply::RedoApplyState,
     /// Set once this core's state is unknown. It then refuses every request.
     pub(in crate::data::executor) fail_stop: super::fail_stop::CoreFailStop,
+    /// Record groups of queued journalled writes, and their held events.
+    pub(in crate::data::executor) write_set_journal: super::write_set_journal::WriteSetJournalState,
 }

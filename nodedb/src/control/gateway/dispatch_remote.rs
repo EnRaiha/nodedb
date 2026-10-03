@@ -21,7 +21,8 @@ use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId, TxnId, VShardId};
 use nodedb_physical::physical_plan::wire as plan_wire;
 
-use super::dispatcher::{DispatchOutcome, map_typed_cluster_error};
+use super::cluster_error::map_typed_cluster_error;
+use super::dispatcher::DispatchOutcome;
 use super::version_set::GatewayVersionSet;
 
 /// Arguments for a remote dispatch call (bundles the parameters to stay
@@ -39,6 +40,12 @@ pub(super) struct RemoteDispatchArgs<'a> {
     /// Session-transaction context forwarded to the remote executor, or `None`
     /// for non-transactional dispatch.
     pub txn_id: Option<TxnId>,
+    /// The route is a leg of a linearizable read. Exchange nodes resolved here
+    /// before the plan ships inherit it.
+    pub linearizable: bool,
+    /// Groups the remote node confirms before it reads. Empty for a write or
+    /// a weaker read.
+    pub read_groups: Vec<u64>,
 }
 
 /// Remote dispatch via `ExecuteRequest` RPC.
@@ -56,6 +63,8 @@ pub(super) async fn dispatch_remote(
         deadline_ms,
         version_set,
         txn_id,
+        linearizable,
+        read_groups,
     } = args;
     let transport = shared.cluster_transport.as_ref().ok_or(Error::Internal {
         detail: "gateway: cluster transport not available for remote dispatch".into(),
@@ -73,13 +82,15 @@ pub(super) async fn dispatch_remote(
     // Cluster remote-dispatch: no session-transaction context crosses this
     // boundary yet, so `None`. TRACKED: cross-node in-transaction reads are a
     // known gap (see resolve/exchange.rs).
-    let plan = match Box::pin(crate::control::server::exchange::resolve_exchange_in_plan(
-        shared,
+    let scope = crate::control::server::exchange::ReadScope {
         database_id,
         tenant_id,
-        plan,
         trace_id,
-        None,
+        txn_id: None,
+        linearizable,
+    };
+    let plan = match Box::pin(crate::control::server::exchange::resolve_exchange_in_plan(
+        shared, plan, scope,
     ))
     .await?
     {
@@ -103,10 +114,8 @@ pub(super) async fn dispatch_remote(
         }
         crate::control::server::exchange::Resolved::Plan(p) => *p,
         // Gateway path returns collected bytes: materialize the stream into one
-        // merged-array payload. (Single-node streaming never reaches the gateway
-        // — `state.gateway.is_none()` gates the Stream branch — but handle it
-        // exhaustively and behaviour-preservingly regardless.) Key the collected
-        // watermark to the collection's owning vShard this route dispatched to.
+        // merged-array payload. Key the collected watermark to the collection's
+        // owning vShard this route dispatched to.
         crate::control::server::exchange::Resolved::Stream(s) => {
             let (merged, lsn) = crate::control::server::result_stream::materialize(s).await?;
             return Ok(DispatchOutcome {
@@ -140,6 +149,7 @@ pub(super) async fn dispatch_remote(
         )
         .collect();
 
+    let scoped_vshard = scoped_vshard(&plan, vshard_id)?;
     let req = RaftRpc::ExecuteRequest(ExecuteRequest {
         plan_bytes,
         tenant_id: tenant_id.as_u64(),
@@ -148,6 +158,8 @@ pub(super) async fn dispatch_remote(
         trace_id: trace_id.0,
         descriptor_versions,
         txn_id,
+        vshard_id: scoped_vshard,
+        read_groups,
     });
 
     debug!(
@@ -168,6 +180,7 @@ pub(super) async fn dispatch_remote(
             vshard_id: VShardId::new((vshard_id % VShardId::COUNT as u64) as u32),
             leader_node: 0,
             leader_addr: format!("node-{node_id} (transport error: {e})"),
+            leader_term: 0,
         }
     })?;
 
@@ -212,7 +225,7 @@ pub(super) async fn dispatch_remote(
 /// [`map_typed_cluster_error`] to a retryable [`Error`] and propagated to the
 /// gateway's existing not-leader retry loop. Once at least one chunk has been
 /// observed, any subsequent error is TERMINAL — it is surfaced as a stream
-/// `Err` and never retried (re-running the plan would duplicate the rows
+/// `Err` and never retried (re-running the plan duplicates the rows
 /// already streamed to the client).
 ///
 /// The returned stream re-emits the buffered first batch followed by the rest.
@@ -230,6 +243,8 @@ pub(super) async fn dispatch_remote_stream(
         deadline_ms,
         version_set,
         txn_id,
+        linearizable,
+        read_groups,
     } = args;
     let transport = shared.cluster_transport.as_ref().ok_or(Error::Internal {
         detail: "gateway: cluster transport not available for remote stream dispatch".into(),
@@ -237,13 +252,15 @@ pub(super) async fn dispatch_remote_stream(
 
     // Resolve Exchange nodes before shipping (symmetric with `dispatch_remote`).
     // No session-transaction context crosses this boundary yet, so `None`.
-    let plan = match Box::pin(crate::control::server::exchange::resolve_exchange_in_plan(
-        shared,
+    let scope = crate::control::server::exchange::ReadScope {
         database_id,
         tenant_id,
-        plan,
         trace_id,
-        None,
+        txn_id: None,
+        linearizable,
+    };
+    let plan = match Box::pin(crate::control::server::exchange::resolve_exchange_in_plan(
+        shared, plan, scope,
     ))
     .await?
     {
@@ -281,6 +298,7 @@ pub(super) async fn dispatch_remote_stream(
         )
         .collect();
 
+    let scoped_vshard = scoped_vshard(&plan, vshard_id)?;
     let req = RaftRpc::ExecuteStreamRequest(ExecuteRequest {
         plan_bytes,
         tenant_id: tenant_id.as_u64(),
@@ -289,6 +307,8 @@ pub(super) async fn dispatch_remote_stream(
         trace_id: trace_id.0,
         descriptor_versions,
         txn_id,
+        vshard_id: scoped_vshard,
+        read_groups,
     });
 
     debug!(
@@ -308,6 +328,7 @@ pub(super) async fn dispatch_remote_stream(
             vshard_id: VShardId::new((vshard_id % VShardId::COUNT as u64) as u32),
             leader_node: 0,
             leader_addr: format!("node-{node_id} (stream open error: {e})"),
+            leader_term: 0,
         })?;
     // The `async_stream` body is `!Unpin`; pin it on the heap so we can pull
     // the eager first frame and then keep the tail around for `.chain`.
@@ -397,10 +418,63 @@ fn map_stream_cluster_error(err: ClusterError, vshard_id: u64) -> Error {
         | ClusterError::SpatialGather(_)
         | ClusterError::Bm25Gather(_)
         | ClusterError::TsGather(_)
+        | ClusterError::ShufflePush(_)
         | ClusterError::RemoteUntyped { .. }) => Error::NotLeader {
             vshard_id: VShardId::new((vshard_id % VShardId::COUNT as u64) as u32),
             leader_node: 0,
             leader_addr: format!("stream dispatch error: {other}"),
+            leader_term: 0,
         },
+    }
+}
+
+/// The vShard a remote receiver must run `plan` on, or `None` when the plan
+/// fans across the receiver's local cores.
+///
+/// A transaction meta-op names no collection, so only the route's own vShard
+/// can pick the core that holds the transaction's staging overlay.
+fn scoped_vshard(
+    plan: &nodedb_physical::physical_plan::PhysicalPlan,
+    vshard_id: u64,
+) -> Result<Option<VShardId>, Error> {
+    if !super::router::is_task_vshard_scoped(plan) {
+        return Ok(None);
+    }
+    let raw = u32::try_from(vshard_id)
+        .ok()
+        .filter(|raw| *raw < VShardId::COUNT)
+        .ok_or_else(|| Error::Internal {
+            detail: format!(
+                "gateway: vShard-scoped plan routed to out-of-range vShard {vshard_id}"
+            ),
+        })?;
+    Ok(Some(VShardId::new(raw)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodedb_physical::physical_plan::{MetaOp, PhysicalPlan};
+
+    #[test]
+    fn a_transaction_meta_op_carries_its_route_vshard() {
+        let plan = PhysicalPlan::Meta(MetaOp::DropTxnOverlay {
+            txn_id: TxnId::new(4),
+        });
+        assert_eq!(scoped_vshard(&plan, 77).unwrap(), Some(VShardId::new(77)));
+    }
+
+    #[test]
+    fn a_fanned_plan_carries_no_vshard() {
+        let plan = PhysicalPlan::Meta(MetaOp::Checkpoint);
+        assert_eq!(scoped_vshard(&plan, 77).unwrap(), None);
+    }
+
+    #[test]
+    fn an_out_of_range_vshard_is_refused() {
+        let plan = PhysicalPlan::Meta(MetaOp::DropTxnOverlay {
+            txn_id: TxnId::new(4),
+        });
+        assert!(scoped_vshard(&plan, u64::from(VShardId::COUNT)).is_err());
     }
 }

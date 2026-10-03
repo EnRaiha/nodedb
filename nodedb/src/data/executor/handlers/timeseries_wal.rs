@@ -48,6 +48,9 @@ impl CoreLoop {
         let mut current = None;
 
         for (index, record) in records.iter().enumerate() {
+            if self.replay_halted() {
+                break;
+            }
             let logical_type = record.logical_record_type();
             let record_type = RecordType::from_raw(logical_type);
 
@@ -276,7 +279,6 @@ impl CoreLoop {
             if restart {
                 self.note_ts_record_applied(record_lsn);
             }
-
             replayed += accepted;
             in_flight += usize::from(passed);
         }
@@ -365,14 +367,16 @@ mod tests {
     /// A `TimeseriesBatch`-typed WAL record carrying one ILP line, in the
     /// format-preserving five-element timeseries tuple, at `lsn`.
     fn ilp_wal_record(collection: &str, lsn: u64, tenant_id: u64, line: &str) -> WalRecord {
-        let payload = zerompk::to_msgpack_vec(&(
-            "timeseries".to_string(),
-            collection.to_string(),
-            line.as_bytes().to_vec(),
-            Option::<SyncProvenance>::None,
-            "ilp".to_string(),
-        ))
-        .expect("encode timeseries tuple");
+        let payload = crate::control::server::wal_dispatch::encode_timeseries_ingest_payload(
+            crate::control::server::wal_dispatch::TimeseriesIngestRecord {
+                collection,
+                payload: line.as_bytes(),
+                provenance: None,
+                format: "ilp",
+                default_timestamp_ms: 1_700_000_000_000,
+            },
+        )
+        .expect("encode timeseries ingest record");
         WalRecord::new(WalRecordArgs {
             record_type: RecordType::TimeseriesBatch as u32,
             lsn,
@@ -876,31 +880,19 @@ mod tests {
         assert!(surrogates.is_empty())
     }
 
+    /// Every timeseries ingest record carries its statement instant. The
+    /// five-element tuple, which carried none, is not a record shape.
     #[test]
-    fn format_preserving_timeseries_tuple_decodes_before_legacy_shapes() {
+    fn a_five_element_timeseries_tuple_is_not_a_record_shape() {
         let bytes = zerompk::to_msgpack_vec(&(
             "timeseries".to_string(),
             "cpu".to_string(),
-            vec![
-                0x91, 0xa9, b'c', b'p', b'u', b' ', b'v', b'a', b'l', b'u', b'e',
-            ],
+            vec![0x90u8],
             None::<SyncProvenance>,
             "ilp-msgpack".to_string(),
         ))
-        .expect("encode format-preserving tuple");
-        let DecodedBatchRecord {
-            kind,
-            collection,
-            format,
-            surrogates,
-            default_timestamp_ms,
-            ..
-        } = decode_batch_record(&bytes).expect("decode format-preserving tuple");
-        assert_eq!(kind.as_deref(), Some("timeseries"));
-        assert_eq!(collection, "cpu");
-        assert_eq!(format.as_deref(), Some("ilp-msgpack"));
-        assert!(surrogates.is_empty());
-        assert_eq!(default_timestamp_ms, None);
+        .expect("encode five-element tuple");
+        assert!(decode_batch_record(&bytes).is_err());
     }
 
     #[test]

@@ -13,7 +13,6 @@
 //! and enable enumeration.
 
 use argon2::password_hash::rand_core::{OsRng, RngCore};
-use std::fmt::Write;
 
 /// Size in bytes of the random payload (128 bits).
 const RANDOM_BYTES: usize = 16;
@@ -28,12 +27,7 @@ const RANDOM_BYTES: usize = 16;
 pub fn generate_tagged_random_hex(prefix: &str) -> String {
     let mut bytes = [0u8; RANDOM_BYTES];
     OsRng.fill_bytes(&mut bytes);
-    let mut s = String::with_capacity(prefix.len() + RANDOM_BYTES * 2);
-    s.push_str(prefix);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+    format!("{prefix}{}", hex::encode(bytes))
 }
 
 #[cfg(test)]
@@ -42,7 +36,7 @@ mod tests {
 
     /// The identifier must not embed the wall-clock second. An attacker that
     /// knows roughly when it was issued (from HTTP `Date:` headers, TLS
-    /// handshake timestamps, or response timing) would otherwise recover a
+    /// handshake timestamps, or response timing) otherwise recovers a
     /// timestamp component directly.
     #[test]
     fn does_not_leak_wall_clock_second() {
@@ -114,7 +108,7 @@ mod tests {
 
     /// A batch of identifiers must all be distinct AND must not share any
     /// common prefix beyond the caller-chosen tag — a shared runtime prefix
-    /// would indicate a deterministic (timestamp/counter) component.
+    /// indicates a deterministic (timestamp/counter) component.
     #[test]
     fn batch_ids_have_no_shared_deterministic_prefix() {
         let prefix = "tag_";

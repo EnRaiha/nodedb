@@ -36,7 +36,8 @@
 //! ## Records that cannot be applied
 //!
 //! Restart policy: a committed record an arm cannot decode, cannot route, or
-//! whose handler rejects stops recovery (`replay_abort::abort_replay`).
+//! whose handler rejects stops recovery (`replay_abort`): the core
+//! fail-stops, no arm applies a later record, and boot refuses to start.
 //! Starting with a hole in the replayed suffix is worse than not starting.
 //! Online policy: the error fails the apply response. The funnel then refuses
 //! or aborts the entry, and the process keeps serving.
@@ -54,7 +55,6 @@ use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::transaction::redo_apply::RedoApplyPass;
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
-use crate::data::executor::replay_abort::abort_replay;
 
 impl CoreLoop {
     /// Whether a committed-redo apply is driving the replay arms.
@@ -150,9 +150,10 @@ impl CoreLoop {
         self.replay_watermark_skips(self.floors.replay_floors.sparse_vector.covers(record_lsn))
     }
 
-    /// A committed record cannot be applied. Restart replay stops recovery
-    /// and never returns. A committed-redo apply records the error for its
-    /// response and returns, and the caller skips the record.
+    /// A committed record cannot be applied. Restart replay halts: the core
+    /// fail-stops and no arm applies a later record. A committed-redo apply
+    /// records the error for its response. Either way the caller skips the
+    /// record.
     pub(in crate::data::executor) fn replay_record_unapplied(
         &mut self,
         engine: &str,
@@ -167,7 +168,7 @@ impl CoreLoop {
                      {stage}): {detail}"
                 ),
             }),
-            None => abort_replay(engine, stage, self.core_id, record_lsn, detail),
+            None => self.halt_replay(engine, stage, record_lsn, detail),
         }
     }
 

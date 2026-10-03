@@ -10,7 +10,6 @@ use crate::control::state::SharedState;
 use crate::engine::graph::edge_store::Direction;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
 use crate::engine::graph::traversal_options::MAX_GRAPH_TRAVERSAL_DEPTH;
-use crate::types::TraceId;
 use nodedb_physical::physical_plan::GraphOp;
 use nodedb_types::DatabaseId;
 
@@ -82,7 +81,7 @@ fn check_tenant_graph_depth(
 /// depth-1 `GraphOp::Hop` dispatch -- merging staged edges into an N-hop
 /// cross-core BFS is out of scope for this single-hop read-your-own-writes
 /// unit (see `graph_txn_merge`'s doc comment).
-/// Fail closed unless `identity` may read the traversal's collection.
+/// Fail closed unless `identity` can read the traversal's collection.
 ///
 /// A traversal discloses which nodes exist in a collection and how they are
 /// connected, so it carries the same read grant the collection's rows do.
@@ -104,7 +103,7 @@ fn authorize_traversal(
     // seam: the traversal returns topology, so there are no stored columns in
     // its result for the redaction hook to mask.
     // `collection` is passed bare: the callee qualifies it against
-    // `database_id` itself, so qualifying it here too would double-qualify.
+    // `database_id` itself, so qualifying it here too will double-qualify.
     crate::control::planner::redaction_refusal::refuse_unredactable_graph_collection(
         collection,
         database_id,
@@ -124,6 +123,8 @@ pub struct TraverseRequest {
     pub depth: usize,
     pub edge_label: Option<String>,
     pub direction: GraphDirection,
+    /// The session reads linearizably.
+    pub linearizable: bool,
 }
 
 pub async fn traverse(
@@ -138,6 +139,7 @@ pub async fn traverse(
         depth,
         edge_label,
         direction,
+        linearizable,
     } = req;
     if start.is_empty() {
         return Err(ddl_err("42601", "missing FROM '<node_id>'"));
@@ -157,12 +159,18 @@ pub async fn traverse(
         crate::control::server::graph_dispatch::CrossCoreTraverseSubgraphParams {
             tenant_id,
             database_id,
-            collection: Some(collection),
+            // The walk plans read edges by the stored, database-qualified name.
+            collection: Some(
+                nodedb_types::QualifiedCollection::new(database_id, &collection)
+                    .as_str()
+                    .to_owned(),
+            ),
             start,
             edge_label,
             direction: dir,
             max_depth: depth,
             options: &GraphTraversalOptions::default(),
+            linearizable,
         },
     )
     .await
@@ -185,6 +193,8 @@ pub struct NeighborsRequest {
     pub direction: GraphDirection,
     /// The session's active transaction, for read-your-own-writes overlay merge.
     pub txn_id: Option<crate::types::TxnId>,
+    /// The session reads linearizably.
+    pub linearizable: bool,
 }
 
 pub async fn neighbors(
@@ -199,6 +209,7 @@ pub async fn neighbors(
         edge_label,
         direction,
         txn_id,
+        linearizable,
     } = req;
     if node.is_empty() {
         return Err(ddl_err("42601", "missing OF '<node_id>'"));
@@ -207,6 +218,7 @@ pub async fn neighbors(
     let dir = to_engine_direction(direction);
     let tenant_id = identity.tenant_id;
 
+    let node_key = node.clone();
     let plan = PhysicalPlan::Graph(GraphOp::Neighbors {
         collection: Some(nodedb_types::QualifiedCollection::new(
             database_id,
@@ -218,17 +230,20 @@ pub async fn neighbors(
         rls_filters: Vec::new(),
     });
 
-    match crate::control::server::broadcast::broadcast_to_all_cores_txn(
+    // The node's edges live on its key vShard: the read runs on that vShard's
+    // leader, confirmed there when linearizable.
+    match crate::control::server::graph_dispatch::read_on_key_owner(
         state,
         tenant_id,
         database_id,
+        &node_key,
         plan,
-        TraceId::ZERO,
         txn_id,
+        linearizable,
     )
     .await
     {
-        Ok(resp) => Ok(payload_to_rows(&resp.payload)),
+        Ok(payload) => Ok(payload_to_rows(&payload)),
         Err(e) => Err(DdlError::from_error(&e)),
     }
 }
@@ -247,6 +262,8 @@ pub struct ShortestPathRequest {
     pub dst: String,
     pub max_depth: usize,
     pub edge_label: Option<String>,
+    /// The session reads linearizably.
+    pub linearizable: bool,
 }
 
 pub async fn shortest_path(
@@ -261,6 +278,7 @@ pub async fn shortest_path(
         dst,
         max_depth,
         edge_label,
+        linearizable,
     } = req;
     if src.is_empty() || dst.is_empty() {
         return Err(ddl_err(
@@ -277,11 +295,18 @@ pub async fn shortest_path(
         crate::control::server::graph_dispatch::CrossCoreShortestPathParams {
             tenant_id,
             database_id,
-            collection,
+            // The walk plans read edges by the stored, database-qualified name.
+            collection: Some(
+                nodedb_types::QualifiedCollection::new(database_id, &collection)
+                    .as_str()
+                    .to_owned(),
+            ),
             src,
             dst,
             edge_label,
             max_depth,
+            options: GraphTraversalOptions::default(),
+            linearizable,
         },
     )
     .await

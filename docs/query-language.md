@@ -631,7 +631,7 @@ SHOW CHANGE STREAMS;
 CREATE CONSUMER GROUP processors ON order_changes;
 
 -- Commit offset for a specific partition
-COMMIT OFFSET PARTITION 0 AT 42 ON order_changes CONSUMER GROUP processors;
+COMMIT OFFSET PARTITION 0 AT 0:42 ON order_changes CONSUMER GROUP processors;
 
 -- Batch commit all partitions at their latest consumed position
 COMMIT OFFSETS ON order_changes CONSUMER GROUP processors;
@@ -1071,7 +1071,7 @@ Isolation level: **Snapshot Isolation (SI)**. Reads see a consistent snapshot fr
 
 ### Cross-Shard Transactions
 
-An interactive `BEGIN ... COMMIT` block whose statements span multiple vShards or nodes commits **atomically** by default — the whole block flushes through the Calvin sequencer's durable vote/verdict barrier at COMMIT. Reads taken during the transaction (point reads, predicate scans, index probes, both sides of distributed JOINs) are OCC-validated at COMMIT; a stale read aborts with `40001` (retry the transaction). `SET cross_shard_txn = 'best_effort_non_atomic'` opts bulk loads out of cross-shard atomicity. Single-node deployments run the same path by default (`single_node_calvin = true`), so transactions spanning cores commit atomically too. See [Architecture — Cross-Shard Transactions](architecture.md#cross-shard-transactions).
+An interactive `BEGIN ... COMMIT` block whose statements span multiple vShards or nodes commits **atomically** by default — the whole block flushes through the Calvin sequencer's durable vote/verdict barrier at COMMIT. Reads taken during the transaction (point reads, predicate scans, index probes, both sides of distributed JOINs) are OCC-validated at COMMIT; a stale read aborts with `40001` (retry the transaction). `SET cross_shard_txn = 'best_effort_non_atomic'` opts bulk loads out of cross-shard atomicity. Single-node deployments always run the same path, so transactions spanning cores commit atomically too. See [Architecture — Cross-Shard Transactions](architecture.md#cross-shard-transactions).
 
 ### Read-Your-Own-Writes
 

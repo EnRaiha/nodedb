@@ -24,13 +24,17 @@ pub struct CrossShardWriteRequest {
     /// Database context for the trigger body execution.
     #[msgpack(default)]
     pub database_id: u64,
-    /// Source vShard that generated this event (for HWM dedup).
+    /// vShard that owns the source write.
     pub source_vshard: u32,
-    /// Source LSN — used for high-water-mark dedup on the target.
-    /// Events with `source_lsn <= hwm[source_vshard]` are duplicates.
+    /// LSN of the source write.
     pub source_lsn: u64,
-    /// Source sequence number — monotonic per (core, collection).
+    /// Sequence number of the source write — monotonic per (core, collection).
     pub source_sequence: u64,
+    /// Body that emitted this request within the source write, such as
+    /// `trigger/<database>/<name>`. The receiver deduplicates on
+    /// `(source_vshard, source_lsn, source_sequence, origin)`.
+    #[msgpack(default)]
+    pub origin: String,
     /// Cascade depth to prevent infinite trigger chains.
     pub cascade_depth: u32,
     /// Source collection that triggered this cross-shard write.
@@ -44,7 +48,7 @@ pub struct CrossShardWriteRequest {
 pub struct CrossShardWriteResponse {
     /// Whether the write was successfully executed.
     pub success: bool,
-    /// If the write was a duplicate (HWM dedup), this is true.
+    /// True when the request's dedup key already applied on the target.
     /// The sender should NOT retry duplicates.
     pub duplicate: bool,
     /// Error message if `success` is false and `duplicate` is false.
@@ -82,30 +86,43 @@ impl CrossShardWriteResponse {
     }
 }
 
-/// A NOTIFY broadcast message sent to all peers for cluster-wide delivery.
+/// A stretch of one Control-Plane change-stream partition, forwarded by the
+/// node that leads the partition to every node that does not replicate it.
 ///
-/// When a node publishes a NOTIFY (via `ChangeStream.publish()`), it also
-/// broadcasts this message to all peer nodes via `VShardEnvelope(NotifyBroadcast)`.
-/// Each peer delivers the event to its local `ChangeStream` for LISTEN subscribers.
+/// The sender holds every event of the partition in `(after, through]`, and
+/// `changes` are all of them. The receiver appends the changes it does not
+/// hold, and records a hole when `after` lies above what it saw.
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub struct NotifyBroadcastMsg {
-    /// The originating node ID (for dedup — don't re-broadcast our own events).
+    /// The forwarding node.
     pub source_node: u64,
-    /// Monotonic sequence on the source node (for dedup on receiver).
-    pub sequence: u64,
-    /// Tenant that published the NOTIFY.
+    /// [`NOTIFY_PARTITION_GROUP`] or [`NOTIFY_PARTITION_CALVIN`].
+    pub partition_kind: u8,
+    /// The data group, or the Calvin vShard.
+    pub partition_id: u64,
+    pub after: crate::event::cdc::CdcOffset,
+    pub through: crate::event::cdc::CdcOffset,
+    pub changes: Vec<NotifyChange>,
+}
+
+/// `NotifyBroadcastMsg::partition_kind` of a data group's feed.
+pub const NOTIFY_PARTITION_GROUP: u8 = 0;
+/// `NotifyBroadcastMsg::partition_kind` of a vShard's Calvin feed.
+pub const NOTIFY_PARTITION_CALVIN: u8 = 1;
+
+/// One forwarded change at its position.
+#[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+pub struct NotifyChange {
+    pub position: crate::event::cdc::CdcOffset,
     pub tenant_id: u64,
-    /// Database containing the affected collection.
     pub database_id: u64,
-    /// Collection affected.
     pub collection: String,
-    /// Document ID affected.
     pub document_id: String,
-    /// Operation type: "INSERT", "UPDATE", "DELETE".
+    /// `INSERT`, `UPDATE`, or `DELETE`.
     pub operation: String,
-    /// Timestamp (epoch milliseconds).
+    /// Epoch milliseconds.
     pub timestamp_ms: u64,
-    /// LSN from the source node's WAL.
+    /// LSN from the applying node's WAL. Observability only.
     pub lsn: u64,
 }
 
@@ -122,6 +139,7 @@ mod tests {
             source_vshard: 3,
             source_lsn: 1500,
             source_sequence: 42,
+            origin: "trigger/42/audit".into(),
             cascade_depth: 0,
             source_collection: "orders".into(),
             target_vshard: 7,
@@ -132,6 +150,7 @@ mod tests {
         assert_eq!(decoded.source_lsn, 1500);
         assert_eq!(decoded.source_vshard, 3);
         assert_eq!(decoded.database_id, 42);
+        assert_eq!(decoded.origin, "trigger/42/audit");
     }
 
     #[test]
@@ -158,22 +177,30 @@ mod tests {
 
     #[test]
     fn notify_broadcast_roundtrip() {
+        use crate::event::cdc::CdcOffset;
         let msg = NotifyBroadcastMsg {
             source_node: 1,
-            sequence: 42,
-            tenant_id: 5,
-            database_id: 1024,
-            collection: "orders".into(),
-            document_id: "o-123".into(),
-            operation: "INSERT".into(),
-            timestamp_ms: 1700000000000,
-            lsn: 500,
+            partition_kind: NOTIFY_PARTITION_GROUP,
+            partition_id: 7,
+            after: CdcOffset::whole_index(9),
+            through: CdcOffset::whole_index(10),
+            changes: vec![NotifyChange {
+                position: CdcOffset::data_event(0, 10, 1),
+                tenant_id: 5,
+                database_id: 1024,
+                collection: "orders".into(),
+                document_id: "o-123".into(),
+                operation: "INSERT".into(),
+                timestamp_ms: 1700000000000,
+                lsn: 500,
+            }],
         };
         let bytes = zerompk::to_msgpack_vec(&msg).unwrap();
         let decoded: NotifyBroadcastMsg = zerompk::from_msgpack(&bytes).unwrap();
         assert_eq!(decoded.source_node, 1);
-        assert_eq!(decoded.database_id, 1024);
-        assert_eq!(decoded.collection, "orders");
-        assert_eq!(decoded.lsn, 500);
+        assert_eq!(decoded.partition_id, 7);
+        assert_eq!(decoded.after, CdcOffset::whole_index(9));
+        assert_eq!(decoded.changes[0].position, CdcOffset::data_event(0, 10, 1));
+        assert_eq!(decoded.changes[0].collection, "orders");
     }
 }

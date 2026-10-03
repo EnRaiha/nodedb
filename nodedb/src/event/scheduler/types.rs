@@ -45,7 +45,8 @@ impl MissedPolicy {
 #[msgpack(c_enum)]
 pub enum ScheduleScope {
     /// Runs on the shard leader for the target collection (or `_system` coordinator
-    /// for cross-collection jobs). In single-node mode, always runs locally.
+    /// for cross-collection jobs). A one-node cluster leads every shard, so
+    /// it runs every such schedule.
     #[default]
     Normal = 0,
     /// Runs on the creating node only. Never migrates, never syncs.

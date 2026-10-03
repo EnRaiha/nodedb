@@ -5,9 +5,9 @@
 /// Filter tombstoned source surrogates from response bytes.
 ///
 /// Given the raw msgpack payload from a source scan, returns a filtered
-/// payload that excludes rows whose surrogates are in `tombstoned`.
-/// If `tombstoned` is empty this is a no-op and returns `None` (caller
-/// keeps the original bytes).
+/// payload that excludes rows whose surrogates are in `tombstoned`. Returns
+/// the payload unchanged when nothing is filtered, and `None` only when a
+/// non-empty payload is not a msgpack array.
 pub fn filter_tombstoned_rows(
     payload: &[u8],
     tombstoned: &std::collections::HashSet<u32>,
@@ -15,7 +15,7 @@ pub fn filter_tombstoned_rows(
     use nodedb_query::msgpack_scan;
 
     if tombstoned.is_empty() || payload.is_empty() {
-        return None;
+        return Some(payload.to_vec());
     }
 
     let (count, mut offset) = msgpack_scan::array_header(payload, 0)?;
@@ -38,7 +38,7 @@ pub fn filter_tombstoned_rows(
     }
 
     if kept.len() == count {
-        return None; // nothing filtered
+        return Some(payload.to_vec());
     }
 
     Some(encode_msgpack_array(&kept))

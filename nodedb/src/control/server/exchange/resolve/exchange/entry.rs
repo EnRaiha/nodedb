@@ -6,8 +6,9 @@ use nodedb_physical::physical_plan::PhysicalPlan;
 
 use crate::bridge::envelope::Response;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::exchange::read_scope::ReadScope;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, Lsn, TenantId, TraceId, TxnId, VShardId};
+use crate::types::{Lsn, VShardId};
 
 use crate::control::server::exchange::resolve::capture::DistributedReadCapture;
 use crate::control::server::exchange::resolve::materialize::materialize_providers;
@@ -31,12 +32,12 @@ pub enum Resolved {
     /// gathered `HashJoin`) and the SHUFFLE JOIN path (probe/left and
     /// build/right). The record seam records one read-set entry per capture, so
     /// EVERY participating collection's vshard is validated at commit rather than
-    /// just the plan's collapsed left collection. Empty when there is no
+    /// only the plan's collapsed left collection. Empty when there is no
     /// in-transaction base-collection capture (autocommit reads, and shuffle
     /// AGGREGATE which carries its single read version on the response scalar).
     Gathered(Response, Vec<(VShardId, Lsn)>, Vec<DistributedReadCapture>),
     /// The plan (possibly mutated by catalog materialization or Broadcast
-    /// embedding) is self-contained and should be dispatched normally.
+    /// embedding) is self-contained and is dispatched normally.
     Plan(Box<PhysicalPlan>),
     /// The plan was a single-node, unordered, non-aggregate scan eligible for
     /// streaming. The coordinator has eagerly dispatched it to all cores; the
@@ -50,19 +51,17 @@ pub enum Resolved {
 ///
 /// See module-level documentation for the two-pass behaviour.
 ///
-/// `txn_id` is the originating session transaction id (if the dispatching
-/// task ran inside a transaction block); it is threaded down to every
-/// per-core `Request` built by the gather primitives so in-transaction scans
-/// can merge the transaction's staging overlay (read-your-own-writes).
-/// Autocommit / non-transactional callers pass `None`.
+/// `scope.txn_id` is the originating session transaction id (if the
+/// dispatching task ran inside a transaction block); it is threaded down to
+/// every per-core `Request` built by the gather primitives so in-transaction
+/// scans can merge the transaction's staging overlay (read-your-own-writes).
+/// Autocommit / non-transactional callers pass `None`. `scope.linearizable`
+/// makes every leg confirm its group where it is served.
 pub async fn resolve_and_materialize(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    database_id: DatabaseId,
-    tenant_id: TenantId,
     plan: PhysicalPlan,
-    trace_id: TraceId,
-    txn_id: Option<TxnId>,
+    scope: ReadScope,
 ) -> crate::Result<Resolved> {
     // Pass 1: fill empty ProviderScan rows (identity-scoped, per-request).
     let plan = materialize_providers(state, identity, plan).await?;
@@ -71,16 +70,7 @@ pub async fn resolve_and_materialize(
     // base-collection gather point beneath the plan root and consumed (taken)
     // once at the root arm that returns `Resolved::Gathered`.
     let mut captures = Vec::new();
-    resolve_exchange(
-        state,
-        database_id,
-        tenant_id,
-        plan,
-        trace_id,
-        txn_id,
-        &mut captures,
-    )
-    .await
+    resolve_exchange(state, scope, plan, &mut captures).await
 }
 
 /// Resolve only `Exchange` nodes (pass 2), without catalog provider
@@ -92,24 +82,12 @@ pub async fn resolve_and_materialize(
 /// pgwire/native paths that own the request identity. A no-op for plans with no
 /// `Exchange` node.
 ///
-/// See `resolve_and_materialize` for `txn_id` semantics.
+/// See `resolve_and_materialize` for the `scope` semantics.
 pub async fn resolve_exchange_in_plan(
     state: &SharedState,
-    database_id: DatabaseId,
-    tenant_id: TenantId,
     plan: PhysicalPlan,
-    trace_id: TraceId,
-    txn_id: Option<TxnId>,
+    scope: ReadScope,
 ) -> crate::Result<Resolved> {
     let mut captures = Vec::new();
-    resolve_exchange(
-        state,
-        database_id,
-        tenant_id,
-        plan,
-        trace_id,
-        txn_id,
-        &mut captures,
-    )
-    .await
+    resolve_exchange(state, scope, plan, &mut captures).await
 }

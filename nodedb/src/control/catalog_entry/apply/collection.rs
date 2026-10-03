@@ -9,6 +9,7 @@ use crate::control::security::catalog::auth_types::object_type;
 use crate::control::security::catalog::{StoredCollection, SystemCatalog, catalog_err};
 
 pub fn put(stored: &StoredCollection, catalog: &SystemCatalog) -> crate::Result<()> {
+    reap_clone_aux_on_materialize(stored, catalog)?;
     catalog
         .put_collection(stored.database_id, stored)
         .map_err(|e| {
@@ -34,6 +35,32 @@ pub fn put(stored: &StoredCollection, catalog: &SystemCatalog) -> crate::Result<
     // reaches here with `is_active = true`, which restores the indexes the
     // soft-delete hid.
     sync_index_visibility(stored, catalog)
+}
+
+/// Drop this node's copy-on-write rows of a clone the materializer finished.
+///
+/// The flip to `Materialized` with no `cloned_from` is the materializer's last
+/// write. Every node applies it, so every node drops its own copy-up and
+/// tombstone rows here. The rows go before the collection row: a crash in
+/// between re-applies the whole entry on replay, because the persisted row
+/// still differs from it.
+fn reap_clone_aux_on_materialize(
+    stored: &StoredCollection,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
+    if stored.cloned_from.is_some()
+        || stored.clone_status != nodedb_types::CloneStatus::Materialized
+    {
+        return Ok(());
+    }
+    let qualified = crate::control::planner::sql_plan_convert::convert::db_qualified(
+        stored.database_id,
+        &stored.name,
+    );
+    catalog.delete_all_clone_copyups_for_collection(&qualified)?;
+    catalog.delete_all_clone_tombstones_for_collection(&qualified)?;
+    catalog.delete_all_kv_clone_tombstones_for_collection(&qualified)?;
+    Ok(())
 }
 
 /// Align the collection's index records with its own `is_active` state, so a
@@ -114,7 +141,7 @@ pub fn put_if_absent(stored: &StoredCollection, catalog: &SystemCatalog) -> crat
 /// from crossing an incomplete reclaim.
 ///
 /// Returns whether a row was found and deactivated. `false` is legitimate
-/// only for the replicated applier (may never have held the row) — a caller
+/// only for the replicated applier (it can lack the row) — a caller
 /// that already read the row must use [`prepare_purge_checked`] instead.
 pub fn prepare_purge(
     database_id: u64,
@@ -140,8 +167,8 @@ pub fn prepare_purge(
 }
 
 /// Fail-closed [`prepare_purge`] for callers that resolved the collection
-/// before asking for the purge. A miss is never benign: the reclaim would run
-/// while the row is active and a same-name CREATE could register over keys
+/// before asking for the purge. A miss is never benign: the reclaim runs
+/// while the row is active and a same-name CREATE can register over keys
 /// the old incarnation still owns. Raises rather than reporting success.
 pub fn prepare_purge_checked(
     database_id: u64,
@@ -186,6 +213,20 @@ pub fn finalize_purge(
     // collection; the Data Plane storage itself is reclaimed by the
     // `UnregisterCollection` half of the purge.
     purge_index_records(database_id.as_u64(), tenant_id, name, catalog)?;
+    // Statistics, checkpoints, and a compaction point left behind describe
+    // a later collection of the same name.
+    catalog.delete_column_stats_for_collection(database_id.as_u64(), tenant_id, name)?;
+    catalog.delete_checkpoints_for_collection(database_id.as_u64(), tenant_id, name)?;
+    catalog.delete_compaction_point(database_id.as_u64(), tenant_id, name)?;
+    // A grant row left behind reloads on the next boot and opens a later
+    // collection of the same name.
+    catalog.delete_permissions_for_target(
+        &crate::control::security::permission::collection_target(
+            database_id,
+            nodedb_types::TenantId::new(tenant_id),
+            name,
+        ),
+    )?;
     let removed = catalog.delete_collection(database_id, tenant_id, name)?;
     debug!(
         collection = %name,
@@ -329,7 +370,7 @@ pub fn deactivate(
     }
     // Intentionally preserve the `StoredOwner` row on soft-delete: the
     // primary record's `owner` field stays populated, and stripping the
-    // owner row would break `UNDROP COLLECTION`'s ownership restore.
+    // owner row breaks `UNDROP COLLECTION`'s ownership restore.
     Ok(())
 }
 
@@ -402,7 +443,7 @@ mod tests {
         let (credentials, _tmp) = open_catalog();
         let catalog = credentials.catalog();
 
-        let stored = StoredCollection::new(1, "widgets", "carol");
+        let stored = StoredCollection::stamped_for_test(1, "widgets", "carol");
         apply_to(&CatalogEntry::PutCollection(Box::new(stored)), catalog)
             .expect("apply put_collection");
 
@@ -422,7 +463,7 @@ mod tests {
 
         // Set up through `apply_to` so the owner row is written alongside the
         // primary row, avoiding an orphan-row integrity trip on deactivate.
-        let stored = StoredCollection::new(1, "archived", "carol");
+        let stored = StoredCollection::stamped_for_test(1, "archived", "carol");
         apply_to(&CatalogEntry::PutCollection(Box::new(stored)), catalog)
             .expect("apply put_collection");
 
@@ -446,9 +487,9 @@ mod tests {
     }
 
     /// DROP COLLECTION is a soft delete, so it must advance the same ordering
-    /// metadata a CREATE or ALTER would — a replayed CREATE cannot be ordered
+    /// metadata a CREATE or ALTER does — a replayed CREATE cannot be ordered
     /// against the current row otherwise, and retention (which reads
-    /// `modification_hlc` as the drop time) would measure from the original
+    /// `modification_hlc` as the drop time) measures from the original
     /// CREATE instead. Drives the entry through the exact production path:
     /// `descriptor_stamp::stamp` then `apply_to`.
     #[test]
@@ -462,7 +503,8 @@ mod tests {
             CatalogEntry::PutCollection(Box::new(stored)),
             &clock,
             catalog,
-        );
+        )
+        .expect("stamp");
         let CatalogEntry::PutCollection(created) = &create else {
             panic!("expected PutCollection");
         };
@@ -480,7 +522,8 @@ mod tests {
             },
             &clock,
             catalog,
-        );
+        )
+        .expect("stamp");
         apply_to(&deactivate, catalog).expect("apply deactivate_collection");
 
         let loaded = catalog
@@ -500,9 +543,9 @@ mod tests {
     }
 
     /// `deactivate()` must stamp `deactivated_at_ns` from the same
-    /// `modification_hlc.wall_ns` it stamps on the row — this is the field
-    /// `resolve_retention` reads instead of `modification_hlc`, so a mismatch
-    /// here reproduces the pre-fix bug one field over.
+    /// `modification_hlc.wall_ns` it stamps on the row. `resolve_retention`
+    /// reads this field instead of `modification_hlc`, so a mismatch here
+    /// skews retention.
     #[test]
     fn apply_deactivate_collection_stamps_deactivated_at_ns_from_modification_hlc() {
         let (credentials, _tmp) = open_catalog();
@@ -514,7 +557,8 @@ mod tests {
             CatalogEntry::PutCollection(Box::new(stored)),
             &clock,
             catalog,
-        );
+        )
+        .expect("stamp");
         apply_to(&create, catalog).expect("apply put_collection");
 
         let deactivate = stamp(
@@ -527,7 +571,8 @@ mod tests {
             },
             &clock,
             catalog,
-        );
+        )
+        .expect("stamp");
         apply_to(&deactivate, catalog).expect("apply deactivate_collection");
 
         let loaded = catalog
@@ -548,8 +593,8 @@ mod tests {
     fn purge_collection_is_scoped_to_database() {
         let (credentials, _tmp) = open_catalog();
         let catalog = credentials.catalog();
-        let default = StoredCollection::new(1, "shared", "default_owner");
-        let mut other = StoredCollection::new(1, "shared", "other_owner");
+        let default = StoredCollection::stamped_for_test(1, "shared", "default_owner");
+        let mut other = StoredCollection::stamped_for_test(1, "shared", "other_owner");
         other.database_id = DatabaseId::new(9);
         apply_to(&CatalogEntry::PutCollection(Box::new(default)), catalog)
             .expect("apply put_collection");
@@ -563,6 +608,8 @@ mod tests {
                 database_id: 9,
                 tenant_id: 1,
                 name: "shared".into(),
+                target_descriptor_version: 0,
+                target_hlc: nodedb_types::Hlc::ZERO,
             },
             catalog,
         )
@@ -594,7 +641,7 @@ mod tests {
         let catalog = credentials.catalog();
         catalog.fail_next_collection_write_for_test();
 
-        let stored = StoredCollection::new(1, "wedged", "carol");
+        let stored = StoredCollection::stamped_for_test(1, "wedged", "carol");
         let error = apply_to(&CatalogEntry::PutCollection(Box::new(stored)), catalog)
             .expect_err("a failed catalog write must raise, not be swallowed");
 
@@ -634,7 +681,7 @@ mod tests {
     fn prepare_purge_reports_the_row_it_deactivated() {
         let (credentials, _tmp) = open_catalog();
         let catalog = credentials.catalog();
-        let stored = StoredCollection::new(1, "orders", "tester");
+        let stored = StoredCollection::stamped_for_test(1, "orders", "tester");
         apply_to(&CatalogEntry::PutCollection(Box::new(stored)), catalog).expect("apply");
 
         let found = prepare_purge(0, 1, "orders", catalog).expect("prepare purge");
@@ -648,7 +695,7 @@ mod tests {
         );
     }
 
-    /// The replicated applier runs on nodes that may never have held the row, so
+    /// The replicated applier runs on nodes that can lack the row, so
     /// `prepare_purge` reports the miss instead of raising.
     #[test]
     fn prepare_purge_reports_a_missing_row_without_raising() {
@@ -665,7 +712,7 @@ mod tests {
     fn prepare_purge_checked_rejects_a_database_id_that_holds_no_row() {
         let (credentials, _tmp) = open_catalog();
         let catalog = credentials.catalog();
-        let stored = StoredCollection::new(1, "orders", "tester");
+        let stored = StoredCollection::stamped_for_test(1, "orders", "tester");
         apply_to(&CatalogEntry::PutCollection(Box::new(stored)), catalog).expect("apply");
 
         let err = prepare_purge_checked(1024, 1, "orders", catalog)
@@ -692,7 +739,7 @@ mod tests {
     fn prepare_purge_checked_accepts_the_database_that_holds_the_row() {
         let (credentials, _tmp) = open_catalog();
         let catalog = credentials.catalog();
-        let mut stored = StoredCollection::new(1, "orders", "tester");
+        let mut stored = StoredCollection::stamped_for_test(1, "orders", "tester");
         stored.database_id = DatabaseId::new(1024);
         apply_to(&CatalogEntry::PutCollection(Box::new(stored)), catalog).expect("apply");
 

@@ -330,6 +330,7 @@ mod tests {
             options: Default::default(),
             bm25_query: None,
             bm25_field: None,
+            stage: nodedb_physical::physical_plan::RagStage::Local,
         })
     }
 

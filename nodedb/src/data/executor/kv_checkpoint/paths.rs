@@ -33,34 +33,16 @@ pub(crate) fn kv_ckpt_gen_dir(ckpt_dir: &std::path::Path, generation: u64) -> st
 /// only `[0-9a-f]`, so the `-coll-` separator never collides with the encoded
 /// name and the numeric tenant id never collides with the encoding.
 pub(crate) fn kv_ckpt_filename(tenant_id: u64, collection: &str) -> String {
-    use std::fmt::Write as _;
-    let mut hex = String::with_capacity(collection.len() * 2);
-    for b in collection.as_bytes() {
-        // infallible: writing to a String never returns Err
-        let _ = write!(hex, "{b:02x}");
-    }
-    format!("tenant-{tenant_id}-coll-{hex}.ckpt")
+    format!("tenant-{tenant_id}-coll-{}.ckpt", hex::encode(collection))
 }
 
 /// Parse a checkpoint file stem (no extension) back into `(tenant_id,
 /// collection)`. Returns `None` for any unparseable stem.
 pub(crate) fn parse_kv_ckpt_stem(stem: &str) -> Option<(u64, String)> {
     let rest = stem.strip_prefix("tenant-")?;
-    let (tid_str, hex) = rest.split_once("-coll-")?;
+    let (tid_str, encoded) = rest.split_once("-coll-")?;
     let tenant_id = tid_str.parse::<u64>().ok()?;
-    if hex.len() % 2 != 0 {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    let raw = hex.as_bytes();
-    let mut i = 0;
-    while i < raw.len() {
-        let hi = (raw[i] as char).to_digit(16)?;
-        let lo = (raw[i + 1] as char).to_digit(16)?;
-        bytes.push((hi * 16 + lo) as u8);
-        i += 2;
-    }
-    let collection = String::from_utf8(bytes).ok()?;
+    let collection = String::from_utf8(hex::decode(encoded).ok()?).ok()?;
     Some((tenant_id, collection))
 }
 

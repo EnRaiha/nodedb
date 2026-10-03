@@ -34,6 +34,12 @@ use crate::{Surrogate, Value};
 /// `PRIMARY KEY`. INSERT and every stored-row identity derivation use it.
 pub const DEFAULT_IDENTITY_COLUMN: &str = "id";
 
+/// The system column a strict collection with no declared `PRIMARY KEY`
+/// stores its row id in. The first write fills it from the row's surrogate,
+/// and a copy keeps it, so the row keeps its identity under a new surrogate
+/// after a clone, restore, or tenant move.
+pub const ROWID_COLUMN: &str = "_rowid";
+
 /// Prefix of a rendered key for a row with no surrogate binding, used by both
 /// planes: the Data Plane's `HybridFusionKey::Headless` and the Control
 /// Plane's hybrid response decoders that must recognize the same sentinel.
@@ -110,14 +116,36 @@ impl RowIdentity {
     ///
     /// The identity column is `declared_primary_key`, else
     /// [`DEFAULT_IDENTITY_COLUMN`]. A body carrying that column yields its
-    /// value. A body without it yields the decimal surrogate of `key`.
+    /// value. A body without it yields its [`ROWID_COLUMN`] value, and a body
+    /// with neither yields the decimal surrogate of `key`. A first write sets
+    /// `_rowid` to that same surrogate, so the two agree until a copy moves
+    /// the row to a new surrogate.
     pub fn of_stored_row(
         body: &[u8],
         declared_primary_key: Option<&str>,
         key: StorageKey,
     ) -> RowIdentity {
+        match crate::value_from_msgpack(body) {
+            Ok(row) => Self::of_row_value(&row, declared_primary_key, key),
+            Err(_) => key.to_identity(),
+        }
+    }
+
+    /// [`Self::of_stored_row`] applied to a decoded row. A row that is not
+    /// an object yields the decimal surrogate of `key`. A scan that projects
+    /// the identity columns returns a row this reads the same identity from.
+    pub fn of_row_value(
+        row: &Value,
+        declared_primary_key: Option<&str>,
+        key: StorageKey,
+    ) -> RowIdentity {
         let column = declared_primary_key.unwrap_or(DEFAULT_IDENTITY_COLUMN);
-        extract_pk_value(body, column)
+        let Value::Object(obj) = row else {
+            return key.to_identity();
+        };
+        obj.get(column)
+            .and_then(value_to_pk_string)
+            .or_else(|| obj.get(ROWID_COLUMN).and_then(value_to_pk_string))
             .map(RowIdentity::from_user_key)
             .unwrap_or_else(|| key.to_identity())
     }
@@ -285,6 +313,26 @@ mod tests {
                 .unwrap_or_else(|| RowIdentity::from_user_key("user-declared-id"))
                 .as_str(),
             "user-declared-id"
+        );
+    }
+    /// A copied strict row keeps the identity its `_rowid` carries, not its
+    /// new storage surrogate.
+    #[test]
+    fn of_stored_row_keeps_the_rowid_identity_under_a_new_surrogate() {
+        let copied = body(&[
+            ("_rowid", Value::Integer(123)),
+            ("name", Value::String("a".into())),
+        ]);
+        let new_key = StorageKey::for_surrogate(Surrogate::new(456));
+        assert_eq!(
+            RowIdentity::of_stored_row(&copied, None, new_key).as_str(),
+            "123"
+        );
+        let declared = body(&[("sku", Value::Integer(9)), ("_rowid", Value::Integer(123))]);
+        assert_eq!(
+            RowIdentity::of_stored_row(&declared, Some("sku"), new_key).as_str(),
+            "9",
+            "a declared key wins over _rowid"
         );
     }
 }

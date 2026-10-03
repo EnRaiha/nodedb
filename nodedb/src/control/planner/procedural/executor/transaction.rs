@@ -1,158 +1,143 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Procedure transaction context: buffers DML tasks for COMMIT/ROLLBACK/SAVEPOINT.
+//! Post-commit effects of one procedural transaction.
 //!
-//! Stored procedures can execute COMMIT mid-body to finalize buffered DML,
-//! ROLLBACK to discard it, and SAVEPOINT/ROLLBACK TO for partial rollback.
-//!
-//! Triggers do NOT use this — they dispatch DML immediately.
+//! A body's DML stages into an open system transaction at the statement
+//! (see `control::system_txn::OpenSystemTxn`). Two effects cannot stage as
+//! writes: trigger writes homed on another node, and `PUBLISH TO`. Both are
+//! held here and commit as messages in the transaction's redo record, which
+//! the Event Plane delivers once the COMMIT succeeds. ROLLBACK drops them,
+//! and a savepoint rewinds them with the staged writes.
 
-use nodedb_physical::physical_task::PhysicalTask;
+use crate::control::sql_dispatch::PreparedPublish;
 
-use crate::control::lease::QueryLeaseScope;
+/// Upper bound on the post-commit effects one transaction holds.
+pub const MAX_POST_COMMIT_EFFECTS: usize = 1024;
 
-/// Lease scope retained for one planned statement in a procedure transaction.
-///
-/// `task_start` lets savepoint rollback drop scopes for every statement it
-/// discards without requiring individual tasks to own a scope.
-struct BufferedStatementScope {
-    task_start: usize,
-    scope: QueryLeaseScope,
+/// One trigger statement homed on another node, held until the local commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteWrite {
+    /// vShard the statement writes. The outbox sends the request to the
+    /// vShard's leader at delivery.
+    pub target_vshard: u32,
+    /// The bound statement text, re-planned on the target node.
+    pub sql: String,
 }
 
-/// Buffered transaction context for stored procedure execution.
-///
-/// DML statements inside a procedure body are collected here until
-/// an explicit COMMIT flushes them as one system transaction, or ROLLBACK
-/// discards them. An implicit COMMIT occurs at the end of the procedure.
+/// Effects a committed transaction still owes, in statement order.
+#[derive(Debug, Default)]
+pub struct PostCommitEffects {
+    pub remote: Vec<RemoteWrite>,
+    pub publishes: Vec<PreparedPublish>,
+}
+
+impl PostCommitEffects {
+    pub fn is_empty(&self) -> bool {
+        self.remote.is_empty() && self.publishes.is_empty()
+    }
+}
+
+/// Positions a savepoint rewinds the held effects to.
+struct Savepoint {
+    name: String,
+    remote: usize,
+    publishes: usize,
+}
+
+/// Post-commit effects held for the open transaction.
 #[derive(Default)]
 pub struct ProcedureTransactionCtx {
-    /// Buffered DML tasks awaiting COMMIT.
-    buffer: Vec<PhysicalTask>,
-    /// Descriptor lease scopes, one per planned statement, retained until its
-    /// tasks have finished COMMIT dispatch or the statement is discarded.
-    statement_scopes: Vec<BufferedStatementScope>,
-    /// Savepoint stack: (name, buffer_position_at_savepoint_time).
-    savepoints: Vec<(String, usize)>,
+    effects: PostCommitEffects,
+    /// Savepoint stack, innermost last.
+    savepoints: Vec<Savepoint>,
+}
+
+fn over_limit() -> crate::Error {
+    crate::Error::BadRequest {
+        detail: format!(
+            "a procedural transaction holds at most {MAX_POST_COMMIT_EFFECTS} cross-node \
+             writes and PUBLISH statements; split the body or the source statement"
+        ),
+    }
 }
 
 impl ProcedureTransactionCtx {
     pub fn new() -> Self {
-        Self {
-            buffer: Vec::new(),
-            statement_scopes: Vec::new(),
-            savepoints: Vec::new(),
+        Self::default()
+    }
+
+    fn held(&self) -> usize {
+        self.effects.remote.len() + self.effects.publishes.len()
+    }
+
+    /// Hold a remote-homed write until the local COMMIT.
+    pub fn buffer_remote(&mut self, write: RemoteWrite) -> crate::Result<()> {
+        if self.held() >= MAX_POST_COMMIT_EFFECTS {
+            return Err(over_limit());
         }
+        self.effects.remote.push(write);
+        Ok(())
     }
 
-    /// Buffer all tasks planned for one statement and retain its descriptor
-    /// leases until those tasks are dispatched at COMMIT.
-    pub fn buffer_statement(&mut self, tasks: Vec<PhysicalTask>, scope: QueryLeaseScope) {
-        let task_start = self.buffer.len();
-        self.buffer.extend(tasks);
-        self.statement_scopes
-            .push(BufferedStatementScope { task_start, scope });
+    /// Hold a checked `PUBLISH TO` until the local COMMIT.
+    pub fn buffer_publish(&mut self, publish: PreparedPublish) -> crate::Result<()> {
+        if self.held() >= MAX_POST_COMMIT_EFFECTS {
+            return Err(over_limit());
+        }
+        self.effects.publishes.push(publish);
+        Ok(())
     }
 
-    /// Buffer a task without a lease scope. Kept as a task-only test helper.
-    pub fn buffer_task(&mut self, task: PhysicalTask) {
-        self.buffer_task_with_empty_scope(task);
-    }
-
-    fn buffer_task_with_empty_scope(&mut self, task: PhysicalTask) {
-        self.buffer_statement(vec![task], QueryLeaseScope::empty());
-    }
-
-    /// Take all buffered tasks and their owned scopes (on COMMIT). The caller
-    /// must keep the scopes alive until every WAL append and dispatch finishes.
-    pub fn take_buffered(&mut self) -> (Vec<PhysicalTask>, Vec<QueryLeaseScope>) {
+    /// Take the held effects (at COMMIT). Clears the savepoint stack.
+    pub fn take_effects(&mut self) -> PostCommitEffects {
         self.savepoints.clear();
-        let scopes = std::mem::take(&mut self.statement_scopes)
-            .into_iter()
-            .map(|statement| statement.scope)
-            .collect();
-        (std::mem::take(&mut self.buffer), scopes)
+        std::mem::take(&mut self.effects)
     }
 
-    /// Take every buffered statement with its lease scope, in buffer order
-    /// (on COMMIT). Clears the savepoint stack.
-    pub fn take_statements(&mut self) -> Vec<(Vec<PhysicalTask>, QueryLeaseScope)> {
-        self.savepoints.clear();
-        let mut tasks = std::mem::take(&mut self.buffer);
-        let scopes = std::mem::take(&mut self.statement_scopes);
-        let mut statements = Vec::with_capacity(scopes.len() + 1);
-        // Each statement owns the tasks from its start to the next start.
-        for statement in scopes.into_iter().rev() {
-            let own = tasks.split_off(statement.task_start.min(tasks.len()));
-            statements.push((own, statement.scope));
-        }
-        // Tasks buffered ahead of the first statement carry no lease.
-        if !tasks.is_empty() {
-            statements.push((tasks, QueryLeaseScope::empty()));
-        }
-        statements.reverse();
-        statements
-    }
-
-    /// Take tasks only. Kept for existing task-oriented tests; it intentionally
-    /// drops the associated scopes when the returned tasks are taken.
-    pub fn take_buffered_tasks(&mut self) -> Vec<PhysicalTask> {
-        self.take_buffered().0
-    }
-
-    /// Discard all buffered tasks and their descriptor lease scopes (on
-    /// ROLLBACK). Clears the savepoint stack.
+    /// Drop the held effects (at ROLLBACK). Clears the savepoint stack.
     pub fn rollback(&mut self) {
-        self.buffer.clear();
-        self.statement_scopes.clear();
+        self.effects = PostCommitEffects::default();
         self.savepoints.clear();
     }
 
-    /// Record a savepoint at the current buffer position.
+    /// Record a savepoint at the current positions.
     pub fn savepoint(&mut self, name: &str) {
-        let pos = self.buffer.len();
-        // Remove any existing savepoint with the same name (redefine).
-        self.savepoints.retain(|(n, _)| n != name);
-        self.savepoints.push((name.to_string(), pos));
+        // A redefined name moves to the new position.
+        self.savepoints.retain(|sp| sp.name != name);
+        self.savepoints.push(Savepoint {
+            name: name.to_string(),
+            remote: self.effects.remote.len(),
+            publishes: self.effects.publishes.len(),
+        });
     }
 
-    /// Rollback to a named savepoint: discard tasks buffered after it.
+    /// Whether a savepoint named `name` exists.
+    pub fn has_savepoint(&self, name: &str) -> bool {
+        self.savepoints.iter().any(|sp| sp.name == name)
+    }
+
+    /// Drop the effects held after a savepoint, and every later savepoint.
     pub fn rollback_to(&mut self, name: &str) -> crate::Result<()> {
-        let pos = self
-            .savepoints
-            .iter()
-            .rev()
-            .find(|(n, _)| n == name)
-            .map(|(_, p)| *p);
-
-        match pos {
-            Some(p) => {
-                self.buffer.truncate(p);
-                // Savepoints occur between statements, so every discarded
-                // statement starts at or after the saved task position.
-                self.statement_scopes
-                    .retain(|statement| statement.task_start < p);
-                // Remove savepoints created after this one.
-                if let Some(idx) = self.savepoints.iter().position(|(n, _)| n == name) {
-                    self.savepoints.truncate(idx + 1);
-                }
-                Ok(())
-            }
-            None => Err(crate::Error::BadRequest {
+        let Some(idx) = self.savepoints.iter().rposition(|sp| sp.name == name) else {
+            return Err(crate::Error::BadRequest {
                 detail: format!("savepoint '{name}' does not exist"),
-            }),
-        }
+            });
+        };
+        let (remote, publishes) = (self.savepoints[idx].remote, self.savepoints[idx].publishes);
+        self.effects.remote.truncate(remote);
+        self.effects.publishes.truncate(publishes);
+        self.savepoints.truncate(idx + 1);
+        Ok(())
     }
 
-    /// Release a savepoint without rolling back (keeps buffered tasks).
+    /// Release a savepoint without rolling back.
     pub fn release_savepoint(&mut self, name: &str) -> crate::Result<()> {
-        let existed = self.savepoints.iter().any(|(n, _)| n == name);
-        if !existed {
+        if !self.has_savepoint(name) {
             return Err(crate::Error::BadRequest {
                 detail: format!("savepoint '{name}' does not exist"),
             });
         }
-        self.savepoints.retain(|(n, _)| n != name);
+        self.savepoints.retain(|sp| sp.name != name);
         Ok(())
     }
 }
@@ -160,155 +145,87 @@ impl ProcedureTransactionCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::envelope::PhysicalPlan;
-    use crate::types::{TenantId, VShardId};
-    use nodedb_physical::physical_plan::DocumentOp;
-    use nodedb_physical::physical_task::PostSetOp;
 
-    fn dummy_task(id: &str) -> PhysicalTask {
-        PhysicalTask {
-            tenant_id: TenantId::new(1),
-            vshard_id: VShardId::new(0),
-            database_id: crate::types::DatabaseId::DEFAULT,
-            plan: PhysicalPlan::Document(DocumentOp::PointPut {
-                collection: nodedb_types::QualifiedCollection::new(
-                    crate::types::DatabaseId::DEFAULT,
-                    "test",
-                ),
-                document_id: id.into(),
-                value: vec![],
-                surrogate: nodedb_types::Surrogate::ZERO,
-                pk_bytes: Vec::new(),
-                returning: None,
-                rls_filters: Vec::new(),
-                resolved_sum_targets: Vec::new(),
-            }),
-            post_set_op: PostSetOp::None,
-            txn_id: None,
+    fn remote(sql: &str) -> RemoteWrite {
+        RemoteWrite {
+            target_vshard: 7,
+            sql: sql.into(),
+        }
+    }
+
+    fn publish(payload: &str) -> PreparedPublish {
+        PreparedPublish {
+            database_id: 1,
+            tenant_id: 1,
+            topic: "events".into(),
+            payload: payload.into(),
+            metadata_floor: 0,
         }
     }
 
     #[test]
-    fn buffer_and_take() {
+    fn rollback_drops_every_effect() {
         let mut ctx = ProcedureTransactionCtx::new();
-        ctx.buffer_task(dummy_task("a"));
-        ctx.buffer_task(dummy_task("b"));
-        let tasks = ctx.take_buffered_tasks();
-        assert_eq!(tasks.len(), 2);
-        assert!(ctx.take_buffered_tasks().is_empty());
-    }
-
-    #[test]
-    fn rollback_clears_buffer() {
-        let mut ctx = ProcedureTransactionCtx::new();
-        ctx.buffer_task(dummy_task("a"));
+        ctx.buffer_remote(remote("a")).unwrap();
+        ctx.buffer_publish(publish("p")).unwrap();
         ctx.rollback();
-        assert!(ctx.take_buffered_tasks().is_empty());
+        assert!(ctx.take_effects().is_empty());
     }
 
     #[test]
-    fn commit_takes_each_statement_with_its_own_tasks() {
+    fn rollback_to_savepoint_truncates_effects() {
         let mut ctx = ProcedureTransactionCtx::new();
-        ctx.buffer_statement(
-            vec![dummy_task("a"), dummy_task("b")],
-            QueryLeaseScope::empty(),
-        );
-        ctx.buffer_statement(vec![dummy_task("c")], QueryLeaseScope::empty());
-        let statements = ctx.take_statements();
-        let sizes: Vec<usize> = statements.iter().map(|(tasks, _)| tasks.len()).collect();
-        assert_eq!(sizes, vec![2, 1]);
-        assert!(ctx.take_statements().is_empty());
-    }
-
-    #[test]
-    fn rollback_and_commit_take_owned_statement_scopes() {
-        let mut ctx = ProcedureTransactionCtx::new();
-        ctx.buffer_statement(vec![dummy_task("a")], QueryLeaseScope::empty());
-        assert_eq!(ctx.statement_scopes.len(), 1);
-
-        ctx.rollback();
-        assert!(ctx.statement_scopes.is_empty());
-
-        ctx.buffer_statement(vec![dummy_task("b")], QueryLeaseScope::empty());
-        let (tasks, scopes) = ctx.take_buffered();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(scopes.len(), 1);
-        assert!(ctx.statement_scopes.is_empty());
-    }
-
-    #[test]
-    fn savepoint_and_rollback_to() {
-        let mut ctx = ProcedureTransactionCtx::new();
-        ctx.buffer_task(dummy_task("a"));
+        ctx.buffer_remote(remote("a")).unwrap();
+        ctx.buffer_publish(publish("kept")).unwrap();
         ctx.savepoint("sp1");
-        ctx.buffer_task(dummy_task("b"));
-        ctx.buffer_task(dummy_task("c"));
+        ctx.buffer_remote(remote("b")).unwrap();
+        ctx.buffer_publish(publish("dropped")).unwrap();
 
         ctx.rollback_to("sp1").unwrap();
-        assert_eq!(ctx.statement_scopes.len(), 1);
-        let tasks = ctx.take_buffered_tasks();
-        assert_eq!(tasks.len(), 1); // Only "a" remains
+        let effects = ctx.take_effects();
+        assert_eq!(effects.remote, vec![remote("a")]);
+        assert_eq!(effects.publishes, vec![publish("kept")]);
     }
 
     #[test]
-    fn rollback_to_nonexistent_fails() {
+    fn nested_savepoints_rewind_in_order() {
+        let mut ctx = ProcedureTransactionCtx::new();
+        ctx.buffer_remote(remote("a")).unwrap();
+        ctx.savepoint("sp1");
+        ctx.buffer_remote(remote("b")).unwrap();
+        ctx.savepoint("sp2");
+        ctx.buffer_remote(remote("c")).unwrap();
+
+        ctx.rollback_to("sp2").unwrap();
+        ctx.rollback_to("sp1").unwrap();
+        assert_eq!(ctx.take_effects().remote, vec![remote("a")]);
+    }
+
+    #[test]
+    fn released_savepoint_keeps_effects() {
+        let mut ctx = ProcedureTransactionCtx::new();
+        ctx.savepoint("sp1");
+        ctx.buffer_remote(remote("a")).unwrap();
+        ctx.release_savepoint("sp1").unwrap();
+        assert!(ctx.rollback_to("sp1").is_err());
+        assert_eq!(ctx.take_effects().remote.len(), 1);
+    }
+
+    #[test]
+    fn unknown_savepoint_is_refused() {
         let mut ctx = ProcedureTransactionCtx::new();
         assert!(ctx.rollback_to("nope").is_err());
-    }
-
-    #[test]
-    fn release_savepoint() {
-        let mut ctx = ProcedureTransactionCtx::new();
-        ctx.buffer_task(dummy_task("a"));
-        ctx.savepoint("sp1");
-        ctx.buffer_task(dummy_task("b"));
-        ctx.release_savepoint("sp1").unwrap();
-
-        // Rollback to released savepoint should fail.
-        assert!(ctx.rollback_to("sp1").is_err());
-
-        // But tasks are still there.
-        let tasks = ctx.take_buffered_tasks();
-        assert_eq!(tasks.len(), 2);
-    }
-
-    #[test]
-    fn nested_savepoints() {
-        let mut ctx = ProcedureTransactionCtx::new();
-        ctx.buffer_task(dummy_task("a"));
-        ctx.savepoint("sp1");
-        ctx.buffer_task(dummy_task("b"));
-        ctx.savepoint("sp2");
-        ctx.buffer_task(dummy_task("c"));
-
-        // Rollback to sp2: discard "c" only.
-        ctx.rollback_to("sp2").unwrap();
-        assert_eq!(ctx.buffer.len(), 2); // a + b
-
-        // Rollback to sp1: discard "b".
-        ctx.rollback_to("sp1").unwrap();
-        assert_eq!(ctx.buffer.len(), 1); // a only
-
-        let tasks = ctx.take_buffered_tasks();
-        assert_eq!(tasks.len(), 1);
-    }
-
-    #[test]
-    fn release_nonexistent_fails() {
-        let mut ctx = ProcedureTransactionCtx::new();
         assert!(ctx.release_savepoint("nope").is_err());
     }
 
     #[test]
-    fn savepoint_redefine() {
+    fn effects_are_bounded() {
         let mut ctx = ProcedureTransactionCtx::new();
-        ctx.buffer_task(dummy_task("a"));
-        ctx.savepoint("sp1");
-        ctx.buffer_task(dummy_task("b"));
-        ctx.savepoint("sp1"); // Redefine — now at position 2
-        ctx.buffer_task(dummy_task("c"));
-
-        ctx.rollback_to("sp1").unwrap();
-        assert_eq!(ctx.buffer.len(), 2); // a + b (redefined position)
+        for _ in 0..MAX_POST_COMMIT_EFFECTS {
+            ctx.buffer_remote(remote("w")).unwrap();
+        }
+        assert!(ctx.buffer_remote(remote("over")).is_err());
+        assert!(ctx.buffer_publish(publish("over")).is_err());
+        assert_eq!(ctx.take_effects().remote.len(), MAX_POST_COMMIT_EFFECTS);
     }
 }

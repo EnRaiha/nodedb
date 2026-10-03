@@ -51,7 +51,7 @@ pub(super) fn put_one(e: &mut ArrayEngine, x: i64, y: i64, v: i64, lsn: u64) {
         vec![ArrayPutCell {
             coord: vec![CoordValue::Int64(x), CoordValue::Int64(y)],
             attrs: vec![CellValue::Int64(v)],
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new((x * 100 + y + 1) as u32),
             system_from_ms: 0,
             valid_from_ms: 0,
             valid_until_ms: i64::MAX,

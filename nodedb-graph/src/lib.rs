@@ -34,5 +34,5 @@ pub use overlay_delta::GraphOverlayDelta;
 pub use params::{AlgoColumnType, AlgoParams, GraphAlgorithm};
 pub use path_params::ShortestPathParams;
 pub use sharded::ShardedCsrIndex;
-pub use traversal_options::{GraphResponseMeta, GraphTraversalOptions, MAX_GRAPH_TRAVERSAL_DEPTH};
+pub use traversal_options::{GraphTraversalOptions, MAX_GRAPH_TRAVERSAL_DEPTH};
 pub use traversal_surrogate::{SurrogateBfsParams, SurrogateHops};

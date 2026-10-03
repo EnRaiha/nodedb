@@ -79,26 +79,6 @@ pub struct ServerSection {
     #[serde(default)]
     pub tls: Option<TlsSettings>,
 
-    /// Enable the Calvin transaction stack on a standalone (non-cluster)
-    /// server. Default `false`.
-    ///
-    /// When `true` and `[cluster]` is absent, the server synthesizes a
-    /// one-node cluster (this node as its own sole seed, replication
-    /// factor 1) and drives the same cluster startup a real deployment
-    /// uses: the sequencer Raft group and per-vShard schedulers come up,
-    /// its QUIC transport binds to a loopback port that never dials a
-    /// peer, and a cross-core (cross-vShard) transaction traverses the
-    /// deterministic Calvin path exactly as in cluster mode.
-    ///
-    /// On by default: a standalone node stands up the single-node Calvin
-    /// stack so cross-core (cross-vShard) transactions commit atomically
-    /// through the deterministic sequencer path instead of being rejected.
-    /// Set to `false` to force the legacy single-node path (no Calvin stack;
-    /// cross-shard interactive transactions are rejected) — e.g. for a
-    /// minimal deployment that never issues cross-core transactions.
-    #[serde(default = "default_single_node_calvin")]
-    pub single_node_calvin: bool,
-
     /// Capture an out-of-process minidump when the server dies to a native
     /// fault (SIGSEGV, abort, stack overflow) rather than a Rust panic.
     /// Default `false`.
@@ -127,17 +107,9 @@ impl Default for ServerSection {
             max_connections: default_max_connections(),
             log_format: LogFormat::Text,
             tls: None,
-            single_node_calvin: default_single_node_calvin(),
             native_crash_dumps: false,
         }
     }
-}
-
-/// Default for [`ServerSection::single_node_calvin`]: on, so a standalone
-/// node supports cross-core transactions through the single-node Calvin path
-/// out of the box.
-fn default_single_node_calvin() -> bool {
-    true
 }
 
 fn default_host() -> IpAddr {
@@ -232,6 +204,12 @@ mod tests {
     #[test]
     fn unknown_field_rejected() {
         let result: Result<ServerSection, _> = toml::from_str("frobnicate = true\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn single_node_calvin_key_rejected() {
+        let result: Result<ServerSection, _> = toml::from_str("single_node_calvin = false\n");
         assert!(result.is_err());
     }
 }

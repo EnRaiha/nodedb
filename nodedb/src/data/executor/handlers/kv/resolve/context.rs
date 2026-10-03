@@ -71,6 +71,29 @@ pub(super) fn put_mutation(put: ResolvedPut<'_>) -> KvResolvedMutation {
     }
 }
 
+/// Bundled inputs for [`rewrite_mutation`]: a new value for a row the key
+/// already holds. It carries no surrogate: the row keeps its bound identity.
+pub(super) struct ResolvedRewrite<'a> {
+    pub collection: &'a str,
+    pub key: &'a [u8],
+    pub value: Vec<u8>,
+    pub ttl_ms: u64,
+    pub expire_at_ms: u64,
+    pub precondition: Vec<u8>,
+}
+
+/// Build the `Rewrite` mutation a resolved write applies.
+pub(super) fn rewrite_mutation(rewrite: ResolvedRewrite<'_>) -> KvResolvedMutation {
+    KvResolvedMutation::Rewrite {
+        collection: nodedb_types::QualifiedCollection::from_stored(rewrite.collection.to_owned()),
+        key: rewrite.key.to_vec(),
+        value: rewrite.value,
+        ttl_ms: rewrite.ttl_ms,
+        expire_at_ms: rewrite.expire_at_ms,
+        precondition: rewrite.precondition,
+    }
+}
+
 /// Build the `Delete` mutation a resolved write applies.
 pub(super) fn delete_mutation(
     collection: &str,

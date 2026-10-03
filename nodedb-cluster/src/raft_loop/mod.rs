@@ -15,13 +15,17 @@
 //!   peer, propose `AddLearner` on every group, wait for commit,
 //!   broadcast topology, persist catalog, build the wire response.
 
+pub mod apply_gate;
 mod auth_lease;
 pub mod auth_lease_hook;
 mod builder;
+mod group_unmount;
 pub mod handle_rpc;
 pub mod hooks;
+mod hooks_routed;
 pub mod in_flight_snapshots;
 pub mod join;
+mod leader_balance;
 mod leadership_transfer;
 mod lease_gc;
 pub mod loop_core;
@@ -29,13 +33,18 @@ mod membership_convergence;
 mod placement_reconcile;
 pub mod proposals;
 mod read_index;
+mod routing_persist;
+mod run;
+mod snapshot_membership;
 pub mod tick;
+mod tick_state;
 
+pub use apply_gate::{ApplyPermit, GroupApplyGates, InstallPermit};
 pub use auth_lease_hook::AuthLeaseService;
 pub use hooks::{
-    AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, ReleaseReservation, ReserveRead,
-    ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver, SnapshotApplier,
-    SnapshotBuilder, SnapshotQuarantineHook,
+    AssignRemoteSurrogate, BuiltGroupSnapshot, CalvinSubmit, CalvinSubmitInbox,
+    MetadataSnapshotCapture, ReleaseReservation, ReserveRead, ShuffleAggregator, ShuffleConsumer,
+    ShuffleProducer, ShuffleReceiver, SnapshotApplier, SnapshotBuilder, SnapshotQuarantineHook,
 };
 pub use in_flight_snapshots::{InFlightSnapshotGuard, InFlightSnapshots};
 pub use loop_core::{CommitApplier, RaftLoop, VShardEnvelopeHandler};

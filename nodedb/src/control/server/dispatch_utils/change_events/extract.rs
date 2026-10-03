@@ -7,17 +7,20 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::change_stream::ChangeOperation;
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::{
-    ArrayOp, ClusterArrayOp, ColumnarOp, CrdtOp, DocumentOp, DocumentResolvedMutation, KvOp,
-    KvResolvedMutation, MetaOp, TimeseriesOp, VectorOp, VectorResolvedMutation, VectorWriteTargets,
+    ArrayOp, ColumnarOp, CrdtOp, DocumentOp, DocumentResolvedMutation, KvOp, KvResolvedMutation,
+    MetaOp, TimeseriesOp, VectorOp, VectorResolvedMutation, VectorWriteTargets,
 };
 use nodedb_types::{RowIdentity, StorageKey};
+
+use super::cluster_array::cluster_array_change_meta;
+use super::redo::redo_change_meta;
 
 /// One row change a plan yields: `(collection, row identity, op)`.
 pub(super) type WriteChangeMeta = (String, RowIdentity, ChangeOperation);
 
 /// The identity a batch or predicate write reports: every row in the
 /// collection, not one addressable row. A subscriber sees `"*"`.
-fn every_row() -> RowIdentity {
+pub(super) fn every_row() -> RowIdentity {
     RowIdentity::from_user_key("*")
 }
 
@@ -43,6 +46,33 @@ fn vector_target_events(
             vec![(collection.to_string(), every_row(), operation)]
         }
     }
+}
+
+/// One event per resolved vector-primary mutation, naming every row touched —
+/// never collapsed to "*". An upsert's pre-image is what the resolve found
+/// stored: absent is an insert, present is an update.
+fn vector_resolved_change_meta(
+    collection: &str,
+    mutations: &[VectorResolvedMutation],
+) -> Vec<WriteChangeMeta> {
+    mutations
+        .iter()
+        .map(|mutation| {
+            let operation = match mutation {
+                VectorResolvedMutation::Delete { .. } => ChangeOperation::Delete,
+                VectorResolvedMutation::Update { .. } => ChangeOperation::Update,
+                VectorResolvedMutation::Upsert { old_payload, .. } => match old_payload {
+                    Some(_) => ChangeOperation::Update,
+                    None => ChangeOperation::Insert,
+                },
+            };
+            (
+                collection.to_owned(),
+                StorageKey::for_surrogate(mutation.surrogate()).to_identity(),
+                operation,
+            )
+        })
+        .collect()
 }
 
 /// A KV row's identity is its key bytes, rendered as text for the subscriber.
@@ -166,7 +196,7 @@ pub(super) fn extract_write_metadata(
         PhysicalPlan::Document(_) => Vec::new(),
 
         // Batch write and truncate: document_id="*" names every row. Per-row
-        // events would flood the bus — subscribe via collection_filter.
+        // events will flood the bus — subscribe via collection_filter.
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest { collection, .. }) => {
             vec![(collection.to_string(), every_row(), ChangeOperation::Insert)]
         }
@@ -259,7 +289,7 @@ pub(super) fn extract_write_metadata(
                 ChangeOperation::Insert,
             ),
         ],
-        // Reports one event per mutation, naming every collection/key touched — may
+        // Reports one event per mutation, naming every collection/key touched — can
         // span two collections (a resolved `TransferItem`).
         PhysicalPlan::Kv(KvOp::ResolvedWrite { mutations, .. }) => mutations
             .iter()
@@ -271,9 +301,9 @@ pub(super) fn extract_write_metadata(
                         Some(_) => ChangeOperation::Update,
                         None => ChangeOperation::Insert,
                     },
-                    KvResolvedMutation::Expire { .. } | KvResolvedMutation::Persist { .. } => {
-                        ChangeOperation::Update
-                    }
+                    KvResolvedMutation::Rewrite { .. }
+                    | KvResolvedMutation::Expire { .. }
+                    | KvResolvedMutation::Persist { .. } => ChangeOperation::Update,
                 };
                 (
                     mutation.collection().to_string(),
@@ -318,7 +348,7 @@ pub(super) fn extract_write_metadata(
         // `GRAPH INSERT EDGE` and `SetNodeLabels`/`RemoveNodeLabels` are known CDC gaps.
         PhysicalPlan::Graph(_) => Vec::new(),
 
-        // Vector is normally a Document secondary index — publishing here would duplicate.
+        // Vector is normally a Document secondary index — publishing here will duplicate.
         // The direct write family is the exception: the sole writes for a vector-primary
         // collection. The row's identity is its PK-bound surrogate, rendered as the decimal
         // surrogate, which is what a sidecar read reports as the row id.
@@ -356,30 +386,11 @@ pub(super) fn extract_write_metadata(
             targets,
             ..
         }) => vector_target_events(collection, targets, ChangeOperation::Update),
-        // Reports one event per mutation, naming every row touched — never collapses to "*".
-        // An upsert's pre-image is what the resolve found stored: absent = insert, present = update.
         PhysicalPlan::Vector(VectorOp::ResolvedDirectWrite {
             collection,
             mutations,
             ..
-        }) => mutations
-            .iter()
-            .map(|mutation| {
-                let operation = match mutation {
-                    VectorResolvedMutation::Delete { .. } => ChangeOperation::Delete,
-                    VectorResolvedMutation::Update { .. } => ChangeOperation::Update,
-                    VectorResolvedMutation::Upsert { old_payload, .. } => match old_payload {
-                        Some(_) => ChangeOperation::Update,
-                        None => ChangeOperation::Insert,
-                    },
-                };
-                (
-                    collection.to_string(),
-                    StorageKey::for_surrogate(mutation.surrogate()).to_identity(),
-                    operation,
-                )
-            })
-            .collect(),
+        }) => vector_resolved_change_meta(&collection.to_string(), mutations),
         // The resolve pass reads; the rows it decides are published by the
         // resolved write that applies them.
         PhysicalPlan::Vector(_) => Vec::new(),
@@ -467,33 +478,19 @@ pub(super) fn extract_write_metadata(
         // Query: joins, aggregates, coordinator Exchange nodes are read-only.
         PhysicalPlan::Query(_) => Vec::new(),
 
-        // Publishes the same events its constituent writes would emit under autocommit.
+        // Publishes the same events its constituent writes will emit under autocommit.
         PhysicalPlan::Meta(MetaOp::TransactionBatch { plans, .. }) => plans
             .iter()
             .flat_map(|plan| extract_write_metadata(plan, _tenant_id))
             .collect(),
+        // A committed transaction's redo publishes the rows it installs.
+        PhysicalPlan::Meta(MetaOp::ApplyTransactionRedo { redo, .. }) => redo_change_meta(redo),
         PhysicalPlan::Meta(_) => Vec::new(),
 
-        // Never reached via normal dispatch — `routing/cluster_array.rs` calls this
-        // directly via `publish_cluster_array_change_events`, so it IS load-bearing there.
+        // A coordinator op publishes nothing itself: each shard's committed
+        // array write publishes as its replicas apply it.
         PhysicalPlan::ClusterArray(op) => cluster_array_change_meta(op),
         PhysicalPlan::ClusterEvent(_) => Vec::new(),
-    }
-}
-
-/// Map a `ClusterArrayOp` to its CDC change metadata. Shared by the
-/// `PhysicalPlan::ClusterArray` arm and `publish_cluster_array_change_events`,
-/// which holds the op by reference to avoid cloning the write batch.
-pub(crate) fn cluster_array_change_meta(op: &ClusterArrayOp) -> Vec<WriteChangeMeta> {
-    match op {
-        ClusterArrayOp::Put { array_id, .. } => {
-            vec![(array_id.name.clone(), every_row(), ChangeOperation::Insert)]
-        }
-        ClusterArrayOp::Delete { array_id, .. } => {
-            vec![(array_id.name.clone(), every_row(), ChangeOperation::Delete)]
-        }
-        // Slice/Agg are reads — no row changed.
-        ClusterArrayOp::Slice { .. } | ClusterArrayOp::Agg { .. } => Vec::new(),
     }
 }
 
@@ -501,6 +498,7 @@ pub(crate) fn cluster_array_change_meta(op: &ClusterArrayOp) -> Vec<WriteChangeM
 mod tests {
     use super::*;
     use nodedb_array::types::ArrayId;
+    use nodedb_physical::physical_plan::ClusterArrayOp;
     use nodedb_physical::physical_plan::{ColumnarInsertIntent, GraphOp};
     use nodedb_types::{
         DatabaseId, QualifiedCollection, Surrogate, VectorQuantization, VectorStorageDtype,
@@ -525,7 +523,7 @@ mod tests {
                 PhysicalPlan::Document(DocumentOp::PointDelete {
                     collection: QualifiedCollection::new(DatabaseId::DEFAULT, "users"),
                     document_id: "u2".into(),
-                    surrogate: Surrogate::new(2),
+                    surrogate: Some(Surrogate::new(2)),
                     pk_bytes: Vec::new(),
                     returning: None,
                     rls_filters: Vec::new(),
@@ -597,6 +595,7 @@ mod tests {
             cells_msgpack: Vec::new(),
             wal_lsn: 0,
             provenance: None,
+            vshard_id: 0,
         });
         let meta = extract_write_metadata(&plan, TenantId::new(1));
         assert_eq!(
@@ -612,6 +611,7 @@ mod tests {
             coords_msgpack: Vec::new(),
             wal_lsn: 0,
             provenance: None,
+            vshard_id: 0,
         });
         let meta = extract_write_metadata(&plan, TenantId::new(1));
         assert_eq!(
@@ -680,7 +680,7 @@ mod tests {
     }
 
     // Implicit edges mirror into a separate `GraphOp::EdgePut`; the underlying
-    // `DocumentOp` already published the event — emitting here would double-publish.
+    // `DocumentOp` already published the event — emitting here will double-publish.
     #[test]
     fn graph_edge_put_emits_no_change_event() {
         let plan = PhysicalPlan::Graph(GraphOp::EdgePut {

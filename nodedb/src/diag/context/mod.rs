@@ -7,6 +7,7 @@
 //! report with a rising count instead of one per attempt.
 
 mod catalog;
+mod continuous_agg;
 mod crdt;
 mod data_plane;
 mod index_rebuild;
@@ -25,6 +26,7 @@ pub(in crate::diag) use catalog::{
     CatalogApplyOrphanRow, CollectionPurgeRowMissing, ConsumerGroupOffsetsRetained,
     MetadataApplyWedged, SynonymGroupNotApplied,
 };
+pub(in crate::diag) use continuous_agg::ContinuousAggregateNotApplied;
 pub(in crate::diag) use crdt::HistoryCompactionNotApplied;
 pub use data_plane::LostResponseWrite;
 pub(in crate::diag) use data_plane::{

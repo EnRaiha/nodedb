@@ -45,6 +45,21 @@ impl Scheduler {
         self.cut_floors.fold(self.applied.fully_applied_epoch());
     }
 
+    /// The commit HLC of the transaction `txn_id`: the instant every WAL
+    /// record of its install carries. A transaction whose state is gone takes
+    /// the node's HLC now.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn txn_commit_hlc(
+        &self,
+        txn_id: TxnId,
+    ) -> u64 {
+        match self.pending.get(&txn_id) {
+            Some(pending) => self
+                .cut_floors
+                .commit_hlc(pending.txn.epoch, pending.txn.epoch_system_ms),
+            None => self.shared.hlc_clock.now().wall_ns,
+        }
+    }
+
     /// Record the commit HLC of the committed transaction `txn_id` on its
     /// tenant's observed write high-water, before its `CompletionAck` lets
     /// the coordinator acknowledge the COMMIT.
@@ -52,6 +67,11 @@ impl Scheduler {
     /// Only a slice that carries a primary user data write records it. The
     /// implicit edge cleanup that dual-homes alongside one writes no user row
     /// of its own.
+    ///
+    /// A transaction that re-issues a RESTORE raises the tenant's restore
+    /// mark under its restore id instead, so a retry of that RESTORE finds
+    /// only its own marks. Its commit HLC still folds into this node's clock,
+    /// so a later backup here stamps a newer watermark.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) fn record_calvin_write_mark(
         &self,
         txn_id: TxnId,
@@ -64,12 +84,19 @@ impl Scheduler {
         }
         let tx_class = &pending.txn.tx_class;
         let tenant_id = tx_class.tenant_id.as_u64();
+        let restore_id = tx_class.restore_id;
         let collection = tx_class.write_set.0.first().map(|set| set.collection());
         let commit_hlc = self
             .cut_floors
             .commit_hlc(pending.txn.epoch, pending.txn.epoch_system_ms);
-        self.shared
-            .advance_tenant_write_hlc(tenant_id, commit_hlc, "calvin flush", collection);
+        if restore_id == 0 {
+            self.shared
+                .advance_tenant_write_hlc(tenant_id, commit_hlc, "calvin flush", collection);
+        } else {
+            self.shared
+                .hlc_clock
+                .update(nodedb_types::Hlc::new(commit_hlc, 0));
+        }
 
         // The durable mark, in the data group that homes this vShard, lands
         // before the ack too: RESTORE's guard reads it on every node, after a
@@ -87,13 +114,17 @@ impl Scheduler {
             }
         };
         let marks = &self.shared.tenant_marks;
-        marks.raise(
-            group_id,
-            tenant_id,
-            commit_hlc,
-            MarkSite::CalvinFlush,
-            collection,
-        );
+        if restore_id == 0 {
+            marks.raise(
+                group_id,
+                tenant_id,
+                commit_hlc,
+                MarkSite::CalvinFlush,
+                collection,
+            );
+        } else {
+            marks.raise_restore(group_id, tenant_id, commit_hlc, collection, restore_id);
+        }
         if let Err(error) = marks.persist(self.shared.credentials.catalog()) {
             // The mark stays pending; the next persist on this node writes it.
             tracing::error!(

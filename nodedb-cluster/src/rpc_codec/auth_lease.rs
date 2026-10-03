@@ -42,8 +42,9 @@ pub enum AuthLeaseRenewOutcome {
     /// The report does not cover every acknowledged change. The sender's
     /// lease is not extended.
     Withheld,
-    /// The receiver does not lead the metadata group.
-    NotLeader { leader_hint: Option<u64> },
+    /// The receiver does not lead the metadata group. `leader_hint` is the
+    /// leader the receiver knows at `term`, its current term.
+    NotLeader { leader_hint: Option<u64>, term: u64 },
 }
 
 /// Response to an [`AuthLeaseRenewRequest`].
@@ -66,8 +67,9 @@ pub struct AuthBarrierRequest {
 pub enum AuthBarrierOutcome {
     /// No node can plan against state older than the targets.
     Released,
-    /// The receiver does not lead the metadata group.
-    NotLeader { leader_hint: Option<u64> },
+    /// The receiver does not lead the metadata group. `leader_hint` is the
+    /// leader the receiver knows at `term`, its current term.
+    NotLeader { leader_hint: Option<u64>, term: u64 },
     /// The barrier did not release in time.
     Timeout { waited_ms: u64 },
 }
@@ -182,6 +184,7 @@ mod tests {
             AuthLeaseRenewOutcome::Withheld,
             AuthLeaseRenewOutcome::NotLeader {
                 leader_hint: Some(1),
+                term: 3,
             },
         ] {
             match roundtrip(RaftRpc::AuthLeaseRenewResponse(AuthLeaseRenewResponse {
@@ -207,7 +210,10 @@ mod tests {
         }
         for outcome in [
             AuthBarrierOutcome::Released,
-            AuthBarrierOutcome::NotLeader { leader_hint: None },
+            AuthBarrierOutcome::NotLeader {
+                leader_hint: None,
+                term: 0,
+            },
             AuthBarrierOutcome::Timeout { waited_ms: 5000 },
         ] {
             match roundtrip(RaftRpc::AuthBarrierResponse(AuthBarrierResponse {

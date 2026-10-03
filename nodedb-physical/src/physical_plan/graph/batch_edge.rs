@@ -8,8 +8,7 @@ use nodedb_types::{QualifiedCollection, Surrogate};
 ///
 /// `src_surrogate` / `dst_surrogate` carry the global row identity for the
 /// edge endpoints (resolved at construction time via the surrogate assigner).
-/// `Surrogate::ZERO` is used in test fixtures and on in-memory paths where
-/// no catalog is wired; production paths always populate real surrogates.
+/// Neither is ever `Surrogate::ZERO`: an edge that carries it is refused.
 #[derive(
     Debug,
     Clone,

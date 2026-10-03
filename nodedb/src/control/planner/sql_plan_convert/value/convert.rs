@@ -31,7 +31,7 @@ pub(crate) fn sql_value_to_string(v: &SqlValue) -> String {
         SqlValue::Decimal(d) => d.to_string(),
         SqlValue::Bool(b) => b.to_string(),
         SqlValue::Timestamp(dt) | SqlValue::Timestamptz(dt) => dt.to_iso8601(),
-        SqlValue::Bytes(b) => format!("\\x{}", hex_encode(b)),
+        SqlValue::Bytes(b) => format!("\\x{}", hex::encode(b)),
         SqlValue::Array(arr) => format_pg_array(arr),
         SqlValue::Null => String::new(),
     }
@@ -58,14 +58,6 @@ fn pg_array_string_needs_quotes(value: &str) -> bool {
         || value
             .chars()
             .any(|c| c.is_whitespace() || matches!(c, ',' | '{' | '}' | '"' | '\\'))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }
 
 /// Raw bytes for a KV key or a single-`value` column body.
@@ -105,7 +97,7 @@ mod tests {
     /// The read-side stringifier (`sql_value_to_string`, which the index-range
     /// read-set capture uses) and the write-side index-key stringifier
     /// (`json_scalar_to_string`) MUST agree on the canonical string for every
-    /// scalar type — otherwise a captured `IndexEq` value would never match the
+    /// scalar type — otherwise a captured `IndexEq` value will never match the
     /// index key a write records. This parity is the load-bearing guarantee the
     /// per-value comparison (a later change) will rest on.
     #[test]

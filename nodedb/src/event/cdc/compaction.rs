@@ -112,6 +112,8 @@ mod tests {
             row_id: format!("row-{seq}"),
             event_time: now_ms,
             lsn: seq * 10,
+            index: seq * 10,
+            epoch: 0,
             database_id: crate::types::DatabaseId::new(7),
             tenant_id: 1,
             new_value: Some(serde_json::json!({"id": key_val, "name": format!("v{seq}")})),

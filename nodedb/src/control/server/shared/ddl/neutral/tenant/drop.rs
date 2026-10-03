@@ -6,13 +6,11 @@
 //! optional), parallel to the `CREATE TENANT <name>` and
 //! `SHOW TENANT <name|id>` paths.
 //!
-//! Ported verbatim from the pgwire `ddl::tenant::drop` handler. The
-//! `reconcile_tenant_users` cleanup now calls `neutral::user::drop_user`
-//! directly (it was already protocol-neutral) instead of round-tripping
-//! through `ddl_encode::ddl_results_to_pgwire`.
+//! The `reconcile_tenant_users` cleanup calls `neutral::user::drop_user`
+//! directly, because that function is protocol-neutral.
 
 use crate::control::catalog_entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -22,7 +20,7 @@ use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::strip_if_exists;
 use super::support::{ddl_err, resolve_tenant_ref, status, tenant_exists};
 
-pub fn drop_tenant(
+pub async fn drop_tenant(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -102,34 +100,12 @@ pub fn drop_tenant(
     //     `CREATE TENANT` is dropped as part of the tenant lifecycle;
     //   * any other user is real and operator-owned — refuse the drop
     //     (`42501`) and name them, so nobody is silently hard-deleted.
-    reconcile_tenant_users(state, identity, tenant_id)?;
+    reconcile_tenant_users(state, identity, tenant_id).await?;
 
     let entry = CatalogEntry::DeleteTenant { tenant_id: tid };
-    let outcome = propose_catalog_entry(state, &entry)
+    propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        {
-            let catalog = state.credentials.catalog();
-            catalog
-                .delete_tenant(tid)
-                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        }
-        {
-            let mut tenants = match state.tenants.lock() {
-                Ok(t) => t,
-                Err(p) => p.into_inner(),
-            };
-            tenants.remove_quota(tenant_id);
-        }
-        // Single-node path: no applier runs, so this branch owns both the
-        // quota row deletion and the live cap release.
-        crate::control::catalog_entry::apply::quota::purge_tenant_scope(
-            tid,
-            state.credentials.catalog(),
-        )
-        .map_err(|e| DdlError::from_error_in_context("quota purge failed", &e))?;
-        crate::control::catalog_entry::post_apply::quota::release_tenant_scope(tenant_id, state);
-    }
 
     state.audit_record(
         AuditEvent::TenantDeleted,
@@ -151,7 +127,7 @@ pub fn drop_tenant(
 /// path. Any other user is operator-owned: the drop is refused with
 /// `42501` and the remaining users are named, so no real account is
 /// ever silently hard-deleted by a tenant drop.
-fn reconcile_tenant_users(
+async fn reconcile_tenant_users(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     tenant_id: TenantId,
@@ -204,7 +180,7 @@ fn reconcile_tenant_users(
     // all run — the same guarantees `DROP USER` gives directly.
     if let Some(admin) = lifecycle_admin {
         let parts = ["DROP", "USER", admin.as_str()];
-        super::super::user::drop_tenant_admin(state, identity, &parts)?;
+        super::super::user::drop_tenant_admin(state, identity, &parts).await?;
     }
 
     Ok(())

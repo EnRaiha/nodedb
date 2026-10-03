@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Dispatch for KvOp variants (engine pressure check + delegation to execute_kv).
+//! Dispatch for KvOp variants: engine pressure check, refusal of an unbound
+//! row write, then delegation to execute_kv.
 
 use crate::bridge::envelope::Response;
 use nodedb_physical::physical_plan::KvOp;
@@ -37,6 +38,11 @@ impl CoreLoop {
         );
         if is_kv_write && let Some(r) = self.check_engine_pressure(task, nodedb_mem::EngineId::Kv) {
             return r;
+        }
+        if let Some(refusal) =
+            crate::data::executor::handlers::kv::unbound::refuse_unbound_kv_write(op)
+        {
+            return self.response_error(task, refusal);
         }
         self.execute_kv(task, did, tid, op)
     }

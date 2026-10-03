@@ -19,7 +19,7 @@ pub struct CrossShardMetrics {
     pub retries: AtomicU64,
     /// Total events sent to DLQ after max retries.
     pub dlq_enqueued: AtomicU64,
-    /// Total duplicate events dropped by HWM dedup.
+    /// Total duplicate events dropped by dedup.
     pub duplicates_dropped: AtomicU64,
     /// Total delivery failures (transport errors, execution errors).
     pub delivery_failures: AtomicU64,

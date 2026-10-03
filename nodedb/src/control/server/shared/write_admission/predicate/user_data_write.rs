@@ -5,7 +5,7 @@
 //! RESTORE's staleness guard refuses an envelope older than the tenant's
 //! newest user-data write. A write-class plan that installs schema state on a
 //! replica changes no row. The node proposes it on its own, for example the
-//! constraint reconcile loop on every boot. Counting it would refuse a restore
+//! constraint reconcile loop on every boot. Counting it will refuse a restore
 //! of a backup that already holds every row the tenant wrote.
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -66,7 +66,7 @@ mod tests {
             key: b"k".to_vec(),
             value: b"v".to_vec(),
             ttl_ms: 0,
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,

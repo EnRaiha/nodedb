@@ -57,10 +57,9 @@ pub const ARRAY_WAL_FORMAT_VERSION: u8 = 3;
 pub struct ArrayPutCell {
     pub coord: Vec<CoordValue>,
     pub attrs: Vec<CellValue>,
-    /// Control-Plane-allocated global surrogate for this `(array, coord)`.
-    /// Recovery and follower replication re-derive it from the catalog
-    /// surrogate map; the live INSERT path stamps it here so engine
-    /// writers can carry it directly into the memtable / segment.
+    /// Control-Plane-allocated global surrogate for this `(array, coord)`,
+    /// carried into the memtable and segment. Never `Surrogate::ZERO`: a put
+    /// with an unbound cell is refused before any cell is written.
     pub surrogate: Surrogate,
     /// System-time timestamp (HLC ms) when the write was accepted by the
     /// Control Plane. Monotonically increasing within a given array.
@@ -223,7 +222,7 @@ mod tests {
             cells: vec![ArrayPutCell {
                 coord: vec![CoordValue::Int64(1), CoordValue::Int64(2)],
                 attrs: vec![CellValue::Int64(99)],
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 system_from_ms: 1_000,
                 valid_from_ms: 1_000,
                 valid_until_ms: i64::MAX,

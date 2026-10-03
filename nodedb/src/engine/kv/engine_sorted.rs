@@ -178,10 +178,9 @@ impl KvEngine {
 
 #[cfg(test)]
 mod tests {
-    use nodedb_types::Surrogate;
-
     use crate::engine::kv::sorted_index::key::{SortColumn, SortDirection, SortKeyEncoder};
     use crate::engine::kv::sorted_index::window::WindowConfig;
+    use crate::engine::kv::test_support::row_surrogate;
     use crate::engine::kv::{AtomicKeyCtx, KvPutParams, KvScanParams, admit_any};
 
     use super::*;
@@ -249,8 +248,9 @@ mod tests {
             value: &mp_scored(player_id, score),
             ttl_ms: 0,
             now_ms: now(),
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(player_id.as_bytes()),
+        })
+        .expect("a bound row writes");
     }
 
     fn ranked_keys(entries: Option<Vec<(u32, Vec<u8>)>>) -> Vec<String> {
@@ -352,7 +352,7 @@ mod tests {
                 collection: "players",
                 key: b"p1",
                 now_ms: n,
-                surrogate: Surrogate::ZERO,
+                surrogate: row_surrogate(b"p1"),
             },
             89,
             // `ttl_ms == 0` preserves whatever TTL the key already has, so the
@@ -481,8 +481,9 @@ mod tests {
             value: &mp_obj(&[("player_id", "p1"), ("score", "200")]),
             ttl_ms: 5000,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"p1"),
+        })
+        .expect("a bound row writes");
         e.put(KvPutParams {
             database_id: 0,
             tenant_id: 1,
@@ -491,8 +492,9 @@ mod tests {
             value: &mp_obj(&[("player_id", "p2"), ("score", "100")]),
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"p2"),
+        })
+        .expect("a bound row writes");
 
         assert_eq!(e.sorted_index_rank(0, 1, "lb", b"p1", n), Some(1));
         assert_eq!(e.sorted_index_rank(0, 1, "lb", b"p2", n), Some(2));
@@ -538,8 +540,9 @@ mod tests {
             value: &mp_obj(&[("player_id", "p1"), ("score", "200")]),
             ttl_ms: 0,
             now_ms: n,
-            surrogate: Surrogate::ZERO,
-        });
+            surrogate: row_surrogate(b"p1"),
+        })
+        .expect("a bound row writes");
         assert_eq!(e.sorted_index_rank(0, 1, "lb", b"p1", n), Some(1));
 
         assert_eq!(e.truncate(0, 1, "players"), 1);

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Per-task routing: freeze/mirror checks, orchestrated DML, exchange
+//! Per-task routing: mirror checks, orchestrated DML, exchange
 //! resolution, and the replicated-vs-local dispatch choice.
 
 use std::sync::Arc;
 
 use crate::bridge::envelope::Response;
+use crate::control::cluster::linearizable_read::{
+    confirm_linearizable_read, statement_read_deadline,
+};
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::exchange::ReadScope;
 use crate::control::server::exchange::resolve::{
     DistributedReadCapture, Resolved, resolve_and_materialize,
 };
+use crate::control::server::shared::write_admission::plan_is_write;
 use crate::types::{Lsn, ReadConsistency, TraceId, VShardId};
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -23,20 +28,12 @@ impl NodeDbPgHandler {
         mut task: PhysicalTask,
         user_id: Option<Arc<str>>,
         identity: &AuthenticatedIdentity,
+        linearizable: bool,
         shard_watermarks: &mut Vec<(VShardId, Lsn)>,
         distributed_reads: &mut Vec<DistributedReadCapture>,
     ) -> crate::Result<Response> {
-        // Reject user writes against a database frozen by a clone materializer sweep.
-        // Reads/DDL pass through.
         use crate::control::security::identity::{Permission, required_permission};
         let perm = required_permission(&task.plan);
-        if matches!(perm, Permission::Write | Permission::Admin)
-            && self.state.materialize_freeze.is_frozen(task.database_id)
-        {
-            return Err(crate::Error::SourceFrozen {
-                database_id: task.database_id,
-            });
-        }
 
         // Mirror enforcement: writes reject on non-promoted mirrors; reads gate by
         // ReadConsistency. Catalog lookup skipped for db id=0 to stay allocation-free.
@@ -131,9 +128,7 @@ impl NodeDbPgHandler {
 
         // Can't replicate bare over Raft — a follower has no writing identity to decide
         // `$auth.*` against. `write_resolve` resolves it while the identity is live.
-        if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&task.plan)
-            && self.state.async_raft_proposer().is_some()
-        {
+        if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&task.plan) {
             let authorized = self.authorize_for_dispatch(identity, &task)?;
             return crate::control::write_resolve::run_authorized_write_resolve(
                 &self.state,
@@ -143,24 +138,13 @@ impl NodeDbPgHandler {
             .await;
         }
 
-        // `DROP ARRAY` reaches every core so each releases its store and segment dir —
-        // otherwise a follow-up `CREATE ARRAY` carries stale state.
-        if matches!(
-            task.plan,
-            crate::bridge::envelope::PhysicalPlan::Array(
-                nodedb_physical::physical_plan::ArrayOp::DropArray { .. }
-            )
-        ) {
-            // Broadcast bypasses the write funnel, so a denied DROP must not
-            // delete catalog rows or surrogate bindings.
+        // Array DDL proposes a replicated catalog entry; every node's
+        // post-apply opens or drops the array on its cores.
+        if crate::control::array_catalog::ddl::is_array_ddl(&task.plan) {
             let authorized = self.authorize_for_dispatch(identity, &task)?;
-            let task = authorized.into_physical_task();
-            return crate::control::array_catalog::ddl::run_authorized_drop(
+            return crate::control::array_catalog::ddl::run_authorized_array_ddl(
                 &self.state,
-                task.tenant_id,
-                task.database_id,
-                task.plan,
-                TraceId::ZERO,
+                authorized,
             )
             .await;
         }
@@ -175,17 +159,14 @@ impl NodeDbPgHandler {
         }
 
         // Resolve derived Exchange plans before authorizing the dispatched task.
-        match resolve_and_materialize(
-            &self.state,
-            identity,
-            task.database_id,
-            task.tenant_id,
-            task.plan,
-            TraceId::ZERO,
-            task.txn_id,
-        )
-        .await?
-        {
+        let scope = ReadScope {
+            database_id: task.database_id,
+            tenant_id: task.tenant_id,
+            trace_id: TraceId::ZERO,
+            txn_id: task.txn_id,
+            linearizable,
+        };
+        match resolve_and_materialize(&self.state, identity, task.plan, scope).await? {
             Resolved::Gathered(resp, wms, caps) => {
                 *shard_watermarks = wms;
                 *distributed_reads = caps;
@@ -210,23 +191,65 @@ impl NodeDbPgHandler {
             }
             crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(t) => t,
         };
-        if let Some(async_proposer) = self.state.async_raft_proposer()
-            && let Some(entry) = crate::control::wal_replication::to_replicated_entry(
-                checked.tenant_id(),
-                checked.database_id(),
-                checked.vshard_id(),
-                &crate::control::wal_replication::ReplicableWrite::decide_for_replication(
-                    checked.plan(),
-                )?,
-            )?
-        {
+        // The entry carries resolved rows: a timeseries ingest resolves here,
+        // on the proposer, before the entry exists.
+        let resolved = crate::control::write_resolve::resolve_for_log(
+            &self.state,
+            crate::control::write_resolve::WriteResolveContext {
+                tenant_id: checked.tenant_id(),
+                database_id: checked.database_id(),
+            },
+            checked.vshard_id(),
+            checked.plan(),
+        )
+        .await?;
+        if let Some(entry) = crate::control::wal_replication::to_replicated_entry(
+            checked.tenant_id(),
+            checked.database_id(),
+            checked.vshard_id(),
+            &crate::control::wal_replication::ReplicableWrite::decide_for_replication(
+                resolved.as_ref().unwrap_or(checked.plan()),
+            )?,
+        )? {
+            let async_proposer = self.state.async_raft_proposer()?;
+            let (_authorized, _lease) = checked.into_parts();
             return self
                 .dispatch_replicated_write(ReplicatedWrite {
                     entry,
                     proposer: async_proposer,
-                    authorized: checked.into_authorized(),
                 })
                 .await;
+        }
+        // A read runs here when this node replicates its group (and leads it,
+        // for a transaction's read: the staging overlay lives on the leader),
+        // confirmed first. Otherwise it runs on the group's leader.
+        if !plan_is_write(checked.plan()) {
+            use crate::control::server::dispatch_utils::{
+                ReadPlacement, owner_response, read_placement,
+            };
+            match read_placement(&self.state, checked.vshard_id(), checked.txn_id())? {
+                ReadPlacement::Here(groups) => {
+                    if linearizable {
+                        let deadline = statement_read_deadline(&self.state);
+                        confirm_linearizable_read(&self.state, &groups, deadline).await?;
+                    }
+                }
+                ReadPlacement::Owner => {
+                    let gateway = self.state.installed_gateway()?;
+                    let ctx = crate::control::gateway::core::QueryContext {
+                        tenant_id: checked.tenant_id(),
+                        trace_id: TraceId::ZERO,
+                        database_id: checked.database_id(),
+                        txn_id: checked.txn_id(),
+                        linearizable,
+                    };
+                    let outcome = gateway.execute_with_watermarks(&ctx, checked).await;
+                    if let Ok((_, wms, _)) = &outcome {
+                        *shard_watermarks = wms.clone();
+                    }
+                    return owner_response(outcome);
+                }
+            }
         }
         self.dispatch_local(checked, user_id).await
     }

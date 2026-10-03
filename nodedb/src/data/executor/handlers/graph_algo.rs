@@ -9,8 +9,8 @@
 //! before the algorithm executes rather than post-filtered on output.
 
 use nodedb_graph::CsrIndex;
-use nodedb_graph::csr::weights::extract_weight_from_properties;
-use nodedb_types::{DatabaseId, TenantId};
+use nodedb_physical::physical_plan::AlgoStage;
+use nodedb_types::TenantId;
 use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
@@ -20,6 +20,8 @@ use crate::engine::graph::algo::params::{AlgoParams, GraphAlgorithm};
 use crate::engine::graph::algo::result::AlgoResultBatch;
 use crate::engine::graph::edge_store::EdgeStore;
 
+use super::graph_algo_edges::{collection_edges, csr_from_edges};
+
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_graph_algo(
         &self,
@@ -27,6 +29,7 @@ impl CoreLoop {
         tid: u64,
         algorithm: &GraphAlgorithm,
         params: &AlgoParams,
+        stage: &AlgoStage,
     ) -> Response {
         debug!(
             core = self.core_id,
@@ -37,6 +40,18 @@ impl CoreLoop {
             "graph algorithm dispatch"
         );
 
+        let database_id = task.request.database_id.as_u64();
+
+        // The export stage runs nothing: it answers this core's edges for the
+        // coordinator to gather. The gathered stage reads no edges of its own.
+        let gathered = match stage {
+            AlgoStage::ExportEdges { system_as_of_ms } => {
+                return self.export_algo_edges(task, tid, params, *system_as_of_ms);
+            }
+            AlgoStage::Gathered { edges } => Some(edges),
+            AlgoStage::Local => None,
+        };
+
         if *algorithm == GraphAlgorithm::Sssp && params.source_node.is_none() {
             return self.response_error(
                 task,
@@ -46,22 +61,25 @@ impl CoreLoop {
             );
         }
 
-        let database_id = task.request.database_id.as_u64();
         let memory = nodedb_mem::ScopedMemory::new(
             self.governor.clone(),
             task.request.database_id,
             TenantId::new(tid),
             nodedb_mem::EngineId::Graph,
         );
-        let scoped_csr = match build_csr_for_collection(
-            &self.edge_store,
-            database_id,
-            tid,
-            &params.collection,
-            params.edge_label.as_deref(),
-            None,
-            memory,
-        ) {
+        let built = match gathered {
+            Some(edges) => csr_from_edges(edges, memory),
+            None => build_csr_for_collection(
+                &self.edge_store,
+                database_id,
+                tid,
+                &params.collection,
+                params.edge_label.as_deref(),
+                None,
+                memory,
+            ),
+        };
+        let scoped_csr = match built {
             Ok(c) => c,
             Err(e) => return self.response_error(task, ErrorCode::from(e)),
         };
@@ -79,6 +97,36 @@ impl CoreLoop {
                 |e| self.response_error(task, ErrorCode::from(e)),
                 |payload| self.response_with_payload(task, payload),
             )
+    }
+
+    /// Answer this core's edges of `params.collection`, after the label
+    /// filter, as a msgpack array of `AlgoEdge`. `system_as_of_ms` bounds them
+    /// to the edges live at that system time.
+    fn export_algo_edges(
+        &self,
+        task: &ExecutionTask,
+        tid: u64,
+        params: &AlgoParams,
+        system_as_of_ms: Option<i64>,
+    ) -> Response {
+        collection_edges(
+            &self.edge_store,
+            task.request.database_id.as_u64(),
+            tid,
+            &params.collection,
+            params.edge_label.as_deref(),
+            system_as_of_ms.map(nodedb_types::ms_to_ordinal_upper),
+        )
+        .and_then(|edges| {
+            zerompk::to_msgpack_vec(&edges).map_err(|e| crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("algorithm edge export: {e}"),
+            })
+        })
+        .map_or_else(
+            |e| self.response_error(task, ErrorCode::from(e)),
+            |payload| self.response_with_payload(task, payload),
+        )
     }
 }
 
@@ -99,52 +147,15 @@ pub(super) fn build_csr_for_collection(
     system_as_of: Option<i64>,
     memory: nodedb_mem::ScopedMemory,
 ) -> crate::Result<CsrIndex> {
-    let records = edge_store.scan_all_edges_decoded(system_as_of)?;
-    let target_db = DatabaseId::new(database_id);
-    let target_tid = TenantId::new(tid);
-
-    let mut csr = CsrIndex::new(memory);
-
-    // Pass 1: intern endpoint nodes.
-    for (rec_db, rec_tid, coll, src, label, dst, _props) in &records {
-        if *rec_db != target_db || *rec_tid != target_tid || coll != collection {
-            continue;
-        }
-        if edge_label.is_some_and(|el| label != el) {
-            continue;
-        }
-        csr.add_node(src).map_err(|e| crate::Error::Internal {
-            detail: format!("build_csr_for_collection add src: {e}"),
-        })?;
-        csr.add_node(dst).map_err(|e| crate::Error::Internal {
-            detail: format!("build_csr_for_collection add dst: {e}"),
-        })?;
-    }
-
-    // Pass 2: insert edges.
-    for (rec_db, rec_tid, coll, src, label, dst, props) in &records {
-        if *rec_db != target_db || *rec_tid != target_tid || coll != collection {
-            continue;
-        }
-        if edge_label.is_some_and(|el| label != el) {
-            continue;
-        }
-        let weight = extract_weight_from_properties(props);
-        let res = if weight != 1.0 {
-            csr.add_edge_weighted(src, label, dst, weight)
-        } else {
-            csr.add_edge(src, label, dst)
-        };
-        res.map_err(|e| crate::Error::Internal {
-            detail: format!("build_csr_for_collection add edge: {e}"),
-        })?;
-    }
-
-    csr.compact().map_err(|e| crate::Error::Internal {
-        detail: format!("build_csr_for_collection compact: {e}"),
-    })?;
-
-    Ok(csr)
+    let edges = collection_edges(
+        edge_store,
+        database_id,
+        tid,
+        collection,
+        edge_label,
+        system_as_of,
+    )?;
+    csr_from_edges(&edges, memory)
 }
 
 /// Shared implementation used by both current-state and temporal

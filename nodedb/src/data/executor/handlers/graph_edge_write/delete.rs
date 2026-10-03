@@ -4,7 +4,7 @@
 
 use tracing::debug;
 
-use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::envelope::{EdgeImage, ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
@@ -49,10 +49,22 @@ impl CoreLoop {
             src_id,
             label,
             dst_id,
+            src_surrogate,
+            dst_surrogate,
             rls_write_check,
         } = params;
         debug!(core = self.core_id, tid, %collection, %src_id, %label, %dst_id, "edge delete");
         let database_id = task.request.database_id.as_u64();
+        // Both endpoints carry the surrogate their coordinator bound.
+        for surrogate in [src_surrogate, dst_surrogate] {
+            if let Some(refusal) =
+                crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+                    "graph", collection, surrogate,
+                )
+            {
+                return self.response_error(task, refusal);
+            }
+        }
 
         // The pre-image is always read: the RLS write gate needs it for any
         // non-admit-all policy, and the response needs it to report a
@@ -80,9 +92,11 @@ impl CoreLoop {
             return self.response_error(task, error);
         }
 
-        let ord = self
-            .active_graph_system_from
-            .unwrap_or_else(|| self.hlc.next_ordinal());
+        let stamp = match self.graph_write_stamp() {
+            Ok(stamp) => stamp,
+            Err(e) => return self.response_error(task, e),
+        };
+        let ord = stamp.system_from;
         let target = EdgeTarget {
             database_id,
             tid,
@@ -103,17 +117,33 @@ impl CoreLoop {
                 label,
                 dst_id,
             ),
-            ord,
+            stamp,
             owns_logical_edge_stats(task, src_id),
         ) {
             Ok(tombstone) => {
+                let current = tombstone.current.clone();
                 // The tombstone is written whether or not the edge was live,
                 // so the undo that removes it is recorded either way.
                 if let (Some(undo), Some(csr)) = (undo, csr_prior) {
                     undo.push(UndoEntry::EdgeWrite(Box::new(target.undo(tombstone, csr))));
                 }
-                let partition = self.csr_partition_mut(database_id, tid);
-                partition.remove_edge_in_collection(src_id, label, dst_id, collection);
+                // The CSR follows what the edge resolves to: a tombstone a
+                // TRUNCATE hides, or one below a newer version, leaves the
+                // edge as it was.
+                if let Err(e) = self.mirror_edge_csr(
+                    database_id,
+                    tid,
+                    (src_id, label, dst_id),
+                    collection,
+                    current.as_deref(),
+                ) {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: e.to_string(),
+                        },
+                    );
+                }
                 self.checkpoint_coordinator.mark_dirty("sparse", 1);
                 self.note_edge_write_lsn(task, tid, collection, src_id, label, dst_id);
                 // CDC: emit after `note_edge_write_lsn` so the event LSN matches
@@ -125,11 +155,28 @@ impl CoreLoop {
                         src_id,
                         label,
                         dst_id,
+                        src_surrogate,
+                        dst_surrogate,
                         op: crate::event::WriteOp::Delete,
                         properties: None,
                     },
                 );
-                self.response_affected(task, u64::from(existed))
+                let mut response = self.response_affected(task, u64::from(existed));
+                // The tombstone's ordinal was decided here, so the tombstone is
+                // journalled after apply at exactly that ordinal.
+                response.write_set = vec![WriteSetEntry::edge(EdgeImage::Delete(
+                    crate::wal::EdgeDeleteRedo {
+                        collection: collection.to_string(),
+                        src_id: src_id.to_string(),
+                        label: label.to_string(),
+                        dst_id: dst_id.to_string(),
+                        src_surrogate: src_surrogate.as_u32(),
+                        dst_surrogate: dst_surrogate.as_u32(),
+                        system_from: Some(ord),
+                        applied: (stamp.applied != ord).then_some(stamp.applied),
+                    },
+                ))];
+                response
             }
             Err(e) => self.response_error(
                 task,
@@ -199,6 +246,8 @@ mod tests {
                 src_id: "a",
                 label: "KNOWS",
                 dst_id: "b",
+                src_surrogate: Surrogate::new(1),
+                dst_surrogate: Surrogate::new(2),
                 rls_write_check: &check,
             },
         );
@@ -255,6 +304,8 @@ mod tests {
                 src_id: "a",
                 label: "KNOWS",
                 dst_id: "b",
+                src_surrogate: Surrogate::new(1),
+                dst_surrogate: Surrogate::new(2),
                 rls_write_check: &check,
             },
         );
@@ -276,6 +327,8 @@ mod tests {
                 src_id: "ghost-a",
                 label: "KNOWS",
                 dst_id: "ghost-b",
+                src_surrogate: Surrogate::new(3),
+                dst_surrogate: Surrogate::new(4),
                 rls_write_check: &no_policy,
             },
         );
@@ -329,6 +382,8 @@ mod tests {
                 src_id: "a",
                 label: "KNOWS",
                 dst_id: "b",
+                src_surrogate: Surrogate::new(1),
+                dst_surrogate: Surrogate::new(2),
                 rls_write_check: &no_policy,
             },
         );
@@ -344,5 +399,10 @@ mod tests {
             crate::event::graph_cdc::edge_row_id("a", "KNOWS", "b").as_str()
         );
         assert_eq!(event.op, WriteOp::Delete);
+        let crate::event::types::RowId::Edge(edge) = &event.row_id else {
+            panic!("an edge delete names an edge row");
+        };
+        assert_eq!(edge.src_surrogate(), Surrogate::new(1));
+        assert_eq!(edge.dst_surrogate(), Surrogate::new(2));
     }
 }

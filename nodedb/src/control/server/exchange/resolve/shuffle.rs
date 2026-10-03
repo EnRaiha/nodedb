@@ -43,11 +43,13 @@ use crate::control::server::exchange::full_scan::{ScanSide, full_scan_plan_for_c
 use crate::control::server::exchange::gather::outcome_to_response;
 use crate::control::server::payload_merge::merge_msgpack_arrays;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, Lsn, TenantId, TraceId};
+use crate::types::{DatabaseId, Lsn, TenantId};
 
 use super::capture::DistributedReadCapture;
 use super::exchange::Resolved;
-use super::peers::{distinct_data_node_count, producer_nodes, send_produce};
+use super::peers::{
+    ShuffleRead, distinct_data_node_count, producer_nodes, producer_read_groups, send_produce,
+};
 
 /// Orchestrate a distributed shuffle hash join.
 ///
@@ -64,8 +66,12 @@ pub async fn resolve_shuffle_join(
     child: PhysicalPlan,
     _keys: Vec<(String, String)>,
     num_parts: usize,
-    trace_id: TraceId,
+    read: ShuffleRead,
 ) -> crate::Result<Resolved> {
+    let ShuffleRead {
+        trace_id,
+        linearizable,
+    } = read;
     // 1. The child MUST be a HashJoin — shuffle wraps a complete hash join.
     let PhysicalPlan::Query(QueryOp::HashJoin {
         left_collection,
@@ -168,6 +174,18 @@ pub async fn resolve_shuffle_join(
     //    leader each, but compute generally and dedup).
     let build_nodes = producer_nodes(&routing_snapshot, database_id, right_collection.as_str())?;
     let probe_nodes = producer_nodes(&routing_snapshot, database_id, left_collection.as_str())?;
+    let build_read_groups = producer_read_groups(
+        &routing_snapshot,
+        database_id,
+        right_collection.as_str(),
+        linearizable,
+    )?;
+    let probe_read_groups = producer_read_groups(
+        &routing_snapshot,
+        database_id,
+        left_collection.as_str(),
+        linearizable,
+    )?;
     let build_producer_count = build_nodes.len() as u32;
     let probe_producer_count = probe_nodes.len() as u32;
     if build_producer_count == 0 || probe_producer_count == 0 {
@@ -179,7 +197,7 @@ pub async fn resolve_shuffle_join(
     // Ensure the transport knows every target node's address before dispatching.
     // In production the WarmPeers startup phase registers every peer from the
     // topology, but a node that joined after that phase — or a coordinator that
-    // never had to reach a given peer — may not yet have it in the transport's
+    // never had to reach a given peer — can still lack it in the transport's
     // address map, and `send_rpc` to an unregistered peer fails with
     // NodeUnreachable even though the topology knows the node. Resolve each
     // producer/consumer node's address from the live topology and register it
@@ -252,6 +270,7 @@ pub async fn resolve_shuffle_join(
             deadline_remaining_ms,
             trace_id: trace_id.0,
             descriptor_versions: Vec::<DescriptorVersionEntry>::new(),
+            read_groups: build_read_groups.clone(),
         };
         build_produce_futures.push(send_produce(transport, node, req));
     }
@@ -270,6 +289,7 @@ pub async fn resolve_shuffle_join(
             deadline_remaining_ms,
             trace_id: trace_id.0,
             descriptor_versions: Vec::<DescriptorVersionEntry>::new(),
+            read_groups: probe_read_groups.clone(),
         };
         probe_produce_futures.push(send_produce(transport, node, req));
     }
@@ -347,9 +367,8 @@ pub async fn resolve_shuffle_join(
     // `ShuffleProduceResponse.read_version_lsn`. The record seam records one
     // read-set entry per capture, re-homing and revalidating each side's vshard
     // independently, so a concurrent write to EITHER side between the in-txn read
-    // and commit is detected (the build side was previously never recorded — the
-    // hole this closes). The response's own scalar stays `ZERO`: the captures
-    // carry the versions, and also setting the scalar would double-record the
+    // and commit is detected (the build side is recorded too). The response's own scalar stays `ZERO`: the captures
+    // carry the versions, and also setting the scalar will double-record the
     // left side. The core-global watermark is not threaded through the shuffle
     // transport and likewise stays `ZERO`.
     let captures = vec![

@@ -40,7 +40,8 @@ fn a_replayed_row_carries_the_source_of_its_write() {
     }
     wal.sync().expect("sync");
 
-    let events = replay_wal_to_events(&wal, Lsn::new(0), 0, 1, 0).expect("replay");
+    let events = replay_wal_to_events(&wal, Lsn::new(0), 0, 1, 0, &dir.path().join("ts-outcomes"))
+        .expect("replay");
     let replayed: Vec<EventSource> = events.iter().map(|event| event.source).collect();
     assert_eq!(replayed, sources.to_vec());
 }

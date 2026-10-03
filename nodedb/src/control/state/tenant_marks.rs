@@ -11,21 +11,20 @@
 //! every group that holds the tenant's data, so its answer does not depend
 //! on which node's memory saw the write.
 //!
-//! A server with no Raft groups records its writes under
-//! [`LOCAL_MARK_GROUP`]. Each such write's mark is durable before its WAL
-//! record is minted (see [`TenantMarks::stamp_local_write`]).
+//! Each `(group, tenant)` keeps two marks: the newest write a RESTORE
+//! re-issued, with that restore's id, and the newest of every other write.
+//! A retry of a restore then tells its own writes apart, and no restore write
+//! hides a newer user write.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use crate::control::security::catalog::SystemCatalog;
-use crate::control::security::catalog::tenant_group_marks::StoredGroupMark;
+use crate::control::security::catalog::tenant_group_marks::{RESTORE_SITE_CODE, StoredGroupMark};
 
-use super::local_write_stamps::{LocalWriteStamp, LocalWriteStamps};
-
-/// The pseudo-group a server with no Raft groups records its writes under.
-/// No Raft group carries this id.
-pub const LOCAL_MARK_GROUP: u64 = u64::MAX;
+/// One group mark as a group snapshot carries it:
+/// `(tenant_id, commit_hlc, site_code, collection, restore_id)`.
+pub type GroupMarkEntry = (u64, u64, u8, String, u64);
 
 /// The apply path that recorded a mark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,8 +33,8 @@ pub enum MarkSite {
     ReplicatedApply,
     /// A committed Calvin transaction's install.
     CalvinFlush,
-    /// A write on a server with no Raft groups.
-    LocalWrite,
+    /// A write a RESTORE re-issued.
+    Restore,
 }
 
 impl MarkSite {
@@ -44,7 +43,7 @@ impl MarkSite {
         match self {
             Self::ReplicatedApply => "replicated apply",
             Self::CalvinFlush => "calvin flush",
-            Self::LocalWrite => "local write",
+            Self::Restore => "restore re-issue",
         }
     }
 
@@ -53,7 +52,7 @@ impl MarkSite {
         match self {
             Self::ReplicatedApply => 0,
             Self::CalvinFlush => 1,
-            Self::LocalWrite => 2,
+            Self::Restore => RESTORE_SITE_CODE,
         }
     }
 
@@ -61,7 +60,7 @@ impl MarkSite {
     pub fn from_code(code: u8) -> Self {
         match code {
             1 => Self::CalvinFlush,
-            2 => Self::LocalWrite,
+            RESTORE_SITE_CODE => Self::Restore,
             _ => Self::ReplicatedApply,
         }
     }
@@ -75,26 +74,26 @@ pub struct GroupMark {
     pub site: MarkSite,
     /// The collection the write named, when it named one.
     pub collection: Option<String>,
+    /// The restore that re-issued the write, `0` for any other write.
+    pub restore_id: u64,
 }
+
+/// `(group_id, tenant_id, is_restore_mark)`.
+type MarkKey = (u64, u64, bool);
 
 #[derive(Debug, Default)]
 struct MarkState {
-    marks: HashMap<(u64, u64), GroupMark>,
+    marks: HashMap<MarkKey, GroupMark>,
     /// Marks raised since the last persist.
-    dirty: BTreeSet<(u64, u64)>,
-    /// The highest commit HLC of each mark the catalog holds.
-    persisted: HashMap<(u64, u64), u64>,
+    dirty: BTreeSet<MarkKey>,
 }
 
 /// This node's per-group tenant write marks.
 #[derive(Debug, Default)]
 pub struct TenantMarks {
     state: Mutex<MarkState>,
-    /// Held across each persist, so a caller that finds its mark persisted
-    /// knows the catalog commit that wrote it finished.
+    /// Serializes persists, so two never write the same dirty marks at once.
     persist_lock: Mutex<()>,
-    /// The local writes minting their records now.
-    local_stamps: LocalWriteStamps,
 }
 
 impl TenantMarks {
@@ -104,15 +103,14 @@ impl TenantMarks {
         {
             let mut state = marks.state.lock().unwrap_or_else(|p| p.into_inner());
             for stored in catalog.load_tenant_group_marks()? {
-                state
-                    .persisted
-                    .insert((stored.group_id, stored.tenant_id), stored.hlc);
+                let key = (stored.group_id, stored.tenant_id, stored.restore_id != 0);
                 state.marks.insert(
-                    (stored.group_id, stored.tenant_id),
+                    key,
                     GroupMark {
                         hlc: stored.hlc,
                         site: MarkSite::from_code(stored.site),
                         collection: (!stored.collection.is_empty()).then_some(stored.collection),
+                        restore_id: stored.restore_id,
                     },
                 );
             }
@@ -130,11 +128,41 @@ impl TenantMarks {
         site: MarkSite,
         collection: Option<&str>,
     ) {
+        self.raise_mark(group_id, tenant_id, hlc, site, collection, 0);
+    }
+
+    /// Raise the mark of the writes RESTORE `restore_id` re-issued. `0` is a
+    /// re-issue that is no RESTORE: its writes raise the user mark.
+    pub fn raise_restore(
+        &self,
+        group_id: u64,
+        tenant_id: u64,
+        hlc: u64,
+        collection: Option<&str>,
+        restore_id: u64,
+    ) {
+        let site = if restore_id == 0 {
+            MarkSite::ReplicatedApply
+        } else {
+            MarkSite::Restore
+        };
+        self.raise_mark(group_id, tenant_id, hlc, site, collection, restore_id);
+    }
+
+    fn raise_mark(
+        &self,
+        group_id: u64,
+        tenant_id: u64,
+        hlc: u64,
+        site: MarkSite,
+        collection: Option<&str>,
+        restore_id: u64,
+    ) {
         if hlc == 0 {
             return;
         }
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let key = (group_id, tenant_id);
+        let key = (group_id, tenant_id, restore_id != 0);
         if state.marks.get(&key).is_some_and(|mark| mark.hlc >= hlc) {
             return;
         }
@@ -144,6 +172,7 @@ impl TenantMarks {
                 hlc,
                 site,
                 collection: collection.map(str::to_owned),
+                restore_id,
             },
         );
         state.dirty.insert(key);
@@ -156,98 +185,26 @@ impl TenantMarks {
         self.persist_pending(catalog)
     }
 
-    /// Persist until the catalog holds `tenant_id`'s mark in `group_id` at or
-    /// above `hlc`. A persist that already wrote it, or one running now, covers
-    /// it: concurrent callers share one catalog commit.
-    pub fn persist_through(
-        &self,
-        catalog: &SystemCatalog,
-        group_id: u64,
-        tenant_id: u64,
-        hlc: u64,
-    ) -> crate::Result<()> {
-        let _persisting = self.persist_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let covered = self
-            .state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .persisted
-            .get(&(group_id, tenant_id))
-            .is_some_and(|persisted| *persisted >= hlc);
-        if covered {
-            return Ok(());
-        }
-        self.persist_pending(catalog)
-    }
-
-    /// Stamp a user write on a server with no Raft groups, and make its mark
-    /// durable before the write mints its WAL record.
-    ///
-    /// The stamp is the write's commit HLC. It stays open until the returned
-    /// guard drops, which the caller does once the record is minted. A backup
-    /// cut waits for every open stamp at or below its watermark (see
-    /// [`Self::await_local_stamps_minted`]). So a write stamped below the
-    /// watermark is in the backup, and one stamped above it has a mark above
-    /// it. A crash after the mint leaves the mark in the catalog, whether or
-    /// not the record reached disk.
-    pub fn stamp_local_write(
-        &self,
-        clock: &nodedb_types::HlcClock,
-        catalog: &SystemCatalog,
-        tenant_id: u64,
-        collection: Option<&str>,
-    ) -> crate::Result<LocalWriteStamp<'_>> {
-        let stamp = self.local_stamps.stamp(clock);
-        self.record_local_write(catalog, tenant_id, stamp.hlc(), collection)?;
-        Ok(stamp)
-    }
-
-    /// Raise `tenant_id`'s mark under [`LOCAL_MARK_GROUP`] to `hlc` and
-    /// persist it. A mark the catalog already holds at or above `hlc` costs
-    /// no catalog commit.
-    pub fn record_local_write(
-        &self,
-        catalog: &SystemCatalog,
-        tenant_id: u64,
-        hlc: u64,
-        collection: Option<&str>,
-    ) -> crate::Result<()> {
-        self.raise(
-            LOCAL_MARK_GROUP,
-            tenant_id,
-            hlc,
-            MarkSite::LocalWrite,
-            collection,
-        );
-        self.persist_through(catalog, LOCAL_MARK_GROUP, tenant_id, hlc)
-    }
-
-    /// Wait until every local write stamped at or below `watermark` minted
-    /// its record. `false` when `deadline` passes first.
-    pub async fn await_local_stamps_minted(
-        &self,
-        watermark: u64,
-        deadline: tokio::time::Instant,
-    ) -> bool {
-        self.local_stamps
-            .await_minted_through(watermark, deadline)
-            .await
-    }
-
     /// Write every dirty mark. The caller holds `persist_lock`.
     fn persist_pending(&self, catalog: &SystemCatalog) -> crate::Result<()> {
-        let pending: Vec<StoredGroupMark> = {
+        let pending: Vec<(MarkKey, StoredGroupMark)> = {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             state
                 .dirty
                 .iter()
                 .filter_map(|key| {
-                    state.marks.get(key).map(|mark| StoredGroupMark {
-                        group_id: key.0,
-                        tenant_id: key.1,
-                        hlc: mark.hlc,
-                        site: mark.site.code(),
-                        collection: mark.collection.clone().unwrap_or_default(),
+                    state.marks.get(key).map(|mark| {
+                        (
+                            *key,
+                            StoredGroupMark {
+                                group_id: key.0,
+                                tenant_id: key.1,
+                                hlc: mark.hlc,
+                                site: mark.site.code(),
+                                collection: mark.collection.clone().unwrap_or_default(),
+                                restore_id: mark.restore_id,
+                            },
+                        )
                     })
                 })
                 .collect()
@@ -255,34 +212,33 @@ impl TenantMarks {
         if pending.is_empty() {
             return Ok(());
         }
-        catalog.raise_tenant_group_marks(&pending)?;
+        let stored: Vec<StoredGroupMark> = pending.iter().map(|(_, m)| m.clone()).collect();
+        catalog.raise_tenant_group_marks(&stored)?;
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        for mark in &pending {
-            let key = (mark.group_id, mark.tenant_id);
+        for (key, mark) in &pending {
             // A raise after the snapshot above stays pending.
-            if state.marks.get(&key).is_some_and(|m| m.hlc == mark.hlc) {
-                state.dirty.remove(&key);
+            if state.marks.get(key).is_some_and(|m| m.hlc == mark.hlc) {
+                state.dirty.remove(key);
             }
-            let persisted = state.persisted.entry(key).or_insert(0);
-            *persisted = (*persisted).max(mark.hlc);
         }
         Ok(())
     }
 
-    /// Every tenant's mark in `group_id`, in the form a group snapshot carries:
-    /// `(tenant_id, commit_hlc, site_code, collection)`.
-    pub fn group_entries(&self, group_id: u64) -> Vec<(u64, u64, u8, String)> {
+    /// Every tenant's marks in `group_id`, user and restore, in the form a
+    /// group snapshot carries.
+    pub fn group_entries(&self, group_id: u64) -> Vec<GroupMarkEntry> {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let mut entries: Vec<(u64, u64, u8, String)> = state
+        let mut entries: Vec<GroupMarkEntry> = state
             .marks
             .iter()
-            .filter(|((group, _), _)| *group == group_id)
-            .map(|((_, tenant_id), mark)| {
+            .filter(|((group, _, _), _)| *group == group_id)
+            .map(|((_, tenant_id, _), mark)| {
                 (
                     *tenant_id,
                     mark.hlc,
                     mark.site.code(),
                     mark.collection.clone().unwrap_or_default(),
+                    mark.restore_id,
                 )
             })
             .collect();
@@ -291,25 +247,40 @@ impl TenantMarks {
     }
 
     /// Raise `group_id`'s marks from the entries of a group snapshot.
-    pub fn raise_group_entries(&self, group_id: u64, entries: &[(u64, u64, u8, String)]) {
-        for (tenant_id, hlc, site, collection) in entries {
-            self.raise(
+    pub fn raise_group_entries(&self, group_id: u64, entries: &[GroupMarkEntry]) {
+        for (tenant_id, hlc, site, collection, restore_id) in entries {
+            self.raise_mark(
                 group_id,
                 *tenant_id,
                 *hlc,
                 MarkSite::from_code(*site),
                 (!collection.is_empty()).then_some(collection.as_str()),
+                *restore_id,
             );
         }
     }
 
-    /// `tenant_id`'s mark in `group_id`, if the group applied any write of it.
+    /// `tenant_id`'s user mark in `group_id`, if the group applied any write
+    /// of it no RESTORE re-issued.
     pub fn get(&self, group_id: u64, tenant_id: u64) -> Option<GroupMark> {
+        self.get_key((group_id, tenant_id, false))
+    }
+
+    /// Both of `tenant_id`'s marks in `group_id`: the user mark, then the
+    /// mark of the newest restore write.
+    pub fn get_all(&self, group_id: u64, tenant_id: u64) -> Vec<GroupMark> {
+        [false, true]
+            .into_iter()
+            .filter_map(|restore| self.get_key((group_id, tenant_id, restore)))
+            .collect()
+    }
+
+    fn get_key(&self, key: MarkKey) -> Option<GroupMark> {
         self.state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .marks
-            .get(&(group_id, tenant_id))
+            .get(&key)
             .cloned()
     }
 }
@@ -329,27 +300,38 @@ mod tests {
         assert!(marks.get(2, 7).is_none(), "a mark binds only its group");
     }
 
+    /// A restore write keeps its own mark: it never hides an older user write
+    /// newer than a backup, and the user mark never carries a restore id.
     #[test]
-    fn a_local_write_mark_is_durable_once_stamped() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let catalog = SystemCatalog::open(&dir.path().join("system.redb")).expect("catalog");
-        let clock = nodedb_types::HlcClock::new();
+    fn a_restore_write_never_hides_a_user_write() {
         let marks = TenantMarks::default();
-        let hlc = {
-            let stamp = marks
-                .stamp_local_write(&clock, &catalog, 4, Some("orders"))
-                .expect("stamp");
-            stamp.hlc()
-        };
-        let reloaded = TenantMarks::load(&catalog).expect("reload");
+        marks.raise(1, 7, 100, MarkSite::ReplicatedApply, Some("docs"));
+        marks.raise_restore(1, 7, 300, Some("docs"), 42);
+        assert_eq!(marks.get(1, 7).map(|m| m.hlc), Some(100));
+        let all = marks.get_all(1, 7);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1].restore_id, 42);
+        assert_eq!(all[1].site, MarkSite::Restore);
+
+        marks.raise_restore(1, 7, 400, None, 0);
         assert_eq!(
-            reloaded.get(LOCAL_MARK_GROUP, 4),
-            Some(GroupMark {
-                hlc,
-                site: MarkSite::LocalWrite,
-                collection: Some("orders".to_owned()),
-            })
+            marks.get(1, 7).map(|m| m.hlc),
+            Some(400),
+            "a re-issue with no restore id raises the user mark"
         );
+    }
+
+    #[test]
+    fn group_entries_carry_restore_marks_across_a_snapshot() {
+        let source = TenantMarks::default();
+        source.raise(4, 7, 100, MarkSite::ReplicatedApply, None);
+        source.raise_restore(4, 7, 200, Some("c"), 9);
+        let entries = source.group_entries(4);
+        assert_eq!(entries.len(), 2);
+
+        let follower = TenantMarks::default();
+        follower.raise_group_entries(4, &entries);
+        assert_eq!(follower.get_all(4, 7), source.get_all(4, 7));
     }
 
     #[test]
@@ -358,6 +340,7 @@ mod tests {
         let catalog = SystemCatalog::open(&dir.path().join("system.redb")).expect("catalog");
         let marks = TenantMarks::default();
         marks.raise(3, 1, 900, MarkSite::CalvinFlush, Some("orders"));
+        marks.raise_restore(4, 1, 950, Some("orders"), 5);
         marks.persist(&catalog).expect("persist");
 
         let reloaded = TenantMarks::load(&catalog).expect("reload");
@@ -367,7 +350,17 @@ mod tests {
                 hlc: 900,
                 site: MarkSite::CalvinFlush,
                 collection: Some("orders".to_owned()),
+                restore_id: 0,
             })
+        );
+        assert_eq!(
+            reloaded.get_all(4, 1),
+            vec![GroupMark {
+                hlc: 950,
+                site: MarkSite::Restore,
+                collection: Some("orders".to_owned()),
+                restore_id: 5,
+            }]
         );
     }
 }

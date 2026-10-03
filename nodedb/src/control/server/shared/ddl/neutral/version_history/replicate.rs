@@ -9,30 +9,28 @@
 //! The oplog compaction behind `COMPACT HISTORY` is node-local physical state,
 //! so it runs from the post-apply lane on every node that applies the entry.
 
-use crate::control::catalog_entry::apply::checkpoint as apply;
 use crate::control::catalog_entry::entry::CatalogEntry;
-use crate::control::propose_outcome::ProposeOutcome;
 use crate::control::security::catalog::types::{CheckpointDoc, CheckpointRecord};
 use crate::control::state::SharedState;
 
 use super::super::super::result::DdlError;
-use super::super::replicate::{propose_and_apply, propose_and_apply_outcome};
+use super::super::replicate::propose_and_apply_async;
 
 /// Propose the checkpoint row. The leader reports the duplicate before
 /// proposing, so apply is a plain write that never rejects.
-pub(super) fn propose_put(state: &SharedState, record: &CheckpointRecord) -> Result<(), DdlError> {
+pub(super) async fn propose_put(
+    state: &SharedState,
+    record: &CheckpointRecord,
+) -> Result<(), DdlError> {
     let entry = CatalogEntry::PutCheckpoint(Box::new(record.clone()));
-    propose_and_apply(state, &entry, || {
-        apply::put(record, state.credentials.catalog())
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))
-    })
+    propose_and_apply_async(state, &entry).await
 }
 
 /// Propose removal of one checkpoint row on every node.
 ///
 /// The leader reports the missing checkpoint before proposing, so apply stays
 /// idempotent under replay.
-pub(super) fn propose_delete(
+pub(super) async fn propose_delete(
     state: &SharedState,
     doc: CheckpointDoc<'_>,
     checkpoint_name: &str,
@@ -44,10 +42,7 @@ pub(super) fn propose_delete(
         doc_id: doc.doc_id.to_string(),
         checkpoint_name: checkpoint_name.to_string(),
     };
-    propose_and_apply(state, &entry, || {
-        apply::delete(doc, checkpoint_name, state.credentials.catalog())
-            .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))
-    })
+    propose_and_apply_async(state, &entry).await
 }
 
 /// Propose one COMPACT HISTORY statement as a single entry carrying the
@@ -58,14 +53,14 @@ pub(super) fn propose_delete(
 /// rides along because post-apply compacts each node's oplog to it, and apply
 /// has already deleted the checkpoint row that holds it.
 ///
-/// The returned outcome tells the handler whether a post-apply lane will run
-/// this node's compaction dispatch.
-pub(super) fn propose_compact_history(
+/// The post-apply lane runs this node's compaction dispatch, which this call
+/// awaits.
+pub(super) async fn propose_compact_history(
     state: &SharedState,
     doc: CheckpointDoc<'_>,
     before_timestamp: u64,
     target_version_json: &str,
-) -> Result<ProposeOutcome, DdlError> {
+) -> Result<(), DdlError> {
     let entry = CatalogEntry::CompactHistory {
         tenant_id: doc.tenant_id,
         database_id: doc.database_id,
@@ -74,8 +69,5 @@ pub(super) fn propose_compact_history(
         before_timestamp,
         target_version_json: target_version_json.to_string(),
     };
-    propose_and_apply_outcome(state, &entry, || {
-        apply::delete_before(doc, before_timestamp, state.credentials.catalog())
-            .map_err(|e| DdlError::from_error_in_context("catalog range delete", &e))
-    })
+    propose_and_apply_async(state, &entry).await
 }

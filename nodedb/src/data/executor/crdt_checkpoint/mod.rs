@@ -36,8 +36,10 @@ mod publish;
 mod test_support;
 
 pub(crate) use manifest::{read_crdt_manifest_at, storage_err};
-pub(crate) use paths::{crdt_ckpt_dir, crdt_ckpt_filename, crdt_ckpt_gen_dir, crdt_ckpt_stem};
-pub(crate) use publish::{next_generation, publish_crdt_generation};
+pub(crate) use paths::{
+    CRDT_CKPT_MANIFEST, crdt_ckpt_dir, crdt_ckpt_filename, crdt_ckpt_gen_dir, crdt_ckpt_stem,
+};
+pub(crate) use publish::publish_crdt_generation;
 
 #[cfg(test)]
 pub(crate) use format::test_manifest_bytes;

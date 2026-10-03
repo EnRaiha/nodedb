@@ -45,7 +45,7 @@ pub struct AppState {
 ///
 /// Validation is awaited, never blocked on: a JWKS cache miss fetches the
 /// provider's key set over the network, and the whole HTTP request path runs on
-/// Tokio worker threads, so blocking here would stall a worker at best and
+/// Tokio worker threads, so blocking here will stall a worker at best and
 /// abort the request at worst.
 async fn try_validate_jwt(
     state: &AppState,
@@ -330,6 +330,10 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         use super::types::HttpError;
 
+        let plain = |status: StatusCode, message: String| {
+            (status, axum::Json(HttpError::new(message))).into_response()
+        };
+
         match self {
             ApiError::RateLimited {
                 message,
@@ -355,22 +359,14 @@ impl IntoResponse for ApiError {
                 };
                 (status, axum::Json(body)).into_response()
             }
-            other => {
-                let (status, message) = match other {
-                    ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
-                    ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
-                    ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-                    ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-                    ApiError::RateLimited { .. } => unreachable!(),
-                    ApiError::Coded { .. } => unreachable!(),
-                    ApiError::HttpStatus(code, msg) => (
-                        StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                        msg,
-                    ),
-                };
-                let body = HttpError::new(message);
-                (status, axum::Json(body)).into_response()
-            }
+            ApiError::Unauthorized(msg) => plain(StatusCode::UNAUTHORIZED, msg),
+            ApiError::Forbidden(msg) => plain(StatusCode::FORBIDDEN, msg),
+            ApiError::BadRequest(msg) => plain(StatusCode::BAD_REQUEST, msg),
+            ApiError::Internal(msg) => plain(StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::HttpStatus(code, msg) => plain(
+                StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                msg,
+            ),
         }
     }
 }
@@ -378,7 +374,7 @@ impl IntoResponse for ApiError {
 /// Axum extractor that resolves and enforces HTTP auth before a handler runs.
 ///
 /// Add this as the first parameter to any handler that performs tenant-scoped
-/// or admin work. Handlers that should remain public (health probes, etc.) must
+/// or admin work. Handlers that remain public (health probes, etc.) must
 /// NOT include this extractor.
 ///
 /// Produces a 401/403 response and short-circuits the handler if auth fails.
@@ -568,6 +564,7 @@ mod tests {
                     vshard_id: VShardId::new(1),
                     leader_node: 2,
                     leader_addr: "10.0.0.1:9000".into(),
+                    leader_term: 3,
                 },
                 StatusCode::SERVICE_UNAVAILABLE,
             ),

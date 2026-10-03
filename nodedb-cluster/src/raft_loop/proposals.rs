@@ -64,6 +64,14 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         mr.propose_to_group(crate::metadata_group::METADATA_GROUP_ID, data)
     }
 
+    /// Propose the encoded metadata entry `data` to the metadata group,
+    /// stamped with the node clock (see
+    /// [`MultiRaft::set_metadata_clock`](crate::multi_raft::MultiRaft::set_metadata_clock)).
+    pub fn propose_stamped_to_metadata_group(&self, data: &[u8]) -> Result<u64> {
+        let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
+        mr.propose_stamped_metadata(data)
+    }
+
     /// Propose to the metadata Raft group, transparently forwarding
     /// to the current leader if this node is not it.
     ///
@@ -74,7 +82,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// receiving leader applies the proposal locally and returns
     /// the log index.
     ///
-    /// On `NotLeader { leader_hint: None }` (election in progress,
+    /// On `NotLeader { leader_hint: None, .. }` (election in progress,
     /// no observed leader yet) the call returns the original
     /// `NotLeader` error so the caller can decide whether to retry.
     /// We deliberately do not implement a wait-and-retry loop here
@@ -85,15 +93,35 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// the bare `propose_to_metadata_group` — the only extra cost is
     /// an `is_leader_locally` check before the local propose.
     pub async fn propose_to_metadata_group_via_leader(&self, data: Vec<u8>) -> Result<u64> {
+        self.propose_metadata_via_leader(data, false).await
+    }
+
+    /// [`Self::propose_to_metadata_group_via_leader`] for an unstamped
+    /// metadata entry the leader stamps as it appends it (see
+    /// [`MultiRaft::propose_stamped_metadata`](crate::multi_raft::MultiRaft::propose_stamped_metadata)).
+    pub async fn propose_stamped_to_metadata_group_via_leader(&self, data: Vec<u8>) -> Result<u64> {
+        self.propose_metadata_via_leader(data, true).await
+    }
+
+    async fn propose_metadata_via_leader(&self, data: Vec<u8>, stamp: bool) -> Result<u64> {
         // First, try a local propose.
-        match self.propose_to_metadata_group(data.clone()) {
+        let local = if stamp {
+            self.propose_stamped_to_metadata_group(&data)
+        } else {
+            self.propose_to_metadata_group(data.clone())
+        };
+        match local {
             Ok(idx) => Ok(idx),
             Err(crate::error::ClusterError::Raft(nodedb_raft::RaftError::NotLeader {
                 leader_hint,
+                term,
             })) => {
                 let Some(leader_id) = leader_hint else {
                     return Err(crate::error::ClusterError::Raft(
-                        nodedb_raft::RaftError::NotLeader { leader_hint: None },
+                        nodedb_raft::RaftError::NotLeader {
+                            leader_hint: None,
+                            term,
+                        },
                     ));
                 };
                 if leader_id == self.node_id {
@@ -104,11 +132,12 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                     return Err(crate::error::ClusterError::Raft(
                         nodedb_raft::RaftError::NotLeader {
                             leader_hint: Some(leader_id),
+                            term,
                         },
                     ));
                 }
                 // Otherwise forward to the hinted leader.
-                self.forward_metadata_propose(leader_id, data).await
+                self.forward_metadata_propose(leader_id, data, stamp).await
             }
             Err(other) => Err(other),
         }
@@ -117,7 +146,12 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// Send a `MetadataProposeRequest` to `leader_id`. Looks up the
     /// leader's listen address via the local topology snapshot and
     /// dispatches through the existing peer transport.
-    async fn forward_metadata_propose(&self, leader_id: u64, data: Vec<u8>) -> Result<u64> {
+    async fn forward_metadata_propose(
+        &self,
+        leader_id: u64,
+        data: Vec<u8>,
+        stamp: bool,
+    ) -> Result<u64> {
         // Resolve and register the leader's address with the
         // transport so `send_rpc` has a destination. Topology is
         // updated by the membership / health subsystem; if the
@@ -146,7 +180,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         }
 
         let req = crate::rpc_codec::RaftRpc::MetadataProposeRequest(
-            crate::rpc_codec::MetadataProposeRequest { bytes: data },
+            crate::rpc_codec::MetadataProposeRequest { bytes: data, stamp },
         );
         let resp = self.transport.send_rpc(leader_id, req).await?;
         match resp {
@@ -154,6 +188,11 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                 if r.success {
                     Ok(r.log_index)
                 } else if let Some(hint) = r.leader_hint {
+                    self.observe_redirect(
+                        crate::metadata_group::METADATA_GROUP_ID,
+                        Some(hint),
+                        r.leader_term,
+                    );
                     // The receiving node was also not the leader
                     // (rare: leader changed between our local check
                     // and the forwarded RPC). Surface as NotLeader
@@ -161,6 +200,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                     Err(crate::error::ClusterError::Raft(
                         nodedb_raft::RaftError::NotLeader {
                             leader_hint: Some(hint),
+                            term: r.leader_term,
                         },
                     ))
                 } else {
@@ -183,8 +223,8 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// a `DataProposeRequest` over QUIC. The receiving leader applies the
     /// proposal locally and returns `(group_id, log_index)`.
     ///
-    /// On `NotLeader { leader_hint: None }` (election in progress) the call
-    /// returns the original `NotLeader` error so the caller can retry.
+    /// On `NotLeader { leader_hint: None, .. }` (election in progress) the
+    /// call returns the original `NotLeader` error so the caller can retry.
     pub async fn propose_via_data_leader(
         &self,
         vshard_id: u32,
@@ -195,16 +235,21 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             Ok(pair) => Ok(pair),
             Err(crate::error::ClusterError::Raft(nodedb_raft::RaftError::NotLeader {
                 leader_hint,
+                term,
             })) => {
                 let Some(leader_id) = leader_hint else {
                     return Err(crate::error::ClusterError::Raft(
-                        nodedb_raft::RaftError::NotLeader { leader_hint: None },
+                        nodedb_raft::RaftError::NotLeader {
+                            leader_hint: None,
+                            term,
+                        },
                     ));
                 };
                 if leader_id == self.node_id {
                     return Err(crate::error::ClusterError::Raft(
                         nodedb_raft::RaftError::NotLeader {
                             leader_hint: Some(leader_id),
+                            term,
                         },
                     ));
                 }
@@ -253,6 +298,17 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                 if r.success {
                     Ok((r.group_id, r.log_index))
                 } else {
+                    let group_id = self
+                        .multi_raft
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .routing()
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .group_for_vshard(vshard_id);
+                    if let Ok(group_id) = group_id {
+                        self.observe_redirect(group_id, r.leader_hint, r.leader_term);
+                    }
                     Err(r.refusal_error())
                 }
             }

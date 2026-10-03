@@ -4,6 +4,7 @@
 //! consumer groups, topics, stream/topic consumption, and pub/sub subscribe.
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -22,14 +23,15 @@ pub(super) async fn try_string(
     sql: &str,
     upper: &str,
     database_id: DatabaseId,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     // Schedule SHOW. `SHOW SCHEDULE HISTORY <name>` parses into a typed
     // `AutomationStmt::ShowScheduleHistory` and `SHOW SCHEDULES` into
-    // `AutomationStmt::ShowSchedules`, but the pgwire router dispatched both from
-    // the raw token slice by string prefix (the `SHOW SCHEDULE` prefix also
-    // captures the bare-singular `SHOW SCHEDULE` input, which parses into no
-    // typed variant). Replicate that exactly here, before the parse gate, so the
-    // prefix recognition and `parts.get(3)` name extraction stay byte-identical.
+    // `AutomationStmt::ShowSchedules`, but the router dispatches both from
+    // the raw token slice by string prefix, before the parse gate (the
+    // `SHOW SCHEDULE` prefix also captures the bare-singular `SHOW SCHEDULE`
+    // input, which parses into no typed variant). The name comes from
+    // `parts.get(3)`.
     if upper.starts_with("SHOW SCHEDULE HISTORY ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         let name = parts.get(3).copied().unwrap_or("");
@@ -46,12 +48,11 @@ pub(super) async fn try_string(
 
     // Alert SHOW. `SHOW ALERT STATUS <name>` parses into a typed
     // `AutomationStmt::ShowAlertStatus` and `SHOW ALERTS` into
-    // `AutomationStmt::ShowAlerts`, but the pgwire admin router dispatched both
-    // from the raw token slice by string prefix (the `SHOW ALERT` prefix also
-    // captures the bare-singular `SHOW ALERT` input, which parses into
-    // `ShowAlerts`). Replicate that exactly here, before the parse gate, so the
-    // prefix recognition (STATUS checked first) and the `parts.get(4)` name
-    // extraction (name after `ON`) stay byte-identical.
+    // `AutomationStmt::ShowAlerts`, but the router dispatches both from the
+    // raw token slice by string prefix, before the parse gate (the
+    // `SHOW ALERT` prefix also captures the bare-singular `SHOW ALERT` input,
+    // which parses into `ShowAlerts`). STATUS is checked first, and the name
+    // comes from `parts.get(4)` (name after `ON`).
     if upper.starts_with("SHOW ALERT STATUS ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         let name = parts.get(4).copied().unwrap_or("");
@@ -62,11 +63,10 @@ pub(super) async fn try_string(
     }
 
     // Change streams: `SHOW CHANGE STREAM(S)`. This parses into a typed
-    // `StreamViewStmt::ShowChangeStreams`, but the pgwire router dispatched it
-    // from the raw SQL by string prefix (the `SHOW CHANGE STREAM` prefix, which
-    // captures both the plural `SHOW CHANGE STREAMS` and the bare-singular
-    // input). Replicate that exactly here, before the parse gate, so the prefix
-    // recognition stays byte-identical.
+    // `StreamViewStmt::ShowChangeStreams`, but the router dispatches it from
+    // the raw SQL by string prefix, before the parse gate (the
+    // `SHOW CHANGE STREAM` prefix captures both the plural
+    // `SHOW CHANGE STREAMS` and the bare-singular input).
     if upper.starts_with("SHOW CHANGE STREAM") {
         return Some(change_stream::show_change_streams(
             state,
@@ -76,15 +76,13 @@ pub(super) async fn try_string(
     }
 
     // Consumer groups: `SHOW CONSUMER GROUPS ON <stream>`, `SHOW PARTITIONS ON
-    // <stream>`, and `COMMIT OFFSET(S) …`. The pgwire streaming router dispatched
-    // all four by string prefix from the raw token slice. `SHOW CONSUMER GROUPS`
-    // parses into a typed `StreamViewStmt::ShowConsumerGroups`, but the pgwire
-    // string dispatch claimed it before any typed arm ran; `SHOW PARTITIONS` and
-    // `COMMIT OFFSET(S)` parse into no typed variant at all. Replicate that
-    // exactly here, before the parse gate, so the prefix recognition and the
-    // `parts`-based syntax messages stay byte-identical. (`SHOW PARTITIONS ` also
-    // shadows the timeseries `show_partitions` handler exactly as the pgwire
-    // streaming router — which ran before engine_ops — did.)
+    // <stream>`, and `COMMIT OFFSET(S) …`. The router dispatches all four by
+    // string prefix from the raw token slice, before the parse gate.
+    // `SHOW CONSUMER GROUPS` parses into a typed
+    // `StreamViewStmt::ShowConsumerGroups`, but string dispatch claims it
+    // before any typed arm runs; `SHOW PARTITIONS` and `COMMIT OFFSET(S)`
+    // parse into no typed variant at all. (`SHOW PARTITIONS ` also shadows the
+    // timeseries `show_partitions` handler.)
     if upper.starts_with("SHOW CONSUMER GROUPS ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(consumer_group::show_consumer_groups(
@@ -109,12 +107,10 @@ pub(super) async fn try_string(
     }
 
     // Topics: `CREATE TOPIC`, `DROP TOPIC`, `SHOW TOPIC(S)`, and `PUBLISH TO`.
-    // None of these parse into any typed AST variant — the pgwire streaming
-    // router dispatched all four by string prefix from the raw token slice /
-    // SQL. Replicate that exactly here, before the parse gate, so the prefix
-    // recognition (including the trailing-space-less `SHOW TOPIC`, which
-    // captures both `SHOW TOPICS` and the bare-singular input) and the
-    // `parts`-based syntax messages stay byte-identical.
+    // None of these parse into any typed AST variant — the router dispatches
+    // all four by string prefix from the raw token slice / SQL, before the
+    // parse gate. The `SHOW TOPIC` prefix has no trailing space, so it
+    // captures both `SHOW TOPICS` and the bare-singular input.
     if upper.starts_with("CREATE TOPIC ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(topic::create_topic(state, identity, database_id, &parts, sql).await);
@@ -127,14 +123,13 @@ pub(super) async fn try_string(
         return Some(topic::show_topics(state, identity, database_id));
     }
     if upper.starts_with("PUBLISH TO ") {
-        return Some(topic::handle_publish(state, identity, database_id, sql).await);
+        return Some(topic::handle_publish(state, identity, database_id, sql, txn_ctx).await);
     }
 
     // Stream consumption: `SELECT * FROM STREAM <name> CONSUMER GROUP <group>
     // [PARTITION <p>] [LIMIT <n>]`. Parses into no typed AST variant — the
-    // pgwire streaming router recognized it by string prefix from the raw
-    // token slice. Replicate that exactly here, before the parse gate, so the
-    // prefix recognition and the `parts`-based extraction stay byte-identical.
+    // router recognizes it by string prefix from the raw token slice, before
+    // the parse gate.
     if upper.starts_with("SELECT ")
         && upper.contains("FROM STREAM ")
         && upper.contains("CONSUMER GROUP")
@@ -144,10 +139,9 @@ pub(super) async fn try_string(
     }
 
     // Stream/Topic consumption: `SELECT * FROM TOPIC <name> CONSUMER GROUP
-    // <group> [LIMIT <n>]`. Topics use "topic:<name>" buffer keys; the pgwire
-    // streaming router rewrote the token slice (TOPIC → STREAM, name →
-    // "topic:<name>") and delegated to the stream-consume handler. Replicate
-    // that rewrite exactly here, before the parse gate.
+    // <group> [LIMIT <n>]`. Topics use "topic:<name>" buffer keys; the router
+    // rewrites the token slice (TOPIC → STREAM, name → "topic:<name>") and
+    // delegates to the stream-consume handler, before the parse gate.
     if upper.starts_with("SELECT ")
         && upper.contains("FROM TOPIC ")
         && upper.contains("CONSUMER GROUP")

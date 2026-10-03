@@ -1,28 +1,18 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Single-node Calvin always-on: a STANDALONE (non-cluster) server can run the
-//! full Calvin stack — sequencer Raft group + per-vShard schedulers — so a
+//! Single-node Calvin is always on: a server with no `[cluster]` runs the full
+//! Calvin stack — sequencer Raft group + per-vShard schedulers — so a
 //! cross-core (cross-vShard) transaction traverses the SAME deterministic
-//! Calvin path it would in a multi-node cluster.
-//!
-//! Gated behind `server.single_node_calvin` (default `false`). When the flag is
-//! off, the standalone server starts no Calvin stack and every write stays on
-//! the existing single-node path; when it is on, the server synthesizes a
+//! Calvin path as in a multi-node cluster. The server synthesizes a
 //! one-node cluster (self-seeded, replication factor 1) via
 //! `init_single_node_calvin`.
 //!
-//! ## What each test proves
-//!
-//! - `flag_on`: with the flag set, `calvin_available` becomes true
-//!   (`cluster_transport` + `sequencer_inbox` are both wired) and an AUTOCOMMIT
-//!   cross-shard write — a `GRAPH INSERT EDGE` whose endpoints home to DISTINCT
-//!   vShards — is admitted to a Calvin epoch (the sequencer's `admitted_total`
-//!   advances) and dual-homes atomically (a reverse/IN traversal from the
-//!   destination reaches the source). That is the sequencer→scheduler path, not
-//!   the single-home fast path and not a `SequencerUnavailable` error.
-//! - `flag_off`: a standalone server with no Calvin stack reports
-//!   `calvin_available == false` and single-shard writes still commit on the
-//!   fast path.
+//! The test proves that `cluster_transport` and `sequencer_inbox` are both
+//! wired, and that an AUTOCOMMIT cross-shard write — a `GRAPH INSERT EDGE`
+//! whose endpoints home to DISTINCT vShards — is admitted to a Calvin epoch
+//! (the sequencer's `admitted_total` advances) and dual-homes atomically (a
+//! reverse/IN traversal from the destination reaches the source). That is the
+//! sequencer→scheduler path, not the single-home fast path.
 
 use crate::common;
 
@@ -34,7 +24,6 @@ use nodedb_cluster::calvin::SEQUENCER_GROUP_ID;
 use nodedb_types::id::VShardId;
 
 use common::cluster_harness::{TestClusterNode, wait_for};
-use common::pgwire_harness::TestServer;
 
 /// Observed sequencer-group leader id from a node's local Raft status, or `0`
 /// if no leader is known yet.
@@ -104,11 +93,10 @@ fn traversed_node_ids(v: &serde_json::Value) -> HashSet<String> {
         .collect()
 }
 
-/// Flag ON: a standalone server with `single_node_calvin = true` runs the
-/// Calvin stack and routes an autocommit cross-shard edge insert through the
-/// single-node sequencer→scheduler path.
+/// A server with no `[cluster]` runs the Calvin stack and routes an autocommit
+/// cross-shard edge insert through the single-node sequencer→scheduler path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn single_node_calvin_flag_on_routes_cross_shard_write_through_sequencer() {
+async fn single_node_calvin_routes_cross_shard_write_through_sequencer() {
     // 4 Data-Plane cores so distinct vShards land on distinct cores — a genuine
     // cross-core transaction.
     let node = TestClusterNode::spawn_single_node_calvin(4)
@@ -124,14 +112,13 @@ async fn single_node_calvin_flag_on_routes_cross_shard_write_through_sequencer()
     )
     .await;
 
-    // calvin_available == true: both fields the neutral gate checks are wired.
     assert!(
         node.shared.cluster_transport.is_some(),
         "single-node calvin must install cluster_transport"
     );
     assert!(
         node.shared.sequencer_inbox.get().is_some(),
-        "single-node calvin must install sequencer_inbox → calvin_available"
+        "single-node calvin must install sequencer_inbox"
     );
 
     // A graph-capable collection.
@@ -150,8 +137,8 @@ async fn single_node_calvin_flag_on_routes_cross_shard_write_through_sequencer()
     let (src, dst) = distinct_vshard_node_keys();
     let admitted_before = sequencer_admitted(&node);
 
-    // AUTOCOMMIT cross-shard edge insert. Because `calvin_available` is true and
-    // the endpoints home to distinct vShards, `insert_edge` dual-homes the edge
+    // AUTOCOMMIT cross-shard edge insert. Because the endpoints home to
+    // distinct vShards, `insert_edge` dual-homes the edge
     // atomically through Calvin (`submit_calvin_routed`) instead of taking the
     // single-home fast path. If the single-node sequencer stack were not
     // operational this would error (`SequencerUnavailable`) or time out.
@@ -187,47 +174,4 @@ async fn single_node_calvin_flag_on_routes_cross_shard_write_through_sequencer()
     );
 
     node.shutdown().await;
-}
-
-/// Flag OFF: a standalone server starts no Calvin stack, so `calvin_available`
-/// is false and single-shard writes commit on the existing fast path.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn single_node_calvin_flag_off_keeps_fast_path() {
-    let server = TestServer::start().await;
-
-    // No cluster/Calvin stack was started on a standalone server.
-    assert!(
-        server.shared.cluster_transport.is_none(),
-        "standalone server (flag off) must not install cluster_transport"
-    );
-    assert!(
-        server.shared.sequencer_inbox.get().is_none(),
-        "standalone server (flag off) must leave sequencer_inbox unset → calvin_available false"
-    );
-
-    // A single-shard write commits and reads back on the fast path.
-    server
-        .client
-        .simple_query("CREATE COLLECTION sncalvin_fastpath (id TEXT PRIMARY KEY, v TEXT)")
-        .await
-        .expect("CREATE COLLECTION sncalvin_fastpath");
-    server
-        .client
-        .simple_query("INSERT INTO sncalvin_fastpath (id, v) VALUES ('k1', 'hello')")
-        .await
-        .expect("single-shard INSERT on the fast path");
-
-    let rows = server
-        .client
-        .simple_query("SELECT v FROM sncalvin_fastpath WHERE id = 'k1'")
-        .await
-        .expect("SELECT sncalvin_fastpath");
-    let count = rows
-        .iter()
-        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
-        .count();
-    assert_eq!(
-        count, 1,
-        "single-shard row must be present after the fast-path write"
-    );
 }

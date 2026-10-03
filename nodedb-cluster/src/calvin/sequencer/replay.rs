@@ -57,6 +57,10 @@ impl SequencerStateMachine {
     /// * `ReserveRead`  targeting `vshard_id` → [`SchedulerInput::Reserve`].
     /// * `ReleaseReservation` targeting `vshard_id` → [`SchedulerInput::Release`].
     /// * `CutMarker` → [`SchedulerInput::CutMarker`], for every vShard.
+    /// * `TxnPart` of a transaction in the epoch range, targeting `vshard_id`
+    ///   → [`SchedulerInput::TxnPart`].
+    /// * `TxnPartsAbandoned` of a transaction in the epoch range →
+    ///   [`SchedulerInput::PartsAbandoned`], for every vShard.
     /// * All other variants carry no per-vShard scheduler input.
     ///
     /// Entries are emitted in Raft-log order (and, within an epoch batch, in
@@ -145,7 +149,7 @@ impl SequencerStateMachine {
                         per_vshard.epoch_system_ms = batch.epoch_system_ms;
                         per_vshard.epoch_vshard_txn_count =
                             vshard_txn_counts.get(&vshard_id).copied().unwrap_or(0);
-                        result.push(SchedulerInput::Txn(per_vshard));
+                        result.push(SchedulerInput::Txn(Box::new(per_vshard)));
                     }
                 }
                 // Re-fan the read reservation exactly as the live `ReserveRead`
@@ -164,9 +168,47 @@ impl SequencerStateMachine {
                 }
                 // A cut marker reaches every vShard, exactly as the live
                 // `CutMarker` arm fans it out.
-                SequencerEntry::CutMarker { hlc } => {
+                SequencerEntry::CutMarker { hlc, .. } => {
                     result.push(SchedulerInput::CutMarker { hlc });
                 }
+                // A part reaches the vShards it targets, exactly as the live
+                // `TxnPart` arm fans it out. The scheduler ignores a part of a
+                // transaction it holds no header for.
+                SequencerEntry::TxnPart {
+                    epoch,
+                    position,
+                    index,
+                    first_task,
+                    targets,
+                    plans,
+                    chunk,
+                } if epoch >= from_epoch
+                    && epoch <= to_epoch
+                    && targets.binary_search(&vshard_id).is_ok() =>
+                {
+                    result.push(SchedulerInput::TxnPart {
+                        txn: crate::calvin::types::TxnIdWire { epoch, position },
+                        index,
+                        first_task,
+                        plans: std::sync::Arc::new(plans),
+                        chunk,
+                    });
+                }
+                SequencerEntry::TxnPart { .. } => {}
+                // An abandonment reaches every vShard. The scheduler acts only
+                // on a transaction it holds, which it holds only when it
+                // participates.
+                SequencerEntry::TxnPartsAbandoned { epoch, position }
+                    if epoch >= from_epoch && epoch <= to_epoch =>
+                {
+                    result.push(SchedulerInput::PartsAbandoned {
+                        txn: crate::calvin::types::TxnIdWire { epoch, position },
+                    });
+                }
+                SequencerEntry::TxnPartsAbandoned { .. } => {}
+                // An epoch floor only moves the next epoch the sequencer
+                // proposes. No scheduler input comes from it.
+                SequencerEntry::EpochFloor { .. } => {}
                 // Reservation entries for a different vShard carry nothing for us.
                 SequencerEntry::ReserveRead { .. } => {}
                 SequencerEntry::ReleaseReservation { .. } => {}

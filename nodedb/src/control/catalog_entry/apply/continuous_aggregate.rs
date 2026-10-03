@@ -104,6 +104,8 @@ mod tests {
                 database_id: 9,
                 tenant_id: 1,
                 name: "shared".into(),
+                target_descriptor_version: 0,
+                target_hlc: nodedb_types::Hlc::ZERO,
             },
             catalog,
         )

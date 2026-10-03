@@ -10,7 +10,7 @@
 //! locally-authored definition.
 //!
 //! No SQL DDL emits this variant yet, so the tests propose the entry
-//! directly through `metadata_proposer::propose_catalog_entry` (which
+//! directly through `metadata_proposer::propose_catalog_entry_async` (which
 //! forwards to the metadata-group leader) and assert idempotency +
 //! no-clobber by reading the replicated record on every node.
 
@@ -21,7 +21,7 @@ use std::time::Duration;
 use common::cluster_harness::{TestCluster, wait_for};
 
 use nodedb::control::catalog_entry::CatalogEntry;
-use nodedb::control::metadata_proposer::propose_catalog_entry;
+use nodedb::control::metadata_proposer::propose_catalog_entry_async;
 use nodedb::control::security::catalog::StoredCollection;
 use nodedb_types::DatabaseId;
 
@@ -47,11 +47,11 @@ fn coll_fields(
 /// Propose a `PutCollectionIfAbsent` for `coll`, trying each node
 /// until one accepts (the proposer forwards to the metadata leader,
 /// so any node works — the loop mirrors `exec_ddl_on_any_leader`).
-fn propose_if_absent(cluster: &TestCluster, coll: StoredCollection) -> Result<(), String> {
+async fn propose_if_absent(cluster: &TestCluster, coll: StoredCollection) -> Result<(), String> {
     let entry = CatalogEntry::PutCollectionIfAbsent(Box::new(coll));
     let mut last_err = String::new();
     for node in &cluster.nodes {
-        match propose_catalog_entry(&node.shared, &entry) {
+        match propose_catalog_entry_async(&node.shared, &entry).await {
             Ok(_) => return Ok(()),
             Err(e) => last_err = e.to_string(),
         }
@@ -71,7 +71,9 @@ async fn put_if_absent_creates_then_no_clobbers_then_idempotent() {
     a.declared_primary_key = Some("a_key".to_string());
 
     // 1. Create via PutCollectionIfAbsent (collection is absent).
-    propose_if_absent(&cluster, a.clone()).expect("propose A");
+    propose_if_absent(&cluster, a.clone())
+        .await
+        .expect("propose A");
 
     // Assert A materialized on all three nodes with A's fields.
     wait_for(
@@ -92,7 +94,7 @@ async fn put_if_absent_creates_then_no_clobbers_then_idempotent() {
     let mut b = StoredCollection::new(TENANT, COLL, "tester");
     b.bitemporal = false;
     b.declared_primary_key = Some("b_key".to_string());
-    propose_if_absent(&cluster, b).expect("propose B");
+    propose_if_absent(&cluster, b).await.expect("propose B");
 
     // Wait for B's proposal to have applied cluster-wide, then assert
     // every node STILL shows A's fields — B was skipped, no clobber.
@@ -119,7 +121,7 @@ async fn put_if_absent_creates_then_no_clobbers_then_idempotent() {
 
     // 3. Re-propose A verbatim — idempotent no-op. Still exactly one
     //    collection, unchanged.
-    propose_if_absent(&cluster, a).expect("re-propose A");
+    propose_if_absent(&cluster, a).await.expect("re-propose A");
     wait_for(
         "idempotent: still exactly one collection with A's fields",
         Duration::from_secs(10),

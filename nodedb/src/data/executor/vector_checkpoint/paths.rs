@@ -12,7 +12,7 @@ use nodedb_types::DatabaseId;
 use crate::types::TenantId;
 
 /// Filename of the manifest that names the live generation.
-pub(super) const VECTOR_CKPT_MANIFEST: &str = "MANIFEST";
+pub(crate) const VECTOR_CKPT_MANIFEST: &str = "MANIFEST";
 
 /// Canonical path for a core's vector checkpoint directory.
 ///
@@ -44,13 +44,7 @@ pub(crate) fn vector_ckpt_gen_dir(
 /// between two names survives the encoding and reclaim can still match every
 /// field index of one collection.
 pub(crate) fn vector_ckpt_stem(db: u64, tid: u64, coll_key: &str) -> String {
-    use std::fmt::Write as _;
-    let mut hex = String::with_capacity(coll_key.len() * 2);
-    for b in coll_key.as_bytes() {
-        // Infallible: writing to a String never returns Err.
-        let _ = write!(hex, "{b:02x}");
-    }
-    format!("db-{db}-tenant-{tid}-key-{hex}")
+    format!("db-{db}-tenant-{tid}-key-{}", hex::encode(coll_key))
 }
 
 /// Parse a stem produced by [`vector_ckpt_stem`] back into the
@@ -61,21 +55,9 @@ pub(super) fn parse_vector_ckpt_stem(stem: &str) -> Option<(DatabaseId, TenantId
     let rest = stem.strip_prefix("db-")?;
     let (db_str, rest) = rest.split_once("-tenant-")?;
     let db = db_str.parse::<u64>().ok()?;
-    let (tid_str, hex) = rest.split_once("-key-")?;
+    let (tid_str, encoded) = rest.split_once("-key-")?;
     let tid = tid_str.parse::<u64>().ok()?;
-    if hex.len() % 2 != 0 {
-        return None;
-    }
-    let raw = hex.as_bytes();
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    let mut i = 0;
-    while i < raw.len() {
-        let hi = (raw[i] as char).to_digit(16)?;
-        let lo = (raw[i + 1] as char).to_digit(16)?;
-        bytes.push((hi * 16 + lo) as u8);
-        i += 2;
-    }
-    let coll_key = String::from_utf8(bytes).ok()?;
+    let coll_key = String::from_utf8(hex::decode(encoded).ok()?).ok()?;
     Some((DatabaseId::new(db), TenantId::new(tid), coll_key))
 }
 

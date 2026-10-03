@@ -24,6 +24,10 @@ pub(super) enum EntryOutcome {
     /// first copy's outcome is durable, so it extends the prefix. The ledger
     /// already holds the proposal.
     Repeat,
+    /// A snapshot this node installed holds the entry's effects: the
+    /// snapshot was cut above its Raft index. The installed state is durable,
+    /// so the entry extends the prefix without applying.
+    Covered,
     /// The entry was applied. `durable` says its outcome survives a restart.
     /// `result` is what its waiter received, when the apply produced one.
     Applied {
@@ -39,7 +43,7 @@ impl EntryOutcome {
     /// [`ProposalGate::prior_wrote_rows`]).
     pub fn wrote_rows(&self) -> bool {
         match self {
-            Self::Skipped | Self::Repeat => false,
+            Self::Skipped | Self::Repeat | Self::Covered => false,
             Self::Applied {
                 result: Some(outcome),
                 ..
@@ -137,6 +141,12 @@ impl ProposalGate {
         true
     }
 
+    /// Note a proposal a snapshot install covered. It committed and applied
+    /// through the snapshot, with no outcome kept on this node.
+    pub fn note_restored(&mut self, proposal_key: u64) {
+        self.ledger.note(proposal_key, None);
+    }
+
     /// Note that a copy of `proposal_key` started and has not concluded.
     pub fn open(&mut self, proposal_key: u64) {
         if proposal_key != 0 {
@@ -168,6 +178,13 @@ impl ProposalGate {
         match outcome {
             EntryOutcome::Skipped => PrefixStep::Neutral,
             EntryOutcome::Repeat => PrefixStep::Record(true),
+            EntryOutcome::Covered => {
+                // A later copy of the proposal is a duplicate here too.
+                if proposal_key != 0 {
+                    self.ledger.note(proposal_key, None);
+                }
+                PrefixStep::Record(true)
+            }
             EntryOutcome::Applied { durable, result } => {
                 if durable {
                     self.ledger.note(proposal_key, result);
@@ -220,5 +237,17 @@ mod tests {
         assert_eq!(step, PrefixStep::Record(false));
         assert!(!gate.in_flight(7));
         assert!(!gate.skip_duplicate(&tracker, 1, 9, 7));
+    }
+
+    /// An entry an installed snapshot's cut covers extends the durable
+    /// prefix, and a later copy of its proposal never applies.
+    #[test]
+    fn a_cut_covered_entry_extends_the_prefix_and_skips_a_later_copy() {
+        let tracker = ProposeTracker::new();
+        let mut gate = ProposalGate::new(ProposalLedger::new(PROPOSAL_LEDGER_CAPACITY));
+        let step = gate.conclude(11, false, EntryOutcome::Covered);
+        assert_eq!(step, PrefixStep::Record(true));
+        assert!(!EntryOutcome::Covered.wrote_rows());
+        assert!(gate.skip_duplicate(&tracker, 1, 14, 11));
     }
 }

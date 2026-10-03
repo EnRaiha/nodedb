@@ -5,7 +5,7 @@
 //!
 //! Two entry points:
 //! - [`dispatch_register_if_needed`] — leader-side, called from
-//!   the pgwire handler path. Parses the FIELDS clause from
+//!   the handler path. Parses the FIELDS clause from
 //!   `parts` to derive index paths.
 //! - [`dispatch_register_from_stored`] — applier-side, called
 //!   from the metadata applier's post-apply hook after a
@@ -16,12 +16,9 @@
 //! which builds the storage-mode + enforcement-options
 //! `EnforcementOptions` value and dispatches to the Data Plane.
 //!
-//! Relocated verbatim from the pgwire
-//! `pgwire::ddl::collection::create::register` module (now deleted) so the
-//! neutral `continuous_agg` / `materialized_view` families, the
-//! `catalog_entry::post_apply` hook, and the (still pgwire) `alter`
-//! handlers can all depend on a protocol-neutral home instead of reaching
-//! across the pgwire boundary.
+//! The neutral `continuous_agg` / `materialized_view` families, the
+//! `catalog_entry::post_apply` hook, and the pgwire `alter` handlers all
+//! depend on this protocol-neutral home.
 
 use crate::bootstrap::constraint_reconcile::CollectionSource;
 use crate::control::security::catalog::StoredCollection;
@@ -33,8 +30,8 @@ use nodedb_types::DatabaseId;
 use super::enforcement::{build_generated_column_specs, find_materialized_sum_bindings};
 
 /// Dispatch a `DocumentOp::Register` to the Data Plane after
-/// collection creation (leader-side pgwire path). Looks up the
-/// just-created collection from catalog and parses the FIELDS
+/// collection creation (leader-side handler path). Looks up the
+/// created collection from catalog and parses the FIELDS
 /// clause from `parts` for index paths.
 ///
 /// Returns an error if any Data Plane core fails to acknowledge the
@@ -73,31 +70,6 @@ pub async fn dispatch_register_if_needed(
     dispatch_register_from_stored_inner(state, tenant_id, &coll, indexes).await
 }
 
-/// Typed leader-side entry point: dispatch `DocumentOp::Register`
-/// after collection creation when the collection name is known but
-/// no raw SQL parts are available (typed AST path).
-///
-/// `database_id` must match the database the collection was created in so the
-/// catalog lookup succeeds in non-default databases.
-///
-/// Returns an error if any Data Plane core fails to acknowledge the
-/// registration.
-pub async fn dispatch_register_by_name(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    name: &str,
-    database_id: DatabaseId,
-) -> crate::Result<()> {
-    let tenant_id = identity.tenant_id;
-    let catalog = state.credentials.catalog();
-    let Ok(Some(coll)) = catalog.get_collection(database_id, tenant_id.as_u64(), name) else {
-        return Ok(());
-    };
-    let mut indexes = derive_auto_indexes(coll.fields.iter().map(|(n, _)| n.as_str()));
-    extend_with_catalog_indexes(&mut indexes, &coll);
-    dispatch_register_from_stored_inner(state, tenant_id, &coll, indexes).await
-}
-
 /// Applier-side entry point: dispatch `DocumentOp::Register` using
 /// a fully-populated [`StoredCollection`]. Called from the
 /// production `MetadataCommitApplier` after it materializes a
@@ -119,6 +91,27 @@ pub async fn dispatch_register_from_stored(
     dispatch_register_from_stored_inner(state, tenant_id, coll, indexes).await
 }
 
+/// Register `coll` on this node's Data Plane after a handler proposed its
+/// `PutCollection` with result `outcome`, when the proposal left that to the
+/// handler.
+///
+/// - A durable outcome ran the entry's awaited post-apply on this node. That
+///   post-apply registered the collection on every core, so this call
+///   registers nothing.
+/// - A buffered outcome ran no post-apply. The open transaction's later
+///   statements read the new shape, so this call registers it. ROLLBACK
+///   registers the stored shape again.
+pub async fn register_proposed_collection(
+    state: &SharedState,
+    outcome: crate::control::propose_outcome::ProposeOutcome,
+    coll: &StoredCollection,
+) -> crate::Result<()> {
+    if outcome.is_durable() {
+        return Ok(());
+    }
+    dispatch_register_from_stored(state, coll).await
+}
+
 /// Re-register every collection that DRIVES a materialized-sum binding `coll`
 /// declares, so those sources learn they now drive one.
 ///
@@ -131,7 +124,7 @@ pub async fn dispatch_register_from_stored(
 /// asserting it drives nothing. Every write into it then folds nothing at all
 /// and the stored total silently stays where it was.
 ///
-/// Only the co-resident path reads that config, which is why this could go
+/// Only the co-resident path reads that config, which is why this can go
 /// unnoticed: a cross-shard binding is settled on the Control Plane at plan time
 /// from the catalog and travels on its own `ApplyBalanceDelta` task, which
 /// consults no Data-Plane config.
@@ -242,7 +235,7 @@ fn build_timeseries_schema(
     }))
 }
 
-/// Build the `CollectionConfig` a `DocumentOp::Register` would install in
+/// Build the `CollectionConfig` a `DocumentOp::Register` will install in
 /// `doc_configs`, straight from the durable catalog — storage mode,
 /// enforcement options, generated columns, and secondary indexes.
 ///
@@ -325,7 +318,7 @@ pub(crate) fn build_doc_config_from_stored<S: CollectionSource + ?Sized>(
     // Written as a struct literal with every field named — and deliberately
     // NOT `..Default::default()`. A field added to `CollectionConfig` that is
     // never derived from the catalog is invisible at runtime: the collection
-    // simply behaves as though the attribute was never declared. Naming every
+    // behaves as though the attribute was never declared. Naming every
     // field turns that into a compile error here, in the one function both the
     // live-DDL path and the boot seed go through.
     crate::engine::document::store::CollectionConfig {
@@ -418,7 +411,7 @@ mod tests {
     /// This is the ONE builder both the live-DDL register broadcast and the
     /// boot-time `doc_configs` seed go through, so a marker that survives here
     /// survives a restart too. A marker that existed only after a live CREATE
-    /// would make a vector-primary collection readable until the first restart
+    /// will make a vector-primary collection readable until the first restart
     /// and unreadable after it — the same defect one layer down.
     #[test]
     fn a_vector_primary_collection_carries_its_marker_into_the_doc_config() {
@@ -438,7 +431,7 @@ mod tests {
     }
 
     /// Every other engine must leave the marker unset, or every collection's
-    /// rows would be decoded as tagged sidecars.
+    /// rows will be decoded as tagged sidecars.
     #[test]
     fn a_plain_document_collection_carries_no_vector_primary_marker() {
         let coll = StoredCollection::new(1, "plain_docs", "owner");

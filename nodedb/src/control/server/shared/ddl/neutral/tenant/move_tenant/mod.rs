@@ -10,14 +10,15 @@
 //!
 //! 1. **Pre-flight** — verify every collection the tenant has data in exists
 //!    in the target with a compatible schema. No state mutation.
-//! 2. **Drain** — revoke the tenant's active sessions on the source via the
-//!    [`SessionInvalidationBus`]; reject new writes; wait for in-flight ops to
-//!    complete (bounded timeout).
-//! 3. **Snapshot** — call the tenant backup orchestrator to write the tenant's
-//!    data to an in-cluster temporary area.
-//! 4. **Cutover** — a single Raft proposal that atomically performs DROP TENANT
-//!    from the source database, RESTORE TENANT into the target database, and
-//!    updates the tenant→database catalog mapping.
+//! 2. **Drain** — revoke the tenant's sessions, then drain every source
+//!    collection through the replicated descriptor-lease drain: every node
+//!    refuses new plans on it, and the phase waits until no node holds a lease
+//!    on it (bounded timeout). The cutover's catalog entry ends the drain.
+//! 3. **Snapshot** — capture every live collection of the source database
+//!    from every vShard of the cluster, after a consistent cut.
+//! 4. **Cutover** — re-issue the captured rows into the target database as
+//!    replicated writes, then one Raft proposal moves every catalog row. Each
+//!    node that applies it reclaims the source-keyed storage on every core.
 //! 5. **Resume** — drain is released; writes accepted on target.
 //!
 //! ## Online MOVE TENANT is a separate initiative
@@ -32,9 +33,10 @@
 //! | Pre-flight              | Nothing; no state changed.                          |
 //! | Drain timeout           | Release drain; resume source writes; return error.  |
 //! | Snapshot failure        | Same as drain + delete partial snapshot.            |
-//! | Cutover failure         | Release drain; source intact (single-proposal fail).|
+//! | Cutover failure         | Release drain; source catalog and rows intact.      |
 //! | Already moved (retry)   | Return `MOVE_TENANT_ALREADY_AT_TARGET`.             |
 
+pub mod arrays;
 pub mod cutover;
 pub mod drain;
 pub mod entry;

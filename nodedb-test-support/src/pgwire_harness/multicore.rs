@@ -18,7 +18,6 @@ use nodedb::wal::WalManager;
 use super::support::{bind_http_listener, bind_native_listener, init_test_memory_governor};
 use super::types::{TestClient, TestServer};
 
-#[allow(dead_code)]
 impl TestServer {
     /// Spawn an N-core NodeDB server and connect via pgwire.
     ///
@@ -46,14 +45,19 @@ impl TestServer {
         let mut shared =
             SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials, false)
                 .expect("build shared state");
-        if let Some(s) = Arc::get_mut(&mut shared) {
+        let cluster = crate::single_node::init(dir.path())
+            .await
+            .expect("init the one-node cluster");
+        {
+            let s = Arc::get_mut(&mut shared).expect("shared state is not cloned yet");
+            crate::single_node::wire(s, &cluster, dir.path()).expect("wire the one-node cluster");
             s.backup_kek = Some(Arc::new([0x42u8; 32]));
             s.governor = init_test_memory_governor();
         }
         let shared = shared;
         // The same gateway install production boot runs, after every
         // `Arc::get_mut` above.
-        nodedb::bootstrap::state_wiring::install_gateway(&shared);
+        nodedb::bootstrap::state_wiring::install_gateway(&shared).expect("install gateway");
 
         let mut core_stop_txs = Vec::new();
         let mut core_handles = Vec::new();
@@ -74,6 +78,7 @@ impl TestServer {
                     replay: None,
                     graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
                     query_tuning: nodedb_types::config::tuning::QueryTuning::default(),
+                    timeseries_tuning: nodedb_types::config::tuning::TimeseriesToning::default(),
                     // Seeded from the SAME durable catalog production reads, so a
                     // harness restart reconstructs cores the way a real one does.
                     // An empty catalog yields an empty seed, which is exactly what
@@ -81,6 +86,7 @@ impl TestServer {
                     doc_config_seed: nodedb::bootstrap::data_plane::load_doc_config_registry_from(
                         shared.credentials.catalog(),
                     ),
+                    event_interest: crate::core_loop_runner::event_interest_for(&shared),
                     stop_rx: core_stop_rx,
                 });
             core_stop_txs.push(core_stop_tx);
@@ -121,6 +127,10 @@ impl TestServer {
             shutdown: Arc::clone(&shared.shutdown),
             shutdown_bus: shutdown_bus.clone(),
         });
+
+        let raft = crate::single_node::start(&cluster, &shared, dir.path())
+            .await
+            .expect("start the one-node cluster");
 
         let pg_listener = PgListener::bind("127.0.0.1:0".parse().unwrap())
             .await
@@ -180,6 +190,7 @@ impl TestServer {
             poller_handle: Some(poller_handle),
             core_handles: Some(core_handles),
             event_plane: Some(event_plane),
+            raft: Some(raft),
             _dir: dir,
         }
     }

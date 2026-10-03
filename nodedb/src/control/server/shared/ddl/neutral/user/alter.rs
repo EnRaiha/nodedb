@@ -3,13 +3,10 @@
 //! Protocol-neutral `ALTER USER` DDL handler — typed dispatch for every
 //! `AlterUserOp`.
 //!
-//! Ported from the pgwire `ddl::user::alter` handler. All non-return logic
-//! (self-vs-admin permission gates, per-op `prepare_*` credential mutations,
-//! ISO-8601 expiry parsing, session-invalidation reasons, default-database
-//! resolution, catalog propose + single-node `LocalOnly` fallback +
-//! `install_replicated_user`, and `audit_record`) is preserved verbatim; only
-//! the result construction changed from pgwire `Response` / `PgWireError` to
-//! [`DdlResult`] / [`DdlError`].
+//! The self-vs-admin permission gates, per-op `prepare_*` credential
+//! mutations, ISO-8601 expiry parsing, session-invalidation reasons,
+//! default-database resolution, catalog propose, and `audit_record` run here.
+//! The result is [`DdlResult`] / [`DdlError`].
 
 use nodedb_sql::ddl_ast::AlterUserOp;
 
@@ -23,7 +20,7 @@ use super::super::role_checks::visible_user_or_missing;
 use super::iso8601::parse_iso8601_to_unix;
 
 /// ALTER USER <name> ... — typed dispatch for all AlterUserOp forms.
-pub fn alter_user(
+pub async fn alter_user(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     username: &str,
@@ -60,7 +57,7 @@ pub fn alter_user(
                 .prepare_user_update_from(base, Some(password.as_str()), None)
                 .map_err(|e| DdlError::from_error(&e))?;
             // Password change — no role/access change; no invalidation.
-            propose_and_install(state, stored, None)?;
+            propose_and_install(state, stored).await?;
 
             state.audit_record(
                 AuditEvent::PrivilegeChange,
@@ -88,12 +85,7 @@ pub fn alter_user(
                 .credentials
                 .prepare_user_update_from(base, None, Some(new_roles.clone()))
                 .map_err(|e| DdlError::from_error(&e))?;
-            let replicated = propose_and_install(
-                state,
-                stored,
-                Some(crate::control::security::buses::SessionInvalidationReason::RoleAltered),
-            )?;
-            if replicated {
+            if propose_and_install(state, stored).await? {
                 super::super::role_checks::confirm_user_roles(
                     state, username, &new_roles, tenant_id,
                 )?;
@@ -114,7 +106,7 @@ pub fn alter_user(
             let stored = state
                 .credentials
                 .prepare_set_must_change_password_from(base, true);
-            propose_and_install(state, stored, None)?;
+            propose_and_install(state, stored).await?;
 
             state.audit_record(
                 AuditEvent::PrivilegeChange,
@@ -131,7 +123,7 @@ pub fn alter_user(
             let stored = state
                 .credentials
                 .prepare_set_password_expires_at_from(base, 0);
-            propose_and_install(state, stored, None)?;
+            propose_and_install(state, stored).await?;
 
             state.audit_record(
                 AuditEvent::PrivilegeChange,
@@ -154,7 +146,7 @@ pub fn alter_user(
             let stored = state
                 .credentials
                 .prepare_set_password_expires_at_from(base, expires_at);
-            propose_and_install(state, stored, None)?;
+            propose_and_install(state, stored).await?;
 
             state.audit_record(
                 AuditEvent::PrivilegeChange,
@@ -178,7 +170,7 @@ pub fn alter_user(
             let stored = state
                 .credentials
                 .prepare_set_password_expires_at_from(base, expires_at);
-            propose_and_install(state, stored, None)?;
+            propose_and_install(state, stored).await?;
 
             state.audit_record(
                 AuditEvent::PrivilegeChange,
@@ -190,7 +182,7 @@ pub fn alter_user(
         }
 
         AlterUserOp::SetDefaultDatabase { db_name } => {
-            // Users can set their own default database; admin may set for others.
+            // Users can set their own default database; admin can set for others.
             if !can_alter {
                 return Err(DdlError::new(
                     "42501",
@@ -215,7 +207,7 @@ pub fn alter_user(
             let stored = state
                 .credentials
                 .prepare_set_default_database_from(base, db_id.as_u64());
-            propose_and_install(state, stored, None)?;
+            propose_and_install(state, stored).await?;
 
             state.audit_record(
                 AuditEvent::PrivilegeChange,
@@ -228,30 +220,16 @@ pub fn alter_user(
     }
 }
 
-/// Propose a `StoredUser` via Raft and install it locally on single-node.
-/// Returns whether the entry was replicated through the metadata group.
-///
-/// `invalidation` is passed to `install_replicated_user` for in-process
-/// session notification in single-node mode. Cluster-mode notifications
-/// arrive via `post_apply::user::put` after Raft commit.
-fn propose_and_install(
+/// Propose a `StoredUser`. Returns whether the entry applied on this node,
+/// through the metadata group or directly without one. The apply installs
+/// the user and notifies its sessions through `post_apply::user::put`.
+async fn propose_and_install(
     state: &SharedState,
     stored: crate::control::security::catalog::StoredUser,
-    invalidation: Option<crate::control::security::buses::SessionInvalidationReason>,
 ) -> Result<bool, DdlError> {
-    let entry = crate::control::catalog_entry::CatalogEntry::PutUser(Box::new(stored.clone()));
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let entry = crate::control::catalog_entry::CatalogEntry::PutUser(Box::new(stored));
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        {
-            let catalog = state.credentials.catalog();
-            catalog
-                .put_user(&stored)
-                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        }
-        state
-            .credentials
-            .install_replicated_user(&stored, invalidation);
-    }
-    Ok(outcome.is_replicated())
+    Ok(outcome.is_durable())
 }

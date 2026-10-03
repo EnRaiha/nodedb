@@ -49,7 +49,7 @@ pub struct PollParams {
 pub struct PollResponse {
     /// Events in this batch.
     pub events: Vec<serde_json::Value>,
-    /// Per-partition latest canonical `<lsn>:<sequence>` offset in this batch.
+    /// Per-partition latest canonical `<epoch>:<index>:<sequence>` offset in this batch.
     pub partition_offsets: std::collections::BTreeMap<String, String>,
     /// Total events returned.
     pub count: usize,
@@ -168,7 +168,7 @@ pub async fn poll_stream(
         limit,
     };
 
-    let mut result = match consume_stream(&state.shared, &consume_params) {
+    let mut result = match consume_stream(&state.shared, &consume_params).await {
         Ok(r) => r,
         Err(ConsumeError::RemotePartition { leader_node, .. }) => {
             // Forward to remote node.
@@ -180,6 +180,10 @@ pub async fn poll_stream(
             .await
             {
                 Ok(r) => r,
+                Err(ConsumeError::OffsetOutOfRange {
+                    partition_id,
+                    available_from,
+                }) => return reset_required(partition_id, available_from),
                 Err(e) => {
                     return (
                         StatusCode::BAD_GATEWAY,
@@ -189,6 +193,10 @@ pub async fn poll_stream(
                 }
             }
         }
+        Err(ConsumeError::OffsetOutOfRange {
+            partition_id,
+            available_from,
+        }) => return reset_required(partition_id, available_from),
         Err(ConsumeError::BufferEmpty(_)) => ConsumeResult {
             events: Vec::new(),
             partition_offsets: Vec::new(),
@@ -236,6 +244,23 @@ pub async fn poll_stream(
             evicted_since_last_poll: result.evicted_since_last_poll,
             oldest_available_offset: result.oldest_available_offset.token(),
         }),
+    )
+        .into_response()
+}
+
+/// `409 Conflict`: the consumer group's offset lies below the events any
+/// reachable replica holds. The consumer commits `available_from` or later.
+fn reset_required(
+    partition_id: u32,
+    available_from: crate::event::cdc::CdcOffset,
+) -> axum::response::Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "reset_required",
+            "partition": partition_id,
+            "available_from": available_from.token(),
+        })),
     )
         .into_response()
 }

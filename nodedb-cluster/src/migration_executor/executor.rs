@@ -62,6 +62,8 @@ pub struct MigrationExecutor {
     pub(super) catalog: Option<Arc<ClusterCatalog>>,
     pub(super) metadata_proposer: Option<Arc<dyn MetadataProposer>>,
     pub(super) migration_state: Option<SharedMigrationStateTable>,
+    /// Where each migration this executor runs reports its state.
+    pub(super) tracker: Arc<super::MigrationTracker>,
 }
 
 impl MigrationExecutor {
@@ -80,7 +82,15 @@ impl MigrationExecutor {
             catalog: None,
             metadata_proposer: None,
             migration_state: None,
+            tracker: Arc::new(super::MigrationTracker::new()),
         }
+    }
+
+    /// Report every migration's state to `tracker`, which `SHOW MIGRATIONS`
+    /// and the status route read.
+    pub fn with_tracker(mut self, tracker: Arc<super::MigrationTracker>) -> Self {
+        self.tracker = tracker;
+        self
     }
 
     pub fn with_metadata_proposer(mut self, proposer: Arc<dyn MetadataProposer>) -> Self {
@@ -161,10 +171,13 @@ impl MigrationExecutor {
             "starting vShard migration"
         );
 
-        super::phases::phase1_base_copy(self, &mut state, source_group, &req, migration_id).await?;
-        super::phases::phase2_wal_catchup(self, &mut state, source_group, &req, migration_id)
-            .await?;
-        super::phases::phase3_cutover(self, &mut state, source_group, &req, migration_id).await?;
+        self.tracker.record(migration_id, &state);
+        let phases = self
+            .run_phases(&mut state, source_group, &req, migration_id)
+            .await;
+        // The final state, a failure included, stays visible until GC.
+        self.tracker.record(migration_id, &state);
+        phases?;
 
         let elapsed = state.elapsed();
         let phase = state.phase().clone();
@@ -184,6 +197,21 @@ impl MigrationExecutor {
             elapsed,
             migration_id,
         })
+    }
+
+    /// Run the three phases, recording the state after each.
+    async fn run_phases(
+        &self,
+        state: &mut MigrationState,
+        source_group: u64,
+        req: &MigrationRequest,
+        migration_id: MigrationId,
+    ) -> Result<()> {
+        super::phases::phase1_base_copy(self, state, source_group, req, migration_id).await?;
+        self.tracker.record(migration_id, state);
+        super::phases::phase2_wal_catchup(self, state, source_group, req, migration_id).await?;
+        self.tracker.record(migration_id, state);
+        super::phases::phase3_cutover(self, state, source_group, req, migration_id).await
     }
 
     pub(super) async fn propose_checkpoint(

@@ -50,9 +50,43 @@ pub struct TopicDef {
     /// Last sequence durably assigned to this topic.
     #[msgpack(default)]
     pub last_sequence: u64,
-    /// Last LSN durably assigned to this topic.
+    /// Position of the last message: the Raft log index of the entry that
+    /// carries it.
     #[msgpack(default)]
     pub last_lsn: u64,
+    /// Partition epoch of the last message's position.
+    #[msgpack(default)]
+    pub last_epoch: u64,
+    /// Stamped at propose time on create; fences a replayed delete to the
+    /// incarnation it targeted.
+    #[msgpack(default)]
+    pub modification_hlc: nodedb_types::Hlc,
+}
+
+/// Where a committed transaction's message comes from: the change-feed
+/// partition of the record that carries it, and the message's position in
+/// that partition. Every replica of the record names the message alike.
+///
+/// A topic appends one message per origin. Committed messages of one
+/// partition are delivered in position order, so a topic keeps the highest
+/// position it took from each partition and refuses every position at or
+/// below it as a delivery it already holds.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+#[msgpack(map)]
+pub struct PublishOrigin {
+    pub partition: u32,
+    pub position: crate::event::cdc::CdcOffset,
 }
 
 /// A durably retained topic publication.
@@ -69,8 +103,12 @@ pub struct TopicMessage {
     pub sequence: u64,
     /// Wall-clock event timestamp in milliseconds.
     pub event_time: u64,
-    /// Monotonic WAL-style position for this topic.
+    /// Position of the message: the Raft log index of the entry that
+    /// carries it.
     pub lsn: u64,
+    /// Partition epoch of the position.
+    #[msgpack(default)]
+    pub epoch: u64,
     /// Original publish payload, without JSON normalization.
     pub payload: String,
 }
@@ -88,6 +126,8 @@ impl TopicMessage {
             row_id: format!("msg-{}", self.sequence),
             event_time: self.event_time,
             lsn: self.lsn,
+            index: self.lsn,
+            epoch: self.epoch,
             database_id: self.database_id,
             tenant_id: self.tenant_id,
             new_value: Some(value),

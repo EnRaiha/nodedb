@@ -84,7 +84,10 @@ async fn a_replicated_write_to_an_unrelated_collection_applies_while_a_calvin_fl
     while count_lines(&boot_section(&h.server_log(), 1), &[FLUSH_HELD]) == 0 {
         assert!(
             Instant::now() < deadline && !txn.is_finished(),
-            "transaction A's flush was never held"
+            "transaction A's flush was never held (A finished: {}).{}\n{}",
+            txn.is_finished(),
+            h.keep_data_dir_note(),
+            crash_harness::diagnostics::log_tail_section(&h.server_log())
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

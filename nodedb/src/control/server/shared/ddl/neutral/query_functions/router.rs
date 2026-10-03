@@ -3,13 +3,12 @@
 //! Protocol-neutral routing for the temporal / audit query functions.
 //!
 //! These are `SELECT <FUNC>(...)` calls that never parse into a typed DDL AST
-//! statement — the pgwire router recognized them by substring (`upper.contains`)
-//! in its `router::function::dispatch`, after the typed-AST parse gate and the
-//! auth family. Replicate that exactly: this router is invoked only from the
-//! `None` (non-DDL-parse) branch of the parent neutral router, so any typed DDL
-//! statement (or parse error) whose body happens to contain one of these
-//! substrings is handled by the typed path first, byte-identically to before.
-//! The substring recognition order is preserved verbatim.
+//! statement — the router recognizes them by substring (`upper.contains`)
+//! after the typed-AST parse gate and the auth family. This router is invoked
+//! only from the `None` (non-DDL-parse) branch of the parent neutral router,
+//! so any typed DDL statement (or parse error) whose body contains one of
+//! these substrings is handled by the typed path first. The substring
+//! recognition order is fixed.
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;

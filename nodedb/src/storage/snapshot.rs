@@ -2,17 +2,16 @@
 
 //! Layered snapshots and Point-In-Time Recovery (PITR).
 //!
-//! - **Layered Snapshots**: Base image + block-level deltas.
+//! - **Incremental bases**: every base is a full image built from
+//!   content-addressed chunks. A base that reuses stored chunks names its
+//!   parent, and still restores without it.
 //! - **PITR**: Restore base image, then replay WAL to exact target timestamp.
+//!   The offline `nodedb restore` plans and runs it from this catalog.
 //!
 //! Snapshot operations emit begin/end markers with consistent LSN boundaries.
-//! Restore supports dry-run validation before serving traffic.
-//! PITR accepts absolute UTC timestamps and exposes resolved replay LSN.
 
 use tracing::info;
 
-use crate::storage::snapshot_restore::parse_utc_timestamp;
-pub use crate::storage::snapshot_restore::{PitrTarget, RestoreDryRun, dry_run_restore};
 use crate::types::Lsn;
 
 /// On-disk format version for [`SnapshotMeta`].
@@ -20,7 +19,7 @@ use crate::types::Lsn;
 /// Increment this constant whenever the serialized layout of `SnapshotMeta`
 /// changes in a backward-incompatible way. Readers must reject any snapshot
 /// whose stored `format_version` does not match this value.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 /// Snapshot metadata stored alongside the snapshot data.
 #[derive(
@@ -38,17 +37,22 @@ pub struct SnapshotMeta {
     pub format_version: u32,
     /// Unique snapshot identifier.
     pub snapshot_id: u64,
-    /// LSN at snapshot begin (inclusive).
+    /// The lowest per-core replay floor. WAL records above it bring every
+    /// core forward from this snapshot.
     pub begin_lsn: Lsn,
-    /// LSN at snapshot end (inclusive). All data up to this LSN is captured.
+    /// The highest per-core replay floor. Every core holds every record at
+    /// or below it that the core applied.
     pub end_lsn: Lsn,
+    /// The highest LSN whose effect the snapshot includes. A core can hold
+    /// records above its own floor, so this can exceed `end_lsn`.
+    pub applied_high_lsn: Lsn,
     /// UTC timestamp when snapshot was initiated (microseconds since epoch).
     pub created_at_us: u64,
     /// Node that created this snapshot.
     pub created_by: String,
-    /// Whether this is a base snapshot or a delta.
+    /// Whether the base reused stored chunks.
     pub kind: SnapshotKind,
-    /// Parent snapshot ID (for deltas).
+    /// The newest base before this one, when this one reused stored chunks.
     pub parent_id: Option<u64>,
     /// Total uncompressed data size in bytes.
     pub data_bytes: u64,
@@ -86,9 +90,10 @@ impl SnapshotMeta {
 #[repr(u8)]
 #[msgpack(c_enum)]
 pub enum SnapshotKind {
-    /// Full base image.
+    /// A full image whose chunks were all new to the store.
     Base = 0,
-    /// Block-level delta relative to a parent snapshot.
+    /// A full image that reuses chunks already stored. `parent_id` names the
+    /// newest base before it. Restore reads only its own manifest.
     Delta = 1,
 }
 
@@ -112,6 +117,7 @@ impl SnapshotCatalog {
             kind = ?meta.kind,
             begin_lsn = meta.begin_lsn.as_u64(),
             end_lsn = meta.end_lsn.as_u64(),
+            applied_high_lsn = meta.applied_high_lsn.as_u64(),
             "registered snapshot"
         );
         self.snapshots.push(meta);
@@ -119,58 +125,14 @@ impl SnapshotCatalog {
 
     /// Find the best base snapshot for a given target LSN.
     ///
-    /// Returns the most recent base snapshot whose `end_lsn <= target_lsn`.
+    /// Returns the most recent snapshot of either kind whose
+    /// `applied_high_lsn` is at or below `target_lsn`, so the base holds no
+    /// write after the target. Every snapshot is a full image.
     pub fn find_base(&self, target_lsn: Lsn) -> Option<&SnapshotMeta> {
         self.snapshots
             .iter()
-            .filter(|s| s.kind == SnapshotKind::Base && s.end_lsn <= target_lsn)
-            .max_by_key(|s| s.end_lsn)
-    }
-
-    /// Find all delta snapshots between a base and target LSN.
-    pub fn find_deltas(&self, base_lsn: Lsn, target_lsn: Lsn) -> Vec<&SnapshotMeta> {
-        let mut deltas: Vec<_> = self
-            .snapshots
-            .iter()
-            .filter(|s| {
-                s.kind == SnapshotKind::Delta && s.begin_lsn >= base_lsn && s.end_lsn <= target_lsn
-            })
-            .collect();
-        deltas.sort_by_key(|s| s.begin_lsn);
-        deltas
-    }
-
-    /// Resolve a PITR target from an absolute UTC timestamp.
-    ///
-    /// The `lsn_for_timestamp` callback resolves the UTC timestamp to an LSN
-    /// (typically by scanning WAL metadata).
-    pub fn resolve_pitr<F>(
-        &self,
-        target_timestamp_us: u64,
-        lsn_for_timestamp: F,
-    ) -> Option<PitrTarget>
-    where
-        F: Fn(u64) -> Option<Lsn>,
-    {
-        let replay_lsn = lsn_for_timestamp(target_timestamp_us)?;
-        let base = self.find_base(replay_lsn)?;
-        let deltas: Vec<_> = self
-            .find_deltas(base.end_lsn, replay_lsn)
-            .into_iter()
-            .cloned()
-            .collect();
-
-        let last_snapshot_lsn = deltas.last().map(|d| d.end_lsn).unwrap_or(base.end_lsn);
-        let wal_records = replay_lsn
-            .as_u64()
-            .saturating_sub(last_snapshot_lsn.as_u64());
-
-        Some(PitrTarget {
-            base_snapshot: base.clone(),
-            deltas,
-            replay_lsn,
-            wal_records_to_replay: wal_records,
-        })
+            .filter(|s| s.applied_high_lsn <= target_lsn)
+            .max_by_key(|s| s.applied_high_lsn)
     }
 
     pub fn len(&self) -> usize {
@@ -181,7 +143,7 @@ impl SnapshotCatalog {
         self.snapshots.is_empty()
     }
 
-    /// All snapshots sorted by end_lsn.
+    /// All registered snapshots, in registration order.
     pub fn all(&self) -> &[SnapshotMeta] {
         &self.snapshots
     }
@@ -219,31 +181,6 @@ impl SnapshotCatalog {
                 .as_micros() as u64,
         }
     }
-
-    /// Resolve a PITR target from an absolute UTC timestamp string.
-    ///
-    /// Accepts ISO 8601 format: `"2024-03-15T14:30:00Z"` or
-    /// Unix epoch microseconds: `"1710509400000000"`.
-    ///
-    /// Returns the resolved replay LSN and the full restore plan.
-    pub fn resolve_pitr_utc<F>(
-        &self,
-        utc_input: &str,
-        lsn_for_timestamp: F,
-    ) -> crate::Result<PitrTarget>
-    where
-        F: Fn(u64) -> Option<Lsn>,
-    {
-        let timestamp_us = parse_utc_timestamp(utc_input)?;
-        self.resolve_pitr(timestamp_us, lsn_for_timestamp)
-            .ok_or_else(|| crate::Error::Storage {
-                engine: "snapshot".into(),
-                detail: format!(
-                    "no snapshot available for PITR target timestamp {utc_input} \
-                     (resolved to {timestamp_us}µs)"
-                ),
-            })
-    }
 }
 
 /// Snapshot begin/end marker for consistent LSN boundaries.
@@ -271,11 +208,18 @@ mod tests {
     use super::*;
 
     fn base_snapshot(id: u64, end_lsn: u64) -> SnapshotMeta {
+        base_holding(id, end_lsn, end_lsn)
+    }
+
+    /// A base whose cores hold records up to `applied_high`, above their
+    /// floors up to `end_lsn`.
+    fn base_holding(id: u64, end_lsn: u64, applied_high: u64) -> SnapshotMeta {
         SnapshotMeta {
             format_version: SNAPSHOT_FORMAT_VERSION,
             snapshot_id: id,
             begin_lsn: Lsn::new(1),
             end_lsn: Lsn::new(end_lsn),
+            applied_high_lsn: Lsn::new(applied_high),
             created_at_us: 1_700_000_000_000_000,
             created_by: "node-1".into(),
             kind: SnapshotKind::Base,
@@ -284,17 +228,12 @@ mod tests {
         }
     }
 
-    fn delta_snapshot(id: u64, begin: u64, end: u64, parent: u64) -> SnapshotMeta {
+    /// A base that reuses the chunks of `parent`.
+    fn incremental(id: u64, applied_high: u64, parent: u64) -> SnapshotMeta {
         SnapshotMeta {
-            format_version: SNAPSHOT_FORMAT_VERSION,
-            snapshot_id: id,
-            begin_lsn: Lsn::new(begin),
-            end_lsn: Lsn::new(end),
-            created_at_us: 1_700_000_000_000_000 + end * 1000,
-            created_by: "node-1".into(),
             kind: SnapshotKind::Delta,
             parent_id: Some(parent),
-            data_bytes: 100_000,
+            ..base_holding(id, applied_high, applied_high)
         }
     }
 
@@ -324,80 +263,36 @@ mod tests {
     }
 
     #[test]
-    fn find_deltas_in_range() {
+    fn an_incremental_base_restores_on_its_own() {
         let mut cat = SnapshotCatalog::new();
         cat.add(base_snapshot(1, 100));
-        cat.add(delta_snapshot(2, 100, 200, 1));
-        cat.add(delta_snapshot(3, 200, 300, 1));
-        cat.add(delta_snapshot(4, 300, 400, 1));
-
-        let deltas = cat.find_deltas(Lsn::new(100), Lsn::new(350));
-        assert_eq!(deltas.len(), 2); // #2 and #3 (end_lsn <= 350)
-        assert_eq!(deltas[0].snapshot_id, 2);
-        assert_eq!(deltas[1].snapshot_id, 3);
+        cat.add(incremental(2, 200, 1));
+        assert_eq!(cat.find_base(Lsn::new(250)).unwrap().snapshot_id, 2);
+        assert_eq!(cat.find_base(Lsn::new(150)).unwrap().snapshot_id, 1);
     }
 
+    /// A core applies records out of LSN order, so its files can hold a record
+    /// above its floor. A base holding a write after the target must never be
+    /// chosen, whatever its floors say.
     #[test]
-    fn resolve_pitr() {
+    fn find_base_never_picks_a_base_above_the_target() {
         let mut cat = SnapshotCatalog::new();
-        cat.add(base_snapshot(1, 100));
-        cat.add(delta_snapshot(2, 100, 200, 1));
+        cat.add(base_holding(1, 100, 100));
+        cat.add(base_holding(2, 200, 260));
 
-        // Timestamp resolves to LSN 250.
-        let target = cat
-            .resolve_pitr(1_700_000_000_250_000, |_| Some(Lsn::new(250)))
-            .unwrap();
-
-        assert_eq!(target.base_snapshot.snapshot_id, 1);
-        assert_eq!(target.deltas.len(), 1);
-        assert_eq!(target.deltas[0].snapshot_id, 2);
-        assert_eq!(target.replay_lsn, Lsn::new(250));
-        assert_eq!(target.wal_records_to_replay, 50); // 250 - 200
-    }
-
-    #[test]
-    fn dry_run_valid() {
-        let target = PitrTarget {
-            base_snapshot: base_snapshot(1, 100),
-            deltas: vec![delta_snapshot(2, 100, 200, 1)],
-            replay_lsn: Lsn::new(250),
-            wal_records_to_replay: 50,
-        };
-
-        let result = dry_run_restore(&target);
-        assert!(result.valid);
-        assert!(result.issues.is_empty());
-        assert_eq!(result.files_to_read, 2);
-        assert_eq!(result.wal_records, 50);
-        assert!(result.plan_description.contains("base snapshot #1"));
-    }
-
-    #[test]
-    fn dry_run_detects_gap() {
-        let target = PitrTarget {
-            base_snapshot: base_snapshot(1, 100),
-            deltas: vec![delta_snapshot(2, 150, 200, 1)], // gap: 100..150
-            replay_lsn: Lsn::new(250),
-            wal_records_to_replay: 50,
-        };
-
-        let result = dry_run_restore(&target);
-        assert!(!result.valid);
-        assert!(!result.issues.is_empty());
-        assert!(result.issues[0].contains("gap"));
-    }
-
-    #[test]
-    fn pitr_no_deltas_needed() {
-        let mut cat = SnapshotCatalog::new();
-        cat.add(base_snapshot(1, 100));
-
-        let target = cat
-            .resolve_pitr(1_700_000_000_110_000, |_| Some(Lsn::new(110)))
-            .unwrap();
-
-        assert!(target.deltas.is_empty());
-        assert_eq!(target.wal_records_to_replay, 10); // 110 - 100
+        // Base #2's floor (200) is below 250, but it holds record 260.
+        assert_eq!(cat.find_base(Lsn::new(250)).unwrap().snapshot_id, 1);
+        assert_eq!(cat.find_base(Lsn::new(260)).unwrap().snapshot_id, 2);
+        for target in [0, 50, 99, 100, 150, 259, 260, 1_000] {
+            if let Some(base) = cat.find_base(Lsn::new(target)) {
+                assert!(
+                    base.applied_high_lsn <= Lsn::new(target),
+                    "base #{} holds lsn {} past target {target}",
+                    base.snapshot_id,
+                    base.applied_high_lsn.as_u64()
+                );
+            }
+        }
     }
 
     #[test]

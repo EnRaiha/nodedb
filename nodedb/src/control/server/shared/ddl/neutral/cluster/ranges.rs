@@ -2,18 +2,16 @@
 
 //! Protocol-neutral `SHOW RANGES` — vshard distribution across the cluster.
 //!
-//! Ported from the pgwire `ddl::cluster::ranges` handler. The routing /
-//! per-vshard-metrics reads are preserved verbatim; only the result
-//! construction changed from pgwire `Response` / `QueryResponse` to the
+//! The routing / per-vshard-metrics reads run here. The result is the
 //! protocol-neutral `DdlResult` over `ShapedRows`.
 //!
 //! `qps` and `p99_latency_ms` are `float8` columns. Unlike every other
 //! migrated column (rendered as `JsonValue::String` decimal/text), these are
 //! carried as `JsonValue::Number` so the shared pgwire `ddl_encode.rs` can
 //! encode them through pgwire's native `f64` text path (ryu +
-//! `extra_float_digits`) — the exact path the original handler's
-//! `encoder.encode_field(&f64)` used. Pre-rendering via `f64::to_string()`
-//! would diverge (e.g. `1.0` → pgwire `"1.0"` vs Rust `"1"`).
+//! `extra_float_digits`) — the path `encoder.encode_field(&f64)`
+//! uses. Pre-rendering via `f64::to_string()`
+//! will diverge (e.g. `1.0` → pgwire `"1.0"` vs Rust `"1"`).
 //!
 //! Both source values are always finite: `qps` is an integer centihertz
 //! counter divided by 100.0, and `p99_latency_ms` is an integer microsecond
@@ -28,7 +26,7 @@ use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::support::ddl_err;
+use super::support::{cluster_not_started, ddl_err};
 
 fn float_cell(v: f64) -> JsonValue {
     Number::from_f64(v)
@@ -56,12 +54,7 @@ pub fn show_ranges(
 
     let routing = match &state.cluster_routing {
         Some(r) => r,
-        None => {
-            return Err(ddl_err(
-                "55000",
-                "cluster mode not enabled (single-node instance)",
-            ));
-        }
+        None => return Err(cluster_not_started("cluster routing table")),
     };
 
     let columns = vec![

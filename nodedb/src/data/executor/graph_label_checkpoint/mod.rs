@@ -77,3 +77,5 @@ mod format;
 mod load;
 mod paths;
 mod write;
+
+pub(crate) use paths::{graph_label_ckpt_dir, graph_label_ckpt_state_path};

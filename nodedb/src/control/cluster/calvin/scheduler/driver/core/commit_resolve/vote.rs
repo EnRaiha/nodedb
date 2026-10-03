@@ -42,27 +42,46 @@ impl Scheduler {
         staged_response: &Response,
     ) {
         // A staged error is always an abort vote. Only successful staged
-        // responses may use `None` for the dependent-read path; accepting an
-        // error-plus-None as commit would let a failed participant flush after
+        // responses can use `None` for the dependent-read path; accepting an
+        // error-plus-None as commit will let a failed participant flush after
         // its peers received a global commit verdict.
-        let vote = staged_commit_vote(staged_response);
+        let superseded = self
+            .pending
+            .get(&txn_id)
+            .is_some_and(|pending| pending.superseded);
+        let vote = if superseded {
+            StagedVote::CollectionSuperseded
+        } else {
+            match staged_commit_vote(staged_response) {
+                // A read another node served is numbered in that node's WAL:
+                // this node's versions cannot show it still current.
+                StagedVote::Commit if self.validates_read_served_elsewhere(txn_id) => {
+                    StagedVote::SerializationConflict
+                }
+                vote => vote,
+            }
+        };
 
         // Durably propose this participant's commit vote via the sequencer
-        // Raft group, leader-guarded like `OllpMismatch`: only the data-group
-        // leader ran read-set validation, so only a leader's vote is
+        // Raft group, leader-guarded: only the data-group leader ran
+        // read-set validation, so only a leader's vote is
         // authoritative. The sequencer aggregates every participant's vote into
         // the single global verdict this txn parks on below. An abort travels as
         // `AbortVote` so its cause survives to the coordinator. The vote stays
         // owed until the tally holds it, so a refused or dropped proposal is
         // proposed again rather than lost.
-        if self.is_group_leader() {
-            self.propose_sequencer_entry(
-                txn_id,
-                SchedulerProposal::Vote {
-                    abort: vote.abort_reason(),
-                },
-            );
-        }
+        //
+        // A follower owes an abort vote and proposes it only if it comes to
+        // lead before any vote of this vShard applies: the previous leader
+        // lost its leadership, or its scheduler cannot run. A follower ran
+        // none of the leader-only checks, so abort is the only vote it can
+        // cast. The txn fails with a retryable conflict and never hangs.
+        let abort = if self.is_group_leader() {
+            vote.abort_reason()
+        } else {
+            Some(nodedb_cluster::calvin::AbortReason::SerializationConflict)
+        };
+        self.propose_sequencer_entry(txn_id, SchedulerProposal::Vote { abort });
 
         if vote == StagedVote::SerializationConflict {
             // The staged slice's read-set was no longer current: observe it, the
@@ -88,15 +107,25 @@ impl Scheduler {
         match self.pending.get_mut(&txn_id) {
             Some(pending) => {
                 pending.commit_state = Some(CommitState::AwaitingVerdict);
-                pending.stage_error = (vote == StagedVote::ParticipantError)
-                    .then(|| error_response_text("stage", staged_response));
+                // A superseded slice cannot flush here: its collection is gone.
+                pending.stage_error = match vote {
+                    StagedVote::ParticipantError | StagedVote::PredictionDrift => {
+                        Some(error_response_text("stage", staged_response))
+                    }
+                    StagedVote::CollectionSuperseded => Some(
+                        "a collection the transaction names no longer holds its planned \
+                         incarnation"
+                            .to_owned(),
+                    ),
+                    StagedVote::Commit | StagedVote::SerializationConflict => None,
+                };
                 // no-determinism: local stall-warning deadline only; the global replicated verdict, not this wall-clock, decides commit/abort.
                 pending.verdict_deadline = Some(Instant::now() + self.config.verdict_stall_warn());
             }
             None => return,
         }
 
-        // PROBE on park (correctness backstop): the verdict may already be
+        // PROBE on park (correctness backstop): the verdict can already be
         // durable — on replay, or a push that raced ahead of this park. Resume
         // immediately if so; the double-resume guard in `resume_on_verdict`
         // makes a later duplicate push/probe a no-op.
@@ -106,5 +135,21 @@ impl Scheduler {
         )) {
             self.resume_on_verdict(txn_id, verdict);
         }
+    }
+
+    /// Whether a read this vShard validates for `txn_id` was served by a node
+    /// other than this one. Its `read_lsn` is a position in that node's WAL.
+    fn validates_read_served_elsewhere(&self, txn_id: TxnId) -> bool {
+        let Some(pending) = self.pending.get(&txn_id) else {
+            return false;
+        };
+        let tx_class = &pending.txn.tx_class;
+        tx_class.versioned_reads.iter().any(|entry| {
+            super::super::routing::versioned_read_homes_on(
+                entry,
+                tx_class.database_id,
+                self.vshard_id,
+            ) && entry.served_by != self.shared.node_id
+        })
     }
 }

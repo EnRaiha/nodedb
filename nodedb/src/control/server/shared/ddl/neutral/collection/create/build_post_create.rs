@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Post-create side effects for `build_and_persist`: vector-field
-//! auto-config logging and `SERIAL` sequence auto-creation. Relocated
-//! verbatim from the pgwire `pgwire::ddl::collection::create::build` module
-//! (now deleted).
+//! auto-config logging and `SERIAL` sequence auto-creation.
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
-use super::super::super::super::catalog::propose_and_apply;
+use super::super::super::super::catalog::propose_and_apply_async;
 use super::super::super::super::result::DdlError;
 
 /// INFO-log every detected vector field so operators can see what
@@ -28,9 +26,9 @@ pub(super) fn log_vector_fields(collection_name: &str, fields: &[(String, String
 }
 
 /// Materialise one `StoredSequence` per `SERIAL` column, via the same
-/// propose+apply path as `CREATE SEQUENCE`, gated the same way: shared-registry
-/// install only on `needs_local_apply`, so a `Buffered` outcome cannot leak it.
-pub(super) fn create_serial_sequences(
+/// propose path as `CREATE SEQUENCE`. A `Buffered` outcome installs nothing
+/// in the shared registry until COMMIT.
+pub(super) async fn create_serial_sequences(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -47,16 +45,12 @@ pub(super) fn create_serial_sequences(
             identity.username.clone(),
         );
         seq_def.created_at = now;
-        // Route the auto-created sequence through the proposer +
-        // local apply path so the OWNERS row lands alongside the
-        // sequence row — the same architectural guarantee CREATE
-        // SEQUENCE has, applied to SERIAL columns.
-        let seq_entry =
-            crate::control::catalog_entry::CatalogEntry::PutSequence(Box::new(seq_def.clone()));
-        let outcome = propose_and_apply(state, &seq_entry)?;
-        if outcome.needs_local_apply() {
-            let _ = state.sequence_registry.create(seq_def);
-        }
+        // Route the auto-created sequence through the proposer so the
+        // OWNERS row lands alongside the sequence row — the same
+        // architectural guarantee CREATE SEQUENCE has, applied to SERIAL
+        // columns.
+        let seq_entry = crate::control::catalog_entry::CatalogEntry::PutSequence(Box::new(seq_def));
+        propose_and_apply_async(state, &seq_entry).await?;
         tracing::info!(
             collection = %collection_name,
             field = %field_name,

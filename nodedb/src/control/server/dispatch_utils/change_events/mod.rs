@@ -3,10 +3,12 @@
 //! Write-metadata extraction and CDC change-event publishing for dispatched
 //! writes.
 
+mod cluster_array;
 mod extract;
 mod publish;
+mod redo;
 
 pub(crate) use publish::{
-    WriteChangeSet, extract_write_change_set, publish_change_set, publish_change_set_with_lsn,
-    publish_cluster_array_change_events, publish_origin_change_events,
+    CalvinApply, PendingChanges, WriteChangeSet, extract_write_change_set,
+    publish_calvin_change_sets, publish_settled_changes, redo_change_set,
 };

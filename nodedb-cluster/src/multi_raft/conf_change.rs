@@ -92,10 +92,11 @@ impl MultiRaft {
 
             let data = change.to_entry_data()?;
             let log_index = node.propose(data)?;
-            // A single-voter group self-commits inside `propose`:
-            // its `commit_index` is bumped to the new `log_index`
-            // before we return. Detecting this is the one safe
-            // trigger for an inline apply.
+            // A single-voter group commits once its own disk holds the
+            // entry. When that is already so inside `propose`, the
+            // `commit_index` reaches `log_index` before we return, and the
+            // change applies inline. Otherwise it applies with the
+            // group's other committed entries on a later tick.
             let committed_immediately = node.commit_index() >= log_index;
             (log_index, committed_immediately)
         };
@@ -187,7 +188,10 @@ impl MultiRaft {
             }
             ConfChangeType::RemoveLearner => {
                 // Non-voting removal: safe at any time — learners are not in
-                // quorum, commit, or election paths.
+                // quorum, commit, or election paths. The departing learner is
+                // told its removal committed, as a departing voter is, so its
+                // routing view stops listing it as a replica of the group.
+                node.notify_removed_peer(change.node_id);
                 node.remove_learner(change.node_id);
                 self.routing
                     .write()
@@ -293,12 +297,14 @@ mod tests {
     fn propose_promote_requires_learner_caught_up() {
         let (mut mr, _dir) = new_mr(1, &[0]);
         // Force election: single-voter group becomes leader on first tick,
-        // and its no-op commits immediately.
+        // and its no-op commits once its disk holds it.
         for node in mr.groups.values_mut() {
             node.election_deadline_override(
                 std::time::Instant::now() - std::time::Duration::from_millis(1),
             );
         }
+        mr.tick().unwrap();
+        mr.wait_all_durable_blocking();
         mr.tick().unwrap();
         let node = mr.groups.get(&0).unwrap();
         assert_eq!(node.role(), nodedb_raft::NodeRole::Leader);
@@ -350,6 +356,8 @@ mod tests {
             );
         }
         mr.tick().unwrap();
+        mr.wait_all_durable_blocking();
+        mr.tick().unwrap();
 
         mr.apply_conf_change(
             0,
@@ -367,6 +375,8 @@ mod tests {
             term: mr.groups.get(&0).unwrap().current_term(),
             success: true,
             last_log_index: last,
+            round: nodedb_raft::node::leader_lease::UNTRACKED_ROUND,
+            needs_snapshot: false,
         };
         mr.handle_append_entries_response(0, 2, &resp).unwrap();
         assert_eq!(mr.match_index_for(0, 2), Some(last));

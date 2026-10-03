@@ -50,7 +50,7 @@ pub(super) fn decode_lock_key(wire: &LockKeyWire) -> LockKey {
 ///
 /// All keys in both the read set and write set are acquired as exclusive
 /// (write) locks.
-pub(super) fn expand_rw_set(txn: &SequencedTxn) -> BTreeSet<LockKey> {
+pub(crate) fn expand_rw_set(txn: &SequencedTxn) -> BTreeSet<LockKey> {
     let mut keys = BTreeSet::new();
     let add_key_set = |keys: &mut BTreeSet<LockKey>, ks: &EngineKeySet| match ks {
         EngineKeySet::Document {
@@ -92,6 +92,14 @@ pub(super) fn expand_rw_set(txn: &SequencedTxn) -> BTreeSet<LockKey> {
                     dst,
                 });
             }
+        }
+        // Each participating vShard's lock table holds the whole array on
+        // that vShard: the collection key every writer of the array takes.
+        EngineKeySet::Array { collection, .. } => {
+            keys.insert(LockKey::Surrogate {
+                collection: Arc::from(collection.as_str()),
+                surrogate: crate::control::planner::calvin::tx_class::write_keys::COLLECTION_KEY,
+            });
         }
     };
 

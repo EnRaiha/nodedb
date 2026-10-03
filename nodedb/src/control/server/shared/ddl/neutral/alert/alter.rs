@@ -23,7 +23,7 @@ fn err(sqlstate: &str, message: String) -> DdlError {
     DdlError::new(sqlstate, message)
 }
 
-pub fn alter_alert(
+pub async fn alter_alert(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -45,7 +45,7 @@ pub fn alter_alert(
         _ => return Err(err("42601", "expected ENABLE or DISABLE".to_string())),
     }
 
-    super::replicate::propose_put(state, &def)?;
+    super::replicate::propose_put(state, &def).await?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

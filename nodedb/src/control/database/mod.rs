@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+pub mod allocate;
 pub mod persist;
 pub mod registry;
 
-pub use persist::{DatabaseHwmPersist, SystemCatalogDatabaseHwm};
-pub use registry::{
-    DatabaseAllocError, DatabaseRegistry, FLUSH_ELAPSED_THRESHOLD, FLUSH_OPS_THRESHOLD,
-    USER_DB_START,
-};
+pub use allocate::allocate_database_id;
+pub use persist::DatabaseHwmPersist;
+pub use registry::{DatabaseAllocError, DatabaseRegistry, USER_DB_START};

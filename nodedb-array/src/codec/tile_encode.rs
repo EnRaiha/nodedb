@@ -10,7 +10,7 @@
 //   [u32 LE cell_count]
 //   [u32 LE axis_count]
 //   per axis: [u32 LE encoded_len][coord_rle payload]
-//   [u32 LE surrogates_len][fastlanes payload]
+//   [u32 LE surrogates_len][fastlanes payload — live rows only]
 //   [u32 LE row_kinds_len][raw u8s]
 //   [u32 LE system_from_ms_len][gorilla payload — absent for Raw tag]
 //   [u32 LE valid_from_ms_len][gorilla payload]
@@ -58,6 +58,9 @@ fn write_framed(chunk: &[u8], out: &mut Vec<u8>) {
 /// Encode a `SparseTile` into `out`. The segment writer wraps this payload
 /// in BlockFraming (length + CRC).
 pub fn encode_sparse_tile(tile: &SparseTile, out: &mut Vec<u8>) -> ArrayResult<()> {
+    // A stored live cell always holds a bound surrogate. A derived result tile
+    // holds none and is refused here, before any byte is written.
+    tile.check_stored_identities()?;
     let tag = choose_tag(tile);
     out.push(tag.as_byte());
     out.push(PAYLOAD_VERSION);
@@ -89,8 +92,10 @@ fn encode_structural(tile: &SparseTile, out: &mut Vec<u8>) -> ArrayResult<()> {
         write_framed(&axis_buf, out);
     }
 
-    // Surrogates.
-    let surr_bytes = encode_surrogates(&tile.surrogates)?;
+    // Surrogates: live rows only, in row order. A tombstone or erasure row
+    // holds none, and the decoder restores the gaps from the row kinds.
+    let live_surrogates: Vec<_> = tile.surrogates.iter().copied().flatten().collect();
+    let surr_bytes = encode_surrogates(&live_surrogates)?;
     write_framed(&surr_bytes, out);
 
     // Row kinds.
@@ -157,7 +162,7 @@ mod tests {
             b.push_row(SparseRow {
                 coord: &[CoordValue::Int64(i as i64), CoordValue::Int64(i as i64 * 2)],
                 attrs: &[CellValue::Int64(i as i64)],
-                surrogate: Surrogate::ZERO,
+                surrogate: Some(Surrogate::new(i as u32 + 1)),
                 valid_from_ms: i as i64 * 10,
                 valid_until_ms: OPEN_UPPER,
                 kind: RowKind::Live,
@@ -217,7 +222,7 @@ mod tests {
             b.push_row(SparseRow {
                 coord: &[CoordValue::Int64(i), CoordValue::Int64(i)],
                 attrs: &[],
-                surrogate: Surrogate::ZERO,
+                surrogate: None,
                 valid_from_ms: 0,
                 valid_until_ms: OPEN_UPPER,
                 kind: RowKind::Tombstone,
@@ -247,5 +252,52 @@ mod tests {
         encode_sparse_tile(&tile, &mut buf).unwrap();
         let decoded = decode_sparse_tile(&buf).unwrap();
         assert_eq!(decoded.surrogates, tile.surrogates);
+    }
+
+    /// Tombstone rows interleaved with live rows keep no identity through the
+    /// structural codec, and every live row keeps its own.
+    #[test]
+    fn structural_roundtrip_keeps_sentinel_rows_without_identity() {
+        let s = schema();
+        let mut b = SparseTileBuilder::new(&s);
+        for i in 0..20i64 {
+            let coord = [CoordValue::Int64(i), CoordValue::Int64(i)];
+            if i % 3 == 0 {
+                b.push_row(SparseRow::sentinel(&coord, RowKind::Tombstone))
+                    .unwrap();
+            } else {
+                b.push_row(SparseRow::live(
+                    &coord,
+                    &[CellValue::Int64(i)],
+                    Surrogate::new(100 + i as u32),
+                    0,
+                    OPEN_UPPER,
+                ))
+                .unwrap();
+            }
+        }
+        let tile = b.build();
+        let mut buf = Vec::new();
+        encode_sparse_tile(&tile, &mut buf).unwrap();
+        assert_eq!(buf[0], CodecTag::Structural.as_byte());
+        let decoded = decode_sparse_tile(&buf).unwrap();
+        assert_eq!(decoded.surrogates, tile.surrogates);
+        assert_eq!(decoded.surrogates[0], None);
+        assert_eq!(decoded.surrogates[1], Some(Surrogate::new(101)));
+    }
+
+    /// A derived result tile holds no identity, so it is never written.
+    #[test]
+    fn a_derived_tile_is_refused_by_the_encoder() {
+        let s = schema();
+        let mut b = SparseTileBuilder::new(&s);
+        b.push(
+            &[CoordValue::Int64(1), CoordValue::Int64(1)],
+            &[CellValue::Int64(1)],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        assert!(encode_sparse_tile(&b.build(), &mut buf).is_err());
+        assert!(buf.is_empty(), "nothing is written for a refused tile");
     }
 }

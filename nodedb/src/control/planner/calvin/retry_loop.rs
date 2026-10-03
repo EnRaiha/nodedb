@@ -9,7 +9,7 @@
 //! under predicate drift. The scheduler's only job on mismatch is to release the
 //! aborted attempt's locks and signal the completion registry so this loop wakes.
 
-use nodedb_cluster::calvin::{AttemptOutcome, CalvinCompletionRegistry, TxnId};
+use nodedb_cluster::calvin::{AbortReason, AttemptOutcome, CalvinCompletionRegistry, TxnId};
 
 use crate::control::cluster::calvin::executor::ollp::error::OllpError;
 use crate::control::cluster::calvin::executor::ollp::orchestrator::OllpOrchestrator;
@@ -36,9 +36,13 @@ fn pre_admission_cause(err: OllpError) -> OllpExhaustedCause {
 /// Terminal outcome of the dependent-read retry loop.
 #[derive(Debug)]
 pub enum DependentOutcome {
-    /// The dependent transaction committed; carries its `TxnId` so the caller
-    /// can drain the applied response the scheduler deposited.
-    Committed(TxnId),
+    /// The dependent transaction committed. The caller drains the applied
+    /// response the scheduler deposited under `txn_id`, and reads each
+    /// participant's report from `ack_results`.
+    Committed {
+        txn_id: TxnId,
+        ack_results: Vec<Vec<u8>>,
+    },
     /// The batch decided an empty write set — the predicate matched no rows and
     /// no other task in it writes — so no Calvin entry was proposed. The
     /// statement's result is zero rows affected.
@@ -128,8 +132,8 @@ where
         // registry, which receives the replicated completion ack on every
         // sequencer-group member.
         let txn_id = TxnId::new(assignment.epoch, assignment.position);
-        let completion_rx = registry.register_completion(txn_id, assignment.participants);
-        let outcome = tokio::time::timeout(timeout, completion_rx)
+        let completion_rx = registry.register_completion_report(txn_id, assignment.participants);
+        let report = tokio::time::timeout(timeout, completion_rx)
             .await
             .map_err(|_| Error::Internal {
                 detail: "timed out waiting for Calvin completion".into(),
@@ -138,17 +142,26 @@ where
                 detail: "Calvin completion channel closed".into(),
             })?;
 
-        match outcome {
+        match report.outcome {
             // Return the completed txn's id so the caller can drain the applied
-            // Response (RETURNING rows) the scheduler deposited before the ack.
-            AttemptOutcome::Completed => return Ok(DependentOutcome::Committed(txn_id)),
-            // Terminal, NON-retryable: the global cross-shard verdict was ABORT.
-            // A committed verdict is not OLLP predicate drift — a fresh
-            // reconnaissance cannot change it — so surface it to the client
-            // immediately instead of burning retries. The verdict's reason picks
-            // the error: a stale read-set is SQLSTATE 40001, a participant error
-            // is not.
-            AttemptOutcome::Aborted { reason } => {
+            // Response (RETURNING rows) the scheduler deposited before the ack,
+            // and the participants' reports for a participant on another node.
+            AttemptOutcome::Completed => {
+                return Ok(DependentOutcome::Committed {
+                    txn_id,
+                    ack_results: report.ack_results,
+                });
+            }
+            // Terminal, NON-retryable: the global cross-shard verdict was ABORT
+            // for a reason a fresh reconnaissance cannot change, so surface it
+            // to the client immediately instead of burning retries. The
+            // verdict's reason picks the error: a stale read-set is SQLSTATE
+            // 40001, a participant error is not. `PredictionDrift` and
+            // `PartsLost` retry, in the arm below: a multi-part transaction
+            // whose parts a leader change lost staged nothing anywhere.
+            AttemptOutcome::Aborted { reason }
+                if reason != AbortReason::PredictionDrift && reason != AbortReason::PartsLost =>
+            {
                 return Err(calvin_abort_error(reason));
             }
             // Terminal, NON-retryable: the scheduler rejected the transaction's
@@ -160,11 +173,14 @@ where
                     detail: format!("calvin transaction routing failed: {detail}"),
                 });
             }
-            AttemptOutcome::Mismatch => {
-                // POST-EXEC predicate drift. The scheduler already released the
-                // aborted attempt's locks before signalling the registry, so a
-                // FRESH reconnaissance is safe — and necessary, since the stale
-                // prediction can never converge under drift.
+            AttemptOutcome::Mismatch | AttemptOutcome::Aborted { .. } => {
+                // POST-EXEC predicate drift: an OLLP mismatch, or an abort
+                // verdict because a participant found state other than the
+                // reconnaissance predicted and wrote nothing. The scheduler
+                // already released the aborted attempt's locks before
+                // signalling the registry, so a FRESH reconnaissance is safe —
+                // and necessary, since the stale prediction can never converge
+                // under drift.
                 if retry >= ollp_max_retries {
                     return Err(Error::OllpExhausted {
                         retries: ollp_max_retries.min(u8::MAX as u32) as u8,
@@ -189,16 +205,16 @@ mod tests {
     //! without a live server/executor. The coordinator's injected `submit` closure
     //! returns a `RoutedAssignment` carrying a deterministic `(epoch, position)` —
     //! exactly the `(epoch, position)` the loop feeds to
-    //! `register_completion(TxnId::new(epoch, position))`. The closure also forwards
+    //! `register_completion_report(TxnId::new(epoch, position))`. The closure also forwards
     //! that same `TxnId` to the fake over an mpsc channel; the fake then either calls
     //! `note_ollp_mismatch(txn)` (first K submissions → `Mismatch`) or
     //! `note_completion_ack(txn, 1)` (submission K+1, 1 participant → fires
     //! `Completed`). The `rescan` closure increments a counter and returns a fresh
     //! prediction vec.
     //!
-    //! Since the routed `submit` now returns the assignment itself (the leader
-    //! assigns and replies with `(epoch, position)`), the loop no longer calls
-    //! `register_submission` / the fake no longer needs `note_assigned`. The
+    //! The routed `submit` returns the assignment itself (the leader
+    //! assigns and replies with `(epoch, position)`), so the loop never calls
+    //! `register_submission` and the fake needs no `note_assigned`. The
     //! `(epoch, position)` source is deterministic on the test side: `epoch =
     //! inbox_seq`, `position = 0`. Both the `RoutedAssignment` returned by `submit`
     //! AND the fake's `note_completion_ack` / `note_ollp_mismatch` use that same
@@ -206,7 +222,7 @@ mod tests {
     //!
     //! Determinism: a current-thread runtime plus a bounded fake channel with enough
     //! capacity that the closure's `send().await` never yields control to the fake
-    //! before `register_completion` runs.
+    //! before `register_completion_report` runs.
 
     use super::*;
 
@@ -228,7 +244,7 @@ mod tests {
     /// Spawn the fake scheduler. It reads `TxnId` events (the same `TxnId` the loop
     /// registers for completion) and, for the first `mismatch_count` events, signals
     /// an OLLP mismatch; on the next event it acks completion with a single
-    /// participant (which fires `Completed`). The loop no longer calls
+    /// participant (which fires `Completed`). The loop never calls
     /// `register_submission`, so `note_assigned` is not needed.
     fn spawn_fake_scheduler(
         registry: Arc<CalvinCompletionRegistry>,
@@ -315,7 +331,7 @@ mod tests {
             };
 
             assert!(
-                matches!(result, Ok(DependentOutcome::Committed(_))),
+                matches!(result, Ok(DependentOutcome::Committed { .. })),
                 "expected Committed, got {result:?}"
             );
             assert_eq!(
@@ -459,7 +475,7 @@ mod tests {
             };
 
             assert!(
-                matches!(result, Ok(DependentOutcome::Committed(_))),
+                matches!(result, Ok(DependentOutcome::Committed { .. })),
                 "expected Committed, got {result:?}"
             );
             assert_eq!(
@@ -617,5 +633,102 @@ mod tests {
                 "message must name the real cause: {cause}"
             );
         });
+    }
+
+    /// Run the loop against a fake that answers the first attempt with an
+    /// ABORT verdict for `reason` and commits every later attempt. Returns
+    /// the result, the submit count and the rescan count.
+    fn run_with_first_abort(reason: AbortReason) -> (crate::Result<DependentOutcome>, u64, u32) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+        rt.block_on(async {
+            let registry = CalvinCompletionRegistry::new_detached();
+            let orchestrator = zero_backoff_orchestrator();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<TxnId>(16);
+            let fake = {
+                let registry = Arc::clone(&registry);
+                tokio::spawn(async move {
+                    let mut first = true;
+                    while let Some(txn) = rx.recv().await {
+                        if first {
+                            registry.note_verdict(
+                                txn,
+                                nodedb_cluster::calvin::VerdictOutcome::Abort(reason),
+                            );
+                            first = false;
+                        }
+                        registry.note_completion_ack(txn, 1);
+                    }
+                })
+            };
+            let seq = Arc::new(AtomicU64::new(1));
+            let submit_calls = Arc::new(AtomicU64::new(0));
+            let rescan_calls = Arc::new(AtomicU32::new(0));
+            let result = {
+                let seq = Arc::clone(&seq);
+                let submit_calls = Arc::clone(&submit_calls);
+                let rescan_calls = Arc::clone(&rescan_calls);
+                let tx = tx.clone();
+                run_dependent_with_retry(DependentRetryArgs {
+                    registry: &registry,
+                    orchestrator: &orchestrator,
+                    predicate_class_hash: 0xABCD,
+                    timeout: std::time::Duration::from_secs(5),
+                    ollp_max_retries: 5,
+                    initial_predicted: vec![1],
+                    submit: move |_predicted: &Vec<u32>| {
+                        let seq = Arc::clone(&seq);
+                        let submit_calls = Arc::clone(&submit_calls);
+                        let tx = tx.clone();
+                        async move {
+                            submit_calls.fetch_add(1, Ordering::SeqCst);
+                            let assignment = fake_assignment(seq.fetch_add(1, Ordering::SeqCst));
+                            let txn = TxnId::new(assignment.epoch, assignment.position);
+                            tx.send(txn).await.expect("fake recv alive");
+                            Ok::<Option<RoutedAssignment>, OllpError>(Some(assignment))
+                        }
+                    },
+                    rescan: move || {
+                        let rescan_calls = Arc::clone(&rescan_calls);
+                        async move {
+                            rescan_calls.fetch_add(1, Ordering::SeqCst);
+                            Ok(vec![2])
+                        }
+                    },
+                })
+                .await
+            };
+            drop(tx);
+            let _ = fake.await;
+            (
+                result,
+                submit_calls.load(Ordering::SeqCst),
+                rescan_calls.load(Ordering::SeqCst),
+            )
+        })
+    }
+
+    #[test]
+    fn a_prediction_drift_abort_rescans_and_retries() {
+        let (result, submits, rescans) = run_with_first_abort(AbortReason::PredictionDrift);
+        assert!(
+            matches!(result, Ok(DependentOutcome::Committed { .. })),
+            "expected Committed, got {result:?}"
+        );
+        assert_eq!(submits, 2, "one drift abort + one commit → two submits");
+        assert_eq!(rescans, 1, "the drift abort reads again once");
+    }
+
+    #[test]
+    fn a_participant_error_abort_is_terminal() {
+        let (result, submits, rescans) = run_with_first_abort(AbortReason::ParticipantError);
+        assert!(
+            matches!(result, Err(Error::CalvinParticipantError)),
+            "expected CalvinParticipantError, got {result:?}"
+        );
+        assert_eq!(submits, 1);
+        assert_eq!(rescans, 0);
     }
 }

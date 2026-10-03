@@ -2,7 +2,10 @@
 
 //! Per-peer QUIC connection pool: registration, dialling, eviction, warm-up.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use tracing::debug;
 
@@ -51,19 +54,26 @@ impl NexarTransport {
         })
     }
 
-    /// Get an existing connection to a peer, or establish a new one.
-    pub(super) async fn get_or_connect(&self, target: u64) -> Result<quinn::Connection> {
-        // Check cache — fast path.
-        {
-            let peers = self.peers.read().unwrap_or_else(|p| p.into_inner());
-            if let Some(conn) = peers.get(&target)
-                && conn.close_reason().is_none()
-            {
-                return Ok(conn.clone());
-            }
-        }
+    /// The pooled connection to `target`, if it is open.
+    fn pooled_connection(&self, target: u64) -> Option<quinn::Connection> {
+        let peers = self.peers.read().unwrap_or_else(|p| p.into_inner());
+        peers
+            .get(&target)
+            .filter(|conn| conn.close_reason().is_none())
+            .cloned()
+    }
 
-        // Resolve address.
+    /// Get an existing connection to a peer, or establish a new one.
+    ///
+    /// Dials to one peer are single-flight. A caller that finds no open
+    /// connection waits for the peer's dial gate. It then reuses the
+    /// connection an earlier dial pooled meanwhile, or shares the failure of
+    /// a dial that ended while it waited. Only a caller with neither dials,
+    /// so a burst of sends to one peer opens one connection.
+    pub(super) async fn get_or_connect(&self, target: u64) -> Result<quinn::Connection> {
+        if let Some(conn) = self.pooled_connection(target) {
+            return Ok(conn);
+        }
         let addr = {
             let addrs = self.peer_addrs.read().unwrap_or_else(|p| p.into_inner());
             addrs
@@ -72,6 +82,40 @@ impl NexarTransport {
                 .ok_or(ClusterError::NodeUnreachable { node_id: target })?
         };
 
+        let waiting_since = Instant::now();
+        let gate = self.dial_gates.gate(target);
+        // Held across this peer's dial only. Eviction takes no gate.
+        let mut last_dial = gate.lock().await;
+        if let Some(conn) = self.pooled_connection(target) {
+            return Ok(conn);
+        }
+        if let Some(failure) = last_dial.failed_since(waiting_since) {
+            return Err(ClusterError::Transport {
+                detail: format!(
+                    "dial to node {target} at {addr} failed while this send waited: {failure}"
+                ),
+            });
+        }
+        self.drop_closed_connection(target);
+        match self.dial(target, addr).await {
+            Ok(conn) => {
+                last_dial.failure = None;
+                let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
+                peers.insert(target, conn.clone());
+                Ok(conn)
+            }
+            Err(error) => {
+                last_dial.failure = Some(DialFailure {
+                    at: Instant::now(),
+                    detail: error.to_string(),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// Connect to `target` at `addr` and negotiate the wire version.
+    async fn dial(&self, target: u64, addr: SocketAddr) -> Result<quinn::Connection> {
         // Connect — bounded by rpc_timeout so a hung QUIC handshake
         // (peer not yet serving) doesn't block for the full 30s idle timeout.
         let connecting = self
@@ -130,24 +174,149 @@ impl NexarTransport {
 
         // Cache the agreed version keyed on the QUIC connection's stable id.
         self.store_agreed_version(conn.stable_id(), agreed);
-
-        // Cache (harmless race: last writer wins, both connections valid).
-        let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
-        peers.insert(target, conn.clone());
         Ok(conn)
     }
 
-    /// Remove a cached connection (forces reconnect on next use).
-    pub(super) fn evict_peer(&self, target: u64) {
-        let stable_id = {
+    /// Drop the pooled connection to `target` if it is closed.
+    fn drop_closed_connection(&self, target: u64) {
+        let closed = {
             let peers = self.peers.read().unwrap_or_else(|p| p.into_inner());
-            peers.get(&target).map(|c| c.stable_id())
+            peers
+                .get(&target)
+                .filter(|conn| conn.close_reason().is_some())
+                .map(quinn::Connection::stable_id)
         };
-        let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
-        peers.remove(&target);
-        drop(peers);
-        if let Some(id) = stable_id {
-            self.evict_agreed_version(id);
+        if let Some(stable_id) = closed {
+            self.evict_connection(target, stable_id);
         }
+    }
+
+    /// Drop the connection `stable_id` from the pool, so the next send to
+    /// `target` dials a fresh one. A newer connection pooled for `target`
+    /// stays.
+    pub(super) fn evict_connection(&self, target: u64, stable_id: usize) {
+        {
+            let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
+            if peers
+                .get(&target)
+                .is_some_and(|conn| conn.stable_id() == stable_id)
+            {
+                peers.remove(&target);
+            }
+        }
+        self.evict_agreed_version(stable_id);
+    }
+}
+
+/// The last failed dial to one peer.
+#[derive(Debug)]
+struct DialFailure {
+    /// When the dial ended.
+    at: Instant,
+    detail: String,
+}
+
+/// Outcome of the last dial to one peer, behind the peer's dial gate.
+#[derive(Debug, Default)]
+struct LastDial {
+    failure: Option<DialFailure>,
+}
+
+impl LastDial {
+    /// The failure of a dial that ended at or after `since`.
+    fn failed_since(&self, since: Instant) -> Option<&str> {
+        self.failure
+            .as_ref()
+            .filter(|failure| failure.at >= since)
+            .map(|failure| failure.detail.as_str())
+    }
+}
+
+/// One dial gate per peer. A gate is held across a dial to its peer only.
+#[derive(Debug, Default)]
+pub(super) struct DialGates {
+    gates: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<LastDial>>>>,
+}
+
+impl DialGates {
+    /// The dial gate of `target`. The map holds one gate per peer ever
+    /// dialled, so it stays bounded by the cluster's nodes.
+    fn gate(&self, target: u64) -> Arc<tokio::sync::Mutex<LastDial>> {
+        let mut gates = self.gates.lock().unwrap_or_else(|p| p.into_inner());
+        Arc::clone(gates.entry(target).or_default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::super::transport::tests::serve_echo;
+    use super::*;
+    use crate::transport::credentials::TransportCredentials;
+
+    /// A burst of sends to one peer opens one connection.
+    #[tokio::test]
+    async fn concurrent_callers_share_one_dial() {
+        let (_server, client, _shutdown) = serve_echo().await;
+        let callers = (0..16).map(|_| {
+            let client = Arc::clone(&client);
+            async move { client.get_or_connect(1).await.map(|conn| conn.stable_id()) }
+        });
+
+        let ids = futures::future::try_join_all(callers).await.expect("dial");
+
+        assert!(ids.windows(2).all(|pair| pair[0] == pair[1]), "{ids:?}");
+        assert_eq!(client.peer_connection_stable_id(1), ids.first().copied());
+    }
+
+    /// Callers that waited behind a failed dial share its failure. None of
+    /// them dials again, so a peer that is down costs one dial timeout.
+    #[tokio::test]
+    async fn waiters_share_a_failed_dial() {
+        // Bound but never answering: every dial runs into the handshake timeout.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let client = Arc::new(
+            NexarTransport::with_timeout(
+                2,
+                "127.0.0.1:0".parse().expect("addr"),
+                Duration::from_millis(300),
+                TransportCredentials::Insecure,
+            )
+            .expect("transport"),
+        );
+        client.register_peer(1, silent.local_addr().expect("addr"));
+        let callers = (0..8).map(|_| {
+            let client = Arc::clone(&client);
+            async move { client.get_or_connect(1).await }
+        });
+
+        let outcomes = futures::future::join_all(callers).await;
+
+        let shared = outcomes
+            .iter()
+            .filter(|outcome| {
+                outcome
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains("while this send waited"))
+            })
+            .count();
+        assert!(outcomes.iter().all(Result::is_err));
+        assert_eq!(shared, outcomes.len() - 1, "one dial, its failure shared");
+    }
+
+    /// Eviction removes only the connection that failed. A newer connection
+    /// pooled for the same peer stays.
+    #[tokio::test]
+    async fn eviction_spares_a_newer_connection() {
+        let (_server, client, _shutdown) = serve_echo().await;
+        let conn = client.get_or_connect(1).await.expect("dial");
+        let stale = conn.stable_id().wrapping_add(1);
+
+        client.evict_connection(1, stale);
+        assert_eq!(client.peer_connection_stable_id(1), Some(conn.stable_id()));
+
+        client.evict_connection(1, conn.stable_id());
+        assert_eq!(client.peer_connection_stable_id(1), None);
     }
 }

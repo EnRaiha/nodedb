@@ -53,6 +53,7 @@ impl CoreLoop {
                 cells_msgpack,
                 wal_lsn,
                 provenance,
+                ..
             } => {
                 self.handle_array_put(task, array_id, cells_msgpack, *wal_lsn, provenance.as_ref())
             }
@@ -61,6 +62,7 @@ impl CoreLoop {
                 coords_msgpack,
                 wal_lsn,
                 provenance,
+                ..
             } => self.handle_array_delete(
                 task,
                 array_id,
@@ -76,8 +78,8 @@ impl CoreLoop {
                 audit_retain_ms,
             } => self.handle_array_compact(task, array_id, *audit_retain_ms),
             ArrayOp::DropArray { array_id } => self.handle_array_drop(task, array_id),
-            ArrayOp::RestoreArrayDrop { array_id } => {
-                self.handle_array_drop_restore(task, array_id)
+            ArrayOp::RekeyArray { array_id, target } => {
+                self.handle_array_rekey(task, array_id, target)
             }
             ArrayOp::PurgeArrayDrop { array_id } => self.handle_array_drop_purge(task, array_id),
             ArrayOp::Slice {

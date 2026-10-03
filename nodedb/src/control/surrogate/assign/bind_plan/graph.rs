@@ -61,6 +61,13 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut GraphOp) -> crate::Resu
         | GraphOp::TemporalNeighbors { .. }
         | GraphOp::TemporalAlgorithm { .. }
         | GraphOp::Stats { .. } => Ok(()),
+        // The guards compare edges and documents by name and bind nothing.
+        // A TRUNCATE's share reads each edge's surrogates from the core's
+        // graph.
+        GraphOp::NodeEdgeGuard { .. }
+        | GraphOp::NodePresenceGuard { .. }
+        | GraphOp::TruncateEdges { .. }
+        | GraphOp::NodePresenceRead { .. } => Ok(()),
     }
 }
 

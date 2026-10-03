@@ -9,17 +9,25 @@
 //! lazy query sinks (pgwire fast path, native protocol, HTTP-NDJSON).
 
 pub mod all_cores;
+mod cluster_leaf;
+pub mod core_outcome;
 pub mod full_scan;
 pub mod gather;
 pub mod owning_core;
+pub mod read_scope;
+pub mod received;
 pub mod resolve;
 pub mod response;
 pub mod streamable;
 
 pub use all_cores::NodeLevelResult;
-pub(crate) use all_cores::{execute_plan_all_local_cores, snapshot_tenant_on_local_cores};
+pub(crate) use all_cores::{
+    capture_base_on_local_cores, execute_plan_all_local_cores, snapshot_tenant_on_local_cores,
+};
 pub(crate) use gather::gather_all_cores;
 pub use gather::{GatherOutcome, finalize_aggregate};
+pub use read_scope::ReadScope;
+pub(crate) use received::execute_received_plan;
 pub use resolve::{
     DistributedReadCapture, Resolved, resolve_and_materialize, resolve_exchange_in_plan,
 };

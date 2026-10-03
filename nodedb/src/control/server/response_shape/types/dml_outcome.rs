@@ -8,7 +8,8 @@
 //! count payload becomes a [`DmlOutcome`]; pgwire and native both call them.
 
 use crate::control::server::shared::sql::staging_predicates::{
-    StagedTagKind, extract_kv_conflict_op, require_affected_count,
+    StagedTagKind, extract_ingest_rejections, extract_kv_conflict_op, rejected_lines_notice,
+    require_affected_count,
 };
 
 use super::PlanKind;
@@ -103,6 +104,29 @@ impl StatementTag {
     }
 }
 
+/// The outcome a write an INSTEAD OF trigger body replaced contributes: the
+/// statement ran and changed nothing. A count-bearing plan keeps its verb with
+/// a zero count, so the fold stays on one verb. `None` for a plan whose
+/// outcome folds as opaque.
+pub(crate) fn replaced_write_outcome(plan_kind: super::PlanKind) -> Option<DmlOutcome> {
+    use super::PlanKind;
+    match plan_kind {
+        PlanKind::DmlResult(verb) => Some(DmlOutcome { verb, affected: 0 }),
+        // The verb is resolved at apply time and no apply happened. The
+        // statement is an `INSERT ... ON CONFLICT DO UPDATE`, so it reports
+        // as `INSERT`.
+        PlanKind::DmlResultByOp => Some(DmlOutcome {
+            verb: "INSERT",
+            affected: 0,
+        }),
+        PlanKind::Execution
+        | PlanKind::ArraySlice
+        | PlanKind::ReturningRows
+        | PlanKind::SingleDocument
+        | PlanKind::MultiRow => None,
+    }
+}
+
 /// The count-bearing outcome of a staged write, from the neutral
 /// [`StagedTagKind`] the staging gate decided. Verb mapping: `INSERT` /
 /// `UPDATE` / `DELETE` by kind, and for a KV `InsertOnConflictUpdate` the
@@ -129,7 +153,7 @@ pub(crate) fn staged_dml_outcome(kind: StagedTagKind, affected: usize) -> DmlOut
         // sole SQL surface (`SELECT KV_INCR(..)` and friends, in
         // `ddl/neutral/kv_atomic/`) reads `StagedWriteOutcome::payload`
         // directly, and both dispatch loops fold `RawPayload` as opaque. This
-        // arm exists only so the match stays exhaustive against a new
+        // arm exists only so the match stays exhaustive against a further
         // `PhysicalPlan::Kv` caller; it names the tag a function-call
         // `SELECT` renders.
         StagedTagKind::RawPayload => "SELECT",
@@ -149,13 +173,29 @@ pub(crate) fn staged_dml_outcome(kind: StagedTagKind, affected: usize) -> DmlOut
 /// affected exactly 1 row" shortcut: a point delete or a conflicting
 /// `ON CONFLICT DO NOTHING` insert is the same plan whether it touched a row
 /// or not, so assuming 1 here reported rows that were never there.
+///
+/// A timeseries ingest answer that rejected lines raises a statement notice
+/// with the collection and the count: pgwire sends it as a
+/// `NoticeResponse`, and the native protocol adds it to `warnings`.
 pub(crate) fn dml_outcome_from_payload(
     payload: &[u8],
     verb: &'static str,
 ) -> crate::Result<DmlOutcome> {
+    // A verb that reports no count reads none. A staged TRUNCATE, in a
+    // session transaction or a Calvin transaction, stages no count, and
+    // both protocols answer it bare.
+    if !DmlOutcome::verb_carries_count(verb) {
+        return Ok(DmlOutcome { verb, affected: 0 });
+    }
     let affected = require_affected_count(payload).map_err(|e| crate::Error::Internal {
         detail: format!("{verb} response is missing its affected count: {e}"),
     })?;
+    if let Some((collection, rejected)) = extract_ingest_rejections(payload) {
+        crate::control::server::shared::session::statement_notice::raise(rejected_lines_notice(
+            &collection,
+            rejected,
+        ));
+    }
     Ok(DmlOutcome { verb, affected })
 }
 
@@ -372,5 +412,16 @@ mod tests {
         let staged = staged_dml_outcome(StagedTagKind::Truncate, 0);
         assert_eq!(staged, outcome("TRUNCATE", 0));
         assert!(!staged.carries_count());
+    }
+
+    /// A TRUNCATE payload with no count, as a Calvin TRUNCATE stages it,
+    /// answers the bare tag. A count-bearing verb still requires one.
+    #[test]
+    fn a_count_less_truncate_payload_answers_the_bare_tag() {
+        assert_eq!(
+            dml_outcome_from_payload(&[], "TRUNCATE").expect("truncate"),
+            outcome("TRUNCATE", 0)
+        );
+        assert!(dml_outcome_from_payload(&[], "DELETE").is_err());
     }
 }

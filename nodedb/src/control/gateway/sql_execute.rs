@@ -84,7 +84,7 @@ impl Gateway {
                 if let Some(cached_plan) = self.plan_cache.get(&full_key) {
                     debug!(sql = %sql, "gateway: plan cache hit (two-phase)");
                     let checked = authorize_fn(cached_plan.as_ref().clone()).await?;
-                    let plan = authorized_plan_for_context(ctx, checked)?;
+                    let (plan, _lease) = authorized_plan_for_context(ctx, checked)?;
                     return self
                         .execute_with_version_set(ctx, plan, stored_vs)
                         .await
@@ -101,7 +101,7 @@ impl Gateway {
             .await?;
 
         // A volatile plan froze its `nextval` / `now()` / UUID values while it
-        // was built. Admitting it would replay this execution's values into
+        // was built. Admitting it replays this execution's values into
         // every later one, so it skips both caches and re-plans next time.
         // The side cache is skipped too: its entry is pruned only alongside the
         // plan entry it maps to, so storing one without a plan leaves an orphan
@@ -118,7 +118,7 @@ impl Gateway {
         }
 
         let checked = authorize_fn(plan.clone()).await?;
-        let plan = authorized_plan_for_context(ctx, checked)?;
+        let (plan, _lease) = authorized_plan_for_context(ctx, checked)?;
         self.execute_with_version_set(ctx, plan, actual_vs)
             .await
             .map(|outcome| outcome.payloads)

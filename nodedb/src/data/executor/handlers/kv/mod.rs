@@ -21,6 +21,7 @@ pub(in crate::data::executor) mod sorted_index_compute;
 mod sorted_txn;
 pub(in crate::data::executor) mod transfer;
 pub(in crate::data::executor) mod ttl;
+pub(in crate::data::executor) mod unbound;
 
 pub(in crate::data::executor) mod field_compute;
 pub(in crate::data::executor) mod transfer_compute;

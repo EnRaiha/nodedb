@@ -304,13 +304,13 @@ impl CoreLoop {
     /// head of a rolled-back row. FATAL on failure, like the primary-store
     /// restore: a rollback that leaves the persisted head ahead of the rows is
     /// a chain that verifies as broken forever after.
-    fn undo_chain_hash(
+    pub(super) fn undo_chain_hash(
         &mut self,
         database_id: u64,
         tid: u64,
         collection: &str,
         entry_index: usize,
-        chain_hash_prior: Option<Option<String>>,
+        chain_hash_prior: Option<Option<crate::types::hash_chain::ChainHead>>,
     ) -> Result<(), (usize, String)> {
         let key = (
             crate::types::DatabaseId::new(database_id),
@@ -506,8 +506,12 @@ mod tests {
             )
         };
 
+        let head = |seq: u64, hash: &str| crate::types::hash_chain::ChainHead {
+            seq,
+            hash: hash.to_string(),
+        };
         // Restore-to-prior case: map holds "h1", undo restores "h0".
-        core.chain_hashes.insert(key(), "h1".into());
+        core.chain_hashes.insert(key(), head(2, "h1"));
         let restore = UndoEntry::PutDocument {
             collection: "c".into(),
             document_id: storage_key(0),
@@ -516,13 +520,10 @@ mod tests {
             bitemporal_index_tuples: Vec::new(),
             secondary_index_added: Vec::new(),
             secondary_index_removed: Vec::new(),
-            chain_hash_prior: Some(Some("h0".into())),
+            chain_hash_prior: Some(Some(head(1, "h0"))),
         };
         core.apply_undo_document(DB, TID, 0, restore).unwrap();
-        assert_eq!(
-            core.chain_hashes.get(&key()).map(String::as_str),
-            Some("h0")
-        );
+        assert_eq!(core.chain_hashes.get(&key()), Some(&head(1, "h0")));
 
         // Genesis case: undo removes the key entirely.
         let genesis = UndoEntry::PutDocument {

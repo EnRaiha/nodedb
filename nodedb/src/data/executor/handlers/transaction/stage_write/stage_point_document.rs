@@ -19,12 +19,13 @@
 
 use nodedb_physical::physical_plan::UpdateValue;
 
+use super::constraint::StagedStatement;
 use super::context::StageCtx;
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
+use crate::data::executor::enforcement::unique::evaluate_generated;
 use crate::data::executor::handlers::generated;
-use crate::data::executor::handlers::transaction::overlay::Staged;
 use crate::engine::document::store::StorageKey;
 use crate::types::TenantId;
 
@@ -35,6 +36,13 @@ impl CoreLoop {
         value: &[u8],
         if_absent: bool,
     ) -> Response {
+        if let Some(refusal) = crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+            "document",
+            ctx.collection,
+            ctx.surrogate,
+        ) {
+            return self.response_error(ctx.task, refusal);
+        }
         let storage_key = StorageKey::for_surrogate(ctx.surrogate);
         let bitemporal = self.is_bitemporal(ctx.database_id, ctx.tid, ctx.collection);
 
@@ -71,6 +79,13 @@ impl CoreLoop {
         ctx: &StageCtx<'_>,
         value: &[u8],
     ) -> Response {
+        if let Some(refusal) = crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+            "document",
+            ctx.collection,
+            ctx.surrogate,
+        ) {
+            return self.response_error(ctx.task, refusal);
+        }
         // Upsert semantics: no primary-key existence check (overwrite allowed);
         // UNIQUE indexes still apply against a DIFFERENT row.
         if let Err(e) = self.stage_check_unique(ctx, value) {
@@ -188,6 +203,18 @@ impl CoreLoop {
         ) {
             return self.response_error(ctx.task, e);
         }
+        // UNIQUE holds at the end of each statement, as in PostgreSQL.
+        if let Err(e) = self.stage_stored_unique_check(
+            &StagedStatement {
+                database_id: ctx.database_id,
+                tid: ctx.tid,
+                txn_id: ctx.txn_id,
+                coll_key: &ctx.coll_key,
+            },
+            &[(ctx.surrogate.0, body.as_slice())],
+        ) {
+            return self.response_error(ctx.task, e);
+        }
         if let Err(e) = self.stage_put_capped(ctx, body) {
             return self.response_error(ctx.task, e);
         }
@@ -210,20 +237,9 @@ impl CoreLoop {
         // An incoming body that will not decode cannot be checked against the
         // UNIQUE indexes at all; skipping the check here would let it stage
         // and commit over a value another row already owns.
-        let incoming_doc = doc_format::decode_document(value)?;
-        let staged_others: Vec<Vec<u8>> = self
-            .txn_overlays
-            .get(&ctx.txn_id)
-            .map(|o| {
-                o.iter_for_collection(&ctx.coll_key)
-                    .filter_map(|(s, st)| match st {
-                        Staged::Put(body) if s != ctx.surrogate.0 => Some(body.clone()),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.stage_unique_check(ctx, &config, &incoming_doc, &staged_others)
+        let mut incoming_doc = doc_format::decode_document(value)?;
+        evaluate_generated(&config, &mut incoming_doc)?;
+        self.stage_unique_check(ctx, &config, &incoming_doc)
     }
 
     fn stage_encode_and_commit(&mut self, ctx: &StageCtx<'_>, value: &[u8]) -> Response {

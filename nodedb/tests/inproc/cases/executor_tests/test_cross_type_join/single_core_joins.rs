@@ -2,7 +2,7 @@
 
 //! Single-core hash join and self-join tests.
 
-use super::super::helpers::{make_ctx, send_ok};
+use super::super::helpers::{doc_surrogate, make_ctx, send_ok};
 use nodedb::bridge::scan_filter::{FilterOp, ScanFilter};
 use nodedb::data::executor::response_codec;
 use nodedb_physical::physical_plan::{DocumentOp, JoinProjection, KvOp, PhysicalPlan, QueryOp};
@@ -55,7 +55,7 @@ fn single_core_cross_type_hash_join() {
                 key: key.as_bytes().to_vec(),
                 value,
                 ttl_ms: 0,
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(key.as_bytes()),
                 returning: None,
                 rls_filters: Vec::new(),
                 provenance: None,
@@ -175,7 +175,7 @@ fn single_core_left_join_with_nulls() {
                 key: key.as_bytes().to_vec(),
                 value,
                 ttl_ms: 0,
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(key.as_bytes()),
                 returning: None,
                 rls_filters: Vec::new(),
                 provenance: None,
@@ -356,7 +356,7 @@ fn single_core_self_join_star_keeps_both_sides() {
                 ),
                 document_id: id.into(),
                 value: doc,
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: doc_surrogate(id),
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),

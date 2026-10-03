@@ -3,10 +3,8 @@
 //! Protocol-neutral tenant introspection: SHOW TENANTS, SHOW TENANT
 //! <name|id>, SHOW TENANTS WITH NAME <name>.
 //!
-//! Ported from the pgwire `ddl::inspect` handlers. The tenant-set union
-//! (catalog-registered tenants + tenants owning at least one user) and the
-//! per-tenant usage reads are preserved verbatim; only the result
-//! construction changed from pgwire `Response` / `QueryResponse` to the
+//! The tenant-set union (catalog-registered tenants + tenants owning at least
+//! one user) and the per-tenant usage reads run here. The result is the
 //! protocol-neutral `DdlResult` over `ShapedRows`.
 
 use serde_json::{Map, Value as JsonValue};

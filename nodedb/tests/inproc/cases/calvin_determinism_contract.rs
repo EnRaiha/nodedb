@@ -83,6 +83,7 @@ fn make_request(plan: PhysicalPlan) -> Request {
         txn_id: None,
         wal_lsn: None,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: nodedb::bridge::envelope::Admission::Admitted,
     }
 }
@@ -146,7 +147,7 @@ fn document_schemaless_non_bitemporal_byte_identical() {
                 ),
                 document_id: format!("doc-{i}"),
                 value: doc.into_bytes(),
-                surrogate: nodedb_types::Surrogate::new(i),
+                surrogate: nodedb_types::Surrogate::new(i + 1),
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
@@ -174,7 +175,7 @@ fn kv_no_ttl_byte_identical() {
                 key: format!("key-{i}").into_bytes(),
                 value: format!("val-{i}").into_bytes(),
                 ttl_ms: 0,
-                surrogate: nodedb_types::Surrogate::new(i),
+                surrogate: nodedb_types::Surrogate::new(i + 1),
                 returning: None,
                 rls_filters: Vec::new(),
                 provenance: None,
@@ -215,7 +216,7 @@ fn vector_insert_byte_identical() {
             vector: vec![i as f32 * 0.1, 0.5, 0.3],
             dim: 3,
             field_name: String::new(),
-            surrogate: nodedb_types::Surrogate::new(i),
+            surrogate: nodedb_types::Surrogate::new(i + 1),
             pk_bytes: None,
             provenance: None,
         }));
@@ -277,7 +278,7 @@ fn crdt_apply_byte_identical() {
                 delta: delta.clone(),
                 peer_id: 1,
                 mutation_id: i as u64,
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new(i + 1),
                 provenance: None,
                 constraint_version_required: 0,
                 expected_frontier_digest: None,
@@ -322,7 +323,7 @@ fn document_bitemporal_byte_identical() {
                 ),
                 document_id: format!("bt-doc-{i}"),
                 value: doc.into_bytes(),
-                surrogate: nodedb_types::Surrogate::new(i),
+                surrogate: nodedb_types::Surrogate::new(i + 1),
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
@@ -359,7 +360,7 @@ fn kv_with_ttl_byte_identical() {
                 key: format!("ttl-key-{i}").into_bytes(),
                 value: format!("ttl-val-{i}").into_bytes(),
                 ttl_ms: 60_000,
-                surrogate: nodedb_types::Surrogate::new(i),
+                surrogate: nodedb_types::Surrogate::new(i + 1),
                 returning: None,
                 rls_filters: Vec::new(),
                 provenance: None,
@@ -396,8 +397,8 @@ fn graph_edge_put_byte_identical() {
                 label: "REL".into(),
                 dst_id: format!("node-{}", i + 1),
                 properties: Vec::new(),
-                src_surrogate: nodedb_types::Surrogate::new(i),
-                dst_surrogate: nodedb_types::Surrogate::new(i + 1),
+                src_surrogate: nodedb_types::Surrogate::new(i + 1),
+                dst_surrogate: nodedb_types::Surrogate::new(i + 2),
             })
         })
         .collect();

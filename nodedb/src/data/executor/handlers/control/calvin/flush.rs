@@ -2,7 +2,7 @@
 
 //! Flush a staged Calvin transaction: install its committed redo record.
 
-use nodedb_physical::physical_plan::RedoSumTargets;
+use nodedb_physical::physical_plan::{MetaOp, PhysicalPlan, RedoOrigin, RedoSumTargets};
 use tracing::{debug, info_span};
 
 use crate::bridge::envelope::{Payload, Response, Status};
@@ -27,7 +27,7 @@ impl CoreLoop {
     /// Flush the Calvin transaction staged under `(epoch, position)`.
     ///
     /// The flush installs the transaction's committed redo record through
-    /// [`CoreLoop::install_committed_redo`], the install every committed
+    /// [`CoreLoop::install_committed_redo_into`], the install every committed
     /// transaction and restart replay run: validate, install with undo, then
     /// settle and cover. An absent staged entry means a duplicate dispatch,
     /// which answers `Ok` and installs nothing.
@@ -56,11 +56,14 @@ impl CoreLoop {
         } = flush;
         let vshard_id = task.request.vshard_id.as_u32();
         let key = (epoch, position, vshard_id);
-        let Some((tenant_id, epoch_system_ms)) = self
-            .calvin
-            .commit_pending
-            .get(&key)
-            .map(|pending| (pending.tenant_id, pending.epoch_system_ms))
+        let Some((tenant_id, epoch_system_ms, origin)) =
+            self.calvin.commit_pending.get(&key).map(|pending| {
+                (
+                    pending.tenant_id,
+                    pending.epoch_system_ms,
+                    redo_origin(&pending.plans),
+                )
+            })
         else {
             debug!(
                 core = self.core_id,
@@ -77,14 +80,18 @@ impl CoreLoop {
             trace_id = ?task.request.trace_id,
         )
         .entered();
-        const NANOS_PER_MS: i64 = 1_000_000;
-        self.hlc
-            .update_from_remote(epoch_system_ms.saturating_mul(NANOS_PER_MS));
+        // The record's graph versions stamp at least the transaction's
+        // ordinal, so a later local write stamps above them.
+        let txn_ordinal = nodedb_types::calvin_txn_ordinal(epoch_system_ms, position);
+        self.hlc.update_from_remote(txn_ordinal);
 
+        // What each resolved timeseries batch of the record stored: the
+        // reply answers the apply's counts and stored rows, not the resolve's.
+        let mut ts_installs = Vec::new();
         let mut response = if redo.is_empty() {
             self.response_ok(task)
         } else {
-            self.install_committed_redo(
+            self.install_committed_redo_into(
                 task,
                 tenant_id.as_u64(),
                 CommittedRedo {
@@ -92,11 +99,16 @@ impl CoreLoop {
                     collections,
                     sum_targets,
                 },
+                origin,
+                &mut ts_installs,
             )
         };
         if response.status != Status::Ok {
             return response;
         }
+        // Restart replay folds the record's sum targets from its stamp, so the
+        // folded target rows stay out of the record's group.
+        response.write_set.clear();
         // The record installed: the staged entry and its overlay are spent.
         let reply = self
             .calvin
@@ -109,13 +121,28 @@ impl CoreLoop {
         self.calvin.fence.note_resolved(key, task.wal_lsn());
         let prev_epoch_ms = self.epoch_system_ms;
         self.epoch_system_ms = Some(epoch_system_ms);
-        let rendered = self.calvin_reply_payload(task, tenant_id.as_u64(), reply);
+        let rendered = self.calvin_reply_payload(task, tenant_id.as_u64(), reply, &ts_installs);
         self.epoch_system_ms = prev_epoch_ms;
         match rendered {
             Ok(payload) => response.payload = Payload::from_vec(payload),
             Err(error) => response.error_code = Some(Box::new(error)),
         }
         response
+    }
+}
+
+/// The origin of a Calvin transaction's redo record: a RESTORE when its
+/// local plans install a RESTORE batch, a commit otherwise. A RESTORE's rows
+/// passed their collection's rules when they were first written, so the
+/// install runs only the checks a RESTORE runs.
+fn redo_origin(plans: &[PhysicalPlan]) -> RedoOrigin {
+    if plans
+        .iter()
+        .any(|plan| matches!(plan, PhysicalPlan::Meta(MetaOp::RestoreRedo(_))))
+    {
+        RedoOrigin::Restore
+    } else {
+        RedoOrigin::Commit
     }
 }
 
@@ -148,7 +175,8 @@ mod tests {
     /// Stage `plans` at `(1, 0)`, resolve them, and return the redo bytes.
     fn stage_and_resolve(core: &mut CoreLoop, plans: &[PhysicalPlan]) -> Vec<u8> {
         let task = make_task();
-        let staged = core.execute_calvin_execute_static(&task, CTX, &TenantId::new(1), plans, &[]);
+        let staged =
+            core.execute_calvin_execute_static(&task, CTX, &TenantId::new(1), plans, &[], &[]);
         assert_eq!(staged.status, Status::Ok, "{:?}", staged.error_code);
         let resolved = core.execute_calvin_resolve(&task, 1, 0);
         assert_eq!(resolved.status, Status::Ok, "{:?}", resolved.error_code);
@@ -447,6 +475,35 @@ mod tests {
         assert!(
             !holds(&core, b"autocommit"),
             "the refused write never applies"
+        );
+    }
+
+    /// A constraint-set install on a collection a staged transaction writes
+    /// runs at once. It writes no row the flush installs, and a parked
+    /// install holds its data group's apply loop behind the flush.
+    #[test]
+    fn a_constraint_install_on_an_owned_collection_does_not_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        stage_and_resolve(&mut core, &[point_insert_plan("orders", "o1", 7)]);
+
+        let mut install = make_task();
+        install.request.plan =
+            PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::SetConstraints {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
+                constraint_version: 1,
+                constraints: Vec::new(),
+            });
+        install.request.admission = crate::bridge::envelope::Admission::Exempt(
+            crate::bridge::envelope::ExemptReason::AlreadyOrdered,
+        );
+        core.task_queue.push(install);
+        core.tick();
+
+        assert_eq!(
+            core.calvin.fence.len(),
+            0,
+            "a constraint install never waits for a Calvin flush"
         );
     }
 

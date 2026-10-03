@@ -40,8 +40,7 @@ impl PeerWarmReport {
         self.failed.is_empty() && self.succeeded.len() == self.attempted
     }
 
-    /// Empty report — used when the topology has no peers
-    /// (single-node mode).
+    /// Empty report — used when the topology has no peers.
     pub fn empty() -> Self {
         Self {
             attempted: 0,

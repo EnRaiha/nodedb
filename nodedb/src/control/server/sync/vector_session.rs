@@ -3,8 +3,7 @@
 //! Session-level vector insert/delete handlers.
 //!
 //! Contains the `SyncSession::handle_vector_insert` and
-//! `SyncSession::handle_vector_delete` methods, extracted from
-//! `vector_handler.rs` to keep both files under the 500-line limit.
+//! `SyncSession::handle_vector_delete` methods.
 
 use tracing::{debug, error, warn};
 
@@ -74,12 +73,15 @@ impl SyncSession {
             return SyncFrame::try_encode(SyncMessageType::VectorInsertAck, &ack);
         }
 
-        let surrogate = match dispatcher.assign_surrogate(
-            self.database_id(),
-            self.tenant_id.unwrap_or(TenantId::new(0)),
-            &msg.collection,
-            &msg.id,
-        ) {
+        let surrogate = match dispatcher
+            .assign_surrogate(
+                self.database_id(),
+                self.tenant_id.unwrap_or(TenantId::new(0)),
+                &msg.collection,
+                &msg.id,
+            )
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 error!(
@@ -212,15 +214,20 @@ impl SyncSession {
             return SyncFrame::try_encode(SyncMessageType::VectorDeleteAck, &ack);
         }
 
-        // Resolve surrogate — idempotent: if the surrogate was never assigned,
-        // the delete is a no-op.
-        let surrogate = match dispatcher.assign_surrogate(
-            self.database_id(),
-            self.tenant_id.unwrap_or(TenantId::new(0)),
-            &msg.collection,
-            &msg.id,
-        ) {
-            Ok(s) => s,
+        // A delete only reads the key's binding at the collection's home. A key
+        // the home never bound names no row: the delete dispatches `None`,
+        // which removes nothing and still advances the producer's sequence
+        // through the idempotency gate.
+        let surrogate = match dispatcher
+            .lookup_surrogate(
+                self.database_id(),
+                self.tenant_id.unwrap_or(TenantId::new(0)),
+                &msg.collection,
+                &msg.id,
+            )
+            .await
+        {
+            Ok(found) => found,
             Err(e) => {
                 error!(
                     session = %self.session_id,

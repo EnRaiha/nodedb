@@ -39,6 +39,12 @@ impl VectorCollection {
     ///
     /// A vector without the collection dimension fails with
     /// [`VectorError::DimensionMismatch`] before the old binding is touched.
+    ///
+    /// [`Surrogate::ZERO`] binds nothing: a headless vector has no surrogate,
+    /// so it never enters `surrogate_map` or `surrogate_to_local`, and no
+    /// lookup or delete by `ZERO` reaches it. Compaction, checkpoint restore
+    /// and rollback rebuild both maps from `surrogate_map` alone, so they
+    /// never map `ZERO` either.
     pub fn insert_with_surrogate(
         &mut self,
         vector: Vec<f32>,
@@ -338,5 +344,31 @@ mod tests {
         assert!(coll.delete_by_surrogate(s));
         assert_eq!(coll.vector_for_surrogate(s), None);
         assert_eq!(coll.vector_for_id(999), None);
+    }
+
+    #[test]
+    fn headless_vectors_bind_no_surrogate() {
+        let mut coll = collection();
+        let first = coll
+            .insert_with_surrogate(vec![1.0, 0.0], Surrogate::ZERO)
+            .unwrap();
+        let second = coll
+            .insert_with_surrogate(vec![0.0, 1.0], Surrogate::ZERO)
+            .unwrap();
+        coll.insert_multi_vector(&[&[0.5, 0.5]], Surrogate::ZERO)
+            .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(coll.live_count(), 3, "every headless insert stays live");
+        assert_eq!(coll.local_for_surrogate(Surrogate::ZERO), None);
+        assert_eq!(coll.get_surrogate(first), None);
+        assert_eq!(coll.get_surrogate(second), None);
+        assert!(coll.surrogate_to_local.is_empty());
+        assert!(coll.multi_doc_map.is_empty());
+
+        assert!(
+            !coll.delete_by_surrogate(Surrogate::ZERO),
+            "a delete by ZERO reaches no vector"
+        );
+        assert_eq!(coll.live_count(), 3);
     }
 }

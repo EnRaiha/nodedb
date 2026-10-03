@@ -6,14 +6,9 @@
 //! - `SHOW VECTOR MODELS` — catalog view of all vector columns with model metadata
 //! - `SELECT VECTOR_METADATA('collection', 'column')` — inline JSON query
 //!
-//! Ported verbatim from the pgwire `ddl::collection::vector_metadata`
-//! handlers; only the result construction changed from pgwire `Response` /
-//! `QueryResponse` (text fields) to the protocol-neutral [`DdlResult`] over
-//! [`ShapedRows`] (all-text columns — every field the pgwire handlers encoded
-//! via `text_field`, including `dimensions` / `strict_dimensions`, was a text
-//! column). The parsing, catalog reads/writes, `chrono_format_utc` default,
-//! SQLSTATE codes / messages, and the `ALTER COLLECTION` command tag are
-//! unchanged.
+//! The result is a protocol-neutral [`DdlResult`] over
+//! [`ShapedRows`] (all-text columns, including `dimensions` /
+//! `strict_dimensions`).
 
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 use nodedb_types::DatabaseId;
@@ -32,7 +27,7 @@ fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
 }
 
 /// Handle `ALTER COLLECTION x SET VECTOR METADATA ON column (model = '...', dimensions = N, ...)`.
-pub fn handle_set_vector_metadata(
+pub async fn handle_set_vector_metadata(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
@@ -148,7 +143,7 @@ pub fn handle_set_vector_metadata(
         },
     };
 
-    super::super::vector_replicate::propose_put_model(state, &entry)?;
+    super::super::vector_replicate::propose_put_model(state, &entry).await?;
 
     tracing::info!(
         %collection,

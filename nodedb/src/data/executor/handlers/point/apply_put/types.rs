@@ -38,6 +38,12 @@ pub(in crate::data::executor) struct PointPutParams<'a> {
     /// commit phase), so re-running enforcement here would double-check
     /// already-accepted writes.
     pub enforce: bool,
+    /// Who judges this row's UNIQUE claims. `Row` probes the committed index
+    /// here, which is correct only for a unit of one row. A caller writing
+    /// several rows as one unit judges the unit's post-state first and passes
+    /// `Unit`: a per-row probe refuses a value a later row of the unit
+    /// releases.
+    pub unique: crate::data::executor::enforcement::unique::UniqueJudge,
     /// WAL LSN the Control Plane allocated for this write (`None` for writes
     /// with no threaded LSN — e.g. some internal/materialization paths). Used
     /// to advance the checkpoint watermark of any secondary vector index this
@@ -152,7 +158,6 @@ pub(in crate::data::executor) fn map_enforcement_error(e: ErrorCode) -> crate::E
         | ErrorCode::RejectedAuthz { .. }
         | ErrorCode::ConflictRetry
         | ErrorCode::CrdtFrontierMismatch { .. }
-        | ErrorCode::FanOutExceeded
         | ErrorCode::ResourcesExhausted
         | ErrorCode::RejectedDanglingEdge { .. }
         | ErrorCode::DuplicateWrite

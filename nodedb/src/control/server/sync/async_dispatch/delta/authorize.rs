@@ -153,7 +153,7 @@ mod tests {
         let permissions = PermissionStore::new();
         permissions
             .grant(
-                "collection:9:orders",
+                "collection:0:9:orders",
                 "user:writer",
                 Permission::Write,
                 "admin",

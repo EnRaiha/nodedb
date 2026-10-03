@@ -11,7 +11,7 @@ use super::context::RlsCtx;
 pub(super) fn inject_text(ctx: &RlsCtx<'_>, op: &mut TextOp) -> crate::Result<()> {
     match op {
         // Inject: the policy lands in the post-score / post-fusion slot the
-        // handler applies before the ranked hits are returned. The result may
+        // handler applies before the ranked hits are returned. The result can
         // hold fewer than `top_k` rows, which is the intended effect.
         TextOp::Search {
             collection,
@@ -72,7 +72,7 @@ mod tests {
                 nodedb_types::DatabaseId::DEFAULT,
                 collection,
             ),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             text: "hello".into(),
             provenance: None,
         })

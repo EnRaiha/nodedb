@@ -83,10 +83,13 @@ mod tests {
     use crate::control::state::SharedState;
     use crate::event::cdc::CdcOffset;
     use crate::event::cdc::stream_def::RetentionConfig;
-    use crate::event::topic::{TopicDef, publish_to_topic};
+    use crate::event::topic::TopicDef;
     use crate::types::DatabaseId;
     use crate::wal::WalManager;
 
+    /// A state opened on a catalog that retains a topic's messages loads them
+    /// into the topic's buffer. The messages are appended the way the data
+    /// group's apply appends them, at their entries' positions.
     #[tokio::test(flavor = "current_thread")]
     async fn restart_hydrates_retained_messages_and_resumes_topic_hwm() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -106,42 +109,33 @@ mod tests {
             created_at: 0,
             last_sequence: 0,
             last_lsn: 0,
+            last_epoch: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         };
 
+        // The append prunes messages older than the topic's retention age, so
+        // each message carries the current wall-clock time.
+        let event_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_millis() as u64;
         {
-            let credentials = Arc::new(CredentialStore::open(&catalog_path).expect("catalog"));
-            credentials
-                .catalog()
-                .put_ep_topic(&definition)
-                .expect("persist topic");
-            let (dispatcher, _) = crate::bridge::dispatch::Dispatcher::new(1, 16);
-            let state =
-                SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials, false)
-                    .expect("state");
-            assert_eq!(
-                publish_to_topic(
-                    &state,
-                    database_id,
-                    tenant_id,
-                    topic_name,
-                    r#"{"message":"one"}"#
-                )
-                .await
-                .expect("publish one"),
-                1
-            );
-            assert_eq!(
-                publish_to_topic(
-                    &state,
-                    database_id,
-                    tenant_id,
-                    topic_name,
-                    r#"{"message":"two"}"#
-                )
-                .await
-                .expect("publish two"),
-                2
-            );
+            let credentials = CredentialStore::open(&catalog_path).expect("catalog");
+            let catalog = credentials.catalog();
+            catalog.put_ep_topic(&definition).expect("persist topic");
+            for (index, payload) in [(1, r#"{"message":"one"}"#), (2, r#"{"message":"two"}"#)] {
+                let appended = catalog
+                    .append_replicated_topic_message(
+                        (database_id, tenant_id, topic_name),
+                        payload,
+                        event_time,
+                        (1, index),
+                        None,
+                    )
+                    .expect("append")
+                    .expect("a new position appends");
+                assert_eq!(appended.sequence, index);
+            }
         }
 
         let credentials = Arc::new(CredentialStore::open(&catalog_path).expect("reopen catalog"));
@@ -177,34 +171,13 @@ mod tests {
                 .sequence,
             2
         );
-        assert_eq!(
-            publish_to_topic(
-                &state,
-                database_id,
-                tenant_id,
-                topic_name,
-                r#"{"message":"three"}"#
-            )
-            .await
-            .expect("publish after restart"),
-            3
-        );
-        assert_eq!(
-            buffer
-                .partition_tails()
-                .get(&0)
-                .copied()
-                .expect("new topic hwm")
-                .sequence,
-            3
-        );
 
         // Explicit rehydration is idempotent and does not broadcast retained data.
         let mut live = state
             .ep_topic_registry
             .subscribe(database_id, tenant_id, topic_name)
             .expect("live receiver");
-        assert_eq!(hydrate_topic_buffers(&state).expect("repeat hydration"), 3);
+        assert_eq!(hydrate_topic_buffers(&state).expect("repeat hydration"), 2);
         assert!(matches!(
             live.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)

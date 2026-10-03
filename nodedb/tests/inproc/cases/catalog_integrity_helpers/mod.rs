@@ -63,7 +63,7 @@ pub fn put_admin_user(catalog: &SystemCatalog) {
 }
 
 pub fn make_collection(name: &str) -> StoredCollection {
-    StoredCollection::new(TENANT, name, ADMIN)
+    nodedb_test_support::catalog_fixtures::stamped_collection(TENANT, name, ADMIN)
 }
 
 pub fn make_function(name: &str) -> StoredFunction {
@@ -202,6 +202,7 @@ pub fn make_stream(name: &str) -> ChangeStreamDef {
         owner: ADMIN.into(),
         created_at: 0,
         subscriber_roles: Vec::new(),
+        modification_hlc: Default::default(),
     }
 }
 

@@ -15,7 +15,7 @@
 //! so there is exactly one place that knows how a grant reaches durable state.
 
 use crate::control::catalog_entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::security::catalog::StoredScopeGrant;
 use crate::control::security::time::now_secs;
 use crate::control::state::SharedState;
@@ -27,22 +27,19 @@ use super::types::{ScopeGrant, ScopeGrantParams, grant_key};
 /// the same upsert with a later expiry, and the automatic downgrade the expiry
 /// sweep issues).
 ///
-/// A grant that only reached the node that decided on it would authorize there
+/// A grant that only reached the node that decided on it authorizes there
 /// and nowhere else, so the catalog write is the applier's job on every node.
-/// The `LocalOnly` branch is the standalone-origin path, where there is
-/// no raft group to apply the entry.
-pub(crate) fn propose_grant(state: &SharedState, stored: &StoredScopeGrant) -> crate::Result<()> {
+pub(crate) async fn propose_grant(
+    state: &SharedState,
+    stored: &StoredScopeGrant,
+) -> crate::Result<()> {
     let entry = CatalogEntry::PutScopeGrant(Box::new(stored.clone()));
-    let outcome = propose_catalog_entry(state, &entry)?;
-    if outcome.needs_local_apply() {
-        state.credentials.catalog().put_scope_grant(stored)?;
-        state.scope_grants.install_replicated_grant(stored);
-    }
+    propose_catalog_entry_async(state, &entry).await?;
     Ok(())
 }
 
-/// Replicate a scope-grant removal. Same dual path as [`propose_grant`].
-pub(crate) fn propose_revoke(
+/// Replicate a scope-grant removal, as [`propose_grant`] does an upsert.
+pub(crate) async fn propose_revoke(
     state: &SharedState,
     scope_name: &str,
     grantee_type: &str,
@@ -53,16 +50,7 @@ pub(crate) fn propose_revoke(
         grantee_type: grantee_type.to_string(),
         grantee_id: grantee_id.to_string(),
     };
-    let outcome = propose_catalog_entry(state, &entry)?;
-    if outcome.needs_local_apply() {
-        state
-            .credentials
-            .catalog()
-            .delete_scope_grant(scope_name, grantee_type, grantee_id)?;
-        state
-            .scope_grants
-            .install_replicated_revoke(scope_name, grantee_type, grantee_id);
-    }
+    propose_catalog_entry_async(state, &entry).await?;
     Ok(())
 }
 
@@ -258,7 +246,7 @@ mod tests {
     }
 
     /// `prepare_grant` is the proposal builder: it must not make the grant
-    /// visible, or a failed propose would leave the proposing node
+    /// visible, or a failed propose leaves the proposing node
     /// authorizing on a grant no other node has.
     #[test]
     fn prepare_grant_does_not_install() {

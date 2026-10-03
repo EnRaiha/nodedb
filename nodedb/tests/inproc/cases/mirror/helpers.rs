@@ -105,14 +105,16 @@ pub fn inject_lag_record_for_id(
 /// state without needing a full SQL round-trip.
 ///
 /// `status` must be one of `MirrorStatus::Following`, `Degraded`, etc.
-pub fn inject_mirror_descriptor(
+pub async fn inject_mirror_descriptor(
     server: &TestServer,
     name: &str,
     status: MirrorStatus,
     last_applied_lsn: u64,
 ) {
     let catalog = server.shared.credentials.catalog();
-    let db_id = server.shared.database_registry.alloc_one();
+    let db_id = nodedb::control::database::allocate_database_id(&server.shared)
+        .await
+        .expect("allocate mirror database id");
     let descriptor = make_mirror_descriptor(db_id.as_u64(), name, status, last_applied_lsn);
     // put_database writes both the forward (DATABASES) and reverse
     // (DATABASES_BY_NAME) rows in one transaction.

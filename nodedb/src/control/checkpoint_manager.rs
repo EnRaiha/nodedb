@@ -23,9 +23,10 @@
 //!    them, so a truncation past a lagging consumer silently drops every CDC
 //!    row, trigger fire and streaming-MV update in the gap.
 //! 5. A `RecordType::Checkpoint` WAL record is written at the global LSN.
-//! 6. Eligible segments are archived to cold storage when it is configured.
-//!    A segment the archive did not accept bounds the truncation point, so
-//!    no segment is deleted before it is safely in cold storage.
+//! 6. When cold storage is configured, the WAL archiver uploads every sealed
+//!    segment the archive does not hold yet. The lowest unarchived segment
+//!    bounds the truncation point, so no segment is deleted before it is in
+//!    cold storage. The archiver also runs on its own shorter tick.
 //! 7. `WalManager::truncate_before()` deletes old WAL segments.
 //!
 //! ## Frequency
@@ -40,31 +41,73 @@ use tracing::{debug, info, warn};
 
 use crate::bridge::dispatch::Dispatcher;
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Status};
-use crate::control::checkpoint_archival::archive_wal_segments_before_truncation;
+use crate::control::checkpoint_archival::archive_then_bound;
 use crate::control::request_tracker::RequestTracker;
 use crate::types::{DatabaseId, Lsn, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
 use crate::wal::WalManager;
+use crate::wal::archiver::WalArchiver;
 use nodedb_physical::physical_plan::MetaOp;
 
 /// Monotonic counter for checkpoint request IDs.
 /// Uses a high base to avoid collision with session-generated request IDs.
 static CHECKPOINT_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0xFFFF_0000_0000_0000);
 
-/// Configuration for the checkpoint manager.
+/// Configuration for the checkpoint manager. Both intervals are non-zero by
+/// construction: a zero period makes the tick timer panic.
 #[derive(Debug, Clone)]
 pub struct CheckpointManagerConfig {
+    interval: Duration,
+    core_timeout: Duration,
+    archive_interval: Duration,
+}
+
+impl CheckpointManagerConfig {
+    /// Fails with `Error::Config` naming the setting when an interval is zero.
+    pub fn new(
+        interval: Duration,
+        core_timeout: Duration,
+        archive_interval: Duration,
+    ) -> crate::Result<Self> {
+        for (value, field) in [
+            (interval, "checkpoint.interval_secs"),
+            (archive_interval, "checkpoint.wal_archive_interval_secs"),
+        ] {
+            if value.is_zero() {
+                return Err(crate::Error::Config {
+                    detail: format!("invalid value '0' for {field}: expected a positive integer"),
+                });
+            }
+        }
+        Ok(Self {
+            interval,
+            core_timeout,
+            archive_interval,
+        })
+    }
+
     /// Interval between checkpoint cycles.
-    pub interval: Duration,
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
 
     /// Timeout for individual core checkpoint responses.
-    pub core_timeout: Duration,
+    pub fn core_timeout(&self) -> Duration {
+        self.core_timeout
+    }
+
+    /// Interval between WAL archive passes. Bounds the archive lag of a
+    /// sealed segment.
+    pub fn archive_interval(&self) -> Duration {
+        self.archive_interval
+    }
 }
 
 impl Default for CheckpointManagerConfig {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(300), // 5 minutes
+            interval: Duration::from_secs(300),
             core_timeout: Duration::from_secs(30),
+            archive_interval: Duration::from_secs(10),
         }
     }
 }
@@ -73,9 +116,9 @@ impl Default for CheckpointManagerConfig {
 ///
 /// Returns `None` (defer truncation) unless EVERY core reported a fresh
 /// flush LSN. A core that failed to dispatch or missed its response
-/// deadline may still hold acknowledged-but-unflushed records below the
-/// reporting cores' minimum LSN; truncating there would delete them and
-/// lose the writes on restart. Also returns `None` when the minimum is 0
+/// deadline can still hold acknowledged-but-unflushed records below the
+/// reporting cores' minimum LSN; truncating there deletes them and
+/// loses the writes on restart. Also returns `None` when the minimum is 0
 /// (no writes yet, nothing to truncate).
 ///
 /// ## Why the Event Plane is a floor too
@@ -85,10 +128,10 @@ impl Default for CheckpointManagerConfig {
 /// watermark — and that watermark is flushed lazily, so it always trails the
 /// engines. Once a segment below a consumer's watermark is unlinked, that
 /// suffix is gone: every CDC row, trigger fire, and streaming-MV update for the
-/// acknowledged writes in it is unrecoverable. Replay now refuses a request
+/// acknowledged writes in it is unrecoverable. Replay refuses a request
 /// below the retained floor rather than returning the shorter suffix that
-/// survives, so the loss is loud instead of silent — but refusing is only an
-/// alarm. This floor is what keeps it from happening.
+/// survives, so the loss is loud instead of silent. Refusing is only an
+/// alarm. This floor keeps the loss from happening.
 ///
 /// `event_watermarks` is therefore folded in exactly as each core's engine LSN
 /// is, with the same conservatism: one entry per core, and a core that has
@@ -125,8 +168,9 @@ pub struct CheckpointCycleInputs<'a> {
     pub num_cores: usize,
     /// Per-core response deadline.
     pub timeout: Duration,
-    /// When configured, segments are archived before they are unlinked.
-    pub cold_storage: Option<std::sync::Arc<crate::storage::cold::ColdStorage>>,
+    /// Present when cold storage is configured. Truncation never passes the
+    /// lowest segment it has not archived.
+    pub archiver: Option<&'a mut WalArchiver>,
     /// When present, the tombstone set is GC'd to the new truncation point.
     pub catalog: Option<&'a crate::control::security::catalog::SystemCatalog>,
     /// The applied state of every Calvin scheduler on this node. Saved in
@@ -156,11 +200,11 @@ fn save_calvin_applied(
 }
 
 /// Run one checkpoint cycle: dispatch checkpoint to all cores, collect LSNs,
-/// write checkpoint record, archive eligible WAL segments to cold storage (if
+/// write checkpoint record, archive sealed WAL segments to cold storage (if
 /// configured), then truncate the WAL.
 ///
 /// Returns the global checkpoint LSN (min across all cores), or `None` if
-/// the checkpoint could not be completed (e.g., a core didn't respond).
+/// the checkpoint did not complete (e.g., a core didn't respond).
 pub async fn run_checkpoint_cycle(inputs: CheckpointCycleInputs<'_>) -> Option<Lsn> {
     let CheckpointCycleInputs {
         dispatcher,
@@ -169,7 +213,7 @@ pub async fn run_checkpoint_cycle(inputs: CheckpointCycleInputs<'_>) -> Option<L
         watermark_store,
         num_cores,
         timeout,
-        cold_storage,
+        archiver,
         catalog,
         calvin_mirrors,
     } = inputs;
@@ -207,6 +251,7 @@ pub async fn run_checkpoint_cycle(inputs: CheckpointCycleInputs<'_>) -> Option<L
                 txn_id: None,
                 wal_lsn: None,
                 resolved_now_ms: None,
+                commit_hlc: None,
                 admission: crate::bridge::envelope::Admission::Exempt(
                     crate::bridge::envelope::ExemptReason::AlreadyOrdered,
                 ),
@@ -272,7 +317,7 @@ pub async fn run_checkpoint_cycle(inputs: CheckpointCycleInputs<'_>) -> Option<L
     }
 
     // 3. Read the Event Plane's persisted progress. Its consumers recover only
-    // from the WAL suffix above these watermarks, so they bound truncation just
+    // from the WAL suffix above these watermarks, so they bound truncation
     // as the engines do. A read failure defers the cycle rather than dropping
     // the floor: an unknown watermark is not a permissive one.
     let event_watermarks: Vec<u64> = match watermark_store.load_all(num_cores) {
@@ -288,9 +333,9 @@ pub async fn run_checkpoint_cycle(inputs: CheckpointCycleInputs<'_>) -> Option<L
     };
 
     // Truncation is only safe when every core reported a fresh flush LSN.
-    // A core that failed to dispatch or missed its deadline may hold
+    // A core that failed to dispatch or missed its deadline can hold
     // acknowledged-but-unflushed records below the reporting cores'
-    // minimum; truncating would delete them and lose the writes on
+    // minimum; truncating deletes them and loses the writes on
     // restart. Defer the entire checkpoint (no marker, no truncation) and
     // retry next cycle.
     let global_lsn = match checkpoint_truncation_lsn(&checkpoint_lsns, &event_watermarks, num_cores)
@@ -372,21 +417,21 @@ pub async fn run_checkpoint_cycle(inputs: CheckpointCycleInputs<'_>) -> Option<L
         return Some(checkpoint_lsn);
     }
 
-    // 6. Archive eligible WAL segments to cold storage before deletion. A
-    // segment the archive did not accept bounds truncation: deleting it would
-    // leave a hole no point-in-time recovery can cross.
+    // 6. Archive sealed WAL segments before deletion. An unarchived segment
+    // bounds truncation: deleting it leaves a hole no point-in-time
+    // recovery can cross.
     let mut truncate_lsn = global_lsn;
-    if let Some(ref cold) = cold_storage {
-        let bound = archive_wal_segments_before_truncation(wal, global_lsn, cold).await;
-        if bound < global_lsn {
+    if let Some(archiver) = archiver {
+        let bound = archive_then_bound(archiver, wal, global_lsn).await;
+        if bound.held {
             warn!(
                 checkpoint_lsn = global_lsn,
-                truncate_lsn = bound,
+                truncate_lsn = bound.lsn,
                 "WAL truncation held back to the archived bound: segments from this LSN up are \
                  not in cold storage and stay on local disk until archival recovers"
             );
-            truncate_lsn = bound;
         }
+        truncate_lsn = bound.lsn;
     }
 
     // 7. Truncate old WAL segments.
@@ -427,7 +472,7 @@ pub async fn run_checkpoint_cycle(inputs: CheckpointCycleInputs<'_>) -> Option<L
                     Ok(_) => {}
                     Err(e) => {
                         // Non-fatal: a stale tombstone row is replay-safe,
-                        // it just wastes redb space until the next pass.
+                        // it only wastes redb space until the next pass.
                         warn!(
                             error = %e,
                             truncate_lsn,
@@ -461,6 +506,21 @@ mod tests {
     }
 
     #[test]
+    fn zero_intervals_are_config_errors_not_panics() {
+        let s = Duration::from_secs(1);
+        let zero = Duration::ZERO;
+        for (interval, archive, field) in [
+            (zero, s, "checkpoint.interval_secs"),
+            (s, zero, "checkpoint.wal_archive_interval_secs"),
+        ] {
+            let err = CheckpointManagerConfig::new(interval, s, archive).unwrap_err();
+            assert!(matches!(err, crate::Error::Config { .. }), "{err}");
+            assert!(err.to_string().contains(field), "{err}");
+        }
+        assert!(CheckpointManagerConfig::new(s, s, s).is_ok());
+    }
+
+    #[test]
     fn all_cores_reported_distinct_lsns_returns_min() {
         assert_eq!(
             checkpoint_truncation_lsn(&[10, 5, 8], &ahead(3), 3),
@@ -470,7 +530,7 @@ mod tests {
 
     #[test]
     fn one_core_missing_defers_even_though_responders_have_a_min() {
-        // Truncating at 5 would delete the missing core's unflushed records.
+        // Truncating at 5 deletes the missing core's unflushed records.
         assert_eq!(checkpoint_truncation_lsn(&[5, 10], &ahead(3), 3), None);
     }
 
@@ -496,7 +556,7 @@ mod tests {
 
     /// The Event Plane binds truncation when it trails the engines. Its
     /// consumers recover ONLY from the WAL above their persisted watermark, so
-    /// truncating at the engine minimum would drop every CDC row, trigger fire
+    /// truncating at the engine minimum drops every CDC row, trigger fire
     /// and MV update in between — unrecoverably, whether or not replay notices.
     #[test]
     fn event_plane_behind_the_engines_clamps_truncation_to_it() {

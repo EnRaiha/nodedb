@@ -35,6 +35,23 @@ impl TestClusterNode {
     /// (this op is not collection-scoped). Returns an empty `Vec` on dispatch
     /// error or non-Ok response.
     pub async fn create_tenant_snapshot(&self, tenant: TenantId) -> Vec<u8> {
+        self.snapshot_tenant(tenant, false).await
+    }
+
+    /// Every array cell version of `tenant` in the default database that
+    /// this node's core holds, exported the way a backup exports them.
+    /// Empty on dispatch error or non-Ok response.
+    pub async fn array_cells(&self, tenant: TenantId) -> Vec<nodedb::types::ArrayCellsBlob> {
+        let bytes = self.snapshot_tenant(tenant, true).await;
+        if bytes.is_empty() {
+            return Vec::new();
+        }
+        zerompk::from_msgpack::<nodedb::types::TenantDataSnapshot>(&bytes)
+            .map(|snap| snap.arrays)
+            .unwrap_or_default()
+    }
+
+    async fn snapshot_tenant(&self, tenant: TenantId, arrays: bool) -> Vec<u8> {
         let request_id = RequestId::new(SNAPSHOT_REQUEST_ID.fetch_add(1, Ordering::Relaxed));
         let vshard_id = VShardId::new(vshard_for_collection(
             nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "__system"),
@@ -47,6 +64,8 @@ impl TestClusterNode {
             plan: PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot {
                 tenant_id: tenant.as_u64(),
                 cut_watermark: None,
+                cut_capture: None,
+                arrays,
             }),
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
             priority: Priority::Normal,
@@ -60,6 +79,7 @@ impl TestClusterNode {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: nodedb::bridge::envelope::Admission::Exempt(
                 nodedb::bridge::envelope::ExemptReason::Read,
             ),
@@ -88,16 +108,15 @@ impl TestClusterNode {
     /// Restore a captured tenant snapshot into this node's engines via
     /// `MetaOp::RestoreTenantSnapshot`.
     ///
-    /// Test hook for proving U6's restore path (`restore.rs`). Mirrors the
-    /// production `DataPlaneSnapshotApplier` dispatch shape: `tenant_id: 0`
-    /// is only the routing/dispatch key (the merged Raft snapshot applies
-    /// with dispatch tenant 0), and `replace_mode: true` because this
-    /// simulates a Raft `InstallSnapshot` apply, which must overwrite local
-    /// state rather than fail against it. The restore handler installs each
-    /// snapshot entry (including `crdt_constraints`) by its own
-    /// tenant-explicit fields, independent of the dispatch tenant. Routed to
-    /// the `"__system"` vshard. Returns `true` iff the response status is
-    /// `Ok`.
+    /// Test hook for proving U6's restore path (`restore.rs`) on ONE core:
+    /// the core the `"__system"` vshard routes to. `tenant_id: 0` is only the
+    /// dispatch key, and `replace_mode: true` because this simulates a Raft
+    /// `InstallSnapshot` apply, which must overwrite local state rather than
+    /// fail against it. The restore handler installs each snapshot entry
+    /// (including `crdt_constraints`) by its own tenant-explicit fields,
+    /// independent of the dispatch tenant. The production applier splits a
+    /// snapshot per owning core instead. Returns `true` iff the response
+    /// status is `Ok`.
     pub async fn restore_tenant_snapshot(&self, snapshot_bytes: Vec<u8>) -> bool {
         let request_id = RequestId::new(SNAPSHOT_REQUEST_ID.fetch_add(1, Ordering::Relaxed));
         let vshard_id = VShardId::new(vshard_for_collection(
@@ -112,8 +131,8 @@ impl TestClusterNode {
                 tenant_id: 0,
                 snapshot: snapshot_bytes,
                 replace_mode: true,
-                clear_vshards: Vec::new(),
                 collections_to_clear: Vec::new(),
+                group_vshards: Vec::new(),
             }),
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
             priority: Priority::Normal,
@@ -127,6 +146,7 @@ impl TestClusterNode {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: nodedb::bridge::envelope::Admission::Exempt(
                 nodedb::bridge::envelope::ExemptReason::Read,
             ),

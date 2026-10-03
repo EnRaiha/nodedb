@@ -95,6 +95,26 @@ pub(super) async fn fan_out(
     target: &CoreFanout<'_>,
     plan: &PhysicalPlan,
 ) -> FanoutAnswers {
+    send_to_every_core(shared, target, plan)
+        .answers(target)
+        .await
+}
+
+/// The requests of one fan-out, enqueued and not yet answered.
+pub(super) struct SentFanout {
+    deadline: std::time::Instant,
+    /// Cores that refused the request at the enqueue.
+    refused: Vec<usize>,
+    receivers: Vec<(usize, ResponseReceiver)>,
+}
+
+/// Enqueue `plan` on every core on this node. Awaits nothing, so a caller
+/// can mark what the requests carry as sent in the same synchronous step.
+pub(super) fn send_to_every_core(
+    shared: &SharedState,
+    target: &CoreFanout<'_>,
+    plan: &PhysicalPlan,
+) -> SentFanout {
     let num_cores = {
         let d = shared.dispatcher.lock().unwrap_or_else(|p| p.into_inner());
         d.num_cores()
@@ -125,6 +145,7 @@ pub(super) async fn fan_out(
                 txn_id: None,
                 wal_lsn: None,
                 resolved_now_ms: None,
+                commit_hlc: None,
                 admission: crate::bridge::envelope::Admission::Exempt(
                     crate::bridge::envelope::ExemptReason::AlreadyOrdered,
                 ),
@@ -139,26 +160,41 @@ pub(super) async fn fan_out(
         }
     }
 
-    let mut pending: Vec<(usize, ResponseReceiver)> = Vec::new();
-    let wait_until = tokio::time::Instant::from_std(deadline);
-    for (core_id, mut rx) in receivers {
-        match tokio::time::timeout_at(wait_until, final_response(&mut rx)).await {
-            Ok(Some(resp)) if resp.status == Status::Ok => {
-                debug!(
-                    tenant = target.tenant_id,
-                    collection = %target.collection,
-                    detail = target.detail,
-                    core_id,
-                    what = target.what,
-                    "post-apply core ack"
-                );
-            }
-            Ok(_) => refused.push(core_id),
-            Err(_) => pending.push((core_id, rx)),
-        }
+    SentFanout {
+        deadline,
+        refused,
+        receivers,
     }
+}
 
-    FanoutAnswers { refused, pending }
+impl SentFanout {
+    /// Collect the answers that arrive by the dispatch deadline.
+    pub(super) async fn answers(self, target: &CoreFanout<'_>) -> FanoutAnswers {
+        let SentFanout {
+            deadline,
+            mut refused,
+            receivers,
+        } = self;
+        let mut pending: Vec<(usize, ResponseReceiver)> = Vec::new();
+        let wait_until = tokio::time::Instant::from_std(deadline);
+        for (core_id, mut rx) in receivers {
+            match tokio::time::timeout_at(wait_until, final_response(&mut rx)).await {
+                Ok(Some(resp)) if resp.status == Status::Ok => {
+                    debug!(
+                        tenant = target.tenant_id,
+                        collection = %target.collection,
+                        detail = target.detail,
+                        core_id,
+                        what = target.what,
+                        "post-apply core ack"
+                    );
+                }
+                Ok(_) => refused.push(core_id),
+                Err(_) => pending.push((core_id, rx)),
+            }
+        }
+        FanoutAnswers { refused, pending }
+    }
 }
 
 /// The request's final response, skipping partial frames. `None` once the

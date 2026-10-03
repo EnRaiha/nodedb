@@ -68,23 +68,23 @@ impl CoreLoop {
                 }
             }
 
-            MetaOp::CreateTenantSnapshot { tenant_id, .. } => {
-                self.execute_create_tenant_snapshot(task, *tenant_id)
-            }
+            MetaOp::CreateTenantSnapshot {
+                tenant_id, arrays, ..
+            } => self.execute_create_tenant_snapshot(task, *tenant_id, *arrays),
 
             MetaOp::RestoreTenantSnapshot {
                 tenant_id,
                 snapshot,
                 replace_mode,
-                clear_vshards,
                 collections_to_clear,
+                group_vshards,
             } => self.execute_restore_tenant_snapshot(
                 task,
                 *tenant_id,
                 snapshot,
                 *replace_mode,
-                clear_vshards,
                 collections_to_clear,
+                group_vshards,
             ),
 
             MetaOp::ConvertCollection {
@@ -124,6 +124,12 @@ impl CoreLoop {
                 self.execute_query_collection_size(task, *tenant_id, name)
             }
 
+            MetaOp::VerifyHashChain { collection } => {
+                self.execute_verify_hash_chain(task, collection.as_str())
+            }
+
+            MetaOp::HomeVersions { probes } => self.execute_home_versions(task, probes),
+
             // Retention / purge / continuous-agg / last-value bodies live in
             // `dispatch/meta_retention/`; the arms below are one-line delegations
             // so the Meta match stays exhaustive.
@@ -143,19 +149,14 @@ impl CoreLoop {
                 series_id,
             } => self.meta_query_last_value(task, collection.as_str(), *series_id),
 
-            MetaOp::AlterArray {
-                audit_retain_ms, ..
-            } => {
-                // All catalog + registry mutations are performed on the Control
-                // Plane before this op is dispatched. The Data Plane simply echoes
-                // an 8-byte LE u64 acknowledgement (the new audit_retain_ms, or 0
-                // when set to NULL).
-                let ack: u64 = (*audit_retain_ms)
-                    .and_then(|inner| inner)
-                    .map(|ms| ms as u64)
-                    .unwrap_or(0);
-                self.response_with_payload(task, ack.to_le_bytes().to_vec())
-            }
+            // ALTER ARRAY is a replicated catalog entry; the Control Plane never
+            // sends it to a core.
+            MetaOp::AlterArray { .. } => self.response_error(
+                task,
+                ErrorCode::Unsupported {
+                    detail: "ALTER ARRAY runs through the replicated array catalog".into(),
+                },
+            ),
 
             op @ (MetaOp::TemporalPurgeEdgeStore { .. }
             | MetaOp::TemporalPurgeDocumentStrict { .. }
@@ -171,6 +172,7 @@ impl CoreLoop {
                 epoch_system_ms,
                 is_group_leader,
                 versioned_reads,
+                body_plans,
             } => self.execute_calvin_execute_static(
                 task,
                 CalvinExecCtx {
@@ -182,6 +184,7 @@ impl CoreLoop {
                 tenant_id,
                 plans,
                 versioned_reads,
+                body_plans,
             ),
 
             MetaOp::CalvinExecutePassive {
@@ -236,23 +239,6 @@ impl CoreLoop {
                 self.execute_delete_synonym_group(task, *tenant_id, name)
             }
 
-            MetaOp::RenameCollection {
-                tenant_id,
-                old_database_id,
-                new_database_id,
-                old_collection,
-                new_collection,
-            } => self.execute_rename_collection(
-                task,
-                crate::data::executor::handlers::control::move_tenant::RenameCollectionParams {
-                    tenant_id: *tenant_id,
-                    old_database_id: *old_database_id,
-                    new_database_id: *new_database_id,
-                    old_collection: old_collection.as_str(),
-                    new_collection: new_collection.as_str(),
-                },
-            ),
-
             MetaOp::RecordCalvinWriteVersions { tenant_id, plans } => {
                 // The Calvin apply already committed; this records the write
                 // version of every key it wrote at the applied WAL LSN the
@@ -288,7 +274,7 @@ impl CoreLoop {
             // `RedoRecord` and return its bytes. Reads the overlay by `&`; never
             // mutates base (the redo record is installed separately).
             MetaOp::ResolveTxn { txn_id, plans } => {
-                self.execute_resolve_txn(task, tid, *txn_id, plans)
+                self.execute_resolve_session_txn(task, tid, *txn_id, plans)
             }
 
             // Same shape as `ResolveTxn` above, but sourced from Calvin's own
@@ -314,6 +300,17 @@ impl CoreLoop {
                     sum_targets,
                 },
                 *origin,
+            ),
+
+            // A RESTORE batch installs only inside its Calvin transaction:
+            // its resolve appends the batch to the transaction's redo record.
+            MetaOp::RestoreRedo(_) => self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: "a RESTORE batch reached the Data Plane outside its Calvin \
+                             transaction; only the transaction's resolve installs it"
+                        .into(),
+                },
             ),
 
             MetaOp::StageWrite { plan } => self.execute_stage_write(task, tid, plan),
@@ -466,6 +463,7 @@ mod txn_created_columnar_engine_tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: crate::bridge::envelope::Admission::Exempt(
                 crate::bridge::envelope::ExemptReason::Read,
             ),

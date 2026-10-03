@@ -135,7 +135,7 @@ pub async fn create_vector_index(
         ));
     }
 
-    // A name already taken by an index of any kind would leave exactly one of
+    // A name already taken by an index of any kind will leave exactly one of
     // the two droppable, since the registry is keyed by name.
     if let Some(taken) = state
         .credentials
@@ -163,7 +163,8 @@ pub async fn create_vector_index(
         tenant_id,
         index_name,
         &identity.username,
-    )?;
+    )
+    .await?;
 
     let set_params_plan = PhysicalPlan::Vector(VectorOp::SetParams {
         collection: nodedb_types::QualifiedCollection::new(database_id, collection),
@@ -227,20 +228,10 @@ pub async fn create_vector_index(
         pq_m: params.pq_m,
         ivf_cells: params.ivf_cells,
         ivf_nprobe: params.ivf_nprobe,
+        // Frozen by the proposer's stamp.
+        modification_hlc: nodedb_types::Hlc::ZERO,
     };
-    let outcome = super::super::vector_replicate::propose_put_params(state, &stored)?;
-
-    // Single node: no applier runs, so post-apply never fires. Run the
-    // per-node install the post-apply lane runs everywhere else — the redo
-    // record plus the fan-out that reaches every core, not just the one the
-    // pre-flight dispatched to.
-    if outcome.needs_local_apply() {
-        let shared = state
-            .self_arc()
-            .map_err(|e| DdlError::from_error_in_context("install vector index params", &e))?;
-        crate::control::catalog_entry::post_apply::install_vector_index_params(stored, shared)
-            .await;
-    }
+    super::super::vector_replicate::propose_put_params(state, &stored).await?;
 
     propose_index_record(
         state,
@@ -252,7 +243,8 @@ pub async fn create_vector_index(
             collection,
             fields: vec![field_name.clone()],
         },
-    )?;
+    )
+    .await?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

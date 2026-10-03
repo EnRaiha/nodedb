@@ -93,7 +93,7 @@ pub(in super::super) fn convert_create_array(
     // reject a negative, so today every value arrives inside `i64`; this is
     // checked rather than cast so that a future entry point which skips that
     // validation fails here instead of wrapping to a negative retention, which
-    // would put the horizon in the future and purge every version the array has.
+    // will put the horizon in the future and purge every version the array has.
     let audit_retain_ms = audit_retain_ms
         .map(i64::try_from)
         .transpose()
@@ -105,8 +105,8 @@ pub(in super::super) fn convert_create_array(
             ),
         })?;
 
-    // 3. Build DDL metadata only. Catalog and retention mutations happen at
-    // the authorized dispatch boundary, never while converting a SQL plan.
+    // 3. Build DDL metadata only. The catalog changes through the replicated
+    // `PutArray` entry the front door proposes, never while converting.
     let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
     let entry = ArrayCatalogEntry {
         array_id: aid.clone(),
@@ -117,6 +117,8 @@ pub(in super::super) fn convert_create_array(
         prefix_bits,
         audit_retain_ms,
         minimum_audit_retain_ms,
+        modification_hlc: nodedb_types::Hlc::ZERO,
+        incarnation: nodedb_types::Hlc::ZERO,
     };
     {
         let cat = array_catalog.read().map_err(|_| crate::Error::PlanError {
@@ -129,8 +131,8 @@ pub(in super::super) fn convert_create_array(
         }
     }
 
-    // 4. Emit OpenArray so the authorized execution boundary can durably
-    // register it immediately before opening the engine side.
+    // 4. Emit OpenArray. The front door hands it to the replicated array
+    // catalog (`array_catalog::ddl`), which opens it on every node.
     let vshard = ctx.collection_key(name).vshard();
     Ok(vec![PhysicalTask {
         tenant_id,

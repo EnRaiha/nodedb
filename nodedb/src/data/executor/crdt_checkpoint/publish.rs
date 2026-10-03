@@ -8,18 +8,9 @@
 //! calls this to make it live.
 
 use super::format::{CRDT_CKPT_FORMAT_VERSION, CrdtCheckpointManifest};
-use super::manifest::{read_crdt_manifest_at, storage_err};
+use super::manifest::storage_err;
 use super::paths::CRDT_CKPT_MANIFEST;
 use crate::types::Lsn;
-
-/// The generation number the next publish under `ckpt_dir` must use.
-///
-/// Never reuses a live generation: a reader holding the current manifest must
-/// keep seeing an intact generation until the new one is published, so the new
-/// files cannot be written over the live ones.
-pub(crate) fn next_generation(ckpt_dir: &std::path::Path) -> crate::Result<u64> {
-    Ok(read_crdt_manifest_at(ckpt_dir)?.map_or(0, |m| m.generation.wrapping_add(1)))
-}
 
 /// Publish a written generation by atomically replacing the manifest.
 ///

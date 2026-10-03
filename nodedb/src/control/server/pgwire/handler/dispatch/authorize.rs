@@ -68,7 +68,7 @@ mod tests {
             delta: Vec::new(),
             peer_id: 1,
             mutation_id: 1,
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
             provenance: None,
             constraint_version_required: 0,
             expected_frontier_digest: None,

@@ -22,7 +22,9 @@ use crate::data::executor::response_codec::{
     flatten_vector_hits_to_relational_rows,
 };
 
-use super::dispatch::{ResolveCtx, resolve_exchange};
+use crate::control::server::exchange::read_scope::ReadScope;
+
+use super::dispatch::resolve_exchange;
 use super::entry::Resolved;
 
 /// Fields of a `QueryOp::PostProcess` plan node, carried through resolution
@@ -128,15 +130,16 @@ pub(super) enum ChildRows {
 /// child's base collection in `captures` at its observed read-version.
 pub(super) async fn materialize_child_rows(
     state: &SharedState,
-    ctx: ResolveCtx,
+    ctx: ReadScope,
     captures: &mut Vec<DistributedReadCapture>,
     input: PhysicalPlan,
 ) -> crate::Result<ChildRows> {
-    let ResolveCtx {
+    let ReadScope {
         database_id,
         tenant_id,
         trace_id,
         txn_id,
+        ..
     } = ctx;
 
     // The converter wraps a sharded body in `Exchange{Gather}`; unwrap
@@ -152,18 +155,8 @@ pub(super) async fn materialize_child_rows(
 
     // Resolve any Exchange nested inside the child first (e.g. a
     // `HashJoin` build-side `Broadcast`) so the plan gathered below is
-    // self-contained — no Exchange may reach a Data-Plane core.
-    let child = match Box::pin(resolve_exchange(
-        state,
-        database_id,
-        tenant_id,
-        child,
-        trace_id,
-        txn_id,
-        captures,
-    ))
-    .await?
-    {
+    // self-contained — no Exchange can reach a Data-Plane core.
+    let child = match Box::pin(resolve_exchange(state, ctx, child, captures)).await? {
         Resolved::Plan(p) => *p,
         // The unwrapped body is not itself a root Gather / stream;
         // surface these without dropping the caller's tail.
@@ -187,8 +180,8 @@ pub(super) async fn materialize_child_rows(
     // consumes `child`.
     let hit_kind = classify_hit_shape(&child);
     // Extract the collection from the hit op directly: `collection()`
-    // has no arm for sparse / multi-vector search, so it would yield
-    // `None` and the PK resolver would be handed an empty collection.
+    // has no arm for sparse / multi-vector search, so it will yield
+    // `None` and the PK resolver will be handed an empty collection.
     let hit_collection = hit_collection_name(&child);
 
     // Record the child's single base collection in the in-transaction
@@ -219,7 +212,7 @@ pub(super) async fn materialize_child_rows(
         )
         .await?
     } else {
-        gather_all_vshards(state, tenant_id, database_id, child, trace_id, txn_id).await?
+        gather_all_vshards(state, child, ctx).await?
     };
 
     if let Some(coll) = probe_collection
@@ -272,7 +265,7 @@ pub(super) async fn materialize_child_rows(
 /// gathered here, so the relational tail never runs per-shard.
 pub(super) async fn resolve_post_process(
     state: &SharedState,
-    ctx: ResolveCtx,
+    ctx: ReadScope,
     captures: &mut Vec<DistributedReadCapture>,
     fields: PostProcessFields,
 ) -> crate::Result<Resolved> {

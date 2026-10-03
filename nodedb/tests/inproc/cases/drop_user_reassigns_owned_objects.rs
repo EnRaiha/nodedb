@@ -383,7 +383,7 @@ async fn startup_repair_revokes_preexisting_grants_to_missing_users() {
         .await
         .unwrap();
     let grant = StoredPermission {
-        target: "collection:1:any_notes".to_string(),
+        target: "collection:0:1:any_notes".to_string(),
         grantee: "user:lost_grantee".to_string(),
         permission: "read".to_string(),
         granted_by: "nodedb".to_string(),
@@ -496,7 +496,7 @@ async fn drop_user_reassigns_every_owner_bearing_kind_and_sweeps_grants() {
     plant_owner(&catalog, "index", "victim_index", VICTIM);
 
     let grant = StoredPermission {
-        target: "collection:1:victim_coll".to_string(),
+        target: "collection:0:1:victim_coll".to_string(),
         grantee: format!("user:{VICTIM}"),
         permission: "read".to_string(),
         granted_by: "nodedb".to_string(),

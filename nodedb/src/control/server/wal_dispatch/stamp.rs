@@ -9,7 +9,7 @@ use crate::types::Lsn;
 use nodedb_physical::physical_plan::ArrayOp;
 
 /// Overwrite the LSN carried *inside* `plan` with `lsn` — the LSN of the
-/// durable record the funnel just minted for this write.
+/// durable record the funnel minted for this write.
 ///
 /// Almost every engine takes its committed version from `Request.wal_lsn`,
 /// which the funnel stamps on the envelope; for those plans this is a no-op.
@@ -62,7 +62,7 @@ fn stamp_array_op(op: &mut ArrayOp, lsn: Lsn) {
         | ArrayOp::Aggregate { .. }
         | ArrayOp::Elementwise { .. }
         | ArrayOp::DropArray { .. }
-        | ArrayOp::RestoreArrayDrop { .. }
+        | ArrayOp::RekeyArray { .. }
         | ArrayOp::PurgeArrayDrop { .. }
         | ArrayOp::Compact { .. } => {}
     }
@@ -85,6 +85,7 @@ mod tests {
             cells_msgpack: Vec::new(),
             wal_lsn: 0,
             provenance: None,
+            vshard_id: 0,
         });
         stamp_minted_lsn(&mut plan, Lsn::new(77));
         let PhysicalPlan::Array(ArrayOp::Put { wal_lsn, .. }) = plan else {
@@ -100,6 +101,7 @@ mod tests {
             coords_msgpack: Vec::new(),
             wal_lsn: 0,
             provenance: None,
+            vshard_id: 0,
         });
         stamp_minted_lsn(&mut plan, Lsn::new(9));
         let PhysicalPlan::Array(ArrayOp::Delete { wal_lsn, .. }) = plan else {

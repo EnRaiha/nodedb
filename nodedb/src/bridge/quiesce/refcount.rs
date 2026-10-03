@@ -2,7 +2,7 @@
 
 //! Scan refcount + `ScanGuard` RAII wrapper.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
@@ -12,9 +12,10 @@ use tokio::sync::Notify;
 pub(super) struct CollectionState {
     /// Number of scans currently open against this collection.
     pub(super) open_scans: usize,
-    /// Number of lifecycle operations currently holding the collection drain.
-    /// CREATE remains blocked until every holder completes.
-    pub(super) drain_holders: usize,
+    /// Ids of the drain holds on this collection. New scans and CREATE stay
+    /// blocked until every hold is released. Each hold releases only its own
+    /// id, so a release never frees another holder.
+    pub(super) drain_holders: BTreeSet<u64>,
 }
 
 /// Why `try_start_scan` refused a new scan.
@@ -51,6 +52,11 @@ pub struct CollectionQuiesce {
 #[derive(Debug, Default)]
 pub(super) struct Inner {
     pub(super) states: HashMap<(u64, u64, String), CollectionState>,
+    /// Id the next drain hold receives.
+    pub(super) next_hold_id: u64,
+    /// The hold each `_system.pending_reclaim` row owns. It outlives the
+    /// operation that took it and is released once the row is removed.
+    pub(super) reclaim_holds: HashMap<super::hold::ReclaimOwner, u64>,
 }
 
 impl CollectionQuiesce {
@@ -67,12 +73,12 @@ impl CollectionQuiesce {
         tenant_id: u64,
         collection: &str,
     ) -> Result<ScanGuard, ScanStartError> {
-        let mut inner = self.inner.lock().expect("CollectionQuiesce mutex poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let entry = inner
             .states
             .entry((database_id, tenant_id, collection.to_string()))
             .or_default();
-        if entry.drain_holders > 0 {
+        if !entry.drain_holders.is_empty() {
             return Err(ScanStartError::Draining);
         }
         entry.open_scans += 1;
@@ -87,7 +93,7 @@ impl CollectionQuiesce {
 
     /// Current open-scan count. For tests / metrics.
     pub fn open_scans(&self, database_id: u64, tenant_id: u64, collection: &str) -> usize {
-        let inner = self.inner.lock().expect("CollectionQuiesce mutex poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner
             .states
             .get(&(database_id, tenant_id, collection.to_string()))
@@ -96,15 +102,15 @@ impl CollectionQuiesce {
 
     /// Whether a drain is currently in progress for this collection.
     pub fn is_draining(&self, database_id: u64, tenant_id: u64, collection: &str) -> bool {
-        let inner = self.inner.lock().expect("CollectionQuiesce mutex poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner
             .states
             .get(&(database_id, tenant_id, collection.to_string()))
-            .is_some_and(|s| s.drain_holders > 0)
+            .is_some_and(|s| !s.drain_holders.is_empty())
     }
 
     pub(super) fn release_scan(&self, database_id: u64, tenant_id: u64, collection: &str) {
-        let mut inner = self.inner.lock().expect("CollectionQuiesce mutex poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(state) = inner
             .states
             .get_mut(&(database_id, tenant_id, collection.to_string()))
@@ -192,7 +198,7 @@ mod tests {
     #[test]
     fn drain_rejects_new_scans() {
         let q = CollectionQuiesce::new();
-        q.begin_drain(DB, 1, "c");
+        let _hold = q.begin_drain(DB, 1, "c");
         let err = q.try_start_scan(DB, 1, "c").unwrap_err();
         assert_eq!(err, ScanStartError::Draining);
         assert!(q.is_draining(DB, 1, "c"));
@@ -201,7 +207,7 @@ mod tests {
     #[test]
     fn drain_does_not_affect_other_scopes() {
         let q = CollectionQuiesce::new();
-        q.begin_drain(DB, 1, "c");
+        let _hold = q.begin_drain(DB, 1, "c");
         assert!(q.try_start_scan(DB, 1, "other").is_ok());
         assert!(q.try_start_scan(DB, 2, "c").is_ok());
         assert!(q.try_start_scan(1, 1, "c").is_ok());

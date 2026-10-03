@@ -10,14 +10,16 @@
 //!   synchronous in-memory cache updates **inline** on the raft
 //!   applier thread, BEFORE the metadata applier bumps the
 //!   `AppliedIndexWatcher`.
-//! - [`spawn_post_apply_async_side_effects`] (in `async_dispatch`)
-//!   spawns tokio tasks for the genuinely async work — runs on
-//!   **every node** (leader and followers) so each node's local
-//!   Data Plane observes catalog mutations symmetrically.
+//! - [`run_post_apply_async_side_effects`] (in `async_dispatch`)
+//!   runs the async work — on **every node** (leader and followers)
+//!   so each node's local Data Plane observes catalog mutations
+//!   symmetrically. The metadata applier awaits it before it
+//!   advances past the entry.
 
 // Per-family modules (existing).
 pub mod alert_rule;
 pub mod api_key;
+pub mod array;
 pub mod auth_user;
 pub mod change_stream;
 pub mod collection;
@@ -51,11 +53,23 @@ mod async_dispatch;
 pub(crate) mod gateway_invalidation;
 mod sync;
 
-pub(crate) use async_dispatch::collection::{ReclaimFailure, reclaim_collection_storage};
-pub(crate) use async_dispatch::crdt_compact::compact_async;
-pub use async_dispatch::spawn_post_apply_async_side_effects;
+pub(crate) use async_dispatch::array::{
+    delete_on_every_core as drop_array_on_every_core,
+    open_on_every_core as open_array_on_every_core,
+};
+pub(crate) use async_dispatch::collection::{
+    ReclaimFailure, clear_before_recreate, reclaim_collection_storage,
+};
+pub(crate) use async_dispatch::continuous_aggregate::{
+    RegisterFailure as ContinuousAggregateRegisterFailure,
+    delete_async as unregister_continuous_aggregate,
+    register_on_every_core as register_continuous_aggregate_on_every_core,
+};
+pub(crate) use async_dispatch::crdt_compact::{compact_async, drain_pending_compactions};
+pub use async_dispatch::run_post_apply_async_side_effects;
 pub(crate) use async_dispatch::synonym_group::delete_async as remove_synonym_group;
 pub(crate) use async_dispatch::synonym_group::put_async as install_synonym_group;
+pub(crate) use async_dispatch::vector::delete_async as remove_vector_index_params;
 pub(crate) use async_dispatch::vector::longest_core_wait as vector_install_longest_core_wait;
 pub(crate) use async_dispatch::vector::put_async as install_vector_index_params;
 pub use sync::apply_post_apply_side_effects_sync;

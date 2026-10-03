@@ -2,12 +2,10 @@
 
 //! Node-local table of in-flight `DdlPendingPropose` records.
 //!
-//! Rebuilt entirely by metadata Raft log replay, the same way
-//! `SharedState::metadata_ddl_owner` and `MetadataCache` are — never
-//! persisted on its own. A record is inserted on `DdlPendingPropose`
-//! apply and removed on the matching `DdlPendingFinalize` /
-//! `DdlPendingCancel` apply (see
-//! `control::cluster::metadata_applier::pending_ddl`).
+//! A record is inserted on `DdlPendingPropose` apply and removed on the
+//! matching `DdlPendingFinalize` / `DdlPendingCancel` apply (see
+//! `control::cluster::metadata_applier::pending_ddl`). Each apply writes its
+//! `SystemCatalog` row first, and boot seeds this table from those rows.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -64,6 +62,15 @@ impl PendingDdlTable {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&token)
+    }
+
+    /// Drop every record. A metadata snapshot install calls this before
+    /// loading the persisted records.
+    pub fn clear(&self) {
+        self.records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     /// True when a pending record exists for `token`.

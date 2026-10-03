@@ -8,7 +8,7 @@ use std::time::Duration;
 use nodedb_types::config::tuning::ClusterTransportTuning;
 
 use super::TestCluster;
-use super::types::ClusterSpawnConfig;
+use super::types::{ClusterSpawnConfig, DEFAULT_NUM_GROUPS};
 use crate::cluster_harness::node::TestClusterNode;
 
 impl TestCluster {
@@ -31,9 +31,136 @@ impl TestCluster {
             num_cores,
             log_compaction_threshold,
             replication_factor,
+            num_groups: DEFAULT_NUM_GROUPS,
             single_node_calvin: false,
+            backup_storage: None,
+            pitr: None,
+            node_timeseries_tuning: std::collections::HashMap::new(),
         };
+        Self::spawn_three_with_config(config).await
+    }
 
+    /// Spawn a 3-node cluster with `num_groups` data groups, a low Raft
+    /// `log_compaction_threshold` and `replication_factor`. More groups give
+    /// the rendezvous placement more distinct replica sets to choose from.
+    pub async fn spawn_three_with_groups_compaction_threshold_and_rf(
+        num_groups: u64,
+        threshold: u64,
+        replication_factor: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_three_with_config(ClusterSpawnConfig {
+            tuning: super::types::fast_cluster_tuning(),
+            graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
+            query_tuning: nodedb_types::config::tuning::QueryTuning::default(),
+            num_cores: 1,
+            log_compaction_threshold: Some(threshold),
+            replication_factor,
+            num_groups,
+            single_node_calvin: false,
+            backup_storage: None,
+            pitr: None,
+            node_timeseries_tuning: std::collections::HashMap::new(),
+        })
+        .await
+    }
+
+    /// Spawn a 3-node cluster with `num_groups` data groups,
+    /// `replication_factor`, and `num_cores` Data-Plane cores per node.
+    pub async fn spawn_three_with_groups_rf_and_cores(
+        num_groups: u64,
+        replication_factor: usize,
+        num_cores: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_three_with_config(ClusterSpawnConfig {
+            tuning: super::types::fast_cluster_tuning(),
+            graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
+            query_tuning: nodedb_types::config::tuning::QueryTuning::default(),
+            num_cores,
+            log_compaction_threshold: None,
+            replication_factor,
+            num_groups,
+            single_node_calvin: false,
+            backup_storage: None,
+            pitr: None,
+            node_timeseries_tuning: std::collections::HashMap::new(),
+        })
+        .await
+    }
+
+    /// Spawn a 3-node cluster where node `node_id` runs `timeseries_tuning`
+    /// and the other nodes run the default. Uses the standard fast-election
+    /// tuning and 1 core per node.
+    pub async fn spawn_three_with_node_timeseries_tuning(
+        node_id: u64,
+        timeseries_tuning: nodedb_types::config::tuning::TimeseriesToning,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_three_with_config(ClusterSpawnConfig {
+            tuning: super::types::fast_cluster_tuning(),
+            graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
+            query_tuning: nodedb_types::config::tuning::QueryTuning::default(),
+            num_cores: 1,
+            log_compaction_threshold: None,
+            replication_factor: 3,
+            num_groups: DEFAULT_NUM_GROUPS,
+            single_node_calvin: false,
+            backup_storage: None,
+            pitr: None,
+            node_timeseries_tuning: std::collections::HashMap::from([(node_id, timeseries_tuning)]),
+        })
+        .await
+    }
+
+    /// Spawn a 3-node cluster whose nodes share one `[backup_storage]`
+    /// `local_root`, so a `file://` backup URI names the same file on every
+    /// node. Uses the standard fast-election tuning and 1 core per node.
+    pub async fn spawn_three_with_backup_root(
+        local_root: std::path::PathBuf,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_three_with_config(ClusterSpawnConfig {
+            tuning: super::types::fast_cluster_tuning(),
+            graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
+            query_tuning: nodedb_types::config::tuning::QueryTuning::default(),
+            num_cores: 1,
+            log_compaction_threshold: None,
+            replication_factor: 3,
+            num_groups: DEFAULT_NUM_GROUPS,
+            single_node_calvin: false,
+            backup_storage: Some(nodedb::config::server::BackupStorageSettings {
+                local_root: Some(local_root),
+                ..Default::default()
+            }),
+            pitr: None,
+            node_timeseries_tuning: std::collections::HashMap::new(),
+        })
+        .await
+    }
+
+    /// Spawn a 3-node cluster whose nodes share `pitr`'s cold store,
+    /// snapshot store and WAL key. Uses the standard fast-election tuning and
+    /// 1 core per node.
+    pub async fn spawn_three_with_pitr(
+        pitr: crate::cluster_harness::pitr::PitrStorage,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_three_with_config(ClusterSpawnConfig {
+            tuning: super::types::fast_cluster_tuning(),
+            graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
+            query_tuning: nodedb_types::config::tuning::QueryTuning::default(),
+            num_cores: 1,
+            log_compaction_threshold: None,
+            replication_factor: 3,
+            num_groups: DEFAULT_NUM_GROUPS,
+            single_node_calvin: false,
+            backup_storage: None,
+            pitr: Some(pitr),
+            node_timeseries_tuning: std::collections::HashMap::new(),
+        })
+        .await
+    }
+
+    /// Spawn node 1, then nodes 2 and 3 joining it, all with `config`.
+    async fn spawn_three_with_config(
+        config: ClusterSpawnConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let node1 = TestClusterNode::spawn_with_full_config(1, vec![], &config).await?;
 
         // Wait until node 1 has bootstrapped (topology shows itself)
@@ -71,7 +198,9 @@ impl TestCluster {
             spawn_config: config,
         };
 
-        cluster.await_ready().await;
+        cluster
+            .await_ready(super::ready::LeaderBar::Preferred)
+            .await;
 
         Ok(cluster)
     }

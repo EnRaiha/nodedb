@@ -2,10 +2,8 @@
 
 //! Protocol-neutral `SHOW SCHEDULES` and `SHOW SCHEDULE HISTORY` DDL handlers.
 //!
-//! Ported from the pgwire `ddl::schedule::show` handlers. The registry read,
-//! `job_history` lookups, next-fire computation, and the exact column set /
-//! per-column text encoding are preserved verbatim; only the result
-//! construction changed from pgwire `Response` / `QueryResponse` to the
+//! The registry read, `job_history` lookups, next-fire computation, and the
+//! exact column set / per-column text encoding run here. The result is the
 //! protocol-neutral [`DdlResult::Rows`] over [`ShapedRows`].
 
 use serde_json::{Map, Value as JsonValue};

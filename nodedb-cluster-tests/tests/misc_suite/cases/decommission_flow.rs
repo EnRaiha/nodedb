@@ -62,7 +62,7 @@ impl MetadataProposer for DirectProposer {
     async fn propose_and_wait(&self, entry: MetadataEntry) -> Result<u64> {
         let idx = self.next_index.fetch_add(1, Ordering::SeqCst);
         let bytes = encode_entry(&entry).expect("encode metadata entry");
-        self.applier.apply(&[(idx, bytes)]);
+        self.applier.apply(&[(idx, bytes)]).await;
         self.proposed.lock().unwrap().push(entry);
         Ok(idx)
     }

@@ -27,8 +27,10 @@ pub enum DocumentOp {
         document_id: String,
         /// Catalog-bound identity for `(collection, document_id)`. Hex-encoded
         /// by the handler for the substrate row key — user-PK strings are
-        /// never used for storage addressing here.
-        surrogate: Surrogate,
+        /// never used for storage addressing here. `None` when the key is
+        /// unbound in this database: the read matches no row here, and a
+        /// clone reads through to its source.
+        surrogate: Option<Surrogate>,
         /// Raw primary-key bytes, for follower-side WAL decode to re-derive
         /// the surrogate via the catalog rev table.
         pk_bytes: Vec<u8>,
@@ -87,8 +89,7 @@ pub enum DocumentOp {
         if_absent: bool,
         /// Stable cross-engine identity assigned by the CP-side
         /// `SurrogateAssigner` from `(collection, document_id_bytes)`.
-        /// `Surrogate::ZERO` is reserved as a sentinel and only appears
-        /// in test fixtures.
+        /// Never `Surrogate::ZERO`: a put that carries it is refused.
         surrogate: Surrogate,
         /// When `Some`, return the STORED post-image of the inserted row
         /// projected per spec — see `PointPut::returning`. A conflict skipped
@@ -116,8 +117,10 @@ pub enum DocumentOp {
         collection: QualifiedCollection,
         document_id: String,
         /// Catalog-bound identity for `(collection, document_id)`. The
-        /// handler hex-encodes this for the substrate row key.
-        surrogate: Surrogate,
+        /// handler hex-encodes this for the substrate row key. `None` when
+        /// the key is unbound in this database: the delete matches no row
+        /// here, and a clone resolves it against its source.
+        surrogate: Option<Surrogate>,
         /// Raw primary-key bytes for follower WAL decode rebind.
         pk_bytes: Vec<u8>,
         /// When `Some`, return the pre-deletion document projected per spec.
@@ -142,8 +145,10 @@ pub enum DocumentOp {
         collection: QualifiedCollection,
         document_id: String,
         /// Catalog-bound identity for `(collection, document_id)`. The
-        /// handler hex-encodes this for the substrate row key.
-        surrogate: Surrogate,
+        /// handler hex-encodes this for the substrate row key. `None` when
+        /// the key is unbound in this database: the update matches no row
+        /// here, and a clone copies the source row up first.
+        surrogate: Option<Surrogate>,
         /// Raw primary-key bytes for follower WAL decode rebind.
         pk_bytes: Vec<u8>,
         /// Field name → assignment RHS (literal bytes or row-scope expression).
@@ -199,9 +204,9 @@ pub enum DocumentOp {
         collection: QualifiedCollection,
         /// (document_id, value_bytes) pairs.
         documents: Vec<(String, Vec<u8>)>,
-        /// Per-row surrogates (parallel to `documents`). When non-empty and
-        /// same length as `documents`, the handler uses these for FTS indexing.
-        /// `Surrogate::ZERO` entries are silently skipped by the FTS path.
+        /// Per-row surrogates, parallel to `documents`: one bound surrogate
+        /// per row. A batch with a `Surrogate::ZERO` entry is refused before
+        /// any row is written.
         surrogates: Vec<nodedb_types::Surrogate>,
         /// When `Some`, return one row per inserted document — the STORED
         /// post-image of each, in `documents` order — projected per spec.
@@ -362,7 +367,8 @@ pub enum DocumentOp {
         value: Vec<u8>,
         on_conflict_updates: Vec<(String, UpdateValue)>,
         /// Stable cross-engine identity assigned by the CP-side
-        /// `SurrogateAssigner`. `Surrogate::ZERO` only in test fixtures.
+        /// `SurrogateAssigner`. Never `Surrogate::ZERO`: an upsert that
+        /// carries it is refused.
         surrogate: Surrogate,
         /// Write policy gating the persist against whichever body actually
         /// lands: the insert body when absent, the merged/conflict-updated
@@ -547,6 +553,12 @@ pub enum DocumentOp {
         count: usize,
         system_as_of_ms: Option<i64>,
         // Point-in-time snapshot: `AllVersions` is rejected upstream.
+        /// Return each body as stored, transcoded to MessagePack with no
+        /// `id` added. Every clone materializer copy reads these: a
+        /// `HASH_CHAIN` link covers the stored contents, and a strict target
+        /// refuses a field its schema lacks.
+        #[serde(default)]
+        raw_bodies: bool,
     },
 
     /// Add a signed amount to a materialized-sum balance on a TARGET row.

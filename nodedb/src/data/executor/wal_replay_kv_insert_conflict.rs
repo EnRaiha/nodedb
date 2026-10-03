@@ -13,18 +13,11 @@
 //! durable replay never diverge. A key absent at replay time installs
 //! `value` verbatim, matching the live handler's insert branch.
 //!
-//! `kv_insert_on_conflict_update` optionally carries a Control-Plane-resolved
-//! absolute `expire_at_ms` as a trailing seventh element, present only when
-//! the live write's `ttl_ms > 0` (same additive-shape convention as
-//! `encode_kv_put` / `encode_kv_incr`). Both shapes are genuinely produced
-//! in production, so both must be decoded; the seven-element shape is tried
-//! first — zerompk's strict array-length check means it can never match the
-//! six-element tuple, so try-order does not matter for correctness, but
-//! skipping it would silently drop the recorded absolute instant.
-//!
-//! Like the rest of the `Put` family, this local WAL record does not carry
-//! the surrogate (it lives in the separately-durable surrogate catalog), so
-//! replay passes `Surrogate::ZERO`, matching `kv_put` / `kv_batch_put` replay.
+//! The record has one shape, `("kv_insert_on_conflict_update", collection,
+//! key, value, ttl_ms, updates, expire_at_ms, surrogate)`. `expire_at_ms` is
+//! the Control-Plane-resolved absolute instant, `None` when the write has no
+//! TTL. `surrogate` is the identity the live handler binds the row to, and
+//! replay binds the same one.
 
 use tracing::warn;
 
@@ -49,14 +42,13 @@ struct ReplayedInsertOnConflictUpdate<'a> {
     ttl_ms: u64,
     updates: &'a [(String, UpdateValue)],
     expire_at_ms: Option<u64>,
+    surrogate: nodedb_types::Surrogate,
 }
 
 impl CoreLoop {
-    /// Try both `kv_insert_on_conflict_update` WAL payload shapes in turn,
-    /// seven-element (absolute expiry) before six-element (no TTL). Returns
-    /// `None` when neither decodes (caller tries the next candidate arm in
-    /// `wal_replay/kv.rs`), otherwise `Some(puts)` from whichever shape
-    /// decoded.
+    /// Replay a `kv_insert_on_conflict_update` record. `None` when the payload
+    /// is not one (the caller tries the next candidate arm in
+    /// `wal_replay/kv.rs`).
     pub(super) fn try_replay_kv_insert_on_conflict_update(
         &mut self,
         payload: &[u8],
@@ -66,39 +58,7 @@ impl CoreLoop {
         record_lsn: u64,
         tombstones: &nodedb_wal::TombstoneSet,
     ) -> Option<usize> {
-        if let Some(applied) = self.try_replay_kv_insert_on_conflict_update_with_expiry(
-            payload,
-            tenant_id,
-            database_id,
-            now_ms,
-            record_lsn,
-            tombstones,
-        ) {
-            return Some(applied);
-        }
-        self.try_replay_kv_insert_on_conflict_update_no_expiry(
-            payload,
-            tenant_id,
-            database_id,
-            now_ms,
-            record_lsn,
-            tombstones,
-        )
-    }
-
-    /// Seven-element shape: `("kv_insert_on_conflict_update", collection,
-    /// key, value, ttl_ms, updates, expire_at_ms)` — recorded only when the
-    /// live write's `ttl_ms > 0`.
-    fn try_replay_kv_insert_on_conflict_update_with_expiry(
-        &mut self,
-        payload: &[u8],
-        tenant_id: u64,
-        database_id: u64,
-        now_ms: u64,
-        record_lsn: u64,
-        tombstones: &nodedb_wal::TombstoneSet,
-    ) -> Option<usize> {
-        let (disc, collection, key, value, ttl_ms, updates, expire_at_ms) =
+        let (disc, collection, key, value, ttl_ms, updates, expire_at_ms, surrogate) =
             zerompk::from_msgpack::<(
                 &str,
                 String,
@@ -106,10 +66,13 @@ impl CoreLoop {
                 Vec<u8>,
                 u64,
                 Vec<(String, UpdateValue)>,
-                u64,
+                Option<u64>,
+                u32,
             )>(payload)
             .ok()?;
-        if disc != "kv_insert_on_conflict_update" {
+        // A record without the row's surrogate matches no shape; the KV pass
+        // refuses it as unapplied.
+        if disc != "kv_insert_on_conflict_update" || surrogate == 0 {
             return None;
         }
         let tombstones = &tombstones.for_database(database_id);
@@ -127,56 +90,13 @@ impl CoreLoop {
                 value: &value,
                 ttl_ms,
                 updates: &updates,
-                expire_at_ms: Some(expire_at_ms),
+                expire_at_ms,
+                surrogate: nodedb_types::Surrogate::new(surrogate),
             }),
         )
     }
 
-    /// Six-element shape: `("kv_insert_on_conflict_update", collection, key,
-    /// value, ttl_ms, updates)` — recorded when the live write's `ttl_ms ==
-    /// 0` (no TTL to carry an absolute instant for).
-    fn try_replay_kv_insert_on_conflict_update_no_expiry(
-        &mut self,
-        payload: &[u8],
-        tenant_id: u64,
-        database_id: u64,
-        now_ms: u64,
-        record_lsn: u64,
-        tombstones: &nodedb_wal::TombstoneSet,
-    ) -> Option<usize> {
-        let (disc, collection, key, value, ttl_ms, updates) = zerompk::from_msgpack::<(
-            &str,
-            String,
-            Vec<u8>,
-            Vec<u8>,
-            u64,
-            Vec<(String, UpdateValue)>,
-        )>(payload)
-        .ok()?;
-        if disc != "kv_insert_on_conflict_update" {
-            return None;
-        }
-        let tombstones = &tombstones.for_database(database_id);
-        if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
-            return Some(0);
-        }
-        Some(
-            self.apply_replayed_insert_on_conflict_update(ReplayedInsertOnConflictUpdate {
-                database_id,
-                tenant_id,
-                now_ms,
-                record_lsn,
-                collection: &collection,
-                key: &key,
-                value: &value,
-                ttl_ms,
-                updates: &updates,
-                expire_at_ms: None,
-            }),
-        )
-    }
-
-    /// Shared RMW + write-back for both shapes: absent key installs `value`
+    /// RMW + write-back: absent key installs `value`
     /// verbatim (the live handler's insert branch); present key re-runs
     /// `merge_kv_conflict_body`, the exact merge the live handler uses. A
     /// merge failure is logged and the record is skipped rather than
@@ -196,6 +116,7 @@ impl CoreLoop {
             ttl_ms,
             updates,
             expire_at_ms,
+            surrogate,
         } = f;
         let existing_bytes = self
             .kv_engine
@@ -224,34 +145,30 @@ impl CoreLoop {
             },
         };
 
-        match expire_at_ms {
-            Some(expire_at_ms) => {
-                self.kv_engine.put_with_absolute_expiry(
-                    crate::engine::kv::KvPutParams {
-                        database_id,
-                        tenant_id,
-                        collection,
-                        key,
-                        value: &stored_bytes,
-                        ttl_ms,
-                        now_ms,
-                        surrogate: nodedb_types::Surrogate::ZERO,
-                    },
-                    expire_at_ms,
-                );
-            }
-            None => {
-                self.kv_engine.put(crate::engine::kv::KvPutParams {
-                    database_id,
-                    tenant_id,
-                    collection,
-                    key,
-                    value: &stored_bytes,
-                    ttl_ms,
-                    now_ms,
-                    surrogate: nodedb_types::Surrogate::ZERO,
-                });
-            }
+        let params = crate::engine::kv::KvPutParams {
+            database_id,
+            tenant_id,
+            collection,
+            key,
+            value: &stored_bytes,
+            ttl_ms,
+            now_ms,
+            surrogate,
+        };
+        let written = match expire_at_ms {
+            Some(expire_at_ms) => self
+                .kv_engine
+                .put_with_absolute_expiry(params, expire_at_ms),
+            None => self.kv_engine.put(params),
+        };
+        if let Err(e) = written {
+            self.replay_record_unapplied(
+                "kv",
+                "insert_on_conflict_identity",
+                record_lsn,
+                &e.to_string(),
+            );
+            return 0;
         }
         self.note_replay_write_lsn(
             database_id,
@@ -413,6 +330,49 @@ mod tests {
         );
     }
 
+    /// The live write binds the row to its surrogate, and restart replay
+    /// binds the same one, on both the insert and the merge branch.
+    #[test]
+    fn insert_on_conflict_update_identity_survives_replay() {
+        let updates = vec![(
+            "mana".to_string(),
+            UpdateValue::Literal(
+                nodedb_types::value_to_msgpack(&Value::Integer(5)).expect("encode literal"),
+            ),
+        )];
+        let upsert = |key: &[u8], surrogate: u32| {
+            PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "players"),
+                key: key.to_vec(),
+                value: obj_bytes(&[("hp", 1)]),
+                ttl_ms: 0,
+                updates: updates.clone(),
+                surrogate: Surrogate::new(surrogate),
+                rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
+                returning: None,
+                rls_filters: Vec::new(),
+            })
+        };
+        // `fresh` takes the insert branch. `p1` is written twice, so its
+        // second record takes the merge branch.
+        let records =
+            append_via_autocommit(&[upsert(b"fresh", 41), upsert(b"p1", 42), upsert(b"p1", 42)]);
+
+        let mut h = make_core();
+        h.core.replay_kv_wal(&records, 1, &TombstoneSet::new());
+
+        let did = DatabaseId::DEFAULT.as_u64();
+        for (key, surrogate) in [(b"fresh".as_slice(), 41), (b"p1".as_slice(), 42)] {
+            assert_eq!(
+                h.core
+                    .kv_engine
+                    .key_for_surrogate(did, TID, "players", Surrogate::new(surrogate)),
+                Some(key.to_vec()),
+                "the replayed row must resolve through the surrogate the live write bound"
+            );
+        }
+    }
+
     #[test]
     fn insert_on_conflict_update_onto_absent_key_installs_value_verbatim() {
         let excluded = obj_bytes(&[("hp", 100)]);
@@ -480,6 +440,7 @@ mod tests {
             5_000,
             &updates,
             Some(6_000),
+            1,
         )
         .expect("encode kv_insert_on_conflict_update with absolute expiry");
 

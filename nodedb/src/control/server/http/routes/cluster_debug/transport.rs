@@ -10,7 +10,7 @@ use nodedb_cluster::{BreakerSnapshot, TransportPeerSnapshot};
 
 use super::super::super::auth::{AppState, ResolvedIdentity};
 use super::super::super::peer::PeerAddr;
-use super::guard::{cluster_disabled, ensure_debug_access, ok_json};
+use super::guard::{cluster_not_started, ensure_debug_access, ok_json};
 
 #[derive(serde::Serialize)]
 struct TransportDebugResponse {
@@ -28,7 +28,7 @@ pub async fn transport_debug(
         return resp;
     }
     let Some(transport) = state.shared.cluster_transport.as_ref() else {
-        return cluster_disabled();
+        return cluster_not_started();
     };
     let response = TransportDebugResponse {
         node_id: state.shared.node_id,

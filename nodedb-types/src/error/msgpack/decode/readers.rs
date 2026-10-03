@@ -183,24 +183,6 @@ pub(super) fn read_string_vec<'a, R: Read<'a>>(
     Ok(out)
 }
 
-pub(super) fn read_fan_out<'a, R: Read<'a>>(
-    reader: &mut R,
-    field_count: usize,
-) -> zerompk::Result<(u16, u16)> {
-    if field_count < 2 {
-        return Err(zerompk::Error::InvalidMarker(0));
-    }
-    let _k1 = reader.read_u8()?;
-    let shards_touched = reader.read_u16()?;
-    let _k2 = reader.read_u8()?;
-    let limit = reader.read_u16()?;
-    for _ in 2..field_count {
-        reader.read_u8()?;
-        skip_one(reader)?;
-    }
-    Ok((shards_touched, limit))
-}
-
 /// Read 2 string fields, tolerating `field_count < 2` by filling missing
 /// fields with `"unspecified"`.
 pub(super) fn read2_str_tolerant<'a, R: Read<'a>>(

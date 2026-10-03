@@ -14,7 +14,7 @@
 //!
 //! Performance target: 633K vertices / 34M edges in < 30s.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::params::AlgoParams;
 use super::progress::ProgressReporter;
@@ -52,8 +52,10 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> AlgoResultBatch {
             let current_comm = community[node];
             let node_deg = node_degree[node];
 
-            // Compute weights to each neighbor community.
-            let mut comm_weights: HashMap<usize, f64> = HashMap::new();
+            // Compute weights to each neighbor community. Ordered by community
+            // id, so a tie between equal gains always goes to the same
+            // community and the result is the same on every run.
+            let mut comm_weights: BTreeMap<usize, f64> = BTreeMap::new();
             for &(neighbor, weight) in &adj[node] {
                 let nc = community[neighbor];
                 *comm_weights.entry(nc).or_insert(0.0) += weight;

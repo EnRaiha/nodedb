@@ -41,6 +41,11 @@ fn make_event(source: EventSource, op: WriteOp, collection: &str) -> WriteEvent 
         valid_time_ms: None,
         user_id: None,
         statement_digest: None,
+        // The write committed now, so the event stays in age retention.
+        commit_hlc: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok()),
     }
 }
 
@@ -523,7 +528,7 @@ fn dlq_enqueue_and_list() {
     assert_eq!(unresolved[0].error(), "constraint violation");
 
     // Resolve and verify.
-    assert!(dlq.resolve(id));
+    assert!(dlq.resolve(id).unwrap());
     assert_eq!(dlq.list_unresolved().len(), 0);
 }
 
@@ -531,7 +536,7 @@ fn dlq_enqueue_and_list() {
 fn dlq_resolve_nonexistent_returns_false() {
     let dir = tempfile::tempdir().unwrap();
     let mut dlq = TriggerDlq::open(dir.path()).unwrap();
-    assert!(!dlq.resolve(999));
+    assert!(!dlq.resolve(999).unwrap());
 }
 
 #[test]

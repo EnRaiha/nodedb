@@ -74,6 +74,10 @@ impl CoreLoop {
                 returning: _,
                 rls_filters: _,
             } => {
+                // An unbound key names no row: the delete matches nothing.
+                let Some(surrogate) = surrogate else {
+                    return self.stage_point_matched_nothing(task, tid, collection.as_str(), None);
+                };
                 let ctx = StageCtx::new(
                     task,
                     tid,

@@ -92,10 +92,8 @@ pub(super) async fn dispatch_task(
     }
 
     // A governed predicate resolves to a concrete row set before proposing
-    // (`control::write_resolve`); local (non-Raft) path skips this.
-    if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&task.plan)
-        && ctx.state.async_raft_proposer().is_some()
-    {
+    // (`control::write_resolve`).
+    if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&task.plan) {
         let authorized = super::sql_gateway::authorize_native_task(ctx, &task)?;
         let resp = crate::control::write_resolve::run_authorized_write_resolve(
             ctx.state, authorized, resolver,
@@ -104,38 +102,26 @@ pub(super) async fn dispatch_task(
         return Ok((resp, Vec::new(), Vec::new()));
     }
 
-    // Native DROP uses the same reversible all-core protocol as pgwire.
-    if matches!(
-        task.plan,
-        crate::bridge::envelope::PhysicalPlan::Array(
-            nodedb_physical::physical_plan::ArrayOp::DropArray { .. }
-        )
-    ) {
+    // Array DDL proposes a replicated catalog entry, as on pgwire.
+    if crate::control::array_catalog::ddl::is_array_ddl(&task.plan) {
         let authorized = super::sql_gateway::authorize_native_task(ctx, &task)?;
-        let task = authorized.into_physical_task();
-        let resp = crate::control::array_catalog::ddl::run_authorized_drop(
-            ctx.state,
-            task.tenant_id,
-            task.database_id,
-            task.plan,
-            TraceId::ZERO,
-        )
-        .await?;
+        let resp =
+            crate::control::array_catalog::ddl::run_authorized_array_ddl(ctx.state, authorized)
+                .await?;
         return Ok((resp, Vec::new(), Vec::new()));
     }
 
     // Materialize catalog providers and resolve Exchange nodes before dispatch.
-    match resolve_and_materialize(
-        ctx.state,
-        ctx.identity,
-        task.database_id,
-        task.tenant_id,
-        task.plan,
-        TraceId::ZERO,
-        task.txn_id,
-    )
-    .await?
-    {
+    // The native protocol has no weaker read consistency: every read is
+    // strong, so every leg confirms its group where it is served.
+    let scope = crate::control::server::exchange::ReadScope {
+        database_id: task.database_id,
+        tenant_id: task.tenant_id,
+        trace_id: TraceId::ZERO,
+        txn_id: task.txn_id,
+        linearizable: true,
+    };
+    match resolve_and_materialize(ctx.state, ctx.identity, task.plan, scope).await? {
         Resolved::Gathered(resp, shard_watermarks, dist_reads) => {
             return Ok((resp, shard_watermarks, dist_reads));
         }
@@ -150,7 +136,7 @@ pub(super) async fn dispatch_task(
         }
     }
 
-    // Everything else routes through the gateway when available, or local SPSC otherwise.
+    // Everything else routes through the gateway.
     let resp = dispatch_task_via_gateway(ctx, task).await?;
     Ok((resp, Vec::new(), Vec::new()))
 }

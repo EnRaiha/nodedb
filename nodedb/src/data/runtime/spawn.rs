@@ -12,9 +12,9 @@ use crate::data::eventfd::{EventFd, EventFdNotifier};
 use crate::data::executor::core_loop::CoreLoop;
 
 use super::boot_replay::replay_wal_and_rebuild_indexes;
-use super::boot_restore::load_boot_checkpoints;
 use super::boot_seed::seed_catalog_state;
 use super::event_loop::run_event_loop;
+use super::load_boot_checkpoints;
 use super::params::SpawnCoreParams;
 
 /// Spawn a Data Plane core on a dedicated OS thread with TPC isolation.
@@ -38,6 +38,7 @@ pub fn spawn_core(
         compaction_config,
         system_metrics,
         event_producer,
+        event_interest,
         governor,
         quiesce,
         hlc,
@@ -83,6 +84,7 @@ pub fn spawn_core(
                     maintenance_budget,
                     system_metrics,
                     event_producer,
+                    event_interest,
                     quiesce,
                     quarantine_registry,
                 },
@@ -133,7 +135,7 @@ pub fn spawn_core(
                 &vector_index_param_seed,
                 &columnar_schema_seed,
             );
-            replay_wal_and_rebuild_indexes(
+            let replayed = replay_wal_and_rebuild_indexes(
                 &mut core,
                 &wal_records,
                 num_cores,
@@ -144,8 +146,12 @@ pub fn spawn_core(
             // Replay is complete: every in-memory index (HNSW, etc.) has been
             // rebuilt from the WAL. Signal boot so the client gateway is not
             // opened until this core is ready to serve fully-recovered results.
+            // A failed replay signals its error, and boot refuses to start.
+            // The core still enters its event loop: it is fail-stopped, so it
+            // answers every request with a refusal instead of leaving boot's
+            // dispatches unanswered until boot gives up.
             // A closed receiver (boot already gave up) is not actionable here.
-            let _ = replay_done.send(());
+            let _ = replay_done.send(replayed);
 
             info!(core_id, "data plane core started (eventfd-driven)");
 
@@ -161,6 +167,7 @@ struct WiredDependencies {
     maintenance_budget: Arc<crate::control::maintenance::MaintenanceBudgetTracker>,
     system_metrics: Option<Arc<crate::control::metrics::SystemMetrics>>,
     event_producer: Option<crate::event::bus::EventProducer>,
+    event_interest: Arc<crate::event::interest::EventInterest>,
     quiesce: Option<Arc<crate::bridge::quiesce::CollectionQuiesce>>,
     quarantine_registry: Arc<crate::storage::quarantine::QuarantineRegistry>,
 }
@@ -173,6 +180,7 @@ fn wire_core_dependencies(core: &mut CoreLoop, deps: WiredDependencies) {
         maintenance_budget,
         system_metrics,
         event_producer,
+        event_interest,
         quiesce,
         quarantine_registry,
     } = deps;
@@ -188,6 +196,7 @@ fn wire_core_dependencies(core: &mut CoreLoop, deps: WiredDependencies) {
     if let Some(ep) = event_producer {
         core.set_event_producer(ep);
     }
+    core.set_event_interest(event_interest);
 
     // 2b. Wire the shared scan-quiesce registry so scan
     // handlers can refuse new scans against a draining

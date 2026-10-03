@@ -35,47 +35,45 @@ pub(super) async fn try_typed(
             priority,
             security,
             body_sql,
-        }) => Some(trigger::create_trigger(
-            state,
-            identity,
-            trigger::create::CreateTriggerRequest {
-                or_replace: *or_replace,
-                execution_mode,
-                name,
-                timing,
-                events_insert: *events_insert,
-                events_update: *events_update,
-                events_delete: *events_delete,
-                collection,
-                granularity,
-                when_condition: when_condition.as_deref(),
-                priority: *priority,
-                security: security.as_deref(),
-                body_sql,
-            },
-        )),
+        }) => Some(
+            trigger::create_trigger(
+                state,
+                identity,
+                trigger::create::CreateTriggerRequest {
+                    or_replace: *or_replace,
+                    execution_mode,
+                    name,
+                    timing,
+                    events_insert: *events_insert,
+                    events_update: *events_update,
+                    events_delete: *events_delete,
+                    collection,
+                    granularity,
+                    when_condition: when_condition.as_deref(),
+                    priority: *priority,
+                    security: security.as_deref(),
+                    body_sql,
+                },
+            )
+            .await,
+        ),
 
         NodedbStatement::Automation(AutomationStmt::AlterTrigger {
             name,
             action,
             new_owner,
-        }) => Some(trigger::alter_trigger(
-            state,
-            identity,
-            name,
-            action,
-            new_owner.as_deref(),
-        )),
+        }) => {
+            Some(trigger::alter_trigger(state, identity, name, action, new_owner.as_deref()).await)
+        }
 
         NodedbStatement::Automation(AutomationStmt::DropTrigger {
             name, if_exists, ..
         }) => {
-            // IF EXISTS short-circuit folded from the pgwire guard: a DROP of a
+            // IF EXISTS short-circuit: a DROP of a
             // non-existing trigger returns the tag before the token handler runs
             // (and before any catalog-read error surfaces). The `if_exists:
             // false` case and the existing-trigger case fall through to
-            // `drop_trigger`, which re-derives the name / IF EXISTS from `parts`
-            // exactly as the pgwire schema string dispatch did.
+            // `drop_trigger`, which re-derives the name / IF EXISTS from `parts`.
             if *if_exists && !trigger::trigger_exists(state, identity, name) {
                 return Some(Ok(vec![DdlResult::Status {
                     command: "DROP TRIGGER".to_string(),
@@ -83,7 +81,7 @@ pub(super) async fn try_typed(
                 }]));
             }
             let parts: Vec<&str> = sql.split_whitespace().collect();
-            Some(trigger::drop_trigger(state, identity, &parts))
+            Some(trigger::drop_trigger(state, identity, &parts).await)
         }
 
         NodedbStatement::Automation(AutomationStmt::ShowTriggers { .. }) => {
@@ -98,40 +96,45 @@ pub(super) async fn try_typed(
             scope,
             missed_policy,
             allow_overlap,
-        }) => Some(schedule::create_schedule(
-            state,
-            identity,
-            database_id,
-            &CreateScheduleRequest {
-                name,
-                cron_expr,
-                body_sql,
-                scope,
-                missed_policy,
-                allow_overlap: *allow_overlap,
-            },
-        )),
+        }) => Some(
+            schedule::create_schedule(
+                state,
+                identity,
+                database_id,
+                &CreateScheduleRequest {
+                    name,
+                    cron_expr,
+                    body_sql,
+                    scope,
+                    missed_policy,
+                    allow_overlap: *allow_overlap,
+                },
+            )
+            .await,
+        ),
 
         NodedbStatement::Automation(AutomationStmt::AlterSchedule {
             name,
             action,
             cron_expr,
-        }) => Some(schedule::alter_schedule(
-            state,
-            identity,
-            database_id,
-            name,
-            action,
-            cron_expr.as_deref(),
-        )),
+        }) => Some(
+            schedule::alter_schedule(
+                state,
+                identity,
+                database_id,
+                name,
+                action,
+                cron_expr.as_deref(),
+            )
+            .await,
+        ),
 
         NodedbStatement::Automation(AutomationStmt::DropSchedule { name, if_exists }) => {
-            // IF EXISTS short-circuit folded from the pgwire guard: a DROP of a
+            // IF EXISTS short-circuit: a DROP of a
             // non-existing schedule returns the tag before the token handler runs
             // (and before the tenant-admin gate). The `if_exists: false` case and
             // the existing-schedule case fall through to `drop_schedule`, which
-            // re-derives the name / IF EXISTS from `parts` exactly as the pgwire
-            // admin string dispatch did.
+            // re-derives the name / IF EXISTS from `parts`.
             if *if_exists && !schedule::schedule_exists(state, identity, database_id, name) {
                 return Some(Ok(vec![DdlResult::Status {
                     command: "DROP SCHEDULE".to_string(),
@@ -139,12 +142,7 @@ pub(super) async fn try_typed(
                 }]));
             }
             let parts: Vec<&str> = sql.split_whitespace().collect();
-            Some(schedule::drop_schedule(
-                state,
-                identity,
-                database_id,
-                &parts,
-            ))
+            Some(schedule::drop_schedule(state, identity, database_id, &parts).await)
         }
 
         NodedbStatement::Automation(AutomationStmt::CreateAlert {
@@ -158,35 +156,37 @@ pub(super) async fn try_typed(
             recover_after,
             severity,
             notify_targets_raw,
-        }) => Some(alert::create_alert(
-            state,
-            identity,
-            &CreateAlertRequest {
-                name,
-                collection,
-                where_filter: where_filter.as_deref(),
-                condition_raw,
-                group_by,
-                window_raw,
-                fire_after: *fire_after,
-                recover_after: *recover_after,
-                severity,
-                notify_targets_raw,
-                database_id,
-            },
-        )),
-
-        NodedbStatement::Automation(AutomationStmt::AlterAlert { name, action }) => Some(
-            alert::alter_alert(state, identity, database_id, name, action),
+        }) => Some(
+            alert::create_alert(
+                state,
+                identity,
+                &CreateAlertRequest {
+                    name,
+                    collection,
+                    where_filter: where_filter.as_deref(),
+                    condition_raw,
+                    group_by,
+                    window_raw,
+                    fire_after: *fire_after,
+                    recover_after: *recover_after,
+                    severity,
+                    notify_targets_raw,
+                    database_id,
+                },
+            )
+            .await,
         ),
 
+        NodedbStatement::Automation(AutomationStmt::AlterAlert { name, action }) => {
+            Some(alert::alter_alert(state, identity, database_id, name, action).await)
+        }
+
         NodedbStatement::Automation(AutomationStmt::DropAlert { name, if_exists }) => {
-            // IF EXISTS short-circuit folded from the pgwire guard: a DROP of a
+            // IF EXISTS short-circuit: a DROP of a
             // non-existing alert returns the tag before the token handler runs
             // (and before the tenant-admin gate). The `if_exists: false` case and
             // the existing-alert case fall through to `drop_alert`, which
-            // re-derives the name from `parts[2]` exactly as the pgwire admin
-            // string dispatch did.
+            // re-derives the name from `parts[2]`.
             if *if_exists && !alert::alert_exists(state, identity, database_id, name) {
                 return Some(Ok(vec![DdlResult::Status {
                     command: "DROP ALERT".to_string(),
@@ -194,7 +194,7 @@ pub(super) async fn try_typed(
                 }]));
             }
             let parts: Vec<&str> = sql.split_whitespace().collect();
-            Some(alert::drop_alert(state, identity, database_id, &parts))
+            Some(alert::drop_alert(state, identity, database_id, &parts).await)
         }
 
         _ => None,

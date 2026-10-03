@@ -16,7 +16,21 @@ use crate::control::cluster::handle::ClusterHandle;
 
 /// Node id for the synthesized single-node Calvin deployment. A standalone
 /// server is a cluster of one, so the id is fixed and non-zero.
-const SINGLE_NODE_CALVIN_NODE_ID: u64 = 1;
+pub const SINGLE_NODE_CALVIN_NODE_ID: u64 = 1;
+
+/// The node id a server booted from `config` runs as.
+///
+/// It is `[cluster] node_id` when the section is present. A server without
+/// `[cluster]` runs the synthesized one-node cluster as
+/// [`SINGLE_NODE_CALVIN_NODE_ID`]. The WAL archive and the PITR base
+/// snapshots key on this id, so an offline restore reads the node life the
+/// server wrote under it.
+pub fn configured_node_id(config: &crate::ServerConfig) -> u64 {
+    match &config.cluster {
+        Some(cluster) => cluster.node_id,
+        None => SINGLE_NODE_CALVIN_NODE_ID,
+    }
+}
 
 /// Raft group count for the synthesized single-node Calvin deployment. This
 /// node is the sole member of every group, so the value only affects how the
@@ -84,6 +98,35 @@ pub async fn init_cluster_with_transport(
         })?,
     );
 
+    // Raise this boot's epoch durably, on a blocking thread, before either
+    // transport sends. Peers keep their replay windows for this node across
+    // a restart, so every boot sends in a sequence range above every earlier
+    // boot's. No clock goes into it.
+    let boot_epoch = {
+        let catalog = Arc::clone(&catalog);
+        tokio::task::spawn_blocking(move || catalog.advance_boot_epoch())
+            .await
+            .map_err(|e| crate::Error::Config {
+                detail: format!("cluster boot epoch task: {e}"),
+            })?
+            .map_err(|e| crate::Error::Config {
+                detail: format!("cluster boot epoch: {e}"),
+            })?
+    };
+    transport.enter_boot_epoch(boot_epoch);
+
+    // SWIM binds before startup so bootstrap, join, and restart advertise the
+    // bound address in this node's topology entry. A bind error fails startup.
+    let swim_transport = Arc::new(
+        nodedb_cluster::bind_swim_listener(config.swim_listen, config.listen, transport.mac_key())
+            .await
+            .map_err(|e| crate::Error::Config {
+                detail: format!("cluster SWIM listener: {e}"),
+            })?,
+    );
+    swim_transport.enter_boot_epoch(boot_epoch);
+    let swim_addr = nodedb_cluster::swim::Transport::local_addr(swim_transport.as_ref());
+
     // 3. Bootstrap, join, or restart.
     let cluster_config = nodedb_cluster::ClusterConfig {
         node_id: config.node_id,
@@ -97,7 +140,7 @@ pub async fn init_cluster_with_transport(
             max_attempts: config.join_retry_max_attempts,
             max_backoff_secs: config.join_retry_max_backoff_secs,
         },
-        swim_udp_addr: None,
+        swim_udp_addr: Some(swim_addr),
         election_timeout_min: std::time::Duration::from_millis(
             transport_tuning.effective_election_timeout_min_ms(),
         ),
@@ -107,6 +150,7 @@ pub async fn init_cluster_with_transport(
         install_snapshot_chunk_bytes: 4 * 1024 * 1024,
         orphan_partial_max_age_secs: 300,
         log_compaction_threshold: config.log_compaction_threshold,
+        wire_build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
     };
 
     let lifecycle = nodedb_cluster::ClusterLifecycleTracker::new();
@@ -163,11 +207,13 @@ pub async fn init_cluster_with_transport(
         running_cluster: Mutex::new(None),
         pending_subsystems: Mutex::new(Some(crate::control::cluster::handle::PendingSubsystems {
             config: cluster_config,
+            swim_transport,
         })),
+        migration_tracker: Arc::new(nodedb_cluster::MigrationTracker::new()),
     })
 }
 
-/// Initialize a flag-gated single-node Calvin deployment on a standalone server.
+/// Initialize the single-node Calvin deployment of a server with no `[cluster]`.
 ///
 /// Synthesizes a one-node cluster configuration — this node as its own sole
 /// seed, replication factor 1 — and drives the SAME cluster startup a real
@@ -175,14 +221,12 @@ pub async fn init_cluster_with_transport(
 /// to an ephemeral loopback port and never dials a peer; a single-member Raft
 /// group is the deterministic bootstrapper and self-elects, committing locally.
 /// The single node therefore hosts every vShard, so the sequencer group and
-/// per-vShard schedulers all come up and `calvin_available` becomes true.
+/// per-vShard schedulers all come up.
 ///
 /// The caller must still call [`super::start_raft::start_raft`] after
 /// `SharedState` is constructed, exactly as for [`init_cluster`].
 ///
-/// Only reached when `server.single_node_calvin` is set and `[cluster]` is
-/// absent; when the flag is off (the default) the standalone boot path never
-/// calls this and no Calvin stack is started.
+/// Boot calls this whenever `[cluster]` is absent.
 pub async fn init_single_node_calvin(
     data_dir: &std::path::Path,
     transport_tuning: &ClusterTransportTuning,
@@ -229,6 +273,9 @@ pub async fn init_single_node_calvin(
         log_compaction_threshold: None,
         join_retry_max_attempts: 8,
         join_retry_max_backoff_secs: 32,
+        // The QUIC port is OS-assigned, so `port + 1` can be taken. No peer
+        // ever probes this node, so an OS-assigned loopback port serves.
+        swim_listen: Some(listen_placeholder),
     };
 
     init_cluster_with_transport(&settings, transport, data_dir, transport_tuning).await

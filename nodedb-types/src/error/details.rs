@@ -119,8 +119,6 @@ pub enum ErrorDetails {
     // Query
     #[serde(rename = "plan_error")]
     PlanError { phase: String, detail: String },
-    #[serde(rename = "fan_out_exceeded")]
-    FanOutExceeded { shards_touched: u16, limit: u16 },
     #[serde(rename = "sql_not_enabled")]
     SqlNotEnabled,
     /// A function call names no registered scalar/aggregate/window function.

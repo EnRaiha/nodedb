@@ -20,19 +20,23 @@ use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::entry::CloneWriteOutcome;
-use super::probes::{fetch_source_row, probe_row_in_target};
+use super::probes::{ProbeTarget, fetch_source_row, probe_row_in_target};
 use super::util::{strip_db_prefix, synthetic_affected_response, write_err};
+use crate::control::server::shared::session::ddl_buffer::buffered_clone_suppressions;
+use crate::types::TxnId;
 
 /// The clone-relevant shape of one document write.
 enum DocWriteKind<'a> {
     Update {
         document_id: &'a str,
         /// Target-side surrogate carried by the plan, used to probe the clone.
-        surrogate: Surrogate,
+        /// `None` when the key has no target binding.
+        surrogate: Option<Surrogate>,
     },
     Delete {
         document_id: &'a str,
-        surrogate: Surrogate,
+        /// See `Update::surrogate`.
+        surrogate: Option<Surrogate>,
     },
     /// Insert / put / upsert. Carries one id per row the statement writes.
     Insert { document_ids: Vec<&'a str> },
@@ -108,41 +112,46 @@ fn classify(plan: &PhysicalPlan) -> Option<DocWrite<'_>> {
     }
 }
 
-/// Resolve the surrogate the source database bound to `document_id`.
+/// Resolve the surrogate the source database bound to `document_id`, at the
+/// source collection's home through the async routed exchange.
 ///
 /// `None` means the source never held that primary key.
-fn source_surrogate(
+async fn source_surrogate(
     state: &SharedState,
     tenant_id: TenantId,
     source_db_id: DatabaseId,
     source_coll_qualified: &str,
     document_id: &str,
 ) -> crate::Result<Option<Surrogate>> {
-    state
-        .surrogate_assigner
-        .lookup(
-            nodedb_types::CollectionKey::from_qualified_str(source_db_id, source_coll_qualified)?,
-            tenant_id,
-            document_id.as_bytes(),
-        )
-        .map_err(|e| write_err(format!("clone write source surrogate lookup: {e}")))
+    crate::control::server::surrogate_exchange::lookup_surrogate_routed(
+        state,
+        nodedb_types::CollectionKey::from_qualified_str(source_db_id, source_coll_qualified)?,
+        tenant_id,
+        document_id.as_bytes(),
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| write_err(format!("clone write source surrogate lookup: {e}")))
 }
 
 /// Point a `PointUpdate` plan at the surrogate the copy-up bound in the target
 /// database. The plan resolved the pk read-only, so before the copy-up there
-/// was no target binding to carry and the plan holds `Surrogate::ZERO`.
+/// was no target binding to carry and the plan holds `None`.
 fn retarget_point_update(plan: &mut PhysicalPlan, target: Surrogate) {
     if let PhysicalPlan::Document(DocumentOp::PointUpdate { surrogate, .. }) = plan {
-        *surrogate = target;
+        *surrogate = Some(target);
     }
 }
 
-/// Handle Document CoW write interception.
+/// Handle Document CoW write interception. Inside transaction `txn_id` the
+/// presence probes read its overlay, and a source row the transaction already
+/// tombstoned or copied up counts as gone from the source.
 pub(super) async fn intercept_doc_clone_write(
     state: &SharedState,
     task: &mut PhysicalTask,
     identity: &AuthenticatedIdentity,
     tenant_id: TenantId,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<CloneWriteOutcome> {
     let Some(write) = classify(&task.plan) else {
         return Ok(CloneWriteOutcome::Passthrough);
@@ -184,6 +193,17 @@ pub(super) async fn intercept_doc_clone_write(
         source_db_id,
         origin.source_collection.as_str(),
     );
+    // Source rows this transaction's buffered tombstones and copy-ups hide.
+    let hidden = buffered_clone_suppressions(
+        &crate::control::planner::sql_plan_convert::convert::db_qualified(db_id, coll_name),
+    )
+    .surrogates;
+    let target = ProbeTarget {
+        tenant_id,
+        db_id,
+        collection_qualified: write.collection_qualified,
+        txn_id,
+    };
 
     match write.kind {
         DocWriteKind::Insert { document_ids } => {
@@ -194,18 +214,21 @@ pub(super) async fn intercept_doc_clone_write(
                     source_db_id,
                     &source_coll_qualified,
                     document_id,
-                )?
+                )
+                .await?
                 else {
                     continue;
                 };
                 // A binding without a live row makes the tombstone a read no-op —
                 // not worth a probe round trip per inserted key.
                 perform_clone_tombstone(TombstoneParams {
+                    tenant_id,
                     state,
                     target_db_id: db_id,
                     target_collection: coll_name,
                     source_surrogate: surrogate,
                 })
+                .await
                 .map_err(|e| write_err(format!("clone insert tombstone: {e}")))?;
             }
             Ok(CloneWriteOutcome::Passthrough)
@@ -215,17 +238,10 @@ pub(super) async fn intercept_doc_clone_write(
             document_id,
             surrogate,
         } => {
-            let row_in_target = probe_row_in_target(
-                state,
-                identity,
-                tenant_id,
-                db_id,
-                write.collection_qualified,
-                document_id,
-                surrogate,
-            )
-            .await
-            .map_err(|e| write_err(format!("clone write probe: {e}")))?;
+            let row_in_target =
+                probe_row_in_target(state, identity, target, document_id, surrogate)
+                    .await
+                    .map_err(|e| write_err(format!("clone write probe: {e}")))?;
 
             let src = source_surrogate(
                 state,
@@ -233,17 +249,20 @@ pub(super) async fn intercept_doc_clone_write(
                 source_db_id,
                 &source_coll_qualified,
                 document_id,
-            )?;
+            )
+            .await?;
 
             // Tombstone regardless of target residency — after DELETE the clone
             // must never show the source copy again.
             if let Some(src) = src {
                 perform_clone_tombstone(TombstoneParams {
+                    tenant_id,
                     state,
                     target_db_id: db_id,
                     target_collection: coll_name,
                     source_surrogate: src,
                 })
+                .await
                 .map_err(|e| write_err(format!("clone tombstone: {e}")))?;
             }
 
@@ -253,7 +272,8 @@ pub(super) async fn intercept_doc_clone_write(
 
             // The source read decides rows-affected (1 or 0) — a resolved surrogate
             // is not evidence the row exists, since a surrogate outlives its row.
-            let source_row = match src {
+            // A row this transaction already hid is gone from the clone.
+            let source_row = match src.filter(|src| !hidden.contains(&src.as_u32())) {
                 Some(src) => fetch_source_row(
                     state,
                     identity,
@@ -279,17 +299,10 @@ pub(super) async fn intercept_doc_clone_write(
             document_id,
             surrogate,
         } => {
-            let row_in_target = probe_row_in_target(
-                state,
-                identity,
-                tenant_id,
-                db_id,
-                write.collection_qualified,
-                document_id,
-                surrogate,
-            )
-            .await
-            .map_err(|e| write_err(format!("clone write probe: {e}")))?;
+            let row_in_target =
+                probe_row_in_target(state, identity, target, document_id, surrogate)
+                    .await
+                    .map_err(|e| write_err(format!("clone write probe: {e}")))?;
 
             if row_in_target {
                 return Ok(CloneWriteOutcome::Passthrough);
@@ -301,10 +314,15 @@ pub(super) async fn intercept_doc_clone_write(
                 source_db_id,
                 &source_coll_qualified,
                 document_id,
-            )?
+            )
+            .await?
             else {
                 return Ok(CloneWriteOutcome::Passthrough);
             };
+            // A row this transaction already hid updates nothing.
+            if hidden.contains(&src.as_u32()) {
+                return Ok(CloneWriteOutcome::Passthrough);
+            }
 
             let source_row_bytes = fetch_source_row(
                 state,
@@ -335,7 +353,7 @@ pub(super) async fn intercept_doc_clone_write(
             .map_err(|e| write_err(format!("clone copyup: {e}")))?;
 
             // The copied-up row lives under a target surrogate the plan
-            // could not know: hand it to the passthrough dispatch so the
+            // cannot know: hand it to the passthrough dispatch so the
             // UPDATE lands on that row instead of an unbound key.
             retarget_point_update(&mut task.plan, target_surrogate);
             Ok(CloneWriteOutcome::Passthrough)

@@ -10,13 +10,12 @@
 //! SHOW DELEGATIONS
 //! ```
 //!
-//! Ported from the pgwire `ddl::impersonation_ddl` handlers. All five mutate
+//! All five handlers mutate
 //! or read the GLOBAL `state.impersonation` registry (keyed by user_id, not
 //! by connection) plus the audit log — not the current connection's identity
 //! — so they carry no per-connection state. The superuser / delegator gates,
 //! the token parsing (`AS` / `SCOPES` / `EXPIRES` / `REASON` extraction), the
-//! registry calls, and the audit records are preserved verbatim; only the
-//! result construction changed from pgwire `Response` / `PgWireError` to the
+//! registry calls, and the audit records run here. The result is the
 //! protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use serde_json::{Map, Value as JsonValue};

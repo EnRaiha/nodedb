@@ -2,20 +2,17 @@
 
 //! Vote/verdict-tally methods for [`super::completion::CalvinCompletionRegistry`].
 //!
-//! Split out of `completion.rs` (which hit the file-size limit): this module
-//! holds every method that participates in the cross-shard commit-barrier
-//! vote tally and verdict push, plus their tests. It reaches into
-//! `completion.rs`'s otherwise-private `Inner` / `PendingCompletion` internals
-//! via `pub(crate)` fields — no visibility is widened beyond this crate.
+//! This module holds every method that takes part in the cross-shard
+//! commit-barrier vote tally and verdict push, plus their tests. It reads
+//! `Inner` and `PendingCompletion` through `pub(crate)` fields.
 
 use std::collections::BTreeMap;
 
 use tokio::sync::mpsc;
 
 use super::TxnId;
-use super::completion::{
-    CalvinCompletionRegistry, ParticipantVote, PendingCompletion, VerdictOutcome,
-};
+use super::completion::{CalvinCompletionRegistry, ParticipantVote, VerdictOutcome};
+use super::completion_entry::PendingCompletion;
 use super::sequencer::AbortReason;
 
 /// Push notification that a staged cross-shard txn's authoritative global
@@ -51,6 +48,16 @@ impl CalvinCompletionRegistry {
             .unwrap_or_else(|p| p.into_inner())
             .verdict_signal_senders
             .insert(vshard, tx);
+    }
+
+    /// Stop pushing verdicts to `vshard`'s scheduler: this node no longer
+    /// replicates the vShard.
+    pub fn unregister_verdict_signal_sender(&self, vshard: u32) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .verdict_signal_senders
+            .remove(&vshard);
     }
 
     /// Seed the expected participant count for `txn` deterministically from the
@@ -173,9 +180,6 @@ impl CalvinCompletionRegistry {
                     );
                     entry.verdict = Some(verdict);
                 }
-                // Same decision, but a legacy abort recorded no reason: adopt the
-                // one this apply carries.
-                Some(VerdictOutcome::Abort(None)) => entry.verdict = Some(verdict),
                 Some(_) => {}
                 None => entry.verdict = Some(verdict),
             }
@@ -223,26 +227,34 @@ impl CalvinCompletionRegistry {
 /// Aggregate a complete vote tally: commit only when every participant voted
 /// commit, otherwise abort with the highest-precedence reason.
 ///
-/// Precedence: `ParticipantError` outranks `SerializationConflict` — a peer that
-/// never staged makes a stale read-set unverifiable, and the infrastructure
-/// failure is the actionable diagnosis.
+/// Precedence: `PartsLost` outranks everything, since no participant holds
+/// the whole transaction. `ParticipantError` outranks `CollectionSuperseded`, which
+/// outranks `PredictionDrift`, which outranks `SerializationConflict`. A peer
+/// that never staged makes every other verdict unverifiable, a superseded
+/// collection makes a retry against the same read-set pointless, and a
+/// drifted prediction retries with a fresh reconnaissance. The tally is
+/// order-independent.
 fn tally_verdict(votes: &BTreeMap<u32, ParticipantVote>) -> VerdictOutcome {
-    let mut aborted = false;
-    let mut reason: Option<AbortReason> = None;
-    for vote in votes.values() {
-        let ParticipantVote::Abort(vote_reason) = vote else {
-            continue;
-        };
-        aborted = true;
-        match (reason, vote_reason) {
-            (Some(AbortReason::ParticipantError), _) | (Some(_), None) => {}
-            _ => reason = *vote_reason,
+    fn rank(reason: AbortReason) -> u8 {
+        match reason {
+            AbortReason::PartsLost => 4,
+            AbortReason::ParticipantError => 3,
+            AbortReason::CollectionSuperseded => 2,
+            AbortReason::PredictionDrift => 1,
+            AbortReason::SerializationConflict => 0,
         }
     }
-    if aborted {
-        VerdictOutcome::Abort(reason)
-    } else {
-        VerdictOutcome::Commit
+    let mut reason: Option<AbortReason> = None;
+    for vote in votes.values() {
+        if let ParticipantVote::Abort(vote_reason) = *vote
+            && reason.is_none_or(|held| rank(vote_reason) > rank(held))
+        {
+            reason = Some(vote_reason);
+        }
+    }
+    match reason {
+        Some(reason) => VerdictOutcome::Abort(reason),
+        None => VerdictOutcome::Commit,
     }
 }
 
@@ -258,16 +270,14 @@ mod tests {
         reg.note_vote(
             txn,
             2,
-            ParticipantVote::Abort(Some(AbortReason::SerializationConflict)),
+            ParticipantVote::Abort(AbortReason::SerializationConflict),
         );
         let tally = reg.vote_tally(txn).expect("entry created by note_vote");
         assert_eq!(tally.len(), 2);
         assert_eq!(tally.get(&1), Some(&ParticipantVote::Commit));
         assert_eq!(
             tally.get(&2),
-            Some(&ParticipantVote::Abort(Some(
-                AbortReason::SerializationConflict
-            )))
+            Some(&ParticipantVote::Abort(AbortReason::SerializationConflict))
         );
     }
 
@@ -309,14 +319,14 @@ mod tests {
         reg.note_vote(
             txn,
             2,
-            ParticipantVote::Abort(Some(AbortReason::SerializationConflict)),
+            ParticipantVote::Abort(AbortReason::SerializationConflict),
         );
         // Any abort vote makes the aggregated verdict an abort.
         assert_eq!(
             rx.try_recv().expect("verdict emitted"),
             (
                 txn,
-                VerdictOutcome::Abort(Some(AbortReason::SerializationConflict))
+                VerdictOutcome::Abort(AbortReason::SerializationConflict)
             )
         );
         assert!(rx.try_recv().is_err());
@@ -333,19 +343,16 @@ mod tests {
         reg.note_vote(
             txn,
             1,
-            ParticipantVote::Abort(Some(AbortReason::SerializationConflict)),
+            ParticipantVote::Abort(AbortReason::SerializationConflict),
         );
         reg.note_vote(
             txn,
             2,
-            ParticipantVote::Abort(Some(AbortReason::ParticipantError)),
+            ParticipantVote::Abort(AbortReason::ParticipantError),
         );
         assert_eq!(
             rx.try_recv().expect("verdict emitted"),
-            (
-                txn,
-                VerdictOutcome::Abort(Some(AbortReason::ParticipantError))
-            ),
+            (txn, VerdictOutcome::Abort(AbortReason::ParticipantError)),
             "a peer that never staged makes the stale read-set unverifiable"
         );
     }
@@ -361,20 +368,44 @@ mod tests {
         reg.note_vote(
             txn,
             1,
-            ParticipantVote::Abort(Some(AbortReason::ParticipantError)),
+            ParticipantVote::Abort(AbortReason::ParticipantError),
         );
         reg.note_vote(
             txn,
             2,
-            ParticipantVote::Abort(Some(AbortReason::SerializationConflict)),
+            ParticipantVote::Abort(AbortReason::SerializationConflict),
         );
         assert_eq!(
             rx.try_recv().expect("verdict emitted"),
-            (
-                txn,
-                VerdictOutcome::Abort(Some(AbortReason::ParticipantError))
-            )
+            (txn, VerdictOutcome::Abort(AbortReason::ParticipantError))
         );
+    }
+
+    /// A superseded collection aborts a transaction other slices voted to
+    /// commit, outranks a conflict, and yields to a participant error, in any
+    /// vote order.
+    #[test]
+    fn a_superseded_collection_aborts_the_whole_transaction() {
+        let superseded = ParticipantVote::Abort(AbortReason::CollectionSuperseded);
+        let conflict = ParticipantVote::Abort(AbortReason::SerializationConflict);
+        let errored = ParticipantVote::Abort(AbortReason::ParticipantError);
+        let tally = |votes: [&ParticipantVote; 2]| {
+            let votes: BTreeMap<u32, ParticipantVote> =
+                (1..).zip(votes.into_iter().copied()).collect();
+            tally_verdict(&votes)
+        };
+        let aborted = VerdictOutcome::Abort;
+
+        assert_eq!(
+            tally([&ParticipantVote::Commit, &superseded]),
+            aborted(AbortReason::CollectionSuperseded)
+        );
+        for votes in [[&superseded, &conflict], [&conflict, &superseded]] {
+            assert_eq!(tally(votes), aborted(AbortReason::CollectionSuperseded));
+        }
+        for votes in [[&superseded, &errored], [&errored, &superseded]] {
+            assert_eq!(tally(votes), aborted(AbortReason::ParticipantError));
+        }
     }
 
     #[tokio::test]
@@ -476,7 +507,7 @@ mod tests {
         let txn = TxnId::new(51, 0);
         reg.note_verdict(
             txn,
-            VerdictOutcome::Abort(Some(AbortReason::SerializationConflict)),
+            VerdictOutcome::Abort(AbortReason::SerializationConflict),
         );
 
         // Both locally registered vShard schedulers receive the broadcast; each
@@ -526,7 +557,7 @@ mod tests {
         // Must not panic despite the closed channel; the verdict still stores.
         reg.note_verdict(
             txn,
-            VerdictOutcome::Abort(Some(AbortReason::SerializationConflict)),
+            VerdictOutcome::Abort(AbortReason::SerializationConflict),
         );
         assert_eq!(reg.verdict(txn), Some(false));
     }
@@ -573,14 +604,14 @@ mod tests {
         reg.note_vote(
             txn,
             2,
-            ParticipantVote::Abort(Some(AbortReason::SerializationConflict)),
+            ParticipantVote::Abort(AbortReason::SerializationConflict),
         );
         assert_eq!(reg.verdict(txn), None);
         assert_eq!(
             reg.drain_unproposed_verdicts(),
             vec![(
                 txn,
-                VerdictOutcome::Abort(Some(AbortReason::SerializationConflict))
+                VerdictOutcome::Abort(AbortReason::SerializationConflict)
             )],
             "any abort vote makes the re-proposed verdict an abort"
         );

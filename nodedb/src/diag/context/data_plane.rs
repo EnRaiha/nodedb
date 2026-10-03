@@ -152,7 +152,8 @@ impl DomainContext for CalvinApplyHalted<'_> {
 /// failed.
 pub(in crate::diag) struct CoreFailStopped<'a> {
     pub core_id: usize,
-    /// Cause label (`rollback_failed`, `post_install_failed`).
+    /// Cause label (`rollback_failed`, `post_install_failed`,
+    /// `committed_row_unfit`).
     pub cause: &'a str,
     pub detail: &'a str,
 }

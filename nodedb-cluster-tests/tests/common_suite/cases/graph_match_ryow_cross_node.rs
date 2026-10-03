@@ -104,9 +104,8 @@ async fn staged_varlen_edge_is_read_your_own_writes_across_cores() {
         .await
         .expect("spawn standalone single-node-calvin server");
 
-    // The lone sequencer voter self-elects; wait for it so `calvin_available` is
-    // genuinely operational (a cross-shard edge is dual-home, not forced
-    // single-home).
+    // The lone sequencer voter self-elects; wait for it so the sequencer is
+    // operational before the cross-shard edge write.
     wait_for(
         "single-node sequencer leader elected",
         Duration::from_secs(10),
@@ -116,7 +115,7 @@ async fn staged_varlen_edge_is_read_your_own_writes_across_cores() {
     .await;
     assert!(
         node.shared.cluster_transport.is_some() && node.shared.sequencer_inbox.get().is_some(),
-        "single-node calvin must wire calvin_available (cluster_transport + sequencer_inbox)"
+        "single-node calvin must wire cluster_transport and sequencer_inbox"
     );
 
     node.client

@@ -98,7 +98,8 @@ struct CrdtAdmissionWorkflow<'a> {
 }
 
 /// Whether an operation changes the Loro frontier and must serialize with an
-/// admission preview when executed directly on a single-node Data Plane.
+/// admission preview when it is dispatched to this node's cores without a
+/// proposal.
 pub fn changes_crdt_frontier(op: &CrdtOp) -> bool {
     match op {
         CrdtOp::Apply { .. }
@@ -201,6 +202,15 @@ pub(crate) async fn dispatch_crdt_apply_admitted_outcome(
         event_source,
         policy,
     } = request;
+    // Every CRDT apply converges here; the lease gates it on a drained
+    // collection and lives until the apply's outcome.
+    let _lease = crate::control::server::shared::clone_write::write_lease(
+        state,
+        tenant_id,
+        database_id,
+        &plan,
+    )
+    .await?;
     let (document_id, delta) = match &plan {
         PhysicalPlan::Crdt(
             CrdtOp::Apply {
@@ -249,15 +259,34 @@ pub(crate) async fn dispatch_crdt_apply_admitted_outcome(
     };
     tokio::time::timeout(
         timeout,
-        state.vshard_admission_sequencer.run(vshard_id, || {
-            admit_apply_locked(&workflow, plan, &document_id, &delta)
-        }),
+        state.vshard_admission_sequencer.run_after_proposed(
+            vshard_id,
+            |last_proposed| async move {
+                caught_up(&workflow, last_proposed).await?;
+                admit_apply_locked(&workflow, plan, &document_id, &delta).await
+            },
+        ),
     )
     .await
     .map_err(|_| crate::Error::CrdtAdmissionTimeout {
         vshard_id,
         timeout_ms: timeout_ms(timeout),
     })?
+}
+
+/// Wait until this node applied every write admitted to the workflow's
+/// vShard before this admission took the slot, so its preview reads them.
+async fn caught_up(
+    workflow: &CrdtAdmissionWorkflow<'_>,
+    last_proposed: Option<crate::control::wal_replication::ProposedAt>,
+) -> crate::Result<()> {
+    crate::control::vshard_admission::await_admitted_applies(
+        workflow.state,
+        workflow.vshard_id,
+        last_proposed,
+        std::time::Instant::now() + workflow.timeout,
+    )
+    .await
 }
 
 async fn admit_apply_locked(
@@ -426,6 +455,15 @@ pub(crate) async fn dispatch_crdt_restore_admitted(
         event_source,
         policy,
     } = request;
+    // The restore writes a delta like any apply; the lease gates it on a
+    // drained collection and lives until its outcome.
+    let _lease = crate::control::server::shared::clone_write::collections_write_lease(
+        state,
+        tenant_id,
+        database_id,
+        [collection.to_owned()],
+    )
+    .await?;
     // `collection` is the plan's database-qualified name.
     let vshard_id =
         nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
@@ -441,39 +479,50 @@ pub(crate) async fn dispatch_crdt_restore_admitted(
     };
     tokio::time::timeout(
         timeout,
-        state.vshard_admission_sequencer.run(vshard_id, || async {
-            for _attempt in 0..FRONTIER_RETRY_LIMIT {
-                let delta =
-                    generate_restore_delta(&workflow, document_id, target_version_json, surrogate)
-                        .await?;
-                if delta.is_empty() {
-                    return Ok(None);
+        state.vshard_admission_sequencer.run_after_proposed(
+            vshard_id,
+            |last_proposed| async move {
+                caught_up(&workflow, last_proposed).await?;
+                for _attempt in 0..FRONTIER_RETRY_LIMIT {
+                    let delta = generate_restore_delta(
+                        &workflow,
+                        document_id,
+                        target_version_json,
+                        surrogate,
+                    )
+                    .await?;
+                    if delta.is_empty() {
+                        return Ok(None);
+                    }
+                    let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
+                        collection: nodedb_types::QualifiedCollection::from_stored(
+                            collection.to_owned(),
+                        ),
+                        document_id: document_id.to_owned(),
+                        delta: delta.clone(),
+                        peer_id,
+                        mutation_id: 0,
+                        surrogate,
+                        provenance: None,
+                        constraint_version_required: 0,
+                        expected_frontier_digest: None,
+                    });
+                    let preview = preview(&workflow, document_id, &delta).await?;
+                    workflow.policy.evaluate(&preview)?;
+                    match apply_fenced(&workflow, stamp_fence(plan, preview.frontier_digest)?).await
+                    {
+                        Err(crate::Error::DataPlane(ErrorCode::CrdtFrontierMismatch {
+                            ..
+                        })) => {}
+                        result => return result.map(Some),
+                    }
                 }
-                let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
-                    collection: nodedb_types::QualifiedCollection::from_stored(
-                        collection.to_owned(),
-                    ),
-                    document_id: document_id.to_owned(),
-                    delta: delta.clone(),
-                    peer_id,
-                    mutation_id: 0,
-                    surrogate,
-                    provenance: None,
-                    constraint_version_required: 0,
-                    expected_frontier_digest: None,
-                });
-                let preview = preview(&workflow, document_id, &delta).await?;
-                workflow.policy.evaluate(&preview)?;
-                match apply_fenced(&workflow, stamp_fence(plan, preview.frontier_digest)?).await {
-                    Err(crate::Error::DataPlane(ErrorCode::CrdtFrontierMismatch { .. })) => {}
-                    result => return result.map(Some),
-                }
-            }
-            Err(crate::Error::CrdtAdmissionRetriesExhausted {
-                vshard_id,
-                attempts: FRONTIER_RETRY_LIMIT,
-            })
-        }),
+                Err(crate::Error::CrdtAdmissionRetriesExhausted {
+                    vshard_id,
+                    attempts: FRONTIER_RETRY_LIMIT,
+                })
+            },
+        ),
     )
     .await
     .map_err(|_| crate::Error::CrdtAdmissionTimeout {
@@ -518,61 +567,32 @@ async fn apply_fenced(
     workflow: &CrdtAdmissionWorkflow<'_>,
     plan: PhysicalPlan,
 ) -> crate::Result<CrdtAdmissionOutcome> {
-    if let Some(raw) = workflow.state.raw_async_raft_proposer() {
-        let entry = to_replicated_entry(
-            workflow.tenant_id,
-            workflow.database_id,
-            workflow.vshard_id,
-            &ReplicableWrite::decide_for_replication(&plan)?,
-        )?
-        .ok_or(crate::Error::CrdtAdmissionInvalidPlan {
-            reason: "admitted CRDT Apply has no replicated form",
-        })?
-        // Every replica gives the write the source this node dispatches it
-        // with.
-        .with_event_source(workflow.event_source);
-        let outcome = tokio::time::timeout(
-            workflow.timeout,
-            crate::control::wal_replication::propose_replicated_entry(workflow.state, raw, entry),
-        )
-        .await
-        .map_err(|_| crate::Error::CrdtAdmissionTimeout {
-            vshard_id: workflow.vshard_id,
-            timeout_ms: timeout_ms(workflow.timeout),
-        })??;
-        // This node's apply of the entry recorded its commit HLC.
-        return Ok(CrdtAdmissionOutcome {
-            payload: outcome.0,
-            write_version: outcome.1,
-            trimmed_ops: 0,
-        });
-    }
-    let response = tokio::time::timeout(
+    let raw = workflow.state.raw_async_raft_proposer()?;
+    let entry = to_replicated_entry(
+        workflow.tenant_id,
+        workflow.database_id,
+        workflow.vshard_id,
+        &ReplicableWrite::decide_for_replication(&plan)?,
+    )?
+    .ok_or(crate::Error::CrdtAdmissionInvalidPlan {
+        reason: "admitted CRDT Apply has no replicated form",
+    })?
+    // Every replica gives the write the source this node dispatches it
+    // with.
+    .with_event_source(workflow.event_source);
+    let outcome = tokio::time::timeout(
         workflow.timeout,
-        crate::control::server::dispatch_utils::dispatch_autocommit_write(
-            workflow.state,
-            crate::control::server::dispatch_utils::AutocommitWrite {
-                tenant_id: workflow.tenant_id,
-                database_id: workflow.database_id,
-                vshard_id: workflow.vshard_id,
-                plan,
-                trace_id: crate::types::TraceId::ZERO,
-                event_source: workflow.event_source,
-                txn_id: None,
-            },
-        ),
+        crate::control::wal_replication::propose_replicated_entry(workflow.state, raw, entry),
     )
     .await
     .map_err(|_| crate::Error::CrdtAdmissionTimeout {
         vshard_id: workflow.vshard_id,
         timeout_ms: timeout_ms(workflow.timeout),
     })??;
-    if response.status != Status::Ok {
-        return Err(response_error(&response));
-    }
+    // This node's apply of the entry recorded its commit HLC.
     Ok(CrdtAdmissionOutcome {
-        payload: response.payload.to_vec(),
-        write_version: response.read_version_lsn,
+        payload: outcome.0,
+        write_version: outcome.1,
         trimmed_ops: 0,
     })
 }
@@ -630,7 +650,7 @@ mod tests {
             delta: vec![0x91, 0x01],
             peer_id: 7,
             mutation_id: 9,
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
             provenance: None,
             constraint_version_required: 0,
             expected_frontier_digest: None,
@@ -709,7 +729,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admitted_local_apply_previews_exact_post_image_before_fenced_apply() {
+    async fn admitted_apply_previews_exact_post_image_before_fenced_apply() {
         let (state, side, _directory) = fixture();
         let digest = [0x4d; 32];
         let post_image = vec![0x81, 0xa2, b'o', b'k', 0xc3];
@@ -721,14 +741,12 @@ mod tests {
         })
         .expect("preview payload");
         let preview_fields = Arc::new(Mutex::new(Vec::new()));
-        let apply_fences = Arc::new(Mutex::new(Vec::new()));
         let fields = Arc::clone(&preview_fields);
-        let fences = Arc::clone(&apply_fences);
         let responder =
             tokio::spawn(respond_n(
                 Arc::clone(&state),
                 side,
-                2,
+                1,
                 move |request| match request.plan {
                     PhysicalPlan::Crdt(CrdtOp::PreviewApply {
                         collection,
@@ -741,19 +759,36 @@ mod tests {
                             .push((collection, document_id, delta));
                         response(request.request_id, preview_payload.clone())
                     }
-                    PhysicalPlan::Crdt(CrdtOp::Apply {
+                    other => panic!("unexpected request: {other:?}"),
+                },
+            ));
+        let apply_fences = Arc::new(Mutex::new(Vec::new()));
+        let fences = Arc::clone(&apply_fences);
+        let raw: Arc<crate::control::wal_replication::AsyncRaftProposer> =
+            Arc::new(move |_shard, _key, bytes, _deadline| {
+                let fences = Arc::clone(&fences);
+                Box::pin(async move {
+                    let entry =
+                        crate::control::wal_replication::ReplicatedEntry::from_bytes(&bytes)
+                            .expect("replicated entry");
+                    if let crate::control::wal_replication::ReplicatedWrite::CrdtApplyFenced {
                         expected_frontier_digest,
                         ..
-                    }) => {
+                    } = entry.write
+                    {
                         fences
                             .lock()
                             .expect("fences lock")
                             .push(expected_frontier_digest);
-                        response(request.request_id, Vec::new())
                     }
-                    other => panic!("unexpected request: {other:?}"),
-                },
-            ));
+                    Ok((Vec::new(), Lsn::ZERO))
+                })
+            });
+        crate::control::vshard_admission::install_async_raft_proposer(
+            &state,
+            crate::control::vshard_admission::applying_submit(raw),
+        )
+        .expect("install raw/sequenced proposer pair");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let policy = RecordingPolicy {
             seen: Arc::clone(&seen),
@@ -761,14 +796,11 @@ mod tests {
         };
         dispatch_crdt_apply_admitted(&state, admission_request(&policy))
             .await
-            .expect("admitted local apply");
+            .expect("admitted apply");
         responder.await.expect("responder completes");
         assert_eq!(*seen.lock().expect("seen lock"), vec![post_image]);
         assert_eq!(preview_fields.lock().expect("fields lock").len(), 1);
-        assert_eq!(
-            *apply_fences.lock().expect("fences lock"),
-            vec![Some(digest)]
-        );
+        assert_eq!(*apply_fences.lock().expect("fences lock"), vec![digest]);
     }
 
     #[tokio::test]
@@ -851,8 +883,11 @@ mod tests {
                     Ok((Vec::new(), Lsn::ZERO))
                 })
             });
-        crate::control::vshard_admission::install_async_raft_proposer(&state, raw)
-            .expect("install raw/sequenced proposer pair");
+        crate::control::vshard_admission::install_async_raft_proposer(
+            &state,
+            crate::control::vshard_admission::applying_submit(raw),
+        )
+        .expect("install raw/sequenced proposer pair");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let policy = RecordingPolicy {
             seen,
@@ -899,8 +934,11 @@ mod tests {
                     }
                 })
             });
-        crate::control::vshard_admission::install_async_raft_proposer(&state, raw)
-            .expect("install raw/sequenced proposer pair");
+        crate::control::vshard_admission::install_async_raft_proposer(
+            &state,
+            crate::control::vshard_admission::applying_submit(raw),
+        )
+        .expect("install raw/sequenced proposer pair");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let policy = RecordingPolicy {
             seen: Arc::clone(&seen),
@@ -964,8 +1002,11 @@ mod tests {
                 })
             })
         };
-        crate::control::vshard_admission::install_async_raft_proposer(&state, raw)
-            .expect("install proposer");
+        crate::control::vshard_admission::install_async_raft_proposer(
+            &state,
+            crate::control::vshard_admission::applying_submit(raw),
+        )
+        .expect("install proposer");
         let policy = RecordingPolicy {
             seen: Arc::new(Mutex::new(Vec::new())),
             reject: false,
@@ -978,7 +1019,7 @@ mod tests {
                 collection: "docs",
                 document_id: "doc-1",
                 target_version_json: "{}",
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 peer_id: 1,
                 timeout: Duration::from_secs(1),
                 event_source: EventSource::User,
@@ -1028,8 +1069,11 @@ mod tests {
                     }))
                 })
             });
-        crate::control::vshard_admission::install_async_raft_proposer(&state, raw)
-            .expect("install raw/sequenced proposer pair");
+        crate::control::vshard_admission::install_async_raft_proposer(
+            &state,
+            crate::control::vshard_admission::applying_submit(raw),
+        )
+        .expect("install raw/sequenced proposer pair");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let policy = RecordingPolicy {
             seen: Arc::clone(&seen),
@@ -1055,8 +1099,9 @@ mod tests {
     async fn signed_delta_collection_rejects_plain_external_apply_before_preview() {
         let (state, _side, _directory) = fixture();
         let tenant_id = TenantId::new(1);
-        let mut collection =
-            crate::control::security::catalog::StoredCollection::new(1, "docs", "owner");
+        let mut collection = crate::control::security::catalog::StoredCollection::stamped_for_test(
+            1, "docs", "owner",
+        );
         collection.crdt = true;
         collection.crdt_signing_required = true;
         state
@@ -1150,9 +1195,7 @@ mod tests {
             &state,
             "docs",
             authorized,
-            Duration::from_millis(10),
             EventSource::User,
-            None,
         )
         .await;
         assert!(matches!(
@@ -1171,7 +1214,7 @@ mod tests {
 
     #[test]
     fn frontier_classifier_covers_every_crdt_operation_category() {
-        let surrogate = Surrogate::ZERO;
+        let surrogate = Surrogate::new(1);
         assert_frontier_mutation(CrdtOp::Apply {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             document_id: "id".into(),
@@ -1230,7 +1273,7 @@ mod tests {
         assert_frontier_mutation(CrdtOp::DocDelete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, &collection()),
             document_id: "id".into(),
-            surrogate,
+            surrogate: Some(surrogate),
             returning: None,
             rls_filters: Vec::new(),
         });

@@ -44,11 +44,12 @@ pub(crate) fn sole_voter_term(state: &SharedState) -> Option<u64> {
         .map(|group| group.term)
 }
 
-/// The leader hint to send back with a refusal.
-pub(crate) fn leader_hint(state: &SharedState) -> Option<u64> {
-    metadata_leader(state)
-        .map(|(leader_id, _)| leader_id)
-        .filter(|leader_id| *leader_id != 0)
+/// The leader hint to send back with a refusal, and the term this node
+/// knows it at: `(leader_hint, term)`.
+pub(crate) fn leader_hint(state: &SharedState) -> (Option<u64>, u64) {
+    metadata_leader(state).map_or((None, 0), |(leader_id, term)| {
+        ((leader_id != 0).then_some(leader_id), term)
+    })
 }
 
 /// Send `rpc` to the metadata leader `leader_id` and return its answer.

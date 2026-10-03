@@ -9,7 +9,7 @@
 //! 4. Raft replicates to quorum and commits
 //! 5. [`DistributedApplier`] receives committed entries, queues for async execution
 //! 6. Background task dispatches each write to the local Data Plane
-//! 7. If a waiter exists (leader path), sends the response; otherwise just applies (follower)
+//! 7. If a waiter exists (leader path), sends the response; otherwise only applies (follower)
 //!
 //! Split into:
 //! - [`aliases`]: Raft propose/compact callback type aliases + serde defaults.
@@ -24,8 +24,11 @@ mod replicated_write;
 mod transaction_redo_wire;
 mod wire_shapes;
 
-pub use aliases::{AsyncRaftProposer, RaftAppliedIndexSink, RaftCompactor, RaftProposer};
-pub use replicated_entry::ReplicatedEntry;
+pub use aliases::{
+    AppliedWait, AsyncRaftProposer, AsyncRaftSubmit, ProposedAt, ProposedWrite,
+    RaftAppliedIndexSink, RaftCompactor, RaftProposer,
+};
+pub use replicated_entry::{CollectionIncarnation, ReplicatedEntry};
 pub use replicated_write::ReplicatedWrite;
 pub use transaction_redo_wire::{ReplicatedEventSource, ReplicatedIdentity};
 pub use wire_shapes::{

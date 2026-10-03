@@ -31,6 +31,9 @@
 //! A record missing `index` (say) simply fails to decode at all, instead
 //! of replaying as "insert/delete at position 0" and silently diverging
 //! replica state from what was actually written.
+//!
+//! Each variant carries the parent document's bound `surrogate`. The writer
+//! refuses `Surrogate::ZERO`, and replay refuses a record that carries it.
 
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +55,8 @@ pub(crate) enum CrdtListOpWalRecord {
     Insert {
         collection: String,
         document_id: String,
+        /// The parent document's bound surrogate, never `Surrogate::ZERO`.
+        surrogate: u32,
         list_path: String,
         index: u64,
         /// JSON-encoded field map for the inserted block.
@@ -60,12 +65,16 @@ pub(crate) enum CrdtListOpWalRecord {
     Delete {
         collection: String,
         document_id: String,
+        /// The parent document's bound surrogate, never `Surrogate::ZERO`.
+        surrogate: u32,
         list_path: String,
         index: u64,
     },
     Move {
         collection: String,
         document_id: String,
+        /// The parent document's bound surrogate, never `Surrogate::ZERO`.
+        surrogate: u32,
         list_path: String,
         from_index: u64,
         to_index: u64,
@@ -81,6 +90,7 @@ mod tests {
         let rec = CrdtListOpWalRecord::Insert {
             collection: "notes".to_string(),
             document_id: "doc1".to_string(),
+            surrogate: 7,
             list_path: "blocks".to_string(),
             index: 2,
             fields_json: r#"{"type":"text"}"#.to_string(),
@@ -95,6 +105,7 @@ mod tests {
         let rec = CrdtListOpWalRecord::Delete {
             collection: "notes".to_string(),
             document_id: "doc1".to_string(),
+            surrogate: 7,
             list_path: "blocks".to_string(),
             index: 5,
         };
@@ -108,6 +119,7 @@ mod tests {
         let rec = CrdtListOpWalRecord::Move {
             collection: "notes".to_string(),
             document_id: "doc1".to_string(),
+            surrogate: 7,
             list_path: "blocks".to_string(),
             from_index: 0,
             to_index: 3,
@@ -127,6 +139,7 @@ mod tests {
         let rec = CrdtListOpWalRecord::Move {
             collection: "notes".to_string(),
             document_id: "doc1".to_string(),
+            surrogate: 7,
             list_path: "blocks".to_string(),
             from_index: 3,
             to_index: 1,

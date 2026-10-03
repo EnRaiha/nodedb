@@ -7,9 +7,14 @@
 
 use thiserror::Error;
 
-/// A superstep aggregate was read while shards were still missing.
+/// A superstep could not complete as one step of the whole graph.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum BspBarrierError {
+    /// A routed contribution names a vertex its receiving shard does not
+    /// own. Applying nothing would drop its mass from the graph.
+    #[error("'{algorithm}' contribution to vertex '{vertex}' reached a shard that does not own it")]
+    UnownedContribution { algorithm: String, vertex: String },
+    /// A superstep aggregate was read while shards were still missing.
     #[error(
         "superstep barrier incomplete for '{algorithm}' at iteration {iteration}: \
          {acked} of {expected} shards ACKed"

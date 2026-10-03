@@ -9,24 +9,18 @@
 
 use std::sync::Arc;
 
-use nodedb_cluster::rpc_codec::TypedClusterError;
-
 use crate::Error;
-use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
-use crate::control::local_dispatch::reject_data_plane_error;
-use crate::control::server::dispatch_utils::{
-    AutocommitWrite, dispatch_autocommit_write, dispatch_to_data_plane_with_txn,
-    extract_write_change_set, publish_change_set_with_lsn,
-};
+use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::result_stream::ResultStream;
-use crate::control::server::shared::write_admission::plan_is_write;
+use crate::control::server::shared::session::served_reads;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId, TxnId, VShardId};
 
+use super::dispatch_local::{LocalContext, dispatch_local};
 use super::dispatch_remote::{RemoteDispatchArgs, dispatch_remote, dispatch_remote_stream};
+use super::read_leg::{confirm_local_read, linearizable_read_groups};
 use super::route::{RouteDecision, TaskRoute};
-use super::router::is_task_vshard_scoped;
-use super::version_check::check_descriptor_versions;
+use super::version_check::check_local_descriptor_versions;
 use super::version_set::GatewayVersionSet;
 
 /// Result of dispatching a single route: the raw payload bytes plus the
@@ -63,6 +57,9 @@ pub struct DispatchRouteParams<'a> {
     pub deadline_ms: u64,
     pub version_set: &'a GatewayVersionSet,
     pub txn_id: Option<TxnId>,
+    /// The route is a leg of a linearizable read (see
+    /// `QueryContext::linearizable`).
+    pub linearizable: bool,
 }
 
 /// Dispatch a single route and return the raw payload bytes.
@@ -78,23 +75,32 @@ pub(crate) async fn dispatch_route(
         deadline_ms,
         version_set,
         txn_id,
+        linearizable,
     } = params;
     reject_unadmitted_crdt_apply(&route.plan)?;
+    let read_groups = linearizable_read_groups(shared, &route, linearizable)?;
+    let route_vshard = route.vshard_id;
     match route.decision {
         RouteDecision::Local => {
-            dispatch_local(
+            confirm_local_read(shared, database_id, &route.plan, &read_groups, deadline_ms).await?;
+            let outcome = dispatch_local(
                 route,
-                shared,
-                tenant_id,
-                database_id,
-                trace_id,
-                txn_id,
-                version_set,
+                LocalContext {
+                    shared,
+                    tenant_id,
+                    database_id,
+                    trace_id,
+                    txn_id,
+                    version_set,
+                },
             )
-            .await
+            .await?;
+            // The read's versions are this node's WAL positions.
+            served_reads::note(route_vshard, shared.node_id);
+            Ok(outcome)
         }
         RouteDecision::Remote { node_id, vshard_id } => {
-            dispatch_remote(RemoteDispatchArgs {
+            let outcome = dispatch_remote(RemoteDispatchArgs {
                 plan: route.plan,
                 shared,
                 node_id,
@@ -105,12 +111,17 @@ pub(crate) async fn dispatch_route(
                 deadline_ms,
                 version_set,
                 txn_id,
+                linearizable,
+                read_groups,
             })
-            .await
+            .await?;
+            // The read's versions are the remote node's WAL positions.
+            served_reads::note(route_vshard, node_id);
+            Ok(outcome)
         }
         RouteDecision::Broadcast { .. } => {
             // Split into individual Local/Remote routes by the router before
-            // dispatch; this arm should not be reached.
+            // dispatch; this arm is unreachable.
             Err(Error::Internal {
                 detail: "dispatcher: Broadcast route reached dispatch — should have been split"
                     .into(),
@@ -123,6 +134,7 @@ pub(crate) async fn dispatch_route(
                 vshard_id: VShardId::new(vshard_id as u32),
                 leader_node: 0,
                 leader_addr: String::new(),
+                leader_term: 0,
             })
         }
     }
@@ -137,11 +149,11 @@ pub struct DispatchRouteStreamParams<'a> {
     pub trace_id: TraceId,
     pub deadline_ms: u64,
     pub version_set: &'a GatewayVersionSet,
+    /// The route is a leg of a linearizable read.
+    pub linearizable: bool,
 }
 
-/// Streaming sibling of [`dispatch_route`]: `Local` fans to all local cores,
-/// `Remote` uses eager-first-frame dispatch, `Broadcast` is unreachable
-/// (pre-split by the router), `LeaderUnknown` returns `NotLeader`.
+/// Refuse a CRDT apply or snapshot import that did not pass CRDT admission.
 fn reject_unadmitted_crdt_apply(plan: &PhysicalPlan) -> Result<(), Error> {
     if matches!(
         plan,
@@ -156,6 +168,9 @@ fn reject_unadmitted_crdt_apply(plan: &PhysicalPlan) -> Result<(), Error> {
     Ok(())
 }
 
+/// Streaming sibling of [`dispatch_route`]: `Local` fans to all local cores,
+/// `Remote` uses eager-first-frame dispatch, `Broadcast` is unreachable
+/// (pre-split by the router), `LeaderUnknown` returns `NotLeader`.
 pub(crate) async fn dispatch_route_stream(
     args: DispatchRouteStreamParams<'_>,
 ) -> Result<ResultStream, Error> {
@@ -167,8 +182,10 @@ pub(crate) async fn dispatch_route_stream(
         trace_id,
         deadline_ms,
         version_set,
+        linearizable,
     } = args;
     reject_unadmitted_crdt_apply(&route.plan)?;
+    let read_groups = linearizable_read_groups(shared, &route, linearizable)?;
     match route.decision {
         // Cluster gateway route dispatch: no session-transaction context
         // crosses this boundary yet, so `None`. TRACKED: cross-node
@@ -177,6 +194,7 @@ pub(crate) async fn dispatch_route_stream(
             // Same fence as the one-shot local path: a streaming read planned
             // against a superseded descriptor must not reach the cores.
             check_local_descriptor_versions(shared, tenant_id, database_id, version_set)?;
+            confirm_local_read(shared, database_id, &route.plan, &read_groups, deadline_ms).await?;
             crate::control::server::exchange::gather::gather_all_cores_stream(
                 shared,
                 tenant_id,
@@ -200,6 +218,8 @@ pub(crate) async fn dispatch_route_stream(
                 // No session-transaction context crosses the streaming gateway
                 // boundary yet (see `resolve/exchange.rs`), so `None`.
                 txn_id: None,
+                linearizable,
+                read_groups,
             })
             .await
         }
@@ -211,267 +231,8 @@ pub(crate) async fn dispatch_route_stream(
             vshard_id: VShardId::new(vshard_id as u32),
             leader_node: 0,
             leader_addr: String::new(),
+            leader_term: 0,
         }),
-    }
-}
-
-/// Re-compare a plan's stamped descriptor versions against this node's own
-/// catalog. A mismatch surfaces as [`Error::RetryableSchemaChanged`], which the
-/// gateway's cache-miss retry absorbs by re-planning against fresh state.
-fn check_local_descriptor_versions(
-    shared: &Arc<SharedState>,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    version_set: &GatewayVersionSet,
-) -> Result<(), Error> {
-    check_descriptor_versions(
-        shared.credentials.catalog(),
-        database_id,
-        tenant_id.as_u64(),
-        version_set
-            .iter()
-            .map(|(collection, version)| (collection.as_str(), *version)),
-    )?;
-    Ok(())
-}
-
-/// Local dispatch via SPSC bridge.
-///
-/// Carries `txn_id` so the Data Plane can resolve this session transaction's
-/// staging overlay (read-your-own-writes) for in-block SQL and direct ops.
-async fn dispatch_local(
-    route: TaskRoute,
-    shared: &Arc<SharedState>,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    trace_id: TraceId,
-    txn_id: Option<TxnId>,
-    version_set: &GatewayVersionSet,
-) -> Result<DispatchOutcome, Error> {
-    // Staying on this node does not make the plan fresh: a DDL can bump a
-    // descriptor between planning and dispatch, and a drain that times out is
-    // force-ended. Fence the local plan against this node's catalog exactly as
-    // the leaseholder fences a forwarded one.
-    check_local_descriptor_versions(shared, tenant_id, database_id, version_set)?;
-
-    let vshard_id = VShardId::new(route.vshard_id);
-
-    if txn_id.is_some()
-        && matches!(
-            &route.plan,
-            PhysicalPlan::Crdt(
-                nodedb_physical::physical_plan::CrdtOp::Apply { .. }
-                    | nodedb_physical::physical_plan::CrdtOp::ApplyAuthenticated { .. }
-            )
-        )
-    {
-        return Err(Error::CrdtApplyForbiddenInTransaction);
-    }
-
-    // In local mode, frontier-changing CRDT operations have no Raft ordering.
-    // Serialize their complete Data Plane dispatch; replicated/transactional
-    // paths rely on the fenced-apply retry rather than this local mutex.
-    if txn_id.is_none()
-        && shared.async_raft_proposer().is_none()
-        && let PhysicalPlan::Crdt(op) = &route.plan
-        && crate::control::crdt_admission::changes_crdt_frontier(op)
-    {
-        let resp = shared
-            .vshard_admission_sequencer
-            .run(vshard_id, || async {
-                dispatch_local_plan(LocalPlan {
-                    shared,
-                    tenant_id,
-                    database_id,
-                    vshard_id,
-                    plan: route.plan,
-                    trace_id,
-                    txn_id: None,
-                })
-                .await
-            })
-            .await?;
-        reject_data_plane_error(&resp)?;
-        return Ok(DispatchOutcome {
-            payloads: vec![resp.payload.to_vec()],
-            shard_watermarks: vec![(vshard_id, resp.watermark_lsn)],
-            read_version_lsn: resp.read_version_lsn,
-            not_found: is_not_found(&resp),
-        });
-    }
-
-    if txn_id.is_none()
-        && let Some(proposer) = shared.async_raft_proposer()
-        && let Some(entry) = crate::control::wal_replication::to_replicated_entry(
-            tenant_id,
-            database_id,
-            vshard_id,
-            &crate::control::wal_replication::ReplicableWrite::decide_for_replication(&route.plan)?,
-        )?
-    {
-        let (payload, write_version) =
-            crate::control::wal_replication::propose_replicated_entry(shared, proposer, entry)
-                .await?;
-        // Replicas apply with `ChangeFeedOwner::Unowned`. This node proposed
-        // the write once, so it publishes the change event.
-        publish_change_set_with_lsn(
-            shared,
-            tenant_id,
-            database_id,
-            extract_write_change_set(&route.plan, tenant_id),
-            write_version,
-        );
-        return Ok(DispatchOutcome {
-            payloads: vec![payload],
-            // A write carries no read watermark (Lsn::ZERO); its post-write
-            // `coll_write_lsn` is surfaced via `read_version_lsn` instead.
-            shard_watermarks: vec![(vshard_id, Lsn::ZERO)],
-            read_version_lsn: write_version,
-            not_found: false,
-        });
-    }
-
-    let resp = dispatch_local_plan(LocalPlan {
-        shared,
-        tenant_id,
-        database_id,
-        vshard_id,
-        plan: route.plan,
-        trace_id,
-        txn_id,
-    })
-    .await?;
-    // The remote sibling turns `ExecuteResponse.error` into `Err`; the local
-    // route must reject its own error status the same way. Keeping only the
-    // payload would hand a post-scan operator's failed expression back as an
-    // empty success — an error status is not an empty result set.
-    reject_data_plane_error(&resp)?;
-    Ok(DispatchOutcome {
-        payloads: vec![resp.payload.to_vec()],
-        shard_watermarks: vec![(vshard_id, resp.watermark_lsn)],
-        read_version_lsn: resp.read_version_lsn,
-        not_found: is_not_found(&resp),
-    })
-}
-
-/// One plan this node applies on its own cores.
-struct LocalPlan<'a> {
-    shared: &'a Arc<SharedState>,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    vshard_id: VShardId,
-    plan: PhysicalPlan,
-    trace_id: TraceId,
-    txn_id: Option<TxnId>,
-}
-
-/// Dispatch a plan to this node's cores on the route its class needs.
-///
-/// A base-state write enters the funnel with `AppendHere`, which appends its
-/// redo record under the write-admission guard. It reaches here when no Raft
-/// proposal carries it: a standalone node, a plan with no replicated
-/// encoding, or a write a transaction cannot buffer. The transaction meta-ops
-/// own their durability, and a staged write is logged at COMMIT, so both take
-/// the read route with everything else.
-async fn dispatch_local_plan(local: LocalPlan<'_>) -> Result<Response, Error> {
-    let LocalPlan {
-        shared,
-        tenant_id,
-        database_id,
-        vshard_id,
-        plan,
-        trace_id,
-        txn_id,
-    } = local;
-    if plan_is_write(&plan) && !is_task_vshard_scoped(&plan) {
-        return dispatch_autocommit_write(
-            shared,
-            AutocommitWrite {
-                tenant_id,
-                database_id,
-                vshard_id,
-                plan,
-                trace_id,
-                event_source: crate::event::EventSource::User,
-                txn_id,
-            },
-        )
-        .await;
-    }
-    dispatch_to_data_plane_with_txn(
-        shared,
-        tenant_id,
-        database_id,
-        vshard_id,
-        plan,
-        trace_id,
-        txn_id,
-    )
-    .await
-}
-
-/// Whether the core refused the task with `ErrorCode::NotFound`.
-///
-/// `reject_data_plane_error` passes this refusal as an empty success.
-/// The flag keeps the verdict for a caller that needs it.
-fn is_not_found(resp: &Response) -> bool {
-    resp.status == Status::Error && resp.error_code.as_deref() == Some(&ErrorCode::NotFound)
-}
-
-/// Map a [`TypedClusterError`] to an internal [`Error`].
-///
-/// `NotLeader` is mapped such that the gateway retry loop can extract the
-/// hinted leader from `Error::NotLeader.leader_node` and update the routing
-/// table before the next attempt.
-pub(super) fn map_typed_cluster_error(err: TypedClusterError, vshard_id: u64) -> Error {
-    match err {
-        TypedClusterError::NotLeader {
-            leader_node_id,
-            leader_addr,
-            ..
-        } => Error::NotLeader {
-            vshard_id: VShardId::new((vshard_id % VShardId::COUNT as u64) as u32),
-            leader_node: leader_node_id.unwrap_or(0),
-            leader_addr: leader_addr.unwrap_or_default(),
-        },
-        TypedClusterError::DescriptorMismatch {
-            collection,
-            expected_version,
-            actual_version,
-        } => {
-            // A repeating mismatch means the planner and leaseholder disagree
-            // persistently — a bug, not the transient race the retry assumes.
-            tracing::debug!(
-                %collection,
-                expected_version,
-                actual_version,
-                "gateway: descriptor version mismatch at leaseholder"
-            );
-            Error::RetryableSchemaChanged {
-                descriptor: collection,
-            }
-        }
-        TypedClusterError::DeadlineExceeded { .. } => Error::DeadlineExceeded {
-            request_id: crate::types::RequestId::new(0),
-        },
-        // Remote Data-Plane verdict: keep the code so the client sees the
-        // SQLSTATE local execution renders, not a generic internal error.
-        TypedClusterError::DataPlane { code } => Error::DataPlane(code.into()),
-        // Remote constraint refusal: keep the kind so the client sees 23502
-        // vs 23505, exactly as a local refusal on this node would render.
-        TypedClusterError::RejectedConstraint {
-            collection,
-            constraint,
-            detail,
-        } => Error::RejectedConstraint {
-            collection,
-            constraint,
-            detail,
-        },
-        // A numeric class crosses as `Error::RemoteTyped`, so the client sees
-        // the SQLSTATE the executing node gave it. Only a code of 0 (no class)
-        // decodes as `Error::Internal`.
-        internal @ TypedClusterError::Internal { .. } => Error::from(internal),
     }
 }
 
@@ -490,58 +251,6 @@ pub fn statement_deadline_ms(shared: &SharedState) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nodedb_cluster::rpc_codec::TypedClusterError;
-
-    #[test]
-    fn map_not_leader() {
-        let err = TypedClusterError::NotLeader {
-            group_id: 0,
-            leader_node_id: Some(5),
-            leader_addr: Some("10.0.0.5:9400".into()),
-            term: 3,
-        };
-        match map_typed_cluster_error(err, 7) {
-            Error::NotLeader { leader_node, .. } => assert_eq!(leader_node, 5),
-            other => panic!("expected NotLeader, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn map_descriptor_mismatch() {
-        let err = TypedClusterError::DescriptorMismatch {
-            collection: "orders".into(),
-            expected_version: 1,
-            actual_version: 2,
-        };
-        match map_typed_cluster_error(err, 0) {
-            Error::RetryableSchemaChanged { descriptor } => assert_eq!(descriptor, "orders"),
-            other => panic!("expected RetryableSchemaChanged, got {other:?}"),
-        }
-    }
-
-    /// A remote error with a numeric class keeps it, never `Internal`.
-    #[test]
-    fn map_internal_keeps_its_numeric_class() {
-        let err = TypedClusterError::Internal {
-            code: u32::from(nodedb_types::error::ErrorCode::AUTHORIZATION_DENIED.0),
-            message: "permission denied on orders".into(),
-        };
-        match map_typed_cluster_error(err, 0) {
-            Error::RemoteTyped { code, .. } => {
-                assert_eq!(code, nodedb_types::error::ErrorCode::AUTHORIZATION_DENIED);
-            }
-            other => panic!("expected RemoteTyped, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn map_deadline_exceeded() {
-        let err = TypedClusterError::DeadlineExceeded { elapsed_ms: 100 };
-        assert!(matches!(
-            map_typed_cluster_error(err, 0),
-            Error::DeadlineExceeded { .. }
-        ));
-    }
 
     #[test]
     fn gateway_rejects_unadmitted_crdt_apply_before_route_selection() {
@@ -551,7 +260,7 @@ mod tests {
             delta: vec![1],
             peer_id: 1,
             mutation_id: 1,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             provenance: None,
             constraint_version_required: 0,
             expected_frontier_digest: None,

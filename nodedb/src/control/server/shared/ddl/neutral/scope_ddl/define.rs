@@ -50,8 +50,9 @@ pub fn define_scope(
                     return Err(err("42601", "INCLUDE requires a scope name"));
                 }
             }
-            "READ" | "WRITE" | "CREATE" | "DROP" | "ALTER" | "ADMIN" => {
-                // <perm> ON <collection>
+            "READ" | "WRITE" | "CREATE" | "DROP" | "ALTER" | "ADMIN" | "BACKUP" => {
+                // <perm> ON <collection>. `BACKUP ON 'tenant:<id>'` covers
+                // the backups and restores of that tenant.
                 if i + 2 < def_parts.len() && def_parts[i + 1].to_uppercase() == "ON" {
                     let coll = def_parts[i + 2].trim_matches('\'').trim_end_matches(',');
                     grants.push((token.to_lowercase(), coll.to_string()));

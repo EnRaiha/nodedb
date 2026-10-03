@@ -22,6 +22,21 @@ pub fn load_sink_state(
     shared.mv_persistence.restore_all(&shared.mv_registry)?;
     let ledgers = SinkLedgers::open(wal, watermarks, num_cores)?;
     ledgers.cdc.restore_into(&shared.cdc_router)?;
+    // A snapshot install before the ledger opened raised its floors in
+    // memory only.
+    ledgers
+        .cdc
+        .persist_floors(&shared.cdc_router.availability().all())?;
+    // A WAL catch-up can rebuild events of records applied before the
+    // restart. Their replicated positions come back from the WAL markers.
+    shared.cdc_router.positions().recover(&wal.replay()?);
+    // The Control-Plane change feeds come back from their journal, so a
+    // cursor inside retention resumes after the restart.
+    let journal = crate::control::change_stream::ChangeJournal::open(
+        watermarks.dir(),
+        shared.change_stream.capacity(),
+    )?;
+    shared.change_stream.attach_journal(Arc::new(journal))?;
     if shared.sink_ledgers.set(Arc::new(ledgers)).is_err() {
         return Err(crate::Error::Internal {
             detail: "event plane sink ledgers were already installed".into(),

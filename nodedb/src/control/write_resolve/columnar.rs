@@ -3,14 +3,14 @@
 //! Columnar implementation of [`EngineWriteResolver`].
 //!
 //! Resolves a governed columnar predicate `UPDATE`/`DELETE` to the concrete
-//! rows it would write, then rebuilds it as `ColumnarOp::ResolvedUpdate` /
+//! rows it writes, then rebuilds it as `ColumnarOp::ResolvedUpdate` /
 //! `ResolvedDelete`.
 
 use async_trait::async_trait;
 use nodedb_types::{RlsWriteCheck, Value};
 
 use crate::bridge::envelope::{PhysicalPlan, Status};
-use crate::control::maintenance::clone_materializer::dispatch_local;
+use crate::control::maintenance::clone_materializer::dispatch_resolve_pass;
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::ColumnarOp;
 
@@ -90,7 +90,8 @@ impl EngineWriteResolver for ColumnarWriteResolver {
     ) -> crate::Result<ResolvedRows> {
         let collection = &self.collection;
         let resp =
-            dispatch_local(state, ctx.tenant_id, ctx.database_id, collection, op, None).await?;
+            dispatch_resolve_pass(state, ctx.tenant_id, ctx.database_id, collection, op, None)
+                .await?;
         if resp.status != Status::Ok {
             return Err(match resp.error_code {
                 Some(code) => crate::Error::DataPlane(*code),

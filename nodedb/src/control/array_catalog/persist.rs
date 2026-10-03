@@ -5,8 +5,8 @@
 //! Mirrors the `trigger` / `sequence` registry pattern: the
 //! [`SystemCatalog`] owns the redb table and exposes typed read/write
 //! helpers (see `control/security/catalog/arrays.rs`). This module
-//! provides the bulk `load_all` entry used at server startup and the
-//! `persist` / `remove` wrappers used by DDL handlers.
+//! provides the bulk `load_all` entry and the `persist` / `remove`
+//! wrappers the `PutArray` / `DeleteArray` apply writes through.
 
 use nodedb_types::NodeDbError;
 
@@ -26,6 +26,26 @@ pub fn load_all(catalog: &SystemCatalog) -> Result<ArrayCatalog, NodeDbError> {
     Ok(reg)
 }
 
+/// Register every entry of a boot-time `load_all_arrays` read into `reg`.
+///
+/// Boot fails open: a read error or an entry that does not register logs a
+/// warning and the rest boots. `register` refuses an id already present, so
+/// a second load never duplicates an entry.
+pub fn register_loaded(reg: &mut ArrayCatalog, loaded: crate::Result<Vec<ArrayCatalogEntry>>) {
+    match loaded {
+        Ok(entries) => {
+            for entry in entries {
+                if let Err(e) = reg.register(entry) {
+                    tracing::warn!(error = %e, "failed to register array at startup");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load _system.arrays at startup");
+        }
+    }
+}
+
 /// Persist (or overwrite) a single entry.
 pub fn persist(catalog: &SystemCatalog, entry: &ArrayCatalogEntry) -> Result<(), NodeDbError> {
     catalog.put_array(entry).map_err(NodeDbError::from)
@@ -38,6 +58,24 @@ pub fn remove(
 ) -> Result<(), NodeDbError> {
     catalog
         .delete_array_in_database(array_id.tenant_id, array_id.database_id, &array_id.name)
+        .map(|_existed| ())
+        .map_err(NodeDbError::from)
+}
+
+/// Remove the array under `array_id` and move every surrogate mapping to
+/// `to`, in one durable transaction.
+pub fn move_with_surrogates(
+    catalog: &SystemCatalog,
+    array_id: &nodedb_array::types::ArrayId,
+    to: nodedb_types::DatabaseId,
+) -> Result<(), NodeDbError> {
+    catalog
+        .move_array_surrogates_in_database(
+            array_id.tenant_id,
+            array_id.database_id,
+            to,
+            &array_id.name,
+        )
         .map(|_existed| ())
         .map_err(NodeDbError::from)
 }
@@ -75,6 +113,8 @@ mod tests {
             prefix_bits: 8,
             audit_retain_ms: None,
             minimum_audit_retain_ms: None,
+            modification_hlc: nodedb_types::Hlc::ZERO,
+            incarnation: nodedb_types::Hlc::ZERO,
         }
     }
 

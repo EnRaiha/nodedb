@@ -120,22 +120,18 @@ async fn staged_edge_put_visible_in_tx_read_your_own_writes() {
          visible from inside the transaction, got: {base_in_tx:?}"
     );
 
-    // NOTE ON COMMIT: unlike every other engine's staged-write overlay test
-    // (KV, Document, Spatial, Columnar), this suite does not additionally
-    // assert post-COMMIT persistence in the SAME flow. In this standalone
-    // (non-cluster) `TestServer`, COMMIT-time replay of ANY buffered
-    // `GraphOp::EdgePut` task -- even a single-vShard self-loop, even with no
-    // interstitial read -- is unconditionally rejected with "cross-shard
-    // transactions require a cluster deployment with the Calvin sequencer".
-    // This reproduces with a minimal `BEGIN; INSERT (implicit edge); COMMIT`
-    // and no `GRAPH NEIGHBORS` call at all, so it is not caused by this
-    // unit's read-merge or staging code -- durable replay of the 6 GRAPH
-    // write ops was already wired before this unit (`to_replicated_entry`)
-    // and is explicitly out of this unit's scope to newly verify. Testing
-    // COMMIT durability for a GRAPH edge write requires a real cluster
-    // deployment with a Calvin sequencer, which this test file does not
-    // stand up.
-    server.client.simple_query("ROLLBACK").await.unwrap();
+    // The document write and its implicit edge home on different vShards,
+    // so COMMIT flushes the buffer through the single-node Calvin sequencer.
+    server
+        .exec("COMMIT")
+        .await
+        .expect("COMMIT of a staged implicit-edge insert must succeed");
+
+    let committed = neighbors_of(&server, "staged_commit", "knows").await;
+    assert!(
+        committed.contains(&"staged_commit".to_string()),
+        "the committed edge must persist after COMMIT, got: {committed:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

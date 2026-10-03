@@ -3,15 +3,12 @@
 //! Append-only enforcement: reject UPDATE and DELETE on append-only collections.
 //!
 //! A hash-chained collection is refused on exactly the same terms, and with the
-//! same error. `verify_chain` walks entries in insertion order and each link
-//! covers its predecessor's hash, so removing or rewriting a link does not
-//! report THAT row as broken — it reports its SUCCESSOR's, because the
-//! successor's stored hash no longer matches what the surviving sequence
-//! computes. Tamper-evidence would then blame an untampered row for its
-//! predecessor's removal, which is worse than no evidence at all. `HASH_CHAIN`
-//! already implies `APPEND_ONLY` at DDL time, so refusing here enforces an
-//! invariant the collection declared rather than inventing a new one — and
-//! reusing `AppendOnlyViolation` says exactly that to the client.
+//! same error. Each link covers its row and its predecessor's link, so
+//! `VERIFY_HASH_CHAIN` reports any rewritten or removed row as a break. An
+//! admitted UPDATE or DELETE makes a legitimate write read as tampering.
+//! `HASH_CHAIN` already implies `APPEND_ONLY` at DDL time, so refusing here
+//! enforces an invariant the collection declared rather than inventing a new
+//! one — and reusing `AppendOnlyViolation` says exactly that to the client.
 
 use crate::bridge::envelope::ErrorCode;
 use nodedb_physical::physical_plan::EnforcementOptions;
@@ -94,9 +91,8 @@ mod tests {
         assert!(check_point_put("ledger", &chained(), &None).is_ok());
     }
 
-    /// Rewriting a link makes `verify_chain` report the SUCCESSOR row as
-    /// broken, so the update is refused rather than allowed to frame an
-    /// untampered row.
+    /// A rewritten row reads as tampering to `VERIFY_HASH_CHAIN`, so the
+    /// update is refused.
     #[test]
     fn update_rejected_on_hash_chain() {
         let old = Some(vec![1, 2, 3]);

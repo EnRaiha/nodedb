@@ -91,6 +91,31 @@ impl WalManager {
         Ok(kept)
     }
 
+    /// Record every time anchor in `records` and drop the anchors from the
+    /// stream. Anchors are commit-time metadata, and no engine replays them.
+    ///
+    /// The paginated readers keep anchors in their pages: a page of only
+    /// anchors otherwise reads as empty while `has_more` is set.
+    fn without_time_anchors(&self, mut records: Vec<WalRecord>) -> crate::Result<Vec<WalRecord>> {
+        self.time_anchors
+            .absorb_replayed(&records)
+            .map_err(crate::Error::Wal)?;
+        records.retain(|record| {
+            nodedb_wal::record::RecordType::from_raw(record.logical_record_type())
+                != Some(nodedb_wal::record::RecordType::TimeAnchor)
+        });
+        Ok(records)
+    }
+
+    /// Anchor every record recovered at open that no persisted anchor covers.
+    ///
+    /// Boot calls this once after [`Self::replay`] and before any append, so
+    /// the WAL frontier is the last recovered LSN.
+    pub fn anchor_recovered_tail(&self) {
+        let last_recovered = self.next_lsn().as_u64().saturating_sub(1);
+        self.time_anchors.cover_recovered(last_recovered);
+    }
+
     /// Replay all committed records from the WAL.
     ///
     /// Payloads come back as plaintext: the manager's key ring is handed to the
@@ -106,6 +131,7 @@ impl WalManager {
             self.encryption_ring.as_ref(),
         )
         .map_err(crate::Error::Wal)?;
+        let records = self.without_time_anchors(records)?;
         let records = Self::without_aborted_writes(records)?;
         info!(records = records.len(), "WAL replay complete");
         Ok(records)
@@ -126,6 +152,7 @@ impl WalManager {
             wal.replay_from(from_lsn.as_u64())
                 .map_err(crate::Error::Wal)?
         };
+        let records = self.without_time_anchors(records)?;
         Self::without_aborted_writes(records)
     }
 
@@ -137,6 +164,7 @@ impl WalManager {
             self.encryption_ring.as_ref(),
         )
         .map_err(crate::Error::Wal)?;
+        let records = self.without_time_anchors(records)?;
         Self::without_aborted_writes(records)
     }
 
@@ -176,5 +204,61 @@ impl WalManager {
             self.encryption_ring.as_ref(),
         )
         .map_err(crate::Error::Wal)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{DatabaseId, TenantId, VShardId};
+    use crate::wal::manager::NO_APPLY_KEY;
+
+    fn put(wal: &WalManager, payload: &[u8]) -> Lsn {
+        wal.appender(NO_APPLY_KEY)
+            .with_event_source(crate::event::EventSource::User)
+            .append_put(
+                TenantId::new(1),
+                VShardId::new(0),
+                DatabaseId::DEFAULT,
+                payload,
+            )
+            .expect("append")
+    }
+
+    #[test]
+    fn time_anchors_survive_a_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wal");
+
+        let live = {
+            let wal = WalManager::open_for_testing(&path).expect("open wal");
+            put(&wal, b"a");
+            put(&wal, b"b");
+            wal.sync().expect("sync");
+            put(&wal, b"c");
+            wal.sync().expect("sync");
+            wal.time_anchors().anchors()
+        };
+        // The empty log's open anchor is in memory only.
+        let persisted: Vec<_> = live.into_iter().filter(|a| a.lsn > 0).collect();
+        assert_eq!(
+            persisted.iter().map(|a| a.lsn).collect::<Vec<_>>(),
+            vec![3, 5]
+        );
+
+        let wal = WalManager::open_for_testing(&path).expect("reopen wal");
+        let records = wal.replay().expect("replay");
+        assert_eq!(records.len(), 3, "anchors are not handed to engine replay");
+        wal.anchor_recovered_tail();
+        assert_eq!(wal.time_anchors().anchors(), persisted);
+
+        let first_ns = persisted[0].hlc_wall_ns;
+        assert_eq!(
+            wal.time_anchors()
+                .lsn_at_or_before(first_ns)
+                .expect("lookup"),
+            3
+        );
+        assert!(wal.time_anchors().lsn_at_or_before(first_ns - 1).is_err());
     }
 }

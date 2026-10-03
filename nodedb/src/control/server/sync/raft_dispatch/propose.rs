@@ -2,25 +2,69 @@
 
 //! Raft proposal for sync writes.
 //!
-//! In a multi-node deployment the `async_raft_proposer` field is set on
-//! `SharedState` after Raft starts. When it is `Some` **and** the write plan
-//! maps to a `ReplicatedEntry`, the write is proposed to the Raft group and
-//! blocks here until the entry is committed to a quorum and applied on the
-//! local node. That gives quorum-durable ACK semantics: an acknowledged sync
-//! write cannot be lost on leader failover.
+//! `start_raft` installs the `async_raft_proposer` on every node. When the
+//! write plan maps to a `ReplicatedEntry`, the write is proposed to the Raft
+//! group and blocks here until the entry is committed to a quorum and applied
+//! on the local node. An acknowledged sync write survives leader failover.
 //!
 //! The idempotency gate embedded in every `ReplicatedEntry` runs on every
-//! replica via the replicated provenance, so a reconnecting Lite client that
-//! re-sends a delta on failover will be deduplicated on the new leader.
-//!
-//! Single-node deployments never set `async_raft_proposer`, so they always fall
-//! through to the local Data Plane path — zero overhead.
+//! replica via the replicated provenance. A reconnecting Lite client that
+//! re-sends a delta on failover is deduplicated on the new leader.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::bridge::envelope::PhysicalPlan;
+use crate::control::server::dispatch_utils::RecordOwner;
 use crate::control::state::SharedState;
-use crate::control::wal_replication::{AsyncRaftProposer, ReplicatedEntry};
+use crate::control::wal_replication::{
+    AsyncRaftProposer, ReplicableWrite, ReplicatedEntry, to_replicated_entry,
+};
+use crate::event::EventSource;
+
+/// Propose a sync write's `plan` through its vShard's data group and return
+/// the apply payload once the entry applied on this node.
+///
+/// The entry's apply appends the write's redo record on every replica.
+///
+/// Every sync write plan has a replicated form. A plan without one is
+/// refused.
+pub(crate) async fn propose_sync_plan(
+    state: &SharedState,
+    owner: RecordOwner,
+    plan: &PhysicalPlan,
+    event_source: EventSource,
+) -> crate::Result<Vec<u8>> {
+    let RecordOwner {
+        tenant_id,
+        database_id,
+        vshard_id,
+    } = owner;
+    let proposer = state.async_raft_proposer()?;
+    // The entry carries resolved rows: a timeseries ingest resolves here, on
+    // the proposer, before the entry exists.
+    let resolved = crate::control::write_resolve::resolve_for_log(
+        state,
+        crate::control::write_resolve::WriteResolveContext {
+            tenant_id,
+            database_id,
+        },
+        vshard_id,
+        plan,
+    )
+    .await?;
+    let proposed = resolved.as_ref().unwrap_or(plan);
+    let replicable = ReplicableWrite::decide_for_replication(proposed)?;
+    let entry = to_replicated_entry(tenant_id, database_id, vshard_id, &replicable)?.ok_or(
+        crate::Error::Internal {
+            detail: format!(
+                "sync write to '{}' has no replicated form",
+                plan.collection().unwrap_or("<unknown>")
+            ),
+        },
+    )?;
+    propose_sync_write(state, entry.with_event_source(event_source), proposer).await
+}
 
 /// Propose a `ReplicatedEntry` through Raft and block until the entry is
 /// committed to a quorum and applied on the local node.
@@ -33,13 +77,28 @@ use crate::control::wal_replication::{AsyncRaftProposer, ReplicatedEntry};
 /// (leader failover during the propose). All attempts share one statement
 /// deadline, so a retry gets only the time that remains. Only propose-layer machinery failures
 /// map to [`crate::Error::Dispatch`]; a classified apply verdict passes through.
+///
+/// An edge write is not proposed. It runs as a Calvin transaction
+/// (`planner::calvin::edge_sequencing`), and its applied payload comes back.
 pub(crate) async fn propose_sync_write(
     state: &SharedState,
-    entry: ReplicatedEntry,
+    mut entry: ReplicatedEntry,
     proposer: &Arc<AsyncRaftProposer>,
 ) -> crate::Result<Vec<u8>> {
+    if let Some(response) =
+        crate::control::planner::calvin::sequence_replicated_edge_write(state, &entry).await?
+    {
+        return Ok(response.payload.to_vec());
+    }
+    // The proposer below takes prebuilt bytes, so the floor is stamped here:
+    // replicas hold the write until they applied the collection's DDL. The
+    // commit instant is stamped once, before the first propose, so every
+    // retry and every replica dates the write alike.
+    entry.write_hlc = state.hlc_clock.now().wall_ns;
+    crate::control::wal_replication::stamp_metadata_floor(state, &mut entry);
+    crate::control::wal_replication::stamp_collection_incarnations(state, &mut entry)?;
     let idempotency_key = entry.idempotency_key;
-    let data = entry.to_bytes();
+    let data = entry.encode()?;
     let vshard_id = entry.vshard_id;
     let deadline = tokio::time::Instant::now()
         + Duration::from_secs(state.tuning.network.default_deadline_secs);

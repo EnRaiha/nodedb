@@ -257,12 +257,7 @@ pub(super) fn compute_hmac(secret: &str, message: &str) -> String {
         return String::new();
     };
     mac.update(message.as_bytes());
-    let result = mac.finalize();
-    result
-        .into_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex::encode(mac.finalize().into_bytes())
 }
 
 #[cfg(test)]

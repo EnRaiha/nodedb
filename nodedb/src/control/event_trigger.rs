@@ -40,7 +40,7 @@ pub async fn process_write_event(
     // fire triggers fire event definitions. A restored row fired its event
     // definitions when it was first written.
     let fires = match event.source {
-        EventSource::User | EventSource::Deferred => true,
+        EventSource::User | EventSource::ImplicitClient | EventSource::Deferred => true,
         EventSource::Trigger
         | EventSource::RaftFollower
         | EventSource::CrdtSync
@@ -96,6 +96,14 @@ pub async fn process_write_event(
                     event.tenant_id,
                     sql,
                     &event_def.name,
+                    event_action_key(
+                        event.vshard_id.as_u32(),
+                        event.lsn.as_u64(),
+                        event.sequence,
+                        event.database_id,
+                        &event_def.name,
+                        index,
+                    ),
                 )
                 .await
             }
@@ -139,8 +147,8 @@ pub async fn process_write_event(
                 "event trigger action failed"
             );
             // Only an action that applied nothing can be re-run. A malformed
-            // template will never render, and a part-applied action would
-            // duplicate the tasks that already landed.
+            // template will never render, and a part-applied action
+            // duplicates the tasks that already landed.
             if let (true, Ok(sql)) = (error.is_retryable(), &rendered) {
                 queue.enqueue(FailedAction {
                     key: ActionKey {
@@ -174,6 +182,7 @@ fn event_operation(op: WriteOp) -> &'static str {
         WriteOp::Update => "UPDATE",
         WriteOp::Delete | WriteOp::BulkDelete { .. } => "DELETE",
         WriteOp::Heartbeat => "HEARTBEAT",
+        WriteOp::Publish => "PUBLISH",
     }
 }
 
@@ -321,13 +330,31 @@ fn render_then_action_sql(action: &str, event: &WriteEvent) -> Result<String, Tr
 /// - `$document_id` → a string literal containing the affected document ID
 /// - `$collection` → a quoted collection identifier
 /// - `$operation` → an `INSERT`, `UPDATE`, or `DELETE` string literal
+///
+/// `applied_key` names the action within its source event. The commit
+/// records it with its writes on every replica, and an action whose key is
+/// recorded does not run again: a later owner fires the event again when the
+/// earlier owner's cursor commit did not land.
 pub async fn run_event_action_sql(
     shared: Arc<SharedState>,
     database_id: DatabaseId,
     tenant_id: TenantId,
     sql: &str,
     trigger_name: &str,
+    applied_key: crate::wal::CrossShardAppliedKey,
 ) -> Result<(), TriggerActionError> {
+    if let Some(dedup) = shared.cross_shard_dedup.get()
+        && dedup
+            .is_applied(&applied_key)
+            .map_err(|source| TriggerActionError::AppliedLookup { source })?
+    {
+        debug!(
+            trigger = trigger_name,
+            "event trigger action already applied for this event; not run again"
+        );
+        return Ok(());
+    }
+    let key_vshard = applied_key.source_vshard;
     let query_ctx = QueryContext::for_state(&shared);
     // A trigger action is database-defined code with no external requester, so
     // it plans as the system — the same SECURITY DEFINER model the trigger
@@ -351,13 +378,19 @@ pub async fn run_event_action_sql(
     // Keep the Arc and lease scope alive through the whole action. Admission
     // is fail-closed while a descriptor drains.
     let lease_scope = Arc::new(
-        Arc::clone(&shared)
+        shared
             .acquire_plan_lease_scope(&versions)
+            .await
             .map_err(|source| TriggerActionError::LeaseAdmission { source })?,
     );
+    // The action writes, so it is checked only before dispatch: cancelling
+    // committing tasks leaves their outcome unknown.
+    lease_scope
+        .check_not_revoked()
+        .map_err(|source| TriggerActionError::LeaseAdmission { source })?;
 
     // The action's tasks commit as one transaction. An action that dispatched
-    // its tasks one by one could stop half-applied, and re-running a
+    // its tasks one by one can stop half-applied, and re-running a
     // half-applied action repeats the tasks that already landed — which is
     // what makes a retry queue unsafe to point at it.
     let identity = event_action_identity(tenant_id);
@@ -367,6 +400,7 @@ pub async fn run_event_action_sql(
         tasks,
         lease_scope,
         crate::event::EventSource::Trigger,
+        Some((applied_key, key_vshard)),
     )
     .await
     .map_err(|source| TriggerActionError::Transaction { source })?;
@@ -377,6 +411,25 @@ pub async fn run_event_action_sql(
         "event trigger action executed"
     );
     Ok(())
+}
+
+/// The key of THEN clause `index` of event `event_name`, fired by the source
+/// event `(source_vshard, source_lsn, source_sequence)`: the event's
+/// replicated identity, which every replica shares.
+pub fn event_action_key(
+    source_vshard: u32,
+    source_lsn: u64,
+    source_sequence: u64,
+    database_id: DatabaseId,
+    event_name: &str,
+    index: usize,
+) -> crate::wal::CrossShardAppliedKey {
+    crate::wal::CrossShardAppliedKey {
+        source_vshard,
+        source_lsn,
+        source_sequence,
+        origin: format!("event/{}/{event_name}/{index}", database_id.as_u64()),
+    }
 }
 
 /// Identity a DEFINE EVENT action executes under.
@@ -427,6 +480,7 @@ mod tests {
             valid_time_ms: None,
             user_id: None,
             statement_digest: None,
+            commit_hlc: Some(crate::event::test_utils::test_commit_hlc()),
         }
     }
 

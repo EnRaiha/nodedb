@@ -21,6 +21,7 @@ fn targets(entry: &CatalogEntry, database_id: u64, tenant_id: u64, name: &str) -
             database_id: entry_database,
             tenant_id: entry_tenant,
             name: entry_name,
+            ..
         } => *entry_database == database_id && *entry_tenant == tenant_id && entry_name == name,
         _ => false,
     }
@@ -81,6 +82,8 @@ mod tests {
             database_id: 2,
             tenant_id: 1,
             name: name.to_owned(),
+            target_descriptor_version: 0,
+            target_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 

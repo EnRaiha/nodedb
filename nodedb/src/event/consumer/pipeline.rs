@@ -3,9 +3,14 @@
 //! Deliver an event to every side effect.
 //!
 //! Events from the ring and events WAL catch-up rebuilt take the same path:
-//! DML audit, the awaited AFTER and DEFINE EVENT actions, then the watermark,
-//! CDC, streaming materialized views and CRDT sync. The guard admits each
-//! event once, so an event both paths carry is delivered once.
+//! DML audit, the hold of the event's AFTER and DEFINE EVENT actions, then
+//! the watermark, CDC, streaming materialized views and CRDT sync. A
+//! committed transaction's publish event is held for delivery to its topic
+//! instead. The guard admits each event once, so an event both paths carry
+//! is delivered once.
+//!
+//! Every replica holds an event's actions. Only the partition's owner fires
+//! them, from a replicated cursor (see `trigger::lane`).
 //!
 //! The permission cache is not a side effect here. The permission step runs
 //! on ring events by their core numbers, before delivery (see
@@ -14,7 +19,6 @@
 use std::sync::Arc;
 
 use crate::control::state::SharedState;
-use crate::event::action::ActionRetryQueue;
 use crate::event::cdc::CdcRouter;
 use crate::event::sink_ledger::SinkEventKey;
 use crate::event::types::WriteEvent;
@@ -23,33 +27,45 @@ use super::delivery::DeliveryGuard;
 
 /// Deliver every event of `events` the guard admits, in order. Returns how
 /// many were delivered.
-pub async fn deliver_events<'a>(
+///
+/// `events` is a concrete slice, never a generic iterator: an `impl
+/// IntoIterator` parameter held across the awaits below makes the spawned
+/// consumer future fail its `Send` check.
+pub async fn deliver_events(
     core_id: usize,
-    events: impl IntoIterator<Item = &'a WriteEvent>,
+    events: &[WriteEvent],
     guard: &mut DeliveryGuard,
     shared_state: &Arc<SharedState>,
-    retry_queue: &mut ActionRetryQueue,
     cdc_router: &Arc<CdcRouter>,
 ) -> u64 {
     let mut delivered = 0u64;
+    let mut held = Vec::new();
     for event in events {
         if !guard.admit(event) {
             continue;
         }
-        deliver_event(core_id, event, shared_state, retry_queue, cdc_router).await;
+        deliver_event(core_id, event, shared_state, cdc_router, &mut held).await;
         delivered += 1;
     }
+    // The batch's events are durable in the lane before the consumer's safe
+    // LSN, and so its persisted watermark, passes them.
+    crate::event::trigger::lane::hold_rows(shared_state, &held).await;
     delivered
 }
 
-/// Deliver one admitted event.
+/// Deliver one admitted event. Its trigger action row joins `held`.
 async fn deliver_event(
     core_id: usize,
     event: &WriteEvent,
     shared_state: &Arc<SharedState>,
-    retry_queue: &mut ActionRetryQueue,
     cdc_router: &Arc<CdcRouter>,
+    held: &mut Vec<crate::event::trigger::lane::HeldRow>,
 ) {
+    // A committed transaction's message is held for delivery to its topic.
+    // It is no row, so no other side effect sees it.
+    if event.op == crate::event::types::WriteOp::Publish {
+        crate::event::topic::hold_committed_publish(event, shared_state).await;
+    }
     if !event.op.is_data_event() {
         shared_state
             .watermark_tracker
@@ -62,52 +78,36 @@ async fn deliver_event(
     // Recorded before the actions run, as the statement's audit precedes its
     // triggers.
     crate::event::audit_dml::audit_dml_event(event, shared_state, key.as_ref());
-    // Every action finishes before the watermark or any other side effect
-    // moves past the event.
-    dispatch_event_actions(event, shared_state, retry_queue).await;
+    // Every replica positions the event in apply order and holds it.
+    if event_actions_required(event)
+        && let Some(row) = crate::event::trigger::lane::action_row(event, shared_state, cdc_router)
+    {
+        held.push(row);
+    }
     accumulate_data_event(event, key.as_ref(), shared_state, cdc_router);
 }
 
-/// Run the AFTER-ROW triggers and DEFINE EVENT actions of a data event.
-pub async fn dispatch_event_actions(
-    event: &WriteEvent,
-    shared_state: &Arc<SharedState>,
-    retry_queue: &mut ActionRetryQueue,
-) {
-    if !event_actions_required(event) {
-        return;
-    }
-    crate::event::trigger::dispatcher::dispatch_triggers(event, shared_state, retry_queue).await;
-    crate::control::event_trigger::process_write_event(
-        Arc::clone(shared_state),
-        event,
-        retry_queue,
-    )
-    .await;
-}
-
+/// Whether `event` is a row write that triggers and event actions act on.
+///
+/// A graph edge write reaches the stream of the edge's collection for its
+/// change streams. It is not a row of that collection, and its image is the
+/// edge's properties, not a row map. The document write that mirrors an
+/// implicit edge emits its own row event, which fires the collection's
+/// triggers once.
 fn event_actions_required(event: &WriteEvent) -> bool {
-    event.op.is_data_event()
+    event.op.is_data_event() && !matches!(event.row_id, crate::event::types::RowId::Edge(_))
 }
 
-/// Apply the side effects after the actions: the wall-time watermark, CDC
-/// routing, streaming materialized views and CRDT sync packaging.
+/// Apply the side effects after the actions: CDC routing, the wall-time
+/// watermark, streaming materialized views and CRDT sync packaging.
 fn accumulate_data_event(
     event: &WriteEvent,
     key: Option<&SinkEventKey>,
     shared_state: &Arc<SharedState>,
     cdc_router: &Arc<CdcRouter>,
 ) {
-    let event_time_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    shared_state.watermark_tracker.advance(
-        event.vshard_id.as_u32(),
-        event.lsn.as_u64(),
-        event_time_ms,
-    );
-
+    // Routing runs before the watermark moves: the late-data check compares
+    // the event against the watermark of the events before it.
     match shared_state.sink_ledgers.get() {
         Some(ledgers) => {
             ledgers
@@ -118,6 +118,15 @@ fn accumulate_data_event(
         // stopping) a change stream is not exactly-once across a restart.
         None => cdc_router.route_event(event, &shared_state.watermark_tracker),
     }
+    let event_time_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    shared_state.watermark_tracker.advance(
+        event.vshard_id.as_u32(),
+        event.lsn.as_u64(),
+        event_time_ms,
+    );
     let matching_streams = shared_state.stream_registry.find_matching(
         event.database_id,
         event.tenant_id.as_u64(),
@@ -168,6 +177,7 @@ mod tests {
             valid_time_ms: None,
             user_id: None,
             statement_digest: None,
+            commit_hlc: Some(crate::event::test_utils::test_commit_hlc()),
         }
     }
 
@@ -178,5 +188,20 @@ mod tests {
             count: 2
         })));
         assert!(!event_actions_required(&event(WriteOp::Heartbeat)));
+    }
+
+    #[test]
+    fn an_edge_write_runs_no_row_actions() {
+        let mut edge = event(WriteOp::Insert);
+        edge.row_id = RowId::edge(
+            crate::event::types::EdgeEndpoints {
+                src: "a",
+                src_surrogate: nodedb_types::Surrogate::new(1),
+                dst: "b",
+                dst_surrogate: nodedb_types::Surrogate::new(2),
+            },
+            "knows",
+        );
+        assert!(!event_actions_required(&edge));
     }
 }

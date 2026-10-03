@@ -165,6 +165,8 @@ mod tests {
                 },
             ],
             txn_id: None,
+            vshard_id: None,
+            read_groups: Vec::new(),
         };
         let decoded = roundtrip_req(req.clone());
         assert_eq!(decoded.plan_bytes, req.plan_bytes);
@@ -189,9 +191,33 @@ mod tests {
             trace_id: [0u8; 16],
             descriptor_versions: vec![],
             txn_id: None,
+            vshard_id: None,
+            read_groups: Vec::new(),
         };
         let decoded = roundtrip_req(req);
         assert!(decoded.descriptor_versions.is_empty());
+    }
+
+    #[test]
+    fn roundtrip_execute_request_carries_the_scoped_vshard() {
+        let req = ExecuteRequest {
+            plan_bytes: vec![0x01],
+            tenant_id: 1,
+            database_id: 0,
+            deadline_remaining_ms: 1000,
+            trace_id: [0u8; 16],
+            descriptor_versions: vec![],
+            txn_id: Some(nodedb_types::id::TxnId::new(9)),
+            vshard_id: Some(nodedb_types::id::VShardId::new(513)),
+            read_groups: vec![7, 9],
+        };
+        let decoded = roundtrip_req(req);
+        assert_eq!(
+            decoded.vshard_id,
+            Some(nodedb_types::id::VShardId::new(513))
+        );
+        assert_eq!(decoded.txn_id, Some(nodedb_types::id::TxnId::new(9)));
+        assert_eq!(decoded.read_groups, vec![7, 9]);
     }
 
     #[test]
@@ -381,6 +407,8 @@ mod tests {
                 version: 3,
             }],
             txn_id: None,
+            vshard_id: None,
+            read_groups: Vec::new(),
         };
         let rpc = RaftRpc::ExecuteStreamRequest(req.clone());
         let encoded =

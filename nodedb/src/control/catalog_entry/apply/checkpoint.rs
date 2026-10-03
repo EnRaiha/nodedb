@@ -4,10 +4,12 @@
 //!
 //! Writes only. The leader reports the duplicate and the missing checkpoint
 //! before proposing, so apply runs the unvalidated catalog path: a rejection
-//! here would diverge a follower from a statement the leader already accepted.
+//! here diverges a follower from a statement the leader already accepted.
 
 use crate::control::security::catalog::types::{CheckpointDoc, CheckpointRecord};
-use crate::control::security::catalog::{SystemCatalog, catalog_err};
+use crate::control::security::catalog::{
+    StoredCompactionPoint, StoredPendingHistoryCompaction, SystemCatalog, catalog_err,
+};
 
 /// Apply a `PutCheckpoint` entry. A re-delivery rewrites the same row.
 pub fn put(record: &CheckpointRecord, catalog: &SystemCatalog) -> crate::Result<()> {
@@ -51,6 +53,38 @@ pub fn delete_before(
             )
         })
         .map(|_| ())
+}
+
+/// Apply a `CompactHistory` entry: record the collection's compaction point
+/// and the owed oplog compaction, then delete the checkpoint rows below the
+/// boundary.
+///
+/// The compaction point is replicated, so a node that installs a metadata
+/// image learns every compaction the image covers. The owed row is
+/// node-local. It is written before the checkpoint delete and removed by
+/// post-apply once every local core compacted durably. A crash between
+/// apply and that removal leaves the row for the boot drain.
+pub fn compact_history(
+    doc: CheckpointDoc<'_>,
+    before_timestamp: u64,
+    target_version_json: &str,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
+    catalog.put_compaction_point(&StoredCompactionPoint {
+        database_id: doc.database_id,
+        tenant_id: doc.tenant_id,
+        collection: doc.collection.to_string(),
+        target_version_json: target_version_json.to_string(),
+    })?;
+    catalog.enqueue_pending_history_compaction(&StoredPendingHistoryCompaction {
+        database_id: doc.database_id,
+        tenant_id: doc.tenant_id,
+        collection: doc.collection.to_string(),
+        target_version_json: target_version_json.to_string(),
+        last_error: String::new(),
+        attempts: 0,
+    })?;
+    delete_before(doc, before_timestamp, catalog)
 }
 
 #[cfg(test)]
@@ -267,6 +301,32 @@ mod tests {
             vec!["boundary".to_string(), "newer".to_string()],
             "created_at == before_timestamp survives the range delete"
         );
+    }
+
+    /// Applying `CompactHistory` records the owed compaction before post-apply
+    /// runs, so a crash before the fan-out leaves it for the boot drain.
+    #[test]
+    fn apply_records_the_owed_compaction() {
+        let (_dir, catalog) = open_catalog();
+        apply::apply_to(
+            &CatalogEntry::CompactHistory {
+                tenant_id: TENANT,
+                database_id: DATABASE,
+                collection: COLLECTION.to_string(),
+                doc_id: DOC.to_string(),
+                before_timestamp: 100,
+                target_version_json: "{\"n1\":4}".to_string(),
+            },
+            &catalog,
+        )
+        .unwrap();
+
+        let owed = catalog.load_pending_history_compactions().unwrap();
+        assert_eq!(owed.len(), 1);
+        assert_eq!(owed[0].database_id, DATABASE);
+        assert_eq!(owed[0].tenant_id, TENANT);
+        assert_eq!(owed[0].collection, COLLECTION);
+        assert_eq!(owed[0].target_version_json, "{\"n1\":4}");
     }
 
     #[test]

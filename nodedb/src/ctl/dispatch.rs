@@ -5,7 +5,8 @@
 use std::path::PathBuf;
 
 use super::args::parse_flags;
-use super::{healthcheck, join_token, regen_certs, rotate_ca};
+use super::restore::{RestoreArgs, parse_restore_args};
+use super::{healthcheck, join_token, regen_certs, restore, rotate_ca};
 
 /// All operator subcommands. Constructed by [`parse_subcommand`] from
 /// the raw `std::env::args()` tail so `main()` can decide before it
@@ -28,6 +29,9 @@ pub enum Subcommand {
     /// Used by container `HEALTHCHECK` directives so distroless /
     /// Chainguard runtime images don't need to ship `curl`.
     Healthcheck { port: u16 },
+    /// Restore this node offline to a point in time: a base snapshot plus
+    /// archived WAL cut at the target.
+    Restore(RestoreArgs),
     /// Print the version string and exit 0.
     PrintVersion,
     /// Reserved subcommand that is not yet implemented.
@@ -39,7 +43,6 @@ fn stub_description(name: &str) -> &'static str {
     match name {
         "migrate" => "schema/data migration",
         "backup" => "online backup",
-        "restore" => "restore",
         "verify" => "verify (consistency check)",
         "repair" => "repair",
         "dump" => "dump (logical export)",
@@ -56,52 +59,24 @@ pub fn parse_subcommand(args: &[String]) -> Result<Option<Subcommand>, String> {
     let Some(first) = args.first() else {
         return Ok(None);
     };
-    // Known subcommand names — anything else is assumed to be a config
-    // file path so the `nodedb /etc/nodedb.toml` spelling keeps working.
+    // Anything that is not a subcommand name is a config file path, so the
+    // `nodedb /etc/nodedb.toml` spelling keeps working.
     let name = first.as_str();
-    if !matches!(
-        name,
-        "regen-certs"
-            | "rotate-ca"
-            | "join-token"
-            | "healthcheck"
-            | "help"
-            | "--help"
-            | "-h"
-            | "--version"
-            | "-V"
-            | "version"
-            | "migrate"
-            | "backup"
-            | "restore"
-            | "verify"
-            | "repair"
-            | "dump"
-            | "fsck"
-    ) {
-        return Ok(None);
-    }
-
-    if matches!(name, "help" | "--help" | "-h") {
-        print_usage();
-        std::process::exit(0);
-    }
-
-    if matches!(name, "--version" | "-V" | "version") {
-        return Ok(Some(Subcommand::PrintVersion));
-    }
-
-    if matches!(
-        name,
-        "migrate" | "backup" | "restore" | "verify" | "repair" | "dump" | "fsck"
-    ) {
-        return Ok(Some(Subcommand::NotImplemented {
-            name: name.to_string(),
-        }));
-    }
-
     let tail = &args[1..];
     match name {
+        "help" | "--help" | "-h" => {
+            print_usage();
+            std::process::exit(0);
+        }
+        "--version" | "-V" | "version" => Ok(Some(Subcommand::PrintVersion)),
+        "migrate" | "backup" | "verify" | "repair" | "dump" | "fsck" => {
+            Ok(Some(Subcommand::NotImplemented {
+                name: name.to_string(),
+            }))
+        }
+        "restore" => parse_restore_args(tail)
+            .map(|args| Some(Subcommand::Restore(args)))
+            .map_err(|e| e.to_string()),
         "regen-certs" => {
             let flags = parse_flags(tail)?;
             let data_dir = PathBuf::from(super::args::required(&flags, "data-dir")?);
@@ -146,7 +121,7 @@ pub fn parse_subcommand(args: &[String]) -> Result<Option<Subcommand>, String> {
                 ttl,
             }))
         }
-        _ => unreachable!("name checked above"),
+        _ => Ok(None),
     }
 }
 
@@ -190,6 +165,7 @@ pub fn run_subcommand(cmd: Subcommand) -> i32 {
             }
         },
         Subcommand::Healthcheck { port } => healthcheck::run(port),
+        Subcommand::Restore(args) => restore::run(args),
         Subcommand::PrintVersion => {
             print!("{}", format_version_block());
             0
@@ -229,12 +205,19 @@ USAGE:
     nodedb join-token --create --data-dir D --for-node N [--ttl 10m]
                                              Emit a one-time HMAC token for a joining node
     nodedb healthcheck [--port N]            Probe local HTTP /health (exit 0=healthy, 1=unhealthy)
+    nodedb restore --config C (--target-time T | --target-lsn N) [--incarnation I] [--dry-run]
+                                             Restore this node offline into the empty data dir of
+                                             config C: the newest base snapshot at or below the
+                                             target plus archived WAL cut at the target. T is
+                                             RFC 3339 or epoch s/ms/us. --dry-run prints the plan
+    nodedb restore --config C --cluster --restore-point ID [--incarnation I] [--dry-run]
+                                             This node's part of a cluster restore to restore
+                                             point ID. Stop every node, then run it on each
     nodedb help                              Print this message
 
 RESERVED (not yet implemented):
     nodedb migrate                           Schema/data migration
     nodedb backup                            Online backup
-    nodedb restore                           Restore from backup
     nodedb verify                            Consistency check
     nodedb repair                            Repair corrupted data
     nodedb dump                              Logical export
@@ -289,13 +272,31 @@ mod tests {
     }
 
     #[test]
-    fn stub_restore() {
+    fn restore_parses() {
+        let parsed = parse_subcommand(&args(&[
+            "restore",
+            "--config",
+            "/etc/nodedb.toml",
+            "--target-lsn",
+            "120",
+            "--dry-run",
+        ]))
+        .unwrap();
+        let Some(Subcommand::Restore(restore)) = parsed else {
+            panic!("expected a restore subcommand, got {parsed:?}");
+        };
+        assert_eq!(restore.config, PathBuf::from("/etc/nodedb.toml"));
         assert_eq!(
-            parse_subcommand(&args(&["restore"])).unwrap(),
-            Some(Subcommand::NotImplemented {
-                name: "restore".to_string()
-            })
+            restore.scope,
+            crate::ctl::restore::RestoreScope::Node(crate::ctl::restore::RestoreTarget::Lsn(120))
         );
+        assert!(restore.dry_run);
+    }
+
+    #[test]
+    fn restore_without_a_target_is_a_usage_error() {
+        let err = parse_subcommand(&args(&["restore", "--config", "/c.toml"])).unwrap_err();
+        assert!(err.contains("--target-time"), "{err}");
     }
 
     #[test]

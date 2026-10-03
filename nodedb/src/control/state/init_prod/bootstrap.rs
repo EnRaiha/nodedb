@@ -10,8 +10,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use nodedb_types::DatabaseId;
-
 use crate::control::security::apikey::ApiKeyStore;
 use crate::control::security::audit::AuditLog;
 use crate::control::security::blacklist::store::BlacklistStore;
@@ -32,7 +30,7 @@ use crate::control::trigger::TriggerRegistry;
 /// Every value computed before `SharedState`'s `Self { .. }` literal in
 /// `SharedState::open`, bundled so the constructor can destructure one
 /// return value instead of ~30 separate `let`s. Field-for-field, this is
-/// the same set of locals `open()` would otherwise build directly.
+/// the same set of locals `open()` otherwise builds directly.
 pub(super) struct ProdBootstrap {
     pub(super) credentials: Arc<CredentialStore>,
     pub(super) producer_registry: Option<Arc<SyncProducerRegistry>>,
@@ -91,21 +89,11 @@ pub(super) fn run(
 
     // Share the credential store's already-open catalog (one redb file
     // handle). Opening a second `SystemCatalog` on the same path is rejected
-    // by redb, which would silently disable durable fencing.
-    let producer_registry = {
-        let catalog = credentials.catalog();
-        match SyncProducerRegistry::open(Arc::new(catalog.clone())) {
-            Ok(reg) => Some(Arc::new(reg)),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "SharedState::open: SyncProducerRegistry::open failed; \
-                     sync handshake will use in-memory fork detection only"
-                );
-                None
-            }
-        }
-    };
+    // by redb. The registry holds replicated state the metadata applier
+    // writes, so an unreadable registry fails boot.
+    let producer_registry = Some(Arc::new(SyncProducerRegistry::open(Arc::new(
+        credentials.catalog().clone(),
+    ))?));
 
     credentials.set_lockout_policy_with_grace(
         auth_config.max_failed_logins,
@@ -137,72 +125,26 @@ pub(super) fn run(
     let mut audit_start_seq = 1u64;
     {
         let catalog = credentials.catalog();
-        api_keys.load_from(catalog)?;
-        roles.load_from(catalog)?;
-        permissions.load_from(catalog)?;
-        blacklist.load_from(catalog)?;
-        trigger_registry.load_all(catalog);
-        stream_registry.load_from_catalog(catalog);
-        group_registry.load_from_catalog(catalog);
-        schedule_registry.load_from_catalog(catalog);
-        if let Err(e) = synonym_registry.reload_from_catalog(catalog) {
-            tracing::warn!(error = %e, "boot: failed to load synonym groups from catalog");
+        super::catalog_registries::CatalogRegistries {
+            api_keys: &api_keys,
+            roles: &roles,
+            permissions: &permissions,
+            blacklist: &blacklist,
+            trigger_registry: &trigger_registry,
+            stream_registry: &stream_registry,
+            group_registry: &group_registry,
+            schedule_registry: &schedule_registry,
+            synonym_registry: &synonym_registry,
+            custom_type_registry: &custom_type_registry,
+            retention_policy_registry: &retention_policy_registry,
+            alert_registry: &alert_registry,
+            ep_topic_registry: &ep_topic_registry,
+            mv_registry: &mv_registry,
+            sequence_registry: &sequence_registry,
+            rls_store: &rls_store,
+            redaction_store: &redaction_store,
         }
-        if let Err(e) = custom_type_registry.reload_from_catalog(catalog) {
-            tracing::warn!(error = %e, "boot: failed to load custom types from catalog");
-        }
-        if let Ok(rp_defs) = catalog.load_all_retention_policies() {
-            retention_policy_registry.load(rp_defs);
-        }
-        alert_registry.load_from_catalog(catalog);
-        ep_topic_registry.load_from_catalog(catalog)?;
-        mv_registry.load_from_catalog(catalog);
-        sequence_registry.load_from_catalog(catalog);
-        // Every stored row is installed: a row that cannot be compiled
-        // against its collection installs as a restrictive deny-all
-        // (`StoredRlsPolicy::rehydrate`), never skipped.
-        match catalog.load_all_rls_policies() {
-            Ok(stored) => {
-                for s in &stored {
-                    rls_store.install_replicated_policy(s.rehydrate(catalog));
-                }
-                if !stored.is_empty() {
-                    tracing::info!(
-                        rls_policies = stored.len(),
-                        "loaded RLS policies from catalog"
-                    );
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "failed to load RLS policies"),
-        }
-        match catalog.load_all_redaction_policies() {
-            Ok(stored) => {
-                let mut loaded = 0usize;
-                for s in &stored {
-                    match s.to_runtime() {
-                        Ok(p) => {
-                            redaction_store.install_replicated_policy(p);
-                            loaded += 1;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                name = %s.name,
-                                collection = %s.collection,
-                                error = %e,
-                                "boot replay: skipped invalid redaction policy"
-                            );
-                        }
-                    }
-                }
-                if loaded > 0 {
-                    tracing::info!(
-                        redaction_policies = loaded,
-                        "loaded redaction policies from catalog"
-                    );
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "failed to load redaction policies"),
-        }
+        .load(catalog)?;
         let max_seq = catalog.load_audit_max_seq()?;
         if max_seq > 0 {
             audit_start_seq = max_seq + 1;
@@ -212,13 +154,16 @@ pub(super) fn run(
     let mut audit_log = AuditLog::new(10_000);
     audit_log.set_next_seq(audit_start_seq);
 
-    // Bootstrap the database-id registry from the persisted hwm.
-    // On a fresh server this starts at USER_DB_START (1024); on restart
-    // it seeds from the persisted hwm so post-restart allocations cannot
-    // collide with pre-restart ones.
+    // Seed the database-id registry from the persisted hwm and the
+    // applied-reservation cursor. Every issued id was persisted before it
+    // left the registry, and metadata-log replay skips each reservation at
+    // or below the cursor.
     let database_registry = {
-        let hwm = credentials.catalog().get_database_hwm().unwrap_or(0);
-        crate::control::database::DatabaseRegistry::from_persisted_hwm(hwm)
+        let catalog = credentials.catalog();
+        crate::control::database::DatabaseRegistry::from_persisted(
+            catalog.get_database_hwm()?,
+            catalog.get_database_reserve_index()?,
+        )
     };
 
     // Bootstrap the global surrogate registry from the persisted hwm. On
@@ -234,10 +179,10 @@ pub(super) fn run(
             // The singleton is flushed lazily and no engine contributes a
             // "surrogate durable through" floor to WAL truncation, so a
             // checkpoint can truncate the `SurrogateAlloc` / `SurrogateBind`
-            // records that would have covered a stale singleton. Take the
+            // records that cover a stale singleton. Take the
             // highest surrogate any live binding refers to as a floor the
             // allocator can never start below — re-issuing one already bound to
-            // a live row would corrupt cross-engine identity.
+            // a live row corrupts cross-engine identity.
             let bound_floor = catalog.max_bound_surrogate()?.as_u32();
             let floor = hwm.max(bound_floor);
             if is_cluster {
@@ -266,17 +211,9 @@ pub(super) fn run(
     ));
 
     // Pre-load permission tree definitions before wrapping in RwLock
-    // (avoids blocking_write() which panics inside async runtimes). The
-    // edges and grants load at boot once the data groups replayed.
-    let mut permission_cache = PermissionCache::new();
-    let catalog = credentials.catalog();
-    for coll in &catalog.load_all_collections(DatabaseId::DEFAULT)? {
-        if let Some(change) =
-            crate::control::security::auth_fence::TreeDefChange::from_collection(coll)?
-        {
-            change.apply(&mut permission_cache);
-        }
-    }
+    // (avoids blocking_write() which panics inside async runtimes).
+    let permission_cache =
+        crate::control::security::auth_fence::cache_from_catalog(credentials.catalog())?;
 
     let shutdown = Arc::new(ShutdownWatch::new());
     let loop_registry = Arc::new(LoopRegistry::new());

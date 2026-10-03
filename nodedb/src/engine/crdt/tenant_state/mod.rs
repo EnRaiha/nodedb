@@ -20,5 +20,5 @@ mod snapshot_io;
 mod snapshot_restore;
 pub mod validate;
 
-pub use apply_validated::{DeltaSigningAdmission, ValidatedApplyOutcome};
+pub use apply_validated::{ApplyTarget, DeltaSigningAdmission, ValidatedApplyOutcome};
 pub use core::TenantCrdtEngine;

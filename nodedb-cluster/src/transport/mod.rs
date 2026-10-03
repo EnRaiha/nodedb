@@ -4,13 +4,16 @@ pub mod auth_context;
 pub mod client;
 pub mod config;
 pub mod credentials;
+mod frame_io;
 mod identity_admission;
 pub mod peer_identity_store;
 pub mod peer_identity_verifier;
 pub mod pinned_verifier;
 pub mod rpc_handler;
 pub mod server;
+mod shuffle_drain;
 mod stream_dispatch;
+mod stream_identity;
 mod topology_identity_store;
 
 pub use auth_context::AuthContext;
@@ -41,4 +44,5 @@ pub use peer_identity_verifier::{
     IDENTITY_MISMATCH_QUIC_ERROR, VerifyMethod, VerifyOutcome, spki_pin_from_cert_der,
 };
 pub use rpc_handler::RaftRpcHandler;
+pub use shuffle_drain::ShufflePushError;
 pub use topology_identity_store::TopologyIdentityStore;

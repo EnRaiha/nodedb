@@ -10,6 +10,7 @@
 //! `restore_segments.rs`). `text` indexes
 //! the restored rows' full-text postings.
 
+mod edges;
 mod engines;
 mod keys;
 mod tenant_snapshot;

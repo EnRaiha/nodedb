@@ -163,6 +163,7 @@ mod tests {
                     txn_id: None,
                     wal_lsn: wal_lsn.map(crate::types::Lsn::new),
                     resolved_now_ms: None,
+                    commit_hlc: None,
                     admission: crate::bridge::envelope::Admission::Admitted,
                 }))
                 .expect("push request");
@@ -393,14 +394,17 @@ mod tests {
 
     /// The `TimeseriesBatch` WAL record a live ingest of one row appends.
     fn ingest_record(host: &str, value: f64, ts_ms: i64, lsn: u64) -> nodedb_wal::WalRecord {
-        let payload = zerompk::to_msgpack_vec(&(
-            "timeseries".to_string(),
-            COLL.to_string(),
-            ilp_line(host, value, ts_ms).into_bytes(),
-            Option::<nodedb_types::sync::wire::SyncProvenance>::None,
-            "ilp".to_string(),
-        ))
-        .expect("encode timeseries tuple");
+        let line = ilp_line(host, value, ts_ms);
+        let payload = crate::control::server::wal_dispatch::encode_timeseries_ingest_payload(
+            crate::control::server::wal_dispatch::TimeseriesIngestRecord {
+                collection: COLL,
+                payload: line.as_bytes(),
+                provenance: None,
+                format: "ilp",
+                default_timestamp_ms: ts_ms,
+            },
+        )
+        .expect("encode timeseries ingest record");
         wal_record(
             nodedb_wal::record::RecordType::TimeseriesBatch,
             lsn,

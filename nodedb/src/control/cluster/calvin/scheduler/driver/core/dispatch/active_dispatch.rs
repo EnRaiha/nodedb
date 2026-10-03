@@ -14,8 +14,7 @@ use nodedb_physical::physical_plan::meta::MetaOp;
 use super::super::deferred::{DispatchOutcome, DispatchStep};
 use super::super::scheduler::Scheduler;
 use super::primary_write::{
-    participant_change_sets, plans_have_primary_write, plans_have_returning,
-    txn_has_non_derived_write,
+    plans_have_primary_write, plans_have_returning, txn_has_non_derived_write,
 };
 use crate::control::cluster::calvin::scheduler::lock_manager::TxnId;
 
@@ -50,7 +49,12 @@ impl Scheduler {
                 return;
             }
         };
-        let has_non_derived_write = txn_has_non_derived_write(&plans);
+        // An assembled multi-part txn carries only its local tasks. The
+        // whole-transaction fact comes from its manifest.
+        let has_non_derived_write = match &txn.tx_class.multi_part {
+            Some(manifest) => manifest.user_write,
+            None => txn_has_non_derived_write(&plans),
+        };
         let mut plans =
             match self.local_calvin_plans(plans, txn.tx_class.database_id, epoch, position) {
                 Ok(p) if !p.is_empty() => p,
@@ -97,7 +101,6 @@ impl Scheduler {
         }
         let has_primary_write = plans_have_primary_write(&plans, has_non_derived_write);
         let has_returning = plans_have_returning(&plans);
-        let change_sets = participant_change_sets(&plans, tenant_id, self.vshard_id);
         let flush_scope = super::super::super::types::FlushScope::of_plans(&plans);
         let plan = PhysicalPlan::Meta(MetaOp::CalvinExecuteActive {
             epoch,
@@ -117,6 +120,8 @@ impl Scheduler {
 
         // The txn enters `pending` before the dispatch, so a stage refused at
         // capacity stays in flight with its locks until the re-send.
+        // Every replica checks the transaction's collection incarnations.
+        let (superseded, gates) = self.check_incarnations(&txn.tx_class);
         self.pending.insert(
             txn_id,
             super::super::super::types::PendingTxn {
@@ -126,7 +131,8 @@ impl Scheduler {
                 dispatch_time: Instant::now(),
                 has_primary_write,
                 has_returning,
-                change_sets,
+                // The commit's resolved redo fills them.
+                change_sets: Vec::new(),
                 // The dependent-read active path STAGES (leader-verify OLLP +
                 // buffer, no base apply); its response drives the same
                 // resolve → redo → flush as the static path, for
@@ -139,6 +145,11 @@ impl Scheduler {
                 // Set once a committed txn appends its redo record.
                 redo_records: None,
                 flush_scope,
+                superseded,
+                gates,
+                ungated: false,
+                // Taken when the flush dispatches.
+                install_permit: None,
             },
         );
 

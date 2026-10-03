@@ -4,9 +4,10 @@
 //!
 //! Spawned once per cluster node at startup. Wakes every
 //! `check_interval`, walks the local node's leases in
-//! `metadata_cache.leases`, and re-acquires every lease whose
+//! `metadata_cache.leases`, and re-acquires every held lease whose
 //! remaining time is below `threshold_pct` of the original
-//! duration. Re-acquire goes through the standard
+//! duration. A lease no statement holds is released instead, so an
+//! idle lease lapses at its expiry. Re-acquire goes through the standard
 //! `SharedState::acquire_descriptor_lease` slow path, which
 //! transparently forwards to the metadata-group leader if this
 //! node isn't it.
@@ -15,15 +16,11 @@
 //! blocked on its tokio task. On every tick it upgrades to a
 //! strong reference, doing nothing if the upgrade fails.
 //!
-//! **Single-node clusters skip this loop entirely.** In single-node
-//! mode there is no metadata raft handle, every `acquire_lease`
-//! call writes straight into the local cache, and there is no
-//! concurrent writer that could expire a lease behind the loop's
-//! back. The `spawn` constructor returns `None` in that case so
-//! the embedded usage path doesn't carry an idle tokio task.
+//! Every node runs the loop, a one-node cluster included: every lease
+//! is granted and released through the metadata raft group.
 //!
 //! The DDL drain gate reads `metadata_cache.leases` to decide
-//! when a `Put*` of a new descriptor version may commit. The
+//! when a `Put*` of a new descriptor version can commit. The
 //! renewal loop is what keeps that map populated past initial
 //! acquisition.
 
@@ -40,11 +37,16 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
 
+/// How often the loop checks the self-fence and revokes in-flight statements.
+/// Revocation then trails the fence by at most this, well inside the 5 s
+/// clock-skew margin other nodes wait on top of the fence window.
+const LEASE_FENCE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
 use crate::control::state::SharedState;
 
 /// Configuration extracted from `ClusterTransportTuning` at spawn
 /// time. Captured so the loop has stable values for the duration
-/// of its life — tuning hot-reload (if it ever lands) would need
+/// of its life — tuning hot-reload (if it ever lands) needs
 /// to restart the loop.
 #[derive(Debug, Clone, Copy)]
 pub struct LeaseRenewalConfig {
@@ -90,9 +92,9 @@ pub struct LeaseRenewalLoop {
 }
 
 impl LeaseRenewalLoop {
-    /// Spawn the renewal loop on the current tokio runtime. Returns
-    /// `None` (and does not spawn anything) on single-node clusters
-    /// where `metadata_raft` is not wired — see the module docstring.
+    /// Spawn the renewal loop on the current tokio runtime. Fails, and
+    /// spawns nothing, before `start_raft` installed the metadata raft
+    /// handle.
     ///
     /// The returned handle is `(JoinHandle, LoopMetrics)`; the caller
     /// registers the metrics with the cluster's loop-metrics registry
@@ -102,11 +104,8 @@ impl LeaseRenewalLoop {
         shared: Arc<SharedState>,
         tuning: &ClusterTransportTuning,
         shutdown_rx: watch::Receiver<bool>,
-    ) -> Option<(JoinHandle<()>, Arc<LoopMetrics>)> {
-        if shared.metadata_raft.get().is_none() {
-            debug!("descriptor lease renewal: skipping spawn (no metadata raft handle)");
-            return None;
-        }
+    ) -> crate::Result<(JoinHandle<()>, Arc<LoopMetrics>)> {
+        shared.metadata_raft_handle()?;
         let config = LeaseRenewalConfig::from_tuning(tuning);
         info!(
             check_interval_secs = config.check_interval.as_secs(),
@@ -126,7 +125,7 @@ impl LeaseRenewalLoop {
             loop_handle.run().await;
             metrics_for_task.set_up(false);
         });
-        Some((join, loop_metrics))
+        Ok((join, loop_metrics))
     }
 
     async fn run(mut self) {
@@ -136,6 +135,8 @@ impl LeaseRenewalLoop {
         // acquires won't be near expiry.
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await;
+        let mut fence_check = tokio::time::interval(LEASE_FENCE_CHECK_INTERVAL);
+        fence_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         self.loop_metrics.set_up(true);
         loop {
             tokio::select! {
@@ -146,9 +147,14 @@ impl LeaseRenewalLoop {
                         return;
                     }
                 }
+                _ = fence_check.tick() => {
+                    if let Some(shared) = self.shared.upgrade() {
+                        super::revoke_if_fenced(&shared);
+                    }
+                }
                 _ = interval.tick() => {
                     let started = Instant::now();
-                    self.tick();
+                    self.tick().await;
                     self.loop_metrics.observe(started.elapsed());
                 }
             }
@@ -161,7 +167,7 @@ impl LeaseRenewalLoop {
     /// next tick retries it.
     ///
     /// **Why we use wall-clock nanoseconds, not `hlc_clock.peek()`**:
-    /// `peek` returns the last HLC the clock observed, which may
+    /// `peek` returns the last HLC the clock observed, which can
     /// be frozen at the moment the lease was stamped if nothing
     /// else has advanced the clock since. We want "real time now"
     /// to compute `remaining = expires_at - now`, and the lease's
@@ -169,8 +175,8 @@ impl LeaseRenewalLoop {
     /// it was stamped. Comparing against `SystemTime::now()` keeps
     /// both sides of the subtraction in the same reference frame
     /// and avoids spuriously classifying leases as "not near
-    /// expiry" just because the HLC hasn't ticked.
-    fn tick(&self) {
+    /// expiry" only because the HLC hasn't ticked.
+    async fn tick(&self) {
         let Some(shared) = self.shared.upgrade() else {
             return;
         };
@@ -184,16 +190,45 @@ impl LeaseRenewalLoop {
             "descriptor lease renewal: re-acquiring near-expiry leases"
         );
         for (id, held_version) in near_expiry {
-            let current_version = lookup_current_version(&shared, &id);
-            match current_version {
-                Some(v) => {
-                    let version = v.max(held_version);
+            // An idle lease lapses at expiry instead of renewing: no statement
+            // holds it, and the next one re-acquires it.
+            if shared.lease_refcount.current(&id) == 0 {
+                if let Err(e) =
+                    super::release::release_unheld_leases(&shared, vec![id.clone()]).await
+                {
+                    error!(
+                        descriptor = ?id,
+                        held_version,
+                        error = %e,
+                        "descriptor lease renewal: idle lease release failed; it \
+                         lapses at its expiry"
+                    );
+                    self.loop_metrics.record_error("release");
+                }
+                continue;
+            }
+            let lookup = lookup_current_version(&shared, &id);
+            if let Err(e) = &lookup {
+                error!(
+                    descriptor = ?id,
+                    held_version,
+                    error = %e,
+                    "descriptor lease renewal: catalog read failed; the lease is left \
+                     alone this tick"
+                );
+                self.loop_metrics.record_error("lookup");
+            }
+            match renewal_step(held_version, &lookup) {
+                RenewalStep::Skip => {}
+                RenewalStep::Renew(version) => {
                     if let Err(e) = super::propose::force_refresh_lease(
                         &shared,
                         id.clone(),
                         version,
                         self.config.full_duration,
-                    ) {
+                    )
+                    .await
+                    {
                         error!(
                             descriptor = ?id,
                             version,
@@ -211,8 +246,9 @@ impl LeaseRenewalLoop {
                         self.loop_metrics.record_error("renew");
                     }
                 }
-                None => {
-                    if let Err(e) = super::release::release_leases(&shared, vec![id.clone()]) {
+                RenewalStep::ReleaseDropped => {
+                    if let Err(e) = super::release::release_leases(&shared, vec![id.clone()]).await
+                    {
                         error!(
                             descriptor = ?id,
                             held_version,
@@ -235,47 +271,69 @@ impl LeaseRenewalLoop {
     }
 }
 
+/// What one renewal tick does with one near-expiry lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RenewalStep {
+    /// Re-acquire the lease at this version.
+    Renew(u64),
+    /// The descriptor is gone. Release the lease.
+    ReleaseDropped,
+    /// The catalog read failed. Leave the lease alone this tick.
+    Skip,
+}
+
+/// Decide the step for a held lease from its catalog lookup.
+///
+/// A catalog read error says nothing about the descriptor. Releasing
+/// drops a lease a statement still uses, so the lease is skipped
+/// and the next tick retries the lookup.
+fn renewal_step(held_version: u64, lookup: &crate::Result<Option<u64>>) -> RenewalStep {
+    match lookup {
+        Ok(Some(v)) => RenewalStep::Renew((*v).max(held_version)),
+        Ok(None) => RenewalStep::ReleaseDropped,
+        Err(_) => RenewalStep::Skip,
+    }
+}
+
 /// Look up the current persisted version for a descriptor.
-/// Returns `None` if the descriptor has been dropped, the
-/// catalog is unavailable, or the descriptor kind is not one
-/// the planner / renewal path tracks.
-fn lookup_current_version(shared: &SharedState, id: &DescriptorId) -> Option<u64> {
+///
+/// Returns `Ok(None)` when the descriptor is dropped or its kind is not
+/// one the planner and renewal path track. A catalog read error returns
+/// `Err`.
+fn lookup_current_version(shared: &SharedState, id: &DescriptorId) -> crate::Result<Option<u64>> {
     use nodedb_cluster::DescriptorKind;
     let catalog = shared.credentials.catalog();
-    match id.kind {
+    let database_id = DatabaseId::new(id.database_id);
+    let version = match id.kind {
         DescriptorKind::Collection => catalog
-            .get_collection(DatabaseId::new(id.database_id), id.tenant_id, &id.name)
-            .ok()
-            .flatten()
+            .get_collection(database_id, id.tenant_id, &id.name)?
             .filter(|c| c.is_active)
             .map(|c| c.descriptor_version.max(1)),
         DescriptorKind::Function => catalog
-            .get_function_in_database(DatabaseId::new(id.database_id), id.tenant_id, &id.name)
-            .ok()
-            .flatten()
+            .get_function_in_database(database_id, id.tenant_id, &id.name)?
             .map(|f| f.descriptor_version.max(1)),
         DescriptorKind::Procedure => catalog
-            .get_procedure_in_database(DatabaseId::new(id.database_id), id.tenant_id, &id.name)
-            .ok()
-            .flatten()
+            .get_procedure_in_database(database_id, id.tenant_id, &id.name)?
             .map(|p| p.descriptor_version.max(1)),
         DescriptorKind::Trigger => catalog
-            .get_trigger_in_database(DatabaseId::new(id.database_id), id.tenant_id, &id.name)
-            .ok()
-            .flatten()
+            .get_trigger_in_database(database_id, id.tenant_id, &id.name)?
             .map(|t| t.descriptor_version.max(1)),
         DescriptorKind::Sequence => catalog
-            .get_sequence(id.database_id, id.tenant_id, &id.name)
-            .ok()
-            .flatten()
+            .get_sequence(id.database_id, id.tenant_id, &id.name)?
             .map(|s| s.descriptor_version.max(1)),
         DescriptorKind::MaterializedView => catalog
-            .get_materialized_view(id.database_id, id.tenant_id, &id.name)
-            .ok()
-            .flatten()
+            .get_materialized_view(id.database_id, id.tenant_id, &id.name)?
             .map(|v| v.descriptor_version.max(1)),
+        DescriptorKind::Array => catalog
+            .get_array_in_database(
+                nodedb_types::TenantId::new(id.tenant_id),
+                database_id,
+                &id.name,
+            )?
+            .map(|_| crate::control::server::shared::clone_write::ARRAY_DESCRIPTOR_VERSION),
         _ => None,
-    }
+    };
+    Ok(version)
 }
 
 /// Snapshot every lease in `(_, this_node_id)` whose remaining
@@ -420,6 +478,25 @@ mod tests {
         assert!(names.contains(&"d".to_string()));
         assert!(!names.contains(&"a".to_string()));
         assert!(!names.contains(&"c".to_string()));
+    }
+
+    /// A catalog read error skips the lease: no renew, no release.
+    #[test]
+    fn catalog_read_error_skips_the_lease() {
+        let lookup: crate::Result<Option<u64>> = Err(crate::Error::Storage {
+            engine: "catalog".into(),
+            detail: "read failed".into(),
+        });
+        assert_eq!(renewal_step(3, &lookup), RenewalStep::Skip);
+    }
+
+    /// A dropped descriptor releases the lease. A live one renews at the
+    /// higher of the held and catalog versions.
+    #[test]
+    fn lookup_outcome_picks_the_step() {
+        assert_eq!(renewal_step(3, &Ok(None)), RenewalStep::ReleaseDropped);
+        assert_eq!(renewal_step(3, &Ok(Some(5))), RenewalStep::Renew(5));
+        assert_eq!(renewal_step(7, &Ok(Some(5))), RenewalStep::Renew(7));
     }
 
     #[test]

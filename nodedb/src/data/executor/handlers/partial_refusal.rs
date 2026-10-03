@@ -7,8 +7,27 @@
 //! them. A handler whose refusal follows a landed write must answer with a
 //! code that keeps the records, or recovery drops the part that landed.
 
-use crate::bridge::envelope::ErrorCode;
+use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::control::server::dispatch_utils::write_definitely_not_applied;
+use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::task::ExecutionTask;
+
+impl CoreLoop {
+    /// The refusal of a handler that committed the rows `landed` names before
+    /// it refused. The rows stay in storage, so the refusal carries their
+    /// write-set entries and the Control Plane journals them like the rows of
+    /// an accepted write.
+    pub(in crate::data::executor) fn refusal_with_landed_rows(
+        &self,
+        task: &ExecutionTask,
+        code: ErrorCode,
+        landed: Vec<WriteSetEntry>,
+    ) -> Response {
+        let mut response = self.response_error(task, code);
+        response.write_set = landed;
+        response
+    }
+}
 
 /// `code` as a refusal that follows a landed write.
 ///

@@ -133,6 +133,20 @@ impl AuthUserStore {
         })
     }
 
+    /// Replace the in-memory records with the catalog's auth users.
+    pub fn reload_from_catalog(&self, catalog: &SystemCatalog) -> crate::Result<()> {
+        let users: HashMap<String, AuthUserRecord> = catalog
+            .load_all_auth_users()?
+            .iter()
+            .map(|s| {
+                let record = AuthUserRecord::from_stored(s);
+                (record.id.clone(), record)
+            })
+            .collect();
+        *self.users.write() = users;
+        Ok(())
+    }
+
     /// Get an auth user by ID.
     pub fn get(&self, id: &str) -> Option<AuthUserRecord> {
         let users = self.users.read();
@@ -161,7 +175,7 @@ impl AuthUserStore {
 
     /// Install a record replicated from another node: update the in-memory
     /// cache only. The redb row was already written by the catalog applier,
-    /// so re-writing it here would be a redundant second write.
+    /// so re-writing it here is a redundant second write.
     pub fn install_replicated(&self, stored: &StoredAuthUser) {
         let record = AuthUserRecord::from_stored(stored);
         let mut users = self.users.write();

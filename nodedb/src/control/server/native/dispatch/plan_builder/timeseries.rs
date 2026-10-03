@@ -9,7 +9,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::native::dispatch::DispatchCtx;
 use nodedb_physical::physical_plan::TimeseriesOp;
 
-pub(crate) fn build_scan(
+pub(crate) async fn build_scan(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -45,7 +45,7 @@ pub(crate) fn build_scan(
     }))
 }
 
-pub(crate) fn build_ingest(
+pub(crate) async fn build_ingest(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,

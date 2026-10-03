@@ -19,7 +19,9 @@
 use crate::bridge::scan_filter::{FilterOp, ScanFilter};
 use crate::control::security::auth_context::AuthContext;
 use crate::control::security::permission_tree::resolver::accessible_resources;
-use crate::control::security::permission_tree::{PermissionCache, PermissionTreeDef};
+use crate::control::security::permission_tree::{
+    PermissionCache, PermissionTreeDef, TreeKey, TreeScope,
+};
 use crate::types::TenantId;
 
 use super::super::filters::merge_filters;
@@ -43,7 +45,8 @@ impl PermTreeLevel {
     }
 }
 
-/// Permission cache plus the requester's tenant and authenticated identity.
+/// Permission cache plus the requester's database, tenant, and authenticated
+/// identity.
 ///
 /// A superuser bypasses permission-tree filtering entirely, so [`PermCtx::new`]
 /// returns `None` for one and no walk runs at all — no arm has to restate the
@@ -53,8 +56,9 @@ pub(super) struct PermCtx<'a> {
     cache: &'a PermissionCache,
     tenant_id: u64,
     auth: &'a AuthContext,
-    /// Database bare op-carried collection names (e.g.
-    /// `AlgoParams.collection`) must be qualified against before a lookup.
+    /// The database the task runs in. Every tree lookup resolves in it, and
+    /// bare op-carried collection names (e.g. `AlgoParams.collection`) are
+    /// qualified against it.
     pub(super) database_id: nodedb_types::DatabaseId,
 }
 
@@ -84,7 +88,7 @@ impl<'a> PermCtx<'a> {
     /// this operation produces or acts on: a storage-pushdown `filters` field
     /// or a dedicated post-fetch `rls_filters` field. The bytes are merged
     /// rather than replaced because this pass runs after RLS injection, which
-    /// may already own the slot.
+    /// can already own the slot.
     ///
     /// An identity with no accessible resource yields `IN ()`, which matches
     /// nothing — the caller sees an empty result rather than an error, exactly
@@ -95,10 +99,10 @@ impl<'a> PermCtx<'a> {
         level: PermTreeLevel,
         slot: &mut Vec<u8>,
     ) -> crate::Result<()> {
-        let Some(def) = self.cache.get_tree_def(self.tenant_id, collection.as_str()) else {
+        let Some((scope, def)) = self.tree_def(collection)? else {
             return Ok(());
         };
-        let accessible = self.accessible(def, level);
+        let accessible = self.accessible(scope, def, level);
         let in_filter = ScanFilter {
             field: def.resource_column.clone(),
             op: FilterOp::In,
@@ -131,10 +135,10 @@ impl<'a> PermCtx<'a> {
         collection: &nodedb_types::QualifiedCollection,
         level: PermTreeLevel,
     ) -> crate::Result<()> {
-        let Some(def) = self.cache.get_tree_def(self.tenant_id, collection.as_str()) else {
+        let Some((scope, def)) = self.tree_def(collection)? else {
             return Ok(());
         };
-        if self.accessible(def, level).is_empty() {
+        if self.accessible(scope, def, level).is_empty() {
             let required = level.required_in(def);
             return Err(crate::Error::RejectedAuthz {
                 tenant_id: TenantId::new(self.tenant_id),
@@ -156,12 +160,7 @@ impl<'a> PermCtx<'a> {
         collection: &nodedb_types::QualifiedCollection,
         why: &str,
     ) -> crate::Result<()> {
-        if collection.as_str().is_empty()
-            || self
-                .cache
-                .get_tree_def(self.tenant_id, collection.as_str())
-                .is_none()
-        {
+        if collection.as_str().is_empty() || self.tree_def(collection)?.is_none() {
             return Ok(());
         }
         Err(crate::Error::PlanError {
@@ -171,12 +170,15 @@ impl<'a> PermCtx<'a> {
         })
     }
 
-    /// Refuse when any collection in the tenant carries a permission tree.
+    /// Refuse when any collection of the tenant, in any database, carries a
+    /// permission tree.
     ///
     /// Used only where the plan does not name the collection it reads, so the
     /// narrow per-collection question cannot be asked and the plan cannot be
-    /// shown to avoid a governed collection. Mirrors the RLS pass's
-    /// tenant-wide fallback for the same shapes.
+    /// shown to avoid a governed collection. A plan without a collection is
+    /// not shown to stay inside its database either, so the question spans
+    /// every database. Mirrors the RLS pass's tenant-wide fallback for the
+    /// same shapes.
     pub(super) fn refuse_if_any_tree(&self, why: &str) -> crate::Result<()> {
         if !self.cache.has_tree_defs_for_tenant(self.tenant_id) {
             return Ok(());
@@ -189,12 +191,35 @@ impl<'a> PermCtx<'a> {
         })
     }
 
+    /// The tree governing `collection`, a name qualified for the task's
+    /// database, and the scope its hierarchy and grants live in.
+    ///
+    /// A name not qualified for that database cannot be resolved. While the
+    /// tenant has a tree that is an error, since the name can be governed.
+    fn tree_def(
+        &self,
+        collection: &nodedb_types::QualifiedCollection,
+    ) -> crate::Result<Option<(TreeScope, &'a PermissionTreeDef)>> {
+        let key =
+            match TreeKey::from_qualified(self.database_id, self.tenant_id, collection.as_str()) {
+                Ok(key) => key,
+                Err(_) if !self.cache.has_tree_defs_for_tenant(self.tenant_id) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+        Ok(self.cache.get_tree_def(&key).map(|def| (key.scope, def)))
+    }
+
     /// Resource ids this identity holds at least `level` on.
-    fn accessible(&self, def: &PermissionTreeDef, level: PermTreeLevel) -> Vec<String> {
+    fn accessible(
+        &self,
+        scope: TreeScope,
+        def: &PermissionTreeDef,
+        level: PermTreeLevel,
+    ) -> Vec<String> {
         accessible_resources(
             self.cache,
             def,
-            self.tenant_id,
+            scope,
             &self.auth.id,
             &self.auth.roles,
             level.required_in(def),

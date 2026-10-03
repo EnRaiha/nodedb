@@ -32,13 +32,16 @@ use super::proposal_gate::{EntryOutcome, ledger_outcome};
 use super::start::Prepared;
 
 /// What a generic entry's apply takes from its decoded envelope.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct EntryScope {
     /// Database scope of the entry.
     pub database_id: DatabaseId,
     /// The source the proposer stamped. Every replica gives the write's
     /// events this source.
     pub event_source: crate::event::EventSource,
+    /// The collections the write names, with the incarnations its proposer
+    /// planned against.
+    pub incarnations: Vec<crate::control::wal_replication::CollectionIncarnation>,
 }
 
 /// Prepare a generic entry. `exclusive` marks a Raft-native array cell write:
@@ -80,6 +83,7 @@ async fn enqueue_generic_entry<'a>(
     let EntryScope {
         database_id,
         event_source,
+        incarnations,
     } = scope;
     let ApplyContext { state, tracker, .. } = ctx;
     let AppliedPosition {
@@ -88,11 +92,11 @@ async fn enqueue_generic_entry<'a>(
         applied_key,
         ..
     } = pos;
-    let decoded = from_replicated_entry(&entry.data, Some(state.surrogate_assigner.as_ref()));
+    let decoded = from_replicated_entry(&entry.data, state.surrogate_assigner.as_ref());
     let (tenant_id, vshard_id, plan, resolved_now_ms) = match decoded {
         Ok(Some(t)) => t,
         Ok(None) => {
-            // Couldn't deserialize — might be a different format or corrupted.
+            // Couldn't deserialize — a different format or corrupted.
             debug!(
                 group_id,
                 index = entry.index,
@@ -139,6 +143,36 @@ async fn enqueue_generic_entry<'a>(
         }
     };
 
+    // A write for a collection incarnation this node no longer holds has
+    // nothing to mutate. The gates stay held until the write is enqueued.
+    let _gates =
+        match super::collection_route::route(state, tenant_id.as_u64(), database_id, &incarnations)
+            .await
+        {
+            Ok(super::collection_route::CollectionRoute::Apply(gates)) => gates,
+            Ok(super::collection_route::CollectionRoute::Superseded) => {
+                tracker.complete(
+                    group_id,
+                    entry.index,
+                    applied_key,
+                    Err(crate::Error::DataPlane(
+                        crate::bridge::envelope::ErrorCode::NotFound,
+                    )),
+                );
+                return StartedEntry::concluded(EntryOutcome::Applied {
+                    durable: true,
+                    result: None,
+                });
+            }
+            Err(error) => {
+                tracker.complete(group_id, entry.index, applied_key, Err(error));
+                return StartedEntry::concluded(EntryOutcome::Applied {
+                    durable: false,
+                    result: None,
+                });
+            }
+        };
+
     // Raft-native array cell writes (`ArrayCellPut` / `ArrayCellDelete`)
     // decode to `PhysicalPlan::Array(Put | Delete)`. A follower must
     // OPEN the array on the Data Plane before applying, so these route
@@ -160,6 +194,7 @@ async fn enqueue_generic_entry<'a>(
                 database_id,
                 vshard: vshard_id,
                 resolved_now_ms,
+                event_source,
             },
             plan,
         )
@@ -209,22 +244,26 @@ async fn enqueue_generic_entry<'a>(
             // write's `expire_at_ms` to the instant the proposing node
             // resolved, so this replica's redo record and its live apply
             // install the byte-identical value every other replica does.
+            // `change_position` gives the write's change events the entry's
+            // log position, which every replica shares.
             durability: WalDurability::AppendHere {
                 now_override: resolved_now_ms,
                 apply_key: applied_key,
                 commit_hlc: pos.carried_commit_hlc(),
+                change_position: Some(pos.change_position(state, vshard_id.as_u32())),
             },
             // Raft committed this entry at a fixed log index; every
             // replica applies it in that order. Re-entering the
-            // write-admission gate would re-decide an ordering that is
+            // write-admission gate re-decides an ordering that is
             // already final.
             ordering: WriteOrdering::AlreadyOrdered,
-            // This loop runs on EVERY replica, so it must not publish:
-            // the node that proposed this entry already published the
-            // write's change event once, after commit + apply. Emitting
-            // here would give each subscriber one copy per replica plus
-            // a NOTIFY fan-out from each. See [`ChangeFeedOwner`].
-            change_feed: ChangeFeedOwner::Unowned,
+            // Every replica stages the write's change events under the
+            // entry, and publishes them at its log position once the entry
+            // settles. See [`ChangeFeedOwner`].
+            change_feed: ChangeFeedOwner::Replicated {
+                group_id,
+                log_index,
+            },
         },
     )
     .await;

@@ -18,18 +18,15 @@ use nodedb_array::types::ArrayId;
 use nodedb_array::types::domain::{Domain, DomainBound};
 use nodedb_types::TenantId;
 
-#[allow(dead_code)]
 pub fn rep(id: u64) -> ReplicaId {
     ReplicaId::new(id)
 }
 
-#[allow(dead_code)]
 pub fn hlc(ms: u64, rid: u64) -> Hlc {
     Hlc::new(ms, 0, rep(rid)).expect("valid HLC")
 }
 
 /// One-dimensional Int64 schema over [0, 99] with attribute "v" (Float64).
-#[allow(dead_code)]
 pub fn simple_schema(name: &str) -> ArraySchema {
     ArraySchema {
         name: name.into(),
@@ -47,7 +44,6 @@ pub fn simple_schema(name: &str) -> ArraySchema {
 
 /// Build a real Loro snapshot for `array_name` and return
 /// `(snapshot_bytes, schema_hlc)` suitable for `import_snapshot` calls.
-#[allow(dead_code)]
 pub fn build_schema_snapshot(array_name: &str) -> (Vec<u8>, Hlc) {
     let hlc_gen = HlcGenerator::new(rep(1));
     let schema = simple_schema(array_name);
@@ -59,7 +55,6 @@ pub fn build_schema_snapshot(array_name: &str) -> (Vec<u8>, Hlc) {
 /// Import a pre-built snapshot on `shared`. Use this with a single
 /// `(bytes, schema_hlc)` tuple shared across all nodes so every replica
 /// observes the same remote HLC.
-#[allow(dead_code)]
 pub fn import_schema_snapshot(
     shared: &Arc<SharedState>,
     array_name: &str,
@@ -74,7 +69,6 @@ pub fn import_schema_snapshot(
 
 /// Register an array catalog entry on `shared` so the Data Plane can open
 /// the array when applying ops. Independent of schema-CRDT registration.
-#[allow(dead_code)]
 pub fn register_catalog_entry(shared: &Arc<SharedState>, array_name: &str) {
     let schema = simple_schema(array_name);
     let schema_msgpack = zerompk::to_msgpack_vec(&schema).expect("encode schema");
@@ -87,6 +81,8 @@ pub fn register_catalog_entry(shared: &Arc<SharedState>, array_name: &str) {
         prefix_bits: 8,
         audit_retain_ms: None,
         minimum_audit_retain_ms: None,
+        modification_hlc: nodedb_types::Hlc::ZERO,
+        incarnation: nodedb_types::Hlc::ZERO,
     };
     let mut cat = shared.array_catalog.write().expect("array catalog lock");
     if cat.lookup_by_name(array_name).is_none() {
@@ -97,24 +93,11 @@ pub fn register_catalog_entry(shared: &Arc<SharedState>, array_name: &str) {
 /// Build one snapshot and import it on every node, returning the shared
 /// schema HLC. Use this HLC when stamping ops so the schema-gating check
 /// in `OriginArrayInbound` accepts them on every replica.
-#[allow(dead_code)]
 pub fn register_schema_on_all(shareds: &[&Arc<SharedState>], array_name: &str) -> Hlc {
     let (bytes, schema_hlc) = build_schema_snapshot(array_name);
     for shared in shareds {
         import_schema_snapshot(shared, array_name, &bytes, schema_hlc);
         register_catalog_entry(shared, array_name);
     }
-    schema_hlc
-}
-
-/// Register a single node with a freshly built snapshot. Used by tests that
-/// add a new node mid-flight (e.g. snapshot-install learner). Returns the
-/// schema HLC, but tests should typically use the HLC produced by the
-/// initial `register_schema_on_all` call instead.
-#[allow(dead_code)]
-pub fn register_schema(shared: &Arc<SharedState>, array_name: &str) -> Hlc {
-    let (bytes, schema_hlc) = build_schema_snapshot(array_name);
-    import_schema_snapshot(shared, array_name, &bytes, schema_hlc);
-    register_catalog_entry(shared, array_name);
     schema_hlc
 }

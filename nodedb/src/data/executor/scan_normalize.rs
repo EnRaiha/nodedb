@@ -487,7 +487,7 @@ mod tests {
     /// `kv_row_to_doc` helper, so output must be byte-identical.
     #[test]
     fn for_each_matches_scan_collection_on_kv() {
-        use nodedb_types::Surrogate;
+        use crate::engine::kv::test_support::row_surrogate;
 
         let dir = tempfile::tempdir().unwrap();
         let (mut core, _req_tx, _resp_rx) =
@@ -503,36 +503,42 @@ mod tests {
             std::collections::HashMap::new(),
         ))
         .unwrap();
-        core.kv_engine.put(crate::engine::kv::KvPutParams {
-            database_id: 0,
-            tenant_id: tid,
-            collection: coll,
-            key: b"a",
-            value: &val,
-            ttl_ms: 0,
-            now_ms,
-            surrogate: Surrogate::ZERO,
-        });
-        core.kv_engine.put(crate::engine::kv::KvPutParams {
-            database_id: 0,
-            tenant_id: tid,
-            collection: coll,
-            key: b"b",
-            value: &val,
-            ttl_ms: 0,
-            now_ms,
-            surrogate: Surrogate::ZERO,
-        });
-        core.kv_engine.put(crate::engine::kv::KvPutParams {
-            database_id: 0,
-            tenant_id: tid,
-            collection: coll,
-            key: b"c",
-            value: &val,
-            ttl_ms: 0,
-            now_ms,
-            surrogate: Surrogate::ZERO,
-        });
+        core.kv_engine
+            .put(crate::engine::kv::KvPutParams {
+                database_id: 0,
+                tenant_id: tid,
+                collection: coll,
+                key: b"a",
+                value: &val,
+                ttl_ms: 0,
+                now_ms,
+                surrogate: row_surrogate(b"a"),
+            })
+            .expect("a bound row writes");
+        core.kv_engine
+            .put(crate::engine::kv::KvPutParams {
+                database_id: 0,
+                tenant_id: tid,
+                collection: coll,
+                key: b"b",
+                value: &val,
+                ttl_ms: 0,
+                now_ms,
+                surrogate: row_surrogate(b"b"),
+            })
+            .expect("a bound row writes");
+        core.kv_engine
+            .put(crate::engine::kv::KvPutParams {
+                database_id: 0,
+                tenant_id: tid,
+                collection: coll,
+                key: b"c",
+                value: &val,
+                ttl_ms: 0,
+                now_ms,
+                surrogate: row_surrogate(b"c"),
+            })
+            .expect("a bound row writes");
 
         let mut expected = core.scan_collection(0, tid, coll, usize::MAX).unwrap();
         expected.sort_by(|a, b| a.0.cmp(&b.0));
@@ -621,7 +627,7 @@ mod tests {
     /// Neither vector is sorted before the assertion.
     #[test]
     fn for_each_matches_scan_collection_order_on_kv() {
-        use nodedb_types::Surrogate;
+        use crate::engine::kv::test_support::row_surrogate;
 
         let dir = tempfile::tempdir().unwrap();
         let (mut core, _req_tx, _resp_rx) =
@@ -638,46 +644,54 @@ mod tests {
         .unwrap();
 
         // Insert in non-sorted order: "k3", "k1", "k4", "k2".
-        core.kv_engine.put(crate::engine::kv::KvPutParams {
-            database_id: 0,
-            tenant_id: tid,
-            collection: coll,
-            key: b"k3",
-            value: &val,
-            ttl_ms: 0,
-            now_ms,
-            surrogate: Surrogate::ZERO,
-        });
-        core.kv_engine.put(crate::engine::kv::KvPutParams {
-            database_id: 0,
-            tenant_id: tid,
-            collection: coll,
-            key: b"k1",
-            value: &val,
-            ttl_ms: 0,
-            now_ms,
-            surrogate: Surrogate::ZERO,
-        });
-        core.kv_engine.put(crate::engine::kv::KvPutParams {
-            database_id: 0,
-            tenant_id: tid,
-            collection: coll,
-            key: b"k4",
-            value: &val,
-            ttl_ms: 0,
-            now_ms,
-            surrogate: Surrogate::ZERO,
-        });
-        core.kv_engine.put(crate::engine::kv::KvPutParams {
-            database_id: 0,
-            tenant_id: tid,
-            collection: coll,
-            key: b"k2",
-            value: &val,
-            ttl_ms: 0,
-            now_ms,
-            surrogate: Surrogate::ZERO,
-        });
+        core.kv_engine
+            .put(crate::engine::kv::KvPutParams {
+                database_id: 0,
+                tenant_id: tid,
+                collection: coll,
+                key: b"k3",
+                value: &val,
+                ttl_ms: 0,
+                now_ms,
+                surrogate: row_surrogate(b"k3"),
+            })
+            .expect("a bound row writes");
+        core.kv_engine
+            .put(crate::engine::kv::KvPutParams {
+                database_id: 0,
+                tenant_id: tid,
+                collection: coll,
+                key: b"k1",
+                value: &val,
+                ttl_ms: 0,
+                now_ms,
+                surrogate: row_surrogate(b"k1"),
+            })
+            .expect("a bound row writes");
+        core.kv_engine
+            .put(crate::engine::kv::KvPutParams {
+                database_id: 0,
+                tenant_id: tid,
+                collection: coll,
+                key: b"k4",
+                value: &val,
+                ttl_ms: 0,
+                now_ms,
+                surrogate: row_surrogate(b"k4"),
+            })
+            .expect("a bound row writes");
+        core.kv_engine
+            .put(crate::engine::kv::KvPutParams {
+                database_id: 0,
+                tenant_id: tid,
+                collection: coll,
+                key: b"k2",
+                value: &val,
+                ttl_ms: 0,
+                now_ms,
+                surrogate: row_surrogate(b"k2"),
+            })
+            .expect("a bound row writes");
 
         // Reference output — NOT sorted.
         let expected = core.scan_collection(0, tid, coll, usize::MAX).unwrap();

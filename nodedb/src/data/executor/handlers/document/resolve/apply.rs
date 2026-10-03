@@ -14,6 +14,7 @@ use tracing::debug;
 use super::apply_row::{ApplyResolvedDelete, ApplyResolvedPut};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::enforcement::unique::SubmittedWrite;
 use crate::data::executor::handlers::rls_write_gate;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::StorageKey;
@@ -36,6 +37,11 @@ impl CoreLoop {
         );
         if let Err(code) = self.check_resolved_document_preconditions(task, tid, mutations) {
             return self.response_error(task, code);
+        }
+        // Each mutation below commits on its own, so UNIQUE is judged on the
+        // statement's post-state before the first one lands.
+        if let Err(e) = self.check_resolved_document_unique(task, tid, mutations) {
+            return self.response_error(task, e);
         }
         // The gate stays on every write path even though
         // `DecidedEarlierInRequest` makes this a no-op — a single path that
@@ -62,7 +68,10 @@ impl CoreLoop {
             }
         }
 
+        // Each mutation commits on its own, so a refusal after one landed
+        // carries the entries of every landed row.
         let mut write_set = Vec::new();
+        let mut landed = 0u64;
         for mutation in mutations {
             let applied = match mutation {
                 DocumentResolvedMutation::Put {
@@ -104,14 +113,45 @@ impl CoreLoop {
                 ),
             };
             match applied {
-                Ok(entries) => write_set.extend(entries),
-                Err(code) => return self.response_error(task, code),
+                Ok(entries) => {
+                    write_set.extend(entries);
+                    landed += 1;
+                }
+                Err(code) => {
+                    let code = crate::data::executor::handlers::partial_refusal::refusal_after_rows(
+                        landed, code,
+                    );
+                    return self.refusal_with_landed_rows(task, code, write_set);
+                }
             }
         }
 
         let mut response = self.response_with_payload(task, response_payload.to_vec());
         response.write_set = write_set;
         response
+    }
+
+    /// Refuse the statement when its post-state gives one unique value two
+    /// owners. A value one mutation releases is free for another.
+    fn check_resolved_document_unique(
+        &self,
+        task: &ExecutionTask,
+        tid: u64,
+        mutations: &[DocumentResolvedMutation],
+    ) -> crate::Result<()> {
+        let writes: Vec<SubmittedWrite<'_>> = mutations
+            .iter()
+            .map(|mutation| SubmittedWrite {
+                collection: mutation.collection().as_str(),
+                surrogate: mutation.surrogate().as_u32(),
+                body: match mutation {
+                    DocumentResolvedMutation::Put { value, .. } => Some(value.as_slice()),
+                    DocumentResolvedMutation::Delete { .. } => None,
+                },
+                judged: true,
+            })
+            .collect();
+        self.check_submitted_unit_unique(task.request.database_id.as_u64(), tid, &writes)
     }
 
     /// Confirm every mutation still describes the row it was resolved against.

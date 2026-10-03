@@ -58,8 +58,8 @@ pub(super) struct PendingTxn {
     /// `Some(instant)` only while parked: if the deadline passes with the
     /// durable global verdict still unknown, the scheduler emits a stall
     /// warning and re-arms this deadline — it NEVER releases locks and NEVER
-    /// aborts (a unilateral abort while a peer may have already flushed a commit
-    /// would tear the transaction). `None` in every other state.
+    /// aborts (a unilateral abort while a peer can have already flushed a commit
+    /// will tear the transaction). `None` in every other state.
     ///
     /// `Instant::now()` is used for this deadline (observability / liveness
     /// only; never influences WAL bytes).
@@ -78,6 +78,21 @@ pub(super) struct PendingTxn {
     /// What a committed flush names beside its redo record, derived once
     /// from this vShard's slice when it stages.
     pub flush_scope: FlushScope,
+    /// A collection the transaction names no longer held its planned
+    /// incarnation when this replica staged it. The vote is an abort.
+    pub superseded: bool,
+    /// The gates of the collections the transaction names, held shared from
+    /// the incarnation check until the txn leaves `pending`. A purge of one
+    /// waits, so a staged slice never flushes into a recreated collection.
+    pub gates: Vec<crate::control::write_gate::SharedGate>,
+    /// A halt released `gates` while the txn had no write in flight. Its
+    /// flush checks the incarnations again and takes the gates back first.
+    pub ungated: bool,
+    /// The shared hold of the vShard's data-group apply gate, taken when the
+    /// flush dispatches and dropped once the txn left `pending` and its
+    /// position is marked applied. A data-group snapshot capture or install
+    /// holds the gate exclusive, so it never sees a flush half applied.
+    pub install_permit: Option<nodedb_cluster::ApplyPermit>,
 }
 
 /// What a vShard's committed flush carries: the collections its slice
@@ -99,6 +114,17 @@ pub(super) struct FlushScope {
     /// Flushes sent for this txn. A refused install resends the flush until
     /// the count reaches its bound.
     pub sends: u32,
+    /// Every plan of this vShard's slice is one a trigger body buffered, and
+    /// a client plan of the transaction homes on another vShard. The slice
+    /// then commits under `Trigger`: a single overlay holding the whole
+    /// transaction tags each of these rows `Trigger` beside the client's.
+    pub body_only: bool,
+    /// The slice reads a whole collection at resolve: a TRUNCATE of rows. A
+    /// TRUNCATE's edge share reads none. A resolve otherwise runs as soon as
+    /// its verdict arrives,
+    /// beside lower txns that have not flushed. A TRUNCATE's resolve then
+    /// misses their rows, so it waits for its flush turn.
+    pub resolve_at_turn: bool,
 }
 
 impl FlushScope {
@@ -116,8 +142,30 @@ impl FlushScope {
             // The resolve fills these once it answers.
             redo: Vec::new(),
             sends: 0,
+            body_only: false,
+            resolve_at_turn: plans.iter().any(reads_whole_collection_at_resolve),
         }
     }
+}
+
+/// Whether the resolve of `plan` reads a whole collection's stored state.
+///
+/// A TRUNCATE's edge share is not among them. Its resolve records a cut at
+/// the transaction's ordinal and reads no stored edge, and the cut hides by
+/// ordinal whatever this vShard flushes before or after it. The rows'
+/// truncate on the collection's vShard still reads every row at resolve.
+fn reads_whole_collection_at_resolve(plan: &nodedb_physical::physical_plan::PhysicalPlan) -> bool {
+    use nodedb_physical::physical_plan::{
+        ColumnarOp, DocumentOp, KvOp, PhysicalPlan, TimeseriesOp, VectorOp,
+    };
+    matches!(
+        plan,
+        PhysicalPlan::Document(DocumentOp::Truncate { .. })
+            | PhysicalPlan::Kv(KvOp::Truncate { .. })
+            | PhysicalPlan::Columnar(ColumnarOp::Truncate { .. })
+            | PhysicalPlan::Timeseries(TimeseriesOp::Truncate { .. })
+            | PhysicalPlan::Vector(VectorOp::DirectTruncate { .. })
+    )
 }
 
 /// Commit-resolution state of a staged static Calvin transaction.
@@ -142,6 +190,15 @@ pub(in crate::control::cluster::calvin::scheduler::driver) enum CommitState {
     /// post-images into a replayable `RedoRecord`; awaiting that response
     /// before the redo is WAL-appended and the flush dispatched.
     AwaitingRedoResolve,
+    /// The txn committed, and its slice reads a whole collection at resolve
+    /// (a TRUNCATE). Its resolve waits for its turn: every lower txn of this
+    /// vShard finished, so the resolve reads every write sequenced before it
+    /// and none after. See [`FlushScope::resolve_at_turn`].
+    AwaitingResolveTurn,
+    /// The txn committed and its redo record is appended. Its flush waits for
+    /// its turn: every lower txn of this vShard finished. See
+    /// [`super::core::flush_turn`].
+    AwaitingFlushTurn { redo_lsn: Option<crate::types::Lsn> },
     /// A flush (`committed = true`) or drop (`committed = false`) has been
     /// dispatched, or parked for re-send at dispatcher capacity; awaiting its
     /// response before the commit tail runs.

@@ -2,11 +2,10 @@
 
 //! `DROP FUNCTION [IF EXISTS]` DDL handler.
 //!
-//! Ported from the pgwire `ddl::function::drop` handler. The catalog path
-//! (`propose_catalog_entry` + local applier fallback, dependency-block check,
-//! replicated dependency deletion, Lite definition-sync broadcast, and the `audit_record`
-//! call) is preserved verbatim; only the result construction changed from
-//! pgwire `Response` / `PgWireError` to protocol-neutral result types.
+//! The catalog path (`propose_catalog_entry_async` + local applier fallback,
+//! dependency-block check, replicated dependency deletion, Lite
+//! definition-sync broadcast, and the `audit_record` call) runs here. The
+//! result types are protocol-neutral.
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -18,7 +17,7 @@ use super::parse::validate_identifier;
 /// Handle `DROP FUNCTION [IF EXISTS] <name>`
 ///
 /// Requires superuser or tenant_admin — same privilege level as CREATE FUNCTION.
-pub fn drop_function(
+pub async fn drop_function(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -77,10 +76,13 @@ pub fn drop_function(
         database_id,
         tenant_id,
         name: name.clone(),
+        // Frozen by the proposer's stamp.
+        target_descriptor_version: 0,
+        target_hlc: nodedb_types::Hlc::ZERO,
     };
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    crate::control::catalog_entry::apply::local::apply_locally_if_needed(state, &entry, outcome);
 
     // Broadcast deletion to connected Lite sessions.
     {

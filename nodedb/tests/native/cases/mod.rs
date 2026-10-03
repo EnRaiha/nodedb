@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+mod native_backup_database;
+mod native_check_constraints;
 mod native_clone_read_intercept;
 mod native_clone_write_intercept;
 mod native_create_then_dml;
@@ -20,5 +22,6 @@ mod native_show_dispatch;
 mod native_sql_authorization;
 mod native_transactions_savepoint;
 mod native_transactions_staging;
+mod native_trigger_statement_txn;
 mod native_txn_commit_visibility;
 mod native_txn_overlay_teardown_reclaim;

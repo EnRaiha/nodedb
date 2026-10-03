@@ -3,7 +3,7 @@
 //! Token utility functions for the procedural SQL parser.
 
 use super::super::error::ProceduralError;
-use super::super::tokenizer::Token;
+use super::super::tokenizer::{Token, TokenStream};
 
 /// Check if a token matches a pattern token (ignoring content for parameterized variants).
 pub(super) fn token_matches(token: &Token, pattern: &Token) -> bool {
@@ -53,52 +53,9 @@ pub(super) fn skip_if(tokens: &[Token], pos: &mut usize, token: &Token) {
     }
 }
 
-/// Convert a token back to its SQL text representation.
-pub(super) fn token_to_sql(token: &Token) -> String {
-    match token {
-        Token::Ident(s) => s.clone(),
-        Token::StringLit(s) => format!("'{}'", s.replace('\'', "''")),
-        Token::NumberLit(s) => s.clone(),
-        Token::SqlFragment(s) => s.clone(),
-        Token::Semicolon => ";".into(),
-        Token::Assign => ":=".into(),
-        Token::DotDot => "..".into(),
-        Token::In => "IN".into(),
-        Token::Reverse => "REVERSE".into(),
-        Token::If => "IF".into(),
-        Token::Then => "THEN".into(),
-        Token::Else => "ELSE".into(),
-        Token::End => "END".into(),
-        Token::Begin => "BEGIN".into(),
-        Token::Loop => "LOOP".into(),
-        Token::Return => "RETURN".into(),
-        Token::Insert => "INSERT".into(),
-        Token::Update => "UPDATE".into(),
-        Token::Delete => "DELETE".into(),
-        Token::To => "TO".into(),
-        Token::Savepoint => "SAVEPOINT".into(),
-        Token::Release => "RELEASE".into(),
-        Token::Commit => "COMMIT".into(),
-        Token::Rollback => "ROLLBACK".into(),
-        Token::Declare => "DECLARE".into(),
-        Token::Raise => "RAISE".into(),
-        Token::Notice => "NOTICE".into(),
-        Token::Warning => "WARNING".into(),
-        Token::Exception => "EXCEPTION".into(),
-        Token::Break => "BREAK".into(),
-        Token::Continue => "CONTINUE".into(),
-        Token::While => "WHILE".into(),
-        Token::For => "FOR".into(),
-        Token::Elsif => "ELSIF".into(),
-        Token::ReturnQuery => "RETURN QUERY".into(),
-        Token::EndIf => "END IF".into(),
-        Token::EndLoop => "END LOOP".into(),
-    }
-}
-
 /// Collect tokens as a SQL expression until one of the terminator tokens is found.
 pub(super) fn collect_sql_until(
-    tokens: &[Token],
+    tokens: &TokenStream<'_>,
     pos: &mut usize,
     terminators: &[Token],
 ) -> Result<super::super::ast::SqlExpr, ProceduralError> {
@@ -112,19 +69,61 @@ pub(super) fn collect_sql_until(
     Ok(super::super::ast::SqlExpr::new(sql))
 }
 
-/// Collect tokens as raw SQL text until a terminator is found.
+/// Collect tokens until a terminator is found, and return the source text
+/// they cover, spelled as written.
+///
+/// The text ends at the last token that is not a comment. A trailing line
+/// comment will otherwise swallow the `;` a caller appends to the text.
 pub(super) fn collect_raw_sql_until(
-    tokens: &[Token],
+    tokens: &TokenStream<'_>,
     pos: &mut usize,
     terminators: &[Token],
 ) -> String {
-    let mut parts = Vec::new();
+    let first = *pos;
+    let mut last_code: Option<usize> = None;
     while *pos < tokens.len() {
-        if terminators.iter().any(|t| token_matches(&tokens[*pos], t)) {
+        let token = &tokens[*pos];
+        if terminators.iter().any(|t| token_matches(token, t)) {
             break;
         }
-        parts.push(token_to_sql(&tokens[*pos]));
+        if !token.is_comment() {
+            last_code = Some(*pos);
+        }
         *pos += 1;
     }
-    parts.join(" ").trim().to_string()
+    last_code
+        .and_then(|last| tokens.source_of(first, last))
+        .map(|sql| sql.trim().to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::tokenizer::tokenize;
+    use super::*;
+
+    #[test]
+    fn collected_sql_keeps_its_source_spelling() {
+        let tokens = tokenize(
+            "INSERT INTO t (id, v) VALUES ('it''s', 1.5e3::float) WHERE a>=1 AND b||c <> d;",
+        )
+        .expect("tokenize");
+        let mut pos = 0;
+        assert_eq!(
+            collect_raw_sql_until(&tokens, &mut pos, &[Token::Semicolon]),
+            "INSERT INTO t (id, v) VALUES ('it''s', 1.5e3::float) WHERE a>=1 AND b||c <> d"
+        );
+        assert_eq!(tokens.get(pos), Some(&Token::Semicolon));
+    }
+
+    #[test]
+    fn collected_sql_ends_at_its_last_code_token() {
+        let tokens =
+            tokenize("DELETE FROM t /* keep */ WHERE id = 1 -- trailing\n;").expect("tokenize");
+        let mut pos = 0;
+        assert_eq!(
+            collect_raw_sql_until(&tokens, &mut pos, &[Token::Semicolon]),
+            "DELETE FROM t /* keep */ WHERE id = 1"
+        );
+    }
 }

@@ -7,6 +7,9 @@ use nodedb_types::config::tuning::ClusterTransportTuning;
 
 use super::super::node::TestClusterNode;
 
+/// Data Raft groups a test cluster bootstraps with by default.
+pub(crate) const DEFAULT_NUM_GROUPS: u64 = 2;
+
 /// The spawn configuration used to bring up every node in a cluster.
 ///
 /// Captured at spawn so that a later [`TestCluster::add_learner_node`]
@@ -25,13 +28,40 @@ pub(crate) struct ClusterSpawnConfig {
     /// `min(replication_factor, node_count)`). Defaults to 3 for every
     /// spawn entry point except [`TestCluster::spawn_three_with_compaction_threshold_and_rf`].
     pub(crate) replication_factor: usize,
+    /// Data Raft groups the cluster bootstraps with. Every spawn entry
+    /// point uses [`DEFAULT_NUM_GROUPS`] except
+    /// [`TestCluster::spawn_three_with_groups_compaction_threshold_and_rf`].
+    pub(crate) num_groups: u64,
     /// When `true`, the node acquires its cluster handle from
-    /// `init_single_node_calvin` (the flag-gated standalone Calvin
-    /// synthesis) instead of building explicit `ClusterSettings` and
-    /// calling `init_cluster_with_transport`. Used only by
-    /// [`TestClusterNode::spawn_single_node_calvin`]. Defaults to `false`
-    /// for every multi-node spawn path.
+    /// `init_single_node_calvin` (the one-node cluster synthesis production
+    /// boot runs when `[cluster]` is absent) instead of building explicit
+    /// `ClusterSettings` and calling `init_cluster_with_transport`. Only
+    /// [`TestClusterNode::spawn_single_node_calvin`] uses it. Every multi-node
+    /// spawn path sets `false`.
     pub(crate) single_node_calvin: bool,
+    /// `[backup_storage]` installed on every node. `None` leaves every
+    /// `file://` backup URI refused.
+    pub(crate) backup_storage: Option<nodedb::config::server::BackupStorageSettings>,
+    /// Shared PITR storage. `Some` opens every node's WAL encrypted at
+    /// `<data_dir>/wal` and wires PITR before its Raft groups start.
+    pub(crate) pitr: Option<crate::cluster_harness::pitr::PitrStorage>,
+    /// Timeseries tuning of the node with each listed id. Every other node
+    /// runs `TimeseriesToning::default()`.
+    pub(crate) node_timeseries_tuning:
+        std::collections::HashMap<u64, nodedb_types::config::tuning::TimeseriesToning>,
+}
+
+impl ClusterSpawnConfig {
+    /// The timeseries tuning node `node_id` runs.
+    pub(crate) fn timeseries_tuning_for(
+        &self,
+        node_id: u64,
+    ) -> nodedb_types::config::tuning::TimeseriesToning {
+        self.node_timeseries_tuning
+            .get(&node_id)
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 /// An in-process cluster of `TestClusterNode`s.

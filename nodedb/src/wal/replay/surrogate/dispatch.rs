@@ -100,7 +100,7 @@ pub fn replay_surrogate_records(
             | RecordType::TransactionRedo
             | RecordType::Checkpoint
             | RecordType::CollectionTombstoned
-            | RecordType::LsnMsAnchor
+            | RecordType::TimeAnchor
             | RecordType::TemporalPurge
             | RecordType::CalvinApplied
             // SyncSeqAdvance: not relevant to surrogate replay; the sync
@@ -117,7 +117,19 @@ pub fn replay_surrogate_records(
             // it), and the marker itself binds no surrogate.
             | RecordType::WriteAborted
             // ProposalApplied only names an applied Raft proposal.
-            | RecordType::ProposalApplied => {}
+            | RecordType::ProposalApplied
+            // ChangePosition only names a replicated log position.
+            | RecordType::ChangePosition
+            | RecordType::RestorePoint
+            // A node cascade tombstones edges and binds no surrogate.
+            | RecordType::GraphNodeCascade
+            // An edge cut hides edge versions and binds no surrogate.
+            | RecordType::GraphEdgeCut
+            // A snapshot install marker names a group, not a surrogate.
+            | RecordType::SnapshotInstalled
+            // A write group carries row images, whose surrogates were bound
+            // before the write that stored them.
+            | RecordType::WriteGroup => {}
         }
     }
     Ok(stats)

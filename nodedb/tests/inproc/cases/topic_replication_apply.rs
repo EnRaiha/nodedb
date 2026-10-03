@@ -44,6 +44,8 @@ fn topic() -> TopicDef {
         created_at: 1_000,
         last_sequence: 0,
         last_lsn: 0,
+        last_epoch: 0,
+        modification_hlc: nodedb_types::Hlc::ZERO,
     }
 }
 
@@ -55,6 +57,7 @@ fn group(stream: &str) -> ConsumerGroupDef {
         stream_name: stream.to_string(),
         owner: "admin".to_string(),
         created_at: 1_000,
+        modification_hlc: nodedb_types::Hlc::ZERO,
     }
 }
 
@@ -67,6 +70,7 @@ fn delete_topic_entry() -> CatalogEntry {
         database_id: DB,
         tenant_id: TENANT,
         name: TOPIC.to_string(),
+        target_hlc: nodedb_types::Hlc::ZERO,
     }
 }
 
@@ -205,7 +209,7 @@ async fn replicated_delete_removes_the_topic_its_groups_and_their_offsets() {
             .shared
             .offset_store
             .get_offset(database(), TENANT, &stream, GROUP, PARTITION)
-            .lsn,
+            .index,
         0,
         "a stale cursor would make a recreated topic skip events on this node"
     );
@@ -279,6 +283,7 @@ async fn replicated_delete_removes_the_consumer_group_and_its_offsets() {
             tenant_id: TENANT,
             stream_name: stream.clone(),
             name: GROUP.to_string(),
+            target_hlc: nodedb_types::Hlc::ZERO,
         },
     );
 
@@ -295,7 +300,7 @@ async fn replicated_delete_removes_the_consumer_group_and_its_offsets() {
             .shared
             .offset_store
             .get_offset(database(), TENANT, &stream, GROUP, PARTITION)
-            .lsn,
+            .index,
         0,
         "the replicated delete must clear committed offsets on every node"
     );
@@ -347,7 +352,7 @@ async fn replicated_migrate_rekeys_the_group_and_carries_its_offsets() {
             .shared
             .offset_store
             .get_offset(database(), TENANT, &stream, GROUP, PARTITION)
-            .lsn,
+            .index,
         5,
         "the migration must carry the committed cursor across"
     );

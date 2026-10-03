@@ -88,6 +88,22 @@ pub(crate) fn stamp_put_cells(
     cells: Vec<ArrayPutCell>,
     lsn: u64,
 ) -> ArrayEngineResult<()> {
+    // A live cell always holds a bound surrogate. One cell under
+    // `Surrogate::ZERO` refuses the whole batch before any cell is buffered.
+    if let Some(unbound) = cells
+        .iter()
+        .find(|c| c.surrogate == nodedb_types::Surrogate::ZERO)
+    {
+        return Err(nodedb_array::ArrayError::InvalidOp {
+            detail: format!(
+                "array put into '{}' at {:?} carries Surrogate::ZERO; every cell carries the \
+                 surrogate its coordinator bound",
+                store.schema().name,
+                unbound.coord
+            ),
+        }
+        .into());
+    }
     let schema = store.schema().clone();
     for c in cells {
         store.memtable.put_cell(
@@ -161,7 +177,7 @@ mod tests {
         let cells = vec![ArrayPutCell {
             coord: vec![CoordValue::Int64(3), CoordValue::Int64(5)],
             attrs: vec![CellValue::Int64(77)],
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             system_from_ms: 0,
             valid_from_ms: 0,
             valid_until_ms: i64::MAX,
@@ -176,5 +192,27 @@ mod tests {
         let pred = MbrQueryPredicate::default();
         let tiles = e.scan_tiles(&aid(), &pred).unwrap();
         assert!(!tiles.is_empty());
+    }
+
+    /// One cell under `Surrogate::ZERO` refuses the whole batch, and the
+    /// bound cell before it is not buffered either.
+    #[test]
+    fn a_batch_with_an_unbound_cell_is_refused_and_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let mut e = ArrayEngine::new(ArrayEngineConfig::new(dir.path().to_path_buf())).unwrap();
+        e.open_array(aid(), schema(), 0xCAFE).unwrap();
+        let cell = |x: i64, surrogate: u32| ArrayPutCell {
+            coord: vec![CoordValue::Int64(x), CoordValue::Int64(x)],
+            attrs: vec![CellValue::Int64(x)],
+            surrogate: nodedb_types::Surrogate::new(surrogate),
+            system_from_ms: 0,
+            valid_from_ms: 0,
+            valid_until_ms: i64::MAX,
+        };
+        assert!(
+            e.put_cells(&aid(), vec![cell(1, 7), cell(2, 0)], 1)
+                .is_err()
+        );
+        assert_eq!(e.store(&aid()).unwrap().memtable.stats().cell_count, 0);
     }
 }

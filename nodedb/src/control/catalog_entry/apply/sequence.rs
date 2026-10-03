@@ -99,6 +99,8 @@ mod tests {
             database_id: 3,
             tenant_id: 42,
             name: "gone".into(),
+            target_descriptor_version: 4,
+            target_hlc: nodedb_types::Hlc::new(7, 1),
         };
         let bytes = encode(&entry).unwrap();
         match decode(&bytes).unwrap() {
@@ -106,7 +108,11 @@ mod tests {
                 database_id,
                 tenant_id,
                 name,
+                target_descriptor_version,
+                target_hlc,
             } => {
+                assert_eq!(target_descriptor_version, 4);
+                assert_eq!(target_hlc, nodedb_types::Hlc::new(7, 1));
                 assert_eq!(database_id, 3);
                 assert_eq!(tenant_id, 42);
                 assert_eq!(name, "gone");
@@ -134,6 +140,8 @@ mod tests {
                 database_id: 3,
                 tenant_id: 1,
                 name: "orders_id_seq".into(),
+                target_descriptor_version: 0,
+                target_hlc: nodedb_types::Hlc::ZERO,
             },
             catalog,
         )
@@ -183,6 +191,8 @@ mod tests {
                 database_id: 1,
                 tenant_id: 7,
                 name: "shared_seq".into(),
+                target_descriptor_version: 0,
+                target_hlc: nodedb_types::Hlc::ZERO,
             },
             catalog,
         )

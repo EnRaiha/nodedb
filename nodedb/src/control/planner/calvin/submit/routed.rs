@@ -18,7 +18,8 @@ use crate::bridge::envelope::Response;
 use crate::control::cluster::warm_peers::register_peers_from_topology;
 use crate::control::state::SharedState;
 
-use super::local::{submit_and_await_calvin, synthetic_returning_response};
+use super::local::{submit_prepared_and_await, synthetic_returning_response};
+use super::stream::{StreamTarget, stream_parts};
 
 /// Backoff schedule (milliseconds) for waiting on the sequencer-group leader
 /// election before a cross-shard submit. Covers the brief post-startup window
@@ -27,12 +28,33 @@ use super::local::{submit_and_await_calvin, synthetic_returning_response};
 /// leaderless cluster surfaces a typed error rather than hanging.
 const SEQUENCER_LEADER_WAIT_BACKOFF_MS: &[u64] = &[50, 100, 200, 400, 800, 1000, 1000, 1000];
 
+/// Submit a Calvin write whose tx class holds a write, routed as
+/// [`submit_calvin_routed`], and return its answer.
+///
+/// A committed write always answers. Its primary participant deposits the
+/// answer on its own replicas and reports it in its completion ack, which
+/// every coordinator reads (see `with_reported_results`). So the affected
+/// count reaches the coordinator wherever it runs, even on a node that hosts
+/// none of the participants.
+pub async fn submit_calvin_routed_write(
+    state: &SharedState,
+    tx_class: TxClass,
+) -> crate::Result<Response> {
+    submit_calvin_routed(state, tx_class)
+        .await?
+        .ok_or_else(|| Error::Internal {
+            detail: "a committed Calvin write reported no answer; its primary participant \
+                     reports one in its completion ack"
+                .to_owned(),
+        })
+}
+
 /// Submit a cross-shard Calvin `tx_class`, routing it to the sequencer-group
 /// leader so it is actually sequenced and acked.
 ///
 /// Routing logic (mirrors `assign_surrogate_routed`):
-/// - **Not cluster mode** (no `cluster_transport` / `cluster_routing`): submit
-///   locally — single-node IS the sequencer leader.
+/// - **No `cluster_transport`**: this `SharedState` never ran `start_raft`,
+///   so no sequencer runs here. Return `SequencerUnavailable`.
 /// - **Leader is self**: submit-and-await locally.
 /// - **Leader is a remote node**: register the leader's address from the live
 ///   topology, then send one `SubmitCalvinTxnRequest` (carrying the
@@ -44,15 +66,15 @@ const SEQUENCER_LEADER_WAIT_BACKOFF_MS: &[u64] = &[50, 100, 200, 400, 800, 1000,
 ///   discarded.
 pub async fn submit_calvin_routed(
     state: &SharedState,
-    tx_class: TxClass,
+    mut tx_class: TxClass,
 ) -> crate::Result<Option<Response>> {
-    // Not cluster mode — single-node is the only sequencer member, hence the
-    // leader. Submit-and-await locally.
-    let (Some(transport), Some(_routing)) = (
-        state.cluster_transport.as_ref(),
-        state.cluster_routing.as_ref(),
-    ) else {
-        return submit_and_await_calvin(state, tx_class).await;
+    super::local::raise_metadata_floor(state, &mut tx_class);
+    super::local::stamp_incarnations(state, &mut tx_class)?;
+    let stream = super::parts::split_into_parts(state, &mut tx_class)?;
+    // Every running server has a cluster transport, the synthesized one-node
+    // cluster included. Without one, `start_raft` never ran here.
+    let Some(transport) = state.cluster_transport.as_ref() else {
+        return Err(Error::SequencerUnavailable);
     };
 
     // Resolve the sequencer-group leader from THIS node's live Raft status. The
@@ -94,10 +116,11 @@ pub async fn submit_calvin_routed(
         });
     }
 
-    // Leader is self: submit-and-await locally (a self-RPC would be a pointless
+    // Leader is self: submit-and-await locally (a self-RPC will be a pointless
     // extra hop and the local registry is the one that completes).
     if leader == state.node_id {
-        return submit_and_await_calvin(state, tx_class).await;
+        let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
+        return submit_prepared_and_await(state, tx_class, stream, timeout).await;
     }
 
     // Remote leader: ensure its address is registered before dispatch, then send
@@ -125,52 +148,58 @@ pub async fn submit_calvin_routed(
 
     // The leader-side handler holds this RPC open until the transaction is
     // sequenced AND completion-acked (up to `deadline_remaining_ms`). The generic
-    // short `rpc_timeout` (a normal request/response round-trip budget) would
+    // short `rpc_timeout` (a normal request/response round-trip budget) will
     // abort the call long before that, so bound the response read by the
     // forwarded deadline plus a margin for the round-trip itself.
     let read_timeout = Duration::from_millis(deadline_remaining_ms.saturating_add(2_000));
-    match transport
-        .send_rpc_with_read_timeout(leader, RaftRpc::SubmitCalvinTxnRequest(req), read_timeout)
-        .await
-    {
+    let header = transport.send_rpc_with_read_timeout(
+        leader,
+        RaftRpc::SubmitCalvinTxnRequest(req),
+        read_timeout,
+    );
+    // The header's reply comes only at completion, so the parts stream
+    // beside it. The leader opens the stream when it proposes the header;
+    // until then it answers `Unknown`, and the stream waits.
+    let reply = match &stream {
+        None => header.await,
+        Some(stream) => {
+            tokio::pin!(header);
+            let streaming = stream_parts(state, StreamTarget::Remote(leader), stream, false);
+            tokio::pin!(streaming);
+            tokio::select! {
+                reply = &mut header => reply,
+                end = &mut streaming => {
+                    end.into_result()?;
+                    header.await
+                }
+            }
+        }
+    };
+    match reply {
         Ok(RaftRpc::SubmitCalvinTxnResponse(SubmitCalvinTxnResponse {
             error: None,
             payload_bytes,
         })) => {
             // The leader drained ITS local sidecar and forwarded the RETURNING
             // payload bytes over this non-Raft RPC response. Reconstruct a
-            // minimal Control-Plane Response carrying just that payload so the
+            // minimal Control-Plane Response carrying only that payload so the
             // coordinator emits DATA-ROW output; `None` for plain writes.
             Ok(payload_bytes.map(synthetic_returning_response))
         }
-        // A Data-Plane verdict from the sequencer leader keeps its code, so a
-        // constraint violation on a routed write reaches the client as its own
-        // SQLSTATE instead of a generic internal error.
+        // An error with no class keeps the leader in its message.
         Ok(RaftRpc::SubmitCalvinTxnResponse(SubmitCalvinTxnResponse {
-            error: Some(TypedClusterError::DataPlane { code }),
+            error: Some(TypedClusterError::Internal { code: 0, message }),
             ..
-        })) => Err(Error::DataPlane(code.into())),
-        // A constraint refusal on the sequencer leader keeps its kind, so a
-        // NOT NULL refusal on a routed write reaches the client as 23502
-        // instead of collapsing into a generic internal error.
-        Ok(RaftRpc::SubmitCalvinTxnResponse(SubmitCalvinTxnResponse {
-            error:
-                Some(TypedClusterError::RejectedConstraint {
-                    collection,
-                    constraint,
-                    detail,
-                }),
-            ..
-        })) => Err(Error::RejectedConstraint {
-            collection,
-            constraint,
-            detail,
+        })) => Err(Error::Internal {
+            detail: format!("calvin-submit failed on sequencer leader node {leader}: {message}"),
         }),
+        // Every other error from the sequencer leader is rebuilt as the error
+        // a local submit returns: a Calvin abort stays a serialization
+        // conflict, a superseded collection stays retryable, and a Data-Plane
+        // or constraint verdict keeps its SQLSTATE.
         Ok(RaftRpc::SubmitCalvinTxnResponse(SubmitCalvinTxnResponse {
             error: Some(e), ..
-        })) => Err(Error::Internal {
-            detail: format!("calvin-submit failed on sequencer leader node {leader}: {e:?}"),
-        }),
+        })) => Err(Error::from(e)),
         Ok(other) => Err(Error::Internal {
             detail: format!("calvin-submit: unexpected reply from node {leader}: {other:?}"),
         }),

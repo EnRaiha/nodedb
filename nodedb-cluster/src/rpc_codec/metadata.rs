@@ -11,6 +11,8 @@ use crate::error::{ClusterError, Result};
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MetadataProposeRequest {
     pub bytes: Vec<u8>,
+    /// Whether the leader stamps `bytes` as it appends them.
+    pub stamp: bool,
 }
 
 /// Response to a forwarded metadata-group proposal.
@@ -19,6 +21,9 @@ pub struct MetadataProposeResponse {
     pub success: bool,
     pub log_index: u64,
     pub leader_hint: Option<u64>,
+    /// The refusing node's term, which `leader_hint` is known at. `0` on
+    /// success and on a refusal that is not `NotLeader`.
+    pub leader_term: u64,
     pub error_message: String,
 }
 
@@ -28,15 +33,19 @@ impl MetadataProposeResponse {
             success: true,
             log_index,
             leader_hint: None,
+            leader_term: 0,
             error_message: String::new(),
         }
     }
 
-    pub fn err(message: impl Into<String>, leader_hint: Option<u64>) -> Self {
+    /// A refusal. `leader_hint` is the leader the refusing node knows at
+    /// `leader_term`.
+    pub fn err(message: impl Into<String>, leader_hint: Option<u64>, leader_term: u64) -> Self {
         Self {
             success: false,
             log_index: 0,
             leader_hint,
+            leader_term,
             error_message: message.into(),
         }
     }

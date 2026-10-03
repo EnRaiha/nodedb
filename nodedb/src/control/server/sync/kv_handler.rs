@@ -20,7 +20,6 @@ use nodedb_types::sync::wire::{AckStatus, SyncAckResult, SyncProvenance};
 use nodedb_types::{QualifiedCollection, RlsWriteCheck};
 
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, SyncHold};
-use crate::control::server::dispatch_utils::RecordOwner;
 use crate::control::server::shared::clone_write::{
     CloneCheckedOutcome, InterceptAndAuthorizeParams, intercept_and_authorize,
 };
@@ -100,11 +99,15 @@ impl KvPushDispatcher for SharedStateKvDispatcher<'_> {
         let qualified = QualifiedCollection::new(database_id, &collection);
         let mut plan = match op {
             KvPushWriteOp::Put { body, ttl_ms } => {
-                let surrogate = self.shared.surrogate_assigner.assign(
-                    nodedb_types::CollectionKey::from_bare(database_id, &collection),
-                    tenant_id,
-                    &key,
-                )?;
+                let surrogate =
+                    crate::control::server::surrogate_exchange::assign_surrogate_routed(
+                        self.shared,
+                        nodedb_types::CollectionKey::from_bare(database_id, &collection),
+                        tenant_id,
+                        &key,
+                        crate::types::TraceId::ZERO,
+                    )
+                    .await?;
                 PhysicalPlan::Kv(KvOp::Put {
                     collection: qualified,
                     key: key.clone(),
@@ -182,16 +185,9 @@ impl KvPushDispatcher for SharedStateKvDispatcher<'_> {
         collection: &str,
         provenance: SyncProvenance,
     ) -> crate::Result<()> {
-        use crate::control::server::wal_dispatch::{WalAppendRequest, wal_append};
-
         let database_id = self.database_id;
-        let owner = RecordOwner {
-            tenant_id,
-            database_id,
-            vshard_id: nodedb_types::CollectionKey::from_bare(database_id, collection).vshard(),
-        };
         // A delete of no keys applies nothing. Its provenance moves the mark,
-        // and its records make the move durable.
+        // and the replicated apply's record makes the move durable.
         let plan = PhysicalPlan::Kv(KvOp::Delete {
             collection: QualifiedCollection::new(database_id, collection),
             keys: Vec::new(),
@@ -200,26 +196,13 @@ impl KvPushDispatcher for SharedStateKvDispatcher<'_> {
             rls_filters: Vec::new(),
             provenance: Some(provenance),
         });
-        let (minted, _) = super::raft_dispatch::append_under_window(self.shared, owner, |wal| {
-            wal_append(WalAppendRequest {
-                wal,
-                event_source: EventSource::CrdtSync,
-                tenant_id,
-                vshard_id: owner.vshard_id,
-                database_id,
-                plan: &plan,
-                credentials: None,
-                now_override: None,
-            })
-            .map(|outcome| outcome.lsn)
-        })
-        .await?;
-        let response = super::raft_dispatch::dispatch_trusted_internal_minted_sync_response(
+        let response = super::raft_dispatch::dispatch_trusted_internal_sync_response(
             self.shared,
-            owner,
+            tenant_id,
+            database_id,
+            nodedb_types::CollectionKey::from_bare(database_id, collection).vshard(),
             plan,
             EventSource::CrdtSync,
-            minted,
         )
         .await?;
         match crate::control::server::shared::response_payload::payload_or_typed_error(response) {

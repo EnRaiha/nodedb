@@ -3,7 +3,7 @@
 //! Protocol-neutral `DROP USER` DDL handler.
 //!
 //! Ownership of every object the user owns (all owner-bearing kinds, not
-//! just collections) is reassigned to the tenant admin, and every grant
+//! only collections) is reassigned to the tenant admin, and every grant
 //! made to the user is revoked, BEFORE the user row is removed — so no
 //! dangling `owner → user` or `permission.grantee → user` reference can
 //! survive the drop and brick the next boot's catalog integrity check.
@@ -30,24 +30,24 @@ enum OwnershipDisposition {
 }
 
 /// DROP USER [IF EXISTS] <name>
-pub fn drop_user(
+pub async fn drop_user(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
-    drop_user_inner(state, identity, parts, false)
+    drop_user_inner(state, identity, parts, false).await
 }
 
 /// Remove the lifecycle administrator while its tenant is being dropped.
-pub(in crate::control::server::shared::ddl::neutral) fn drop_tenant_admin(
+pub(in crate::control::server::shared::ddl::neutral) async fn drop_tenant_admin(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
-    drop_user_inner(state, identity, parts, true)
+    drop_user_inner(state, identity, parts, true).await
 }
 
-fn drop_user_inner(
+async fn drop_user_inner(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -116,13 +116,11 @@ fn drop_user_inner(
     // purge — not misreport it as "nothing owned" the way the reassign path's
     // `None` does.
     let disposition = if tenant_teardown {
-        OwnershipDisposition::Purged(purge_owned_for_tenant_teardown(
-            state,
-            username,
-            user_tenant,
-        )?)
+        OwnershipDisposition::Purged(
+            purge_owned_for_tenant_teardown(state, username, user_tenant).await?,
+        )
     } else {
-        match reassign_owned_and_sweep_grants(state, username, user_tenant)? {
+        match reassign_owned_and_sweep_grants(state, username, user_tenant).await? {
             Some(admin_name) => OwnershipDisposition::Reassigned(admin_name),
             None => OwnershipDisposition::NoneOwned,
         }
@@ -130,54 +128,31 @@ fn drop_user_inner(
 
     // `DropUser` fully removes the identity record on every node —
     // in-memory cache and redb catalog — so the username is freed
-    // for reuse. A soft-delete tombstone would block a later
+    // for reuse. A soft-delete tombstone will block a later
     // `CREATE USER` of the same name.
     let entry = crate::control::catalog_entry::CatalogEntry::DropUser {
         username: username.to_string(),
     };
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    let dropped = if outcome.needs_local_apply() {
-        // Single-node fallback.
-        state
-            .credentials
-            .drop_user(username)
-            .map_err(|e| DdlError::from_error(&e))?
-    } else {
-        // Cluster mode: the raft entry committed, so the
-        // drop WILL be applied on every node. The
-        // `post_apply` hook that updates the local in-memory
-        // cache runs in a spawned tokio task and may not be
-        // visible by the time this function returns — trust the
-        // log index rather than re-reading the cache.
-        true
-    };
 
-    if dropped {
-        let detail = match disposition {
-            OwnershipDisposition::Reassigned(admin_name) => {
-                format!("dropped user '{username}' (ownership reassigned to '{admin_name}')")
-            }
-            OwnershipDisposition::NoneOwned => {
-                format!("dropped user '{username}' (no owned objects required reassignment)")
-            }
-            OwnershipDisposition::Purged(purged) => {
-                format!(
-                    "dropped user '{username}' (tenant teardown purged {purged} owned object(s))"
-                )
-            }
-        };
-        state.audit_record(
-            AuditEvent::PrivilegeChange,
-            Some(identity.tenant_id),
-            &identity.username,
-            &detail,
-        );
-        Ok(status("DROP USER"))
-    } else {
-        Err(DdlError::new(
-            "42704",
-            format!("user '{username}' does not exist"),
-        ))
-    }
+    let detail = match disposition {
+        OwnershipDisposition::Reassigned(admin_name) => {
+            format!("dropped user '{username}' (ownership reassigned to '{admin_name}')")
+        }
+        OwnershipDisposition::NoneOwned => {
+            format!("dropped user '{username}' (no owned objects required reassignment)")
+        }
+        OwnershipDisposition::Purged(purged) => {
+            format!("dropped user '{username}' (tenant teardown purged {purged} owned object(s))")
+        }
+    };
+    state.audit_record(
+        AuditEvent::PrivilegeChange,
+        Some(identity.tenant_id),
+        &identity.username,
+        &detail,
+    );
+    Ok(status("DROP USER"))
 }

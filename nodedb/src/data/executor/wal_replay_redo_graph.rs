@@ -1,29 +1,46 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! WAL redo replay arm for the Graph engine (edges).
+//! WAL replay arm for the Graph engine (edges).
 //!
-//! Like document point writes, graph edge writes have no standalone WAL replay
-//! — they survive a crash today via redb's synchronous commit at apply time.
-//! Under write-ahead-then-install, a transaction's edge sub-records must replay.
+//! Every edge version the edge store holds has a WAL record carrying it at
+//! its ordinal, and this arm applies them all in LSN order: the version
+//! sub-records an autocommit edge write journals in its `WriteGroup` after
+//! apply, and the sub-records of committed `TransactionRedo` records alike.
+//! A restart re-applies versions the store already holds, and a
+//! point-in-time restore applies the versions its base lacks.
 //!
-//! ## Sub-record payload shape (chosen here)
+//! ## Record payload shape
 //!
-//! Extends the autocommit `RecordType::Put` / `Delete` edge shapes
-//! (`wal_append_if_write`):
+//! The map-encoded payloads every edge record carries:
 //!
-//! * PUT — `(collection, src_id, label, dst_id, properties, src_surrogate,
-//!   dst_surrogate, system_from)`. The autocommit shape stops at `properties`;
-//!   the redo shape appends endpoint surrogates and the original temporal
-//!   ordinal. Legacy seven-element transaction redo remains decodable.
-//! * DELETE — `(collection, src_id, label, dst_id)`. Byte-identical to the
-//!   autocommit shape; `execute_edge_delete` needs no surrogate.
+//! * PUT — [`crate::wal::EdgePutRedo`]: the edge, its properties, both endpoint
+//!   surrogates, and the version's ordinal.
+//! * DELETE — [`crate::wal::EdgeDeleteRedo`]: the edge, both endpoint
+//!   surrogates, and the tombstone's ordinal.
+//! * `GraphNodeCascade` — [`crate::wal::NodeCascadeRedo`]: every edge one
+//!   document delete's node cascade tombstoned, each at its own ordinal, in
+//!   a WAL an older build wrote. Replay writes exactly those tombstones,
+//!   skips a key that already holds one, and drops the node's identity
+//!   binding. No live write produces this record.
+//! * `GraphEdgeCut` — [`crate::wal::EdgeCutRedo`]: one TRUNCATE share's cut
+//!   of an edge collection, installed by `wal_replay_redo_graph_cut`.
+//!
+//! A PUT or DELETE that carries an applied ordinal is a restored version: it
+//! keeps its historical system time and is applied at the restore's ordinal.
+//!
+//! An autocommit write's pre-dispatch record carries no ordinal: the apply
+//! decides it. That record is skipped here, and the version record that
+//! follows it installs the version. An edge record that decodes but carries
+//! an unbound endpoint surrogate is refused as unapplied. It is never
+//! installed under `Surrogate::ZERO`.
 //!
 //! ## Idempotency
 //!
-//! Both ops are absolute: a PUT overwrites the versioned edge and its CSR entry,
-//! a DELETE soft-deletes it. Re-applying either converges — no checkpoint gate.
-//! Applied through the same `execute_edge_put` / `execute_edge_delete` handlers
-//! the transaction batch replays through, never a reimplementation.
+//! Both ops write one version key, `(edge, ordinal)`: a PUT overwrites that
+//! version and the edge's CSR entry, a DELETE writes that tombstone.
+//! Re-applying either converges — no checkpoint gate. Applied through the
+//! same `execute_edge_put` / `execute_edge_delete` handlers the transaction
+//! batch replays through, never a reimplementation.
 
 use nodedb_wal::WalRecord;
 use nodedb_wal::record::RecordType;
@@ -51,12 +68,18 @@ impl CoreLoop {
     ) {
         let mut puts = 0usize;
         let mut deletes = 0usize;
+        let mut cuts = 0usize;
 
         for record in records {
+            if self.replay_halted() {
+                break;
+            }
             let record_type = RecordType::from_raw(record.logical_record_type());
             let is_put = record_type == Some(RecordType::Put);
             let is_delete = record_type == Some(RecordType::Delete);
-            if !is_put && !is_delete {
+            let is_cascade = record_type == Some(RecordType::GraphNodeCascade);
+            let is_cut = record_type == Some(RecordType::GraphEdgeCut);
+            if !is_put && !is_delete && !is_cascade && !is_cut {
                 continue;
             }
 
@@ -74,24 +97,53 @@ impl CoreLoop {
             let database_id = DatabaseId::new(record.header.database_id);
             let record_lsn = record.header.lsn;
 
+            if is_cascade {
+                if self.replay_node_cascade(record) {
+                    deletes += 1;
+                }
+                continue;
+            }
+            if is_cut {
+                if self.replay_edge_cut(record, tombstones) {
+                    cuts += 1;
+                }
+                continue;
+            }
+
             if is_put {
-                // One struct decodes both the current record and any legacy
-                // record predating `system_from` (tolerant array decode →
-                // `None`), so there is no hand-maintained fallback tuple to
-                // drift out of sync with the encoder.
-                let Ok(crate::wal::EdgePutRedo {
+                // A payload that is not an edge put belongs to another arm.
+                let Ok(edge) = zerompk::from_msgpack::<crate::wal::EdgePutRedo>(&record.payload)
+                else {
+                    continue;
+                };
+                // An autocommit write's pre-dispatch record names the write,
+                // not the version: the apply decided the ordinal, and the
+                // version record journalled after apply carries it.
+                if edge.system_from.is_none() {
+                    continue;
+                }
+                let Some((src_surrogate, dst_surrogate)) = edge.endpoints() else {
+                    self.replay_record_unapplied(
+                        "graph",
+                        "edge_put_identity",
+                        record_lsn,
+                        &format!(
+                            "edge put in '{}' carries an unbound endpoint",
+                            edge.collection
+                        ),
+                    );
+                    continue;
+                };
+                let crate::wal::EdgePutRedo {
                     collection,
                     src_id,
                     label,
                     dst_id,
                     properties,
-                    src_surrogate: src_sur,
-                    dst_surrogate: dst_sur,
                     system_from,
-                }) = zerompk::from_msgpack::<crate::wal::EdgePutRedo>(&record.payload)
-                else {
-                    continue;
-                };
+                    applied,
+                    ..
+                } = edge;
                 if tombstones.is_tombstoned(
                     database_id.as_u64(),
                     tenant_id,
@@ -116,11 +168,12 @@ impl CoreLoop {
                         label: label.clone(),
                         dst_id: dst_id.clone(),
                         properties: properties.clone(),
-                        src_surrogate: nodedb_types::Surrogate::new(src_sur),
-                        dst_surrogate: nodedb_types::Surrogate::new(dst_sur),
+                        src_surrogate,
+                        dst_surrogate,
                     }),
                 );
-                self.active_graph_system_from = system_from;
+                self.apply_scope.graph_system_from = system_from;
+                self.apply_scope.graph_applied = applied;
                 let mut undo = Vec::new();
                 let recording = self.recording_redo_undo();
                 let response = self.execute_edge_put_with_undo(
@@ -132,12 +185,13 @@ impl CoreLoop {
                         label: &label,
                         dst_id: &dst_id,
                         properties: &properties,
-                        src_surrogate: nodedb_types::Surrogate::new(src_sur),
-                        dst_surrogate: nodedb_types::Surrogate::new(dst_sur),
+                        src_surrogate,
+                        dst_surrogate,
                     },
                     recording.then_some(&mut undo),
                 );
-                self.active_graph_system_from = None;
+                self.apply_scope.graph_system_from = None;
+                self.apply_scope.graph_applied = None;
                 self.record_redo_undo(undo);
                 if response.status == crate::bridge::envelope::Status::Ok {
                     puts += 1;
@@ -150,19 +204,37 @@ impl CoreLoop {
                     );
                 }
             } else {
-                // One struct decodes both the current record and any legacy
-                // record predating `system_from` (tolerant array decode →
-                // `None`), so there is no hand-maintained fallback tuple.
-                let Ok(crate::wal::EdgeDeleteRedo {
+                // A payload that is not an edge delete belongs to another arm.
+                let Ok(edge) = zerompk::from_msgpack::<crate::wal::EdgeDeleteRedo>(&record.payload)
+                else {
+                    continue;
+                };
+                // See the put arm: the tombstone record journalled after
+                // apply carries the ordinal.
+                if edge.system_from.is_none() {
+                    continue;
+                }
+                let Some((src_surrogate, dst_surrogate)) = edge.endpoints() else {
+                    self.replay_record_unapplied(
+                        "graph",
+                        "edge_delete_identity",
+                        record_lsn,
+                        &format!(
+                            "edge delete in '{}' carries an unbound endpoint",
+                            edge.collection
+                        ),
+                    );
+                    continue;
+                };
+                let crate::wal::EdgeDeleteRedo {
                     collection,
                     src_id,
                     label,
                     dst_id,
                     system_from,
-                }) = zerompk::from_msgpack::<crate::wal::EdgeDeleteRedo>(&record.payload)
-                else {
-                    continue;
-                };
+                    applied,
+                    ..
+                } = edge;
                 if tombstones.is_tombstoned(
                     database_id.as_u64(),
                     tenant_id,
@@ -186,15 +258,16 @@ impl CoreLoop {
                         src_id: src_id.clone(),
                         label: label.clone(),
                         dst_id: dst_id.clone(),
-                        src_surrogate: nodedb_types::Surrogate::ZERO,
-                        dst_surrogate: nodedb_types::Surrogate::ZERO,
+                        src_surrogate,
+                        dst_surrogate,
                         // No predicate here: this is crash-recovery replay of
                         // an already-committed WAL record. The identity that
                         // wrote it is not present at boot.
                         rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
                     }),
                 );
-                self.active_graph_system_from = system_from;
+                self.apply_scope.graph_system_from = system_from;
+                self.apply_scope.graph_applied = applied;
                 let mut undo = Vec::new();
                 let recording = self.recording_redo_undo();
                 let response = self.execute_edge_delete_with_undo(
@@ -205,6 +278,8 @@ impl CoreLoop {
                         src_id: &src_id,
                         label: &label,
                         dst_id: &dst_id,
+                        src_surrogate,
+                        dst_surrogate,
                         // Replay carries no predicate: the policy decided this
                         // edge when the record was written, and the writing
                         // identity is not present at boot.
@@ -212,7 +287,8 @@ impl CoreLoop {
                     },
                     recording.then_some(&mut undo),
                 );
-                self.active_graph_system_from = None;
+                self.apply_scope.graph_system_from = None;
+                self.apply_scope.graph_applied = None;
                 self.record_redo_undo(undo);
                 if response.status == crate::bridge::envelope::Status::Ok {
                     deletes += 1;
@@ -227,14 +303,57 @@ impl CoreLoop {
             }
         }
 
-        if puts > 0 || deletes > 0 {
+        if puts > 0 || deletes > 0 || cuts > 0 {
             tracing::info!(
                 core = self.core_id,
                 puts,
                 deletes,
+                cuts,
                 "WAL graph redo replay complete"
             );
         }
+    }
+
+    /// Write one journalled node cascade: each tombstone at its ordinal, the
+    /// node's identity binding dropped, and the node's edges gone from the
+    /// CSR. Returns whether it applied. A cascade that does not decode is a
+    /// committed effect replay cannot apply, and halts replay.
+    fn replay_node_cascade(&mut self, record: &WalRecord) -> bool {
+        let record_lsn = record.header.lsn;
+        let cascade = match zerompk::from_msgpack::<crate::wal::NodeCascadeRedo>(&record.payload) {
+            Ok(cascade) => cascade,
+            Err(e) => {
+                self.replay_record_unapplied(
+                    "graph",
+                    "node_cascade_decode",
+                    record_lsn,
+                    &format!("node cascade does not decode: {e}"),
+                );
+                return false;
+            }
+        };
+        if self.claim_for_validation() {
+            return false;
+        }
+        let database_id = record.header.database_id;
+        let tenant_id = record.header.tenant_id;
+        if let Err(e) = self.edge_store.apply_node_cascade(
+            database_id,
+            crate::types::TenantId::new(tenant_id),
+            &cascade.node,
+            &cascade.edges,
+        ) {
+            self.replay_record_unapplied(
+                "graph",
+                "node_cascade_apply",
+                record_lsn,
+                &format!("node cascade of '{}' failed: {e}", cascade.node),
+            );
+            return false;
+        }
+        self.csr_partition_mut(database_id, tenant_id)
+            .remove_node_edges(&cascade.node);
+        true
     }
 
     /// Replay reconstituted `GraphNodeLabelSet` / `GraphNodeLabelRemove` redo
@@ -255,6 +374,9 @@ impl CoreLoop {
         let mut replayed = 0usize;
 
         for record in records {
+            if self.replay_halted() {
+                break;
+            }
             let record_type = RecordType::from_raw(record.logical_record_type());
             let is_set = record_type == Some(RecordType::GraphNodeLabelSet);
             let is_remove = record_type == Some(RecordType::GraphNodeLabelRemove);
@@ -319,6 +441,7 @@ impl CoreLoop {
                 txn_id: None,
                 wal_lsn,
                 resolved_now_ms: None,
+                commit_hlc: None,
                 admission: crate::bridge::envelope::Admission::Exempt(
                     crate::bridge::envelope::ExemptReason::AlreadyOrdered,
                 ),
@@ -378,6 +501,7 @@ mod tests {
             src_surrogate: 10,
             dst_surrogate: 20,
             system_from: Some(nodedb_types::ms_to_ordinal_upper(100)),
+            applied: None,
         })
         .expect("encode edge put sub-record");
         RedoSubRecord {
@@ -391,6 +515,10 @@ mod tests {
             version: 1,
             ops,
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         };
         WalRecord::new(WalRecordArgs {
             record_type: RecordType::TransactionRedo as u32,

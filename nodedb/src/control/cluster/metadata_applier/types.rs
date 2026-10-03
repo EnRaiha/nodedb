@@ -3,7 +3,7 @@
 //! `MetadataCommitApplier` struct definition, construction, and the
 //! `CatalogChangeEvent` it broadcasts.
 
-use std::sync::{Arc, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use tokio::sync::broadcast;
 
@@ -36,6 +36,10 @@ pub struct MetadataCommitApplier {
     /// break the Arc cycle (SharedState → raft loop → applier →
     /// SharedState). `None` in unit tests.
     pub(super) shared: OnceLock<Weak<SharedState>>,
+    /// `(raft_index, start, end)` of a surrogate carve whose persist failed.
+    /// The re-delivered entry persists it and hands this exact batch to the
+    /// allocator still waiting on it.
+    pub(super) unpersisted_carve: Mutex<Option<(u64, u32, u32)>>,
 }
 
 impl MetadataCommitApplier {
@@ -52,6 +56,7 @@ impl MetadataCommitApplier {
             token_state,
             transport: OnceLock::new(),
             shared: OnceLock::new(),
+            unpersisted_carve: Mutex::new(None),
         }
     }
 
@@ -65,5 +70,21 @@ impl MetadataCommitApplier {
     /// its construction sequence.
     pub fn install_shared(&self, shared: Weak<SharedState>) {
         let _ = self.shared.set(shared);
+    }
+
+    /// The installed `SharedState`.
+    ///
+    /// Missing means the applier runs before `start_raft` installed it, or
+    /// after shutdown dropped it. The entry's host effects cannot land, so
+    /// this is a transient error: the entry is re-delivered.
+    pub(super) fn shared_state(&self) -> Result<Arc<SharedState>, crate::Error> {
+        self.shared
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| crate::Error::Internal {
+                detail: "metadata applier has no SharedState (not installed yet, or the node \
+                         shut down); the entry is re-delivered"
+                    .into(),
+            })
     }
 }

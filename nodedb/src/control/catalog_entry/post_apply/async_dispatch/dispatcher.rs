@@ -14,16 +14,17 @@
 //! `DocumentOp::Scan` on the same node must find the collection registered in
 //! `doc_configs` so Binary Tuple (strict) documents decode correctly.
 //!
-//! `tokio::task::block_in_place` is used for the Register dispatch so it runs
-//! synchronously on the calling tokio worker thread. The raft tick loop always
-//! runs on a tokio worker thread, so `block_in_place` is valid here.
+//! [`run_post_apply_async_side_effects`] awaits the Register dispatch, and
+//! the metadata applier awaits it before it advances past the entry.
 //!
-//! Collection purge and materialized-view deletion have the same ordering
-//! requirement: all local Data Plane cores must reclaim the old incarnation
-//! before the applied-index watcher advances, because a same-name re-CREATE may
-//! immediately follow. Reclaim failure is fatal to the applying node; the
-//! durable pending-reclaim record is drained on restart before stale state can
-//! be served.
+//! Collection purge, materialized-view deletion, and the MOVE TENANT cutover
+//! have the same ordering requirement: all local Data Plane cores must reclaim
+//! the old incarnation before the applied-index watcher advances, because a
+//! same-name re-CREATE can immediately follow. A reclaim that queued a durable
+//! `_system.pending_reclaim` retry counts as done: the pending-reclaim worker
+//! and the boot drain own it. A reclaim that queued nothing returns `Err`, the
+//! metadata applier stops the batch at the entry, and the re-delivered entry
+//! retries the reclaim.
 //!
 //! ## Applied-index contract for the vector-index variants
 //!
@@ -32,7 +33,7 @@
 //! the index with default build parameters, and `execute_set_vector_params`
 //! then refuses to reconfigure a materialized index — so a late `SetParams`
 //! never applies and the node serves the wrong index for good. The same
-//! refusal makes a late `DropIndex` block the same-name re-CREATE that may
+//! refusal makes a late `DropIndex` block the same-name re-CREATE that can
 //! follow it.
 //!
 //! ## Applied-index contract for the synonym-group variants
@@ -45,20 +46,24 @@
 //! both answer with the wrong row set and no error, which no later dispatch
 //! makes the client aware of.
 //!
-//! ## Ordering for `CompactHistory`
+//! ## Durability for `CompactHistory`
 //!
-//! `CrdtOp::CompactAtVersion` has no such refusal: a compaction that lands
-//! after a later read still discards the same oplog entries. It is spawned
-//! fire-and-forget.
+//! Apply records the owed compaction in `_system.pending_history_compaction`.
+//! The fan-out is awaited, and the row is removed once every core compacted
+//! and checkpointed. A failed fan-out keeps the row for the retry worker and
+//! the boot drain, so it never stops the batch.
 //!
-//! Variants without a read-after-apply dependency remain fire-and-forget.
+//! Variants without a read-after-apply dependency remain fire-and-forget,
+//! and only where boot rebuilds their effect from redb.
 
 use std::sync::Arc;
+
+use tracing::warn;
 
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::state::SharedState;
 
-use super::collection;
+use super::collection::{self, ReclaimFailure};
 
 /// Dispatch post-apply side effects of `entry`. Runs on every node (leader
 /// and followers) so each node's local Data Plane observes catalog mutations
@@ -68,27 +73,48 @@ use super::collection;
 /// compares the boundary against WAL record LSNs, so it must be a WAL LSN,
 /// never a Raft log index. Every write of the reclaimed collection on this
 /// node sits below the next LSN this WAL assigns.
-pub fn spawn_post_apply_async_side_effects(entry: CatalogEntry, shared: Arc<SharedState>) {
+///
+/// `Err` means a reclaim failed with no durable retry queued. The caller must
+/// not advance past the entry, so its re-delivery retries the reclaim.
+///
+/// A Register that a Data Plane core did not acknowledge is logged, and the
+/// batch advances.
+///
+/// The future resolves once every awaited effect completed. A variant with
+/// no awaited effect resolves on its first poll.
+pub async fn run_post_apply_async_side_effects(
+    entry: CatalogEntry,
+    shared: Arc<SharedState>,
+) -> crate::Result<()> {
     match entry {
         CatalogEntry::PutCollection(stored) => {
-            // SYNCHRONOUS: Register must complete before the applied-index
-            // watcher bumps so any subsequent scan on this node finds the
-            // collection in doc_configs. block_in_place is valid because
-            // the raft tick loop runs on a tokio worker thread.
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    collection::put_async(*stored, shared).await;
-                });
-            });
+            // AWAITED: Register completes before the applied-index watcher
+            // bumps, so any later scan on this node finds the collection in
+            // doc_configs.
+            //
+            // The stamp carries version 1 only on a create, and the validator
+            // admits a create only as a new incarnation. Its storage is
+            // cleared first, so it starts empty.
+            if stored.descriptor_version == 1 {
+                collection::clear_before_recreate(
+                    &shared,
+                    stored.database_id.as_u64(),
+                    stored.tenant_id,
+                    &stored.name,
+                )
+                .await?;
+            }
+            let registered = collection::put_async(&stored, &shared).await;
+            register_outcome(registered, &stored.name);
         }
         CatalogEntry::PutCollectionIfAbsent(stored) => {
             // Register from the CANONICAL collection read back from the
             // catalog after apply — never from the carried entry. On the
             // no-op path (the collection already existed) the carried
-            // `stored` may hold a divergent incoming config; the catalog
+            // `stored` can hold a divergent incoming config; the catalog
             // holds the authoritative pre-existing one. Post-apply the
             // collection always exists (created or pre-existing), so the
-            // read-back is always Some; a None here would mean the redb
+            // read-back is always Some; a None here means the redb
             // write silently failed, so warn and skip rather than register
             // a divergent config.
             let canonical = shared
@@ -99,16 +125,23 @@ pub fn spawn_post_apply_async_side_effects(entry: CatalogEntry, shared: Arc<Shar
                 .flatten();
             match canonical {
                 Some(canonical) => {
-                    // SYNCHRONOUS: Register must complete before the
-                    // applied-index watcher bumps so any subsequent scan on
-                    // this node finds the collection in doc_configs.
-                    // block_in_place is valid because the raft tick loop
-                    // runs on a tokio worker thread.
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async move {
-                            collection::put_async(canonical, shared).await;
-                        });
-                    });
+                    // AWAITED: Register completes before the applied-index
+                    // watcher bumps, so any later scan on this node finds the
+                    // collection in doc_configs.
+                    //
+                    // The canonical row carries the entry's clock only when
+                    // this entry created it: a new incarnation, cleared first.
+                    if canonical.modification_hlc == stored.modification_hlc {
+                        collection::clear_before_recreate(
+                            &shared,
+                            canonical.database_id.as_u64(),
+                            canonical.tenant_id,
+                            &canonical.name,
+                        )
+                        .await?;
+                    }
+                    let registered = collection::put_async(&canonical, &shared).await;
+                    register_outcome(registered, &canonical.name);
                 }
                 None => {
                     tracing::warn!(
@@ -124,56 +157,42 @@ pub fn spawn_post_apply_async_side_effects(entry: CatalogEntry, shared: Arc<Shar
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             let purge_lsn = shared.wal.next_lsn().as_u64();
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    collection::reclaim_collection_storage(
-                        &shared,
-                        database_id,
-                        tenant_id,
-                        &name,
-                        purge_lsn,
-                        false,
-                    )
-                    .await
-                })
-            });
-            if let Err(error) = result {
-                panic!("collection post-apply reclaim failed: {error}");
-            }
+            let result = collection::reclaim_collection_storage(
+                &shared,
+                database_id,
+                tenant_id,
+                &name,
+                purge_lsn,
+                false,
+            )
+            .await;
+            reclaim_outcome(result, "collection purge")?;
         }
-        // SYNCHRONOUS: every node must clear the view target's per-core state
+        // AWAITED: every node must clear the view target's per-core state
         // before its applied-index watcher advances. Otherwise a same-name
         // re-CREATE can observe cached aggregates from the dropped target.
-        // A failure is fatal: the metadata deletion is already committed, so
-        // continuing would serve an inconsistent catalog/Data Plane pair;
-        // restart safely reconstructs the in-memory cache from empty state.
         CatalogEntry::DeleteMaterializedView {
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             let purge_lsn = shared.wal.next_lsn().as_u64();
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    super::materialized_view::delete_async(
-                        database_id,
-                        tenant_id,
-                        name,
-                        purge_lsn,
-                        shared,
-                    )
-                    .await
-                })
-            });
-            if let Err(error) = result {
-                panic!("materialized-view post-apply reclaim failed: {error}");
-            }
+            let result = super::materialized_view::delete_async(
+                database_id,
+                tenant_id,
+                name,
+                purge_lsn,
+                shared,
+            )
+            .await;
+            reclaim_outcome(result, "materialized-view target reclaim")?;
         }
-        // `PutContinuousAggregate` dispatches register to every core on
-        // this node so the local `continuous_agg_mgr` picks up the new
-        // definition after a raft commit without re-issuing DDL.
+        // Fire-and-forget: boot re-registers every stored aggregate from redb,
+        // so a register lost to a crash is rebuilt at the next boot.
         CatalogEntry::PutContinuousAggregate(stored) => {
             let tenant_id = stored.tenant_id;
             let name = stored.name.clone();
@@ -182,40 +201,27 @@ pub fn spawn_post_apply_async_side_effects(entry: CatalogEntry, shared: Arc<Shar
                 super::continuous_aggregate::put_async(tenant_id, name, def_bytes, shared).await;
             });
         }
-        // SYNCHRONOUS: the build parameters must reach every core before the
+        // AWAITED: the build parameters must reach every core before the
         // applied-index watcher bumps, or a write racing ahead of them
         // materializes the index with defaults and pins it there.
         CatalogEntry::PutVectorIndexParams(stored) => {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    super::vector::put_async(*stored, Arc::clone(&shared)).await;
-                });
-            });
+            super::vector::put_async(*stored, shared).await;
         }
-        // SYNCHRONOUS: a same-name re-CREATE may follow immediately, and
+        // AWAITED: a same-name re-CREATE can follow immediately, and
         // `SetParams` is refused while the dropped index is still materialized.
         CatalogEntry::DeleteVectorIndexParams {
             database_id,
             tenant_id,
             collection,
             field_name,
+            ..
         } => {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    super::vector::delete_async(
-                        database_id,
-                        tenant_id,
-                        collection,
-                        field_name,
-                        Arc::clone(&shared),
-                    )
-                    .await;
-                });
-            });
+            super::vector::delete_async(database_id, tenant_id, collection, field_name, shared)
+                .await;
         }
-        // `CompactHistory` dispatches the oplog compaction to every core so
-        // each node discards the same history the leader does. A late
-        // compaction still succeeds, so this stays fire-and-forget.
+        // AWAITED: the owed-compaction row apply wrote is removed once every
+        // core compacted durably. A failed fan-out leaves the row to the
+        // retry worker and the boot drain.
         CatalogEntry::CompactHistory {
             tenant_id,
             collection,
@@ -223,51 +229,99 @@ pub fn spawn_post_apply_async_side_effects(entry: CatalogEntry, shared: Arc<Shar
             target_version_json,
             ..
         } => {
-            tokio::spawn(async move {
-                super::crdt_compact::compact_async(
-                    database_id,
-                    tenant_id,
-                    &collection,
-                    &target_version_json,
-                    &shared,
-                )
-                .await;
-            });
+            let result = super::crdt_compact::compact_async(
+                database_id,
+                tenant_id,
+                &collection,
+                &target_version_json,
+                &shared,
+            )
+            .await;
+            if let Err(error) = result {
+                warn!(
+                    collection = %collection,
+                    tenant = tenant_id,
+                    error = %error,
+                    "history compaction post-apply: still owed on this node; the retry worker \
+                     re-drives it"
+                );
+            }
         }
-        // `DeleteContinuousAggregate` dispatches unregister to every
-        // core so per-node runtime state is reclaimed symmetrically.
+        // Fire-and-forget: boot re-registers only the aggregates redb still
+        // holds, so an unregister lost to a crash is rebuilt at the next boot.
         CatalogEntry::DeleteContinuousAggregate {
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             tokio::spawn(async move {
                 super::continuous_aggregate::delete_async(database_id, tenant_id, name, shared)
                     .await;
             });
         }
-        // SYNCHRONOUS: the group must reach every core's FTS backend before
-        // the applied-index watcher bumps. A query that runs first expands
+        // AWAITED: the group must reach every core's FTS backend before the
+        // applied-index watcher bumps. A query that runs first expands
         // nothing and returns fewer rows with no error.
         CatalogEntry::PutSynonymGroup(stored) => {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    super::synonym_group::put_async(*stored, &shared).await;
-                });
-            });
+            super::synonym_group::put_async(*stored, &shared).await;
         }
-        // SYNCHRONOUS: a query that runs before the removal lands keeps
-        // expanding terms the statement already dropped.
+        // AWAITED: a query that runs before the removal lands keeps expanding
+        // terms the statement already dropped.
         CatalogEntry::DeleteSynonymGroup {
             database_id,
             tenant_id,
             name,
+            ..
         } => {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    super::synonym_group::delete_async(database_id, tenant_id, name, &shared).await;
-                });
-            });
+            super::synonym_group::delete_async(database_id, tenant_id, name, &shared).await;
+        }
+        // AWAITED: the moved rows must leave the source key before the
+        // applied-index watcher bumps. Otherwise a same-name CREATE in the
+        // source database observes them.
+        CatalogEntry::MoveTenantCutover {
+            source_db_id,
+            collections,
+            ..
+        } => {
+            let result =
+                super::move_tenant::reclaim_moved_sources(&shared, source_db_id, &collections)
+                    .await;
+            reclaim_outcome(result, "MOVE TENANT source reclaim")?;
+        }
+        // AWAITED: every shadow collection registers before the applied-index
+        // watcher bumps, as a `PutCollection` does, so a write or scan on the
+        // clone finds its config in doc_configs.
+        CatalogEntry::CloneDatabase {
+            target_descriptor, ..
+        } => {
+            let registered = collection::clone_shadows_async(target_descriptor.id, &shared).await;
+            register_outcome(registered, &target_descriptor.name);
+        }
+        // AWAITED: every core opens the array before the applied-index
+        // watcher advances, purging the tombstone of a prior incarnation, so
+        // the next statement on this node reads the new incarnation.
+        CatalogEntry::PutArray(stored) => {
+            super::array::open_on_every_core(&shared, &stored).await?;
+        }
+        // AWAITED: a same-name CREATE can follow at once, and a moved store
+        // must sit under its target key before the target's `PutArray` opens
+        // it.
+        CatalogEntry::DeleteArray {
+            database_id,
+            tenant_id,
+            name,
+            moved_to,
+            ..
+        } => {
+            super::array::delete_on_every_core(
+                &shared,
+                database_id,
+                tenant_id,
+                &name,
+                moved_to.map(|m| m.target_db_id),
+            )
+            .await?;
         }
         // ── Variants with no async side effect today ─────────────────────────
         // Listed explicitly (no `_ => {}`) so the compiler forces a decision
@@ -327,13 +381,14 @@ pub fn spawn_post_apply_async_side_effects(entry: CatalogEntry, shared: Arc<Shar
         | CatalogEntry::PutCustomType(_)
         | CatalogEntry::DeleteCustomType { .. }
         | CatalogEntry::PutDatabase(_)
+        // The teardown drops the database's arrays through their own
+        // `DeleteArray` entries, ahead of this one.
         | CatalogEntry::DeleteDatabase { .. }
         | CatalogEntry::PutDatabaseGrant { .. }
         | CatalogEntry::DeleteDatabaseGrant { .. }
         | CatalogEntry::PutOidcProvider(_)
         | CatalogEntry::DeleteOidcProvider { .. }
         | CatalogEntry::RecordWalTombstone { .. }
-        | CatalogEntry::CloneDatabase { .. }
         // Quota enforcement is installed synchronously, in `sync.rs`.
         | CatalogEntry::PutDatabaseQuota { .. }
         | CatalogEntry::DeleteDatabaseQuota { .. }
@@ -353,6 +408,10 @@ pub fn spawn_post_apply_async_side_effects(entry: CatalogEntry, shared: Arc<Shar
         | CatalogEntry::PutConsumerGroupIfAbsent(_)
         | CatalogEntry::DeleteConsumerGroup { .. }
         | CatalogEntry::MigrateConsumerGroupStream { .. }
+        // Offset advance happens in `sync.rs`.
+        | CatalogEntry::CommitConsumerOffsets(_)
+        // A backup schedule mark is its catalog row alone.
+        | CatalogEntry::PutBackupScheduleMark(_)
         // Checkpoints have no in-memory mirror at all.
         // CompactHistory has its own async branch above; it does not appear
         // here.
@@ -365,8 +424,52 @@ pub fn spawn_post_apply_async_side_effects(entry: CatalogEntry, shared: Arc<Shar
         | CatalogEntry::DeleteVectorModel { .. }
         // Column statistics have no in-memory mirror.
         | CatalogEntry::PutColumnStats(_)
-        | CatalogEntry::MoveTenantCutover { .. } => {
+        // Clone copy-on-write rows have no in-memory mirror and no Data
+        // Plane side effect.
+        | CatalogEntry::PutCloneCopyup { .. }
+        | CatalogEntry::PutCloneTombstone { .. }
+        | CatalogEntry::PutKvCloneTombstone { .. }
+        // Clone source drain claims are read only from the catalog by the
+        // singleton worker's recovery.
+        | CatalogEntry::PutCloneSourceDrain(_)
+        | CatalogEntry::DeleteCloneSourceDrain { .. } => {
             let _ = shared;
         }
+    }
+    Ok(())
+}
+
+/// Log a Register that a Data Plane core did not acknowledge. The metadata
+/// applier runs the post-apply lane, and no client waits on it. The batch
+/// advances: the catalog row is durable, and boot seeds every core's config
+/// from it.
+fn register_outcome(result: crate::Result<()>, collection: &str) {
+    if let Err(error) = result {
+        tracing::error!(
+            collection,
+            error = %error,
+            "catalog_entry: Register barrier failed — one or more Data Plane cores \
+             did not acknowledge the schema update; this node may serve stale schema"
+        );
+    }
+}
+
+/// Map a reclaim result onto the post-apply contract.
+///
+/// A queued durable retry is owned by the pending-reclaim worker and the boot
+/// drain, so it counts as done. Anything else is `Err`, which stops the apply
+/// batch at this entry.
+fn reclaim_outcome(result: Result<(), ReclaimFailure>, what: &str) -> crate::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(failure) if failure.retry_queued => {
+            warn!(
+                error = %failure.error,
+                "{what} post-apply: reclaim failed on this node; the pending-reclaim worker \
+                 owns the retry"
+            );
+            Ok(())
+        }
+        Err(failure) => Err(failure.error),
     }
 }

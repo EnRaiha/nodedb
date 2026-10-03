@@ -10,6 +10,7 @@ use nodedb_raft::message::{
 use super::auth_lease::{
     AuthBarrierRequest, AuthBarrierResponse, AuthLeaseRenewRequest, AuthLeaseRenewResponse,
 };
+use super::calvin_parts::{CalvinPartsRequest, CalvinPartsResponse};
 use super::calvin_submit::{
     SubmitCalvinInboxRequest, SubmitCalvinInboxResponse, SubmitCalvinTxnRequest,
     SubmitCalvinTxnResponse,
@@ -20,9 +21,12 @@ use super::cluster_mgmt::{
 use super::data_propose::{DataProposeRequest, DataProposeResponse};
 use super::discriminants::*;
 use super::execute::{ExecuteRequest, ExecuteResponse, ExecuteStreamChunk, ExecuteStreamEnd};
+use super::frame_refusal::FrameRefusal;
 use super::header::HEADER_SIZE;
+use super::leader_status::{LeaderStatusRequest, LeaderStatusResponse};
 use super::metadata::{MetadataProposeRequest, MetadataProposeResponse};
 use super::read_index::{ReadIndexRequest, ReadIndexResponse};
+use super::request_refusal::RequestRefusal;
 use super::reservation::{
     ReleaseReservationRequest, ReleaseReservationResponse, ReserveReadRequest, ReserveReadResponse,
 };
@@ -34,8 +38,9 @@ use super::shuffle::{
 use super::surrogate::{AssignSurrogateRequest, AssignSurrogateResponse};
 use super::vshard::VShardRefusal;
 use super::{
-    auth_lease, calvin_submit, cluster_mgmt, data_propose, execute, metadata, raft_msgs,
-    read_index, reservation, shuffle, surrogate, vshard,
+    auth_lease, calvin_parts, calvin_submit, cluster_mgmt, data_propose, execute, frame_refusal,
+    leader_status, metadata, raft_msgs, read_index, request_refusal, reservation, shuffle,
+    surrogate, vshard,
 };
 use crate::error::{ClusterError, Result};
 use crate::wire_version::{unwrap_bytes_versioned, wrap_bytes_versioned};
@@ -66,7 +71,7 @@ pub enum RaftRpc {
     // Topology broadcast
     TopologyUpdate(TopologyUpdate),
     TopologyAck(TopologyAck),
-    // Discriminants 13/14 (ForwardRequest/ForwardResponse) retired in C-δ.6.
+    // Discriminants 13/14 (ForwardRequest/ForwardResponse) are retired.
     // VShardEnvelope
     VShardEnvelope(Vec<u8>),
     // Metadata-group proposal forwarding (group 0)
@@ -130,6 +135,11 @@ pub enum RaftRpc {
     // error.
     SubmitCalvinInboxRequest(SubmitCalvinInboxRequest),
     SubmitCalvinInboxResponse(SubmitCalvinInboxResponse),
+    // Streamed parts of a multi-part Calvin transaction. A coordinator sends
+    // one bounded batch of parts to the sequencer leader, which queues them
+    // and answers how far the stream got.
+    CalvinPartsRequest(CalvinPartsRequest),
+    CalvinPartsResponse(CalvinPartsResponse),
     // Routed reserve-read (Calvin OLLP). A coordinator sends a
     // `ReserveReadRequest` carrying a msgpack-encoded `LockKeyWire` to the
     // sequencer-group leader; the leader assign-only reserves the read lock
@@ -152,6 +162,10 @@ pub enum RaftRpc {
     // for a read index confirmed against a quorum.
     ReadIndexRequest(ReadIndexRequest),
     ReadIndexResponse(ReadIndexResponse),
+    // Leader status. A node asks another which leader it knows for a group;
+    // the receiver answers from its own Raft state, with no quorum round.
+    LeaderStatusRequest(LeaderStatusRequest),
+    LeaderStatusResponse(LeaderStatusResponse),
     // Authorization lease renewal and the writer-side barrier, both answered
     // by the metadata group leader.
     AuthLeaseRenewRequest(AuthLeaseRenewRequest),
@@ -161,6 +175,10 @@ pub enum RaftRpc {
     // Answer to a `VShardEnvelope` request whose handler failed. It carries
     // the handler's typed error.
     VShardRefusal(VShardRefusal),
+    // Answer to a request frame the receiver's replay window refused.
+    FrameRefused(FrameRefusal),
+    // Answer to a request whose handler failed. It carries the typed reason.
+    RequestRefused(RequestRefusal),
 }
 
 /// Encode a [`RaftRpc`] into a framed binary message stamped with `epoch`.
@@ -220,6 +238,8 @@ pub fn encode(rpc: &RaftRpc, epoch: &crate::cluster_epoch::ClusterEpochState) ->
         RaftRpc::SubmitCalvinInboxResponse(m) => {
             calvin_submit::encode_submit_calvin_inbox_resp(m, &mut out)
         }
+        RaftRpc::CalvinPartsRequest(m) => calvin_parts::encode_calvin_parts_req(m, &mut out),
+        RaftRpc::CalvinPartsResponse(m) => calvin_parts::encode_calvin_parts_resp(m, &mut out),
         RaftRpc::ReserveReadRequest(m) => reservation::encode_reserve_read_req(m, &mut out),
         RaftRpc::ReserveReadResponse(m) => reservation::encode_reserve_read_resp(m, &mut out),
         RaftRpc::ReleaseReservationRequest(m) => {
@@ -232,11 +252,15 @@ pub fn encode(rpc: &RaftRpc, epoch: &crate::cluster_epoch::ClusterEpochState) ->
         RaftRpc::DataProposeResponse(m) => data_propose::encode_data_propose_resp(m, &mut out),
         RaftRpc::ReadIndexRequest(m) => read_index::encode_read_index_req(m, &mut out),
         RaftRpc::ReadIndexResponse(m) => read_index::encode_read_index_resp(m, &mut out),
+        RaftRpc::LeaderStatusRequest(m) => leader_status::encode_leader_status_req(m, &mut out),
+        RaftRpc::LeaderStatusResponse(m) => leader_status::encode_leader_status_resp(m, &mut out),
         RaftRpc::AuthLeaseRenewRequest(m) => auth_lease::encode_renew_req(m, &mut out),
         RaftRpc::AuthLeaseRenewResponse(m) => auth_lease::encode_renew_resp(m, &mut out),
         RaftRpc::AuthBarrierRequest(m) => auth_lease::encode_barrier_req(m, &mut out),
         RaftRpc::AuthBarrierResponse(m) => auth_lease::encode_barrier_resp(m, &mut out),
         RaftRpc::VShardRefusal(m) => vshard::encode_vshard_refusal(m, &mut out),
+        RaftRpc::FrameRefused(m) => frame_refusal::encode_frame_refusal(m, &mut out),
+        RaftRpc::RequestRefused(m) => request_refusal::encode_request_refusal(m, &mut out),
     }?;
     super::header::stamp_epoch(&mut out, epoch)?;
     Ok(out)
@@ -300,7 +324,7 @@ pub fn decode(data: &[u8], epoch: &crate::cluster_epoch::ClusterEpochState) -> R
         RPC_FORWARD_REQ | RPC_FORWARD_RESP => Err(ClusterError::Codec {
             detail: format!(
                 "rpc_type {rpc_type} is a retired wire variant (ForwardRequest/ForwardResponse, \
-                 retired in C-δ.6); upgrade all cluster nodes to remove this peer"
+                 retired); upgrade all cluster nodes to remove this peer"
             ),
         }),
         RPC_VSHARD_ENVELOPE => vshard::decode_vshard_envelope(payload),
@@ -326,6 +350,8 @@ pub fn decode(data: &[u8], epoch: &crate::cluster_epoch::ClusterEpochState) -> R
         RPC_SUBMIT_CALVIN_TXN_RESP => calvin_submit::decode_submit_calvin_txn_resp(payload),
         RPC_SUBMIT_CALVIN_INBOX_REQ => calvin_submit::decode_submit_calvin_inbox_req(payload),
         RPC_SUBMIT_CALVIN_INBOX_RESP => calvin_submit::decode_submit_calvin_inbox_resp(payload),
+        RPC_CALVIN_PARTS_REQ => calvin_parts::decode_calvin_parts_req(payload),
+        RPC_CALVIN_PARTS_RESP => calvin_parts::decode_calvin_parts_resp(payload),
         RPC_RESERVE_READ_REQ => reservation::decode_reserve_read_req(payload),
         RPC_RESERVE_READ_RESP => reservation::decode_reserve_read_resp(payload),
         RPC_RELEASE_RESERVATION_REQ => reservation::decode_release_reservation_req(payload),
@@ -334,11 +360,15 @@ pub fn decode(data: &[u8], epoch: &crate::cluster_epoch::ClusterEpochState) -> R
         RPC_DATA_PROPOSE_RESP => data_propose::decode_data_propose_resp(payload),
         RPC_READ_INDEX_REQ => read_index::decode_read_index_req(payload),
         RPC_READ_INDEX_RESP => read_index::decode_read_index_resp(payload),
+        RPC_LEADER_STATUS_REQ => leader_status::decode_leader_status_req(payload),
+        RPC_LEADER_STATUS_RESP => leader_status::decode_leader_status_resp(payload),
         RPC_AUTH_LEASE_RENEW_REQ => auth_lease::decode_renew_req(payload),
         RPC_AUTH_LEASE_RENEW_RESP => auth_lease::decode_renew_resp(payload),
         RPC_AUTH_BARRIER_REQ => auth_lease::decode_barrier_req(payload),
         RPC_AUTH_BARRIER_RESP => auth_lease::decode_barrier_resp(payload),
         RPC_VSHARD_REFUSAL => vshard::decode_vshard_refusal(payload),
+        RPC_FRAME_REFUSAL => frame_refusal::decode_frame_refusal(payload),
+        RPC_REQUEST_REFUSAL => request_refusal::decode_request_refusal(payload),
         _ => Err(ClusterError::Codec {
             detail: format!("unknown rpc_type: {rpc_type}"),
         }),
@@ -441,6 +471,8 @@ mod tests {
             term: 1,
             success: true,
             last_log_index: 5,
+            round: 3,
+            needs_snapshot: false,
         });
         let encoded = encode(&rpc, &crate::cluster_epoch::ClusterEpochState::default()).unwrap();
         let header: [u8; HEADER_SIZE] = encoded[..HEADER_SIZE].try_into().unwrap();

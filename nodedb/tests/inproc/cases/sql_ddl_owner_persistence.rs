@@ -81,10 +81,9 @@ fn catalog_of(server: &TestServer) -> &SystemCatalog {
 fn assert_owner_persisted(catalog: &SystemCatalog, object_type: &str, object_name: &str) {
     let owner = owner_row_for(catalog, object_type, object_name).unwrap_or_else(|| {
         panic!(
-            "CREATE {object_type} '{object_name}' via pgwire on a single-node server \
-             must persist a matching StoredOwner row to redb — the handler's \
-             `log_index == 0` direct-write path is responsible for the owner row \
-             because no Raft applier runs in single-node mode"
+            "CREATE {object_type} '{object_name}' via pgwire on a one-node cluster \
+             must persist a matching StoredOwner row to redb — the metadata \
+             applier writes the owner row when the entry applies"
         )
     });
     assert_eq!(

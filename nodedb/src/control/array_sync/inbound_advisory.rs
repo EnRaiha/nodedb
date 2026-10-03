@@ -121,7 +121,7 @@ mod tests {
         shared
             .permissions
             .grant(
-                &format!("collection:{TENANT}:{ARRAY}"),
+                &format!("collection:0:{TENANT}:{ARRAY}"),
                 "user:advisory-user",
                 permission,
                 "test",

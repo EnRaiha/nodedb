@@ -2,9 +2,8 @@
 
 //! Protocol-neutral database DDL family handlers (CREATE / DROP / ALTER
 //! DATABASE, SHOW DATABASES / QUOTA / USAGE / LINEAGE, CLONE / MIRROR / PROMOTE,
-//! BACKUP / RESTORE). Ported from the pgwire `ddl::database` handlers; every
-//! catalog / data-plane / audit / privilege-gate side effect is preserved
-//! verbatim.
+//! BACKUP / RESTORE). Every catalog / data-plane / audit / privilege-gate
+//! side effect runs in these handlers.
 //!
 //! `USE DATABASE` is intentionally NOT here — it is session-coupled (mutates the
 //! per-connection current database) and stays on the pgwire side.
@@ -22,3 +21,4 @@ pub mod show_lineage;
 pub mod show_quota;
 pub mod show_usage;
 pub mod support;
+pub mod teardown;

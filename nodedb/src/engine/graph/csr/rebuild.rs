@@ -211,15 +211,15 @@ mod tests {
         assert_eq!(csr.node_surrogate("a"), None);
     }
 
-    /// A cascade delete takes the node's binding with it, and leaves the
-    /// neighbours' alone.
+    /// A journalled node cascade takes the node's binding with it, and
+    /// leaves the neighbours' alone.
     #[test]
-    fn a_cascaded_node_delete_drops_only_that_nodes_binding() {
+    fn a_journalled_node_cascade_drops_only_that_nodes_binding() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("graph.redb");
         let store = store_with_a_bound_edge(&path);
         store
-            .delete_edges_for_node(DB.as_u64(), tenant(), "a", 200)
+            .apply_node_cascade(DB.as_u64(), tenant(), "a", &[])
             .unwrap();
 
         let remaining = store.scan_all_node_surrogates().unwrap();

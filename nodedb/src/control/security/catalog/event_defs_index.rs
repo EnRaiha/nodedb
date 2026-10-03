@@ -26,6 +26,8 @@ use nodedb_types::DatabaseId;
 
 use redb::{ReadableDatabase, ReadableTable};
 
+use crate::event::interest::{Interest, InterestSlice};
+
 use super::collection::StoredCollection;
 use super::collection_constraints::EventDefinition;
 use super::system_catalog::SystemCatalog;
@@ -40,11 +42,27 @@ type IndexKey = (DatabaseId, u64, String);
 #[derive(Debug, Default)]
 pub struct EventDefsIndex {
     by_collection: RwLock<HashMap<IndexKey, Arc<[EventDefinition]>>>,
+    /// The collections with definitions, republished after every change.
+    interest: Arc<InterestSlice>,
 }
 
 impl EventDefsIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The collections whose write events a definition of this index reads.
+    pub fn interest(&self) -> Arc<InterestSlice> {
+        Arc::clone(&self.interest)
+    }
+
+    /// Republish the collections that carry definitions.
+    fn publish_interest(&self, map: &HashMap<IndexKey, Arc<[EventDefinition]>>) {
+        let mut interest = Interest::default();
+        for (database_id, _, collection) in map.keys() {
+            interest.insert(*database_id, collection);
+        }
+        self.interest.publish(interest);
     }
 
     /// Replace the whole index with the definitions of `rows`, each keyed
@@ -56,7 +74,9 @@ impl EventDefsIndex {
                 map.insert(key_of(*database_id, row), defs);
             }
         }
-        *self.write() = map;
+        let mut current = self.write();
+        *current = map;
+        self.publish_interest(&current);
     }
 
     /// Record `row`, committed under `database_id`. An inactive row, or a
@@ -72,12 +92,14 @@ impl EventDefsIndex {
                 map.remove(&key);
             }
         }
+        self.publish_interest(&map);
     }
 
     /// Forget a collection whose row was deleted.
     pub fn remove(&self, database_id: DatabaseId, tenant_id: u64, collection: &str) {
-        self.write()
-            .remove(&(database_id, tenant_id, collection.to_owned()));
+        let mut map = self.write();
+        map.remove(&(database_id, tenant_id, collection.to_owned()));
+        self.publish_interest(&map);
     }
 
     /// The committed event definitions of a collection. `None` when it has
@@ -104,6 +126,11 @@ impl EventDefsIndex {
 }
 
 impl SystemCatalog {
+    /// The collections with committed DEFINE EVENT definitions.
+    pub fn event_definition_interest(&self) -> Arc<InterestSlice> {
+        self.event_defs.interest()
+    }
+
     /// Rebuild the event-definition index from every committed collection
     /// row, keyed by the database each row is stored under.
     pub fn reload_event_definitions(&self) -> crate::Result<()> {
@@ -177,6 +204,19 @@ mod tests {
             .get(DB, row.tenant_id, &row.name)
             .map(|defs| defs.iter().map(|d| d.name.clone()).collect())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_collection_with_definitions_consumes_write_events() {
+        let index = EventDefsIndex::new();
+        let interest = index.interest();
+        index.install(DB, &row(vec![def("a")]));
+        assert!(interest.contains(DB, "orders"));
+        index.install(DB, &row(Vec::new()));
+        assert!(!interest.contains(DB, "orders"));
+        index.install(DB, &row(vec![def("a")]));
+        index.remove(DB, 7, "orders");
+        assert!(!interest.contains(DB, "orders"));
     }
 
     #[test]

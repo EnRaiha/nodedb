@@ -53,6 +53,18 @@ fn truncating_dir_name(collection: &str, lsn: u64) -> String {
     format!("{collection}{TRUNCATING_MARKER}{lsn}")
 }
 
+/// The aside directory of the collection directory `original` at `lsn`: a
+/// sibling named after `original`'s last component. A collection of a
+/// non-default database is stored under `{database_id}/{name}`, so the name
+/// the aside takes is that last component, never the qualified name.
+fn aside_dir(original: &Path, lsn: u64) -> PathBuf {
+    let name = original
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    original.with_file_name(truncating_dir_name(&name, lsn))
+}
+
 /// Remove `dir` and everything below it. A missing directory is already
 /// removed.
 pub(in crate::data::executor) fn remove_dir_tree(dir: &Path) -> crate::Result<()> {
@@ -98,7 +110,7 @@ impl CoreLoop {
                 .wal_lsn()
                 .map(|l| l.as_u64())
                 .unwrap_or(self.watermark.as_u64());
-            let moved = original.with_file_name(truncating_dir_name(collection, lsn));
+            let moved = aside_dir(&original, lsn);
             if let Err(e) = rename_aside(&original, &moved) {
                 return self.response_error(task, e);
             }
@@ -264,27 +276,42 @@ fn rename_aside(original: &Path, moved: &PathBuf) -> crate::Result<()> {
 /// Remove every aside directory under the timeseries root at boot. The
 /// truncate that produced it is in the WAL ahead of the rename, so replay
 /// re-applies the truncate whether or not the removal completed.
+///
+/// A collection of a non-default database lives one level deeper, under the
+/// `{database_id}` directory its qualified name starts with, and so does its
+/// aside directory.
 pub(in crate::data::executor) fn remove_truncating_leftovers(ts_root: &Path) -> crate::Result<()> {
     let Ok(db_dirs) = std::fs::read_dir(ts_root) else {
         return Ok(());
     };
     for db_dir in db_dirs.flatten() {
+        let db_name = db_dir.file_name();
         let Ok(tenant_dirs) = std::fs::read_dir(db_dir.path()) else {
             continue;
         };
         for tenant_dir in tenant_dirs.flatten() {
-            let Ok(coll_dirs) = std::fs::read_dir(tenant_dir.path()) else {
-                continue;
-            };
-            for coll_dir in coll_dirs.flatten() {
-                let name = coll_dir.file_name();
-                let Some(name) = name.to_str() else {
-                    continue;
-                };
-                if is_truncating_leftover(name) && coll_dir.path().is_dir() {
-                    remove_dir_tree(&coll_dir.path())?;
-                }
+            remove_leftovers_in(&tenant_dir.path())?;
+            let qualified = tenant_dir.path().join(&db_name);
+            if qualified.is_dir() {
+                remove_leftovers_in(&qualified)?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Remove every aside directory directly under `dir`.
+fn remove_leftovers_in(dir: &Path) -> crate::Result<()> {
+    let Ok(coll_dirs) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for coll_dir in coll_dirs.flatten() {
+        let name = coll_dir.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if is_truncating_leftover(name) && coll_dir.path().is_dir() {
+            remove_dir_tree(&coll_dir.path())?;
         }
     }
     Ok(())
@@ -564,6 +591,24 @@ mod tests {
         remove_truncating_leftovers(&root).expect("recover");
         assert!(live.exists(), "the live directory is untouched");
         assert!(!aside.exists(), "the aside directory is removed");
+    }
+
+    /// A non-default database's collection directory is `{db}/{name}`. Its
+    /// aside is a sibling named after `name`, and boot removes it.
+    #[test]
+    fn a_qualified_collection_sets_its_aside_beside_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("ts");
+        let live = super::super::paths::ts_collection_dir(tmp.path(), 1025, 1, "1025/metrics");
+        let aside = aside_dir(&live, 7);
+        assert_eq!(aside, live.with_file_name("metrics.truncating-7"));
+
+        std::fs::create_dir_all(live.join("ts-1")).expect("live");
+        rename_aside(&live, &aside).expect("the aside rename finds its parent");
+        assert!(aside.exists() && !live.exists());
+
+        remove_truncating_leftovers(&root).expect("recover");
+        assert!(!aside.exists(), "the nested aside directory is removed");
     }
 
     #[test]

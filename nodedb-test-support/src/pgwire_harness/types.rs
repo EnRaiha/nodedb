@@ -52,7 +52,6 @@ pub struct TestServer {
     /// Underlying shared state — exposed so integration tests can drive
     /// store-level side effects (e.g. seeding a session handle with a
     /// specific `ClientFingerprint`) before hitting the wire.
-    #[allow(dead_code)]
     pub shared: Arc<SharedState>,
     pub(super) conn_handle: Option<tokio::task::JoinHandle<()>>,
     // Fields wrapped in Option so that `graceful_shutdown(self)` can `.take()`
@@ -67,6 +66,8 @@ pub struct TestServer {
     pub(super) poller_handle: Option<tokio::task::JoinHandle<()>>,
     pub(super) core_handles: Option<Vec<tokio::task::JoinHandle<()>>>,
     pub(super) event_plane: Option<EventPlane>,
+    /// The one-node cluster's Raft side: its lease loop and subsystems.
+    pub(super) raft: Option<crate::single_node::OneNodeRaft>,
     pub(super) _dir: tempfile::TempDir,
 }
 
@@ -118,6 +119,9 @@ impl Drop for TestServer {
             for h in handles {
                 h.abort();
             }
+        }
+        if let Some(raft) = self.raft.take() {
+            raft.abort();
         }
     }
 }

@@ -3,11 +3,9 @@
 //! Protocol-neutral `SHOW CONSUMER GROUPS ON <stream>` and
 //! `SHOW PARTITIONS ON <stream>` handlers.
 //!
-//! Ported from the pgwire `ddl::consumer_group::show` handlers. The token-based
-//! syntax checks, the tenant scoping, the per-group offset counting, and the
-//! per-partition buffer-scan statistics are preserved verbatim; only the result
-//! construction changed from a pgwire `QueryResponse` to the protocol-neutral
-//! [`DdlResult::Rows`].
+//! The token-based syntax checks, the tenant scoping, the per-group offset
+//! counting, and the per-partition buffer-scan statistics run here. The
+//! result is the protocol-neutral [`DdlResult::Rows`].
 
 use serde_json::{Map, Value as JsonValue};
 

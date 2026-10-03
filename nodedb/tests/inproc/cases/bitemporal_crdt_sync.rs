@@ -41,7 +41,7 @@ fn change(
     ProposedChange {
         collection: USERS.into(),
         row_id: row_id.into(),
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(row_id.as_bytes()),
         fields: vec![
             ("name".into(), LoroValue::String("Alice".into())),
             ("email".into(), LoroValue::String(email.into())),

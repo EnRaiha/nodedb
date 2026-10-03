@@ -61,6 +61,7 @@ fn make_request(plan: PhysicalPlan) -> Request {
         txn_id: None,
         wal_lsn: None,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: nodedb::bridge::envelope::Admission::Admitted,
     }
 }
@@ -99,7 +100,7 @@ fn kv_put(coll: &str, key: &[u8], value: &[u8]) -> PhysicalPlan {
         key: key.to_vec(),
         value: value.to_vec(),
         ttl_ms: 0,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(key),
         returning: None,
         rls_filters: Vec::new(),
         provenance: None,
@@ -136,6 +137,7 @@ fn stage_and_resolve(
             epoch_system_ms: 0,
             is_group_leader: true,
             versioned_reads: Vec::new(),
+            body_plans: Vec::new(),
         }),
     );
     let redo = send_ok(
@@ -172,6 +174,10 @@ fn flush(
 
 /// A timeseries batch whose line names another measurement than its
 /// collection: it passes validation and fails while it installs.
+///
+/// The payload is the six-element ingest tuple every timeseries ingest record
+/// takes: `("timeseries", collection, payload, provenance, format,
+/// default_timestamp_ms)`.
 fn failing_install_sub_record() -> RedoSubRecord {
     let lines = zerompk::to_msgpack_vec(&vec!["other_probe,host=a value=1 1".to_string()])
         .expect("encode lines");
@@ -183,6 +189,7 @@ fn failing_install_sub_record() -> RedoSubRecord {
             lines.as_slice(),
             None::<&nodedb_types::sync::wire::SyncProvenance>,
             "ilp-msgpack",
+            0i64,
         ))
         .expect("encode ingest"),
     }

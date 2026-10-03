@@ -4,8 +4,11 @@
 
 use tracing::debug;
 
-use crate::bridge::envelope::{ErrorCode, PhysicalPlan};
+use crate::bridge::dispatch::JournalGroup;
+use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::fail_stop::FailStopCause;
+use crate::data::executor::enforcement::unique::{SubmittedWrite, UniqueJudge};
 use crate::data::executor::handlers::point::apply_put::{PointPutOutcome, PointPutParams};
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::DocumentOp;
@@ -27,6 +30,74 @@ fn is_batchable_put(task: &ExecutionTask) -> bool {
 }
 
 impl CoreLoop {
+    /// Whether a put writes a `HASH_CHAIN` collection. Each of its rows links
+    /// after the one before through `execute_point_put`, which this path does
+    /// not run, so such a put is never absorbed.
+    fn chains_rows(&self, task: &ExecutionTask) -> bool {
+        let PhysicalPlan::Document(DocumentOp::PointPut { collection, .. }) = task.plan() else {
+            return false;
+        };
+        let key = (
+            task.request.database_id,
+            task.request.tenant_id,
+            collection.as_str().to_string(),
+        );
+        self.doc_configs
+            .get(&key)
+            .is_some_and(|config| config.enforcement.hash_chain)
+    }
+
+    /// Judge the UNIQUE claims of the last put in `tasks`. Every task is its
+    /// own statement, applied after the tasks before it in one uncommitted
+    /// transaction, so its claims meet the committed index as those tasks
+    /// leave it. A probe of the committed index alone admits two tasks
+    /// of the batch claiming one value.
+    fn check_batched_put_unique(&self, tasks: &[ExecutionTask]) -> crate::Result<()> {
+        let Some((last, earlier)) = tasks.split_last() else {
+            return Ok(());
+        };
+        let PhysicalPlan::Document(DocumentOp::PointPut { collection, .. }) = last.plan() else {
+            return Ok(());
+        };
+        let database_id = last.request.database_id;
+        let tenant_id = last.request.tenant_id;
+        if self
+            .unique_config(
+                database_id.as_u64(),
+                tenant_id.as_u64(),
+                collection.as_str(),
+            )
+            .is_none()
+        {
+            return Ok(());
+        }
+        let unit: Vec<SubmittedWrite<'_>> = earlier
+            .iter()
+            .map(|task| (task, false))
+            .chain(std::iter::once((last, true)))
+            .filter_map(|(task, judged)| match task.plan() {
+                PhysicalPlan::Document(DocumentOp::PointPut {
+                    collection: written,
+                    value,
+                    surrogate,
+                    ..
+                }) if task.request.database_id == database_id
+                    && task.request.tenant_id == tenant_id
+                    && written.as_str() == collection.as_str() =>
+                {
+                    Some(SubmittedWrite {
+                        collection: written.as_str(),
+                        surrogate: surrogate.as_u32(),
+                        body: Some(value.as_slice()),
+                        judged,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        self.check_submitted_unit_unique(database_id.as_u64(), tenant_id.as_u64(), &unit)
+    }
+
     /// Batch-coalesce consecutive PointPut tasks from the front of the task queue.
     ///
     /// Opens ONE redb WriteTransaction, executes all PointPuts within it,
@@ -41,7 +112,7 @@ impl CoreLoop {
         let front_is_put = self
             .task_queue
             .front()
-            .is_some_and(|t| is_batchable_put(t) && !t.is_expired());
+            .is_some_and(|t| is_batchable_put(t) && !t.is_expired() && !self.chains_rows(t));
         // While a staged Calvin transaction owns rows, every write passes the
         // fence in `poll_one` one at a time.
         if !front_is_put || !self.calvin.commit_pending.is_empty() {
@@ -54,7 +125,7 @@ impl CoreLoop {
             let is_put = self
                 .task_queue
                 .front()
-                .is_some_and(|t| is_batchable_put(t) && !t.is_expired());
+                .is_some_and(|t| is_batchable_put(t) && !t.is_expired() && !self.chains_rows(t));
             if !is_put {
                 break;
             }
@@ -74,10 +145,20 @@ impl CoreLoop {
             return 0;
         }
 
+        // A batch with a journalled put runs journalled as a whole: its one
+        // commit and the write sets reach stable storage together.
+        let journalled = batch.iter().any(|task| self.journals_write_set(task));
+        if journalled {
+            self.begin_journalled();
+        }
+
         // Open ONE transaction for the entire batch.
         let txn = match self.sparse.begin_write() {
             Ok(t) => t,
             Err(_) => {
+                if journalled {
+                    self.finish_journalled(&[]);
+                }
                 // Can't open txn — put tasks back, let poll_one handle individually.
                 for t in batch.into_iter().rev() {
                     self.task_queue.push_front(t);
@@ -85,6 +166,10 @@ impl CoreLoop {
                 return 0;
             }
         };
+        let groups: Vec<_> = batch
+            .iter()
+            .map(|task| self.take_journal_group(task))
+            .collect();
 
         // Execute each PointPut within the shared transaction.
         // Track per-task success/failure for individual responses, and
@@ -92,7 +177,7 @@ impl CoreLoop {
         // below can resolve Insert vs Update from the actual mutation.
         let mut results: Vec<Result<PointPutOutcome, crate::bridge::envelope::Response>> =
             Vec::with_capacity(batch.len());
-        for task in &batch {
+        for (index, task) in batch.iter().enumerate() {
             let PhysicalPlan::Document(DocumentOp::PointPut {
                 collection,
                 value,
@@ -106,32 +191,29 @@ impl CoreLoop {
             let tid = task.request.tenant_id.as_u64();
             let db_id = task.request.database_id.as_u64();
             let storage_key = crate::engine::document::store::StorageKey::for_surrogate(*surrogate);
-            results.push(
-                self.apply_point_put(
-                    &txn,
-                    PointPutParams {
-                        database_id: db_id,
-                        tid,
-                        collection: collection.as_str(),
-                        storage_key,
-                        surrogate: *surrogate,
-                        value,
-                        index_text: true,
-                        user_roles: &task.request.user_roles,
-                        enforce: true,
-                        wal_lsn: task.wal_lsn(),
-                        resolved_targets: resolved_sum_targets.as_slice(),
-                    },
-                )
-                .map_err(|e| {
-                    self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
+            let applied = self
+                .check_batched_put_unique(&batch[..=index])
+                .and_then(|()| {
+                    self.apply_point_put(
+                        &txn,
+                        PointPutParams {
+                            database_id: db_id,
+                            tid,
+                            collection: collection.as_str(),
+                            storage_key,
+                            surrogate: *surrogate,
+                            value,
+                            index_text: true,
+                            user_roles: &task.request.user_roles,
+                            enforce: true,
+                            unique: UniqueJudge::Unit,
+                            wal_lsn: task.wal_lsn(),
+                            resolved_targets: resolved_sum_targets.as_slice(),
                         },
                     )
-                }),
-            );
+                });
+            // The error keeps its own code: a UNIQUE refusal answers 23505.
+            results.push(applied.map_err(|e| self.response_error(task, e)));
         }
 
         // If ANY write failed hard (document put error), abort the batch.
@@ -139,12 +221,14 @@ impl CoreLoop {
         if any_hard_failure {
             // Don't commit — transaction is dropped (implicit rollback).
             // Send error responses for failed tasks, put successful ones back.
+            drop(txn);
             let count = batch.len();
-            for (task, result) in batch.into_iter().zip(results) {
+            let mut responses = Vec::with_capacity(count);
+            for (task, result) in batch.iter().zip(results) {
                 let response = match result {
                     Err(err_response) => err_response,
                     Ok(_) => self.response_error(
-                        &task,
+                        task,
                         ErrorCode::Internal {
                             detail: "batch aborted due to sibling failure".into(),
                         },
@@ -152,8 +236,9 @@ impl CoreLoop {
                 };
                 // The transaction was dropped un-committed above, so a lost
                 // response costs the caller its error message, not its write.
-                self.send_response(response, crate::diag::LostResponseWrite::RolledBack);
+                responses.push((response, crate::diag::LostResponseWrite::RolledBack));
             }
+            self.finish_journalled_batch(&batch, groups, responses);
             return count;
         }
 
@@ -161,6 +246,7 @@ impl CoreLoop {
         let commit_result = txn.commit();
 
         let count = batch.len();
+        let mut responses = Vec::with_capacity(count);
         for (task, result) in batch.iter().zip(results.iter()) {
             let response = match &commit_result {
                 Ok(()) => {
@@ -199,14 +285,8 @@ impl CoreLoop {
 
             // Record idempotency key.
             if let Some(key) = task.request.idempotency_key {
-                let succeeded = response.status == crate::bridge::envelope::Status::Ok;
-                if self.idempotency_cache.len() >= 16_384
-                    && let Some(oldest) = self.idempotency_order.pop_front()
-                {
-                    self.idempotency_cache.remove(&oldest);
-                }
-                self.idempotency_cache.insert(key, succeeded);
-                self.idempotency_order.push_back(key);
+                self.idempotency
+                    .record(key, response.status == crate::bridge::envelope::Status::Ok);
             }
 
             // A committed batch whose response is lost is the ambiguous case:
@@ -215,13 +295,44 @@ impl CoreLoop {
                 Ok(()) => crate::diag::LostResponseWrite::Committed,
                 Err(_) => crate::diag::LostResponseWrite::RolledBack,
             };
-            self.send_response(response, write);
+            responses.push((response, write));
         }
+        self.finish_journalled_batch(&batch, groups, responses);
 
         if commit_result.is_ok() {
             debug!(core = self.core_id, count, "write batch committed");
         }
 
         count
+    }
+
+    /// Store the write sets of the journalled tasks of `batch`, finish the
+    /// journalled run, then send every response.
+    fn finish_journalled_batch(
+        &mut self,
+        batch: &[ExecutionTask],
+        groups: Vec<Option<JournalGroup>>,
+        responses: Vec<(Response, crate::diag::LostResponseWrite)>,
+    ) {
+        if groups.iter().any(Option::is_some) {
+            let mut captures = Vec::new();
+            let mut unstored = None;
+            for ((task, group), (response, _)) in batch.iter().zip(groups).zip(&responses) {
+                let Some(group) = group else {
+                    continue;
+                };
+                match self.write_set_capture(task, group, response) {
+                    Ok(capture) => captures.push(capture),
+                    Err(error) => unstored = Some(error),
+                }
+            }
+            self.finish_journalled(&captures);
+            if let Some(error) = unstored {
+                self.fail_stop_core(FailStopCause::WriteSetUnpersisted, &error.to_string());
+            }
+        }
+        for (response, write) in responses {
+            self.send_response(response, write);
+        }
     }
 }

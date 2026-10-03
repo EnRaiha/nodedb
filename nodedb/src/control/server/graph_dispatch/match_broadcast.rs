@@ -12,7 +12,7 @@
 //! ```
 //!
 //! The generic `gather_all_cores` / `broadcast_to_all_cores` primitives treat
-//! the whole payload as a BARE msgpack array of row elements, which would
+//! the whole payload as a BARE msgpack array of row elements, which will
 //! mis-merge this map. This module mirrors `gather_all_cores`'s per-core SPSC
 //! fan-out (eager dispatch → `join_all`, NotFound-tolerant) but, for each core,
 //! it DECODES the envelope and:
@@ -31,7 +31,8 @@
 
 use futures::future::join_all;
 
-use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
+use crate::bridge::envelope::{Payload, PhysicalPlan, Response};
+use crate::control::server::exchange::core_outcome::{classify_core_response, require_every_core};
 use crate::control::server::exchange::gather::eager_dispatch_to_all_cores;
 use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
 use crate::data::executor::handlers::graph_match::{
@@ -40,6 +41,17 @@ use crate::data::executor::handlers::graph_match::{
 use crate::engine::graph::pattern::executor::{UnresolvedExpansion, VarLenResume};
 use crate::types::{DatabaseId, TenantId, TraceId, TxnId};
 use nodedb_query::msgpack_scan::reader::{map_header, read_str_advance, skip_value};
+
+/// How a graph read runs.
+#[derive(Debug, Clone, Copy)]
+pub struct GraphRead {
+    /// The session transaction whose staged edge overlay the read merges.
+    /// `None` for autocommit.
+    pub txn_id: Option<TxnId>,
+    /// The read observes every write committed before it began: each node
+    /// that serves part of it confirms its groups first.
+    pub linearizable: bool,
+}
 
 /// Result of a MATCH cross-core broadcast after envelope unwrapping.
 pub struct MatchBroadcastOutcome {
@@ -55,10 +67,12 @@ pub struct MatchBroadcastOutcome {
     /// this is a `Vec` — a single node fanned across N cores can truncate on
     /// several cores at once and ALL their cursors must survive (the round loop
     /// re-dispatches each independently). Carried onto the cross-node wire by
-    /// `encode_match_envelope_raw` so remote truncation is no longer dropped.
+    /// `encode_match_envelope_raw` so remote truncation survives.
     pub resume: Vec<VarLenResume>,
     /// `true` if any core returned a partial (truncated) result.
     pub partial: bool,
+    /// The highest watermark any core served the MATCH at.
+    pub watermark_lsn: crate::types::Lsn,
 }
 
 /// Locate a top-level map value by key in a msgpack map payload.
@@ -183,18 +197,32 @@ pub fn unwrap_match_envelope(payload: &Payload) -> crate::Result<UnwrappedMatchE
 /// Fan a MATCH plan to every Data-Plane core, unwrap each core's
 /// `{rows, frontier}` envelope, and merge the results.
 ///
+/// `read.linearizable` is false when the read accepts this replica as it is,
+/// or when the caller has already confirmed it (a leg received from another
+/// node, confirmed by `exec_receiver::read_leg`).
+///
 /// Mirrors `exchange::gather::gather_all_cores`'s eager per-core dispatch +
-/// `join_all` collection and its NotFound-tolerant / partial-result error
-/// handling, but unwraps the MATCH envelope per core instead of treating the
-/// payload as a bare row array.
+/// `join_all` collection and its strict per-core merge, but unwraps the MATCH
+/// envelope per core instead of treating the payload as a bare row array.
 pub async fn broadcast_match_to_all_cores(
     state: &crate::control::state::SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     plan: PhysicalPlan,
     trace_id: TraceId,
-    txn_id: Option<TxnId>,
+    read: GraphRead,
 ) -> crate::Result<MatchBroadcastOutcome> {
+    let GraphRead {
+        txn_id,
+        linearizable,
+    } = read;
+    // A linearizable read confirms the groups the plan reads first. A MATCH
+    // walks the local CSR, so that is every group this node replicates. A
+    // no-op without a cluster.
+    if linearizable {
+        super::read_groups::confirm_graph_read(state, database_id, &plan).await?;
+    }
+
     // Shared broadcast call counter (parity with the generic gather path).
     crate::control::server::broadcast::broadcast_call_count_increment();
 
@@ -217,7 +245,7 @@ pub async fn broadcast_match_to_all_cores(
         })?;
 
     // Await all cores in parallel, draining the full bounded response per core
-    // (a core's result may stream as several Partial frames before its terminal
+    // (a core's result can stream as several Partial frames before its terminal
     // frame).
     let max_result_bytes = state.tuning.network.max_query_result_bytes as usize;
     let response_futures = receivers
@@ -237,40 +265,21 @@ pub async fn broadcast_match_to_all_cores(
         });
 
     let results: Vec<crate::Result<Response>> = join_all(response_futures).await;
+    // `NotFound` is an empty CSR slice on that core. Any other core error fails
+    // the MATCH: rows from the surviving cores are not the full answer.
+    let answered = require_every_core(results.into_iter().map(classify_core_response))?;
 
     let mut all_row_elements: Vec<Vec<u8>> = Vec::new();
     let mut frontier: Vec<UnresolvedExpansion> = Vec::new();
     let mut resume: Vec<VarLenResume> = Vec::new();
     let mut partial = false;
-    // First error seen across cores, kept as a TYPED error: a core cut short by
-    // the statement's deadline reports the deadline rather than collapsing into
-    // a generic dispatch failure.
-    let mut first_error: Option<crate::Error> = None;
+    let mut watermark_lsn = crate::types::Lsn::ZERO;
 
-    for result in results {
-        let resp = match result {
-            Ok(r) => r,
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-                continue;
-            }
-        };
-
-        if resp.status == Status::Error {
-            // `NotFound` is an empty CSR slice on this core, not an error.
-            if let Err(error) = crate::control::local_dispatch::reject_data_plane_error(&resp)
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
-            continue;
-        }
-
+    for resp in answered {
         if resp.partial {
             partial = true;
         }
+        watermark_lsn = watermark_lsn.max(resp.watermark_lsn);
 
         if resp.payload.is_empty() {
             continue;
@@ -285,12 +294,6 @@ pub async fn broadcast_match_to_all_cores(
         resume.append(&mut decoded.resume);
     }
 
-    if all_row_elements.is_empty()
-        && let Some(error) = first_error
-    {
-        return Err(error);
-    }
-
     let merged_rows = encode_msgpack_array(&all_row_elements);
 
     Ok(MatchBroadcastOutcome {
@@ -298,6 +301,7 @@ pub async fn broadcast_match_to_all_cores(
         frontier,
         resume,
         partial,
+        watermark_lsn,
     })
 }
 
@@ -348,7 +352,7 @@ mod tests {
         // Rows preserved: 2 elements. Merging them back into a bare array
         // reproduces the exact `rows` map values embedded in the envelope —
         // compare against the SAME bytes the envelope carries (a second
-        // independent `rows_to_msgpack` call could differ only in HashMap key
+        // independent `rows_to_msgpack` call can differ only in HashMap key
         // order, so we reconstruct the expected bare array from the envelope's
         // own `rows` field rather than re-serializing).
         assert_eq!(decoded.row_elements.len(), 2);

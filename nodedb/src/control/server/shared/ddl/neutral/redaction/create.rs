@@ -4,14 +4,12 @@
 //! set for one `(tenant, collection, for_role)` triple.
 //!
 //! Shaped after the sibling `neutral::rls` create handler: authorize, validate,
-//! pre-check the duplicate, propose `CatalogEntry::PutRedactionPolicy`, and fall
-//! back to an inline catalog write plus in-memory install when no metadata raft
-//! group is configured (`LocalOnly`).
+//! pre-check the duplicate, and propose `CatalogEntry::PutRedactionPolicy`.
 
 use nodedb_sql::ddl_ast::statement::RedactionRuleSpec;
 
 use crate::control::catalog_entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::planner::sql_plan_convert::convert::db_qualified;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::catalog::StoredRedactionPolicy;
@@ -80,7 +78,7 @@ fn compile_rules(specs: &[RedactionRuleSpec]) -> Result<Vec<RedactionRule>, DdlE
 ///
 /// All fields are pre-parsed by the `nodedb-sql` AST layer; this handler only
 /// validates the modes, refuses array targets, and mutates the catalog.
-pub fn create_redaction_policy(
+pub async fn create_redaction_policy(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     req: &CreateRedactionPolicyRequest<'_>,
@@ -133,17 +131,9 @@ pub fn create_redaction_policy(
         .map_err(|e| DdlError::from_error_in_context("redaction serialize", &e))?;
 
     let entry = CatalogEntry::PutRedactionPolicy(Box::new(stored.clone()));
-    let outcome = propose_catalog_entry(state, &entry)
+    propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        {
-            let catalog = state.credentials.catalog();
-            catalog
-                .put_redaction_policy(&stored)
-                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        }
-        state.redaction.install_replicated_policy(policy);
-    }
 
     state.audit_record(
         AuditEvent::AdminAction,

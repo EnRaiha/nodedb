@@ -711,9 +711,17 @@ mod tests {
                 ],
                 leader_commit: 0,
                 group_id: 7,
+                round: 1,
+                replicated_floor: 0,
             };
             assert!(node.handle_append_entries(&ae).success);
             node.persist_hard_state_if_dirty().unwrap();
+            // Age the leader contact and end the boot fence, so the vote is
+            // not refused as disruptive.
+            node.leader_contact_at_override(
+                std::time::Instant::now() - std::time::Duration::from_secs(1),
+            );
+            node.expire_boot_vote_fence();
 
             // Grant a vote to candidate 2 in TERM, then persist it durably.
             let rv = RequestVoteRequest {
@@ -722,6 +730,7 @@ mod tests {
                 last_log_index: 2,
                 last_log_term: TERM,
                 group_id: 7,
+                transfer: false,
             };
             assert!(
                 node.handle_request_vote(&rv).vote_granted,
@@ -734,6 +743,10 @@ mod tests {
         let storage = RedbLogStorage::open(&path).unwrap();
         let mut node = RaftNode::new(config(), storage);
         node.restore().unwrap();
+
+        // The restarted node's boot fence would refuse any vote. End it, so
+        // only the restored `voted_for` can refuse the second candidate.
+        node.expire_boot_vote_fence();
 
         // Log-reload half: the durably-appended entries survived the restart.
         assert_eq!(node.last_log_index(), 2, "log entries must survive restart");
@@ -750,6 +763,7 @@ mod tests {
             last_log_index: 2,
             last_log_term: TERM,
             group_id: 7,
+            transfer: false,
         };
         assert!(
             !node.handle_request_vote(&rv2).vote_granted,

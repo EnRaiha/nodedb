@@ -75,7 +75,7 @@ mod tests {
     /// and the direct class is not `XX000`.
     #[test]
     fn gateway_and_direct_mapper_agree_on_classified_errors() {
-        use crate::types::{DatabaseId, TenantId};
+        use crate::types::TenantId;
 
         let samples = vec![
             Error::RejectedConstraint {
@@ -123,9 +123,6 @@ mod tests {
             },
             Error::CalvinSerializationConflict,
             Error::CalvinParticipantError,
-            Error::SourceFrozen {
-                database_id: DatabaseId::new(7),
-            },
             Error::CloneWriteRequiresMaterialize {
                 collection: "c".into(),
                 engine: "kv".into(),
@@ -139,10 +136,6 @@ mod tests {
             },
             Error::MemoryExhausted {
                 engine: "kv".into(),
-            },
-            Error::FanOutExceeded {
-                shards_touched: 9,
-                limit: 8,
             },
             Error::MaterializedSumTargetNotFound {
                 target_collection: "t".into(),

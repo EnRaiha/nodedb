@@ -3,11 +3,12 @@
 //! Ceiling resolver — reverse range scan with optional valid-time filter.
 
 use super::keys::{
-    EdgeRef, edge_version_prefix, is_gdpr_erasure, is_sentinel, is_tombstone,
-    parse_versioned_edge_key, versioned_edge_key,
+    EdgeRef, edge_version_prefix, is_gdpr_erasure, is_tombstone, parse_versioned_edge_key,
+    versioned_edge_key,
 };
 use super::payload::EdgeValuePayload;
-use crate::engine::graph::edge_store::store::{EDGES, Edge, EdgeStore, redb_err};
+use super::visibility::read_visibility;
+use crate::engine::graph::edge_store::store::{EDGES, EdgeStore, redb_err};
 use redb::{ReadableDatabase, ReadableTable};
 
 impl EdgeStore {
@@ -49,6 +50,7 @@ impl EdgeStore {
         let table = read_txn
             .open_table(EDGES)
             .map_err(|e| redb_err("open edges", e))?;
+        let mut visibility = read_visibility(&read_txn)?;
 
         // Inclusive upper — the exact key at system_as_of is a valid ceiling.
         let range = table
@@ -61,6 +63,14 @@ impl EdgeStore {
             let (kd, kt, composite) = k.value();
             if kd != d || kt != t || !composite.starts_with(&prefix) {
                 break;
+            }
+            let Some((_, _, _, _, sys)) = parse_versioned_edge_key(composite) else {
+                continue;
+            };
+            // A version a TRUNCATE hides is skipped: the edge resolves to its
+            // newest version the cut leaves visible.
+            if visibility.hidden(d, t, edge.collection, composite, sys, system_as_of)? {
+                continue;
             }
             let bytes = v.value();
             if is_tombstone(bytes) || is_gdpr_erasure(bytes) {
@@ -78,30 +88,76 @@ impl EdgeStore {
         }
         Ok(None)
     }
-}
 
-/// Decode a raw edge value to an [`Edge`] projection, treating sentinels as
-/// absent. Used by future current-state scanners.
-#[allow(dead_code)]
-pub(crate) fn edge_from_versioned_entry(
-    composite: &str,
-    value: &[u8],
-) -> Option<(Edge, EdgeValuePayload)> {
-    if is_sentinel(value) {
-        return None;
+    /// The `system_from` of the newest stored version of
+    /// `(collection, src, label, dst)`, tombstones included, or `None` when
+    /// the edge has no version.
+    pub fn latest_version_ordinal(&self, edge: EdgeRef<'_>) -> crate::Result<Option<i64>> {
+        let prefix = edge_version_prefix(edge.collection, edge.src, edge.label, edge.dst);
+        let upper = versioned_edge_key(edge.collection, edge.src, edge.label, edge.dst, i64::MAX)?;
+        let d = edge.db.as_u64();
+        let t = edge.tid.as_u64();
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| redb_err("begin_read", e))?;
+        let table = read_txn
+            .open_table(EDGES)
+            .map_err(|e| redb_err("open edges", e))?;
+        let mut range = table
+            .range((d, t, prefix.as_str())..=(d, t, upper.as_str()))
+            .map_err(|e| redb_err("latest version range", e))?;
+        match range.next_back() {
+            Some(entry) => {
+                let (k, _) = entry.map_err(|e| redb_err("latest version iter", e))?;
+                let (_, _, composite) = k.value();
+                Ok(parse_versioned_edge_key(composite).map(|(_, _, _, _, sys)| sys))
+            }
+            None => Ok(None),
+        }
     }
-    let (collection, src, label, dst, _sys) = parse_versioned_edge_key(composite)?;
-    let payload = EdgeValuePayload::decode(value).ok()?;
-    Some((
-        Edge {
-            collection: collection.to_string(),
-            src_id: src.to_string(),
-            label: label.to_string(),
-            dst_id: dst.to_string(),
-            properties: payload.properties.clone(),
-        },
-        payload,
-    ))
+
+    /// The `system_from` of the newest stored version of
+    /// `(collection, src, label, dst)` that another write applied: a version
+    /// applied at `applied` is skipped, tombstones included. `None` when no
+    /// other write stored a version.
+    ///
+    /// A Calvin transaction writes an edge on both endpoint homes. When one
+    /// core holds both, the other home's version of the same transaction can
+    /// be stored before this home resolves. Skipping it makes the answer the
+    /// same on every home and replica: the versions of every earlier writer.
+    pub fn latest_version_ordinal_of_other_writes(
+        &self,
+        edge: EdgeRef<'_>,
+        applied: i64,
+    ) -> crate::Result<Option<i64>> {
+        let prefix = edge_version_prefix(edge.collection, edge.src, edge.label, edge.dst);
+        let upper = versioned_edge_key(edge.collection, edge.src, edge.label, edge.dst, i64::MAX)?;
+        let d = edge.db.as_u64();
+        let t = edge.tid.as_u64();
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| redb_err("begin_read", e))?;
+        let table = read_txn
+            .open_table(EDGES)
+            .map_err(|e| redb_err("open edges", e))?;
+        let visibility = read_visibility(&read_txn)?;
+        let range = table
+            .range((d, t, prefix.as_str())..=(d, t, upper.as_str()))
+            .map_err(|e| redb_err("latest version range", e))?;
+        for entry in range.rev() {
+            let (k, _) = entry.map_err(|e| redb_err("latest version iter", e))?;
+            let composite = k.value().2;
+            let Some((_, _, _, _, sys)) = parse_versioned_edge_key(composite) else {
+                continue;
+            };
+            if visibility.applied_at(d, t, composite, sys)? != applied {
+                return Ok(Some(sys));
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -122,6 +178,36 @@ mod tests {
 
     fn e<'a>(src: &'a str, label: &'a str, dst: &'a str) -> EdgeRef<'a> {
         EdgeRef::new(DB, T, COLL, src, label, dst)
+    }
+
+    #[test]
+    fn latest_version_ordinal_reads_the_newest_version_of_one_edge() {
+        let (store, _dir) = make_store();
+        assert_eq!(
+            store.latest_version_ordinal(e("a", "L", "b")).unwrap(),
+            None
+        );
+        for sys in [100, 300, 200] {
+            store
+                .put_edge_versioned(e("a", "L", "b"), b"v", sys, sys, i64::MAX)
+                .unwrap();
+        }
+        store
+            .put_edge_versioned(e("a", "L", "bb"), b"v", 900, 900, i64::MAX)
+            .unwrap();
+        store
+            .put_edge_versioned(e("a", "L", "c"), b"v", 40, 40, i64::MAX)
+            .unwrap();
+        store.soft_delete_edge(e("a", "L", "c"), 50).unwrap();
+        assert_eq!(
+            store.latest_version_ordinal(e("a", "L", "b")).unwrap(),
+            Some(300)
+        );
+        assert_eq!(
+            store.latest_version_ordinal(e("a", "L", "c")).unwrap(),
+            Some(50),
+            "a tombstone is a version"
+        );
     }
 
     #[test]

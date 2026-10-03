@@ -47,6 +47,7 @@ fn params() -> StoredVectorIndexParams {
         pq_m: 0,
         ivf_cells: 0,
         ivf_nprobe: 0,
+        modification_hlc: nodedb_types::Hlc::ZERO,
     }
 }
 
@@ -139,6 +140,7 @@ async fn replicated_delete_removes_the_vector_index_params() {
         tenant_id: TENANT,
         collection: COLLECTION.to_string(),
         field_name: FIELD.to_string(),
+        target_hlc: nodedb_types::Hlc::ZERO,
     };
 
     apply_entry(&server, &delete);

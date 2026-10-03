@@ -9,9 +9,9 @@
 
 use crate::control::system_txn::SystemTxnError;
 
-/// Why a DEFINE EVENT THEN action template could not become executable SQL.
+/// Why a DEFINE EVENT THEN action template did not become executable SQL.
 ///
-/// Both cases mean the template is malformed in a way that could change what
+/// Both cases mean the template is malformed in a way that can change what
 /// the rendered statement does, so rendering refuses rather than guessing.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum TriggerRenderError {
@@ -34,7 +34,7 @@ pub enum TriggerRenderError {
 /// Why one DEFINE EVENT THEN action did not run to completion.
 #[derive(Debug, thiserror::Error)]
 pub enum TriggerActionError {
-    /// The action template could not be rendered into executable SQL.
+    /// The action template cannot be rendered into executable SQL.
     #[error("trigger action rejected: {source}")]
     Rejected {
         #[source]
@@ -61,6 +61,14 @@ pub enum TriggerActionError {
         #[source]
         source: SystemTxnError,
     },
+
+    /// Whether an earlier firing of the event already applied the action
+    /// was unreadable, so the action did not run.
+    #[error("trigger action applied-key lookup failed: {source}")]
+    AppliedLookup {
+        #[source]
+        source: crate::Error,
+    },
 }
 
 impl From<TriggerActionError> for crate::Error {
@@ -72,9 +80,9 @@ impl From<TriggerActionError> for crate::Error {
             TriggerActionError::Rejected { source } => crate::Error::BadRequest {
                 detail: source.to_string(),
             },
-            TriggerActionError::Plan { source } | TriggerActionError::LeaseAdmission { source } => {
-                source
-            }
+            TriggerActionError::Plan { source }
+            | TriggerActionError::LeaseAdmission { source }
+            | TriggerActionError::AppliedLookup { source } => source,
             // The transaction error keeps its class: its statement or commit
             // error, or the Data-Plane verdict that aborted the commit.
             TriggerActionError::Transaction { source } => source.into(),
@@ -94,7 +102,10 @@ impl TriggerActionError {
         match self {
             // A failed transaction applied nothing at all, so there is never
             // a partial application to duplicate by running it again.
-            Self::Plan { .. } | Self::LeaseAdmission { .. } | Self::Transaction { .. } => true,
+            Self::Plan { .. }
+            | Self::LeaseAdmission { .. }
+            | Self::Transaction { .. }
+            | Self::AppliedLookup { .. } => true,
             Self::Rejected { .. } => false,
         }
     }

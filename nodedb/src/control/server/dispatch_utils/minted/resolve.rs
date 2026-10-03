@@ -66,14 +66,14 @@ pub(crate) async fn resolve_on_response(
 /// A refusal that arrives after the caller timed out still cancels its
 /// records, so a restart cannot apply a write the caller never saw applied. A
 /// channel that closes before a final response leaves the outcome unknown:
-/// the window holds.
+/// the window holds. Returns the final response, when one arrived.
 pub(crate) async fn resolve_at_final(
     wal: &Arc<WalManager>,
     owner: RecordOwner,
     final_refusal_key: u64,
     mut rx: crate::control::ResponseReceiver,
     minted: MintedRecords,
-) {
+) -> Option<Response> {
     loop {
         match rx.recv().await {
             Some(response) if response.partial => continue,
@@ -86,11 +86,11 @@ pub(crate) async fn resolve_at_final(
                         "a late refusal's abort marker failed; its records stay replayable"
                     );
                 }
-                return;
+                return Some(response);
             }
             None => {
                 minted.hold();
-                return;
+                return None;
             }
         }
     }

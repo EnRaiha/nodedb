@@ -44,6 +44,13 @@ impl WalManager {
         Lsn::new(wal.next_lsn())
     }
 
+    /// The largest payload one record takes. Every splitter sizes its
+    /// records to it.
+    pub fn max_payload(&self) -> usize {
+        let wal = self.wal.lock().unwrap_or_else(|p| p.into_inner());
+        wal.max_payload()
+    }
+
     /// Total WAL size on disk across all segments.
     pub fn total_size_bytes(&self) -> crate::Result<u64> {
         let wal = self.wal.lock().unwrap_or_else(|p| p.into_inner());
@@ -54,6 +61,18 @@ impl WalManager {
     pub fn list_segments(&self) -> crate::Result<Vec<nodedb_wal::segment::SegmentMeta>> {
         let wal = self.wal.lock().unwrap_or_else(|p| p.into_inner());
         wal.list_segments().map_err(crate::Error::Wal)
+    }
+
+    /// Every segment on disk plus the writer's active `first_lsn`, read under
+    /// one lock. A segment below the active `first_lsn` was sealed (fsynced)
+    /// by the roll that installed the active writer, and its file handle is
+    /// closed.
+    pub fn segments_with_active(
+        &self,
+    ) -> crate::Result<(Vec<nodedb_wal::segment::SegmentMeta>, u64)> {
+        let wal = self.wal.lock().unwrap_or_else(|p| p.into_inner());
+        let segments = wal.list_segments().map_err(crate::Error::Wal)?;
+        Ok((segments, wal.active_segment_first_lsn()))
     }
 }
 
@@ -91,8 +110,9 @@ mod tests {
             wal.sync().unwrap();
         }
 
+        // The sync's time anchor took LSN 3.
         let wal = WalManager::open_for_testing(&path).unwrap();
-        assert_eq!(wal.next_lsn(), Lsn::new(3));
+        assert_eq!(wal.next_lsn(), Lsn::new(4));
 
         let lsn = wal
             .appender(NO_APPLY_KEY)
@@ -104,7 +124,7 @@ mod tests {
                 b"c",
             )
             .unwrap();
-        assert_eq!(lsn, Lsn::new(3));
+        assert_eq!(lsn, Lsn::new(4));
     }
 
     #[test]

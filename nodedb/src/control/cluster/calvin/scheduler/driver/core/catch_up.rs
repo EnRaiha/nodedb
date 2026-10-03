@@ -6,7 +6,7 @@
 //! per-vShard scheduler channels with a bounded `try_send`. On a Full/Closed
 //! channel the input is DROPPED (only bookkept, never blocking — `apply` shares
 //! its call stack with every Raft group and must not stall node-wide
-//! heartbeats). A dropped input would otherwise permanently diverge this
+//! heartbeats). A dropped input will otherwise permanently diverge this
 //! replica's lock table from its peers, since the lock table is a local
 //! projection every replica rebuilds from the byte-identical sequencer Raft log.
 //!
@@ -94,28 +94,33 @@ impl Scheduler {
 
         // 2. MultiRaft-lock scope: read the committed sequencer log window. No
         //    SM lock is held here (see the lock-discipline note above).
+        // The read runs under the MultiRaft lock alone; the result is handled
+        // after the lock drops.
+        let read = self
+            .multi_raft
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .read_committed_entries(SEQUENCER_GROUP_ID, lo, end);
         let entries = {
-            let mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-            match mr.read_committed_entries(SEQUENCER_GROUP_ID, lo, end) {
+            match read {
                 Ok(entries) => entries,
                 Err(nodedb_cluster::error::ClusterError::Raft(
                     nodedb_raft::RaftError::LogCompacted { .. },
                 )) => {
-                    // The armed index has been compacted below the retained log.
-                    // The sequencer-group compaction hold-down (floored at
-                    // `min_catch_up_from`) is meant to make this unreachable for
-                    // an armed catch-up; if it is nonetheless hit (e.g. a
-                    // snapshot-install resync that already subsumes this index),
-                    // no replay is owed. Escalate non-silently, CLEAR the entry
-                    // to avoid an infinite retry against a permanently-compacted
-                    // index, and return.
+                    // The armed index is below the retained log: an input
+                    // this replica never applied is gone, and only a
+                    // data-group snapshot brings the vShard's Calvin state
+                    // back. The compaction floor keeps every armed index, so
+                    // the log reached this node compacted already: a
+                    // sequencer snapshot installed under the armed index.
                     self.metrics.record_catch_up_log_compacted();
                     tracing::error!(
                         vshard = self.vshard_id,
                         lo,
-                        "calvin catch-up: sequencer log compacted below armed index; \
-                         state is snapshot-covered"
+                        "calvin catch-up: the sequencer log no longer holds the armed index; \
+                         the vShard's data group takes a snapshot"
                     );
+                    self.lose_calvin_base();
                     self.sequencer_state_machine
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -173,8 +178,14 @@ impl Scheduler {
         //    next drain resumes at the first input not yet processed.
         let mut replayed: u64 = 0;
         let mut resume_from: Option<u64> = None;
+        // The replayed transactions, which the sequencer log keeps until
+        // this scheduler made them durable.
+        let mut received: Vec<(u64, u64, u32)> = Vec::new();
         let mut feed = inputs.into_iter().peekable();
-        while let Some((_, input)) = feed.next() {
+        while let Some((index, input)) = feed.next() {
+            if let SchedulerInput::Txn(txn) = &input {
+                received.push((index, txn.epoch, txn.position));
+            }
             self.process_scheduler_input(input);
             replayed += 1;
             if self.intake_closure().is_some() {
@@ -186,10 +197,13 @@ impl Scheduler {
         let resume_from = resume_from.or(end.checked_add(1).filter(|&next| next <= hi));
 
         {
-            let sm = self
+            let mut sm = self
                 .sequencer_state_machine
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
+            for (index, epoch, position) in received {
+                sm.note_replayed_txn(index, self.vshard_id, epoch, position);
+            }
             match resume_from {
                 // Stopped early: re-arm exactly at the first unprocessed input's
                 // index. Clearing below it first lets the min-collapse arm move
@@ -278,10 +292,11 @@ mod tests {
     // it through `replay_epochs_for_vshard`, and feeds each input through
     // `process_scheduler_input` — and assert the dropped input's effect lands in
     // the scheduler's lock table. This proves the whole mechanism closes the
-    // fan-out gap, not just each half.
+    // fan-out gap, not only each half.
 
     /// Ensure the sequencer Raft group exists on this scheduler's `MultiRaft` and
-    /// that this single node is its leader, so proposals commit immediately.
+    /// that this single node is its leader, so a proposal commits once its disk
+    /// holds it.
     fn ensure_sequencer_leader(scheduler: &Scheduler) {
         let mut mr = scheduler
             .multi_raft
@@ -312,7 +327,8 @@ mod tests {
     /// Encode `batch` and propose it to the committed sequencer Raft log, returning
     /// its committed Raft index and the encoded bytes (reused to drive `apply`, so
     /// the index handed to `apply` is the SAME real committed index the drain will
-    /// read back). Single-voter groups commit on propose.
+    /// read back). A single-voter group commits once its disk holds the entry,
+    /// on the next tick.
     fn commit_epoch_batch(scheduler: &Scheduler, batch: EpochBatch) -> (u64, Vec<u8>) {
         let bytes = zerompk::to_msgpack_vec(&SequencerEntry::EpochBatch { batch })
             .expect("encode epoch batch");
@@ -321,8 +337,12 @@ mod tests {
                 .multi_raft
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            mr.propose_to_group(nodedb_cluster::calvin::SEQUENCER_GROUP_ID, bytes.clone())
-                .expect("propose epoch batch to sequencer group")
+            let index = mr
+                .propose_to_group(nodedb_cluster::calvin::SEQUENCER_GROUP_ID, bytes.clone())
+                .expect("propose epoch batch to sequencer group");
+            mr.wait_all_durable_blocking();
+            mr.tick().expect("tick");
+            index
         };
         (index, bytes)
     }
@@ -351,7 +371,7 @@ mod tests {
     ) {
         let (full_tx, full_rx) = tokio::sync::mpsc::channel(1);
         full_tx
-            .try_send(SchedulerInput::Txn(fill.clone()))
+            .try_send(SchedulerInput::Txn(Box::new(fill.clone())))
             .expect("pre-fill the capacity-1 channel");
         // Keep the receiver alive for the duration of `apply` so the sender reports
         // Full rather than Closed (either records a catch-up index, but Full is the
@@ -495,7 +515,7 @@ mod tests {
 
         // Deliver epoch 1 LIVE: it acquires, blocks behind the sentinel, and is now
         // in-flight (its (epoch, position) sits in `blocked`). It was NOT dropped.
-        scheduler.process_scheduler_input(SchedulerInput::Txn(txn1.clone()));
+        scheduler.process_scheduler_input(SchedulerInput::Txn(Box::new(txn1.clone())));
         let live_owner = TxnId::new(1, 0);
         assert!(
             scheduler.blocked.contains_key(&live_owner),

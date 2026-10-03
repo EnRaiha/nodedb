@@ -14,7 +14,7 @@ use axum::response::Response;
 
 use super::super::super::auth::{AppState, ResolvedIdentity};
 use super::super::super::peer::PeerAddr;
-use super::guard::{cluster_disabled, ensure_debug_access, json_response, ok_json};
+use super::guard::{cluster_not_started, ensure_debug_access, json_response, ok_json};
 
 #[derive(serde::Serialize)]
 struct RaftDebugResponse {
@@ -33,7 +33,7 @@ pub async fn raft_debug(
         return resp;
     }
     let Some(status_fn) = state.shared.raft_status_fn.get() else {
-        return cluster_disabled();
+        return cluster_not_started();
     };
     let statuses = status_fn();
     match statuses.into_iter().find(|s| s.group_id == group_id) {

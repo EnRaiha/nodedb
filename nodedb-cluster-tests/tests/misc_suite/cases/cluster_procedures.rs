@@ -9,7 +9,6 @@
 //! - Procedure body parsing with transaction control statements
 
 use nodedb::control::planner::procedural::ast::*;
-use nodedb::control::planner::procedural::executor::transaction::ProcedureTransactionCtx;
 use nodedb::control::planner::procedural::parse_block;
 use nodedb::types::{DatabaseId, TenantId, VShardId};
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
@@ -41,7 +40,7 @@ fn procedure_dml_creates_replicated_entry() {
         collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "archive"),
         document_id: "a-1".into(),
         value: b"{}".to_vec(),
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_types::Surrogate::new(1),
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
@@ -84,54 +83,49 @@ fn procedure_reads_not_replicated() {
 }
 
 // ---------------------------------------------------------------------------
-// Mid-procedure COMMIT: buffered tasks flushed independently
+// Procedure DML: each planned write replicates through Raft
 // ---------------------------------------------------------------------------
 
 #[test]
-fn tx_ctx_commit_yields_independent_tasks() {
-    let mut ctx = ProcedureTransactionCtx::new();
+fn procedure_writes_replicate_independently() {
+    // Two DML statements of a procedure body, as planned tasks.
+    let tasks = [
+        PhysicalTask {
+            tenant_id: TenantId::new(1),
+            vshard_id: VShardId::new(0),
+            database_id: DatabaseId::DEFAULT,
+            plan: PhysicalPlan::Document(DocumentOp::PointPut {
+                collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
+                document_id: "o-1".into(),
+                value: b"{}".to_vec(),
+                surrogate: nodedb_types::Surrogate::new(2),
+                pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
+            }),
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        },
+        PhysicalTask {
+            tenant_id: TenantId::new(1),
+            vshard_id: VShardId::new(1),
+            database_id: DatabaseId::DEFAULT,
+            plan: PhysicalPlan::Document(DocumentOp::PointDelete {
+                collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "temp"),
+                document_id: "t-1".into(),
+                surrogate: Some(nodedb_types::Surrogate::new(1)),
+                pk_bytes: Vec::new(),
+                returning: None,
+                rls_filters: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+                resolved_sum_targets: Vec::new(),
+            }),
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        },
+    ];
 
-    // Simulate two DML statements in a procedure body.
-    ctx.buffer_task(PhysicalTask {
-        tenant_id: TenantId::new(1),
-        vshard_id: VShardId::new(0),
-        database_id: DatabaseId::DEFAULT,
-        plan: PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
-            document_id: "o-1".into(),
-            value: b"{}".to_vec(),
-            surrogate: nodedb_types::Surrogate::ZERO,
-            pk_bytes: Vec::new(),
-            returning: None,
-            rls_filters: Vec::new(),
-            resolved_sum_targets: Vec::new(),
-        }),
-        post_set_op: PostSetOp::None,
-        txn_id: None,
-    });
-    ctx.buffer_task(PhysicalTask {
-        tenant_id: TenantId::new(1),
-        vshard_id: VShardId::new(0),
-        database_id: DatabaseId::DEFAULT,
-        plan: PhysicalPlan::Document(DocumentOp::PointDelete {
-            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "temp"),
-            document_id: "t-1".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
-            pk_bytes: Vec::new(),
-            returning: None,
-            rls_filters: Vec::new(),
-            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
-            resolved_sum_targets: Vec::new(),
-        }),
-        post_set_op: PostSetOp::None,
-        txn_id: None,
-    });
-
-    // COMMIT flushes both tasks.
-    let tasks = ctx.take_buffered_tasks();
-    assert_eq!(tasks.len(), 2);
-
-    // Each task is an independent write that replicates via Raft.
     for task in &tasks {
         assert!(
             encode_entry(task.tenant_id, task.database_id, task.vshard_id, &task.plan,)
@@ -139,56 +133,6 @@ fn tx_ctx_commit_yields_independent_tasks() {
                 .is_some()
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// Cross-shard DML: different vshards in same procedure
-// ---------------------------------------------------------------------------
-
-#[test]
-fn procedure_can_target_multiple_vshards() {
-    let mut ctx = ProcedureTransactionCtx::new();
-
-    // Task on vshard 0
-    ctx.buffer_task(PhysicalTask {
-        tenant_id: TenantId::new(1),
-        vshard_id: VShardId::new(0),
-        database_id: DatabaseId::DEFAULT,
-        plan: PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "a"),
-            document_id: "d1".into(),
-            value: vec![],
-            surrogate: nodedb_types::Surrogate::ZERO,
-            pk_bytes: Vec::new(),
-            returning: None,
-            rls_filters: Vec::new(),
-            resolved_sum_targets: Vec::new(),
-        }),
-        post_set_op: PostSetOp::None,
-        txn_id: None,
-    });
-    // Task on vshard 1 (different shard)
-    ctx.buffer_task(PhysicalTask {
-        tenant_id: TenantId::new(1),
-        vshard_id: VShardId::new(1),
-        database_id: DatabaseId::DEFAULT,
-        plan: PhysicalPlan::Document(DocumentOp::PointPut {
-            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "b"),
-            document_id: "d2".into(),
-            value: vec![],
-            surrogate: nodedb_types::Surrogate::ZERO,
-            pk_bytes: Vec::new(),
-            returning: None,
-            rls_filters: Vec::new(),
-            resolved_sum_targets: Vec::new(),
-        }),
-        post_set_op: PostSetOp::None,
-        txn_id: None,
-    });
-
-    let tasks = ctx.take_buffered_tasks();
-    assert_eq!(tasks.len(), 2);
-    assert_ne!(tasks[0].vshard_id, tasks[1].vshard_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -241,21 +185,6 @@ fn delta_reject_with_custom_hint() {
         reject.compensation,
         Some(CompensationHint::Custom { .. })
     ));
-}
-
-// ---------------------------------------------------------------------------
-// Procedure execution: coordinator-only (not migrated to shard leader)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn procedure_executes_on_coordinator() {
-    // Procedures execute on the coordinator that received CALL, never
-    // migrating to a shard leader; body DML dispatches to shard leaders via
-    // the normal query path (ProcedureTransactionCtx buffers locally, then
-    // flushes via dispatch_to_data_plane).
-    let mut ctx = ProcedureTransactionCtx::new();
-    // Empty context = no migration state, executes locally.
-    assert!(ctx.take_buffered_tasks().is_empty());
 }
 
 // ---------------------------------------------------------------------------

@@ -61,16 +61,40 @@ impl CoreLoop {
                 key,
                 value,
                 ..
+            }
+            | KvResolvedMutation::Rewrite {
+                collection,
+                key,
+                value,
+                ..
             } = mutation
                 && let Err(error) =
                     admit_kv_row(rls_write_check, value, key, tid, collection.as_str())
             {
                 return self.response_error(task, error);
             }
+            // A put binds its row. One carrying `Surrogate::ZERO` is refused
+            // here, before any mutation applies.
+            if let KvResolvedMutation::Put {
+                collection,
+                surrogate,
+                ..
+            } = mutation
+                && *surrogate == nodedb_types::Surrogate::ZERO
+            {
+                return self.response_error(
+                    task,
+                    crate::engine::kv::UnboundKvWrite {
+                        collection: collection.as_str().to_owned(),
+                    },
+                );
+            }
         }
 
         for mutation in mutations {
-            self.apply_kv_resolved_mutation(task, did, tid, mutation, now_ms);
+            if let Err(e) = self.apply_kv_resolved_mutation(task, did, tid, mutation, now_ms) {
+                return self.response_error(task, e);
+            }
         }
 
         self.response_with_payload(task, response_payload.to_vec())
@@ -85,7 +109,7 @@ impl CoreLoop {
         tid: u64,
         mutation: &KvResolvedMutation,
         now_ms: u64,
-    ) {
+    ) -> Result<(), crate::engine::kv::UnboundKvWrite> {
         match mutation {
             KvResolvedMutation::Put {
                 collection,
@@ -108,7 +132,7 @@ impl CoreLoop {
                         surrogate: *surrogate,
                     },
                     *expire_at_ms,
-                );
+                )?;
                 if let Some(ref m) = self.metrics {
                     m.record_kv_put();
                 }
@@ -123,6 +147,41 @@ impl CoreLoop {
                     key,
                     Some(value),
                     precondition.as_deref(),
+                );
+                self.note_kv_write_lsn(task, did, tid, collection.as_str(), key);
+            }
+            // The drift check confirmed the row holds `precondition`, so it is
+            // present and keeps its bound identity.
+            KvResolvedMutation::Rewrite {
+                collection,
+                key,
+                value,
+                ttl_ms,
+                expire_at_ms,
+                precondition,
+            } => {
+                self.kv_engine.rewrite_with_absolute_expiry(
+                    crate::engine::kv::KvRewriteParams {
+                        database_id: did,
+                        tenant_id: tid,
+                        collection: collection.as_str(),
+                        key,
+                        value,
+                        ttl_ms: *ttl_ms,
+                        now_ms,
+                    },
+                    *expire_at_ms,
+                );
+                if let Some(ref m) = self.metrics {
+                    m.record_kv_put();
+                }
+                self.emit_kv_write_event(
+                    task,
+                    collection.as_str(),
+                    crate::event::WriteOp::Update,
+                    key,
+                    Some(value),
+                    Some(precondition.as_slice()),
                 );
                 self.note_kv_write_lsn(task, did, tid, collection.as_str(), key);
             }
@@ -172,6 +231,7 @@ impl CoreLoop {
                 self.note_kv_write_lsn(task, did, tid, collection.as_str(), key);
             }
         }
+        Ok(())
     }
 }
 
@@ -242,16 +302,18 @@ mod tests {
     }
 
     fn seed(core: &mut CoreLoop, collection: &str, key: &[u8], value: &[u8]) {
-        core.kv_engine.put(crate::engine::kv::KvPutParams {
-            database_id: did(),
-            tenant_id: TID,
-            collection,
-            key,
-            value,
-            ttl_ms: 0,
-            now_ms: crate::engine::kv::current_ms(),
-            surrogate: Surrogate::new(1),
-        });
+        core.kv_engine
+            .put(crate::engine::kv::KvPutParams {
+                database_id: did(),
+                tenant_id: TID,
+                collection,
+                key,
+                value,
+                ttl_ms: 0,
+                now_ms: crate::engine::kv::current_ms(),
+                surrogate: crate::engine::kv::test_support::row_surrogate(key),
+            })
+            .expect("a bound row writes");
     }
 
     fn stored(core: &CoreLoop, collection: &str, key: &[u8]) -> Option<Vec<u8>> {

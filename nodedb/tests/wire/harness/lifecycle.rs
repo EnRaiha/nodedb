@@ -115,6 +115,23 @@ impl TestServer {
         Self::connect_and_build(spawned, dir, AuthMode::Trust).await
     }
 
+    /// Reopen `dir` with the lowered timeseries memtable budget a server
+    /// started by [`Self::start_with_timeseries_memtable_budget`] used.
+    pub async fn open_on_path_with_timeseries_memtable_budget(
+        dir: TestDataDir,
+        bytes: usize,
+    ) -> (Self, TestDataDir) {
+        let spawned = process::spawn(
+            dir.path(),
+            AuthMode::Trust,
+            TuningOverrides::timeseries_memtable_budget(bytes),
+            1,
+        );
+        let placeholder = tempfile::tempdir().expect("placeholder tempdir");
+        let server = Self::connect_and_build(spawned, placeholder, AuthMode::Trust).await;
+        (server, dir)
+    }
+
     /// Spawn a single-core NodeDB server with a lowered vector seal threshold,
     /// so a few hundred inserts seal segments and queue HNSW builds.
     pub async fn start_with_vector_seal_threshold(vectors: usize) -> Self {
@@ -145,41 +162,11 @@ impl TestServer {
         (server, dir)
     }
 
-    /// Spawn a single-core NodeDB server with `single_node_calvin = false`:
-    /// no cluster topology, so the planner emits the single-node plan forms
-    /// (`ArrayOp::{Put, Delete, Slice, ...}`) rather than the `ClusterArrayOp`
-    /// routing wrappers. Single-vShard transactions commit through the
-    /// single-shard path; cross-shard interactive transactions are rejected.
-    pub async fn start_standalone() -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let spawned = process::spawn(
-            dir.path(),
-            AuthMode::Trust,
-            TuningOverrides::standalone(),
-            1,
-        );
-        Self::connect_and_build(spawned, dir, AuthMode::Trust).await
-    }
-
     /// Open a server backed by an existing data directory, reopened in place
     /// so a previous server's data is visible after boot. `dir` is not
     /// consumed — ownership stays with the caller.
     pub async fn open_on_path(dir: TestDataDir) -> (Self, TestDataDir) {
         let spawned = process::spawn(dir.path(), AuthMode::Trust, TuningOverrides::none(), 1);
-        let placeholder = tempfile::tempdir().expect("placeholder tempdir");
-        let server = Self::connect_and_build(spawned, placeholder, AuthMode::Trust).await;
-        (server, dir)
-    }
-
-    /// [`Self::open_on_path`] for a server booted with
-    /// [`Self::start_standalone`]: no cluster topology, so no Raft groups.
-    pub async fn open_on_path_standalone(dir: TestDataDir) -> (Self, TestDataDir) {
-        let spawned = process::spawn(
-            dir.path(),
-            AuthMode::Trust,
-            TuningOverrides::standalone(),
-            1,
-        );
         let placeholder = tempfile::tempdir().expect("placeholder tempdir");
         let server = Self::connect_and_build(spawned, placeholder, AuthMode::Trust).await;
         (server, dir)
@@ -264,6 +251,7 @@ impl TestServer {
             native_port: spawned.ports.native,
             http_port: spawned.ports.http,
             resp_port: spawned.ports.resp,
+            ilp_port: spawned.ports.ilp,
             spawned: Some(spawned),
             conn_handle: Some(conn_handle),
             _dir: dir,

@@ -29,7 +29,7 @@ use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_staged_write};
 use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 use crate::control::server::shared::sql::staging_predicates::{
-    is_stageable_write, require_affected_count, stageable_write_shape,
+    is_stageable_write, require_affected_count, stageable_write_shape, stages_returning,
 };
 use crate::control::server::shared::write_admission::{plan_is_write, plan_requires_txn_buffering};
 use crate::control::state::SharedState;
@@ -80,8 +80,12 @@ pub struct StagedWriteOutcome {
     /// RawPayload`] outcomes (KV `Incr` / `IncrFloat` / `Cas` / `GetSet`,
     /// which return a computed value rather than an affected-row count) are
     /// expected to be forwarded to the client instead of being reduced to a
-    /// tag + count.
+    /// tag + count. Empty for a write that answers `RETURNING`.
     pub payload: Vec<u8>,
+    /// One `RowsPayload` per staged write that answers `RETURNING`: the rows
+    /// it staged, projected per the plan's spec. Empty for every other
+    /// write.
+    pub returning_rows: Vec<Vec<u8>>,
 }
 
 /// Session store + collision-free session identity, bundled so the
@@ -92,6 +96,20 @@ pub struct StagedWriteOutcome {
 pub struct DmlTxnCtx<'a> {
     pub sessions: &'a SessionStore,
     pub session_id: SessionId,
+}
+
+impl DmlTxnCtx<'_> {
+    /// Whether this session's reads must be linearizable.
+    ///
+    /// The session's `default_read_consistency` decides. A transport with no
+    /// such setting (native, HTTP, RESP, ws, promql) never sets it, so its
+    /// session reads the `ReadConsistency` default, `Strong`
+    /// (`types/consistency.rs`, via `SessionStore::read_consistency`).
+    pub fn linearizable_reads(&self) -> bool {
+        self.sessions
+            .read_consistency(self.session_id)
+            .requires_leader()
+    }
 }
 
 /// An owned, session-less scope for callers with no BEGIN/COMMIT transaction
@@ -213,27 +231,61 @@ where
         ));
     }
 
+    // A delete on an edge-bearing collection carries the edge tasks of each
+    // row it deletes. They are read before the delete stages, so the read
+    // still sees the rows.
+    let node_delete_tasks =
+        crate::control::planner::calvin::node_delete_txn::txn_node_delete_tasks(
+            state,
+            &task,
+            sessions.tx_id(session_id),
+        )
+        .await
+        .map_err(StagingGateError::Dispatch)?;
+
     // Point writes execute at STATEMENT time via the staging overlay (real
     // tag + statement-time constraint errors); the plan is still buffered so
     // COMMIT stays the sole durable apply. Other writes keep buffer + "OK",
     // reshaped first into the per-shard plans COMMIT can replay.
-    if !is_stageable_write(&task.plan) {
+    let route = if is_stageable_write(&task.plan) {
+        InTxnRoute::Staged(stage_write(state, sessions, session_id, task, &dispatch).await?)
+    } else {
         let buffered = expand_for_buffering(task).map_err(StagingGateError::Dispatch)?;
         for shard_task in buffered {
             sessions.buffer_write(session_id, shard_task);
         }
-        return Ok(InTxnRoute::Buffered);
-    }
-
-    Ok(InTxnRoute::Staged(
-        stage_write(state, sessions, session_id, task, dispatch).await?,
-    ))
+        InTxnRoute::Buffered
+    };
+    super::node_delete_stage::stage_node_delete_tasks(
+        state,
+        sessions,
+        session_id,
+        node_delete_tasks,
+        &dispatch,
+    )
+    .await?;
+    Ok(route)
 }
 
 /// Wrap `plan` in a `MetaOp::StageWrite` task addressed to `vshard_id`,
 /// carrying the transaction id. Shared by every staging-overlay dispatch: a
 /// plain in-transaction write below, and `array_fanout_stage`'s per-shard
 /// fan-out of a `ClusterArrayOp::{Put, Delete}`.
+/// The collection and rejected line count of a staged timeseries ingest
+/// whose stage-time preview rejected a line. `None` for every other write.
+fn staged_ts_rejections(plan: &PhysicalPlan, payload: &[u8]) -> Option<(String, u64)> {
+    let PhysicalPlan::Timeseries(nodedb_physical::physical_plan::TimeseriesOp::Ingest {
+        collection,
+        ..
+    }) = plan
+    else {
+        return None;
+    };
+    let rejected =
+        crate::control::server::shared::sql::staging_predicates::extract_rejected_count(payload);
+    (rejected > 0).then(|| (collection.as_str().to_owned(), rejected))
+}
+
 pub(super) fn wrap_stage_write(
     tenant_id: TenantId,
     vshard_id: VShardId,
@@ -254,7 +306,7 @@ pub(super) fn wrap_stage_write(
 }
 
 /// Stage a stageable write into the per-transaction overlay and classify its
-/// outcome. Split out of [`route_in_tx_write`] to keep that function short.
+/// outcome. [`route_in_tx_write`] calls it.
 ///
 /// Visible to the `session` module so the statement-time MERGE expander
 /// ([`super::expander_stage`]) can stage each of the concrete point ops it
@@ -331,7 +383,7 @@ where
     }
 
     // Metered here, once the staging dispatch above has already succeeded.
-    // The per-transaction overlay write it just performed IS the real engine
+    // The per-transaction overlay write it performed IS the real engine
     // work a `Staged` in-transaction write does — COMMIT only decides
     // whether that already-billed work becomes durable or is discarded by a
     // ROLLBACK, not whether it happened. Every `Staged` route funnels
@@ -349,12 +401,30 @@ where
     // a transaction block, mid-write) with no identity ever recorded — not
     // reachable in practice, since every path that can enter `InBlock` state
     // authenticates first. Metering must never fail a request, so a missing
-    // identity just skips the (impossible) charge rather than panicking.
+    // identity skips the (impossible) charge rather than panicking.
     if let Some(scope) = &scope {
         meter_staged_write(state, scope, &task.plan, &resp);
     }
 
     let kind = shape.tag_kind(resp.payload.as_ref());
+
+    // A write that answers `RETURNING` replies with its count and the rows it
+    // staged, projected per the plan's spec.
+    if stages_returning(&task.plan) {
+        let reply: crate::data::executor::response_codec::StagedReturningReply =
+            zerompk::from_msgpack(resp.payload.as_ref()).map_err(|error| {
+                StagingGateError::Dispatch(crate::Error::Internal {
+                    detail: format!("staged RETURNING reply does not decode: {error}"),
+                })
+            })?;
+        sessions.buffer_write(session_id, task);
+        return Ok(StagedWriteOutcome {
+            kind,
+            affected: reply.affected as usize,
+            payload: Vec::new(),
+            returning_rows: vec![reply.rows],
+        });
+    }
 
     // Every count-bearing stage handler answers with a real count
     // (`stage_count_response`), so a missing one means a staging handler stopped
@@ -371,13 +441,26 @@ where
         require_affected_count(resp.payload.as_ref()).map_err(StagingGateError::Dispatch)? as usize
     };
     let payload = resp.payload.as_ref().to_vec();
+    let ts_rejected = staged_ts_rejections(&task.plan, &payload);
 
     // Durable path unchanged: still buffered, replayed at COMMIT.
     sessions.buffer_write(session_id, task);
+    // A staged timeseries ingest reports the lines its stage-time preview
+    // rejected. COMMIT compares the count with its authoritative resolve.
+    if let Some((collection, rejected)) = ts_rejected {
+        sessions.note_ts_preview_rejected(session_id, rejected);
+        super::statement_notice::raise(
+            crate::control::server::shared::sql::staging_predicates::rejected_lines_notice(
+                &collection,
+                rejected,
+            ),
+        );
+    }
 
     Ok(StagedWriteOutcome {
         kind,
         affected,
         payload,
+        returning_rows: Vec::new(),
     })
 }

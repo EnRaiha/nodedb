@@ -1,125 +1,45 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+//! Plan and dispatch one rebuilt collection-DML statement.
+
 use std::sync::Arc;
 
 use crate::control::planner::context::PlanSecurityContext;
 use crate::control::security::audit::ArcAuditEmitter;
-use crate::control::security::identity::{AuthenticatedIdentity, Permission};
+use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::RequestAuthScope;
-use crate::control::sequence::SessionSequenceAccess;
 use crate::control::server::pgwire::types::error_to_sqlstate;
-use crate::control::server::response_shape::compose::{ShapeOutcome, shape_response_materialized};
-use crate::control::server::response_shape::redaction::QueryRedaction;
-use crate::control::server::response_shape::request::MaterializedShapeRequest;
-use crate::control::server::response_shape::types::{PlanKind, ShapedRows};
-use crate::control::server::shared::authorization::{
-    AuthorizationError, AuthorizedTaskSet, authorize_collection, authorize_task_set,
+use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::shared::authorization::{AuthorizedTaskSet, authorize_task_set};
+use crate::control::server::shared::clone_write::{
+    CloneCheckedOutcome, InterceptAndAuthorizeParams, intercept_and_authorize,
 };
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::returning;
-use crate::control::server::shared::session::{
-    DmlTxnCtx, InTxnRoute, StagingGateError, route_in_tx_write,
+use crate::control::server::shared::session::DmlTxnCtx;
+use crate::control::server::shared::txn_route::{
+    StatementEvents, TxnTaskContext, TxnTaskOutcome, route_txn_task,
 };
 use crate::control::server::shared::write_admission::all_writes_bufferable;
 use crate::control::state::SharedState;
 use crate::types::TraceId;
 
+use super::dispatch_write::{
+    ReturningShape, authorization_error_to_ddl, dispatch_staged, error_to_ddl, staging_error_to_ddl,
+};
 use super::types::ddl_err;
-
-/// Dispatch a write plan on the durable route, returning an error response on
-/// failure. `None` means the write applied.
-pub(in crate::control::server::shared::ddl::neutral::collection) async fn dispatch_plan(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    database_id: crate::types::DatabaseId,
-    vshard_id: crate::types::VShardId,
-    plan: crate::bridge::envelope::PhysicalPlan,
-) -> Option<Result<Vec<DdlResult>, DdlError>> {
-    let task = nodedb_physical::physical_task::PhysicalTask {
-        tenant_id: identity.tenant_id,
-        database_id,
-        vshard_id,
-        plan,
-        post_set_op: nodedb_physical::physical_task::PostSetOp::None,
-        txn_id: None,
-    };
-    let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
-    let checked = match crate::control::server::shared::clone_write::intercept_and_authorize(
-        crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
-            state,
-            task,
-            identity,
-            tenant_id: identity.tenant_id,
-            permissions: &state.permissions,
-            roles: &state.roles,
-            emitter: &emitter,
-        },
-    )
-    .await
-    {
-        Ok(crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(_)) => {
-            return None;
-        }
-        Ok(crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(checked)) => {
-            checked
-        }
-        Err(error) => {
-            let (_, sqlstate, message) = error_to_sqlstate(&error);
-            return Some(Err(ddl_err(sqlstate, message)));
-        }
-    };
-
-    // The durable route: Raft in cluster mode, else the funnel's `AppendHere`.
-    match crate::control::server::dispatch_utils::dispatch_authorized_durable_write(
-        state,
-        checked,
-        TraceId::ZERO,
-    )
-    .await
-    {
-        Err(error) => {
-            let (_, sqlstate, message) = error_to_sqlstate(&error);
-            Some(Err(ddl_err(sqlstate, message)))
-        }
-        // A refusal arrives as an error status inside an `Ok` response.
-        Ok(response) if response.status == crate::bridge::envelope::Status::Error => {
-            Some(Err(match response.error_code.as_deref() {
-                Some(code) => {
-                    let (_, sqlstate, message) = error_code_to_sqlstate(code);
-                    ddl_err(sqlstate, message)
-                }
-                None => DdlError::internal("unknown data plane error"),
-            }))
-        }
-        Ok(_) => None,
-    }
-}
-
-/// Authorize a write target before triggers, sequences, or catalog reads run.
-pub(in crate::control::server::shared::ddl::neutral::collection) fn authorize_write_target(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    database_id: crate::types::DatabaseId,
-    collection: &str,
-) -> Result<(), DdlError> {
-    let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
-    authorize_collection(
-        identity,
-        database_id,
-        collection,
-        Permission::Write,
-        &state.permissions,
-        &state.roles,
-        &emitter,
-    )
-    .map_err(authorization_error_to_ddl)
-}
 
 /// Plan SQL through nodedb-sql, authorize the final task set, and dispatch it.
 ///
 /// Returns the rows a `RETURNING` clause on `sql` produced, empty when the
-/// statement carries none. The rows are decoded from the Data Plane's own
+/// statement carries none.
+///
+/// Inside a transaction block every task takes the shared `txn_route`: its
+/// BEFORE, INSTEAD OF and SYNC AFTER bodies join the transaction when
+/// `fire_triggers` is set (a caller that fired them around the statement
+/// itself clears it), a shadowed clone takes its copy-on-write steps, and
+/// the write stages. The rows are decoded from the Data Plane's own
 /// response — the STORED post-image — and are redacted before they leave, so
 /// this path answers `RETURNING` exactly as the pgwire planner does rather than
 /// echoing back the values the caller submitted.
@@ -130,6 +50,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     database_id: crate::types::DatabaseId,
     sql: &str,
     txn_ctx: &DmlTxnCtx<'_>,
+    fire_triggers: bool,
 ) -> Result<Vec<DdlResult>, DdlError> {
     // The clause is stripped from the rebuilt statement before planning. The
     // planner resolves the item text against the planned target and attaches
@@ -142,20 +63,19 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     // This is a client statement — the object-literal `INSERT INTO c { … }` and
     // `UPSERT` forms land here after being rewritten to standard SQL — so it
     // plans under the requester's own scope, the same one it is authorized and
-    // metered as below. Planning it as the system would apply no row policy to
-    // it: read filters would not be injected, and the write gates would decide
+    // metered as below. Planning it as the system will apply no row policy to
+    // it: read filters will not be injected, and the write gates will decide
     // nothing, on a transport a client can reach directly.
     //
     // Injection happens inside planning, before the task set is consumed:
     // implicit-edge extraction, authorization, staging, and dispatch all read
-    // `tasks` after this point, and injecting later would hand them
+    // `tasks` after this point, and injecting later will hand them
     // un-injected copies.
     let (mut tasks, output_schema, versions) = {
         let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
-        let permission_cache =
-            crate::control::security::auth_fence::permission_view(state, tenant_id)
-                .await
-                .map_err(|error| DdlError::from_error(&error))?;
+        crate::control::security::auth_fence::admit_permission_view(state, tenant_id)
+            .await
+            .map_err(|error| DdlError::from_error(&error))?;
         let sec = PlanSecurityContext {
             identity,
             auth: scope.auth(),
@@ -163,7 +83,9 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             redaction_store: &state.redaction,
             permissions: &state.permissions,
             roles: &state.roles,
-            permission_cache: Some(&*permission_cache),
+            permission_tree: crate::control::planner::context::PermissionTreeSource::Live(
+                &state.permission_cache,
+            ),
         };
         let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
         let (tasks, output_schema, versions, _) = query_ctx
@@ -249,11 +171,12 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     // Admission follows final authorization so an implicit-edge target denied
     // by policy does not consume a descriptor lease. The scope remains live
     // through expansion's successors, transaction staging, and dispatch below.
-    let plan_lease_scope =
-        Arc::new(state.acquire_plan_lease_scope(&versions).map_err(|error| {
+    let plan_lease_scope = Arc::new(state.acquire_plan_lease_scope(&versions).await.map_err(
+        |error| {
             let (_, sqlstate, message) = error_to_sqlstate(&error);
             ddl_err(sqlstate, message)
-        })?);
+        },
+    )?);
 
     // A statement dispatched to Calvin as autocommit escapes the transaction
     // buffer entirely: it applies durably at statement time and ROLLBACK cannot
@@ -271,7 +194,6 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     let sum_read_vshards = crate::control::planner::calvin::read_vshards_of(&sum_target_reads)
         .map_err(|error| DdlError::from_error(&error))?;
     if !in_txn_block
-        && state.sequencer_inbox.get().is_some()
         && matches!(
             crate::control::planner::calvin::classify_dispatch(&tasks, &sum_read_vshards),
             crate::control::planner::calvin::DispatchClass::MultiShard { .. }
@@ -293,7 +215,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
         })?;
         // A cross-shard Calvin dispatch returns no per-task payload here, so
         // there is no stored row to project. Refused rather than answered with
-        // an empty row set, which would read as "the write matched nothing".
+        // an empty row set, which will read as "the write matched nothing".
         if has_returning {
             return Err(ddl_err(
                 "0A000",
@@ -303,121 +225,93 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
         return Ok(Vec::new());
     }
 
+    // The row images the statement's cross-shard balances were settled from
+    // join the transaction's read set, so COMMIT's conflict check covers
+    // them.
+    if in_txn_block && !sum_target_reads.is_empty() {
+        txn_ctx
+            .sessions
+            .record_read_entries(txn_ctx.session_id, sum_target_reads);
+    }
+
+    let auth_scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
+    let route_ctx = in_txn_block.then(|| TxnTaskContext {
+        state,
+        identity,
+        auth: auth_scope.auth(),
+        txn: txn_ctx,
+        lease_scope: &plan_lease_scope,
+        fire_triggers,
+    });
+    let returning_shape = ReturningShape {
+        state,
+        identity,
+        database_id,
+        txn_ctx,
+        output_schema: &output_schema,
+    };
+    let mut statement_events = StatementEvents::default();
     let mut returned_rows: Option<ShapedRows> = None;
-    let statement_buffer_start = txn_ctx.sessions.buffered_task_count(txn_ctx.session_id);
     for (task, initial_authorized) in tasks.into_iter().zip(authorized_tasks.into_tasks()) {
-        let routed = route_in_tx_write(
-            state,
-            txn_ctx.sessions,
-            txn_ctx.session_id,
-            task,
-            |staged| async move {
-                let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
-                match crate::control::server::shared::clone_write::intercept_and_authorize(
-                    crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
-                        state,
-                        task: staged,
-                        identity,
-                        tenant_id,
-                        permissions: &state.permissions,
-                        roles: &state.roles,
-                        emitter: &emitter,
-                    },
-                )
-                .await?
+        drop(initial_authorized);
+        let task = match route_ctx.as_ref() {
+            Some(route) => {
+                let plan = task.plan.clone();
+                match route_txn_task(route, task, &mut statement_events, |staged| {
+                    dispatch_staged(state, identity, staged)
+                })
+                .await
+                .map_err(staging_error_to_ddl)?
                 {
-                    crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(
-                        resp,
-                    ) => Ok(resp),
-                    crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(
-                        checked,
-                    ) => {
-                        crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
-                            state,
-                            checked,
-                            TraceId::ZERO,
-                        )
-                        .await
+                    TxnTaskOutcome::Dispatch(task) => *task,
+                    TxnTaskOutcome::Staged(staged) => {
+                        if has_returning {
+                            for rows in &staged.returning_rows {
+                                returning_shape.fold(&plan, rows, &mut returned_rows)?;
+                            }
+                        }
+                        continue;
                     }
-                }
-            },
-        )
-        .await;
-
-        if txn_ctx.sessions.buffered_task_count(txn_ctx.session_id) > statement_buffer_start
-            && !txn_ctx.sessions.attach_tx_lease_scope_since(
-                txn_ctx.session_id,
-                statement_buffer_start,
-                Arc::clone(&plan_lease_scope),
-            )
-        {
-            return Err(DdlError::internal(
-                "internal error: failed to retain descriptor leases for buffered transaction tasks",
-            ));
-        }
-
-        let task = match routed {
-            Ok(InTxnRoute::Read(task) | InTxnRoute::Autocommit(task)) => *task,
-            Ok(InTxnRoute::Buffered) | Ok(InTxnRoute::Staged(_)) => {
-                drop(initial_authorized);
-                // A buffered/staged write produces its rows at COMMIT, not
-                // here, so the clause cannot be answered on this path. Refused
-                // through the shared rule so this transport's message is the
-                // one the pgwire and native loops give for the same limitation.
-                if has_returning {
-                    let (_, sqlstate, message) =
-                        error_to_sqlstate(&returning::in_transaction_returning_unsupported());
-                    return Err(ddl_err(sqlstate, message));
-                }
-                continue;
-            }
-            Err(StagingGateError::Dispatch(error)) => {
-                let (_, sqlstate, message) = error_to_sqlstate(&error);
-                return Err(ddl_err(sqlstate, message));
-            }
-            Err(StagingGateError::Rejected { code }) => {
-                return Err(match code {
-                    Some(code) => {
-                        let (_, sqlstate, message) = error_code_to_sqlstate(&code);
-                        ddl_err(sqlstate, message)
+                    TxnTaskOutcome::CloneHandled(resp) => {
+                        if has_returning {
+                            returning_shape.fold(
+                                &plan,
+                                resp.payload.as_bytes(),
+                                &mut returned_rows,
+                            )?;
+                        }
+                        continue;
                     }
-                    None => DdlError::internal("unknown data plane error"),
-                });
+                    TxnTaskOutcome::Buffered | TxnTaskOutcome::InsteadOf => continue,
+                }
             }
+            None => task,
         };
 
-        drop(initial_authorized);
         let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
-        let response = match crate::control::server::shared::clone_write::intercept_and_authorize(
-            crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
-                state,
-                task: task.clone(),
-                identity,
-                tenant_id,
-                permissions: &state.permissions,
-                roles: &state.roles,
-                emitter: &emitter,
-            },
-        )
+        let response = match intercept_and_authorize(InterceptAndAuthorizeParams {
+            state,
+            task: task.clone(),
+            identity,
+            tenant_id,
+            permissions: &state.permissions,
+            roles: &state.roles,
+            emitter: &emitter,
+        })
         .await
-        .map_err(|error| {
-            let (_, sqlstate, message) = error_to_sqlstate(&error);
-            ddl_err(sqlstate, message)
-        })? {
-            crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(resp) => resp,
+        .map_err(|error| error_to_ddl(&error))?
+        {
+            CloneCheckedOutcome::Handled(resp) => resp,
             // A write takes the durable route: Raft in cluster mode, else the
             // funnel's `AppendHere`. A read takes the read route.
-            crate::control::server::shared::clone_write::CloneCheckedOutcome::Proceed(checked) => {
+            CloneCheckedOutcome::Proceed(checked) => {
                 crate::control::server::dispatch_utils::dispatch_authorized_task_by_class(
                     state,
                     checked,
                     TraceId::ZERO,
                 )
                 .await
-                .map_err(|error| {
-                    let (_, sqlstate, message) = error_to_sqlstate(&error);
-                    ddl_err(sqlstate, message)
-                })?
+                .map_err(|error| error_to_ddl(&error))?
             }
         };
 
@@ -431,44 +325,15 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             });
         }
 
-        // Shape the STORED rows the write returned, redacted for the caller —
-        // the same choke point the pgwire dispatch loop uses, so a redaction
-        // policy masks identically on both transports.
         if has_returning {
-            let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
-            let redaction = QueryRedaction::for_plan(tenant_id, scope.auth(), &task.plan);
-            // A RETURNING expression is evaluated here, per returned row, and
-            // a sequence accessor in it resolves against this session's
-            // `currval` map exactly as the pgwire loop's does.
-            let sequences = SessionSequenceAccess::for_session(
-                state,
-                txn_ctx.sessions.sequence_values(txn_ctx.session_id),
-                database_id,
-                tenant_id,
-            );
-            let outcome = shape_response_materialized(MaterializedShapeRequest {
-                payload: response.payload.as_bytes(),
-                plan: &task.plan,
-                plan_kind: PlanKind::ReturningRows,
-                // The statement's announced `RETURNING` columns, so this
-                // transport renders a returned cell exactly as pgwire does.
-                projection: Some(&output_schema),
-                state,
-                database_id,
-                tenant_id,
-                redaction: Some(redaction.ctx(&state.redaction)),
-                sequences: Some(&sequences),
-            })
-            .map_err(|error| DdlError::from_error(&crate::Error::from(error)))?;
-            // Folded rather than pushed: a statement is ONE result set, however
-            // many tasks it planned to.
-            if let ShapeOutcome::Rows(shaped) = outcome {
-                match returned_rows {
-                    Some(ref mut accumulated) => accumulated.append(shaped),
-                    None => returned_rows = Some(shaped),
-                }
-            }
+            returning_shape.fold(&task.plan, response.payload.as_bytes(), &mut returned_rows)?;
         }
+    }
+    if let Some(route) = route_ctx.as_ref() {
+        statement_events
+            .fire(route)
+            .await
+            .map_err(|error| error_to_ddl(&error))?;
     }
     Ok(returned_rows.map(DdlResult::Rows).into_iter().collect())
 }
@@ -483,16 +348,10 @@ fn authorize_final_task_set(
         .map_err(authorization_error_to_ddl)
 }
 
-fn authorization_error_to_ddl(error: AuthorizationError) -> DdlError {
-    DdlError::new(
-        nodedb_types::error::sqlstate::INSUFFICIENT_PRIVILEGE,
-        error.resource().to_owned(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::server::shared::authorization::AuthorizationError;
     use crate::types::TenantId;
 
     #[test]

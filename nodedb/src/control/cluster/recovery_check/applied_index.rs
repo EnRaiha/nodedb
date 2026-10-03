@@ -8,7 +8,7 @@
 //! behind between `raft_ready_rx` firing (which only waits for
 //! the first entry) and the recovery check running. Serving
 //! client traffic against that state is a correctness bug —
-//! the next DDL would race an unapplied prior entry.
+//! the next DDL will race an unapplied prior entry.
 //!
 //! Implementation note: `MetadataCache.applied_index` is the
 //! local applier's watermark. The "expected committed index"
@@ -39,20 +39,7 @@ impl AppliedIndexGate {
 
 /// Read both the `MetadataCache.applied_index` and the
 /// `AppliedIndexWatcher::current` and report any gap.
-///
-/// Single-node mode (no cluster handle) returns a gate with
-/// zero gap and zero indexes — there is nothing to replay.
 pub fn check_applied_index(shared: &SharedState) -> AppliedIndexGate {
-    // If we're in single-node mode, neither source exists in a
-    // meaningful sense. Return a trivially-ok gate.
-    if shared.cluster_topology.is_none() {
-        return AppliedIndexGate {
-            cache_applied: 0,
-            watcher_current: 0,
-            gap: 0,
-        };
-    }
-
     let cache_applied = {
         let cache = match shared.metadata_cache.read() {
             Ok(c) => c,

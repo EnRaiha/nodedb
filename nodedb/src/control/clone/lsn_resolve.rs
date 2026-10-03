@@ -1,21 +1,36 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! LSN ↔ wall-clock millisecond resolution for the clone CoW resolver.
+//! Wall-clock millisecond → LSN resolution for the clone CoW resolver.
 //!
-//! Converts a user-supplied `AS OF SYSTEM TIME <ms>` value to the closest
-//! WAL LSN using the anchor map held by `SharedState`.  When the map is
-//! empty (no anchors replayed yet) the WAL frontier is used as a safe
-//! approximation — the same behaviour as the original clone handler.
+//! Resolves a user-supplied `AS OF SYSTEM TIME <ms>` value to the WAL state
+//! committed by then, from the WAL's time anchors. LSNs here are exclusive
+//! bounds, as `wal.next_lsn()` is.
 
-use nodedb_types::Lsn;
+use nodedb_types::{Lsn, LsnTimeError};
 
 use crate::control::state::SharedState;
 
-/// Resolve wall-clock milliseconds to the nearest LSN.
+/// The exclusive LSN bound of the state committed by millisecond `wall_ms`.
 ///
-/// Delegates to [`SharedState::ms_to_lsn`] which performs binary-search
-/// interpolation across the anchor map, falling back to `wal.next_lsn()`
-/// when the map is empty.
-pub fn wall_ms_to_lsn(state: &SharedState, wall_ms: i64) -> Lsn {
+/// Fails when `wall_ms` is before the oldest retained time anchor. See
+/// [`SharedState::ms_to_lsn`].
+pub fn wall_ms_to_lsn(state: &SharedState, wall_ms: i64) -> Result<Lsn, LsnTimeError> {
     state.ms_to_lsn(wall_ms)
+}
+
+/// System time, in wall ms, at which a read through a clone cuts its source:
+/// the commit time of the source state below `as_of_lsn`.
+///
+/// `None` for a non-bitemporal source. It keeps only current versions, so a
+/// system-time cut hides every row. A clone collection carries its
+/// source's `bitemporal` flag.
+pub fn source_as_of_ms(
+    state: &SharedState,
+    source_bitemporal: bool,
+    as_of_lsn: Lsn,
+) -> Option<i64> {
+    if !source_bitemporal {
+        return None;
+    }
+    state.ms_to_lsn_inverse(as_of_lsn)
 }

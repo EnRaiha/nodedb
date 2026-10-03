@@ -57,6 +57,39 @@ pub(super) fn finish_observability(
         .set(calvin_completion_registry);
     let _ = shared.ollp_orchestrator.set(ollp_orchestrator);
 
+    publish_raft_status(handle, shared, &raft_loop);
+    spawn_auth_lease_renew(shared);
+    publish_epoch_and_proposer(shared, &raft_loop);
+    start_surrogate_refiller(shared);
+
+    // Subscribe to the boot-time readiness watch BEFORE spawning the
+    // tick loop so we cannot miss the first transition. The receiver
+    // is returned to `main.rs`, which awaits it before binding any
+    // client-facing listener.
+    let ready_rx = raft_loop.subscribe_ready();
+
+    // Register the raft-tick loop's standardized metrics so the
+    // `/metrics` route can expose them alongside every other driver.
+    shared
+        .loop_metrics_registry
+        .register(raft_loop.loop_metrics());
+
+    spawn_raft_services(handle, shared, &raft_loop, sequencer_service);
+    log_cluster_version_view(handle, shared);
+    start_health_monitor(handle, shared, transport_tuning);
+
+    info!(node_id = handle.node_id, "raft loop and RPC server started");
+
+    ready_rx
+}
+
+/// Publish the cluster observer, the live Raft leader status, the metadata
+/// term and contact probes, and the read gate onto `SharedState`.
+fn publish_raft_status(
+    handle: &ClusterHandle,
+    shared: &Arc<SharedState>,
+    raft_loop: &Arc<RaftLoopType>,
+) {
     // Publish the cluster observability handle to SharedState before
     // any listener starts serving.
     let observer = Arc::new(nodedb_cluster::ClusterObserver::new(
@@ -82,9 +115,8 @@ pub(super) fn finish_observability(
     // `group_statuses()` snapshot.
     // Weak for the same cycle-breaking reason as `cluster_observer` above.
     // A dropped loop (only reachable post-shutdown) yields an empty status
-    // snapshot, which every consumer already treats as "no cluster groups"
-    // — identical to the single-node case where this fn is never installed.
-    let raft_loop_for_status = Arc::downgrade(&raft_loop);
+    // snapshot, which every consumer treats as "no cluster groups".
+    let raft_loop_for_status = Arc::downgrade(raft_loop);
     if shared
         .raft_status_fn
         .set(Arc::new(move || {
@@ -98,6 +130,39 @@ pub(super) fn finish_observability(
         tracing::warn!("raft_status_fn already set — start_raft appears to have run twice");
     }
 
+    // The lease drainer polls the metadata term every few milliseconds, so it
+    // reads that one group rather than every group's status.
+    let multi_raft_for_term = raft_loop.multi_raft_handle();
+    if shared
+        .lease_runtime
+        .metadata_leader_term
+        .set(Arc::new(move || {
+            multi_raft_for_term
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .leader_term(nodedb_cluster::METADATA_GROUP_ID)
+        }))
+        .is_err()
+    {
+        tracing::warn!(
+            "metadata leader term fn already set — start_raft appears to have run twice"
+        );
+    }
+    let multi_raft_for_contact = raft_loop.multi_raft_handle();
+    if shared
+        .lease_runtime
+        .metadata_contact
+        .set(Arc::new(move |window| {
+            multi_raft_for_contact
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .leader_contact_within(nodedb_cluster::METADATA_GROUP_ID, window)
+        }))
+        .is_err()
+    {
+        tracing::warn!("metadata contact fn already set — start_raft appears to have run twice");
+    }
+
     // Publish the leadership confirmer so a linearizable read served on this
     // node proves against a quorum that it is still the leader. Holds the
     // same coordinator mutex the loop ticks, and the loop only weakly, to ask
@@ -105,14 +170,16 @@ pub(super) fn finish_observability(
     let gate: Arc<dyn crate::control::cluster::read_index::RaftReadGate> =
         Arc::new(crate::control::cluster::read_index::MultiRaftReadGate::new(
             raft_loop.multi_raft_handle(),
-            Arc::downgrade(&raft_loop),
+            Arc::downgrade(raft_loop),
         ));
     if shared.raft_read_gate.set(gate).is_err() {
         tracing::warn!("raft_read_gate already set — start_raft appears to have run twice");
     }
+}
 
-    // Renew this node's authorization lease with the metadata leader. Its
-    // confirmed coverage needs the read gate above.
+/// Renew this node's authorization lease with the metadata leader. Its
+/// confirmed coverage needs the read gate [`publish_raft_status`] sets.
+fn spawn_auth_lease_renew(shared: &Arc<SharedState>) {
     if let Some(timing) = shared.authorization_fence.timing() {
         let renew_state = Arc::clone(shared);
         crate::control::shutdown::spawn_loop(
@@ -129,10 +196,13 @@ pub(super) fn finish_observability(
             },
         );
     }
+}
 
+/// Publish the cluster-epoch state and the metadata proposer handle.
+fn publish_epoch_and_proposer(shared: &Arc<SharedState>, raft_loop: &Arc<RaftLoopType>) {
     // Publish this node's cluster-epoch state so the routing gate can tell
     // whether this node has missed a topology transition before it coordinates
-    // work on a view of the cluster that may already be superseded.
+    // work on a view of the cluster that can already be superseded.
     if shared
         .cluster_epoch
         .set(raft_loop.cluster_epoch_handle())
@@ -149,13 +219,24 @@ pub(super) fn finish_observability(
     if shared.metadata_raft.set(proposer_handle).is_err() {
         tracing::warn!("metadata_raft already set — start_raft appears to have run twice");
     }
+}
 
+/// Install the surrogate assigner's cluster wiring and spawn its
+/// reservation refiller.
+fn start_surrogate_refiller(shared: &Arc<SharedState>) {
     // Allow the surrogate assigner's flush path to propose
     // `SurrogateAlloc` entries to the Raft group so followers advance
     // their in-memory HWM on every checkpoint.
     shared
         .surrogate_assigner
         .install_shared(Arc::downgrade(shared));
+    // A cluster node resolves every key it plans or reads at the key's
+    // collection home, never with a value of its own.
+    shared.surrogate_assigner.install_home_authority(Arc::new(
+        crate::control::server::surrogate_exchange::RoutedHomeAuthority::new(Arc::downgrade(
+            shared,
+        )),
+    ));
 
     // Spawn the per-node surrogate reservation refiller. It owns ALL batch
     // reservation so the latency-critical `assign` insert path never blocks
@@ -183,19 +264,15 @@ pub(super) fn finish_observability(
             info!("surrogate refill loop stopped");
         },
     );
+}
 
-    // Subscribe to the boot-time readiness watch BEFORE spawning the
-    // tick loop so we cannot miss the first transition. The receiver
-    // is returned to `main.rs`, which awaits it before binding any
-    // client-facing listener.
-    let ready_rx = raft_loop.subscribe_ready();
-
-    // Register the raft-tick loop's standardized metrics so the
-    // `/metrics` route can expose them alongside every other driver.
-    shared
-        .loop_metrics_registry
-        .register(raft_loop.loop_metrics());
-
+/// Spawn the Raft tick loop, the sequencer service, and the RPC server.
+fn spawn_raft_services(
+    handle: &ClusterHandle,
+    shared: &Arc<SharedState>,
+    raft_loop: &Arc<RaftLoopType>,
+    sequencer_service: nodedb_cluster::calvin::SequencerService,
+) {
     // Start the Raft tick loop. `RaftLoop::run` takes a raw
     // `watch::Receiver<bool>` and drives shutdown internally, so it gets one
     // from the canonical watch; the `spawn_loop` receiver is unused. Routing
@@ -244,25 +321,31 @@ pub(super) fn finish_observability(
             }
         },
     );
+}
 
-    // Wire version of every node is now carried on the live
-    // `NodeInfo` in `cluster_topology`. Log the derived view for observability.
-    {
-        let view = shared.cluster_version_view();
-        let compat = crate::control::rolling_upgrade::should_compat_mode(&view);
-        info!(
-            node_id = handle.node_id,
-            nodes = view.node_count,
-            min_version = view.min_version,
-            max_version = view.max_version,
-            mixed = view.is_mixed_version(),
-            compat_mode = compat,
-            "cluster version view derived from topology"
-        );
-    }
+/// Log the cluster version view. The wire version of every node is carried
+/// on the live `NodeInfo` in `cluster_topology`.
+fn log_cluster_version_view(handle: &ClusterHandle, shared: &Arc<SharedState>) {
+    let view = shared.cluster_version_view();
+    let compat = crate::control::rolling_upgrade::should_compat_mode(&view);
+    info!(
+        node_id = handle.node_id,
+        nodes = view.node_count,
+        min_version = view.min_version,
+        max_version = view.max_version,
+        mixed = view.is_mixed_version(),
+        compat_mode = compat,
+        "cluster version view derived from topology"
+    );
+}
 
-    // Start the health monitor (periodic pings, failure detection,
-    // topology re-broadcast).
+/// Start the health monitor: periodic pings, failure detection, and
+/// topology re-broadcast.
+fn start_health_monitor(
+    handle: &ClusterHandle,
+    shared: &Arc<SharedState>,
+    transport_tuning: &nodedb_types::config::tuning::ClusterTransportTuning,
+) {
     let health_config = nodedb_cluster::HealthConfig {
         ping_interval: std::time::Duration::from_secs(transport_tuning.health_ping_interval_secs),
         failure_threshold: transport_tuning.health_failure_threshold,
@@ -290,8 +373,4 @@ pub(super) fn finish_observability(
             health_monitor.run(health_raw_shutdown).await;
         },
     );
-
-    info!(node_id = handle.node_id, "raft loop and RPC server started");
-
-    ready_rx
 }

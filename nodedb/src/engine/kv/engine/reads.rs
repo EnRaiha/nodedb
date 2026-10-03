@@ -3,10 +3,10 @@
 use nodedb_types::Surrogate;
 
 use super::KvEngine;
-use crate::engine::kv::KvPutParams;
 use crate::engine::kv::engine_helpers::table_key;
 use crate::engine::kv::entry::NO_EXPIRY;
 use crate::engine::kv::hash_table::{EntryMeta, KvExportEntry};
+use crate::engine::kv::{KvPutParams, UnboundKvWrite};
 
 /// One key of one KV collection.
 #[derive(Debug, Clone, Copy)]
@@ -151,8 +151,14 @@ impl KvEngine {
     }
 
     /// Reinstall `image` under `key`: the value, the absolute expiry instant
-    /// and the surrogate it held, with every index maintained.
-    pub fn restore_entry_image(&mut self, target: KvKeyRef<'_>, image: &KvEntryImage, now_ms: u64) {
+    /// and the surrogate it held, with every index maintained. An image with
+    /// no bound surrogate is refused and nothing is written.
+    pub fn restore_entry_image(
+        &mut self,
+        target: KvKeyRef<'_>,
+        image: &KvEntryImage,
+        now_ms: u64,
+    ) -> Result<(), UnboundKvWrite> {
         self.put_with_absolute_expiry(
             KvPutParams {
                 database_id: target.database_id,
@@ -165,7 +171,8 @@ impl KvEngine {
                 surrogate: image.surrogate,
             },
             image.expire_at_ms,
-        );
+        )?;
+        Ok(())
     }
 
     /// Put `key` back to `image`, or remove it when `image` is `None`: the
@@ -175,7 +182,7 @@ impl KvEngine {
         target: KvKeyRef<'_>,
         image: Option<&KvEntryImage>,
         now_ms: u64,
-    ) {
+    ) -> Result<(), UnboundKvWrite> {
         match image {
             Some(image) => self.restore_entry_image(target, image, now_ms),
             None => {
@@ -187,6 +194,7 @@ impl KvEngine {
                     &key,
                     now_ms,
                 );
+                Ok(())
             }
         }
     }

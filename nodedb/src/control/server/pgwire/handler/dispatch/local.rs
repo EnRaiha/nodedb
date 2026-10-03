@@ -16,7 +16,7 @@ use super::authorize::reject_unadmitted_crdt_apply;
 impl NodeDbPgHandler {
     /// Dispatch a task directly to the local Data Plane (single-node or reads).
     ///
-    /// WAL append happens inside the write funnel, under the admission guard just
+    /// WAL append happens inside the write funnel, under the admission guard right
     /// before enqueue, so LSN order equals apply order. Reads bypass the WAL entirely.
     pub(super) async fn dispatch_local(
         &self,
@@ -30,6 +30,7 @@ impl NodeDbPgHandler {
                 now_override: None,
                 apply_key: 0,
                 commit_hlc: None,
+                change_position: None,
             },
         )
         .await
@@ -38,22 +39,11 @@ impl NodeDbPgHandler {
     /// Dispatch a task to the Data Plane WITHOUT individual WAL append.
     ///
     /// Used by COMMIT after the transaction is written as one `RecordType::Transaction`
-    /// record — per-task WAL would double-write.
+    /// record — per-task WAL will double-write.
     pub(in crate::control::server::pgwire::handler) async fn dispatch_task_no_wal(
         &self,
         task: PhysicalTask,
     ) -> crate::Result<Response> {
-        // Without this, a transaction begun before the freeze could COMMIT mid-scan and
-        // break the as-of contract.
-        use crate::control::security::identity::{Permission, required_permission};
-        let perm = required_permission(&task.plan);
-        if matches!(perm, Permission::Write | Permission::Admin)
-            && self.state.materialize_freeze.is_frozen(task.database_id)
-        {
-            return Err(crate::Error::SourceFrozen {
-                database_id: task.database_id,
-            });
-        }
         reject_unadmitted_crdt_apply(&task.plan)?;
         let txn_id = task.txn_id;
         // The caller owns the transaction's durability, so the task carries no

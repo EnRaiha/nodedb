@@ -66,7 +66,7 @@ mod tests {
             epoch_system_ms: 0,
             is_group_leader: true,
         };
-        let resp = core.execute_calvin_execute_static(&task, ctx, &tenant_id, &plans, &[]);
+        let resp = core.execute_calvin_execute_static(&task, ctx, &tenant_id, &plans, &[], &[]);
         assert_eq!(resp.status, Status::Ok);
 
         let vshard_id = task.request.vshard_id.as_u32();

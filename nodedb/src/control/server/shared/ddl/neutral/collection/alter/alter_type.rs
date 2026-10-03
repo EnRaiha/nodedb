@@ -3,13 +3,12 @@
 //! `ALTER COLLECTION <name> ALTER COLUMN <col> TYPE <type>` — change a
 //! column's declared type in a strict-document collection's schema.
 //!
-//! Ported verbatim from the pgwire `ddl::collection::alter::alter_type`
-//! handler; only the result type changed to the protocol-neutral
-//! [`DdlResult`] / [`DdlError`]. The full-equality gate rejects any type
-//! change that requires re-encoding existing rows, including a parameter
-//! change (`VECTOR(384)` to `VECTOR(768)`) that shares a discriminant with
-//! the current type. Version bump, persist, and audit are unchanged, as is
-//! the `ALTER COLLECTION` command tag.
+//! The result type is the protocol-neutral [`DdlResult`] / [`DdlError`]. The
+//! full-equality gate rejects any type change that requires re-encoding
+//! existing rows, including a parameter change (`VECTOR(384)` to
+//! `VECTOR(768)`) that shares a discriminant with the current type. Version
+//! bump, persist, and audit run here, and the command tag is
+//! `ALTER COLLECTION`.
 
 use std::str::FromStr;
 

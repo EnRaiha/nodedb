@@ -5,6 +5,8 @@ use tracing::debug;
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::redo_image::StoredRow;
+use crate::data::executor::enforcement::unique::PostImage;
 use crate::data::executor::enforcement::write_hook;
 use crate::data::executor::handlers::partial_refusal::refusal_after_partial_apply;
 use crate::data::executor::handlers::point::update_reindex::NonbitemporalUpdateReindex;
@@ -16,7 +18,7 @@ use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::{OllpPredictedEdge, ResolvedSumTarget, ReturningSpec};
 
-use super::update_project::{ProjectUpdateRows, ProjectedUpdateRow};
+use super::update_project::{MatchedRows, ProjectUpdateRows, ProjectedUpdateRow};
 
 /// Parameters for a bulk update operation.
 pub(in crate::data::executor) struct BulkUpdateParams<'a> {
@@ -178,13 +180,10 @@ impl CoreLoop {
 
         // Apply updates to each matching document.
         let mut affected = 0u64;
-        // One post-apply `Put` redo entry per updated row on a vector collection.
-        // Each row's `sparse.put` above reconciled storage + the btree/FTS/graph
-        // overlays but minted no WAL redo carrying the new body, so a WAL-only
-        // restart would rebuild the HNSW from the pre-update `Put` records and
-        // resurrect the stale embeddings. Carrying the surrogate + post-image back
-        // lets the Control Plane mint a durable `Put` redo per row. Only populated
-        // when the collection has a vector index.
+        // One post-apply `Put` redo entry per updated row, in commit order,
+        // each followed by the target rows its fold rewrote. The plan carries
+        // no pre-dispatch record, so these entries are the rows' only WAL
+        // record. A refusal after a row landed carries them too.
         let mut write_set: Vec<WriteSetEntry> = Vec::new();
         let mut returned_docs: Vec<nodedb_types::Value> = if returning.is_some() {
             Vec::with_capacity(apply_ids.len())
@@ -200,7 +199,7 @@ impl CoreLoop {
             database_id,
             tid,
             collection,
-            doc_ids: &apply_ids,
+            rows: MatchedRows::Stored(&apply_ids),
             updates,
             strict_schema: strict_schema.as_ref(),
             declared_primary_key,
@@ -208,6 +207,21 @@ impl CoreLoop {
             Ok(projected) => projected,
             Err(e) => return self.response_error(task, e),
         };
+
+        // UNIQUE over the statement's post-state, before any row lands: a
+        // value one matched row releases is free for another, and two matched
+        // rows claiming one value are refused.
+        let post_images: Vec<PostImage<'_>> = projected
+            .iter()
+            .map(|row| PostImage {
+                surrogate: row.key.surrogate().as_u32(),
+                doc: Some(&row.doc),
+                judged: true,
+            })
+            .collect();
+        if let Err(e) = self.check_unit_unique(database_id, tid, collection, &post_images) {
+            return self.response_error(task, e);
+        }
 
         // BALANCED over the statement's whole matched set. An update takes the
         // old amount off its group and puts the new one on, so an update that
@@ -276,15 +290,33 @@ impl CoreLoop {
                 // the predicate's matches were rewritten. The row's own
                 // transaction did not commit, but earlier rows did.
                 Err(e) if affected > 0 => {
-                    return self
-                        .response_error(task, refusal_after_partial_apply(ErrorCode::from(e)));
+                    let code = refusal_after_partial_apply(ErrorCode::from(e));
+                    return self.refusal_with_landed_rows(task, code, write_set);
                 }
                 Err(e) => return self.response_error(task, e),
             };
-            // One durable redo entry per derived target row, naming the
-            // TARGET collection: the statement's own redo describes the
-            // source row only, so without these a WAL-only restart
-            // leaves every total as it stood before the statement.
+            // The identity is the one INSERT minted: the declared primary
+            // key when the collection declares one, else the decimal
+            // surrogate. The event and the redo entry name the row by it.
+            let row_identity = stored_row_identity(
+                &updated_bytes,
+                strict_schema.as_ref(),
+                declared_primary_key,
+                storage_key,
+            );
+            // The row's post-image, then one durable redo entry per derived
+            // target row, naming the TARGET collection.
+            write_set.push(self.stored_row_image(
+                StoredRow {
+                    database_id,
+                    tid,
+                    collection,
+                    surrogate: storage_key.surrogate().as_u32(),
+                    identity: row_identity.clone(),
+                },
+                &updated_bytes,
+                None,
+            ));
             write_set.extend(write_hook::target_write_set(&target_writes));
             // Published only after the commit succeeded — the same
             // ordering the reindex helper used when it owned the
@@ -325,7 +357,8 @@ impl CoreLoop {
                 })
             {
                 // The row's body already committed.
-                return self.response_error(task, refusal_after_partial_apply(ErrorCode::from(e)));
+                let code = refusal_after_partial_apply(ErrorCode::from(e));
+                return self.refusal_with_landed_rows(task, code, write_set);
             }
             // Emit an update event per affected row to the Event Plane,
             // so AFTER-UPDATE triggers and CDC/change-stream consumers
@@ -339,15 +372,6 @@ impl CoreLoop {
             // metadata reconstructed only when the live per-row events
             // were lost — the live path always emits per row.
             //
-            // The identity is the one INSERT minted: the declared primary
-            // key when the collection declares one, else the decimal
-            // surrogate. The redo entry below journals the same identity.
-            let row_identity = stored_row_identity(
-                &updated_bytes,
-                strict_schema.as_ref(),
-                declared_primary_key,
-                storage_key,
-            );
             // `row_identity` is read again below for `RETURNING`'s `id` field,
             // so the event-emit boundary gets a clone rather than the move.
             self.emit_put_event(
@@ -367,52 +391,35 @@ impl CoreLoop {
                 returning_doc::attach_row_id(&mut row, &row_identity);
                 returned_docs.push(row);
             }
-            // Carry the surrogate + post-image back for a post-apply
-            // `Put` redo. `updated_bytes` is moved as its last use;
-            // gated on `has_vectors` so a non-vector collection pays
-            // nothing.
-            if has_vectors {
-                write_set.push(WriteSetEntry {
-                    surrogate: surrogate.as_u32(),
-                    identity: row_identity,
-                    is_delete: false,
-                    value: updated_bytes,
-                    collection: None,
-                });
-            }
         }
 
         debug!(core = self.core_id, %collection, affected, "bulk update complete");
 
+        // Every matched row committed, so an encode error answers with the
+        // rows' entries as well.
         let mut response = if let Some(spec) = returning {
             match returning_rows::build_rows_payload(spec, rls_filters, &returned_docs) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("RETURNING encode: {e}"),
-                        },
-                    );
-                }
+                Err(e) => self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("RETURNING encode: {e}"),
+                    },
+                ),
             }
         } else {
             let result = serde_json::json!({ "affected": affected });
             match response_codec::encode_json_as_msgpack(&result) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
-                }
+                Err(e) => self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: e.to_string(),
+                    },
+                ),
             }
         };
-        if !write_set.is_empty() {
-            response.write_set = write_set;
-        }
+        response.write_set = write_set;
         response
     }
 }

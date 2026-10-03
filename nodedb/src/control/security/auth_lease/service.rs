@@ -18,6 +18,11 @@
 //! meanwhile answers `NotLeader`, so no lease it grants and no barrier it
 //! releases outlives its term unseen.
 //!
+//! Each reply has a deadline: the leader budget of [`LeaseTiming`] after the
+//! request arrived, or after a barrier's own wait. It ends a reply margin
+//! before the holder's read timeout, so the reply arrives before the holder
+//! gives up.
+//!
 //! A leader that is the only voter of the metadata group pins its own lease
 //! (see [`super::table`]). No other node can lead the group then, so every
 //! barrier releases here, and each one waits for this node's coverage.
@@ -103,8 +108,13 @@ impl LeaderLeaseService {
         edit(table);
     }
 
-    /// Make the table of `term` current and load its floors.
-    async fn table_ready(&self, state: &SharedState, term: u64) -> crate::Result<()> {
+    /// Make the table of `term` current and load its floors by `reply_by`.
+    async fn table_ready(
+        &self,
+        state: &SharedState,
+        term: u64,
+        reply_by: Instant,
+    ) -> crate::Result<()> {
         {
             let mut table = self.table();
             if table.as_ref().is_none_or(|t| t.term() != term) {
@@ -122,7 +132,7 @@ impl LeaderLeaseService {
         {
             return Ok(());
         }
-        let floors = self.load_floors(state).await?;
+        let floors = self.load_floors(state, reply_by).await?;
         if let Some(table) = self.table().as_mut().filter(|t| t.term() == term) {
             table.load_floors(&floors);
         }
@@ -130,13 +140,16 @@ impl LeaderLeaseService {
         Ok(())
     }
 
-    /// The floors a new term starts from.
-    async fn load_floors(&self, state: &SharedState) -> crate::Result<Vec<GroupCoverage>> {
-        let timeout = self.timing.lease;
-        let metadata = confirmed_read_index(state, METADATA_GROUP_ID, timeout).await?;
+    /// The floors a new term starts from, loaded by `reply_by`.
+    async fn load_floors(
+        &self,
+        state: &SharedState,
+        reply_by: Instant,
+    ) -> crate::Result<Vec<GroupCoverage>> {
+        let metadata = confirmed_read_index(state, METADATA_GROUP_ID, time_left(reply_by)).await?;
         // The source set comes from tree definitions, which live in the
         // metadata group. Apply it through the read index first.
-        wait_applied(state, METADATA_GROUP_ID, metadata, timeout).await?;
+        wait_applied(state, METADATA_GROUP_ID, metadata, time_left(reply_by)).await?;
         apply_committed_tree_defs(state).await;
 
         let mut groups: HashSet<u64> = HashSet::new();
@@ -144,6 +157,7 @@ impl LeaderLeaseService {
             groups.insert(group_of_vshard(state, vshard_id)?);
         }
         groups.insert(SEQUENCER_GROUP_ID);
+        let timeout = time_left(reply_by);
         let group_floors = try_join_all(groups.into_iter().map(|group_id| async move {
             confirmed_read_index(state, group_id, timeout)
                 .await
@@ -160,27 +174,25 @@ impl LeaderLeaseService {
     }
 
     /// Whether this node still leads the metadata group in `term`, confirmed
-    /// against a quorum now.
-    async fn confirm_leadership(&self, state: &SharedState, term: u64) -> bool {
-        confirmed_read_index(state, METADATA_GROUP_ID, self.timing.lease)
+    /// against a quorum by `reply_by`.
+    async fn confirm_leadership(&self, state: &SharedState, term: u64, reply_by: Instant) -> bool {
+        confirmed_read_index(state, METADATA_GROUP_ID, time_left(reply_by))
             .await
             .is_ok()
             && leading_term(state) == Some(term)
     }
 
     fn not_leader_renewal(state: Option<&SharedState>) -> AuthLeaseRenewResponse {
+        let (leader_hint, term) = state.map_or((None, 0), leader_hint);
         AuthLeaseRenewResponse {
-            outcome: AuthLeaseRenewOutcome::NotLeader {
-                leader_hint: state.and_then(leader_hint),
-            },
+            outcome: AuthLeaseRenewOutcome::NotLeader { leader_hint, term },
         }
     }
 
     fn not_leader_barrier(state: Option<&SharedState>) -> AuthBarrierResponse {
+        let (leader_hint, term) = state.map_or((None, 0), leader_hint);
         AuthBarrierResponse {
-            outcome: AuthBarrierOutcome::NotLeader {
-                leader_hint: state.and_then(leader_hint),
-            },
+            outcome: AuthBarrierOutcome::NotLeader { leader_hint, term },
         }
     }
 
@@ -192,7 +204,8 @@ impl LeaderLeaseService {
         let Some(term) = leading_term(&state) else {
             return Self::not_leader_renewal(Some(&state));
         };
-        if let Err(error) = self.table_ready(&state, term).await {
+        let reply_by = Instant::now() + self.timing.leader_budget();
+        if let Err(error) = self.table_ready(&state, term, reply_by).await {
             if self
                 .withheld_warnings
                 .should_warn(req.node_id, Instant::now())
@@ -251,7 +264,7 @@ impl LeaderLeaseService {
         self.changed.notify_waiters();
         let outcome = match decision {
             RenewDecision::Withheld => AuthLeaseRenewOutcome::Withheld,
-            RenewDecision::Granted if self.confirm_leadership(&state, term).await => {
+            RenewDecision::Granted if self.confirm_leadership(&state, term, reply_by).await => {
                 AuthLeaseRenewOutcome::Granted {
                     lease_ms: u64::try_from(self.timing.lease.as_millis()).unwrap_or(u64::MAX),
                 }
@@ -268,6 +281,7 @@ impl LeaderLeaseService {
     pub async fn hold_barrier(&self, req: AuthBarrierRequest) -> AuthBarrierResponse {
         let started = Instant::now();
         let deadline = started + Duration::from_millis(req.timeout_ms);
+        let reply_by = deadline + self.timing.leader_budget();
         let timed_out = || AuthBarrierResponse {
             outcome: AuthBarrierOutcome::Timeout {
                 waited_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -280,7 +294,7 @@ impl LeaderLeaseService {
             let Some(term) = leading_term(&state) else {
                 return Self::not_leader_barrier(Some(&state));
             };
-            if let Err(error) = self.table_ready(&state, term).await {
+            if let Err(error) = self.table_ready(&state, term, reply_by).await {
                 tracing::debug!(%error, "authorization barrier: floors not loaded yet");
                 if Instant::now() >= deadline {
                     return timed_out();
@@ -305,7 +319,7 @@ impl LeaderLeaseService {
             };
             match status {
                 BarrierState::Released => {
-                    return if self.confirm_leadership(&state, term).await {
+                    return if self.confirm_leadership(&state, term, reply_by).await {
                         AuthBarrierResponse {
                             outcome: AuthBarrierOutcome::Released,
                         }
@@ -332,6 +346,11 @@ impl LeaderLeaseService {
             }
         }
     }
+}
+
+/// Time left until `reply_by`, zero once it passed.
+fn time_left(reply_by: Instant) -> Duration {
+    reply_by.saturating_duration_since(Instant::now())
 }
 
 #[async_trait::async_trait]

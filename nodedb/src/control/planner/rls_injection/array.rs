@@ -35,7 +35,7 @@ pub(super) fn inject_array(_ctx: &RlsCtx<'_>, op: &ArrayOp) -> crate::Result<()>
         | ArrayOp::Flush { .. }
         | ArrayOp::Compact { .. }
         | ArrayOp::DropArray { .. }
-        | ArrayOp::RestoreArrayDrop { .. }
+        | ArrayOp::RekeyArray { .. }
         | ArrayOp::PurgeArrayDrop { .. } => Ok(()),
     }
 }
@@ -55,12 +55,13 @@ pub(super) fn inject_cluster_array(_ctx: &RlsCtx<'_>, op: &ClusterArrayOp) -> cr
 /// Exhaustive over [`ClusterEventOp`].
 pub(super) fn inject_cluster_event(_ctx: &RlsCtx<'_>, op: &ClusterEventOp) -> crate::Result<()> {
     match op {
-        // No-op: a stream consume is addressed by `(stream, group)` and a
-        // topic publish by topic name — neither names a collection this pass
-        // could resolve a policy against. Access to a stream or topic is
-        // authorized on the stream/topic object itself.
+        // No-op: a stream consume is addressed by `(stream, group)`, which
+        // names no collection this pass can resolve a policy against.
+        // Access to a stream is authorized on the stream object itself.
         ClusterEventOp::ConsumeStream { .. }
-        | ClusterEventOp::PublishTopic { .. }
-        | ClusterEventOp::TenantWriteMarks { .. } => Ok(()),
+        | ClusterEventOp::TenantWriteMarks { .. }
+        | ClusterEventOp::SurrogateBinds { .. }
+        | ClusterEventOp::MetadataApplied { .. }
+        | ClusterEventOp::SurrogateHolders { .. } => Ok(()),
     }
 }

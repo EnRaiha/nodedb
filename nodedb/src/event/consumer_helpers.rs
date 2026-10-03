@@ -103,4 +103,13 @@ pub fn flush_watermark(shared: &SharedState, store: &WatermarkStore, core_id: us
     {
         warn!(core_id, lsn = lsn.as_u64(), error = %e, "sink ledger keys not pruned");
     }
+    // Catch-up never rebuilds a record at or below the persisted watermark,
+    // so the core's install outcomes up to it are spent.
+    let outcomes =
+        crate::engine::timeseries::install_outcome::outcome_dir(&shared.data_dir, core_id);
+    if let Err(e) =
+        crate::engine::timeseries::install_outcome::prune_outcomes_through(&outcomes, lsn.as_u64())
+    {
+        warn!(core_id, lsn = lsn.as_u64(), error = %e, "timeseries install outcomes not pruned");
+    }
 }

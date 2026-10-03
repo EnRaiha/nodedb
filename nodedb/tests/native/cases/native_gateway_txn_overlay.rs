@@ -241,7 +241,7 @@ async fn native_commit_makes_strict_row_visible_to_every_read_path() {
         server
             .shared
             .surrogate_assigner
-            .lookup(
+            .lookup_bound(
                 nodedb_types::CollectionKey::from_bare(
                     nodedb_types::DatabaseId::DEFAULT,
                     "native_committed_visibility"

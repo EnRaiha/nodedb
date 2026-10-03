@@ -15,21 +15,47 @@ use super::super::loop_core::{CommitApplier, RaftLoop};
 use super::membership::TOPOLOGY_GROUP_ID;
 
 impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
-    pub(super) fn handle_append_entries_rpc(&self, req: AppendEntriesRequest) -> Result<RaftRpc> {
-        let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-        let resp = mr.handle_append_entries(&req)?;
-        // Persist any term bump (become_follower) durably before the
-        // reply leaves this node, so a restart cannot forget it.
-        mr.persist_group_hard_state(req.group_id)?;
+    /// The leader counts a successful answer as this node holding the
+    /// claimed entries durably. The answer waits only for what it claims:
+    /// - the latest term and vote, whoever staged them
+    /// - the entries and truncations this request staged, with every write
+    ///   staged before them
+    ///
+    /// A request that staged no entries claims only the durable prefix. It
+    /// never waits on writes the apply loop staged. The disk wait runs
+    /// without the `MultiRaft` lock.
+    pub(super) async fn handle_append_entries_rpc(
+        &self,
+        req: AppendEntriesRequest,
+    ) -> Result<RaftRpc> {
+        let (resp, ticket) = {
+            let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
+            let mark = mr.staged_through(req.group_id);
+            let resp = mr.handle_append_entries(&req)?;
+            mr.persist_group_hard_state(req.group_id)?;
+            (resp, mr.reply_ticket(req.group_id, mark))
+        };
+        if let Some(ticket) = ticket {
+            ticket.durable().await?;
+        }
         Ok(RaftRpc::AppendEntriesResponse(resp))
     }
 
-    pub(super) fn handle_request_vote_rpc(&self, req: RequestVoteRequest) -> Result<RaftRpc> {
-        let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-        let resp = mr.handle_request_vote(&req)?;
-        // Persist voted_for/current_term to stable storage BEFORE the
-        // grant leaves this node, so a restart cannot double-vote.
-        mr.persist_group_hard_state(req.group_id)?;
+    /// `voted_for` and `current_term` are durable before the answer leaves
+    /// this node, so a restart cannot double-vote. A repeated request that
+    /// staged nothing still waits for a vote an earlier one staged. The disk
+    /// wait runs without the `MultiRaft` lock.
+    pub(super) async fn handle_request_vote_rpc(&self, req: RequestVoteRequest) -> Result<RaftRpc> {
+        let (resp, ticket) = {
+            let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
+            let mark = mr.staged_through(req.group_id);
+            let resp = mr.handle_request_vote(&req)?;
+            mr.persist_group_hard_state(req.group_id)?;
+            (resp, mr.reply_ticket(req.group_id, mark))
+        };
+        if let Some(ticket) = ticket {
+            ticket.durable().await?;
+        }
         Ok(RaftRpc::RequestVoteResponse(resp))
     }
 
@@ -108,6 +134,12 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         let last_included_index = req.last_included_index;
         let group_id = req.group_id;
 
+        // The snapshot covers conf changes this node never applies. The
+        // final chunk carries the membership they produced.
+        if req.done {
+            self.adopt_snapshot_membership(&req).await?;
+        }
+
         // Route through the chunk accumulator when a data directory is
         // configured. The accumulator writes chunks to a `.partial` file,
         // validates the full CRC on the final chunk, and then calls
@@ -131,12 +163,18 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             )
             .await
             {
-                Ok(crate::install_snapshot::ChunkOutcome::Committed(snap_resp)) => {
-                    // Final chunk committed — bump watcher for metadata group.
-                    if group_id == TOPOLOGY_GROUP_ID {
+                Ok(crate::install_snapshot::ChunkOutcome::Committed(committed)) => {
+                    // The watcher means "state visible through N". It moves
+                    // only when the host state machine holds the snapshot.
+                    // Data-group watchers are bumped by the host apply loop.
+                    if group_id == TOPOLOGY_GROUP_ID && committed.state_installed {
                         self.group_watchers.bump(group_id, last_included_index);
                     }
-                    return Ok(RaftRpc::InstallSnapshotResponse(snap_resp));
+                    // The leader resumes replication after the snapshot index
+                    // once this answer arrives, so the new boundary and any
+                    // term bump are durable first.
+                    self.await_group_durable(group_id).await?;
+                    return Ok(RaftRpc::InstallSnapshotResponse(committed.response));
                 }
                 Ok(crate::install_snapshot::ChunkOutcome::Pending) => {
                     // Non-final chunk — pass a done=false stub to MultiRaft so
@@ -151,14 +189,17 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                         done: false,
                         group_id,
                         total_size: 0,
+                        voters: Vec::new(),
+                        learners: Vec::new(),
                     };
                     let resp = {
                         let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
                         let resp = mr.handle_install_snapshot(&pending_req)?;
-                        // Persist any term bump before replying.
                         mr.persist_group_hard_state(group_id)?;
                         resp
                     };
+                    // Any term bump is durable before the reply.
+                    self.await_group_durable(group_id).await?;
                     return Ok(RaftRpc::InstallSnapshotResponse(resp));
                 }
                 Err(e @ crate::error::ClusterError::SnapshotOffsetRegression { .. }) => {
@@ -188,52 +229,42 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         let resp = {
             let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
             let resp = mr.handle_install_snapshot(&req)?;
-            // Persist any term bump before replying.
             mr.persist_group_hard_state(group_id)?;
             resp
         };
-        // Watcher contract: `applied_index` means "state visible
-        // on this node up to index N", NOT "raft has advanced to
-        // N". Bumping the watcher must therefore mirror actual
-        // state-machine progress.
-        //
-        // - Metadata group: `mr.handle_install_snapshot` restores
-        //   the metadata state machine synchronously before
-        //   returning, so the watcher can be bumped here — state
-        //   IS visible at `last_included_index`.
-        //
-        // - Data groups: snapshot install fast-forwards raft's
-        //   `last_applied` but does NOT restore the data-plane
-        //   state machine (no committed entries are produced for
-        //   `run_apply_loop`, and there is currently no
-        //   data-group state-machine snapshot restore path).
-        //   Bumping the watcher here would wake waiters that
-        //   then read missing state — silent data-loss-shaped
-        //   bug. The data-group watcher is bumped only by the
-        //   host crate's apply loop after the SPSC round-trip
-        //   completes; that path is the single source of truth
-        //   for "state visible".
-        //
-        // When data-group state-machine snapshots are
-        // implemented, the restore path must bump the watcher
-        // itself — not this handler.
-        if group_id == TOPOLOGY_GROUP_ID {
-            self.group_watchers.bump(group_id, last_included_index);
-        }
+        // Any term bump is durable before the reply.
+        self.await_group_durable(group_id).await?;
+        // No host state machine restores anything on this path, so no
+        // watcher moves: the watcher means "state visible through N".
         Ok(RaftRpc::InstallSnapshotResponse(resp))
     }
 
+    /// Wait until every write `group_id` staged so far is durable. Takes the
+    /// ticket under the `MultiRaft` lock and waits without it.
+    async fn await_group_durable(&self, group_id: u64) -> Result<()> {
+        let ticket = self
+            .multi_raft
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .durability_ticket(group_id);
+        match ticket {
+            Some(ticket) => ticket.durable().await,
+            None => Ok(()),
+        }
+    }
+
+    /// A TimeoutNow triggers an immediate election: a term bump and a
+    /// self-vote. The hard state is staged here. The tick loop sends the
+    /// resulting vote requests only once the group's staged writes are
+    /// durable, so a restart cannot forget the term.
     pub(super) async fn on_timeout_now_impl(&self, req: TimeoutNowRequest) {
         let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
         mr.handle_timeout_now(&req);
-        // A TimeoutNow triggers an immediate election (term bump + self-vote);
-        // persist that HardState before the resulting vote requests are
-        // dispatched by the tick loop, so a restart cannot forget the term.
         if let Err(e) = mr.persist_group_hard_state(req.group_id) {
             tracing::error!(
                 group_id = req.group_id,
                 error = %e,
-                "failed to persist hard state after timeout-now election trigger"
+                "failed to stage hard state after timeout-now election trigger"
             );
         }
     }

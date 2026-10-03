@@ -8,107 +8,34 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use nodedb::bridge::dispatch::Dispatcher;
 use nodedb::config::auth::AuthMode;
 use nodedb::control::server::listener::Listener;
-use nodedb::control::state::SharedState;
-use nodedb::data::executor::core_loop::CoreLoop;
-use nodedb::event::{EventPlane, EventPlaneConfig, create_event_bus};
-use nodedb::wal::WalManager;
+use nodedb_test_support::booted_state::{BootOptions, BootedState};
 
-/// A minimal NodeDB server with the native protocol listener running.
+/// A one-node cluster with the native protocol listener running.
 struct NativeTestServer {
     addr: std::net::SocketAddr,
-    shared: Arc<SharedState>,
+    shared: BootedState,
     shutdown_bus: nodedb::control::shutdown::ShutdownBus,
-    poller_shutdown_tx: tokio::sync::watch::Sender<bool>,
-    core_stop_tx: std::sync::mpsc::Sender<()>,
     _listener_handle: tokio::task::JoinHandle<()>,
-    _poller_handle: tokio::task::JoinHandle<()>,
-    _core_handle: tokio::task::JoinHandle<()>,
-    _event_plane: EventPlane,
-    _dir: tempfile::TempDir,
 }
 
 impl NativeTestServer {
     async fn start() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let wal_path = dir.path().join("test.wal");
-        let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
-
-        let (dispatcher, data_sides) = Dispatcher::new(1, 64);
-        let (event_producers, event_consumers) = create_event_bus(1);
-
-        let shared = SharedState::new(dispatcher, Arc::clone(&wal)).unwrap();
-        // The same gateway install production boot runs.
-        nodedb::bootstrap::state_wiring::install_gateway(&shared);
+        let shared = BootedState::boot(BootOptions::default());
         shared
             .credentials
             .bootstrap_trust_superuser("nodedb")
             .expect("bootstrap trust superuser");
-
-        let data_side = data_sides.into_iter().next().unwrap();
-        let core_dir = dir.path().to_path_buf();
-        let event_producer = event_producers.into_iter().next().unwrap();
-        let core_array_catalog = shared.array_catalog.clone();
-        let (core_stop_tx, core_stop_rx) = std::sync::mpsc::channel::<()>();
-        let _core_handle = tokio::task::spawn_blocking(move || {
-            let mut core = CoreLoop::open_with_array_catalog(
-                0,
-                data_side.request_rx,
-                data_side.response_tx,
-                &core_dir,
-                std::sync::Arc::new(nodedb_types::OrdinalClock::new()),
-                nodedb::data::executor::core_loop::test_governor(),
-                core_array_catalog,
-            )
-            .unwrap();
-            core.set_event_producer(event_producer);
-            while matches!(
-                core_stop_rx.try_recv(),
-                Err(std::sync::mpsc::TryRecvError::Empty)
-            ) {
-                core.tick();
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        });
-
-        let shared_poller = Arc::clone(&shared);
-        let (poller_shutdown_tx, mut poller_shutdown_rx) = tokio::sync::watch::channel(false);
-        let _poller_handle = tokio::spawn(async move {
-            loop {
-                shared_poller.poll_and_route_responses();
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(1)) => {}
-                    _ = poller_shutdown_rx.changed() => break,
-                }
-            }
-        });
-
-        let watermark_store =
-            Arc::new(nodedb::event::watermark::WatermarkStore::open(dir.path()).unwrap());
-        let trigger_dlq = Arc::new(std::sync::Mutex::new(
-            nodedb::event::trigger::TriggerDlq::open(dir.path()).unwrap(),
-        ));
         let (shutdown_bus, _) =
             nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&shared.shutdown));
-        let _event_plane = EventPlane::spawn(EventPlaneConfig {
-            consumers_rx: event_consumers,
-            wal: Arc::clone(&wal),
-            watermark_store,
-            shared_state: Arc::clone(&shared),
-            trigger_dlq,
-            cdc_router: Arc::clone(&shared.cdc_router),
-            shutdown: Arc::clone(&shared.shutdown),
-            shutdown_bus: shutdown_bus.clone(),
-        });
 
         let listener = Listener::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
         let addr = listener.local_addr();
 
-        let shared_listener = Arc::clone(&shared);
+        let shared_listener = Arc::clone(&*shared);
         let test_startup_gate = Arc::clone(&shared.startup);
         let bus_listener = shutdown_bus.clone();
         let _listener_handle = tokio::spawn(async move {
@@ -135,20 +62,13 @@ impl NativeTestServer {
             addr,
             shared,
             shutdown_bus,
-            poller_shutdown_tx,
-            core_stop_tx,
             _listener_handle,
-            _poller_handle,
-            _core_handle,
-            _event_plane,
-            _dir: dir,
         }
     }
 
+    /// Stop the listener, then the node. Dropping `shared` stops the node.
     async fn shutdown(self) {
         self.shutdown_bus.initiate();
-        let _ = self.poller_shutdown_tx.send(true);
-        let _ = self.core_stop_tx.send(());
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

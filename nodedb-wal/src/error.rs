@@ -159,6 +159,34 @@ pub enum WalError {
         found_lsn: u64,
     },
 
+    /// The last segment starts at or below an LSN an earlier segment already
+    /// holds. An interrupted roll created it while the earlier segment stayed
+    /// active. Resuming it would reissue LSNs, so the WAL refuses to open.
+    #[error(
+        "WAL segment {path} starts at LSN {first_lsn}, but {previous_path} already holds \
+         records through LSN {previous_last_lsn}; resuming would reissue those LSNs. \
+         {path} was created by an interrupted segment roll: check that it holds no \
+         records, remove it, and restart"
+    )]
+    SegmentOverlapsPrevious {
+        path: String,
+        first_lsn: u64,
+        previous_path: String,
+        previous_last_lsn: u64,
+    },
+
+    /// A segment roll failed, and removing the segment file it created also
+    /// failed. The next open refuses that file with `SegmentOverlapsPrevious`.
+    #[error(
+        "WAL segment roll failed: {roll}; removing the unused segment {path} also failed: \
+         {cleanup}"
+    )]
+    RollCleanupFailed {
+        path: String,
+        roll: Box<WalError>,
+        cleanup: Box<WalError>,
+    },
+
     /// A replay was asked for the suffix starting at `from_lsn`, but the WAL
     /// no longer retains it: checkpoint truncation has already deleted every
     /// segment below `retained_floor_lsn`.

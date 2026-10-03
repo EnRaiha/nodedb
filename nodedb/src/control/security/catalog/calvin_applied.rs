@@ -101,6 +101,39 @@ impl SystemCatalog {
         }))
     }
 
+    /// Replace the saved state of each vShard in `states` with the given one.
+    ///
+    /// A data-group snapshot install replaces the vShard's storage with the
+    /// leader's, so the applied state it brought replaces this node's: a
+    /// position this node applied and the snapshot does not hold is no
+    /// longer applied here.
+    pub fn replace_calvin_applied(&self, states: &[StoredCalvinApplied]) -> crate::Result<()> {
+        if states.is_empty() {
+            return Ok(());
+        }
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| catalog_err("replace_calvin_applied txn", e))?;
+        {
+            let mut table = write_txn
+                .open_table(CALVIN_APPLIED)
+                .map_err(|e| catalog_err("open calvin_applied", e))?;
+            for state in states {
+                let tail = encode_tail(&state.tail)?;
+                table
+                    .insert(
+                        state.vshard_id,
+                        (state.fully_applied_epoch, tail.as_slice()),
+                    )
+                    .map_err(|e| catalog_err("insert calvin_applied", e))?;
+            }
+        }
+        write_txn
+            .commit()
+            .map_err(|e| catalog_err("commit calvin_applied", e))
+    }
+
     /// Save `states` in one transaction. Each is merged with the state
     /// already saved for its vShard, so the saved state only grows.
     pub fn save_calvin_applied(&self, states: Vec<StoredCalvinApplied>) -> crate::Result<()> {

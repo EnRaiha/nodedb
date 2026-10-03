@@ -4,8 +4,6 @@
 
 use std::sync::Arc;
 
-use crate::control::security::credential::CredentialStore;
-
 use super::super::catalog_inputs::CatalogInputs;
 
 /// Query context for the Control Plane.
@@ -18,14 +16,14 @@ use super::super::catalog_inputs::CatalogInputs;
 /// The catalog adapter is **constructed per-plan**, not cached on
 /// the context, because the adapter's `recorded_versions` field
 /// is per-plan state. Holding a shared adapter across concurrent
-/// plans would interleave their recorded descriptor sets and
+/// plans will interleave their recorded descriptor sets and
 /// poison the plan-cache keys. The context stores the inputs
 /// needed to construct an adapter (credentials, optional
 /// `Weak<SharedState>` for lease integration, tenant id,
 /// retention registry) and builds a fresh one on every planning
 /// call.
 pub struct QueryContext {
-    pub(super) catalog_inputs: Option<CatalogInputs>,
+    pub(super) catalog_inputs: CatalogInputs,
     /// Retention policy registry for auto-tier routing.
     pub(super) retention_registry:
         Option<Arc<crate::engine::timeseries::retention_policy::RetentionPolicyRegistry>>,
@@ -35,11 +33,9 @@ pub struct QueryContext {
     pub(super) array_catalog: Option<crate::control::array_catalog::ArrayCatalogHandle>,
     /// WAL allocator — required by array DML for `wal_lsn` allocation.
     pub(super) wal: Option<Arc<crate::wal::WalManager>>,
-    /// Surrogate assigner — `Some` when the planner has access to
-    /// `SharedState` (production path); `None` only for legacy
-    /// `QueryContext::new()` test fixtures that never lower to
-    /// surrogate-bearing variants.
-    pub(super) surrogate_assigner: Option<Arc<crate::control::surrogate::SurrogateAssigner>>,
+    /// The node's surrogate assigner. Every write the planner lowers binds
+    /// its rows through it.
+    pub(super) surrogate_assigner: Arc<crate::control::surrogate::SurrogateAssigner>,
     /// Cluster mode flag — `true` when the node has a live cluster
     /// topology. Passed into `ConvertContext` so array converters can
     /// emit `ClusterArray` variants instead of local `Array` variants.
@@ -108,63 +104,52 @@ pub struct QueryContext {
 }
 
 impl QueryContext {
-    /// Create a new query context without catalog integration.
-    pub fn new() -> Self {
-        Self {
-            catalog_inputs: None,
-            retention_registry: None,
-            array_catalog: None,
-            wal: None,
-            surrogate_assigner: None,
-            cluster_enabled: false,
-            bitemporal_retention_registry: None,
-            max_vector_dim: std::sync::atomic::AtomicU32::new(0),
-            force_shuffle_join: std::sync::atomic::AtomicBool::new(false),
-            shuffle_num_parts: std::sync::atomic::AtomicU32::new(0),
-            force_shuffle_agg: std::sync::atomic::AtomicBool::new(false),
-            shuffle_agg_num_parts: std::sync::atomic::AtomicU32::new(0),
-            broadcast_threshold_bytes: std::sync::atomic::AtomicUsize::new(
-                default_broadcast_threshold_bytes(),
-            ),
-            shuffle_agg_threshold: std::sync::atomic::AtomicUsize::new(
-                super::tuning::DEFAULT_SHUFFLE_AGG_THRESHOLD,
-            ),
-            session_sequences: std::sync::Mutex::new(None),
-        }
-    }
-
     /// Create a query context from `SharedState` without lease
     /// integration. Used by internal sub-planners (neutral DDL
     /// readback queries — check constraints, type guards, ANALYZE,
     /// COPY TO, materialized view refresh — plus procedural DML,
     /// event trigger dispatch, and graph scatter-gather hops) that
     /// run inside a handler whose outer query already acquired
-    /// leases. Re-acquiring via a sub-planner would be redundant —
-    /// the lease store's fast path would return instantly anyway,
+    /// leases. Re-acquiring via a sub-planner is redundant —
+    /// the lease store's fast path returns instantly anyway,
     /// but going through the sub-planner without a direct
-    /// `Arc<SharedState>` reference would require threading one
+    /// `Arc<SharedState>` reference will require threading one
     /// through every call site.
     pub fn for_state(state: &crate::control::state::SharedState) -> Self {
-        let mut ctx = Self::with_catalog(
-            Arc::clone(&state.credentials),
-            Some(Arc::clone(&state.retention_policy_registry)),
-        );
-        ctx.surrogate_assigner = Some(Arc::clone(&state.surrogate_assigner));
-        ctx.cluster_enabled = state.cluster_topology.is_some();
-        ctx.bitemporal_retention_registry = Some(Arc::clone(&state.bitemporal_retention_registry));
-        // max_vector_dim starts at 0 (unlimited); connection handlers call
-        // set_max_vector_dim before each planning call.
-        ctx.max_vector_dim
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        // Seed the broadcast-vs-shuffle byte threshold from the node's
-        // configured tuning default. Connection handlers re-resolve it per
-        // request (session override OR this default) via
-        // `set_broadcast_threshold_bytes`.
-        ctx.broadcast_threshold_bytes.store(
-            state.tuning.cluster_transport.broadcast_threshold_bytes,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        ctx
+        let retention = Some(Arc::clone(&state.retention_policy_registry));
+        Self {
+            catalog_inputs: CatalogInputs {
+                credentials: Arc::clone(&state.credentials),
+                array_catalog: state.array_catalog.clone(),
+                shared: None,
+                retention_policy_registry: retention.clone(),
+            },
+            retention_registry: retention,
+            // `SharedState` owns the array catalog from construction, so every
+            // context can plan array DML.
+            array_catalog: Some(state.array_catalog.clone()),
+            wal: None,
+            surrogate_assigner: Arc::clone(&state.surrogate_assigner),
+            cluster_enabled: state.cluster_topology.is_some(),
+            bitemporal_retention_registry: Some(Arc::clone(&state.bitemporal_retention_registry)),
+            // max_vector_dim starts at 0 (unlimited); connection handlers
+            // call set_max_vector_dim before each planning call.
+            max_vector_dim: std::sync::atomic::AtomicU32::new(0),
+            force_shuffle_join: std::sync::atomic::AtomicBool::new(false),
+            shuffle_num_parts: std::sync::atomic::AtomicU32::new(0),
+            force_shuffle_agg: std::sync::atomic::AtomicBool::new(false),
+            shuffle_agg_num_parts: std::sync::atomic::AtomicU32::new(0),
+            // Seeded from the node's configured tuning default. Connection
+            // handlers re-resolve it per request (session override OR this
+            // default) via `set_broadcast_threshold_bytes`.
+            broadcast_threshold_bytes: std::sync::atomic::AtomicUsize::new(
+                state.tuning.cluster_transport.broadcast_threshold_bytes,
+            ),
+            shuffle_agg_threshold: std::sync::atomic::AtomicUsize::new(
+                super::tuning::DEFAULT_SHUFFLE_AGG_THRESHOLD,
+            ),
+            session_sequences: std::sync::Mutex::new(None),
+        }
     }
 
     /// Create a query context with descriptor lease integration.
@@ -175,15 +160,16 @@ impl QueryContext {
     pub fn for_state_with_lease(state: &Arc<crate::control::state::SharedState>) -> Self {
         let retention = Some(Arc::clone(&state.retention_policy_registry));
         Self {
-            catalog_inputs: Some(CatalogInputs {
+            catalog_inputs: CatalogInputs {
                 credentials: Arc::clone(&state.credentials),
+                array_catalog: state.array_catalog.clone(),
                 shared: Some(Arc::downgrade(state)),
                 retention_policy_registry: retention.clone(),
-            }),
+            },
             retention_registry: retention,
             array_catalog: Some(state.array_catalog.clone()),
             wal: Some(Arc::clone(&state.wal)),
-            surrogate_assigner: Some(Arc::clone(&state.surrogate_assigner)),
+            surrogate_assigner: Arc::clone(&state.surrogate_assigner),
             cluster_enabled: state.cluster_topology.is_some(),
             bitemporal_retention_registry: Some(Arc::clone(&state.bitemporal_retention_registry)),
             // max_vector_dim is tenant-specific; callers supply it via
@@ -197,44 +183,6 @@ impl QueryContext {
             shuffle_agg_num_parts: std::sync::atomic::AtomicU32::new(0),
             broadcast_threshold_bytes: std::sync::atomic::AtomicUsize::new(
                 state.tuning.cluster_transport.broadcast_threshold_bytes,
-            ),
-            shuffle_agg_threshold: std::sync::atomic::AtomicUsize::new(
-                super::tuning::DEFAULT_SHUFFLE_AGG_THRESHOLD,
-            ),
-            session_sequences: std::sync::Mutex::new(None),
-        }
-    }
-
-    /// Create a query context with catalog integration but no
-    /// lease acquisition. Used by `for_state` and by callers
-    /// that construct a context without an `Arc<SharedState>`.
-    pub fn with_catalog(
-        credentials: Arc<CredentialStore>,
-        retention_policy_registry: Option<
-            Arc<crate::engine::timeseries::retention_policy::RetentionPolicyRegistry>,
-        >,
-    ) -> Self {
-        let catalog_inputs = Some(CatalogInputs {
-            credentials,
-            shared: None,
-            retention_policy_registry: retention_policy_registry.clone(),
-        });
-
-        Self {
-            catalog_inputs,
-            retention_registry: retention_policy_registry,
-            array_catalog: None,
-            wal: None,
-            surrogate_assigner: None,
-            cluster_enabled: false,
-            bitemporal_retention_registry: None,
-            max_vector_dim: std::sync::atomic::AtomicU32::new(0),
-            force_shuffle_join: std::sync::atomic::AtomicBool::new(false),
-            shuffle_num_parts: std::sync::atomic::AtomicU32::new(0),
-            force_shuffle_agg: std::sync::atomic::AtomicBool::new(false),
-            shuffle_agg_num_parts: std::sync::atomic::AtomicU32::new(0),
-            broadcast_threshold_bytes: std::sync::atomic::AtomicUsize::new(
-                default_broadcast_threshold_bytes(),
             ),
             shuffle_agg_threshold: std::sync::atomic::AtomicUsize::new(
                 super::tuning::DEFAULT_SHUFFLE_AGG_THRESHOLD,
@@ -265,18 +213,5 @@ impl QueryContext {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
-    }
-}
-
-/// The node-default broadcast threshold (bytes) for fixtures that have no
-/// `SharedState` tuning to read. Sourced from `ClusterTransportTuning::default()`
-/// so the planner default and the config default never drift.
-pub(super) fn default_broadcast_threshold_bytes() -> usize {
-    nodedb_types::config::tuning::ClusterTransportTuning::default().broadcast_threshold_bytes
-}
-
-impl Default for QueryContext {
-    fn default() -> Self {
-        Self::new()
     }
 }

@@ -19,7 +19,8 @@
 //! 4. decodes the inner frame and dispatches to the handler,
 //! 5. wraps the handler's response in its own authenticated envelope
 //!    with `from_node_id = local_node_id` and a fresh outbound seq for
-//!    the caller's id.
+//!    the caller's id. A handler error is answered with a typed
+//!    `RequestRefused` frame in place of the response.
 //!
 //! # Cooperative shutdown
 //!
@@ -40,18 +41,18 @@ use tracing::{debug, warn};
 use crate::error::{ClusterError, Result};
 use crate::forward::ChunkSink;
 use crate::rpc_codec::{
-    self, ExecuteStreamChunk, ExecuteStreamEnd, MAX_RPC_PAYLOAD_SIZE, RaftRpc, auth_envelope,
+    self, ExecuteStreamChunk, ExecuteStreamEnd, FrameRefusal, RaftRpc, RequestRefusal,
+    auth_envelope,
 };
 use crate::transport::auth_context::AuthContext;
-use crate::transport::identity_admission::enrollment_matches;
 use crate::transport::peer_identity_store::PeerIdentityStore;
-use crate::transport::peer_identity_verifier::{
-    IDENTITY_MISMATCH_QUIC_ERROR, VerifyOutcome, verify_peer_identity,
-};
 use crate::transport::rpc_handler::RaftRpcHandler;
 use crate::wire_version::handshake_io::{local_version_range, perform_version_handshake_server};
 
+use super::frame_io::{finish_stream, read_envelope, reply_and_finish, write_rpc_frame};
+use super::shuffle_drain::drain_shuffle_push;
 use super::stream_dispatch;
+use super::stream_identity::{reject_peer_identity, verify_stream_identity};
 
 /// Transport-local [`ChunkSink`] that writes one `RPC_EXECUTE_STREAM_CHUNK`
 /// envelope per chunk to a QUIC send stream.
@@ -79,22 +80,7 @@ impl ChunkSink for QuicChunkSink<'_> {
             payload,
             watermark_lsn,
         });
-        let inner = rpc_codec::encode(&rpc, &self.auth.epoch)?;
-        let seq = self.auth.peer_seq_out.next();
-        let mut envelope = Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + inner.len());
-        auth_envelope::write_envelope(
-            self.auth.local_node_id,
-            seq,
-            &inner,
-            &self.auth.mac_key,
-            &mut envelope,
-        )?;
-        self.send
-            .write_all(&envelope)
-            .await
-            .map_err(|e| ClusterError::Transport {
-                detail: format!("write stream chunk: {e}"),
-            })
+        write_rpc_frame(self.send, self.auth, &rpc, "stream chunk").await
     }
 }
 
@@ -228,14 +214,6 @@ struct StreamContext<H: RaftRpcHandler, S: PeerIdentityStore + ?Sized> {
     shutdown: watch::Receiver<bool>,
 }
 
-fn reject_peer_identity(conn: &quinn::Connection, node_id: u64) -> Result<()> {
-    warn!(node_id, "peer identity mismatch — closing connection");
-    conn.close(IDENTITY_MISMATCH_QUIC_ERROR, b"peer identity mismatch");
-    Err(ClusterError::Transport {
-        detail: format!("peer identity mismatch for node {node_id}"),
-    })
-}
-
 /// Handle a single bidi stream: read request → dispatch → write response.
 ///
 /// Every long-lived await is racing a shutdown signal — see the
@@ -267,8 +245,24 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore + ?Sized>(
         //    keeps the two flows from tripping on each other's entries —
         //    a self-addressed frame can't have been replayed by an
         //    external attacker by definition.
-        if fields.from_node_id != auth.local_node_id {
-            auth.peer_seq_in.accept(fields.from_node_id, fields.seq)?;
+        //    A refused frame is answered with a typed `FrameRefused`, never a
+        //    dropped stream: the MAC verified, so the sender is genuine and
+        //    its link is up. It retries under a fresh sequence number, and a
+        //    dropped stream would count against this node's health instead.
+        if fields.from_node_id != auth.local_node_id
+            && let Err(e) = auth.peer_seq_in.accept(fields.from_node_id, fields.seq)
+        {
+            debug!(
+                from_node_id = fields.from_node_id,
+                error = %e,
+                "raft RPC frame refused by the replay window"
+            );
+            let refusal = RaftRpc::FrameRefused(FrameRefusal {
+                detail: e.to_string(),
+            });
+            write_rpc_frame(&mut send, &auth, &refusal, "frame refusal").await?;
+            finish_stream(&mut send, "frame refusal")?;
+            return Ok::<(), ClusterError>(());
         }
 
         // 3. Decode before the identity decision so an unknown, CA-verified
@@ -277,51 +271,19 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore + ?Sized>(
         validate_join_sender(&request, fields.from_node_id)?;
 
         // 3b. Bind the MAC-authenticated node id to the mTLS leaf identity.
-        // Unknown identities may submit only a JoinRequest whose node id and
-        // advertised pins exactly match that leaf. Every other RPC fails
-        // closed until the successful join is visible in topology.
-        if fields.from_node_id != auth.local_node_id && identity_store.enforces_peer_identity() {
-            let cert_der = peer_cert_der
-                .as_deref()
-                .ok_or_else(|| ClusterError::Transport {
-                    detail: "authenticated cluster peer did not present a leaf certificate".into(),
-                })?;
-            match identity_store.get_node_info(fields.from_node_id) {
-                Some(ref info) => match verify_peer_identity(info, cert_der) {
-                    VerifyOutcome::Accepted { method } => {
-                        debug!(
-                            node_id = fields.from_node_id,
-                            ?method,
-                            "peer identity verified"
-                        );
-                    }
-                    VerifyOutcome::Rejected => {
-                        reject_peer_identity(&conn, fields.from_node_id)?;
-                    }
-                },
-                None if enrollment_matches(
-                    &request,
-                    fields.from_node_id,
-                    cert_der,
-                    &*identity_store,
-                ) =>
-                {
-                    debug!(
-                        node_id = fields.from_node_id,
-                        "accepted identity-bound cluster join enrollment"
-                    );
-                }
-                None => {
-                    reject_peer_identity(&conn, fields.from_node_id)?;
-                }
-            }
-        }
+        verify_stream_identity(
+            &conn,
+            &*identity_store,
+            peer_cert_der.as_deref(),
+            &auth,
+            fields.from_node_id,
+            &request,
+        )?;
 
         // 4b. Streaming path: an `ExecuteStreamRequest` produces a multi-frame
         //     response — N `RPC_EXECUTE_STREAM_CHUNK` envelopes (each written
         //     inline so QUIC flow control throttles the producer) followed by
         //     exactly one `RPC_EXECUTE_STREAM_END` envelope, then `finish()`.
-        //     The non-streaming path below is unchanged: one response envelope.
         if let RaftRpc::ExecuteStreamRequest(req) = request {
             let terminal = {
                 let sink = QuicChunkSink {
@@ -332,86 +294,24 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore + ?Sized>(
             };
 
             let end_rpc = RaftRpc::ExecuteStreamEnd(ExecuteStreamEnd { error: terminal });
-            let end_inner = rpc_codec::encode(&end_rpc, &auth.epoch)?;
-            let end_seq = auth.peer_seq_out.next();
-            let mut end_envelope =
-                Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + end_inner.len());
-            auth_envelope::write_envelope(
-                auth.local_node_id,
-                end_seq,
-                &end_inner,
-                &auth.mac_key,
-                &mut end_envelope,
-            )?;
-            send.write_all(&end_envelope)
-                .await
-                .map_err(|e| ClusterError::Transport {
-                    detail: format!("write stream end: {e}"),
-                })?;
-            send.finish().map_err(|e| ClusterError::Transport {
-                detail: format!("finish stream response: {e}"),
-            })?;
+            write_rpc_frame(&mut send, &auth, &end_rpc, "stream end").await?;
+            finish_stream(&mut send, "stream response")?;
             return Ok::<(), ClusterError>(());
         }
 
-        // 4c. Cross-node streaming shuffle (E1): a `ShufflePushRequest` is the
-        //     opening frame of a producer → receiver stream. The producer keeps
-        //     writing `ShufflePushChunk` envelopes on the SAME bidi stream
-        //     (this read half), terminated by exactly one `ShufflePushEnd`.
-        //     The server reads inbound frames, deposits them via the handler,
-        //     and writes NO reply — the producer fire-and-finishes (mirroring
-        //     the response-direction `send_rpc_stream`, which finishes its send
-        //     half before reading). The loop exits on the `End` frame or on a
-        //     clean stream close (`read_envelope` surfacing a transport error
-        //     after the producer's `finish()`).
+        // 4c. Cross-node streaming shuffle: a `ShufflePushRequest` opens a
+        //     producer → receiver stream on this read half. The server
+        //     deposits each inbound frame and writes no reply.
         if let RaftRpc::ShufflePushRequest(req) = request {
-            let shuffle_id = req.shuffle_id;
-            let part = req.part;
-            let side = req.side;
-            handler.on_shuffle_request(req).await;
-
-            loop {
-                let frame_envelope = match read_envelope(&mut recv).await {
-                    Ok(e) => e,
-                    // Producer closed the stream without (or after) an End.
-                    // A graceful finish surfaces here as a transport read
-                    // error; treat it as end-of-stream rather than propagating.
-                    Err(_) => return Ok::<(), ClusterError>(()),
-                };
-                let (frame_fields, frame_inner) =
-                    auth_envelope::parse_envelope(&frame_envelope, &auth.mac_key)?;
-                if frame_fields.from_node_id != fields.from_node_id {
-                    reject_peer_identity(&conn, frame_fields.from_node_id)?;
-                }
-                if frame_fields.from_node_id != auth.local_node_id {
-                    auth.peer_seq_in
-                        .accept(frame_fields.from_node_id, frame_fields.seq)?;
-                }
-                match rpc_codec::decode(frame_inner, &auth.epoch)? {
-                    RaftRpc::ShufflePushChunk(chunk) => {
-                        handler
-                            .on_shuffle_chunk(shuffle_id, part, side, chunk.payload)
-                            .await?;
-                    }
-                    RaftRpc::ShufflePushEnd(end) => {
-                        handler
-                            .on_shuffle_end(shuffle_id, part, side, end.error)
-                            .await;
-                        return Ok::<(), ClusterError>(());
-                    }
-                    other => {
-                        return Err(ClusterError::Transport {
-                            detail: format!("unexpected frame in shuffle push stream: {other:?}"),
-                        });
-                    }
-                }
-            }
+            let opener = fields.from_node_id;
+            return drain_shuffle_push(&*handler, &auth, &mut recv, req, opener, |node| {
+                reject_peer_identity(&conn, node)
+            })
+            .await;
         }
 
-        // 4d/4e/4f. One-shot shuffle RPCs (ShuffleProduce / ShuffleConsume /
-        //     ShuffleAggregateConsume). Each is a single request/response — no
-        //     additional frames on `recv`. Handled in a shared helper to keep
-        //     this function under the file-size limit.
+        // 4d onward. One-shot RPCs: one request, one response, no further
+        //     frames on `recv`.
         let request =
             match stream_dispatch::try_handle_oneshot_rpc(&*handler, request, &mut send, &auth)
                 .await?
@@ -420,37 +320,37 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore + ?Sized>(
                 Some(req) => req,
             };
 
-        let response = handler.handle_rpc(request).await?;
+        // A handler error is answered with a typed `RequestRefused`, never a
+        // dropped stream. The MAC verified, so the sender is genuine and its
+        // link is up. The sender reads a dropped stream as a link failure.
+        let outcome = handler.handle_rpc(request).await;
+        if let Err(e) = &outcome {
+            debug!(
+                from_node_id = fields.from_node_id,
+                error = %e,
+                "raft RPC refused by the handler"
+            );
+        }
+        let response = reply_for(outcome);
 
         // 5. Wrap the response in its own envelope. `from = local_node_id`,
         //    `seq = next outbound seq scoped to the caller`.
-        let response_inner = rpc_codec::encode(&response, &auth.epoch)?;
-        let response_seq = auth.peer_seq_out.next();
-        let mut response_envelope =
-            Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + response_inner.len());
-        auth_envelope::write_envelope(
-            auth.local_node_id,
-            response_seq,
-            &response_inner,
-            &auth.mac_key,
-            &mut response_envelope,
-        )?;
-
-        send.write_all(&response_envelope)
-            .await
-            .map_err(|e| ClusterError::Transport {
-                detail: format!("write response: {e}"),
-            })?;
-        send.finish().map_err(|e| ClusterError::Transport {
-            detail: format!("finish response: {e}"),
-        })?;
-        Ok::<(), ClusterError>(())
+        reply_and_finish(&mut send, &auth, &response, "response").await
     };
 
     tokio::select! {
         biased;
         _ = shutdown.changed() => Ok(()),
         result = work => result,
+    }
+}
+
+/// The frame that answers a one-shot request: the handler's response, or a
+/// typed refusal carrying its error.
+fn reply_for(outcome: Result<RaftRpc>) -> RaftRpc {
+    match outcome {
+        Ok(response) => response,
+        Err(error) => RaftRpc::RequestRefused(RequestRefusal::from(error)),
     }
 }
 
@@ -468,49 +368,31 @@ fn validate_join_sender(request: &RaftRpc, authenticated_node_id: u64) -> Result
     Ok(())
 }
 
-/// Read a complete authenticated envelope from a QUIC receive stream.
-///
-/// Reads the fixed envelope pre-header (version + from_node_id + seq +
-/// inner_len), then the inner frame, then the MAC tag. Returns the full
-/// envelope bytes for caller-side parsing.
-pub(crate) async fn read_envelope(recv: &mut quinn::RecvStream) -> Result<Vec<u8>> {
-    // Envelope header is version(1) + from_node_id(8) + seq(8) + inner_len(4).
-    const ENV_HDR_LEN: usize = 21;
-
-    let mut hdr = [0u8; ENV_HDR_LEN];
-    recv.read_exact(&mut hdr)
-        .await
-        .map_err(|e| ClusterError::Transport {
-            detail: format!("read envelope header: {e}"),
-        })?;
-
-    let inner_len = u32::from_le_bytes([hdr[17], hdr[18], hdr[19], hdr[20]]);
-    if inner_len > MAX_RPC_PAYLOAD_SIZE {
-        return Err(ClusterError::Codec {
-            detail: format!(
-                "envelope inner length {inner_len} exceeds maximum {MAX_RPC_PAYLOAD_SIZE}"
-            ),
-        });
-    }
-
-    let total = ENV_HDR_LEN + inner_len as usize + rpc_codec::MAC_LEN;
-    let mut buf = vec![0u8; total];
-    buf[..ENV_HDR_LEN].copy_from_slice(&hdr);
-    if total > ENV_HDR_LEN {
-        recv.read_exact(&mut buf[ENV_HDR_LEN..])
-            .await
-            .map_err(|e| ClusterError::Transport {
-                detail: format!("read envelope payload+mac: {e}"),
-            })?;
-    }
-
-    Ok(buf)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc_codec::JoinRequest;
+    use crate::rpc_codec::{JoinRequest, RefusalReason};
+
+    #[test]
+    fn a_handler_error_is_answered_with_a_typed_refusal() {
+        let reply = reply_for(Err(ClusterError::GroupNotFound { group_id: 4 }));
+        match reply {
+            RaftRpc::RequestRefused(refusal) => assert!(matches!(
+                refusal.reason,
+                RefusalReason::GroupNotHosted { group_id: 4 }
+            )),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_handler_response_is_answered_as_is() {
+        let pong = RaftRpc::Pong(crate::rpc_codec::PongResponse {
+            responder_id: 1,
+            topology_version: 3,
+        });
+        assert!(matches!(reply_for(Ok(pong)), RaftRpc::Pong(_)));
+    }
 
     #[test]
     fn join_request_must_match_authenticated_sender() {
@@ -518,8 +400,10 @@ mod tests {
             node_id: 9,
             listen_addr: "127.0.0.1:9400".into(),
             wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
+            build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
             spiffe_id: None,
             spki_pin: Some(vec![1; 32]),
+            swim_addr: None,
         });
         assert!(validate_join_sender(&request, 9).is_ok());
         let error = validate_join_sender(&request, 8).unwrap_err();

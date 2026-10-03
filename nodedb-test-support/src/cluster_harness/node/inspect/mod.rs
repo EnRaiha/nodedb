@@ -9,7 +9,9 @@
 //! spawn/shutdown.
 
 mod catalog;
+mod core_placement;
 mod crdt;
 mod lease;
 mod snapshot;
+mod timeseries;
 mod topology;

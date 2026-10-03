@@ -205,9 +205,9 @@ mod tests {
         let (credentials, _tmp) = open_catalog();
         let catalog = credentials.catalog();
         let src = DatabaseId::new(1);
-        let mut first = StoredCollection::new(5, "orders", "mover");
+        let mut first = StoredCollection::stamped_for_test(5, "orders", "mover");
         first.database_id = src;
-        let mut second = StoredCollection::new(5, "invoices", "mover");
+        let mut second = StoredCollection::stamped_for_test(5, "invoices", "mover");
         second.database_id = src;
         for coll in [&first, &second] {
             apply_to(

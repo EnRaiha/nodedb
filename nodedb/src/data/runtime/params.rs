@@ -23,6 +23,9 @@ pub struct SpawnCoreParams<'a> {
     pub compaction_config: CoreCompactionConfig,
     pub system_metrics: Option<Arc<crate::control::metrics::SystemMetrics>>,
     pub event_producer: Option<crate::event::bus::EventProducer>,
+    /// The collections some Event Plane consumer reads, shared with the
+    /// Control Plane registries that publish them.
+    pub event_interest: Arc<crate::event::interest::EventInterest>,
     pub governor: Arc<nodedb_mem::MemoryGovernor>,
     pub quiesce: Option<Arc<crate::bridge::quiesce::CollectionQuiesce>>,
     pub hlc: Arc<nodedb_types::OrdinalClock>,
@@ -56,8 +59,10 @@ pub struct SpawnCoreParams<'a> {
     /// opening the client gateway, so `/healthz` never reports ready while a
     /// core is still rebuilding its in-memory indexes (HNSW, etc.) from the
     /// WAL — which would otherwise let a just-restarted node serve half-rebuilt
-    /// results. Dropped without firing if the core panics during open/replay,
-    /// which surfaces to boot as a failed readiness gate.
-    // no-plane-separation: passive one-shot readiness Sender, fired once (`send(())`, synchronous and runtime-free) at the end of WAL replay to signal Boot; no tokio runtime or tasks run in the Data Plane.
-    pub replay_done: tokio::sync::oneshot::Sender<()>,
+    /// results. It carries the scopes that owe edge cascades after replay, or
+    /// the replay's error when replay failed, and is
+    /// dropped without firing if the core panics during open/replay. Boot
+    /// fails its readiness gate on either.
+    // no-plane-separation: passive one-shot readiness Sender, fired once (`send(..)`, synchronous and runtime-free) at the end of WAL replay to signal Boot; no tokio runtime or tasks run in the Data Plane.
+    pub replay_done: tokio::sync::oneshot::Sender<crate::Result<()>>,
 }

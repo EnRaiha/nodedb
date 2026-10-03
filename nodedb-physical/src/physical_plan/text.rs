@@ -104,8 +104,10 @@ pub enum TextOp {
     /// Used by the sync path when a Lite client sends an `FtsDelete` frame.
     FtsDeleteDoc {
         collection: QualifiedCollection,
-        /// Pre-assigned global surrogate for `(collection, doc_id)`.
-        surrogate: nodedb_types::Surrogate,
+        /// The global surrogate `(collection, doc_id)` is bound to. `None`
+        /// when the key's home binds none: the delete removes nothing and
+        /// still commits its sync provenance.
+        surrogate: Option<nodedb_types::Surrogate>,
         /// Sync provenance: identifies the originating peer and sequence for idempotency.
         #[serde(default)]
         provenance: Option<nodedb_types::sync::wire::SyncProvenance>,

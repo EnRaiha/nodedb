@@ -2,16 +2,13 @@
 
 //! Async Data-Plane dispatch for system-initiated and authorized work.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response};
-use crate::control::server::dispatch_utils::{
-    Collect, MintedRecords, OwnedResponse, OwnedWait, RecordOwner, await_response_owned,
-};
 use crate::control::server::shared::clone_write::CloneCheckedTask;
 use crate::control::server::shared::response_payload::payload_or_typed_error;
 use crate::control::server::shared::session::statement_deadline;
+use crate::control::server::shared::write_admission::plan_is_write;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
 
@@ -70,7 +67,6 @@ pub(crate) async fn dispatch_system_response_with_source(
             plan: task.plan,
             timeout,
             event_source,
-            minted: task.minted,
         },
     )
     .await
@@ -99,20 +95,56 @@ pub(crate) async fn dispatch_authorized(
     checked: CloneCheckedTask,
     collection: &str,
     timeout: Duration,
+    linearizable: bool,
 ) -> crate::Result<Vec<u8>> {
-    let task = checked.into_authorized().into_physical_task();
+    // The write lease lives until the dispatch returns its outcome.
+    let (authorized, _lease) = checked.into_parts();
+    let task = authorized.into_physical_task();
     let vshard_id = nodedb_types::CollectionKey::from_bare(task.database_id, collection).vshard();
     let tenant_id = task.tenant_id;
+    // A read runs where the collection's owning group serves it: here when
+    // this node replicates the group, on its leader otherwise. A linearizable
+    // read is confirmed where it runs (`dispatch_utils::owner_read`).
+    let plan = if plan_is_write(&task.plan) {
+        task.plan
+    } else {
+        use crate::control::server::dispatch_utils::{OwnedRead, OwnedReadScope, route_owned_read};
+        let scope = OwnedReadScope {
+            tenant_id,
+            database_id: task.database_id,
+            vshard_id,
+            trace_id: crate::types::TraceId::ZERO,
+            txn_id: None,
+            linearizable,
+        };
+        let plan = match route_owned_read(state, scope, task.plan).await? {
+            OwnedRead::Local(plan) => *plan,
+            OwnedRead::Served(resp) => return payload_or_typed_error(resp),
+        };
+        // A RAG fusion's legs live on different nodes in a cluster: it runs
+        // in stages from here (`graph_dispatch::rag_fusion`).
+        if let Some(served) = crate::control::server::graph_dispatch::serve_rag_plan(
+            state,
+            tenant_id,
+            task.database_id,
+            &plan,
+            linearizable,
+        )
+        .await
+        {
+            return served.and_then(payload_or_typed_error);
+        }
+        plan
+    };
     let resp = dispatch_plan(
         state,
         PlanDispatch {
             tenant_id,
             database_id: task.database_id,
             vshard_id,
-            plan: task.plan,
+            plan,
             timeout,
             event_source: crate::event::EventSource::User,
-            minted: None,
         },
     )
     .await?;
@@ -128,9 +160,6 @@ struct PlanDispatch {
     plan: PhysicalPlan,
     timeout: Duration,
     event_source: crate::event::EventSource,
-    /// Records the caller appended for this plan, under their outcome-floor
-    /// window. The transport closes the window from the plan's outcome.
-    minted: Option<MintedRecords>,
 }
 
 /// Shared transport: build the request envelope, dispatch, await the response.
@@ -142,13 +171,7 @@ async fn dispatch_plan(state: &SharedState, dispatch: PlanDispatch) -> crate::Re
         plan,
         timeout,
         event_source,
-        minted,
     } = dispatch;
-    let owner = RecordOwner {
-        tenant_id,
-        database_id,
-        vshard_id,
-    };
     let request_id = state.next_request_id();
 
     // Whichever comes first: the running statement's deadline, or the caller's
@@ -176,6 +199,7 @@ async fn dispatch_plan(state: &SharedState, dispatch: PlanDispatch) -> crate::Re
         txn_id: None,
         wal_lsn: None,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: crate::bridge::envelope::Admission::Exempt(
             crate::bridge::envelope::ExemptReason::AlreadyOrdered,
         ),
@@ -190,56 +214,20 @@ async fn dispatch_plan(state: &SharedState, dispatch: PlanDispatch) -> crate::Re
     if let Err(error) = dispatched {
         // No response will arrive, and no core applied the plan.
         state.tracker.cancel(&request_id);
-        if let Some(minted) = minted {
-            minted.cancel(&state.wal, owner, 0).await?;
-        }
         return Err(crate::Error::Internal {
             detail: error.to_string(),
         });
     }
-    // A core holds the request now. From here the records close from its
-    // final response, never from a drop.
-    if let Some(minted) = &minted {
-        minted.mark_sent();
-    }
-
     // Await to the same instant the envelope carries — yields the thread so the
     // response poller can run. Reaching that instant is the statement running
     // out of time, so it reports the deadline, and so does a producer that
     // stopped after it: the closure there is the symptom, not the cause.
-    let Some(minted) = minted else {
-        let received =
-            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), rx.recv()).await;
-        return match received {
-            Ok(Some(response)) => Ok(response),
-            Ok(None) => Err(closed_error(request_id, deadline)),
-            Err(_) => Err(crate::Error::DeadlineExceeded { request_id }),
-        };
-    };
-    // The records close in a task this future does not own, so a caller
-    // dropped mid-wait still closes them. A late refusal still cancels them.
-    let outcome = await_response_owned(
-        OwnedWait {
-            wal: Arc::clone(&state.wal),
-            owner,
-            final_refusal_key: 0,
-            deadline,
-            collect: Collect::First,
-        },
-        rx,
-        minted,
-    )
-    .await?;
-    match outcome {
-        OwnedResponse::Answered { response, closed } => {
-            closed?;
-            Ok(response)
-        }
-        OwnedResponse::ChannelClosed => Err(closed_error(request_id, deadline)),
-        OwnedResponse::DeadlineExceeded => Err(crate::Error::DeadlineExceeded { request_id }),
-        OwnedResponse::OverBudget { bytes } => Err(crate::Error::ExecutionLimitExceeded {
-            detail: format!("system task response exceeded its byte budget ({bytes} bytes)"),
-        }),
+    let received =
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), rx.recv()).await;
+    match received {
+        Ok(Some(response)) => Ok(response),
+        Ok(None) => Err(closed_error(request_id, deadline)),
+        Err(_) => Err(crate::Error::DeadlineExceeded { request_id }),
     }
 }
 

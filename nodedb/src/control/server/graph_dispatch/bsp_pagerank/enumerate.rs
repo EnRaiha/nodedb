@@ -3,35 +3,25 @@
 //! Shard enumeration for distributed BSP PageRank.
 //!
 //! A "shard" here is one **owner NODE** (the local node + each distinct
-//! non-local data-group leader), NOT one vShard. A remote `ExecuteRequest` runs
-//! on a single core whose per-core `EdgeStore` holds that node's full graph
-//! slice (one core / node — the single-core-coverage property the MATCH scatter
-//! relies on; see the caveat below), and the receiver always dispatches with
-//! `vshard_id = 0` rather than routing to a per-vShard core. Enumerating one
-//! dispatch per *vShard* therefore lands hundreds of dispatches on the SAME core
-//! of the SAME node, each rebuilding that node's full CSR — a massive waste where
-//! most per-vShard dispatches own zero nodes. Enumerating one dispatch per
-//! *node*, carrying that node's FULL set of owned vShards, rebuilds each node's
-//! CSR exactly once per superstep and ranks every node it owns in one pass.
+//! non-local data-group leader), NOT one vShard. One dispatch per node,
+//! carrying that node's FULL set of owned vShards, builds each core's CSR
+//! once per superstep and ranks every node it owns in one pass. A superstep
+//! plan is not vShard-scoped, so the receiving node fans it across all its
+//! cores (`exchange::received`), and each core ranks the owned vShards it
+//! homes (`exchange::all_cores::fanout`).
 //!
-//! This mirrors `match_scatter::round_zero::distinct_remote_owners`'s
-//! one-dispatch-per-distinct-owner-node enumeration (live Raft leadership via the
-//! `raft_status_fn` snapshot, falling back to the routing-table hint). The
-//! metadata group (0) owns no vShards and is skipped. A data group with no
-//! resolvable leader is a hard `NotLeader` error — never a silently-dropped
-//! shard (same contract as the MATCH scatter).
-//!
-//! **Multi-core caveat (pre-existing, shared with MATCH — out of scope here):** a
-//! remote `ExecuteRequest` executes on core 0 only, and the per-core `EdgeStore`
-//! means core 0 holds a node's FULL graph slice only when that node runs a single
-//! Data-Plane core (as the cluster tests do). On a multi-core node, cross-node
-//! reads (BOTH this per-node BSP enumeration AND the existing cross-shard MATCH
-//! scatter) would observe only core-0's partition. This per-node enumeration
-//! assumes the same single-core-coverage property the MATCH scatter already
-//! relies on; a multi-core cross-node fan-out is a separate concern.
+//! The owner of a vShard is its data group's leader: the live Raft leadership
+//! from the `raft_status_fn` snapshot, falling back to the routing-table hint.
+//! The leader replicates the group, so it holds every edge homed on the
+//! group's vShards. This one map is both each handler's owned set and the
+//! coordinator's contribution routing, so a contribution always reaches the
+//! node that ranks its destination. The metadata group (0) owns no vShards
+//! and is skipped. A data group with no resolvable leader is a hard
+//! `NotLeader` error — never a silently-dropped shard.
 
 use std::collections::HashMap;
 
+use crate::control::gateway::live_leaders::LiveLeaders;
 use crate::control::state::SharedState;
 use crate::types::VShardId;
 
@@ -86,17 +76,9 @@ pub(in crate::control::server::graph_dispatch) fn enumerate_shards(
             vshard_owner: HashMap::new(),
         });
     };
+    // Raft snapshot first, routing guard second: see `LiveLeaders`.
+    let live = LiveLeaders::snapshot(state);
     let routing = routing_lock.read().unwrap_or_else(|p| p.into_inner());
-
-    let raft_snapshot: Vec<nodedb_cluster::GroupStatus> =
-        state.raft_status_fn.get().map(|f| f()).unwrap_or_default();
-    let live_leader = |group_id: u64| -> u64 {
-        raft_snapshot
-            .iter()
-            .find(|gs| gs.group_id == group_id)
-            .map(|gs| gs.leader_id)
-            .unwrap_or(0)
-    };
 
     // Accumulate each owner node's full vShard set (union over the data groups it
     // leads), preserving first-seen node order, and build the vShard → owner map.
@@ -114,7 +96,7 @@ pub(in crate::control::server::graph_dispatch) fn enumerate_shards(
             continue;
         }
         // Prefer live Raft leadership; fall back to the routing-table hint.
-        let mut leader = live_leader(group_id);
+        let mut leader = live.leader_of(group_id);
         if leader == 0 {
             leader = routing.group_info(group_id).map(|g| g.leader).unwrap_or(0);
         }
@@ -127,6 +109,7 @@ pub(in crate::control::server::graph_dispatch) fn enumerate_shards(
                 vshard_id: VShardId::new(first),
                 leader_node: 0,
                 leader_addr: String::new(),
+                leader_term: 0,
             });
         }
         if !owned_by_node.contains_key(&leader) {

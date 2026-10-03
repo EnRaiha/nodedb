@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use nodedb_physical::physical_plan::{UpdateValue, VectorDirectWriteIntent, VectorOp};
 use nodedb_types::{RlsWriteCheck, RowIdentity, StorageKey, Surrogate, Value};
 
-use super::context::StageCtx;
+use super::context::{StageCtx, StageScope};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::transaction::overlay::{Staged, StagedVectorRow};
@@ -263,15 +263,15 @@ impl CoreLoop {
     /// COMMIT's replay creates the index.
     pub(super) fn stage_vector_index_key(
         &self,
-        ctx: &StageCtx<'_>,
+        scope: &StageScope<'_>,
         spec: &VectorDirectIndexSpec<'_>,
     ) -> Result<VectorIndexKey, ErrorCode> {
-        if let Some(key) = self.check_vector_direct_index(ctx.database_id, ctx.tid, spec)? {
+        if let Some(key) = self.check_vector_direct_index(scope.database_id, scope.tid, spec)? {
             return Ok(key);
         }
         let declared_dim = self
             .doc_configs
-            .get(&ctx.coll_key)
+            .get(&scope.coll_key)
             .and_then(|config| config.vector_primary.as_ref())
             .map(|primary| primary.dim as usize);
         if let Some(dim) = declared_dim
@@ -282,8 +282,8 @@ impl CoreLoop {
             ));
         }
         Ok(CoreLoop::vector_index_key(
-            ctx.database_id,
-            ctx.tid,
+            scope.database_id,
+            scope.tid,
             spec.collection,
             spec.field,
         ))
@@ -295,14 +295,14 @@ impl CoreLoop {
     /// as an empty payload, the same as the live handlers read it.
     pub(super) fn stage_vector_current_row(
         &self,
-        ctx: &StageCtx<'_>,
+        scope: &StageScope<'_>,
         index_key: &VectorIndexKey,
         surrogate: Surrogate,
     ) -> Result<Option<VectorCurrentRow>, ErrorCode> {
         let staged = self
             .txn_overlays
-            .get(&ctx.txn_id)
-            .and_then(|o| o.get(&ctx.coll_key, surrogate.0));
+            .get(&scope.txn_id)
+            .and_then(|o| o.get(&scope.coll_key, surrogate.0));
         match staged {
             Some(Staged::Tombstone) => return Ok(None),
             Some(Staged::Put(body)) => {
@@ -322,7 +322,7 @@ impl CoreLoop {
                     },
                 }));
             }
-            None if !self.stage_base_visible(ctx) => return Ok(None),
+            None if !self.stage_base_visible(scope.txn_id, &scope.coll_key) => return Ok(None),
             None => {}
         }
         let Some(coll) = self.vector_collections.get(index_key) else {
@@ -332,7 +332,7 @@ impl CoreLoop {
             return Ok(None);
         };
         let sidecar = self
-            .vector_sidecar_row(ctx.database_id, ctx.tid, ctx.collection, surrogate)?
+            .vector_sidecar_row(scope.database_id, scope.tid, scope.collection, surrogate)?
             .unwrap_or_else(|| VectorSidecarRow {
                 bytes: Vec::new(),
                 fields: HashMap::new(),
@@ -379,7 +379,7 @@ impl CoreLoop {
             surrogate,
         );
         let index_key = match self.stage_vector_index_key(
-            &ctx,
+            &ctx.scope(),
             &VectorDirectIndexSpec {
                 collection,
                 field,
@@ -410,7 +410,7 @@ impl CoreLoop {
             }
         };
 
-        let current = match self.stage_vector_current_row(&ctx, &index_key, surrogate) {
+        let current = match self.stage_vector_current_row(&ctx.scope(), &index_key, surrogate) {
             Ok(current) => current,
             Err(e) => return self.response_error(task, e),
         };
@@ -490,7 +490,7 @@ mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::PointGet {
             collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, COLL),
             document_id: "r".into(),
-            surrogate: Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -514,6 +514,7 @@ mod tests {
             txn_id,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: Admission::Exempt(ExemptReason::Read),
         })
     }
@@ -713,7 +714,9 @@ mod tests {
         let txn_id = TxnId::new(9);
         let task = make_task(Some(txn_id));
 
-        let del = core.execute_stage_vector(&task, 1, txn_id, &delete_op(vec![5, 5, 0]));
+        // Surrogate 7 is bound but holds no row: it counts nothing. A repeated
+        // target counts once.
+        let del = core.execute_stage_vector(&task, 1, txn_id, &delete_op(vec![5, 5, 7]));
         assert_eq!(affected(&del), 1);
         let again = core.execute_stage_vector(&task, 1, txn_id, &delete_op(vec![5]));
         assert_eq!(affected(&again), 0);

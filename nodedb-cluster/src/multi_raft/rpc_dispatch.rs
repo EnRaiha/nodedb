@@ -8,7 +8,8 @@
 
 use nodedb_raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    PreVoteRequest, PreVoteResponse, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
+    LogEntry, PreVoteRequest, PreVoteResponse, RequestVoteRequest, RequestVoteResponse,
+    TimeoutNowRequest,
 };
 
 use crate::error::{ClusterError, Result};
@@ -66,6 +67,46 @@ impl MultiRaft {
         Ok(node.handle_install_snapshot(req)?)
     }
 
+    /// Whether a snapshot at `last_included_index`, sent at `term`, must be
+    /// applied to the local state machine.
+    ///
+    /// False for a stale leader's snapshot, and for one this node already
+    /// applied past. Installing either would move the state machine behind
+    /// the log it continues to apply from. A replica that requires a snapshot
+    /// also takes one at exactly its applied index: its log is whole there,
+    /// and the state beside the log is what it lacks.
+    pub fn snapshot_install_needed(
+        &self,
+        group_id: u64,
+        term: u64,
+        last_included_index: u64,
+    ) -> Result<bool> {
+        let node = self
+            .groups
+            .get(&group_id)
+            .ok_or(ClusterError::GroupNotFound { group_id })?;
+        let applied = node.last_applied();
+        let ahead = last_included_index > applied
+            || (node.snapshot_required() && last_included_index == applied);
+        Ok(term >= node.current_term() && ahead)
+    }
+
+    /// Adopt a snapshot the local state machine already holds as the group's
+    /// log boundary and durable applied floor. See
+    /// [`nodedb_raft::RaftNode::adopt_snapshot_boundary`].
+    pub fn adopt_snapshot_boundary(
+        &mut self,
+        group_id: u64,
+        last_included_index: u64,
+        last_included_term: u64,
+    ) -> Result<()> {
+        let node = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or(ClusterError::GroupNotFound { group_id })?;
+        Ok(node.adopt_snapshot_boundary(last_included_index, last_included_term)?)
+    }
+
     /// Route a TimeoutNow RPC to the correct group.
     ///
     /// One-way — no response is produced. Silently ignored if the group is
@@ -78,10 +119,12 @@ impl MultiRaft {
         }
     }
 
-    /// Durably persist a group's HardState (current_term/voted_for) if it
-    /// changed since the last persist. Must run under the `MultiRaft` lock
-    /// before an RPC reply that granted a vote or bumped the term leaves this
-    /// node, so a restart cannot forget the vote and let two leaders form.
+    /// Stage a group's HardState (current_term/voted_for) on its disk if it
+    /// changed since the last persist. Runs under the `MultiRaft` lock and
+    /// never waits on disk. Before an RPC reply that granted a vote or bumped
+    /// the term leaves this node, the caller awaits the group's
+    /// [`MultiRaft::reply_ticket`], so a restart cannot forget the vote and
+    /// let two leaders form.
     ///
     /// No-op when the group is not mounted on this node.
     pub fn persist_group_hard_state(&mut self, group_id: u64) -> Result<()> {
@@ -89,6 +132,27 @@ impl MultiRaft {
             node.persist_hard_state_if_dirty()?;
         }
         Ok(())
+    }
+
+    /// The sequence number of the last write `group_id` staged, or 0 when the
+    /// group is not mounted. A reply handler reads it before its Raft call
+    /// and passes it to [`Self::reply_ticket`].
+    pub fn staged_through(&self, group_id: u64) -> u64 {
+        self.groups
+            .get(&group_id)
+            .map_or(0, |node| node.storage().staged_through())
+    }
+
+    /// A ticket for the writes a reply depends on: the group's latest hard
+    /// state, and every write staged after `mark` when there is one. `None`
+    /// when those are durable or the group is not mounted. Writes the apply
+    /// loop staged before `mark` hold no reply back.
+    pub fn reply_ticket(
+        &self,
+        group_id: u64,
+        mark: u64,
+    ) -> Option<crate::group_disk::DurabilityTicket> {
+        self.groups.get(&group_id)?.storage().reply_ticket(mark)
     }
 
     /// Get the current term and snapshot metadata for a group (for building
@@ -103,6 +167,25 @@ impl MultiRaft {
             node.log_snapshot_index(),
             node.log_snapshot_term(),
         ))
+    }
+
+    /// Record that `peer` installed a snapshot of `group_id` through
+    /// `last_included_index`. No-op when the group is not mounted here.
+    pub fn record_snapshot_installed(
+        &mut self,
+        group_id: u64,
+        peer: u64,
+        last_included_index: u64,
+    ) {
+        if let Some(node) = self.groups.get_mut(&group_id) {
+            node.record_snapshot_installed(peer, last_included_index);
+        }
+    }
+
+    /// Term of the entry at `index` in a group's log, or `None` when the
+    /// group is not mounted here or the log no longer holds that entry.
+    pub fn log_term_at(&self, group_id: u64, index: u64) -> Option<u64> {
+        self.groups.get(&group_id)?.log_term_at(index)
     }
 
     /// Handle AppendEntries response for a specific group.
@@ -160,6 +243,17 @@ impl MultiRaft {
             .get_mut(&group_id)
             .ok_or(ClusterError::GroupNotFound { group_id })?;
         node.advance_applied(applied_to);
+        Ok(())
+    }
+
+    /// Return a committed batch the tick took but did not apply. See
+    /// [`nodedb_raft::RaftNode::requeue_committed`].
+    pub fn requeue_committed(&mut self, group_id: u64, batch: Vec<LogEntry>) -> Result<()> {
+        let node = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or(ClusterError::GroupNotFound { group_id })?;
+        node.requeue_committed(batch);
         Ok(())
     }
 

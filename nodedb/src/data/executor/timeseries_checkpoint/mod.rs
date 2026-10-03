@@ -62,4 +62,5 @@
 
 mod flush;
 mod load;
+pub mod schema;
 pub mod stamp;

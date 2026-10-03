@@ -99,7 +99,7 @@ mod tests {
             valid_from_ms: valid_from,
             valid_until_ms: valid_until,
             attrs: vec![CellValue::Int64(val)],
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
         }
         .encode()
         .unwrap()

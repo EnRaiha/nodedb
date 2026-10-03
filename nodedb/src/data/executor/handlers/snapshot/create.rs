@@ -17,6 +17,7 @@ impl CoreLoop {
         &mut self,
         task: &ExecutionTask,
         tenant_id: u64,
+        arrays: bool,
     ) -> Response {
         info!(
             core = self.core_id,
@@ -80,12 +81,18 @@ impl CoreLoop {
         }
 
         // 2. Graph edges: scan edge_store by tenant prefix. A snapshot that
-        // omitted them would restore every node with no edges.
+        // omits them restores every node with no edges. The versions a
+        // TRUNCATE hides travel apart, with the cuts and applied ordinals.
         match self
             .edge_store
             .scan_edges_for_tenant(database_id, crate::types::TenantId::new(tenant_id))
         {
-            Ok(edges) => snapshot.edges = edges,
+            Ok(edges) => {
+                snapshot.edges = edges.visible;
+                snapshot.edge_hidden = edges.hidden;
+                snapshot.edge_cuts = edges.cuts;
+                snapshot.edge_applied = edges.applied;
+            }
             Err(e) => {
                 return self.response_error(
                     task,
@@ -137,6 +144,25 @@ impl CoreLoop {
             }
         }
 
+        // 9. Arrays: every cell version, grouped by the vShard it routes to,
+        // when the request reads them.
+        let array_blobs = if arrays {
+            self.capture_arrays(task.request.database_id, tid_id)
+        } else {
+            Ok(Vec::new())
+        };
+        match array_blobs {
+            Ok(blobs) => snapshot.arrays = blobs,
+            Err(e) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: format!("snapshot: array capture failed: {e}"),
+                    },
+                );
+            }
+        }
+
         info!(
             tenant_id,
             documents = snapshot.documents.len(),
@@ -153,6 +179,7 @@ impl CoreLoop {
             columnar_engines = snapshot.columnar_engines.len(),
             vector_params = snapshot.vector_params.len(),
             index_configs = snapshot.index_configs.len(),
+            arrays = snapshot.arrays.len(),
             "full tenant snapshot created"
         );
 

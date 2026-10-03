@@ -83,21 +83,18 @@ pub(crate) fn encode_crdt_op_record(
             peer_id,
             ..
         } => {
-            // Versioned payload preserves the admission fence for deterministic
-            // crash replay; legacy records decode without a fence.
+            // The versioned payload keeps the admission fence and the row's
+            // bound surrogate, so crash replay rebuilds the row's projection.
+            // An apply carrying `Surrogate::ZERO` is refused here.
             let payload = crate::wal::CrdtDeltaWalPayload::new(
                 delta.clone(),
-                Some(collection.to_string()),
+                collection.to_string(),
                 provenance.clone(),
                 *expected_frontier_digest,
-                Some(document_id.clone()),
-                Some(surrogate.as_u32()),
+                crate::wal::CrdtDeltaTarget::document(document_id.clone(), *surrogate)?,
             )
             .with_peer_id(*peer_id);
-            let crdt_payload = payload.encode().map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("wal crdt delta: {e}"),
-            })?;
+            let crdt_payload = payload.encode()?;
             Some((CrdtRecordKind::Delta, crdt_payload))
         }
         CrdtOp::ApplyAuthenticated {
@@ -117,11 +114,10 @@ pub(crate) fn encode_crdt_op_record(
         } => {
             let payload = crate::wal::CrdtDeltaWalPayload::new(
                 delta.clone(),
-                Some(collection.to_string()),
+                collection.to_string(),
                 Some(provenance.clone()),
                 *expected_frontier_digest,
-                Some(document_id.clone()),
-                Some(surrogate.as_u32()),
+                crate::wal::CrdtDeltaTarget::document(document_id.clone(), *surrogate)?,
             )
             .with_signing(crate::wal::CrdtDeltaSigning {
                 auth_user_id: *auth_user_id,
@@ -131,10 +127,7 @@ pub(crate) fn encode_crdt_op_record(
                 required: *signing_required,
             })
             .with_peer_id(*peer_id);
-            let crdt_payload = payload.encode().map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("wal authenticated crdt delta: {e}"),
-            })?;
+            let crdt_payload = payload.encode()?;
             Some((CrdtRecordKind::Delta, crdt_payload))
         }
         CrdtOp::ImportSnapshot {
@@ -143,19 +136,16 @@ pub(crate) fn encode_crdt_op_record(
             // Per-collection snapshot import. `import_snapshot_bytes` and
             // `apply_committed_delta` are the same idempotent Loro `state.import`,
             // so the snapshot rides the CRDT delta record and replays identically,
-            // routed to the same collection. No provenance (not a per-doc sync op).
+            // routed to the same collection. No provenance (not a per-doc sync
+            // op) and no row identity: a snapshot import is collection-wide.
             let payload = crate::wal::CrdtDeltaWalPayload::new(
                 bytes.clone(),
-                Some(collection.to_string()),
+                collection.to_string(),
                 None,
                 None,
-                None,
-                None,
+                crate::wal::CrdtDeltaTarget::Collection,
             );
-            let crdt_payload = payload.encode().map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("wal crdt snapshot import: {e}"),
-            })?;
+            let crdt_payload = payload.encode()?;
             Some((CrdtRecordKind::Delta, crdt_payload))
         }
         CrdtOp::ListInsert {
@@ -164,7 +154,7 @@ pub(crate) fn encode_crdt_op_record(
             list_path,
             index,
             fields_json,
-            surrogate: _,
+            surrogate,
         } => {
             // The Data Plane never appends to the WAL and the Control Plane
             // has no `LoroDoc` to compute a delta from, so the intent is
@@ -173,6 +163,7 @@ pub(crate) fn encode_crdt_op_record(
             let payload = crate::wal::CrdtListOpWalRecord::Insert {
                 collection: collection.to_string(),
                 document_id: document_id.clone(),
+                surrogate: bound_document_surrogate(collection.as_str(), document_id, *surrogate)?,
                 list_path: list_path.clone(),
                 index: *index as u64,
                 fields_json: fields_json.clone(),
@@ -185,11 +176,12 @@ pub(crate) fn encode_crdt_op_record(
             document_id,
             list_path,
             index,
-            surrogate: _,
+            surrogate,
         } => {
             let payload = crate::wal::CrdtListOpWalRecord::Delete {
                 collection: collection.to_string(),
                 document_id: document_id.clone(),
+                surrogate: bound_document_surrogate(collection.as_str(), document_id, *surrogate)?,
                 list_path: list_path.clone(),
                 index: *index as u64,
             };
@@ -202,11 +194,12 @@ pub(crate) fn encode_crdt_op_record(
             list_path,
             from_index,
             to_index,
-            surrogate: _,
+            surrogate,
         } => {
             let payload = crate::wal::CrdtListOpWalRecord::Move {
                 collection: collection.to_string(),
                 document_id: document_id.clone(),
+                surrogate: bound_document_surrogate(collection.as_str(), document_id, *surrogate)?,
                 list_path: list_path.clone(),
                 from_index: *from_index as u64,
                 to_index: *to_index as u64,
@@ -231,24 +224,29 @@ pub(crate) fn encode_crdt_op_record(
             let payload = crate::wal::CrdtDocOpWalRecord::Upsert {
                 collection: collection.to_string(),
                 document_id: document_id.clone(),
-                surrogate: surrogate.as_u32(),
+                surrogate: bound_document_surrogate(collection.as_str(), document_id, *surrogate)?,
                 fields_json: fields_json.clone(),
                 partial: *partial,
             };
             let bytes = encode_crdt_doc_op_payload(payload)?;
             Some((CrdtRecordKind::DocOp, bytes))
         }
+        // A delete of a key unbound in its database removes no row, so it
+        // has no durable effect to journal.
+        CrdtOp::DocDelete {
+            surrogate: None, ..
+        } => None,
         CrdtOp::DocDelete {
             collection,
             document_id,
-            surrogate,
+            surrogate: Some(surrogate),
             returning: _,
             rls_filters: _,
         } => {
             let payload = crate::wal::CrdtDocOpWalRecord::Delete {
                 collection: collection.to_string(),
                 document_id: document_id.clone(),
-                surrogate: surrogate.as_u32(),
+                surrogate: bound_document_surrogate(collection.as_str(), document_id, *surrogate)?,
             };
             let bytes = encode_crdt_doc_op_payload(payload)?;
             Some((CrdtRecordKind::DocOp, bytes))
@@ -275,6 +273,24 @@ pub(crate) fn encode_crdt_op_record(
         CrdtOp::RestoreToVersion { .. } => None,
     };
     Ok(appended)
+}
+
+/// The document surrogate a list-op or doc-op record carries. Refuses
+/// `Surrogate::ZERO`: every such op names a bound document.
+fn bound_document_surrogate(
+    collection: &str,
+    document_id: &str,
+    surrogate: nodedb_types::Surrogate,
+) -> crate::Result<u32> {
+    if surrogate == nodedb_types::Surrogate::ZERO {
+        return Err(crate::Error::Internal {
+            detail: format!(
+                "CRDT op on '{document_id}' in '{collection}' carries no surrogate; every \
+                 document op carries its document's bound surrogate"
+            ),
+        });
+    }
+    Ok(surrogate.as_u32())
 }
 
 /// Encode a `CrdtListOpWalRecord` for a `CrdtOp::ListInsert` / `ListDelete` /
@@ -346,6 +362,38 @@ mod tests {
         ));
     }
 
+    /// An apply without its row's surrogate is refused before any record is
+    /// written, so replay never meets a document delta it cannot project.
+    #[test]
+    fn apply_without_surrogate_is_refused_and_appends_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = open_wal(dir.path());
+        let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
+            document_id: "d1".to_string(),
+            delta: vec![9, 9, 9],
+            peer_id: 1,
+            mutation_id: 1,
+            surrogate: Surrogate::ZERO,
+            provenance: None,
+            constraint_version_required: 0,
+            expected_frontier_digest: None,
+        });
+
+        let outcome = super::super::wal_append_if_write(
+            &wal,
+            TenantId::new(1),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            &plan,
+        );
+        assert!(outcome.is_err(), "an unbound apply must be refused");
+        assert!(!has_record_of_type(
+            &wal,
+            nodedb_wal::record::RecordType::CrdtDelta
+        ));
+    }
+
     #[test]
     fn list_insert_appends_crdt_list_op_record() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -372,6 +420,34 @@ mod tests {
             "ListInsert must produce a durable LSN"
         );
         assert!(has_record_of_type(
+            &wal,
+            nodedb_wal::record::RecordType::CrdtListOp
+        ));
+    }
+
+    /// A list op without its document's surrogate is refused before any
+    /// record is written.
+    #[test]
+    fn list_op_without_surrogate_is_refused_and_appends_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = open_wal(dir.path());
+        let plan = PhysicalPlan::Crdt(CrdtOp::ListDelete {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
+            document_id: "d1".to_string(),
+            list_path: "blocks".to_string(),
+            index: 0,
+            surrogate: Surrogate::ZERO,
+        });
+
+        let outcome = super::super::wal_append_if_write(
+            &wal,
+            TenantId::new(1),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            &plan,
+        );
+        assert!(outcome.is_err(), "an unbound list op must be refused");
+        assert!(!has_record_of_type(
             &wal,
             nodedb_wal::record::RecordType::CrdtListOp
         ));

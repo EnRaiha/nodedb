@@ -102,6 +102,16 @@ pub enum MetaOp {
         /// Data Plane never reads it.
         #[serde(default)]
         cut_watermark: Option<u64>,
+        /// `Some` asks the receiving node to take the cut with barriers that
+        /// capture the request's tenants, and to answer with the captures it
+        /// parked instead of a snapshot. Requires `cut_watermark`. The Data
+        /// Plane never reads it.
+        #[serde(default)]
+        cut_capture: Option<super::meta_snapshot::CutCaptureRequest>,
+        /// Export every array cell version. Only a backup and a Raft group
+        /// snapshot read them, so every other snapshot skips the export.
+        #[serde(default)]
+        arrays: bool,
     },
 
     /// Restore a tenant's data across all engines from a snapshot.
@@ -116,17 +126,19 @@ pub enum MetaOp {
         tenant_id: u64,
         snapshot: Vec<u8>,
         replace_mode: bool,
-        /// vShard IDs whose state must be cleared before install (clear-then-install
-        /// for a lagging follower). Empty = legacy install-over-present behavior.
+        /// Collections this core clears before it installs, pre-resolved by
+        /// the Raft snapshot applier from the local catalog. Empty = no clear.
         #[serde(default)]
-        clear_vshards: Vec<u32>,
-        /// `(database_id, tenant_id, collection)` triples to clear before
-        /// install — pre-resolved by the applier from the local catalog for the
-        /// cleared vShards. `collection` is the name the Data Plane stores the
-        /// collection under: database-qualified outside the default database.
-        /// Empty = no clear.
+        collections_to_clear: Vec<super::meta_snapshot::SnapshotClearTarget>,
+        /// The data group's vShards, whose records the install replaces: the
+        /// array cells with the snapshot's `arrays`, and every graph edge
+        /// with an endpoint home among them with the snapshot's edges. With
+        /// it set, `collections_to_clear` keeps graph edges: an edge lives
+        /// on its endpoints' vShards, not on its collection's home. Empty =
+        /// no group install: no array replace, and collection clears take
+        /// their edges too.
         #[serde(default)]
-        collections_to_clear: Vec<(u64, u64, String)>,
+        group_vshards: Vec<u32>,
     },
 
     /// Purge ALL data for a tenant across every engine and cache.
@@ -189,6 +201,11 @@ pub enum MetaOp {
     /// surface "how much storage will a hard-delete reclaim?"
     /// without waiting for a purge cycle.
     QueryCollectionSize { tenant_id: u64, name: String },
+
+    /// Walk a `HASH_CHAIN` collection's chain in install order from genesis
+    /// over its raw stored rows. Read-only. The response payload is a
+    /// MessagePack `ChainVerdict` naming the first break, if any.
+    VerifyHashChain { collection: QualifiedCollection },
 
     /// Enforce retention on a timeseries collection: drop segments older than
     /// the cutoff. Called by the retention policy enforcement loop.
@@ -340,6 +357,11 @@ pub enum MetaOp {
         /// defaults to empty on decode of older entries.
         #[serde(default)]
         versioned_reads: Vec<VersionedReadEntry>,
+        /// Indexes into `plans` of the plans a trigger body buffered. Their
+        /// rows commit under `Trigger`, so they fire no trigger. Empty for a
+        /// transaction no body joined.
+        #[serde(default)]
+        body_plans: Vec<u32>,
     },
 
     /// Calvin dependent-read executor: passive participant reads keys and
@@ -437,23 +459,6 @@ pub enum MetaOp {
     ///
     /// Called after the Control Plane has already removed it from the catalog.
     DeleteSynonymGroup { tenant_id: u64, name: String },
-
-    /// Re-key all documents and secondary indexes for a collection from
-    /// `old_collection` (db-qualified source name) to `new_collection`
-    /// (db-qualified target name) in the local Data Plane sparse engine.
-    ///
-    /// Called after `MoveTenantCutover` applies so that physical data is
-    /// accessible under the new database context.  Both `old_collection` and
-    /// `new_collection` are the `db_qualified` strings used as the logical
-    /// collection identifier in the sparse store
-    /// (e.g. `"2/orders"` for database 2, collection `orders`).
-    RenameCollection {
-        tenant_id: u64,
-        old_database_id: u64,
-        new_database_id: u64,
-        old_collection: QualifiedCollection,
-        new_collection: QualifiedCollection,
-    },
 
     /// Execute a point write at STATEMENT time by STAGING it into the
     /// per-transaction overlay, instead of buffering it for COMMIT.
@@ -605,5 +610,27 @@ pub enum MetaOp {
         collections: Vec<String>,
         sum_targets: Vec<super::RedoSumTargets>,
         origin: super::RedoOrigin,
+    },
+
+    /// Install one batch of a RESTORE as part of a Calvin transaction, on
+    /// the vShard the batch names.
+    ///
+    /// It stages nothing. The transaction's resolve appends the batch's rows
+    /// and edge versions to its redo record, each edge version applied at
+    /// the transaction's ordinal, and its flush installs the record as a
+    /// RESTORE. Its write keys are the rows and edges the batch writes.
+    RestoreRedo(Box<super::RestoredRedo>),
+
+    /// Report the current version of each home in `probes`.
+    ///
+    /// A read-only transaction's commit sends this to the leader of the
+    /// vShards its cross-shard graph reads observed, one request per leader.
+    /// The leader hands each core the probes whose vShard that core owns. The
+    /// core answers each probe with the collection's write floor on the core,
+    /// or with the core watermark for a probe with no collection. The payload
+    /// is a msgpack array of `HomeVersion`. It reads nothing else and writes
+    /// nothing.
+    HomeVersions {
+        probes: Vec<super::HomeVersionProbe>,
     },
 }

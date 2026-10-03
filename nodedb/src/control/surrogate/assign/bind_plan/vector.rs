@@ -38,9 +38,19 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut VectorOp) -> crate::Res
         VectorOp::MultiVectorInsert {
             collection,
             document_surrogate,
+            pk_bytes,
             ..
-        } => binder
-            .resolve_self_keyed_in_place(binder.plan_key(collection.as_str())?, document_surrogate),
+        } => match pk_bytes {
+            Some(pk) => binder.resolve_in_place(
+                binder.plan_key(collection.as_str())?,
+                pk,
+                document_surrogate,
+            ),
+            None => binder.resolve_self_keyed_in_place(
+                binder.plan_key(collection.as_str())?,
+                document_surrogate,
+            ),
+        },
         VectorOp::DirectUpsert {
             collection,
             surrogate,

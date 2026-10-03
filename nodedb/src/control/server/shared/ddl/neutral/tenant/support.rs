@@ -3,9 +3,7 @@
 //! Shared error/result constructors and tenant-reference resolution helpers
 //! for the protocol-neutral tenant DDL handlers.
 //!
-//! Ported verbatim from the pgwire `ddl::tenant` module: `resolve_tenant_ref`
-//! and `tenant_exists` are byte-identical except for the error type
-//! (`DdlError` instead of `PgWireError`).
+//! `resolve_tenant_ref` and `tenant_exists` report errors as `DdlError`.
 
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;

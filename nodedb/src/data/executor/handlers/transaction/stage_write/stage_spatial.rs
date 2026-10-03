@@ -102,15 +102,20 @@ impl CoreLoop {
     }
 
     /// Stage a `SpatialOp::Delete`: record a tombstone keyed by the
-    /// surrogate. Returns `{"affected": 1}`.
+    /// surrogate. Returns `{"affected": 1}`. A delete of a key its home never
+    /// bound (`None`) names no row: it stages nothing and returns
+    /// `{"affected": 0}`.
     pub(in crate::data::executor) fn stage_spatial_delete(
         &mut self,
         task: &ExecutionTask,
         tid: u64,
         txn_id: TxnId,
         collection: &str,
-        surrogate: Surrogate,
+        surrogate: Option<Surrogate>,
     ) -> Response {
+        let Some(surrogate) = surrogate else {
+            return self.stage_count_response(task, 0);
+        };
         let ctx = StageCtx::new(
             task,
             tid,

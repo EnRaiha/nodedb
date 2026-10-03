@@ -77,7 +77,7 @@ impl SystemCatalog {
     }
 
     /// Write a tenant quota record consensus already accepted. No validation
-    /// and no ceiling check — a rejection here would diverge nodes.
+    /// and no ceiling check — a rejection here diverges nodes.
     pub fn write_tenant_quota(
         &self,
         db_id: DatabaseId,
@@ -231,6 +231,25 @@ impl SystemCatalog {
 
     // ── sum-of-tenant-quotas validation ──────────────────────────────────────
 
+    /// Check a tenant quota for a database the caller creates with
+    /// `db_quota`, before either exists in the catalog.
+    ///
+    /// `others` holds every other tenant quota the caller installs in the
+    /// same new database. Their sum plus `record` must fit `db_quota`.
+    pub fn check_tenant_quota_in_new_database(
+        db_quota: Option<&QuotaRecord>,
+        others: &[&QuotaRecord],
+        record: &QuotaRecord,
+    ) -> crate::Result<()> {
+        record.validate().map_err(|e| crate::Error::BadRequest {
+            detail: e.to_string(),
+        })?;
+        match db_quota {
+            Some(db_quota) => tenant_sum_fits(db_quota, others.iter().copied(), record),
+            None => Ok(()),
+        }
+    }
+
     fn check_tenant_quota_ceiling(
         &self,
         db_id: DatabaseId,
@@ -242,85 +261,96 @@ impl SystemCatalog {
             Some(q) => q,
             None => return Ok(()),
         };
-
-        // Build a GlobalQuotaCeiling from the database quota's non-zero limits.
-        let ceiling = GlobalQuotaCeiling {
-            max_memory_bytes: db_quota.max_memory_bytes,
-            max_storage_bytes: db_quota.max_storage_bytes,
-            max_qps: db_quota.max_qps as u64,
-            max_connections: db_quota.max_connections as u64,
-        };
-
-        // If all dimensions are zero, the database quota imposes no limits.
-        if ceiling.max_memory_bytes == 0
-            && ceiling.max_storage_bytes == 0
-            && ceiling.max_qps == 0
-            && ceiling.max_connections == 0
-        {
-            return Ok(());
-        }
-
         let tenants = self.list_tenant_quotas_for_database(db_id)?;
-
-        let mut sum_memory: u64 = 0;
-        let mut sum_storage: u64 = 0;
-        let mut sum_qps: u64 = 0;
-        let mut sum_connections: u64 = 0;
-
-        for (tid, rec) in &tenants {
-            if *tid == tenant_id {
-                continue; // Will be replaced by `proposed`.
-            }
-            sum_memory = sum_memory.saturating_add(rec.max_memory_bytes);
-            sum_storage = sum_storage.saturating_add(rec.max_storage_bytes);
-            sum_qps = sum_qps.saturating_add(rec.max_qps as u64);
-            sum_connections = sum_connections.saturating_add(rec.max_connections as u64);
-        }
-
-        sum_memory = sum_memory.saturating_add(proposed.max_memory_bytes);
-        sum_storage = sum_storage.saturating_add(proposed.max_storage_bytes);
-        sum_qps = sum_qps.saturating_add(proposed.max_qps as u64);
-        sum_connections = sum_connections.saturating_add(proposed.max_connections as u64);
-
-        if ceiling.max_memory_bytes > 0 && sum_memory > ceiling.max_memory_bytes {
-            return Err(crate::Error::QuotaOvercommit {
-                field: "max_memory_bytes".into(),
-                detail: format!(
-                    "tenant sum {sum_memory} exceeds database quota {}",
-                    ceiling.max_memory_bytes
-                ),
-            });
-        }
-        if ceiling.max_storage_bytes > 0 && sum_storage > ceiling.max_storage_bytes {
-            return Err(crate::Error::QuotaOvercommit {
-                field: "max_storage_bytes".into(),
-                detail: format!(
-                    "tenant sum {sum_storage} exceeds database quota {}",
-                    ceiling.max_storage_bytes
-                ),
-            });
-        }
-        if ceiling.max_qps > 0 && sum_qps > ceiling.max_qps {
-            return Err(crate::Error::QuotaOvercommit {
-                field: "max_qps".into(),
-                detail: format!(
-                    "tenant sum {sum_qps} exceeds database quota {}",
-                    ceiling.max_qps
-                ),
-            });
-        }
-        if ceiling.max_connections > 0 && sum_connections > ceiling.max_connections {
-            return Err(crate::Error::QuotaOvercommit {
-                field: "max_connections".into(),
-                detail: format!(
-                    "tenant sum {sum_connections} exceeds database quota {}",
-                    ceiling.max_connections
-                ),
-            });
-        }
-
-        Ok(())
+        tenant_sum_fits(
+            &db_quota,
+            tenants
+                .iter()
+                .filter(|(tid, _)| *tid != tenant_id)
+                .map(|(_, rec)| rec),
+            proposed,
+        )
     }
+}
+
+/// Whether the tenant quotas `others` plus `proposed` fit the database quota.
+fn tenant_sum_fits<'a>(
+    db_quota: &QuotaRecord,
+    others: impl Iterator<Item = &'a QuotaRecord>,
+    proposed: &QuotaRecord,
+) -> crate::Result<()> {
+    // Build a GlobalQuotaCeiling from the database quota's non-zero limits.
+    let ceiling = GlobalQuotaCeiling {
+        max_memory_bytes: db_quota.max_memory_bytes,
+        max_storage_bytes: db_quota.max_storage_bytes,
+        max_qps: db_quota.max_qps as u64,
+        max_connections: db_quota.max_connections as u64,
+    };
+
+    // If all dimensions are zero, the database quota imposes no limits.
+    if ceiling.max_memory_bytes == 0
+        && ceiling.max_storage_bytes == 0
+        && ceiling.max_qps == 0
+        && ceiling.max_connections == 0
+    {
+        return Ok(());
+    }
+
+    let mut sum_memory: u64 = 0;
+    let mut sum_storage: u64 = 0;
+    let mut sum_qps: u64 = 0;
+    let mut sum_connections: u64 = 0;
+
+    for rec in others {
+        sum_memory = sum_memory.saturating_add(rec.max_memory_bytes);
+        sum_storage = sum_storage.saturating_add(rec.max_storage_bytes);
+        sum_qps = sum_qps.saturating_add(rec.max_qps as u64);
+        sum_connections = sum_connections.saturating_add(rec.max_connections as u64);
+    }
+
+    sum_memory = sum_memory.saturating_add(proposed.max_memory_bytes);
+    sum_storage = sum_storage.saturating_add(proposed.max_storage_bytes);
+    sum_qps = sum_qps.saturating_add(proposed.max_qps as u64);
+    sum_connections = sum_connections.saturating_add(proposed.max_connections as u64);
+
+    if ceiling.max_memory_bytes > 0 && sum_memory > ceiling.max_memory_bytes {
+        return Err(crate::Error::QuotaOvercommit {
+            field: "max_memory_bytes".into(),
+            detail: format!(
+                "tenant sum {sum_memory} exceeds database quota {}",
+                ceiling.max_memory_bytes
+            ),
+        });
+    }
+    if ceiling.max_storage_bytes > 0 && sum_storage > ceiling.max_storage_bytes {
+        return Err(crate::Error::QuotaOvercommit {
+            field: "max_storage_bytes".into(),
+            detail: format!(
+                "tenant sum {sum_storage} exceeds database quota {}",
+                ceiling.max_storage_bytes
+            ),
+        });
+    }
+    if ceiling.max_qps > 0 && sum_qps > ceiling.max_qps {
+        return Err(crate::Error::QuotaOvercommit {
+            field: "max_qps".into(),
+            detail: format!(
+                "tenant sum {sum_qps} exceeds database quota {}",
+                ceiling.max_qps
+            ),
+        });
+    }
+    if ceiling.max_connections > 0 && sum_connections > ceiling.max_connections {
+        return Err(crate::Error::QuotaOvercommit {
+            field: "max_connections".into(),
+            detail: format!(
+                "tenant sum {sum_connections} exceeds database quota {}",
+                ceiling.max_connections
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -350,6 +380,26 @@ mod tests {
             max_graph_depth: 8,
             deactivated_collection_retention_days: Some(14),
         }
+    }
+
+    /// Two tenants that each fit a new database's quota alone are refused
+    /// together when their sum exceeds it.
+    #[test]
+    fn new_database_sums_every_tenant_quota() {
+        let mut db = sample_record();
+        db.max_connections = 50;
+        let mut first = sample_record();
+        first.max_connections = 30;
+        let mut second = sample_record();
+        second.max_connections = 30;
+
+        SystemCatalog::check_tenant_quota_in_new_database(Some(&db), &[], &first)
+            .expect("one tenant fits");
+        SystemCatalog::check_tenant_quota_in_new_database(Some(&db), &[], &second)
+            .expect("the other fits alone");
+        let err = SystemCatalog::check_tenant_quota_in_new_database(Some(&db), &[&first], &second)
+            .expect_err("the two tenants together exceed the database quota");
+        assert!(matches!(err, crate::Error::QuotaOvercommit { .. }), "{err}");
     }
 
     /// Bytes redb accepts as a value but zerompk cannot decode.

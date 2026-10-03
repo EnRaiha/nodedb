@@ -48,8 +48,11 @@ impl CoreLoop {
             format,
             default_timestamp_ms,
         } = args;
-        if let Ok(batch) =
-            zerompk::from_msgpack::<nodedb_types::timeseries::TimeseriesWalBatch>(payload)
+        let resolved =
+            format == Some(crate::engine::timeseries::resolved_ingest::RESOLVED_INGEST_FORMAT);
+        if !resolved
+            && let Ok(batch) =
+                zerompk::from_msgpack::<nodedb_types::timeseries::TimeseriesWalBatch>(payload)
         {
             let key = (db_id, tid, collection.to_string());
             if self.recording_redo_undo() {
@@ -160,6 +163,12 @@ impl CoreLoop {
         }
         if format == "ilp-msgpack" {
             return zerompk::from_msgpack::<Vec<String>>(payload).map_or(0, |rows| rows.len());
+        }
+        if format == crate::engine::timeseries::resolved_ingest::RESOLVED_INGEST_FORMAT {
+            return crate::engine::timeseries::resolved_ingest::ResolvedTsBatch::from_bytes(
+                payload,
+            )
+            .map_or(0, |batch| batch.rows.len());
         }
         match nodedb_types::value_from_msgpack(payload) {
             Ok(nodedb_types::Value::Array(rows)) => rows.len(),

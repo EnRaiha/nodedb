@@ -11,6 +11,9 @@
 //! - **Renewal:** every heartbeat interval. A holder that covers a change
 //!   renews within one heartbeat, so an acknowledgement waits about one
 //!   heartbeat when every node is healthy.
+//! - **Reply margin:** the heartbeat interval. The leader answers a renewal
+//!   or a barrier this much before the holder's read timeout ends. The reply
+//!   then reaches the holder before the holder gives up on it.
 
 use std::time::{Duration, Instant};
 
@@ -23,6 +26,9 @@ pub struct LeaseTiming {
     pub skew_margin: Duration,
     /// How often a holder renews.
     pub renew_every: Duration,
+    /// How much earlier the leader's reply deadline ends than the holder's
+    /// read timeout.
+    pub reply_margin: Duration,
 }
 
 impl LeaseTiming {
@@ -43,7 +49,32 @@ impl LeaseTiming {
             lease: election_timeout_min,
             skew_margin: heartbeat_interval,
             renew_every: heartbeat_interval,
+            reply_margin: heartbeat_interval,
         })
+    }
+
+    /// The longest the leader spends confirming its leadership and loading
+    /// floors for one reply. It ends a reply margin inside the lease.
+    /// [`Self::from_raft`] keeps it non-zero: the heartbeat is below the lease.
+    pub fn leader_budget(&self) -> Duration {
+        self.lease.saturating_sub(self.reply_margin)
+    }
+
+    /// How long a planning path waits for the next renewal once it found
+    /// the lease lapsed: one renewal interval for the next round to start,
+    /// plus the reply margin for it to finish.
+    pub fn lapse_grace(&self) -> Duration {
+        self.renew_every + self.reply_margin
+    }
+
+    /// The holder's read timeout for an RPC whose leader handler first waits
+    /// up to `wait`, then spends up to [`Self::leader_budget`].
+    ///
+    /// It exceeds the handler's own deadline by the reply margin. A slow
+    /// reply then still arrives, and a read timeout means the leader is
+    /// unreachable rather than busy.
+    pub fn rpc_read_timeout(&self, wait: Duration) -> Duration {
+        wait + self.leader_budget() + self.reply_margin
     }
 
     /// When a lease the leader granted for `granted`, requested at `sent_at`
@@ -69,6 +100,24 @@ mod tests {
         assert_eq!(timing.lease, Duration::from_millis(150));
         assert_eq!(timing.skew_margin, Duration::from_millis(50));
         assert_eq!(timing.renew_every, Duration::from_millis(50));
+        assert_eq!(timing.reply_margin, Duration::from_millis(50));
+        assert_eq!(timing.lapse_grace(), Duration::from_millis(100));
+    }
+
+    /// The leader's reply deadline ends strictly inside the holder's read
+    /// timeout, for a renewal and for a barrier that waits first.
+    #[test]
+    fn the_leader_answers_before_the_holder_times_out() {
+        let timing = LeaseTiming::from_raft(Duration::from_millis(500), Duration::from_millis(50))
+            .expect("timing");
+        assert_eq!(timing.leader_budget(), Duration::from_millis(450));
+        assert_eq!(timing.rpc_read_timeout(Duration::ZERO), timing.lease);
+        for wait in [Duration::ZERO, Duration::from_secs(3)] {
+            let leader_done = wait + timing.leader_budget();
+            let holder_gives_up = timing.rpc_read_timeout(wait);
+            assert!(leader_done < holder_gives_up);
+            assert_eq!(holder_gives_up - leader_done, timing.reply_margin);
+        }
     }
 
     #[test]

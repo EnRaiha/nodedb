@@ -15,6 +15,7 @@ mod body;
 mod column_list;
 mod dispatcher;
 mod engine_suffix;
+mod flags;
 mod with_clause;
 
 pub(super) use dispatcher::try_parse;

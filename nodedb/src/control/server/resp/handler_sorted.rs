@@ -41,8 +41,10 @@ pub(super) async fn handle_zadd(
     // In RESP mode, the sorted index name = session.collection.
     // The args are: score1 member1 [score2 member2 ...]
     let index_name = session.collection.clone();
-    let mut added = 0i64;
 
+    // Every pair is parsed before any write, so an invalid score refuses the
+    // whole command.
+    let mut members: Vec<(f64, Vec<u8>)> = Vec::with_capacity(cmd.argc() / 2);
     let mut i = 0;
     while i + 1 < cmd.argc() {
         let score_str = match cmd.arg_str(i) {
@@ -53,8 +55,30 @@ pub(super) async fn handle_zadd(
             Ok(v) => v,
             Err(_) => return RespValue::err("ERR value is not a valid float"),
         };
-        let member = cmd.args[i + 1].clone();
+        members.push((score, cmd.args[i + 1].clone()));
+        i += 2;
+    }
 
+    // Every member's identity, in one batch at the index collection's home.
+    let keys: Vec<&[u8]> = members
+        .iter()
+        .map(|(_, member)| member.as_slice())
+        .collect();
+    let surrogates = match crate::control::server::surrogate_exchange::assign_surrogates_routed(
+        state,
+        nodedb_types::CollectionKey::from_bare(crate::types::DatabaseId::DEFAULT, &index_name),
+        session.tenant_id,
+        &keys,
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => return RespValue::from_error(&e),
+    };
+
+    let mut added = 0i64;
+    for ((score, member), surrogate) in members.into_iter().zip(surrogates) {
         // Write to the underlying KV collection as a MessagePack document
         // containing the score and member. The sorted index auto-maintenance
         // in KvEngine::put will update the order-statistic tree.
@@ -64,14 +88,6 @@ pub(super) async fn handle_zadd(
         }))
         .unwrap_or_default();
 
-        let surrogate = match state.surrogate_assigner.assign(
-            nodedb_types::CollectionKey::from_bare(crate::types::DatabaseId::DEFAULT, &index_name),
-            session.tenant_id,
-            &member,
-        ) {
-            Ok(s) => s,
-            Err(e) => return RespValue::from_error(&e),
-        };
         let plan = PhysicalPlan::Kv(KvOp::Put {
             collection: QualifiedCollection::new(crate::types::DatabaseId::DEFAULT, &index_name),
             key: member,
@@ -87,8 +103,6 @@ pub(super) async fn handle_zadd(
             Ok(_) => added += 1,
             Err(e) => return RespValue::from_error(&e),
         }
-
-        i += 2;
     }
 
     RespValue::integer(added)

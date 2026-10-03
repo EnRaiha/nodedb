@@ -23,4 +23,4 @@ pub mod start;
 
 pub use config::{ClusterConfig, ClusterState, JoinRetryPolicy};
 pub use handle_join::handle_join_request;
-pub use start::{start_cluster, start_cluster_subsystems};
+pub use start::{SubsystemHandles, start_cluster, start_cluster_subsystems};

@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
-use nodedb_cluster::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
+use nodedb_cluster::circuit_breaker::{
+    Admission, CircuitBreaker, CircuitBreakerConfig, CircuitState,
+};
 use nodedb_cluster::error::{ClusterError, Result};
 use nodedb_cluster::reachability::{
     ReachabilityDriver, ReachabilityDriverConfig, ReachabilityProber,
@@ -61,7 +63,7 @@ async fn reachability_loop_recovers_open_breaker_without_user_traffic() {
         // driver still needs to drive the actual transition.
         cooldown: Duration::from_millis(100),
     }));
-    breaker.record_failure(42);
+    breaker.record_failure(42, Admission::Normal);
     assert_eq!(breaker.state(42), CircuitState::Open);
 
     // --- Flappy prober starts "unhealthy". ---
@@ -81,19 +83,19 @@ async fn reachability_loop_recovers_open_breaker_without_user_traffic() {
     impl ReachabilityProber for RelayProber {
         async fn probe(&self, peer: u64) -> Result<()> {
             // Mirror send_rpc: check → probe → record outcome.
-            if self.breaker.check(peer).is_err() {
+            let Ok(admission) = self.breaker.check(peer) else {
                 return Err(ClusterError::CircuitOpen {
                     node_id: peer,
                     failures: self.breaker.failure_count(peer),
                 });
-            }
+            };
             match self.inner.probe(peer).await {
                 Ok(()) => {
-                    self.breaker.record_success(peer);
+                    self.breaker.record_success(peer, admission);
                     Ok(())
                 }
                 Err(e) => {
-                    self.breaker.record_failure(peer);
+                    self.breaker.record_failure(peer, admission);
                     Err(e)
                 }
             }

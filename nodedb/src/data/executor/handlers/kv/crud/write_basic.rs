@@ -41,7 +41,7 @@ impl CoreLoop {
 
         // See `CoreLoop::kv_ttl_now_ms` for the precedence this resolves.
         let now_ms: u64 = self.kv_ttl_now_ms(task);
-        let old = self.kv_engine.put(crate::engine::kv::KvPutParams {
+        let old = match self.kv_engine.put(crate::engine::kv::KvPutParams {
             database_id: did,
             tenant_id: tid,
             collection,
@@ -50,7 +50,10 @@ impl CoreLoop {
             ttl_ms,
             now_ms,
             surrogate,
-        });
+        }) {
+            Ok(old) => old,
+            Err(e) => return self.response_error(task, e),
+        };
         if let Some(ref m) = self.metrics {
             m.record_kv_put();
         }
@@ -131,7 +134,7 @@ impl CoreLoop {
             );
         }
 
-        self.kv_engine.put(crate::engine::kv::KvPutParams {
+        if let Err(e) = self.kv_engine.put(crate::engine::kv::KvPutParams {
             database_id: did,
             tenant_id: tid,
             collection,
@@ -140,7 +143,9 @@ impl CoreLoop {
             ttl_ms,
             now_ms,
             surrogate,
-        });
+        }) {
+            return self.response_error(task, e);
+        }
         if let Some(ref m) = self.metrics {
             m.record_kv_put();
         }
@@ -211,7 +216,7 @@ impl CoreLoop {
             return self.response_affected(task, 0);
         }
 
-        self.kv_engine.put(crate::engine::kv::KvPutParams {
+        if let Err(e) = self.kv_engine.put(crate::engine::kv::KvPutParams {
             database_id: did,
             tenant_id: tid,
             collection,
@@ -220,7 +225,9 @@ impl CoreLoop {
             ttl_ms,
             now_ms,
             surrogate,
-        });
+        }) {
+            return self.response_error(task, e);
+        }
         if let Some(ref m) = self.metrics {
             m.record_kv_put();
         }

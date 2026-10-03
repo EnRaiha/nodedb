@@ -1,171 +1,152 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `DatabaseRegistry` — thread-safe monotonic database-id allocator.
+//! `DatabaseRegistry` — monotonic database-id allocator.
 //!
-//! ## Counter semantics
+//! ## Id ranges
 //!
-//! The internal `AtomicU64` counter stores the **next** database id to
-//! be handed out. `alloc_one()` does `fetch_add(1, AcqRel)`; the returned
-//! value is the previous counter (i.e. the id the caller now owns). After
-//! every successful allocation, `current_hwm()` returns the highest id
-//! ever issued — equivalently, `counter - 1`.
+//! `DatabaseId(0)` is the built-in `default` database. `1..=1023` is
+//! reserved for system databases. User databases start at
+//! [`USER_DB_START`].
 //!
-//! ## Reserved range
+//! ## Allocation
 //!
-//! `DatabaseId(0)` is permanently reserved for the built-in `default`
-//! database. `DatabaseId(1..=1023)` is reserved for future system
-//! databases; none are assigned in v1. User-created databases start
-//! at `DatabaseId(1024)`. `from_persisted_hwm` enforces this floor:
-//! if the persisted hwm is less than 1023, the counter is initialized
-//! to 1024 so the first allocation cannot invade the reserved range.
+//! Every id comes from a `DatabaseIdReserve` log entry of the metadata Raft
+//! group, a one-node cluster included. [`DatabaseRegistry::reserve_at_index`]
+//! runs at apply time on every node, in log order, so every node computes
+//! the same id. It persists the hwm together with the entry's log index.
 //!
-//! ## Restart semantics
+//! The hwm is persisted before the id leaves the registry. A persist error
+//! returns `Err` and leaves the counter unchanged, so a restart never
+//! reissues an id.
 //!
-//! `from_persisted_hwm(hwm)` initializes `counter = max(hwm + 1, 1024)`.
+//! ## Replay
 //!
-//! ## Raft routing
-//!
-//! The atomic counter is a local cache only. The authoritative
-//! allocation goes through Raft metadata group 0 via
-//! `crate::control::metadata_proposer::propose_database_hwm`. The
-//! `install_shared` hook (mirroring `SurrogateAssigner`) wires the
-//! weak `SharedState` handle so the flush path can propose.
-//!
-//! ## Width
-//!
-//! Database IDs are `u64`. With user databases starting at 1024 and
-//! u64::MAX ≈ 1.8 × 10^19, overflow is not a practical concern; the
-//! registry does not implement an `Exhausted` error path.
+//! The metadata log replays from its first entry on every boot. The
+//! registry is seeded with the persisted `(hwm, reserve_index)` pair, and
+//! `reserve_at_index` skips every entry at or below `reserve_index`. Those
+//! reservations are already folded into the seeded hwm.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use nodedb_types::DatabaseId;
 
 use super::persist::DatabaseHwmPersist;
 
-/// Periodic flush trigger: every N allocations, regardless of elapsed time.
-pub const FLUSH_OPS_THRESHOLD: u64 = 64;
-
-/// Periodic flush trigger: every T elapsed since the last flush.
-pub const FLUSH_ELAPSED_THRESHOLD: Duration = Duration::from_millis(200);
-
 /// First user-assignable database id. `0..=1023` reserved.
 pub const USER_DB_START: u64 = 1024;
 
-/// Allocation errors. Surfaced to the caller; `From` impl wires this into
-/// the crate's central `Error` enum.
+/// Allocation errors. `From` wires this into the crate's central `Error`.
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseAllocError {
-    #[error("database hwm flush failed: {detail}")]
-    FlushFailed { detail: String },
+    #[error("database hwm persist failed: {detail}")]
+    PersistFailed { detail: String },
+}
+
+/// Counter state guarded as one unit so the id and its cursor move together.
+struct Counter {
+    /// Next id to issue. Always `>= USER_DB_START`.
+    next: u64,
+    /// Highest metadata log index whose reservation is folded into `next`.
+    reserve_index: u64,
 }
 
 /// Thread-safe database-id allocator.
-///
-/// The `Mutex<Instant>` for `last_flush_at` is uncontended on the hot
-/// path (`alloc_one` only touches atomics); only `should_flush` and
-/// `flush` take the lock, which run at most once per ~200 ms or per 64
-/// allocations.
 pub struct DatabaseRegistry {
-    /// Next id to hand out. Always >= `USER_DB_START`.
-    counter: AtomicU64,
-    /// Allocations since the last flush. Reset by `flush()`.
-    allocs_since_flush: AtomicU64,
-    /// Wall-clock anchor for the elapsed-time flush trigger.
-    last_flush_at: Mutex<Instant>,
+    counter: Mutex<Counter>,
+    /// In-flight replicated reservations of this node: request id -> the id
+    /// the applier carved for it, once applied.
+    pending: Mutex<HashMap<u64, Option<DatabaseId>>>,
 }
 
 impl DatabaseRegistry {
-    /// Create an empty registry — first allocation returns `DatabaseId(1024)`.
+    /// Create an empty registry — the first id issued is `USER_DB_START`.
     pub fn new() -> Self {
-        Self::from_persisted_hwm(0)
+        Self::from_persisted(0, 0)
     }
 
-    /// Restore from a persisted high-watermark. Next allocation returns
-    /// `max(hwm + 1, USER_DB_START)`.
-    pub fn from_persisted_hwm(hwm: u64) -> Self {
-        let next = (hwm + 1).max(USER_DB_START);
+    /// Restore from the persisted hwm and applied-reservation cursor.
+    pub fn from_persisted(hwm: u64, reserve_index: u64) -> Self {
         Self {
-            counter: AtomicU64::new(next),
-            allocs_since_flush: AtomicU64::new(0),
-            last_flush_at: Mutex::new(Instant::now()),
+            counter: Mutex::new(Counter {
+                next: hwm.saturating_add(1).max(USER_DB_START),
+                reserve_index,
+            }),
+            pending: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Allocate a single database id.
-    pub fn alloc_one(&self) -> DatabaseId {
-        let prev = self.counter.fetch_add(1, Ordering::AcqRel);
-        self.allocs_since_flush.fetch_add(1, Ordering::AcqRel);
-        DatabaseId::new(prev)
+    /// Reset the counter to the persisted hwm and applied-reservation
+    /// cursor, after the catalog rows were replaced by a metadata snapshot.
+    /// Waiting requests stay registered: their entries fall inside the
+    /// snapshot, so they time out and retry.
+    pub fn restore_persisted(&self, hwm: u64, reserve_index: u64) {
+        let mut counter = self.lock_counter();
+        counter.next = hwm.saturating_add(1).max(USER_DB_START);
+        counter.reserve_index = reserve_index;
     }
 
-    /// Highest database id ever issued — `USER_DB_START - 1` if no user
-    /// allocations yet (meaning no user database has been created).
-    pub fn current_hwm(&self) -> u64 {
-        let next = self.counter.load(Ordering::Acquire);
-        next.saturating_sub(1)
-    }
-
-    /// Idempotently raise the high-watermark to at least `new_hwm`.
-    /// Used by WAL replay or Raft follower catch-up. Never lowers.
-    pub fn restore_hwm(&self, new_hwm: u64) {
-        let target = new_hwm + 1;
-        let mut current = self.counter.load(Ordering::Acquire);
-        loop {
-            if target <= current {
-                return;
-            }
-            match self.counter.compare_exchange_weak(
-                current,
-                target,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(actual) => current = actual,
-            }
+    /// Apply the `DatabaseIdReserve` entry at `raft_index`.
+    ///
+    /// Returns `None` for an entry already folded into the seeded hwm
+    /// (replay or duplicate delivery). Otherwise issues the next id and
+    /// persists it with `raft_index` before returning it.
+    pub fn reserve_at_index(
+        &self,
+        raft_index: u64,
+        persist: &dyn DatabaseHwmPersist,
+    ) -> Result<Option<DatabaseId>, DatabaseAllocError> {
+        let mut counter = self.lock_counter();
+        if raft_index <= counter.reserve_index {
+            return Ok(None);
         }
-    }
-
-    /// True if the periodic-flush thresholds (ops or elapsed) are tripped.
-    pub fn should_flush(&self) -> bool {
-        if self.allocs_since_flush.load(Ordering::Acquire) >= FLUSH_OPS_THRESHOLD {
-            return true;
-        }
-        if let Ok(last) = self.last_flush_at.lock() {
-            return last.elapsed() >= FLUSH_ELAPSED_THRESHOLD;
-        }
-        false
-    }
-
-    /// Persist the current high-watermark and reset flush counters.
-    /// Idempotent: calling on an unmodified registry just rewrites the
-    /// same hwm.
-    pub fn flush(&self, persist: &dyn DatabaseHwmPersist) -> Result<(), DatabaseAllocError> {
-        let hwm = self.current_hwm();
+        let id = counter.next;
         persist
-            .checkpoint(hwm)
-            .map_err(|e| DatabaseAllocError::FlushFailed {
-                detail: e.to_string(),
-            })?;
-        self.allocs_since_flush.store(0, Ordering::Release);
-        if let Ok(mut guard) = self.last_flush_at.lock() {
-            *guard = Instant::now();
-        }
-        Ok(())
+            .checkpoint_reserve(id, raft_index)
+            .map_err(persist_failed)?;
+        counter.next = id + 1;
+        counter.reserve_index = raft_index;
+        Ok(Some(DatabaseId::new(id)))
     }
 
-    /// Test-only: force the elapsed-flush trigger by rewinding the
-    /// wall-clock anchor.
-    #[cfg(test)]
-    fn rewind_flush_clock(&self, by: Duration) {
-        if let Ok(mut guard) = self.last_flush_at.lock()
-            && let Some(earlier) = guard.checked_sub(by)
-        {
-            *guard = earlier;
+    /// Highest id ever issued, or `USER_DB_START - 1` before the first one.
+    pub fn current_hwm(&self) -> u64 {
+        self.lock_counter().next - 1
+    }
+
+    /// Register an in-flight replicated reservation. The request id is
+    /// random, so a request of this process never matches an entry a
+    /// previous process of this node proposed.
+    pub fn begin_request(&self) -> u64 {
+        let mut pending = self.lock_pending();
+        loop {
+            let request_id = rand::random::<u64>();
+            if let std::collections::hash_map::Entry::Vacant(slot) = pending.entry(request_id) {
+                slot.insert(None);
+                return request_id;
+            }
         }
+    }
+
+    /// Record the id the applier carved for `request_id`. A request this
+    /// process does not wait on is ignored.
+    pub fn complete_request(&self, request_id: u64, id: DatabaseId) {
+        if let Some(slot) = self.lock_pending().get_mut(&request_id) {
+            *slot = Some(id);
+        }
+    }
+
+    /// Stop waiting on `request_id` and return its id, if it was applied.
+    pub fn finish_request(&self, request_id: u64) -> Option<DatabaseId> {
+        self.lock_pending().remove(&request_id).flatten()
+    }
+
+    fn lock_counter(&self) -> std::sync::MutexGuard<'_, Counter> {
+        self.counter.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Option<DatabaseId>>> {
+        self.pending.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -175,10 +156,16 @@ impl Default for DatabaseRegistry {
     }
 }
 
+fn persist_failed(e: crate::Error) -> DatabaseAllocError {
+    DatabaseAllocError::PersistFailed {
+        detail: e.to_string(),
+    }
+}
+
 impl From<DatabaseAllocError> for crate::Error {
     fn from(e: DatabaseAllocError) -> Self {
         match e {
-            DatabaseAllocError::FlushFailed { detail } => crate::Error::Storage {
+            DatabaseAllocError::PersistFailed { detail } => crate::Error::Storage {
                 engine: "database_registry".into(),
                 detail,
             },
@@ -188,148 +175,145 @@ impl From<DatabaseAllocError> for crate::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+    use crate::control::security::catalog::SystemCatalog;
 
+    #[derive(Default)]
     struct MemPersist {
-        last: std::sync::Mutex<Option<u64>>,
-        calls: AtomicU32,
+        state: Mutex<(u64, u64)>,
+        fail: AtomicBool,
     }
 
     impl MemPersist {
-        fn new() -> Self {
-            Self {
-                last: std::sync::Mutex::new(None),
-                calls: AtomicU32::new(0),
+        fn check_fail(&self) -> crate::Result<()> {
+            if self.fail.load(Ordering::Acquire) {
+                return Err(crate::Error::Storage {
+                    engine: "test".into(),
+                    detail: "injected".into(),
+                });
             }
-        }
-
-        fn last(&self) -> Option<u64> {
-            *self.last.lock().unwrap()
-        }
-
-        fn calls(&self) -> u32 {
-            self.calls.load(Ordering::Acquire)
+            Ok(())
         }
     }
 
     impl DatabaseHwmPersist for MemPersist {
-        fn checkpoint(&self, hwm: u64) -> crate::Result<()> {
-            *self.last.lock().unwrap() = Some(hwm);
-            self.calls.fetch_add(1, Ordering::AcqRel);
+        fn checkpoint_reserve(&self, hwm: u64, reserve_index: u64) -> crate::Result<()> {
+            self.check_fail()?;
+            *self.state.lock().unwrap() = (hwm, reserve_index);
             Ok(())
         }
 
         fn load(&self) -> crate::Result<u64> {
-            Ok(self.last().unwrap_or(0))
+            Ok(self.state.lock().unwrap().0)
+        }
+
+        fn load_reserve_index(&self) -> crate::Result<u64> {
+            Ok(self.state.lock().unwrap().1)
         }
     }
 
-    #[test]
-    fn first_alloc_returns_user_db_start() {
-        let reg = DatabaseRegistry::new();
-        let d = reg.alloc_one();
-        assert_eq!(d.as_u64(), USER_DB_START);
+    fn reopen(persist: &dyn DatabaseHwmPersist) -> DatabaseRegistry {
+        DatabaseRegistry::from_persisted(
+            persist.load().unwrap(),
+            persist.load_reserve_index().unwrap(),
+        )
     }
 
     #[test]
-    fn monotonic_100() {
+    fn first_reservation_is_user_db_start_and_persisted() {
+        let persist = MemPersist::default();
         let reg = DatabaseRegistry::new();
-        let mut prev = 0u64;
-        for _ in 0..100 {
-            let d = reg.alloc_one();
-            assert!(d.as_u64() > prev);
-            prev = d.as_u64();
+        let id = reg.reserve_at_index(1, &persist).unwrap();
+        assert_eq!(id, Some(DatabaseId::new(USER_DB_START)));
+        assert_eq!(persist.load().unwrap(), USER_DB_START);
+        assert_eq!(persist.load_reserve_index().unwrap(), 1);
+    }
+
+    #[test]
+    fn hwm_below_user_start_is_floored() {
+        let persist = MemPersist::default();
+        let reg = DatabaseRegistry::from_persisted(500, 0);
+        assert_eq!(
+            reg.reserve_at_index(1, &persist).unwrap(),
+            Some(DatabaseId::new(USER_DB_START))
+        );
+    }
+
+    #[test]
+    fn persist_error_is_returned_and_leaves_the_counter() {
+        let persist = MemPersist::default();
+        let reg = DatabaseRegistry::new();
+        persist.fail.store(true, Ordering::Release);
+        assert!(reg.reserve_at_index(1, &persist).is_err());
+        persist.fail.store(false, Ordering::Release);
+        assert_eq!(
+            reg.reserve_at_index(1, &persist).unwrap(),
+            Some(DatabaseId::new(USER_DB_START))
+        );
+    }
+
+    /// Two nodes applying the same log compute the same ids.
+    #[test]
+    fn reservations_agree_across_nodes() {
+        let (pa, pb) = (MemPersist::default(), MemPersist::default());
+        let (a, b) = (DatabaseRegistry::new(), DatabaseRegistry::new());
+        for index in [3, 8, 9] {
+            assert_eq!(
+                a.reserve_at_index(index, &pa).unwrap(),
+                b.reserve_at_index(index, &pb).unwrap()
+            );
         }
+        assert_eq!(a.current_hwm(), USER_DB_START + 2);
     }
 
+    /// A full-log replay after a restart skips every folded reservation and
+    /// issues fresh ids only for entries past the cursor.
     #[test]
-    fn restart_respects_hwm() {
-        let reg = DatabaseRegistry::from_persisted_hwm(5000);
-        let d = reg.alloc_one();
-        assert_eq!(d.as_u64(), 5001);
-        assert_eq!(reg.current_hwm(), 5001);
-    }
-
-    #[test]
-    fn restart_below_user_start_floored() {
-        // hwm=0 → counter starts at USER_DB_START
-        let reg = DatabaseRegistry::from_persisted_hwm(0);
-        let d = reg.alloc_one();
-        assert_eq!(d.as_u64(), USER_DB_START);
-        // hwm=500 → still floored to USER_DB_START
-        let reg2 = DatabaseRegistry::from_persisted_hwm(500);
-        let d2 = reg2.alloc_one();
-        assert_eq!(d2.as_u64(), USER_DB_START);
-    }
-
-    #[test]
-    fn restore_hwm_monotonic() {
+    fn replay_after_restart_skips_folded_reservations() {
+        let persist = MemPersist::default();
         let reg = DatabaseRegistry::new();
-        reg.restore_hwm(9000);
-        let d = reg.alloc_one();
-        assert_eq!(d.as_u64(), 9001);
-        // Lowering is a no-op
-        reg.restore_hwm(100);
-        let d2 = reg.alloc_one();
-        assert_eq!(d2.as_u64(), 9002);
+        let first = reg.reserve_at_index(4, &persist).unwrap();
+        let second = reg.reserve_at_index(6, &persist).unwrap();
+        assert_eq!(first, Some(DatabaseId::new(USER_DB_START)));
+        assert_eq!(second, Some(DatabaseId::new(USER_DB_START + 1)));
+
+        let reg = reopen(&persist);
+        assert_eq!(reg.reserve_at_index(4, &persist).unwrap(), None);
+        assert_eq!(reg.reserve_at_index(6, &persist).unwrap(), None);
+        assert_eq!(
+            reg.reserve_at_index(11, &persist).unwrap(),
+            Some(DatabaseId::new(USER_DB_START + 2))
+        );
+    }
+
+    /// The hwm and cursor survive a reopen of the real catalog.
+    #[test]
+    fn catalog_backed_hwm_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("system.redb");
+        let before = {
+            let catalog = SystemCatalog::open(&path).unwrap();
+            let reg = reopen(&catalog);
+            reg.reserve_at_index(5, &catalog).unwrap();
+            reg.reserve_at_index(7, &catalog).unwrap().unwrap()
+        };
+        let catalog = SystemCatalog::open(&path).unwrap();
+        let reg = reopen(&catalog);
+        assert_eq!(reg.current_hwm(), before.as_u64());
+        assert_eq!(reg.reserve_at_index(7, &catalog).unwrap(), None);
+        let after = reg.reserve_at_index(12, &catalog).unwrap().unwrap();
+        assert!(after.as_u64() > before.as_u64());
     }
 
     #[test]
-    fn concurrent_32x50_unique() {
-        let reg = Arc::new(DatabaseRegistry::new());
-        let mut handles = Vec::with_capacity(32);
-        for _ in 0..32 {
-            let r = reg.clone();
-            handles.push(std::thread::spawn(move || {
-                (0..50).map(|_| r.alloc_one().as_u64()).collect::<Vec<_>>()
-            }));
-        }
-        let mut all: Vec<u64> = handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap())
-            .collect();
-        all.sort();
-        all.dedup();
-        assert_eq!(all.len(), 1600);
-    }
-
-    #[test]
-    fn flush_ops_threshold() {
+    fn request_routing_only_completes_waited_requests() {
         let reg = DatabaseRegistry::new();
-        for _ in 0..(FLUSH_OPS_THRESHOLD - 1) {
-            reg.alloc_one();
-        }
-        assert!(!reg.should_flush());
-        reg.alloc_one();
-        assert!(reg.should_flush());
-
-        let persist = MemPersist::new();
-        reg.flush(&persist).unwrap();
-        assert_eq!(persist.calls(), 1);
-        assert!(!reg.should_flush());
-    }
-
-    #[test]
-    fn flush_elapsed_threshold() {
-        let reg = DatabaseRegistry::new();
-        reg.alloc_one();
-        assert!(!reg.should_flush());
-        reg.rewind_flush_clock(FLUSH_ELAPSED_THRESHOLD * 2);
-        assert!(reg.should_flush());
-        let persist = MemPersist::new();
-        reg.flush(&persist).unwrap();
-        assert!(!reg.should_flush());
-    }
-
-    #[test]
-    fn flush_idempotent() {
-        let reg = DatabaseRegistry::new();
-        let persist = MemPersist::new();
-        reg.flush(&persist).unwrap();
-        reg.flush(&persist).unwrap();
-        assert_eq!(persist.calls(), 2);
+        let request = reg.begin_request();
+        reg.complete_request(request.wrapping_add(1), DatabaseId::new(9));
+        reg.complete_request(request, DatabaseId::new(2000));
+        assert_eq!(reg.finish_request(request), Some(DatabaseId::new(2000)));
+        assert_eq!(reg.finish_request(request), None);
     }
 }

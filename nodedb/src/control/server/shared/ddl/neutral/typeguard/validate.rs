@@ -6,10 +6,9 @@
 //! type guards, and returns a result set of violations (field, document_id, detail).
 //! Does NOT modify or reject data — read-only audit.
 //!
-//! Ported from the pgwire `ddl::typeguard::validate` handler. The scan planning,
-//! Data Plane dispatch, JSON decode, and per-guard enforcement logic are
-//! preserved verbatim; only the result construction changed from pgwire
-//! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
+//! The scan planning, Data Plane dispatch, JSON decode, and per-guard
+//! enforcement logic run here. The result is the protocol-neutral
+//! [`DdlResult`] / [`DdlError`].
 
 use nodedb_types::DatabaseId;
 

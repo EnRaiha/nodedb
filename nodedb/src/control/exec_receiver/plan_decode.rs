@@ -14,8 +14,8 @@ use nodedb_physical::physical_plan::wire as plan_wire;
 use super::support::{PLAN_DECODE_FAILED, plan_contains_exchange};
 
 /// Decodes `plan_bytes` into a [`PhysicalPlan`], re-resolves a
-/// `DocumentOp::PointGet` surrogate when the coordinator shipped
-/// `Surrogate::ZERO`, and rejects a plan that still contains an
+/// `DocumentOp::PointGet` surrogate when the coordinator shipped none, and
+/// rejects a plan that still contains an
 /// unresolved Exchange node.
 pub(super) fn decode_plan(
     state: &SharedState,
@@ -39,15 +39,15 @@ pub(super) fn decode_plan(
     // The query coordinator resolves `WHERE pk = <v>` → surrogate against
     // ITS OWN local catalog. The surrogate↔PK map is sharded to the
     // collection's data-group members, so a coordinator that is NOT a
-    // member of that group misses the binding and ships `Surrogate::ZERO`.
-    // We (the owner) ARE a group member, so our local catalog HAS the
-    // binding — re-resolve here before the plan reaches the Data Plane.
+    // member of that group misses the binding and ships `None`. We (the
+    // owner) ARE a group member, so our local catalog HAS the binding —
+    // re-resolve here before the plan reaches the Data Plane.
     //
     // Scope is intentionally tight: only `DocumentOp::PointGet` reads, only
-    // when the carried surrogate is ZERO and `pk_bytes` is non-empty. A
-    // non-ZERO carried surrogate is authoritative (immutable first-wins
-    // bind) and is left untouched; a genuinely-absent PK stays ZERO and
-    // correctly resolves to not-found.
+    // when the carried surrogate is `None` and `pk_bytes` is non-empty. A
+    // carried surrogate is authoritative (immutable first-wins bind) and is
+    // left untouched; a genuinely-absent PK stays `None` and correctly
+    // resolves to not-found.
     let catalog_ref = state.credentials.catalog();
     if let nodedb_physical::physical_plan::PhysicalPlan::Document(
         nodedb_physical::physical_plan::DocumentOp::PointGet {
@@ -57,13 +57,13 @@ pub(super) fn decode_plan(
             ..
         },
     ) = &mut plan
-        && *surrogate == nodedb_types::Surrogate::ZERO
+        && surrogate.is_none()
         && !pk_bytes.is_empty()
         && let Ok(key) = nodedb_types::CollectionKey::from_qualified(database_id, collection)
         && let Ok(Some(resolved)) =
             catalog_ref.get_surrogate_for_pk(key, crate::types::TenantId::new(tenant_id), pk_bytes)
     {
-        *surrogate = resolved;
+        *surrogate = Some(resolved);
     }
 
     // ── 3b. Reject unresolved Exchange nodes ──────────────────────────────

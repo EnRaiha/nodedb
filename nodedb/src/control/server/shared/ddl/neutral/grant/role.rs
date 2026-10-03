@@ -2,13 +2,11 @@
 
 //! Protocol-neutral `GRANT/REVOKE ROLE x TO/FROM user` handlers.
 //!
-//! Ported from the pgwire `ddl::grant::role` handlers. All non-return logic
-//! (tenant-admin gate, superuser-grant guard, self-superuser-revoke guard,
+//! The tenant-admin gate, superuser-grant guard, self-superuser-revoke guard,
 //! grantee resolution, role-list mutation, `prepare_user_update`, catalog
 //! propose + single-node fallback, `install_replicated_user`, the role-to-role
-//! `set_role_parent` delegation, and `audit_record`) is preserved verbatim;
-//! only the result construction changed from pgwire `Response` / `PgWireError`
-//! to the protocol-neutral [`DdlResult`] / [`DdlError`].
+//! `set_role_parent` delegation, and `audit_record` run here. The result is the
+//! protocol-neutral [`DdlResult`] / [`DdlError`].
 //!
 //! Reuses the existing `CatalogEntry::PutUser` variant. The mutated role list
 //! is built locally from the user's current record, then
@@ -18,7 +16,7 @@
 //! separate `Add/RemoveRole` variant needed.
 
 use crate::control::catalog_entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::{AuthenticatedIdentity, Role};
 use crate::control::state::SharedState;
@@ -37,32 +35,22 @@ fn current_roles(
     Ok((roles, crate::types::TenantId::new(user.tenant_id)))
 }
 
-fn propose_user_with_roles(
+async fn propose_user_with_roles(
     state: &SharedState,
     username: &str,
     tenant_id: crate::types::TenantId,
     new_roles: Vec<Role>,
-    invalidation: crate::control::security::buses::SessionInvalidationReason,
 ) -> Result<(), DdlError> {
     let base = super::super::role_checks::visible_user_or_missing(state, username)?;
     let stored = state
         .credentials
         .prepare_user_update_from(base, None, Some(new_roles.clone()))
         .map_err(|e| DdlError::new("42704", e.to_string()))?;
-    let entry = CatalogEntry::PutUser(Box::new(stored.clone()));
-    let outcome = propose_catalog_entry(state, &entry)
+    let entry = CatalogEntry::PutUser(Box::new(stored));
+    let outcome = propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        {
-            let catalog = state.credentials.catalog();
-            catalog
-                .put_user(&stored)
-                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        }
-        state
-            .credentials
-            .install_replicated_user(&stored, Some(invalidation));
-    } else if outcome.is_replicated() {
+    if outcome.is_durable() {
         super::super::role_checks::confirm_user_roles(state, username, &new_roles, tenant_id)?;
     }
     Ok(())
@@ -75,7 +63,7 @@ fn propose_user_with_roles(
 /// listed role becomes the grantee's inheritance parent (role-to-role
 /// membership) — the role hierarchy permits one parent, so granting more
 /// than one role to a role is rejected.
-pub fn grant_role(
+pub async fn grant_role(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     roles: &[String],
@@ -87,9 +75,9 @@ pub fn grant_role(
     }
 
     if super::super::role_checks::visible_user(state, grantee).is_some() {
-        grant_roles_to_user(state, identity, roles, grantee)
+        grant_roles_to_user(state, identity, roles, grantee).await
     } else if super::super::role_checks::visible_roles(state).contains_key(grantee) {
-        grant_role_to_role(state, identity, roles, grantee)
+        grant_role_to_role(state, identity, roles, grantee).await
     } else {
         Err(DdlError::new(
             "42704",
@@ -98,7 +86,7 @@ pub fn grant_role(
     }
 }
 
-fn grant_roles_to_user(
+async fn grant_roles_to_user(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     role_names: &[String],
@@ -106,7 +94,7 @@ fn grant_roles_to_user(
 ) -> Result<Vec<DdlResult>, DdlError> {
     let (mut roles, tenant_id) = current_roles(state, username)?;
     let granted: Vec<Role> = role_names.iter().map(|name| parse_role(name)).collect();
-    // A role that is neither built in nor defined in the user's tenant would
+    // A role that is neither built in nor defined in the user's tenant will
     // grant nothing: refuse it by name.
     super::super::role_checks::check_user_roles(state, &granted, tenant_id)?;
     for role in granted {
@@ -120,13 +108,7 @@ fn grant_roles_to_user(
             roles.push(role);
         }
     }
-    propose_user_with_roles(
-        state,
-        username,
-        tenant_id,
-        roles,
-        crate::control::security::buses::SessionInvalidationReason::RoleGranted,
-    )?;
+    propose_user_with_roles(state, username, tenant_id, roles).await?;
 
     state.audit_record(
         AuditEvent::PrivilegeChange,
@@ -141,7 +123,7 @@ fn grant_roles_to_user(
     Ok(status("GRANT"))
 }
 
-fn grant_role_to_role(
+async fn grant_role_to_role(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     role_names: &[String],
@@ -154,7 +136,7 @@ fn grant_role_to_role(
         ));
     }
     let parent = &role_names[0];
-    super::super::role::set_role_parent(state, child, Some(parent))?;
+    super::super::role::set_role_parent(state, child, Some(parent)).await?;
 
     state.audit_record(
         AuditEvent::PrivilegeChange,
@@ -167,7 +149,7 @@ fn grant_role_to_role(
 }
 
 /// `REVOKE <role>[, ...] FROM <grantee>`.
-pub fn revoke_role(
+pub async fn revoke_role(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     roles: &[String],
@@ -193,9 +175,9 @@ pub fn revoke_role(
     }
 
     if super::super::role_checks::visible_user(state, grantee).is_some() {
-        revoke_roles_from_user(state, identity, roles, grantee)
+        revoke_roles_from_user(state, identity, roles, grantee).await
     } else if super::super::role_checks::visible_roles(state).contains_key(grantee) {
-        revoke_role_from_role(state, identity, roles, grantee)
+        revoke_role_from_role(state, identity, roles, grantee).await
     } else {
         Err(DdlError::new(
             "42704",
@@ -204,7 +186,7 @@ pub fn revoke_role(
     }
 }
 
-fn revoke_roles_from_user(
+async fn revoke_roles_from_user(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     role_names: &[String],
@@ -221,13 +203,7 @@ fn revoke_roles_from_user(
         }
     }
     roles.retain(|r| !revoked.contains(r));
-    propose_user_with_roles(
-        state,
-        username,
-        tenant_id,
-        roles,
-        crate::control::security::buses::SessionInvalidationReason::RoleRevoked,
-    )?;
+    propose_user_with_roles(state, username, tenant_id, roles).await?;
 
     state.audit_record(
         AuditEvent::PrivilegeChange,
@@ -242,7 +218,7 @@ fn revoke_roles_from_user(
     Ok(status("REVOKE"))
 }
 
-fn revoke_role_from_role(
+async fn revoke_role_from_role(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     role_names: &[String],
@@ -262,7 +238,7 @@ fn revoke_role_from_role(
             format!("role '{child}' does not inherit from '{parent}'"),
         ));
     }
-    super::super::role::set_role_parent(state, child, None)?;
+    super::super::role::set_role_parent(state, child, None).await?;
 
     state.audit_record(
         AuditEvent::PrivilegeChange,

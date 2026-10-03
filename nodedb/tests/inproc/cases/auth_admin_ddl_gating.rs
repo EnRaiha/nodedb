@@ -336,19 +336,19 @@ async fn move_tenant_cluster_admin_denied() {
 // ─── BACKUP DATABASE ─────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn backup_database_owner_allowed_gets_not_implemented() {
+async fn backup_database_owner_passes_the_gate() {
     let state = make_state_with_catalog();
     let foo_id = setup_foo_db(&state).await;
     let owner = database_owner_user(foo_id);
     let err = ddl_err(&state, &owner, "BACKUP DATABASE foo TO 's3://x'").await;
-    // The gate passed; the placeholder returns 0A000 (not yet implemented).
+    // The gate passed; the bucket-only URI is refused next.
     assert!(
         !err.contains("42501"),
         "database_owner must pass the gate; got: {err}"
     );
     assert!(
-        err.contains("0A000") || err.contains("not yet implemented"),
-        "expected 0A000/not yet implemented after gate pass; got: {err}"
+        err.contains("22023"),
+        "expected 22023 for a URI with no object key; got: {err}"
     );
 }
 
@@ -368,19 +368,32 @@ async fn backup_database_readonly_denied() {
 // ─── RESTORE DATABASE ────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn restore_database_superuser_allowed_gets_not_implemented() {
+async fn restore_database_superuser_passes_the_gate() {
     let state = make_state_with_catalog();
     let su = superuser();
     let err = ddl_err(&state, &su, "RESTORE DATABASE foo FROM 's3://x'").await;
-    // Superuser passes the gate; the placeholder returns 0A000.
+    // Superuser passes the gate; the bucket-only URI is refused next.
     assert!(
         !err.contains("42501"),
         "superuser must pass the gate; got: {err}"
     );
     assert!(
-        err.contains("0A000") || err.contains("not yet implemented"),
-        "expected 0A000/not yet implemented after gate pass; got: {err}"
+        err.contains("22023"),
+        "expected 22023 for a URI with no object key; got: {err}"
     );
+}
+
+#[tokio::test]
+async fn backup_database_cluster_admin_denied() {
+    let state = make_state_with_catalog();
+    let foo_id = setup_foo_db(&state).await;
+    let ca = cluster_admin_user();
+    let err = ddl_err(&state, &ca, "BACKUP DATABASE foo TO 's3://x/y'").await;
+    assert!(
+        err.contains("42501") || err.contains("permission denied"),
+        "BACKUP DATABASE needs superuser or the database owner, got: {err}"
+    );
+    assert_audit_has(&state, AuditEvent::PermissionDenied, Some(foo_id));
 }
 
 #[tokio::test]

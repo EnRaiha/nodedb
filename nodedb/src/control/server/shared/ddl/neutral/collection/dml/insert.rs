@@ -2,9 +2,7 @@
 
 //! INSERT INTO dispatch for schemaless, KV, and columnar collections.
 //!
-//! Relocated verbatim from the pgwire `ddl::collection::insert` handler (now
-//! deleted) except for the result type, which is [`DdlError`] / [`DdlResult`]
-//! instead of pgwire `Response` / `PgWireResult`.
+//! The result type is [`DdlError`] / [`DdlResult`].
 
 use nodedb_physical::physical_plan::VectorOp;
 use nodedb_types::DatabaseId;
@@ -16,11 +14,14 @@ use crate::control::server::shared::session::{DmlTxnCtx, PendingFieldInference};
 use crate::control::state::SharedState;
 
 use super::indexed_vector_fields::indexed_vector_fields;
+use super::parse::ParsedInsert;
 use super::parse::{
     authorize_write_target, dispatch_plan, extract_vector_fields, fields_to_insert_sql,
     parse_write_statement, plan_and_dispatch,
 };
 use super::triggers::{fire_before_triggers, fire_instead_triggers, fire_sync_after_triggers};
+use crate::control::trigger::statement_txn::{fires_joined_body, in_block, with_statement_txn};
+use crate::control::trigger::{DmlEvent, SyncFire, TriggerScope};
 
 /// INSERT INTO <collection> (col1, col2, ...) VALUES (val1, val2, ...)
 pub async fn insert_document(
@@ -39,36 +40,64 @@ pub async fn insert_document(
         return Some(Err(error));
     }
 
+    // A write that fires a BEFORE, INSTEAD OF or SYNC AFTER body runs in its
+    // statement's transaction together with the bodies.
+    let implicit = !in_block(txn_ctx)
+        && fires_joined_body(
+            state,
+            TriggerScope {
+                database_id,
+                tenant_id: identity.tenant_id,
+            },
+            &parsed.coll_name,
+            DmlEvent::Insert,
+        );
+    Some(
+        with_statement_txn(
+            state,
+            identity,
+            txn_ctx,
+            implicit,
+            async |ctx: &DmlTxnCtx<'_>| {
+                insert_parsed(state, identity, database_id, &parsed, ctx).await
+            },
+        )
+        .await,
+    )
+}
+
+/// Insert one parsed document on the statement's transaction `txn_ctx`.
+async fn insert_parsed(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
+    parsed: &ParsedInsert,
+    txn_ctx: &DmlTxnCtx<'_>,
+) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
 
-    // Fire INSTEAD OF INSERT triggers — if handled, skip normal dispatch.
-    if let Some(result) = fire_instead_triggers(
+    let fire = SyncFire {
         state,
         identity,
-        database_id,
-        tenant_id,
-        &parsed.coll_name,
-        &parsed.fields,
-        "INSERT",
-    )
-    .await
+        scope: TriggerScope {
+            database_id,
+            tenant_id,
+        },
+        cascade_depth: 0,
+        txn: txn_ctx,
+    };
+
+    // Fire INSTEAD OF INSERT triggers — if handled, skip normal dispatch.
+    if let Some(result) =
+        fire_instead_triggers(fire, &parsed.coll_name, &parsed.fields, "INSERT").await
     {
-        return Some(result);
+        return result;
     }
 
-    // Fire BEFORE INSERT triggers — may reject via RAISE EXCEPTION, may mutate NEW fields.
-    let fields = match fire_before_triggers(
-        state,
-        identity,
-        database_id,
-        tenant_id,
-        &parsed.coll_name,
-        &parsed.fields,
-    )
-    .await
-    {
+    // Fire BEFORE INSERT triggers — can reject via RAISE EXCEPTION, can mutate NEW fields.
+    let fields = match fire_before_triggers(fire, &parsed.coll_name, &parsed.fields).await {
         Ok(f) => f,
-        Err(e) => return Some(e),
+        Err(e) => return e,
     };
 
     // Auto-generate sequence values for fields with sequence_name where the
@@ -101,11 +130,11 @@ pub async fn insert_document(
                         fields.insert(field_def.name.clone(), typed_val);
                     }
                     Err(e) => {
-                        return Some(Err(DdlError::from_error(
+                        return Err(DdlError::from_error(
                             &crate::control::sequence::error_map::sequence_error_to_error(
                                 seq_name, e,
                             ),
-                        )));
+                        ));
                     }
                 }
             }
@@ -127,10 +156,10 @@ pub async fn insert_document(
                 )
         {
             let (_severity, code, message) = error_code_to_sqlstate(&violation);
-            return Some(Err(DdlError::new(code, message)));
+            return Err(DdlError::new(code, message));
         }
 
-        // General CHECK constraints (Control Plane enforcement, may have subqueries).
+        // General CHECK constraints (Control Plane enforcement, can have subqueries).
         if !coll_def.check_constraints.is_empty()
             && let Err(e) =
                 crate::control::server::shared::check_constraint::enforce_check_constraints(
@@ -142,7 +171,7 @@ pub async fn insert_document(
                 )
                 .await
         {
-            return Some(Err(e));
+            return Err(e);
         }
     }
 
@@ -166,7 +195,7 @@ pub async fn insert_document(
                     type_name,
                     label,
                 ) {
-                    return Some(Err(ddl_err("22P02", msg)));
+                    return Err(ddl_err("22P02", msg));
                 }
             }
         }
@@ -175,8 +204,8 @@ pub async fn insert_document(
     // Build SQL from fields and route through nodedb-sql → sql_plan_convert.
     // This ensures all engine-type routing goes through the shared EngineRules.
     // The statement is REBUILT from `fields`, so the author's `RETURNING` list
-    // has to be re-attached here or the planner would never see it and the
-    // clause would be silently dropped.
+    // has to be re-attached here or the planner will never see it and the
+    // clause will be silently dropped.
     let mut insert_sql = fields_to_insert_sql(&parsed.coll_name, &fields);
     if let Some(ref columns) = parsed.returning_clause {
         insert_sql.push_str(" RETURNING ");
@@ -189,16 +218,19 @@ pub async fn insert_document(
         database_id,
         &insert_sql,
         txn_ctx,
+        // The statement fired its INSTEAD OF, BEFORE and SYNC AFTER bodies
+        // around this write itself.
+        false,
     )
     .await
     {
         Ok(rows) => rows,
-        Err(e) => return Some(Err(e)),
+        Err(e) => return Err(e),
     };
 
     // Track field names in catalog for schemaless collections. Learned fields
     // are part of the replicated descriptor, so they go out through the
-    // metadata path with a stamped version; a bare `put_collection` would leave
+    // metadata path with a stamped version; a bare `put_collection` will leave
     // the local record byte-different at the same version and wedge the applier.
     if parsed
         .collection_type
@@ -206,7 +238,7 @@ pub async fn insert_document(
         .is_none_or(|ct| ct.is_schemaless())
     {
         // Inside a transaction the merge is deferred to COMMIT. Bumping the
-        // descriptor now would move the version out from under this
+        // descriptor now will move the version out from under this
         // transaction's own buffered writes and drain against the lease this
         // very session is holding for them, which can never clear.
         let pending = PendingFieldInference {
@@ -223,33 +255,26 @@ pub async fn insert_document(
                 pending.database_id,
                 pending.tenant_id,
                 &pending.collection,
+                None,
                 &pending.fields,
             )
+            .await
         {
-            return Some(Err(DdlError::from_error_in_context(
+            return Err(DdlError::from_error_in_context(
                 "record inferred schema fields",
                 &e,
-            )));
+            ));
         }
     }
 
     // Fire SYNC AFTER INSERT triggers.
-    if let Some(err) = fire_sync_after_triggers(
-        state,
-        identity,
-        database_id,
-        tenant_id,
-        &parsed.coll_name,
-        &fields,
-    )
-    .await
-    {
-        return Some(err);
+    if let Some(err) = fire_sync_after_triggers(fire, &parsed.coll_name, &fields).await {
+        return err;
     }
 
     // Dispatch VectorInsert for the numeric-array fields no vector index
     // covers. The document write above already indexed the covered ones, and
-    // a second insert would append a second HNSW node for the same row.
+    // a second insert will append a second HNSW node for the same row.
     let indexed = match indexed_vector_fields(
         state,
         database_id,
@@ -258,7 +283,7 @@ pub async fn insert_document(
         parsed.collection_type.as_ref(),
     ) {
         Ok(indexed) => indexed,
-        Err(e) => return Some(Err(e)),
+        Err(e) => return Err(e),
     };
     let vec_vshard =
         nodedb_types::CollectionKey::from_bare(database_id, &parsed.coll_name).vshard();
@@ -283,23 +308,27 @@ pub async fn insert_document(
             ) && entry.metadata.strict_dimensions
                 && entry.metadata.dimensions != dim
             {
-                return Some(Err(ddl_err(
+                return Err(ddl_err(
                     "23514",
                     format!(
                         "strict_dimensions: vector has {} dimensions, model '{}' requires {}",
                         dim, entry.metadata.model, entry.metadata.dimensions
                     ),
-                )));
+                ));
             }
         }
-        let surrogate = match state.surrogate_assigner.assign(
+        let surrogate = match crate::control::server::surrogate_exchange::assign_surrogate_routed(
+            state,
             nodedb_types::CollectionKey::from_bare(database_id, &parsed.coll_name),
             tenant_id,
             parsed.doc_id.as_bytes(),
-        ) {
+            crate::types::TraceId::ZERO,
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
-                return Some(Err(DdlError::from_error_in_context("surrogate assign", &e)));
+                return Err(DdlError::from_error_in_context("surrogate assign", &e));
             }
         };
         let vec_plan = crate::bridge::envelope::PhysicalPlan::Vector(VectorOp::Insert {
@@ -312,22 +341,26 @@ pub async fn insert_document(
             provenance: None,
         });
 
-        if let Some(err) = dispatch_plan(state, identity, database_id, vec_vshard, vec_plan).await {
-            return Some(err);
+        // The vector write joins the statement's transaction with the
+        // document write, so both commit or neither does.
+        if let Some(err) =
+            dispatch_plan(state, identity, database_id, vec_vshard, vec_plan, txn_ctx).await
+        {
+            return err;
         }
     }
 
     if !returned_rows.is_empty() {
-        return Some(Ok(returned_rows));
+        return Ok(returned_rows);
     }
 
     // A single-document `{ ... }` insert without RETURNING always applies
     // exactly one row — the Postgres `INSERT <oid> <rows>` tag needs a real
     // count, not a bare `INSERT` (which real `psql` cannot parse).
-    Some(Ok(vec![DdlResult::Status {
+    Ok(vec![DdlResult::Status {
         command: "INSERT".to_string(),
         rows_affected: Some(1),
-    }]))
+    }])
 }
 
 /// The `(field, sql_type)` pairs a schemaless write contributes to the

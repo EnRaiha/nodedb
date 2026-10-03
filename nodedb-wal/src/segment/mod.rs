@@ -28,6 +28,7 @@ pub mod continuity;
 pub mod decrypt;
 pub mod discovery;
 pub mod meta;
+pub mod orphan;
 pub mod retained;
 pub mod truncate;
 
@@ -38,6 +39,10 @@ pub use checkpoint_frame::{read_checkpoint_framed, write_checkpoint_framed};
 pub use continuity::SegmentContinuity;
 pub use decrypt::SegmentDecryptor;
 pub use discovery::discover_segments;
-pub use meta::{DEFAULT_SEGMENT_TARGET_SIZE, SegmentMeta, segment_filename, segment_path};
+pub use meta::{
+    DEFAULT_SEGMENT_TARGET_SIZE, SegmentMeta, parse_segment_filename, segment_filename,
+    segment_path,
+};
+pub use orphan::check_resume_above_previous;
 pub use retained::check_retained_floor;
 pub use truncate::{TruncateResult, truncate_segments};

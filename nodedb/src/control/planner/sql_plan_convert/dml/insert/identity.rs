@@ -38,7 +38,7 @@ pub(in super::super::super) fn declared_primary_key_name(
     let Some(credentials) = ctx.credentials.as_ref() else {
         return Ok(None);
     };
-    // `collection` may be bare or db-qualified. The catalog keys collections
+    // `collection` can be bare or db-qualified. The catalog keys collections
     // by the bare name.
     let bare =
         crate::control::target_identity::naming::bare_collection_name(ctx.database_id, collection);
@@ -98,6 +98,45 @@ pub(in super::super) fn resolve_doc_identity_with_declared(
             Ok((pk, s))
         }
     }
+}
+
+/// The keys that content-address the surrogates of `rows`, the rows that
+/// name one, in row order. An auto-`_rowid` collection has none: each of its
+/// rows mints a fresh surrogate.
+pub(in super::super) fn doc_identity_keys(
+    primary_key: &str,
+    declared: Option<&str>,
+    rows: &[impl AsRef<[(String, SqlValue)]>],
+) -> Vec<String> {
+    if is_auto_rowid_pk(primary_key) {
+        return Vec::new();
+    }
+    let mint_key = declared.unwrap_or(primary_key);
+    rows.iter()
+        .filter_map(|row| match extract_doc_id(row.as_ref(), mint_key) {
+            DocId::Present(id) => Some(id),
+            DocId::ExplicitNull | DocId::Absent => None,
+        })
+        .collect()
+}
+
+/// How many of `rows` mint a fresh surrogate: every row of an auto-`_rowid`
+/// collection, and a row that names no key when no primary key is declared.
+/// A row that names no declared key mints nothing: its conversion refuses it.
+pub(in super::super) fn fresh_identity_count(
+    primary_key: &str,
+    declared: Option<&str>,
+    rows: &[impl AsRef<[(String, SqlValue)]>],
+) -> usize {
+    if is_auto_rowid_pk(primary_key) {
+        return rows.len();
+    }
+    if declared.is_some() {
+        return 0;
+    }
+    rows.iter()
+        .filter(|row| !matches!(extract_doc_id(row.as_ref(), primary_key), DocId::Present(_)))
+        .count()
 }
 
 pub(in super::super) fn assign_for_pk(

@@ -118,7 +118,7 @@ fn make_dummy_task() -> ExecutionTask {
         plan: PhysicalPlan::Document(DocumentOp::PointGet {
             collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "test"),
             document_id: "dummy".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -136,6 +136,7 @@ fn make_dummy_task() -> ExecutionTask {
         txn_id: None,
         wal_lsn: None,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: crate::bridge::envelope::Admission::Exempt(
             crate::bridge::envelope::ExemptReason::Read,
         ),

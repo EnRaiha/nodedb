@@ -2,11 +2,9 @@
 
 //! Privilege-gate helpers for the protocol-neutral database DDL handlers.
 //!
-//! These mirror the pgwire `types::privilege` gates verbatim — same allowed
-//! roles, same `AuditEvent::PermissionDenied`-on-denial behaviour, same
-//! SQLSTATE (42501, `INSUFFICIENT_PRIVILEGE`), and byte-identical messages —
-//! but return [`DdlError`] instead of `PgWireError` so they carry no pgwire
-//! types.
+//! Each gate emits `AuditEvent::PermissionDenied` on denial and returns
+//! SQLSTATE 42501 (`INSUFFICIENT_PRIVILEGE`) as a [`DdlError`], so the gates
+//! carry no pgwire types.
 
 use nodedb_types::error::sqlstate;
 use nodedb_types::id::DatabaseId;
@@ -22,10 +20,9 @@ use super::support::ddl_err;
 ///
 /// Emits `AuditEvent::PermissionDenied` and returns SQLSTATE 42501 on failure.
 ///
-/// Visibility is widened to the whole `neutral` tree (not just `database`) so
-/// the tenant family's `MOVE TENANT` handler — which uses this exact gate
-/// verbatim from the pgwire `types::privilege::require_superuser` — can reuse
-/// it instead of duplicating the audit-on-denial logic.
+/// Visibility spans the whole `neutral` tree (not just `database`) so the
+/// tenant family's `MOVE TENANT` handler reuses it instead of duplicating the
+/// audit-on-denial logic.
 pub(in crate::control::server::shared::ddl::neutral) fn require_superuser(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -114,8 +111,7 @@ pub(super) fn require_database_owner_or_higher(
 /// record on denial. Used by the read-only database SHOW handlers, and reused
 /// (visibility widened to the `neutral` tree) by the tenant family's
 /// `SHOW TENANT QUOTA|USAGE FOR ... IN DATABASE ...` and
-/// `ALTER TENANT ... IN DATABASE ... SET QUOTA` handlers, which used the
-/// identical pgwire gate.
+/// `ALTER TENANT ... IN DATABASE ... SET QUOTA` handlers.
 pub(in crate::control::server::shared::ddl::neutral) fn require_tenant_admin(
     identity: &AuthenticatedIdentity,
     action: &str,

@@ -16,10 +16,8 @@ use super::auth_support::{
     parse_role, require_tenant_admin, status, strip_if_exists, strip_if_not_exists,
 };
 
-/// Superuser gate, folded in verbatim from the pgwire `require_superuser`
-/// helper: on denial it emits `AuditEvent::PermissionDenied` (database-less
-/// scope, matching the `None` `db_id` the pgwire handler passed) and returns
-/// SQLSTATE 42501, preserving both the side effect and the wire error.
+/// Superuser gate: on denial it emits `AuditEvent::PermissionDenied`
+/// (database-less scope, a `None` `db_id`) and returns SQLSTATE 42501.
 fn require_superuser(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -48,7 +46,7 @@ fn require_superuser(
 ///
 /// Creates a service account — a non-interactive identity that can only
 /// authenticate via API keys. No password, no pgwire login.
-pub fn create_service_account(
+pub async fn create_service_account(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -174,7 +172,7 @@ pub fn create_service_account(
     }
     let _ = seen_for_tenant; // suppress unused warning
 
-    // A role that is neither built in nor defined in the tenant would leave
+    // A role that is neither built in nor defined in the tenant will leave
     // the account with no permissions: refuse it by name.
     super::role_checks::check_user_roles(state, std::slice::from_ref(&role), tenant_id)?;
 
@@ -184,18 +182,11 @@ pub fn create_service_account(
         .credentials
         .prepare_new_service_account(name, tenant_id, vec![role.clone()], accessible_databases)
         .map_err(|e| DdlError::new("42710", e.to_string()))?;
-    let entry = crate::control::catalog_entry::CatalogEntry::PutUser(Box::new(stored.clone()));
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let entry = crate::control::catalog_entry::CatalogEntry::PutUser(Box::new(stored));
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        state
-            .credentials
-            .catalog()
-            .put_user(&stored)
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        // A new account has no open sessions to invalidate.
-        state.credentials.install_replicated_user(&stored, None);
-    } else if outcome.is_replicated() {
+    if outcome.is_durable() {
         super::role_checks::confirm_user_roles(
             state,
             name,
@@ -215,7 +206,7 @@ pub fn create_service_account(
 }
 
 /// DROP SERVICE ACCOUNT [IF EXISTS] <name>
-pub fn drop_service_account(
+pub async fn drop_service_account(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -257,14 +248,14 @@ pub fn drop_service_account(
     // Dropped through the replicated `DROP USER` path, so the account goes
     // on every node, and its owned objects and grants are handled as a
     // user's are. That path records the audit entry.
-    super::user::drop_user(state, identity, &["DROP", "USER", name])?;
+    super::user::drop_user(state, identity, &["DROP", "USER", name]).await?;
     Ok(status("DROP SERVICE ACCOUNT"))
 }
 
 /// ALTER SERVICE ACCOUNT <name> SET DATABASES (db1, db2, ...)
 ///
 /// Superuser only. Resolves database names to IDs; rejects unknown names with `42704`.
-pub fn alter_service_account_set_databases(
+pub async fn alter_service_account_set_databases(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -341,20 +332,10 @@ pub fn alter_service_account_set_databases(
         .credentials
         .prepare_service_account_databases_from(user, db_ids)
         .map_err(|e| DdlError::from_error(&e))?;
-    let entry = crate::control::catalog_entry::CatalogEntry::PutUser(Box::new(stored.clone()));
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let entry = crate::control::catalog_entry::CatalogEntry::PutUser(Box::new(stored));
+    crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        state
-            .credentials
-            .catalog()
-            .put_user(&stored)
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        state.credentials.install_replicated_user(
-            &stored,
-            Some(crate::control::security::buses::SessionInvalidationReason::RoleAltered),
-        );
-    }
 
     state.audit_record(
         AuditEvent::PrivilegeChange,

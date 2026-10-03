@@ -13,7 +13,7 @@ pub use errors::{BootstrapError, ShutdownError, TopoError};
 pub use health::{ClusterHealth, SubsystemHealth};
 pub use impls::{
     DecommissionSubsystem, ReachabilitySubsystem, RebalancerSubsystem, SwimSubsystem,
-    SwimSubsystemConfig,
+    SwimSubsystemConfig, SwimWiring,
 };
 pub use registry::{RunningCluster, SubsystemRegistry};
 pub use topo_sort::topo_sort;

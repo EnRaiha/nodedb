@@ -2,69 +2,21 @@
 
 //! Route a single-vShard-homed plan to its ONE owning Data-Plane core.
 //!
-//! `gather_single_owning_core` is the single-node sibling of
-//! [`super::gather::gather_all_cores`] for plans whose whole collection lives on
-//! exactly one vShard (document / kv / columnar / timeseries / spatial / vector
-//! / text). Instead of broadcasting the plan to every core — which seeds an
-//! identity scalar-aggregate row on each empty non-owning core and returns one
-//! row per core for a no-`GROUP BY` aggregate — it resolves the collection's
-//! owning vShard and dispatches the bare plan to it alone, exactly mirroring
-//! what the cluster branch of [`super::gather::gather_all_vshards`] does via the
-//! gateway. The owning core already holds every row of a single-vShard-homed
-//! collection, so this returns the identical row set a broadcast would have,
-//! minus the empty cores' spurious contributions.
+//! `gather_single_owning_core` is the one-core sibling of
+//! [`super::gather::gather_all_cores`]. It dispatches the bare plan to the one
+//! core that owns a vShard, the way [`super::gather::gather_all_vshards`]
+//! routes a single-vShard-homed plan through the gateway. Broadcasting instead
+//! will seed an identity scalar-aggregate row on each empty non-owning core,
+//! and a no-`GROUP BY` aggregate will return one row per core.
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::local_dispatch::reject_data_plane_error;
-use crate::control::server::dispatch_utils::dispatch_to_data_plane_with_txn;
+use crate::control::server::dispatch_utils::dispatch_routed_read_to_data_plane;
 use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, TxnId, VShardId};
 
-use super::gather::{GatherOutcome, gather_all_cores};
-
-/// Single-node routing decision for a resolved `Exchange{Gather}` child plan.
-///
-/// Mirrors the cluster branch of [`super::gather::gather_all_vshards`]:
-///
-/// - A cluster-partitioned leaf (graph traversal / array) spreads its rows
-///   across cores by node-id / tile-id, so it fans to every local core via
-///   [`gather_all_cores`].
-/// - A single-vShard-homed collection (document / kv / columnar / timeseries /
-///   spatial / vector / text) lives wholly on ONE core; the bare plan routes to
-///   that owning core via [`gather_single_owning_core`]. Broadcasting would seed
-///   a scalar-aggregate identity row on every empty non-owning core — so a
-///   no-`GROUP BY` aggregate returns one row PER core instead of one merged row
-///   — and would duplicate a plain scan's rows across cores.
-/// - A plan with no resolvable collection (e.g. `ProviderScan` carrying embedded
-///   rows) keeps the broadcast fallback unchanged.
-pub async fn gather_single_node(
-    state: &SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    plan: PhysicalPlan,
-    trace_id: TraceId,
-    txn_id: Option<TxnId>,
-) -> crate::Result<GatherOutcome> {
-    if nodedb_physical::physical_plan::plan_contains_cluster_partitioned_leaf(&plan) {
-        return gather_all_cores(state, tenant_id, database_id, plan, trace_id, txn_id).await;
-    }
-    if let Some(collection) = plan.collection() {
-        let vshard_id =
-            nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
-        return gather_single_owning_core(
-            state,
-            tenant_id,
-            database_id,
-            plan,
-            vshard_id,
-            trace_id,
-            txn_id,
-        )
-        .await;
-    }
-    gather_all_cores(state, tenant_id, database_id, plan, trace_id, txn_id).await
-}
+use super::gather::GatherOutcome;
 
 /// Dispatch `plan` to the single Data-Plane core that owns `vshard_id` and
 /// gather the one bounded response into a [`GatherOutcome`].
@@ -128,7 +80,9 @@ pub async fn dispatch_single_owning_core(
     // re-enters `resolve_exchange_in_plan`. The plan handed here is the bare,
     // Exchange-free child of the resolved Gather, so the re-entrant resolve is a
     // no-op — but the future must be heap-indirected so its size stays finite.
-    let resp = Box::pin(dispatch_to_data_plane_with_txn(
+    // Every caller already routed the read to this node and confirmed it: a
+    // single-node gather, or a leg another node sent here.
+    let resp = Box::pin(dispatch_routed_read_to_data_plane(
         state,
         tenant_id,
         database_id,

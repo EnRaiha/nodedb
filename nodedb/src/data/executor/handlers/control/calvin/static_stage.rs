@@ -11,7 +11,7 @@ use nodedb_types::calvin::VersionedReadEntry;
 use crate::bridge::envelope::{ErrorCode, Payload, Response, Status};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::commit_pending::PendingCommit;
-use crate::data::executor::handlers::control::calvin_reply::CalvinReply;
+use crate::data::executor::handlers::control::calvin_reply::{CalvinReply, CalvinStaging};
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::PhysicalPlan;
@@ -34,7 +34,8 @@ impl CoreLoop {
     /// record (or [`CoreLoop::execute_calvin_drop`] discards the staged
     /// state). The response carries the vote on `read_set_valid`. Staging runs
     /// under the epoch's deterministic time anchor, which the pending entry
-    /// keeps for resolve.
+    /// keeps for resolve. `body_plans` indexes the plans a trigger body
+    /// buffered: they stage under `Trigger`, so their rows fire no trigger.
     pub(in crate::data::executor) fn execute_calvin_execute_static(
         &mut self,
         task: &ExecutionTask,
@@ -42,6 +43,7 @@ impl CoreLoop {
         tenant_id: &TenantId,
         plans: &[PhysicalPlan],
         versioned_reads: &[VersionedReadEntry],
+        body_plans: &[u32],
     ) -> Response {
         let CalvinExecCtx {
             epoch,
@@ -87,13 +89,15 @@ impl CoreLoop {
         let prev_epoch_ms = self.epoch_system_ms;
         self.epoch_system_ms = Some(epoch_system_ms);
         let stage_result = catch_unwind(AssertUnwindSafe(|| {
-            let mut reply = CalvinReply::default();
-            for plan in plans {
-                self.stage_calvin_plan(task, synthetic_txn_id, *tenant_id, plan, &mut reply)?;
+            let mut staging = CalvinStaging::default();
+            for (index, plan) in plans.iter().enumerate() {
+                let body = u32::try_from(index).is_ok_and(|index| body_plans.contains(&index));
+                self.begin_calvin_plan_staging(task, synthetic_txn_id, *tenant_id, plan, body);
+                self.stage_calvin_plan(task, synthetic_txn_id, *tenant_id, plan, &mut staging)?;
                 // Test-only fault boundary after a potentially-mutating stage.
                 crate::fail_point!("calvin_static::during_overlay_stage");
             }
-            Ok::<CalvinReply, ErrorCode>(reply)
+            Ok::<CalvinReply, ErrorCode>(staging.reply)
         }));
         self.epoch_system_ms = prev_epoch_ms;
         let reply = match stage_result {
@@ -150,6 +154,36 @@ impl CoreLoop {
     }
 }
 
+impl CoreLoop {
+    /// Tell the transaction overlay the source `plan` stages under: `Trigger`
+    /// for a body's plan, else the transaction's own.
+    fn begin_calvin_plan_staging(
+        &mut self,
+        task: &ExecutionTask,
+        txn_id: crate::types::TxnId,
+        tenant_id: TenantId,
+        plan: &PhysicalPlan,
+        body: bool,
+    ) {
+        let source = if body {
+            crate::event::EventSource::Trigger
+        } else {
+            task.request.event_source
+        };
+        let database_id = task.request.database_id;
+        let collections =
+            crate::control::wal_replication::transaction_redo::collections::written_collections(
+                std::slice::from_ref(plan),
+            );
+        self.txn_overlay_mut(txn_id).begin_staging(
+            source,
+            collections
+                .into_iter()
+                .map(|collection| (database_id, tenant_id, collection)),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nodedb_physical::physical_plan::TimeseriesOp;
@@ -180,7 +214,7 @@ mod tests {
             is_group_leader: true,
         };
 
-        let resp = core.execute_calvin_execute_static(&task, ctx, &tenant_id, &plans, &[]);
+        let resp = core.execute_calvin_execute_static(&task, ctx, &tenant_id, &plans, &[], &[]);
         assert_eq!(resp.status, Status::Ok);
 
         let vshard_id = task.request.vshard_id.as_u32();
@@ -223,6 +257,7 @@ mod tests {
             },
             &tenant_id,
             &[point_insert_plan("orders", "o1", 7)],
+            &[],
             &[],
         );
 
@@ -268,7 +303,7 @@ mod tests {
             bulk_delete_plan("orders", None),
         ];
 
-        let response = core.execute_calvin_execute_static(&task, ctx, &tenant_id, &plans, &[]);
+        let response = core.execute_calvin_execute_static(&task, ctx, &tenant_id, &plans, &[], &[]);
 
         assert_eq!(response.status, Status::Error);
         assert_eq!(response.read_set_valid, Some(false));
@@ -304,6 +339,7 @@ mod tests {
             },
             &tenant_id,
             &[bulk_delete_plan("orders", None)],
+            &[],
             &[],
         );
 
@@ -351,6 +387,7 @@ mod tests {
             &tenant_id,
             &[point_insert_plan("orders", "o1", 7)],
             &[],
+            &[],
         );
 
         assert_eq!(response.status, Status::Error);
@@ -396,6 +433,7 @@ mod tests {
             &tenant,
             &[malformed],
             &[],
+            &[],
         );
         assert_eq!(failed.read_set_valid, Some(false));
         assert!(matches!(
@@ -417,6 +455,7 @@ mod tests {
             &tenant,
             &[valid],
             &[],
+            &[],
         );
         assert_eq!(staged.read_set_valid, Some(true));
         assert_eq!(
@@ -437,6 +476,7 @@ mod tests {
             },
             &tenant,
             &[mismatch],
+            &[],
             &[],
         );
         let mismatch_id = calvin_synthetic_txn_id(21, 2, vshard).expect("synthetic transaction id");
@@ -460,6 +500,7 @@ mod tests {
             },
             &tenant,
             &[overflow],
+            &[],
             &[],
         );
         let overflow_id = calvin_synthetic_txn_id(21, 3, vshard).expect("synthetic transaction id");

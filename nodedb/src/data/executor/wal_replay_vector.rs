@@ -30,6 +30,9 @@ impl CoreLoop {
         let mut skipped = 0usize;
 
         for record in records {
+            if self.replay_halted() {
+                break;
+            }
             let logical_type = record.logical_record_type();
 
             let record_type = RecordType::from_raw(logical_type);
@@ -70,7 +73,15 @@ impl CoreLoop {
             // checkpoint applies here as it applied live, after the higher
             // ones. `VectorParams` is configuration the catalog seeds at boot,
             // not index content the checkpoint holds, so it always replays.
+            // An index drop the checkpoint holds still removes that
+            // configuration: the `VectorParams` it cancels replayed above
+            // it, and left in place it lets a later document put rebuild the
+            // index the user dropped. The index content stays as the
+            // checkpoint restored it.
             if !is_vector_params && self.vector_replay_skips(record_lsn) {
+                if is_index_drop {
+                    self.forget_vector_index_config_record(database_id, tenant_id, &record.payload);
+                }
                 skipped += 1;
                 continue;
             }
@@ -100,28 +111,22 @@ impl CoreLoop {
             }
 
             if is_vector_put {
-                // Try the newest shape first (7 elements with trailing provenance),
-                // then the 5-element shape (surrogate, no provenance),
-                // then legacy 3-element shapes. The 7-element arm threads
-                // provenance into `execute_vector_insert` so the idempotency
-                // gate runs on replay exactly as it does on the live path.
-                if let Ok((
-                    collection,
-                    vector,
-                    dim,
-                    field_name,
-                    doc_id,
-                    surrogate_u32,
-                    provenance,
-                )) = zerompk::from_msgpack::<(
-                    String,
-                    Vec<f32>,
-                    usize,
-                    String,
-                    Option<String>,
-                    u32,
-                    Option<nodedb_types::sync::wire::SyncProvenance>,
-                )>(&record.payload)
+                // A `VectorPut` payload has two shapes, one per writer
+                // (`wal_dispatch::vector::encode`): the 6-element single
+                // insert and the 4-element batch. Both carry every vector's
+                // surrogate. The single-insert arm threads provenance into
+                // `execute_vector_insert` so the idempotency gate runs on
+                // replay exactly as it does on the live path. A payload of
+                // any other shape stops replay.
+                if let Ok((collection, vector, dim, field_name, surrogate_u32, provenance)) =
+                    zerompk::from_msgpack::<(
+                        String,
+                        Vec<f32>,
+                        usize,
+                        String,
+                        u32,
+                        Option<nodedb_types::sync::wire::SyncProvenance>,
+                    )>(&record.payload)
                 {
                     if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
                         skipped += 1;
@@ -168,10 +173,7 @@ impl CoreLoop {
                         skipped += 1;
                         continue;
                     }
-                    // Local replay rebinds by the carried surrogate; the
-                    // compat doc-id slot (always `None` on this write path)
-                    // maps straight through to `pk_bytes` for fidelity.
-                    let pk_bytes = doc_id.as_ref().map(|d| d.as_bytes().to_vec());
+                    // Local replay rebinds by the carried surrogate.
                     let Some(vshard) = self.replay_vshard(
                         "vector",
                         record_lsn,
@@ -193,7 +195,7 @@ impl CoreLoop {
                             dim,
                             field_name: field_name.clone(),
                             surrogate,
-                            pk_bytes,
+                            pk_bytes: None,
                             provenance: provenance.clone(),
                         }),
                     );
@@ -224,174 +226,36 @@ impl CoreLoop {
                         continue;
                     }
                     inserted += 1;
-                } else if let Ok((collection, vector, dim, field_name, doc_id)) =
-                    zerompk::from_msgpack::<(String, Vec<f32>, usize, String, Option<String>)>(
+                } else if let Ok((collection, vectors, dim, surrogates_u32)) =
+                    zerompk::from_msgpack::<(String, Vec<Vec<f32>>, usize, Vec<u32>)>(
                         &record.payload,
                     )
                 {
-                    // A committed redo record never carries this shape; left
-                    // unclaimed, the validate pass refuses the record.
-                    if self.applying_committed_redo() {
-                        continue;
-                    }
                     if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
                         skipped += 1;
                         continue;
                     }
-                    if vector.len() != dim {
-                        // `dim` and the vector both come out of the SAME
-                        // payload, so a disagreement is not a schema change the
-                        // record predates — it is a record whose two halves
-                        // cannot both be what the writer wrote.
-                        self.replay_record_unapplied(
-                            "vector",
-                            "dim",
-                            record_lsn,
-                            &format!(
-                                "record for '{collection}' declares dim {dim} but carries {} \
-                                 components",
-                                vector.len()
-                            ),
-                        );
-                        skipped += 1;
-                        continue;
-                    }
-                    let index_key = CoreLoop::vector_index_key(
-                        database_id,
-                        tenant_id,
-                        &collection,
-                        &field_name,
-                    );
-                    let index = match self.ensure_vector_collection(&index_key, &index_key, dim) {
-                        Ok(index) => index,
-                        Err(e) => {
-                            self.replay_record_rejected(
-                                "vector",
-                                record_lsn,
-                                None,
-                                &format!("vector record for '{collection}': {e}"),
-                            );
-                            continue;
-                        }
-                    };
-                    // Unlike the record-internal check above, this compares the
-                    // record against a LIVE index whose width the collection
-                    // may legitimately have changed since the record was
-                    // written (an index rebuilt at a new dimension). The record
-                    // is genuinely inapplicable to the current index rather
-                    // than malformed, so this stays a skip: aborting here would
-                    // wedge the boot on a retained pre-rebuild tail.
-                    if index.dim() != dim {
-                        let index_dim = index.dim();
-                        self.replay_record_rejected(
-                            "vector",
-                            record_lsn,
-                            None,
-                            &format!(
-                                "vector record for '{collection}' has dim {dim}, the index has \
-                                 dim {index_dim}"
-                            ),
-                        );
-                        continue;
-                    }
-                    // WAL replay rebinds vectors on the local node;
-                    // surrogate identity is restored via the dedicated
-                    // `SurrogateBind` replay path. Engine inserts here are
-                    // local-id-only and bind to `Surrogate::ZERO`.
-                    let _ = doc_id;
-                    if let Err(e) =
-                        index.insert_with_surrogate(vector, nodedb_types::Surrogate::ZERO)
+                    if surrogates_u32.len() != vectors.len()
+                        || surrogates_u32.contains(&nodedb_types::Surrogate::ZERO.as_u32())
                     {
-                        self.replay_record_rejected(
-                            "vector",
-                            record_lsn,
-                            None,
-                            &format!("vector record for '{collection}': {e}"),
-                        );
-                        continue;
-                    }
-                    inserted += 1;
-                } else if let Ok((collection, vector, dim)) =
-                    zerompk::from_msgpack::<(String, Vec<f32>, usize)>(&record.payload)
-                {
-                    // A committed redo record never carries this shape; left
-                    // unclaimed, the validate pass refuses the record.
-                    if self.applying_committed_redo() {
-                        continue;
-                    }
-                    if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
-                        skipped += 1;
-                        continue;
-                    }
-                    if vector.len() != dim {
-                        // `dim` and the vector both come out of the SAME
-                        // payload, so a disagreement is not a schema change the
-                        // record predates — it is a record whose two halves
-                        // cannot both be what the writer wrote.
                         self.replay_record_unapplied(
                             "vector",
-                            "dim",
+                            "batch_identity",
                             record_lsn,
                             &format!(
-                                "record for '{collection}' declares dim {dim} but carries {} \
-                                 components",
-                                vector.len()
+                                "batch record for '{collection}' carries {} surrogates for {} \
+                                 vectors, or an unbound one",
+                                surrogates_u32.len(),
+                                vectors.len()
                             ),
                         );
                         skipped += 1;
                         continue;
                     }
-                    let index_key =
-                        CoreLoop::vector_index_key(database_id, tenant_id, &collection, "");
-                    let index = match self.ensure_vector_collection(&index_key, &index_key, dim) {
-                        Ok(index) => index,
-                        Err(e) => {
-                            self.replay_record_rejected(
-                                "vector",
-                                record_lsn,
-                                None,
-                                &format!("vector record for '{collection}': {e}"),
-                            );
-                            continue;
-                        }
-                    };
-                    // Unlike the record-internal check above, this compares the
-                    // record against a LIVE index whose width the collection
-                    // may legitimately have changed since the record was
-                    // written (an index rebuilt at a new dimension). The record
-                    // is genuinely inapplicable to the current index rather
-                    // than malformed, so this stays a skip: aborting here would
-                    // wedge the boot on a retained pre-rebuild tail.
-                    if index.dim() != dim {
-                        let index_dim = index.dim();
-                        self.replay_record_rejected(
-                            "vector",
-                            record_lsn,
-                            None,
-                            &format!(
-                                "vector record for '{collection}' has dim {dim}, the index has \
-                                 dim {index_dim}"
-                            ),
-                        );
-                        continue;
-                    }
-                    if let Err(e) = index.insert(vector) {
-                        self.replay_record_rejected(
-                            "vector",
-                            record_lsn,
-                            None,
-                            &format!("vector record for '{collection}': {e}"),
-                        );
-                        continue;
-                    }
-                    inserted += 1;
-                } else if let Ok((collection, vectors, dim)) =
-                    zerompk::from_msgpack::<(String, Vec<Vec<f32>>, usize)>(&record.payload)
-                {
-                    if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
-                        skipped += 1;
-                        continue;
-                    }
+                    let surrogates: Vec<nodedb_types::Surrogate> = surrogates_u32
+                        .into_iter()
+                        .map(nodedb_types::Surrogate::new)
+                        .collect();
                     let index_key =
                         CoreLoop::vector_index_key(database_id, tenant_id, &collection, "");
                     if !self.redo_vector_prelude(
@@ -400,7 +264,7 @@ impl CoreLoop {
                             tid: tenant_id,
                             collection: &collection,
                             dim,
-                            surrogates: &[],
+                            surrogates: &surrogates,
                             ids: &[],
                             sidecars: false,
                         },
@@ -424,7 +288,7 @@ impl CoreLoop {
                     };
                     // Checked as a whole before any vector lands, so a record
                     // holding one vector of another width applies nothing.
-                    if let Err(e) = index.insert_batch_with_surrogates(&vectors, &[]) {
+                    if let Err(e) = index.insert_batch_with_surrogates(&vectors, &surrogates) {
                         self.replay_record_rejected(
                             "vector",
                             record_lsn,
@@ -434,6 +298,14 @@ impl CoreLoop {
                         continue;
                     }
                     inserted += 1;
+                } else {
+                    self.replay_record_unapplied(
+                        "vector",
+                        "put_decode",
+                        record_lsn,
+                        "VectorPut payload matched none of its record shapes",
+                    );
+                    skipped += 1;
                 }
             } else if is_vector_delete {
                 if self.replay_vector_delete_record(
@@ -506,8 +378,8 @@ mod tests {
         }
     }
 
-    /// A bare (unfielded) `VectorPut` WAL record at `lsn` — decodes through the
-    /// 3-element replay arm.
+    /// An unfielded single-insert `VectorPut` WAL record at `lsn`, its vector
+    /// bound to a surrogate numbered after the LSN.
     fn vector_put_record(
         lsn: u64,
         tenant_id: u64,
@@ -515,8 +387,15 @@ mod tests {
         vector: Vec<f32>,
     ) -> nodedb_wal::WalRecord {
         let dim = vector.len();
-        let payload =
-            zerompk::to_msgpack_vec(&(collection, vector, dim)).expect("encode vector put");
+        let payload = crate::control::server::wal_dispatch::encode_vector_put_payload(
+            collection,
+            &vector,
+            dim,
+            "",
+            nodedb_types::Surrogate::new(lsn as u32),
+            None,
+        )
+        .expect("encode vector put");
         nodedb_wal::WalRecord::new(nodedb_wal::record::WalRecordArgs {
             record_type: nodedb_wal::record::RecordType::VectorPut as u32,
             lsn,

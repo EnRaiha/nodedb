@@ -4,7 +4,8 @@
 //!
 //! Builds the replicated transaction descriptor (`TxClass`) from a physical
 //! task slice: the per-engine write set (`EngineKeySet` — document / vector
-//! surrogates, KV raw keys, graph-edge identity + routing homes) plus the
+//! surrogates, KV raw keys, graph-edge identity + routing homes, array tile
+//! vShards) plus the
 //! msgpack-encoded plans. Four builders, split by shape (static vs
 //! dependent-read) and participant floor (strict multi-vshard vs the
 //! single-vshard opt-in):
@@ -18,7 +19,7 @@
 pub mod dependent_builder;
 pub mod shared;
 pub mod static_builder;
+pub mod write_keys;
 
 pub use dependent_builder::{build_dependent_tx_class, build_single_vshard_dependent_tx_class};
-pub(crate) use shared::collection_name_from_plan;
 pub use static_builder::{build_single_vshard_tx_class, build_static_tx_class};

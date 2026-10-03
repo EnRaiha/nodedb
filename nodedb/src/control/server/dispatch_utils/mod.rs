@@ -7,18 +7,19 @@ mod dispatch;
 mod durability_barrier;
 mod durable_write;
 mod minted;
+mod owner_read;
 mod submit_write;
 mod types;
+mod unlogged_dispatch;
 mod write_abort;
 
 pub(crate) use change_events::{
-    WriteChangeSet, extract_write_change_set, publish_change_set_with_lsn,
-    publish_cluster_array_change_events, publish_origin_change_events,
+    CalvinApply, WriteChangeSet, publish_calvin_change_sets, publish_settled_changes,
+    redo_change_set,
 };
 pub use dispatch::{dispatch_authorized_autocommit_write, dispatch_authorized_to_data_plane};
 pub(crate) use dispatch::{
-    dispatch_authorized_autocommit_write_with_source, dispatch_authorized_minted_to_data_plane,
-    dispatch_autocommit_write, dispatch_to_data_plane, dispatch_to_data_plane_with_txn,
+    dispatch_autocommit_write, dispatch_replayed_write_to_data_plane, dispatch_to_data_plane,
     dispatch_trusted_internal_write_to_data_plane,
 };
 pub use durability_barrier::writes_acked_without_durability;
@@ -26,14 +27,19 @@ pub(crate) use durable_write::{
     dispatch_authorized_durable_write, dispatch_authorized_durable_write_with_source,
     dispatch_authorized_task_by_class, dispatch_durable_autocommit_write,
 };
-pub(crate) use minted::{
-    Collect, MintedRecords, OwnedResponse, OwnedWait, RecordOwner, await_response_owned,
+pub(crate) use minted::{MintedRecords, RecordOwner, SentRecords};
+pub(crate) use owner_read::{
+    OwnedRead, OwnedReadScope, ReadPlacement, not_found_response, ok_payload_response,
+    owner_response, prepare_local_pass, read_placement, route_owned_read,
 };
 pub(crate) use submit_write::{
     ChangeFeedOwner, PendingWrite, SubmitOutcome, SubmitWrite, WalDurability, WriteOrdering,
-    enqueue_write, submit_write,
+    dispatch_when_capacity_frees, enqueue_write, submit_write,
 };
 pub(crate) use types::{AutocommitWrite, WriteDispatch};
+pub(crate) use unlogged_dispatch::{
+    dispatch_routed_read_to_data_plane, dispatch_to_data_plane_with_txn,
+};
 pub(crate) use write_abort::{
     error_is_final_refusal, refusal_is_final, write_definitely_not_applied,
 };

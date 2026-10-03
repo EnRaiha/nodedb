@@ -8,10 +8,13 @@ use std::path::PathBuf;
 use nodedb_types::config::TuningConfig;
 use serde::{Deserialize, Serialize};
 
+use super::backup::BackupSettings;
+use super::backup_storage::BackupStorageSettings;
 use super::checkpoint::CheckpointSettings;
 use super::cluster::ClusterSettings;
 use super::cold_storage::ColdStorageSettings;
 use super::observability::ObservabilityConfig;
+use super::pitr::PitrSettings;
 use super::retention::RetentionSettings;
 use super::scheduler::SchedulerConfig;
 use super::section::ServerSection;
@@ -71,6 +74,16 @@ pub struct ServerConfig {
     #[serde(default)]
     pub backup_encryption: Option<BackupEncryptionSettings>,
 
+    /// Object-store access for `BACKUP DATABASE` and `RESTORE DATABASE`.
+    /// Absent = every `file://` URI is refused, and `s3://` URIs use IAM
+    /// credentials against AWS.
+    #[serde(default)]
+    pub backup_storage: Option<BackupStorageSettings>,
+
+    /// Scheduled logical backups: `[[backup.schedule]]` entries.
+    #[serde(default)]
+    pub backup: BackupSettings,
+
     /// Checkpoint and WAL management settings.
     #[serde(default)]
     pub checkpoint: CheckpointSettings,
@@ -83,7 +96,9 @@ pub struct ServerConfig {
 
     /// Cluster mode settings. When present, the node participates in a
     /// distributed cluster via Multi-Raft consensus over QUIC transport.
-    /// When absent, runs in single-node mode (default).
+    /// When absent (default), the node synthesizes a one-node cluster and runs
+    /// the single-node Calvin sequencer, so cross-core transactions commit
+    /// atomically.
     #[serde(default)]
     pub cluster: Option<ClusterSettings>,
 
@@ -91,6 +106,10 @@ pub struct ServerConfig {
     /// When present, old L1 segments are promoted to S3-compatible cold storage.
     #[serde(default)]
     pub cold_storage: Option<ColdStorageSettings>,
+
+    /// Point-in-time recovery. `enabled = true` requires `cold_storage`.
+    #[serde(default)]
+    pub pitr: PitrSettings,
 
     /// Snapshot storage configuration.
     /// Controls where warm-tier snapshots are persisted. When absent, defaults

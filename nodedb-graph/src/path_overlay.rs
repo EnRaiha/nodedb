@@ -59,50 +59,57 @@ impl CsrIndex {
         let mut fwd_frontier: Vec<String> = vec![src.to_string()];
         let mut bwd_frontier: Vec<String> = vec![dst.to_string()];
 
-        let label_id = label_filter.and_then(|l| self.label_id(l));
+        let labels = self.label_filter(label_filter);
 
         for _depth in 0..max_depth {
             if fwd_parent.len() + bwd_parent.len() >= max_visited {
                 break;
             }
 
-            let mut next_fwd = Vec::new();
+            // Each level's edges are relaxed in (neighbour, frontier node)
+            // name order, as the durable search relaxes them.
+            let mut candidates: Vec<(String, String)> = Vec::new();
             for node in std::mem::take(&mut fwd_frontier) {
-                let neighbors =
-                    self.forward_neighbors(&node, label_id, label_filter, frontier_bitmap, overlay);
-                for neighbor in neighbors {
-                    if let Some(meeting) = relax(
-                        &neighbor,
-                        &node,
-                        &mut fwd_parent,
-                        &bwd_parent,
-                        &mut next_fwd,
-                    ) {
-                        return Some(reconstruct(&meeting, &fwd_parent, &bwd_parent));
-                    }
+                for neighbor in
+                    self.forward_neighbors(&node, labels, label_filter, frontier_bitmap, overlay)
+                {
+                    candidates.push((neighbor, node.clone()));
+                }
+            }
+            candidates.sort();
+            let mut next_fwd = Vec::new();
+            for (neighbor, node) in candidates {
+                if let Some(meeting) = relax(
+                    &neighbor,
+                    &node,
+                    &mut fwd_parent,
+                    &bwd_parent,
+                    &mut next_fwd,
+                ) {
+                    return Some(reconstruct(&meeting, &fwd_parent, &bwd_parent));
                 }
             }
             fwd_frontier = next_fwd;
 
-            let mut next_bwd = Vec::new();
+            let mut candidates: Vec<(String, String)> = Vec::new();
             for node in std::mem::take(&mut bwd_frontier) {
-                let neighbors = self.backward_neighbors(
+                for neighbor in
+                    self.backward_neighbors(&node, labels, label_filter, frontier_bitmap, overlay)
+                {
+                    candidates.push((neighbor, node.clone()));
+                }
+            }
+            candidates.sort();
+            let mut next_bwd = Vec::new();
+            for (neighbor, node) in candidates {
+                if let Some(meeting) = relax(
+                    &neighbor,
                     &node,
-                    label_id,
-                    label_filter,
-                    frontier_bitmap,
-                    overlay,
-                );
-                for neighbor in neighbors {
-                    if let Some(meeting) = relax(
-                        &neighbor,
-                        &node,
-                        &mut bwd_parent,
-                        &fwd_parent,
-                        &mut next_bwd,
-                    ) {
-                        return Some(reconstruct(&meeting, &fwd_parent, &bwd_parent));
-                    }
+                    &mut bwd_parent,
+                    &fwd_parent,
+                    &mut next_bwd,
+                ) {
+                    return Some(reconstruct(&meeting, &fwd_parent, &bwd_parent));
                 }
             }
             bwd_frontier = next_bwd;
@@ -120,7 +127,7 @@ impl CsrIndex {
     fn forward_neighbors(
         &self,
         node: &str,
-        label_id: Option<u32>,
+        labels: crate::csr::index::LabelFilter,
         label_filter: Option<&str>,
         frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
         overlay: &GraphOverlayDelta,
@@ -129,7 +136,7 @@ impl CsrIndex {
         if let Some(&node_id) = self.node_to_id.get(node) {
             self.record_access(node_id);
             for (lid, dst) in self.dense_iter_out(node_id) {
-                if label_id.is_some_and(|f| f != lid) {
+                if !labels.keeps(lid) {
                     continue;
                 }
                 let dst_name = &self.id_to_node[dst as usize];
@@ -156,7 +163,7 @@ impl CsrIndex {
     fn backward_neighbors(
         &self,
         node: &str,
-        label_id: Option<u32>,
+        labels: crate::csr::index::LabelFilter,
         label_filter: Option<&str>,
         frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
         overlay: &GraphOverlayDelta,
@@ -165,7 +172,7 @@ impl CsrIndex {
         if let Some(&node_id) = self.node_to_id.get(node) {
             self.record_access(node_id);
             for (lid, src) in self.dense_iter_in(node_id) {
-                if label_id.is_some_and(|f| f != lid) {
+                if !labels.keeps(lid) {
                     continue;
                 }
                 let src_name = &self.id_to_node[src as usize];

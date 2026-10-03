@@ -54,6 +54,11 @@ fn write_event(seq: u64, op: WriteOp, payload_bytes: Vec<u8>, is_delete: bool) -
         valid_time_ms,
         user_id: None,
         statement_digest: None,
+        // The write committed now, so the event stays in age retention.
+        commit_hlc: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok()),
     }
 }
 
@@ -76,6 +81,7 @@ fn stream_def() -> ChangeStreamDef {
         owner: "admin".into(),
         created_at: 0,
         subscriber_roles: Vec::new(),
+        modification_hlc: nodedb_types::Hlc::ZERO,
     }
 }
 

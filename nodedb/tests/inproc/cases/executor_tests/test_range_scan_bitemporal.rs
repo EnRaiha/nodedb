@@ -116,7 +116,7 @@ fn delete(ctx: &mut TestCtx, collection: &str, doc_id: &str, surrogate: u32) {
                 collection,
             ),
             document_id: doc_id.into(),
-            surrogate: nodedb_types::Surrogate::new(surrogate),
+            surrogate: Some(nodedb_types::Surrogate::new(surrogate)),
             pk_bytes: doc_id.as_bytes().to_vec(),
             returning: None,
             rls_filters: Vec::new(),

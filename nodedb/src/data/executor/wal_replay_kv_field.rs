@@ -72,7 +72,7 @@ impl CoreLoop {
             }
         };
 
-        self.kv_engine.put(crate::engine::kv::KvPutParams {
+        if let Err(e) = self.kv_engine.put(crate::engine::kv::KvPutParams {
             database_id,
             tenant_id,
             collection: &collection,
@@ -81,7 +81,10 @@ impl CoreLoop {
             ttl_ms: 0,
             now_ms,
             surrogate: nodedb_types::Surrogate::new(surrogate),
-        });
+        }) {
+            self.replay_record_unapplied("kv", "field_set_identity", record_lsn, &e.to_string());
+            return Some(0);
+        }
         self.note_replay_write_lsn(
             database_id,
             tenant_id,

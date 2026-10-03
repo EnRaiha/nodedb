@@ -15,18 +15,18 @@
 //! the data's home node).
 //!
 //! A request carrying `lookup_only: Some(true)` takes the READ-ONLY branch:
-//! `SurrogateAssigner::lookup`, which never allocates and never writes. A miss
-//! comes back as `found: Some(false)` with no error — the key simply names no
+//! `SurrogateAssigner::lookup_bound`, which never allocates and never writes. A miss
+//! comes back as `found: Some(false)` with no error — the key names no
 //! existing row, which is an answer, not a failure. Allocating on that path
-//! would mint identity for a row that does not exist.
+//! will mint identity for a row that does not exist.
 //!
 //! Otherwise, on `on_assign_surrogate`, the leader:
-//! 1. runs `SurrogateAssigner::assign(database_id, tenant_id, collection, pk)` —
-//!    a LOCAL assign that allocates from this node's HiLo batch on the first call
-//!    and returns the persisted binding on every later call;
-//! 2. because the leader IS the home node, that value is the AUTHORITATIVE
-//!    surrogate the home node stores under: first-wins, idempotent, the same one
-//!    every coordinator that routes here will receive;
+//! 1. runs `authority::assign_at_home`: the binding its catalog holds, or a
+//!    fresh value bound through the home vShard's Raft log, read back after
+//!    it applies;
+//! 2. because the leader leads the key's collection home, that value is the
+//!    AUTHORITATIVE surrogate every owner stores under: first-wins, idempotent,
+//!    the same one every coordinator that routes here will receive;
 //! 3. maps `Ok(surrogate)` → [`AssignSurrogateResponse`] with `error: None` and
 //!    `Err` → a typed [`TypedClusterError::Internal`] (surrogate `0`) — never a
 //!    silent drop.
@@ -74,7 +74,7 @@ impl nodedb_cluster::AssignRemoteSurrogate for RegistryAssignRemoteSurrogate {
             return match self
                 .state
                 .surrogate_assigner
-                .lookup(key, tenant_id, &req.pk)
+                .lookup_bound(key, tenant_id, &req.pk)
             {
                 Ok(Some(surrogate)) => AssignSurrogateResponse {
                     surrogate: surrogate.as_u32(),
@@ -97,10 +97,14 @@ impl nodedb_cluster::AssignRemoteSurrogate for RegistryAssignRemoteSurrogate {
             };
         }
 
-        match self
-            .state
-            .surrogate_assigner
-            .assign(key, tenant_id, &req.pk)
+        match super::authority::assign_at_home(
+            &self.state,
+            crate::types::VShardId::new(req.vshard_id),
+            key,
+            tenant_id,
+            &req.pk,
+        )
+        .await
         {
             Ok(surrogate) => AssignSurrogateResponse {
                 surrogate: surrogate.as_u32(),

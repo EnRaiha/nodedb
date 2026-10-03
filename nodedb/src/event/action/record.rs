@@ -10,9 +10,10 @@
 //! exactly enough to re-run that one action and nothing else.
 //!
 //! Payloads name what to run, never how to run it: a trigger by name, an
-//! event action by its SQL text. Both are re-resolved and re-planned at retry
-//! time, so an action queued before a DDL runs against the catalog as it
-//! stands when the retry fires rather than against a frozen plan.
+//! event action or a committed trigger's cross-node requests by SQL text.
+//! Each is re-resolved and re-planned at retry time, so an action queued
+//! before a DDL runs against the catalog as it stands when the retry fires
+//! rather than against a frozen plan.
 
 use std::collections::HashMap;
 

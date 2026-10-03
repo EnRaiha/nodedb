@@ -17,8 +17,8 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{DatabaseId, TenantId, VShardId};
 
 /// Serialize optional sync provenance into the cross-node wire shape.
-/// `.expect()`, not `.ok()`: losing provenance on a follower would defeat the
-/// idempotency gate and risk double-apply.
+/// `.expect()`, not `.ok()`: losing provenance on a follower defeats the
+/// idempotency gate and risks double-apply.
 pub(super) fn encode_provenance(
     provenance: &Option<nodedb_types::sync::wire::SyncProvenance>,
 ) -> Option<Vec<u8>> {
@@ -60,7 +60,8 @@ pub fn to_replicated_entry(
         PhysicalPlan::Columnar(op) => entry_columnar_family::columnar_write(op)?,
         PhysicalPlan::Timeseries(op) => entry_columnar_family::timeseries_write(op),
         PhysicalPlan::Text(op) => entry_columnar_family::text_write(op),
-        PhysicalPlan::Spatial(op) => entry_columnar_family::spatial_write(op),
+        // Fallible: a geometry that does not encode refuses the write.
+        PhysicalPlan::Spatial(op) => entry_columnar_family::spatial_write(op)?,
         PhysicalPlan::Array(op) => entry_array::array_write(op),
         // Cluster-fanned array ops execute entirely on the Control Plane (`ArrayCoordinator`).
         PhysicalPlan::ClusterArray(_) => None,
@@ -69,6 +70,22 @@ pub fn to_replicated_entry(
         PhysicalPlan::Meta(_) | PhysicalPlan::ClusterEvent(_) => None,
     };
 
+    // Array cell writes route by the array's own incarnation.
+    let collections = match plan {
+        PhysicalPlan::Array(_) | PhysicalPlan::ClusterArray(_) => Vec::new(),
+        PhysicalPlan::Vector(_)
+        | PhysicalPlan::Graph(_)
+        | PhysicalPlan::Document(_)
+        | PhysicalPlan::Kv(_)
+        | PhysicalPlan::Text(_)
+        | PhysicalPlan::Columnar(_)
+        | PhysicalPlan::Timeseries(_)
+        | PhysicalPlan::Spatial(_)
+        | PhysicalPlan::Crdt(_)
+        | PhysicalPlan::Query(_)
+        | PhysicalPlan::Meta(_)
+        | PhysicalPlan::ClusterEvent(_) => plan.named_collections(),
+    };
     Ok(encoded.map(|write| {
         ReplicatedEntry::new(
             tenant_id.as_u64(),
@@ -76,6 +93,7 @@ pub fn to_replicated_entry(
             vshard_id.as_u32(),
             write,
         )
+        .naming(collections)
     }))
 }
 
@@ -107,7 +125,7 @@ mod tests {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             document_id: "d".into(),
             value: vec![],
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
@@ -122,7 +140,7 @@ mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::PointGet {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             document_id: "d".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -215,7 +233,7 @@ mod tests {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             document_id: "d1".into(),
             value: vec![1, 2, 3],
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),

@@ -69,6 +69,11 @@ impl CoreLoop {
                 },
             );
         }
+        if let Some(refusal) =
+            super::unbound_surrogate::refuse_unbound("multi-vector", collection, document_surrogate)
+        {
+            return self.response_error(task, refusal);
+        }
         if vectors_flat.len() != count * dim {
             return self.response_error(
                 task,
@@ -131,6 +136,10 @@ impl CoreLoop {
     }
 
     /// Delete all vectors for a multi-vector document.
+    ///
+    /// Idempotent: a document with no vectors, or a field with no index,
+    /// answers `Ok` and changes nothing. A re-issue deletes before it
+    /// inserts, so the first delete of a document finds nothing.
     pub(in crate::data::executor) fn execute_multi_vector_delete(
         &mut self,
         task: &ExecutionTask,
@@ -148,7 +157,7 @@ impl CoreLoop {
         let database_id = task.request.database_id.as_u64();
         let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
         let Some(coll) = self.vector_collections.get_mut(&index_key) else {
-            return self.response_error(task, ErrorCode::NotFound);
+            return self.response_ok(task);
         };
 
         let deleted = coll.delete_multi_vector(document_surrogate);
@@ -158,10 +167,8 @@ impl CoreLoop {
             // surrogate so cross-shard OCC read-set validation sees this
             // delete.
             self.note_surrogate_write_lsn(task, tid, collection, document_surrogate.as_u32());
-            self.response_ok(task)
-        } else {
-            self.response_error(task, ErrorCode::NotFound)
         }
+        self.response_ok(task)
     }
 
     /// Search with multi-vector aggregated scoring.
@@ -355,6 +362,7 @@ mod tests {
             txn_id: None,
             wal_lsn: Some(Lsn::new(lsn)),
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: Admission::Exempt(ExemptReason::Read),
         })
     }
@@ -399,5 +407,47 @@ mod tests {
             Some(Lsn::new(31)),
             "multi-vector insert must advance the collection write-version floor"
         );
+    }
+
+    /// The restore re-issue deletes a multi-vector document, then inserts its
+    /// full set. The delete answers Ok when nothing exists, and a repeated
+    /// delete-then-insert leaves the set once.
+    #[test]
+    fn delete_then_insert_is_idempotent_and_keeps_every_vector() {
+        let mut h = make_core();
+        let task = make_task_with_lsn(40);
+        let document_surrogate = Surrogate::new(11);
+        let vectors = [1.0, 0.0, 0.0, 1.0, 0.5, 0.5];
+
+        let absent =
+            h.core
+                .execute_multi_vector_delete(&task, 1, "chunks", "emb", document_surrogate);
+        assert_eq!(absent.status, Status::Ok, "deleting nothing answers Ok");
+
+        for _ in 0..2 {
+            let deleted =
+                h.core
+                    .execute_multi_vector_delete(&task, 1, "chunks", "emb", document_surrogate);
+            assert_eq!(deleted.status, Status::Ok);
+            let inserted = h.core.execute_multi_vector_insert(MultiVectorInsertParams {
+                task: &task,
+                tid: 1,
+                collection: "chunks",
+                field_name: "emb",
+                document_surrogate,
+                vectors_flat: &vectors,
+                count: 3,
+                dim: 2,
+            });
+            assert_eq!(inserted.status, Status::Ok);
+        }
+
+        let index_key = CoreLoop::vector_index_key(0, 1, "chunks", "emb");
+        let live = h
+            .core
+            .vector_collections
+            .get(&index_key)
+            .map(|coll| coll.live_count());
+        assert_eq!(live, Some(3), "the document keeps all three vectors, once");
     }
 }

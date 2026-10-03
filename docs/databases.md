@@ -389,8 +389,8 @@ Database operations are gated by role:
 | `CLONE DATABASE`               | `Superuser`                    |
 | `MIRROR DATABASE`              | `Superuser`                    |
 | `MOVE TENANT`                  | `Superuser`                    |
-| `BACKUP DATABASE`              | `DatabaseOwner` or higher      |
-| `RESTORE DATABASE`             | `Superuser`                    |
+| `BACKUP DATABASE`              | `DatabaseOwner` or `Superuser` |
+| `RESTORE DATABASE`             | `DatabaseOwner` or `Superuser`; `Superuser` when the database does not exist |
 
 See [Roles & Permissions](security/rbac.md) for full role definitions.
 

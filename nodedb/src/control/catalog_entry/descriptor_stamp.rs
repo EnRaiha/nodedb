@@ -13,16 +13,22 @@
 //! Every prior read is committed-only. Deriving a version from the
 //! transaction's own uncommitted DDL overlay stamps one descriptor twice.
 //!
-//! Rolling upgrade: stamping is gated by
-//! [`crate::control::rolling_upgrade::DESCRIPTOR_VERSIONING_VERSION`], and the
-//! applier skips this helper in compat mode. That gate lives at the call site.
+//! Every proposer stamps. There is no unstamped compat path.
 //!
 //! Variants without descriptor fields pass through unchanged: `PutUser`,
 //! `PutRole`, `PutPermission`, `PutOwner`, `PutTenant`, `PutApiKey`,
-//! `PutAuthUser`, `PutRlsPolicy`, `PutSchedule`, `PutChangeStream`,
-//! `PutSequenceState`, and every `Delete*` / `Purge*` variant.
+//! `PutAuthUser`, `PutRlsPolicy`, `PutSchedule`, `PutSequenceState`, and
+//! every unfenced `Delete*` variant.
 //! `DeactivateCollection` does carry them: a soft delete rewrites the row, so it
 //! consumes a version like any other mutation.
+//!
+//! A fenced delete (`PurgeCollection` and the `Delete*` of every stored type
+//! with an incarnation clock) freezes the target row's incarnation instead.
+//! `PutSynonymGroup`, `PutVectorIndexParams`, `CreateTopicIfAbsent`,
+//! `PutChangeStream`, `PutConsumerGroupIfAbsent`,
+//! `MigrateConsumerGroupStream`, and `PutArray` stamp only `modification_hlc`. See
+//! [`super::incarnation`].
+//! `CloneDatabase` stamps the fresh incarnation its shadow collections take.
 //! The match is exhaustive on [`CatalogEntry`], so a new variant is a compile
 //! error here. Deciding whether it needs a stamp is deliberate.
 
@@ -38,10 +44,7 @@ fn next_collection_stamp(
     clock: &HlcClock,
     hlc: Hlc,
 ) -> (u64, Hlc) {
-    let hlc = match prior.map(|c| c.modification_hlc) {
-        Some(prior_hlc) if prior_hlc >= hlc => clock.update(prior_hlc),
-        _ => hlc,
-    };
+    let hlc = super::incarnation::stamp::after(prior.map(|c| c.modification_hlc), clock, hlc);
     let prior_descriptor = prior.map(|c| c.descriptor_version).unwrap_or(0);
     (prior_descriptor.saturating_add(1), hlc)
 }
@@ -49,17 +52,21 @@ fn next_collection_stamp(
 /// Read the prior persisted descriptor, assign `descriptor_version = prior + 1`
 /// (or `1` on create), stamp `modification_hlc = clock.now()`, return the entry.
 ///
-/// Infallible by design: a failed redb read stamps as if the record was absent
-/// (version `1`). Version `0` is never emitted — it is strictly the
-/// pre-stamping compat-mode sentinel.
-pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> CatalogEntry {
+/// A failed catalog read fails the stamp: a guessed prior emits a
+/// version-1 put or an unfenced delete. Version `0` is never emitted.
+pub fn stamp(
+    entry: CatalogEntry,
+    clock: &HlcClock,
+    catalog: &SystemCatalog,
+) -> crate::Result<CatalogEntry> {
     let mut hlc = clock.now();
-    match entry {
+    Ok(match entry {
         CatalogEntry::PutCollection(mut stored) => {
-            let prior = catalog
-                .get_committed_collection(stored.database_id, stored.tenant_id, &stored.name)
-                .ok()
-                .flatten();
+            let prior = catalog.get_committed_collection(
+                stored.database_id,
+                stored.tenant_id,
+                &stored.name,
+            )?;
             let (descriptor_version, stamped_hlc) =
                 next_collection_stamp(prior.as_ref(), clock, hlc);
             stored.descriptor_version = descriptor_version;
@@ -80,29 +87,39 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
                 prior_constraint_version
             };
             stored.modification_hlc = hlc;
+            stored.incarnation = super::incarnation::stamp::collection_incarnation(
+                stored.incarnation,
+                prior.as_ref(),
+                hlc,
+            );
             CatalogEntry::PutCollection(stored)
         }
         CatalogEntry::PutCollectionIfAbsent(mut stored) => {
-            let prior = catalog
-                .get_committed_collection(stored.database_id, stored.tenant_id, &stored.name)
-                .ok()
-                .flatten();
+            let prior = catalog.get_committed_collection(
+                stored.database_id,
+                stored.tenant_id,
+                &stored.name,
+            )?;
             // Existing is a semantic no-op: freeze the exact persisted record, so
             // replay stays payload-identical and later batch entries see the prior.
             if let Some(prior) = prior {
-                return CatalogEntry::PutCollectionIfAbsent(Box::new(prior));
+                return Ok(CatalogEntry::PutCollectionIfAbsent(Box::new(prior)));
             }
             stored.descriptor_version = 1;
             let new_set = crate::control::security::catalog::collection_constraints(&stored);
             stored.constraint_version = u64::from(!new_set.is_empty());
             stored.modification_hlc = hlc;
+            stored.incarnation =
+                super::incarnation::stamp::collection_incarnation(stored.incarnation, None, hlc);
             CatalogEntry::PutCollectionIfAbsent(stored)
         }
         CatalogEntry::PutMaterializedView(mut stored) => {
             let prior = catalog
-                .get_committed_materialized_view(stored.database_id, stored.tenant_id, &stored.name)
-                .ok()
-                .flatten()
+                .get_committed_materialized_view(
+                    stored.database_id,
+                    stored.tenant_id,
+                    &stored.name,
+                )?
                 .map(|v| v.descriptor_version)
                 .unwrap_or(0);
             stored.descriptor_version = prior.saturating_add(1);
@@ -115,9 +132,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
                     stored.database_id,
                     stored.tenant_id,
                     &stored.name,
-                )
-                .ok()
-                .flatten()
+                )?
                 .map(|f| f.descriptor_version)
                 .unwrap_or(0);
             stored.descriptor_version = prior.saturating_add(1);
@@ -130,9 +145,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
                     stored.database_id,
                     stored.tenant_id,
                     &stored.name,
-                )
-                .ok()
-                .flatten()
+                )?
                 .map(|p| p.descriptor_version)
                 .unwrap_or(0);
             stored.descriptor_version = prior.saturating_add(1);
@@ -145,9 +158,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
                     stored.database_id,
                     stored.tenant_id,
                     &stored.name,
-                )
-                .ok()
-                .flatten()
+                )?
                 .map(|t| t.descriptor_version)
                 .unwrap_or(0);
             stored.descriptor_version = prior.saturating_add(1);
@@ -156,9 +167,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         }
         CatalogEntry::PutSequence(mut stored) => {
             let prior = catalog
-                .get_sequence(stored.database_id, stored.tenant_id, &stored.name)
-                .ok()
-                .flatten()
+                .get_sequence(stored.database_id, stored.tenant_id, &stored.name)?
                 .map(|s| s.descriptor_version)
                 .unwrap_or(0);
             stored.descriptor_version = prior.saturating_add(1);
@@ -167,9 +176,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         }
         CatalogEntry::PutContinuousAggregate(mut stored) => {
             let prior = catalog
-                .get_continuous_aggregate(stored.database_id, stored.tenant_id, &stored.name)
-                .ok()
-                .flatten()
+                .get_continuous_aggregate(stored.database_id, stored.tenant_id, &stored.name)?
                 .map(|c| c.descriptor_version)
                 .unwrap_or(0);
             stored.descriptor_version = prior.saturating_add(1);
@@ -183,15 +190,12 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
             ..
         } => {
             // A soft delete rewrites the row, advancing the same ordering
-            // metadata a `PutCollection` would.
-            let prior = catalog
-                .get_committed_collection(
-                    crate::types::DatabaseId::new(database_id),
-                    tenant_id,
-                    &name,
-                )
-                .ok()
-                .flatten();
+            // metadata a `PutCollection` does.
+            let prior = catalog.get_committed_collection(
+                crate::types::DatabaseId::new(database_id),
+                tenant_id,
+                &name,
+            )?;
             let (descriptor_version, stamped_hlc) =
                 next_collection_stamp(prior.as_ref(), clock, hlc);
             CatalogEntry::DeactivateCollection {
@@ -202,21 +206,39 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
                 modification_hlc: stamped_hlc,
             }
         }
-        // Variants without descriptor versioning pass through unchanged.
+        entry @ CatalogEntry::CloneDatabase { .. } => {
+            super::incarnation::stamp::stamp_clone(entry, hlc)
+        }
         entry @ (CatalogEntry::PurgeCollection { .. }
+        | CatalogEntry::DeleteSequence { .. }
+        | CatalogEntry::DeleteTrigger { .. }
         | CatalogEntry::DeleteFunction { .. }
         | CatalogEntry::DeleteProcedure { .. }
-        | CatalogEntry::DeleteTrigger { .. }
         | CatalogEntry::DeleteMaterializedView { .. }
-        | CatalogEntry::PutStreamingMaterializedView(_)
-        | CatalogEntry::DeleteStreamingMaterializedView { .. }
         | CatalogEntry::DeleteContinuousAggregate { .. }
-        | CatalogEntry::DeleteSequence { .. }
+        | CatalogEntry::DeleteSynonymGroup { .. }
+        | CatalogEntry::DeleteTopicWithConsumerGroups { .. }
+        | CatalogEntry::DeleteVectorIndexParams { .. }
+        | CatalogEntry::DeleteChangeStream { .. }
+        | CatalogEntry::DeleteConsumerGroup { .. }
+        | CatalogEntry::DeleteArray { .. }) => {
+            super::incarnation::stamp::stamp_delete(entry, catalog)?
+        }
+        entry @ (CatalogEntry::PutSynonymGroup(_)
+        | CatalogEntry::PutVectorIndexParams(_)
+        | CatalogEntry::CreateTopicIfAbsent(_)
+        | CatalogEntry::PutChangeStream(_)
+        | CatalogEntry::PutConsumerGroupIfAbsent(_)
+        | CatalogEntry::MigrateConsumerGroupStream { .. }
+        | CatalogEntry::PutArray(_)) => {
+            super::incarnation::stamp::stamp_put(entry, clock, catalog, hlc)?
+        }
+        // Variants without descriptor versioning pass through unchanged.
+        entry @ (CatalogEntry::PutStreamingMaterializedView(_)
+        | CatalogEntry::DeleteStreamingMaterializedView { .. }
         | CatalogEntry::PutSequenceState(_)
         | CatalogEntry::PutSchedule(_)
         | CatalogEntry::DeleteSchedule { .. }
-        | CatalogEntry::PutChangeStream(_)
-        | CatalogEntry::DeleteChangeStream { .. }
         | CatalogEntry::PutUser(_)
         | CatalogEntry::DropUser { .. }
         | CatalogEntry::PutRole(_)
@@ -239,8 +261,6 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::DeleteIndexRecord { .. }
         | CatalogEntry::PutOwner(_)
         | CatalogEntry::DeleteOwner { .. }
-        | CatalogEntry::PutSynonymGroup(_)
-        | CatalogEntry::DeleteSynonymGroup { .. }
         | CatalogEntry::PutCustomType(_)
         | CatalogEntry::DeleteCustomType { .. }
         | CatalogEntry::PutDatabase(_)
@@ -250,7 +270,6 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::PutOidcProvider(_)
         | CatalogEntry::DeleteOidcProvider { .. }
         | CatalogEntry::RecordWalTombstone { .. }
-        | CatalogEntry::CloneDatabase { .. }
         | CatalogEntry::PutDatabaseQuota { .. }
         | CatalogEntry::DeleteDatabaseQuota { .. }
         | CatalogEntry::PutTenantQuota { .. }
@@ -261,21 +280,21 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::DeleteRetentionPolicy { .. }
         | CatalogEntry::PutAlertRule(_)
         | CatalogEntry::DeleteAlertRule { .. }
-        | CatalogEntry::CreateTopicIfAbsent(_)
-        | CatalogEntry::DeleteTopicWithConsumerGroups { .. }
-        | CatalogEntry::PutConsumerGroupIfAbsent(_)
-        | CatalogEntry::DeleteConsumerGroup { .. }
-        | CatalogEntry::MigrateConsumerGroupStream { .. }
         | CatalogEntry::PutCheckpoint(_)
         | CatalogEntry::DeleteCheckpoint { .. }
         | CatalogEntry::CompactHistory { .. }
         | CatalogEntry::PutVectorModel(_)
         | CatalogEntry::DeleteVectorModel { .. }
-        | CatalogEntry::PutVectorIndexParams(_)
-        | CatalogEntry::DeleteVectorIndexParams { .. }
         | CatalogEntry::PutColumnStats(_)
-        | CatalogEntry::MoveTenantCutover { .. }) => entry,
-    }
+        | CatalogEntry::PutCloneCopyup { .. }
+        | CatalogEntry::PutCloneTombstone { .. }
+        | CatalogEntry::PutKvCloneTombstone { .. }
+        | CatalogEntry::PutCloneSourceDrain(_)
+        | CatalogEntry::DeleteCloneSourceDrain { .. }
+        | CatalogEntry::MoveTenantCutover { .. }
+        | CatalogEntry::CommitConsumerOffsets(_)
+        | CatalogEntry::PutBackupScheduleMark(_)) => entry,
+    })
 }
 
 /// Stamp a transactional DDL batch in statement order. Persisted catalog state
@@ -284,10 +303,10 @@ pub fn stamp_batch(
     entries: Vec<CatalogEntry>,
     clock: &HlcClock,
     catalog: &SystemCatalog,
-) -> Vec<CatalogEntry> {
+) -> crate::Result<Vec<CatalogEntry>> {
     let mut stamped_entries = Vec::with_capacity(entries.len());
     for entry in entries {
-        let mut stamped = stamp(entry, clock, catalog);
+        let mut stamped = stamp(entry, clock, catalog)?;
         if let Some(prior) = stamped_entries
             .iter()
             .rev()
@@ -295,9 +314,10 @@ pub fn stamp_batch(
         {
             stamped = advance_after(prior, stamped);
         }
+        let stamped = super::incarnation::stamp::retarget_in_batch(&stamped_entries, stamped);
         stamped_entries.push(stamped);
     }
-    stamped_entries
+    Ok(stamped_entries)
 }
 
 /// The `(database, tenant, name)` a versioned collection entry mutates. A soft
@@ -454,6 +474,11 @@ fn advance_collection(
     current: &mut crate::control::security::catalog::StoredCollection,
 ) {
     current.descriptor_version = prior.descriptor_version.saturating_add(1);
+    // A later put of a row an earlier entry of the batch leaves active keeps
+    // that entry's incarnation.
+    if prior.is_active && prior.incarnation != Hlc::ZERO {
+        current.incarnation = prior.incarnation;
+    }
     let prior_set = crate::control::security::catalog::collection_constraints(prior);
     let current_set = crate::control::security::catalog::collection_constraints(current);
     current.constraint_version = if prior_set == current_set {
@@ -495,7 +520,7 @@ mod tests {
         let stored = StoredCollection::new(1, "orders", "tester");
         let entry = CatalogEntry::PutCollection(Box::new(stored));
 
-        let stamped = stamp(entry, &clock, catalog);
+        let stamped = stamp(entry, &clock, catalog).expect("stamp");
         let CatalogEntry::PutCollection(boxed) = stamped else {
             panic!("expected PutCollection");
         };
@@ -513,7 +538,7 @@ mod tests {
         for expected in 1u64..=5 {
             let stored = StoredCollection::new(1, "orders", "tester");
             let entry = CatalogEntry::PutCollection(Box::new(stored));
-            let stamped = stamp(entry, &clock, catalog);
+            let stamped = stamp(entry, &clock, catalog).expect("stamp");
             let CatalogEntry::PutCollection(boxed) = stamped else {
                 panic!("expected PutCollection");
             };
@@ -535,7 +560,7 @@ mod tests {
             CatalogEntry::PutCollection(Box::new(StoredCollection::new(1, "orders", "tester"))),
             CatalogEntry::PutCollection(Box::new(StoredCollection::new(1, "orders", "tester"))),
         ];
-        let stamped = stamp_batch(entries, &clock, store.catalog());
+        let stamped = stamp_batch(entries, &clock, store.catalog()).expect("stamp batch");
         let CatalogEntry::PutCollection(first) = &stamped[0] else {
             panic!("expected first collection");
         };
@@ -548,7 +573,7 @@ mod tests {
 
     /// Persist a collection at `version` so the next stamp reads it as prior.
     fn seed_prior(catalog: &SystemCatalog, name: &str, version: u64) {
-        let mut stored = StoredCollection::new(1, name, "tester");
+        let mut stored = StoredCollection::stamped_for_test(1, name, "tester");
         stored.descriptor_version = version;
         catalog
             .put_collection(DatabaseId::DEFAULT, &stored)
@@ -666,7 +691,8 @@ mod tests {
             ],
             &clock,
             store.catalog(),
-        );
+        )
+        .expect("stamp batch");
         let CatalogEntry::PutCollectionIfAbsent(noop) = &stamped[0] else {
             panic!("expected create-only entry");
         };
@@ -690,7 +716,8 @@ mod tests {
             ],
             &clock,
             store.catalog(),
-        );
+        )
+        .expect("stamp batch");
         let CatalogEntry::PutSequence(first) = &stamped[0] else {
             panic!("expected first sequence");
         };
@@ -701,11 +728,8 @@ mod tests {
         assert_eq!(second.descriptor_version, 2);
     }
 
-    /// A soft delete (`DeactivateCollection`) must advance the same
-    /// descriptor version and HLC a `PutCollection` would — it is a mutation
-    /// of the row, not a pass-through. `stamp_ignores_deletes` previously
-    /// asserted the opposite (pass-through unchanged), which encoded the
-    /// bug this test now guards against.
+    /// A soft delete (`DeactivateCollection`) advances the descriptor version
+    /// and HLC the same way a `PutCollection` does. It mutates the row.
     #[test]
     fn stamp_advances_deactivate_collection_version_and_hlc() {
         let (store, _tmp) = make_catalog();
@@ -717,7 +741,8 @@ mod tests {
             CatalogEntry::PutCollection(Box::new(stored)),
             &clock,
             catalog,
-        );
+        )
+        .expect("stamp");
         let CatalogEntry::PutCollection(created) = &create else {
             panic!("expected PutCollection");
         };
@@ -737,7 +762,8 @@ mod tests {
             },
             &clock,
             catalog,
-        );
+        )
+        .expect("stamp");
         let CatalogEntry::DeactivateCollection {
             descriptor_version,
             modification_hlc,

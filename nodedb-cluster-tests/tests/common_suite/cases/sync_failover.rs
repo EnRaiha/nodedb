@@ -78,6 +78,7 @@ async fn cluster_sync_producer_fence_survives_failover() {
             registration.current_epoch,
             CREATED_MS,
         )
+        .await
         .expect("propose producer register");
         registration.producer_id
     };
@@ -96,6 +97,7 @@ async fn cluster_sync_producer_fence_survives_failover() {
             LITE_ID,
             5,
         )
+        .await
         .expect("propose producer fence");
     }
 

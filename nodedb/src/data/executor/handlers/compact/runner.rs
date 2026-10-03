@@ -2,8 +2,8 @@
 
 //! Top-level compaction orchestration.
 //!
-//! `run_compaction` drives all five compaction phases (vector, CSR, dangling
-//! edges, timeseries L1, FTS LSM) and aggregates the results into a
+//! `run_compaction` drives all four compaction phases (vector, CSR,
+//! timeseries L1, FTS LSM) and aggregates the results into a
 //! `CompactionStats`. `execute_compact` is the entry point dispatched from
 //! the Control Plane via `PhysicalPlan::Compact`.
 
@@ -21,7 +21,7 @@ impl CoreLoop {
     /// Execute an on-demand compaction request.
     ///
     /// Forces compaction of all vector collections (regardless of tombstone
-    /// ratio), CSR compaction, and dangling edge sweep. Returns a summary
+    /// ratio), CSR compaction, segment and FTS compaction. Returns a summary
     /// payload with compaction statistics.
     pub(in crate::data::executor) fn execute_compact(&mut self, task: &ExecutionTask) -> Response {
         let result = self.run_compaction(true);
@@ -147,42 +147,22 @@ impl CoreLoop {
             }
         }
 
-        // 3. Dangling edge sweep — budget-gated against DEFAULT (sweep is
-        // process-wide; per-tenant attribution happens inside the sweep loop).
-        let edges_db = DatabaseId::DEFAULT;
-        match self.acquire_maintenance_lease(edges_db, force) {
-            BudgetGate::Granted(_lease) => {
-                stats.edges_swept = self.sweep_dangling_edges();
-                // _lease drops here, recording elapsed wall-clock into the budget window.
-            }
-            BudgetGate::Deferred => {
-                stats.edges_deferred = true;
-                tracing::debug!(
-                    core = self.core_id,
-                    db = edges_db.as_u64(),
-                    "edge sweep deferred: database over maintenance budget"
-                );
-            }
-        }
-
-        // 4. L1 segment compaction: per-(tenant, collection) → per-database gated.
+        // 3. L1 segment compaction: per-(tenant, collection) → per-database gated.
         let (merged, deferred) = self.run_segment_compaction(force);
         stats.segments_merged = merged;
         stats.segments_deferred = deferred;
 
-        // 5. FTS LSM level compaction: merge L0→L1→… segments per collection.
+        // 4. FTS LSM level compaction: merge L0→L1→… segments per collection.
         let fts_outcome = self.run_fts_compaction(force);
         stats.fts_compacted = fts_outcome.merged;
         stats.fts_deferred = fts_outcome.deferred;
         stats.fts_enumeration_failed = fts_outcome.enumeration_failed;
 
         if stats.vectors_compacted > 0
-            || stats.edges_swept > 0
             || stats.segments_merged > 0
             || stats.fts_compacted > 0
             || stats.vectors_deferred > 0
             || stats.csr_deferred
-            || stats.edges_deferred
             || stats.segments_deferred > 0
             || stats.fts_deferred > 0
             || stats.fts_enumeration_failed
@@ -191,12 +171,10 @@ impl CoreLoop {
                 core = self.core_id,
                 vectors_compacted = stats.vectors_compacted,
                 collections_compacted = stats.collections_compacted,
-                edges_swept = stats.edges_swept,
                 segments_merged = stats.segments_merged,
                 fts_compacted = stats.fts_compacted,
                 vectors_deferred = stats.vectors_deferred,
                 csr_deferred = stats.csr_deferred,
-                edges_deferred = stats.edges_deferred,
                 segments_deferred = stats.segments_deferred,
                 fts_deferred = stats.fts_deferred,
                 fts_enumeration_failed = stats.fts_enumeration_failed,
@@ -295,10 +273,6 @@ mod tests {
         assert!(
             stats.csr_deferred,
             "CSR compaction must defer when the DEFAULT db is over budget"
-        );
-        assert!(
-            stats.edges_deferred,
-            "edge sweep must defer when the DEFAULT db is over budget"
         );
         assert!(!stats.csr_compacted, "CSR must not have run while deferred");
 

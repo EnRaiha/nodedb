@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Dispatch context: holds references needed by all per-opcode handlers.
-//! Split out of `mod.rs` to keep that file declarations/re-exports only.
 
 use std::sync::Arc;
 
@@ -69,10 +68,19 @@ impl DispatchCtx<'_> {
         collection: &str,
     ) -> VShardId {
         if let PhysicalPlan::Graph(op) = plan {
+            // A presence guard, its read and a TRUNCATE's edge share name
+            // their vShard.
+            if let GraphOp::NodePresenceGuard { vshard, .. }
+            | GraphOp::NodePresenceRead { vshard, .. }
+            | GraphOp::TruncateEdges { vshard, .. } = op
+            {
+                return VShardId::new(*vshard);
+            }
             let node_key = match op {
                 GraphOp::EdgePut { src_id, .. } | GraphOp::EdgeDelete { src_id, .. } => {
                     src_id.as_str()
                 }
+                GraphOp::NodeEdgeGuard { node_id, .. } => node_id.as_str(),
                 GraphOp::EdgePutBatch { .. }
                 | GraphOp::ResolveEdgeDelete(_)
                 | GraphOp::EdgeDeleteBatch { .. }
@@ -92,7 +100,10 @@ impl DispatchCtx<'_> {
                 | GraphOp::RemoveNodeLabels { .. }
                 | GraphOp::TemporalNeighbors { .. }
                 | GraphOp::TemporalAlgorithm { .. }
-                | GraphOp::Stats { .. } => document_id.unwrap_or(collection),
+                | GraphOp::Stats { .. }
+                | GraphOp::NodePresenceGuard { .. }
+                | GraphOp::NodePresenceRead { .. }
+                | GraphOp::TruncateEdges { .. } => document_id.unwrap_or(collection),
             };
             return VShardId::from_key(node_key.as_bytes());
         }

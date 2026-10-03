@@ -3,7 +3,7 @@
 //! Statement-time staging for predicate `DELETE ... WHERE <predicate>`
 //! (`DocumentOp::BulkDelete`) inside a transaction. A `RETURNING` clause does
 //! not change what is staged — the matched rows are tombstoned identically;
-//! the clause only governs the client response shape.
+//! the reply projects their pre-deletion images per the clause.
 //!
 //! Mirrors point `DELETE` staging in `dispatch.rs` (`stage_point_delete`):
 //! each row in the BASE ∪ OVERLAY matching set (resolved via
@@ -15,6 +15,7 @@
 use nodedb_types::StorageKey;
 
 use super::body::stored_row_identity;
+use super::stage_returning::{StageReturning, StagedRowsOf};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
@@ -36,6 +37,8 @@ pub(in crate::data::executor) struct StageBulkDeleteParams<'a> {
     /// Declared `PRIMARY KEY` column of the collection, `None` otherwise.
     /// Names the column each removed row's identity is read from.
     pub declared_primary_key: Option<&'a str>,
+    /// The plan's `RETURNING` spec, `None` when it carries none.
+    pub returning: Option<StageReturning<'a>>,
 }
 
 impl CoreLoop {
@@ -55,6 +58,7 @@ impl CoreLoop {
             filter_bytes,
             rls_write_check,
             declared_primary_key,
+            returning,
         } = params;
         let database_id = task.request.database_id;
         let coll_key: (DatabaseId, TenantId, String) =
@@ -157,6 +161,24 @@ impl CoreLoop {
             self.txn_overlay_mut(txn_id)
                 .insert_tombstone(coll_key.clone(), surrogate, identity);
             affected += 1;
+        }
+
+        if let Some(returning) = returning {
+            let removed: Vec<(&nodedb_types::RowIdentity, &[u8])> = identified
+                .iter()
+                .map(|(_, identity, body)| (identity, body.as_slice()))
+                .collect();
+            return self.staged_returning_response(
+                StagedRowsOf {
+                    task,
+                    database_id: database_id.as_u64(),
+                    tid,
+                    collection,
+                },
+                returning,
+                affected,
+                &removed,
+            );
         }
 
         match response_codec::encode_json_as_msgpack(&serde_json::json!({ "affected": affected })) {

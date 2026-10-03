@@ -11,6 +11,8 @@ use nodedb_types::Surrogate;
 
 use crate::bridge::envelope::{ErrorCode, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::redo_image::{removed_row_image, submitted_row_image};
+use crate::data::executor::enforcement::chain_guard::{ChainGuard, abort_after_apply};
 use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
@@ -71,7 +73,20 @@ impl CoreLoop {
             self.remove_document_vector_indexes(database_id, tid, collection, storage_key);
         }
 
-        let txn = self.sparse.begin_write().map_err(ErrorCode::from)?;
+        // A row absent before this write is a link of a HASH_CHAIN target.
+        let mut chain = ChainGuard::begin(self, database_id, tid, collection);
+        if precondition.is_none() {
+            chain
+                .chain_insert(self, surrogate, value)
+                .map_err(ErrorCode::from)?;
+        }
+        let txn = match self.sparse.begin_write() {
+            Ok(txn) => txn,
+            Err(e) => {
+                chain.restore(self);
+                return Err(ErrorCode::from(e));
+            }
+        };
         let mut outcome = match self.apply_point_put(
             &txn,
             PointPutParams {
@@ -84,6 +99,7 @@ impl CoreLoop {
                 index_text: true,
                 user_roles: &task.request.user_roles,
                 enforce: true,
+                unique: crate::data::executor::enforcement::unique::UniqueJudge::Unit,
                 wal_lsn: task.wal_lsn(),
                 resolved_targets: resolved_sum_targets,
             },
@@ -91,11 +107,17 @@ impl CoreLoop {
             Ok(outcome) => outcome,
             Err(e) => {
                 // Dropping `txn` reverses the write but not the cache entry.
-                self.doc_cache
-                    .invalidate(database_id, tid, collection, &storage_key);
+                abort_after_apply(self, &mut chain, database_id, tid, collection, &storage_key);
                 return Err(ErrorCode::from(e));
             }
         };
+        if let Err(e) = chain
+            .settle(self, surrogate, &outcome.stored_value)
+            .and_then(|()| chain.persist_head(self, &txn))
+        {
+            abort_after_apply(self, &mut chain, database_id, tid, collection, &storage_key);
+            return Err(ErrorCode::from(e));
+        }
 
         let hook_ctx = HookCtx {
             database_id,
@@ -117,8 +139,7 @@ impl CoreLoop {
         let enforcement = match write_hook::run(self, &txn, &hook_ctx, images) {
             Ok(enforcement) => enforcement,
             Err(e) => {
-                self.doc_cache
-                    .invalidate(database_id, tid, collection, &storage_key);
+                abort_after_apply(self, &mut chain, database_id, tid, collection, &storage_key);
                 return Err(ErrorCode::from(e));
             }
         };
@@ -127,14 +148,16 @@ impl CoreLoop {
         if let Err(e) =
             self.settle_balanced_entries(database_id, tid, collection, enforcement.balanced_entries)
         {
-            self.doc_cache
-                .invalidate(database_id, tid, collection, &storage_key);
+            abort_after_apply(self, &mut chain, database_id, tid, collection, &storage_key);
             return Err(ErrorCode::from(e));
         }
 
-        txn.commit().map_err(|e| ErrorCode::Internal {
-            detail: format!("commit: {e}"),
-        })?;
+        if let Err(e) = txn.commit() {
+            abort_after_apply(self, &mut chain, database_id, tid, collection, &storage_key);
+            return Err(ErrorCode::Internal {
+                detail: format!("commit: {e}"),
+            });
+        }
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
         // Same post-commit index bookkeeping `execute_point_update` runs.
@@ -162,18 +185,18 @@ impl CoreLoop {
         );
         self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
 
-        let mut write_set = Vec::new();
-        // Without this a WAL-only restart rebuilds HNSW from the pre-write
-        // body and resurrects the old embedding.
-        if has_vectors {
-            write_set.push(WriteSetEntry {
-                surrogate: surrogate.as_u32(),
-                identity: row_identity,
-                is_delete: false,
-                value: value.to_vec(),
-                collection: None,
-            });
-        }
+        // The row, journalled after apply from the body `apply_point_put`
+        // took. A resolved write's mutations can name several collections,
+        // so the entry names its own.
+        let mut write_set = vec![
+            submitted_row_image(
+                surrogate.as_u32(),
+                row_identity,
+                value.to_vec(),
+                outcome.bitemporal_sys_from_ms,
+            )
+            .in_collection(collection.to_string()),
+        ];
         // Derived target rows live in a DIFFERENT collection, so each carries
         // its own `Some(collection)` and homes to that collection's vShard.
         write_set.extend(target_write_set);
@@ -266,6 +289,20 @@ impl CoreLoop {
                 Some(old_converted.as_deref().unwrap_or(prior_bytes)),
             );
         }
-        Ok(target_write_set)
+        // The removal, journalled after apply, naming its own collection,
+        // then the target rows its debit rewrote.
+        let mut write_set = Vec::with_capacity(target_write_set.len() + 1);
+        if outcome.prior_value.is_some() {
+            write_set.push(
+                removed_row_image(
+                    surrogate.as_u32(),
+                    RowIdentity::from_user_key(document_id),
+                    outcome.bitemporal_sys_from_ms,
+                )
+                .in_collection(collection.to_string()),
+            );
+        }
+        write_set.extend(target_write_set);
+        Ok(write_set)
     }
 }

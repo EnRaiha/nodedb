@@ -3,12 +3,11 @@
 //! `ALTER COLLECTION ... SET {RETENTION,LEGAL_HOLD,APPEND_ONLY,LAST_VALUE_CACHE}`
 //! — non-schema enforcement knobs propagated through `CatalogEntry::PutCollection`.
 //!
-//! Ported verbatim from the pgwire `ddl::collection::alter::enforcement`
-//! handlers; only the result type changed to the protocol-neutral
-//! [`DdlResult`] / [`DdlError`]. The retention-period validation, legal-hold
-//! add/remove bookkeeping, append-only / last-value-cache guards, the
-//! `PutCollection` propose, and the `schema_version` bump are unchanged, as is
-//! the `ALTER COLLECTION` command tag.
+//! The result type is the protocol-neutral [`DdlResult`] / [`DdlError`]. The
+//! retention-period validation, legal-hold add/remove bookkeeping,
+//! append-only / last-value-cache guards, the `PutCollection` propose, and
+//! the `schema_version` bump run here, and the command tag is
+//! `ALTER COLLECTION`.
 
 use nodedb_types::DatabaseId;
 
@@ -19,7 +18,7 @@ use crate::control::state::SharedState;
 use super::support::{err, load_active_collection, status};
 
 /// ALTER COLLECTION <name> SET RETENTION = '<value>'
-pub(super) fn alter_collection_set_retention(
+pub(super) async fn alter_collection_set_retention(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -33,11 +32,11 @@ pub(super) fn alter_collection_set_retention(
         .map_err(|e| err("22023", e.to_string()))?;
 
     coll.retention_period = Some(value.to_string());
-    persist_and_bump(state, &coll)
+    persist_and_bump(state, &coll).await
 }
 
 /// ALTER COLLECTION <name> SET LEGAL_HOLD = TRUE|FALSE TAG '<tag>'
-pub(super) fn alter_collection_set_legal_hold(
+pub(super) async fn alter_collection_set_legal_hold(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -76,11 +75,11 @@ pub(super) fn alter_collection_set_legal_hold(
         }
     }
 
-    persist_and_bump(state, &coll)
+    persist_and_bump(state, &coll).await
 }
 
 /// ALTER COLLECTION <name> SET APPEND_ONLY
-pub(super) fn alter_collection_set_append_only(
+pub(super) async fn alter_collection_set_append_only(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -96,11 +95,11 @@ pub(super) fn alter_collection_set_append_only(
         ));
     }
     coll.append_only = true;
-    persist_and_bump(state, &coll)
+    persist_and_bump(state, &coll).await
 }
 
 /// ALTER COLLECTION <name> SET LAST_VALUE_CACHE = TRUE|FALSE
-pub(super) fn alter_collection_set_last_value_cache(
+pub(super) async fn alter_collection_set_last_value_cache(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -117,15 +116,15 @@ pub(super) fn alter_collection_set_last_value_cache(
         ));
     }
     coll.lvc_enabled = enabled;
-    persist_and_bump(state, &coll)
+    persist_and_bump(state, &coll).await
 }
 
-fn persist_and_bump(
+async fn persist_and_bump(
     state: &SharedState,
     coll: &crate::control::security::catalog::StoredCollection,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll.clone()));
-    super::support::propose_and_apply(state, &entry)?;
+    super::support::propose_and_apply_async(state, entry).await?;
     state.schema_version.bump();
     Ok(status("ALTER COLLECTION"))
 }

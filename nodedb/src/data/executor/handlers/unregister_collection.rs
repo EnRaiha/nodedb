@@ -92,6 +92,7 @@ impl CoreLoop {
             collection,
             false,
             reclaim_l1_files,
+            true,
         ) {
             Ok(stats) => stats,
             // Fail-closed: a failed engine purge must surface as an error so
@@ -187,6 +188,11 @@ impl CoreLoop {
     /// `true`; other cores still evict their own per-core in-memory state but
     /// must not race `remove_dir_all`/`unlink` on the same tree. Single-core
     /// callers (snapshot restore) pass `true`.
+    ///
+    /// `clear_edges` false keeps the collection's graph edges and CSR. An
+    /// edge lives on its endpoints' vShards, not on the collection's home, so
+    /// a data-group install clears edges by vShard instead
+    /// (`EdgeStore::purge_homed`).
     pub(in crate::data::executor) fn clear_collection_all_engines(
         &mut self,
         database_id: DatabaseId,
@@ -194,6 +200,7 @@ impl CoreLoop {
         collection: &str,
         preserve_collection_metadata: bool,
         reclaim_l1_files: bool,
+        clear_edges: bool,
     ) -> crate::Result<ClearCollectionStats> {
         let db = database_id;
         let tid = tenant_id;
@@ -236,13 +243,19 @@ impl CoreLoop {
         })?;
 
         // Graph edge store: remove all edges scoped to this (database, collection).
-        let edges_removed =
-            retry_reclaim("edge_store.purge_collection", tid_raw, collection, || {
-                self.edge_store.purge_collection(db_raw, tid, collection)
-            })?;
-        // The CSR in-memory index is collection-agnostic. Stale edges will
-        // be absent from the next CSR rebuild (which reads from EdgeStore).
-        self.csr.drop_collection(db, tid, collection);
+        let edges_removed = if clear_edges {
+            let removed =
+                retry_reclaim("edge_store.purge_collection", tid_raw, collection, || {
+                    self.edge_store.purge_collection(db_raw, tid, collection)
+                })?;
+            // The CSR in-memory index is collection-agnostic. Stale edges
+            // will be absent from the next CSR rebuild (which reads from
+            // EdgeStore).
+            self.csr.drop_collection(db, tid, collection);
+            removed
+        } else {
+            0
+        };
 
         // ── In-memory, tuple-keyed state (reclaimable today) ─────────────────
 
@@ -495,7 +508,7 @@ mod tests {
             },
         );
 
-        core.clear_collection_all_engines(database, tenant, "products", false, true)
+        core.clear_collection_all_engines(database, tenant, "products", false, true, true)
             .expect("full collection clear");
 
         assert_eq!(core.aggregate_cache.len(), 1);

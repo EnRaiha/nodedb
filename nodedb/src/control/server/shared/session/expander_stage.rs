@@ -8,6 +8,12 @@
 
 use std::future::Future;
 
+use super::connection::SessionId;
+use super::staging_gate::{
+    InTxnRoute, StagedTagKind, StagedWriteOutcome, StagingGateError, stage_write,
+};
+use super::state::TransactionState;
+use super::store::SessionStore;
 use crate::bridge::envelope::{PhysicalPlan, Response};
 use crate::control::insert_select::resolve_and_emit_insert_select_ops;
 use crate::control::merge_orchestrator::resolve_and_emit_merge_ops;
@@ -15,14 +21,6 @@ use crate::control::state::SharedState;
 use crate::control::update_from_join_orchestrator::resolve_and_emit_update_from_join_ops;
 use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
-use nodedb_types::Surrogate;
-
-use super::connection::SessionId;
-use super::staging_gate::{
-    InTxnRoute, StagedTagKind, StagedWriteOutcome, StagingGateError, stage_write,
-};
-use super::state::TransactionState;
-use super::store::SessionStore;
 
 /// Outcome of [`route_in_tx_expander`].
 pub(crate) enum ExpanderOutcome {
@@ -49,11 +47,32 @@ where
     F: Fn(PhysicalTask) -> Fut,
     Fut: Future<Output = crate::Result<Response>>,
 {
+    match expand_in_tx(state, sessions, session_id, &mut task).await? {
+        Some((ops, kind)) => Ok(ExpanderOutcome::Handled(
+            stage_and_aggregate(state, sessions, session_id, ops, kind, dispatch).await?,
+        )),
+        None => Ok(ExpanderOutcome::Passthrough(Box::new(task))),
+    }
+}
+
+/// Resolve an in-transaction `MERGE`/`UPDATE ... FROM`/`INSERT ... SELECT`, or
+/// reshape a `BatchInsert` page, into the concrete point ops it expands to,
+/// with the command tag the statement renders. Stages nothing. `None` for
+/// every other plan, and outside a transaction block.
+///
+/// The ops are `PointInsert` for an inserted row, `PointPut` for an updated
+/// row's post-image, and `PointDelete` for a removed row.
+pub(crate) async fn expand_in_tx(
+    state: &SharedState,
+    sessions: &SessionStore,
+    session_id: SessionId,
+    task: &mut PhysicalTask,
+) -> Result<Option<(Vec<PhysicalTask>, StagedTagKind)>, StagingGateError> {
     // Only in-transaction join-expanding DML is handled here; everything else falls through.
     if sessions.transaction_state(session_id) != TransactionState::InBlock {
-        return Ok(ExpanderOutcome::Passthrough(Box::new(task)));
+        return Ok(None);
     }
-    let (ops, kind) = match &task.plan {
+    let expanded = match &task.plan {
         PhysicalPlan::Document(DocumentOp::Merge {
             resolved_inserts: None,
             ..
@@ -61,7 +80,7 @@ where
             // Stamp txn_id so the resolve pass folds this transaction's staging overlay.
             task.txn_id = sessions.tx_id(session_id);
             // A resolve/surrogate-assignment failure maps to the gate's `Dispatch` variant.
-            let ops = resolve_and_emit_merge_ops(state, task.tenant_id, &task)
+            let ops = resolve_and_emit_merge_ops(state, task.tenant_id, task)
                 .await
                 .map_err(StagingGateError::Dispatch)?;
             (ops, StagedTagKind::Merge)
@@ -70,7 +89,7 @@ where
             // Stamp txn_id so the resolve pass folds this transaction's staging overlay.
             task.txn_id = sessions.tx_id(session_id);
             // A resolve failure maps to the gate's `Dispatch` variant.
-            let ops = resolve_and_emit_update_from_join_ops(state, task.tenant_id, &task)
+            let ops = resolve_and_emit_update_from_join_ops(state, task.tenant_id, task)
                 .await
                 .map_err(StagingGateError::Dispatch)?;
             (ops, StagedTagKind::UpdateFromJoin)
@@ -79,26 +98,27 @@ where
             // Stamp txn_id so the source scan folds this transaction's staging overlay.
             task.txn_id = sessions.tx_id(session_id);
             // Reuses `StagedTagKind::Insert` — `INSERT ... SELECT` renders the `INSERT n` tag.
-            let ops = resolve_and_emit_insert_select_ops(state, task.tenant_id, &task)
+            let ops = resolve_and_emit_insert_select_ops(state, task.tenant_id, task)
                 .await
                 .map_err(StagingGateError::Dispatch)?;
             (ops, StagedTagKind::Insert)
         }
         // A `BatchInsert` page is autocommit-shaped; only point ops give an overlay
         // post-image, per-row undo, and row-level redo, so expand back to points.
-        PhysicalPlan::Document(DocumentOp::BatchInsert { .. }) => {
-            (expand_batch_insert(&task), StagedTagKind::Insert)
-        }
-        _ => return Ok(ExpanderOutcome::Passthrough(Box::new(task))),
+        PhysicalPlan::Document(DocumentOp::BatchInsert { .. }) => (
+            expand_batch_insert(task).map_err(StagingGateError::Dispatch)?,
+            StagedTagKind::Insert,
+        ),
+        _ => return Ok(None),
     };
-    Ok(ExpanderOutcome::Handled(
-        stage_and_aggregate(state, sessions, session_id, ops, kind, dispatch).await?,
-    ))
+    Ok(Some(expanded))
 }
 
 /// Expand a `BatchInsert` page into one `PointInsert` op per row. Nothing is
-/// resolved — pure reshaping. A non-page plan comes back empty.
-fn expand_batch_insert(task: &PhysicalTask) -> Vec<PhysicalTask> {
+/// resolved — pure reshaping. A non-page plan comes back empty. A page whose
+/// rows and surrogates differ in count is refused: every row carries its own
+/// bound surrogate.
+fn expand_batch_insert(task: &PhysicalTask) -> crate::Result<Vec<PhysicalTask>> {
     let PhysicalPlan::Document(DocumentOp::BatchInsert {
         collection,
         documents,
@@ -110,12 +130,23 @@ fn expand_batch_insert(task: &PhysicalTask) -> Vec<PhysicalTask> {
         ..
     }) = &task.plan
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    documents
+    if documents.len() != surrogates.len() {
+        return Err(crate::Error::PlanError {
+            detail: format!(
+                "batch insert into '{}' carries {} documents but {} surrogates; every row \
+                 must carry its own surrogate",
+                collection.as_str(),
+                documents.len(),
+                surrogates.len(),
+            ),
+        });
+    }
+    Ok(documents
         .iter()
-        .enumerate()
-        .map(|(i, (document_id, value))| PhysicalTask {
+        .zip(surrogates.iter().copied())
+        .map(|((document_id, value), surrogate)| PhysicalTask {
             tenant_id: task.tenant_id,
             // Rows home to the same vShard the page was routed to.
             vshard_id: task.vshard_id,
@@ -126,8 +157,7 @@ fn expand_batch_insert(task: &PhysicalTask) -> Vec<PhysicalTask> {
                 value: value.clone(),
                 // A page carries no per-row conflict behaviour.
                 if_absent: false,
-                // No surrogate filled falls back to `ZERO`, leaving identity to the Data Plane.
-                surrogate: surrogates.get(i).copied().unwrap_or(Surrogate::ZERO),
+                surrogate,
                 returning: returning.clone(),
                 rls_filters: rls_filters.clone(),
                 resolved_sum_targets: resolved_sum_targets.clone(),
@@ -136,7 +166,7 @@ fn expand_batch_insert(task: &PhysicalTask) -> Vec<PhysicalTask> {
             post_set_op: PostSetOp::None,
             txn_id: task.txn_id,
         })
-        .collect()
+        .collect())
 }
 
 /// Stage + buffer each concrete point op a resolved DML expands to,
@@ -158,13 +188,32 @@ where
     // for COMMIT replay — the raw Merge/UpdateFromJoin/InsertSelect is never buffered.
     let mut affected = 0usize;
     for op in ops {
+        // A removed row of an edge-bearing collection carries its node's edge
+        // tasks, read before the removal stages.
+        let node_delete_tasks =
+            crate::control::planner::calvin::node_delete_txn::txn_node_delete_tasks(
+                state,
+                &op,
+                sessions.tx_id(session_id),
+            )
+            .await
+            .map_err(StagingGateError::Dispatch)?;
         let outcome = stage_write(state, sessions, session_id, op, &dispatch).await?;
         affected += outcome.affected;
+        super::node_delete_stage::stage_node_delete_tasks(
+            state,
+            sessions,
+            session_id,
+            node_delete_tasks,
+            &dispatch,
+        )
+        .await?;
     }
 
     Ok(InTxnRoute::Staged(StagedWriteOutcome {
         kind,
         affected,
         payload: Vec::new(),
+        returning_rows: Vec::new(),
     }))
 }

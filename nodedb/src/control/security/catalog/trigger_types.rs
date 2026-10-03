@@ -5,6 +5,12 @@
 use nodedb_types::id::DatabaseId;
 
 /// When the trigger fires relative to the DML operation.
+///
+/// A BEFORE or INSTEAD OF body runs in the Control Plane before the
+/// triggering write stages. It joins the triggering statement's transaction:
+/// the client's transaction block, or an implicit one around the statement.
+/// The write and the body's writes commit together or not at all. A body
+/// error rolls back the body's own writes and fails the statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 #[repr(u8)]
 #[msgpack(c_enum)]
@@ -50,10 +56,14 @@ impl TriggerEvents {
 
 /// Execution mode for AFTER triggers.
 ///
-/// Controls where and when the trigger body executes:
-/// - `Async` (default): Event Plane, eventually consistent, zero write latency impact.
-/// - `Sync`: Control Plane write path, same logical transaction, adds to write latency.
-/// - `Deferred`: Data Plane at COMMIT time, same transaction, batched.
+/// Controls where and when the trigger body executes. A body's writes fire
+/// no triggers:
+/// - `Async` (default): Event Plane, after the triggering write commits. The
+///   body commits as its own transaction.
+/// - `Sync`: Control Plane write path, after the triggering write stages. The
+///   body joins the triggering statement's transaction.
+/// - `Deferred`: Event Plane, once the triggering transaction commits. The
+///   body commits as its own transaction.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, zerompk::ToMessagePack, zerompk::FromMessagePack,
 )]
@@ -64,12 +74,15 @@ pub enum TriggerExecutionMode {
     /// Default. Eventually consistent side effects. Zero write latency impact.
     #[default]
     Async = 0,
-    /// Trigger fires synchronously in the Control Plane write path.
-    /// ACID (same logical transaction). Adds trigger execution time to write latency.
+    /// Trigger fires synchronously in the Control Plane write path, after
+    /// the triggering write stages. Adds trigger execution time to write
+    /// latency. The body joins the triggering statement's transaction: a
+    /// failed body fails the statement, and the statement's transaction
+    /// commits neither the write nor the body's writes.
     /// Cross-shard SYNC triggers are rejected at CREATE TRIGGER time.
     Sync = 1,
-    /// Trigger fires at COMMIT time in the Data Plane, batched.
-    /// ACID (same transaction). Only adds latency at COMMIT, not per-statement.
+    /// Trigger fires from the Event Plane once the triggering transaction
+    /// commits, batched per COMMIT. The body commits as its own transaction.
     Deferred = 2,
 }
 

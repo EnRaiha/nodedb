@@ -80,6 +80,9 @@ pub async fn create_topic(
         created_at: now,
         last_sequence: 0,
         last_lsn: 0,
+        last_epoch: 0,
+        // Frozen by the proposer's stamp.
+        modification_hlc: nodedb_types::Hlc::ZERO,
     };
 
     if state
@@ -93,7 +96,7 @@ pub async fn create_topic(
         ));
     }
 
-    super::replicate::propose_create(state, &def)?;
+    super::replicate::propose_create(state, &def).await?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

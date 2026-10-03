@@ -66,6 +66,12 @@ pub struct OriginOpLog {
     db: Arc<Database>,
 }
 
+impl crate::storage::RedbBacked for OriginOpLog {
+    fn redb_database(&self) -> &redb::Database {
+        &self.db
+    }
+}
+
 impl OriginOpLog {
     /// Open or create the op-log database at `{data_dir}/array_sync/op_log.redb`.
     pub fn open(data_dir: &Path) -> crate::Result<Self> {

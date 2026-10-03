@@ -9,7 +9,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::native::dispatch::DispatchCtx;
 use nodedb_physical::physical_plan::TextOp;
 
-pub(crate) fn build_search(
+pub(crate) async fn build_search(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -33,7 +33,7 @@ pub(crate) fn build_search(
     }))
 }
 
-pub(crate) fn build_hybrid_search(
+pub(crate) async fn build_hybrid_search(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,

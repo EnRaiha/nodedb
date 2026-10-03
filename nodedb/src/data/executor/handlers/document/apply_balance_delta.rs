@@ -147,16 +147,12 @@ impl CoreLoop {
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
         let mut response = self.response_affected(task, 1);
-        response.write_set = vec![crate::bridge::envelope::WriteSetEntry {
-            surrogate: write.surrogate.as_u32(),
-            identity: write.identity,
-            is_delete: false,
-            value: write.body,
-            // Always `Some`: the row lives in the TARGET collection, and the
-            // redo has to name it so the record homes to the target's vShard
-            // rather than to whichever collection the statement started from.
-            collection: Some(write.collection),
-        }];
+        // The entry names the TARGET collection, so the record homes to the
+        // target's vShard rather than to whichever collection the statement
+        // started from, and carries the version key of a versioned target.
+        response.write_set = crate::data::executor::enforcement::write_hook::target_write_set(
+            std::slice::from_ref(&write),
+        );
         response
     }
 }

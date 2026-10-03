@@ -17,6 +17,7 @@ pub mod dispatch;
 pub mod healthcheck;
 pub mod join_token;
 pub mod regen_certs;
+pub mod restore;
 pub mod rotate_ca;
 
 pub use dispatch::{Subcommand, parse_subcommand, run_subcommand};

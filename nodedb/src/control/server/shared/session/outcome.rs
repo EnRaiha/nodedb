@@ -22,8 +22,7 @@ pub enum CommitOutcome {
     /// (offsets, GAP_FREE finalize, DDL propose, cursor/notify flush) fired.
     Committed,
     /// The transaction aborted before durable commit. Carries enough to let
-    /// each transport reconstruct the exact wire error it emitted before the
-    /// orchestrator was extracted.
+    /// each transport reconstruct the exact wire error.
     Aborted { reason: AbortReason },
 }
 
@@ -63,7 +62,7 @@ pub enum AbortReason {
 /// its materialize-freeze gate; native routes through the gateway-or-SPSC
 /// branch). `dispatch_no_wal` runs a single already-built [`PhysicalTask`] and
 /// returns the neutral [`Response`], exactly as the transport's own single-task
-/// dispatch would.
+/// dispatch does.
 ///
 /// The returned future is boxed: the orchestrator awaits it inside the deeply
 /// nested listener request pipeline, and a boxed (type-erased) future keeps that
@@ -80,4 +79,17 @@ pub trait TxnDataPlane {
     /// The source the transaction's committed writes carry into the Event
     /// Plane, on every replica that applies them.
     fn event_source(&self) -> crate::event::EventSource;
+
+    /// The cross-shard request this transaction applies, written into its
+    /// redo record so the dedup key commits with the writes. `None` for every
+    /// transaction but a cross-shard receiver's.
+    fn applied_key(&self) -> Option<crate::wal::CrossShardAppliedKey> {
+        None
+    }
+
+    /// The vShard the cross-shard request addresses. A commit that spans
+    /// vShards writes [`Self::applied_key`] into this vShard's redo record.
+    fn applied_key_vshard(&self) -> Option<u32> {
+        None
+    }
 }

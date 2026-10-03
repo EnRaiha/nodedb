@@ -2,8 +2,7 @@
 
 //! Session-level FTS index/delete handlers.
 //!
-//! Contains `SyncSession::handle_fts_index` and `SyncSession::handle_fts_delete`,
-//! extracted from `fts_handler.rs` to keep both files under the 500-line limit.
+//! Contains `SyncSession::handle_fts_index` and `SyncSession::handle_fts_delete`.
 
 use tracing::{debug, error};
 
@@ -53,12 +52,15 @@ impl SyncSession {
             return SyncFrame::try_encode(SyncMessageType::FtsIndexAck, &ack);
         }
 
-        let surrogate = match dispatcher.assign_surrogate(
-            self.database_id(),
-            self.tenant_id.unwrap_or(TenantId::new(0)),
-            &msg.collection,
-            &msg.doc_id,
-        ) {
+        let surrogate = match dispatcher
+            .assign_surrogate(
+                self.database_id(),
+                self.tenant_id.unwrap_or(TenantId::new(0)),
+                &msg.collection,
+                &msg.doc_id,
+            )
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 error!(
@@ -185,13 +187,20 @@ impl SyncSession {
             return SyncFrame::try_encode(SyncMessageType::FtsDeleteAck, &ack);
         }
 
-        let surrogate = match dispatcher.assign_surrogate(
-            self.database_id(),
-            self.tenant_id.unwrap_or(TenantId::new(0)),
-            &msg.collection,
-            &msg.doc_id,
-        ) {
-            Ok(s) => s,
+        // A delete only reads the key's binding at the collection's home. A key
+        // the home never bound names no row: the delete dispatches `None`,
+        // which removes nothing and still advances the producer's sequence
+        // through the idempotency gate.
+        let surrogate = match dispatcher
+            .lookup_surrogate(
+                self.database_id(),
+                self.tenant_id.unwrap_or(TenantId::new(0)),
+                &msg.collection,
+                &msg.doc_id,
+            )
+            .await
+        {
+            Ok(found) => found,
             Err(e) => {
                 error!(
                     session = %self.session_id,

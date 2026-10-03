@@ -8,9 +8,8 @@
 //! (document with/without surrogate/provenance, KV point / batch); the parser
 //! tries them in most-specific-first order and returns the first that decodes.
 //!
-//! A `TransactionRedo` sub-op payload is byte-identical to its raw per-op
-//! record, so `wal_replay` parses each sub-op with these same parsers. Every
-//! event takes its identity and event source from the [`ReplayScope`].
+//! `wal_replay` parses each `TransactionRedo` sub-op with these same parsers.
+//! Every event takes its identity and event source from the [`ReplayScope`].
 
 use std::sync::Arc;
 
@@ -18,66 +17,19 @@ use nodedb_types::RowIdentity;
 use nodedb_types::sync::wire::SyncProvenance;
 use tracing::warn;
 
-use crate::event::types::{RecordPosition, RowId, WriteEvent, WriteOp};
+use crate::event::types::{EdgeEndpoints, RecordPosition, RowId, WriteEvent, WriteOp};
+use crate::event::wal_replay_doc_shapes::{DocPut, decode_doc_delete, decode_doc_put};
+use crate::event::wal_replay_kv_shapes::parse_kv_put_family;
 use crate::event::wal_replay_scope::ReplayScope;
 
 /// `(op, new_value, old_value)` for a node-label CDC event — the op tag plus
 /// the label-delta payload placed on whichever side its `WriteOp` implies.
 type LabelEventFields = (WriteOp, Option<Arc<[u8]>>, Option<Arc<[u8]>>);
 
-/// The `(collection, key, value)` an event needs out of a `kv_put` record, in
-/// whichever of its three decodable arities the record was written.
-fn decode_kv_put_event_fields(payload: &[u8]) -> Option<(String, Vec<u8>, Vec<u8>)> {
-    if let Ok((disc, collection, key, value, _ttl, _expire, _surrogate)) =
-        zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, Option<u64>, u32)>(payload)
-        && disc == "kv_put"
-    {
-        return Some((collection, key, value));
-    }
-    if let Ok((disc, collection, key, value, _ttl, _expire)) =
-        zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, u64)>(payload)
-        && disc == "kv_put"
-    {
-        return Some((collection, key, value));
-    }
-    if let Ok((disc, collection, key, value, _ttl)) =
-        zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64)>(payload)
-        && disc == "kv_put"
-    {
-        return Some((collection, key, value));
-    }
-    None
-}
-
-/// The `(collection, entries)` an event needs out of a `kv_batch_put` record,
-/// in whichever of its three decodable arities the record was written.
-#[allow(clippy::type_complexity)]
-fn decode_kv_batch_put_event_fields(payload: &[u8]) -> Option<(String, Vec<(Vec<u8>, Vec<u8>)>)> {
-    if let Ok((disc, collection, entries, _ttl, _expire, _surrogates)) = zerompk::from_msgpack::<(
-        &str,
-        String,
-        Vec<(Vec<u8>, Vec<u8>)>,
-        u64,
-        Option<u64>,
-        Vec<u32>,
-    )>(payload)
-        && disc == "kv_batch_put"
-    {
-        return Some((collection, entries));
-    }
-    if let Ok((disc, collection, entries, _ttl, _expire)) =
-        zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64, u64)>(payload)
-        && disc == "kv_batch_put"
-    {
-        return Some((collection, entries));
-    }
-    if let Ok((disc, collection, entries, _ttl)) =
-        zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64)>(payload)
-        && disc == "kv_batch_put"
-    {
-        return Some((collection, entries));
-    }
-    None
+/// Whether a `Put` / `Delete` payload is a graph edge record.
+pub(super) fn is_edge_record(payload: &[u8]) -> bool {
+    zerompk::from_msgpack::<crate::wal::EdgePutRedo>(payload).is_ok()
+        || zerompk::from_msgpack::<crate::wal::EdgeDeleteRedo>(payload).is_ok()
 }
 
 /// Parse a `RecordType::Put` payload. May be a document put, KV put, or
@@ -93,78 +45,30 @@ pub(super) fn parse_put_record(
         vshard_id,
         lsn,
         sources,
+        commit_hlc,
     } = *scope;
-    // Try KV put first. Three arities decode: the current
-    // `("kv_put", collection, key, value, ttl_ms, expire_at_ms, surrogate)` and
-    // the two that predate the carried surrogate. The event stream keys on the
-    // raw KV key, so only `collection`, `key`, and `value` are read out.
-    if let Some((collection, key, value)) = decode_kv_put_event_fields(payload) {
-        *sequence += 1;
-        let key_str = String::from_utf8_lossy(&key);
-        // The same `{key, value}` row image the live KV write event carries.
-        let row = nodedb_query::msgpack_scan::kv_row_msgpack(&key_str, &value);
-        let (system_time_ms, valid_time_ms) =
-            crate::event::bitemporal_extract::extract_stamps(Some(&row));
-        // AUDIT_DML rows replayed from WAL after a crash carry user_id = None and
-        // statement_digest = None; pre-crash audit rows are durable in the catalog.
-        // Widening the WAL record format to carry these fields is tracked separately.
-        return Some(WriteEvent {
-            sequence: *sequence,
-            collection: Arc::from(collection.as_str()),
-            op: WriteOp::Insert,
-            row_id: RowId::row(RowIdentity::from_user_key(key_str.into_owned())),
-            lsn,
-            record: Some(RecordPosition::first(lsn)),
-            database_id,
-            tenant_id,
-            vshard_id,
-            source: sources.other,
-            new_value: Some(Arc::from(row.as_slice())),
-            old_value: None,
-            system_time_ms,
-            valid_time_ms,
-            user_id: None,
-            statement_digest: None,
-        });
+    // Try the KV put family first: its payloads open with a discriminator no
+    // document or edge shape carries.
+    if let Some(event) = parse_kv_put_family(payload, scope, sequence) {
+        return Some(event);
     }
 
-    // Try KV batch put — same three-arity story as the point put above.
-    if let Some((collection, entries)) = decode_kv_batch_put_event_fields(payload) {
-        // Emit one event for the batch (BulkInsert).
-        *sequence += 1;
-        return Some(WriteEvent {
-            sequence: *sequence,
-            collection: Arc::from(collection.as_str()),
-            op: WriteOp::BulkInsert {
-                count: entries.len() as u32,
-            },
-            row_id: RowId::Batch,
-            lsn,
-            record: Some(RecordPosition::first(lsn)),
-            database_id,
-            tenant_id,
-            vshard_id,
-            source: sources.other,
-            new_value: None,
-            old_value: None,
-            system_time_ms: None,
-            valid_time_ms: None,
-            user_id: None,
-            statement_digest: None,
-        });
-    }
-
-    // Try document put with surrogate (current arity):
-    // (collection, document_id, value, provenance, surrogate_u32). The trailing
-    // surrogate is consumed by the Data Plane's vector-index replay. The event
-    // stream keys on `document_id`, which the writer journals as the row's
-    // `RowIdentity` text, so it is wrapped verbatim and never reinterpreted.
-    if let Ok((collection, document_id, value, _prov, _surrogate)) =
-        zerompk::from_msgpack::<(String, String, Vec<u8>, Option<SyncProvenance>, u32)>(payload)
+    // Try document put with surrogate, plain or bitemporal. The surrogate is
+    // consumed by the Data Plane's vector-index replay. The event stream keys
+    // on `document_id`, which the writer journals as the row's `RowIdentity`
+    // text, so it is wrapped verbatim and never reinterpreted.
+    if let Some(DocPut {
+        collection,
+        document_id,
+        value,
+        stamps,
+    }) = decode_doc_put(payload)
     {
         *sequence += 1;
-        let (system_time_ms, valid_time_ms) =
-            crate::event::bitemporal_extract::extract_stamps(Some(&value));
+        let (system_time_ms, valid_time_ms) = match stamps {
+            Some((system, valid)) => (Some(system), valid),
+            None => crate::event::bitemporal_extract::extract_stamps(Some(&value)),
+        };
         return Some(WriteEvent {
             sequence: *sequence,
             collection: Arc::from(collection.as_str()),
@@ -182,6 +86,7 @@ pub(super) fn parse_put_record(
             valid_time_ms,
             user_id: None,
             statement_digest: None,
+            commit_hlc,
         });
     }
 
@@ -209,6 +114,7 @@ pub(super) fn parse_put_record(
             valid_time_ms,
             user_id: None,
             statement_digest: None,
+            commit_hlc,
         });
     }
 
@@ -239,19 +145,29 @@ pub(super) fn parse_put_record(
             valid_time_ms,
             user_id: None,
             statement_digest: None,
+            commit_hlc,
         });
     }
 
-    // Try graph edge put: (collection, src_id, label, dst_id, properties).
-    // Tried after every document/KV arm above so it only ever sees genuine
-    // non-matches: it is distinguished by its 5-field shape whose 3rd/4th
-    // fields are strings (label, dst_id) and 5th is a byte blob (properties) —
-    // no document-with-surrogate `(.., Vec<u8>, .., u32)` or KV `(.., u64)`
-    // shape decodes into it. `row_id` is the same `(src,label,dst)` composition
-    // the forward emit uses, so replay events dedup against forward events.
-    if let Ok((collection, src_id, label, dst_id, properties)) =
-        zerompk::from_msgpack::<(String, String, String, String, Vec<u8>)>(payload)
-    {
+    // Try graph edge put: a map-encoded `EdgePutRedo`, the payload of both the
+    // autocommit record and a transaction's redo sub-op. No array-encoded
+    // document or KV shape above decodes as a map. An edge record without both
+    // endpoint surrogates is refused. `row_id` is the forward emit's
+    // `(src,label,dst)` composition, so replay events dedup against forward
+    // events, and it carries the record's endpoint surrogates.
+    if let Ok(edge) = zerompk::from_msgpack::<crate::wal::EdgePutRedo>(payload) {
+        let Some((src_surrogate, dst_surrogate)) = edge.endpoints() else {
+            refuse_unbound_edge(lsn, &edge.collection);
+            return None;
+        };
+        let crate::wal::EdgePutRedo {
+            collection,
+            src_id,
+            label,
+            dst_id,
+            properties,
+            ..
+        } = edge;
         *sequence += 1;
         let (system_time_ms, valid_time_ms) =
             crate::event::bitemporal_extract::extract_stamps(Some(&properties));
@@ -259,7 +175,15 @@ pub(super) fn parse_put_record(
             sequence: *sequence,
             collection: Arc::from(collection.as_str()),
             op: WriteOp::Insert,
-            row_id: RowId::edge(src_id, label, dst_id),
+            row_id: RowId::edge(
+                EdgeEndpoints {
+                    src: src_id,
+                    src_surrogate,
+                    dst: dst_id,
+                    dst_surrogate,
+                },
+                label,
+            ),
             lsn,
             record: Some(RecordPosition::first(lsn)),
             database_id,
@@ -272,6 +196,7 @@ pub(super) fn parse_put_record(
             valid_time_ms,
             user_id: None,
             statement_digest: None,
+            commit_hlc,
         });
     }
 
@@ -306,6 +231,7 @@ pub(super) fn parse_graph_node_label_record(
         vshard_id,
         lsn,
         sources,
+        commit_hlc,
     } = *scope;
     let (node_id, labels) = match zerompk::from_msgpack::<(String, Vec<String>)>(payload) {
         Ok(decoded) => decoded,
@@ -342,6 +268,7 @@ pub(super) fn parse_graph_node_label_record(
         valid_time_ms: None,
         user_id: None,
         statement_digest: None,
+        commit_hlc,
     })
 }
 
@@ -357,6 +284,7 @@ pub(super) fn parse_delete_record(
         vshard_id,
         lsn,
         sources,
+        commit_hlc,
     } = *scope;
     // Try KV delete: ("kv_delete", collection, keys)
     if let Ok((disc, collection, keys)) =
@@ -383,15 +311,14 @@ pub(super) fn parse_delete_record(
             valid_time_ms: None,
             user_id: None,
             statement_digest: None,
+            commit_hlc,
         });
     }
 
-    // Try document delete with surrogate (redo 4-tuple): (collection, document_id, provenance, surrogate).
-    // PointDelete and the post-apply write-set redo helper both emit this shape;
+    // Try document delete with surrogate, plain or bitemporal. PointDelete, a
+    // transaction's redo, and the post-apply write-set redo helper emit it;
     // try it before the 3-tuple so a surrogate-carrying record isn't misdecoded.
-    if let Ok((collection, document_id, _prov, _surrogate)) =
-        zerompk::from_msgpack::<(String, String, Option<SyncProvenance>, u32)>(payload)
-    {
+    if let Some((collection, document_id)) = decode_doc_delete(payload) {
         *sequence += 1;
         return Some(WriteEvent {
             sequence: *sequence,
@@ -410,6 +337,7 @@ pub(super) fn parse_delete_record(
             valid_time_ms: None,
             user_id: None,
             statement_digest: None,
+            commit_hlc,
         });
     }
 
@@ -435,6 +363,7 @@ pub(super) fn parse_delete_record(
             valid_time_ms: None,
             user_id: None,
             statement_digest: None,
+            commit_hlc,
         });
     }
 
@@ -458,23 +387,40 @@ pub(super) fn parse_delete_record(
             valid_time_ms: None,
             user_id: None,
             statement_digest: None,
+            commit_hlc,
         });
     }
 
-    // Try graph edge delete: (collection, src_id, label, dst_id). Four strings,
-    // tried after every document/KV arm above. It cannot collide with
-    // document-delete-with-surrogate `(String, String, Option<SyncProvenance>,
-    // u32)` (its 4th field is a `u32`, not a string) nor any shorter-arity arm.
-    // `row_id` matches the forward emit's `(src,label,dst)` composition.
-    if let Ok((collection, src_id, label, dst_id)) =
-        zerompk::from_msgpack::<(String, String, String, String)>(payload)
-    {
+    // Try graph edge delete: a map-encoded `EdgeDeleteRedo`, as for the put.
+    // An edge record without both endpoint surrogates is refused. `row_id`
+    // matches the forward emit's `(src,label,dst)` composition and carries
+    // the record's endpoint surrogates.
+    if let Ok(edge) = zerompk::from_msgpack::<crate::wal::EdgeDeleteRedo>(payload) {
+        let Some((src_surrogate, dst_surrogate)) = edge.endpoints() else {
+            refuse_unbound_edge(lsn, &edge.collection);
+            return None;
+        };
+        let crate::wal::EdgeDeleteRedo {
+            collection,
+            src_id,
+            label,
+            dst_id,
+            ..
+        } = edge;
         *sequence += 1;
         return Some(WriteEvent {
             sequence: *sequence,
             collection: Arc::from(collection.as_str()),
             op: WriteOp::Delete,
-            row_id: RowId::edge(src_id, label, dst_id),
+            row_id: RowId::edge(
+                EdgeEndpoints {
+                    src: src_id,
+                    src_surrogate,
+                    dst: dst_id,
+                    dst_surrogate,
+                },
+                label,
+            ),
             lsn,
             record: Some(RecordPosition::first(lsn)),
             database_id,
@@ -487,6 +433,7 @@ pub(super) fn parse_delete_record(
             valid_time_ms: None,
             user_id: None,
             statement_digest: None,
+            commit_hlc,
         });
     }
 
@@ -496,4 +443,15 @@ pub(super) fn parse_delete_record(
         "WAL replay: unrecognized Delete payload format, skipping"
     );
     None
+}
+
+/// Log the refusal of an edge record whose endpoint surrogate is unbound.
+/// Every edge writer carries both identities, so no event is built from one
+/// that lacks them.
+fn refuse_unbound_edge(lsn: crate::types::Lsn, collection: &str) {
+    warn!(
+        lsn = lsn.as_u64(),
+        %collection,
+        "WAL replay: edge record carries an unbound endpoint surrogate, refused"
+    );
 }

@@ -26,8 +26,8 @@ fn edge_put_and_graph_neighbors() {
                 label: "KNOWS".into(),
                 dst_id: dst.to_string(),
                 properties: vec![],
-                src_surrogate: nodedb_types::Surrogate::ZERO,
-                dst_surrogate: nodedb_types::Surrogate::ZERO,
+                src_surrogate: doc_surrogate("alice"),
+                dst_surrogate: doc_surrogate(dst),
             }),
         );
     }
@@ -67,8 +67,8 @@ fn graph_hop_traversal() {
                 label: "NEXT".into(),
                 dst_id: d.to_string(),
                 properties: vec![],
-                src_surrogate: nodedb_types::Surrogate::ZERO,
-                dst_surrogate: nodedb_types::Surrogate::ZERO,
+                src_surrogate: doc_surrogate(s),
+                dst_surrogate: doc_surrogate(d),
             }),
         );
     }
@@ -112,8 +112,8 @@ fn graph_path_and_subgraph() {
                 label: "L".into(),
                 dst_id: d.to_string(),
                 properties: vec![],
-                src_surrogate: nodedb_types::Surrogate::ZERO,
-                dst_surrogate: nodedb_types::Surrogate::ZERO,
+                src_surrogate: doc_surrogate(s),
+                dst_surrogate: doc_surrogate(d),
             }),
         );
     }
@@ -170,8 +170,8 @@ fn edge_delete_updates_csr() {
             label: "R".into(),
             dst_id: "y".into(),
             properties: vec![],
-            src_surrogate: nodedb_types::Surrogate::ZERO,
-            dst_surrogate: nodedb_types::Surrogate::ZERO,
+            src_surrogate: doc_surrogate("x"),
+            dst_surrogate: doc_surrogate("y"),
         }),
     );
 
@@ -187,8 +187,8 @@ fn edge_delete_updates_csr() {
             src_id: "x".into(),
             label: "R".into(),
             dst_id: "y".into(),
-            src_surrogate: nodedb_types::Surrogate::ZERO,
-            dst_surrogate: nodedb_types::Surrogate::ZERO,
+            src_surrogate: doc_surrogate("x"),
+            dst_surrogate: doc_surrogate("y"),
             rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         }),
     );
@@ -226,7 +226,9 @@ fn graph_rag_fusion_pipeline() {
                 vector: vec![i as f32, 0.0, 0.0],
                 dim: 3,
                 field_name: String::new(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                // The vector binds the surrogate of graph node `i`, so a hit
+                // seeds the expansion from that node.
+                surrogate: doc_surrogate(&i.to_string()),
                 pk_bytes: None,
                 provenance: None,
             }),
@@ -253,8 +255,8 @@ fn graph_rag_fusion_pipeline() {
                 label: "CITES".into(),
                 dst_id: d.to_string(),
                 properties: vec![],
-                src_surrogate: nodedb_types::Surrogate::ZERO,
-                dst_surrogate: nodedb_types::Surrogate::ZERO,
+                src_surrogate: doc_surrogate(s),
+                dst_surrogate: doc_surrogate(d),
             }),
         );
     }
@@ -280,6 +282,7 @@ fn graph_rag_fusion_pipeline() {
             options: Default::default(),
             bm25_query: None,
             bm25_field: None,
+            stage: nodedb_physical::physical_plan::RagStage::Local,
         }),
     );
 

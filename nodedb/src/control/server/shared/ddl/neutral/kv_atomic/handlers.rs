@@ -53,14 +53,15 @@ pub async fn kv_incr(
     let ttl_ms = parse_optional_ttl(&args[3..])?;
 
     let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
-    let surrogate = state
-        .surrogate_assigner
-        .assign(
-            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
-            identity.tenant_id,
-            key.as_bytes(),
-        )
-        .map_err(|e| DdlError::from_error(&e))?;
+    let surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
+        state,
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
+        identity.tenant_id,
+        key.as_bytes(),
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| DdlError::from_error(&e))?;
     let shape = counter_shape(state, identity, &collection, &key, KvCounterKind::Integer)?;
     let plan = PhysicalPlan::Kv(KvOp::Incr {
         collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
@@ -120,14 +121,15 @@ pub async fn kv_incr_float(
     }
 
     let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
-    let surrogate = state
-        .surrogate_assigner
-        .assign(
-            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
-            identity.tenant_id,
-            key.as_bytes(),
-        )
-        .map_err(|e| DdlError::from_error(&e))?;
+    let surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
+        state,
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
+        identity.tenant_id,
+        key.as_bytes(),
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| DdlError::from_error(&e))?;
     let shape = counter_shape(state, identity, &collection, &key, KvCounterKind::Float)?;
     let plan = PhysicalPlan::Kv(KvOp::IncrFloat {
         collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
@@ -212,14 +214,15 @@ pub async fn kv_cas(
     let new_value = unquote(&args[3]);
 
     let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
-    let surrogate = state
-        .surrogate_assigner
-        .assign(
-            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
-            identity.tenant_id,
-            key.as_bytes(),
-        )
-        .map_err(|e| DdlError::from_error(&e))?;
+    let surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
+        state,
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
+        identity.tenant_id,
+        key.as_bytes(),
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| DdlError::from_error(&e))?;
     let plan = PhysicalPlan::Kv(KvOp::Cas {
         collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
         key: key.as_bytes().to_vec(),
@@ -265,14 +268,15 @@ pub async fn kv_getset(
     let new_value = unquote(&args[2]);
 
     let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
-    let surrogate = state
-        .surrogate_assigner
-        .assign(
-            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
-            identity.tenant_id,
-            key.as_bytes(),
-        )
-        .map_err(|e| DdlError::from_error(&e))?;
+    let surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
+        state,
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
+        identity.tenant_id,
+        key.as_bytes(),
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| DdlError::from_error(&e))?;
     let plan = PhysicalPlan::Kv(KvOp::GetSet {
         collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
         key: key.as_bytes().to_vec(),

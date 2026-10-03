@@ -3,8 +3,7 @@
 //! Session-level spatial insert/delete handlers.
 //!
 //! Contains `SyncSession::handle_spatial_insert` and
-//! `SyncSession::handle_spatial_delete`, extracted from `spatial_handler.rs`
-//! to keep both files under the 500-line limit.
+//! `SyncSession::handle_spatial_delete`.
 
 use tracing::{debug, error};
 
@@ -72,12 +71,15 @@ impl SyncSession {
             }
         };
 
-        let surrogate = match dispatcher.assign_surrogate(
-            self.database_id(),
-            self.tenant_id.unwrap_or(TenantId::new(0)),
-            &msg.collection,
-            &msg.doc_id,
-        ) {
+        let surrogate = match dispatcher
+            .assign_surrogate(
+                self.database_id(),
+                self.tenant_id.unwrap_or(TenantId::new(0)),
+                &msg.collection,
+                &msg.doc_id,
+            )
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 error!(
@@ -188,8 +190,8 @@ impl SyncSession {
         }
     }
 
-    /// Process a `SpatialDeleteMsg`: allocate/lookup surrogate, WAL-append on
-    /// CP, dispatch removal through the idempotency gate, return an ACK frame.
+    /// Process a `SpatialDeleteMsg`: look up surrogate, WAL-append on CP,
+    /// dispatch removal through the idempotency gate, return an ACK frame.
     pub async fn handle_spatial_delete<D: SpatialDispatcher>(
         &mut self,
         msg: &SpatialDeleteMsg,
@@ -213,13 +215,20 @@ impl SyncSession {
             return SyncFrame::try_encode(SyncMessageType::SpatialDeleteAck, &ack);
         }
 
-        let surrogate = match dispatcher.assign_surrogate(
-            self.database_id(),
-            self.tenant_id.unwrap_or(TenantId::new(0)),
-            &msg.collection,
-            &msg.doc_id,
-        ) {
-            Ok(s) => s,
+        // A delete only reads the key's binding at the collection's home. A key
+        // the home never bound names no row: the delete dispatches `None`,
+        // which removes nothing and still advances the producer's sequence
+        // through the idempotency gate.
+        let surrogate = match dispatcher
+            .lookup_surrogate(
+                self.database_id(),
+                self.tenant_id.unwrap_or(TenantId::new(0)),
+                &msg.collection,
+                &msg.doc_id,
+            )
+            .await
+        {
+            Ok(found) => found,
             Err(e) => {
                 error!(
                     session = %self.session_id,

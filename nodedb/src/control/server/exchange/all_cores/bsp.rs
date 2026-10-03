@@ -8,12 +8,13 @@ use crate::types::{DatabaseId, Lsn, TenantId, TraceId};
 use nodedb_physical::physical_plan::{BspSuperstepResult, PhysicalPlan};
 
 use super::dispatch::NodeLevelResult;
-use super::fanout::gather_graph_op_all_cores;
+use super::fanout::gather_every_core;
+use super::read_cut::resolve_plan_cut;
 
 /// BSP superstep fan: dispatch to all local cores, decode each core's
 /// [`BspSuperstepResult`], merge by field concatenation, and re-encode.
 ///
-/// Owned-node sets are disjoint across cores because `gather_graph_op_all_cores`
+/// Owned-node sets are disjoint across cores because `gather_every_core`
 /// scopes each core's `owned_vshards` to the vShards homed on that core, so each
 /// graph node is owned by exactly one core; concatenation therefore requires no
 /// dedup.
@@ -21,15 +22,19 @@ pub(super) async fn fan_bsp_all_cores(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
-    plan: PhysicalPlan,
+    mut plan: PhysicalPlan,
     trace_id: TraceId,
 ) -> crate::Result<NodeLevelResult> {
-    let responses =
-        gather_graph_op_all_cores(state, tenant_id, database_id, plan, trace_id, None, "bsp")
-            .await?;
+    // Every core reads the graph at the run's read cut.
+    let system_as_of = resolve_plan_cut(state, &mut plan).await?;
+    let responses = gather_every_core(state, tenant_id, database_id, plan, trace_id, "bsp").await?;
 
     let mut parts: Vec<BspSuperstepResult> = Vec::with_capacity(responses.len());
+    // The highest watermark any core served the superstep at, for the
+    // coordinator's transaction read-set.
+    let mut watermark_lsn = Lsn::ZERO;
     for resp in responses {
+        watermark_lsn = watermark_lsn.max(resp.watermark_lsn);
         // An empty payload decodes to BspSuperstepResult::default() (a
         // zero-vertex shard — contributes nothing to global_n or the ranks),
         // matching decode_single_result's contract.
@@ -45,7 +50,8 @@ pub(super) async fn fan_bsp_all_cores(
         parts.push(part);
     }
 
-    let merged = merge_bsp_results(parts);
+    let mut merged = merge_bsp_results(parts);
+    merged.system_as_of = Some(system_as_of);
     let payload = zerompk::to_msgpack_vec(&merged).map_err(|e| crate::Error::Serialization {
         format: "msgpack".into(),
         detail: format!("bsp gather: merged result encode: {e}"),
@@ -53,7 +59,7 @@ pub(super) async fn fan_bsp_all_cores(
 
     Ok(NodeLevelResult {
         payload,
-        watermark_lsn: Lsn::ZERO,
+        watermark_lsn,
         read_version_lsn: Lsn::ZERO,
     })
 }

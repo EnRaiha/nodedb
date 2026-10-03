@@ -11,10 +11,10 @@ use crate::control::security::catalog::types::CheckpointDoc;
 use super::outcome::ApplyOutcome;
 
 use super::{
-    alert_rule, api_key, auth_user, change_stream, checkpoint, collection, column_stats,
-    consumer_group, continuous_aggregate, custom_type, database, function, index_registry,
-    materialized_view, oidc_provider, owner, permission, procedure, quota, redaction,
-    retention_policy, rls, role, schedule, scope_grant, scope_quota, sequence,
+    alert_rule, api_key, array, auth_user, backup_schedule, change_stream, checkpoint, clone_cow,
+    collection, column_stats, consumer_group, continuous_aggregate, custom_type, database,
+    function, index_registry, materialized_view, oidc_provider, owner, permission, procedure,
+    quota, redaction, retention_policy, rls, role, schedule, scope_grant, scope_quota, sequence,
     streaming_materialized_view, synonym_group, tenant, topic, trigger, user, vector,
     wal_tombstone,
 };
@@ -27,7 +27,7 @@ use super::{
 /// [`ApplyOutcome::Refused`] reports an entry that breaks a role rule at its
 /// log position; every node refuses it alike. Debug builds verify
 /// referential integrity after every apply — release-gated because a full
-/// rescan would wedge `raft_tick_loop` on a node with a pre-existing orphan.
+/// rescan wedges `raft_tick_loop` on a node with a pre-existing orphan.
 pub fn apply_to(
     entry: &CatalogEntry,
     catalog: &SystemCatalog,
@@ -62,10 +62,7 @@ pub fn apply_to(
                 .into_iter()
                 .filter(|d| matches!(d.kind, DivergenceKind::OrphanRow { .. }))
                 .collect();
-        if let Some(first) = orphans.first() {
-            let DivergenceKind::OrphanRow { kind, .. } = &first.kind else {
-                unreachable!("filtered to OrphanRow above");
-            };
+        if let Some(DivergenceKind::OrphanRow { kind, .. }) = orphans.first().map(|d| &d.kind) {
             crate::diag::catalog_apply_orphan_row(entry.kind(), kind, orphans.len());
             return Err(crate::Error::CatalogIntegrityViolation {
                 entry_kind: entry.kind().to_string(),
@@ -103,29 +100,27 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             // Preserve an inactive row until post-apply storage reclaim
             // succeeds — the restart-durable same-name lifecycle barrier.
-            match collection::prepare_purge(*database_id, *tenant_id, name, catalog) {
-                // A node that never held the row has nothing to fence.
-                // Interactive purge paths use `prepare_purge_checked` instead.
-                Ok(found) => {
-                    debug!(
-                        collection = %name,
-                        tenant = *tenant_id,
-                        found,
-                        "catalog_entry: purge preparation"
-                    );
-                    Ok(())
-                }
-                Err(error) => panic!("collection catalog purge preparation failed: {error}"),
-            }
+            // A node that never held the row has nothing to fence.
+            // Interactive purge paths use `prepare_purge_checked` instead.
+            let found = collection::prepare_purge(*database_id, *tenant_id, name, catalog)?;
+            debug!(
+                collection = %name,
+                tenant = *tenant_id,
+                found,
+                "catalog_entry: purge preparation"
+            );
+            Ok(())
         }
         CatalogEntry::PutSequence(stored) => sequence::put(stored, catalog),
         CatalogEntry::DeleteSequence {
             database_id,
             tenant_id,
             name,
+            ..
         } => sequence::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutSequenceState(state) => sequence::put_state(state, catalog),
         CatalogEntry::PutTrigger(stored) => trigger::put(stored, catalog),
@@ -133,18 +128,21 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             database_id,
             tenant_id,
             name,
+            ..
         } => trigger::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutFunction(stored) => function::put(stored, catalog),
         CatalogEntry::DeleteFunction {
             database_id,
             tenant_id,
             name,
+            ..
         } => function::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutProcedure(stored) => procedure::put(stored, catalog),
         CatalogEntry::DeleteProcedure {
             database_id,
             tenant_id,
             name,
+            ..
         } => procedure::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutSchedule(stored) => schedule::put(stored, catalog),
         CatalogEntry::DeleteSchedule {
@@ -157,6 +155,7 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             database_id,
             tenant_id,
             name,
+            ..
         } => change_stream::delete(*database_id, *tenant_id, name, catalog),
         // Applied by `apply_to`, which reports a refused entry.
         CatalogEntry::PutUser(_) => Ok(()),
@@ -173,10 +172,8 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             database_id,
             tenant_id,
             name,
-        } => match materialized_view::delete(*database_id, *tenant_id, name, catalog) {
-            Ok(()) => Ok(()),
-            Err(error) => panic!("materialized-view catalog deletion failed: {error}"),
-        },
+            ..
+        } => materialized_view::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutStreamingMaterializedView(definition) => {
             streaming_materialized_view::put(definition, catalog)
         }
@@ -184,15 +181,13 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             database_id,
             tenant_id,
             name,
-        } => match streaming_materialized_view::delete(*database_id, *tenant_id, name, catalog) {
-            Ok(()) => Ok(()),
-            Err(error) => panic!("streaming materialized-view catalog deletion failed: {error}"),
-        },
+        } => streaming_materialized_view::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutContinuousAggregate(stored) => continuous_aggregate::put(stored, catalog),
         CatalogEntry::DeleteContinuousAggregate {
             database_id,
             tenant_id,
             name,
+            ..
         } => continuous_aggregate::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutTenant(stored) => tenant::put(stored, catalog),
         // Applied by `apply_to` so its commit outcome can suppress post-apply.
@@ -241,6 +236,7 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             database_id,
             tenant_id,
             name,
+            ..
         } => synonym_group::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutCustomType(stored) => custom_type::put(stored, catalog),
         CatalogEntry::DeleteCustomType {
@@ -263,7 +259,8 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
         CatalogEntry::CloneDatabase {
             target_descriptor,
             source_db_id,
-        } => database::clone_apply(target_descriptor, *source_db_id, catalog),
+            incarnation,
+        } => database::clone_apply(target_descriptor, *source_db_id, *incarnation, catalog),
         CatalogEntry::PutOidcProvider(provider) => oidc_provider::put(provider, catalog),
         CatalogEntry::DeleteOidcProvider { name } => oidc_provider::delete(name, catalog),
         CatalogEntry::RecordWalTombstone {
@@ -304,6 +301,7 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             database_id,
             tenant_id,
             name,
+            ..
         } => topic::delete_with_consumer_groups(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutConsumerGroupIfAbsent(def) => consumer_group::put_if_absent(def, catalog),
         CatalogEntry::DeleteConsumerGroup {
@@ -311,6 +309,7 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             tenant_id,
             stream_name,
             name,
+            ..
         } => consumer_group::delete(*database_id, *tenant_id, stream_name, name, catalog),
         CatalogEntry::MigrateConsumerGroupStream { def, legacy_stream } => {
             consumer_group::migrate_stream(def, legacy_stream, catalog)
@@ -327,18 +326,17 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             checkpoint_name,
             catalog,
         ),
-        // `target_version_json` drives the post-apply compaction, not the row
-        // delete.
         CatalogEntry::CompactHistory {
             tenant_id,
             database_id,
             collection,
             doc_id,
             before_timestamp,
-            ..
-        } => checkpoint::delete_before(
+            target_version_json,
+        } => checkpoint::compact_history(
             CheckpointDoc::new(*database_id, *tenant_id, collection, doc_id),
             *before_timestamp,
+            target_version_json,
             catalog,
         ),
         CatalogEntry::PutVectorModel(entry) => vector::put_model(entry, catalog),
@@ -354,8 +352,61 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             tenant_id,
             collection,
             field_name,
+            ..
         } => vector::delete_params(*database_id, *tenant_id, collection, field_name, catalog),
         CatalogEntry::PutColumnStats(rows) => column_stats::put_rows(rows, catalog),
+        CatalogEntry::PutCloneCopyup {
+            database_id,
+            tenant_id,
+            collection,
+            source_surrogate,
+            target_surrogate,
+        } => clone_cow::put_copyup(
+            clone_target(*database_id, *tenant_id, collection),
+            *source_surrogate,
+            *target_surrogate,
+            catalog,
+        ),
+        CatalogEntry::PutCloneTombstone {
+            database_id,
+            tenant_id,
+            collection,
+            source_surrogate,
+        } => clone_cow::put_tombstone(
+            clone_target(*database_id, *tenant_id, collection),
+            *source_surrogate,
+            catalog,
+        ),
+        CatalogEntry::PutKvCloneTombstone {
+            database_id,
+            tenant_id,
+            collection,
+            kv_key,
+        } => clone_cow::put_kv_tombstone(
+            clone_target(*database_id, *tenant_id, collection),
+            kv_key,
+            catalog,
+        ),
+        CatalogEntry::PutArray(stored) => array::put(stored, catalog),
+        CatalogEntry::DeleteArray {
+            database_id,
+            tenant_id,
+            name,
+            moved_to,
+            ..
+        } => array::delete(
+            *database_id,
+            *tenant_id,
+            name,
+            moved_to.map(|m| m.target_db_id),
+            catalog,
+        ),
+        CatalogEntry::PutCloneSourceDrain(row) => catalog.put_clone_source_drain(row),
+        CatalogEntry::DeleteCloneSourceDrain {
+            clone_database,
+            tenant_id,
+            clone_collection,
+        } => catalog.delete_clone_source_drain(*clone_database, *tenant_id, clone_collection),
         CatalogEntry::MoveTenantCutover {
             tenant_id,
             source_db_id,
@@ -368,5 +419,18 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) -> crate::Resul
             collections,
             catalog,
         ),
+        // Offsets live in the Event-Plane offset store, not the catalog.
+        // The post-apply writes them.
+        CatalogEntry::CommitConsumerOffsets(_) => Ok(()),
+        CatalogEntry::PutBackupScheduleMark(mark) => backup_schedule::raise_mark(mark, catalog),
+    }
+}
+
+/// The clone collection a copy-on-write entry names.
+fn clone_target(database_id: u64, tenant_id: u64, collection: &str) -> clone_cow::CloneTarget<'_> {
+    clone_cow::CloneTarget {
+        database_id,
+        tenant_id,
+        collection,
     }
 }

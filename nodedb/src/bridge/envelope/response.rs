@@ -8,14 +8,16 @@ use super::status::Status;
 use crate::types::{Lsn, RequestId};
 use nodedb_types::RowIdentity;
 
-/// One row-level effect of an applied write, carried back from the Data Plane
-/// so the Control Plane can mint a durable redo record *after* apply.
+/// One row-level effect of an applied document write, carried back from the
+/// Data Plane so the Control Plane journals it *after* apply.
 ///
-/// Populated only by write handlers whose autocommit path mints no WAL redo of
-/// its own but whose effect must still survive a WAL-only restart — today, a
-/// `PointUpdate` on a document collection carrying a secondary vector (HNSW)
-/// index (see `data::executor::handlers::point::update`). `value` is the
-/// post-image body for a put; empty and ignored when `is_delete`.
+/// Every document and edge write handler reports every row it stores or
+/// removes that its pre-dispatch WAL record does not carry exactly: the
+/// post-image of an update, a bulk or batch write, a derived
+/// materialized-sum target row, the stamped image of a versioned row, and an
+/// edge version or tombstone at its decided ordinal. The Control
+/// Plane journals the entries, in entry order, as the parts of the write's
+/// record group, and WAL replay applies them in LSN order.
 #[derive(Debug, Clone)]
 pub struct WriteSetEntry {
     /// The row's stable global surrogate.
@@ -25,11 +27,8 @@ pub struct WriteSetEntry {
     /// The redo record journals this text as its `document_id`, so a WAL
     /// replay names the same row a live event names.
     pub identity: RowIdentity,
-    /// `true` for a delete effect (no body), `false` for a put (post-image in
-    /// `value`).
-    pub is_delete: bool,
-    /// Post-image body for a put; empty for a delete.
-    pub value: Vec<u8>,
+    /// What the write did to the row.
+    pub effect: RowEffect,
     /// Collection this entry's row belongs to.
     ///
     /// `None` means the statement's own collection, which is every entry a
@@ -38,6 +37,136 @@ pub struct WriteSetEntry {
     /// consequence of this statement — whose redo record must name `c` rather
     /// than the plan's collection, and which homes to a different vShard.
     pub collection: Option<String>,
+}
+
+/// The effect one [`WriteSetEntry`] reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowEffect {
+    /// The row holds `value` now. `value` is the MessagePack body the write
+    /// path encodes into storage, never a strict Binary Tuple: replay hands
+    /// it to that same encoder.
+    Put {
+        value: Vec<u8>,
+        /// The version key of a row on a `bitemporal=true` collection.
+        version: Option<RowVersion>,
+    },
+    /// The row is gone.
+    Delete {
+        /// The system time of the tombstone of a row on a `bitemporal=true`
+        /// collection.
+        system_from_ms: Option<i64>,
+    },
+    /// Replay must not apply the write's own pre-dispatch record: the apply
+    /// wrote nothing, or another entry of this write set carries the row's
+    /// exact image. The Control Plane cancels that record with a
+    /// `WriteAborted` marker once every image of the write set is appended.
+    CancelForward,
+    /// A graph edge version the apply wrote, at the ordinal it decided. The
+    /// entry's collection is `None`: an edge record homes to the write's own
+    /// vShard.
+    Edge(EdgeImage),
+}
+
+/// The graph edge versions an apply wrote, in the payload shape their WAL
+/// sub-record carries. Every ordinal is the one the apply decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeImage {
+    /// One edge version. `system_from` is always `Some`.
+    Put(crate::wal::EdgePutRedo),
+    /// One edge tombstone. `system_from` is always `Some`.
+    Delete(crate::wal::EdgeDeleteRedo),
+}
+
+/// The version key a `bitemporal=true` row landed at. Replay installs the row
+/// at exactly this key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowVersion {
+    pub sys_from_ms: i64,
+    pub valid_from_ms: i64,
+    pub valid_until_ms: i64,
+}
+
+impl RowVersion {
+    /// The key of a version valid for all time, written at `sys_from_ms`.
+    pub fn open(sys_from_ms: i64) -> Self {
+        Self {
+            sys_from_ms,
+            valid_from_ms: i64::MIN,
+            valid_until_ms: i64::MAX,
+        }
+    }
+}
+
+impl WriteSetEntry {
+    /// The row identified by `surrogate` now holds `value`.
+    pub fn put(surrogate: u32, identity: RowIdentity, value: Vec<u8>) -> Self {
+        Self {
+            surrogate,
+            identity,
+            effect: RowEffect::Put {
+                value,
+                version: None,
+            },
+            collection: None,
+        }
+    }
+
+    /// The row identified by `surrogate` is gone.
+    pub fn delete(surrogate: u32, identity: RowIdentity) -> Self {
+        Self {
+            surrogate,
+            identity,
+            effect: RowEffect::Delete {
+                system_from_ms: None,
+            },
+            collection: None,
+        }
+    }
+
+    /// The write's pre-dispatch record for the row identified by `surrogate`
+    /// must not replay.
+    pub fn cancel_forward(surrogate: u32, identity: RowIdentity) -> Self {
+        Self {
+            surrogate,
+            identity,
+            effect: RowEffect::CancelForward,
+            collection: None,
+        }
+    }
+
+    /// The edge version an apply wrote. The entry names the edge by its
+    /// source endpoint.
+    pub fn edge(image: EdgeImage) -> Self {
+        let (src_surrogate, src_id) = match &image {
+            EdgeImage::Put(put) => (put.src_surrogate, put.src_id.as_str()),
+            EdgeImage::Delete(delete) => (delete.src_surrogate, delete.src_id.as_str()),
+        };
+        Self {
+            surrogate: src_surrogate,
+            identity: RowIdentity::from_user_key(src_id),
+            effect: RowEffect::Edge(image),
+            collection: None,
+        }
+    }
+
+    /// This entry, at the version a `bitemporal=true` collection wrote it at.
+    /// `None` leaves the entry unversioned.
+    pub fn versioned(mut self, version: Option<RowVersion>) -> Self {
+        match &mut self.effect {
+            RowEffect::Put { version: slot, .. } => *slot = version,
+            RowEffect::Delete { system_from_ms } => {
+                *system_from_ms = version.map(|v| v.sys_from_ms);
+            }
+            RowEffect::CancelForward | RowEffect::Edge(_) => {}
+        }
+        self
+    }
+
+    /// This entry, naming a row of `collection` rather than the statement's.
+    pub fn in_collection(mut self, collection: String) -> Self {
+        self.collection = Some(collection);
+        self
+    }
 }
 
 /// Response envelope: Data Plane -> Control Plane.
@@ -90,10 +219,9 @@ pub struct Response {
     /// buffer to base on `Some(true)` and drops it on `Some(false)`.
     pub read_set_valid: Option<bool>,
 
-    /// Row-level effects the Control Plane must turn into durable redo records
-    /// *after* the Data Plane applied them. Empty for every response that owns
-    /// its durability on the pre-dispatch WAL path (the common case); non-empty
-    /// only for post-apply-redo writes (see [`WriteSetEntry`]).
+    /// Row-level effects the Control Plane turns into durable redo records
+    /// *after* the Data Plane applied them (see [`WriteSetEntry`]). Empty for
+    /// a response whose pre-dispatch WAL record carries its whole effect.
     pub write_set: Vec<WriteSetEntry>,
 }
 

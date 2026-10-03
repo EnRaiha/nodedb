@@ -32,8 +32,8 @@ impl CsrIndex {
             return Vec::new();
         };
         self.record_access(node_id);
-        let label_id = label_filter.and_then(|l| self.label_to_id.get(l).copied());
-        let keep = |lid: u32| label_id.is_none_or(|f| f == lid);
+        let labels = self.label_filter(label_filter);
+        let keep = |lid: u32| labels.keeps(lid);
 
         let mut result = Vec::new();
         if matches!(direction, Direction::Out | Direction::Both) {

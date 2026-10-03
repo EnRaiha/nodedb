@@ -135,7 +135,7 @@ fn document_touched_collections(
 
 /// Extract every collection name touched by a `PhysicalPlan`.
 ///
-/// Returns a `Vec<String>` that may contain duplicates; callers are
+/// Returns a `Vec<String>` that can contain duplicates; callers are
 /// responsible for de-duplication (e.g., `GatewayVersionSet::from_plan`).
 pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
     use nodedb_physical::physical_plan::*;
@@ -234,8 +234,15 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 }
                 | SetNodeLabels { .. }
                 | RemoveNodeLabels { .. }
+                // A node delete's guard is keyed on the node's key home.
+                | NodeEdgeGuard { .. }
                 // The wrapped delete is structural too — node IDs, no collection.
                 | ResolveEdgeDelete(_) => {}
+                TruncateEdges { collection, .. }
+                | NodePresenceGuard { collection, .. }
+                | NodePresenceRead { collection, .. } => {
+                    out.push(collection.as_str().to_owned())
+                }
             }
         }
 
@@ -265,7 +272,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
 
                 // The wrapped ingest is the intercepted write verbatim.
                 ResolveIngest(inner) => {
-                    if let Ingest { collection, .. } = inner.as_ref() {
+                    if let Ingest { collection, .. } = &inner.ingest {
                         out.push(collection.as_str().to_owned());
                     }
                 }
@@ -430,7 +437,7 @@ mod tests {
             ),
             item_key: vec![],
             dest_key: vec![],
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             source_rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             dest_rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         });

@@ -19,7 +19,7 @@
 //! delivery at `applied_index + 1`, and the two never overlap. Maintaining it
 //! is entirely about WHERE the index advances: only after the write funnel's
 //! durable-at-ack barrier has fsynced that entry's redo record. Advancing at
-//! engine-apply instead would leave a crash window between the engine's commit
+//! engine-apply instead leaves a crash window between the engine's commit
 //! and the index write in which the entry is applied but not covered — the
 //! double-apply this exists to close.
 
@@ -34,8 +34,8 @@ use crate::control::state::SharedState;
 /// returned `Ok` with an ok status, whose durable-at-ack barrier has performed
 /// that fsync. It deliberately does NOT fsync again.
 ///
-/// A failed apply must NOT advance the floor, and neither may any entry BEHIND
-/// one: leaving the floor below the first failure is what keeps that entry
+/// A failed apply must NOT advance the floor, and no entry BEHIND
+/// one advances it: leaving the floor below the first failure is what keeps that entry
 /// replayable on the next boot instead of silently skipped. Use
 /// [`AppliedPrefix`] to compute the index rather than passing a bare success.
 ///
@@ -46,18 +46,21 @@ pub fn save_applied_index(state: &Arc<SharedState>, group_id: u64, applied_index
     let Some(sink) = state.raft_applied_index_sink.get() else {
         return;
     };
-    if let Err(e) = sink(group_id, applied_index) {
-        // A failed save costs correctness only in the safe direction: the floor
-        // stays behind, so the next boot re-delivers entries WAL replay also
-        // covers — the pre-existing double-apply — rather than skipping any.
-        // The next successful apply in this group re-saves a higher index and
-        // closes the gap.
-        tracing::warn!(
-            group_id,
-            applied_index,
-            error = %e,
-            "failed to persist durable raft applied index"
-        );
+    match sink(group_id, applied_index) {
+        Ok(()) => state.pitr.note_durable_applied(group_id, applied_index),
+        Err(e) => {
+            // A failed save costs correctness only in the safe direction: the
+            // floor stays behind, so the next boot re-delivers entries WAL
+            // replay also covers — the pre-existing double-apply — rather
+            // than skipping any. The next successful apply in this group
+            // re-saves a higher index and closes the gap.
+            tracing::warn!(
+                group_id,
+                applied_index,
+                error = %e,
+                "failed to persist durable raft applied index"
+            );
+        }
     }
 }
 
@@ -109,8 +112,8 @@ impl AppliedPrefix {
     /// Note an entry that carries no durable state — it neither advances the
     /// prefix nor breaks it.
     ///
-    /// Advancing on it would assert a redo record that was never written;
-    /// breaking on it would stall the floor and force the batch's later,
+    /// Advancing on it asserts a redo record that was never written;
+    /// breaking on it stalls the floor and forces the batch's later,
     /// genuinely durable writes to be re-delivered and applied twice. A
     /// no-op is the only correct answer, and it is spelled out rather than
     /// left implicit so every branch of the apply loop is deliberate.
@@ -141,8 +144,8 @@ mod tests {
         prefix.record(1, true);
         prefix.record(2, true);
         prefix.record(3, false);
-        // Entry 3 never applied; 4 and 5 did. Saving 5 would make the next boot
-        // resume at 6 and drop 3 forever.
+        // Entry 3 never applied; 4 and 5 did. Saving 5 makes the next boot
+        // resume at 6 and drops 3 forever.
         prefix.record(4, true);
         prefix.record(5, true);
         assert_eq!(prefix.floor(), Some(2));

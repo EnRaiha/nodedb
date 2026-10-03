@@ -60,7 +60,7 @@ fn select_nodes_for_group(group_id: u64, active_nodes: &[u64], rf: usize) -> Vec
 ///
 /// Uses a fixed 16-byte little-endian layout so the hash value is
 /// identical on every node and platform.
-fn hrw_score(group_id: u64, node_id: u64) -> u64 {
+pub(crate) fn hrw_score(group_id: u64, node_id: u64) -> u64 {
     let mut key = [0u8; 16];
     key[..8].copy_from_slice(&group_id.to_le_bytes());
     key[8..].copy_from_slice(&node_id.to_le_bytes());

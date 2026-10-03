@@ -20,3 +20,4 @@ pub mod state_wiring;
 pub mod tls;
 pub mod tracing_init;
 pub mod wal_init;
+pub mod write_group_settle;

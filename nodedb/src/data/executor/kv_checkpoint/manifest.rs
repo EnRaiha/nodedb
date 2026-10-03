@@ -16,7 +16,7 @@ impl CoreLoop {
     /// generation it names is durable through, and treating corruption as
     /// "no generation" would let the caller install no floor while the WAL
     /// below that LSN may already be gone.
-    pub(super) fn read_kv_manifest(
+    pub(in crate::data::executor) fn read_kv_manifest(
         &self,
         ckpt_dir: &std::path::Path,
     ) -> Result<Option<KvCheckpointManifest>, CheckpointDecodeError> {

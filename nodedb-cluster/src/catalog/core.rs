@@ -24,6 +24,9 @@ use super::schema::{
 /// Persistent cluster catalog backed by redb.
 pub struct ClusterCatalog {
     pub(super) db: redb::Database,
+    /// Test hook: the next `save_cluster_epoch` fails once.
+    #[cfg(test)]
+    fail_next_epoch_write: std::sync::atomic::AtomicBool,
 }
 
 impl ClusterCatalog {
@@ -66,7 +69,23 @@ impl ClusterCatalog {
             "cluster catalog opened"
         );
 
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            #[cfg(test)]
+            fail_next_epoch_write: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Make the next `save_cluster_epoch` return an error.
+    #[cfg(test)]
+    pub(crate) fn fail_next_epoch_write_for_test(&self) {
+        self.fail_next_epoch_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The redb database that holds this catalog.
+    pub fn database(&self) -> &redb::Database {
+        &self.db
     }
 
     // ── Metadata ────────────────────────────────────────────────────
@@ -114,6 +133,15 @@ impl ClusterCatalog {
     /// Persist the cluster epoch (the leader-bumped monotonic fence
     /// token stamped on every Raft RPC). Overwrites any prior value.
     pub fn save_cluster_epoch(&self, epoch: u64) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_epoch_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(crate::error::ClusterError::Transport {
+                detail: "injected cluster epoch write failure".into(),
+            });
+        }
         let bytes = epoch.to_le_bytes();
         let txn = self.db.begin_write().map_err(catalog_err)?;
         {

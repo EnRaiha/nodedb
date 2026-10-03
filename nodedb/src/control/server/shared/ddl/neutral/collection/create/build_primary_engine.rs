@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Resolve the `WITH (primary='vector', vector_field=...)` access-path
-//! config for `build_and_persist`. Relocated verbatim from the pgwire
-//! `pgwire::ddl::collection::create::build` module (now deleted).
+//! config for `build_and_persist`.
 
 use super::super::super::super::result::DdlError;
 use super::build_flags::err;

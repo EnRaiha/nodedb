@@ -11,16 +11,18 @@
 
 use std::sync::Mutex;
 
+use super::capture::RetryStoreCaptures;
 use super::record::FailedAction;
 
 /// Actions an operator has sent back for another attempt, parked per consumer
-/// core.
+/// core, and the retry store capture requests each consumer answers.
 ///
 /// Bounded per core: an operator requeueing faster than the Event Plane drains
 /// must be refused rather than allowed to grow the inbox without limit.
 pub struct ActionRequeueInbox {
     per_core: Vec<Mutex<Vec<FailedAction>>>,
     capacity_per_core: usize,
+    retry_captures: RetryStoreCaptures,
 }
 
 /// Default depth of one core's inbox. Requeue is a manual operation; a
@@ -44,7 +46,13 @@ impl ActionRequeueInbox {
         Self {
             per_core: (0..num_cores).map(|_| Mutex::new(Vec::new())).collect(),
             capacity_per_core: DEFAULT_CAPACITY_PER_CORE,
+            retry_captures: RetryStoreCaptures::for_cores(num_cores),
         }
+    }
+
+    /// The retry store capture requests, one slot list per consumer core.
+    pub fn retry_captures(&self) -> &RetryStoreCaptures {
+        &self.retry_captures
     }
 
     /// The consumer that owns `vshard_id`.

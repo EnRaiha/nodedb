@@ -2,10 +2,8 @@
 
 //! `SHOW CONSTRAINTS ON <collection>` — unified view of all constraint kinds.
 //!
-//! Ported from the pgwire `ddl::constraint::show`. The per-row content is
-//! preserved verbatim; only the result construction changed from a pgwire
-//! `QueryResponse` (4 text columns via `DataRowEncoder`) to a protocol-neutral
-//! [`DdlResult::Rows`] carrying the same four text columns.
+//! The result is a protocol-neutral [`DdlResult::Rows`] with four text
+//! columns.
 
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 use nodedb_types::DatabaseId;

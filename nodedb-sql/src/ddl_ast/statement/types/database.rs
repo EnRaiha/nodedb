@@ -129,19 +129,20 @@ pub enum DatabaseStmt {
         /// Filter to a specific mirror by name, or `None` to show all mirrors.
         name: Option<String>,
     },
-    /// `BACKUP DATABASE <name> TO <uri>`
-    ///
-    /// Returns `FEATURE_NOT_YET_IMPLEMENTED` until the backup subsystem lands.
+    /// `BACKUP DATABASE <name> TO '<uri>'`: every tenant's rows in the
+    /// database, written to an object-store URI.
     BackupDatabase {
         name: String,
         uri: String,
     },
-    /// `RESTORE DATABASE <name> FROM <uri>`
-    ///
-    /// Returns `FEATURE_NOT_YET_IMPLEMENTED` until the restore subsystem lands.
+    /// `RESTORE DATABASE <name> FROM '<uri>' [FORCE] [DRY RUN]`.
     RestoreDatabase {
         name: String,
         uri: String,
+        /// Overwrite writes newer than the backup.
+        force: bool,
+        /// Check the backup and write nothing.
+        dry_run: bool,
     },
 
     // ── Backup / restore ─────────────────────────────────────────

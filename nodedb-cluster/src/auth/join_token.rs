@@ -105,12 +105,7 @@ pub fn issue_token(
 
 /// Encode raw token bytes as a lowercase hex string.
 pub fn token_to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(out, "{b:02x}");
-    }
-    out
+    hex::encode(bytes)
 }
 
 /// Compute SHA-256 of the token bytes. Used as the stable identity for
@@ -218,25 +213,7 @@ fn parse_layout(bytes: &[u8]) -> Result<ParsedTokenLayout, TokenError> {
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, TokenError> {
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for chunk in s.as_bytes().chunks(2) {
-        if chunk.len() != 2 {
-            return Err(TokenError::InvalidHex);
-        }
-        let hi = hex_digit(chunk[0]).ok_or(TokenError::InvalidHex)?;
-        let lo = hex_digit(chunk[1]).ok_or(TokenError::InvalidHex)?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
-}
-
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(10 + b - b'a'),
-        b'A'..=b'F' => Some(10 + b - b'A'),
-        _ => None,
-    }
+    hex::decode(s).map_err(|_| TokenError::InvalidHex)
 }
 
 #[cfg(test)]

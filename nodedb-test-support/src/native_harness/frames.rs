@@ -12,7 +12,7 @@ use nodedb_types::protocol::request_fields::RequestFields;
 use nodedb_types::protocol::text_fields::TextFields;
 use nodedb_types::protocol::{
     AuthMethod, FRAME_HEADER_LEN, HELLO_ACK_MAGIC, HELLO_ERROR_MAGIC_U32, HelloAckFrame,
-    HelloErrorFrame, HelloFrame, NativeRequest, NativeResponse, OpCode,
+    HelloErrorFrame, HelloFrame, NativeRequest, NativeResponse, OpCode, ResponseStatus,
 };
 
 /// Perform the handshake with a custom `HelloFrame`.
@@ -221,6 +221,31 @@ pub async fn send_api_key_auth(stream: &mut TcpStream, seq: u64, token: String) 
         },
     )
     .await
+}
+
+/// Open a native connection to `127.0.0.1:port` and authenticate it as the
+/// trust-mode user `username`. The JSON Auth request also selects JSON
+/// framing for the rest of the session. Panics when the handshake or the
+/// authentication fails.
+pub async fn open_trust_session(port: u16, username: &str) -> TcpStream {
+    let addr = format!("127.0.0.1:{port}").parse().expect("native addr");
+    let (mut stream, _ack) = do_handshake(addr, &HelloFrame::current())
+        .await
+        .unwrap_or_else(|e| panic!("native handshake: {e:?}"));
+    let auth = send_request(
+        &mut stream,
+        1,
+        OpCode::Auth,
+        TextFields {
+            auth: Some(AuthMethod::Trust {
+                username: username.to_string(),
+            }),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(auth.status, ResponseStatus::Ok, "native auth: {auth:?}");
+    stream
 }
 
 /// Send a `SHOW`/SQL statement over an established JSON-encoding session and

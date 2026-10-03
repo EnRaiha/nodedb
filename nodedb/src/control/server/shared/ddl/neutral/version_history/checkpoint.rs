@@ -76,7 +76,7 @@ pub async fn create_checkpoint(
     };
 
     // The duplicate is reported here, on the leader. Apply is policy-free:
-    // rejecting there would leave followers without a row the leader accepted.
+    // rejecting there will leave followers without a row the leader accepted.
     let catalog = state.credentials.catalog();
     let doc = CheckpointDoc::new(
         database_id.as_u64(),
@@ -94,7 +94,7 @@ pub async fn create_checkpoint(
             format!("checkpoint '{checkpoint_name}' already exists for {collection}/{doc_id}"),
         ));
     }
-    super::replicate::propose_put(state, &record)?;
+    super::replicate::propose_put(state, &record).await?;
 
     state
         .audit
@@ -114,7 +114,7 @@ pub async fn create_checkpoint(
 }
 
 /// DROP CHECKPOINT 'name' ON collection WHERE id = 'doc-id'
-pub fn drop_checkpoint(
+pub async fn drop_checkpoint(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -142,7 +142,7 @@ pub fn drop_checkpoint(
             format!("checkpoint '{checkpoint_name}' not found for {collection}/{doc_id}"),
         ));
     }
-    super::replicate::propose_delete(state, doc, &checkpoint_name)?;
+    super::replicate::propose_delete(state, doc, &checkpoint_name).await?;
 
     state
         .audit

@@ -33,6 +33,7 @@ fn targets(entry: &CatalogEntry, target: &Target<'_>) -> bool {
             tenant_id,
             collection,
             field_name,
+            ..
         } => {
             *database_id == target.database_id
                 && *tenant_id == target.tenant_id
@@ -92,6 +93,7 @@ mod tests {
             pq_m: 0,
             ivf_cells: 0,
             ivf_nprobe: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 
@@ -119,6 +121,7 @@ mod tests {
                 tenant_id: 1,
                 collection: "docs".to_owned(),
                 field_name: "emb".to_owned(),
+                target_hlc: nodedb_types::Hlc::ZERO,
             });
             assert!(resolve(Some(params(16))).is_none());
         })

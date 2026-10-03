@@ -66,7 +66,11 @@ pub(super) fn resolver_for_graph_op(op: &GraphOp) -> Option<Box<dyn EngineWriteR
         | GraphOp::TemporalAlgorithm { .. }
         | GraphOp::Stats { .. }
         | GraphOp::BspSuperstep(_)
-        | GraphOp::WccSuperstep(_) => return None,
+        | GraphOp::WccSuperstep(_)
+        | GraphOp::NodeEdgeGuard { .. }
+        | GraphOp::NodePresenceGuard { .. }
+        | GraphOp::TruncateEdges { .. }
+        | GraphOp::NodePresenceRead { .. } => return None,
     };
     Some(Box::new(GraphWriteResolver {
         collection: collection.as_str().to_owned(),

@@ -13,8 +13,8 @@
 //! endpoint the edge must be staged into BOTH overlays.
 //!
 //! `dual_home_edge_stages_both_overlays_and_rollback_tears_down` proves the new
-//! behavior end to end on a `single_node_calvin` server (where `calvin_available`
-//! is true so a cross-shard edge is genuinely dual-home, not forced single-home):
+//! behavior end to end on a `single_node_calvin` server, where a cross-shard
+//! edge is dual-home:
 //!
 //! 1. `BEGIN`; `GRAPH INSERT EDGE` across two distinct vShards is ACCEPTED (no
 //!    `CrossShardInExplicitTransaction`) and staged.
@@ -115,9 +115,8 @@ async fn dual_home_edge_stages_both_overlays_and_rollback_tears_down() {
         .await
         .expect("spawn standalone single-node-calvin server");
 
-    // The lone sequencer voter self-elects; wait for it so `calvin_available` is
-    // genuinely operational (a cross-shard edge is dual-home, not forced
-    // single-home).
+    // The lone sequencer voter self-elects; wait for it so the sequencer is
+    // operational before the cross-shard edge write.
     wait_for(
         "single-node sequencer leader elected",
         Duration::from_secs(10),
@@ -127,7 +126,7 @@ async fn dual_home_edge_stages_both_overlays_and_rollback_tears_down() {
     .await;
     assert!(
         node.shared.cluster_transport.is_some() && node.shared.sequencer_inbox.get().is_some(),
-        "single-node calvin must wire calvin_available (cluster_transport + sequencer_inbox)"
+        "single-node calvin must wire cluster_transport and sequencer_inbox"
     );
 
     node.client

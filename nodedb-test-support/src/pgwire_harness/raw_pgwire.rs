@@ -103,6 +103,31 @@ impl RawPgConn {
     }
 }
 
+/// The message (`M`) field of every `NoticeResponse` (`N`) in `messages`, in
+/// wire order.
+pub fn notice_messages(messages: &[(u8, Vec<u8>)]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|(tag, _)| *tag == b'N')
+        .filter_map(|(_, body)| {
+            // Fields are `code byte, NUL-terminated string`, closed by a NUL
+            // code byte.
+            let mut rest = body.as_slice();
+            while let Some((&code, tail)) = rest.split_first() {
+                if code == 0 {
+                    break;
+                }
+                let end = tail.iter().position(|b| *b == 0).unwrap_or(tail.len());
+                if code == b'M' {
+                    return Some(String::from_utf8_lossy(&tail[..end]).into_owned());
+                }
+                rest = tail.get(end + 1..).unwrap_or_default();
+            }
+            None
+        })
+        .collect()
+}
+
 /// `CommandComplete` (`C`) tag strings in `messages`, in wire order.
 pub fn command_tags(messages: &[(u8, Vec<u8>)]) -> Vec<String> {
     messages

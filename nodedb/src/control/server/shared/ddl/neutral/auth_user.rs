@@ -9,11 +9,9 @@
 //! SHOW AUTH USERS
 //! ```
 //!
-//! Ported from the pgwire `ddl::auth_user_ddl` handlers. The superuser gate,
-//! status parsing, auth-user store mutations, and `audit_record` side effects
-//! are preserved verbatim; only the result construction changed from pgwire
-//! `Response` / `QueryResponse` / `Tag` to the protocol-neutral [`DdlResult`]
-//! over [`ShapedRows`].
+//! The superuser gate, status parsing, auth-user store mutations, and
+//! `audit_record` side effects run here. The result is the protocol-neutral
+//! [`DdlResult`] over [`ShapedRows`].
 
 use serde_json::{Map, Value as JsonValue};
 
@@ -24,8 +22,7 @@ use crate::control::state::SharedState;
 
 use super::super::result::{DdlError, DdlResult};
 
-/// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
-/// the pgwire handlers produced.
+/// Construct a [`DdlError`] from a SQLSTATE code and a message.
 fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
 }

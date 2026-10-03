@@ -9,7 +9,8 @@ use crate::state::HardState;
 /// Implementors handle durability. The `nodedb-cluster` crate provides
 /// a production implementation backed by `nodedb-wal`.
 pub trait LogStorage: Send {
-    /// Persist log entries (must be durable before returning).
+    /// Persist log entries: durable before returning, or staged and reported
+    /// through [`Self::stable_through`] once durable.
     fn append(&mut self, entries: &[LogEntry]) -> Result<()>;
 
     /// Truncate log entries from `index` onward (inclusive).
@@ -44,6 +45,19 @@ pub trait LogStorage: Send {
     /// retained log — the safe direction for storage written before this index
     /// existed.
     fn load_applied_index(&self) -> Result<u64>;
+
+    /// The last log entry this storage holds durably, as `(index, term)`.
+    ///
+    /// `None`, the default, for storage whose every write is durable before
+    /// it returns. Storage that stages writes and makes them durable later
+    /// reports how far its disk has come. The node then counts only durable
+    /// entries toward its own acknowledgement of a commit (see
+    /// [`crate::RaftLog::stable_index`]). A caller of such storage makes a
+    /// write durable before it sends a reply or a vote request that depends
+    /// on it.
+    fn stable_through(&self) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 /// In-memory storage for testing.

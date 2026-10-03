@@ -25,7 +25,7 @@ use super::super::peer::PeerAddr;
 /// GET /health/live — unconditional liveness probe.
 ///
 /// Always returns 200. If this endpoint fails to respond, the
-/// process is dead and should be restarted. No internal state is
+/// process is dead and must be restarted. No internal state is
 /// checked — the mere ability to respond proves the event loop and
 /// HTTP listener are alive.
 pub async fn live() -> impl IntoResponse {
@@ -193,7 +193,8 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// The lease state `/healthz` reports: `valid`, `invalid`, `sole_voter` for
-/// a pinned lease, or `not_required` on a single node without a cluster.
+/// a pinned lease, or `not_required` before `start_raft` installed the lease
+/// timing.
 fn lease_label(state: &AppState) -> &'static str {
     use crate::control::security::auth_lease::{LeaseStatus, lease_status};
     match lease_status(&state.shared, std::time::Instant::now()) {
@@ -262,8 +263,8 @@ fn outcome_floor_bound(state: &AppState) -> std::time::Duration {
     statement.max(crate::control::catalog_entry::post_apply::vector_install_longest_core_wait())
 }
 
-/// Why a cross-shard Calvin write would be refused on this node right now,
-/// or `None` when one would be accepted.
+/// Why a cross-shard Calvin write will be refused on this node right now,
+/// or `None` when one will be accepted.
 ///
 /// Mirrors the two refusals `control::planner::calvin::submit` raises before a
 /// transaction ever reaches the inbox, so a client that waits for `/healthz`
@@ -272,10 +273,6 @@ fn sequencer_not_servable(
     state: &AppState,
     cluster: Option<&ClusterInfoSnapshot>,
 ) -> Option<&'static str> {
-    // No Calvin stack on this node (embedded / local boot with the sequencer
-    // never started): nothing to wait for, readiness is unchanged.
-    state.shared.sequencer_inbox.get()?;
-
     // Same resolution `submit_calvin_routed` performs: a missing group entry is
     // leader 0, which is exactly the state that refuses a submit.
     let leader = cluster?

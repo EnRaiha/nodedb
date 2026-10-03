@@ -15,10 +15,8 @@ use nodedb::control::cluster::snapshot_applier::DataPlaneSnapshotApplier;
 use nodedb::control::cluster::snapshot_builder::DataPlaneSnapshotBuilder;
 use nodedb_cluster::SnapshotApplier;
 use nodedb_cluster::SnapshotBuilder;
-use nodedb_cluster::routing::vshard_for_collection;
-use nodedb_types::id::DatabaseId;
 
-use super::snapshot_rt_common::{DATA_GROUP_ID, single_node_routing};
+use super::snapshot_rt_common::{await_group_calvin_kept, data_group_of, rebase_metadata_floor};
 
 /// Builder→applier round-trip for the **CRDT** snapshot section.
 ///
@@ -34,18 +32,6 @@ use super::snapshot_rt_common::{DATA_GROUP_ID, single_node_routing};
 async fn snapshot_round_trip_crdt() {
     const COLL: &str = "crdt_coll";
     const DOC: &str = "doc1";
-
-    // ── Sanity: the collection's vShard belongs to the data group we build. ───
-    let vshard = vshard_for_collection(nodedb_types::CollectionKey::from_bare(
-        DatabaseId::DEFAULT,
-        COLL,
-    ));
-    assert!(
-        single_node_routing()
-            .vshards_for_group(DATA_GROUP_ID)
-            .contains(&vshard),
-        "collection vShard {vshard} must belong to data group {DATA_GROUP_ID}"
-    );
 
     // ── Craft a real Loro delta matching the `CrdtState` model. ───────────────
     // Collection = root map keyed by name; row = a Map container under it; the
@@ -69,7 +55,9 @@ async fn snapshot_round_trip_crdt() {
     // The builder enumerates tenants from the system catalog, so the collection
     // must be registered (as it always is in production: CRDT collections are
     // created before any delta is applied) for the tenant to be snapshotted.
-    let source = TestServer::start_with_routing(single_node_routing()).await;
+    let source = TestServer::start().await;
+    // The data group that homes the collection: the group built and applied.
+    let group = data_group_of(&source, COLL);
     source
         .exec(&format!("CREATE COLLECTION {COLL}"))
         .await
@@ -92,11 +80,13 @@ async fn snapshot_round_trip_crdt() {
     );
 
     // ── Build the group snapshot via the PRODUCTION builder. ──────────────────
+    await_group_calvin_kept(&source, group).await;
     let builder = DataPlaneSnapshotBuilder::new(source.shared.clone());
     let bytes = builder
-        .build_group_snapshot(DATA_GROUP_ID, 0, 0)
+        .build_group_snapshot(group, 0, 0)
         .await
-        .expect("build_group_snapshot");
+        .expect("build_group_snapshot")
+        .bytes;
     assert!(
         !bytes.is_empty(),
         "production builder must produce a non-empty group snapshot"
@@ -119,15 +109,20 @@ async fn snapshot_round_trip_crdt() {
         decoded.crdt_state[0].1
     );
 
-    // ── TARGET node: fresh server, NO routing. The applier needs none (the
-    // bytes are already group-filtered), and a CRDT point read on a plain node
-    // stays on the local dispatch path. ──────────────────────────────────────
+    // ── TARGET node: fresh server with the same routing table. It creates the
+    //    collection, so its catalog holds what the builder's catalog held. ────
     let target = TestServer::start().await;
+    assert_eq!(data_group_of(&target, COLL), group);
+    target
+        .exec(&format!("CREATE COLLECTION {COLL}"))
+        .await
+        .expect("CREATE COLLECTION on target");
+    let bytes = rebase_metadata_floor(&bytes, &target);
 
     // ── Apply via the PRODUCTION applier. ─────────────────────────────────────
     let applier = DataPlaneSnapshotApplier::new(target.shared.clone());
     applier
-        .apply_snapshot(DATA_GROUP_ID, &bytes)
+        .apply_snapshot(group, &bytes)
         .await
         .expect("apply_snapshot");
 

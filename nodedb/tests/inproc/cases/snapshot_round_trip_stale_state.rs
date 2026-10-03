@@ -14,8 +14,9 @@
 //!   snapshot has its data gone after apply.
 //! - A SURVIVOR key (`a1`) is intact (cleared-then-reinstalled).
 //!
-//! Both nodes are started with `single_node_routing()`: the applier now needs
-//! routing on the TARGET to resolve the group's vshards for the clear pass.
+//! Each node runs a one-node cluster whose routing table the applier reads to
+//! resolve the group's vshards for the clear pass. Collection B takes a name
+//! whose vShard lands in collection A's data group.
 
 use nodedb_test_support::pgwire_harness::TestServer;
 
@@ -23,35 +24,30 @@ use nodedb::control::cluster::snapshot_applier::DataPlaneSnapshotApplier;
 use nodedb::control::cluster::snapshot_builder::DataPlaneSnapshotBuilder;
 use nodedb_cluster::SnapshotApplier;
 use nodedb_cluster::SnapshotBuilder;
-use nodedb_cluster::routing::vshard_for_collection;
-use nodedb_types::id::DatabaseId;
 
-use super::snapshot_rt_common::{DATA_GROUP_ID, first_value, single_node_routing};
+use super::snapshot_rt_common::{
+    await_group_calvin_kept, data_group_of, first_value, rebase_metadata_floor,
+};
 
 #[tokio::test]
 async fn snapshot_round_trip_stale_state() {
     const COLL_A: &str = "stale_rt_a";
-    const COLL_B: &str = "stale_rt_b";
     const CREATE_A: &str = "CREATE COLLECTION stale_rt_a \
          (id TEXT PRIMARY KEY, val TEXT) WITH (engine='document_strict')";
-    const CREATE_B: &str = "CREATE COLLECTION stale_rt_b \
-         (id TEXT PRIMARY KEY, val TEXT) WITH (engine='document_strict')";
-
-    // ── Sanity: both collections' vShards belong to the data group we build. ──
-    let routing = single_node_routing();
-    for coll in [COLL_A, COLL_B] {
-        let vshard = vshard_for_collection(nodedb_types::CollectionKey::from_bare(
-            DatabaseId::DEFAULT,
-            coll,
-        ));
-        assert!(
-            routing.vshards_for_group(DATA_GROUP_ID).contains(&vshard),
-            "collection {coll} vShard {vshard} must belong to data group {DATA_GROUP_ID}"
-        );
-    }
 
     // ── SOURCE node: only collection A with rows a1,a2,a3 (NO B). ─────────────
-    let source = TestServer::start_with_routing(single_node_routing()).await;
+    let source = TestServer::start().await;
+    // The data group built and applied: the one that homes A. B is named so
+    // that the same group homes it.
+    let group = data_group_of(&source, COLL_A);
+    let coll_b = (0u32..)
+        .map(|i| format!("stale_rt_b{i}"))
+        .find(|name| data_group_of(&source, name) == group)
+        .expect("some name lands in the group");
+    let create_b = format!(
+        "CREATE COLLECTION {coll_b} (id TEXT PRIMARY KEY, val TEXT) \
+         WITH (engine='document_strict')"
+    );
     {
         let client = &*source.client;
         client
@@ -69,19 +65,23 @@ async fn snapshot_round_trip_stale_state() {
     }
 
     // ── Build the group snapshot via the PRODUCTION builder. ──────────────────
+    await_group_calvin_kept(&source, group).await;
     let builder = DataPlaneSnapshotBuilder::new(source.shared.clone());
     let bytes = builder
-        .build_group_snapshot(DATA_GROUP_ID, 0, 0)
+        .build_group_snapshot(group, 0, 0)
         .await
-        .expect("build_group_snapshot");
+        .expect("build_group_snapshot")
+        .bytes;
     assert!(
         !bytes.is_empty(),
         "production builder must produce a non-empty group snapshot"
     );
 
-    // ── TARGET node: lagging follower with STALE state. Routing is REQUIRED so
-    //    the applier can resolve the group's vshards for the clear pass. ───────
-    let target = TestServer::start_with_routing(single_node_routing()).await;
+    // ── TARGET node: lagging follower with STALE state. The applier reads its
+    //    routing table to resolve the group's vshards for the clear pass. ──────
+    let target = TestServer::start().await;
+    assert_eq!(data_group_of(&target, COLL_A), group);
+    assert_eq!(data_group_of(&target, &coll_b), group);
     {
         let client = &*target.client;
         // A carries an extra stale key `a4` absent from the snapshot.
@@ -99,23 +99,24 @@ async fn snapshot_round_trip_stale_state() {
         }
         // B is a dropped collection absent from the snapshot entirely.
         client
-            .simple_query(CREATE_B)
+            .simple_query(&create_b)
             .await
             .expect("CREATE B on target");
         for pk in ["b1", "b2"] {
             client
                 .simple_query(&format!(
-                    "INSERT INTO {COLL_B} (id, val) VALUES ('{pk}', 'v_{pk}')"
+                    "INSERT INTO {coll_b} (id, val) VALUES ('{pk}', 'v_{pk}')"
                 ))
                 .await
                 .unwrap_or_else(|e| panic!("INSERT {pk} into B on target: {e}"));
         }
     }
+    let bytes = rebase_metadata_floor(&bytes, &target);
 
     // ── Apply via the PRODUCTION applier (clear-then-install). ────────────────
     let applier = DataPlaneSnapshotApplier::new(target.shared.clone());
     applier
-        .apply_snapshot(DATA_GROUP_ID, &bytes)
+        .apply_snapshot(group, &bytes)
         .await
         .expect("apply_snapshot");
 
@@ -163,7 +164,7 @@ async fn snapshot_round_trip_stale_state() {
     //     avoid depending on COUNT-of-empty-collection semantics.
     for pk in ["b1", "b2"] {
         let row = client
-            .simple_query(&format!("SELECT val FROM {COLL_B} WHERE id = '{pk}'"))
+            .simple_query(&format!("SELECT val FROM {coll_b} WHERE id = '{pk}'"))
             .await
             .unwrap_or_else(|e| panic!("SELECT {pk} FROM B on target: {e}"));
         assert_eq!(

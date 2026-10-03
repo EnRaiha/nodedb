@@ -6,9 +6,9 @@
 //! write-class plan reaching it with no LSN is NOT by itself a bug: most
 //! engines have write ops whose durability is owned somewhere other than this
 //! funnel's WAL append, and those arms are deliberate and documented. A naive
-//! "write-class plan with no LSN" assertion would fire on every document
-//! INSERT (the row is redb-synchronous-durable) and be switched off within a
-//! day, which is strictly worse than no check.
+//! "write-class plan with no LSN" assertion will fire on every document
+//! UPDATE that matched no row (it journals nothing) and be switched off within
+//! a day, which is strictly worse than no check.
 //!
 //! What IS an invariant is narrower and checkable: for the engines below,
 //! EVERY write-class op mints a WAL redo record on this path. If one of them
@@ -32,7 +32,7 @@ use nodedb_physical::physical_plan::{GraphOp, MetaOp};
 /// to an engine whose every write-class op mints one on this path.
 ///
 /// Stays at zero by construction. A non-zero value names a write op that was
-/// classified as needing no durable record and is now acknowledged before it
+/// classified as needing no durable record and is acknowledged before it
 /// is recoverable.
 static WRITES_ACKED_WITHOUT_DURABILITY: AtomicU64 = AtomicU64::new(0);
 
@@ -50,9 +50,9 @@ pub fn writes_acked_without_durability() -> u64 {
 /// * the plan is not a base-state write at all — reads, control ops, and the
 ///   per-transaction overlay ops (`StageWrite`, savepoint mark / rollback),
 ///   all excluded by [`plan_is_write`];
-/// * `Document` — every document write op is documented as redb-synchronous-
-///   durable, and the one restart-fidelity gap (a secondary vector index) is
-///   covered by the post-apply write-set redo, not by a forward record;
+/// * `Document` — a document write journals the rows its apply decides after
+///   apply, from `Response::write_set`, and a write whose apply stores no row
+///   (an update or delete that matched nothing) journals nothing at all;
 /// * `Crdt` — constraint installs are Raft-log-replay durable and
 ///   `RestoreToVersion` only computes a forward delta that a follow-up
 ///   `Apply` logs;
@@ -146,7 +146,7 @@ mod tests {
             key: b"k".to_vec(),
             value: b"v".to_vec(),
             ttl_ms: 0,
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -184,8 +184,8 @@ mod tests {
     }
 
     /// The false-positive guard that decides whether this check is usable at
-    /// all: document writes are redb-synchronous-durable and legitimately
-    /// reach the barrier with no LSN, on the hottest write path there is.
+    /// all: a document write that stores no row journals nothing and
+    /// legitimately reaches the barrier with no LSN.
     #[test]
     fn document_write_is_not_held_to_the_barrier() {
         let plan = PhysicalPlan::Document(DocumentOp::Truncate {

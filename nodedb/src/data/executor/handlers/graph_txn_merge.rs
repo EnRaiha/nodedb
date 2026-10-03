@@ -15,7 +15,7 @@
 //! `self.graph_txn_overlays.get(&txn_id)` and pass it in, so this logic is
 //! unit-testable without constructing a full `CoreLoop`.
 
-use crate::data::executor::handlers::transaction::overlay::GraphTxnOverlay;
+use crate::data::executor::handlers::transaction::overlay::{GraphCollKey, GraphTxnOverlay};
 use crate::engine::graph::csr::GraphOverlayDelta;
 use crate::engine::graph::edge_store::Direction;
 use crate::types::TenantId;
@@ -200,6 +200,43 @@ fn edge_endpoints<'a>(
     }
 }
 
+/// Merge a transaction's staged edge writes in one collection into the
+/// durable `(src, label, dst)` edges of `node_id`, respecting `direction`
+/// and `edge_label`. A staged tombstone removes a durable edge. A staged put
+/// adds an edge the durable list lacks. The result is sorted and holds no
+/// duplicates. Returns `durable` sorted when `overlay` is `None`.
+pub(in crate::data::executor) fn merge_graph_txn_overlay_collection_edges(
+    overlay: Option<&GraphTxnOverlay>,
+    coll_key: &GraphCollKey,
+    node_id: &str,
+    edge_label: Option<&str>,
+    direction: Direction,
+    durable: Vec<(String, String, String)>,
+) -> Vec<(String, String, String)> {
+    let mut merged: std::collections::BTreeSet<(String, String, String)> =
+        durable.into_iter().collect();
+    let Some(overlay) = overlay else {
+        return merged.into_iter().collect();
+    };
+    merged.retain(|(src, label, dst)| !overlay.is_edge_tombstoned(coll_key, src, label, dst));
+    let label_matches = |label: &str| edge_label.is_none_or(|filter| filter == label);
+    if matches!(direction, Direction::Out | Direction::Both) {
+        for (label, dst, _) in overlay.edges_for_src(coll_key, node_id) {
+            if label_matches(label) {
+                merged.insert((node_id.to_string(), label.to_string(), dst.to_string()));
+            }
+        }
+    }
+    if matches!(direction, Direction::In | Direction::Both) {
+        for (label, src, _) in overlay.edges_for_dst(coll_key, node_id) {
+            if label_matches(label) {
+                merged.insert((src.to_string(), label.to_string(), node_id.to_string()));
+            }
+        }
+    }
+    merged.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +373,43 @@ mod tests {
             Vec::new(),
         );
         assert!(out.is_empty());
+    }
+
+    fn triple(src: &str, dst: &str) -> (String, String, String) {
+        (src.to_string(), "knows".to_string(), dst.to_string())
+    }
+
+    /// The collection merge folds only the named collection's staged writes:
+    /// a tombstone there removes a durable edge, a put there adds one, and
+    /// another collection's put is not an edge of this collection.
+    #[test]
+    fn collection_merge_folds_only_its_own_collection() {
+        let mut overlay = GraphTxnOverlay::new();
+        overlay.stage_edge_delete(coll_key("g"), "a", "knows", "b");
+        overlay.stage_edge_put(coll_key("g"), "c", "knows", "a", Vec::new());
+        overlay.stage_edge_put(coll_key("other"), "a", "knows", "d", Vec::new());
+
+        let out = merge_graph_txn_overlay_collection_edges(
+            Some(&overlay),
+            &coll_key("g"),
+            "a",
+            None,
+            Direction::Both,
+            vec![triple("a", "b"), triple("a", "e")],
+        );
+        assert_eq!(out, vec![triple("a", "e"), triple("c", "a")]);
+    }
+
+    #[test]
+    fn collection_merge_without_overlay_sorts_and_dedups() {
+        let out = merge_graph_txn_overlay_collection_edges(
+            None,
+            &coll_key("g"),
+            "a",
+            None,
+            Direction::Both,
+            vec![triple("a", "z"), triple("a", "b"), triple("a", "z")],
+        );
+        assert_eq!(out, vec![triple("a", "b"), triple("a", "z")]);
     }
 }

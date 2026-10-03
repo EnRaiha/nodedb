@@ -41,6 +41,16 @@ impl AppliedPosition {
     pub(crate) fn carried_commit_hlc(&self) -> Option<u64> {
         (self.commit_hlc != 0).then_some(self.commit_hlc)
     }
+
+    /// The entry's Raft log position for a write of `vshard`, which
+    /// positions its change events.
+    pub(crate) fn change_position(
+        &self,
+        state: &SharedState,
+        vshard: u32,
+    ) -> crate::event::cdc::position::ReplicatedPosition {
+        crate::event::cdc::position::entry_position(state, vshard, self.group_id, self.log_index)
+    }
 }
 
 /// One committed array write, ready for the Control-Plane write funnel.
@@ -61,6 +71,10 @@ pub(super) struct ArrayWriteSubmit {
     pub commit_hlc: Option<u64>,
     /// Contextual label for the error surfaced to the propose waiter.
     pub op_label: &'static str,
+    /// The committed entry the write applies. Its change events stage under
+    /// it until the apply loop settles it.
+    pub group_id: u64,
+    pub log_index: u64,
 }
 
 /// Submit a committed array write through the shared Control-Plane write funnel
@@ -91,6 +105,8 @@ pub(super) async fn submit_array_write(
         apply_key,
         commit_hlc,
         op_label,
+        group_id,
+        log_index,
     } = params;
 
     let outcome = submit_write(
@@ -110,21 +126,23 @@ pub(super) async fn submit_array_write(
             // committed plan: the proposer's LSN is deliberately not carried on
             // the wire, and the array engine's tile state has no other
             // durability path than this record's replay.
+            // An array write emits no Data-Plane change event to position.
             durability: WalDurability::AppendHere {
                 now_override: resolved_now_ms,
                 apply_key,
                 commit_hlc,
+                change_position: None,
             },
             // Raft committed this entry at a fixed log index and every replica
             // applies it in that order; re-entering the write-admission gate
-            // would re-decide an ordering that is already final.
+            // re-decides an ordering that is already final.
             ordering: WriteOrdering::AlreadyOrdered,
-            // An `ArrayOp::Put` / `Delete` does yield change metadata, but this
-            // apply path runs on EVERY replica of the committed entry — the
-            // node that proposed it owns the single publish. Emitting here
-            // would give each subscriber one copy per replica plus a NOTIFY
-            // fan-out from each. See [`ChangeFeedOwner`].
-            change_feed: ChangeFeedOwner::Unowned,
+            // Every replica stages the write's change events under the entry,
+            // and publishes them at its log position once the entry settles.
+            change_feed: ChangeFeedOwner::Replicated {
+                group_id,
+                log_index,
+            },
         },
     )
     .await?;
@@ -277,6 +295,7 @@ pub(super) fn build_array_request(
         txn_id: None,
         wal_lsn: None,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: crate::bridge::envelope::Admission::Exempt(
             crate::bridge::envelope::ExemptReason::AlreadyOrdered,
         ),

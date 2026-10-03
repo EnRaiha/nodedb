@@ -24,7 +24,7 @@ pub async fn metrics(
 
     // Blacklist + account status, no rate limit: a Prometheus scrape runs on a
     // fixed interval and is not the per-query traffic the rate limiter's cost
-    // table models, so metering it would only risk starving monitoring. A
+    // table models, so metering it will only risk starving monitoring. A
     // blacklisted IP or suspended/banned monitor account must still be refused
     // before any internal counter is read.
     admit_without_rate_limit(
@@ -246,7 +246,7 @@ pub async fn metrics(
         output.push_str("# TYPE nodedb_tenant_qps_total counter\n");
         for (tid, usage, _quota) in tenants.iter_usage() {
             let t = tid.as_u64();
-            // Tenant label only — database label requires tenant→DB lookup which may
+            // Tenant label only — database label requires tenant→DB lookup which can
             // be expensive; include tenant_id as a proxy for now. Full database+tenant
             // labeling is done in the expanded tenant loop below.
             let _ = std::fmt::write(
@@ -389,8 +389,9 @@ fn render_loop_specific_gauges(state: &AppState, out: &mut String) {
 
     // gateway_plan_cache_hit_ratio — derived from the plan cache's
     // hit+miss counters. Returns 0.0 when the cache has never been
-    // consulted so the series never reports NaN.
-    if let Some(gateway) = state.shared.gateway.get() {
+    // consulted so the series never reports NaN. A scrape never fails, so a
+    // node whose gateway is not yet installed omits the series.
+    if let Ok(gateway) = state.shared.installed_gateway() {
         let hits = gateway.plan_cache.cache_hit_count();
         let misses = gateway.plan_cache.cache_miss_count();
         let ratio = gateway.plan_cache.hit_ratio();

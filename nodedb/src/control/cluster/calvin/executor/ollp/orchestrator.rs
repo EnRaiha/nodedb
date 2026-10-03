@@ -181,6 +181,9 @@ impl OllpOrchestrator {
         // `submit_with_retry` call from the SQL layer with a fresh `tx_builder`
         // closure; the budget + circuit checks below run on every attempt
         // because they are stored on `self` and persist across calls.
+        // A bare inbox carries single-entry classes only: a multi-part class
+        // needs a coordinator to stream its parts, which the routed submit
+        // of `submit_with_retry_via` runs.
         let Some(tx_class) = self.check_and_build(predicate_class, tenant_id, tx_builder)? else {
             return Ok(None);
         };
@@ -343,11 +346,11 @@ mod tests {
     #[test]
     fn tenant_budget_exceeded_at_1000_per_min() {
         let mut bucket = RateBucket::new(1000, Duration::from_secs(60));
-        // First 1000 should NOT exceed.
+        // First 1000 must NOT exceed.
         for _ in 0..1000 {
             assert!(!bucket.record_and_check());
         }
-        // 1001st should exceed.
+        // 1001st must exceed.
         assert!(bucket.record_and_check());
     }
 }

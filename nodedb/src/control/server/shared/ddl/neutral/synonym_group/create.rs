@@ -48,29 +48,16 @@ pub async fn create_synonym_group(
         name: name.to_string(),
         terms: terms.to_vec(),
         created_at,
+        // Frozen by the proposer's stamp.
+        modification_hlc: nodedb_types::Hlc::ZERO,
     };
 
-    let catalog = state.credentials.catalog();
-
-    let entry =
-        crate::control::catalog_entry::CatalogEntry::PutSynonymGroup(Box::new(stored.clone()));
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    // The apply registers the group and installs it in every core's FTS
+    // backend in post-apply. A buffered group registers nothing until COMMIT.
+    let entry = crate::control::catalog_entry::CatalogEntry::PutSynonymGroup(Box::new(stored));
+    crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-
-    // Single node: no applier runs, so post-apply never fires. Run the two
-    // per-node effects the applier runs everywhere else — the catalog write,
-    // and the fan-out that installs the group in every core's FTS backend.
-    if outcome.needs_local_apply() {
-        catalog
-            .put_synonym_group(&stored)
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        crate::control::catalog_entry::post_apply::install_synonym_group(stored.clone(), state)
-            .await;
-    }
-
-    // Idempotent: the applier's synchronous post-apply already registered the
-    // group on the replicated path.
-    state.synonym_registry.register(stored);
 
     Ok(vec![DdlResult::Status {
         command: "CREATE SYNONYM GROUP".to_string(),

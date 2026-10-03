@@ -45,6 +45,19 @@ impl CoreLoop {
                 );
             }
         };
+        // Every cell carries the surrogate its coordinator bound. One unbound
+        // cell refuses the whole put before any cell is written.
+        for cell in &cells {
+            if let Some(refusal) =
+                crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+                    "array",
+                    &array_id.name,
+                    cell.surrogate,
+                )
+            {
+                return self.response_error(task, refusal);
+            }
+        }
         let n = cells.len();
         if let Err(e) = self.array_engine.put_cells(array_id, cells, wal_lsn) {
             return self.response_error(
@@ -188,7 +201,7 @@ impl CoreLoop {
         self.flush_array_if_full(array_id)
     }
 
-    /// Stage, restore, and purge form the reversible physical side of DROP.
+    /// Stage and purge form the physical side of DROP.
     pub(in crate::data::executor) fn handle_array_drop(
         &mut self,
         task: &ExecutionTask,
@@ -205,20 +218,34 @@ impl CoreLoop {
         encode_count_response(self, task, "dropped", 1)
     }
 
-    pub(in crate::data::executor) fn handle_array_drop_restore(
+    /// Move this core's store of `array_id` under `target`. An open store
+    /// flushes first: WAL replay skips the source identity once its catalog
+    /// row is gone, so every cell must already sit in a segment.
+    pub(in crate::data::executor) fn handle_array_rekey(
         &mut self,
         task: &ExecutionTask,
         array_id: &ArrayId,
+        target: &ArrayId,
     ) -> Response {
-        if let Err(e) = self.array_engine.restore_drop_array(array_id) {
+        if self.array_engine.is_open(array_id)
+            && let Err(e) = self.flush_array(array_id)
+        {
             return self.response_error(
                 task,
                 ErrorCode::Internal {
-                    detail: format!("array drop restore: {e}"),
+                    detail: format!("array rekey flush: {e}"),
                 },
             );
         }
-        encode_count_response(self, task, "restored", 1)
+        if let Err(e) = self.array_engine.rekey_array(array_id, target) {
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("array rekey: {e}"),
+                },
+            );
+        }
+        encode_count_response(self, task, "rekeyed", 1)
     }
 
     pub(in crate::data::executor) fn handle_array_drop_purge(
@@ -317,6 +344,7 @@ mod tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: crate::bridge::envelope::Admission::Admitted,
         }
     }
@@ -386,7 +414,7 @@ mod tests {
         let cells = vec![ArrayPutCell {
             coord: vec![CoordValue::Int64(1), CoordValue::Int64(2)],
             attrs: vec![CellValue::Float64(3.5)],
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             system_from_ms: 0,
             valid_from_ms: 0,
             valid_until_ms: i64::MAX,
@@ -399,6 +427,7 @@ mod tests {
                     cells_msgpack: cells_bytes,
                     wal_lsn: 42,
                     provenance: None,
+                    vshard_id: 0,
                 }),
                 2,
             )))
@@ -492,7 +521,7 @@ mod tests {
         let cells = vec![ArrayPutCell {
             coord: vec![CoordValue::Int64(3)],
             attrs: vec![CellValue::Float64(42.0)],
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             system_from_ms: 0,
             valid_from_ms: 0,
             valid_until_ms: i64::MAX,
@@ -505,6 +534,7 @@ mod tests {
                     cells_msgpack: cells_bytes,
                     wal_lsn: 7,
                     provenance: None,
+                    vshard_id: 0,
                 }),
                 2,
             )))

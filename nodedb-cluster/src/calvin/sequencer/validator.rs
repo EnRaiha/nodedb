@@ -139,6 +139,20 @@ fn flatten_set(set: &ReadWriteSet) -> Vec<FlatKey> {
                     });
                 }
             }
+            // The whole array on each vShard it names.
+            EngineKeySet::Array {
+                collection,
+                vshards,
+            } => {
+                for &vshard in vshards.as_slice() {
+                    out.push(FlatKey {
+                        discriminant: 4,
+                        engine_name: "array",
+                        collection: collection.clone(),
+                        key_bytes: vshard.to_le_bytes().to_vec(),
+                    });
+                }
+            }
         }
     }
     out

@@ -9,6 +9,7 @@
 mod dispatch;
 mod entry;
 mod merge;
+mod shadow;
 mod temporal;
 
 pub(in crate::control::server) use entry::{

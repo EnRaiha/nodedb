@@ -12,7 +12,7 @@
 //! are applied. Declaring only the binding leaves a strict target with no
 //! `balance` field, and every maintenance write into it is a full document
 //! write that the Binary Tuple encoder rejects on a field the schema does not
-//! carry — the balance would never land, and neither would the source row that
+//! carry — the balance will never land, and neither will the source row that
 //! caused it. Column and binding are mutated into one `StoredCollection` and
 //! proposed as a single `PutCollection`, so no committed state ever holds a
 //! binding whose column does not exist.
@@ -76,6 +76,10 @@ pub(super) async fn add_materialized_sum(
     let catalog = state.credentials.catalog();
 
     let mut coll = load_active_collection(state, database_id, tenant_id, target_collection)?;
+    crate::control::server::shared::ddl::neutral::collection::enforcement::validate_sum_target(
+        &coll,
+    )
+    .map_err(|e| err(e.sqlstate(), e.to_string()))?;
 
     if coll
         .materialized_sums
@@ -99,13 +103,14 @@ pub(super) async fn add_materialized_sum(
     declare_target_column(&mut coll, target_column, target_column_type)?;
     coll.materialized_sums.push(def);
     let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll.clone()));
-    super::support::propose_and_apply_async(state, entry).await?;
+    let outcome = super::support::propose_and_apply_async(state, entry).await?;
 
     // The Data Plane's in-memory shape is what the Binary Tuple encoder
     // consults, so it must learn the new column before the first source write
     // arrives; without this the binding is durable and the very next
-    // maintenance write is still rejected on an unknown field.
-    super::super::register::dispatch_register_from_stored(state, &coll)
+    // maintenance write is still rejected on an unknown field. A durable
+    // apply registered the target and its sources in its post-apply.
+    super::super::register::register_proposed_collection(state, outcome, &coll)
         .await
         .map_err(|e| DdlError::from_error(&e))?;
 
@@ -115,9 +120,11 @@ pub(super) async fn add_materialized_sum(
     // derived for the source. Registering only the target leaves the source
     // asserting it drives no binding, so every co-resident write into it folds
     // nothing and the total silently stays where it was.
-    super::super::register::dispatch_register_for_sum_sources(state, &coll)
-        .await
-        .map_err(|e| DdlError::from_error(&e))?;
+    if outcome.is_buffered() {
+        super::super::register::dispatch_register_for_sum_sources(state, &coll)
+            .await
+            .map_err(|e| DdlError::from_error(&e))?;
+    }
 
     state.schema_version.bump();
 
@@ -181,7 +188,7 @@ fn declare_target_column(
     Ok(())
 }
 
-/// Refuse a binding that would make some collection both a materialized-sum
+/// Refuse a binding that will make some collection both a materialized-sum
 /// source and a materialized-sum target.
 ///
 /// Maintenance of a materialized sum writes the target row through a plain
@@ -215,7 +222,7 @@ fn validate_binding_depth(
         return Err(chain_error(target_collection, source_collection));
     }
 
-    // The new target already feeds another collection: it would become both a
+    // The new target already feeds another collection: it will become both a
     // sink (of this binding) and a source (of that one).
     if let Some(downstream) = existing
         .iter()
@@ -294,7 +301,7 @@ mod tests {
     /// needs to: the resolution a write carries is keyed on the
     /// `(target collection, join value)` PAIR, so each binding resolves, defers
     /// and folds against its own target row independently. There is nothing left
-    /// for a DDL-time guard to protect, and refusing the shape here would reject
+    /// for a DDL-time guard to protect, and refusing the shape here will reject
     /// a schema the engine now maintains correctly.
     #[test]
     fn a_second_binding_on_the_same_source_and_join_column_is_accepted() {
@@ -304,7 +311,7 @@ mod tests {
 
     #[test]
     fn extending_an_existing_target_into_a_source_is_rejected() {
-        // entries -> accounts already exists; accounts -> ledger would chain.
+        // entries -> accounts already exists; accounts -> ledger will chain.
         let existing = vec![binding("entries", "accounts")];
         let error = validate_binding_depth(&existing, "ledger", "accounts")
             .expect_err("a two-hop chain must be refused");
@@ -322,7 +329,7 @@ mod tests {
 
     #[test]
     fn feeding_an_existing_source_is_rejected() {
-        // entries -> accounts already exists; raw_events -> entries would chain.
+        // entries -> accounts already exists; raw_events -> entries will chain.
         let existing = vec![binding("entries", "accounts")];
         let error = validate_binding_depth(&existing, "entries", "raw_events")
             .expect_err("a two-hop chain must be refused");
@@ -351,7 +358,7 @@ mod tests {
     #[test]
     fn longer_chain_is_rejected_at_every_extension_point() {
         let existing = vec![binding("a", "b"), binding("c", "d")];
-        // b -> c would join the two independent edges into a -> b -> c -> d.
+        // b -> c will join the two independent edges into a -> b -> c -> d.
         assert!(validate_binding_depth(&existing, "c", "b").is_err());
     }
 }

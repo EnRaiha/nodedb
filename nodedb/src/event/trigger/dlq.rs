@@ -13,10 +13,11 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::TableDefinition;
+use tracing::{debug, warn};
 
 use crate::event::action::FailedAction;
-use tracing::{debug, warn};
+use crate::event::redb_store::RedbStore;
 
 /// redb table: monotonic entry_id → MessagePack-serialized `TriggerDlqEntry`.
 const TRIGGER_DLQ: TableDefinition<u64, &[u8]> = TableDefinition::new("trigger_dlq");
@@ -70,121 +71,91 @@ impl TriggerDlqEntry {
 }
 
 /// Why an entry could not be taken out of the DLQ for another attempt.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum RequeueTakeError {
     #[error("no dead-letter entry {entry_id}")]
     NotFound { entry_id: u64 },
 
     #[error("dead-letter entry {entry_id} is already resolved")]
     AlreadyResolved { entry_id: u64 },
+
+    /// redb refused the resolved mark. The entry stays unresolved.
+    #[error("dead-letter entry {entry_id} could not be marked resolved: {source}")]
+    Persist {
+        entry_id: u64,
+        #[source]
+        source: Box<crate::Error>,
+    },
 }
 
 /// Trigger dead-letter queue.
+///
+/// Every mutation writes redb first and changes the in-memory index only
+/// after the write commits, so the index never holds a change redb refused.
 pub struct TriggerDlq {
-    db: Database,
-    /// In-memory index for fast listing (mirrors redb for read performance).
+    store: RedbStore<TriggerDlqEntry>,
+    /// In-memory index for fast listing. Mirrors redb.
     entries: VecDeque<TriggerDlqEntry>,
     next_entry_id: u64,
     max_entries: usize,
 }
 
+impl crate::storage::RedbBacked for TriggerDlq {
+    fn redb_database(&self) -> &redb::Database {
+        self.store.redb_database()
+    }
+}
+
 impl TriggerDlq {
     /// Open or create the trigger DLQ at `{data_dir}/event_plane/trigger_dlq.redb`.
     pub fn open(data_dir: &Path) -> crate::Result<Self> {
-        let dir = data_dir.join("event_plane");
-        std::fs::create_dir_all(&dir).map_err(|e| crate::Error::Storage {
-            engine: "event_plane".into(),
-            detail: format!("create dir {}: {e}", dir.display()),
-        })?;
-
-        let path = dir.join("trigger_dlq.redb");
-        let db = Database::create(&path).map_err(|e| crate::Error::Storage {
-            engine: "event_plane".into(),
-            detail: format!("open trigger DLQ db {}: {e}", path.display()),
-        })?;
-
-        // Ensure table exists and load existing entries.
-        let mut entries = VecDeque::new();
-        let mut max_id = 0u64;
-        {
-            let txn = db.begin_write().map_err(|e| crate::Error::Storage {
-                engine: "event_plane".into(),
-                detail: format!("begin_write: {e}"),
-            })?;
-            {
-                let table = txn
-                    .open_table(TRIGGER_DLQ)
-                    .map_err(|e| crate::Error::Storage {
-                        engine: "event_plane".into(),
-                        detail: format!("open_table: {e}"),
-                    })?;
-                let mut range = table.range(0u64..).map_err(|e| crate::Error::Storage {
-                    engine: "event_plane".into(),
-                    detail: format!("range: {e}"),
-                })?;
-                while let Some(Ok((key_guard, value_guard))) = range.next() {
-                    let id: u64 = key_guard.value();
-                    if id > max_id {
-                        max_id = id;
-                    }
-                    let bytes: &[u8] = value_guard.value();
-                    if let Ok(entry) = zerompk::from_msgpack::<TriggerDlqEntry>(bytes) {
-                        entries.push_back(entry);
-                    }
-                }
-            }
-            txn.commit().map_err(|e| crate::Error::Storage {
-                engine: "event_plane".into(),
-                detail: format!("commit: {e}"),
-            })?;
-        }
-
+        let store = RedbStore::open(data_dir, "trigger_dlq.redb", TRIGGER_DLQ, "trigger DLQ")?;
+        let loaded = store.load()?;
         debug!(
-            entries = entries.len(),
-            next_id = max_id + 1,
+            entries = loaded.records.len(),
+            next_id = loaded.next_key,
             "trigger DLQ loaded"
         );
-
         Ok(Self {
-            db,
-            entries,
-            next_entry_id: max_id + 1,
+            store,
+            entries: loaded.records,
+            next_entry_id: loaded.next_key,
             max_entries: DEFAULT_MAX_ENTRIES,
         })
     }
 
     /// Record an action that has exhausted its retries.
+    ///
+    /// At capacity the oldest entries are removed in the same redb
+    /// transaction that writes the new one. On error nothing changes.
     pub fn enqueue(&mut self, action: FailedAction) -> crate::Result<u64> {
         let entry_id = self.next_entry_id;
-        self.next_entry_id += 1;
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
         let entry = TriggerDlqEntry {
             entry_id,
             action,
-            created_at: now,
+            created_at: now_ms(),
             resolved: false,
         };
 
-        // Evict oldest if at capacity.
-        while self.entries.len() >= self.max_entries {
-            if let Some(evicted) = self.entries.pop_front() {
-                self.delete_from_redb(evicted.entry_id);
+        let evict_count = (self.entries.len() + 1).saturating_sub(self.max_entries);
+        let evicted: Vec<u64> = self
+            .entries
+            .iter()
+            .take(evict_count)
+            .map(|e| e.entry_id)
+            .collect();
+        self.store.put_evicting(entry_id, &entry, &evicted)?;
+
+        self.next_entry_id += 1;
+        for _ in 0..evict_count {
+            if let Some(old) = self.entries.pop_front() {
                 warn!(
-                    entry_id = evicted.entry_id,
-                    owner = %evicted.owner(),
+                    entry_id = old.entry_id,
+                    owner = %old.owner(),
                     "trigger DLQ evicted oldest entry (at capacity)"
                 );
             }
         }
-
-        // Persist to redb.
-        self.write_to_redb(&entry)?;
-
         debug!(
             entry_id,
             owner = %entry.owner(),
@@ -199,19 +170,14 @@ impl TriggerDlq {
         self.entries.iter().filter(|e| !e.resolved).collect()
     }
 
-    /// Mark an entry as resolved.
-    pub fn resolve(&mut self, entry_id: u64) -> bool {
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.entry_id == entry_id) {
-            entry.resolved = true;
-            true
-        } else {
-            return false;
+    /// Mark an entry as resolved. Returns `Ok(false)` when no entry has
+    /// `entry_id`. On error the entry stays unresolved.
+    pub fn resolve(&mut self, entry_id: u64) -> crate::Result<bool> {
+        let Some(entry) = self.entries.iter_mut().find(|e| e.entry_id == entry_id) else {
+            return Ok(false);
         };
-        // Persist the update to redb (entry cloned to avoid borrow conflict).
-        if let Some(entry) = self.entries.iter().find(|e| e.entry_id == entry_id) {
-            let _ = self.write_to_redb(entry);
-        }
-        true
+        mark_resolved(&self.store, entry)?;
+        Ok(true)
     }
 
     /// Take the action of an unresolved entry so it can be run again, and
@@ -229,11 +195,11 @@ impl TriggerDlq {
         if entry.resolved {
             return Err(RequeueTakeError::AlreadyResolved { entry_id });
         }
-        let action = entry.action.clone();
-        entry.resolved = true;
-        let updated = entry.clone();
-        let _ = self.write_to_redb(&updated);
-        Ok(action)
+        mark_resolved(&self.store, entry).map_err(|e| RequeueTakeError::Persist {
+            entry_id,
+            source: Box::new(e),
+        })?;
+        Ok(entry.action.clone())
     }
 
     /// Every entry, newest last, for operator introspection.
@@ -249,45 +215,25 @@ impl TriggerDlq {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
 
-    fn write_to_redb(&self, entry: &TriggerDlqEntry) -> crate::Result<()> {
-        let bytes = zerompk::to_msgpack_vec(entry).map_err(|e| crate::Error::Serialization {
-            format: "msgpack".into(),
-            detail: format!("trigger DLQ entry: {e}"),
-        })?;
-        let txn = self.db.begin_write().map_err(|e| crate::Error::Storage {
-            engine: "event_plane".into(),
-            detail: format!("begin_write: {e}"),
-        })?;
-        {
-            let mut table = txn
-                .open_table(TRIGGER_DLQ)
-                .map_err(|e| crate::Error::Storage {
-                    engine: "event_plane".into(),
-                    detail: format!("open_table: {e}"),
-                })?;
-            table
-                .insert(entry.entry_id, bytes.as_slice())
-                .map_err(|e| crate::Error::Storage {
-                    engine: "event_plane".into(),
-                    detail: format!("insert: {e}"),
-                })?;
-        }
-        txn.commit().map_err(|e| crate::Error::Storage {
-            engine: "event_plane".into(),
-            detail: format!("commit: {e}"),
-        })?;
-        Ok(())
-    }
+/// Persist `entry` as resolved, then set the flag in memory.
+fn mark_resolved(
+    store: &RedbStore<TriggerDlqEntry>,
+    entry: &mut TriggerDlqEntry,
+) -> crate::Result<()> {
+    let mut updated = entry.clone();
+    updated.resolved = true;
+    store.put(updated.entry_id, &updated)?;
+    entry.resolved = true;
+    Ok(())
+}
 
-    fn delete_from_redb(&self, entry_id: u64) {
-        if let Ok(txn) = self.db.begin_write() {
-            if let Ok(mut table) = txn.open_table(TRIGGER_DLQ) {
-                let _ = table.remove(entry_id);
-            }
-            let _ = txn.commit();
-        }
-    }
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]
@@ -349,8 +295,42 @@ mod tests {
             .enqueue(failed("orders", "order-1", "audit", 100))
             .unwrap();
 
-        assert!(dlq.resolve(id));
+        assert!(dlq.resolve(id).unwrap());
         assert!(dlq.list_unresolved().is_empty());
+        assert!(!dlq.resolve(999).unwrap());
+    }
+
+    #[test]
+    fn a_resolve_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut dlq = TriggerDlq::open(dir.path()).unwrap();
+            let id = dlq
+                .enqueue(failed("orders", "order-1", "audit", 100))
+                .unwrap();
+            assert!(dlq.resolve(id).unwrap());
+        }
+        let dlq = TriggerDlq::open(dir.path()).unwrap();
+        assert!(dlq.list_unresolved().is_empty());
+    }
+
+    #[test]
+    fn eviction_is_persisted_with_the_new_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut dlq = TriggerDlq::open(dir.path()).unwrap();
+            dlq.max_entries = 2;
+            for i in 0u64..4 {
+                dlq.enqueue(failed("c", &format!("r-{i}"), "t", i)).unwrap();
+            }
+        }
+        let dlq = TriggerDlq::open(dir.path()).unwrap();
+        let rows: Vec<&str> = dlq
+            .list()
+            .map(|e| e.action.context.row_id.as_str())
+            .collect();
+        assert_eq!(rows, vec!["r-2", "r-3"]);
+        assert_eq!(dlq.next_entry_id, 5);
     }
 
     #[test]
@@ -402,20 +382,20 @@ mod tests {
             .enqueue(failed("orders", "order-1", "audit", 100))
             .unwrap();
         dlq.take_for_requeue(id).expect("first take");
-        assert_eq!(
+        assert!(matches!(
             dlq.take_for_requeue(id).unwrap_err(),
-            RequeueTakeError::AlreadyResolved { entry_id: id }
-        );
+            RequeueTakeError::AlreadyResolved { entry_id } if entry_id == id
+        ));
     }
 
     #[test]
     fn an_unknown_entry_reports_not_found() {
         let dir = tempfile::tempdir().unwrap();
         let mut dlq = TriggerDlq::open(dir.path()).unwrap();
-        assert_eq!(
+        assert!(matches!(
             dlq.take_for_requeue(99).unwrap_err(),
             RequeueTakeError::NotFound { entry_id: 99 }
-        );
+        ));
     }
 
     #[test]

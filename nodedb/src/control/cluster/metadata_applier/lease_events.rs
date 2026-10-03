@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Descriptor-drain and CA-trust-change host-side effects.
+//! Descriptor-drain, lease-release, and CA-trust-change host-side effects.
 
 use tracing::debug;
 
-use nodedb_cluster::DescriptorId;
+use nodedb_cluster::{DescriptorId, DrainOwner};
 use nodedb_types::Hlc;
 
 use super::audit::apply_ca_trust_change;
@@ -14,40 +14,60 @@ impl MetadataCommitApplier {
     pub(super) fn apply_drain_start(
         &self,
         descriptor_id: &DescriptorId,
+        owner: &DrainOwner,
         up_to_version: u64,
         expires_at: Hlc,
+        proposer_node_id: u64,
     ) -> Result<(), crate::Error> {
-        if let Some(weak) = self.shared.get()
-            && let Some(shared) = weak.upgrade()
-        {
-            // This exact gate also covers plan admission's drain check,
-            // refcount increment, and first-holder acquire.
-            let _admission_gate = shared
-                .lease_admission_gate
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            shared
-                .lease_drain
-                .install_start(descriptor_id.clone(), up_to_version, expires_at);
-            debug!(
-                descriptor = ?descriptor_id,
-                up_to_version,
-                "drain_start applied to host tracker"
-            );
-        }
+        let shared = self.shared_state()?;
+        crate::control::lease::apply_drain_start(
+            &shared,
+            descriptor_id,
+            owner,
+            up_to_version,
+            expires_at,
+            proposer_node_id,
+        )?;
+        debug!(
+            descriptor = ?descriptor_id,
+            up_to_version,
+            "drain_start applied to host tracker"
+        );
         Ok(())
     }
 
-    pub(super) fn apply_drain_end(&self, descriptor_id: &DescriptorId) -> Result<(), crate::Error> {
-        if let Some(weak) = self.shared.get()
-            && let Some(shared) = weak.upgrade()
-        {
-            shared.lease_drain.install_end(descriptor_id);
-            debug!(
-                descriptor = ?descriptor_id,
-                "drain_end applied to host tracker"
-            );
-        }
+    /// A release of this node's lease ends the statements still running
+    /// under it: other nodes now treat the lease as gone.
+    pub(super) fn apply_lease_release(
+        &self,
+        node_id: u64,
+        descriptor_ids: &[DescriptorId],
+    ) -> Result<(), crate::Error> {
+        let shared = self.shared_state()?;
+        self.credentials
+            .catalog()
+            .remove_descriptor_leases(node_id, descriptor_ids)?;
+        crate::control::lease::revoke_on_release(&shared, node_id, descriptor_ids);
+        // A drain waiting on one of these leases counts again now.
+        shared.lease_drain.wake_drain_waiters();
+        Ok(())
+    }
+
+    pub(super) fn apply_drain_end(
+        &self,
+        descriptor_id: &DescriptorId,
+        owner: &DrainOwner,
+    ) -> Result<(), crate::Error> {
+        let shared = self.shared_state()?;
+        crate::control::lease::apply_drain_ends(
+            &shared,
+            &[(descriptor_id.clone(), owner.clone())],
+        )?;
+        debug!(
+            descriptor = ?descriptor_id,
+            ?owner,
+            "drain_end applied to host tracker"
+        );
         Ok(())
     }
 
@@ -57,11 +77,7 @@ impl MetadataCommitApplier {
         remove_ca_fingerprint: Option<&[u8; 32]>,
         raft_index: u64,
     ) -> Result<(), crate::Error> {
-        if let Some(weak) = self.shared.get()
-            && let Some(shared) = weak.upgrade()
-        {
-            apply_ca_trust_change(&shared, add_ca_cert, remove_ca_fingerprint, raft_index);
-        }
-        Ok(())
+        let shared = self.shared_state()?;
+        apply_ca_trust_change(&shared, add_ca_cert, remove_ca_fingerprint, raft_index)
     }
 }

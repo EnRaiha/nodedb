@@ -3,9 +3,8 @@
 //! Intra-transaction visibility for sequences.
 //!
 //! `CREATE SEQUENCE` is buffered like any other DDL, but the shared
-//! `SequenceRegistry` only gains the entry at COMMIT (`post_apply` runs only
-//! for `ProposeOutcome::needs_local_apply()`, which a buffered outcome never
-//! satisfies). This codebase has no SQL-level `NEXTVAL(...)` expression —
+//! `SequenceRegistry` only gains the entry at COMMIT (`post_apply` never runs
+//! for a `ProposeOutcome::Buffered` entry). This codebase has no SQL-level `NEXTVAL(...)` expression —
 //! `SequenceRegistry::nextval` is reached only from the SERIAL-column INSERT
 //! path, which auto-creates its sequence outside the buffered-DDL mechanism
 //! entirely. `ALTER SEQUENCE ... RESTART WITH` is the SQL surface that does

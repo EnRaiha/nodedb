@@ -279,4 +279,71 @@ mod tests {
             "the restored durable LSN is what a failed flush clamps to"
         );
     }
+
+    /// A restart keeps multi-vector membership. The one-vector document
+    /// matters most: without its membership it restores as a single-vector
+    /// row, and `MultiVectorDelete` then leaves it behind.
+    #[test]
+    fn multi_vector_documents_survive_checkpoint_and_restart() {
+        use crate::bridge::envelope::{PhysicalPlan, Status};
+        use crate::data::executor::core_loop::CoreLoop;
+        use nodedb_physical::physical_plan::MetaOp;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let one_vector = Surrogate::new(9);
+        let two_vector = Surrogate::new(5);
+
+        let mut core = open_core_at(dir.path());
+        let mut coll = collection_with_one_vector();
+        let one: [&[f32]; 1] = [&[0.5, 0.5, 0.5, 0.5]];
+        coll.insert_multi_vector(&one, one_vector).unwrap();
+        let two: [&[f32]; 2] = [&[0.9, 0.1, 0.0, 0.0], &[0.0, 0.1, 0.9, 0.0]];
+        coll.insert_multi_vector(&two, two_vector).unwrap();
+        core.vector_collections.insert(collection_key(), coll);
+        core.checkpoint_vector_indexes()
+            .expect("flush must publish");
+        drop(core);
+
+        let mut restored = open_core_at(dir.path());
+        restored
+            .load_vector_checkpoints()
+            .expect("load must succeed");
+        let live = |core: &CoreLoop| {
+            core.vector_collections
+                .get(&collection_key())
+                .map(|c| c.live_count())
+        };
+        assert_eq!(
+            restored
+                .vector_collections
+                .get(&collection_key())
+                .map(|c| c.multi_vector_documents()),
+            Some(vec![two_vector, one_vector]),
+            "both multi-vector documents restore as multi-vector documents"
+        );
+        assert_eq!(live(&restored), Some(4));
+
+        let task = CoreLoop::replay_vector_task(
+            TenantId::new(7),
+            DatabaseId::DEFAULT,
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "docs").vshard(),
+            PhysicalPlan::Meta(MetaOp::WalAppend {
+                payload: Vec::new(),
+            }),
+        );
+        let response = restored.execute_multi_vector_delete(&task, 7, "docs", "emb", one_vector);
+        assert_eq!(response.status, Status::Ok);
+        assert_eq!(
+            live(&restored),
+            Some(3),
+            "the delete removes the one-vector document"
+        );
+        let response = restored.execute_multi_vector_delete(&task, 7, "docs", "emb", two_vector);
+        assert_eq!(response.status, Status::Ok);
+        assert_eq!(
+            live(&restored),
+            Some(1),
+            "the delete removes both vectors and keeps the single-vector row"
+        );
+    }
 }

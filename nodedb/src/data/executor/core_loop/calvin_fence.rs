@@ -11,6 +11,7 @@
 //!   its row, or truncated its collection.
 //! - Every other write, and a committed session transaction's redo, waits
 //!   when a staged transaction writes its collection.
+//! - A CRDT constraint-set install writes no row and never waits.
 //!
 //! When the owner resolves, each waiting write that no other owner fences
 //! runs, in arrival order. A write whose WAL record sits below the redo record
@@ -22,7 +23,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use nodedb_physical::physical_plan::{DocumentOp, KvOp, MetaOp, PhysicalPlan};
+use nodedb_physical::physical_plan::{CrdtOp, DocumentOp, KvOp, MetaOp, PhysicalPlan};
 use nodedb_types::{RowIdentity, TenantId};
 
 use super::CoreLoop;
@@ -108,6 +109,10 @@ fn fence_targets(plan: &PhysicalPlan) -> Option<Vec<FenceTarget>> {
                 .collect(),
         );
     }
+    // A constraint-set install replaces the per-core CRDT validator's set for
+    // its collection, fenced by its own constraint version. It writes no row,
+    // so no flush can overwrite it. Parking it holds its data group's
+    // apply loop, and every later write in that group, behind the flush.
     if matches!(
         plan,
         PhysicalPlan::Meta(
@@ -116,7 +121,7 @@ fn fence_targets(plan: &PhysicalPlan) -> Option<Vec<FenceTarget>> {
                 | MetaOp::CalvinFlush { .. }
                 | MetaOp::CalvinDrop { .. }
                 | MetaOp::CalvinResolve { .. }
-        )
+        ) | PhysicalPlan::Crdt(CrdtOp::SetConstraints { .. } | CrdtOp::DropConstraints { .. })
     ) || !plan_is_write(plan)
     {
         return None;
@@ -132,8 +137,14 @@ fn fence_targets(plan: &PhysicalPlan) -> Option<Vec<FenceTarget>> {
                 collection,
                 surrogate,
                 ..
-            }
-            | DocumentOp::PointUpdate {
+            },
+        ) => vec![FenceTarget::Surrogate(
+            collection.as_str().to_string(),
+            surrogate.as_u32(),
+        )],
+        // A key unbound in this database names no row to fence.
+        PhysicalPlan::Document(
+            DocumentOp::PointUpdate {
                 collection,
                 surrogate,
                 ..
@@ -143,10 +154,10 @@ fn fence_targets(plan: &PhysicalPlan) -> Option<Vec<FenceTarget>> {
                 surrogate,
                 ..
             },
-        ) => vec![FenceTarget::Surrogate(
-            collection.as_str().to_string(),
-            surrogate.as_u32(),
-        )],
+        ) => surrogate
+            .iter()
+            .map(|s| FenceTarget::Surrogate(collection.as_str().to_string(), s.as_u32()))
+            .collect(),
         PhysicalPlan::Kv(
             KvOp::Put {
                 collection, key, ..
@@ -327,6 +338,7 @@ impl CoreLoop {
         let parked = std::mem::take(&mut self.calvin.fence.parked);
         for write in parked {
             if now > write.task.request.deadline {
+                self.drop_journal_group(write.task.request_id().as_u64());
                 let response = self.response_error(
                     &write.task,
                     ErrorCode::RetryableRefusal {

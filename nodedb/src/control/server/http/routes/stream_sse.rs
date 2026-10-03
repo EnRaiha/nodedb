@@ -6,7 +6,7 @@
 //!
 //! Pushes events as Server-Sent Events in real-time. On each poll cycle,
 //! reads new events from the buffer since the consumer group's committed
-//! offset. The consumer should COMMIT OFFSET via SQL to advance the cursor.
+//! offset. The consumer must COMMIT OFFSET via SQL to advance the cursor.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -193,7 +193,7 @@ pub async fn stream_events(
                 limit: 100,
             };
 
-            let mut result = match consume_stream(&state.shared, &consume_params) {
+            let mut result = match consume_stream(&state.shared, &consume_params).await {
                 Ok(r) => r,
                 Err(ConsumeError::RemotePartition { leader_node, .. }) => {
                     match crate::event::cdc::consume::consume_remote(
@@ -204,6 +204,12 @@ pub async fn stream_events(
                     .await
                     {
                         Ok(r) => r,
+                        Err(e @ ConsumeError::OffsetOutOfRange { .. }) => {
+                            yield Ok(Event::default()
+                                .event("reset_required")
+                                .data(e.to_string()));
+                            return;
+                        }
                         Err(e) => {
                             yield Ok(Event::default()
                                 .event("error")
@@ -211,6 +217,12 @@ pub async fn stream_events(
                             return;
                         }
                     }
+                }
+                Err(e @ ConsumeError::OffsetOutOfRange { .. }) => {
+                    yield Ok(Event::default()
+                        .event("reset_required")
+                        .data(e.to_string()));
+                    return;
                 }
                 Err(ConsumeError::BufferEmpty(_)) => {
                     // No events yet — wait and retry.

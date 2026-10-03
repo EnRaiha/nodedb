@@ -9,7 +9,7 @@
 //! runs, since nearly every collection drives no binding. The Data-Plane
 //! leader then re-verifies the join-key set against the rows it actually
 //! matched, returning `OllpRetryRequired` before writing on any drift — a
-//! silent divergence would leave a stored total that disagrees with
+//! silent divergence will leave a stored total that disagrees with
 //! `SUM(...)` over the source rows.
 
 use std::sync::Arc;
@@ -97,7 +97,7 @@ pub(super) async fn resolve_predicate_sum_targets(
     )
     .await?;
 
-    // Folded from the SAME scan the resolution came from: a second scan would
+    // Folded from the SAME scan the resolution came from: a second scan will
     // see a different snapshot, and two snapshots is two totals.
     let images = predicate_images(&scope, &read.rows)?;
     let input = SettleInput {
@@ -108,6 +108,7 @@ pub(super) async fn resolve_predicate_sum_targets(
         // that JOINS the match set after the scan has to invalidate it too.
         source_row: None,
         read_version_lsn: read.read_version_lsn,
+        served_by: read.served_by,
     };
     let settlement =
         settle_cross_shard_images(&bindings, &input, &resolved, txn_id, tenant_id, database_id)?;
@@ -175,7 +176,7 @@ async fn resolve_scanned_rows(
 /// by predicate. `UpdateFromJoin` is deliberately absent: which target rows it
 /// matches depends on the SOURCE collection's rows, which are only shipped by
 /// its Control-Plane orchestrator — so it resolves there, from the RESOLVE
-/// pass's own classification, rather than from a predicate-only scan that would
+/// pass's own classification, rather than from a predicate-only scan that will
 /// over-approximate the match set.
 fn predicate_scope(op: &DocumentOp) -> Option<PredicateScope> {
     match op {

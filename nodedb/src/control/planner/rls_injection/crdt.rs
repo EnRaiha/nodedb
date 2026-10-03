@@ -33,8 +33,8 @@ pub(super) fn inject_crdt(ctx: &RlsCtx<'_>, op: &mut CrdtOp) -> crate::Result<()
     match op {
         // Refuse: all four return stored row content — the current state, a
         // historical state, the oplog deltas those states were built from, or
-        // the state a delta would produce — and none has a slot the policy
-        // could occupy.
+        // the state a delta will produce — and none has a slot the policy
+        // can occupy.
         CrdtOp::Read { collection, .. }
         | CrdtOp::ReadAtVersion { collection, .. }
         | CrdtOp::ExportDelta { collection, .. }
@@ -144,7 +144,7 @@ mod tests {
                 "notes",
             ),
             document_id: "d1".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: Some(nodedb_types::Surrogate::new(1)),
             returning: None,
             rls_filters: Vec::new(),
         });
@@ -172,7 +172,7 @@ mod tests {
             ),
             document_id: "d1".into(),
             fields_json: "{}".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             partial: false,
             verb: nodedb_physical::physical_plan::CrdtWriteVerb::Insert,
             returning: None,

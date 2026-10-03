@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Phase 2 validation gate tests.
+//! Cross-engine validation tests.
 //!
-//! These verify end-to-end correctness across all engines and ensure
-//! the system is ready to move from Phase 2 to Phase 3.
+//! These verify end-to-end correctness across all engines.
 
 use nodedb::bridge::dispatch::BridgeRequest;
 use nodedb::bridge::envelope::Status;
@@ -40,7 +39,7 @@ fn cross_model_query_vector_graph_relational() {
                     "citations": i * 10,
                 }))
                 .unwrap(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: doc_surrogate(&format!("p{i}")),
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
@@ -61,7 +60,7 @@ fn cross_model_query_vector_graph_relational() {
                 vector: vec![i as f32, (i as f32).sin(), (i as f32).cos()],
                 dim: 3,
                 field_name: String::new(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: doc_surrogate(&format!("p{i}")),
                 pk_bytes: None,
                 provenance: None,
             }),
@@ -88,8 +87,8 @@ fn cross_model_query_vector_graph_relational() {
                 label: "CITES".into(),
                 dst_id: format!("p{}", i + 1),
                 properties: vec![],
-                src_surrogate: nodedb_types::Surrogate::ZERO,
-                dst_surrogate: nodedb_types::Surrogate::ZERO,
+                src_surrogate: doc_surrogate(&format!("p{i}")),
+                dst_surrogate: doc_surrogate(&format!("p{}", i + 1)),
             }),
         );
     }
@@ -206,6 +205,7 @@ fn cross_model_query_vector_graph_relational() {
             options: Default::default(),
             bm25_query: None,
             bm25_field: None,
+            stage: nodedb_physical::physical_plan::RagStage::Local,
         }),
     );
     let rag_body = payload_value(&rag_payload);
@@ -244,7 +244,7 @@ fn rrf_fusion_mathematically_correct() {
                     "body": format!("document about database systems topic {i}"),
                 }))
                 .unwrap(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: doc_surrogate(&format!("d{i}")),
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
@@ -265,7 +265,7 @@ fn rrf_fusion_mathematically_correct() {
                 vector: vec![i as f32, 0.0, 0.0],
                 dim: 3,
                 field_name: String::new(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: doc_surrogate(&format!("d{i}")),
                 pk_bytes: None,
                 provenance: None,
             }),
@@ -426,7 +426,7 @@ fn document_indexes_consistent_after_simulated_crash() {
                 "articles",
             ),
             document_id: "a1".into(),
-            surrogate: nodedb_types::Surrogate::new(1),
+            surrogate: Some(nodedb_types::Surrogate::new(1)),
             pk_bytes: b"a1".to_vec(),
             returning: None,
             rls_filters: Vec::new(),
@@ -495,7 +495,7 @@ fn document_indexes_consistent_after_simulated_crash() {
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
-            surrogate: nodedb_types::Surrogate::new(1),
+            surrogate: Some(nodedb_types::Surrogate::new(1)),
             pk_bytes: b"a1".to_vec(),
         }),
     );
@@ -514,7 +514,7 @@ fn document_indexes_consistent_after_simulated_crash() {
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
-            surrogate: nodedb_types::Surrogate::new(2),
+            surrogate: Some(nodedb_types::Surrogate::new(2)),
             pk_bytes: b"a2".to_vec(),
         }),
     );

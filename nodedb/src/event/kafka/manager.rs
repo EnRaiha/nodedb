@@ -2,12 +2,13 @@
 
 //! Kafka producer lifecycle manager.
 //!
-//! Tracks running Kafka producer tasks per stream. Starts producers on
-//! `CREATE CHANGE STREAM ... WITH (DELIVERY = 'kafka')`, stops them on
-//! `DROP CHANGE STREAM`.
+//! Tracks running Kafka producer tasks per stream. Every node runs a
+//! producer for every registered change stream with Kafka delivery: a
+//! reconciler matches the producers to the stream registry once per second.
+//! Only the lease holder of the stream's owning group publishes; see
+//! [`crate::event::cdc::sink_owner`].
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -15,41 +16,82 @@ use tracing::{debug, info};
 
 use super::config::KafkaDeliveryConfig;
 use crate::control::state::SharedState;
+use crate::event::sink_tasks::{SinkTaskKey as TaskKey, SinkTasks};
 use crate::types::DatabaseId;
-
-type TaskKey = (DatabaseId, u64, String);
-
-struct ManagerState {
-    tasks: HashMap<TaskKey, tokio::task::JoinHandle<()>>,
-    draining: bool,
-}
 
 /// Manages Kafka producer tasks for change streams.
 pub struct KafkaManager {
     /// Producer handles and admission state are locked together so shutdown
     /// cannot race a task admitted by `start`.
-    state: Mutex<ManagerState>,
+    state: Mutex<SinkTasks>,
     /// Shutdown signal receiver (cloned per task).
     shutdown_rx: watch::Receiver<bool>,
-    /// Shared state (set once after SharedState construction).
-    shared_state: OnceLock<Arc<SharedState>>,
+    /// Back-reference to the `SharedState` that owns this manager, set once
+    /// after construction. It is `Weak`: a strong one forms a cycle that
+    /// keeps `SharedState`, its redb files, and its QUIC endpoint alive after
+    /// shutdown.
+    shared_state: OnceLock<Weak<SharedState>>,
 }
 
 impl KafkaManager {
     pub fn new(shutdown_rx: watch::Receiver<bool>) -> Self {
         Self {
-            state: Mutex::new(ManagerState {
-                tasks: HashMap::new(),
-                draining: false,
-            }),
+            state: Mutex::new(SinkTasks::default()),
             shutdown_rx,
             shared_state: OnceLock::new(),
         }
     }
 
-    /// Set the shared state reference (called once during startup).
-    pub fn set_state(&self, state: Arc<SharedState>) {
-        let _ = self.shared_state.set(state);
+    /// Set the shared state reference (called once during startup), and
+    /// start the reconciler.
+    pub fn set_state(&self, state: &Arc<SharedState>) {
+        if self.shared_state.set(Arc::downgrade(state)).is_err() {
+            return;
+        }
+        crate::event::webhook::manager::spawn_reconciler(state, |state| {
+            state.kafka_manager.reconcile()
+        });
+    }
+
+    /// Start a producer for every registered stream with Kafka delivery, and
+    /// stop the producer of every stream no longer registered.
+    pub fn reconcile(&self) {
+        let Some(state) = self.shared_state.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let streams: Vec<_> = state
+            .stream_registry
+            .list_all()
+            .into_iter()
+            .filter(|def| def.kafka.enabled)
+            .collect();
+        let registered: std::collections::HashSet<TaskKey> = streams
+            .iter()
+            .map(|def| (def.database_id, def.tenant_id, def.name.clone()))
+            .collect();
+        let stale: Vec<TaskKey> = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .tasks
+            .keys()
+            .filter(|key| !registered.contains(*key))
+            .cloned()
+            .collect();
+        for (database_id, tenant_id, name) in stale {
+            self.stop(database_id, tenant_id, &name);
+        }
+        for def in streams {
+            let running = self
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .tasks
+                .contains_key(&(def.database_id, def.tenant_id, def.name.clone()));
+            if !running {
+                self.start(def.database_id, def.tenant_id, &def.name, def.kafka.clone());
+            }
+        }
     }
 
     /// Start a Kafka producer for a change stream.
@@ -73,10 +115,10 @@ impl KafkaManager {
                 return false;
             }
         }
-        let shared_state = match self.shared_state.get() {
-            Some(state) => Arc::clone(state),
+        let shared_state = match self.shared_state.get().and_then(Weak::upgrade) {
+            Some(state) => state,
             None => {
-                tracing::warn!("Kafka manager: state not set, cannot start producer");
+                tracing::warn!("Kafka manager: state not set or dropped, cannot start producer");
                 return false;
             }
         };
@@ -120,27 +162,10 @@ impl KafkaManager {
         }
     }
 
-    /// Stop admitting producers, then join those already admitted.
-    ///
-    /// Tasks are allowed to finish naturally through `deadline`; only then are
-    /// remaining handles aborted and joined. The handle map is drained before
-    /// any await, avoiding both a std mutex across await and double ownership.
+    /// Stop admitting producers, then join those already admitted. See
+    /// [`crate::event::sink_tasks::shutdown_and_join`].
     pub async fn shutdown_and_join(&self, deadline: Duration) {
-        let tasks = {
-            let mut manager = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            manager.draining = true;
-            std::mem::take(&mut manager.tasks)
-        };
-        let deadline_at = tokio::time::Instant::now() + deadline;
-        for (_, mut handle) in tasks {
-            if tokio::time::timeout_at(deadline_at, &mut handle)
-                .await
-                .is_err()
-            {
-                handle.abort();
-                let _ = handle.await;
-            }
-        }
+        crate::event::sink_tasks::shutdown_and_join(&self.state, deadline).await;
         debug!("Kafka manager producer tasks drained");
     }
 

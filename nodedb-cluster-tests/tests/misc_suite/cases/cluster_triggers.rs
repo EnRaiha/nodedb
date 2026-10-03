@@ -44,7 +44,7 @@ fn async_trigger_not_in_raft_log() {
         collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
         document_id: "doc-1".into(),
         value: b"{}".to_vec(),
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_types::Surrogate::new(1),
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
@@ -63,9 +63,12 @@ fn async_trigger_not_in_raft_log() {
     assert!(entry.is_some());
 
     // The entry serializes to bytes that can be deserialized back.
-    let bytes = entry.unwrap().to_bytes();
+    let bytes = entry
+        .expect("a PointPut has a replicated encoding")
+        .encode()
+        .expect("encode replicated entry bytes");
     let (tid, vsid, restored, _resolved_now_ms) =
-        nodedb::control::wal_replication::from_replicated_entry(&bytes, None)
+        nodedb::control::wal_replication::decode_replicated_entry(&bytes)
             .unwrap()
             .unwrap();
     assert_eq!(tid, TenantId::new(1));
@@ -92,6 +95,7 @@ fn cross_shard_request_carries_cascade_depth() {
         target_vshard: 1,
         source_lsn: 100,
         source_sequence: 1,
+        origin: String::new(),
         cascade_depth: 3,
         source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders").to_string(),
     };
@@ -111,6 +115,7 @@ fn cross_shard_request_serialization_roundtrip() {
         target_vshard: 2,
         source_lsn: 500,
         source_sequence: 42,
+        origin: String::new(),
         cascade_depth: 1,
         source_collection: "articles".into(),
     };
@@ -193,6 +198,11 @@ fn event_source_preserved_through_write_event() {
         valid_time_ms: None,
         user_id: None,
         statement_digest: None,
+        // The write committed now, so the event stays in age retention.
+        commit_hlc: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok()),
     };
     // After leader failover, new leader's Event Plane replays from WAL.
     // The replayed events have source: User → triggers fire.
@@ -208,7 +218,7 @@ fn replicated_entry_roundtrip_point_delete() {
     let plan = PhysicalPlan::Document(DocumentOp::PointDelete {
         collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
         document_id: "doc-99".into(),
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: Some(nodedb_types::Surrogate::new(99)),
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),
@@ -223,8 +233,8 @@ fn replicated_entry_roundtrip_point_delete() {
     )
     .expect("encode replicated entry")
     .expect("a write plan encodes to an entry");
-    let bytes = entry.to_bytes();
-    let (_, _, restored, _) = nodedb::control::wal_replication::from_replicated_entry(&bytes, None)
+    let bytes = entry.encode().expect("encode the replicated entry");
+    let (_, _, restored, _) = nodedb::control::wal_replication::decode_replicated_entry(&bytes)
         .unwrap()
         .unwrap();
     assert!(matches!(
@@ -242,7 +252,7 @@ fn read_ops_not_replicated() {
         rls_filters: vec![],
         system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: None,
         pk_bytes: Vec::new(),
     });
     let entry = encode_entry(
@@ -268,7 +278,7 @@ fn procedure_dml_is_normal_write() {
         collection: QualifiedCollection::new(DatabaseId::DEFAULT, "archive"),
         document_id: "a-1".into(),
         value: b"{}".to_vec(),
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_types::Surrogate::new(1),
         pk_bytes: Vec::new(),
         returning: None,
         rls_filters: Vec::new(),

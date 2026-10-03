@@ -58,6 +58,12 @@ pub struct AppendEntriesRequest {
     pub leader_commit: u64,
     /// Raft group ID for Multi-Raft routing.
     pub group_id: u64,
+    /// Leader-lease round this request belongs to. The follower echoes it so
+    /// the leader can anchor its lease at the round's send time.
+    pub round: u64,
+    /// The highest log index every voter's log is known to hold (see
+    /// `RaftNode::replicated_floor`). The follower keeps the highest value.
+    pub replicated_floor: u64,
 }
 
 #[derive(
@@ -76,9 +82,16 @@ pub struct AppendEntriesResponse {
     pub term: u64,
     /// True if follower contained entry matching prev_log_index and prev_log_term.
     pub success: bool,
-    /// Optimization: on rejection, the follower's last log index.
-    /// Allows leader to skip back faster than decrementing one-by-one.
+    /// On success, the last entry the follower shares with the leader and
+    /// holds durably. The leader takes it as the follower's match index.
+    /// On rejection, the follower's last log index, so the leader skips back
+    /// faster than one entry at a time.
     pub last_log_index: u64,
+    /// `round` of the request this answers.
+    pub round: u64,
+    /// Set on a rejection from a follower that holds no state it can resume
+    /// the log from. The leader sends it a snapshot instead of entries.
+    pub needs_snapshot: bool,
 }
 
 /// RequestVote RPC (Raft paper Figure 2).
@@ -104,6 +117,10 @@ pub struct RequestVoteRequest {
     pub last_log_term: u64,
     /// Raft group ID for Multi-Raft routing.
     pub group_id: u64,
+    /// Set by a campaign that a `TimeoutNow` started. Only such a campaign
+    /// may win a vote from a node that still hears a live leader: the leader
+    /// asked for its own replacement and stopped serving lease reads first.
+    pub transfer: bool,
 }
 
 #[derive(
@@ -235,6 +252,18 @@ pub struct InstallSnapshotRequest {
     #[serde(default)]
     #[msgpack(default)]
     pub total_size: u64,
+    /// The group's voters as the leader holds them when it sends the final
+    /// chunk, the leader included. A snapshot covers the conf changes of its
+    /// range, and the receiver never applies them, so it takes the
+    /// membership from here. Empty on every other chunk.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub voters: Vec<u64>,
+    /// The group's learners as the leader holds them when it sends the final
+    /// chunk. Empty on every other chunk.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub learners: Vec<u64>,
 }
 
 #[derive(
@@ -279,6 +308,8 @@ mod tests {
             entries: vec![],
             leader_commit: 8,
             group_id: 0,
+            round: 1,
+            replicated_floor: 0,
         };
         assert!(req.entries.is_empty());
     }
@@ -318,10 +349,12 @@ mod tests {
             last_log_index: 100,
             last_log_term: 6,
             group_id: 5,
+            transfer: true,
         };
         let json = sonic_rs::to_string(&req).unwrap();
         let decoded: RequestVoteRequest = sonic_rs::from_str(&json).unwrap();
         assert_eq!(req.term, decoded.term);
         assert_eq!(req.candidate_id, decoded.candidate_id);
+        assert!(decoded.transfer);
     }
 }

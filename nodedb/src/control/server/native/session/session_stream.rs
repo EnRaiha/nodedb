@@ -81,7 +81,7 @@ pub(super) async fn emit_sql_stream(
         stream: mut rows_stream,
         projection,
         redaction,
-        lease_scope: _lease_scope,
+        lease_scope,
     } = sql_stream;
 
     let mut emitted: usize = 0;
@@ -89,7 +89,17 @@ pub(super) async fn emit_sql_stream(
     let mut last_lsn: u64 = 0;
 
     while emitted < limit {
-        let batch = match rows_stream.next().await {
+        // A lease this node loses mid-stream ends the stream with a
+        // retryable error rather than more rows from a stale descriptor.
+        let next = match &lease_scope {
+            Some(scope) => scope.guard(rows_stream.next()).await,
+            None => Ok(rows_stream.next().await),
+        };
+        let next = match next {
+            Ok(next) => next,
+            Err(revoked) => Some(Err(revoked)),
+        };
+        let batch = match next {
             None => break,
             Some(Ok(b)) => b,
             Some(Err(e)) => {
@@ -157,7 +167,9 @@ pub(super) async fn emit_sql_stream(
         watermark_lsn: last_lsn,
         error: None,
         auth: None,
-        warnings: Vec::new(),
+        // Notices raised below the response shaper while the stream ran
+        // (`session::statement_notice`).
+        warnings: crate::control::server::shared::session::statement_notice::take(),
     };
     let bytes = codec::encode_response(&terminal, format)?;
     codec::write_frame(stream, &bytes).await?;

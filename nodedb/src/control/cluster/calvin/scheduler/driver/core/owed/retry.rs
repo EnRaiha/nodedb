@@ -30,7 +30,8 @@ impl Scheduler {
         proposal: SchedulerProposal,
     ) {
         let kind = proposal.kind();
-        let bytes = match zerompk::to_msgpack_vec(&proposal.entry(txn_id, self.vshard_id)) {
+        let entry = proposal.entry(txn_id, self.vshard_id, self.shared.node_id);
+        let bytes = match zerompk::to_msgpack_vec(&entry) {
             Ok(bytes) => bytes,
             Err(e) => {
                 error!(
@@ -45,13 +46,14 @@ impl Scheduler {
             }
         };
         let entry_seen = self.participant_progress(txn_id).is_some();
-        let in_flight = propose_owed(
-            self.sequencer_proposer.as_ref(),
-            self.vshard_id,
-            txn_id,
-            kind,
-            bytes.clone(),
-        );
+        let in_flight = self.may_propose(kind)
+            && propose_owed(
+                self.sequencer_proposer.as_ref(),
+                self.vshard_id,
+                txn_id,
+                kind,
+                bytes.clone(),
+            );
         self.owed.insert(
             (txn_id, kind),
             OwedEntry {
@@ -70,6 +72,7 @@ impl Scheduler {
     pub(in crate::control::cluster::calvin::scheduler::driver::core) fn retry_owed_sequencer_entries(
         &mut self,
     ) {
+        let leads = self.is_group_leader();
         let registry = &self.registry;
         let vshard_id = self.vshard_id;
         self.owed.retain(|(txn_id, kind), owed| {
@@ -79,6 +82,10 @@ impl Scheduler {
         });
 
         for ((txn_id, kind), owed) in self.owed.iter_mut() {
+            if kind.leader_only() && !leads {
+                // Stays owed: this replica proposes it if it comes to lead.
+                continue;
+            }
             if owed.in_flight {
                 owed.in_flight = false;
                 continue;
@@ -93,6 +100,18 @@ impl Scheduler {
                 owed.bytes.clone(),
             );
         }
+    }
+
+    /// Whether this scheduler can propose an entry of `kind` now.
+    ///
+    /// A vote and a `CompletionAck` answer for the vShard on every node: the
+    /// first one the sequencer log holds counts. So only the vShard's
+    /// data-group leader proposes them. A node that left the group leads none
+    /// of it, so an entry from its stale state never enters the log. Every
+    /// other replica keeps the entry owed and proposes it if it comes to lead
+    /// before one applies. Which entry counts then depends on the log alone.
+    fn may_propose(&self, kind: OwedKind) -> bool {
+        !kind.leader_only() || self.is_group_leader()
     }
 
     /// The registry's view of `txn_id` for this scheduler's vShard.
@@ -184,7 +203,6 @@ mod tests {
                 epoch: 20,
                 position: 1,
                 vshard: VSHARD,
-                commit: true,
             }]
         );
 
@@ -229,6 +247,8 @@ mod tests {
         );
         let proposer = CapturingProposer::failing_first(1);
         scheduler.sequencer_proposer = proposer.clone();
+        // Only the vShard's group leader proposes the ack.
+        elect_data_group_leader(&scheduler);
         scheduler.registry.seed_expected(cluster_txn_id(txn_id), 2);
 
         scheduler
@@ -244,6 +264,8 @@ mod tests {
                 epoch: 21,
                 position: 0,
                 vshard_id: VSHARD,
+                result: Vec::new(),
+                from_node: scheduler.shared.node_id,
             }]
         );
         scheduler.retry_owed_sequencer_entries();
@@ -274,12 +296,16 @@ mod tests {
         let (mut scheduler, _dir) = build_test_scheduler(VSHARD);
         let proposer = CapturingProposer::failing_first(1);
         scheduler.sequencer_proposer = proposer.clone();
+        elect_data_group_leader(&scheduler);
         let txn_id = TxnId::new(22, 0);
         let _outcome = scheduler
             .registry
             .register_completion(cluster_txn_id(txn_id), 1);
 
-        scheduler.propose_sequencer_entry(txn_id, SchedulerProposal::CompletionAck);
+        scheduler.propose_sequencer_entry(
+            txn_id,
+            SchedulerProposal::CompletionAck { result: Vec::new() },
+        );
         scheduler
             .registry
             .note_completion_ack(cluster_txn_id(txn_id), VSHARD);
@@ -288,6 +314,59 @@ mod tests {
         scheduler.retry_owed_sequencer_entries();
         assert_eq!(proposer.attempt_count(), 1);
         assert!(scheduler.owed.is_empty());
+    }
+
+    /// A replica that does not lead the vShard's group proposes no ack. It
+    /// keeps the ack owed, so it proposes it if it comes to lead first.
+    #[tokio::test]
+    async fn a_replica_that_does_not_lead_proposes_no_ack() {
+        let (mut scheduler, _dir) = build_test_scheduler(VSHARD);
+        let proposer = CapturingProposer::accepting();
+        scheduler.sequencer_proposer = proposer.clone();
+        let txn_id = TxnId::new(25, 0);
+
+        scheduler.propose_sequencer_entry(
+            txn_id,
+            SchedulerProposal::CompletionAck { result: Vec::new() },
+        );
+        scheduler.retry_owed_sequencer_entries();
+        assert_eq!(proposer.attempt_count(), 0);
+        assert_eq!(scheduler.owed.len(), 1);
+
+        elect_data_group_leader(&scheduler);
+        scheduler.retry_owed_sequencer_entries();
+        assert_eq!(proposer.attempt_count(), 1);
+    }
+
+    /// A follower that staged a txn owes an abort vote. It proposes the vote
+    /// only once it leads the vShard's group and no vote has applied, so the
+    /// txn ends in a retryable abort instead of waiting on a lost leader.
+    #[tokio::test]
+    async fn a_follower_that_comes_to_lead_votes_abort_for_its_staged_txn() {
+        let (mut scheduler, _dir) = build_test_scheduler(VSHARD);
+        let proposer = CapturingProposer::accepting();
+        scheduler.sequencer_proposer = proposer.clone();
+        let txn_id = TxnId::new(26, 0);
+        scheduler.registry.seed_expected(cluster_txn_id(txn_id), 2);
+        scheduler
+            .pending
+            .insert(txn_id, staged_pending(make_sequenced_txn(26, 0), txn_id));
+
+        scheduler.resolve_staged_commit(txn_id, &staged_response(Status::Ok, Some(true)));
+        scheduler.retry_owed_sequencer_entries();
+        assert_eq!(proposer.attempt_count(), 0, "a follower casts no vote");
+
+        elect_data_group_leader(&scheduler);
+        scheduler.retry_owed_sequencer_entries();
+        assert_eq!(
+            proposer.accepted(),
+            vec![SequencerEntry::AbortVote {
+                epoch: 26,
+                position: 0,
+                vshard: VSHARD,
+                reason: nodedb_cluster::calvin::AbortReason::SerializationConflict,
+            }]
+        );
     }
 
     /// A txn this node never seeded keeps its entry owed: a missing registry

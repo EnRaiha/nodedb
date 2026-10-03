@@ -2,15 +2,34 @@
 
 //! Lossless CDC positions.
 //!
-//! A WAL LSN alone is not a consumer cursor: one transaction can emit several
-//! redo events at the same LSN, and durable topics can publish several messages
-//! in one millisecond. `CdcOffset` therefore orders the event LSN and its
-//! per-stream sequence lexicographically.
+//! A position is `(epoch, index, sequence)`, ordered lexicographically within
+//! one partition.
+//!
+//! - `epoch` counts the partition's moves between data groups. Each data group
+//!   numbers its own log, so a move restarts the index; the epoch rises with
+//!   it, so positions never go backwards. A committed `ReassignVShard`
+//!   metadata entry is the one event that raises it. No path proposes one, so
+//!   every position has epoch `0`.
+//! - `index` names the write that produced the event. In a cluster it is the
+//!   Raft log index of the data-group entry, or the Calvin sequencer epoch of a
+//!   Calvin transaction. On a single node it is the WAL LSN of the write's
+//!   record. On a durable topic it is the message's log position.
+//! - `sequence` orders the events of one write. Its low 32 bits carry
+//!   `2 × ordinal` for a data event and `2 × ordinal + 1` for that event's
+//!   late-data correction. Its high 32 bits carry the Calvin transaction's
+//!   position within its sequencer epoch, `0` for every other write.
+//!
+//! Every replica applies a write at the same position, so a cursor from one
+//! node is valid on every node.
 
 use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+
+/// Bits of `sequence` that carry the ordinal and correction flag.
+const ORDINAL_BITS: u32 = 32;
+const ORDINAL_MASK: u64 = (1 << ORDINAL_BITS) - 1;
 
 /// A lossless position in a CDC stream partition.
 #[derive(
@@ -30,44 +49,92 @@ use serde::{Deserialize, Serialize};
 )]
 #[msgpack(map)]
 pub struct CdcOffset {
-    /// WAL LSN, or the millisecond timestamp used by durable topics.
-    pub lsn: u64,
-    /// Event sequence that disambiguates positions sharing an LSN.
+    /// Moves of the partition between data groups. See the module docs.
+    pub epoch: u64,
+    /// Position of the write that produced the event.
+    pub index: u64,
+    /// Event sequence that orders the events of one write.
     pub sequence: u64,
 }
 
 impl From<u64> for CdcOffset {
-    /// Bare programmatic LSN values retain the SQL legacy meaning: acknowledge
-    /// every event at that LSN.
-    fn from(lsn: u64) -> Self {
-        Self::legacy_lsn(lsn)
+    /// A bare index acknowledges every event of that write, in epoch 0.
+    fn from(index: u64) -> Self {
+        Self::whole_index(index)
     }
 }
 
 impl PartialEq<u64> for CdcOffset {
-    fn eq(&self, lsn: &u64) -> bool {
-        self.lsn == *lsn && (self.sequence == u64::MAX || (*lsn == 0 && *self == Self::ZERO))
+    /// Equal to the epoch-0 whole-index acknowledgement of `index`, or to
+    /// `ZERO` for `0`.
+    fn eq(&self, index: &u64) -> bool {
+        *self == Self::whole_index(*index) || (*index == 0 && *self == Self::ZERO)
     }
 }
 
 impl CdcOffset {
-    /// The initial cursor before normal CDC positions.
+    /// The initial cursor before every position.
     pub const ZERO: Self = Self {
-        lsn: 0,
+        epoch: 0,
+        index: 0,
         sequence: 0,
     };
 
-    pub const fn new(lsn: u64, sequence: u64) -> Self {
-        Self { lsn, sequence }
+    /// A position in epoch 0.
+    pub const fn new(index: u64, sequence: u64) -> Self {
+        Self::at(0, index, sequence)
     }
 
-    /// Interpret a legacy bare LSN acknowledgement as acknowledgement of the
-    /// complete LSN, including every sibling event.
-    pub const fn legacy_lsn(lsn: u64) -> Self {
+    pub const fn at(epoch: u64, index: u64, sequence: u64) -> Self {
         Self {
-            lsn,
-            sequence: u64::MAX,
+            epoch,
+            index,
+            sequence,
         }
+    }
+
+    /// The position after every event of the epoch-0 write at `index`.
+    pub const fn whole_index(index: u64) -> Self {
+        Self::whole_write(0, index)
+    }
+
+    /// The position after every event of the write at `(epoch, index)`.
+    pub const fn whole_write(epoch: u64, index: u64) -> Self {
+        Self::at(epoch, index, u64::MAX)
+    }
+
+    /// The position of the data event with ordinal `ordinal` (1-based) in the
+    /// write at `(epoch, index)`, whose sequence carries `base` in its high
+    /// bits.
+    pub const fn data_event_in(epoch: u64, index: u64, base: u64, ordinal: u64) -> Self {
+        let low = if ordinal > (ORDINAL_MASK >> 1) {
+            ORDINAL_MASK - 1
+        } else {
+            ordinal * 2
+        };
+        Self::at(epoch, index, (base << ORDINAL_BITS) | low)
+    }
+
+    /// [`Self::data_event_in`] with base `0`.
+    pub const fn data_event(epoch: u64, index: u64, ordinal: u64) -> Self {
+        Self::data_event_in(epoch, index, 0, ordinal)
+    }
+
+    /// The high bits of the sequence: the Calvin position, `0` otherwise.
+    pub const fn base(self) -> u64 {
+        self.sequence >> ORDINAL_BITS
+    }
+
+    /// The ordinal of the data event this position belongs to. A correction
+    /// shares its data event's ordinal.
+    pub const fn ordinal(self) -> u64 {
+        (self.sequence & ORDINAL_MASK) / 2
+    }
+
+    /// The position reserved for the late-data correction of the data event
+    /// at `self`.
+    pub const fn correction(self) -> Self {
+        Self::at(self.epoch, self.index, self.sequence | 1)
     }
 
     /// Canonical text token accepted by `COMMIT OFFSET`.
@@ -78,12 +145,12 @@ impl CdcOffset {
 
 impl fmt::Display for CdcOffset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.lsn, self.sequence)
+        write!(f, "{}:{}:{}", self.epoch, self.index, self.sequence)
     }
 }
 
-/// Error returned when an offset token is neither canonical nor a bare legacy
-/// LSN acknowledgement.
+/// Error returned when an offset token is neither `<epoch>:<index>:<sequence>`
+/// nor `<epoch>:<index>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseCdcOffsetError {
     token: String,
@@ -93,7 +160,7 @@ impl fmt::Display for ParseCdcOffsetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "invalid CDC offset '{}'; expected canonical <lsn>:<sequence> or bare legacy <lsn> (acknowledges the whole LSN)",
+            "invalid CDC offset '{}'; expected <epoch>:<index>:<sequence>, or <epoch>:<index> to acknowledge every event of that write",
             self.token
         )
     }
@@ -108,13 +175,14 @@ impl FromStr for CdcOffset {
         let invalid = || ParseCdcOffsetError {
             token: token.to_string(),
         };
-        match token.split_once(':') {
-            Some((lsn, sequence)) if !lsn.is_empty() && !sequence.is_empty() => Ok(Self::new(
-                lsn.parse().map_err(|_| invalid())?,
-                sequence.parse().map_err(|_| invalid())?,
-            )),
-            Some(_) => Err(invalid()),
-            None => Ok(Self::legacy_lsn(token.parse().map_err(|_| invalid())?)),
+        let number = |part: &str| part.parse::<u64>().map_err(|_| invalid());
+        let parts: Vec<&str> = token.split(':').collect();
+        match parts.as_slice() {
+            [epoch, index, sequence] => {
+                Ok(Self::at(number(epoch)?, number(index)?, number(sequence)?))
+            }
+            [epoch, index] => Ok(Self::whole_write(number(epoch)?, number(index)?)),
+            _ => Err(invalid()),
         }
     }
 }
@@ -124,16 +192,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn offsets_are_lexicographically_ordered() {
+    fn offsets_order_by_epoch_then_index_then_sequence() {
         assert!(CdcOffset::new(10, 2) > CdcOffset::new(10, 1));
         assert!(CdcOffset::new(11, 0) > CdcOffset::new(10, u64::MAX));
+        assert!(CdcOffset::whole_index(10) > CdcOffset::data_event(0, 10, 7));
+        assert!(CdcOffset::whole_index(10) < CdcOffset::data_event(0, 11, 1));
+        // A move to a new data group restarts the index but raises the epoch.
+        assert!(CdcOffset::data_event(1, 3, 1) > CdcOffset::data_event(0, 9_000, 4));
     }
 
     #[test]
-    fn parses_canonical_and_legacy_tokens() {
-        assert_eq!("12:3".parse(), Ok(CdcOffset::new(12, 3)));
-        assert_eq!("12".parse(), Ok(CdcOffset::legacy_lsn(12)));
-        let error = "12:bad".parse::<CdcOffset>().unwrap_err();
-        assert!(error.to_string().contains("bare legacy <lsn>"));
+    fn a_correction_sorts_between_its_event_and_the_next_event() {
+        let first = CdcOffset::data_event(0, 5, 1);
+        let second = CdcOffset::data_event(0, 5, 2);
+        assert!(first < first.correction());
+        assert!(first.correction() < second);
+        assert_eq!(first.correction().ordinal(), first.ordinal());
+        assert_eq!(second.ordinal(), 2);
+    }
+
+    #[test]
+    fn calvin_positions_order_by_transaction_then_ordinal() {
+        let early = CdcOffset::data_event_in(0, 7, 3, 9);
+        let late = CdcOffset::data_event_in(0, 7, 4, 1);
+        assert!(early < late);
+        assert_eq!(late.base(), 4);
+        assert_eq!(late.ordinal(), 1);
+        assert!(early.correction() < late);
+    }
+
+    #[test]
+    fn equal_positions_from_two_replicas_compare_equal() {
+        let leader = CdcOffset::data_event(2, 42, 3);
+        let follower = CdcOffset::data_event(2, 42, 3);
+        assert_eq!(leader, follower);
+        assert_eq!(leader.cmp(&follower), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn parses_canonical_and_whole_write_tokens() {
+        assert_eq!("1:12:3".parse(), Ok(CdcOffset::at(1, 12, 3)));
+        assert_eq!("0:12".parse(), Ok(CdcOffset::whole_index(12)));
+        assert!("12".parse::<CdcOffset>().is_err());
+        let error = "0:12:bad".parse::<CdcOffset>().unwrap_err();
+        assert!(error.to_string().contains("<epoch>:<index>:<sequence>"));
+        assert!(":3".parse::<CdcOffset>().is_err());
+    }
+
+    #[test]
+    fn token_round_trips() {
+        let offset = CdcOffset::at(3, 9, 4);
+        assert_eq!(offset.token().parse(), Ok(offset));
     }
 }

@@ -124,9 +124,11 @@ fn envelope_holds_kv_row(envelope: &[u8], collection: &str, key: &[u8]) -> bool 
         })
         .flat_map(|snapshot| snapshot.kv_tables)
         .filter(|(name, _)| *name == table_key)
-        .filter_map(|(_, rows)| zerompk::from_msgpack::<Vec<(Vec<u8>, Vec<u8>, u64)>>(&rows).ok())
+        .filter_map(|(_, rows)| {
+            zerompk::from_msgpack::<Vec<(Vec<u8>, Vec<u8>, u64, u32)>>(&rows).ok()
+        })
         .flatten()
-        .any(|(row_key, _, _)| row_key.windows(key.len()).any(|window| window == key))
+        .any(|(row_key, _, _, _)| row_key.windows(key.len()).any(|window| window == key))
 }
 
 async fn connect(pg_addr: std::net::SocketAddr) -> tokio_postgres::Client {

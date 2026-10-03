@@ -191,37 +191,6 @@ impl SortedIndexManager {
             .is_some_and(|v| !v.is_empty())
     }
 
-    /// Re-key all sorted indexes from `old_collection` to `new_collection`
-    /// for `tenant_id`.  Used by `MOVE TENANT` to make sorted indexes
-    /// accessible under the target database context.
-    pub fn rename_collection(
-        &mut self,
-        old_database_id: u64,
-        new_database_id: u64,
-        tenant_id: u64,
-        old_collection: &str,
-        new_collection: &str,
-    ) {
-        use super::super::engine_helpers::table_key;
-
-        let old_key = table_key(old_database_id, tenant_id, old_collection);
-        let new_key = table_key(new_database_id, tenant_id, new_collection);
-
-        let Some(index_names) = self.collection_indexes.remove(&old_key) else {
-            return;
-        };
-
-        // Update each index's `def.collection` to the new name so future
-        // writes route correctly.
-        for name in &index_names {
-            if let Some(idx) = self.indexes.get_mut(name) {
-                idx.def.collection = new_collection.to_string();
-            }
-        }
-
-        self.collection_indexes.insert(new_key, index_names);
-    }
-
     // ── Query methods ──────────────────────────────────────────────────
 
     /// Get the 1-based rank of a primary key in a sorted index.

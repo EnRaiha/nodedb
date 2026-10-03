@@ -12,11 +12,11 @@ use crate::control::planner::calvin::{
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 use crate::control::server::shared::session::TransactionState;
+use crate::control::server::shared::txn_route::statement_needs_implicit_txn;
 use crate::control::server::shared::write_admission::all_writes_bufferable;
 use crate::types::TraceId;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-use super::response::data_plane_response_to_native;
 use super::single_task::dispatch_single_task;
 use super::{DispatchCtx, error_to_native, error_to_native_with_sqlstate};
 use crate::control::server::native::sqlstate_code::sqlstate_error;
@@ -65,9 +65,34 @@ pub(crate) async fn handle_direct_op(
         return error_to_native(seq, &e);
     }
 
-    let mut plan = match super::plan_builder::build_plan(ctx, op, fields, &collection) {
+    // A point delete's plan depends on whether the collection is edge-bearing.
+    // The collection's lease is held from before that read until the op's
+    // outcome, so the flag cannot change between the plan and the write: the
+    // flag's catalog write drains every lease on the version the plan read.
+    let _plan_lease = if op == OpCode::PointDelete {
+        match crate::control::server::shared::clone_write::collections_write_lease(
+            ctx.state,
+            tenant_id,
+            ctx.database_id(),
+            std::iter::once(collection.clone()),
+        )
+        .await
+        {
+            Ok(lease) => Some(lease),
+            Err(e) => return error_to_native(seq, &e),
+        }
+    } else {
+        None
+    };
+
+    // A malformed request is a syntax error. Any other error comes from
+    // resolving surrogates at the collection home and keeps its own code.
+    let mut plan = match super::plan_builder::build_plan(ctx, op, fields, &collection).await {
         Ok(p) => p,
-        Err(e) => return error_to_native_with_sqlstate(seq, "42601", &e),
+        Err(e @ crate::Error::BadRequest { .. }) => {
+            return error_to_native_with_sqlstate(seq, "42601", &e);
+        }
+        Err(e) => return error_to_native(seq, &e),
     };
     let vshard_id = ctx.task_vshard(&plan, fields.document_id.as_deref(), &collection);
 
@@ -109,129 +134,25 @@ pub(crate) async fn handle_direct_op(
     }
 
     // False for `dispatch_single_task`, which meters itself — re-metering here
-    // would double-bill a `Staged` dispatch and wrongly bill a `Buffered` one.
+    // will double-bill a `Staged` dispatch and wrongly bill a `Buffered` one.
     let mut needs_top_level_metering = true;
     // Wrapped in an async block so `return` inside each branch exits only this
     // block, letting the metering call below run exactly once regardless of branch.
     let response: NativeResponse = async {
-        // `INSERT ... SELECT` orchestrates on the Control Plane; never reaches the
-        // Data Plane as a single op.
-        if matches!(
-            &plan,
-            PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. })
-        ) {
-            let task = PhysicalTask {
-                tenant_id,
-                vshard_id,
-                database_id: ctx.database_id(),
-                plan: plan.clone(),
-                post_set_op: PostSetOp::None,
-                txn_id: None,
-            };
-            let authorized = match super::sql_gateway::authorize_native_task(ctx, &task) {
-                Ok(authorized) => authorized,
-                Err(error) => return error_to_native(seq, &error),
-            };
-            let _request = ctx.state.tenant_request_guard(tenant_id);
-            let result =
-                crate::control::insert_select::run_authorized_insert_select(ctx.state, authorized)
-                    .await;
-            return match result {
-                Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
-                Err(e) => error_to_native(seq, &e),
-            };
-        }
-
-        // Autocommit `MERGE` orchestrates on the Control Plane; never reaches the
-        // Data Plane as a single op.
-        if matches!(
-            &plan,
-            PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Merge {
-                resolved_inserts: None,
-                ..
-            })
-        ) {
-            let task = PhysicalTask {
-                tenant_id,
-                vshard_id,
-                database_id: ctx.database_id(),
-                plan: plan.clone(),
-                post_set_op: PostSetOp::None,
-                txn_id: None,
-            };
-            let authorized = match super::sql_gateway::authorize_native_task(ctx, &task) {
-                Ok(authorized) => authorized,
-                Err(error) => return error_to_native(seq, &error),
-            };
-            let _request = ctx.state.tenant_request_guard(tenant_id);
-            let result =
-                crate::control::merge_orchestrator::run_authorized_merge(ctx.state, authorized)
-                    .await;
-            return match result {
-                Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
-                Err(e) => error_to_native(seq, &e),
-            };
-        }
-
-        // Autocommit `UPDATE ... FROM <source>` scans the source on its own core and
-        // ships it into the plan; never reaches the Data Plane as a single op.
-        if matches!(
-            &plan,
-            PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
-                source_rows: None,
-                ..
-            })
-        ) {
-            let task = PhysicalTask {
-                tenant_id,
-                vshard_id,
-                database_id: ctx.database_id(),
-                plan: plan.clone(),
-                post_set_op: PostSetOp::None,
-                txn_id: None,
-            };
-            let authorized = match super::sql_gateway::authorize_native_task(ctx, &task) {
-                Ok(authorized) => authorized,
-                Err(error) => return error_to_native(seq, &error),
-            };
-            let _request = ctx.state.tenant_request_guard(tenant_id);
-            let result =
-                crate::control::update_from_join_orchestrator::run_authorized_update_from_join(
-                    ctx.state, authorized,
-                )
-                .await;
-            return match result {
-                Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
-                Err(e) => error_to_native(seq, &e),
-            };
-        }
-
-        // A governed predicate resolves to a concrete row set before proposing — see
-        // `control::write_resolve`. Local (non-Raft) path skips this.
-        if let Some(resolver) = crate::control::write_resolve::resolver_for_plan(&plan)
-            && ctx.state.async_raft_proposer().is_some()
+        // Plans that orchestrate on the Control Plane never reach the Data
+        // Plane as a single op.
+        if let Some(response) =
+            super::direct_orchestrated::dispatch_orchestrated(ctx, seq, &plan, vshard_id).await
         {
-            let task = PhysicalTask {
-                tenant_id,
-                vshard_id,
-                database_id: ctx.database_id(),
-                plan: plan.clone(),
-                post_set_op: PostSetOp::None,
-                txn_id: None,
-            };
-            let authorized = match super::sql_gateway::authorize_native_task(ctx, &task) {
-                Ok(authorized) => authorized,
-                Err(error) => return error_to_native(seq, &error),
-            };
-            let _request = ctx.state.tenant_request_guard(tenant_id);
-            let result = crate::control::write_resolve::run_authorized_write_resolve(
-                ctx.state, authorized, resolver,
-            )
-            .await;
-            return match result {
-                Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
-                Err(e) => error_to_native(seq, &e),
-            };
+            return response;
+        }
+
+        // A graph algorithm or neighbors read runs where the graph's partitions
+        // live, not on the one node the collection routes to.
+        if let Some(response) =
+            super::graph_owner::dispatch_graph_owner_read(ctx, seq, &plan, vshard_id).await
+        {
+            return response;
         }
 
         // Stamp the connection's active txn id so the Data Plane resolves the staging
@@ -262,6 +183,19 @@ pub(crate) async fn handle_direct_op(
         ) {
             return error_to_native(seq, &crate::Error::from(error));
         }
+        // The lease gates the direct op on a drained collection and lives
+        // until the op's outcome.
+        let lease = match crate::control::server::shared::clone_write::write_lease(
+            ctx.state,
+            tenant_id,
+            ctx.database_id(),
+            &tasks[0].plan,
+        )
+        .await
+        {
+            Ok(lease) => std::sync::Arc::new(lease),
+            Err(e) => return error_to_native(seq, &e),
+        };
 
         if let Err(e) = crate::control::planner::implicit_edges::append_implicit_edge_tasks(
             ctx.state,
@@ -302,7 +236,7 @@ pub(crate) async fn handle_direct_op(
         }
 
         // Period-lock reference rows, resolved into the same plan slot as the
-        // materialized-sum targets just above.
+        // materialized-sum targets right above.
         if let Err(e) = crate::control::planner::period_lock::resolve_period_lock_targets(
             ctx.state,
             &mut tasks,
@@ -326,6 +260,34 @@ pub(crate) async fn handle_direct_op(
             ) {
                 Ok(authorized) => authorized,
                 Err(error) => return error_to_native(seq, &crate::Error::from(error)),
+            };
+
+        // A write that fires a BEFORE, INSTEAD OF or SYNC AFTER body, or a
+        // MERGE into an edge-bearing collection, runs in one transaction, as
+        // the SQL path's does. The loop there clone-checks, authorizes and
+        // meters each task itself.
+        if statement_needs_implicit_txn(ctx.state, &tasks) {
+            let _request = ctx.state.tenant_request_guard(tenant_id);
+            needs_top_level_metering = false;
+            return super::direct_txn::dispatch_direct_in_txn(
+                ctx,
+                seq,
+                super::direct_txn::DirectWrite {
+                    tasks,
+                    sum_target_reads,
+                    lease: std::sync::Arc::clone(&lease),
+                },
+            )
+            .await;
+        }
+
+        // A delete or update on an edge-bearing collection commits its edge
+        // cleanup in the same Calvin transaction, as the SQL path's does.
+        use super::edge_recon_gate::{EdgeReconResult, try_edge_recon_dispatch};
+        let (tasks, authorized_tasks) =
+            match try_edge_recon_dispatch(ctx, seq, tasks, authorized_tasks).await {
+                EdgeReconResult::Outcome(outcome) => return outcome.into_response(),
+                EdgeReconResult::NotFired(tasks, authorized) => (tasks, authorized),
             };
 
         if tasks.len() == 1 {

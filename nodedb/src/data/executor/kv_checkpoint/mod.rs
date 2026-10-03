@@ -81,3 +81,5 @@ mod load;
 mod manifest;
 mod paths;
 mod write;
+
+pub(crate) use paths::{KV_CKPT_MANIFEST, kv_ckpt_dir, kv_ckpt_gen_dir};

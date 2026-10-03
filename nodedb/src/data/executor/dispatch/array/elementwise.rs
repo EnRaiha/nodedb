@@ -197,11 +197,10 @@ fn filter_by_surrogates(
         }
         let attr_row = live_idx;
         live_idx += 1;
-        let sur = tile
-            .surrogates
-            .get(row)
-            .copied()
-            .unwrap_or(nodedb_types::Surrogate::ZERO);
+        // A stored live row always holds its bound surrogate.
+        let sur = tile.live_surrogate(row).map_err(|e| ErrorCode::Internal {
+            detail: format!("array elementwise filter: {e}"),
+        })?;
         if !f.contains(sur) {
             continue;
         }
@@ -217,14 +216,13 @@ fn filter_by_surrogates(
             .get(row)
             .copied()
             .unwrap_or(nodedb_types::OPEN_UPPER);
-        b.push_row(SparseRow {
-            coord: &coord,
-            attrs: &attrs,
-            surrogate: sur,
+        b.push_row(SparseRow::live(
+            &coord,
+            &attrs,
+            sur,
             valid_from_ms,
             valid_until_ms,
-            kind: RowKind::Live,
-        })
+        ))
         .map_err(|e| ErrorCode::Internal {
             detail: format!("array elementwise filter: {e}"),
         })?;
@@ -264,25 +262,25 @@ fn union_tiles(schema: &ArraySchema, tiles: Vec<TilePayload>) -> Result<SparseTi
                 .iter()
                 .map(|c| c[attr_row].clone())
                 .collect();
+            // A stored live row always holds its bound surrogate.
             let surrogate = sparse
-                .surrogates
-                .get(row)
-                .copied()
-                .unwrap_or(nodedb_types::Surrogate::ZERO);
+                .live_surrogate(row)
+                .map_err(|e| ErrorCode::Internal {
+                    detail: format!("array elementwise union: {e}"),
+                })?;
             let valid_from_ms = sparse.valid_from_ms.get(row).copied().unwrap_or(0);
             let valid_until_ms = sparse
                 .valid_until_ms
                 .get(row)
                 .copied()
                 .unwrap_or(nodedb_types::OPEN_UPPER);
-            b.push_row(SparseRow {
-                coord: &coord,
-                attrs: &attrs,
+            b.push_row(SparseRow::live(
+                &coord,
+                &attrs,
                 surrogate,
                 valid_from_ms,
                 valid_until_ms,
-                kind: RowKind::Live,
-            })
+            ))
             .map_err(|e| ErrorCode::Internal {
                 detail: format!("array elementwise union: {e}"),
             })?;
@@ -333,6 +331,7 @@ mod tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: crate::bridge::envelope::Admission::Admitted,
         }
     }
@@ -421,6 +420,7 @@ mod tests {
                 cells_msgpack: bytes,
                 wal_lsn: lsn,
                 provenance: None,
+                vshard_id: 0,
             });
             assert_eq!(r.status, Status::Ok, "put failed: {r:?}");
         }
@@ -438,7 +438,7 @@ mod tests {
         ArrayPutCell {
             coord: vec![CoordValue::Int64(x), CoordValue::Int64(y)],
             attrs: vec![CellValue::Float64(v)],
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new((x * 100 + y + 1) as u32),
             system_from_ms: 0,
             valid_from_ms: 0,
             valid_until_ms: i64::MAX,

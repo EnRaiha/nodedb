@@ -2,9 +2,7 @@
 
 //! Protocol-neutral peer health DDL command: SHOW PEER HEALTH.
 //!
-//! Ported from the pgwire `ddl::cluster::health` handler. The topology /
-//! circuit-breaker reads are preserved verbatim; only the result
-//! construction changed from pgwire `Response` / `QueryResponse` to the
+//! The topology / circuit-breaker reads run here. The result is the
 //! protocol-neutral `DdlResult` over `ShapedRows`.
 
 use serde_json::{Map, Value as JsonValue};
@@ -14,7 +12,7 @@ use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::support::{ddl_err, node_state_str};
+use super::support::{cluster_not_started, ddl_err, node_state_str};
 
 /// SHOW PEER HEALTH — circuit breaker state for all known peers.
 ///
@@ -32,19 +30,12 @@ pub fn show_peer_health(
 
     let transport = match &state.cluster_transport {
         Some(t) => t,
-        None => {
-            return Err(ddl_err(
-                "55000",
-                "cluster mode not enabled (single-node instance)",
-            ));
-        }
+        None => return Err(cluster_not_started("cluster transport")),
     };
 
     let topo = match &state.cluster_topology {
         Some(t) => t,
-        None => {
-            return Err(ddl_err("55000", "cluster topology not available"));
-        }
+        None => return Err(cluster_not_started("cluster topology")),
     };
 
     let topo = topo.read().unwrap_or_else(|p| p.into_inner());

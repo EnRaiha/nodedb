@@ -2,12 +2,9 @@
 
 //! Handler for `SHOW DATABASES`.
 //!
-//! Ported from the pgwire `ddl::database::show` handler. The tenant-admin gate,
-//! catalog list, per-database collection count, status mapping, and parent
-//! clone rendering are preserved verbatim; only the result construction changed
-//! from pgwire `QueryResponse` to the protocol-neutral [`DdlResult`] over
-//! `ShapedRows`. Every column is a `text_field` in the original, so all columns
-//! stay `Text`.
+//! The tenant-admin gate, catalog list, per-database collection count, status
+//! mapping, and parent clone rendering run here. The result is the
+//! protocol-neutral [`DdlResult`] over `ShapedRows`. Every column is `Text`.
 
 use serde_json::{Map, Value as JsonValue};
 

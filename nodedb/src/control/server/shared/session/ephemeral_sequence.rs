@@ -4,8 +4,8 @@
 //!
 //! `CREATE SEQUENCE` inside an open transaction is buffered
 //! ([`super::ddl_buffer`]) and never reaches `SequenceRegistry`'s shared map
-//! until COMMIT applies it (`post_apply` only runs for
-//! `ProposeOutcome::needs_local_apply()`, which `Buffered` never satisfies).
+//! until COMMIT applies it (`post_apply` never runs for a
+//! `ProposeOutcome::Buffered` entry).
 //! This slot holds handles the same connection has materialized from its own
 //! buffered `CREATE SEQUENCE` so `NEXTVAL` / `CURRVAL` / `SETVAL` see them
 //! before COMMIT. See `control::sequence::ddl_overlay` for the fallback that

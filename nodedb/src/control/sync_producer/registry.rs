@@ -118,6 +118,27 @@ impl SyncProducerRegistry {
         })
     }
 
+    /// Reload the allocator watermark and the peer bindings from the catalog,
+    /// after the catalog rows were replaced. The watermark only rises.
+    pub fn reload_from_catalog(&self) -> crate::Result<()> {
+        self.alloc.restore_hwm(self.catalog.get_producer_hwm()?)?;
+        let peer_bindings: HashMap<PeerBindingKey, u64> = self
+            .catalog
+            .list_peer_bindings()?
+            .into_iter()
+            .map(|(key, binding)| (key, binding.producer_id))
+            .collect();
+        *self
+            .peer_bindings
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = peer_bindings;
+        self.converged_peer_bindings
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        Ok(())
+    }
+
     /// Look up the registration for `lite_id`.  Returns `None` if the Lite
     /// client has never registered.
     pub fn get(&self, lite_id: &str) -> crate::Result<Option<ProducerRegistration>> {

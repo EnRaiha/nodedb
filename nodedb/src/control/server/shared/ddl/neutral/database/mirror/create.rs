@@ -2,17 +2,15 @@
 
 //! Handler for `MIRROR DATABASE <local_name> FROM <source_cluster>.<source_database> [MODE = sync | async]`.
 //!
-//! Ported from the pgwire `ddl::database::mirror::create` handler. The superuser
-//! gate, duplicate-name rejection, self-mirror pre-flight, descriptor build with
-//! `MirrorStatus::Bootstrapping`, Raft propose / single-node fallback,
-//! allocator-hwm flush, and `DatabaseMirrored` audit are preserved verbatim;
-//! only the result construction changed from pgwire `Response` to the
-//! protocol-neutral [`DdlResult`].
+//! The superuser gate, duplicate-name rejection, self-mirror pre-flight,
+//! descriptor build with `MirrorStatus::Bootstrapping`, Raft propose /
+//! single-node fallback, and `DatabaseMirrored` audit run here. The result is
+//! the protocol-neutral [`DdlResult`].
 
 use nodedb_types::{DatabaseId, Lsn, MirrorMode, MirrorOrigin, MirrorStatus};
 
 use crate::control::catalog_entry::entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::security::catalog::database_types::{DatabaseDescriptor, DatabaseStatus};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -24,7 +22,7 @@ use super::super::support::{ddl_err, status};
 /// Handle `MIRROR DATABASE <local_name> FROM <source_cluster>.<source_database> [MODE = ...]`.
 ///
 /// Required role: `Superuser`.
-pub fn mirror_database(
+pub async fn mirror_database(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     local_name: &str,
@@ -71,8 +69,9 @@ pub fn mirror_database(
         ));
     }
 
-    // Allocate a DatabaseId for the new mirror.
-    let db_id = state.database_registry.alloc_one();
+    let db_id = crate::control::database::allocate_database_id(state)
+        .await
+        .map_err(|e| DdlError::from_error_in_context("database id allocation failed", &e))?;
     let created_at_lsn = state.wal.next_lsn().as_u64();
 
     // The source database numeric id on the source cluster is not known until
@@ -105,26 +104,13 @@ pub fn mirror_database(
         idle_session_timeout_secs: 0,
     };
 
-    // Propose through Raft; fall back to direct write in single-node mode.
-    let outcome = propose_catalog_entry(
+    // Propose through the metadata proposer.
+    propose_catalog_entry_async(
         state,
         &CatalogEntry::PutDatabase(Box::new(descriptor.clone())),
     )
+    .await
     .map_err(|e| DdlError::from_error_in_context("catalog propose failed", &e))?;
-
-    if outcome.needs_local_apply() {
-        catalog
-            .put_database(&descriptor)
-            .map_err(|e| DdlError::from_error_in_context("catalog write failed", &e))?;
-    }
-
-    // Flush allocator hwm on threshold.
-    if state.database_registry.should_flush() {
-        let hwm = state.database_registry.current_hwm();
-        if let Err(e) = catalog.put_database_hwm(hwm) {
-            tracing::warn!("database hwm flush failed after MIRROR DATABASE: {e}");
-        }
-    }
 
     state.audit_record_with_db(
         crate::control::security::audit::AuditEvent::DatabaseMirrored,

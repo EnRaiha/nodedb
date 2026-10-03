@@ -5,8 +5,7 @@
 //! The Control Plane decides what a read needs — a confirmed leader, or a
 //! replica within a staleness bound — but only the Raft coordinator, over in
 //! `nodedb-cluster`, can answer either. This trait is the seam between them:
-//! `start_raft` installs an implementation, and single-node deployments
-//! leave it unset because there is no quorum and no replica to weigh.
+//! `start_raft` installs an implementation on every node.
 //!
 //! A refusal carries no leader hint. The caller already read the routing
 //! table to decide the read belonged here, so it builds the redirect from
@@ -33,7 +32,7 @@ pub enum ReadIndexRefusal {
 #[async_trait]
 pub trait RaftReadGate: Send + Sync {
     /// Confirm leadership of `group_id` against a quorum, returning the index
-    /// the read may be served at.
+    /// the read can be served at.
     async fn confirm_leader(
         &self,
         group_id: u64,
@@ -43,6 +42,28 @@ pub trait RaftReadGate: Send + Sync {
     /// Whether this node's replica of `group_id` is within `max_staleness` of
     /// the leader. Local state only — no quorum round, so this does not block.
     fn within_staleness_bound(&self, group_id: u64, max_staleness: Duration) -> bool;
+
+    /// Whether this node leads `group_id` under a leader lease that is valid
+    /// now. Local state only, so this does not block.
+    ///
+    /// The lease lapses before any other node can win an election for the
+    /// group, so at most one node answers `true` for a group at a time.
+    fn holds_leader_lease(&self, group_id: u64) -> bool;
+
+    /// The Raft term of this node's valid leader lease on `group_id`, `None`
+    /// when it holds none. Local state only, so this does not block.
+    ///
+    /// Each later leader of the group leads at a higher term, so the term
+    /// fences work a previous leaseholder started.
+    fn leader_lease_term(&self, group_id: u64) -> Option<u64>;
+
+    /// The index a read of `group_id` can be served at under this node's
+    /// valid leader lease: the commit index, `None` when it holds no lease.
+    /// Local state only, so this does not block.
+    ///
+    /// The read is linearizable once this node has applied the group through
+    /// the index.
+    fn lease_read_index(&self, group_id: u64) -> Option<u64>;
 
     /// A read index for `group_id` on any node: confirmed here when this node
     /// leads the group, asked of the leader otherwise.
@@ -65,7 +86,7 @@ type GateRaftLoop = nodedb_cluster::RaftLoop<
 /// Production implementation, backed by the Raft loop's coordinator.
 ///
 /// Holds the loop weakly: the loop keeps `SharedState` alive, and the gate
-/// lives on `SharedState`, so a strong reference would pin both.
+/// lives on `SharedState`, so a strong reference will pin both.
 pub struct MultiRaftReadGate {
     multi_raft: Arc<Mutex<MultiRaft>>,
     raft_loop: Weak<GateRaftLoop>,
@@ -122,6 +143,7 @@ fn refusal_of(error: ClusterError) -> ReadIndexRefusal {
         | ClusterError::SpatialGather(_)
         | ClusterError::Bm25Gather(_)
         | ClusterError::TsGather(_)
+        | ClusterError::ShufflePush(_)
         | ClusterError::RemoteUntyped { .. }
         | ClusterError::ShardExecution { .. } => ReadIndexRefusal::NotLeader,
     }
@@ -155,5 +177,27 @@ impl RaftReadGate for MultiRaftReadGate {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .within_staleness_bound(group_id, max_staleness)
+    }
+
+    fn holds_leader_lease(&self, group_id: u64) -> bool {
+        self.multi_raft
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .lease_read_index(group_id)
+            .is_some()
+    }
+
+    fn leader_lease_term(&self, group_id: u64) -> Option<u64> {
+        self.multi_raft
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .lease_term(group_id)
+    }
+
+    fn lease_read_index(&self, group_id: u64) -> Option<u64> {
+        self.multi_raft
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .lease_read_index(group_id)
     }
 }

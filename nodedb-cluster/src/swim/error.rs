@@ -61,6 +61,19 @@ pub enum SwimError {
     #[error("swim: decode failure: {detail}")]
     Decode { detail: String },
 
+    /// The SWIM UDP socket could not bind `addr`. Startup fails rather than
+    /// falling back to another port peers do not know.
+    #[error("swim: cannot bind UDP listener on {addr}: {detail}")]
+    Bind {
+        addr: std::net::SocketAddr,
+        detail: String,
+    },
+
+    /// The default SWIM address cannot be derived from the QUIC listen
+    /// address: its port is the highest one, so `port + 1` does not exist.
+    #[error("swim: no default listen address for QUIC listener {quic_listen}; set it explicitly")]
+    NoDefaultAddr { quic_listen: std::net::SocketAddr },
+
     /// Transport backend has been closed; no further I/O is possible.
     /// Returned by [`super::detector::Transport::recv`] on shutdown.
     #[error("swim: transport closed")]

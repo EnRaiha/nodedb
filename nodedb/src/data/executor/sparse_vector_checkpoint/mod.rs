@@ -57,8 +57,7 @@ mod write;
 #[cfg(test)]
 pub(crate) use format::test_manifest_bytes;
 pub(crate) use manifest::read_sparse_vector_manifest_at;
-pub(crate) use paths::{sparse_vector_checkpoint_prefix, sparse_vector_ckpt_gen_dir};
-// Only reclaim's tests build a checkpoint dir from the outside; the write and
-// load paths reach `paths` directly.
-#[cfg(test)]
-pub(crate) use paths::sparse_vector_ckpt_dir;
+pub(crate) use paths::{
+    SPARSE_VECTOR_CKPT_MANIFEST, sparse_vector_checkpoint_prefix, sparse_vector_ckpt_dir,
+    sparse_vector_ckpt_gen_dir,
+};

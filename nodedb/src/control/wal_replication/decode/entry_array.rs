@@ -25,11 +25,13 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             array,
             cells_msgpack,
             provenance,
+            ..
         } => cell_put(ctx, array, cells_msgpack, provenance),
         ReplicatedWrite::ArrayCellDelete {
             array,
             coords_msgpack,
             provenance,
+            ..
         } => cell_delete(ctx, array, coords_msgpack, provenance),
         _ => Err(crate::Error::Internal {
             detail: "entry_array::decode_arm called with a non-array-cell ReplicatedWrite \
@@ -52,6 +54,7 @@ fn cell_put(
         cells_msgpack: cells_msgpack.to_vec(),
         wal_lsn: 0,
         provenance: decode_provenance(provenance)?,
+        vshard_id: ctx.vshard_id,
     }))
 }
 
@@ -69,6 +72,7 @@ fn cell_delete(
         coords_msgpack: coords_msgpack.to_vec(),
         wal_lsn: 0,
         provenance: decode_provenance(provenance)?,
+        vshard_id: ctx.vshard_id,
     }))
 }
 
@@ -135,18 +139,19 @@ mod tests {
             cells_msgpack: cells_msgpack.clone(),
             wal_lsn: 123,
             provenance: None,
+            vshard_id: vshard.as_u32(),
         });
 
-        // Must encode (no longer a replication gap).
+        // Must encode: `ArrayOp::Put` replicates.
         let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
             .expect("encode must not error")
             .expect("ArrayOp::Put must encode to a ReplicatedWrite");
         let bytes = entry.to_bytes();
 
-        // Decode with no assigner (surrogate binding is a no-op) — the cells (and
-        // thus the carried surrogate) must survive verbatim, wal_lsn resets to 0.
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
+        // The cells, and the surrogate each one carries, survive decode
+        // verbatim. `wal_lsn` resets to 0.
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
             .expect("ArrayCellPut must decode to a plan");
         match decoded_plan {
             PhysicalPlan::Array(ArrayOp::Put {
@@ -154,7 +159,13 @@ mod tests {
                 cells_msgpack: decoded_cells,
                 wal_lsn,
                 provenance,
+                vshard_id,
             }) => {
+                assert_eq!(
+                    vshard_id,
+                    vshard.as_u32(),
+                    "the entry's vShard homes the cells"
+                );
                 assert_eq!(
                     decoded_id, array_id,
                     "array id reconstructed from header tenant + name"
@@ -184,14 +195,15 @@ mod tests {
             coords_msgpack: coords_msgpack.clone(),
             wal_lsn: 55,
             provenance: None,
+            vshard_id: vshard.as_u32(),
         });
 
         let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
             .expect("encode must not error")
             .expect("ArrayOp::Delete must encode to a ReplicatedWrite");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
             .expect("ArrayCellDelete must decode to a plan");
         match decoded_plan {
             PhysicalPlan::Array(ArrayOp::Delete {
@@ -199,7 +211,13 @@ mod tests {
                 coords_msgpack: decoded_coords,
                 wal_lsn,
                 provenance,
+                vshard_id,
             }) => {
+                assert_eq!(
+                    vshard_id,
+                    vshard.as_u32(),
+                    "the entry's vShard homes the coords"
+                );
                 assert_eq!(decoded_id, array_id);
                 assert_eq!(decoded_coords, coords_msgpack, "coords carried verbatim");
                 assert_eq!(wal_lsn, 0);

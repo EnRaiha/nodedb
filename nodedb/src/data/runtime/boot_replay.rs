@@ -22,13 +22,16 @@ use crate::data::executor::core_loop::CoreLoop;
 ///
 /// The vector rebuild backstop runs after the replay within this function for
 /// the same reason it is an idempotent overlay — see the comment at the call.
+///
+/// `Err` when replay cannot bring the core to the state the WAL holds. The
+/// rebuild then does not run, and the core must not serve.
 pub(super) fn replay_wal_and_rebuild_indexes(
     core: &mut CoreLoop,
     wal_records: &[nodedb_wal::WalRecord],
     num_cores: usize,
     tombstones: &nodedb_wal::TombstoneSet,
     vector_index_param_seed: &[nodedb_types::StoredVectorIndexParams],
-) {
+) -> crate::Result<()> {
     // Tombstones are pre-built by the caller from
     // (persisted `_system.wal_tombstones` ∪
     // `extract_tombstones(&wal_records)`). The persisted half
@@ -37,7 +40,7 @@ pub(super) fn replay_wal_and_rebuild_indexes(
     // WAL, but shadowed writes in un-truncated older segments
     // must still be skipped. Every per-engine replay method
     // consults the merged set.
-    core.replay_all_wal(wal_records, num_cores, tombstones);
+    core.replay_all_wal(wal_records, num_cores, tombstones)?;
 
     // Crash-recovery backstop: rebuild the HNSW by re-indexing
     // every document from the durable redb `sparse` store. The WAL is
@@ -62,4 +65,5 @@ pub(super) fn replay_wal_and_rebuild_indexes(
     // restored in `load_boot_checkpoints`. Columnar-family (`engine='spatial'`)
     // geometry is re-derived from the restored columnar rows by
     // `restore_columnar_geometry_indexes` during checkpoint restore.
+    Ok(())
 }

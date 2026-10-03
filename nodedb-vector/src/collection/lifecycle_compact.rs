@@ -127,6 +127,16 @@ impl VectorCollection {
         total_removed
     }
 
+    /// The multi-vector documents of this index, by document surrogate, in
+    /// ascending order. `export_snapshot` rows carry no membership, so a
+    /// snapshot records it here: a one-vector document is otherwise
+    /// indistinguishable from a single-vector row.
+    pub fn multi_vector_documents(&self) -> Vec<Surrogate> {
+        let mut documents: Vec<Surrogate> = self.multi_doc_map.keys().copied().collect();
+        documents.sort_unstable();
+        documents
+    }
+
     /// Export all live vectors for snapshot.
     ///
     /// # Errors
@@ -226,5 +236,23 @@ mod tests {
         let id = coll.insert_with_surrogate(vec![0.5, 0.5], s).unwrap();
         assert_eq!(coll.local_for_surrogate(s), Some(id));
         assert_eq!(coll.live_count(), 1);
+    }
+
+    #[test]
+    fn a_one_vector_multi_vector_document_is_listed() {
+        let mut coll = VectorCollection::with_seal_threshold(2, HnswParams::default(), 64);
+        coll.insert_with_surrogate(vec![1.0, 0.0], Surrogate::new(1))
+            .unwrap();
+        let one: [&[f32]; 1] = [&[0.0, 1.0]];
+        coll.insert_multi_vector(&one, Surrogate::new(9)).unwrap();
+        let two: [&[f32]; 2] = [&[0.5, 0.5], &[0.2, 0.8]];
+        coll.insert_multi_vector(&two, Surrogate::new(5)).unwrap();
+
+        assert_eq!(
+            coll.multi_vector_documents(),
+            vec![Surrogate::new(5), Surrogate::new(9)],
+            "every multi-vector document is listed, the one-vector one included; \
+             the single-vector row is not"
+        );
     }
 }

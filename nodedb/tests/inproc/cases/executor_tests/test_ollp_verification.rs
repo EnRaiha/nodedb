@@ -324,7 +324,7 @@ fn bulk_update_stale_prediction_returns_ollp_retry_required() {
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
-            surrogate: surrogate_for("z1"),
+            surrogate: Some(surrogate_for("z1")),
             pk_bytes: "z1".as_bytes().to_vec(),
         }),
     );
@@ -444,7 +444,7 @@ fn bulk_delete_changed_edge_endpoint_returns_ollp_retry_required() {
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
-            surrogate: surrogate_for("e1"),
+            surrogate: Some(surrogate_for("e1")),
             pk_bytes: "e1".as_bytes().to_vec(),
         }),
     );
@@ -588,7 +588,7 @@ fn bulk_update_retry_with_corrected_prediction_succeeds() {
                 rls_filters: Vec::new(),
                 system_time: nodedb_types::SystemTimeScope::Current,
                 valid_at_ms: None,
-                surrogate: surrogate_for(id),
+                surrogate: Some(surrogate_for(id)),
                 pk_bytes: id.as_bytes().to_vec(),
             }),
         );
@@ -621,7 +621,7 @@ fn bulk_update_superset_prediction_returns_ollp_retry_required() {
                 COLLECTION,
             ),
             document_id: "s2".into(),
-            surrogate: surrogate_for("s2"),
+            surrogate: Some(surrogate_for("s2")),
             pk_bytes: "s2".as_bytes().to_vec(),
             returning: None,
             rls_filters: Vec::new(),

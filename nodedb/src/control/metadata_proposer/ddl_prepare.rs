@@ -3,10 +3,9 @@
 //! The DDL preparation lease: the local lock and the replicated lease that
 //! serialize descriptor preparation across the cluster.
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-use tokio::runtime::RuntimeFlavor;
 
 use nodedb_cluster::{METADATA_GROUP_ID, MetadataEntry, WaitOutcome, encode_entry};
 
@@ -15,9 +14,12 @@ use crate::error::Error;
 
 use super::handle::MetadataRaftHandle;
 use super::timeouts::DEFAULT_PROPOSE_TIMEOUT;
+use super::wait::wait_applied;
 
-const DDL_PREPARE_LEASE: Duration = Duration::from_secs(60);
-const DDL_PREPARE_WAIT: Duration = Duration::from_secs(70);
+/// How long a proposer waits for the lease. It outlasts the leader's
+/// stuck-owner fallback, so a reclaim always frees the lease first.
+const DDL_PREPARE_WAIT: Duration =
+    super::ddl_owner::DDL_PREPARE_LEASE.saturating_add(Duration::from_secs(10));
 
 fn wall_now_ns() -> u64 {
     SystemTime::now()
@@ -27,24 +29,36 @@ fn wall_now_ns() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
-fn propose_metadata_and_wait(
-    shared: &SharedState,
-    handle: &dyn MetadataRaftHandle,
-    entry: &MetadataEntry,
-    timeout: Duration,
-) -> Result<u64, Error> {
-    let raw = encode_entry(entry).map_err(|e| Error::Config {
+/// Poll interval while another token holds the preparation lease.
+const DDL_PREPARE_POLL: Duration = Duration::from_millis(10);
+
+/// A fresh preparation-lease token for this node.
+fn next_token(shared: &SharedState) -> u64 {
+    let sequence = shared
+        .metadata_ddl_token_seq
+        .fetch_add(1, Ordering::Relaxed);
+    shared.node_id.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ wall_now_ns().rotate_left(17) ^ sequence
+}
+
+fn encode_metadata(entry: &MetadataEntry) -> Result<Vec<u8>, Error> {
+    encode_entry(entry).map_err(|e| Error::Config {
         detail: format!("metadata entry encode: {e}"),
-    })?;
-    let index = handle.propose(raw)?;
-    let watcher = shared.applied_index_watcher(METADATA_GROUP_ID);
-    let outcome = tokio::task::block_in_place(|| watcher.wait_for(index, timeout));
+    })
+}
+
+/// The result of waiting `timeout` for log index `index` to apply.
+fn applied_or_error(
+    outcome: WaitOutcome,
+    index: u64,
+    timeout: Duration,
+    current: u64,
+) -> Result<u64, Error> {
     match outcome {
         WaitOutcome::Reached => Ok(index),
         WaitOutcome::TimedOut => Err(Error::Config {
             detail: format!(
-                "metadata propose timed out after {timeout:?} waiting for log index {index} (current: {})",
-                watcher.current()
+                "metadata propose timed out after {timeout:?} waiting for log index {index} \
+                 (current: {current})"
             ),
         }),
         WaitOutcome::GroupGone => Err(Error::Config {
@@ -53,140 +67,197 @@ fn propose_metadata_and_wait(
     }
 }
 
-/// RAII ownership of the metadata-Raft-serialized descriptor preparation lease.
-/// The matching release is itself replicated, so another node cannot stamp from
-/// the same prior catalog version until this guard is dropped and that release
-/// has applied.
-pub(crate) struct DdlPrepareGuard<'a> {
-    shared: &'a SharedState,
-    handle: &'a dyn MetadataRaftHandle,
-    token: u64,
+pub(super) async fn propose_metadata_and_wait_async(
+    shared: &SharedState,
+    handle: &dyn MetadataRaftHandle,
+    entry: &MetadataEntry,
+    timeout: Duration,
+) -> Result<u64, Error> {
+    let index = handle.propose_async(encode_metadata(entry)?).await?;
+    let watcher = shared.applied_index_watcher(METADATA_GROUP_ID);
+    let outcome = wait_applied(Arc::clone(&watcher), index, timeout).await?;
+    applied_or_error(outcome, index, timeout, watcher.current())
 }
 
-impl DdlPrepareGuard<'_> {
-    pub(crate) fn token(&self) -> u64 {
-        self.token
+/// What the acquire loop does next, from the current lease owner.
+enum OwnerStep {
+    /// `token` holds the lease.
+    Acquired,
+    /// No owner: propose the acquire again.
+    Retry,
+    /// Another token holds the lease: poll again. The metadata leader's
+    /// reclaim loop frees a lease whose owner died or got stuck.
+    Wait,
+}
+
+fn owner_step(shared: &SharedState, token: u64, deadline: Instant) -> Result<OwnerStep, Error> {
+    match super::ddl_owner::current_owner(shared) {
+        Some(owner) if owner.token == token => Ok(OwnerStep::Acquired),
+        None => Ok(OwnerStep::Retry),
+        Some(_) if Instant::now() < deadline => Ok(OwnerStep::Wait),
+        Some(owner) => Err(Error::Config {
+            detail: format!(
+                "metadata DDL preparation lease timed out after {DDL_PREPARE_WAIT:?}: node {} \
+                 still holds it",
+                owner.node_id
+            ),
+        }),
     }
 }
 
-impl Drop for DdlPrepareGuard<'_> {
-    fn drop(&mut self) {
-        if let Err(error) = propose_metadata_and_wait(
+/// Release the preparation lease `token` and await the release's apply here.
+/// The background lease releaser calls it for a lease dropped unreleased.
+pub(crate) async fn release_ddl_prepare_token(
+    shared: &SharedState,
+    token: u64,
+) -> Result<(), Error> {
+    let handle = shared.metadata_raft_handle()?;
+    propose_metadata_and_wait_async(
+        shared,
+        handle.as_ref(),
+        &MetadataEntry::DdlPrepareRelease { token },
+        DEFAULT_PROPOSE_TIMEOUT,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The metadata-Raft-serialized descriptor preparation lease an async
+/// proposer holds. The matching release is itself replicated, so another
+/// node cannot stamp from the same prior catalog version until that release
+/// has applied.
+///
+/// [`Self::release`] releases it and awaits the release's apply. A lease
+/// dropped unreleased, as when its proposer's future is cancelled, hands its
+/// release to the background lease releaser and never blocks. A release that
+/// never applies ends when the metadata leader reclaims the lease (see
+/// [`super::ddl_reclaim`]).
+pub(crate) struct DdlPrepareLease<'a> {
+    shared: &'a SharedState,
+    handle: &'a dyn MetadataRaftHandle,
+    token: u64,
+    released: bool,
+}
+
+impl DdlPrepareLease<'_> {
+    pub(crate) fn token(&self) -> u64 {
+        self.token
+    }
+
+    /// Release the lease and wait until the release applied here. A failed
+    /// release is logged: the metadata leader reclaims the lease once
+    /// [`super::ddl_owner::DDL_PREPARE_LEASE`] passed.
+    pub(crate) async fn release(mut self) {
+        self.released = true;
+        if let Err(error) = propose_metadata_and_wait_async(
             self.shared,
             self.handle,
             &MetadataEntry::DdlPrepareRelease { token: self.token },
             DEFAULT_PROPOSE_TIMEOUT,
-        ) {
+        )
+        .await
+        {
             tracing::error!(token = self.token, %error, "metadata DDL lease release failed");
         }
     }
 }
 
-pub(crate) fn acquire_ddl_prepare_lease<'a>(
+impl Drop for DdlPrepareLease<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.shared.lease_runtime.releaser.submit(
+                crate::control::lease::releaser::ReleaseRequest::DdlPrepare { token: self.token },
+            );
+        }
+    }
+}
+
+/// Take the preparation lease from async code.
+pub(crate) async fn acquire_ddl_prepare_lease_async<'a>(
     shared: &'a SharedState,
     handle: &'a dyn MetadataRaftHandle,
-) -> Result<DdlPrepareGuard<'a>, Error> {
-    let sequence = shared
-        .metadata_ddl_token_seq
-        .fetch_add(1, Ordering::Relaxed);
-    let token = shared.node_id.wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        ^ wall_now_ns().rotate_left(17)
-        ^ sequence;
+) -> Result<DdlPrepareLease<'a>, Error> {
+    let token = next_token(shared);
     let deadline = Instant::now() + DDL_PREPARE_WAIT;
 
     loop {
-        propose_metadata_and_wait(
+        propose_metadata_and_wait_async(
             shared,
             handle,
-            &MetadataEntry::DdlPrepareAcquire { token },
+            &MetadataEntry::DdlPrepareAcquire {
+                token,
+                node_id: shared.node_id,
+            },
             DEFAULT_PROPOSE_TIMEOUT,
-        )?;
+        )
+        .await?;
 
         loop {
-            let owner = *shared
-                .metadata_ddl_owner
-                .lock()
-                .map_err(|_| Error::Config {
-                    detail: "metadata DDL owner lock poisoned".into(),
-                })?;
-            match owner {
-                Some((current, _)) if current == token => {
-                    return Ok(DdlPrepareGuard {
+            match owner_step(shared, token, deadline)? {
+                OwnerStep::Acquired => {
+                    return Ok(DdlPrepareLease {
                         shared,
                         handle,
                         token,
+                        released: false,
                     });
                 }
-                Some((current, acquired_at))
-                    if shared.is_metadata_leader()
-                        && acquired_at.elapsed() >= DDL_PREPARE_LEASE =>
-                {
-                    // Cancel the dead owner's pending record before releasing its
-                    // lease, so it never lingers visible-but-unresolved past the lease.
-                    if shared.pending_ddl.contains(current) {
-                        propose_metadata_and_wait(
-                            shared,
-                            handle,
-                            &MetadataEntry::DdlPendingCancel { token: current },
-                            DEFAULT_PROPOSE_TIMEOUT,
-                        )?;
-                    }
-                    propose_metadata_and_wait(
-                        shared,
-                        handle,
-                        &MetadataEntry::DdlPrepareRelease { token: current },
-                        DEFAULT_PROPOSE_TIMEOUT,
-                    )?;
-                    break;
-                }
-                None => break,
-                Some(_) if Instant::now() < deadline => {
-                    // Reached from async tasks (ILP batch flush ->
-                    // `propose_catalog_entry`), so hand the worker back to
-                    // tokio rather than parking it: the lease owner this
-                    // polls for is released by a raft apply that needs a
-                    // worker to make progress.
-                    tokio::task::block_in_place(|| {
-                        std::thread::sleep(Duration::from_millis(10));
-                    });
-                }
-                Some(_) => {
-                    return Err(Error::Config {
-                        detail: "metadata DDL preparation lease timed out".into(),
-                    });
-                }
+                OwnerStep::Retry => break,
+                OwnerStep::Wait => tokio::time::sleep(DDL_PREPARE_POLL).await,
             }
         }
     }
 }
 
-/// Take the local DDL preparation lock, handing the wait back to tokio when
-/// the caller is on a multi-thread worker.
-///
-/// The holder keeps this lock across the distributed preparation lease, the
-/// descriptor drain and the local apply wait — each already wrapped in
-/// `block_in_place`, but that only tells tokio about the waits *inside* the
-/// lock, never about the wait *for* it. A bare `lock()` on a worker therefore
-/// removes that worker from the runtime silently, including from the raft
-/// apply work the current holder needs in order to finish, which turns
-/// contention into a self-sustaining stall.
-///
-/// `block_in_place` is a passthrough outside a multi-thread worker (plain sync
-/// callers, blocking-pool threads) and panics on the current-thread runtime,
-/// so it is applied only where it is both legal and meaningful — mirroring
-/// `lease::drain_propose::poll_leases_drained`.
-pub(super) fn lock_ddl_preparation(
+/// Take the local DDL preparation lock from async code. The guard is `Send`,
+/// so the holder can await its post-apply while it holds the lock.
+pub(crate) async fn lock_ddl_preparation_async(
     shared: &SharedState,
-) -> Result<std::sync::MutexGuard<'_, ()>, Error> {
-    let acquire = || {
-        shared.metadata_ddl_lock.lock().map_err(|_| Error::Config {
-            detail: "metadata DDL preparation lock poisoned".into(),
-        })
-    };
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(acquire)
+) -> tokio::sync::MutexGuard<'_, ()> {
+    shared.metadata_ddl_lock.lock().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owner(shared: &SharedState) -> Option<u64> {
+        let current = *shared
+            .metadata_ddl_owner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        current.map(|owner| owner.token)
+    }
+
+    /// A preparation lease dropped unreleased, as a cancelled DDL drops it,
+    /// is released by the background releaser without blocking the drop.
+    #[tokio::test]
+    async fn a_dropped_preparation_lease_is_released_in_the_background() {
+        let cluster = crate::control::cluster::test_one_node::boot().await;
+        let state = Arc::clone(&cluster.state);
+        let token = {
+            let handle = state.metadata_raft_handle().expect("metadata raft handle");
+            let lease = acquire_ddl_prepare_lease_async(&state, handle.as_ref())
+                .await
+                .expect("take the preparation lease");
+            assert_eq!(owner(&state), Some(lease.token()));
+            lease.token()
+        };
+        assert_eq!(
+            owner(&state),
+            Some(token),
+            "the drop itself proposes nothing"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while owner(&state).is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the background releaser did not release the dropped lease"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        _ => acquire(),
+        drop(state);
+        cluster.shutdown().await;
     }
 }

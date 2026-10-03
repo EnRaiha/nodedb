@@ -159,9 +159,8 @@ mod tests {
 
         // Created long ago: an ancient `modification_hlc`, far outside any
         // retention window measured against the real clock.
-        let mut old = StoredCollection::new(1, "ancient", "tester");
+        let mut old = StoredCollection::stamped_for_test(1, "ancient", "tester");
         old.modification_hlc = Hlc::new(1_000, 0);
-        old.descriptor_version = 1;
         // Seeded through `apply_to` rather than `put_collection` so the
         // StoredOwner row lands too — the integrity guard rejects a
         // collection row with no owner.
@@ -180,7 +179,8 @@ mod tests {
             },
             &clock,
             catalog,
-        );
+        )
+        .expect("stamp deactivate_collection");
         apply_to(&deactivate, catalog).expect("apply deactivate_collection");
 
         let dropped = catalog

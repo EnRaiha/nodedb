@@ -23,9 +23,10 @@
 //! Surface: `SystemCatalog::{enqueue,load,record_attempt,remove}_pending_reclaim`.
 //! Structure mirrors `l2_cleanup_queue.rs`.
 
+use nodedb_types::Hlc;
 use redb::{ReadableDatabase, ReadableTable};
 
-use super::types::{PENDING_RECLAIM, SystemCatalog, catalog_err};
+use super::types::{PENDING_RECLAIM, StoredCollection, SystemCatalog, catalog_err};
 
 /// One queue entry: "engine storage purge for this collection is still owed".
 #[derive(zerompk::ToMessagePack, zerompk::FromMessagePack, Debug, Clone)]
@@ -48,6 +49,36 @@ pub struct StoredPendingReclaim {
     /// Number of purge attempts this entry has survived (post-first-failure).
     #[msgpack(default)]
     pub attempts: u32,
+    /// Incarnation the reclaim targets. For a purge: the collection row's
+    /// `modification_hlc` when the reclaim was queued, `None` when no row
+    /// existed then. For a cancelled create: the create's own clock.
+    #[msgpack(default)]
+    pub target_hlc: Option<Hlc>,
+    /// The entry tears down a cancelled create, which never committed a row.
+    #[msgpack(default)]
+    pub cancelled_create: bool,
+}
+
+impl StoredPendingReclaim {
+    /// The key the row's drain hold is owned under: the row's own key.
+    pub fn owner(&self) -> crate::bridge::quiesce::ReclaimOwner {
+        crate::bridge::quiesce::ReclaimOwner::new(self.database_id, self.tenant_id, &self.name)
+    }
+
+    /// Whether the name still belongs to the incarnation this entry reclaims,
+    /// given the committed row now under the name.
+    ///
+    /// No row: nothing newer claimed the name. A cancelled create never
+    /// committed a row, so any row is a later incarnation. A purge owns only
+    /// the row it was queued against, which `prepare_purge` keeps with its
+    /// clock unchanged.
+    pub fn owns(&self, live: Option<&StoredCollection>) -> bool {
+        match live {
+            None => true,
+            Some(_) if self.cancelled_create => false,
+            Some(row) => self.target_hlc == Some(row.modification_hlc),
+        }
+    }
 }
 
 fn pending_key(database_id: u64, tenant_id: u64, name: &str) -> String {
@@ -183,7 +214,43 @@ mod tests {
             enqueued_at_ns: 100,
             last_error: String::new(),
             attempts: 0,
+            target_hlc: None,
+            cancelled_create: false,
         }
+    }
+
+    fn row_at(hlc: Hlc) -> StoredCollection {
+        let mut row = StoredCollection::new(1, "events", "tester");
+        row.modification_hlc = hlc;
+        row
+    }
+
+    /// A purge owns only the row it was queued against.
+    #[test]
+    fn a_purge_owns_only_its_own_incarnation() {
+        let mut purge = entry(1, "events", 500);
+        purge.target_hlc = Some(Hlc::new(10, 0));
+        assert!(purge.owns(None));
+        assert!(purge.owns(Some(&row_at(Hlc::new(10, 0)))));
+        assert!(!purge.owns(Some(&row_at(Hlc::new(20, 0)))));
+    }
+
+    /// A purge queued when no row existed owns no row that appears later.
+    #[test]
+    fn a_purge_of_an_absent_row_owns_no_later_row() {
+        let purge = entry(1, "events", 500);
+        assert!(purge.owns(None));
+        assert!(!purge.owns(Some(&row_at(Hlc::new(20, 0)))));
+    }
+
+    /// A cancelled create committed no row, so every row is a later one.
+    #[test]
+    fn a_cancelled_create_owns_no_committed_row() {
+        let mut cancel = entry(1, "events", 500);
+        cancel.target_hlc = Some(Hlc::new(10, 0));
+        cancel.cancelled_create = true;
+        assert!(cancel.owns(None));
+        assert!(!cancel.owns(Some(&row_at(Hlc::new(10, 0)))));
     }
 
     #[test]

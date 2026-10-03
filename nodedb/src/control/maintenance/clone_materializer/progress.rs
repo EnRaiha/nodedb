@@ -28,8 +28,9 @@ struct Slot {
 /// Intended use-cases:
 ///   1. Background scheduler: calls `notify_start(n)` once it begins N collections,
 ///      then calls `notify_collection_done()` for each that completes.
-///   2. `ALTER DATABASE … MATERIALIZE` / `DROP DATABASE … FORCE`: calls `wait_until_done()`
-///      and blocks (with the Tokio `spawn_blocking` wrapper the DDL handler uses).
+///   2. `ALTER DATABASE … MATERIALIZE` / `DROP DATABASE … FORCE`: pass the handle
+///      to the awaited `force_materialize`, which drives it. `wait_until_done()`
+///      blocks its thread, so only a thread outside the async runtime calls it.
 #[derive(Debug)]
 pub struct CloneMaterializerHandle {
     db_id: DatabaseId,

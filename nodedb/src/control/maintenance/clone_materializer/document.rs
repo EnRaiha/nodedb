@@ -11,15 +11,15 @@
 //! filters CoW-copied rows, and `if_absent` skips already-written rows — the
 //! per-page checkpoint is best-effort but the per-key probes cover it.
 
-use nodedb_types::{CloneStatus, DatabaseId, Lsn, Surrogate, TenantId};
+use nodedb_types::{DatabaseId, TenantId};
 
 use crate::types::TxnId;
 
-use super::dispatch::dispatch_local;
+use super::dispatch::{dispatch_local, dispatch_to_owner};
+use super::document_copy::RowCopy;
 use super::reaper::{ReapParams, reap_materialized_collection};
+use super::status::{checkpoint_progress, mark_materializing};
 use crate::bridge::envelope::Status;
-use crate::control::catalog_entry::entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
 use crate::control::planner::sql_plan_convert::convert::db_qualified;
 use crate::control::security::catalog::{StoredCollection, SystemCatalog};
 use crate::control::state::SharedState;
@@ -38,203 +38,56 @@ pub(super) async fn materialize_document_collection(
     let Some(ref origin) = coll.cloned_from else {
         return Ok(());
     };
+    mark_materializing(state, coll).await?;
 
     let target_qualified = db_qualified(db_id, &coll.name);
-    let source_qualified = db_qualified(origin.source_database, &origin.source_collection);
-    let tenant_id = TenantId::new(coll.tenant_id);
-
-    // Flip status to `Materializing` if still `Shadowed` so concurrent
-    // readers see in-progress state.
-    if matches!(coll.clone_status, CloneStatus::Shadowed) {
-        let mut updated = coll.clone();
-        updated.clone_status = CloneStatus::Materializing {
-            progress_lsn: Lsn::new(0),
-            bytes_done: 0,
-            bytes_total: 0,
-        };
-        let outcome = propose_catalog_entry(
-            state,
-            &CatalogEntry::PutCollection(Box::new(updated.clone())),
-        )?;
-        if outcome.needs_local_apply() {
-            catalog.put_collection(db_id, &updated)?;
-        }
-    }
-
     // Tombstones: source surrogates deleted from the clone before materialization.
     let tombstoned = catalog.list_clone_tombstones(&target_qualified)?;
-
     // Convert as_of_lsn to milliseconds for the source-side scan.
-    let system_as_of_ms = state.ms_to_lsn_inverse(origin.as_of_lsn);
+    let system_as_of_ms = crate::control::clone::lsn_resolve::source_as_of_ms(
+        state,
+        coll.bitemporal,
+        origin.as_of_lsn,
+    );
 
-    let mut cursor: Vec<u8> = Vec::new();
-    let mut copied: u64 = 0;
-    let mut total_seen: u64 = 0;
-
-    loop {
-        let (entries, next_cursor) = scan_source_page(
-            state,
-            tenant_id,
-            origin.source_database,
-            &source_qualified,
-            &cursor,
-            system_as_of_ms,
-            None,
-        )
-        .await?;
-
-        for (doc_id_hex, source_surrogate_u32, value_bytes) in entries {
-            total_seen += 1;
-
-            let source_surrogate = Surrogate::new(source_surrogate_u32);
-
-            // Skip rows deleted from the clone (CoW tombstone).
-            if tombstoned.contains(&source_surrogate_u32) {
-                continue;
-            }
-
-            // Skip rows already copy-up'd into target by the CoW write path.
-            if catalog
-                .get_clone_copyup(&target_qualified, source_surrogate_u32)?
-                .is_some()
-            {
-                continue;
-            }
-
-            // Recover the user-visible PK bytes from the catalog so the
-            // surrogate assigner produces the same surrogate the write path
-            // would allocate for this (collection, pk) pair.
-            let pk_bytes = catalog
-                .get_pk_for_surrogate(
-                    nodedb_types::CollectionKey::from_bare(
-                        origin.source_database,
-                        &origin.source_collection,
-                    ),
-                    tenant_id,
-                    source_surrogate,
-                )
-                .map_err(|e| crate::Error::Storage {
-                    engine: "clone_materializer".into(),
-                    detail: format!(
-                        "get_pk_for_surrogate failed for surrogate {source_surrogate_u32} \
-                         in '{source_qualified}': {e}"
-                    ),
-                })?
-                .unwrap_or_else(|| {
-                    // No PK binding (e.g. very old row): fall back to the hex doc_id
-                    // as key bytes — deterministic but may differ from the write path.
-                    doc_id_hex.as_bytes().to_vec()
-                });
-
-            let document_id = String::from_utf8_lossy(&pk_bytes).into_owned();
-
-            // Allocate target surrogate using the same (collection, pk_bytes) key
-            // the normal INSERT path would use.
-            let target_surrogate = state
-                .surrogate_assigner
-                .assign(
-                    nodedb_types::CollectionKey::from_bare(db_id, &coll.name),
-                    tenant_id,
-                    &pk_bytes,
-                )
-                .map_err(|e| crate::Error::Storage {
-                    engine: "clone_materializer".into(),
-                    detail: format!(
-                        "surrogate assign failed for doc '{doc_id_hex}' in \
-                         '{target_qualified}': {e}"
-                    ),
-                })?;
-
-            let plan = PhysicalPlan::Document(DocumentOp::PointInsert {
-                collection: nodedb_types::QualifiedCollection::new(db_id, &coll.name),
-                document_id: document_id.clone(),
-                value: value_bytes,
-                if_absent: true,
-                surrogate: target_surrogate,
-                // A materializer copy answers no client, so it projects
-                // nothing and needs no read gate.
-                returning: None,
-                rls_filters: Vec::new(),
-                resolved_sum_targets: Vec::new(),
-                deferred_sum_targets: Vec::new(),
-            });
-
-            let resp =
-                dispatch_local(state, tenant_id, db_id, &target_qualified, plan, None).await?;
-            if resp.status != Status::Ok {
-                return Err(crate::Error::Storage {
-                    engine: "clone_materializer".into(),
-                    detail: format!(
-                        "document insert on target '{target_qualified}' for doc \
-                         '{document_id}' returned status {:?}",
-                        resp.status
-                    ),
-                });
-            }
-            copied += 1;
-        }
-
-        // Per-page progress checkpoint.
-        checkpoint_progress(
+    if coll.hash_chain {
+        let copied = super::chained::materialize_chained_collection(
             state,
             catalog,
             db_id,
             coll,
-            origin.as_of_lsn,
-            copied,
-            total_seen,
-        )?;
-
-        if next_cursor.is_empty() {
-            break;
+            &tombstoned,
+            system_as_of_ms,
+        )
+        .await?;
+        checkpoint_progress(state, coll, origin.as_of_lsn, copied, copied).await?;
+    } else {
+        RowCopy {
+            state,
+            catalog,
+            db_id,
+            coll,
+            tenant_id: TenantId::new(coll.tenant_id),
+            source_db_id: origin.source_database,
+            source_collection: &origin.source_collection,
+            source_qualified: db_qualified(origin.source_database, &origin.source_collection),
+            target_qualified: &target_qualified,
+            tombstoned: &tombstoned,
+            system_as_of_ms,
+            as_of_lsn: origin.as_of_lsn,
         }
-        cursor = next_cursor;
+        .run()
+        .await?;
     }
 
-    tracing::info!(
-        db_id = db_id.as_u64(),
-        collection = %coll.name,
-        copied,
-        skipped_tombstoned = tombstoned.len(),
-        source_total = total_seen,
-        "document materialize: source rows copied to target",
-    );
-
     reap_materialized_collection(ReapParams {
-        target_collection_qualified: &target_qualified,
         db_id,
         tenant_id: coll.tenant_id,
         name: &coll.name,
         state,
         catalog,
-    })?;
-
-    Ok(())
-}
-
-/// Persist a `Materializing { progress_lsn, .. }` checkpoint between scan pages.
-fn checkpoint_progress(
-    state: &SharedState,
-    catalog: &SystemCatalog,
-    db_id: DatabaseId,
-    coll: &StoredCollection,
-    as_of_lsn: Lsn,
-    copied: u64,
-    total_seen: u64,
-) -> crate::Result<()> {
-    let mut updated = coll.clone();
-    updated.clone_status = CloneStatus::Materializing {
-        progress_lsn: as_of_lsn,
-        bytes_done: copied,
-        bytes_total: total_seen,
-    };
-    let outcome = propose_catalog_entry(
-        state,
-        &CatalogEntry::PutCollection(Box::new(updated.clone())),
-    )?;
-    if outcome.needs_local_apply() {
-        catalog.put_collection(db_id, &updated)?;
-    }
+    })
+    .await?;
     Ok(())
 }
 
@@ -255,12 +108,57 @@ pub(crate) async fn scan_source_page(
     system_as_of_ms: Option<i64>,
     txn_id: Option<TxnId>,
 ) -> crate::Result<ScanPage> {
+    let page = SourcePage {
+        tenant_id,
+        source_db_id,
+        source_qualified,
+        cursor,
+        system_as_of_ms,
+        raw_bodies: false,
+    };
+    scan_page(state, page, txn_id).await
+}
+
+/// One source-side scan page request.
+pub(super) struct SourcePage<'a> {
+    pub tenant_id: TenantId,
+    pub source_db_id: DatabaseId,
+    pub source_qualified: &'a str,
+    pub cursor: &'a [u8],
+    pub system_as_of_ms: Option<i64>,
+    /// Bodies as stored, with no `id` added.
+    pub raw_bodies: bool,
+}
+
+/// Run one `MaterializeScan` round-trip for `page`.
+pub(super) async fn scan_page(
+    state: &SharedState,
+    page: SourcePage<'_>,
+    txn_id: Option<TxnId>,
+) -> crate::Result<ScanPage> {
+    let SourcePage {
+        tenant_id,
+        source_db_id,
+        source_qualified,
+        cursor,
+        system_as_of_ms,
+        raw_bodies,
+    } = page;
     let plan = PhysicalPlan::Document(DocumentOp::MaterializeScan {
         collection: nodedb_types::QualifiedCollection::from_stored(source_qualified.to_string()),
         cursor: cursor.to_vec(),
         count: SCAN_PAGE,
         system_as_of_ms,
+        raw_bodies,
     });
+    // A transaction's staging overlay lives on the source shard's leader, so
+    // a staged read runs there (`dispatch_local` routes it). Every other read
+    // goes to the source shard's owner.
+    if txn_id.is_none() {
+        let payload =
+            dispatch_to_owner(state, tenant_id, source_db_id, source_qualified, plan).await?;
+        return parse_materialize_scan_payload(&payload);
+    }
     let resp = dispatch_local(
         state,
         tenant_id,

@@ -11,12 +11,15 @@
 //! wait for it to finish.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::control::distributed_applier::applier::ApplyBatch;
 use crate::control::distributed_applier::proposal_ledger::ProposalLedger;
+use crate::control::server::dispatch_utils::publish_settled_changes;
+use crate::control::state::SharedState;
 
 use super::bookkeeping::record_durable_apply;
 use super::context::{ApplyContext, ApplyFuture, LoopEvent, LoopFuture, Started, StartedEntry};
@@ -24,6 +27,7 @@ use super::group_watch::GroupWatch;
 use super::lane::{Lane, QueuedEntry, Slot, SlotState};
 use super::metadata_floor::{HeldEntry, hold_for_metadata};
 use super::proposal_gate::{EntryOutcome, ProposalGate};
+use super::snapshot_gate::{EntryAdmission, admit_entry, hold_permit};
 use super::start::{Prepared, prepare_entry};
 
 /// Every group's lane, and the enqueues and applies that run.
@@ -33,6 +37,9 @@ pub(super) struct Pipeline<'a> {
     gate: ProposalGate,
     watch: GroupWatch,
     running: FuturesUnordered<LoopFuture<'a>>,
+    /// Set by a pump that left an entry queued because a snapshot install
+    /// held its group's apply gate.
+    install_blocked: bool,
 }
 
 impl<'a> Pipeline<'a> {
@@ -41,9 +48,16 @@ impl<'a> Pipeline<'a> {
             ctx,
             lanes: HashMap::new(),
             gate: ProposalGate::new(ledger),
-            watch: GroupWatch::default(),
+            watch: GroupWatch::with_cuts(ctx.state.pitr.recorded_cuts()),
             running: FuturesUnordered::new(),
+            install_blocked: false,
         }
+    }
+
+    /// Whether the last pump left an entry queued behind a snapshot install.
+    /// The loop pumps again once an install releases its gate.
+    pub fn install_blocked(&self) -> bool {
+        self.install_blocked
     }
 
     /// Queue a batch the applier handed off, behind its group's earlier
@@ -53,8 +67,17 @@ impl<'a> Pipeline<'a> {
             .lanes
             .entry(batch.group_id)
             .or_insert_with(|| Lane::new(batch.group_id));
+        let first = lane.backlog.len();
         lane.backlog
             .extend(batch.entries.into_iter().map(QueuedEntry::new));
+        // Every handed-off entry is committed. A snapshot this node builds
+        // carries their keys.
+        self.ctx.tracker.note_committed(
+            batch.group_id,
+            lane.backlog
+                .range(first..)
+                .map(|queued| (queued.entry.index, queued.proposal_key())),
+        );
     }
 
     /// Whether any enqueue or apply runs.
@@ -88,6 +111,9 @@ impl<'a> Pipeline<'a> {
                 self.enqueued(group_id, log_index, entry),
             ),
             LoopEvent::Finished(finished) => {
+                self.ctx
+                    .tracker
+                    .note_concluded(finished.group_id, finished.log_index);
                 let gate = &mut self.gate;
                 let wrote_rows = finished.outcome.wrote_rows();
                 let handled = self.lanes.get_mut(&finished.group_id).is_some_and(|lane| {
@@ -127,6 +153,7 @@ impl<'a> Pipeline<'a> {
             Started::Concluded(outcome) => {
                 // The write concluded without reaching its core. It leaves
                 // its enqueue and concludes in one step.
+                self.ctx.tracker.note_concluded(group_id, log_index);
                 let gate = &mut self.gate;
                 let wrote_rows = outcome.wrote_rows();
                 lane.enqueued(log_index, SlotState::Running, collection, user_write)
@@ -139,6 +166,12 @@ impl<'a> Pipeline<'a> {
 
     /// Start every entry each group can start now, in log order.
     pub fn pump(&mut self) {
+        self.install_blocked = false;
+        // Keys a snapshot install carried, before any entry starts: a later
+        // copy of one of those proposals is a duplicate here too.
+        for key in self.ctx.tracker.take_restored_keys() {
+            self.gate.note_restored(key);
+        }
         let groups: Vec<u64> = self
             .lanes
             .iter()
@@ -151,16 +184,66 @@ impl<'a> Pipeline<'a> {
     }
 
     fn pump_group(&mut self, group_id: u64) {
+        let shared: &'a Arc<SharedState> = self.ctx.state;
+        let gates = shared.raft_apply_gates.get().map(|gates| &**gates);
         while let Some(queued) = self.next_startable(group_id) {
             let log_index = queued.entry.index;
             let proposal_key = queued.proposal_key();
+            let covered_through = self.ctx.tracker.covered_through(group_id);
+            let permit = match admit_entry(gates, group_id, log_index, covered_through) {
+                EntryAdmission::Installing => {
+                    if let Some(lane) = self.lanes.get_mut(&group_id) {
+                        lane.backlog.push_front(queued);
+                    }
+                    self.install_blocked = true;
+                    return;
+                }
+                EntryAdmission::Start(permit) => permit,
+                // At or below the snapshot's Raft index: the installed state
+                // and the Raft boundary both hold the entry.
+                EntryAdmission::Covered => {
+                    if !self.conclude_covered(
+                        group_id,
+                        log_index,
+                        proposal_key,
+                        EntryOutcome::Skipped,
+                    ) {
+                        return;
+                    }
+                    continue;
+                }
+                // Above the Raft index and at or below the cut: only the
+                // installed state holds the entry. It concludes without
+                // applying and extends the durable prefix, so a restart never
+                // delivers it again.
+                EntryAdmission::CoveredByCut => {
+                    if !self.conclude_covered(
+                        group_id,
+                        log_index,
+                        proposal_key,
+                        EntryOutcome::Covered,
+                    ) {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            // Every entry that leaves the backlog for good starts. A snapshot
+            // builder cuts at the highest one.
+            self.ctx.tracker.note_started(group_id, log_index);
             // Stamped before the entry is prepared: a barrier raises the cut
             // floor only for the entries after it.
-            let write_mark = queued.write_stamp().map(|(tenant_id, write_hlc)| {
-                (tenant_id, self.watch.commit_hlc(group_id, write_hlc))
-            });
+            let write_mark = queued
+                .write_stamp()
+                .map(|(tenant_id, write_hlc, restore_id)| {
+                    (
+                        tenant_id,
+                        self.watch.commit_hlc(group_id, log_index, write_hlc),
+                        restore_id,
+                    )
+                });
             // A second copy of an applied proposal never reaches the funnel,
-            // so its plan is classified here. Its first copy may sit above
+            // so its plan is classified here. Its first copy can sit above
             // the saved floor, and this copy then carries the mark again.
             let repeat_writes =
                 self.gate.prior_wrote_rows(proposal_key) && queued.plan_writes_user_data();
@@ -188,6 +271,8 @@ impl<'a> Pipeline<'a> {
                 Prepared::Barrier => (SlotState::Barrier, false, false),
                 Prepared::Enqueue(enqueue) => {
                     self.gate.open(proposal_key);
+                    self.ctx.tracker.note_dispatched(group_id, log_index);
+                    let enqueue = hold_permit(permit, enqueue);
                     self.running
                         .push(Box::pin(enqueue.map(move |entry| LoopEvent::Enqueued {
                             group_id,
@@ -200,7 +285,9 @@ impl<'a> Pipeline<'a> {
                 Prepared::Exclusive(apply) => {
                     // An array op or cell write: user data.
                     self.gate.open(proposal_key);
-                    self.running.push(finished_event(apply));
+                    self.ctx.tracker.note_dispatched(group_id, log_index);
+                    self.running
+                        .push(finished_event(hold_permit(permit, apply)));
                     (SlotState::Running, true, true)
                 }
             };
@@ -221,7 +308,36 @@ impl<'a> Pipeline<'a> {
         }
     }
 
-    /// Take the next entry of `group_id` when it may start now.
+    /// Conclude an entry an installed snapshot holds, without reaching a
+    /// core. It counts as started. Its waiter learns the write committed
+    /// without a result. Returns `false` when the group has no lane.
+    fn conclude_covered(
+        &mut self,
+        group_id: u64,
+        log_index: u64,
+        proposal_key: u64,
+        outcome: EntryOutcome,
+    ) -> bool {
+        self.ctx.tracker.note_started(group_id, log_index);
+        self.ctx
+            .tracker
+            .complete_covered(group_id, log_index, proposal_key);
+        let concluded = SlotState::Concluded(self.gate.conclude(proposal_key, false, outcome));
+        let Some(lane) = self.lanes.get_mut(&group_id) else {
+            return false;
+        };
+        lane.push(Slot {
+            log_index,
+            proposal_key,
+            collection: None,
+            write_mark: None,
+            user_write: false,
+            state: concluded,
+        });
+        true
+    }
+
+    /// Take the next entry of `group_id` when it can start now.
     ///
     /// It waits while the group's previous write is in its enqueue or an
     /// exclusive entry of the group runs, while it is exclusive and an
@@ -253,9 +369,15 @@ impl<'a> Pipeline<'a> {
         let state = self.ctx.state;
         let tracker = self.ctx.tracker;
         for (group_id, lane) in &mut self.lanes {
+            let first = lane.front_index();
             let settled = lane.settle(tracker, &state.tenant_marks);
             if settled > 0 {
                 tracker.window().release(*group_id, settled);
+                // The entries' change events publish in log order, at their
+                // log positions, on every replica.
+                if let (Some(first), Some(last)) = (first, lane.last_settled()) {
+                    publish_settled_changes(state, *group_id, first, last);
+                }
             }
             if !lane.floor_pending() {
                 continue;
@@ -274,6 +396,8 @@ impl<'a> Pipeline<'a> {
                 continue;
             }
             if let Some(floor) = lane.take_floor_to_save() {
+                // Every entry the floor covers keeps its changes on disk.
+                state.change_stream.journal_group(*group_id, floor);
                 record_durable_apply(state, *group_id, floor);
             }
         }

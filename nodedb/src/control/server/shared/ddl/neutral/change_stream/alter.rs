@@ -2,10 +2,8 @@
 
 //! Protocol-neutral `ALTER CHANGE STREAM` DDL handler.
 //!
-//! Ported from the pgwire `ddl::change_stream::alter` handler. The tenant-admin
-//! gate and the action matching are preserved verbatim; only the error
-//! construction changed from pgwire `PgWireError` to the protocol-neutral
-//! [`DdlError`].
+//! The tenant-admin gate and the action matching run here. Errors are the
+//! protocol-neutral [`DdlError`].
 //!
 //! Syntax:
 //! ```sql

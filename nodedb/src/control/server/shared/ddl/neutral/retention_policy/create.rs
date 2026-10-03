@@ -143,7 +143,7 @@ pub async fn create_retention_policy(
 
     // Replicated: every node writes the row and installs the definition in
     // its own `RetentionPolicyRegistry` via post-apply.
-    propose_put(state, &def)?;
+    propose_put(state, &def).await?;
 
     // Emit CRDT sync delta for Lite visibility.
     {
@@ -169,7 +169,7 @@ pub async fn create_retention_policy(
     {
         // Roll back through the same replicated path that created it, so the
         // policy disappears on every node, not only on this one.
-        if let Err(rollback) = propose_delete(state, &def) {
+        if let Err(rollback) = propose_delete(state, &def).await {
             return Err(DdlError::from_error_in_context(
                 &format!(
                     "rollback left the policy in place: {}; failed to auto-wire aggregates",

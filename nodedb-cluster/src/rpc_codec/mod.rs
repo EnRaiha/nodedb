@@ -10,19 +10,23 @@
 
 pub mod auth_envelope;
 pub mod auth_lease;
+pub mod calvin_parts;
 pub mod calvin_submit;
 pub mod cluster_mgmt;
 pub mod data_plane_error;
 pub mod data_propose;
 pub mod discriminants;
 pub mod execute;
+pub mod frame_refusal;
 pub mod header;
+pub mod leader_status;
 pub mod mac;
 pub mod metadata;
 pub mod peer_seq;
 pub mod raft_msgs;
 pub mod raft_rpc;
 pub mod read_index;
+pub mod request_refusal;
 pub mod reservation;
 pub mod shard_error;
 pub mod shuffle;
@@ -36,6 +40,7 @@ pub use auth_lease::{
     AuthBarrierOutcome, AuthBarrierRequest, AuthBarrierResponse, AuthLeaseRenewOutcome,
     AuthLeaseRenewRequest, AuthLeaseRenewResponse, GroupCoverage,
 };
+pub use calvin_parts::{CalvinPartsRequest, CalvinPartsResponse, MAX_PARTS_BATCH_BYTES};
 pub use calvin_submit::{
     SubmitCalvinInboxRequest, SubmitCalvinInboxResponse, SubmitCalvinTxnRequest,
     SubmitCalvinTxnResponse,
@@ -52,12 +57,15 @@ pub use execute::{
     DescriptorVersionEntry, ExecuteRequest, ExecuteResponse, ExecuteStreamChunk, ExecuteStreamEnd,
     PLAN_DECODE_FAILED, TypedClusterError,
 };
+pub use frame_refusal::FrameRefusal;
 pub use header::{HEADER_SIZE, MAX_RPC_PAYLOAD_SIZE};
+pub use leader_status::{LeaderMembership, LeaderStatusRequest, LeaderStatusResponse};
 pub use mac::{MAC_LEN, MacKey};
 pub use metadata::{MetadataProposeRequest, MetadataProposeResponse};
-pub use peer_seq::{PeerSeqSender, PeerSeqWindow, REPLAY_WINDOW};
+pub use peer_seq::{BOOT_EPOCH_SHIFT, PeerSeqSender, PeerSeqWindow, REPLAY_WINDOW};
 pub use raft_rpc::{RaftRpc, decode, encode, frame_size};
 pub use read_index::{ReadIndexOutcome, ReadIndexRequest, ReadIndexResponse};
+pub use request_refusal::{RefusalReason, RequestRefusal};
 pub use reservation::{
     ReleaseReservationRequest, ReleaseReservationResponse, ReserveReadRequest, ReserveReadResponse,
 };

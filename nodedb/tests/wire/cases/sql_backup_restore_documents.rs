@@ -9,9 +9,6 @@
 //! then restarts. Before and after the restart every row reads back, the
 //! index lookups answer, the unique index refuses a duplicate, the bitemporal
 //! row keeps both versions, and the edges traverse.
-//!
-//! Both single-node modes run it: the default server, whose data groups are
-//! Raft groups of one, and a standalone server with no Raft groups.
 
 use super::backup_support::{drain_backup, push_restore};
 use crate::harness::TestServer;
@@ -137,21 +134,5 @@ async fn restored_documents_indexes_and_edges_survive_a_restart() {
     let (target, dir) = target.take_dir();
     target.graceful_shutdown().await;
     let (target, _dir) = TestServer::open_on_path(dir).await;
-    assert_restored(&target, "after a restart").await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn restored_documents_indexes_and_edges_survive_a_standalone_restart() {
-    let backup = source_backup().await;
-
-    let target = TestServer::start_standalone().await;
-    push_restore(&target.client, TENANT, backup)
-        .await
-        .unwrap_or_else(|e| panic!("restore: {e}"));
-    assert_restored(&target, "after the restore").await;
-
-    let (target, dir) = target.take_dir();
-    target.graceful_shutdown().await;
-    let (target, _dir) = TestServer::open_on_path_standalone(dir).await;
     assert_restored(&target, "after a restart").await;
 }

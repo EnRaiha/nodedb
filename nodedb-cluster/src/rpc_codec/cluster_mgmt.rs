@@ -17,11 +17,16 @@ pub struct JoinRequest {
     pub node_id: u64,
     pub listen_addr: String,
     pub wire_version: u16,
+    /// Joiner's `nodedb_types::wire_version::WIRE_BUILD_ID`. Compared for
+    /// exact equality against this node's own build — see `handle_join_request`.
+    pub build_id: String,
     /// SPIFFE URI SAN from the joiner's mTLS leaf certificate, if present.
     pub spiffe_id: Option<String>,
     /// SHA-256 SPKI fingerprint of the joiner's mTLS leaf certificate.
     /// Stored as `Vec<u8>` for rkyv compatibility; always 32 bytes when present.
     pub spki_pin: Option<Vec<u8>>,
+    /// Bound UDP address of the joiner's SWIM failure detector.
+    pub swim_addr: Option<String>,
 }
 
 /// Response to a join request — carries full cluster state.
@@ -48,10 +53,12 @@ pub struct JoinNodeInfo {
     /// SHA-256 SPKI fingerprint for this node.
     /// Stored as `Vec<u8>` for rkyv compatibility; always 32 bytes when present.
     pub spki_pin: Option<Vec<u8>>,
+    /// Bound UDP address of this node's SWIM failure detector, if it runs one.
+    pub swim_addr: Option<String>,
 }
 
 /// Raft group membership in the join response wire format.
-#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct JoinGroupInfo {
     pub group_id: u64,
     pub leader: u64,
@@ -190,8 +197,10 @@ mod tests {
             node_id: 42,
             listen_addr: "10.0.0.5:9400".into(),
             wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
+            build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
             spiffe_id: Some("spiffe://cluster.local/node/42".into()),
             spki_pin: Some(vec![0xabu8; 32]),
+            swim_addr: Some("10.0.0.5:9401".into()),
         };
         match roundtrip(RaftRpc::JoinRequest(req)) {
             RaftRpc::JoinRequest(d) => {
@@ -202,6 +211,8 @@ mod tests {
                     Some("spiffe://cluster.local/node/42")
                 );
                 assert_eq!(d.spki_pin.as_deref(), Some([0xabu8; 32].as_ref()));
+                assert_eq!(d.build_id, nodedb_types::wire_version::WIRE_BUILD_ID);
+                assert_eq!(d.swim_addr.as_deref(), Some("10.0.0.5:9401"));
             }
             other => panic!("expected JoinRequest, got {other:?}"),
         }
@@ -221,6 +232,7 @@ mod tests {
                 wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
                 spiffe_id: None,
                 spki_pin: None,
+                swim_addr: Some("10.0.0.1:9401".into()),
             }],
             vshard_to_group: (0..1024u64).map(|i| i % 4).collect(),
             groups: vec![JoinGroupInfo {
@@ -235,6 +247,7 @@ mod tests {
                 assert!(d.success);
                 assert_eq!(d.nodes.len(), 1);
                 assert_eq!(d.vshard_to_group.len(), 1024);
+                assert_eq!(d.nodes[0].swim_addr.as_deref(), Some("10.0.0.1:9401"));
             }
             other => panic!("expected JoinResponse, got {other:?}"),
         }

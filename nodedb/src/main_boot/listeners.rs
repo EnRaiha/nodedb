@@ -35,7 +35,7 @@ pub(crate) async fn setup(
     config: &ServerConfig,
     cluster_mode_str: &str,
     shutdown_bus: &ShutdownBus,
-    cluster_handle: Option<Arc<ClusterHandle>>,
+    cluster_handle: Arc<ClusterHandle>,
 ) -> anyhow::Result<ListenerSetup> {
     // Create shared connection semaphore — enforced across all listeners.
     let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(config.server.max_connections));

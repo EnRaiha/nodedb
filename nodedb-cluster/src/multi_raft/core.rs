@@ -7,13 +7,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use tracing::info;
-
-use nodedb_raft::node::RaftConfig;
 use nodedb_raft::{RaftNode, Ready};
 
-use crate::error::{ClusterError, Result};
-use crate::raft_storage::RedbLogStorage;
+use crate::applied_watcher::GroupAppliedWatchers;
+use crate::error::Result;
+use crate::group_disk::StagedLogStorage;
 use crate::routing::RoutingTable;
 
 /// Multi-Raft coordinator managing multiple Raft groups on a single node.
@@ -27,7 +25,10 @@ pub struct MultiRaft {
     /// This node's ID.
     pub(super) node_id: u64,
     /// Raft groups hosted on this node (group_id → RaftNode).
-    pub(super) groups: HashMap<u64, RaftNode<RedbLogStorage>>,
+    ///
+    /// Each group's storage stages its writes. The group's own writer thread
+    /// makes them durable, never under this struct's lock.
+    pub(super) groups: HashMap<u64, RaftNode<StagedLogStorage>>,
     /// Routing table (vShard → group mapping).
     ///
     /// This is the SAME `Arc<RwLock<RoutingTable>>` held by
@@ -35,6 +36,9 @@ pub struct MultiRaft {
     /// conf-changes applied here (via `apply_conf_change`) write THROUGH to
     /// the one table the query/data plane reads. Raft is the convergence
     /// mechanism on every applying node (leader and follower).
+    ///
+    /// Lock order: this struct's mutex first, then this routing guard.
+    /// See the lock-order section on [`RoutingTable`].
     pub(super) routing: Arc<RwLock<RoutingTable>>,
     /// Default election timeout range.
     pub(super) election_timeout_min: Duration,
@@ -43,7 +47,7 @@ pub struct MultiRaft {
     pub(super) heartbeat_interval: Duration,
     /// Auto-compaction threshold applied to every group created on this
     /// node. `None` (default) disables auto-compaction. See
-    /// [`RaftConfig::log_compaction_threshold`].
+    /// [`nodedb_raft::node::RaftConfig::log_compaction_threshold`].
     pub(super) log_compaction_threshold: Option<u64>,
     /// Data directory for persistent Raft log storage.
     pub(super) data_dir: PathBuf,
@@ -51,7 +55,30 @@ pub struct MultiRaft {
     /// Compaction is deferred for any group with an active transfer so the
     /// snapshot boundary never advances mid-transfer.
     pub(super) in_flight_snapshots: Arc<crate::raft_loop::in_flight_snapshots::InFlightSnapshots>,
+    /// Per-group gate that orders committed-entry applies against snapshot
+    /// installs.
+    pub(super) apply_gates: Arc<crate::raft_loop::apply_gate::GroupApplyGates>,
+    /// Per-group ceiling on log compaction: the highest index an archiver
+    /// holds a copy of. A group with a ceiling never compacts past it, so no
+    /// entry leaves the log before it is archived.
+    pub(super) compaction_ceilings: HashMap<u64, Arc<std::sync::atomic::AtomicU64>>,
+    /// The node clock the metadata entries this node stamps as leader take
+    /// their stamp from. `None` proposes them unstamped.
+    pub(super) metadata_clock: Option<Arc<nodedb_types::HlcClock>>,
+    /// The per-group applied watchers. A group mounted here seeds its
+    /// watcher with the applied index it restored, because entries at or
+    /// below it are never delivered again. `None` seeds nothing.
+    pub(super) applied_watchers: Option<Arc<GroupAppliedWatchers>>,
+    /// Decides whether a data group mounted here takes a snapshot before any
+    /// log entry. `None` requires none.
+    pub(super) snapshot_requirement: Option<SnapshotRequirement>,
 }
+
+/// Whether this node's replica of a data group must take a snapshot before
+/// it takes log entries. Called with the group id and the first index the
+/// Calvin sequencer log still holds here, under the `MultiRaft` lock: it
+/// must not take that lock.
+pub type SnapshotRequirement = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
 
 /// Aggregated output from all Raft groups after a tick.
 #[derive(Debug, Default)]
@@ -107,7 +134,49 @@ impl MultiRaft {
             in_flight_snapshots: Arc::new(
                 crate::raft_loop::in_flight_snapshots::InFlightSnapshots::default(),
             ),
+            apply_gates: Arc::new(crate::raft_loop::apply_gate::GroupApplyGates::new()),
+            compaction_ceilings: HashMap::new(),
+            metadata_clock: None,
+            applied_watchers: None,
+            snapshot_requirement: None,
         }
+    }
+
+    /// Install the snapshot requirement for data groups, and apply it to
+    /// every data group mounted already.
+    pub fn set_snapshot_requirement(&mut self, requirement: SnapshotRequirement) {
+        let sequencer_first = self.sequencer_first_available();
+        for (&group_id, node) in &mut self.groups {
+            if is_data_group(group_id) {
+                node.set_snapshot_required(requirement(group_id, sequencer_first));
+            }
+        }
+        self.snapshot_requirement = Some(requirement);
+    }
+
+    /// The auto-compaction threshold every group on this node runs with,
+    /// `None` when logs are never compacted.
+    pub fn log_compaction_threshold(&self) -> Option<u64> {
+        self.log_compaction_threshold
+    }
+
+    /// The first index the Calvin sequencer log holds here, `1` when this
+    /// node hosts no sequencer replica.
+    pub(super) fn sequencer_first_available(&self) -> u64 {
+        self.groups
+            .get(&crate::calvin::SEQUENCER_GROUP_ID)
+            .map_or(1, |node| node.first_available_index())
+    }
+
+    /// Install the per-group applied watchers. Every group mounted here, now
+    /// or later, starts its watcher at the applied index it restored: the
+    /// durable applied floor, whose entries applied before the restart and
+    /// are never delivered again.
+    pub fn set_applied_watchers(&mut self, watchers: Arc<GroupAppliedWatchers>) {
+        for (&group_id, node) in &self.groups {
+            seed_watcher(&watchers, group_id, node.last_applied());
+        }
+        self.applied_watchers = Some(watchers);
     }
 
     /// Configure election timeout range.
@@ -129,6 +198,12 @@ impl MultiRaft {
         self.election_timeout_min
     }
 
+    /// The longest election timeout a group on this node waits before it
+    /// campaigns.
+    pub fn election_timeout_max(&self) -> Duration {
+        self.election_timeout_max
+    }
+
     /// How often a leader on this node sends heartbeats.
     pub fn heartbeat_interval(&self) -> Duration {
         self.heartbeat_interval
@@ -136,7 +211,7 @@ impl MultiRaft {
 
     /// Configure the auto-compaction threshold for every group created on
     /// this node. `None` disables auto-compaction (the default). See
-    /// [`RaftConfig::log_compaction_threshold`].
+    /// [`nodedb_raft::node::RaftConfig::log_compaction_threshold`].
     pub fn with_log_compaction_threshold(mut self, threshold: Option<u64>) -> Self {
         self.log_compaction_threshold = threshold;
         self
@@ -167,63 +242,40 @@ impl MultiRaft {
         self.add_group_inner(group_id, voters, learners, true)
     }
 
-    fn add_group_inner(
-        &mut self,
-        group_id: u64,
-        peers: Vec<u64>,
-        learners: Vec<u64>,
-        starts_as_learner: bool,
-    ) -> Result<()> {
-        let config = RaftConfig {
-            node_id: self.node_id,
-            group_id,
-            peers,
-            learners,
-            observers: vec![],
-            starts_as_learner,
-            starts_as_observer: false,
-            election_timeout_min: self.election_timeout_min,
-            election_timeout_max: self.election_timeout_max,
-            heartbeat_interval: self.heartbeat_interval,
-            log_compaction_threshold: self.log_compaction_threshold,
-        };
+    /// A ticket for every storage write `group_id` staged so far, or `None`
+    /// when all of them are durable or the group is not mounted. A caller
+    /// takes it right after the Raft call whose writes a reply depends on,
+    /// and awaits it after it releases this struct's lock.
+    pub fn durability_ticket(&self, group_id: u64) -> Option<crate::group_disk::DurabilityTicket> {
+        self.groups.get(&group_id)?.storage().ticket()
+    }
 
-        let storage_path = self.data_dir.join(format!("raft/group-{group_id}.redb"));
-        let storage = RedbLogStorage::open(&storage_path).map_err(|e| ClusterError::Transport {
-            detail: format!("failed to open raft storage for group {group_id}: {e}"),
-        })?;
-        let mut node = RaftNode::new(config, storage);
-        // Reload durable state (HardState + log) from redb before mounting the
-        // group. On a restart this recovers the persisted term/voted_for — so
-        // a restarted voter cannot forget its vote and double-vote — AND the
-        // persisted log entries, so the node does not depend on full
-        // re-replication from the leader to recover its log. On a fresh group
-        // the storage is empty and this is a no-op (default HardState, empty
-        // log). Also resets the election timeout.
-        node.restore()?;
-        self.groups.insert(group_id, node);
-
-        info!(
-            node = self.node_id,
-            group = group_id,
-            as_learner = starts_as_learner,
-            path = %storage_path.display(),
-            "added raft group with persistent storage"
-        );
-        Ok(())
+    /// Block until every write each group staged so far is durable. For boot
+    /// and tests, off the async threads: a running node waits on a
+    /// [`Self::durability_ticket`] instead.
+    pub fn wait_all_durable_blocking(&self) {
+        for node in self.groups.values() {
+            if let Some(ticket) = node.storage().ticket() {
+                ticket.wait_blocking();
+            }
+        }
     }
 
     /// Tick all Raft groups. Returns aggregated ready output.
     ///
-    /// Any HardState staged by a tick (an election term bump + self-vote from
-    /// an election timeout) is durably persisted BEFORE the aggregated `Ready`
-    /// — and therefore the vote requests it carries — is returned for
-    /// dispatch. A persist failure aborts the tick so the caller never sends
-    /// vote requests for a term that was not made durable.
+    /// Any HardState a tick changes (an election term bump + self-vote from
+    /// an election timeout) is staged on the group's disk before the
+    /// aggregated `Ready` returns. The caller awaits the group's
+    /// [`Self::durability_ticket`] before it sends the vote requests that
+    /// `Ready` carries, so no vote request leaves for a term that is not
+    /// durable. A staging error aborts the tick.
     pub fn tick(&mut self) -> Result<MultiRaftReady> {
         let mut ready = MultiRaftReady::default();
 
         for (&group_id, node) in &mut self.groups {
+            // A leader counts the entries its disk made durable since the
+            // last tick, so a commit the disk completed lands in this Ready.
+            node.on_storage_progress();
             node.tick();
             node.persist_hard_state_if_dirty()?;
             let r = node.take_ready();
@@ -259,6 +311,12 @@ impl MultiRaft {
         self.in_flight_snapshots.clone()
     }
 
+    /// Clone of the per-group apply gates. Every applier of committed entries
+    /// and every snapshot install of this node goes through them.
+    pub fn apply_gates(&self) -> Arc<crate::raft_loop::apply_gate::GroupApplyGates> {
+        self.apply_gates.clone()
+    }
+
     pub fn group_count(&self) -> usize {
         self.groups.len()
     }
@@ -277,9 +335,24 @@ impl MultiRaft {
     }
 
     /// Mutable access to the underlying Raft groups (for testing / bootstrap).
-    pub fn groups_mut(&mut self) -> &mut HashMap<u64, RaftNode<RedbLogStorage>> {
+    pub fn groups_mut(&mut self) -> &mut HashMap<u64, RaftNode<StagedLogStorage>> {
         &mut self.groups
     }
+}
+
+/// Start `group_id`'s watcher at `restored`, the applied index the group
+/// restored from storage. A fresh group restores 0 and seeds nothing.
+pub(super) fn seed_watcher(watchers: &GroupAppliedWatchers, group_id: u64, restored: u64) {
+    if restored > 0 {
+        watchers.bump(group_id, restored);
+    }
+}
+
+/// Whether `group_id` is a data group: neither the metadata group nor the
+/// Calvin sequencer group.
+pub(super) fn is_data_group(group_id: u64) -> bool {
+    group_id != crate::metadata_group::METADATA_GROUP_ID
+        && group_id != crate::calvin::SEQUENCER_GROUP_ID
 }
 
 // Re-export LogEntry so callers of `read_committed_entries` can name the type.
@@ -308,6 +381,10 @@ mod tests {
             node.election_deadline_override(Instant::now() - Duration::from_millis(1));
         }
 
+        // The first tick elects every group's leader. Each leader's no-op
+        // commits once its disk holds it, and the next tick delivers it.
+        mr.tick().unwrap();
+        mr.wait_all_durable_blocking();
         let ready = mr.tick().unwrap();
         assert_eq!(ready.groups.len(), 5);
     }
@@ -337,6 +414,48 @@ mod tests {
 
         let (_gid, idx) = mr.propose(256, b"cmd-shard-256".to_vec()).unwrap();
         assert!(idx > 0);
+    }
+
+    #[test]
+    fn compaction_never_passes_the_ceiling() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let rt = RoutingTable::uniform(1, &[1], 1);
+        let mut mr =
+            MultiRaft::new(1, rt, dir.path().to_path_buf()).with_log_compaction_threshold(Some(1));
+        mr.add_group(0, vec![]).unwrap();
+        for node in mr.groups.values_mut() {
+            node.election_deadline_override(Instant::now() - Duration::from_millis(1));
+        }
+        let ceiling = std::sync::Arc::new(AtomicU64::new(0));
+        mr.set_compaction_ceiling(0, std::sync::Arc::clone(&ceiling));
+        let apply = |mr: &mut MultiRaft| {
+            mr.wait_all_durable_blocking();
+            for (gid, ready) in mr.tick().unwrap().groups {
+                if let Some(last) = ready.committed_entries.last() {
+                    mr.advance_applied(gid, last.index).unwrap();
+                    mr.save_applied_index(gid, last.index).unwrap();
+                }
+            }
+        };
+        mr.tick().unwrap();
+        apply(&mut mr);
+        for i in 0..5u8 {
+            mr.propose_to_group(0, vec![i]).unwrap();
+        }
+        for _ in 0..3 {
+            apply(&mut mr);
+        }
+        let applied = mr.groups[&0].last_applied();
+        assert!(applied >= 5, "applied {applied}");
+
+        assert!(!mr.maybe_compact_group(0, applied).unwrap());
+        assert_eq!(mr.first_available_index(0), Some(1));
+
+        ceiling.store(3, Ordering::Release);
+        assert!(mr.maybe_compact_group(0, applied).unwrap());
+        assert_eq!(mr.first_available_index(0), Some(4));
     }
 
     #[test]

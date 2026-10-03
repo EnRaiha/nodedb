@@ -62,7 +62,7 @@ pub(super) fn apply_document(ctx: &PermCtx<'_>, op: &mut DocumentOp) -> crate::R
         ),
 
         // Refuse: streams raw triples with no filter slot — every body
-        // would copy regardless of the tree.
+        // will copy regardless of the tree.
         DocumentOp::MaterializeScan { collection, .. } => ctx.refuse_if_tree(
             collection,
             "the materializing scan streams raw stored bodies through a cursor payload that \
@@ -195,7 +195,7 @@ mod tests {
                 "docs",
             ),
             document_id: "d1".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             rls_filters: Vec::new(),
             system_time: Default::default(),

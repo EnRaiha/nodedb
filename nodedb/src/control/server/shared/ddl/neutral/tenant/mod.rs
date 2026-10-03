@@ -13,15 +13,13 @@
 //! - [`move_tenant`] — `MOVE TENANT <name> FROM <db> TO <db>` (async, 5-phase).
 //!
 //! `SHOW TENANTS` / `SHOW TENANT <ident>` / `SHOW TENANTS WITH NAME <name>`
-//! were migrated separately to `neutral::inspect` and are not part of this
-//! family. `SHOW TENANT USAGE` / `SHOW TENANT QUOTA` (bare, no `IN DATABASE`)
-//! were confirmed parser-shadowed dead code on the pgwire router — the typed
-//! `ddl_ast` tenant parser never returns `None` for `SHOW TENANT
-//! USAGE|QUOTA...`, so those two forms always resolved to either the typed
-//! `IN DATABASE` variant or a `42601` parse error before reaching the pgwire
-//! string handlers. They were deleted, not migrated; no neutral string prefix
-//! exists for them, so the same input still hits the parse gate and still
-//! returns `42601` — byte-identical.
+//! live in `neutral::inspect` and are not part of this family.
+//! `SHOW TENANT USAGE` / `SHOW TENANT QUOTA` (bare, no `IN DATABASE`) have no
+//! handler here: the typed `ddl_ast` tenant parser never returns `None` for
+//! `SHOW TENANT USAGE|QUOTA...`, so those two forms always resolve to either
+//! the typed `IN DATABASE` variant or a `42601` parse error. No neutral string
+//! prefix exists for them, so the same input hits the parse gate and returns
+//! `42601`.
 
 pub mod alter;
 pub mod alter_quota;

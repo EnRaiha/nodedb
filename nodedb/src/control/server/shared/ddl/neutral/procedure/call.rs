@@ -2,12 +2,10 @@
 
 //! `CALL <procedure>(args)` execution handler.
 //!
-//! Ported from the pgwire `ddl::procedure::call` handler. The CALL parsing,
-//! catalog resolution, argument binding, budgeted body execution, and OUT
-//! parameter extraction are preserved verbatim; only the result construction
-//! changed from pgwire `Response` / `PgWireError` to the protocol-neutral
-//! [`DdlResult`] / [`DdlError`]. The OUT-parameter result set carries the same
-//! text columns and per-row values as the pgwire `QueryResponse` it replaces.
+//! The CALL parsing, catalog resolution, argument binding, budgeted body
+//! execution, and OUT parameter extraction run here. The result is the
+//! protocol-neutral [`DdlResult`] / [`DdlError`]. The OUT-parameter result set
+//! carries text columns.
 
 use crate::control::planner::procedural::executor::bindings::RowBindings;
 use crate::control::planner::procedural::executor::core::StatementExecutor;
@@ -67,7 +65,8 @@ pub async fn call_procedure(
     let block = crate::control::planner::procedural::parse_block(&proc.body_sql)
         .map_err(|e| DdlError::new("42601", format!("procedure body parse error: {e}")))?;
 
-    // Execute with fuel metering, timeout, and transaction context.
+    // Execute with fuel metering and timeout. Every statement stages into a
+    // transaction that COMMIT, ROLLBACK and the block's end resolve.
     let mut budget = ExecutionBudget::new(proc.max_iterations, proc.timeout_secs);
     let executor = StatementExecutor::with_source_in_database(
         state,
@@ -76,13 +75,14 @@ pub async fn call_procedure(
         database_id,
         0,
         crate::event::EventSource::User,
-    )
-    .with_transaction_context();
+    );
 
     executor
         .execute_block_with_budget(&block, &bindings, &mut budget)
         .await
         .map_err(|e| DdlError::new("P0001", e.to_string()))?;
+    // A procedure runs with no cross-shard origin, so it holds no cross-node
+    // write, and its `PUBLISH TO` messages committed in its redo record.
 
     // Check for OUT parameter values.
     let out_params: Vec<_> = proc

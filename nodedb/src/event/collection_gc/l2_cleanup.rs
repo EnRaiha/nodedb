@@ -14,6 +14,9 @@
 //! `last_error` so operators can see via `_system.l2_cleanup_queue`
 //! why an entry is stuck.
 //!
+//! An object a kept base snapshot references is skipped, and its entry
+//! stays queued until retention retires that base.
+//!
 //! Tick cadence defaults to 30s. No configurable backoff: the queue
 //! is small, retries are bounded per tick by the attempt count on
 //! each row, and persistent failures surface via the metric
@@ -27,6 +30,7 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::control::pitr::ColdPins;
 use crate::control::state::SharedState;
 
 const TICK_INTERVAL: Duration = Duration::from_secs(30);
@@ -96,8 +100,35 @@ pub async fn drain_once(shared: &SharedState) {
     let store = cold.object_store();
     for entry in queue {
         let prefix = format!("{}/{}/{}/", entry.database_id, entry.tenant_id, entry.name);
-        match delete_prefix(store.clone(), &prefix).await {
-            Ok(bytes_deleted) => {
+        match delete_prefix(store.clone(), &prefix, shared.pitr.cold_pins()).await {
+            Ok(Reclaimed { bytes, pinned }) if pinned > 0 => {
+                if let Some(metrics) = shared.system_metrics.as_ref()
+                    && bytes > 0
+                {
+                    metrics
+                        .purge
+                        .add_bytes_reclaimed(entry.tenant_id, "unknown", "l2", bytes);
+                }
+                let msg = format!("{pinned} objects are referenced by a kept base snapshot");
+                if let Err(e) = catalog.record_l2_cleanup_attempt(
+                    entry.database_id,
+                    entry.tenant_id,
+                    &entry.name,
+                    &msg,
+                ) {
+                    warn!(error = %e, "l2 cleanup: failed to record attempt");
+                }
+                debug!(
+                    tenant = entry.tenant_id,
+                    collection = %entry.name,
+                    pinned,
+                    "l2 cleanup: pinned objects kept; will retry next tick"
+                );
+            }
+            Ok(Reclaimed {
+                bytes: bytes_deleted,
+                ..
+            }) => {
                 if let Err(e) =
                     catalog.remove_l2_cleanup(entry.database_id, entry.tenant_id, &entry.name)
                 {
@@ -157,22 +188,36 @@ pub async fn drain_once(shared: &SharedState) {
     }
 }
 
-/// Delete every object under `prefix` in the given store. Returns the
-/// total bytes deleted. Errors on any per-object failure after
+/// What one [`delete_prefix`] pass did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Reclaimed {
+    bytes: u64,
+    /// Objects kept because a kept base snapshot references them.
+    pinned: u64,
+}
+
+/// Delete every object under `prefix` in the given store, except the
+/// objects `pins` holds. Errors on any per-object failure after
 /// attempting the rest — i.e. a best-effort pass that surfaces the
 /// first failure for the queue-entry's `last_error`.
+///
+/// The pin read lock is held for the whole pass, so no base pins a key
+/// between its check and its delete.
 async fn delete_prefix(
     store: Arc<dyn ObjectStore>,
     prefix: &str,
-) -> Result<u64, object_store::Error> {
+    pins: &tokio::sync::RwLock<ColdPins>,
+) -> Result<Reclaimed, object_store::Error> {
+    let pins = pins.read().await;
     let path = object_store::path::Path::from(prefix);
     let mut list = store.list(Some(&path));
-    let mut total_bytes: u64 = 0;
+    let mut reclaimed = Reclaimed::default();
     let mut first_err: Option<object_store::Error> = None;
     while let Some(meta) = list.next().await {
         match meta {
+            Ok(m) if pins.is_pinned(m.location.as_ref()) => reclaimed.pinned += 1,
             Ok(m) => {
-                total_bytes += m.size;
+                reclaimed.bytes += m.size;
                 if let Err(e) = store.delete(&m.location).await
                     && first_err.is_none()
                 {
@@ -188,15 +233,74 @@ async fn delete_prefix(
     }
     match first_err {
         Some(e) => Err(e),
-        None => Ok(total_bytes),
+        None => Ok(reclaimed),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    //! End-to-end drain exercise needs a `SharedState` fixture + an
-    //! in-memory `ObjectStore` — deferred to
-    //! `tests/l2_cleanup_drain.rs` as a distinct atomic item.
-    //! The catalog-level queue CRUD has its own unit tests in
-    //! `control/security/catalog/l2_cleanup_queue.rs` (5/5 green).
+    //! The queue drain runs against a full `SharedState`. The catalog-level
+    //! queue CRUD is tested in `control/security/catalog/l2_cleanup_queue.rs`.
+
+    use object_store::PutPayload;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_pinned_object_survives_until_its_base_is_retired() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        for key in ["1/2/c/pinned.seg", "1/2/c/free.seg"] {
+            store
+                .put(&Path::from(key), PutPayload::from_static(b"seg"))
+                .await
+                .unwrap();
+        }
+        let pins = tokio::sync::RwLock::new(ColdPins::default());
+        pins.write()
+            .await
+            .pin("snap-1", vec!["1/2/c/pinned.seg".to_string()]);
+
+        let first = delete_prefix(Arc::clone(&store), "1/2/c/", &pins)
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            Reclaimed {
+                bytes: 3,
+                pinned: 1
+            }
+        );
+        assert!(store.head(&Path::from("1/2/c/pinned.seg")).await.is_ok());
+        assert!(store.head(&Path::from("1/2/c/free.seg")).await.is_err());
+
+        pins.write().await.unpin("snap-1");
+        let second = delete_prefix(Arc::clone(&store), "1/2/c/", &pins)
+            .await
+            .unwrap();
+        assert_eq!(
+            second,
+            Reclaimed {
+                bytes: 3,
+                pinned: 0
+            }
+        );
+        assert!(store.head(&Path::from("1/2/c/pinned.seg")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn incomplete_pins_keep_every_object() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        store
+            .put(&Path::from("1/2/c/x.seg"), PutPayload::from_static(b"x"))
+            .await
+            .unwrap();
+        let pins = tokio::sync::RwLock::new(ColdPins::from_bases([], false));
+        let pass = delete_prefix(Arc::clone(&store), "1/2/c/", &pins)
+            .await
+            .unwrap();
+        assert_eq!(pass.pinned, 1);
+        assert!(store.head(&Path::from("1/2/c/x.seg")).await.is_ok());
+    }
 }

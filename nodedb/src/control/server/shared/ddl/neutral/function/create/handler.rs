@@ -2,17 +2,15 @@
 
 //! The protocol-neutral `create_function` handler.
 //!
-//! Ported from the pgwire `ddl::function::create` handler. All non-return logic
-//! (privilege gate, parsing, body compilation/validation, StoredFunction build,
-//! catalog propose-and-apply, dependency extraction into the replicated
-//! definition, Lite definition-sync broadcast, and the `audit_record` call)
-//! is preserved verbatim; only the
-//! result construction changed from pgwire `Response` / `PgWireError` to the
-//! protocol-neutral [`DdlResult`] / [`DdlError`].
+//! The privilege gate, parsing, body compilation/validation, StoredFunction
+//! build, catalog propose-and-apply, dependency extraction into the
+//! replicated definition, Lite definition-sync broadcast, and the
+//! `audit_record` call run here. The result is the protocol-neutral
+//! [`DdlResult`] / [`DdlError`].
 
 use crate::control::security::catalog::StoredFunction;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::ddl::catalog::propose_and_apply;
+use crate::control::server::shared::ddl::catalog::propose_and_apply_async;
 use crate::control::server::shared::ddl::neutral::auth_support::{require_tenant_admin, status};
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
@@ -27,7 +25,7 @@ use super::parse::{ParsedCreateFunction, parse_create_function};
 /// Requires superuser or tenant_admin — function bodies are SQL
 /// expressions that can reference any collection, so creation is
 /// a privileged operation.
-pub fn create_function(
+pub async fn create_function(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
@@ -121,18 +119,10 @@ pub fn create_function(
     // only until a future batch adds replicated WASM distribution.)
     // Ownership replicates through the parent `PutFunction`
     // post_apply on every node — `stored.owner` carries the creator
-    // and `apply::function::put` installs the owner record. On the
-    // single-node / rolling-upgrade / DDL-buffer fallback path
-    // `propose_and_apply` runs the same applier locally so the
-    // OWNERS row lands too.
+    // and `apply::function::put` installs the owner record, this node
+    // included.
     let entry = crate::control::catalog_entry::CatalogEntry::PutFunction(Box::new(stored.clone()));
-    let outcome = propose_and_apply(state, &entry)?;
-    if outcome.needs_local_apply() {
-        // The no-Raft fallback still uses the CatalogEntry applier for the
-        // durable row. Run the matching post-apply hook so its owner and
-        // function-cache effects match a replicated apply.
-        crate::control::catalog_entry::post_apply::function::put(stored.clone(), state);
-    }
+    propose_and_apply_async(state, &entry).await?;
 
     // Broadcast to connected Lite sessions after the catalog commit is durable.
     emit_function_put(state, &stored);

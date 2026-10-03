@@ -29,6 +29,7 @@ fn fixture() -> (Arc<SharedState>, CoreChannelDataSide, tempfile::TempDir) {
     let (dispatcher, mut sides) = Dispatcher::new(1, 64);
     let side = sides.pop().expect("one data side");
     let state = SharedState::new(dispatcher, wal).expect("shared state");
+    crate::bootstrap::state_wiring::install_gateway(&state).expect("install gateway");
     (state, side, directory)
 }
 
@@ -131,7 +132,7 @@ async fn a_read_runs_and_its_error_fails_the_transaction() {
     let plan = PhysicalPlan::Document(DocumentOp::PointGet {
         collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
         document_id: "d1".into(),
-        surrogate: Surrogate::new(1),
+        surrogate: Some(Surrogate::new(1)),
         pk_bytes: Vec::new(),
         rls_filters: Vec::new(),
         system_time: nodedb_types::SystemTimeScope::Current,
@@ -154,4 +155,93 @@ async fn a_read_runs_and_its_error_fails_the_transaction() {
         ),
         "the read ran and its error failed the transaction: {result:?}"
     );
+}
+
+/// A body statement plans through `plan_sql`, which emits no Calvin OLLP
+/// prediction and no resolved write. Every task it plans, derived writes
+/// included, runs in a system transaction: a bulk write stages at the
+/// statement instead of routing through Calvin or write-resolve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_body_plan_carries_only_stageable_forms() {
+    use crate::control::planner::context::{QueryContext, SystemPlanSecurity};
+    use crate::control::server::shared::ddl::neutral::collection::create::handler::create_collection;
+    use crate::control::server::shared::ddl::neutral::collection::create::request::CreateCollectionRequest;
+    use crate::control::server::shared::plan_admission::append_derived_tasks;
+
+    // The one-node cluster's core acknowledges the create's post-apply Data
+    // Plane work.
+    let cluster = crate::control::cluster::test_one_node::boot().await;
+    let state = Arc::clone(&cluster.state);
+    let columns = vec![
+        ("id".to_string(), "TEXT PRIMARY KEY".to_string()),
+        ("val".to_string(), "INT".to_string()),
+    ];
+    create_collection(
+        &state,
+        &identity(),
+        &CreateCollectionRequest {
+            name: "planned_rows",
+            engine: Some("document_strict"),
+            columns: &columns,
+            options: &[],
+            flags: &[],
+            balanced_raw: None,
+        },
+        DatabaseId::DEFAULT,
+    )
+    .await
+    .expect("create the collection");
+
+    let ctx = QueryContext::for_state(&state);
+    let security = SystemPlanSecurity::new(TenantId::new(1), "_system_procedure");
+    for sql in [
+        "INSERT INTO planned_rows (id, val) VALUES ('a', 1)",
+        "UPDATE planned_rows SET val = 2 WHERE val > 0",
+        "DELETE FROM planned_rows WHERE val > 1",
+    ] {
+        let (mut tasks, _, _, _) = ctx
+            .plan_sql_with_rls_and_versions(
+                sql,
+                TenantId::new(1),
+                DatabaseId::DEFAULT,
+                &security.context(&state),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("plan {sql}: {e}"));
+        append_derived_tasks(
+            &state,
+            &mut tasks,
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
+            crate::types::TraceId::ZERO,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("derive {sql}: {e}"));
+        assert!(!tasks.is_empty(), "{sql} plans a task");
+        for task in &tasks {
+            assert!(
+                !matches!(
+                    &task.plan,
+                    PhysicalPlan::Document(
+                        DocumentOp::BulkUpdate {
+                            ollp_predicted_surrogates: Some(_),
+                            ..
+                        } | DocumentOp::BulkDelete {
+                            ollp_predicted_surrogates: Some(_),
+                            ..
+                        } | DocumentOp::ResolvedWrite { .. }
+                    )
+                ),
+                "{sql} planned a Calvin or resolved form: {:?}",
+                task.plan
+            );
+            assert!(
+                super::run::runs_in_a_system_transaction(&task.plan),
+                "{sql} planned a task no system transaction can run: {:?}",
+                task.plan
+            );
+        }
+    }
+    cluster.shutdown().await;
 }

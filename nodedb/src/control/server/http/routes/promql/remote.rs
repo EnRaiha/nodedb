@@ -80,7 +80,7 @@ pub async fn remote_write(
 
     // This endpoint builds its physical tasks itself instead of going through
     // the SQL planner, so it has to run the planner's row-level-security pass
-    // over each one explicitly — otherwise remote write would be a way to
+    // over each one explicitly — otherwise remote write will be a way to
     // ingest rows a write policy forbids, with the same identity and the same
     // collection an `INSERT` refuses.
     let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
@@ -116,7 +116,7 @@ pub async fn remote_write(
             // Prometheus remote-write answers with an HTTP status, never rows,
             // for the same reason the line-protocol listener does. `inject_rls`
             // still runs over this task, so the read filter it fills in is
-            // simply never consulted.
+            // never consulted.
             returning: None,
             rls_filters: Vec::new(),
         });
@@ -171,25 +171,16 @@ pub async fn remote_write(
             }
         };
 
-        // Route through gateway when available (cluster-aware dispatch);
-        // fall back to capability-bearing local dispatch on single-node boot.
-        let dispatch_result = match state.shared.gateway.get() {
-            Some(gw) => {
-                let gw_ctx = QueryContext {
-                    tenant_id,
-                    trace_id: TraceId::generate(),
-                    database_id: nodedb_types::id::DatabaseId::DEFAULT,
-                    txn_id: None,
-                };
-                gw.execute(&gw_ctx, checked).await
-            }
-            None => crate::control::server::dispatch_utils::dispatch_authorized_durable_write(
-                &state.shared,
-                checked,
-                TraceId::generate(),
-            )
-            .await
-            .map(|_| vec![]),
+        let gw_ctx = QueryContext {
+            tenant_id,
+            trace_id: TraceId::generate(),
+            database_id: nodedb_types::id::DatabaseId::DEFAULT,
+            txn_id: None,
+            linearizable: true,
+        };
+        let dispatch_result = match state.shared.installed_gateway() {
+            Ok(gateway) => gateway.execute(&gw_ctx, checked).await,
+            Err(error) => Err(error),
         };
 
         match dispatch_result {

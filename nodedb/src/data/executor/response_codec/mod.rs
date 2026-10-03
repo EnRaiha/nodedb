@@ -38,10 +38,12 @@ pub(in crate::data::executor) use encode::{
 pub(crate) use encode::{encode_affected, encode_affected_with_op, encode_count};
 #[allow(unused_imports)]
 pub(crate) use hits::ArrayAggregateResponse;
-pub(crate) use hits::{ArraySliceResponse, RowsPayload};
+pub(crate) use hits::{
+    ArraySliceResponse, GraphRagMetadata, GraphRagResponse, GraphRagResult, IngestRejection,
+    RejectingRowsPayload, ReturningRowsReply, RowsPayload, StagedReturningReply,
+};
 pub(in crate::data::executor) use hits::{
-    DocumentRow, GraphRagMetadata, GraphRagResponse, GraphRagResult, HybridSearchHit,
-    NeighborEntry, NeighborMultiEntry, SubgraphEdge, VectorSearchHit,
+    DocumentRow, HybridSearchHit, NeighborEntry, NeighborMultiEntry, SubgraphEdge, VectorSearchHit,
 };
 pub(crate) use raw::{decode_raw_scan_to_docs, encode_raw_document_rows};
 pub use raw::{

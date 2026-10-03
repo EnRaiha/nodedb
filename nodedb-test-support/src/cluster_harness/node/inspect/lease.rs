@@ -19,18 +19,6 @@ impl TestClusterNode {
             .is_draining(descriptor_id, min_version)
     }
 
-    /// Total number of leases (across all descriptors and node_ids)
-    /// in this node's `MetadataCache.leases` map. Includes expired
-    /// records — for filtered counts use [`active_lease_count`].
-    pub fn lease_count(&self) -> usize {
-        let cache = self
-            .shared
-            .metadata_cache
-            .read()
-            .unwrap_or_else(|p| p.into_inner());
-        cache.leases.len()
-    }
-
     /// Number of leases whose `expires_at` is strictly greater
     /// than this node's current HLC peek.
     pub fn active_lease_count(&self) -> usize {
@@ -100,11 +88,6 @@ impl TestClusterNode {
     }
 
     /// Acquire a lease on this node via the SharedState facade.
-    /// Called directly from the test's tokio runtime worker so the
-    /// `block_in_place` inside `acquire_descriptor_lease` lands on
-    /// a real runtime thread (which is what `block_in_place`
-    /// requires — it cannot be called from a `spawn_blocking`
-    /// worker).
     pub async fn acquire_lease(
         &self,
         kind: nodedb_cluster::DescriptorKind,
@@ -121,7 +104,34 @@ impl TestClusterNode {
         );
         self.shared
             .acquire_descriptor_lease(id, version, duration)
+            .await
             .map_err(|e| format!("acquire failed: {e}"))
+    }
+
+    /// Admit a statement on this node that holds a lease on `name` at
+    /// `version` until the returned scope drops.
+    ///
+    /// A bare [`Self::acquire_lease`] leaves an idle lease that a drain start
+    /// releases at once. A held scope is what a drain waits for.
+    pub async fn hold_lease(
+        &self,
+        kind: nodedb_cluster::DescriptorKind,
+        tenant_id: u64,
+        name: &str,
+        version: u64,
+    ) -> Result<nodedb::control::lease::QueryLeaseScope, String> {
+        let id = nodedb_cluster::DescriptorId::new(
+            nodedb_types::DatabaseId::DEFAULT.as_u64(),
+            tenant_id,
+            kind,
+            name.to_string(),
+        );
+        let mut versions = nodedb::control::planner::descriptor_set::DescriptorVersionSet::new();
+        versions.record(id, version);
+        self.shared
+            .acquire_plan_lease_scope(&versions)
+            .await
+            .map_err(|e| format!("hold failed: {e}"))
     }
 
     /// Release a batch of leases on this node via the SharedState facade.
@@ -131,6 +141,7 @@ impl TestClusterNode {
     ) -> Result<(), String> {
         self.shared
             .release_descriptor_leases(descriptor_ids)
+            .await
             .map_err(|e| format!("release failed: {e}"))
     }
 }

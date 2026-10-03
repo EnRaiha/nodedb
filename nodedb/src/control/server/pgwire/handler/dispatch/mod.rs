@@ -5,7 +5,7 @@
 //! Split by concern:
 //! - [`entry`]: the public dispatch entry points and the write-HLC
 //!   bookkeeping wrapper around them.
-//! - [`routing`]: the per-task routing decision — freeze/mirror checks,
+//! - [`routing`]: the per-task routing decision — mirror checks,
 //!   orchestrated DML, exchange resolution, and the replicated-vs-local
 //!   choice.
 //! - [`replicated`]: proposing a write to Raft and shaping the response once

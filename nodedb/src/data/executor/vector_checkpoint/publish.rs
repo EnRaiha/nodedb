@@ -2,24 +2,13 @@
 
 //! Publishing a written vector checkpoint generation.
 //!
-//! Free functions rather than `CoreLoop` methods because the periodic flush is
-//! not the only writer: snapshot restore rebuilds this core's whole index set
-//! from a `CoreSnapshot` with no `CoreLoop` in hand, and it has to publish
-//! through exactly the same manifest the load path reads.
+//! A free function rather than a `CoreLoop` method, so the manifest's
+//! encoding has one producer beside the load path that reads it.
 
 use super::format::{VECTOR_CKPT_FORMAT_VERSION, VectorCheckpointManifest};
-use super::manifest::{read_vector_manifest_at, storage_err};
+use super::manifest::storage_err;
 use super::paths::VECTOR_CKPT_MANIFEST;
 use crate::types::replay_stamp::ReplayStamp;
-
-/// The generation number the next publish under `ckpt_dir` must use.
-///
-/// Never reuses a live generation: a reader holding the current manifest must
-/// keep seeing an intact generation until the new one is published, so the new
-/// files cannot be written over the live ones.
-pub(crate) fn next_generation(ckpt_dir: &std::path::Path) -> crate::Result<u64> {
-    Ok(read_vector_manifest_at(ckpt_dir)?.map_or(0, |m| m.generation.wrapping_add(1)))
-}
 
 /// Publish a written generation by atomically replacing the manifest.
 ///

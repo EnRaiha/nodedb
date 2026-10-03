@@ -110,6 +110,7 @@ mod tests {
             name: "db_terms".to_string(),
             terms: vec!["database".to_string(), "db".to_string()],
             created_at: 42,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 

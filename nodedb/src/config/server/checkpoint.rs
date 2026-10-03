@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 /// interval_secs = 300
 /// core_timeout_secs = 30
 /// wal_segment_target_mb = 64
+/// wal_archive_interval_secs = 10
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointSettings {
@@ -39,6 +40,13 @@ pub struct CheckpointSettings {
     #[serde(default = "default_wal_segment_target_mb")]
     pub wal_segment_target_mb: u64,
 
+    /// How often sealed WAL segments are uploaded to cold storage (seconds).
+    /// Runs only when `[cold_storage]` is configured. A sealed segment
+    /// reaches the archive within one interval.
+    /// Default: 10.
+    #[serde(default = "default_wal_archive_interval")]
+    pub wal_archive_interval_secs: u64,
+
     /// How often each Data Plane core runs automatic compaction (seconds).
     /// Compaction removes tombstoned vectors from HNSW indexes, compacts
     /// CSR write buffers, and sweeps dangling edges.
@@ -60,6 +68,7 @@ impl Default for CheckpointSettings {
             interval_secs: default_checkpoint_interval(),
             core_timeout_secs: default_core_timeout(),
             wal_segment_target_mb: default_wal_segment_target_mb(),
+            wal_archive_interval_secs: default_wal_archive_interval(),
             compaction_interval_secs: default_compaction_interval(),
             compaction_tombstone_threshold: default_compaction_tombstone_threshold(),
         }
@@ -68,11 +77,17 @@ impl Default for CheckpointSettings {
 
 impl CheckpointSettings {
     /// Convert to the checkpoint manager config used by the Control Plane.
-    pub fn to_manager_config(&self) -> crate::control::checkpoint_manager::CheckpointManagerConfig {
-        crate::control::checkpoint_manager::CheckpointManagerConfig {
-            interval: std::time::Duration::from_secs(self.interval_secs),
-            core_timeout: std::time::Duration::from_secs(self.core_timeout_secs),
-        }
+    ///
+    /// Fails with `Error::Config` when `interval_secs` or
+    /// `wal_archive_interval_secs` is zero, whatever path set it.
+    pub fn to_manager_config(
+        &self,
+    ) -> crate::Result<crate::control::checkpoint_manager::CheckpointManagerConfig> {
+        crate::control::checkpoint_manager::CheckpointManagerConfig::new(
+            std::time::Duration::from_secs(self.interval_secs),
+            std::time::Duration::from_secs(self.core_timeout_secs),
+            std::time::Duration::from_secs(self.wal_archive_interval_secs),
+        )
     }
 
     /// WAL segment target size in bytes.
@@ -96,6 +111,10 @@ fn default_core_timeout() -> u64 {
 
 fn default_wal_segment_target_mb() -> u64 {
     64
+}
+
+fn default_wal_archive_interval() -> u64 {
+    10
 }
 
 fn default_compaction_interval() -> u64 {

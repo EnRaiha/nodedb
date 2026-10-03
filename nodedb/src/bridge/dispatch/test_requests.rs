@@ -20,7 +20,7 @@ pub(super) fn make_request(vshard: u32) -> envelope::Request {
         plan: PhysicalPlan::Document(DocumentOp::PointGet {
             collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "users"),
             document_id: "u1".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -38,6 +38,7 @@ pub(super) fn make_request(vshard: u32) -> envelope::Request {
         txn_id: None,
         wal_lsn: None,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: Admission::Exempt(ExemptReason::Read),
     }
 }
@@ -52,7 +53,7 @@ pub(super) fn make_request_for_db(vshard: u32, db: u64, req_id: u64) -> envelope
         plan: PhysicalPlan::Document(DocumentOp::PointGet {
             collection: nodedb_types::QualifiedCollection::new(DatabaseId::new(db), "c"),
             document_id: "d".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -70,6 +71,7 @@ pub(super) fn make_request_for_db(vshard: u32, db: u64, req_id: u64) -> envelope
         txn_id: None,
         wal_lsn: None,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: Admission::Exempt(ExemptReason::Read),
     }
 }

@@ -4,9 +4,9 @@
 //!
 //! The document redo arm hands each decoded row here instead of its restart
 //! path. A replica applying a committed record re-executes the write the way
-//! the transaction batch did: it links the hash chain on an insert and folds
-//! the row into its materialized-sum targets inside the row's own write
-//! transaction. Restart replay runs this path only for a Calvin record whose
+//! the transaction batch did: it links the hash chain on an insert (a row
+//! already installed keeps its durable link) and folds the row into its
+//! materialized-sum targets inside the row's own write transaction. Restart replay runs this path only for a Calvin record whose
 //! stamp names sum targets: the fold subtracts the row's prior image, so a
 //! row that already holds its post-image folds nothing.
 //!
@@ -103,22 +103,22 @@ impl CoreLoop {
             wal_lsn,
         };
 
-        // The pre-image decides insert-vs-update for the hash chain and is the
-        // image the materialized-sum fold subtracts. Read only when one of the
-        // two needs it, as the transaction batch does.
+        // The pre-image decides whether the hash chain links the row or reuses
+        // its durable link, and is the image the materialized-sum fold
+        // subtracts. Read only when one of the two needs it.
         let mut chain = ChainGuard::begin(self, row.database_id, row.tenant_id, row.collection);
         let prior_bytes = if chain.enabled() || write_hook::folds_images(self, &hook_ctx) {
-            self.sparse
-                .get(row.database_id, row.tenant_id, row.collection, &storage_key)?
+            self.current_row(row.database_id, row.tenant_id, row.collection, &storage_key)?
         } else {
             None
         };
-        let chained = if prior_bytes.is_none() {
-            chain.chain_insert(self, row.database_id, row.tenant_id, row.document_id, value)?
-        } else {
-            None
-        };
-        let stored_value: &[u8] = chained.as_deref().unwrap_or(value);
+        // A restore's rows carry their source links to relink. A commit's rows
+        // never carry one: the validate pass refused it. Restart replay applies
+        // records their origin already judged.
+        let relink = self.redo_apply.scope.as_ref().is_none_or(|scope| {
+            scope.origin == nodedb_physical::physical_plan::RedoOrigin::Restore
+        });
+        chain.chain_redo_put(self, surrogate, value, prior_bytes.as_deref(), relink)?;
 
         let txn = match self.sparse.begin_write() {
             Ok(txn) => txn,
@@ -135,22 +135,26 @@ impl CoreLoop {
                 collection: row.collection,
                 storage_key,
                 surrogate,
-                value: stored_value,
+                value,
                 index_text: true,
                 user_roles: &[],
                 enforce: false,
+                unique: crate::data::executor::enforcement::unique::UniqueJudge::Unit,
                 resolved_targets: &resolved,
                 wal_lsn,
             },
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
-                self.abort_committed_write(&chain, row, &storage_key);
+                self.abort_committed_write(&mut chain, row, &storage_key);
                 return Err(error);
             }
         };
-        if let Err(error) = chain.persist_head(self, &txn) {
-            self.abort_committed_write(&chain, row, &storage_key);
+        if let Err(error) = chain
+            .settle(self, surrogate, &outcome.stored_value)
+            .and_then(|()| chain.persist_head(self, &txn))
+        {
+            self.abort_committed_write(&mut chain, row, &storage_key);
             return Err(error);
         }
 
@@ -168,11 +172,14 @@ impl CoreLoop {
         let target_writes = match write_hook::run(self, &txn, &hook_ctx, images) {
             Ok(enforcement) => enforcement.target_writes,
             Err(error) => {
-                self.abort_committed_write(&chain, row, &storage_key);
+                self.abort_committed_write(&mut chain, row, &storage_key);
                 return Err(error);
             }
         };
-        commit_row(txn)?;
+        if let Err(error) = commit_row(txn) {
+            self.abort_committed_write(&mut chain, row, &storage_key);
+            return Err(error);
+        }
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
         let mut index_tuples = outcome.secondary_index_added.clone();
@@ -233,8 +240,6 @@ impl CoreLoop {
                 database_id: row.database_id,
                 tid: row.tenant_id,
                 collection: row.collection,
-                // The graph cascade keys nodes by the client key, as the
-                // autocommit delete does.
                 document_id: row.document_id,
                 surrogate,
                 user_roles: &[],
@@ -298,7 +303,7 @@ impl CoreLoop {
     /// `apply_point_put` ran; the caller drops its transaction uncommitted.
     fn abort_committed_write(
         &mut self,
-        chain: &ChainGuard,
+        chain: &mut ChainGuard,
         row: &CommittedDocWrite<'_>,
         storage_key: &StorageKey,
     ) {

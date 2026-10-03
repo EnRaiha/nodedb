@@ -17,6 +17,9 @@
 //! FtsIndex additionally carries `text_len u32 + text bytes`.
 //! SpatialPut additionally carries `field_len u32 + field bytes + geometry_len u32 + geometry bytes`.
 //! SpatialDelete additionally carries `field_len u32 + field bytes`.
+//! FtsDelete and SpatialDelete prefix the id with a presence tag `u8`:
+//! `0` means the key's home binds no row and no id follows, `1` means the id
+//! follows.
 //!
 //! These structs are net-new (no legacy records to stay compatible with).
 //! Field set can be extended when the handler is wired; the length-prefixed
@@ -83,6 +86,40 @@ fn push_str_field(buf: &mut Vec<u8>, s: &str) -> Result<()> {
     push_u32_le(buf, bytes.len() as u32);
     buf.extend_from_slice(bytes);
     Ok(())
+}
+
+/// Presence tag of an optional string field: absent.
+const FIELD_ABSENT: u8 = 0;
+/// Presence tag of an optional string field: present, followed by the field.
+const FIELD_PRESENT: u8 = 1;
+
+fn push_opt_str_field(buf: &mut Vec<u8>, s: Option<&str>) -> Result<()> {
+    match s {
+        None => {
+            buf.push(FIELD_ABSENT);
+            Ok(())
+        }
+        Some(s) => {
+            buf.push(FIELD_PRESENT);
+            push_str_field(buf, s)
+        }
+    }
+}
+
+fn read_opt_utf8_field(buf: &[u8], offset: usize) -> Result<(Option<String>, usize)> {
+    match buf.get(offset).copied() {
+        Some(FIELD_ABSENT) => Ok((None, offset + 1)),
+        Some(FIELD_PRESENT) => {
+            let (s, next) = read_utf8_field(buf, offset + 1)?;
+            Ok((Some(s), next))
+        }
+        Some(tag) => Err(WalError::InvalidPayload {
+            detail: format!("optional field at offset {offset} has unknown presence tag {tag}"),
+        }),
+        None => Err(WalError::InvalidPayload {
+            detail: format!("truncated at offset {offset}, need a presence tag"),
+        }),
+    }
 }
 
 fn push_bytes_field(buf: &mut Vec<u8>, data: &[u8]) -> Result<()> {
@@ -189,19 +226,21 @@ impl FtsIndexPayload {
 pub struct FtsDeletePayload {
     pub provenance: SyncProvenance,
     pub collection: String,
-    pub doc_id: String,
+    /// The deleted document's identifier. `None` when the key's home binds
+    /// no row: the delete removes nothing and still commits its provenance.
+    pub doc_id: Option<String>,
 }
 
 impl FtsDeletePayload {
     pub fn new(
         provenance: SyncProvenance,
         collection: impl Into<String>,
-        doc_id: impl Into<String>,
+        doc_id: Option<String>,
     ) -> Self {
         Self {
             provenance,
             collection: collection.into(),
-            doc_id: doc_id.into(),
+            doc_id,
         }
     }
 
@@ -209,7 +248,7 @@ impl FtsDeletePayload {
         let mut buf = Vec::new();
         push_provenance(&mut buf, &self.provenance);
         push_str_field(&mut buf, &self.collection)?;
-        push_str_field(&mut buf, &self.doc_id)?;
+        push_opt_str_field(&mut buf, self.doc_id.as_deref())?;
         Ok(buf)
     }
 
@@ -217,7 +256,7 @@ impl FtsDeletePayload {
         let (provenance, mut off) = read_provenance(buf)?;
         let (collection, next) = read_utf8_field(buf, off)?;
         off = next;
-        let (doc_id, _) = read_utf8_field(buf, off)?;
+        let (doc_id, _) = read_opt_utf8_field(buf, off)?;
         Ok(Self {
             provenance,
             collection,
@@ -295,7 +334,9 @@ pub struct SpatialDeletePayload {
     pub provenance: SyncProvenance,
     pub collection: String,
     pub field: String,
-    pub doc_id: String,
+    /// The deleted row's identifier. `None` when the key's home binds no
+    /// row: the delete removes nothing and still commits its provenance.
+    pub doc_id: Option<String>,
 }
 
 impl SpatialDeletePayload {
@@ -303,13 +344,13 @@ impl SpatialDeletePayload {
         provenance: SyncProvenance,
         collection: impl Into<String>,
         field: impl Into<String>,
-        doc_id: impl Into<String>,
+        doc_id: Option<String>,
     ) -> Self {
         Self {
             provenance,
             collection: collection.into(),
             field: field.into(),
-            doc_id: doc_id.into(),
+            doc_id,
         }
     }
 
@@ -318,7 +359,7 @@ impl SpatialDeletePayload {
         push_provenance(&mut buf, &self.provenance);
         push_str_field(&mut buf, &self.collection)?;
         push_str_field(&mut buf, &self.field)?;
-        push_str_field(&mut buf, &self.doc_id)?;
+        push_opt_str_field(&mut buf, self.doc_id.as_deref())?;
         Ok(buf)
     }
 
@@ -328,7 +369,7 @@ impl SpatialDeletePayload {
         off = next;
         let (field, next) = read_utf8_field(buf, off)?;
         off = next;
-        let (doc_id, _) = read_utf8_field(buf, off)?;
+        let (doc_id, _) = read_opt_utf8_field(buf, off)?;
         Ok(Self {
             provenance,
             collection,
@@ -374,9 +415,26 @@ mod tests {
 
     #[test]
     fn fts_delete_roundtrip() {
-        let p = FtsDeletePayload::new(prov(1, 2, 3, 4), "articles", "doc-99");
+        let p = FtsDeletePayload::new(prov(1, 2, 3, 4), "articles", Some("doc-99".to_string()));
         let bytes = p.to_bytes().unwrap();
         assert_eq!(FtsDeletePayload::from_bytes(&bytes).unwrap(), p);
+    }
+
+    #[test]
+    fn fts_delete_of_an_unbound_key_roundtrip() {
+        let p = FtsDeletePayload::new(prov(1, 2, 3, 4), "articles", None);
+        let bytes = p.to_bytes().unwrap();
+        assert_eq!(FtsDeletePayload::from_bytes(&bytes).unwrap(), p);
+    }
+
+    #[test]
+    fn unknown_presence_tag_rejected() {
+        let p = FtsDeletePayload::new(prov(1, 2, 3, 4), "articles", None);
+        let mut bytes = p.to_bytes().unwrap();
+        if let Some(tag) = bytes.last_mut() {
+            *tag = 7;
+        }
+        assert!(FtsDeletePayload::from_bytes(&bytes).is_err());
     }
 
     #[test]
@@ -403,7 +461,19 @@ mod tests {
 
     #[test]
     fn spatial_delete_roundtrip() {
-        let p = SpatialDeletePayload::new(prov(9, 10, 11, 12), "places", "loc", "poi-1");
+        let p = SpatialDeletePayload::new(
+            prov(9, 10, 11, 12),
+            "places",
+            "loc",
+            Some("poi-1".to_string()),
+        );
+        let bytes = p.to_bytes().unwrap();
+        assert_eq!(SpatialDeletePayload::from_bytes(&bytes).unwrap(), p);
+    }
+
+    #[test]
+    fn spatial_delete_of_an_unbound_key_roundtrip() {
+        let p = SpatialDeletePayload::new(prov(9, 10, 11, 12), "places", "loc", None);
         let bytes = p.to_bytes().unwrap();
         assert_eq!(SpatialDeletePayload::from_bytes(&bytes).unwrap(), p);
     }

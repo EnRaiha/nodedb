@@ -259,6 +259,12 @@ impl CoreLoop {
             );
         }
 
+        let emits_events = self.ts_ingest_emits_events(task, collection, mode);
+        let stamps = if bitemporal {
+            Some(ilp_ingest::BitempStamps { system_ms: now_ms })
+        } else {
+            None
+        };
         let Some(mt) = self.columnar_memtables.get_mut(&key) else {
             return self.response_error(
                 task,
@@ -266,12 +272,6 @@ impl CoreLoop {
                     detail: format!("memtable missing after init: {collection}"),
                 },
             );
-        };
-
-        let stamps = if bitemporal {
-            Some(ilp_ingest::BitempStamps { system_ms: now_ms })
-        } else {
-            None
         };
         let lvc = self.ts_last_value_caches.get_mut(&key);
         let catalog = self.ts_series_catalogs.entry(key.clone()).or_default();
@@ -282,7 +282,7 @@ impl CoreLoop {
             default_timestamp_ms: now_ms,
             lvc,
             bitemporal: stamps,
-            collect_row_indices: returning.is_some(),
+            collect_row_indices: returning.is_some() || emits_events,
         });
         let accepted = outcome.accepted;
         let rejected = outcome.rejected;
@@ -305,6 +305,42 @@ impl CoreLoop {
             );
         }
 
+        // Read the stored rows back through the ORDINARY scan projection, at
+        // the indices they landed at, before any flush below can drain the
+        // memtable out from under those indices. Reusing `emit_memtable_row`
+        // is what makes `RETURNING` agree with `SELECT` by construction: a
+        // missing float field is stored as NaN and both paths render it as SQL
+        // NULL, which a hand-written projection over the ingest values prints
+        // as "NaN". The write events carry the same rows.
+        let stored_rows: crate::Result<Vec<rmpv::Value>> = if returning.is_some() || emits_events {
+            match self.columnar_memtables.get(&key) {
+                Some(mt) => {
+                    super::raw_scan::emit_memtable_rows_at(mt, &outcome.accepted_row_indices)
+                }
+                None => Ok(Vec::new()),
+            }
+        } else {
+            Ok(Vec::new())
+        };
+        // Every accepted row landed, so each one's event leaves whatever the
+        // response below says. Rows that do not read back emit no event and
+        // fail only a statement that asked for them.
+        if emits_events {
+            match &stored_rows {
+                Ok(rows) => self.emit_ts_ingest_events(task, collection, rows),
+                Err(error) => tracing::error!(
+                    collection,
+                    error = %error,
+                    "stored timeseries rows did not read back; no write event emitted for them"
+                ),
+            }
+        }
+        let stored_rows = match (returning, stored_rows) {
+            (Some(_), Err(error)) => return self.response_error(task, error),
+            (_, Ok(rows)) => rows,
+            (None, Err(_)) => Vec::new(),
+        };
+
         // A rejected row is a FAILURE, not a requested skip. The count
         // response below reports `rejected`, but a `RETURNING` row set has no
         // place for that number. The tag-ceiling check above refuses every
@@ -326,27 +362,6 @@ impl CoreLoop {
                 },
             );
         }
-
-        // Read the stored rows back through the ORDINARY scan projection, at
-        // the indices they landed at, before any flush below can drain the
-        // memtable out from under those indices. Reusing `emit_memtable_row`
-        // is what makes `RETURNING` agree with `SELECT` by construction: a
-        // missing float field is stored as NaN and both paths render it as SQL
-        // NULL, which a hand-written projection over the ingest values would
-        // have printed as "NaN".
-        let returned_rows: Vec<rmpv::Value> = match returning {
-            Some(_) => match self.columnar_memtables.get(&key) {
-                Some(mt) => {
-                    match super::raw_scan::emit_memtable_rows_at(mt, &outcome.accepted_row_indices)
-                    {
-                        Ok(rows) => rows,
-                        Err(e) => return self.response_error(task, e),
-                    }
-                }
-                None => Vec::new(),
-            },
-            None => Vec::new(),
-        };
 
         let Some(mt) = self.columnar_memtables.get(&key) else {
             return self.response_error(
@@ -390,7 +405,8 @@ impl CoreLoop {
                 task,
                 spec,
                 rls_filters,
-                &returned_rows,
+                &stored_rows,
+                None,
             );
         }
 

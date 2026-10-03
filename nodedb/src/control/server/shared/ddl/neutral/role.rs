@@ -3,12 +3,9 @@
 //! Protocol-neutral `role` DDL — CREATE / DROP ROLE, ALTER ROLE (GRANT /
 //! REVOKE / SET INHERIT), and the shared `set_role_parent` inheritance mutator.
 //!
-//! Ported from the pgwire `ddl::role` handlers. All non-return logic
-//! (tenant-admin gate, IF [NOT] EXISTS short-circuits, `prepare_role`,
-//! parent-existence + inheritance-cycle validation, catalog propose +
-//! single-node `LocalOnly` fallback, `install_replicated_role`,
-//! `drop_role`, and `audit_record`) is preserved verbatim; only the result
-//! construction changed from pgwire `Response` / `PgWireError` to the
+//! The tenant-admin gate, IF [NOT] EXISTS short-circuits, `prepare_role`,
+//! parent-existence + inheritance-cycle validation, catalog propose, the
+//! post-apply role check, and `audit_record` run here. The result is the
 //! protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use nodedb_sql::ddl_ast::AlterRoleOp;
@@ -22,7 +19,7 @@ use super::auth_support::{require_tenant_admin, status, strip_if_exists, strip_i
 use super::grant;
 
 /// CREATE ROLE [IF NOT EXISTS] <name> [INHERIT <parent>]
-pub fn create_role(
+pub async fn create_role(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -66,16 +63,11 @@ pub fn create_role(
     )
     .map_err(|e| DdlError::new("42710", e.to_string()))?;
 
-    let entry = crate::control::catalog_entry::CatalogEntry::PutRole(Box::new(stored.clone()));
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let entry = crate::control::catalog_entry::CatalogEntry::PutRole(Box::new(stored));
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        let catalog = state.credentials.catalog();
-        catalog
-            .put_role(&stored)
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        state.roles.install_replicated_role(&stored);
-    } else if outcome.is_replicated() {
+    if outcome.is_durable() {
         super::role_checks::confirm_role(state, name, parent)?;
     }
 
@@ -93,7 +85,7 @@ pub fn create_role(
 }
 
 /// DROP ROLE [IF EXISTS] <name>
-pub fn drop_role(
+pub async fn drop_role(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -123,53 +115,35 @@ pub fn drop_role(
     }
 
     // As PostgreSQL does, a role that users hold or roles inherit from is
-    // not dropped: dropping it would leave them naming a role that grants
+    // not dropped: dropping it will leave them naming a role that grants
     // nothing.
     super::role_checks::check_role_droppable(state, name)?;
 
     let entry = crate::control::catalog_entry::CatalogEntry::DeleteRole {
         name: name.to_string(),
     };
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    let dropped = if outcome.needs_local_apply() {
-        let catalog = state.credentials.catalog();
-        state
-            .roles
-            .drop_role(name, Some(catalog))
-            .map_err(|e| DdlError::from_error(&e))?
-    } else if outcome.is_replicated() {
-        // The synchronous post-apply removed the role from this node's
-        // cache before the applied index advanced. A role still present
-        // means the applier skipped the entry: a user or role came to
-        // depend on it before the drop committed.
-        if state.roles.get_role(name).is_some() {
-            super::role_checks::check_role_droppable(state, name)?;
-            return Err(DdlError::new(
-                "40001",
-                format!("transient: the drop of role '{name}' was superseded, retry"),
-            ));
-        }
-        true
-    } else {
-        // Buffered in an open transaction: COMMIT applies it.
-        true
-    };
-
-    if dropped {
-        state.audit_record(
-            AuditEvent::PrivilegeChange,
-            Some(identity.tenant_id),
-            &identity.username,
-            &format!("dropped role '{name}'"),
-        );
-        Ok(status("DROP ROLE"))
-    } else {
-        Err(DdlError::new(
-            "42704",
-            format!("role '{name}' does not exist"),
-        ))
+    // The synchronous post-apply removed the role from this node's cache
+    // before the propose returned. A role still present means the apply
+    // skipped the entry: a user or role came to depend on it before the drop
+    // committed. A buffered drop applies at COMMIT.
+    if outcome.is_durable() && state.roles.get_role(name).is_some() {
+        super::role_checks::check_role_droppable(state, name)?;
+        return Err(DdlError::new(
+            "40001",
+            format!("transient: the drop of role '{name}' was superseded, retry"),
+        ));
     }
+
+    state.audit_record(
+        AuditEvent::PrivilegeChange,
+        Some(identity.tenant_id),
+        &identity.username,
+        &format!("dropped role '{name}'"),
+    );
+    Ok(status("DROP ROLE"))
 }
 
 /// Typed dispatch for `ALTER ROLE` — covers GRANT, REVOKE, and SET INHERIT forms.
@@ -177,9 +151,10 @@ pub fn drop_role(
 /// Reuses the protocol-neutral `grant_permission` / `revoke_permission` for the
 /// permission forms so all permission mutations go through the same
 /// catalog-propose path and emit `AuditEvent::PrivilegeChange`.
-pub fn alter_role_typed(
+pub async fn alter_role_typed(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     role_name: &str,
     sub_op: &AlterRoleOp,
 ) -> Result<Vec<DdlResult>, DdlError> {
@@ -199,30 +174,38 @@ pub fn alter_role_typed(
             permission,
             target_type,
             target_name,
-        } => grant::permission::grant_permission(
-            state,
-            identity,
-            std::slice::from_ref(permission),
-            target_type,
-            target_name,
-            role_name,
-        ),
+        } => {
+            grant::permission::grant_permission(
+                state,
+                identity,
+                database_id,
+                std::slice::from_ref(permission),
+                target_type,
+                target_name,
+                role_name,
+            )
+            .await
+        }
 
         AlterRoleOp::Revoke {
             permission,
             target_type,
             target_name,
-        } => grant::permission::revoke_permission(
-            state,
-            identity,
-            std::slice::from_ref(permission),
-            target_type,
-            target_name,
-            role_name,
-        ),
+        } => {
+            grant::permission::revoke_permission(
+                state,
+                identity,
+                database_id,
+                std::slice::from_ref(permission),
+                target_type,
+                target_name,
+                role_name,
+            )
+            .await
+        }
 
         AlterRoleOp::SetInherit { parent } => {
-            set_role_parent(state, role_name, Some(parent))?;
+            set_role_parent(state, role_name, Some(parent)).await?;
 
             state.audit_record(
                 AuditEvent::PrivilegeChange,
@@ -244,7 +227,7 @@ pub fn alter_role_typed(
 /// inheritance mutation goes through one catalog-propose path. The caller
 /// is responsible for the `require_tenant_admin` privilege check and for
 /// emitting the audit record.
-pub fn set_role_parent(
+pub async fn set_role_parent(
     state: &SharedState,
     role_name: &str,
     parent: Option<&str>,
@@ -285,16 +268,11 @@ pub fn set_role_parent(
         created_at: now,
     };
 
-    let entry = crate::control::catalog_entry::CatalogEntry::PutRole(Box::new(stored.clone()));
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    let entry = crate::control::catalog_entry::CatalogEntry::PutRole(Box::new(stored));
+    let outcome = crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        let catalog = state.credentials.catalog();
-        catalog
-            .put_role(&stored)
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        state.roles.install_replicated_role(&stored);
-    } else if outcome.is_replicated() {
+    if outcome.is_durable() {
         super::role_checks::confirm_role(state, role_name, parent)?;
     }
     Ok(())

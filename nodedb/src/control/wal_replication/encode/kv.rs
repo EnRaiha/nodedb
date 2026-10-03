@@ -404,6 +404,21 @@ pub(super) fn resolved_write(
                     surrogate: surrogate.as_u32(),
                     precondition: precondition.clone(),
                 },
+                M::Rewrite {
+                    collection,
+                    key,
+                    value,
+                    ttl_ms,
+                    expire_at_ms,
+                    precondition,
+                } => W::Rewrite {
+                    collection: collection.as_str().to_owned(),
+                    key: key.clone(),
+                    value: value.clone(),
+                    ttl_ms: *ttl_ms,
+                    expire_at_ms: *expire_at_ms,
+                    precondition: precondition.clone(),
+                },
                 M::Delete {
                     collection,
                     key,

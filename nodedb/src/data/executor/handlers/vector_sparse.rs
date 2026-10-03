@@ -287,6 +287,7 @@ mod tests {
             txn_id: None,
             wal_lsn: Some(Lsn::new(lsn)),
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: Admission::Exempt(ExemptReason::Read),
         })
     }

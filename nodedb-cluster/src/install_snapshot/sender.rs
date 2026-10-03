@@ -30,6 +30,10 @@ pub struct SendChunkedParams<'a> {
     pub last_included_term: u64,
     pub snapshot_bytes: &'a [u8],
     pub chunk_bytes: u64,
+    /// The group's voters, the leader included, sent on the final chunk.
+    pub voters: &'a [u64],
+    /// The group's learners, sent on the final chunk.
+    pub learners: &'a [u64],
 }
 
 /// Leader-side chunked send for a single peer.
@@ -54,6 +58,8 @@ pub async fn send_chunked(
         last_included_term,
         snapshot_bytes,
         chunk_bytes,
+        voters,
+        learners,
     } = params;
     // For an empty snapshot we send exactly one stub chunk with done=true.
     if snapshot_bytes.is_empty() {
@@ -67,6 +73,8 @@ pub async fn send_chunked(
             done: true,
             group_id,
             total_size: 0,
+            voters: voters.to_vec(),
+            learners: learners.to_vec(),
         };
         let resp =
             transport
@@ -108,6 +116,8 @@ pub async fn send_chunked(
             done,
             group_id,
             total_size: total,
+            voters: if done { voters.to_vec() } else { Vec::new() },
+            learners: if done { learners.to_vec() } else { Vec::new() },
         };
         let resp =
             transport

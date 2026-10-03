@@ -21,15 +21,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use tracing::{debug, info, trace, warn};
 
-use crate::control::planner::procedural::executor::bindings::RowBindings;
-use crate::control::planner::procedural::executor::core::StatementExecutor;
-use crate::control::security::identity::{AuthenticatedIdentity, Role};
 use crate::control::state::SharedState;
-use crate::types::TenantId;
 
+use super::backup_job::BackupJobs;
+use super::coordinator::is_system_coordinator;
 use super::cron::CronExpr;
 use super::dispatcher::{DispatchOutcome, JobDispatcher, JobDispatcherConfig};
 use super::history::JobHistoryStore;
+use super::job_run::execute_job;
 use super::registry::ScheduleRegistry;
 use super::types::{JobRun, ScheduleDef, ScheduleScope};
 
@@ -114,6 +113,9 @@ async fn scheduler_loop(
     // ticks from epoch.
     let mut last_fired_minute: HashMap<(u64, u64, String), u64> = HashMap::new();
 
+    // `[[backup.schedule]]` jobs share the dispatcher and the history.
+    let backup_jobs = BackupJobs::new(&state.backup_schedules);
+
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -135,6 +137,8 @@ async fn scheduler_loop(
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+
+        backup_jobs.fire(&state, &dispatcher, &history, now_secs);
 
         // Get all enabled schedules.
         let schedules = registry.list_all_enabled();
@@ -296,19 +300,19 @@ async fn scheduler_loop(
 /// Check whether this node should fire the given schedule.
 ///
 /// - `ScheduleScope::Local` → always fire (local node only).
-/// - No `cluster_routing` → single-node mode → always fire.
+/// - No `cluster_routing` → the cluster is not wired → never fire.
 /// - `target_collection` is Some → resolve vShard → check leader.
-/// - `target_collection` is None → cross-collection job → only the lowest
-///   node_id in the cluster fires (acts as `_system` coordinator).
+/// - `target_collection` is None → cross-collection job → only the
+///   `_system` coordinator fires: the vShard 0 leader under a valid lease.
 fn should_fire_on_this_node(sched: &ScheduleDef, state: &SharedState) -> bool {
     // LOCAL scope: always fire on this node.
     if sched.scope == ScheduleScope::Local {
         return true;
     }
 
-    // Single-node mode: no cluster routing → fire everything.
+    // A node whose cluster is not wired knows no leader, so it fires nothing.
     let Some(ref routing_lock) = state.cluster_routing else {
-        return true;
+        return false;
     };
 
     let node_id = state.node_id;
@@ -330,13 +334,7 @@ fn should_fire_on_this_node(sched: &ScheduleDef, state: &SharedState) -> bool {
             }
         }
     } else {
-        // Cross-collection or opaque job: fire on coordinator node.
-        // Convention: the leader of vShard 0 acts as the _system coordinator.
-        let routing = routing_lock.read().unwrap_or_else(|p| p.into_inner());
-        match routing.leader_for_vshard(0) {
-            Ok(coordinator) => coordinator == node_id,
-            Err(_) => false,
-        }
+        is_system_coordinator(state)
     }
 }
 
@@ -346,19 +344,19 @@ fn should_fire_on_this_node(sched: &ScheduleDef, state: &SharedState) -> bool {
 /// If the group is lagging, this node may be a stale leader during a partition.
 /// Skipping prevents dual execution when the new leader hasn't taken over yet.
 ///
-/// Returns `true` (healthy) in single-node mode or when no status function exists.
+/// Returns `false` before `start_raft` installed the status function or when
+/// the cluster is not wired.
 fn is_raft_group_healthy(sched: &ScheduleDef, state: &SharedState) -> bool {
     // LOCAL scope: no Raft group to check.
     if sched.scope == ScheduleScope::Local {
         return true;
     }
 
-    // Single-node mode: always healthy.
     let Some(status_fn) = state.raft_status_fn.get() else {
-        return true;
+        return false;
     };
     let Some(ref routing_lock) = state.cluster_routing else {
-        return true;
+        return false;
     };
 
     // Determine the target vShard's Raft group.
@@ -409,97 +407,6 @@ fn is_raft_group_healthy(sched: &ScheduleDef, state: &SharedState) -> bool {
     true
 }
 
-/// Execute a single scheduled job under a wall-clock `ExecutionBudget`.
-///
-/// `job_timeout_secs` bounds total statement-executor time for the job,
-/// so a runaway body cannot hold `Arc<SharedState>` past the shutdown
-/// deadline. Returns the duration in milliseconds on success.
-async fn execute_job(
-    state: &SharedState,
-    sched: &ScheduleDef,
-    job_timeout_secs: u64,
-) -> crate::Result<u64> {
-    use crate::control::planner::procedural::executor::fuel::ExecutionBudget;
-
-    let start = std::time::Instant::now();
-    let identity = scheduler_identity(TenantId::new(sched.tenant_id), &sched.owner);
-
-    // Pre-execution guard: reject unbounded `SELECT *` bodies before we
-    // dispatch a single task, so the runtime byte ceiling isn't the only
-    // thing standing between a careless schedule and hours of wasted
-    // scanning.
-    if let Err(msg) = super::body_guard::validate_scheduled_body(&sched.body_sql) {
-        return Err(crate::Error::BadRequest {
-            detail: format!("schedule '{}': {msg}", sched.name),
-        });
-    }
-
-    let block = crate::control::planner::procedural::parse_block(&sched.body_sql).map_err(|e| {
-        crate::Error::BadRequest {
-            detail: format!("schedule '{}' body parse error: {e}", sched.name),
-        }
-    })?;
-
-    let executor = StatementExecutor::with_source_in_database(
-        state,
-        identity.clone(),
-        TenantId::new(sched.tenant_id),
-        crate::types::DatabaseId::new(sched.database_id),
-        0,
-        crate::event::EventSource::User,
-    );
-    let bindings = RowBindings::empty();
-    // One budget for the whole job — retries consume the same wall-clock
-    // and fuel pool as the first attempt so a runaway job can't double
-    // its timeout by failing once.
-    let mut budget = ExecutionBudget::new(100_000, job_timeout_secs);
-
-    match executor
-        .execute_block_with_budget(&block, &bindings, &mut budget)
-        .await
-    {
-        Ok(()) => {}
-        Err(first_err) => {
-            tracing::warn!(
-                schedule = %sched.name,
-                error = %first_err,
-                "scheduled job failed, retrying once (possible vShard migration)"
-            );
-            let retry_executor = StatementExecutor::with_source_in_database(
-                state,
-                identity,
-                TenantId::new(sched.tenant_id),
-                crate::types::DatabaseId::new(sched.database_id),
-                0,
-                crate::event::EventSource::User,
-            );
-            retry_executor
-                .execute_block_with_budget(&block, &bindings, &mut budget)
-                .await?;
-        }
-    }
-
-    Ok(start.elapsed().as_millis() as u64)
-}
-
-/// Build the owner's identity for scheduled job execution (SECURITY DEFINER).
-///
-/// SECURITY DEFINER semantics: scheduled jobs always run as superuser
-/// under the creator's username. The username drives audit attribution;
-/// privilege is fixed at superuser regardless of the creator's current
-/// role membership.
-fn scheduler_identity(tenant_id: TenantId, owner: &str) -> AuthenticatedIdentity {
-    AuthenticatedIdentity::new_internal_service(
-        0,
-        owner,
-        tenant_id,
-        vec![Role::Superuser],
-        true,
-        None,
-        crate::control::security::identity::DatabaseSet::All,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::types::MissedPolicy;
@@ -522,13 +429,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn scheduler_identity_is_superuser() {
-        let id = scheduler_identity(TenantId::new(1), "admin");
-        assert!(id.is_superuser);
-        assert_eq!(id.username, "admin");
-    }
-
     #[tokio::test]
     async fn local_scope_always_fires() {
         let sched = make_schedule("local_job", Some("orders"), ScheduleScope::Local);
@@ -539,13 +439,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_node_always_fires() {
+    async fn an_unwired_node_fires_nothing() {
         let sched = make_schedule("normal_job", Some("orders"), ScheduleScope::Normal);
         let dir = tempfile::tempdir().unwrap();
         let (_, _, state, _, _) = crate::event::test_utils::event_test_deps(&dir);
-        // No cluster_routing → single-node → always fires.
         assert!(state.cluster_routing.is_none());
-        assert!(should_fire_on_this_node(&sched, &state));
+        assert!(!should_fire_on_this_node(&sched, &state));
+        assert!(!is_raft_group_healthy(&sched, &state));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_one_node_cluster_fires_its_collection_schedules() {
+        let sched = make_schedule("normal_job", Some("orders"), ScheduleScope::Normal);
+        let cluster = crate::control::cluster::test_one_node::boot().await;
+        assert!(should_fire_on_this_node(&sched, &cluster.state));
+        cluster.shutdown().await;
     }
 
     #[tokio::test]
@@ -553,15 +461,6 @@ mod tests {
         let sched = make_schedule("local_job", None, ScheduleScope::Local);
         let dir = tempfile::tempdir().unwrap();
         let (_, _, state, _, _) = crate::event::test_utils::event_test_deps(&dir);
-        assert!(is_raft_group_healthy(&sched, &state));
-    }
-
-    #[tokio::test]
-    async fn single_node_healthy_without_raft() {
-        let sched = make_schedule("job", Some("orders"), ScheduleScope::Normal);
-        let dir = tempfile::tempdir().unwrap();
-        let (_, _, state, _, _) = crate::event::test_utils::event_test_deps(&dir);
-        // No raft_status_fn → always healthy.
         assert!(is_raft_group_healthy(&sched, &state));
     }
 }

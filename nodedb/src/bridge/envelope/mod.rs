@@ -14,6 +14,6 @@ pub use nodedb_physical::kv_atomic::CounterFault;
 pub use nodedb_physical::physical_plan::PhysicalPlan;
 pub use payload::Payload;
 pub use request::{Admission, ExemptReason, Request};
-pub use response::{Response, WriteSetEntry};
+pub use response::{EdgeImage, Response, RowEffect, RowVersion, WriteSetEntry};
 pub use status::{Priority, Status};
 pub use sync_hold::SyncHold;

@@ -16,19 +16,27 @@ use crate::error::Error;
 /// [`nodedb_cluster::METADATA_GROUP_ID`]); callers of [`Self::propose`]
 /// look it up there rather than receiving it through this handle.
 pub trait MetadataRaftHandle: Send + Sync {
-    /// Propose a raw encoded `MetadataEntry` to the metadata group.
-    /// Returns its assigned log index on success.
-    fn propose(&self, bytes: Vec<u8>) -> Result<u64, Error>;
+    /// Propose a raw encoded `MetadataEntry` to the metadata group. Resolves
+    /// to its assigned log index. Runs on any runtime flavor.
+    fn propose_async<'a>(&'a self, bytes: Vec<u8>) -> ProposeFuture<'a>;
 }
+
+/// The future [`MetadataRaftHandle::propose_async`] returns.
+pub type ProposeFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, Error>> + Send + 'a>>;
 
 /// Concrete impl wrapping `nodedb_cluster::RaftLoop`.
 ///
 /// Holds the loop weakly: this handle lives on `SharedState`, which is
 /// itself kept alive transitively by the `RaftLoop`, so a strong
-/// reference here would close a cycle that pins both forever and blocks
+/// reference here closes a cycle that pins both forever and blocks
 /// clean shutdown. The loop is kept alive by its own spawned tasks;
 /// `upgrade` therefore succeeds throughout normal operation and only
 /// fails once the loop has been dropped on shutdown.
+///
+/// Every entry it proposes carries the metadata leader's HLC stamp, taken as
+/// the leader appends it. A restore keeps an entry only when that stamp is
+/// below the restore point's watermark, the rule it applies to data writes.
 pub struct RaftLoopProposerHandle {
     raft_loop: Weak<
         nodedb_cluster::RaftLoop<
@@ -53,27 +61,36 @@ impl RaftLoopProposerHandle {
     }
 }
 
-impl MetadataRaftHandle for RaftLoopProposerHandle {
-    fn propose(&self, bytes: Vec<u8>) -> Result<u64, Error> {
-        // The cluster crate's `propose_to_metadata_group_via_leader`
-        // is async because it may need to forward to the metadata
-        // leader over QUIC. The trait method is sync because every
-        // caller (catalog DDL handlers, lease grant/release helpers)
-        // is itself sync but runs inside a tokio task. Wrap in
-        // `block_in_place` + the current runtime's `block_on` so the
-        // forwarding QUIC round-trip drives without starving the
-        // raft tick that produces the leader_hint.
-        // `upgrade` fails only once the raft loop has been dropped on
-        // shutdown; a request racing shutdown then fails cleanly with a
-        // typed error instead of panicking.
-        let raft_loop = self.raft_loop.upgrade().ok_or_else(|| Error::Config {
+impl RaftLoopProposerHandle {
+    /// The live raft loop. `upgrade` fails only once the raft loop has been
+    /// dropped on shutdown; a request racing shutdown then fails cleanly with
+    /// a typed error instead of panicking.
+    fn live_loop(
+        &self,
+    ) -> Result<
+        Arc<
+            nodedb_cluster::RaftLoop<
+                crate::control::cluster::SpscCommitApplier,
+                crate::control::LocalPlanExecutor,
+            >,
+        >,
+        Error,
+    > {
+        self.raft_loop.upgrade().ok_or_else(|| Error::Config {
             detail: "metadata propose: cluster not running".into(),
-        })?;
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(raft_loop.propose_to_metadata_group_via_leader(bytes))
         })
-        .map_err(metadata_propose_error)
+    }
+}
+
+impl MetadataRaftHandle for RaftLoopProposerHandle {
+    fn propose_async<'a>(&'a self, bytes: Vec<u8>) -> ProposeFuture<'a> {
+        Box::pin(async move {
+            let raft_loop = self.live_loop()?;
+            raft_loop
+                .propose_stamped_to_metadata_group_via_leader(bytes)
+                .await
+                .map_err(metadata_propose_error)
+        })
     }
 }
 
@@ -83,11 +100,11 @@ fn metadata_propose_error(error: ClusterError) -> Error {
         // An election in progress is transient, not a failure of this
         // proposal. Keep it typed rather than flattening it into a generic
         // config error, so callers can wait the election out instead of
-        // failing the statement — a node that has just restarted answers
+        // failing the statement — a node that has recently restarted answers
         // every metadata proposal this way for a moment.
-        ClusterError::Raft(RaftError::NotLeader { leader_hint: None }) => {
-            Error::MetadataLeaderUnavailable
-        }
+        ClusterError::Raft(RaftError::NotLeader {
+            leader_hint: None, ..
+        }) => Error::MetadataLeaderUnavailable,
         // A typed verdict keeps its class.
         ClusterError::DataPlane { code } => Error::DataPlane(code.into()),
         ClusterError::ShardExecution { error, .. } | ClusterError::StreamTerminal { error, .. } => {
@@ -96,6 +113,7 @@ fn metadata_propose_error(error: ClusterError) -> Error {
         other @ (ClusterError::Raft(
             RaftError::NotLeader {
                 leader_hint: Some(_),
+                ..
             }
             | RaftError::LogCompacted { .. }
             | RaftError::CompactionAheadOfApplied { .. }
@@ -142,6 +160,7 @@ fn metadata_propose_error(error: ClusterError) -> Error {
         | ClusterError::SpatialGather(_)
         | ClusterError::Bm25Gather(_)
         | ClusterError::TsGather(_)
+        | ClusterError::ShufflePush(_)
         | ClusterError::RemoteUntyped { .. }) => Error::Config {
             detail: format!("metadata propose: {other}"),
         },

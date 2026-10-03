@@ -5,7 +5,7 @@
 //! A NOT-MATCHED insert row needs its OWN registered surrogate, and surrogate
 //! registration is Control-Plane-only, so autocommit MERGE runs as a
 //! TOCTOU-safe round trip: (0) ship the source rows (scanned on its own
-//! core, since it may differ from the target's) into `source_rows`; (1)
+//! core, since it can differ from the target's) into `source_rows`; (1)
 //! resolve — the Data Plane classifies the merge read-only and returns
 //! NOT-MATCHED rows; (2) assign a fresh registered surrogate per insert row
 //! and decide the target's write policy over every resolved arm; (3) apply —
@@ -33,7 +33,7 @@ use nodedb_physical::physical_plan::{DocumentOp, ReturningSpec};
 use super::resolve_arms::decode_resolve;
 use crate::control::planner::materialized_sum::resolve_sum_targets_for_bodies;
 use crate::control::target_identity::{
-    assign_target_surrogate, bare_collection_name, derive_document_id, resolve_target_pk,
+    assign_target_surrogates, bare_collection_name, derive_document_id, resolve_target_pk,
 };
 
 /// Upper bound on resolve→apply retries under concurrent source/target drift.
@@ -57,7 +57,7 @@ pub struct MergeArgs<'a> {
     /// pre-processor. `None` selects the affected-count response.
     pub returning: Option<&'a ReturningSpec>,
     /// RLS read filters, carried onto the apply pass so `RETURNING` rows are
-    /// gated as a `SELECT` by the same principal would be.
+    /// gated as a `SELECT` by the same principal is.
     pub rls_filters: &'a [u8],
     /// RLS write predicate, carried onto the apply pass which decides every
     /// arm's image against it. Separate from `rls_filters`: read vs write gate.
@@ -133,7 +133,7 @@ pub(crate) async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate
 
     let mut attempt: u32 = 0;
     loop {
-        // Phase 0: read SOURCE on its own core (may differ from target's)
+        // Phase 0: read SOURCE on its own core (can differ from target's)
         // and ship raw rows into the plan. A fresh read per attempt keeps
         // resolve/apply on one consistent snapshot.
         let source_rows = read_all_source_rows(
@@ -166,7 +166,7 @@ pub(crate) async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate
         }
         let arms = decode_resolve(&resolve_resp.payload)?;
 
-        // Phase 2a: resolve materialized-sum targets from the arms just
+        // Phase 2a: resolve materialized-sum targets from the arms
         // classified (INSERT credits, DELETE debits, UPDATE the difference,
         // both sides on a join-key rewrite). Lookup-only: an unmatched join
         // value fails the statement. Drift is caught by apply's own
@@ -227,17 +227,22 @@ pub(crate) async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate
             by_join_key: Vec::with_capacity(insert_rows.len()),
             identities: Vec::with_capacity(insert_rows.len()),
         };
-        for (join_key, body) in &insert_rows {
-            let surrogate = assign_target_surrogate(
-                state,
-                nodedb_types::CollectionKey::from_qualified_str(
-                    args.database_id,
-                    args.target_collection,
-                )?,
-                args.tenant_id,
-                &target_pk,
-                body,
-            )?;
+        let insert_bodies: Vec<&[u8]> = insert_rows
+            .iter()
+            .map(|(_, body)| body.as_slice())
+            .collect();
+        let insert_surrogates = assign_target_surrogates(
+            state,
+            nodedb_types::CollectionKey::from_qualified_str(
+                args.database_id,
+                args.target_collection,
+            )?,
+            args.tenant_id,
+            &target_pk,
+            &insert_bodies,
+        )
+        .await?;
+        for ((join_key, body), surrogate) in insert_rows.iter().zip(insert_surrogates) {
             let document_id = derive_document_id(&target_pk, body, surrogate);
             inserts
                 .by_join_key
@@ -273,7 +278,7 @@ pub(crate) async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate
                 });
             }
             // Concurrent drift: re-resolve (fresh phase 1) and retry. The
-            // surrogates assigned this round are simply unused (harmless —
+            // surrogates assigned this round are unused (harmless —
             // the counter is monotonic and gap-tolerant).
             continue;
         }

@@ -2,10 +2,8 @@
 
 //! Protocol-neutral `SHOW CHANGE STREAMS` DDL handler.
 //!
-//! Ported from the pgwire `ddl::change_stream::show` handler. The tenant
-//! scoping and the per-stream field extraction are preserved verbatim; only the
-//! result construction changed from a pgwire `QueryResponse` to the
-//! protocol-neutral [`DdlResult::Rows`].
+//! The tenant scoping and the per-stream field extraction run here. The
+//! result is the protocol-neutral [`DdlResult::Rows`].
 
 use serde_json::{Map, Value as JsonValue};
 

@@ -226,7 +226,7 @@ mod tests {
         match ok("BACKUP DATABASE mydb TO 's3://bucket/path'") {
             NodedbStatement::Database(DatabaseStmt::BackupDatabase { name, uri }) => {
                 assert_eq!(name, "mydb");
-                assert!(!uri.is_empty());
+                assert_eq!(uri, "s3://bucket/path");
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -235,12 +235,48 @@ mod tests {
     #[test]
     fn parse_restore_database() {
         match ok("RESTORE DATABASE mydb FROM 's3://bucket/path'") {
-            NodedbStatement::Database(DatabaseStmt::RestoreDatabase { name, uri }) => {
+            NodedbStatement::Database(DatabaseStmt::RestoreDatabase {
+                name,
+                uri,
+                force,
+                dry_run,
+            }) => {
                 assert_eq!(name, "mydb");
-                assert!(!uri.is_empty());
+                assert_eq!(uri, "s3://bucket/path");
+                assert!(!force && !dry_run);
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_restore_database_flags() {
+        match ok("RESTORE DATABASE mydb FROM 'file:///b/x' FORCE DRY RUN") {
+            NodedbStatement::Database(DatabaseStmt::RestoreDatabase {
+                uri,
+                force,
+                dry_run,
+                ..
+            }) => {
+                assert_eq!(uri, "file:///b/x");
+                assert!(force && dry_run);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match ok("RESTORE DATABASE mydb FROM 'file:///b/x' DRY RUN") {
+            NodedbStatement::Database(DatabaseStmt::RestoreDatabase { force, dry_run, .. }) => {
+                assert!(!force && dry_run);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_database_refuses_an_unknown_trailing_word() {
+        assert!(
+            try_parse_database_statement("RESTORE DATABASE mydb FROM 'file:///b/x' LATER").is_err()
+        );
+        assert!(try_parse_database_statement("BACKUP DATABASE mydb TO").is_err());
     }
 
     #[test]

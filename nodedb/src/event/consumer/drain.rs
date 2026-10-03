@@ -50,6 +50,11 @@ impl RingCursor {
         Self::default()
     }
 
+    /// The highest event number taken, a tail drop's numbers included.
+    pub fn last_sequence(&self) -> u64 {
+        self.last_sequence
+    }
+
     /// Remember a snapshot to advance the safe prefix by, unless one is
     /// waiting. Read `final_bound` before `emitted`.
     pub fn take_snapshot(&mut self, final_bound: Lsn, emitted: u64) {
@@ -150,6 +155,7 @@ mod tests {
             valid_time_ms: None,
             user_id: None,
             statement_digest: None,
+            commit_hlc: Some(crate::event::test_utils::test_commit_hlc()),
         }
     }
 

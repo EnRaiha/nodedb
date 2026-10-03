@@ -56,41 +56,43 @@ impl NodeDbPgHandler {
         // Admission still follows the explicit authorization boundary, so a
         // rejected cursor declaration consumes no descriptor lease. The scope
         // remains live while every cursor-materialization task is dispatched.
-        let (tasks, _lease_scope) = retry_on_schema_change(move || async move {
-            let perm_cache =
-                crate::control::security::auth_fence::permission_view(&self.state, tenant_id)
+        let (tasks, _lease_scope) =
+            retry_on_schema_change(&self.state.lease_drain, move || async move {
+                crate::control::security::auth_fence::admit_permission_view(&self.state, tenant_id)
                     .await
                     .map_err(StatementSetupError::from)?;
-            let sec = crate::control::planner::context::PlanSecurityContext {
-                identity,
-                auth: auth_ctx,
-                rls_store: &self.state.rls,
-                redaction_store: &self.state.redaction,
-                permissions: &self.state.permissions,
-                roles: &self.state.roles,
-                permission_cache: Some(&*perm_cache),
-            };
-            let (tasks, _output_schema, versions, _) = query_ctx
-                .plan_sql_with_rls_and_versions(sql, tenant_id, database_id, &sec, None)
-                .await
-                .map_err(StatementSetupError::from)?;
-            drop(perm_cache);
+                let sec = crate::control::planner::context::PlanSecurityContext {
+                    identity,
+                    auth: auth_ctx,
+                    rls_store: &self.state.rls,
+                    redaction_store: &self.state.redaction,
+                    permissions: &self.state.permissions,
+                    roles: &self.state.roles,
+                    permission_tree: crate::control::planner::context::PermissionTreeSource::Live(
+                        &self.state.permission_cache,
+                    ),
+                };
+                let (tasks, _output_schema, versions, _) = query_ctx
+                    .plan_sql_with_rls_and_versions(sql, tenant_id, database_id, &sec, None)
+                    .await
+                    .map_err(StatementSetupError::from)?;
 
-            // Deliberate gate: proves the planned set is authorizable before the
-            // descriptor lease is acquired. Dispatch below re-derives the
-            // capability per task through the clone-check gate.
-            let _preauthorized_tasks = self
-                .authorize_tasks(identity, &tasks)
-                .map_err(StatementSetupError::from)?;
+                // Deliberate gate: proves the planned set is authorizable before the
+                // descriptor lease is acquired. Dispatch below re-derives the
+                // capability per task through the clone-check gate.
+                let _preauthorized_tasks = self
+                    .authorize_tasks(identity, &tasks)
+                    .map_err(StatementSetupError::from)?;
 
-            let lease_scope = self
-                .state
-                .acquire_plan_lease_scope(&versions)
-                .map_err(StatementSetupError::from)?;
-            Ok::<_, StatementSetupError>((tasks, lease_scope))
-        })
-        .await
-        .map_err(PgWireError::from)?;
+                let lease_scope = self
+                    .state
+                    .acquire_plan_lease_scope(&versions)
+                    .await
+                    .map_err(StatementSetupError::from)?;
+                Ok::<_, StatementSetupError>((tasks, lease_scope))
+            })
+            .await
+            .map_err(PgWireError::from)?;
 
         let mut rows = Vec::new();
         for task in tasks {

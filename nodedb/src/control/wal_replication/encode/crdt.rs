@@ -27,7 +27,7 @@ use nodedb_physical::physical_plan::CrdtOp;
 /// `RestoreToVersion` is deliberately not encoded here: the
 /// restore path replicates its effect as a forward delta wrapped in
 /// `CrdtOp::Apply`, which then follows the normal apply replication route.
-/// Encoding the restore op directly would double-apply the change and is
+/// Encoding the restore op directly double-applies the change and is
 /// non-deterministic across replicas.
 pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
     Some(match op {
@@ -160,7 +160,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
         } => doc_delete(
             collection.as_str(),
             document_id,
-            surrogate.as_u32(),
+            surrogate.map(|s| s.as_u32()),
             super::entry::encode_returning(returning),
             rls_filters,
         ),
@@ -329,7 +329,7 @@ pub(super) fn list_move(
 pub(super) fn doc_delete(
     collection: &str,
     document_id: &str,
-    surrogate: u32,
+    surrogate: Option<u32>,
     returning: Option<Vec<u8>>,
     rls_filters: &[u8],
 ) -> ReplicatedWrite {

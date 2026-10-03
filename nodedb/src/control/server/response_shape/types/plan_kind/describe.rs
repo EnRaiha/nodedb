@@ -6,7 +6,7 @@
 
 use crate::bridge::envelope::PhysicalPlan;
 
-use super::array::describe_array;
+use super::array::{describe_array, describe_cluster_array};
 use super::columnar_family::{describe_columnar, describe_spatial, describe_timeseries};
 use super::crdt::describe_crdt;
 use super::document::describe_document;
@@ -28,14 +28,12 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         PhysicalPlan::Timeseries(op) => describe_timeseries(op),
         PhysicalPlan::Spatial(op) => describe_spatial(op),
         PhysicalPlan::Array(op) => describe_array(op),
+        PhysicalPlan::ClusterArray(op) => describe_cluster_array(op),
         PhysicalPlan::Query(op) => describe_query(op),
 
         // Control-plane catalog, session and cluster ops. No `MetaOp` is a
         // client DML: none reports a row count, each answers its own caller.
         PhysicalPlan::Meta(_)
-        // Never dispatched through the plan-shaping path: the pgwire cluster
-        // array router classifies these itself (`routing/cluster_array.rs`).
-        | PhysicalPlan::ClusterArray(_)
         // Event-plane forwarding, answered by its own dispatcher.
         | PhysicalPlan::ClusterEvent(_) => PlanKind::Execution,
     }
@@ -81,7 +79,7 @@ mod tests {
         })
     }
 
-    /// A `MERGE ... RETURNING` payload is real target rows — `Execution` would
+    /// A `MERGE ... RETURNING` payload is real target rows — `Execution` will
     /// pass them unredacted.
     #[test]
     fn merge_with_returning_is_returning_rows() {
@@ -111,7 +109,7 @@ mod tests {
                 document_id: "d".into(),
                 value: Vec::new(),
                 if_absent: false,
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new(1),
                 returning: spec(),
                 rls_filters: Vec::new(),
                 resolved_sum_targets: Vec::new(),
@@ -121,7 +119,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 value: Vec::new(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new(1),
                 pk_bytes: Vec::new(),
                 returning: spec(),
                 rls_filters: Vec::new(),
@@ -141,7 +139,7 @@ mod tests {
                 document_id: "d".into(),
                 value: Vec::new(),
                 on_conflict_updates: Vec::new(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new(1),
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 returning: spec(),
                 rls_filters: Vec::new(),
@@ -173,7 +171,7 @@ mod tests {
                 key: b"k".to_vec(),
                 value: Vec::new(),
                 ttl_ms: 0,
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new(1),
                 returning: spec(),
                 rls_filters: Vec::new(),
             }),
@@ -182,7 +180,7 @@ mod tests {
                 key: b"k".to_vec(),
                 value: Vec::new(),
                 ttl_ms: 0,
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new(1),
                 returning: spec(),
                 rls_filters: Vec::new(),
             }),
@@ -192,7 +190,7 @@ mod tests {
                 value: Vec::new(),
                 ttl_ms: 0,
                 updates: Vec::new(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new(1),
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 returning: spec(),
                 rls_filters: Vec::new(),
@@ -202,7 +200,7 @@ mod tests {
                 key: b"k".to_vec(),
                 value: Vec::new(),
                 ttl_ms: 0,
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new(1),
                 returning: spec(),
                 rls_filters: Vec::new(),
                 provenance: None,
@@ -240,7 +238,7 @@ mod tests {
             key: b"k".to_vec(),
             value: Vec::new(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -267,7 +265,7 @@ mod tests {
             value: Vec::new(),
             ttl_ms: 0,
             updates: Vec::new(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             returning: None,
             rls_filters: Vec::new(),
@@ -301,7 +299,7 @@ mod tests {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
             document_id: "d1".into(),
             fields_json: "{}".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             partial: matches!(verb, CrdtWriteVerb::Update),
             verb,
             returning: None,
@@ -335,6 +333,7 @@ mod tests {
             cells_msgpack: Vec::new(),
             wal_lsn: 0,
             provenance: None,
+            vshard_id: 0,
         });
         assert!(matches!(
             describe_plan(&plan),

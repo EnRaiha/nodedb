@@ -171,23 +171,18 @@ impl NodeDbPgHandler {
                 ) => checked,
             };
 
-        // Single-node fans to local cores directly; cluster routes the scan to
-        // its owning vShard (local or remote over the L4 QUIC streaming
-        // transport) via the gateway and merges per-route streams.
-        let stream = if let Some(gw) = state.gateway.get() {
-            let ctx = crate::control::gateway::core::QueryContext {
-                tenant_id: task.tenant_id,
-                trace_id: crate::types::TraceId::ZERO,
-                database_id: task.database_id,
-                txn_id: None,
-            };
-            gw.execute_stream(&ctx, checked_child).await
-        } else {
-            crate::control::server::exchange::gather::gather_all_cores_stream_authorized(
-                &state,
-                checked_child.into_authorized(),
-                crate::types::TraceId::ZERO,
-            )
+        // The gateway routes the scan to its owning vShard (local or remote
+        // over the L4 QUIC streaming transport) and merges per-route streams.
+        let ctx = crate::control::gateway::core::QueryContext {
+            tenant_id: task.tenant_id,
+            trace_id: crate::types::TraceId::ZERO,
+            database_id: task.database_id,
+            txn_id: None,
+            linearizable: self.sessions.read_consistency(session_id).requires_leader(),
+        };
+        let stream = match state.installed_gateway() {
+            Ok(gateway) => gateway.execute_stream(&ctx, checked_child).await,
+            Err(error) => Err(error),
         }
         .map_err(|e| {
             let (severity, code, message) = error_to_sqlstate(&e);
@@ -198,21 +193,20 @@ impl NodeDbPgHandler {
             )))
         })?;
 
-        // Shape the streamed rows to match the SELECT projection, mirroring
-        // the (now-removed) post-hoc reproject seam:
+        // Shape the streamed rows to match the SELECT projection:
         //   - named columns  -> lazy per-batch shaping + projection
         //   - `SELECT *`      -> materialize, then id-first column union
         //   - anything else   -> raw single-column envelope passthrough
         //
         // Column-level redaction is resolved ONCE here, from the scan plan the
         // stream actually reads, and handed to every batch's shaping call
-        // below. Deriving it per batch would let an early batch ship before
+        // below. Deriving it per batch will let an early batch ship before
         // the policy was consulted.
         let redaction = Some(QueryRedaction::for_plan(task.tenant_id, auth, &child_plan));
 
         // The streaming fast path bypasses the dispatch loop's own metering
         // call, so without this every pgwire autocommit SELECT that streams
-        // would go unbilled — and a token quota over reads would never
+        // will go unbilled — and a token quota over reads will never
         // accumulate anything to enforce against. The guard charges on drop,
         // when the stream finishes or the client disconnects, so what is
         // billed is rows actually written. `None` when metering is disabled.

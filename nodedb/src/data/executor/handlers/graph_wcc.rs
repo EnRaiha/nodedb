@@ -20,6 +20,9 @@
 //! node's LOCAL label is the lexicographically-minimum owned node NAME in its
 //! local component. `VShardId::from_key` is a pure hash, so no routing table is
 //! needed on the Data Plane.
+//!
+//! Every node reads the graph as of the round's read cut (the plan's
+//! `system_as_of`), so a write during the round reaches no node's view.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -117,6 +120,8 @@ pub(super) fn run_wcc_superstep_core(csr: &CsrIndex, owned_vshards: &[u32]) -> W
         node_labels,
         boundary_edges,
         vertex_count,
+        // The fan that dispatched the round stamps the cut it read at.
+        system_as_of: None,
     }
 }
 
@@ -127,6 +132,7 @@ impl CoreLoop {
         tid: u64,
         params: &nodedb_graph::AlgoParams,
         owned_vshards: &[u32],
+        system_as_of: Option<i64>,
     ) -> Response {
         debug!(
             core = self.core_id,
@@ -134,6 +140,26 @@ impl CoreLoop {
             collection = %params.collection,
             "wcc superstep dispatch"
         );
+
+        // Fails this one core's round, so a test can check that the all-core
+        // gather fails the query instead of merging the other cores.
+        #[cfg(feature = "failpoints")]
+        if let Some(detail) =
+            crate::fail_point::eval_fail(&format!("graph::wcc_superstep::core{}", self.core_id))
+        {
+            return self.response_error(task, ErrorCode::Internal { detail });
+        }
+
+        // Every node of the round reads the graph at the round's read cut,
+        // so every node reads the same graph.
+        let Some(system_as_of) = system_as_of else {
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: "wcc superstep: the plan carries no read cut".into(),
+                },
+            );
+        };
 
         let database_id = task.request.database_id.as_u64();
         let memory = nodedb_mem::ScopedMemory::new(
@@ -143,16 +169,17 @@ impl CoreLoop {
             nodedb_mem::EngineId::Graph,
         );
 
-        // Build a collection-scoped CSR — same call as execute_graph_algo — so
-        // distributed WCC runs over exactly the same (collection, edge_label)
-        // subgraph as single-node GRAPH ALGO WCC ON <collection>.
+        // Build a collection-scoped CSR from the edge store as of the cut —
+        // same call as execute_graph_algo — so distributed WCC runs over
+        // exactly the same (collection, edge_label) subgraph as single-node
+        // GRAPH ALGO WCC ON <collection>.
         let csr = match build_csr_for_collection(
             &self.edge_store,
             database_id,
             tid,
             &params.collection,
             params.edge_label.as_deref(),
-            None,
+            Some(system_as_of),
             memory,
         ) {
             Ok(c) => c,

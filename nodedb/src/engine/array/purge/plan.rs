@@ -20,7 +20,6 @@ use nodedb_array::schema::ArraySchema;
 use nodedb_array::segment::reader::TilePayload;
 use nodedb_array::tile::sparse_tile::{RowKind, SparseRow, SparseTile, SparseTileBuilder};
 use nodedb_array::types::TileId;
-use nodedb_types::{OPEN_UPPER, Surrogate};
 
 use crate::engine::array::store::ArrayStore;
 
@@ -212,28 +211,20 @@ pub fn plan(
             match row.kind {
                 RowKind::GdprErased => {}
                 RowKind::Tombstone => {
-                    builder.push_row(SparseRow {
-                        coord: &row.coord,
-                        attrs: &[],
-                        surrogate: Surrogate::ZERO,
-                        valid_from_ms: 0,
-                        valid_until_ms: OPEN_UPPER,
-                        kind: RowKind::Tombstone,
-                    })?;
+                    builder.push_row(SparseRow::sentinel(&row.coord, RowKind::Tombstone))?;
                     cells_in_ceiling += 1;
                 }
                 RowKind::Live => {
                     let p = row.payload.ok_or_else(|| ArrayError::SegmentCorruption {
                         detail: "plan: Live row missing payload".into(),
                     })?;
-                    builder.push_row(SparseRow {
-                        coord: &row.coord,
-                        attrs: &p.attrs,
-                        surrogate: p.surrogate,
-                        valid_from_ms: p.valid_from_ms,
-                        valid_until_ms: p.valid_until_ms,
-                        kind: RowKind::Live,
-                    })?;
+                    builder.push_row(SparseRow::live(
+                        &row.coord,
+                        &p.attrs,
+                        p.surrogate,
+                        p.valid_from_ms,
+                        p.valid_until_ms,
+                    ))?;
                     cells_in_ceiling += 1;
                 }
             }
@@ -254,7 +245,9 @@ pub fn plan(
                 .iter()
                 .min_by_key(|(lsn, sid, _)| (*lsn, sid.clone()))
                 .map(|(_, sid, _)| sid.clone())
-                .expect("outside is non-empty");
+                .ok_or_else(|| ArrayError::SegmentCorruption {
+                    detail: "plan: prefix group has no outside-horizon version".into(),
+                })?;
 
             seg_ceilings
                 .entry(host_seg_id)
@@ -334,7 +327,7 @@ mod tests {
                 vec![ArrayPutCell {
                     coord: vec![CoordValue::Int64(x)],
                     attrs: vec![CellValue::Int64(v)],
-                    surrogate: Surrogate::ZERO,
+                    surrogate: Surrogate::new(x as u32 + 1),
                     system_from_ms: sys_ms,
                     valid_from_ms: 0,
                     valid_until_ms: i64::MAX,

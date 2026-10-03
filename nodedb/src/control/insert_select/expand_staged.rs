@@ -13,7 +13,7 @@
 //!
 //! Emits `PointInsert`, not `BatchInsert`: only `PointPut`/`PointInsert`/
 //! `PointDelete` have an undo-tracked arm in transactional replay: a
-//! `BatchInsert` here would survive an atomic rollback (partial commit).
+//! `BatchInsert` here survives an atomic rollback (partial commit).
 
 use nodedb_types::{DatabaseId, Surrogate, TenantId};
 
@@ -78,7 +78,7 @@ pub(crate) async fn resolve_and_emit_insert_select_ops(
 
     // Resolve materialized-sum targets: these ops stage directly, bypassing
     // statement-level resolution, so without this a bound target collection
-    // would fold against an empty resolution.
+    // folds against an empty resolution.
     let sum_bodies: Vec<&[u8]> = rows.iter().map(|(_, value, _)| value.as_slice()).collect();
     let mut resolved_sum_targets =
         crate::control::planner::materialized_sum::resolve_sum_targets_for_bodies(
@@ -196,7 +196,8 @@ async fn materialize_copy(
             &spec,
             entries,
             &mut remaining,
-        )?;
+        )
+        .await?;
         rows.extend(page);
 
         if next_cursor.is_empty() {

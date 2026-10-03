@@ -149,6 +149,7 @@ fn apply_clone_database_writes_owner_row_for_shadow_collection() {
     let entry = CatalogEntry::CloneDatabase {
         target_descriptor: Box::new(target_descriptor),
         source_db_id: DatabaseId::DEFAULT.as_u64(),
+        incarnation: nodedb_types::Hlc::new(1_000_000, 0),
     };
     apply_to(&entry, &catalog).expect("apply clone_database");
 

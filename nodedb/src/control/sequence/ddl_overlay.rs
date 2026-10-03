@@ -4,8 +4,8 @@
 //! [`super::registry::SequenceRegistry`] map.
 //!
 //! `CREATE SEQUENCE` inside an open transaction is buffered and only reaches
-//! the shared registry at COMMIT (`post_apply` runs only for
-//! `ProposeOutcome::needs_local_apply()`, which `Buffered` never satisfies).
+//! the shared registry at COMMIT (`post_apply` never runs for a
+//! `ProposeOutcome::Buffered` entry).
 //! Without this fallback, `NEXTVAL` / `CURRVAL` / `SETVAL` on a sequence
 //! created earlier in the same transaction resolve as missing.
 //!
@@ -42,6 +42,7 @@ fn buffered_def(database_id: u64, tenant_id: u64, name: &str) -> Option<StoredSe
                     database_id: entry_database,
                     tenant_id: entry_tenant,
                     name: entry_name,
+                    ..
                 } if *entry_database == database_id
                     && *entry_tenant == tenant_id
                     && entry_name == name =>
@@ -93,6 +94,8 @@ mod tests {
             database_id,
             tenant_id,
             name: name.to_owned(),
+            target_descriptor_version: 0,
+            target_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 

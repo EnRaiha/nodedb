@@ -145,7 +145,7 @@ async fn grant_permission_visible_on_every_node() {
         .await
         .expect("grant read");
 
-    let target = "collection:1:documents";
+    let target = "collection:0:1:documents";
     wait_for(
         "all 3 nodes see the grant",
         Duration::from_secs(10),

@@ -34,11 +34,12 @@ use nodedb_physical::physical_plan::PhysicalPlan;
 use super::dispatcher::{DispatchRouteParams, dispatch_route, statement_deadline_ms};
 use super::fuser::fuse_payloads;
 use super::key_extractor::UnwiredKeyExtractor;
+use super::live_leaders::resolve_live_decision;
 use super::outcome::GatewayOutcome;
 use super::plan_cache::PlanCache;
 use super::retry::retry_not_leader;
 use super::route::TaskRoute;
-use super::router::{resolve_decision, route_plan};
+use super::router::route_plan;
 use super::version_set::GatewayVersionSet;
 
 /// Context passed to [`Gateway::execute`].
@@ -55,13 +56,21 @@ pub struct QueryContext {
     /// forwarding on remote `ExecuteRequest`. `None` for autocommit and
     /// non-interactive callers.
     pub txn_id: Option<TxnId>,
+    /// Every read this query dispatches must observe all writes committed
+    /// before it began. The node that serves each read leg confirms the leg's
+    /// group first (see `control::cluster::linearizable_read`). Writes ignore
+    /// it: Raft orders them.
+    pub linearizable: bool,
 }
 
+/// The authorized plan and its write lease. The caller holds the lease until
+/// the plan's outcome returns.
 pub(super) fn authorized_plan_for_context(
     ctx: &QueryContext,
     checked: CloneCheckedTask,
-) -> Result<PhysicalPlan, Error> {
-    let task = checked.into_authorized().into_physical_task();
+) -> Result<(PhysicalPlan, crate::control::lease::QueryLeaseScope), Error> {
+    let (authorized, lease) = checked.into_parts();
+    let task = authorized.into_physical_task();
     if task.tenant_id != ctx.tenant_id
         || task.database_id != ctx.database_id
         || task.txn_id != ctx.txn_id
@@ -70,7 +79,7 @@ pub(super) fn authorized_plan_for_context(
             detail: "authorized task scope does not match gateway query context".into(),
         });
     }
-    Ok(task.plan)
+    Ok((task.plan, lease))
 }
 
 /// The gateway: routes, dispatches, retries, and caches physical plans.
@@ -78,7 +87,7 @@ pub struct Gateway {
     /// `Weak` back-reference to the owning [`SharedState`].
     ///
     /// `SharedState` owns this `Gateway` via its strong `Option<Arc<Gateway>>`
-    /// field, so a strong `Arc<SharedState>` here would form a reference cycle
+    /// field, so a strong `Arc<SharedState>` here forms a reference cycle
     /// that keeps `SharedState` alive forever (its clone count never reaches
     /// zero on shutdown). Holding it `Weak` breaks the cycle: while the node
     /// runs some other owner always keeps `SharedState` alive, so
@@ -176,13 +185,13 @@ impl Gateway {
     /// committed LSN (local SPSC response watermark or the remote's
     /// `ExecuteResponse.watermark_lsn`). The cross-node gather consumer folds
     /// these into the transaction read-set so a remote-homed read records the
-    /// remote's actual LSN instead of the former hardcoded `Lsn::ZERO`.
+    /// remote's actual LSN.
     pub async fn execute_with_watermarks(
         &self,
         ctx: &QueryContext,
         checked: CloneCheckedTask,
     ) -> Result<(Vec<Vec<u8>>, Vec<(VShardId, Lsn)>, Lsn), Error> {
-        let plan = authorized_plan_for_context(ctx, checked)?;
+        let (plan, _lease) = authorized_plan_for_context(ctx, checked)?;
         self.execute_plan_outcome(ctx, plan)
             .await
             .map(GatewayOutcome::into_parts)
@@ -278,35 +287,10 @@ impl Gateway {
                 let database_id = ctx.database_id;
                 let trace_id = ctx.trace_id;
                 let txn_id = ctx.txn_id;
+                let linearizable = ctx.linearizable;
                 let version_set = version_set_for_route.clone();
                 async move {
-                    let decision = {
-                        let routing_guard = shared
-                            .cluster_routing
-                            .as_ref()
-                            .map(|rw| rw.read().unwrap_or_else(|p| p.into_inner()));
-                        let raft_snapshot: Vec<nodedb_cluster::GroupStatus> =
-                            shared.raft_status_fn.get().map(|f| f()).unwrap_or_default();
-                        let live_leader = move |group_id: u64| -> u64 {
-                            raft_snapshot
-                                .iter()
-                                .find(|gs| gs.group_id == group_id)
-                                .map(|gs| gs.leader_id)
-                                .unwrap_or(0)
-                        };
-                        let live_lookup: Option<&dyn Fn(u64) -> u64> =
-                            if shared.raft_status_fn.get().is_some() {
-                                Some(&live_leader)
-                            } else {
-                                None
-                            };
-                        resolve_decision(
-                            vshard_id_u32,
-                            shared.node_id,
-                            routing_guard.as_deref(),
-                            live_lookup,
-                        )
-                    };
+                    let decision = resolve_live_decision(&shared, vshard_id_u32);
                     let route = TaskRoute {
                         plan,
                         decision,
@@ -321,6 +305,7 @@ impl Gateway {
                         deadline_ms,
                         version_set: &version_set,
                         txn_id,
+                        linearizable,
                     })
                     .await
                 }
@@ -388,11 +373,26 @@ impl Gateway {
         plan: PhysicalPlan,
         ctx: &QueryContext,
     ) -> Result<Vec<TaskRoute>, Error> {
+        // A `ClusterArray` plan runs through this node's array coordinator: it
+        // has no wire encoding and no Data-Plane handler. Array DDL proposes a
+        // replicated catalog entry: a route opens the array on one node only.
+        let local_only = if matches!(plan, PhysicalPlan::ClusterArray(_)) {
+            Some("a ClusterArray plan runs through the array coordinator")
+        } else if crate::control::array_catalog::ddl::is_array_ddl(&plan) {
+            Some("array DDL runs through the replicated array catalog")
+        } else {
+            None
+        };
+        if let Some(reason) = local_only {
+            return Err(Error::Internal {
+                detail: format!("gateway: {reason}, never a gateway route"),
+            });
+        }
         // Fail-closed safety floor: refuse a cross-collection write whose source
         // and target are not co-resident on one Data-Plane core. This runs in
         // BOTH single-node and cluster mode — the single-node early-return in
         // `route_plan` bypasses `route_single_collection`, which is exactly the
-        // multi-core scenario that triggers the silent-wrong-result bug.
+        // multi-core scenario that returns silently wrong results.
         let shared = self.shared()?;
         super::colocation_guard::guard_cross_collection_write(&shared, ctx.database_id, &plan)?;
 
@@ -426,7 +426,7 @@ impl Gateway {
     ///
     /// `tenant_id` must match the authenticated tenant of the query so that
     /// the catalog key lookup (`"{tenant_id}:{collection_name}"`) finds the
-    /// correct descriptor version. Using tenant 0 here would return version 0
+    /// correct descriptor version. Using tenant 0 here returns version 0
     /// for every collection stored under any other tenant, causing spurious
     /// `DescriptorMismatch` rejections at the leader.
     ///
@@ -575,7 +575,7 @@ mod tests {
 
         // Ensure the counter trick works: simulate "plan_fn called N times".
         let plan_fn_calls = Arc::new(AtomicUsize::new(0));
-        let _ = plan_fn_calls; // just a placeholder — real test is in integration tests
+        let _ = plan_fn_calls; // placeholder — real test is in integration tests
     }
 
     /// Simulate the full two-phase execute_sql flow using only PlanCache APIs.
@@ -595,7 +595,7 @@ mod tests {
 
         // Helper: simulates what execute_sql does on every call.
         //
-        // `version_of_widgets` is the version the catalog would return.
+        // `version_of_widgets` is the version the catalog returns.
         // `expect_hit` controls whether we assert a hit or miss.
         let simulate_call = |cache: &PlanCache,
                              plan_fn_calls: &Arc<AtomicUsize>,

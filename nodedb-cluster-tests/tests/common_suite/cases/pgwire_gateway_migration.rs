@@ -35,6 +35,7 @@ fn test_ctx() -> QueryContext {
         trace_id: nodedb_types::TraceId::ZERO,
         database_id: nodedb_types::id::DatabaseId::DEFAULT,
         txn_id: None,
+        linearizable: false,
     }
 }
 
@@ -188,7 +189,7 @@ async fn pgwire_gateway_migration_plan_cache_hits() {
             key: b"cache-key".to_vec(),
             value: mp_string("cache-val"),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"cache-key".as_ref()),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,

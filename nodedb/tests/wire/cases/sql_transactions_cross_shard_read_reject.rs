@@ -2,15 +2,12 @@
 
 //! An interactive transaction that writes one vShard and reads a DIFFERENT
 //! vShard is a cross-shard transaction at COMMIT time — even though the
-//! buffered write batch itself is single-shard. The real `nodedb` binary
-//! defaults `single_node_calvin = true` (`config/server/section.rs`), so a
-//! standalone spawned server always has a Calvin sequencer wired and elects
-//! itself leader; the strict cross-shard COMMIT path
+//! buffered write batch itself is single-shard. A server with no `[cluster]`
+//! always runs the single-node Calvin sequencer and elects itself leader.
+//! The strict cross-shard COMMIT path
 //! (`dispatch_strict_atomic_tasks_to_calvin`,
 //! `control/planner/calvin/dispatch_multi.rs`) admits the batch, submits it
-//! through the sequencer, and commits — it is never rejected with
-//! `SequencerUnavailable` here. That rejection is reachable only when
-//! `sequencer_inbox` is unset, which does not happen on this harness.
+//! through the sequencer, and commits.
 
 use crate::harness::TestServer;
 

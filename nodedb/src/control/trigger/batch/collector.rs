@@ -23,11 +23,20 @@ use nodedb_types::Value;
 use super::super::row_identity::inject_row_identity;
 use crate::util::rmpv_value::rmpv_to_value;
 
+/// Position of the write that produced a batch row. A trigger body's
+/// cross-node writes are deduplicated on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowSource {
+    pub lsn: u64,
+    pub sequence: u64,
+    pub vshard: u32,
+}
+
 /// A single row in a trigger batch.
 ///
 /// Stores raw MessagePack bytes from the WriteEvent and decodes directly
 /// to `HashMap<String, nodedb_types::Value>` on first access — skipping
-/// the `serde_json::Value` intermediate that was previously required.
+/// the `serde_json::Value` intermediate.
 #[derive(Debug)]
 pub struct TriggerBatchRow {
     /// Raw NEW value bytes (MessagePack). None for DELETE.
@@ -40,6 +49,8 @@ pub struct TriggerBatchRow {
     old_cache: OnceLock<Option<HashMap<String, Value>>>,
     /// Row identifier (for error blaming).
     pub row_id: String,
+    /// Position of the source write; `None` for rows built in tests.
+    pub source: Option<RowSource>,
 }
 
 impl Clone for TriggerBatchRow {
@@ -67,6 +78,7 @@ impl Clone for TriggerBatchRow {
                     cell
                 }),
             row_id: self.row_id.clone(),
+            source: self.source,
         }
     }
 }
@@ -84,7 +96,14 @@ impl TriggerBatchRow {
             new_cache: OnceLock::new(),
             old_cache: OnceLock::new(),
             row_id,
+            source: None,
         }
+    }
+
+    /// Attach the position of the write that produced this row.
+    pub fn with_source(mut self, source: RowSource) -> Self {
+        self.source = Some(source);
+        self
     }
 
     /// Create from pre-decoded fields (test convenience).
@@ -103,6 +122,7 @@ impl TriggerBatchRow {
             new_cache,
             old_cache,
             row_id,
+            source: None,
         }
     }
 
@@ -314,7 +334,7 @@ pub fn push_write_event(
     // events fire through the deferred dispatcher. A restored row fired its
     // triggers when it was first written.
     match event.source {
-        EventSource::User => {}
+        EventSource::User | EventSource::ImplicitClient => {}
         EventSource::Trigger
         | EventSource::RaftFollower
         | EventSource::CrdtSync
@@ -333,7 +353,12 @@ pub fn push_write_event(
         event.new_value.clone(),
         event.old_value.clone(),
         event.row_id.as_str().to_string(),
-    );
+    )
+    .with_source(RowSource {
+        lsn: event.lsn.as_u64(),
+        sequence: event.sequence,
+        vshard: event.vshard_id.as_u32(),
+    });
 
     collector.push(
         &event.collection,

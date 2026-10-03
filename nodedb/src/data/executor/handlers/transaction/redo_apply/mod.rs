@@ -16,6 +16,7 @@
 //!   engine kind.
 //! - [`calvin_fold_tests`]: a Calvin record folds the same live and in
 //!   restart replay.
+//! - [`unique_handover_tests`]: UNIQUE judged on a record's post-state.
 
 #[cfg(test)]
 mod calvin_fold_tests;
@@ -30,8 +31,10 @@ mod state;
 mod sub_ops;
 #[cfg(test)]
 pub(in crate::data::executor) mod test_commit;
+#[cfg(test)]
+mod unique_handover_tests;
 mod validate;
 
 pub(in crate::data::executor) use document::CommittedDocWrite;
 pub(in crate::data::executor) use entry::CommittedRedo;
-pub(in crate::data::executor) use state::{RedoApplyPass, RedoApplyState};
+pub(in crate::data::executor) use state::{RedoApplyPass, RedoApplyState, TsInstalled};

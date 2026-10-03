@@ -74,7 +74,7 @@ pub(super) fn make_stub_request(id: u64) -> Request {
             vector: vec![0.1],
             dim: 1,
             field_name: "emb".into(),
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(id as u32 + 1),
             pk_bytes: None,
             provenance: None,
         }),
@@ -90,6 +90,7 @@ pub(super) fn make_stub_request(id: u64) -> Request {
         txn_id: None,
         wal_lsn: None,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: Admission::Exempt(ExemptReason::Read),
     }
 }

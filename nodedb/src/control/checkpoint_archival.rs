@@ -1,189 +1,170 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! WAL archival to cold storage, run by the checkpoint cycle before it
-//! truncates. Archival bounds truncation: a segment cold storage did not
-//! accept stays on local disk instead of being deleted unarchived.
+//! The archived bound on WAL truncation. Truncation never deletes a segment
+//! the archive does not hold.
 
-use tracing::{debug, warn};
+use nodedb_wal::segment::SegmentMeta;
 
 use crate::wal::WalManager;
+use crate::wal::archiver::{ArchiveCursor, WalArchiver};
 
 /// Bound that truncates nothing: no WAL segment precedes LSN 0.
 const NO_TRUNCATION_BOUND: u64 = 0;
 
-/// The LSN truncation must not pass, given the segments on disk and the
-/// `first_lsn` of every segment whose archival failed.
+/// The LSN truncation must not pass.
 ///
-/// The bound is `checkpoint_lsn` when every eligible segment reached cold
-/// storage, and the lowest failed `first_lsn` otherwise, so that segment and
-/// everything after it survive. `None` segments means `list_segments` itself
-/// failed: the eligible set is unknown, and unknown is never permissive.
+/// `truncate_before(lsn)` deletes a segment when its successor starts at or
+/// below `lsn`. A bound equal to the lowest unarchived segment's `first_lsn`
+/// therefore keeps that segment and everything after it.
+///
+/// - `None` segments: the WAL directory was unlistable. Unknown is never
+///   permissive, so nothing is truncated.
+/// - `None` cursor: the archive listing has not succeeded yet. Every local
+///   segment counts as unarchived.
 fn archived_truncation_bound(
-    segment_first_lsns: Option<&[u64]>,
-    failed_first_lsns: &[u64],
+    segments: Option<&[SegmentMeta]>,
+    cursor: Option<&ArchiveCursor>,
     checkpoint_lsn: u64,
 ) -> u64 {
-    let Some(first_lsns) = segment_first_lsns else {
+    let Some(segments) = segments else {
         return NO_TRUNCATION_BOUND;
     };
-    let mut bound = checkpoint_lsn;
-    for first_lsn in first_lsns {
-        if failed_first_lsns.contains(first_lsn) {
-            bound = bound.min(*first_lsn);
-        }
-    }
-    bound
+    let lowest_unarchived = match cursor {
+        Some(cursor) => cursor.lowest_unarchived(segments),
+        None => segments.first().map(|seg| seg.first_lsn),
+    };
+    lowest_unarchived.map_or(checkpoint_lsn, |lsn| lsn.min(checkpoint_lsn))
 }
 
-/// Archive WAL segments that the upcoming truncation deletes, and return the
-/// LSN that truncation must not pass.
+/// The truncation bound after an archive pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ArchivedBound {
+    /// The LSN truncation must not pass.
+    pub lsn: u64,
+    /// An unarchived sealed segment, or an unknown archive state, holds
+    /// truncation below the checkpoint. A bound at the active segment is not
+    /// held: the active segment is never deleted.
+    pub held: bool,
+}
+
+/// Run an archive pass, then return the bound the upcoming truncation must
+/// not pass.
 ///
-/// A segment is eligible for deletion (and therefore archival) when the segment
-/// immediately following it has a `first_lsn <= checkpoint_lsn`. Each eligible
-/// segment is uploaded before `truncate_before` deletes it, preserving a
-/// continuous WAL archive in cold storage for point-in-time recovery.
-///
-/// A segment the archive did not accept holds truncation back at that segment.
-/// The local WAL then grows until archival recovers. That is the intended
-/// outcome: a full disk is loud and recoverable, an archive hole is silent and
-/// permanent.
-pub(crate) async fn archive_wal_segments_before_truncation(
+/// A segment the archive did not accept holds truncation back at that
+/// segment. The local WAL then grows until archival recovers. A full disk is
+/// loud and recoverable. An archive hole is silent and permanent.
+pub(crate) async fn archive_then_bound(
+    archiver: &mut WalArchiver,
     wal: &WalManager,
     checkpoint_lsn: u64,
-    cold: &crate::storage::cold::ColdStorage,
-) -> u64 {
-    let segments = match wal.list_segments() {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(
-                error = %e,
-                "WAL archival: segments unlistable — truncation holds until the next cycle"
-            );
-            crate::diag::wal_archival_failed_truncation_held(
-                "list_segments",
-                Some(&e),
-                NO_TRUNCATION_BOUND,
-            );
-            return archived_truncation_bound(None, &[], checkpoint_lsn);
-        }
-    };
-
-    // Determine which segments are eligible using the same logic as truncate_before:
-    // a segment is deletable when its successor's first_lsn <= checkpoint_lsn.
-    let mut failed_first_lsns: Vec<u64> = Vec::new();
-    for seg in &segments {
-        let next_first_lsn = segments
-            .iter()
-            .find(|s| s.first_lsn > seg.first_lsn)
-            .map(|s| s.first_lsn)
-            .unwrap_or(u64::MAX);
-
-        if next_first_lsn > checkpoint_lsn {
-            // Not eligible for deletion; skip.
-            continue;
-        }
-
-        let segment_name = match seg.path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_owned(),
-            None => {
-                warn!(
-                    path = %seg.path.display(),
-                    "WAL archival: segment path unnameable — segment stays on local disk"
-                );
-                crate::diag::wal_archival_failed_truncation_held(
-                    "segment_path",
-                    None,
-                    seg.first_lsn,
-                );
-                failed_first_lsns.push(seg.first_lsn);
-                continue;
-            }
-        };
-
-        match cold.upload_wal_segment(&seg.path, &segment_name).await {
-            Ok(object_path) => {
-                debug!(
-                    segment = %segment_name,
-                    object_path = %object_path,
-                    first_lsn = seg.first_lsn,
-                    "WAL segment archived before truncation"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    segment = %segment_name,
-                    error = %e,
-                    first_lsn = seg.first_lsn,
-                    "WAL archival: upload failed — segment stays on local disk"
-                );
-                crate::diag::wal_archival_failed_truncation_held("upload", Some(&e), seg.first_lsn);
-                failed_first_lsns.push(seg.first_lsn);
-            }
-        }
+) -> ArchivedBound {
+    let snapshot = archiver.tick(wal).await;
+    let lsn = archived_truncation_bound(
+        snapshot.as_ref().map(|s| s.segments.as_slice()),
+        archiver.cursor(),
+        checkpoint_lsn,
+    );
+    let active = snapshot.as_ref().map(|s| s.active_first_lsn);
+    ArchivedBound {
+        lsn,
+        held: lsn < checkpoint_lsn && Some(lsn) != active,
     }
-
-    let first_lsns: Vec<u64> = segments.iter().map(|s| s.first_lsn).collect();
-    archived_truncation_bound(Some(&first_lsns), &failed_first_lsns, checkpoint_lsn)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use nodedb_wal::segment::{discover_segments, segment_path, truncate_segments};
+
     use super::*;
 
-    /// Archival that fully succeeded leaves truncation exactly where the
-    /// checkpoint put it.
+    fn seg(first_lsn: u64) -> SegmentMeta {
+        SegmentMeta {
+            path: segment_path(Path::new("/nonexistent"), first_lsn),
+            first_lsn,
+            file_size: 1,
+        }
+    }
+
+    fn archived(lsns: &[u64]) -> ArchiveCursor {
+        let mut cursor = ArchiveCursor::default();
+        for lsn in lsns {
+            cursor.mark_archived(*lsn);
+        }
+        cursor
+    }
+
+    /// With every sealed segment archived, the active segment is the bound.
+    /// It is never deleted anyway, so the checkpoint alone decides.
     #[test]
-    fn every_upload_succeeded_does_not_lower_the_checkpoint_lsn() {
+    fn fully_archived_sealed_set_bounds_at_the_active_segment() {
+        let segments = [seg(10), seg(20), seg(30)];
+        let cursor = archived(&[10, 20]);
         assert_eq!(
-            archived_truncation_bound(Some(&[10, 20, 30]), &[], 900),
-            900
+            archived_truncation_bound(Some(&segments), Some(&cursor), 900),
+            30
         );
     }
 
-    /// A failed upload keeps its own segment and every later one on disk:
-    /// deleting them would leave a hole the archive can never fill.
+    /// An unarchived middle segment keeps itself and every later one.
     #[test]
-    fn middle_segment_upload_failure_bounds_truncation_at_that_segment() {
+    fn unarchived_middle_segment_bounds_truncation_at_that_segment() {
+        let segments = [seg(10), seg(20), seg(30)];
+        let cursor = archived(&[10, 30]);
         assert_eq!(
-            archived_truncation_bound(Some(&[10, 20, 30]), &[20], 900),
+            archived_truncation_bound(Some(&segments), Some(&cursor), 900),
             20
         );
     }
 
-    /// The lowest failed segment wins, so a later success cannot raise the
-    /// bound past a gap.
+    /// A checkpoint below the archived bound stays the binding floor.
     #[test]
-    fn lowest_failed_segment_wins_over_a_later_one() {
+    fn checkpoint_below_the_archived_bound_wins() {
+        let segments = [seg(10), seg(20), seg(30)];
+        let cursor = archived(&[10, 20]);
         assert_eq!(
-            archived_truncation_bound(Some(&[10, 20, 30]), &[30, 20], 900),
-            20
+            archived_truncation_bound(Some(&segments), Some(&cursor), 15),
+            15
         );
     }
 
-    /// The first eligible segment failing truncates nothing: no segment
-    /// precedes it.
+    /// Before the archive listing succeeds, the lowest local segment is the
+    /// bound, so nothing is deleted.
     #[test]
-    fn first_segment_upload_failure_truncates_nothing() {
-        assert_eq!(
-            archived_truncation_bound(Some(&[10, 20, 30]), &[10], 900),
-            10
-        );
+    fn unrecovered_archiver_truncates_nothing() {
+        let segments = [seg(10), seg(20), seg(30)];
+        assert_eq!(archived_truncation_bound(Some(&segments), None, 900), 10);
     }
 
-    /// An unlistable WAL directory hides which segments are eligible, so the
-    /// cycle archives nothing and truncates nothing.
+    /// An unlistable WAL directory hides which segments exist.
     #[test]
     fn list_segments_failure_truncates_nothing() {
-        assert_eq!(archived_truncation_bound(None, &[], 900), 0);
+        assert_eq!(archived_truncation_bound(None, None, 900), 0);
     }
 
-    /// A failed segment above the checkpoint LSN was never eligible for
-    /// deletion, so it cannot lower the bound.
+    /// The bound applied to a real WAL directory: the checkpoint allows
+    /// deleting every sealed segment, but the unarchived one survives, and so
+    /// does everything after it.
     #[test]
-    fn failure_above_the_checkpoint_lsn_does_not_lower_the_bound() {
-        assert_eq!(
-            archived_truncation_bound(Some(&[10, 950]), &[950], 900),
-            900
-        );
+    fn held_archive_bound_stops_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        for lsn in [10u64, 20, 30, 40] {
+            std::fs::write(segment_path(dir.path(), lsn), b"segment").unwrap();
+        }
+        let segments = discover_segments(dir.path()).unwrap();
+        let cursor = archived(&[10]);
+
+        let bound = archived_truncation_bound(Some(&segments), Some(&cursor), 1_000);
+        assert_eq!(bound, 20);
+        let result = truncate_segments(dir.path(), bound, 40).unwrap();
+        assert_eq!(result.segments_deleted, 1);
+
+        let left: Vec<u64> = discover_segments(dir.path())
+            .unwrap()
+            .iter()
+            .map(|s| s.first_lsn)
+            .collect();
+        assert_eq!(left, vec![20, 30, 40]);
     }
 }

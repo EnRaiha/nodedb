@@ -12,9 +12,9 @@ use nodedb_types::QualifiedCollection;
 use crate::control::server::exchange::resolve::capture::DistributedReadCapture;
 use crate::control::state::SharedState;
 
-use super::dispatch::ResolveCtx;
 use super::entry::Resolved;
 use super::post_process_arm::{ChildRows, materialize_child_rows, provider_scan_of_rows};
+use crate::control::server::exchange::read_scope::ReadScope;
 
 /// Fields of a `QueryOp::Aggregate { input: Some(_) }` plan node, carried
 /// through resolution as one value.
@@ -42,7 +42,7 @@ pub(super) struct AggregateFields {
 /// full relation and no Exchange reaches a Data-Plane core.
 pub(super) async fn resolve_aggregate_input(
     state: &SharedState,
-    ctx: ResolveCtx,
+    ctx: ReadScope,
     captures: &mut Vec<DistributedReadCapture>,
     fields: AggregateFields,
 ) -> crate::Result<Resolved> {

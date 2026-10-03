@@ -9,22 +9,20 @@ use crate::control::local_dispatch;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::identity::{Permission, required_permission};
 use crate::control::server::dispatch_utils;
-use crate::control::server::shared::session::{
-    AbortReason, CommitOutcome, InTxnRoute, StagingGateError, commit, lifecycle, route_in_tx_write,
-};
+use crate::control::server::shared::session::conn_scope::scoped_system_txn;
+use crate::control::server::shared::session::{AbortReason, StagingGateError};
 use crate::control::server::shared::write_admission::plan_requires_txn_buffering;
 use crate::control::state::SharedState;
 use crate::event::EventSource;
 use crate::types::TraceId;
 use nodedb_physical::physical_task::PhysicalTask;
 
-use super::data_plane::SystemTxnDataPlane;
-use super::scope::SystemTxnScope;
+use super::live::OpenSystemTxn;
 
 /// Why a system transaction did not commit.
 #[derive(Debug, thiserror::Error)]
 pub enum SystemTxnError {
-    /// The transaction block could not be opened.
+    /// The transaction block did not open.
     #[error("system transaction could not begin: {source}")]
     Begin {
         #[source]
@@ -88,18 +86,25 @@ pub struct SystemTxnStatement {
 /// `lease_scope` is the plan's descriptor lease scope. It is retained on the
 /// buffered tasks so COMMIT re-checks the versions the plan was built against
 /// before it writes anything.
+///
+/// `applied_key` is the key the commit records with its writes, with the
+/// vShard whose redo record carries it. A DEFINE EVENT action commits its
+/// source event's key, so a later owner that fires the event again finds it
+/// applied.
 pub async fn run_tasks_atomically(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     tasks: Vec<PhysicalTask>,
     lease_scope: Arc<QueryLeaseScope>,
     event_source: EventSource,
+    applied_key: Option<(crate::wal::CrossShardAppliedKey, u32)>,
 ) -> Result<(), SystemTxnError> {
-    run_statements_atomically(
+    run_statements_keyed(
         state,
         identity,
         vec![SystemTxnStatement { tasks, lease_scope }],
         event_source,
+        applied_key,
     )
     .await
 }
@@ -119,106 +124,83 @@ pub async fn run_statements_atomically(
     statements: Vec<SystemTxnStatement>,
     event_source: EventSource,
 ) -> Result<(), SystemTxnError> {
+    run_statements_keyed(state, identity, statements, event_source, None).await
+}
+
+/// [`run_statements_atomically`] whose commit records `applied_key`.
+async fn run_statements_keyed(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    statements: Vec<SystemTxnStatement>,
+    event_source: EventSource,
+    applied_key: Option<(crate::wal::CrossShardAppliedKey, u32)>,
+) -> Result<(), SystemTxnError> {
     let total: usize = statements
         .iter()
         .map(|statement| statement.tasks.len())
         .sum();
-    if let Some((index, task)) = statements
-        .iter()
-        .flat_map(|statement| statement.tasks.iter())
-        .enumerate()
-        .find(|(_, task)| !runs_in_a_system_transaction(&task.plan))
-    {
-        return Err(SystemTxnError::Statement {
-            index,
-            total,
-            source: crate::Error::NotInTransactionBlock {
-                statement: match task.plan.collection() {
-                    Some(collection) => format!("a non-transactional write to '{collection}'"),
-                    None => "a non-transactional write".to_owned(),
-                },
-            },
-        });
-    }
-    let scope = SystemTxnScope::begin(state).map_err(|source| SystemTxnError::Begin { source })?;
-    let dp = SystemTxnDataPlane {
-        state,
-        event_source,
-    };
-    let tasks = statements.into_iter().flat_map(|statement| {
-        let lease_scope = statement.lease_scope;
-        statement
-            .tasks
-            .into_iter()
-            .map(move |task| (task, Arc::clone(&lease_scope)))
-    });
-
-    for (index, (task, lease_scope)) in tasks.enumerate() {
-        let buffered_before = scope.sessions().buffered_task_count(scope.session_id());
-        let routed = route_in_tx_write(
-            state,
-            scope.sessions(),
-            scope.session_id(),
-            task,
-            |staged| dispatch_staged(state, staged, event_source),
-        )
-        .await;
-
-        let read = match routed {
-            Ok(InTxnRoute::Read(task)) => dispatch_read(state, *task).await.err(),
-            // Refused before BEGIN by `runs_in_a_system_transaction`: a write
-            // the transaction cannot buffer applies at once and survives a
-            // rollback.
-            Ok(InTxnRoute::Autocommit(_)) => Some(crate::Error::Internal {
-                detail: "a write a system transaction cannot buffer reached its staging gate"
-                    .into(),
-            }),
-            Ok(InTxnRoute::Buffered | InTxnRoute::Staged(_)) => None,
-            Err(error) => Some(staging_error(error)),
-        };
-        if let Some(source) = read {
-            lifecycle::run_rollback(scope.sessions(), scope.session_id(), identity, state, &dp)
-                .await;
-            return Err(SystemTxnError::Statement {
-                index,
-                total,
-                source,
-            });
+    refuse_unbufferable(
+        statements
+            .iter()
+            .flat_map(|statement| statement.tasks.iter()),
+        0,
+        total,
+    )?;
+    scoped_system_txn(async move {
+        let mut txn = OpenSystemTxn::begin(state, identity.clone(), event_source)?;
+        if let Some((key, target_vshard)) = applied_key {
+            txn.set_applied_key(key, target_vshard);
         }
+        let mut first_task = 0;
+        for statement in statements {
+            let count = statement.tasks.len();
+            if let Err(error) = txn.stage(statement).await {
+                txn.rollback().await;
+                return Err(match error {
+                    SystemTxnError::Statement { index, source, .. } => SystemTxnError::Statement {
+                        index: first_task + index,
+                        total,
+                        source,
+                    },
+                    other => other,
+                });
+            }
+            first_task += count;
+        }
+        txn.commit().await
+    })
+    .await
+}
 
-        // Retain the plan's leases on whatever this task buffered, so the
-        // COMMIT fence has versions to compare. A refusal here means the
-        // session left the block underneath us; committing anyway would skip
-        // the fence entirely.
-        if scope.sessions().buffered_task_count(scope.session_id()) > buffered_before
-            && !scope.sessions().attach_tx_lease_scope_since(
-                scope.session_id(),
-                buffered_before,
-                Arc::clone(&lease_scope),
-            )
-        {
-            lifecycle::run_rollback(scope.sessions(), scope.session_id(), identity, state, &dp)
-                .await;
+/// Refuse the first task that can run in no system transaction: a write the
+/// transaction cannot buffer applies at once and survives a rollback.
+/// `first_index` numbers the first task; `total` is the transaction's count.
+pub(super) fn refuse_unbufferable<'t>(
+    tasks: impl Iterator<Item = &'t PhysicalTask>,
+    first_index: usize,
+    total: usize,
+) -> Result<(), SystemTxnError> {
+    for (offset, task) in tasks.enumerate() {
+        if !runs_in_a_system_transaction(&task.plan) {
             return Err(SystemTxnError::Statement {
-                index,
+                index: first_index + offset,
                 total,
-                source: crate::Error::Internal {
-                    detail: "retaining descriptor leases for a system transaction failed".into(),
+                source: crate::Error::NotInTransactionBlock {
+                    statement: match task.plan.collection() {
+                        Some(collection) => format!("a non-transactional write to '{collection}'"),
+                        None => "a non-transactional write".to_owned(),
+                    },
                 },
             });
         }
     }
-
-    match commit::run_commit(scope.sessions(), scope.session_id(), identity, state, &dp).await {
-        CommitOutcome::Committed => Ok(()),
-        CommitOutcome::Aborted { reason } => Err(commit_abort_error(reason)),
-    }
+    Ok(())
 }
 
 /// The error a commit abort answers with. A dispatch or DDL-propose error
 /// keeps its own class. Every other abort carries its Data-Plane verdict
 /// when one decided it.
-fn commit_abort_error(reason: AbortReason) -> SystemTxnError {
+pub(super) fn commit_abort_error(reason: AbortReason) -> SystemTxnError {
     match reason {
         AbortReason::Dispatch(source) | AbortReason::DdlPropose(source) => {
             SystemTxnError::CommitFailed { source }
@@ -236,7 +218,7 @@ fn commit_abort_error(reason: AbortReason) -> SystemTxnError {
 }
 
 /// Apply one stageable write to the transaction's overlay.
-async fn dispatch_staged(
+pub(super) async fn dispatch_staged(
     state: &SharedState,
     task: PhysicalTask,
     event_source: EventSource,
@@ -261,7 +243,9 @@ async fn dispatch_staged(
 
 /// Whether a task can run inside a system transaction: it is buffered for
 /// COMMIT, or it only reads.
-fn runs_in_a_system_transaction(plan: &nodedb_physical::physical_plan::PhysicalPlan) -> bool {
+pub(super) fn runs_in_a_system_transaction(
+    plan: &nodedb_physical::physical_plan::PhysicalPlan,
+) -> bool {
     plan_requires_txn_buffering(plan)
         || matches!(
             required_permission(plan),
@@ -272,7 +256,18 @@ fn runs_in_a_system_transaction(plan: &nodedb_physical::physical_plan::PhysicalP
 /// Run one read of the transaction against its overlay. The rows are not
 /// kept: a system transaction answers no rows. Its error fails the
 /// transaction.
-async fn dispatch_read(state: &SharedState, task: PhysicalTask) -> crate::Result<()> {
+pub(super) async fn dispatch_read(state: &SharedState, task: PhysicalTask) -> crate::Result<()> {
+    // A cluster array read has no Data-Plane handler. This node's array
+    // coordinator gathers it from the shards that own its cells, folding in
+    // the transaction's staged cells.
+    if crate::control::server::shared::cluster_array_dispatch::is_cluster_array(&task.plan) {
+        let shared = state.self_arc()?;
+        crate::control::server::shared::cluster_array_dispatch::run_trusted_cluster_array(
+            &shared, task,
+        )
+        .await?;
+        return Ok(());
+    }
     let response = dispatch_utils::dispatch_to_data_plane_with_txn(
         state,
         task.tenant_id,
@@ -287,7 +282,7 @@ async fn dispatch_read(state: &SharedState, task: PhysicalTask) -> crate::Result
 }
 
 /// Flatten a staging-gate refusal into the crate error type.
-fn staging_error(error: StagingGateError) -> crate::Error {
+pub(super) fn staging_error(error: StagingGateError) -> crate::Error {
     match error {
         StagingGateError::Dispatch(e) => e,
         StagingGateError::Rejected { code } => match code {
@@ -300,7 +295,7 @@ fn staging_error(error: StagingGateError) -> crate::Error {
 }
 
 /// The Data-Plane verdict a commit abort carries, so a caller surfaces the
-/// same class a client COMMIT would.
+/// same class a client COMMIT does.
 fn abort_code(reason: &AbortReason) -> Option<crate::bridge::envelope::ErrorCode> {
     match reason {
         AbortReason::BatchRejected { code } => code.clone(),

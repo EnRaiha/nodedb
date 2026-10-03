@@ -40,7 +40,10 @@ fn batch_kv(ctx: &mut TestCtx, collection: &str, count: usize) -> String {
             (key, value)
         })
         .collect();
-    let surrogates = vec![nodedb_types::Surrogate::ZERO; entries.len()];
+    let surrogates = entries
+        .iter()
+        .map(|(key, _)| nodedb_test_support::kv_rows::kv_row_surrogate(key))
+        .collect();
     send_ok(
         &mut ctx.core,
         &mut ctx.tx,
@@ -89,7 +92,7 @@ fn hash_join_completeness_past_50k_cap() {
             key: match_key.as_bytes().to_vec(),
             value: b"match".to_vec(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(match_key.as_bytes()),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -163,7 +166,7 @@ fn sort_merge_join_completeness_past_50k_cap() {
             key: match_key.as_bytes().to_vec(),
             value: b"smatch".to_vec(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(match_key.as_bytes()),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -222,7 +225,7 @@ fn nested_loop_join_completeness_past_50k_cap() {
             key: match_key.as_bytes().to_vec(),
             value: b"nlmatch".to_vec(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(match_key.as_bytes()),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,

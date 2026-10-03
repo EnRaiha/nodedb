@@ -6,9 +6,9 @@
 use zerompk::{FromMessagePack, Read};
 
 use super::readers::{
-    read_collection_deactivated, read_fan_out, read_header, read_segment_corrupted_tolerant,
-    read_string_vec, read_sync_delta_rejected, read_u8_field, read1_str, read2_str,
-    read2_str_tolerant, read2_u32, read2_u64, read3_str_tolerant, skip_fields,
+    read_collection_deactivated, read_header, read_segment_corrupted_tolerant, read_string_vec,
+    read_sync_delta_rejected, read_u8_field, read1_str, read2_str, read2_str_tolerant, read2_u32,
+    read2_u64, read3_str_tolerant, skip_fields,
 };
 use crate::error::details::ErrorDetails;
 use crate::error::msgpack::constants::*;
@@ -135,13 +135,6 @@ impl<'a> FromMessagePack<'a> for ErrorDetails {
             TAG_PLAN_ERROR => {
                 let (phase, detail) = read2_str_tolerant(reader, field_count)?;
                 Ok(ErrorDetails::PlanError { phase, detail })
-            }
-            TAG_FAN_OUT_EXCEEDED => {
-                let (shards_touched, limit) = read_fan_out(reader, field_count)?;
-                Ok(ErrorDetails::FanOutExceeded {
-                    shards_touched,
-                    limit,
-                })
             }
             TAG_SQL_NOT_ENABLED => {
                 skip_fields(reader, field_count)?;
@@ -809,15 +802,6 @@ mod tests {
             collection: "old_logs".into(),
             retention_expires_at_ns: 1_700_000_000_000_u64,
             undrop_hint: "UNDROP COLLECTION old_logs".into(),
-        };
-        assert_eq!(roundtrip(&v), v);
-    }
-
-    #[test]
-    fn fan_out_exceeded_roundtrip() {
-        let v = ErrorDetails::FanOutExceeded {
-            shards_touched: 100,
-            limit: 50,
         };
         assert_eq!(roundtrip(&v), v);
     }

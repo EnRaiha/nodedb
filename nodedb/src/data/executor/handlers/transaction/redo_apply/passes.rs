@@ -59,6 +59,8 @@ pub(super) struct RedoTarget<'a> {
     pub sub_records: usize,
     pub database_id: u64,
     pub tid: u64,
+    /// Who committed the record. The document arm reads it from the scope.
+    pub origin: nodedb_physical::physical_plan::RedoOrigin,
 }
 
 impl CoreLoop {
@@ -71,7 +73,8 @@ impl CoreLoop {
     ) -> Result<(), PassRefusal> {
         let (applied, scope) = self.run_redo_arms(
             target,
-            RedoApplyScope::new(RedoApplyPass::Validate, sum_targets.to_vec()),
+            RedoApplyScope::new(RedoApplyPass::Validate, sum_targets.to_vec())
+                .with_origin(target.origin),
         )?;
         if let Some(code) = applied.err().or(scope.error) {
             return Err(PassRefusal::Invalid(final_refusal(code)));
@@ -97,7 +100,8 @@ impl CoreLoop {
     ) -> Result<RedoApplyScope, PassRefusal> {
         let (applied, mut scope) = self.run_redo_arms(
             target,
-            RedoApplyScope::new(RedoApplyPass::Install, sum_targets.to_vec()),
+            RedoApplyScope::new(RedoApplyPass::Install, sum_targets.to_vec())
+                .with_origin(target.origin),
         )?;
         let Some(cause) = applied.err().or(scope.error.take()) else {
             return Ok(scope);

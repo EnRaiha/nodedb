@@ -9,13 +9,13 @@
 use nodedb_sql::ddl_ast::GraphProperties;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::planner::calvin::{build_static_tx_class, submit_calvin_routed};
+use crate::control::planner::calvin::{build_static_tx_class, submit_calvin_routed_write};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::session::{DmlTxnCtx, TransactionState};
 use crate::control::server::shared::sql::staging_predicates::require_affected_count;
 use crate::control::server::surrogate_exchange::assign_surrogate_routed;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TraceId, VShardId};
+use crate::types::{DatabaseId, RecordHomes, TraceId, VShardId};
 use nodedb_physical::physical_plan::GraphOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -74,16 +74,16 @@ pub async fn insert_edge(
 
     // Dual-home: a cross-shard edge must be written on the home vShard of both src
     // and dst, or reverse/IN traversal never finds it.
-    let vsrc = VShardId::from_key(src.as_bytes());
-    let vdst = VShardId::from_key(dst.as_bytes());
+    let homes = RecordHomes::edge(&src, &dst);
+    let (vsrc, vdst) = (homes.owner(), homes.second());
 
     let key = nodedb_types::CollectionKey::from_bare(database_id, &collection);
     let src_surrogate =
-        assign_surrogate_routed(state, vsrc, key, tenant_id, src.as_bytes(), TraceId::ZERO)
+        assign_surrogate_routed(state, key, tenant_id, src.as_bytes(), TraceId::ZERO)
             .await
             .map_err(|e| DdlError::from_error(&e))?;
     let dst_surrogate =
-        assign_surrogate_routed(state, vdst, key, tenant_id, dst.as_bytes(), TraceId::ZERO)
+        assign_surrogate_routed(state, key, tenant_id, dst.as_bytes(), TraceId::ZERO)
             .await
             .map_err(|e| DdlError::from_error(&e))?;
 
@@ -104,11 +104,8 @@ pub async fn insert_edge(
         },
     )?;
 
-    // Calvin cross-shard atomicity needs cluster mode with a wired sequencer. In
-    // single-node, one write already lands both EDGES and REVERSE_EDGES locally.
-    let calvin_available =
-        state.cluster_transport.is_some() && state.sequencer_inbox.get().is_some();
-    let single_home = vsrc == vdst || !calvin_available;
+    // A cross-shard edge commits on both homes atomically through Calvin.
+    let single_home = homes.is_single();
 
     // In a transaction, an insert stages into `GraphTxnOverlay` instead of applying now
     // (COMMIT replays, ROLLBACK discards); a cross-shard edge stages into both endpoints.
@@ -133,7 +130,7 @@ pub async fn insert_edge(
     }
 
     let affected = if single_home {
-        // F1a fast path: single-home write to `vsrc` covers both forward and reverse.
+        // Both endpoints share one home, so one write to `vsrc` stores the edge.
         let plan = PhysicalPlan::Graph(edge_put);
         let response =
             crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
@@ -142,7 +139,6 @@ pub async fn insert_edge(
                 database_id,
                 vsrc,
                 plan,
-                TraceId::ZERO,
                 crate::event::EventSource::User,
             )
             .await
@@ -162,26 +158,13 @@ pub async fn insert_edge(
         };
         let tx_class =
             build_static_tx_class(&[task], tenant_id, &[]).map_err(|e| DdlError::from_error(&e))?;
-        let response = submit_calvin_routed(state, tx_class)
+        // Every participant of this graph-only transaction reports its
+        // answer in its completion ack, so the count arrives on any node.
+        let response = submit_calvin_routed_write(state, tx_class)
             .await
             .map_err(|e| DdlError::from_error(&e))?;
-        match response {
-            Some(response) => {
-                data_plane_verdict(&response)?;
-                response_affected(&response)?
-            }
-            // `plans_have_primary_write` treats a Graph-only tx_class (no
-            // accompanying primary DML, exactly this DSL's own tx_class) as
-            // primary, so `commit_apply_tail` always deposits this
-            // participant's applied response. A missing deposit here is a
-            // scheduler invariant violation, never a value to guess.
-            None => {
-                return Err(DdlError::internal(
-                    "cross-shard edge insert completed with no applied response to read \
-                     its affected count from",
-                ));
-            }
-        }
+        data_plane_verdict(&response)?;
+        response_affected(&response)?
     };
 
     Ok(vec![DdlResult::Status {
@@ -200,8 +183,7 @@ pub struct EdgeRef {
 }
 
 /// The home vShard(s) an edge resolves to: `vsrc` holds the forward row, `vdst`
-/// the reverse row. `single_home` is true when both share one vShard or Calvin
-/// is unavailable. Bundled for [`stage_edge_dual_home`](super::edge_stage::stage_edge_dual_home).
+/// the reverse row. `single_home` is true when both share one vShard. Bundled for [`stage_edge_dual_home`](super::edge_stage::stage_edge_dual_home).
 pub struct EdgeHomes {
     pub vsrc: VShardId,
     pub vdst: VShardId,
@@ -236,16 +218,16 @@ pub async fn delete_edge(
 
     // Dual-home: stored forward on `from_key(src)` and reverse on `from_key(dst)`,
     // so delete must tombstone both homes.
-    let vsrc = VShardId::from_key(src.as_bytes());
-    let vdst = VShardId::from_key(dst.as_bytes());
+    let homes = RecordHomes::edge(&src, &dst);
+    let (vsrc, vdst) = (homes.owner(), homes.second());
 
     let key = nodedb_types::CollectionKey::from_bare(database_id, &collection);
     let src_surrogate =
-        assign_surrogate_routed(state, vsrc, key, tenant_id, src.as_bytes(), TraceId::ZERO)
+        assign_surrogate_routed(state, key, tenant_id, src.as_bytes(), TraceId::ZERO)
             .await
             .map_err(|e| DdlError::from_error(&e))?;
     let dst_surrogate =
-        assign_surrogate_routed(state, vdst, key, tenant_id, dst.as_bytes(), TraceId::ZERO)
+        assign_surrogate_routed(state, key, tenant_id, dst.as_bytes(), TraceId::ZERO)
             .await
             .map_err(|e| DdlError::from_error(&e))?;
 
@@ -266,11 +248,8 @@ pub async fn delete_edge(
         },
     )?;
 
-    // Calvin needs cluster mode with a wired sequencer; single-node already
-    // tombstones both EDGES and REVERSE_EDGES in one write.
-    let calvin_available =
-        state.cluster_transport.is_some() && state.sequencer_inbox.get().is_some();
-    let single_home = vsrc == vdst || !calvin_available;
+    // A cross-shard edge delete commits on both homes atomically through Calvin.
+    let single_home = homes.is_single();
 
     // Inside a transaction, an edge delete stages into `GraphTxnOverlay` instead of
     // applying now, so RYOW sees it removed; COMMIT replays it, ROLLBACK discards it.
@@ -298,7 +277,6 @@ pub async fn delete_edge(
     // writing identity to decide it. Resolve against stored properties while it's live.
     if let Some(resolver) =
         crate::control::write_resolve::resolver_for_plan(&PhysicalPlan::Graph(edge_delete.clone()))
-        && state.async_raft_proposer().is_some()
     {
         let ctx = crate::control::write_resolve::WriteResolveContext {
             tenant_id,
@@ -314,7 +292,7 @@ pub async fn delete_edge(
     }
 
     let affected = if single_home {
-        // F1a fast path: single-home write to `vsrc` tombstones both rows together.
+        // Both endpoints share one home, so one delete on `vsrc` removes the edge.
         let plan = PhysicalPlan::Graph(edge_delete);
         let response =
             crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
@@ -323,7 +301,6 @@ pub async fn delete_edge(
                 database_id,
                 vsrc,
                 plan,
-                TraceId::ZERO,
                 crate::event::EventSource::User,
             )
             .await
@@ -343,28 +320,13 @@ pub async fn delete_edge(
         };
         let tx_class =
             build_static_tx_class(&[task], tenant_id, &[]).map_err(|e| DdlError::from_error(&e))?;
-        let response = submit_calvin_routed(state, tx_class)
+        // Every participant of this graph-only transaction reports its
+        // answer in its completion ack, so the count arrives on any node.
+        let response = submit_calvin_routed_write(state, tx_class)
             .await
             .map_err(|e| DdlError::from_error(&e))?;
-        match response {
-            Some(response) => {
-                data_plane_verdict(&response)?;
-                response_affected(&response)?
-            }
-            // `plans_have_primary_write` treats a Graph-only tx_class (no
-            // accompanying primary DML, exactly this DSL's own tx_class) as
-            // primary, so `commit_apply_tail` always deposits this
-            // participant's applied response. A delete's count is not
-            // deterministic from the plan alone (the edge may already be
-            // absent), so a missing deposit here is a scheduler invariant
-            // violation, never a value to guess.
-            None => {
-                return Err(DdlError::internal(
-                    "cross-shard edge delete completed with no applied response to read \
-                     its affected count from",
-                ));
-            }
-        }
+        data_plane_verdict(&response)?;
+        response_affected(&response)?
     };
 
     Ok(vec![DdlResult::Status {
@@ -402,37 +364,16 @@ pub async fn set_node_labels(
     };
 
     // Single-keyed on `node_id`, so single-home: route to `from_key(node_id)`.
-    // No redb durability — a WAL record is the bitset's only backing. The
-    // record's outcome-floor window opens before the append and closes from
-    // the dispatch's outcome.
-    let owner = crate::control::server::dispatch_utils::RecordOwner {
-        tenant_id,
-        database_id: DatabaseId::DEFAULT,
-        vshard_id,
-    };
-    let minted = crate::control::server::dispatch_utils::MintedRecords::open(&state.outcome_floor);
-    if let Err(e) = minted.append_plan(
-        &state.wal,
-        owner,
-        &plan,
-        // The same source the edge write is dispatched with below.
-        crate::event::EventSource::User,
-    ) {
-        // Any record appended before the error never reaches a core.
-        minted
-            .cancel(&state.wal, owner, 0)
-            .await
-            .map_err(|c| DdlError::from_error(&c))?;
-        return Err(DdlError::from_error(&e));
-    }
-
+    // No redb durability: the WAL record the Raft entry's apply appends on
+    // every replica is the bitset's only backing.
     let response =
-        crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_minted_sync_response(
+        crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
             state,
-            owner,
+            tenant_id,
+            DatabaseId::DEFAULT,
+            vshard_id,
             plan,
             crate::event::EventSource::User,
-            minted,
         )
         .await
         .map_err(|e| DdlError::from_error(&e))?;

@@ -69,7 +69,7 @@ mod tests {
         use nodedb_types::Value;
         let mut obj = std::collections::HashMap::new();
         obj.insert("name".to_string(), Value::String("alice".into()));
-        zerompk::to_msgpack_vec(&Value::Object(obj)).unwrap()
+        nodedb_types::value_to_msgpack(&Value::Object(obj)).unwrap()
     }
 
     fn put_record(surrogate: u32) -> WalRecord {

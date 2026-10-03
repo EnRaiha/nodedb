@@ -4,7 +4,7 @@
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
-use crate::types::{TenantId, VShardId};
+use crate::types::{RecordHomes, TenantId};
 
 /// Dual-homed edges are physically present on both endpoint homes. The source
 /// home is the canonical owner of logical graph cardinality, so only that
@@ -13,7 +13,7 @@ pub(in crate::data::executor) fn owns_logical_edge_stats(
     task: &ExecutionTask,
     src_id: &str,
 ) -> bool {
-    task.request.vshard_id == VShardId::from_key(src_id.as_bytes())
+    task.request.vshard_id == RecordHomes::edge_owner(src_id)
 }
 
 /// Bundled arguments for [`CoreLoop::execute_edge_put`].
@@ -35,11 +35,58 @@ pub(in crate::data::executor) struct EdgeDeleteParams<'a> {
     pub src_id: &'a str,
     pub label: &'a str,
     pub dst_id: &'a str,
+    /// The endpoints' bound identities, carried onto the delete's CDC event.
+    pub src_surrogate: nodedb_types::Surrogate,
+    pub dst_surrogate: nodedb_types::Surrogate,
     /// Compiled RLS write-policy filters the plan carried.
     pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
 
 impl CoreLoop {
+    /// The system-time ordinal an edge write stamps: the decided ordinal of
+    /// the record in apply, or a fresh local one. The local clock folds a
+    /// decided ordinal in, so a later local write stamps above it.
+    pub(in crate::data::executor) fn graph_write_ordinal(&self) -> i64 {
+        match self.apply_scope.graph_system_from {
+            Some(ord) => {
+                self.hlc.update_from_remote(ord);
+                ord
+            }
+            None => self.hlc.next_ordinal(),
+        }
+    }
+
+    /// The system time and applied ordinal an edge write stamps: the
+    /// ordinal of [`Self::graph_write_ordinal`], applied at the record's
+    /// applied ordinal when it carries one. A record whose applied ordinal
+    /// is below its system time is refused.
+    pub(in crate::data::executor) fn graph_write_stamp(
+        &self,
+    ) -> crate::Result<crate::engine::graph::edge_store::VersionStamp> {
+        let ord = self.graph_write_ordinal();
+        crate::engine::graph::edge_store::VersionStamp::applied_at(
+            ord,
+            self.apply_scope.graph_applied,
+        )
+    }
+
+    /// Bring the CSR edge `(src, label, dst)` of `collection` to what the
+    /// edge store resolves it to after a write: live with the weight in
+    /// `current`, or absent.
+    pub(in crate::data::executor) fn mirror_edge_csr(
+        &mut self,
+        database_id: u64,
+        tid: u64,
+        edge: (&str, &str, &str),
+        collection: &str,
+        current: Option<&[u8]>,
+    ) -> Result<(), nodedb_graph::GraphError> {
+        let (src_id, label, dst_id) = edge;
+        let weight = current.map(crate::engine::graph::csr::extract_weight_from_properties);
+        self.csr_partition_mut(database_id, tid)
+            .restore_edge_in_collection(src_id, label, dst_id, collection, weight)
+    }
+
     /// Record a committed edge write's version, keyed by the edge's
     /// `(src, label, dst)` identity, if a WAL LSN was threaded onto the task.
     pub(in crate::data::executor) fn note_edge_write_lsn(
@@ -75,7 +122,7 @@ impl CoreLoop {
 pub(super) mod test_support {
     use super::*;
     use crate::bridge::envelope::{Admission, ExemptReason, PhysicalPlan, Priority, Request};
-    use crate::types::{DatabaseId, Lsn, ReadConsistency, RequestId, TraceId};
+    use crate::types::{DatabaseId, Lsn, ReadConsistency, RequestId, TraceId, VShardId};
     use nodedb_bridge::buffer::RingBuffer;
     use nodedb_physical::physical_plan::GraphOp;
     use std::time::{Duration, Instant};
@@ -137,6 +184,7 @@ pub(super) mod test_support {
             txn_id: None,
             wal_lsn: Some(Lsn::new(lsn)),
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: Admission::Exempt(ExemptReason::Read),
         })
     }

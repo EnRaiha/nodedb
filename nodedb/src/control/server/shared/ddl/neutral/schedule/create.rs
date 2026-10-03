@@ -2,12 +2,9 @@
 
 //! Protocol-neutral `CREATE SCHEDULE` DDL handler.
 //!
-//! Ported from the pgwire `ddl::schedule::create` handler. The catalog path
-//! (`propose_and_apply` + `LocalOnly` local registry refresh, the
-//! `_schedules` CRDT-sync delta enqueue, and the `audit_record` call) is
-//! preserved verbatim; only the result construction changed from pgwire
-//! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
-//! [`DdlError`].
+//! The catalog path (`propose_and_apply`, the `_schedules` CRDT-sync delta
+//! enqueue, and the `audit_record` call) runs here. The result is the
+//! protocol-neutral [`DdlResult`] / [`DdlError`].
 //!
 //! Syntax:
 //! ```sql
@@ -38,7 +35,7 @@ pub struct CreateScheduleRequest<'a> {
 }
 
 /// Handle `CREATE SCHEDULE`.
-pub fn create_schedule(
+pub async fn create_schedule(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: crate::types::DatabaseId,
@@ -108,10 +105,7 @@ pub fn create_schedule(
     };
 
     let entry = crate::control::catalog_entry::CatalogEntry::PutSchedule(Box::new(def.clone()));
-    let outcome = super::super::super::catalog::propose_and_apply(state, &entry)?;
-    if outcome.needs_local_apply() {
-        state.schedule_registry.register(def.clone());
-    }
+    super::super::super::catalog::propose_and_apply_async(state, &entry).await?;
 
     {
         let delta_payload = zerompk::to_msgpack_vec(&def).unwrap_or_default();

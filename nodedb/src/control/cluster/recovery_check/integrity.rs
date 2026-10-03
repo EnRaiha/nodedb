@@ -30,7 +30,7 @@
 //!
 //! Three ownership/grant classes are healed before the abort gate,
 //! because they are reachable from ordinary DDL rather than from
-//! storage corruption, and each would otherwise leave an existing
+//! storage corruption, and each will otherwise leave an existing
 //! data directory permanently unbootable with no repair path.
 //! `verify_and_repair` runs `repair_integrity::heal_orphan_rows`
 //! to a fixpoint over this module's output:
@@ -49,8 +49,13 @@
 
 use std::collections::HashSet;
 
-use crate::control::security::catalog::SystemCatalog;
 use crate::control::security::catalog::auth_types::object_type;
+use crate::control::security::catalog::{
+    StoredMaterializedView, StoredOwner, StoredPermission, StoredRlsPolicy, StoredTrigger,
+    SystemCatalog,
+};
+use crate::event::cdc::stream_def::ChangeStreamDef;
+use crate::event::scheduler::ScheduleDef;
 
 use super::divergence::{Divergence, DivergenceKind};
 
@@ -150,7 +155,7 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
             // Active AND soft-deleted collections both require an
             // owner row. `DeactivateCollection` preserves the
             // primary record for undrop and must preserve the
-            // owner alongside it; splitting them would break
+            // owner alongside it; splitting them will break
             // undrop ownership restoration.
             collections
                 .iter()
@@ -221,7 +226,33 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
                 .collect(),
         ),
     ];
-    for (kind, rows) in &parent_replicated {
+    check_parent_owners(&parent_replicated, &owner_keys, &mut violations);
+    check_owner_users(&owners, &user_names, &mut violations);
+    check_permission_grantees(&permissions, &user_names, &role_names, &mut violations);
+    check_trigger_collections(&triggers, &collection_keys, &mut violations);
+    check_rls_collections(&rls, &legacy_collection_keys, &mut violations);
+    check_materialized_view_sources(&materialized_views, &collection_keys, &mut violations);
+    check_change_stream_collections(&change_streams, &legacy_collection_keys, &mut violations);
+    check_schedule_targets(&schedules, &collection_keys, &mut violations);
+
+    violations
+}
+
+/// Database-scoped collection keys: `(database_id, tenant_id, name)`.
+type CollectionKeys = HashSet<(u64, u64, String)>;
+/// Collection keys of the object families with no database scope:
+/// `(tenant_id, name)`.
+type LegacyCollectionKeys = HashSet<(u64, String)>;
+/// Owner row keys: `(object_type, database_id, tenant_id, name)`.
+type OwnerKeys = HashSet<(String, u64, u64, String)>;
+
+/// Check 1: every parent-replicated DDL object has an owner.
+fn check_parent_owners(
+    parent_replicated: &[ParentOwnerRows],
+    owner_keys: &OwnerKeys,
+    violations: &mut Vec<Divergence>,
+) {
+    for (kind, rows) in parent_replicated {
         for (database_id, tenant, name) in rows {
             let key = ((*kind).to_string(), *database_id, *tenant, name.clone());
             if !owner_keys.contains(&key) {
@@ -233,9 +264,15 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
             }
         }
     }
+}
 
-    // ── Check 2: every owner.owner_username resolves to a user. ──
-    for o in &owners {
+/// Check 2: every owner.owner_username resolves to a user.
+fn check_owner_users(
+    owners: &[StoredOwner],
+    user_names: &HashSet<String>,
+    violations: &mut Vec<Divergence>,
+) {
+    for o in owners {
         if !user_names.contains(&o.owner_username) {
             violations.push(Divergence::new(DivergenceKind::DanglingReference {
                 from_kind: "owner",
@@ -248,9 +285,16 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
             }));
         }
     }
+}
 
-    // ── Check 3: every permission.grantee resolves. ──
-    for p in &permissions {
+/// Check 3: every permission.grantee resolves.
+fn check_permission_grantees(
+    permissions: &[StoredPermission],
+    user_names: &HashSet<String>,
+    role_names: &HashSet<String>,
+    violations: &mut Vec<Divergence>,
+) {
+    for p in permissions {
         // `grantee` is either `"user:<name>"` or `"<role>"`.
         if let Some(username) = p.grantee.strip_prefix("user:") {
             if !user_names.contains(username) {
@@ -277,9 +321,15 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
             }
         }
     }
+}
 
-    // ── Check 4: every trigger.collection exists. ──
-    for t in &triggers {
+/// Check 4: every trigger.collection exists.
+fn check_trigger_collections(
+    triggers: &[StoredTrigger],
+    collection_keys: &CollectionKeys,
+    violations: &mut Vec<Divergence>,
+) {
+    for t in triggers {
         let database_id = t.database_id.as_u64();
         let key = (database_id, t.tenant_id, t.collection.clone());
         if !collection_keys.contains(&key) {
@@ -291,9 +341,15 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
             }));
         }
     }
+}
 
-    // ── Check 5: every rls_policy.collection exists. ──
-    for p in &rls {
+/// Check 5: every rls_policy.collection exists.
+fn check_rls_collections(
+    rls: &[StoredRlsPolicy],
+    legacy_collection_keys: &LegacyCollectionKeys,
+    violations: &mut Vec<Divergence>,
+) {
+    for p in rls {
         let key = (p.tenant_id, p.collection.clone());
         if !legacy_collection_keys.contains(&key) {
             violations.push(Divergence::new(DivergenceKind::DanglingReference {
@@ -304,16 +360,21 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
             }));
         }
     }
+}
 
-    // ── Check 6: every materialized_view.source exists as a
-    //              collection. ──
-    //
-    // An MV whose source was purged (or never existed on this node)
-    // will silently refresh against nothing. Surface as a dangling
-    // reference so operators know to drop the stale MV or restore
-    // the source. Cascade-delete of MVs on `PurgeCollection` is the
-    // preventive path; this check is the detective path.
-    for mv in &materialized_views {
+/// Check 6: every materialized_view.source exists as a collection.
+///
+/// An MV whose source was purged (or never existed on this node)
+/// will silently refresh against nothing. Surface as a dangling
+/// reference so operators know to drop the stale MV or restore
+/// the source. Cascade-delete of MVs on `PurgeCollection` is the
+/// preventive path; this check is the detective path.
+fn check_materialized_view_sources(
+    materialized_views: &[StoredMaterializedView],
+    collection_keys: &CollectionKeys,
+    violations: &mut Vec<Divergence>,
+) {
+    for mv in materialized_views {
         let key = (mv.database_id, mv.tenant_id, mv.source.clone());
         if !collection_keys.contains(&key) {
             violations.push(Divergence::new(DivergenceKind::DanglingReference {
@@ -324,11 +385,17 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
             }));
         }
     }
+}
 
-    // ── Check 7: every change_stream.collection exists as a
-    //              collection, unless it's the wildcard `*` which
-    //              matches any collection for the tenant. ──
-    for cs in &change_streams {
+/// Check 7: every change_stream.collection exists as a collection,
+/// unless it's the wildcard `*` which matches any collection for the
+/// tenant.
+fn check_change_stream_collections(
+    change_streams: &[ChangeStreamDef],
+    legacy_collection_keys: &LegacyCollectionKeys,
+    violations: &mut Vec<Divergence>,
+) {
+    for cs in change_streams {
         if cs.collection == "*" {
             continue;
         }
@@ -342,12 +409,17 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
             }));
         }
     }
+}
 
-    // ── Check 8: every schedule.target_collection (when Some) exists
-    //              as a collection. `None` means the schedule is
-    //              cross-collection or opaque (runs on `_system`
-    //              coordinator) and is exempt. ──
-    for sch in &schedules {
+/// Check 8: every schedule.target_collection (when Some) exists as a
+/// collection. `None` means the schedule is cross-collection or opaque
+/// (runs on `_system` coordinator) and is exempt.
+fn check_schedule_targets(
+    schedules: &[ScheduleDef],
+    collection_keys: &CollectionKeys,
+    violations: &mut Vec<Divergence>,
+) {
+    for sch in schedules {
         let Some(target) = &sch.target_collection else {
             continue;
         };
@@ -361,10 +433,6 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
             }));
         }
     }
-
-    let _ = (functions, procedures, sequences);
-
-    violations
 }
 
 /// Built-in role names that exist outside the `StoredRole`
@@ -395,7 +463,7 @@ mod tests {
             .expect("open integrity catalog");
         let catalog = store.catalog();
 
-        let collection = StoredCollection::new(1, "orders", "owner");
+        let collection = StoredCollection::stamped_for_test(1, "orders", "owner");
         catalog
             .put_collection(DatabaseId::DEFAULT, &collection)
             .expect("store default database collection");

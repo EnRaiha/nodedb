@@ -30,22 +30,19 @@ const ALLOWED: &[&str] = &[
     "engine/timeseries/retention_policy/autowire.rs",
     "engine/timeseries/retention_policy/enforcement.rs",
     "engine/bitemporal/enforcement.rs",
-    // Restore reissue. The COPY handler authorizes the statement once,
-    // against the tenant's BACKUP permission. The rows it re-issues are the
-    // whole tenant, not one user's view: a per-collection grant or an RLS
-    // write policy must not drop a restored row. `durable.rs` is the
-    // single-node re-issue of every non-redo engine. Backup capture, the
+    // `backup/restore/durable.rs` is absent: every restore re-issue proposes
+    // a replicated entry, and each replica applies it. Backup capture, the
     // cluster snapshot builder, PURGE TENANT and the MOVE TENANT snapshot
     // fan out to every core through the all-cores exchange, not a SystemTask.
-    "control/backup/restore/durable.rs",
-    // Cluster snapshot install.
-    "control/cluster/snapshot_applier.rs",
+    // `cluster/snapshot_applier.rs` is absent: a cluster snapshot install
+    // builds its restore plans itself and sends them to each core with the
+    // dispatcher, not through the system door.
     // Committed DDL applied to engine state, and catalog maintenance.
     "control/server/shared/ddl/engine_apply.rs",
     "control/server/shared/ddl/neutral/convert/driver.rs",
-    "control/server/shared/ddl/neutral/continuous_agg/create.rs",
-    "control/server/shared/ddl/neutral/continuous_agg/drop.rs",
-    "control/server/shared/ddl/neutral/continuous_agg/register.rs",
+    // `continuous_agg/create.rs`, `drop.rs` and `register.rs` are absent: a
+    // continuous aggregate replicates as a catalog entry, and each node's
+    // post-apply lane registers or removes it on every core.
     "control/server/shared/ddl/neutral/continuous_agg/show.rs",
     // `synonym_group/create.rs` and `synonym_group/drop.rs` are absent:
     // a synonym group replicates as a catalog entry, and each node's
@@ -56,13 +53,15 @@ const ALLOWED: &[&str] = &[
     // `compact.rs` is absent too: COMPACT HISTORY replicates as a catalog
     // entry, and each node's post-apply lane dispatches the compaction.
     "control/server/shared/ddl/neutral/version_history/checkpoint.rs",
-    // Tenant lifecycle.
-    "control/server/shared/ddl/neutral/tenant/move_tenant/cutover.rs",
+    // `tenant/move_tenant/cutover.rs` is absent: MOVE TENANT re-issues its
+    // rows as durable writes and moves the namespace through one metadata
+    // commit, whose post-apply lane reclaims the source storage.
     // Event Plane rules dispatched back through the Control Plane.
     "event/alert/executor.rs",
     // Legs of a request whose capability was consumed at the entry point.
     "control/crdt_admission.rs",
-    "control/server/sync/raft_dispatch/write.rs",
+    // `sync/raft_dispatch/write.rs` is absent: a sync write proposes its
+    // plan through Raft, and the entry's apply dispatches it on each replica.
 ];
 
 fn src_root() -> PathBuf {

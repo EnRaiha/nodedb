@@ -4,7 +4,7 @@
 //!
 //! Materialized-sum resolution is read off the record, never re-derived: the
 //! pk → surrogate binding needs an async round-trip to another node's leader,
-//! and asking twice could get different answers.
+//! and asking twice can get different answers.
 //!
 //! Every surrogate is rebuilt verbatim from the record; `entry.rs` binds the
 //! whole plan afterwards.
@@ -128,7 +128,7 @@ pub(super) fn point_insert(
 pub(super) fn point_delete(
     collection: &str,
     document_id: &str,
-    surrogate: u32,
+    surrogate: Option<u32>,
     resolved_sum_targets: &WireSumResolution<'_>,
     returning: ReturningFields<'_>,
 ) -> PhysicalPlan {
@@ -136,7 +136,7 @@ pub(super) fn point_delete(
     PhysicalPlan::Document(DocumentOp::PointDelete {
         collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         document_id: document_id.to_owned(),
-        surrogate: nodedb_types::Surrogate::new(surrogate),
+        surrogate: surrogate.map(nodedb_types::Surrogate::new),
         pk_bytes,
         // Carried on the record — see `point_put`.
         returning: returning.returning,
@@ -162,7 +162,7 @@ pub(super) fn point_update(
     collection: &str,
     document_id: &str,
     updates: &[(String, UpdateValue)],
-    surrogate: u32,
+    surrogate: Option<u32>,
     extras: PointUpdateExtras<'_>,
 ) -> PhysicalPlan {
     let PointUpdateExtras {
@@ -174,7 +174,7 @@ pub(super) fn point_update(
     PhysicalPlan::Document(DocumentOp::PointUpdate {
         collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         document_id: document_id.to_owned(),
-        surrogate: nodedb_types::Surrogate::new(surrogate),
+        surrogate: surrogate.map(nodedb_types::Surrogate::new),
         pk_bytes,
         updates: updates.to_vec(),
         // Carried on the record — see `point_put`.
@@ -476,9 +476,9 @@ mod tests {
             .expect("encode must not error")
             .expect("a document insert must replicate")
             .to_bytes();
-        let (_, _, decoded, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded {
             PhysicalPlan::Document(DocumentOp::PointInsert {
                 resolved_sum_targets,
@@ -524,9 +524,9 @@ mod tests {
             .expect("encode must not error")
             .expect("a single-shard bulk delete must replicate")
             .to_bytes();
-        let (_, _, decoded, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded {
             PhysicalPlan::Document(DocumentOp::BulkDelete {
                 resolved_sum_targets,
@@ -564,16 +564,16 @@ mod tests {
             ReplicatedWrite::PointDelete {
                 collection: "entries".into(),
                 document_id: "e1".into(),
-                surrogate: 900,
+                surrogate: Some(900),
                 resolved_sum_targets: vec![("acc-1".into(), 4242)],
                 resolved_sum_target_bindings: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
             },
         );
-        let (_, _, decoded, _) = decode::from_replicated_entry(&entry.to_bytes(), None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded, _) = decode::decode_replicated_entry(&entry.to_bytes())
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded {
             PhysicalPlan::Document(DocumentOp::PointDelete {
                 resolved_sum_targets,
@@ -601,7 +601,7 @@ mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::PointDelete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "entries"),
             document_id: "e1".into(),
-            surrogate: Surrogate::new(900),
+            surrogate: Some(Surrogate::new(900)),
             pk_bytes: b"e1".to_vec(),
             returning: None,
             rls_filters: Vec::new(),
@@ -640,9 +640,9 @@ mod tests {
             other => panic!("expected PointDelete, got {other:?}"),
         }
 
-        let (_, _, decoded, _) = decode::from_replicated_entry(&entry.to_bytes(), None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded, _) = decode::decode_replicated_entry(&entry.to_bytes())
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded {
             PhysicalPlan::Document(DocumentOp::PointDelete {
                 resolved_sum_targets,
@@ -685,9 +685,9 @@ mod tests {
             .expect("DocumentOp::BatchInsert should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
         // No assigner: carried surrogates fall through verbatim.
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Document(DocumentOp::BatchInsert {
                 collection,
@@ -724,9 +724,9 @@ mod tests {
             .expect("encode must not error")
             .expect("DocumentOp::Truncate should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Document(DocumentOp::Truncate {
                 collection,
@@ -748,7 +748,7 @@ mod tests {
 
     /// Encode must not drop `returning` / `rls_filters` on a document write —
     /// the leader re-derives its own plan from the committed entry, so this
-    /// would drop `RETURNING` for the originating request too.
+    /// drops `RETURNING` for the originating request too.
     #[test]
     fn document_point_put_returning_and_rls_filters_roundtrip() {
         let spec = ReturningSpec {
@@ -773,9 +773,9 @@ mod tests {
         .expect("encode must not error")
         .expect("PointPut should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Document(DocumentOp::PointPut {
                 returning,
@@ -812,7 +812,7 @@ mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::PointUpdate {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
             document_id: "a1".into(),
-            surrogate: Surrogate::new(2),
+            surrogate: Some(Surrogate::new(2)),
             pk_bytes: b"a1".to_vec(),
             updates: vec![("balance".into(), UpdateValue::Literal(b"5".to_vec()))],
             returning: Some(spec.clone()),
@@ -830,9 +830,9 @@ mod tests {
         .expect("encode must not error")
         .expect("PointUpdate should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Document(DocumentOp::PointUpdate {
                 returning,
@@ -864,7 +864,7 @@ mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::PointDelete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
             document_id: "a1".into(),
-            surrogate: Surrogate::new(3),
+            surrogate: Some(Surrogate::new(3)),
             pk_bytes: b"a1".to_vec(),
             returning: Some(spec.clone()),
             rls_filters: b"rls-predicate".to_vec(),
@@ -880,9 +880,9 @@ mod tests {
         .expect("encode must not error")
         .expect("PointDelete should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Document(DocumentOp::PointDelete {
                 returning,
@@ -931,9 +931,9 @@ mod tests {
         .expect("encode must not error")
         .expect("Upsert should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Document(DocumentOp::Upsert {
                 returning,

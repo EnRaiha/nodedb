@@ -16,20 +16,18 @@
 //! one way to read a source row at plan time rather than two that can disagree
 //! about where the collection lives.
 //!
-//! Like the OLLP pre-execution scan, the read is routed through the gateway when
-//! one is wired: a bare local dispatch on a coordinator that does not host the
-//! collection's vShard returns nothing, which would silently under-resolve and
-//! leave the write with no target to address.
+//! Like the OLLP pre-execution scan, the read is routed through the gateway: a
+//! bare local dispatch on a coordinator that does not host the collection's
+//! vShard returns nothing, which will silently under-resolve and leave the
+//! write with no target to address.
 //!
 //! # Plane discipline
 //!
-//! Runs on the coordinator's Control Plane (Tokio). The scan crosses the SPSC
-//! bridge (or the gateway) exactly as a `SELECT` does — no storage I/O and no
-//! io_uring here.
+//! Runs on the coordinator's Control Plane (Tokio). The scan goes through the
+//! gateway exactly as a `SELECT` does — no storage I/O and no io_uring here.
 
 use nodedb_types::{Surrogate, TenantId};
 
-use crate::control::server::dispatch_utils::dispatch_to_data_plane;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, TraceId};
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
@@ -40,7 +38,7 @@ use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 /// The version travels with the rows because a delta settled from them is only
 /// as good as the images it was folded from: the caller stamps it onto a
 /// read-set entry so the Calvin OCC check aborts the statement if the source
-/// rows moved between this read and the apply. Rows without their version would
+/// rows moved between this read and the apply. Rows without their version will
 /// be a silently stale total.
 pub(crate) struct ReconRead<T> {
     /// The decoded rows.
@@ -48,6 +46,10 @@ pub(crate) struct ReconRead<T> {
     /// The source collection's write floor at read time — the comparand
     /// cross-shard OCC validation checks the read against.
     pub read_version_lsn: Lsn,
+    /// The node that served the read. `read_version_lsn` is a position in
+    /// that node's WAL, so the commit vote compares it only on that node.
+    /// `0` when no one node is known to have served it.
+    pub served_by: u64,
 }
 
 /// Scan `collection` for the rows `filters` matches, returning each row's full
@@ -55,8 +57,8 @@ pub(crate) struct ReconRead<T> {
 ///
 /// Whole documents rather than a projection: the join column of every binding
 /// the collection drives has to be readable, and so does every column an
-/// expression assignment to a join column evaluates over. A projection would
-/// have to enumerate all of them and would silently drop a value the assignment
+/// expression assignment to a join column evaluates over. A projection will
+/// have to enumerate all of them and will silently drop a value the assignment
 /// depends on.
 ///
 /// Empty `filters` means "no WHERE clause" — every row, which is what `TRUNCATE`
@@ -91,6 +93,7 @@ pub(in crate::control::planner) async fn recon_scan_rows(
     Ok(ReconRead {
         rows,
         read_version_lsn: read.read_version_lsn,
+        served_by: read.served_by,
     })
 }
 
@@ -119,11 +122,11 @@ pub(crate) async fn recon_point_row(
     let get_plan = PhysicalPlan::Document(DocumentOp::PointGet {
         collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         document_id: document_id.to_owned(),
-        surrogate,
+        surrogate: Some(surrogate),
         pk_bytes: document_id.as_bytes().to_vec(),
         // No RLS filters, for the same reason the recon scan carries none: this
-        // read decides which TOTAL a write moves, not what a principal may see.
-        // Filtering it would let a row the caller cannot read leave its
+        // read decides which TOTAL a write moves, not what a principal can see.
+        // Filtering it will let a row the caller cannot read leave its
         // contribution stranded on a target forever.
         rls_filters: Vec::new(),
         system_time: nodedb_types::SystemTimeScope::Current,
@@ -140,16 +143,20 @@ pub(crate) async fn recon_point_row(
             .find(|payload| !payload.is_empty())
             .and_then(|payload| nodedb_types::json_from_msgpack(payload.as_slice()).ok()),
         read_version_lsn: read.read_version_lsn,
+        served_by: read.served_by,
     })
 }
 
-/// Run one read plan against `collection`, through the gateway when one is
-/// wired and over the SPSC bridge otherwise, returning the raw payloads.
+/// Run one read plan through the gateway, returning the raw payloads.
 ///
 /// A bare local dispatch on a coordinator that does not host the collection's
-/// vShard returns nothing, which would silently under-resolve and leave the
-/// write with no target to address — so the gateway is preferred whenever it
-/// exists, for every shape of plan-time read alike.
+/// vShard returns nothing, which will silently under-resolve and leave the
+/// write with no target to address — so every plan-time read routes through
+/// the gateway.
+///
+/// The gateway notes the node that served each vShard it read. The read
+/// validates on `collection`'s vShard, so that vShard's note names the node
+/// whose WAL numbers `read_version_lsn`.
 async fn execute_read(
     state: &SharedState,
     tenant_id: TenantId,
@@ -157,50 +164,29 @@ async fn execute_read(
     collection: &str,
     plan: PhysicalPlan,
 ) -> crate::Result<ReconRead<Vec<Vec<u8>>>> {
-    if let Some(gateway) = state.gateway.get() {
-        let gw_ctx = crate::control::gateway::core::QueryContext {
-            tenant_id,
-            trace_id: TraceId::ZERO,
-            database_id,
-            txn_id: None,
-        };
-        // A shard verdict keeps its own typed error.
-        let (payloads, _watermarks, read_version_lsn) = gateway
-            .execute_internal_with_watermarks(&gw_ctx, plan)
-            .await?;
-        return Ok(ReconRead {
-            rows: payloads,
-            read_version_lsn,
-        });
-    }
-
-    let vshard_id =
-        nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
-    let response = dispatch_to_data_plane(
-        state,
+    let validation_vshard =
+        nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?
+            .vshard()
+            .as_u32();
+    let gateway = state.installed_gateway()?;
+    let gw_ctx = crate::control::gateway::core::QueryContext {
         tenant_id,
+        trace_id: TraceId::ZERO,
         database_id,
-        vshard_id,
-        plan,
-        TraceId::ZERO,
-    )
-    .await?;
-    read_from_response(&response)
-}
-
-/// The rows of a local read response.
-///
-/// A shard verdict keeps its own typed error, so a read the statement's
-/// deadline cut short reports the deadline rather than a storage fault.
-/// `reject_data_plane_error` passes only a `NotFound` refusal. Its payload is
-/// empty, so it reads as no rows, the answer the gateway path gives.
-fn read_from_response(
-    response: &crate::bridge::envelope::Response,
-) -> crate::Result<ReconRead<Vec<Vec<u8>>>> {
-    crate::control::local_dispatch::reject_data_plane_error(response)?;
+        txn_id: None,
+        linearizable: true,
+    };
+    // A shard verdict keeps its own typed error.
+    let (payloads, _watermarks, read_version_lsn) = gateway
+        .execute_internal_with_watermarks(&gw_ctx, plan)
+        .await?;
     Ok(ReconRead {
-        read_version_lsn: response.read_version_lsn,
-        rows: vec![response.payload.to_vec()],
+        rows: payloads,
+        read_version_lsn,
+        served_by: crate::control::server::shared::session::read_set::serving_node(
+            state,
+            validation_vshard,
+        ),
     })
 }
 
@@ -217,48 +203,4 @@ fn decode_rows(payload: &[u8]) -> Vec<serde_json::Value> {
         .into_iter()
         .filter_map(|(_, body)| nodedb_types::json_from_msgpack(&body).ok())
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::bridge::envelope::{ErrorCode, Payload, Response, Status};
-    use crate::types::RequestId;
-
-    fn refusal(code: ErrorCode) -> Response {
-        Response {
-            request_id: RequestId::new(1),
-            status: Status::Error,
-            attempt: 1,
-            partial: false,
-            payload: Payload::empty(),
-            watermark_lsn: Lsn::ZERO,
-            error_code: Some(Box::new(code)),
-            read_set_valid: None,
-            read_version_lsn: Lsn::ZERO,
-            write_set: Vec::new(),
-        }
-    }
-
-    /// A refused read keeps its code, never a storage error.
-    #[test]
-    fn a_refused_read_keeps_its_code() {
-        let code = ErrorCode::Unsupported {
-            detail: "not on this engine".into(),
-        };
-        match read_from_response(&refusal(code.clone())) {
-            Err(crate::Error::DataPlane(kept)) => assert_eq!(kept, code),
-            Err(other) => panic!("expected the typed refusal, got {other:?}"),
-            Ok(_) => panic!("a refused read must fail"),
-        }
-    }
-
-    /// A `NotFound` refusal reads as one empty payload, which decodes to no
-    /// rows.
-    #[test]
-    fn a_not_found_read_has_no_rows() {
-        let read = read_from_response(&refusal(ErrorCode::NotFound))
-            .expect("a NotFound refusal reads as no rows");
-        assert!(read.rows.iter().all(|payload| payload.is_empty()));
-    }
 }

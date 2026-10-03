@@ -99,18 +99,6 @@ impl NodeDbError {
         }
     }
 
-    pub fn fan_out_exceeded(shards_touched: u16, limit: u16) -> Self {
-        Self {
-            code: ErrorCode::FAN_OUT_EXCEEDED,
-            message: format!("query fan-out exceeded: {shards_touched} shards > limit {limit}"),
-            details: ErrorDetails::FanOutExceeded {
-                shards_touched,
-                limit,
-            },
-            cause: None,
-        }
-    }
-
     pub fn sql_not_enabled() -> Self {
         Self {
             code: ErrorCode::SQL_NOT_ENABLED,

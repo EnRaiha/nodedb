@@ -102,16 +102,12 @@ impl SystemCatalog {
 }
 
 fn stream_key(database_id: DatabaseId, tenant_id: u64, name: &str) -> String {
-    let mut encoded = String::with_capacity(name.len() * 2);
-    for byte in name.as_bytes() {
-        use std::fmt::Write;
-        let _ = write!(&mut encoded, "{byte:02x}");
-    }
     format!(
-        "v2/{:016x}/{:016x}/{:08x}/{encoded}",
+        "v2/{:016x}/{:016x}/{:08x}/{}",
         database_id.as_u64(),
         tenant_id,
-        name.len()
+        name.len(),
+        hex::encode(name)
     )
 }
 
@@ -142,6 +138,7 @@ mod tests {
             owner: "admin".into(),
             created_at: 1000,
             subscriber_roles: Vec::new(),
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 

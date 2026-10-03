@@ -390,6 +390,7 @@ mod tests {
             txn_id: None,
             wal_lsn: Some(Lsn::new(7)),
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: Admission::Exempt(ExemptReason::Read),
         })
     }

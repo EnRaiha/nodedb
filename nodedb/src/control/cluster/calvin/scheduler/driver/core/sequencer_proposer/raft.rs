@@ -62,7 +62,7 @@ pub struct RaftSequencerProposer {
     multi_raft: Arc<Mutex<MultiRaft>>,
     /// Source of the cluster transport and topology for forwards. Weak: the
     /// node's `SharedState` holds this proposer, and a strong handle back
-    /// would keep the state, and every file it holds open, alive after
+    /// will keep the state, and every file it holds open, alive after
     /// shutdown.
     shared: Weak<SharedState>,
     /// One permit per forward RPC in flight.
@@ -268,6 +268,8 @@ mod tests {
                     entries: Vec::new(),
                     leader_commit: 0,
                     group_id: SEQUENCER_GROUP_ID,
+                    round: 1,
+                    replicated_floor: 0,
                 })
                 .expect("heartbeat");
             assert_eq!(guard.group_leader(SEQUENCER_GROUP_ID), REMOTE_LEADER);

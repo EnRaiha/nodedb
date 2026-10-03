@@ -75,12 +75,12 @@ pub(super) fn columnar_write(op: &ColumnarOp) -> crate::Result<Option<Replicated
             collection,
             rows,
             rls_write_check: _,
-        } => columnar::bulk_resolved_update(collection.as_str(), rows),
+        } => columnar::bulk_resolved_update(collection.as_str(), rows)?,
         ColumnarOp::ResolvedDelete {
             collection,
             pks,
             rls_write_check: _,
-        } => columnar::bulk_resolved_delete(collection.as_str(), pks),
+        } => columnar::bulk_resolved_delete(collection.as_str(), pks)?,
 
         // Refused at injection under a write policy, so no predicate to
         // resolve; replicates as a plain whole-collection clear.
@@ -89,7 +89,7 @@ pub(super) fn columnar_write(op: &ColumnarOp) -> crate::Result<Option<Replicated
             restart_identity,
         } => columnar::truncate(collection.as_str(), *restart_identity),
 
-        // Not a write — reads/scans. `ResolveDml` only reports the row set a DML would touch.
+        // Not a write — reads/scans. `ResolveDml` only reports the row set a DML touches.
         ColumnarOp::Scan { .. }
         | ColumnarOp::MaterializeScan { .. }
         | ColumnarOp::ResolveDml { .. } => return Ok(None),
@@ -197,7 +197,7 @@ pub(super) fn text_write(op: &TextOp) -> Option<ReplicatedWrite> {
             provenance,
         } => columnar::fts_delete(
             collection.as_str(),
-            surrogate.as_u32(),
+            surrogate.map(|s| s.as_u32()),
             encode_provenance(provenance),
         ),
 
@@ -212,9 +212,9 @@ pub(super) fn text_write(op: &TextOp) -> Option<ReplicatedWrite> {
 }
 
 /// Encode a `SpatialOp` write variant into its `ReplicatedWrite` wire shape,
-/// or `None` for scans.
-pub(super) fn spatial_write(op: &SpatialOp) -> Option<ReplicatedWrite> {
-    Some(match op {
+/// or `None` for scans. Fails when the geometry does not encode.
+pub(super) fn spatial_write(op: &SpatialOp) -> crate::Result<Option<ReplicatedWrite>> {
+    Ok(Some(match op {
         SpatialOp::Insert {
             collection,
             field,
@@ -227,7 +227,7 @@ pub(super) fn spatial_write(op: &SpatialOp) -> Option<ReplicatedWrite> {
             surrogate.as_u32(),
             geometry,
             encode_provenance(provenance),
-        ),
+        )?,
         SpatialOp::Delete {
             collection,
             field,
@@ -236,11 +236,11 @@ pub(super) fn spatial_write(op: &SpatialOp) -> Option<ReplicatedWrite> {
         } => columnar::spatial_delete(
             collection.as_str(),
             field,
-            surrogate.as_u32(),
+            surrogate.map(|s| s.as_u32()),
             encode_provenance(provenance),
         ),
 
         // Not a write — R-tree index scan.
-        SpatialOp::Scan { .. } => return None,
-    })
+        SpatialOp::Scan { .. } => return Ok(None),
+    }))
 }

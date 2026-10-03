@@ -32,7 +32,7 @@ use nodedb::control::state::SharedState;
 use nodedb::types::{DatabaseId, TenantId, VShardId};
 use nodedb::wal::WalManager;
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
-use nodedb_types::{QualifiedCollection, Surrogate};
+use nodedb_types::QualifiedCollection;
 
 /// Build a single-node `SharedState` over a throwaway WAL. The returned
 /// `TempDir` must be kept alive for the WAL's lifetime.
@@ -86,7 +86,7 @@ fn kv_put(collection: &str, key: &[u8]) -> PhysicalPlan {
         key: key.to_vec(),
         value: b"v".to_vec(),
         ttl_ms: 0,
-        surrogate: Surrogate::ZERO,
+        surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(key),
         returning: None,
         rls_filters: Vec::new(),
         provenance: None,

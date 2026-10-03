@@ -11,6 +11,7 @@ pub mod filter;
 pub mod refusal;
 pub mod resolve;
 pub mod rewrite;
+pub mod rewrite_engine;
 
 pub use filter::filter_tombstoned_rows;
 pub use refusal::SourceRewrite;

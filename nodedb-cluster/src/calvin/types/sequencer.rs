@@ -110,7 +110,7 @@ mod tests {
     use nodedb_types::id::{CollectionKey, DatabaseId};
 
     use super::super::primitives::{EngineKeySet, SortedVec, VersionedReadSet};
-    use super::super::transaction::ReadWriteSet;
+    use super::super::read_write_set::ReadWriteSet;
     use super::*;
 
     fn doc_set(collection: &str, surrogates: Vec<u32>) -> EngineKeySet {

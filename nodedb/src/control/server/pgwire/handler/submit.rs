@@ -36,7 +36,9 @@ impl NodeDbPgHandler {
         user_id: Option<Arc<str>>,
         durability: WalDurability,
     ) -> crate::Result<Response> {
-        let task = checked.into_authorized().into_physical_task();
+        // The write lease lives until the submit returns its outcome.
+        let (authorized, _lease) = checked.into_parts();
+        let task = authorized.into_physical_task();
         self.submit_to_data_plane(SubmitArgs {
             tenant_id: task.tenant_id,
             vshard_id: task.vshard_id,
@@ -75,13 +77,11 @@ impl NodeDbPgHandler {
                 user_id,
                 durability,
                 ordering: WriteOrdering::Gate,
-                // This node both handles and applies the write: `dispatch_local`
-                // is reached only when no Raft proposer exists (single node) or
-                // when the plan is not encodable as a replicated entry, so
-                // exactly one node applies it and exactly one event is emitted.
-                // The replicated path publishes at its own origin site instead
-                // — see [`ChangeFeedOwner`].
-                change_feed: ChangeFeedOwner::Funnel,
+                // This node alone applies the write: `dispatch_local` is reached
+                // only for a staged write or a plan with no replicated entry. The
+                // replicated path stages its events under its entry instead —
+                // see [`ChangeFeedOwner`].
+                change_feed: ChangeFeedOwner::LocalApply,
             },
         )
         .await

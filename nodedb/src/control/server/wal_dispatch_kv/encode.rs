@@ -15,8 +15,8 @@ fn encode<T: zerompk::ToMessagePack>(context: &str, value: &T) -> crate::Result<
 }
 
 /// Encode a `kv_put` WAL payload: `("kv_put", collection, key, value, ttl_ms,
-/// expire_at_ms, surrogate)`. A row with no surrogate replays at identity `0`,
-/// read as "always visible" by clone-snapshot. Two shorter legacy shapes stay decodable.
+/// expire_at_ms, surrogate)`. `surrogate` is the row's bound identity. Replay
+/// refuses a record that carries `0`.
 pub(crate) fn encode_kv_put(
     collection: &str,
     key: &[u8],
@@ -39,9 +39,11 @@ pub(crate) fn encode_kv_put(
     )
 }
 
-/// Encode a `kv_insert_on_conflict_update` WAL payload. Delta record: `value`
-/// is the pre-merge `EXCLUDED` row, `updates` carries `DO UPDATE SET` inputs;
-/// replay re-runs the merge. `expire_at_ms` appends a 7th element when `Some`.
+/// Encode a `kv_insert_on_conflict_update` WAL payload:
+/// `("kv_insert_on_conflict_update", collection, key, value, ttl_ms, updates,
+/// expire_at_ms, surrogate)`. Delta record: `value` is the pre-merge
+/// `EXCLUDED` row, `updates` carries `DO UPDATE SET` inputs, and replay re-runs
+/// the merge. `surrogate` is the identity the live write binds the row to.
 pub(crate) fn encode_kv_insert_on_conflict_update(
     collection: &str,
     key: &[u8],
@@ -49,32 +51,21 @@ pub(crate) fn encode_kv_insert_on_conflict_update(
     ttl_ms: u64,
     updates: &[(String, UpdateValue)],
     expire_at_ms: Option<u64>,
+    surrogate: u32,
 ) -> crate::Result<Vec<u8>> {
-    match expire_at_ms {
-        None => encode(
-            "insert on conflict update",
-            &(
-                "kv_insert_on_conflict_update",
-                collection,
-                key,
-                value,
-                ttl_ms,
-                updates,
-            ),
+    encode(
+        "insert on conflict update",
+        &(
+            "kv_insert_on_conflict_update",
+            collection,
+            key,
+            value,
+            ttl_ms,
+            updates,
+            expire_at_ms,
+            surrogate,
         ),
-        Some(expire_at_ms) => encode(
-            "insert on conflict update",
-            &(
-                "kv_insert_on_conflict_update",
-                collection,
-                key,
-                value,
-                ttl_ms,
-                updates,
-                expire_at_ms,
-            ),
-        ),
-    }
+    )
 }
 
 /// Fields of a `kv_transfer` WAL payload, bundled so [`encode_kv_transfer`]
@@ -210,7 +201,7 @@ pub(crate) fn encode_kv_delete(collection: &str, keys: &[Vec<u8>]) -> crate::Res
 
 /// Encode a `kv_batch_put` WAL payload: `("kv_batch_put", collection, entries,
 /// ttl_ms, expire_at_ms, surrogates)`. `surrogates` is positional against
-/// `entries`. Two shorter legacy shapes remain decodable.
+/// `entries`, one bound identity per entry.
 pub(crate) fn encode_kv_batch_put(
     collection: &str,
     entries: &[(Vec<u8>, Vec<u8>)],
@@ -228,6 +219,22 @@ pub(crate) fn encode_kv_batch_put(
             expire_at_ms,
             surrogates,
         ),
+    )
+}
+
+/// Encode a `kv_rewrite` WAL payload: `("kv_rewrite", collection, key, value,
+/// ttl_ms, expire_at_ms)`. It replaces the value of a row the table already
+/// holds and carries no surrogate: the row keeps its bound identity.
+pub(crate) fn encode_kv_rewrite(
+    collection: &str,
+    key: &[u8],
+    value: &[u8],
+    ttl_ms: u64,
+    expire_at_ms: u64,
+) -> crate::Result<Vec<u8>> {
+    encode(
+        "rewrite",
+        &("kv_rewrite", collection, key, value, ttl_ms, expire_at_ms),
     )
 }
 
@@ -426,7 +433,7 @@ mod tests {
              re-derived as zero on replay"
         );
 
-        // Neither pre-surrogate shape may alias the current one — replay tries
+        // Neither pre-surrogate shape can alias the current one — replay tries
         // all three and must never mistake one for another.
         assert!(zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64)>(&entry).is_err());
         assert!(
@@ -622,75 +629,41 @@ mod tests {
     }
 
     #[test]
-    fn kv_insert_on_conflict_update_without_expire_at_carries_updates() {
+    fn kv_insert_on_conflict_update_carries_updates_expiry_and_surrogate() {
         let updates = vec![("score".to_string(), UpdateValue::Literal(b"42".to_vec()))];
-        let entry =
-            encode_kv_insert_on_conflict_update("players", b"p1", b"excluded", 0, &updates, None)
-                .unwrap();
-
-        let (disc, collection, key, value, ttl_ms, decoded_updates) = zerompk::from_msgpack::<(
-            &str,
-            String,
-            Vec<u8>,
-            Vec<u8>,
-            u64,
-            Vec<(String, UpdateValue)>,
-        )>(&entry)
-        .unwrap();
-        assert_eq!(disc, "kv_insert_on_conflict_update");
-        assert_eq!(collection, "players");
-        assert_eq!(key, b"p1");
-        assert_eq!(value, b"excluded");
-        assert_eq!(ttl_ms, 0);
-        assert_eq!(decoded_updates, updates);
-
-        // The extended (with-expiry) shape must not alias this one.
-        assert!(
-            zerompk::from_msgpack::<(
-                &str,
-                String,
-                Vec<u8>,
-                Vec<u8>,
-                u64,
-                Vec<(String, UpdateValue)>,
-                u64
-            )>(&entry)
-            .is_err(),
-            "six-element payload must not decode as the seven-element tuple"
-        );
-    }
-
-    #[test]
-    fn kv_insert_on_conflict_update_with_expire_at_carries_absolute_instant() {
-        let updates = vec![("score".to_string(), UpdateValue::Literal(b"42".to_vec()))];
-        let entry = encode_kv_insert_on_conflict_update(
-            "players",
-            b"p1",
-            b"excluded",
-            5_000,
-            &updates,
-            Some(1_700_000_000_000),
-        )
-        .unwrap();
-
-        let (disc, collection, key, value, ttl_ms, decoded_updates, expire_at_ms) =
-            zerompk::from_msgpack::<(
-                &str,
-                String,
-                Vec<u8>,
-                Vec<u8>,
-                u64,
-                Vec<(String, UpdateValue)>,
-                u64,
-            )>(&entry)
+        for expire_at in [None, Some(1_700_000_000_000)] {
+            let entry = encode_kv_insert_on_conflict_update(
+                "players",
+                b"p1",
+                b"excluded",
+                5_000,
+                &updates,
+                expire_at,
+                17,
+            )
             .unwrap();
-        assert_eq!(disc, "kv_insert_on_conflict_update");
-        assert_eq!(collection, "players");
-        assert_eq!(key, b"p1");
-        assert_eq!(value, b"excluded");
-        assert_eq!(ttl_ms, 5_000);
-        assert_eq!(decoded_updates, updates);
-        assert_eq!(expire_at_ms, 1_700_000_000_000);
+
+            let (disc, collection, key, value, ttl_ms, decoded_updates, expire_at_ms, surrogate) =
+                zerompk::from_msgpack::<(
+                    &str,
+                    String,
+                    Vec<u8>,
+                    Vec<u8>,
+                    u64,
+                    Vec<(String, UpdateValue)>,
+                    Option<u64>,
+                    u32,
+                )>(&entry)
+                .unwrap();
+            assert_eq!(disc, "kv_insert_on_conflict_update");
+            assert_eq!(collection, "players");
+            assert_eq!(key, b"p1");
+            assert_eq!(value, b"excluded");
+            assert_eq!(ttl_ms, 5_000);
+            assert_eq!(decoded_updates, updates);
+            assert_eq!(expire_at_ms, expire_at);
+            assert_eq!(surrogate, 17);
+        }
     }
 
     #[test]

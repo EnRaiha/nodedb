@@ -37,7 +37,9 @@ use nodedb_types::Surrogate;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::bulk_dml::scan::ollp_predicted_doc_ids;
 use crate::data::executor::handlers::transaction::overlay::Staged;
-use crate::data::executor::handlers::transaction::stage_write::stored_row_identity;
+use crate::data::executor::handlers::transaction::stage_write::{
+    StagedStatement, stored_row_identity,
+};
 use crate::data::executor::task::ExecutionTask;
 use crate::types::{DatabaseId, TenantId, TxnId};
 
@@ -213,7 +215,7 @@ impl CoreLoop {
         predicted_sorted.sort_unstable();
         let strict_schema = self.resolve_strict_schema(database_id.as_u64(), tid, collection);
 
-        let mut updated = 0usize;
+        let mut post_images = Vec::new();
         for surrogate in predicted_sorted {
             let storage_key = nodedb_types::StorageKey::for_surrogate(Surrogate::new(surrogate));
 
@@ -254,8 +256,28 @@ impl CoreLoop {
                 tid,
                 collection,
             )?;
+            post_images.push((surrogate, identity, new_body));
+        }
+
+        // UNIQUE holds at the end of the statement: the rows are judged
+        // together, so a value one of them releases is free for another.
+        let judged: Vec<(u32, &[u8])> = post_images
+            .iter()
+            .map(|(surrogate, _, body)| (*surrogate, body.as_slice()))
+            .collect();
+        self.stage_stored_unique_check(
+            &StagedStatement {
+                database_id: database_id.as_u64(),
+                tid,
+                txn_id,
+                coll_key: &coll_key,
+            },
+            &judged,
+        )?;
+
+        let updated = post_images.len();
+        for (surrogate, identity, new_body) in post_images {
             self.stage_bulk_put_capped(txn_id, &coll_key, surrogate, &identity, new_body)?;
-            updated += 1;
         }
         Ok(updated)
     }

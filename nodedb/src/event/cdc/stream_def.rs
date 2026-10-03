@@ -217,6 +217,10 @@ pub struct ChangeStreamDef {
     /// covers are unaffected.
     #[msgpack(default)]
     pub subscriber_roles: Vec<String>,
+    /// Stamped at propose time on every put; fences a replayed delete to the
+    /// incarnation it targeted.
+    #[msgpack(default)]
+    pub modification_hlc: nodedb_types::Hlc,
 }
 
 impl ChangeStreamDef {
@@ -264,6 +268,7 @@ mod tests {
             owner: "admin".into(),
             created_at: 0,
             subscriber_roles: Vec::new(),
+            modification_hlc: nodedb_types::Hlc::ZERO,
         };
         assert!(def.matches_collection("orders"));
         assert!(def.matches_collection("users"));
@@ -287,6 +292,7 @@ mod tests {
             owner: "admin".into(),
             created_at: 0,
             subscriber_roles: Vec::new(),
+            modification_hlc: nodedb_types::Hlc::ZERO,
         };
         assert!(def.matches_collection("orders"));
         assert!(!def.matches_collection("users"));

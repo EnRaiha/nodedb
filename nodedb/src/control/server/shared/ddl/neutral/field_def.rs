@@ -33,7 +33,7 @@ fn err(sqlstate: &str, message: &str) -> DdlError {
 }
 
 /// Parse and store a DEFINE FIELD statement.
-pub fn define_field(
+pub async fn define_field(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -121,11 +121,9 @@ pub fn define_field(
                 // replicated catalog state, and an in-place local mutation
                 // both diverges peers and breaks the version/bytes invariant
                 // the metadata applier enforces on replay after a restart.
-                if let Err(e) = crate::control::catalog_entry::persist_collection_replicated(
-                    state,
-                    database_id,
-                    &coll,
-                ) {
+                if let Err(e) =
+                    crate::control::catalog_entry::persist_collection_replicated(state, &coll).await
+                {
                     return Err(DdlError::from_error_in_context("save collection", &e));
                 }
             }
@@ -154,7 +152,7 @@ pub fn define_field(
 /// Parse and store a DEFINE EVENT statement.
 ///
 /// Syntax: DEFINE EVENT <name> ON <collection> WHEN <condition> THEN <action>
-pub fn define_event(
+pub async fn define_event(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -224,11 +222,9 @@ pub fn define_event(
                 // replicated catalog state, and an in-place local mutation
                 // both diverges peers and breaks the version/bytes invariant
                 // the metadata applier enforces on replay after a restart.
-                if let Err(e) = crate::control::catalog_entry::persist_collection_replicated(
-                    state,
-                    database_id,
-                    &coll,
-                ) {
+                if let Err(e) =
+                    crate::control::catalog_entry::persist_collection_replicated(state, &coll).await
+                {
                     return Err(DdlError::from_error_in_context("save collection", &e));
                 }
             }
@@ -262,7 +258,7 @@ pub fn define_event(
 /// way DEFINE EVENT replicates it with one. Inside a transaction the change
 /// is held for COMMIT, as DEFINE EVENT's is. An undefined name is an error
 /// with SQLSTATE 42704.
-pub fn remove_event(
+pub async fn remove_event(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -311,7 +307,8 @@ pub fn remove_event(
             &format!("event '{event_name}' on '{collection}' does not exist"),
         ));
     }
-    crate::control::catalog_entry::persist_collection_replicated(state, database_id, &coll)
+    crate::control::catalog_entry::persist_collection_replicated(state, &coll)
+        .await
         .map_err(|e| DdlError::from_error_in_context("save collection", &e))?;
 
     state.audit_record(

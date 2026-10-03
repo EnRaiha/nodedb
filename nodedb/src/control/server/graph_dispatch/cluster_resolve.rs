@@ -1,58 +1,21 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Shared cluster-routing helpers for graph scatter paths (`match_scatter` and
-//! `bsp_pagerank`): resolve a vShard to a live `RouteDecision`, and fetch the
+//! Shared cluster-dispatch helpers for graph scatter paths (`match_scatter` and
+//! `bsp_pagerank`): dispatch a superstep to one owner node, and fetch the
 //! gateway `Arc<SharedState>` used for remote dispatch.
 //!
-//! Both helpers resolve against LIVE Raft leadership where available so a stale
-//! routing-table hint cannot misdirect a scatter. Factored here so the MATCH
-//! scatter and the BSP PageRank coordinator share one implementation instead of
-//! duplicating the routing-lock + live-leader plumbing.
+//! vShard resolution against live Raft leadership lives in
+//! `crate::control::gateway::live_leaders`.
 
 use std::sync::Arc;
 
 use crate::bridge::envelope::{Payload, PhysicalPlan};
 use crate::control::gateway::dispatcher::{DispatchRouteParams, dispatch_route};
-use crate::control::gateway::router::resolve_decision;
 use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::gateway::{RouteDecision, TaskRoute};
 use crate::control::server::exchange::execute_plan_all_local_cores;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId};
-
-/// Resolve a vShard to a `RouteDecision` against live Raft leadership, falling
-/// back to the routing-table hint when no live snapshot is available.
-///
-/// `pub(crate)` so the in-transaction staging choke points
-/// (`session::leader_forward`) can resolve a staged write's / overlay drop's
-/// target leader with the same live-leader semantics the graph scatter uses,
-/// instead of duplicating the routing-lock + live-leader plumbing.
-pub(crate) fn resolve_for_vshard(state: &SharedState, vshard_id: u32) -> RouteDecision {
-    let routing_guard = state
-        .cluster_routing
-        .as_ref()
-        .map(|rw| rw.read().unwrap_or_else(|p| p.into_inner()));
-    let raft_snapshot: Vec<nodedb_cluster::GroupStatus> =
-        state.raft_status_fn.get().map(|f| f()).unwrap_or_default();
-    let live_leader = move |group_id: u64| -> u64 {
-        raft_snapshot
-            .iter()
-            .find(|gs| gs.group_id == group_id)
-            .map(|gs| gs.leader_id)
-            .unwrap_or(0)
-    };
-    let live_lookup: Option<&dyn Fn(u64) -> u64> = if state.raft_status_fn.get().is_some() {
-        Some(&live_leader)
-    } else {
-        None
-    };
-    resolve_decision(
-        vshard_id,
-        state.node_id,
-        routing_guard.as_deref(),
-        live_lookup,
-    )
-}
 
 /// Parameters for [`dispatch_superstep_to_node`].
 pub(in crate::control::server::graph_dispatch) struct DispatchSuperstepParams<'a> {
@@ -64,10 +27,19 @@ pub(in crate::control::server::graph_dispatch) struct DispatchSuperstepParams<'a
     pub(in crate::control::server::graph_dispatch) route_vshard: u32,
     pub(in crate::control::server::graph_dispatch) plan: PhysicalPlan,
     pub(in crate::control::server::graph_dispatch) version_set: &'a GatewayVersionSet,
+    /// The superstep reads linearizably: each serving node confirms first.
+    pub(in crate::control::server::graph_dispatch) linearizable: bool,
+}
+
+/// One owner node's answer to a graph superstep: its payload and the highest
+/// watermark its cores served the plan at.
+pub(in crate::control::server::graph_dispatch) struct NodeRead {
+    pub(in crate::control::server::graph_dispatch) payload: Payload,
+    pub(in crate::control::server::graph_dispatch) watermark_lsn: crate::types::Lsn,
 }
 
 /// Dispatch a single already-built graph-superstep `plan` to one owner node and
-/// return its node-level payload. The LOCAL node fans the plan across all its
+/// return its node-level payload and served watermark. The LOCAL node fans the plan across all its
 /// Data-Plane cores via `execute_plan_all_local_cores` (per-core results merged
 /// into one payload); a REMOTE node gets one `RouteDecision::Remote` dispatch via
 /// `dispatch_route`. An empty payload denotes a zero-vertex shard — the caller's
@@ -76,7 +48,7 @@ pub(in crate::control::server::graph_dispatch) struct DispatchSuperstepParams<'a
 pub(in crate::control::server::graph_dispatch) async fn dispatch_superstep_to_node(
     shared_arc: &Arc<SharedState>,
     args: DispatchSuperstepParams<'_>,
-) -> crate::Result<Payload> {
+) -> crate::Result<NodeRead> {
     let DispatchSuperstepParams {
         tenant_id,
         database_id,
@@ -86,12 +58,17 @@ pub(in crate::control::server::graph_dispatch) async fn dispatch_superstep_to_no
         route_vshard,
         plan,
         version_set,
+        linearizable,
     } = args;
     if is_local {
         // Local node: fan across ALL local cores and merge. The per-core
         // owned-node sets are disjoint, so the merged result is correct without
         // dedup. At 1 core/node this is behaviour-identical to a single-core
-        // dispatch.
+        // dispatch. A linearizable graph read confirms the groups the plan
+        // reads first.
+        if linearizable {
+            super::read_groups::confirm_graph_read(shared_arc, database_id, &plan).await?;
+        }
         let node_result = execute_plan_all_local_cores(
             shared_arc.as_ref(),
             tenant_id,
@@ -102,7 +79,10 @@ pub(in crate::control::server::graph_dispatch) async fn dispatch_superstep_to_no
             None,
         )
         .await?;
-        Ok(Payload::from_vec(node_result.payload))
+        Ok(NodeRead {
+            payload: Payload::from_vec(node_result.payload),
+            watermark_lsn: node_result.watermark_lsn,
+        })
     } else {
         // Remote node: one dispatch via the gateway.
         let route = TaskRoute {
@@ -113,7 +93,7 @@ pub(in crate::control::server::graph_dispatch) async fn dispatch_superstep_to_no
             },
             vshard_id: route_vshard,
         };
-        let payloads = dispatch_route(DispatchRouteParams {
+        let outcome = dispatch_route(DispatchRouteParams {
             route,
             shared: shared_arc,
             tenant_id,
@@ -123,16 +103,27 @@ pub(in crate::control::server::graph_dispatch) async fn dispatch_superstep_to_no
             version_set,
             // This resolve path carries no session-transaction context.
             txn_id: None,
+            linearizable,
         })
-        .await?
-        .payloads;
-        payloads
+        .await?;
+        let watermark_lsn = outcome
+            .shard_watermarks
+            .iter()
+            .map(|(_, lsn)| *lsn)
+            .max()
+            .unwrap_or(crate::types::Lsn::ZERO);
+        let payload = outcome
+            .payloads
             .into_iter()
             .next()
             .map(Payload::from_vec)
             .ok_or_else(|| crate::Error::Internal {
                 detail: format!("graph superstep: node={node_id} returned no payload"),
-            })
+            })?;
+        Ok(NodeRead {
+            payload,
+            watermark_lsn,
+        })
     }
 }
 

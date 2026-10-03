@@ -40,6 +40,19 @@ impl<'a> ReplicableWrite<'a> {
                 ),
             });
         }
+        // Each replica accepts different lines against its own tag
+        // cardinality and memory budget, so a timeseries ingest resolves to
+        // its rows on the proposer, and the entry carries those rows.
+        if crate::control::write_resolve::is_unresolved_ingest(plan) {
+            return Err(crate::Error::Internal {
+                detail: format!(
+                    "internal invariant break: a timeseries ingest on '{}' reached the Raft \
+                     propose path unresolved; the proposer resolves it with \
+                     `resolve_for_log` before it builds the entry",
+                    plan.collection().unwrap_or("<unknown>")
+                ),
+            });
+        }
         Ok(Self(plan))
     }
 
@@ -101,6 +114,38 @@ mod tests {
         let write =
             ReplicableWrite::decide_for_replication(&plan).expect("decided check must be accepted");
         assert!(matches!(write.plan(), PhysicalPlan::Columnar(_)));
+    }
+
+    fn timeseries_ingest(format: &str) -> PhysicalPlan {
+        PhysicalPlan::Timeseries(nodedb_physical::physical_plan::TimeseriesOp::Ingest {
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "metrics",
+            ),
+            payload: Vec::new(),
+            format: format.to_string(),
+            wal_lsn: None,
+            surrogates: Vec::new(),
+            provenance: None,
+            rls_write_check: RlsWriteCheck::NoPolicyApplies,
+            returning: None,
+            rls_filters: Vec::new(),
+        })
+    }
+
+    /// Each replica accepts other lines than its peers, so only the
+    /// resolved rows cross the wire.
+    #[test]
+    fn only_a_resolved_timeseries_ingest_is_decided_for_replication() {
+        for format in ["ilp", "ilp-msgpack", "json", "msgpack"] {
+            assert!(
+                ReplicableWrite::decide_for_replication(&timeseries_ingest(format)).is_err(),
+                "an unresolved {format} ingest must be refused"
+            );
+        }
+        let resolved =
+            timeseries_ingest(crate::engine::timeseries::resolved_ingest::RESOLVED_INGEST_FORMAT);
+        assert!(ReplicableWrite::decide_for_replication(&resolved).is_ok());
     }
 
     /// Replay never re-decides, so it wraps whatever the committed entry held.

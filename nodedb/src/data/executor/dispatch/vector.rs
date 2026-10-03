@@ -220,10 +220,13 @@ impl CoreLoop {
                 doc_id,
             } => self.execute_sparse_delete(task, tid, collection.as_str(), field_name, doc_id),
 
+            // The Control Plane bound `document_surrogate` by `pk_bytes`
+            // before dispatch. The engine keys the vectors by the surrogate.
             VectorOp::MultiVectorInsert {
                 collection,
                 field_name,
                 document_surrogate,
+                pk_bytes: _,
                 vectors,
                 count,
                 dim,

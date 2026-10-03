@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
+use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_types::RowIdentity;
 
 use crate::bridge::envelope::Response;
@@ -19,20 +19,66 @@ use crate::data::executor::handlers::transaction::overlay::BitemporalStamp;
 use crate::data::executor::handlers::transaction::stage_write::GRAPH_LABEL_COLL_KEY;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::{TenantId, TxnId};
-use crate::wal::{RedoRecord, RedoSubRecord};
+use crate::wal::{RedoRecord, RedoRowChange, RedoSubRecord};
 
 use super::classify::{classify_document_op, classify_kv_op};
 use super::columnar_image::{ColumnarCollectionImages, ColumnarCollections};
+use super::edge_ordinal::{EdgeOrdinals, StoredEdges};
 use super::graph::EdgeIdentityKey;
 use super::vector_primary::VectorPrimaryCollections;
 use super::{array, columnar_image, crdt, document, graph, kv, spatial, text, vector};
 
 impl CoreLoop {
+    /// Resolve a committing session transaction: check its guards against
+    /// the state it commits on, then resolve it as
+    /// [`Self::execute_resolve_txn`] does.
+    ///
+    /// A session transaction staged its guards at statement time and holds
+    /// no lock since, so a node's edges or a document's presence can change
+    /// before COMMIT. A changed state answers `OllpRetryRequired`, and the
+    /// transaction writes nothing.
+    pub(in crate::data::executor) fn execute_resolve_session_txn(
+        &mut self,
+        task: &ExecutionTask,
+        tid: u64,
+        txn_id: TxnId,
+        plans: &[PhysicalPlan],
+    ) -> Response {
+        let guards_hold = match self.node_edge_guards_hold(task, tid, plans) {
+            Ok(true) => self.node_presence_guards_hold(task, plans),
+            other => other,
+        };
+        match guards_hold {
+            Ok(true) => self.execute_resolve_txn(task, tid, txn_id, plans),
+            Ok(false) => {
+                self.response_error(task, crate::bridge::envelope::ErrorCode::OllpRetryRequired)
+            }
+            Err(e) => self.response_error(task, e),
+        }
+    }
+
     /// Resolve a committing transaction's staged writes into a
     /// [`RedoRecord`] and return its encoded bytes in the response payload.
     /// Reads the overlay by `&` and never mutates any base engine. A session
     /// transaction and a Calvin transaction stage the same way, so both
     /// resolve here.
+    ///
+    /// It checks no guard. A Calvin transaction checks its guards when it
+    /// stages, once its locks are granted, and it holds them until its
+    /// flush. Every Calvin writer of guarded state holds a key the guard
+    /// holds:
+    /// - A node delete's guard holds its node's lock pair. Every edge write,
+    ///   single or batched, holds the lock pair of both endpoints.
+    /// - A presence guard holds the key of every document it names, stored
+    ///   or not, and the collection key. Every CRDT document writer holds
+    ///   its document's id key, bound or not. Every collection-wide write
+    ///   holds the collection key.
+    ///
+    /// Locks are granted in sequence order. So every lower writer of guarded
+    /// state flushed before the guard ran, and no higher one flushes before
+    /// this flush. A resolve check also sees the transaction's own
+    /// writes: another participant on the same core can flush its edge
+    /// deletes first, and one edge store holds both homes of an edge.
     pub(in crate::data::executor) fn execute_resolve_txn(
         &mut self,
         task: &ExecutionTask,
@@ -40,14 +86,50 @@ impl CoreLoop {
         txn_id: TxnId,
         plans: &[PhysicalPlan],
     ) -> Response {
-        let ops = match self.resolve_txn_ops(task, tid, txn_id, plans) {
-            Ok(ops) => ops,
+        let (ops, row_changes) = match self.resolve_txn_ops(task, tid, txn_id, plans) {
+            Ok(resolved) => resolved,
             Err(e) => return self.response_error(task, e),
         };
+        // Rows only a trigger body staged commit under `Trigger`, so they fire
+        // no trigger. A transaction no client wrote lists none.
+        // A row is named as its event names it: the overlay keys a KV row by
+        // its key in hex, and its event by the key's text.
+        let kv_collections: BTreeSet<&str> = plans
+            .iter()
+            .filter(|plan| matches!(plan, PhysicalPlan::Kv(_)))
+            .filter_map(PhysicalPlan::collection)
+            .collect();
+        let body = self
+            .txn_overlays
+            .get(&txn_id)
+            .map(|overlay| overlay.body_writes(task.request.database_id, TenantId::new(tid)))
+            .unwrap_or_default();
+        let body_rows = body.rows.into_iter().map(|(collection, row)| {
+            let row = if kv_collections.contains(collection.as_str()) {
+                crate::data::executor::handlers::transaction::stage_write::unhex_key(&row)
+                    .map(|key| String::from_utf8_lossy(&key).into_owned())
+                    .unwrap_or(row)
+            } else {
+                row
+            };
+            (collection, row)
+        });
         let record = RedoRecord {
             version: 1,
             ops,
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: {
+                use crate::wal::redo::row_sources::{group_rows, whole_collections};
+                let trigger = crate::event::EventSource::Trigger;
+                let mut groups = whole_collections(trigger, body.collections);
+                groups.extend(group_rows(trigger, body_rows));
+                groups
+            },
+            // The commit attaches the transaction's publishes to the
+            // record it resolves here.
+            publishes: Vec::new(),
+            row_changes,
         };
         match record.to_bytes() {
             Ok(bytes) => self.response_with_payload(task, bytes),
@@ -56,15 +138,16 @@ impl CoreLoop {
     }
 
     /// Build the ordered redo sub-records for a transaction's staged
-    /// post-images. Walks the plan once to classify every op and collect
-    /// the touched KV collections; serializes from the overlay, not the plan.
+    /// post-images, with the net change of every document and KV row they
+    /// write. Walks the plan once to classify every op and collect the
+    /// touched KV collections; serializes from the overlay, not the plan.
     fn resolve_txn_ops(
         &mut self,
         task: &ExecutionTask,
         tid: u64,
         txn_id: TxnId,
         plans: &[PhysicalPlan],
-    ) -> crate::Result<Vec<RedoSubRecord>> {
+    ) -> crate::Result<(Vec<RedoSubRecord>, Vec<RedoRowChange>)> {
         let mut kv_collections: BTreeSet<String> = BTreeSet::new();
         let mut doc_collections: BTreeSet<String> = BTreeSet::new();
         let mut graph_collections: BTreeSet<String> = BTreeSet::new();
@@ -77,9 +160,10 @@ impl CoreLoop {
         let mut ops: Vec<RedoSubRecord> = Vec::new();
         // The declared primary key of each truncated document collection,
         // from the plan: names every removed base row in its redo entry.
-        let truncate_primary_keys = truncate_declared_primary_keys(plans);
-        // Unkeyed timeseries ingests seen per collection, in plan order.
-        let mut unkeyed_seen = std::collections::HashMap::new();
+        let truncate_primary_keys = document::truncate_declared_primary_keys(plans);
+        // Unkeyed timeseries ingests seen per collection and the schema each
+        // collection's last ingest resolved to, in plan order.
+        let mut timeseries_state = super::timeseries::TimeseriesResolveState::default();
 
         for plan in plans {
             match plan {
@@ -106,7 +190,8 @@ impl CoreLoop {
                 PhysicalPlan::Text(op) => text::serialize_text_op(op, &mut ops)?,
 
                 // Read-only families: scans, joins, aggregates, exchange, and
-                // maintenance ops carry no persisted post-image.
+                // maintenance ops carry no persisted post-image. A RESTORE
+                // batch serializes from the plan after the staged writes.
                 PhysicalPlan::Query(_) | PhysicalPlan::Meta(_) => {}
 
                 // Plan-driven: each op serializes from the plan node, skips, or
@@ -121,7 +206,7 @@ impl CoreLoop {
                     tid,
                     txn_id,
                     op,
-                    &mut unkeyed_seen,
+                    &mut timeseries_state,
                     &mut ops,
                 )?,
 
@@ -152,6 +237,22 @@ impl CoreLoop {
             || !vector_primary_collections.is_empty()
             || plans.iter().any(graph::is_label_write);
         self.require_staging_overlay(txn_id, reads_overlay)?;
+
+        // A staged transaction holds each timeseries collection it resolved
+        // an ingest into until its overlay drops, so its install finds the
+        // schema its rows were resolved against.
+        if self.txn_overlays.contains_key(&txn_id) {
+            for collection in timeseries_state.resolved_schemas.keys() {
+                self.ts_resolve_holds
+                    .entry((
+                        task.request.database_id,
+                        TenantId::new(tid),
+                        collection.clone(),
+                    ))
+                    .or_default()
+                    .insert(txn_id);
+            }
+        }
 
         // Pin the resolve-time bitemporal stamp once, in the overlay sidecar, for
         // every staged put AND tombstone, so the redo carries it and every apply
@@ -258,8 +359,21 @@ impl CoreLoop {
         )?;
         if let Some(graph_overlay) = self.graph_txn_overlays.get(&txn_id) {
             // Freeze temporal identity independently from the overlay's lease
-            // refresh stamp. Resolve retries reuse the exact same ordinal.
-            let graph_system_from = graph_overlay.freeze_system_from(self.hlc.next_ordinal());
+            // refresh stamp. Resolve retries reuse the exact same ordinal. A
+            // Calvin resolve takes the transaction's ordinal, which every
+            // participant shares. Any other resolve takes the local clock.
+            let candidate = self
+                .apply_scope
+                .calvin_txn_ordinal
+                .unwrap_or_else(|| self.hlc.next_ordinal());
+            let ordinals = EdgeOrdinals::above_stored(
+                graph_overlay.freeze_system_from(candidate),
+                StoredEdges {
+                    store: &self.edge_store,
+                    database_id: task.request.database_id,
+                    tenant_id: TenantId::new(tid),
+                },
+            );
             for collection in &graph_collections {
                 let coll_key = (
                     task.request.database_id,
@@ -271,7 +385,7 @@ impl CoreLoop {
                     &coll_key,
                     collection,
                     &edge_surrogates,
-                    graph_system_from,
+                    &ordinals,
                     &mut ops,
                 )?;
             }
@@ -284,7 +398,23 @@ impl CoreLoop {
             );
             graph::serialize_node_label_deltas(graph_overlay, &label_coll_key, &mut ops)?;
         }
-        Ok(ops)
+        self.serialize_truncated_edges(plans, &mut ops)?;
+        let mut row_changes = self.resolve_row_changes(
+            task.request.database_id,
+            tid,
+            txn_id,
+            &super::row_changes::StagedRowCollections {
+                documents: &doc_collections,
+                kv: &kv_collections,
+                columnar: &columnar_collections,
+                vector_primary: &vector_primary_collections,
+                plans,
+            },
+        )?;
+        // A RESTORE batch stages nothing: its rows and edge versions come
+        // from the plan, after every staged write of the transaction.
+        self.serialize_restored_batches(plans, &mut ops, &mut row_changes)?;
+        Ok((ops, row_changes))
     }
 
     /// Refuse a session resolve whose writes live in a staging overlay this
@@ -347,67 +477,6 @@ impl CoreLoop {
         }
         Ok(())
     }
-
-    /// The base rows a staged TRUNCATE of `collection` removes at COMMIT:
-    /// every base row with no overlay entry. The redo record is the only
-    /// thing a replica installs, so each removed row travels as its own
-    /// `Delete`. Read-only against base.
-    fn truncated_base_rows(
-        &self,
-        task: &ExecutionTask,
-        tid: u64,
-        collection: &str,
-        overlay: &crate::data::executor::handlers::transaction::overlay::TxnOverlay,
-        coll_key: &(crate::types::DatabaseId, TenantId, String),
-    ) -> crate::Result<Vec<(nodedb_types::StorageKey, Vec<u8>)>> {
-        let database_id = task.request.database_id.as_u64();
-        let bitemporal = self.is_bitemporal(database_id, tid, collection);
-        let mut rows = Vec::new();
-        for key in self.scan_matching_documents(database_id, tid, collection, &[])? {
-            if overlay.get(coll_key, key.surrogate().as_u32()).is_some() {
-                continue;
-            }
-            let body = if bitemporal {
-                self.sparse
-                    .versioned_get_current(database_id, tid, collection, &key)?
-            } else {
-                self.sparse.get(database_id, tid, collection, &key)?
-            };
-            if let Some(body) = body {
-                rows.push((key, body));
-            }
-        }
-        Ok(rows)
-    }
-}
-
-/// The declared primary key of every document collection a `Truncate` plan
-/// names, keyed by collection.
-fn truncate_declared_primary_keys(plans: &[PhysicalPlan]) -> BTreeMap<String, Option<String>> {
-    plans
-        .iter()
-        .filter_map(|plan| match plan {
-            PhysicalPlan::Document(DocumentOp::Truncate {
-                collection,
-                declared_primary_key,
-                ..
-            }) => Some((collection.to_string(), declared_primary_key.clone())),
-            PhysicalPlan::Document(_)
-            | PhysicalPlan::Kv(_)
-            | PhysicalPlan::Graph(_)
-            | PhysicalPlan::Crdt(_)
-            | PhysicalPlan::Text(_)
-            | PhysicalPlan::Query(_)
-            | PhysicalPlan::Meta(_)
-            | PhysicalPlan::Vector(_)
-            | PhysicalPlan::Array(_)
-            | PhysicalPlan::Columnar(_)
-            | PhysicalPlan::Timeseries(_)
-            | PhysicalPlan::Spatial(_)
-            | PhysicalPlan::ClusterArray(_)
-            | PhysicalPlan::ClusterEvent(_) => None,
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -478,6 +547,7 @@ mod tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: crate::bridge::envelope::Admission::Exempt(
                 crate::bridge::envelope::ExemptReason::Read,
             ),
@@ -506,7 +576,7 @@ mod tests {
             key: Vec::new(),
             value: Vec::new(),
             ttl_ms: 0,
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -543,7 +613,7 @@ mod tests {
                     key: b"c".to_vec(),
                     delta,
                     ttl_ms: 0,
-                    surrogate: Surrogate::ZERO,
+                    surrogate: Surrogate::new(3),
                     rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                     shape: nodedb_physical::physical_plan::KvCounterShape::Raw,
                 },
@@ -698,16 +768,18 @@ mod tests {
         let now = crate::engine::kv::current_ms();
 
         // Seed a base KV row, then stage a different value for the same key.
-        core.kv_engine.put(crate::engine::kv::KvPutParams {
-            database_id: DatabaseId::DEFAULT.as_u64(),
-            tenant_id: TID,
-            collection: "kvc",
-            key: b"k",
-            value: b"base",
-            ttl_ms: 0,
-            now_ms: now,
-            surrogate: Surrogate::ZERO,
-        });
+        core.kv_engine
+            .put(crate::engine::kv::KvPutParams {
+                database_id: DatabaseId::DEFAULT.as_u64(),
+                tenant_id: TID,
+                collection: "kvc",
+                key: b"k",
+                value: b"base",
+                ttl_ms: 0,
+                now_ms: now,
+                surrogate: Surrogate::new(1),
+            })
+            .expect("a bound row writes");
         let before = core
             .kv_engine
             .get(DatabaseId::DEFAULT.as_u64(), TID, "kvc", b"k", now);
@@ -748,7 +820,7 @@ mod tests {
         let doc_plan = PhysicalPlan::Document(DocumentOp::PointDelete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
             document_id: "gone".to_string(),
-            surrogate: Surrogate::new(surrogate),
+            surrogate: Some(Surrogate::new(surrogate)),
             pk_bytes: Vec::new(),
             returning: Some(ReturningSpec {
                 columns: ReturningColumns::Star,
@@ -817,7 +889,7 @@ mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::PointUpdate {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
             document_id: row_key.to_string(),
-            surrogate: Surrogate::new(surrogate),
+            surrogate: Some(Surrogate::new(surrogate)),
             pk_bytes: Vec::new(),
             updates: vec![("name".to_string(), literal_str("bob"))],
             returning: Some(ReturningSpec {
@@ -1161,6 +1233,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "mc"),
                 field_name: "mv".to_string(),
                 document_surrogate: Surrogate::new(2),
+                pk_bytes: None,
                 vectors: vec![1.0, 2.0, 3.0, 4.0],
                 count: 2,
                 dim: 2,
@@ -1400,6 +1473,7 @@ mod tests {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "mc"),
             field_name: "mv".to_string(),
             document_surrogate: Surrogate::new(7),
+            pk_bytes: None,
             vectors: vec![1.0, 2.0, 3.0, 4.0],
             count: 2,
             dim: 2,
@@ -1437,6 +1511,7 @@ mod tests {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "mc"),
             field_name: "mv".to_string(),
             document_surrogate: Surrogate::new(7),
+            pk_bytes: None,
             vectors: vec![1.0, 2.0, 3.0, 4.0],
             count: 2,
             dim: 2,
@@ -1577,17 +1652,15 @@ mod tests {
         .expect("encode binary tuple")
     }
 
-    /// A schemaless document body in canonical storage encoding, not the raw
-    /// `Value` encoding — `apply_point_put` canonicalizes on write.
+    /// A schemaless document body in canonical storage encoding: a standard
+    /// MessagePack map, as `apply_point_put` stores it.
     fn schemaless_body(name: &str) -> Vec<u8> {
         let mut obj = std::collections::HashMap::new();
         obj.insert(
             "name".to_string(),
             nodedb_types::Value::String(name.to_string()),
         );
-        let encoded =
-            zerompk::to_msgpack_vec(&nodedb_types::Value::Object(obj)).expect("encode msgpack");
-        crate::data::executor::doc_format::canonicalize_document_for_storage(&encoded)
+        nodedb_types::value_to_msgpack(&nodedb_types::Value::Object(obj)).expect("encode msgpack")
     }
 
     /// A resolve plan naming `collection` as a schemaless document write.
@@ -1596,7 +1669,7 @@ mod tests {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             document_id: String::new(),
             value: Vec::new(),
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
@@ -1726,7 +1799,7 @@ mod tests {
         let delete_plan = PhysicalPlan::Document(DocumentOp::PointDelete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
             document_id: "gone".to_string(),
-            surrogate: Surrogate::new(surrogate),
+            surrogate: Some(Surrogate::new(surrogate)),
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
@@ -1761,6 +1834,10 @@ mod tests {
                 ops
             },
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         });
         dst.replay_transaction_redo_wal(
             std::slice::from_ref(&seed),
@@ -1833,6 +1910,10 @@ mod tests {
                 ops
             },
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         });
         core.replay_transaction_redo_wal(
             std::slice::from_ref(&seed),
@@ -2167,8 +2248,8 @@ mod tests {
             src_id: "a".to_string(),
             label: "knows".to_string(),
             dst_id: "b".to_string(),
-            src_surrogate: Surrogate::ZERO,
-            dst_surrogate: Surrogate::ZERO,
+            src_surrogate: Surrogate::new(1),
+            dst_surrogate: Surrogate::new(2),
             rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
         });
         let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
@@ -2182,13 +2263,18 @@ mod tests {
         assert_eq!(decoded.src_id, "a");
         assert_eq!(decoded.label, "knows");
         assert_eq!(decoded.dst_id, "b");
+        assert_eq!(
+            decoded.endpoints(),
+            Some((Surrogate::new(1), Surrogate::new(2))),
+            "the delete redo carries the plan's endpoint surrogates"
+        );
         assert!(decoded.system_from.is_some_and(|s| s > 0));
 
         // Seed the edge at a system-time ordinal earlier than the delete's
         // frozen `system_from`, matching production replay order — a fresh
         // `next_ordinal` seed would incorrectly post-date the tombstone.
         let (mut dst_core, _dst_dir) = make_core();
-        dst_core.active_graph_system_from =
+        dst_core.apply_scope.graph_system_from =
             Some(decoded.system_from.expect("delete froze a system_from") - 1);
         dst_core.execute_edge_put(
             &task,
@@ -2203,7 +2289,7 @@ mod tests {
                 dst_surrogate: Surrogate::new(2),
             },
         );
-        dst_core.active_graph_system_from = None;
+        dst_core.apply_scope.graph_system_from = None;
         assert_eq!(
             dst_core
                 .edge_store
@@ -2625,18 +2711,18 @@ mod tests {
         assert_eq!(redo.ops.len(), 1, "one vector insert -> one sub-record");
         assert_eq!(redo.ops[0].record_type, RecordType::VectorPut as u32);
 
-        // The 7-element autocommit shape carries the surrogate identity.
-        let (collection, vector, dim, _field, _doc, surrogate_u32, _prov) =
-            zerompk::from_msgpack::<(
-                String,
-                Vec<f32>,
-                usize,
-                String,
-                Option<String>,
-                u32,
-                Option<SyncProvenance>,
-            )>(&redo.ops[0].payload)
-            .expect("decode 7-element vector put");
+        // The 6-element autocommit shape carries the surrogate identity.
+        let (collection, vector, dim, _field, surrogate_u32, _prov) = zerompk::from_msgpack::<(
+            String,
+            Vec<f32>,
+            usize,
+            String,
+            u32,
+            Option<SyncProvenance>,
+        )>(
+            &redo.ops[0].payload
+        )
+        .expect("decode 6-element vector put");
         assert_eq!(collection, "emb");
         assert_eq!(vector, vec![1.0, 2.0, 3.0]);
         assert_eq!(dim, 3);
@@ -2939,6 +3025,99 @@ mod tests {
         );
     }
 
+    /// A timeseries ingest into a collection an Event Plane consumer reads
+    /// records each row's event image. WAL catch-up rebuilds one Insert per
+    /// image from the committed record, numbered in row order, with the
+    /// record's commit HLC.
+    #[test]
+    fn a_consumed_timeseries_ingest_records_the_events_catch_up_rebuilds() {
+        use crate::event::interest::{EventInterest, Interest, InterestSlice, InterestSources};
+        use crate::event::types::{RecordPosition, RowId};
+        use crate::wal::manager::{NO_APPLY_KEY, WalManager};
+
+        const COMMIT_HLC: u64 = 9_000_000;
+        let (mut src, _src_dir) = make_core();
+        let triggers = InterestSlice::new();
+        let mut consumed = Interest::default();
+        consumed.insert(DatabaseId::DEFAULT, "metrics");
+        triggers.publish(consumed);
+        let interest = EventInterest::new();
+        interest.install(InterestSources {
+            triggers,
+            ..InterestSources::default()
+        });
+        src.set_event_interest(interest);
+
+        let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
+            payload: b"metrics,host=a value=1 1700000000000000000\n\
+                       metrics,host=b value=2 1700000000001000000"
+                .to_vec(),
+            format: "ilp".to_string(),
+            wal_lsn: None,
+            surrogates: Vec::new(),
+            provenance: None,
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+            returning: None,
+            rls_filters: Vec::new(),
+        });
+        let redo =
+            decode_redo(&src.execute_resolve_txn(&make_task(), TID, TxnId::new(48), &[plan]));
+        assert_eq!(redo.ops.len(), 1);
+        let sub = crate::wal::decode_batch_record(&redo.ops[0].payload)
+            .expect("the timeseries sub-record decodes");
+        assert_eq!(
+            sub.format.as_deref(),
+            Some(crate::engine::timeseries::resolved_ingest::RESOLVED_INGEST_FORMAT)
+        );
+        let batch =
+            crate::engine::timeseries::resolved_ingest::ResolvedTsBatch::from_bytes(&sub.payload)
+                .expect("the resolved batch decodes");
+        assert!(batch.emits_events);
+        let images: Vec<Vec<u8>> = batch.rows.iter().map(|row| row.image.clone()).collect();
+        assert_eq!(images.len(), 2, "one event image per stored row");
+        assert!(images.iter().all(|image| !image.is_empty()));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = WalManager::open_for_testing(&dir.path().join("wal")).expect("open wal");
+        wal.appender(NO_APPLY_KEY)
+            .with_event_source(crate::event::EventSource::User)
+            .with_commit_hlc(COMMIT_HLC)
+            .append_transaction_redo(
+                TenantId::new(TID),
+                crate::types::VShardId::new(0),
+                DatabaseId::DEFAULT,
+                &redo,
+            )
+            .expect("append redo");
+        wal.sync().expect("sync wal");
+
+        let events = crate::event::wal_replay::replay_wal_to_events(
+            &wal,
+            crate::types::Lsn::new(0),
+            0,
+            1,
+            0,
+            &dir.path().join("ts-outcomes"),
+        )
+        .expect("catch-up");
+        assert_eq!(events.len(), 2);
+        for (occurrence, (event, image)) in events.iter().zip(&images).enumerate() {
+            assert_eq!(event.collection.as_ref(), "metrics");
+            assert_eq!(event.row_id, RowId::Batch);
+            assert_eq!(event.new_value.as_deref(), Some(image.as_slice()));
+            assert_eq!(event.commit_hlc, Some(COMMIT_HLC));
+            let position = event.record.expect("a record position");
+            assert_eq!(
+                position,
+                RecordPosition {
+                    lsn: position.lsn,
+                    occurrence: u32::try_from(occurrence).expect("small index"),
+                }
+            );
+        }
+    }
+
     /// A timeseries `Ingest` plan resolves to a `TimeseriesBatch` sub-record
     /// tagged `"timeseries"` and replays its samples into the memtable.
     #[test]
@@ -2964,15 +3143,28 @@ mod tests {
         assert_eq!(redo.ops.len(), 1, "one timeseries ingest -> one sub-record");
         assert_eq!(redo.ops[0].record_type, RecordType::TimeseriesBatch as u32);
 
-        // The payload is the format-preserving 5-element tuple tagged
-        // "timeseries" (a msgpack array), distinct from the columnar map form.
-        let (kind, collection, _payload, _prov, _format) =
-            zerompk::from_msgpack::<(String, String, Vec<u8>, Option<SyncProvenance>, String)>(
-                &redo.ops[0].payload,
-            )
-            .expect("decode timeseries 5-tuple");
+        // The payload is the six-element tuple tagged "timeseries" (a msgpack
+        // array), distinct from the columnar map form. It carries the resolved
+        // rows and the statement instant.
+        let (kind, collection, payload, _prov, format, _instant) = zerompk::from_msgpack::<(
+            String,
+            String,
+            Vec<u8>,
+            Option<SyncProvenance>,
+            String,
+            i64,
+        )>(&redo.ops[0].payload)
+        .expect("decode timeseries six-element tuple");
         assert_eq!(kind, "timeseries");
         assert_eq!(collection, "metrics");
+        assert_eq!(
+            format,
+            crate::engine::timeseries::resolved_ingest::RESOLVED_INGEST_FORMAT
+        );
+        let batch =
+            crate::engine::timeseries::resolved_ingest::ResolvedTsBatch::from_bytes(&payload)
+                .expect("decode resolved batch");
+        assert_eq!(batch.rows.len(), 1);
 
         let record = wrap_redo(&redo);
         let (mut dst, _dst_dir) = make_core();
@@ -3020,15 +3212,32 @@ mod tests {
 
         let redo = decode_redo(&src.execute_resolve_txn(&task, TID, txn, &[plan]));
         assert_eq!(redo.ops.len(), 1);
-        let (kind, collection, replay_payload, _provenance, format) =
-            zerompk::from_msgpack::<(String, String, Vec<u8>, Option<SyncProvenance>, String)>(
-                &redo.ops[0].payload,
-            )
-            .expect("decode format-preserving timeseries redo");
+        let (kind, collection, replay_payload, _provenance, format, _instant) =
+            zerompk::from_msgpack::<(
+                String,
+                String,
+                Vec<u8>,
+                Option<SyncProvenance>,
+                String,
+                i64,
+            )>(&redo.ops[0].payload)
+            .expect("decode timeseries redo");
         assert_eq!(kind, "timeseries");
         assert_eq!(collection, "cpu,load");
-        assert_eq!(format, "ilp-msgpack");
-        assert_eq!(replay_payload, payload);
+        assert_eq!(
+            format,
+            crate::engine::timeseries::resolved_ingest::RESOLVED_INGEST_FORMAT
+        );
+        // The escaped protocol values survive into the resolved row.
+        let batch = crate::engine::timeseries::resolved_ingest::ResolvedTsBatch::from_bytes(
+            &replay_payload,
+        )
+        .expect("decode resolved batch");
+        assert_eq!(batch.measurement, "cpu,load");
+        assert_eq!(
+            batch.rows.first().map(|row| row.tags.clone()),
+            Some(vec![("host name".to_string(), "west,1".to_string())])
+        );
 
         let record = wrap_redo(&redo);
         let (mut dst, _dst_dir) = make_core();
@@ -3149,6 +3358,7 @@ mod tests {
             cells_msgpack: cells_bytes,
             wal_lsn: 0,
             provenance: None,
+            vshard_id: 0,
         });
         let resp = src.execute_resolve_txn(&task, TID, txn, &[plan]);
         let redo = decode_redo(&resp);
@@ -3319,7 +3529,7 @@ mod tests {
         PhysicalPlan::Spatial(SpatialOp::Delete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
             field: field.to_string(),
-            surrogate: Surrogate::new(surrogate),
+            surrogate: Some(Surrogate::new(surrogate)),
             provenance: Some(spatial_prov(seq)),
         })
     }
@@ -3667,7 +3877,7 @@ mod tests {
         let delete_absent = PhysicalPlan::Document(DocumentOp::PointDelete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
             document_id: "absent".to_string(),
-            surrogate: Surrogate::new(9_001),
+            surrogate: Some(Surrogate::new(9_001)),
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
@@ -3713,18 +3923,31 @@ mod tests {
         core.epoch_system_ms = Some(1_700_000_999_000);
         let redo = decode_redo(&core.execute_resolve_txn(&make_task(), TID, txn, &[ingest]));
         assert_eq!(redo.ops.len(), 1);
-        let (_kind, _collection, lines, _prov, format) =
-            zerompk::from_msgpack::<(String, String, Vec<u8>, Option<SyncProvenance>, String)>(
-                &redo.ops[0].payload,
-            )
-            .expect("decode timeseries redo");
-        assert_eq!(format, "ilp-msgpack");
-        let lines: Vec<String> = zerompk::from_msgpack(&lines).expect("decode lines");
-        assert_eq!(lines.len(), 1);
-        assert!(
-            lines[0].ends_with(" 1700000000000000000"),
-            "the row carries the statement's instant: {}",
-            lines[0]
+        let (_kind, _collection, payload, _prov, format, instant) = zerompk::from_msgpack::<(
+            String,
+            String,
+            Vec<u8>,
+            Option<SyncProvenance>,
+            String,
+            i64,
+        )>(&redo.ops[0].payload)
+        .expect("decode timeseries redo");
+        assert_eq!(
+            format,
+            crate::engine::timeseries::resolved_ingest::RESOLVED_INGEST_FORMAT
+        );
+        assert_eq!(
+            instant, 1_700_000_000_000,
+            "the record carries the statement's instant"
+        );
+        let batch =
+            crate::engine::timeseries::resolved_ingest::ResolvedTsBatch::from_bytes(&payload)
+                .expect("decode resolved batch");
+        assert_eq!(batch.now_ms, 1_700_000_000_000);
+        assert_eq!(batch.rows.len(), 1);
+        assert_eq!(
+            batch.rows[0].timestamp_ms, 1_700_000_000_000,
+            "the row carries the statement's instant"
         );
     }
 
@@ -3809,5 +4032,372 @@ mod tests {
             staged.error_code.as_deref(),
             Some(crate::bridge::envelope::ErrorCode::RejectedConstraint { .. })
         ));
+    }
+
+    /// Resolve names each staged row's net kind against the committed state:
+    /// a new row is an insert, a committed row an update or a delete, and a
+    /// row the transaction inserted and deleted no change.
+    #[test]
+    fn resolve_records_each_rows_net_kind() {
+        use crate::wal::RedoRowKind;
+
+        let (mut core, _dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(40);
+        let now_ms = core.kv_read_now_ms();
+        // Each base row is bound under the surrogate the overlay stages it at.
+        for (key, surrogate) in [(b"updated".as_slice(), 2), (b"deleted".as_slice(), 3)] {
+            core.kv_engine
+                .put(crate::engine::kv::KvPutParams {
+                    database_id: 0,
+                    tenant_id: TID,
+                    collection: "netkv",
+                    key,
+                    value: b"base",
+                    ttl_ms: 0,
+                    now_ms,
+                    surrogate: Surrogate::new(surrogate),
+                })
+                .expect("a bound row writes");
+        }
+        {
+            let overlay = core.txn_overlay_mut(txn);
+            overlay.insert_put(
+                coll_key("netkv"),
+                1,
+                &kv_row_identity(b"inserted"),
+                b"v".to_vec(),
+            );
+            overlay.insert_put(
+                coll_key("netkv"),
+                2,
+                &kv_row_identity(b"updated"),
+                b"v".to_vec(),
+            );
+            overlay.insert_tombstone(coll_key("netkv"), 3, &kv_row_identity(b"deleted"));
+            overlay.insert_put(
+                coll_key("netkv"),
+                4,
+                &kv_row_identity(b"transient"),
+                b"v".to_vec(),
+            );
+            overlay.insert_tombstone(coll_key("netkv"), 4, &kv_row_identity(b"transient"));
+        }
+
+        let resp = core.execute_resolve_txn(&task, TID, txn, &[kv_write_plan("netkv")]);
+        let kinds: std::collections::BTreeMap<String, RedoRowKind> = decode_redo(&resp)
+            .row_changes
+            .into_iter()
+            .map(|change| (change.row, change.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            std::collections::BTreeMap::from([
+                ("deleted".to_owned(), RedoRowKind::Delete),
+                ("inserted".to_owned(), RedoRowKind::Insert),
+                ("transient".to_owned(), RedoRowKind::NoChange),
+                ("updated".to_owned(), RedoRowKind::Update),
+            ])
+        );
+    }
+
+    /// The `(row, kind)` of every row change a resolve response's record
+    /// names.
+    fn row_kinds(
+        resp: &crate::bridge::envelope::Response,
+    ) -> std::collections::BTreeMap<String, crate::wal::RedoRowKind> {
+        decode_redo(resp)
+            .row_changes
+            .into_iter()
+            .map(|change| (change.row, change.kind))
+            .collect()
+    }
+
+    /// Stage, on `collection`: an insert of `new`, an update of the
+    /// committed `upd`, a delete of the committed `del`, and an insert then
+    /// delete of `gone`.
+    fn stage_document_writes(core: &mut CoreLoop, txn: TxnId, collection: &str) {
+        let overlay = core.txn_overlay_mut(txn);
+        let id = RowIdentity::from_user_key;
+        overlay.insert_put(coll_key(collection), 1, &id("new"), schemaless_body("n"));
+        overlay.insert_put(coll_key(collection), 2, &id("upd"), schemaless_body("u"));
+        overlay.insert_tombstone(coll_key(collection), 3, &id("del"));
+        overlay.insert_put(coll_key(collection), 4, &id("gone"), schemaless_body("g"));
+        overlay.insert_tombstone(coll_key(collection), 4, &id("gone"));
+    }
+
+    fn expected_document_kinds() -> std::collections::BTreeMap<String, crate::wal::RedoRowKind> {
+        use crate::wal::RedoRowKind;
+        std::collections::BTreeMap::from([
+            ("del".to_owned(), RedoRowKind::Delete),
+            ("gone".to_owned(), RedoRowKind::NoChange),
+            ("new".to_owned(), RedoRowKind::Insert),
+            ("upd".to_owned(), RedoRowKind::Update),
+        ])
+    }
+
+    #[test]
+    fn document_rows_resolve_to_their_net_kind() {
+        let (mut core, _dir) = make_core();
+        let seed = wrap_redo(&RedoRecord {
+            version: 1,
+            ops: {
+                let mut ops = Vec::new();
+                document_put_sub(&mut ops, "notes", 2, "upd", schemaless_body("x"));
+                document_put_sub(&mut ops, "notes", 3, "del", schemaless_body("y"));
+                ops
+            },
+            calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
+        });
+        core.replay_transaction_redo_wal(
+            std::slice::from_ref(&seed),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        )
+        .expect("seed the committed rows");
+        let txn = TxnId::new(60);
+        stage_document_writes(&mut core, txn, "notes");
+
+        let resp = core.execute_resolve_txn(&make_task(), TID, txn, &[doc_put_plan("notes")]);
+        assert_eq!(row_kinds(&resp), expected_document_kinds());
+    }
+
+    /// A bitemporal row existed when it has a current version.
+    #[test]
+    fn bitemporal_document_rows_resolve_to_their_net_kind() {
+        let (mut core, _dir) = make_core();
+        core.doc_configs.insert(
+            coll_key("ledger"),
+            CollectionConfig::new("ledger").with_bitemporal(true),
+        );
+        for surrogate in [2u32, 3] {
+            core.sparse
+                .versioned_put(crate::engine::sparse::btree_versioned::VersionedPut {
+                    database_id: DatabaseId::DEFAULT.as_u64(),
+                    tenant: TID,
+                    coll: "ledger",
+                    doc_id: &storage_key(surrogate),
+                    sys_from_ms: 1,
+                    valid_from_ms: i64::MIN,
+                    valid_until_ms: i64::MAX,
+                    body: &schemaless_body("committed"),
+                })
+                .expect("seed a committed version");
+        }
+        let txn = TxnId::new(61);
+        stage_document_writes(&mut core, txn, "ledger");
+
+        let resp = core.execute_resolve_txn(&make_task(), TID, txn, &[doc_put_plan("ledger")]);
+        assert_eq!(row_kinds(&resp), expected_document_kinds());
+    }
+
+    /// A CRDT row the transaction staged takes its net kind from the
+    /// collection's materialized rows. A block-list mutation of a row it did
+    /// not otherwise write updates that row.
+    #[test]
+    fn crdt_rows_resolve_to_their_net_kind() {
+        use crate::wal::RedoRowKind;
+        use nodedb_physical::physical_plan::{CrdtOp, CrdtWriteVerb};
+
+        let (mut core, _dir) = make_core();
+        let txn = TxnId::new(62);
+        core.txn_overlay_mut(txn).insert_put(
+            coll_key("boards"),
+            7,
+            &RowIdentity::from_user_key("c1"),
+            schemaless_body("card"),
+        );
+        let upsert = PhysicalPlan::Crdt(CrdtOp::DocUpsert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "boards"),
+            document_id: "c1".to_owned(),
+            fields_json: r#"{"name":"card"}"#.to_owned(),
+            surrogate: Surrogate::new(7),
+            partial: false,
+            verb: CrdtWriteVerb::Insert,
+            returning: None,
+            rls_filters: Vec::new(),
+        });
+        let list = PhysicalPlan::Crdt(CrdtOp::ListInsert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "boards"),
+            document_id: "c2".to_owned(),
+            list_path: "blocks".to_owned(),
+            index: 0,
+            fields_json: r#"{"text":"a"}"#.to_owned(),
+            surrogate: Surrogate::new(8),
+        });
+
+        let resp = core.execute_resolve_txn(&make_task(), TID, txn, &[upsert, list]);
+        assert_eq!(
+            row_kinds(&resp),
+            std::collections::BTreeMap::from([
+                ("c1".to_owned(), RedoRowKind::Insert),
+                ("c2".to_owned(), RedoRowKind::Update),
+            ])
+        );
+    }
+
+    /// A vector-primary row existed when the index binds its surrogate.
+    #[test]
+    fn vector_primary_rows_resolve_to_their_net_kind() {
+        use crate::wal::RedoRowKind;
+
+        let (mut core, _dir) = make_core();
+        vp_live_upsert(&mut core, 1, &vp_fields("committed", 1));
+        let txn = TxnId::new(63);
+        let update = vp_upsert_plan(1, vp_fields("changed", 2), Vec::new());
+        let insert = vp_upsert_plan(2, vp_fields("new", 3), Vec::new());
+        for plan in [&update, &insert] {
+            let staged = core.execute_stage_write(&make_stage_task(txn), TID, plan);
+            assert_eq!(staged.status, Status::Ok, "stage: {staged:?}");
+        }
+
+        let resp = core.execute_resolve_txn(&make_task(), TID, txn, &[update, insert]);
+        assert_eq!(
+            row_kinds(&resp),
+            std::collections::BTreeMap::from([
+                ("1".to_owned(), RedoRowKind::Update),
+                ("2".to_owned(), RedoRowKind::Insert),
+            ])
+        );
+    }
+
+    /// A columnar collection names one `*` change per kind of net change its
+    /// rows hold.
+    #[test]
+    fn columnar_rows_resolve_to_one_change_per_net_kind() {
+        use crate::wal::{EVERY_ROW, RedoRowChange, RedoRowKind};
+
+        let (mut core, _dir) = make_core();
+        columnar_base_insert(
+            &mut core,
+            &columnar_insert_plan("moves", columnar_row("b", 2, "y"), 4, Vec::new()),
+        );
+        let txn = TxnId::new(64);
+        let insert = columnar_insert_plan("moves", columnar_row("c", 3, "w"), 5, Vec::new());
+        let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "moves"),
+            filters: zerompk::to_msgpack_vec(&vec![nodedb_query::scan_filter::ScanFilter {
+                field: "id".to_string(),
+                op: nodedb_query::scan_filter::FilterOp::Eq,
+                value: nodedb_types::Value::String("b".into()),
+                clauses: Vec::new(),
+                expr: None,
+            }])
+            .expect("encode filter"),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+        });
+        for plan in [&insert, &delete] {
+            let staged = core.execute_stage_write(&make_stage_task(txn), TID, plan);
+            assert_eq!(staged.status, Status::Ok, "stage: {staged:?}");
+        }
+
+        let resp = core.execute_resolve_txn(&make_task(), TID, txn, &[insert, delete]);
+        let whole = |kind| RedoRowChange {
+            collection: "moves".to_owned(),
+            row: EVERY_ROW.to_owned(),
+            kind,
+        };
+        assert_eq!(
+            decode_redo(&resp).row_changes,
+            vec![whole(RedoRowKind::Insert), whole(RedoRowKind::Delete)]
+        );
+    }
+
+    /// An array names one `*` change per kind of net change its cells hold:
+    /// a put of a new cell inserts, a put of a committed cell updates.
+    #[test]
+    fn array_cells_resolve_to_one_change_per_net_kind() {
+        use crate::engine::array::wal::ArrayPutCell;
+        use crate::wal::{EVERY_ROW, RedoRowChange, RedoRowKind};
+        use nodedb_array::schema::ArraySchemaBuilder;
+        use nodedb_array::schema::attr_spec::{AttrSpec, AttrType};
+        use nodedb_array::schema::dim_spec::{DimSpec, DimType};
+        use nodedb_array::types::ArrayId;
+        use nodedb_array::types::cell_value::value::CellValue;
+        use nodedb_array::types::coord::value::CoordValue;
+        use nodedb_array::types::domain::{Domain, DomainBound};
+
+        let schema = ArraySchemaBuilder::new("grid")
+            .dim(DimSpec::new(
+                "k",
+                DimType::Int64,
+                Domain::new(DomainBound::Int64(0), DomainBound::Int64(15)),
+            ))
+            .attr(AttrSpec::new("v", AttrType::Float64, true))
+            .tile_extents(vec![16])
+            .build()
+            .expect("array schema");
+        let schema_bytes = zerompk::to_msgpack_vec(&schema).expect("encode schema");
+        let aid = ArrayId::new(TenantId::new(TID), "grid");
+        let cell = |k: i64| ArrayPutCell {
+            coord: vec![CoordValue::Int64(k)],
+            attrs: vec![CellValue::Float64(k as f64)],
+            surrogate: Surrogate::new(u32::try_from(k).expect("small coordinate")),
+            system_from_ms: 1_000,
+            valid_from_ms: 1_000,
+            valid_until_ms: i64::MAX,
+        };
+
+        let (mut core, _dir) = make_core();
+        let task = make_task();
+        let opened = core.handle_array_open(&task, &aid, &schema_bytes, 0xABCD, 8);
+        assert_eq!(opened.status, Status::Ok, "array open: {opened:?}");
+        core.array_engine
+            .put_cells(&aid, vec![cell(4)], 1)
+            .expect("commit the cell at 4");
+
+        let txn = TxnId::new(65);
+        let put = PhysicalPlan::Array(ArrayOp::Put {
+            array_id: aid.clone(),
+            cells_msgpack: zerompk::to_msgpack_vec(&vec![cell(3), cell(4)]).expect("encode"),
+            wal_lsn: 0,
+            provenance: None,
+            vshard_id: 0,
+        });
+        let staged = core.execute_stage_write(&make_stage_task(txn), TID, &put);
+        assert_eq!(staged.status, Status::Ok, "stage: {staged:?}");
+
+        let resp = core.execute_resolve_txn(&task, TID, txn, &[put]);
+        let whole = |kind| RedoRowChange {
+            collection: "grid".to_owned(),
+            row: EVERY_ROW.to_owned(),
+            kind,
+        };
+        assert_eq!(
+            decode_redo(&resp).row_changes,
+            vec![whole(RedoRowKind::Insert), whole(RedoRowKind::Update)]
+        );
+    }
+
+    /// Timeseries rows are append-only: an ingest is an insert.
+    #[test]
+    fn a_timeseries_ingest_resolves_to_an_insert() {
+        use crate::wal::{EVERY_ROW, RedoRowChange, RedoRowKind};
+
+        let (mut core, _dir) = make_core();
+        let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "metrics"),
+            payload: b"metrics value=42 1700000000000000000".to_vec(),
+            format: "ilp".to_string(),
+            wal_lsn: None,
+            surrogates: Vec::new(),
+            provenance: None,
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+            returning: None,
+            rls_filters: Vec::new(),
+        });
+        let resp = core.execute_resolve_txn(&make_task(), TID, TxnId::new(66), &[plan]);
+        assert_eq!(
+            decode_redo(&resp).row_changes,
+            vec![RedoRowChange {
+                collection: "metrics".to_owned(),
+                row: EVERY_ROW.to_owned(),
+                kind: RedoRowKind::Insert,
+            }]
+        );
     }
 }

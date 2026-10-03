@@ -119,14 +119,14 @@ struct PreparedFlush {
     max_tile: Option<TileId>,
 }
 
-struct BuiltSegment {
-    bytes: Vec<u8>,
-    min_tile: Option<TileId>,
-    max_tile: Option<TileId>,
-    tile_count: u32,
+pub(super) struct BuiltSegment {
+    pub(super) bytes: Vec<u8>,
+    pub(super) min_tile: Option<TileId>,
+    pub(super) max_tile: Option<TileId>,
+    pub(super) tile_count: u32,
 }
 
-fn build_segment_from_memtable<'a>(
+pub(super) fn build_segment_from_memtable<'a>(
     schema: &ArraySchema,
     schema_hash: u64,
     kek: Option<&nodedb_wal::crypto::WalEncryptionKey>,

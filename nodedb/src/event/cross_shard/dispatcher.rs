@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use nodedb_cluster::wire::{VShardEnvelope, VShardMessageType};
 use nodedb_cluster::{NexarTransport, RaftRpc};
@@ -146,22 +146,10 @@ impl CrossShardDispatcher {
             .map(|(&node_id, _)| node_id)
             .collect()
     }
-
-    /// Test-only: snapshot every pending request queued for a target node, in
-    /// FIFO order, without draining the queue. Lets origination tests assert
-    /// on the exact `CrossShardWriteRequest` fields an `enqueue()` produced.
-    #[cfg(test)]
-    pub(crate) fn peek_pending(&self, target_node: u64) -> Vec<CrossShardWriteRequest> {
-        let queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
-        queues
-            .get(&target_node)
-            .map(|q| q.entries.iter().map(|w| w.request.clone()).collect())
-            .unwrap_or_default()
-    }
 }
 
 /// Send a single cross-shard write via QUIC and return the response.
-async fn send_write(
+pub(crate) async fn send_write(
     transport: &NexarTransport,
     source_node: u64,
     target_node: u64,
@@ -242,13 +230,6 @@ pub fn spawn_dispatcher_task(
                     budget.update_pending_cross_shard(pending);
 
                     // Process retries first.
-                    process_retries(
-                        &retry_queue,
-                        &transport,
-                        &metrics,
-                        &dlq,
-                        dispatcher.node_id,
-                    ).await;
                     drain_retry_queue(&mut retry_queue, &transport, &metrics, &dlq, dispatcher.node_id).await;
 
                     // Drain primary queues for all active targets.
@@ -269,7 +250,7 @@ pub fn spawn_dispatcher_task(
                                     if resp.duplicate {
                                         trace!(
                                             source_lsn = resp.source_lsn,
-                                            "cross-shard write was duplicate (HWM dedup)"
+                                            "cross-shard write was a duplicate (already applied)"
                                         );
                                     }
                                 }
@@ -326,9 +307,8 @@ async fn drain_retry_queue(
     // DLQ exhausted entries.
     if !exhausted.is_empty() {
         let mut dlq_guard = dlq.lock().unwrap_or_else(|p| p.into_inner());
-        for entry in &exhausted {
-            metrics.record_dlq();
-            let _ = dlq_guard.enqueue(DlqEnqueueParams {
+        for entry in exhausted {
+            let enqueued = dlq_guard.enqueue(DlqEnqueueParams {
                 tenant_id: entry.request.tenant_id,
                 source_collection: entry.request.source_collection.clone(),
                 sql: entry.request.sql.clone(),
@@ -337,9 +317,24 @@ async fn drain_retry_queue(
                 target_node: entry.target_node,
                 source_lsn: entry.request.source_lsn,
                 source_sequence: entry.request.source_sequence,
+                origin: entry.request.origin.clone(),
                 error: entry.last_error.clone(),
                 retry_count: entry.attempts,
             });
+            match enqueued {
+                Ok(_) => metrics.record_dlq(),
+                Err(e) => {
+                    // The write stays in the retry queue, and the next due
+                    // drain offers it to the DLQ again.
+                    error!(
+                        collection = %entry.request.source_collection,
+                        source_lsn = entry.request.source_lsn,
+                        error = %e,
+                        "cross-shard DLQ refused an exhausted write; keeping it in the retry queue"
+                    );
+                    retry_queue.hold_exhausted(entry);
+                }
+            }
         }
     }
 
@@ -363,19 +358,6 @@ async fn drain_retry_queue(
     }
 }
 
-/// Process retries is a no-op placeholder — actual work is in drain_retry_queue.
-/// Split to avoid holding mutable ref to retry_queue across await points.
-async fn process_retries(
-    _retry_queue: &CrossShardRetryQueue,
-    _transport: &NexarTransport,
-    _metrics: &CrossShardMetrics,
-    _dlq: &Mutex<CrossShardDlq>,
-    _source_node: u64,
-) {
-    // Retry processing is done in drain_retry_queue which takes &mut.
-    // This function exists to clarify the separation in the main loop.
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +370,7 @@ mod tests {
             source_vshard: 3,
             source_lsn: lsn,
             source_sequence: lsn,
+            origin: String::new(),
             cascade_depth: 0,
             source_collection: "orders".into(),
             target_vshard: 7,

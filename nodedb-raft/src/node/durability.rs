@@ -10,6 +10,7 @@
 //! destroys the only source that can rebuild the memory-only engines.
 
 use crate::error::{RaftError, Result};
+use crate::message::LogEntry;
 use crate::node::core::RaftNode;
 use crate::storage::LogStorage;
 
@@ -19,8 +20,39 @@ impl<S: LogStorage> RaftNode<S> {
     /// This is the DELIVERY watermark: it advances as entries are handed to
     /// the state machine, before their effects are necessarily durable. Use
     /// [`Self::save_durable_applied_index`] for the durability floor.
+    ///
+    /// Monotonic: a snapshot install can raise the watermark while the caller
+    /// applies a batch taken earlier, so a lower `applied_to` is a no-op.
     pub fn advance_applied(&mut self, applied_to: u64) {
-        self.volatile.last_applied = applied_to;
+        self.volatile.last_applied = self.volatile.last_applied.max(applied_to);
+    }
+
+    /// Return a committed batch taken from `Ready` that the caller did not
+    /// apply, so the next `take_ready` delivers it again.
+    ///
+    /// Entries at or below `last_applied` are dropped: a snapshot installed
+    /// since the batch was taken covers them. Entries queued after the take
+    /// that repeat the batch are dropped too, so each index is queued once.
+    pub fn requeue_committed(&mut self, batch: Vec<LogEntry>) {
+        let applied = self.volatile.last_applied;
+        let mut merged: Vec<LogEntry> = batch
+            .into_iter()
+            .filter(|entry| entry.index > applied)
+            .collect();
+        let through = merged.last().map_or(applied, |entry| entry.index);
+        merged.extend(
+            self.ready
+                .committed_entries
+                .drain(..)
+                .filter(|entry| entry.index > through),
+        );
+        self.ready.committed_entries = merged;
+    }
+
+    /// Whether committed entries this node has not applied are gone from its
+    /// log. Only a snapshot can supply them.
+    pub fn has_apply_gap(&self) -> bool {
+        self.volatile.last_applied < self.log.snapshot_index()
     }
 
     /// Highest log index whose apply is durable on this node.
@@ -88,18 +120,31 @@ impl<S: LogStorage> RaftNode<S> {
     /// entries whose redo record is not yet fsynced — losing the only recovery
     /// source for the memory-only engines.
     ///
+    /// It also clamps to `volatile.last_applied`. The data plane can make an
+    /// entry durable before the tick records its hand-off. Compacting past
+    /// `last_applied` then would discard entries the next collection still
+    /// reads.
+    ///
+    /// Every request is first clamped to the compaction ceiling, when one is
+    /// set (see [`Self::set_compaction_ceiling`]).
+    ///
     /// Returns `Ok(false)` when there is nothing to compact
     /// (`up_to_index <= snapshot_index`). Returns
     /// `Err(RaftError::LogCompacted)` if the term at `up_to_index` is no
     /// longer available (already compacted away).
     pub fn compact_log_up_to(&mut self, up_to_index: u64) -> Result<bool> {
+        let up_to_index = match &self.compaction_ceiling {
+            Some(ceiling) => up_to_index.min(ceiling.load(std::sync::atomic::Ordering::Acquire)),
+            None => up_to_index,
+        };
         if up_to_index <= self.log.snapshot_index() {
             return Ok(false);
         }
-        if up_to_index > self.durable_applied {
+        let ceiling = self.durable_applied.min(self.volatile.last_applied);
+        if up_to_index > ceiling {
             return Err(RaftError::CompactionAheadOfApplied {
                 requested: up_to_index,
-                last_applied: self.durable_applied,
+                last_applied: ceiling,
             });
         }
         let term = self
@@ -109,8 +154,17 @@ impl<S: LogStorage> RaftNode<S> {
                 requested: up_to_index,
                 first_available: self.log.snapshot_index() + 1,
             })?;
-        self.log.apply_snapshot(up_to_index, term);
+        self.log.apply_snapshot(up_to_index, term)?;
         Ok(true)
+    }
+
+    /// Bound every compaction of this log by `ceiling`: no entry above the
+    /// value it holds is discarded, whoever asks.
+    pub fn set_compaction_ceiling(
+        &mut self,
+        ceiling: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        self.compaction_ceiling = Some(ceiling);
     }
 
     /// Check the configured auto-compaction threshold against the
@@ -135,8 +189,11 @@ impl<S: LogStorage> RaftNode<S> {
         if applied_index - snapshot_index < threshold {
             return Ok(false);
         }
-        // Never compact past an entry whose apply is not yet durable.
-        let up_to = applied_index.min(self.durable_applied);
+        // Never compact past an entry whose apply is not yet durable, or that
+        // the delivery watermark has not recorded yet.
+        let up_to = applied_index
+            .min(self.durable_applied)
+            .min(self.volatile.last_applied);
         self.compact_log_up_to(up_to)
     }
 }
@@ -212,6 +269,25 @@ mod tests {
     }
 
     #[test]
+    fn no_compaction_passes_the_ceiling() {
+        let mut node = leader_with_applied_noop(test_config(1, vec![]));
+        let mut last = 0;
+        for _ in 0..4 {
+            last = node.propose(b"write".to_vec()).unwrap();
+            apply_durably(&mut node, last);
+        }
+        let ceiling = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        node.set_compaction_ceiling(std::sync::Arc::clone(&ceiling));
+        assert!(
+            !node.compact_log_up_to(last).unwrap(),
+            "a zero ceiling holds every entry"
+        );
+        ceiling.store(2, std::sync::atomic::Ordering::Release);
+        assert!(node.compact_log_up_to(last).unwrap());
+        assert_eq!(node.first_available_index(), 3);
+    }
+
+    #[test]
     fn compact_log_up_to_rejects_ahead_of_applied() {
         let mut cfg = test_config(1, vec![]);
         cfg.log_compaction_threshold = Some(2);
@@ -246,6 +322,72 @@ mod tests {
         // Once the apply is durable the same index compacts.
         node.save_durable_applied_index(idx).unwrap();
         assert!(node.compact_log_up_to(idx).unwrap());
+    }
+
+    /// A batch taken before a snapshot install finishes after it: its lower
+    /// watermark must not pull `last_applied` back below the snapshot.
+    #[test]
+    fn delivery_watermark_never_regresses() {
+        let mut node = RaftNode::new(test_config(1, vec![]), MemStorage::new());
+        node.advance_applied(10);
+        assert_eq!(node.last_applied(), 10);
+
+        node.advance_applied(4);
+        assert_eq!(node.last_applied(), 10);
+
+        node.advance_applied(12);
+        assert_eq!(node.last_applied(), 12);
+    }
+
+    /// The data plane can make an entry durable before the tick records its
+    /// hand-off. Compaction then stops at `last_applied`, so no apply gap
+    /// opens.
+    #[test]
+    fn compaction_never_passes_the_delivery_watermark() {
+        let mut cfg = test_config(1, vec![]);
+        cfg.log_compaction_threshold = Some(1);
+        let mut node = leader_with_applied_noop(cfg);
+        let idx = node
+            .propose(b"write".to_vec())
+            .expect("single voter commits");
+        let _ = node.take_ready();
+        node.save_durable_applied_index(idx).expect("save floor");
+
+        let err = node.compact_log_up_to(idx).expect_err("ahead of delivery");
+        assert!(matches!(err, RaftError::CompactionAheadOfApplied { .. }));
+        node.maybe_compact_log(idx).expect("clamped compaction");
+        assert!(node.log_snapshot_index() <= node.last_applied());
+        assert!(!node.has_apply_gap());
+    }
+
+    /// A requeued batch comes back once, merged with entries queued after it
+    /// was taken, and without the entries a snapshot has since covered.
+    #[test]
+    fn requeued_batch_is_delivered_again_once() {
+        let mut node = leader_with_applied_noop(test_config(1, vec![]));
+        let first = node.propose(b"a".to_vec()).expect("single voter commits");
+        node.propose(b"b".to_vec()).expect("single voter commits");
+        let batch = node.take_ready().committed_entries;
+        let third = node.propose(b"c".to_vec()).expect("single voter commits");
+
+        node.requeue_committed(batch.clone());
+        let indices: Vec<u64> = node
+            .take_ready()
+            .committed_entries
+            .iter()
+            .map(|entry| entry.index)
+            .collect();
+        assert_eq!(indices, vec![first, first + 1, third]);
+
+        node.advance_applied(first);
+        node.requeue_committed(batch);
+        let indices: Vec<u64> = node
+            .take_ready()
+            .committed_entries
+            .iter()
+            .map(|entry| entry.index)
+            .collect();
+        assert_eq!(indices, vec![first + 1]);
     }
 
     /// The durable floor never moves backwards, however a caller retries.

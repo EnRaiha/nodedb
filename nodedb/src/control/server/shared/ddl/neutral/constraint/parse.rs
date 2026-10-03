@@ -2,8 +2,7 @@
 
 //! Parsing helpers for constraint DDL: transition rules, predicates, expressions.
 //!
-//! Ported verbatim from the pgwire `ddl::constraint::parse`; only the error type
-//! changed from pgwire `PgWireError` to the protocol-neutral [`DdlError`].
+//! Parse errors are the protocol-neutral [`DdlError`].
 
 use nodedb_sql::parser::preprocess::lex::{
     find_ascii_case_insensitive, find_ascii_case_insensitive_from,

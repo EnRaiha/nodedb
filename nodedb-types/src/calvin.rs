@@ -111,6 +111,16 @@ pub enum EngineKeySet {
         edges: SortedVec<(u32, u32)>,
         home_vshards: SortedVec<u32>,
     },
+    /// Array engine: the array's cells on each vShard in `vshards`.
+    ///
+    /// An array is tile-partitioned: its cells live on the vShards their
+    /// tiles hash to, not on the array's collection home. Each vShard in
+    /// `vshards` participates, and the transaction locks the whole array on
+    /// it. Appended last: the encoding is positional.
+    Array {
+        collection: String,
+        vshards: SortedVec<u32>,
+    },
 }
 
 impl EngineKeySet {
@@ -130,6 +140,8 @@ impl EngineKeySet {
             Self::Kv { keys, .. } => keys.iter().map(|k| k.len()).sum(),
             // Edge: two u32 per edge = 8 bytes each.
             Self::Edge { edges, .. } => edges.len() * 8,
+            // Array: one u32 vShard each.
+            Self::Array { vshards, .. } => vshards.len() * 4,
         }
     }
 
@@ -139,7 +151,8 @@ impl EngineKeySet {
             Self::Document { collection, .. }
             | Self::Vector { collection, .. }
             | Self::Kv { collection, .. }
-            | Self::Edge { collection, .. } => collection,
+            | Self::Edge { collection, .. }
+            | Self::Array { collection, .. } => collection,
         }
     }
 
@@ -150,6 +163,7 @@ impl EngineKeySet {
             Self::Vector { surrogates, .. } => surrogates.is_empty(),
             Self::Kv { keys, .. } => keys.is_empty(),
             Self::Edge { edges, .. } => edges.is_empty(),
+            Self::Array { vshards, .. } => vshards.is_empty(),
         }
     }
 }
@@ -277,6 +291,16 @@ pub struct VersionedReadEntry {
     pub key: ReadKeyIdent,
     /// The responding shard's write-LSN watermark at read time.
     pub read_lsn: Lsn,
+    /// The vShard whose write versions validate this read. `None` homes the
+    /// read to its collection's vShard. A graph read names the key vShard it
+    /// read edges on, because edges live on their endpoints' vShards. A homed
+    /// read with an empty `collection` observed every collection there, so it
+    /// validates against the shard's core watermark.
+    pub home_vshard: Option<u32>,
+    /// The node that served the read. `read_lsn` is a position in that node's
+    /// WAL, so a participant on any other node treats the read as changed.
+    /// `0` when no one node is known to have served it.
+    pub served_by: u64,
 }
 
 /// The LSN-versioned read-set of a Calvin transaction.

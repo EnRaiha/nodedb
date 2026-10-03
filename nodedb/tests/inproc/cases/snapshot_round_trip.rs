@@ -11,18 +11,19 @@
 //! 2. The production [`DataPlaneSnapshotBuilder`] builds a group snapshot
 //!    (group-filtered `TenantDataSnapshot` bytes).
 //! 3. A FRESH TARGET `TestServer` pre-creates the identical schema, then the
-//!    production [`DataPlaneSnapshotApplier`] installs the bytes.
+//!    production [`DataPlaneSnapshotApplier`] installs the bytes. The target
+//!    is its own cluster, so the snapshot's metadata floor moves into the
+//!    target's metadata index space first (`rebase_metadata_floor`).
 //! 4. The target is verified through the normal query paths: `COUNT(*)`, a PK
 //!    point-lookup (which exercises pk→surrogate resolution against the target
 //!    catalog — proving the applier rebound the binding), and a direct catalog
 //!    surrogate-equality check against the source.
 //!
-//! Routing: a single-node `TestServer` is normally `cluster_routing == None`,
-//! which makes the builder ship an empty snapshot. Both nodes are started with
-//! `RoutingTable::uniform(1, &[1], 1)`. With one data group, every vShard maps
-//! to data group `1` (group `0` is metadata and owns no vShards), so the test
-//! collection's vShard is guaranteed to land in group `1` — the group built and
-//! applied here. The test asserts this membership explicitly.
+//! Routing: each `TestServer` runs a one-node cluster whose routing table
+//! maps every vShard to one of its data groups. The group that homes the test
+//! collection is read from that table and is the group built and applied
+//! here. Every one-node cluster builds the same table, and the test asserts
+//! that the target agrees.
 
 use nodedb_test_support::pgwire_harness::TestServer;
 
@@ -31,29 +32,21 @@ use nodedb::control::cluster::snapshot_builder::DataPlaneSnapshotBuilder;
 use nodedb::types::TenantId;
 use nodedb_cluster::SnapshotApplier;
 use nodedb_cluster::SnapshotBuilder;
-use nodedb_cluster::routing::vshard_for_collection;
 use nodedb_types::id::DatabaseId;
 
-use super::snapshot_rt_common::{DATA_GROUP_ID, first_value, single_node_routing};
+use super::snapshot_rt_common::{
+    await_group_calvin_kept, data_group_of, first_value, rebase_metadata_floor,
+};
 
 #[tokio::test]
 async fn snapshot_round_trip_builder_to_applier() {
     const COLL: &str = "snap_rt_docs";
     let pks = ["pk0", "pk1", "pk2", "pk3", "pk4"];
 
-    // ── Sanity: the collection's vShard belongs to the data group we build. ───
-    let vshard = vshard_for_collection(nodedb_types::CollectionKey::from_bare(
-        DatabaseId::DEFAULT,
-        COLL,
-    ));
-    let routing = single_node_routing();
-    assert!(
-        routing.vshards_for_group(DATA_GROUP_ID).contains(&vshard),
-        "collection vShard {vshard} must belong to data group {DATA_GROUP_ID}"
-    );
-
     // ── SOURCE node: create collection + insert rows over pgwire. ─────────────
-    let source = TestServer::start_with_routing(single_node_routing()).await;
+    let source = TestServer::start().await;
+    // The data group that homes the collection: the group built and applied.
+    let group = data_group_of(&source, COLL);
     {
         let client = &*source.client;
         client
@@ -99,18 +92,21 @@ async fn snapshot_round_trip_builder_to_applier() {
         .expect("source must have a surrogate for pk0");
 
     // ── Build the group snapshot via the PRODUCTION builder. ──────────────────
+    await_group_calvin_kept(&source, group).await;
     let builder = DataPlaneSnapshotBuilder::new(source.shared.clone());
     let bytes = builder
-        .build_group_snapshot(DATA_GROUP_ID, 0, 0)
+        .build_group_snapshot(group, 0, 0)
         .await
-        .expect("build_group_snapshot");
+        .expect("build_group_snapshot")
+        .bytes;
     assert!(
         !bytes.is_empty(),
         "production builder must produce a non-empty group snapshot"
     );
 
     // ── TARGET node: fresh server, same routing, identical schema pre-created. ─
-    let target = TestServer::start_with_routing(single_node_routing()).await;
+    let target = TestServer::start().await;
+    assert_eq!(data_group_of(&target, COLL), group);
     {
         let client = &*target.client;
         client
@@ -121,11 +117,12 @@ async fn snapshot_round_trip_builder_to_applier() {
             .await
             .expect("CREATE COLLECTION on target");
     }
+    let bytes = rebase_metadata_floor(&bytes, &target);
 
     // ── Apply via the PRODUCTION applier. ─────────────────────────────────────
     let applier = DataPlaneSnapshotApplier::new(target.shared.clone());
     applier
-        .apply_snapshot(DATA_GROUP_ID, &bytes)
+        .apply_snapshot(group, &bytes)
         .await
         .expect("apply_snapshot");
 
@@ -196,20 +193,10 @@ async fn snapshot_round_trip_timeseries() {
         ("p4", 4000, 40.0),
     ];
 
-    // ── Sanity: the collection's vShard belongs to the data group we build. ───
-    let vshard = vshard_for_collection(nodedb_types::CollectionKey::from_bare(
-        DatabaseId::DEFAULT,
-        COLL,
-    ));
-    assert!(
-        single_node_routing()
-            .vshards_for_group(DATA_GROUP_ID)
-            .contains(&vshard),
-        "collection vShard {vshard} must belong to data group {DATA_GROUP_ID}"
-    );
-
     // ── SOURCE node: create collection + insert rows over pgwire. ─────────────
-    let source = TestServer::start_with_routing(single_node_routing()).await;
+    let source = TestServer::start().await;
+    // The data group that homes the collection: the group built and applied.
+    let group = data_group_of(&source, COLL);
     {
         let client = &*source.client;
         client
@@ -228,18 +215,21 @@ async fn snapshot_round_trip_timeseries() {
     }
 
     // ── Build the group snapshot via the PRODUCTION builder. ──────────────────
+    await_group_calvin_kept(&source, group).await;
     let builder = DataPlaneSnapshotBuilder::new(source.shared.clone());
     let bytes = builder
-        .build_group_snapshot(DATA_GROUP_ID, 0, 0)
+        .build_group_snapshot(group, 0, 0)
         .await
-        .expect("build_group_snapshot");
+        .expect("build_group_snapshot")
+        .bytes;
     assert!(
         !bytes.is_empty(),
         "production builder must produce a non-empty group snapshot"
     );
 
     // ── TARGET node: fresh server, same routing, identical schema pre-created. ─
-    let target = TestServer::start_with_routing(single_node_routing()).await;
+    let target = TestServer::start().await;
+    assert_eq!(data_group_of(&target, COLL), group);
     {
         let client = &*target.client;
         client
@@ -247,11 +237,12 @@ async fn snapshot_round_trip_timeseries() {
             .await
             .expect("CREATE COLLECTION on target");
     }
+    let bytes = rebase_metadata_floor(&bytes, &target);
 
     // ── Apply via the PRODUCTION applier. ─────────────────────────────────────
     let applier = DataPlaneSnapshotApplier::new(target.shared.clone());
     applier
-        .apply_snapshot(DATA_GROUP_ID, &bytes)
+        .apply_snapshot(group, &bytes)
         .await
         .expect("apply_snapshot");
 
@@ -291,20 +282,10 @@ async fn snapshot_round_trip_vector() {
         ("v4", [0.7, 0.7, 0.0, 0.0]),
     ];
 
-    // ── Sanity: the collection's vShard belongs to the data group we build. ───
-    let vshard = vshard_for_collection(nodedb_types::CollectionKey::from_bare(
-        DatabaseId::DEFAULT,
-        COLL,
-    ));
-    assert!(
-        single_node_routing()
-            .vshards_for_group(DATA_GROUP_ID)
-            .contains(&vshard),
-        "collection vShard {vshard} must belong to data group {DATA_GROUP_ID}"
-    );
-
     // ── SOURCE node: create collection + insert vectors over pgwire. ──────────
-    let source = TestServer::start_with_routing(single_node_routing()).await;
+    let source = TestServer::start().await;
+    // The data group that homes the collection: the group built and applied.
+    let group = data_group_of(&source, COLL);
     {
         let client = &*source.client;
         client
@@ -324,18 +305,21 @@ async fn snapshot_round_trip_vector() {
     }
 
     // ── Build the group snapshot via the PRODUCTION builder. ──────────────────
+    await_group_calvin_kept(&source, group).await;
     let builder = DataPlaneSnapshotBuilder::new(source.shared.clone());
     let bytes = builder
-        .build_group_snapshot(DATA_GROUP_ID, 0, 0)
+        .build_group_snapshot(group, 0, 0)
         .await
-        .expect("build_group_snapshot");
+        .expect("build_group_snapshot")
+        .bytes;
     assert!(
         !bytes.is_empty(),
         "production builder must produce a non-empty group snapshot"
     );
 
     // ── TARGET node: fresh server, same routing, identical vector params. ─────
-    let target = TestServer::start_with_routing(single_node_routing()).await;
+    let target = TestServer::start().await;
+    assert_eq!(data_group_of(&target, COLL), group);
     {
         let client = &*target.client;
         client
@@ -343,11 +327,12 @@ async fn snapshot_round_trip_vector() {
             .await
             .expect("CREATE COLLECTION on target");
     }
+    let bytes = rebase_metadata_floor(&bytes, &target);
 
     // ── Apply via the PRODUCTION applier. ─────────────────────────────────────
     let applier = DataPlaneSnapshotApplier::new(target.shared.clone());
     applier
-        .apply_snapshot(DATA_GROUP_ID, &bytes)
+        .apply_snapshot(group, &bytes)
         .await
         .expect("apply_snapshot");
 
@@ -386,20 +371,10 @@ async fn snapshot_round_trip_edges() {
     // fast; the traversal below is non-empty ONLY if the edges round-trip.
     const FANOUT: usize = 8;
 
-    // ── Sanity: the collection's vShard belongs to the data group we build. ───
-    let vshard = vshard_for_collection(nodedb_types::CollectionKey::from_bare(
-        DatabaseId::DEFAULT,
-        COLL,
-    ));
-    assert!(
-        single_node_routing()
-            .vshards_for_group(DATA_GROUP_ID)
-            .contains(&vshard),
-        "collection vShard {vshard} must belong to data group {DATA_GROUP_ID}"
-    );
-
     // ── SOURCE node: create collection + insert edges over pgwire. ────────────
-    let source = TestServer::start_with_routing(single_node_routing()).await;
+    let source = TestServer::start().await;
+    // The data group that homes the collection: the group built and applied.
+    let group = data_group_of(&source, COLL);
     source
         .exec(&format!("CREATE COLLECTION {COLL}"))
         .await
@@ -413,18 +388,17 @@ async fn snapshot_round_trip_edges() {
             .unwrap_or_else(|e| panic!("GRAPH INSERT EDGE leaf_{i} on source: {e}"));
     }
 
-    // (No source-side traversal sanity: with `cluster_routing` injected — which
-    // the builder requires — `GRAPH TRAVERSE` attempts distributed graph dispatch
-    // and needs a cluster gateway the single-node harness has no. The edge
-    // INSERTs above are `.expect`-checked, so the edges are definitely present;
-    // the round-trip is proven by the TARGET traversal below.)
+    // The edge INSERTs above are `.expect`-checked, so the edges are present.
+    // The round-trip is proven by the TARGET traversal below.
 
     // ── Build the group snapshot via the PRODUCTION builder. ──────────────────
+    await_group_calvin_kept(&source, group).await;
     let builder = DataPlaneSnapshotBuilder::new(source.shared.clone());
     let bytes = builder
-        .build_group_snapshot(DATA_GROUP_ID, 0, 0)
+        .build_group_snapshot(group, 0, 0)
         .await
-        .expect("build_group_snapshot");
+        .expect("build_group_snapshot")
+        .bytes;
     assert!(
         !bytes.is_empty(),
         "production builder must produce a non-empty group snapshot"
@@ -444,20 +418,18 @@ async fn snapshot_round_trip_edges() {
     );
 
     // ── TARGET node: fresh server, identical schema pre-created. ──────────────
-    // The target is started WITHOUT a routing table: the applier does not need
-    // one (the snapshot bytes are already group-filtered), and its absence keeps
-    // the verification `GRAPH TRAVERSE` below on the local (non-distributed) path
-    // so it does not require a cluster gateway.
     let target = TestServer::start().await;
+    assert_eq!(data_group_of(&target, COLL), group);
     target
         .exec(&format!("CREATE COLLECTION {COLL}"))
         .await
         .expect("CREATE COLLECTION on target");
+    let bytes = rebase_metadata_floor(&bytes, &target);
 
     // ── Apply via the PRODUCTION applier. ─────────────────────────────────────
     let applier = DataPlaneSnapshotApplier::new(target.shared.clone());
     applier
-        .apply_snapshot(DATA_GROUP_ID, &bytes)
+        .apply_snapshot(group, &bytes)
         .await
         .expect("apply_snapshot");
 

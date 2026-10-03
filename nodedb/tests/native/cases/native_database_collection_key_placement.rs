@@ -220,13 +220,13 @@ fn surrogates(
         let surrogate = srv
             .shared
             .surrogate_assigner
-            .lookup(canonical, TENANT, pk.as_bytes())
+            .lookup_bound(canonical, TENANT, pk.as_bytes())
             .expect("surrogate lookup")
             .unwrap_or_else(|| panic!("row '{pk}' has no surrogate under the canonical key"));
         let stray = srv
             .shared
             .surrogate_assigner
-            .lookup(raw_qualified, TENANT, pk.as_bytes())
+            .lookup_bound(raw_qualified, TENANT, pk.as_bytes())
             .expect("stray surrogate lookup");
         assert_eq!(
             stray, None,

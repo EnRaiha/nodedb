@@ -30,6 +30,14 @@ pub struct SystemCatalog {
     pub(super) fail_next_function_wasm_write: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     pub(super) fail_next_collection_write: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    pub(super) fail_next_surrogate_write: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::storage::RedbBacked for SystemCatalog {
+    fn redb_database(&self) -> &Database {
+        &self.db
+    }
 }
 
 impl SystemCatalog {
@@ -57,6 +65,8 @@ impl SystemCatalog {
             fail_next_function_wasm_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_collection_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_surrogate_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         catalog.bootstrap_default_database()?;
         catalog.reload_event_definitions()?;
@@ -81,6 +91,8 @@ impl SystemCatalog {
             fail_next_function_wasm_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_collection_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_surrogate_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         catalog.bootstrap_default_database()?;
         catalog.reload_event_definitions()?;
@@ -106,6 +118,14 @@ impl SystemCatalog {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Make the next surrogate watermark write raise, so an applier's error
+    /// path runs.
+    #[cfg(test)]
+    pub(crate) fn fail_next_surrogate_write_for_test(&self) {
+        self.fail_next_surrogate_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Bootstrap every `_system.*` table from the canonical registry —
     /// but only if at least one is actually missing. Probing read-only
     /// first keeps `open` byte-idempotent on an already-bootstrapped
@@ -113,7 +133,7 @@ impl SystemCatalog {
     /// page on redb every time, so an unconditional bootstrap rewrites
     /// `system.redb` on every boot (changing its size/md5) even when
     /// nothing changed — and a boot that then fails its integrity check
-    /// would have mutated persistent catalog state on its way out.
+    /// mutates persistent catalog state on its way out.
     /// Opening a table in a write transaction creates it if absent; the
     /// registry is the single source of truth, so a table cannot be
     /// read in production code without being bootstrapped here. Returns
@@ -279,7 +299,7 @@ mod tests {
         // bootstrap registry, so boot-time readers (integrity walk,
         // continuous-aggregate replay, …) open existing empty tables
         // instead of hitting "table does not exist". Re-opening each
-        // entry read-only would fail with `TableDoesNotExist` if the
+        // entry read-only fails with `TableDoesNotExist` if the
         // init path ever stopped iterating the registry.
         let dir = tempfile::tempdir().unwrap();
         let catalog = SystemCatalog::open(&dir.path().join("system.redb")).unwrap();

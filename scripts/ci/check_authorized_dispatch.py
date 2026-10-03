@@ -58,6 +58,7 @@ FORBIDDEN = (
     "dispatch_crdt_restore_admitted",
     "dispatch_calvin_or_fast",
     "propose_sync_write",
+    "propose_sync_plan",
     "propose_replicated_entry",
     "dispatch_route",
     "dispatch_route_stream",
@@ -74,15 +75,18 @@ ALLOWED_DEFINITIONS = {
         "dispatch_trusted_internal_sync_response",
     ),
     ("control/server/sync/raft_dispatch/propose.rs", "propose_sync_write"),
+    ("control/server/sync/raft_dispatch/propose.rs", "propose_sync_plan"),
 }
 
 # Narrow implementation seams that sit in mixed transport/helper modules. The
 # referenced functions are private or are reached only after a consumed
 # capability; no other occurrence in these files is exempt.
 ALLOWED_REFERENCES = {
+    # A refused KV sync frame still moves the producer mark: an empty-key delete
+    # that carries only the frame's provenance and writes no user data.
     (
-        "control/server/sync/raft_dispatch/response.rs",
-        "dispatch_trusted_internal_write_to_data_plane",
+        "control/server/sync/kv_handler.rs",
+        "dispatch_trusted_internal_sync_response",
     ),
     (
         "control/server/native/dispatch/transaction.rs",
@@ -94,16 +98,14 @@ ALLOWED_REFERENCES = {
         "control/server/sync/raft_dispatch/mod.rs",
         "dispatch_trusted_internal_sync_response",
     ),
-    ("control/server/pgwire/handler/dispatch/replicated.rs", "into_physical_task"),
-    ("control/server/pgwire/handler/dispatch/routing.rs", "into_physical_task"),
     ("control/server/pgwire/handler/submit.rs", "into_physical_task"),
     ("control/server/shared/cluster_array_dispatch.rs", "into_physical_task"),
     ("control/array_sync/inbound.rs", "into_scope"),
     ("control/array_sync/inbound_propose.rs", "into_scope"),
     ("control/array_sync/snapshot_assembly.rs", "into_scope"),
-    ("control/server/native/dispatch/sql_dispatch_task.rs", "into_physical_task"),
-    ("control/server/sync/raft_dispatch/response.rs", "propose_sync_write"),
-    ("control/server/sync/raft_dispatch/write.rs", "propose_sync_write"),
+    ("control/server/sync/raft_dispatch/propose.rs", "propose_sync_write"),
+    ("control/server/sync/raft_dispatch/response.rs", "propose_sync_plan"),
+    ("control/server/sync/raft_dispatch/write.rs", "propose_sync_plan"),
     (
         "control/server/pgwire/handler/dispatch/replicated.rs",
         "propose_replicated_entry",

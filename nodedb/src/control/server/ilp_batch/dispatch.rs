@@ -9,15 +9,19 @@ use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::lease::QueryLeaseScope;
+use crate::control::metadata_proposer::DEFAULT_DRAIN_TIMEOUT;
 use crate::control::planner::calvin::{
-    TxnDispatchPosition, dispatch_authorized_strict_atomic_tasks_to_calvin,
+    TxnDispatchPosition, TxnProvenance, dispatch_strict_atomic_tasks_to_calvin,
 };
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::ClientRequestScope;
 use crate::control::server::ilp_auth::AuthenticatedIlpContext;
 use crate::control::server::shared::authorization::authorize_task_set;
+use crate::control::server::shared::clone_write::write_lease;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
+use crate::control::server::shared::retry::retry_through_drain;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::TimeseriesOp;
@@ -43,7 +47,8 @@ pub(crate) async fn flush_ilp_batch(
 }
 
 /// Strictly parse, authorize, and atomically ingest canonical ILP produced by
-/// another authenticated external transport such as OTLP.
+/// another authenticated external transport such as OTLP. Returns the number
+/// of rows stored: the lines received less the lines the resolve rejected.
 pub(crate) async fn flush_authenticated_ilp_batch(
     state: &Arc<SharedState>,
     identity: &AuthenticatedIdentity,
@@ -53,7 +58,7 @@ pub(crate) async fn flush_authenticated_ilp_batch(
 ) -> crate::Result<u64> {
     // Blacklist + account status, no rate limit: ILP/OTLP ingest is not the
     // per-query traffic the rate-limiter's cost table models, so charging it
-    // against a query rate limit would throttle a legitimate high-volume
+    // against a query rate limit will throttle a legitimate high-volume
     // ingest client. A blacklisted or suspended/banned account must not be
     // able to keep ingesting, though — `check_blacklist_and_status` runs
     // that half of `check_request_admission`'s gate (plus the
@@ -92,25 +97,24 @@ pub(crate) async fn flush_authenticated_ilp_batch(
 ///
 /// The merge is a replicated catalog DDL, and every catalog DDL already
 /// serializes on `SharedState::metadata_ddl_lock`. A second concurrent merge
-/// could therefore only park a second blocking-pool thread on a lock that
-/// admits one holder, so one permit is both the useful and the safe bound —
-/// ingest can never grow the blocking pool no matter how many ILP connections
-/// or OTLP requests are live.
+/// can therefore only park a second task on a lock that admits one holder,
+/// so one permit is both the useful and the safe bound — ingest can never
+/// queue merges no matter how many ILP connections or OTLP requests are live.
 static SCHEMA_PROJECTION_SLOT: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
 
 /// Merge the ingest-inferred schema projection for `groups` off the caller's
 /// task.
 ///
-/// `merge_collection_fields_replicated` is a fully synchronous replicated DDL:
-/// it takes the metadata DDL preparation lock, acquires the distributed
-/// preparation lease, drains prior-version descriptor leases and waits for the
-/// local apply — a chain whose bounds are tens of seconds. Running it inline on
-/// the ingest task is what starved ILP: `handle_ilp_connection` awaits the
-/// flush inside its `select!`, so for the whole of that chain the connection
-/// polls neither the socket-read branch nor the coalescing timer, and no
-/// subsequent batch is dispatched at all.
+/// `merge_collection_fields_replicated` is a replicated DDL: it takes the
+/// metadata DDL preparation lock, acquires the distributed preparation lease,
+/// drains prior-version descriptor leases and waits for the local apply and
+/// its Data Plane register — a chain whose bounds are tens of seconds. Running
+/// it inline on the ingest task is what starved ILP: `handle_ilp_connection`
+/// awaits the flush inside its `select!`, so for the whole of that chain the
+/// connection polls neither the socket-read branch nor the coalescing timer,
+/// and no subsequent batch is dispatched at all.
 ///
-/// It is therefore run on the blocking pool and deliberately NOT awaited. That
+/// It therefore runs on its own task and is deliberately NOT awaited. That
 /// costs no durability: the Calvin write above is already committed, and the
 /// projection is rebuildable and self-healing — every ILP batch re-supplies its
 /// measurement's full field set, so a merge skipped because the slot was busy
@@ -122,7 +126,7 @@ fn spawn_schema_projection_merge(
     tenant_id: TenantId,
     groups: Vec<IlpMeasurementBatch>,
 ) {
-    // Bound the permit to `'static` explicitly: it is moved into the blocking
+    // Bound the permit to `'static` explicitly: it is moved into the merge
     // task and must outlive this frame.
     let slot: &'static Semaphore = &SCHEMA_PROJECTION_SLOT;
     let Ok(permit) = slot.try_acquire() else {
@@ -133,9 +137,9 @@ fn spawn_schema_projection_merge(
         return;
     };
     let state = Arc::clone(state);
-    tokio::task::spawn_blocking(move || {
+    tokio::spawn(async move {
         // Held for the whole merge so the next batch's `try_acquire` observes
-        // a busy slot rather than queueing another blocking thread.
+        // a busy slot rather than queueing another merge.
         let _permit = permit;
         for group in groups {
             match crate::control::catalog_entry::merge_collection_fields_replicated(
@@ -143,12 +147,15 @@ fn spawn_schema_projection_merge(
                 database_id,
                 tenant_id.as_u64(),
                 &group.measurement,
+                group.catalog_time_column.as_ref(),
                 &group.catalog_fields,
-            ) {
+            )
+            .await
+            {
                 Ok(_) => {}
                 // This is a rebuildable control-plane projection. The data
                 // commit is already durable, so logging is required but
-                // retrying the client request would risk a duplicate write.
+                // retrying the client request will risk a duplicate write.
                 Err(error) => warn!(
                     collection = %group.measurement,
                     error = %error,
@@ -173,7 +180,7 @@ async fn flush_ilp_batch_inner(
 
     // This transport builds its physical tasks itself instead of going through
     // the SQL planner, so it has to run the planner's row-level-security pass
-    // over them explicitly — without this the line-protocol listener would be a
+    // over them explicitly — without this the line-protocol listener will be a
     // way to write rows a write policy forbids, with the same identity and the
     // same collection that `INSERT` refuses. The resolved scope is the same one
     // the metering pass below uses, so the policy is evaluated for exactly the
@@ -182,7 +189,7 @@ async fn flush_ilp_batch_inner(
     // It runs BEFORE `authorize_task_set` and before dispatch: the pass mutates
     // the tasks (it compiles the write predicate onto each `Ingest`), and an
     // authorized task set is what gets dispatched, so injecting afterwards
-    // would dispatch the un-injected copies.
+    // will dispatch the un-injected copies.
     //
     // Resolved against the sender's real address like the admission scope
     // above, so a `WHEN`/`REQUIRE IP` scope grant contributes to `$auth.*`
@@ -211,19 +218,37 @@ async fn flush_ilp_batch_inner(
     let authorized =
         authorize_task_set(identity, &tasks, &state.permissions, &state.roles, &emitter)
             .map_err(crate::Error::from)?;
+    // The leases gate the batch on a drained collection and live until the
+    // batch's Calvin write commits.
+    let _leases = acquire_batch_write_leases(state, &tasks).await?;
 
+    // Each measurement resolves to the rows it stores before the batch is
+    // sequenced. The lines a resolve rejected never land, so the batch
+    // reports the rows it stored, not the lines it received.
+    let submitted: Vec<PhysicalTask> = authorized
+        .into_tasks()
+        .into_iter()
+        .map(|task| task.into_physical_task())
+        .collect();
+    let submitted =
+        match crate::control::write_resolve::resolve_tasks_for_log(state, &submitted).await? {
+            Some(resolved) => resolved,
+            None => submitted,
+        };
     // One Calvin submit stages every measurement and makes the TransactionRedo
-    // the sole durability record; no per-measurement WAL or direct dispatch may
+    // the sole durability record; no per-measurement WAL or direct dispatch can
     // race ahead of a later measurement failure.
-    let _ = dispatch_authorized_strict_atomic_tasks_to_calvin(
+    let applied = dispatch_strict_atomic_tasks_to_calvin(
         state,
-        authorized,
+        &submitted,
         tenant_id,
         TxnDispatchPosition::Autocommit,
         &[],
         None,
+        TxnProvenance::client(),
     )
     .await?;
+    let rejected = rejected_lines_of(&submitted, applied.as_ref())?;
 
     // Metered here, once the whole batch's atomic Calvin write has already
     // committed: one usage event per measurement (= one dispatched
@@ -250,12 +275,76 @@ async fn flush_ilp_batch_inner(
     //
     // The merge goes through the replicated metadata path, never a local
     // catalog write: the projection lives inside the replicated collection
-    // descriptor, and mutating that record in place would leave this node's
+    // descriptor, and mutating that record in place will leave this node's
     // copy no longer byte-equal to the replicated entry at the same descriptor
     // version — which wedges the metadata applier on the next replay. That path
     // is synchronous and slow, so it runs off this task entirely.
     spawn_schema_projection_merge(state, database_id, tenant_id, groups);
-    Ok(total_rows)
+    Ok(total_rows.saturating_sub(rejected))
+}
+
+/// Take the descriptor write lease of every task in the batch.
+///
+/// A collection under drain refuses its lease as `RetryableSchemaChanged`.
+/// The refusal comes before anything is sequenced, so the whole acquisition
+/// is retried until the drain ends. An ILP client gets no ack and cannot
+/// retry, so the flush waits as long as a DDL drain can last. Each attempt
+/// reads the descriptor version afresh and reuses the same tasks, so a retry
+/// never stages a row twice. A failed attempt drops every lease it took. The
+/// Calvin submission stays outside this unit, because its outcome can be
+/// ambiguous.
+async fn acquire_batch_write_leases(
+    state: &SharedState,
+    tasks: &[PhysicalTask],
+) -> crate::Result<Vec<QueryLeaseScope>> {
+    retry_through_drain(
+        &state.lease_drain,
+        DEFAULT_DRAIN_TIMEOUT,
+        move || async move {
+            let mut leases = Vec::with_capacity(tasks.len());
+            for task in tasks {
+                leases
+                    .push(write_lease(state, task.tenant_id, task.database_id, &task.plan).await?);
+            }
+            Ok::<_, crate::Error>(leases)
+        },
+    )
+    .await
+}
+
+/// The lines the batch did not store. Each measurement's resolve rejected
+/// some lines, and its install rejected those plus the rows that conflict
+/// with the schema at its log position. The install's count wins for each
+/// collection the apply reports.
+fn rejected_lines_of(
+    submitted: &[PhysicalTask],
+    applied: Option<&crate::bridge::envelope::Response>,
+) -> crate::Result<u64> {
+    let mut by_collection: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    for task in submitted {
+        if let PhysicalPlan::Timeseries(TimeseriesOp::Ingest { collection, .. }) = &task.plan {
+            let rejected = crate::control::write_resolve::rejected_lines(&task.plan)?;
+            let held = by_collection
+                .entry(collection.as_str().to_owned())
+                .or_default();
+            *held = held.saturating_add(rejected);
+        }
+    }
+    let installed = applied.and_then(|response| {
+        crate::engine::timeseries::install_counts::TsInstallCounts::from_payload(
+            response.payload.as_bytes(),
+        )
+    });
+    if let Some(installed) = installed {
+        for (collection, (_, rejected)) in installed.by_collection() {
+            let held = by_collection.entry(collection).or_default();
+            *held = (*held).max(rejected);
+        }
+    }
+    Ok(by_collection
+        .values()
+        .fold(0u64, |total, rejected| total.saturating_add(*rejected)))
 }
 
 fn preflighted_row_count(groups: &[IlpMeasurementBatch]) -> crate::Result<u64> {
@@ -357,7 +446,7 @@ mod tests {
     }
 
     fn grant_write(permissions: &PermissionStore, collection: &str) {
-        let target = format!("collection:9:{collection}");
+        let target = format!("collection:7:9:{collection}");
         permissions
             .grant(
                 &target,
@@ -407,16 +496,15 @@ mod tests {
     }
 
     /// The line-protocol listener builds its physical tasks itself instead of
-    /// going through the SQL planner, so it has to run the row-level-security
-    /// injection pass explicitly. Before that call existed, this transport
-    /// reached the Data Plane without the pass running at all — a write policy
-    /// that refuses an `INSERT` into a collection did nothing to an ILP batch
-    /// into the same collection under the same identity.
+    /// going through the SQL planner, so it runs the row-level-security
+    /// injection pass explicitly. A write policy that refuses an `INSERT`
+    /// into a collection also refuses an ILP batch into the same collection
+    /// under the same identity.
     ///
     /// The policy here names an `$auth` field the identity does not carry, so
     /// the pass fails closed and refuses before dispatch — an outcome only the
-    /// injection pass can produce, which is what makes this a regression test
-    /// for the pass being called rather than for anything downstream.
+    /// injection pass can produce, which makes this a test
+    /// of the pass being called rather than of anything downstream.
     #[tokio::test]
     async fn ilp_ingest_runs_the_row_level_security_injection_pass() {
         use crate::control::security::predicate::{CompareOp, PredicateValue, RlsPredicate};
@@ -436,7 +524,7 @@ mod tests {
             .create_policy(RlsPolicy {
                 name: "cpu_owner".into(),
                 // Seeded straight into the store, so it must carry the key the
-                // DDL would have written: qualified for a non-default database.
+                // DDL writes: qualified for a non-default database.
                 collection: nodedb_types::QualifiedCollection::new(database_id, "cpu").to_string(),
                 display_collection: "cpu".into(),
                 tenant_id: 9,
@@ -500,9 +588,8 @@ mod tests {
     /// batch must pass the admission gate and fail only on its own merits —
     /// here, the missing write grant that preflight refuses.
     ///
-    /// Before the sender's address reached this scope there was no score to
-    /// enforce, so the gate failed closed: turning on `[auth.risk]` took ILP,
-    /// OTLP and Prometheus remote write offline for every client.
+    /// The sender's address reaches this scope, so the gate has a score to
+    /// enforce and does not fail closed when `[auth.risk]` is on.
     #[tokio::test]
     async fn scored_ingest_passes_the_admission_gate_instead_of_failing_closed() {
         let (state, _dir) = risk_state(crate::control::security::risk::RiskConfig {
@@ -556,10 +643,102 @@ mod tests {
         assert_eq!(rejection_reason(&error), "denied by risk policy");
     }
 
+    /// A flush that meets a descriptor drain waits it out. It takes its lease
+    /// at the version the draining DDL commits, so the batch still reaches
+    /// Calvin and the connection survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_leases_retry_through_a_descriptor_drain() {
+        use crate::control::security::catalog::StoredCollection;
+        use nodedb_cluster::{DescriptorId, DescriptorKind, DrainOwner};
+
+        let cluster = crate::control::cluster::test_one_node::boot().await;
+        let state = Arc::clone(&cluster.state);
+        let database_id = DatabaseId::DEFAULT;
+        let mut collection = StoredCollection::stamped_for_test(9, "cpu", "admin");
+        collection.database_id = database_id;
+        collection.collection_type = nodedb_types::CollectionType::timeseries("ts", "1h");
+        collection.fields = vec![
+            ("ts".to_owned(), "BIGINT TIME_KEY".to_owned()),
+            ("value".to_owned(), "BIGINT".to_owned()),
+        ];
+        crate::control::catalog_entry::apply::collection::put(
+            &collection,
+            state.credentials.catalog(),
+        )
+        .expect("store the collection at version 1");
+        let descriptor =
+            DescriptorId::new(database_id.as_u64(), 9, DescriptorKind::Collection, "cpu");
+        {
+            let _gate = state
+                .lease_admission_gate
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.lease_drain.install_start(
+                descriptor.clone(),
+                DrainOwner::Ddl,
+                1,
+                nodedb_types::Hlc::new(u64::MAX, 0),
+                state.node_id,
+            );
+        }
+        let groups = vec![super::IlpMeasurementBatch {
+            measurement: "cpu".into(),
+            raw_lines: vec!["cpu value=1i 1000".into()],
+            catalog_time_column: None,
+            catalog_fields: Vec::new(),
+        }];
+        let tasks =
+            super::build_ilp_calvin_tasks(TenantId::new(9), database_id, &groups).expect("tasks");
+
+        let refused = crate::control::server::shared::clone_write::write_lease(
+            &state,
+            tasks[0].tenant_id,
+            tasks[0].database_id,
+            &tasks[0].plan,
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(crate::Error::RetryableSchemaChanged { .. })),
+            "one attempt is refused while the drain holds"
+        );
+
+        // The DDL commits version 2 and ends its drain while the flush waits.
+        let mut altered = collection.clone();
+        altered.descriptor_version = 2;
+        let ddl = {
+            let state = Arc::clone(&state);
+            let descriptor = descriptor.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                crate::control::catalog_entry::apply::collection::put(
+                    &altered,
+                    state.credentials.catalog(),
+                )
+                .expect("store the collection at version 2");
+                state.lease_drain.install_end(&descriptor, &DrainOwner::Ddl);
+                state.lease_drain.settle();
+            })
+        };
+
+        let leases = super::acquire_batch_write_leases(&state, &tasks)
+            .await
+            .expect("the batch takes its leases once the drain ends");
+        ddl.await.expect("the DDL task completes");
+        assert_eq!(leases.len(), tasks.len());
+        let held = state
+            .lookup_lease_for_self(&descriptor)
+            .expect("the batch holds the collection's lease");
+        assert_eq!(held.version, 2, "the lease pins the committed version");
+
+        drop(leases);
+        drop(state);
+        cluster.shutdown().await;
+    }
+
     #[test]
     fn schema_projection_slot_admits_exactly_one_merge_at_a_time() {
-        // The bound that keeps ingest from queueing blocking-pool threads
-        // behind a metadata DDL lock that admits a single holder.
+        // The bound that keeps ingest from queueing merge tasks behind a
+        // metadata DDL lock that admits a single holder.
         let first = super::SCHEMA_PROJECTION_SLOT
             .try_acquire()
             .expect("the first merge takes the only slot");
@@ -580,11 +759,13 @@ mod tests {
             super::IlpMeasurementBatch {
                 measurement: "cpu".into(),
                 raw_lines: vec!["cpu value=1i".into(), "cpu value=2i".into()],
+                catalog_time_column: None,
                 catalog_fields: Vec::new(),
             },
             super::IlpMeasurementBatch {
                 measurement: "mem".into(),
                 raw_lines: vec!["mem value=3i".into()],
+                catalog_time_column: None,
                 catalog_fields: Vec::new(),
             },
         ];

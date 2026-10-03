@@ -5,9 +5,9 @@
 //! A plan is stamped at plan time with the descriptor versions it was built
 //! against (`GatewayVersionSet`). Holding a descriptor lease does not make
 //! that stamp current: a lease grant never compares the requested version
-//! against the catalog, so a plan stamped just before a DDL committed still
-//! acquires its lease afterwards, at the superseded version. A mixed-version
-//! cluster skips the lease drain outright. Every dispatch path therefore
+//! against the catalog, so a plan stamped shortly before a DDL committed still
+//! acquires its lease afterwards, at the superseded version. Every dispatch
+//! path therefore
 //! re-compares the stamped versions against the executing node's own catalog
 //! before the plan runs.
 
@@ -31,7 +31,7 @@ pub enum DescriptorCheckError {
         actual_version: u64,
     },
 
-    /// The catalog read itself failed, so the versions could not be compared.
+    /// The catalog read itself failed, so the versions were not compared.
     #[error("catalog lookup failed for {collection}: {detail}")]
     CatalogLookup { collection: String, detail: String },
 }
@@ -147,6 +147,27 @@ pub fn check_descriptor_holds(
     Ok(())
 }
 
+/// Re-compare a plan's stamped descriptor versions against this node's own
+/// catalog before a local dispatch. A mismatch surfaces as
+/// [`crate::Error::RetryableSchemaChanged`], which the gateway's cache-miss
+/// retry absorbs by re-planning against fresh state.
+pub(super) fn check_local_descriptor_versions(
+    shared: &crate::control::state::SharedState,
+    tenant_id: crate::types::TenantId,
+    database_id: DatabaseId,
+    version_set: &super::version_set::GatewayVersionSet,
+) -> Result<(), crate::Error> {
+    check_descriptor_versions(
+        shared.credentials.catalog(),
+        database_id,
+        tenant_id.as_u64(),
+        version_set
+            .iter()
+            .map(|(collection, version)| (collection.as_str(), *version)),
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,7 +178,7 @@ mod tests {
     fn catalog_with(collections: &[(&str, u64)]) -> SystemCatalog {
         let catalog = SystemCatalog::open_in_memory().expect("in-memory catalog");
         for (name, version) in collections {
-            let mut stored = StoredCollection::new(TENANT, name, "owner");
+            let mut stored = StoredCollection::stamped_for_test(TENANT, name, "owner");
             stored.descriptor_version = *version;
             catalog
                 .put_collection(DatabaseId::DEFAULT, &stored)

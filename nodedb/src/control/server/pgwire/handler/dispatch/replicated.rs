@@ -5,36 +5,27 @@
 use std::sync::Arc;
 
 use crate::bridge::envelope::Response;
-use crate::control::server::dispatch_utils::publish_origin_change_events;
 
 use super::super::core::NodeDbPgHandler;
 
 /// Inputs for [`NodeDbPgHandler::dispatch_replicated_write`]: the entry to
-/// propose, the proposer, and the identity + plan its origin CDC publish needs.
+/// propose and the proposer.
 pub(super) struct ReplicatedWrite<'a> {
     pub(super) entry: crate::control::wal_replication::ReplicatedEntry,
     pub(super) proposer: &'a Arc<crate::control::wal_replication::AsyncRaftProposer>,
-    pub(super) authorized: crate::control::server::shared::authorization::AuthorizedTask,
 }
 
 impl NodeDbPgHandler {
     /// Dispatch a write through Raft: propose → register waiter → await apply.
     /// `ProposeTracker` is race-safe against an entry applying before register.
     ///
-    /// Also the origin CDC publish site; replicas publish nothing (`ChangeFeedOwner::Unowned`).
+    /// Every replica publishes the write's change events as it applies the
+    /// entry (`ChangeFeedOwner::Replicated`).
     pub(super) async fn dispatch_replicated_write(
         &self,
         args: ReplicatedWrite<'_>,
     ) -> crate::Result<Response> {
-        let ReplicatedWrite {
-            entry,
-            proposer,
-            authorized,
-        } = args;
-        let task = authorized.into_physical_task();
-        let tenant_id = task.tenant_id;
-        let database_id = task.database_id;
-        let plan = task.plan;
+        let ReplicatedWrite { entry, proposer } = args;
         let request_id = self.next_request_id();
 
         // `write_version` is the post-write `coll_write_lsn`, surfaced so the session
@@ -56,9 +47,6 @@ impl NodeDbPgHandler {
             read_version_lsn: write_version,
             write_set: Vec::new(),
         };
-
-        // Propose returned: entry is committed and applied. Publish once, from this plan.
-        publish_origin_change_events(&self.state, tenant_id, database_id, &plan, &response);
 
         Ok(response)
     }

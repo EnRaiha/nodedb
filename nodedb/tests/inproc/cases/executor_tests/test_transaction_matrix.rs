@@ -219,7 +219,7 @@ fn rollback_matrix_raw_crdt_apply_is_refused() {
                 delta: crdt_delta,
                 peer_id: 1,
                 mutation_id: 42,
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new(1),
                 provenance: None,
                 constraint_version_required: 0,
                 expected_frontier_digest: None,
@@ -294,7 +294,7 @@ fn rollback_matrix_doc_doc_second_fails() {
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
-            surrogate: nodedb_types::Surrogate::new(99),
+            surrogate: Some(nodedb_types::Surrogate::new(99)),
             pk_bytes: Vec::new(),
         }),
     );

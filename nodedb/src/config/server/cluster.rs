@@ -24,6 +24,14 @@ pub struct ClusterSettings {
     /// Address to bind the Raft RPC QUIC listener.
     pub listen: SocketAddr,
 
+    /// UDP address for the SWIM failure detector.
+    ///
+    /// Default: the `listen` IP with port `listen` port + 1. The node
+    /// advertises the bound address to peers, so each node can override it
+    /// independently. Startup fails if the address cannot be bound.
+    #[serde(default)]
+    pub swim_listen: Option<SocketAddr>,
+
     /// Seed node addresses for cluster formation or joining.
     /// On first startup, the first reachable seed bootstraps the cluster.
     /// Subsequent nodes join by contacting any seed.
@@ -241,6 +249,7 @@ mod tests {
             log_compaction_threshold: None,
             join_retry_max_attempts: 8,
             join_retry_max_backoff_secs: 32,
+            swim_listen: None,
         }
     }
 

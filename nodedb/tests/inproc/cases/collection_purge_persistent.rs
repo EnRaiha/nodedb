@@ -91,8 +91,9 @@ fn kv_engine_purge_leaves_no_keys_for_collection() {
         value: b"v1",
         ttl_ms: 0,
         now_ms,
-        surrogate: nodedb_types::Surrogate::ZERO,
-    });
+        surrogate: nodedb_types::Surrogate::new(1),
+    })
+    .expect("a bound row writes");
     kv.put(KvPutParams {
         database_id: 0,
         tenant_id: TENANT,
@@ -101,8 +102,9 @@ fn kv_engine_purge_leaves_no_keys_for_collection() {
         value: b"v1",
         ttl_ms: 0,
         now_ms,
-        surrogate: nodedb_types::Surrogate::ZERO,
-    });
+        surrogate: nodedb_types::Surrogate::new(2),
+    })
+    .expect("a bound row writes");
     kv.put(KvPutParams {
         database_id: 0,
         tenant_id: TENANT,
@@ -111,8 +113,9 @@ fn kv_engine_purge_leaves_no_keys_for_collection() {
         value: b"v2",
         ttl_ms: 0,
         now_ms,
-        surrogate: nodedb_types::Surrogate::ZERO,
-    });
+        surrogate: nodedb_types::Surrogate::new(3),
+    })
+    .expect("a bound row writes");
 
     let removed = kv.purge_collection(0, TENANT, "purge_me");
     assert!(
@@ -142,8 +145,9 @@ fn kv_engine_cross_tenant_isolation() {
         value: b"a",
         ttl_ms: 0,
         now_ms,
-        surrogate: nodedb_types::Surrogate::ZERO,
-    });
+        surrogate: nodedb_types::Surrogate::new(1),
+    })
+    .expect("a bound row writes");
     kv.put(KvPutParams {
         database_id: 0,
         tenant_id: 2,
@@ -152,8 +156,9 @@ fn kv_engine_cross_tenant_isolation() {
         value: b"b",
         ttl_ms: 0,
         now_ms,
-        surrogate: nodedb_types::Surrogate::ZERO,
-    });
+        surrogate: nodedb_types::Surrogate::new(2),
+    })
+    .expect("a bound row writes");
 
     kv.purge_collection(0, 1, "docs");
     assert!(kv.get(0, 1, "docs", b"k", now_ms).is_none());

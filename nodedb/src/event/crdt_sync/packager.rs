@@ -98,7 +98,7 @@ impl DeltaPackager {
         // echoed back. Trigger, RaftFollower and Deferred events are derived
         // from a User event that already carries the data change.
         match event.source {
-            EventSource::User | EventSource::Restore => {}
+            EventSource::User | EventSource::ImplicitClient | EventSource::Restore => {}
             EventSource::Trigger
             | EventSource::RaftFollower
             | EventSource::CrdtSync
@@ -136,7 +136,7 @@ impl DeltaPackager {
                 );
                 return false;
             }
-            WriteOp::Heartbeat => return false,
+            WriteOp::Heartbeat | WriteOp::Publish => return false,
         };
 
         let sequence = match ledger {
@@ -215,6 +215,7 @@ mod tests {
             valid_time_ms: None,
             user_id: None,
             statement_digest: None,
+            commit_hlc: Some(crate::event::test_utils::test_commit_hlc()),
         }
     }
 

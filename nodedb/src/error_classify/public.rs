@@ -53,10 +53,6 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
             "cross-shard transaction aborted: a participant vShard returned an error before \
              any read-set was validated",
         ),
-        Error::SourceFrozen { database_id } => NodeDbError::write_conflict(
-            format!("database:{database_id}"),
-            "source database is frozen for clone materialization; retry shortly".to_owned(),
-        ),
         Error::RejectedPrevalidation { constraint, reason } => {
             NodeDbError::prevalidation_rejected(constraint.clone(), reason)
         }
@@ -162,10 +158,6 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
             NodeDbError::no_leader(format!("vshard {vshard_id} has no serving leader"))
         }
         Error::NotLeader { leader_addr, .. } => NodeDbError::not_leader(leader_addr.clone()),
-        Error::FanOutExceeded {
-            shards_touched,
-            limit,
-        } => NodeDbError::fan_out_exceeded(*shards_touched, *limit),
         // `0A000` on the SQL surfaces, the class `Unsupported` has as a
         // Data-Plane code.
         Error::CrossCollectionNotColocated { .. } => NodeDbError::from_wire(
@@ -209,18 +201,27 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         } => NodeDbError::dispatch(format!(
             "raft leader change overwrote entry at group {group_id} index {log_index}; retry exhausted"
         )),
+        // Internal class `XX`: no driver or pool treats it as transient, so
+        // nothing re-proposes a write that already committed.
+        Error::CommittedResultUnavailable { .. } | Error::ProposalOutcomeUnknown { .. } => {
+            NodeDbError::internal(e.to_string())
+        }
         Error::MetadataLeaderUnavailable => NodeDbError::dispatch(
             "metadata raft group has no elected leader yet; retry exhausted".to_string(),
         ),
         // The code renders `55P03`, the SQLSTATE pgwire gives the variant, so
         // the class survives a node hop as a bare numeric code.
-        Error::AuthorizationStateBehind { .. } => NodeDbError::from_wire(
-            nodedb_types::error::ErrorCode::STALE_READ_NOT_LEADER,
-            e.to_string(),
-        ),
+        Error::AuthorizationStateBehind { .. } | Error::LinearizableReadRefused { .. } => {
+            NodeDbError::from_wire(
+                nodedb_types::error::ErrorCode::STALE_READ_NOT_LEADER,
+                e.to_string(),
+            )
+        }
         // The code renders `55P03`, the SQLSTATE pgwire gives both variants.
         // Nothing was applied, and a retry succeeds once a majority answers.
-        Error::GroupQuorumUnavailable { .. } | Error::GroupMarksUnavailable { .. } => {
+        Error::GroupQuorumUnavailable { .. }
+        | Error::GroupMarksUnavailable { .. }
+        | Error::BackupCaptureMoved { .. } => {
             NodeDbError::from_wire(nodedb_types::error::ErrorCode::NO_LEADER, e.to_string())
         }
         Error::ExecutionLimitExceeded { detail } => NodeDbError::bad_request(detail),
@@ -249,12 +250,16 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         Error::Encryption { detail } => NodeDbError::encryption(detail),
         Error::Bridge { detail } => NodeDbError::bridge(detail),
         Error::VersionCompat { detail } => NodeDbError::cluster(detail),
+        Error::RestoreTargetNotEmpty { .. } | Error::RestoreVerificationFailed { .. } => {
+            NodeDbError::storage(e.to_string())
+        }
         Error::Internal { detail } => NodeDbError::internal(detail),
         Error::Shaping(e) => (**e).clone(),
         Error::RemoteTyped { code, message } => NodeDbError::remote_typed(*code, message.clone()),
         Error::DescriptorVersionAnomaly { .. } => NodeDbError::internal(e.to_string()),
         Error::CatalogIntegrityViolation { .. } => NodeDbError::internal(e.to_string()),
         Error::CollectionPurgeRowMissing { .. } => NodeDbError::internal(e.to_string()),
+        Error::CollectionUnstamped { .. } => NodeDbError::internal(e.to_string()),
         Error::Promql(promql_err) => NodeDbError::bad_request(promql_err.to_string()),
         Error::DependentObjectsExist {
             tenant_id: _,
@@ -289,8 +294,8 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
             "cascade cycle / depth-limit ({depth}) exceeded on '{root}'"
         )),
         Error::SequencerUnavailable => NodeDbError::bad_request(
-            "cross-shard transactions require a cluster deployment with the Calvin sequencer; \
-             this node is running in embedded/local mode"
+            "the Calvin sequencer is not running on this node; \
+             cross-shard transactions are refused until cluster startup completes"
                 .to_owned(),
         ),
         // The code follows the cause, the same way pgwire picks the SQLSTATE,
@@ -492,10 +497,18 @@ mod tests {
             stream: "s".to_owned(),
             group: "g".to_owned(),
             partition_id: 0,
-            current_lsn: 2,
-            current_sequence: 2,
-            attempted_lsn: 1,
-            attempted_sequence: 1,
+            offsets: Box::new(crate::error::RegressedOffsets {
+                current: crate::event::cdc::CdcOffset {
+                    epoch: 1,
+                    index: 2,
+                    sequence: 2,
+                },
+                attempted: crate::event::cdc::CdcOffset {
+                    epoch: 1,
+                    index: 1,
+                    sequence: 1,
+                },
+            }),
         };
         assert_eq!(classify(&regression).code(), ErrorCode::DATA_EXCEPTION);
     }

@@ -35,7 +35,7 @@
 //! # Plane discipline
 //!
 //! This runs on the part-owner's Control Plane (the Tokio transport reactor). It
-//! may await the finalize `Notify` and resolve the staged-file path here. The
+//! can await the finalize `Notify` and resolve the staged-file path here. The
 //! merge + finalize itself is dispatched to the `!Send` Data Plane through the
 //! existing SPSC bridge; this hook never touches storage or io_uring, and never
 //! lets the data-plane handler reach back into the Control-Plane registry /
@@ -183,6 +183,7 @@ impl RegistryShuffleAggregator {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: crate::bridge::envelope::Admission::Exempt(
                 crate::bridge::envelope::ExemptReason::Read,
             ),

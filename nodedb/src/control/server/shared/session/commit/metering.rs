@@ -17,7 +17,7 @@ use crate::control::state::SharedState;
 /// task was already metered at STATEMENT time when it staged into the
 /// per-transaction overlay (`staging_gate::stage_write`) — it is buffered
 /// here too (COMMIT replays every write, staged or not, from the one durable
-/// batch), but billing it again here would double-count it. Re-deriving the
+/// batch), but billing it again here will double-count it. Re-deriving the
 /// predicate here, rather than carrying a "was this staged" flag on
 /// `PhysicalTask`, keeps this in lockstep with `route_in_tx_write`'s own
 /// routing decision by construction — the two can never independently drift.
@@ -103,16 +103,16 @@ mod tests {
     }
 
     /// `KvOp::Put` is on `is_stageable_write`'s allow-list — a real
-    /// `Staged` route would already have billed it at STATEMENT time
+    /// `Staged` route has already billed it at STATEMENT time
     /// (`staging_gate::stage_write`), so a task shaped like this must be
-    /// skipped here or COMMIT would double-bill it.
+    /// skipped here or COMMIT will double-bill it.
     fn stageable_task() -> PhysicalTask {
         buffered_task(PhysicalPlan::Kv(KvOp::Put {
             collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "widgets"),
             key: Vec::new(),
             value: Vec::new(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,

@@ -238,6 +238,8 @@ mod tests {
             created_at: 0,
             last_sequence: 0,
             last_lsn: 0,
+            last_epoch: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 
@@ -259,6 +261,7 @@ mod tests {
             sequence: 1,
             event_time: 1,
             lsn: 1,
+            epoch: 0,
             payload: "{}".into(),
         });
         registry.broadcast_committed(Arc::clone(&message));

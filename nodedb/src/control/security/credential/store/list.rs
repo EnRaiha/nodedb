@@ -22,18 +22,27 @@ impl CredentialStore {
     }
 
     /// Reload all users from the given catalog into the in-memory cache.
-    /// Used by the recovery verifier repair path.
+    /// Used by the recovery verifier repair path and by a metadata image
+    /// install.
+    ///
+    /// The next user id never moves down. It rises to the catalog's counter
+    /// and past every loaded user id, so a user the catalog gained never
+    /// shares an id with the next local `CREATE USER`.
     pub fn reload_from_catalog(&self, catalog: &SystemCatalog) -> crate::Result<()> {
         let stored_users = catalog.load_all_users()?;
+        let mut floor = catalog.load_next_user_id()?;
         let mut replacement = std::collections::HashMap::with_capacity(stored_users.len());
         for stored in stored_users {
             validate_stored_user_credentials(&stored, &self.argon2_config)?;
+            floor = floor.max(stored.user_id.saturating_add(1));
             let record = UserRecord::from_stored(stored);
             replacement.insert(record.username.clone(), record);
         }
 
         let mut users = write_lock(&self.users);
         *users = replacement;
+        let mut next = write_lock(&self.next_user_id);
+        *next = (*next).max(floor);
         Ok(())
     }
 

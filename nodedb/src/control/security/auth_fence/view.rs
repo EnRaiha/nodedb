@@ -19,18 +19,28 @@
 //!    leads the metadata group as its only voter holds a pinned lease, which
 //!    never expires: every barrier waits for its coverage instead.
 //!
-//! The lease is checked after the cache guard is taken. The guard fixes the
-//! cache for the whole plan, and a change acknowledged after the check was
-//! acknowledged after the statement started planning.
+//! A lease lapses when one renewal round runs long, though the next round
+//! is a renewal interval away. Before it takes the cache guard, a statement
+//! waits up to the lease's lapse grace for a round to grant it again. The
+//! wait holds no guard, so the leader's own floor load can take the cache's
+//! write lock meanwhile. The check under the guard then decides.
+//!
+//! The lease is checked after the cache guard is taken, so the guarded cache
+//! holds every change acknowledged before the check. A change acknowledged
+//! after the check was acknowledged after the statement started planning.
+//! The cache only moves forward, so a later read of it holds the fenced
+//! state or newer. A planning path that awaits a request (a surrogate at its
+//! collection home) runs the fence with [`admit_permission_view`], holds no
+//! guard across that request, and reads the live cache once it resumes.
 
 use std::time::Instant;
 
 use tokio::sync::RwLockReadGuard;
 
-use crate::control::security::auth_lease::lease_status;
+use crate::control::security::auth_lease::{lease_status, planning_admitted_within};
 use crate::control::security::permission_tree::{PermissionCache, reload};
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId};
+use crate::types::TenantId;
 
 use super::cluster::{behind, group_of_vshard, hosts_group};
 
@@ -42,22 +52,24 @@ pub async fn permission_view(
     apply_committed_tree_defs(state).await;
     reload::reload_if_stale(state).await?;
 
+    if let Some(timing) = state.authorization_fence.timing() {
+        // The check under the guard below decides. This wait only lets a
+        // round that is about to renew finish first.
+        planning_admitted_within(state, timing.lapse_grace()).await;
+    }
     let cache = state.permission_cache.read().await;
     if state.cluster_routing.is_some() && cache.has_tree_defs_for_tenant(tenant_id.as_u64()) {
         for source in cache
             .tree_sources()
             .into_iter()
-            .filter(|source| source.tenant_id == tenant_id.as_u64())
+            .filter(|source| source.key.scope.tenant_id == tenant_id.as_u64())
         {
-            let vshard =
-                nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &source.collection)
-                    .vshard();
-            let group_id = group_of_vshard(state, vshard.as_u32())?;
+            let group_id = group_of_vshard(state, source.key.vshard().as_u32())?;
             if !hosts_group(state, group_id) {
                 return Err(behind(format!(
                     "this node does not replicate raft group {group_id}, which homes \
                      permission source '{}'; run the statement on a node that does",
-                    source.collection
+                    source.key.qualified()
                 )));
             }
         }
@@ -69,6 +81,13 @@ pub async fn permission_view(
         ));
     }
     Ok(cache)
+}
+
+/// Run the fence [`permission_view`] runs for a statement of `tenant_id`,
+/// and release the view. The statement's planning reads the live cache after
+/// its last await.
+pub async fn admit_permission_view(state: &SharedState, tenant_id: TenantId) -> crate::Result<()> {
+    permission_view(state, tenant_id).await.map(drop)
 }
 
 /// Move the tree-definition changes the metadata applier committed into the

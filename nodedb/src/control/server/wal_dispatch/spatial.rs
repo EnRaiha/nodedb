@@ -16,12 +16,8 @@ use super::super::wal_dispatch_fts_spatial;
 /// `Insert` / `Delete` are handled here so any call site that reaches
 /// [`super::wal_append_if_write_with_creds`] with one of these variants is
 /// durable by construction. The sync-inbound handler
-/// (`sync/spatial_handler.rs`) already calls `wal_append_spatial_put` /
-/// `wal_append_spatial_delete` directly and dispatches straight to the Data
-/// Plane via `dispatch_sync_payload` — it never reaches this function, so
-/// this arm cannot double-append on that path today (mirrors
-/// `VectorOp::DeleteBySurrogate`'s identical "sync path bypasses it, but log
-/// here too" reasoning in `wal_dispatch/vector.rs`).
+/// (`sync/spatial_handler.rs`) proposes its write, and the replicated apply
+/// journals it through this function.
 pub(crate) fn wal_append_spatial_op(
     wal: WalAppender<'_>,
     tenant_id: TenantId,

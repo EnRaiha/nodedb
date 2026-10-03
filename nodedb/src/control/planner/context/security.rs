@@ -18,7 +18,38 @@ pub struct PlanSecurityContext<'a> {
     pub redaction_store: &'a crate::control::security::redaction::RedactionStore,
     pub permissions: &'a PermissionStore,
     pub roles: &'a RoleStore,
-    /// Permission tree cache for hierarchical ACL injection.
-    /// `None` = skip permission tree filtering (e.g., internal queries).
-    pub permission_cache: Option<&'a crate::control::security::permission_tree::PermissionCache>,
+    /// Where planning reads the permission tree cache for hierarchical ACL
+    /// injection.
+    pub permission_tree: PermissionTreeSource<'a>,
+}
+
+/// Where planning reads the permission tree cache for hierarchical ACL
+/// injection.
+#[derive(Clone, Copy)]
+pub enum PermissionTreeSource<'a> {
+    /// Skip permission tree filtering (e.g., internal queries).
+    None,
+    /// The node's live permission tree cache. The caller runs the
+    /// authorization fence first (`auth_fence::admit_permission_view`).
+    /// Planning takes the read lock only after its last await, so no lock is
+    /// held across a request to a surrogate's collection home.
+    Live(&'a tokio::sync::RwLock<crate::control::security::permission_tree::PermissionCache>),
+}
+
+impl<'a> PermissionTreeSource<'a> {
+    /// The permission tree cache to inject from, read-locked. `None` when
+    /// this source skips permission tree filtering.
+    pub async fn read(
+        self,
+    ) -> Option<
+        tokio::sync::RwLockReadGuard<
+            'a,
+            crate::control::security::permission_tree::PermissionCache,
+        >,
+    > {
+        match self {
+            Self::None => None,
+            Self::Live(cache) => Some(cache.read().await),
+        }
+    }
 }

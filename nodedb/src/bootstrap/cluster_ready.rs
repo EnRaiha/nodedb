@@ -25,13 +25,10 @@ pub struct ClusterReadyGates {
 
 /// Wait for the metadata raft group to be ready, run catalog sanity checks,
 /// warm the QUIC peer cache, and fire the remaining startup gates.
-///
-/// In single-node mode `raft_ready_rx` is `None` and the raft-ready wait is
-/// skipped. Gate fires are always performed regardless of cluster mode.
 pub async fn await_cluster_ready(
     shared: &Arc<SharedState>,
-    raft_ready_rx: Option<tokio::sync::watch::Receiver<bool>>,
-    data_plane_replay_done: Vec<tokio::sync::oneshot::Receiver<()>>,
+    mut raft_ready_rx: tokio::sync::watch::Receiver<bool>,
+    data_plane_replay_done: Vec<tokio::sync::oneshot::Receiver<crate::Result<()>>>,
     gates: ClusterReadyGates,
 ) -> anyhow::Result<()> {
     let ClusterReadyGates {
@@ -44,28 +41,23 @@ pub async fn await_cluster_ready(
         health_loop_gate,
         gateway_enable_gate,
     } = gates;
-    // Boot-time readiness gate: in cluster mode, wait until the
-    // metadata raft group has applied its first entry on this node
-    // before opening any client-facing listener. This eliminates the
-    // restart-window race where the first DDL would observe
-    // `metadata propose: not leader` because election had not yet
-    // completed.
-    if let Some(mut ready_rx) = raft_ready_rx {
-        wait_for_raft_ready(
-            shared,
-            &mut ready_rx,
-            &raft_gate,
-            RAFT_READY_STALL_TIMEOUT,
-            RAFT_READY_POLL_INTERVAL,
-        )
-        .await?;
-    }
-    // Metadata raft group has applied its first entry (or we're
-    // in single-node mode with no raft).
+    // Boot-time readiness gate: wait until the metadata raft group has
+    // applied its first entry on this node before opening any
+    // client-facing listener. This eliminates the restart-window race
+    // where the first DDL observes `metadata propose: not leader`
+    // because the election has not yet completed.
+    wait_for_raft_ready(
+        shared,
+        &mut raft_ready_rx,
+        &raft_gate,
+        RAFT_READY_STALL_TIMEOUT,
+        RAFT_READY_POLL_INTERVAL,
+    )
+    .await?;
     raft_gate.fire();
 
     // Authoritatively rehydrate the Data Plane per-core schema registry
-    // from the durable catalog, in both single-node and cluster mode.
+    // from the durable catalog.
     // This is NOT a raft-replay side effect: it enumerates every active
     // stored collection and re-registers it directly, awaited and
     // fail-closed, so no client listener can open against a collection
@@ -79,6 +71,19 @@ pub async fn await_cluster_ready(
     if let Err(e) = rehydrate_schema_registry(shared).await {
         schema_gate.fail(format!("schema registry rehydration failed: {e}"));
         return Err(anyhow::anyhow!("schema registry rehydration failed: {e}"));
+    }
+    // The metadata applier skips entries it already applied, so the
+    // post-apply register never re-runs at boot.
+    if let Err(e) =
+        crate::control::server::shared::ddl::neutral::continuous_agg::register_persisted_continuous_aggregates(
+            shared,
+        )
+        .await
+    {
+        schema_gate.fail(format!("continuous aggregate re-registration failed: {e}"));
+        return Err(anyhow::anyhow!(
+            "continuous aggregate re-registration failed: {e}"
+        ));
     }
     schema_gate.fire();
 
@@ -108,19 +113,27 @@ pub async fn await_cluster_ready(
     // from the WAL on its own thread; `/healthz` must not report ready until
     // that is done, or a just-restarted node would serve queries against
     // half-rebuilt indexes (e.g. an empty vector search). A dropped sender
-    // means a core panicked during open/replay — fail closed, exactly as the
-    // raft-readiness gate does, rather than open the gateway on a broken core.
+    // means a core panicked during open/replay, and a signalled error means
+    // its replay stopped short of the WAL — fail closed on both, exactly as
+    // the raft-readiness gate does, rather than open the gateway on a broken
+    // core.
     const REPLAY_READY_TIMEOUT: Duration = Duration::from_secs(300);
     let replay_wait = async {
         for rx in data_plane_replay_done {
-            rx.await.map_err(|_| {
-                anyhow::anyhow!("data plane core exited before signalling WAL replay completion")
-            })?;
+            rx.await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "data plane core exited before signalling WAL replay completion"
+                    )
+                })?
+                .map_err(|e| anyhow::anyhow!("data plane core WAL replay failed: {e}"))?;
         }
-        Ok::<(), anyhow::Error>(())
+        Ok::<_, anyhow::Error>(())
     };
     match tokio::time::timeout(REPLAY_READY_TIMEOUT, replay_wait).await {
-        Ok(Ok(())) => info!("all data plane cores completed WAL replay"),
+        Ok(Ok(())) => {
+            info!("all data plane cores completed WAL replay");
+        }
         Ok(Err(e)) => {
             data_groups_gate.fail(format!("data plane WAL replay failed: {e}"));
             return Err(e);
@@ -148,15 +161,52 @@ pub async fn await_cluster_ready(
         return Err(e);
     }
 
-    // A pending name-scoped reclaim must complete before the gateway opens.
-    // Otherwise a same-name CREATE can install a replacement that the delayed
-    // retry subsequently erases. Fail readiness and let the operator restart
-    // after the underlying storage fault is resolved.
-    if let Err(error) = crate::event::collection_gc::pending_reclaim::drain_once(shared).await {
-        data_groups_gate.fail(format!("pending collection reclaim failed: {error}"));
-        return Err(anyhow::anyhow!(
-            "pending collection reclaim failed during startup: {error}"
+    // Retry every owed reclaim before the gateway opens. A row that does not
+    // reclaim keeps the drain hold its retry took, so a same-name CREATE waits
+    // for the worker's retry and never opens over storage the retry erases.
+    // Only an unreadable queue fails the boot.
+    if let Err(error) = crate::event::collection_gc::pending_reclaim::drain_at_boot(shared).await {
+        data_groups_gate.fail(format!(
+            "pending collection reclaim queue unreadable: {error}"
         ));
+        return Err(anyhow::anyhow!(
+            "pending collection reclaim queue unreadable during startup: {error}"
+        ));
+    }
+
+    // A compaction applied before a crash, or whose fan-out failed, is still
+    // owed. A row that fails again stays queued for the retry worker: stale
+    // history answers old-version reads its peers refuse, and never corrupts
+    // current state.
+    match crate::control::catalog_entry::post_apply::drain_pending_compactions(shared).await {
+        Ok(0) => {}
+        Ok(still_owed) => tracing::warn!(
+            still_owed,
+            "history compactions still owed after the boot drain; the retry worker re-drives them"
+        ),
+        Err(error) => {
+            data_groups_gate.fail(format!("owed history compactions unreadable: {error}"));
+            return Err(anyhow::anyhow!(
+                "owed history compactions unreadable during startup: {error}"
+            ));
+        }
+    }
+
+    // Cleanup owed for nodes that left: their leases and drains block DDL
+    // until released. A row still owed after this pass is re-driven by the
+    // retry worker.
+    match crate::control::lease::leave_cleanup::drain_pending_leave_cleanups(shared).await {
+        Ok(0) => {}
+        Ok(still_owed) => tracing::warn!(
+            still_owed,
+            "leave cleanups still owed after the boot drain; the retry worker re-drives them"
+        ),
+        Err(error) => {
+            data_groups_gate.fail(format!("owed leave cleanups unreadable: {error}"));
+            return Err(anyhow::anyhow!(
+                "owed leave cleanups unreadable during startup: {error}"
+            ));
+        }
     }
 
     // Grants and hierarchy edges live in collections the data groups just
@@ -169,6 +219,14 @@ pub async fn await_cluster_ready(
             "permission tree load failed during startup: {error}"
         ));
     }
+
+    // Resume or compensate an interrupted MOVE TENANT before any client
+    // connects. Its drain ends and its re-capture both propose through the
+    // metadata group and read the data groups, so both must be ready first.
+    crate::control::server::shared::ddl::neutral::tenant::move_tenant::recovery::recover_all(
+        shared,
+    )
+    .await;
 
     data_groups_gate.fire();
     transport_gate.fire();
@@ -204,20 +262,23 @@ pub async fn await_cluster_ready(
     warm_peers_gate.fire();
     health_loop_gate.fire();
 
-    // In a cluster, a node plans permission-checked statements only under
-    // an authorization lease. The renewal loop runs from Raft start, and
-    // every input of a grant is live by now: the Raft groups, the replayed
-    // data groups, the permission cache and the Event Plane. The gateway
-    // opens once the first lease is granted, so the first statements are
-    // not refused.
-    if let Some(timing) = shared.authorization_fence.timing()
-        && let Err(error) = crate::control::security::auth_lease::await_planning_admitted(
-            shared,
-            RAFT_READY_STALL_TIMEOUT,
-            timing.renew_every,
-        )
-        .await
-    {
+    // A node plans permission-checked statements only under an
+    // authorization lease. The renewal loop runs from Raft start, and every
+    // input of a grant is live by now: the Raft groups, the replayed data
+    // groups, the permission cache and the Event Plane. The gateway opens
+    // once the first lease is granted, so the first statements are not
+    // refused.
+    let admitted = match crate::control::security::auth_lease::barrier::lease_timing(shared) {
+        Ok(_) => {
+            crate::control::security::auth_lease::await_planning_admitted(
+                shared,
+                RAFT_READY_STALL_TIMEOUT,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    if let Err(error) = admitted {
         gateway_enable_gate.fail(format!("authorization lease not granted: {error}"));
         return Err(anyhow::anyhow!(
             "authorization lease not granted during startup: {error}"
@@ -236,12 +297,8 @@ const RAFT_READY_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often the stall check samples the applied index while waiting.
 const RAFT_READY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Wait until the metadata raft group applies its first entry.
-///
-/// Bounds the wait on lack of PROGRESS, not on total elapsed time. A node
-/// replaying a large log keeps advancing `applied_index` and must be allowed
-/// to finish; a group that is genuinely stuck advances nothing and fails
-/// after [`RAFT_READY_STALL_TIMEOUT`].
+/// Wait until the metadata raft group applies its first entry, and fail
+/// `raft_gate` when it does not. See [`raft_ready_progress`].
 async fn wait_for_raft_ready(
     shared: &Arc<SharedState>,
     ready_rx: &mut tokio::sync::watch::Receiver<bool>,
@@ -249,6 +306,48 @@ async fn wait_for_raft_ready(
     stall_timeout: Duration,
     poll_interval: Duration,
 ) -> anyhow::Result<()> {
+    match raft_ready_progress(shared, ready_rx, stall_timeout, poll_interval).await {
+        Ok(()) => {
+            info!("metadata raft group ready — opening client listeners");
+            Ok(())
+        }
+        Err(error) => {
+            raft_gate.fail(error.to_string());
+            Err(error.into())
+        }
+    }
+}
+
+/// Wait until the metadata raft group that `start_raft` started applies its
+/// first entry. `ready_rx` is the receiver `start_raft` returned.
+///
+/// The same wait boot runs before it opens a listener. An in-process host
+/// that registers no startup gate calls this before it serves requests.
+pub async fn await_raft_ready(
+    shared: &Arc<SharedState>,
+    mut ready_rx: tokio::sync::watch::Receiver<bool>,
+) -> crate::Result<()> {
+    raft_ready_progress(
+        shared,
+        &mut ready_rx,
+        RAFT_READY_STALL_TIMEOUT,
+        RAFT_READY_POLL_INTERVAL,
+    )
+    .await
+}
+
+/// Wait until the metadata raft group applies its first entry.
+///
+/// Bounds the wait on lack of PROGRESS, not on total elapsed time. A node
+/// replaying a large log keeps advancing `applied_index` and must be allowed
+/// to finish; a group that is genuinely stuck advances nothing and fails
+/// after `stall_timeout`.
+async fn raft_ready_progress(
+    shared: &Arc<SharedState>,
+    ready_rx: &mut tokio::sync::watch::Receiver<bool>,
+    stall_timeout: Duration,
+    poll_interval: Duration,
+) -> crate::Result<()> {
     let applied_index = || {
         shared
             .metadata_cache
@@ -261,15 +360,11 @@ async fn wait_for_raft_ready(
 
     loop {
         match tokio::time::timeout(poll_interval, ready_rx.wait_for(|v| *v)).await {
-            Ok(Ok(_)) => {
-                info!("metadata raft group ready — opening client listeners");
-                return Ok(());
-            }
+            Ok(Ok(_)) => return Ok(()),
             Ok(Err(_)) => {
-                raft_gate.fail("raft readiness watch dropped before signalling ready");
-                return Err(anyhow::anyhow!(
-                    "raft readiness watch dropped before signalling ready"
-                ));
+                return Err(crate::Error::Internal {
+                    detail: "raft readiness watch dropped before signalling ready".into(),
+                });
             }
             // Not ready yet. Replay that is still advancing is healthy.
             Err(_) => {
@@ -280,12 +375,13 @@ async fn wait_for_raft_ready(
                     continue;
                 }
                 if last_progress.elapsed() >= stall_timeout {
-                    let detail = format!(
-                        "metadata group applied no entry for {stall_timeout:?} \
-                         (applied_index stuck at {current}) — it failed to apply its first entry"
-                    );
-                    raft_gate.fail(detail.clone());
-                    return Err(anyhow::anyhow!(detail));
+                    return Err(crate::Error::Internal {
+                        detail: format!(
+                            "metadata group applied no entry for {stall_timeout:?} \
+                             (applied_index stuck at {current}) — it failed to apply its \
+                             first entry"
+                        ),
+                    });
                 }
             }
         }

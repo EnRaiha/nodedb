@@ -3,7 +3,7 @@
 //! EdgeStore root — types, redb table definitions, open/close.
 //!
 //! Query paths (`get_edge`, `scan_*`, `put_edge_raw`) live in `scan.rs`.
-//! Cascade (`delete_edges_for_node`) lives in `cascade.rs`. Bitemporal
+//! Node-level edge reads and journalled cascade replay live in `cascade.rs`. Bitemporal
 //! write/read primitives live in `temporal/`.
 
 use std::path::Path;
@@ -13,6 +13,8 @@ use nodedb_types::{DatabaseId, TenantId};
 use redb::{Database, TableDefinition};
 
 use super::stats::GRAPH_STATS;
+use super::temporal::visibility::{EDGE_APPLIED, EDGE_CUTS};
+use crate::engine::durability_gate::GatedDatabase;
 
 /// `(collection, src, label, dst)` — a base-edge identity (no version suffix).
 pub(super) type BaseKey = (String, String, String, String);
@@ -55,8 +57,8 @@ pub use nodedb_types::graph::Direction;
 
 /// Decoded edge record yielded by `EdgeStore::scan_all_edges_decoded`:
 /// `(database, tenant, collection, src, label, dst, properties)`. Current-state
-/// only — tombstoned and GDPR-erased edges are filtered out, and only the latest
-/// non-sentinel version per base key is yielded.
+/// only — each base key resolves to its newest version no TRUNCATE hides, and
+/// a base whose version is a tombstone or a GDPR erasure is left out.
 pub type EdgeRecord = (
     DatabaseId,
     TenantId,
@@ -82,8 +84,11 @@ pub struct Edge {
 /// Keys are `(TenantId, versioned_composite_key)` tuples — tenant routing
 /// is structural, not lexical. Each Data Plane core owns its own
 /// `EdgeStore` instance; no cross-core sharing.
+///
+/// The database sits behind a durability gate (see
+/// [`crate::engine::durability_gate`]).
 pub struct EdgeStore {
-    pub(super) db: Arc<Database>,
+    pub(super) db: Arc<GatedDatabase>,
 }
 
 impl EdgeStore {
@@ -109,10 +114,30 @@ impl EdgeStore {
             let _ = write_txn
                 .open_table(NODE_SURROGATES)
                 .map_err(|e| redb_err("open node_surrogates", e))?;
+            let _ = write_txn
+                .open_table(EDGE_CUTS)
+                .map_err(|e| redb_err("open edge_cuts", e))?;
+            let _ = write_txn
+                .open_table(EDGE_APPLIED)
+                .map_err(|e| redb_err("open edge_applied", e))?;
         }
         write_txn.commit().map_err(|e| redb_err("commit", e))?;
 
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(GatedDatabase::new(db)),
+        })
+    }
+
+    /// The underlying redb database.
+    pub fn db(&self) -> &Arc<GatedDatabase> {
+        &self.db
+    }
+
+    /// Persist every commit the durability gate deferred.
+    pub fn persist(&self) -> crate::Result<()> {
+        self.db
+            .persist()
+            .map_err(|e| redb_err("persist deferred commits", e))
     }
 }
 

@@ -7,7 +7,6 @@ use nodedb_sql::planner::dml_helpers::KvCounterKind;
 use nodedb_types::QualifiedCollection;
 use nodedb_types::protocol::TextFields;
 
-use super::kv::assign_kv_surrogate;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::planner::sql_plan_convert::kv_counter_shape::kv_counter_shape;
 use crate::control::server::native::dispatch::DispatchCtx;
@@ -21,7 +20,7 @@ fn required_key(fields: &TextFields) -> crate::Result<&str> {
         })
 }
 
-pub(crate) fn build_incr(
+pub(crate) async fn build_incr(
     ctx: &DispatchCtx<'_>,
     collection: &str,
     fields: &TextFields,
@@ -29,7 +28,7 @@ pub(crate) fn build_incr(
     let key = required_key(fields)?;
     let delta = fields.incr_delta.unwrap_or(1);
     let ttl_ms = fields.ttl_ms.unwrap_or(0);
-    let surrogate = assign_kv_surrogate(ctx, collection, key.as_bytes())?;
+    let surrogate = super::helpers::assign_surrogate(ctx, collection, key.as_bytes()).await?;
     // An absent key takes the collection's shape, as a SQL `KV_INCR` does.
     let shape = kv_counter_shape(
         ctx.state,
@@ -51,7 +50,7 @@ pub(crate) fn build_incr(
     }))
 }
 
-pub(crate) fn build_incr_float(
+pub(crate) async fn build_incr_float(
     ctx: &DispatchCtx<'_>,
     collection: &str,
     fields: &TextFields,
@@ -65,7 +64,7 @@ pub(crate) fn build_incr_float(
             detail: format!("KvIncrFloat: delta must be a decimal number, got '{delta}'"),
         });
     }
-    let surrogate = assign_kv_surrogate(ctx, collection, key.as_bytes())?;
+    let surrogate = super::helpers::assign_surrogate(ctx, collection, key.as_bytes()).await?;
     let shape = kv_counter_shape(
         ctx.state,
         ctx.tenant_id(),

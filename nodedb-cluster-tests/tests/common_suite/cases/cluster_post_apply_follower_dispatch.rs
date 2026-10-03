@@ -124,7 +124,7 @@ async fn async_dispatch_fires_on_follower_for_put_and_purge() {
             && *lsn > 0),
         "follower (node_id={}) must observe the WAL tombstone for the purged collection. \
          If this fails, something reintroduced leader gating on the async post-apply \
-         lane — `spawn_post_apply_async_side_effects` must run on every node. \
+         lane — `run_post_apply_async_side_effects` must run on every node. \
          Follower tombstones observed: {latest:?}",
         follower.node_id,
     );

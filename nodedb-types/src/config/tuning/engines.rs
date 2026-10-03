@@ -105,6 +105,11 @@ pub const DEFAULT_VARLEN_MAX_RESULTS: usize = 100_000;
 /// expansion before it must page via cross-shard resume.
 pub const DEFAULT_VARLEN_MAX_FRONTIER: usize = 100_000;
 
+/// Default cap on the edges one gathered graph algorithm run collects. Each
+/// gathered edge holds its three names and a weight, around 100 bytes with
+/// typical keys, so the default bounds one run near 1 GB before its CSR.
+pub const DEFAULT_MAX_GATHERED_ALGO_EDGES: usize = 10_000_000;
+
 /// Graph engine tuning (traversal limits, LCC algorithm).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphTuning {
@@ -129,6 +134,12 @@ pub struct GraphTuning {
     /// dense / bidirectional traversals.
     #[serde(default = "default_varlen_max_frontier")]
     pub varlen_max_frontier: usize,
+    /// Hard cap on the distinct edges a gathered graph algorithm collects from
+    /// every owner before it runs on one core. The algorithm needs every edge
+    /// in one CSR, so a run over more edges is refused with the edge count
+    /// rather than answered from part of the graph.
+    #[serde(default = "default_max_gathered_algo_edges")]
+    pub max_gathered_algo_edges: usize,
 }
 
 impl Default for GraphTuning {
@@ -140,6 +151,7 @@ impl Default for GraphTuning {
             lcc_sample_pairs: default_lcc_sample_pairs(),
             varlen_max_results: default_varlen_max_results(),
             varlen_max_frontier: default_varlen_max_frontier(),
+            max_gathered_algo_edges: default_max_gathered_algo_edges(),
         }
     }
 }
@@ -161,6 +173,9 @@ fn default_varlen_max_results() -> usize {
 }
 fn default_varlen_max_frontier() -> usize {
     DEFAULT_VARLEN_MAX_FRONTIER
+}
+fn default_max_gathered_algo_edges() -> usize {
+    DEFAULT_MAX_GATHERED_ALGO_EDGES
 }
 
 /// Timeseries engine tuning (memtable budgets, block sizes).

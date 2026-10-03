@@ -27,23 +27,18 @@ pub(super) async fn try_string(
     // Version history. None of `CREATE CHECKPOINT`, `DROP CHECKPOINT`, `SHOW
     // VERSIONS OF`, `SELECT … AT VERSION`, `SELECT DIFF(…)`, `RESTORE … SET
     // VERSION`, or `COMPACT HISTORY ON` parse into any typed AST variant — the
-    // pgwire collaborative router dispatched all of them by string prefix from
-    // the raw SQL. Replicate that exactly here, before the parse gate, so the
-    // prefix recognition (including the `RESTORE … SET VERSION` guard that keeps
-    // `RESTORE TENANT` / `RESTORE DATABASE` on the typed path) and syntax
-    // messages stay byte-identical. Guard ordering mirrors the pgwire router.
+    // router dispatches all of them by string prefix from the raw SQL,
+    // before the parse gate. The `RESTORE … SET VERSION` guard keeps
+    // `RESTORE TENANT` / `RESTORE DATABASE` on the typed path.
     if upper.starts_with("CREATE CHECKPOINT ") {
         return Some(
             version_history::checkpoint::create_checkpoint(state, identity, database_id, sql).await,
         );
     }
     if upper.starts_with("DROP CHECKPOINT ") {
-        return Some(version_history::checkpoint::drop_checkpoint(
-            state,
-            identity,
-            database_id,
-            sql,
-        ));
+        return Some(
+            version_history::checkpoint::drop_checkpoint(state, identity, database_id, sql).await,
+        );
     }
     if upper.starts_with("SHOW VERSIONS OF ") {
         return Some(version_history::show_versions::show_versions(
@@ -78,15 +73,13 @@ pub(super) async fn try_string(
     }
 
     // Maintenance: ANALYZE / COMPACT / SHOW STORAGE / SHOW COMPACTION STATUS.
-    // These parse into typed `ClusterStmt` variants, but the pgwire router
-    // dispatched all four by string prefix from the raw SQL / token slice (the
-    // pgwire typed-AST path has no arm for them). Replicate that exactly here,
-    // before the parse gate, so the prefix recognition (trailing space on
-    // `ANALYZE ` / `COMPACT `, and the `SHOW COMPACTION STATUS` exact / prefix
-    // forms) and the `parts`-based name extraction stay byte-identical. The
-    // `COMPACT ` prefix is placed after the version-history `COMPACT HISTORY ON`
-    // guard above, preserving that `COMPACT HISTORY ON …` routes to
-    // version_history exactly as the pgwire dispatch (neutral-first) did.
+    // These parse into typed `ClusterStmt` variants, but the router
+    // dispatches all four by string prefix from the raw SQL / token slice,
+    // before the parse gate (trailing space on `ANALYZE ` / `COMPACT `, and the
+    // `SHOW COMPACTION STATUS` exact / prefix forms; names come from `parts`).
+    // The `COMPACT ` prefix is placed after the version-history
+    // `COMPACT HISTORY ON` guard above, so `COMPACT HISTORY ON …` routes to
+    // version_history.
     if upper.starts_with("ANALYZE ") {
         return Some(maintenance::handle_analyze(state, identity, sql, database_id).await);
     }
@@ -116,13 +109,10 @@ pub(super) async fn try_string(
     // SHOW RAFT GROUP <id>, SHOW MIGRATIONS, REBALANCE, SHOW PEER HEALTH,
     // SHOW NODES, SHOW NODE <id>, REMOVE NODE <id>, SHOW RANGES, SHOW
     // ROUTING, SHOW SCHEMA VERSION. All of these parse into typed
-    // `ClusterStmt` variants, but the pgwire admin router dispatched them by
-    // string prefix from the raw SQL / token slice (the pgwire typed-AST path
-    // only had an arm for `ALTER RAFT GROUP`). Replicate that exactly here,
-    // before the parse gate, so the prefix recognition (order matters: `SHOW
-    // RAFT GROUPS` before `SHOW RAFT GROUP `) and the `parts`-based
-    // extraction stay byte-identical. `ALTER RAFT GROUP` is dispatched via
-    // the typed match below, exactly as the pgwire router did.
+    // `ClusterStmt` variants, but the router dispatches them by
+    // string prefix from the raw SQL / token slice, before the parse gate.
+    // Order matters: `SHOW RAFT GROUPS` comes before `SHOW RAFT GROUP `.
+    // `ALTER RAFT GROUP` is dispatched via the typed match below.
     if upper.starts_with("SHOW CLUSTER") {
         return Some(cluster::show_cluster(state, identity));
     }
@@ -162,13 +152,18 @@ pub(super) async fn try_string(
     if upper.starts_with("SHOW SCHEMA VERSION") {
         return Some(cluster::show_schema_version(state, identity));
     }
+    if upper == "CREATE RESTORE POINT" || upper.starts_with("CREATE RESTORE POINT ") {
+        return Some(cluster::create_restore_point(state, identity).await);
+    }
+    if upper.starts_with("SHOW RESTORE POINTS") {
+        return Some(cluster::show_restore_points(state, identity));
+    }
 
     // Vector index lifecycle: SHOW VECTOR INDEX / ALTER VECTOR INDEX. None of
-    // these are dispatched from a typed AST arm — the pgwire engine_ops router
-    // recognized all four by string prefix from the raw SQL. Replicate that
-    // exactly here, before the parse gate, so the prefix recognition (and the
-    // ` SEAL` / ` COMPACT` / ` SET ` sub-clause guards, checked in this order)
-    // stays byte-identical.
+    // these are dispatched from a typed AST arm — the router recognizes all
+    // four by string prefix from the raw SQL, before the parse gate. The
+    // ` SEAL` / ` COMPACT` / ` SET ` sub-clause guards are checked in this
+    // order.
     if upper.starts_with("SHOW VECTOR INDEX ") {
         return Some(
             maintenance::handle_show_vector_index(state, identity, database_id, sql).await,
@@ -193,21 +188,14 @@ pub(super) async fn try_string(
     // Vector model metadata. None of these are dispatched from a typed AST arm —
     // `ALTER COLLECTION ... SET VECTOR METADATA ON` parses into no
     // `AlterCollectionOp` variant, and `SHOW VECTOR MODELS` / `SELECT
-    // VECTOR_METADATA(...)` parse into no typed DDL AST at all. The pgwire
-    // engine_ops router recognized all three by string prefix from the raw SQL.
-    // Replicate that exactly here, before the parse gate, so the prefix
-    // recognition (and the `ALTER COLLECTION ... SET VECTOR METADATA ON` guard
-    // running before the typed `AlterCollection` parse handling) stays
-    // byte-identical. The `SET VECTOR METADATA ON` guard precedes the typed
-    // parse gate below, so it is never shadowed by the migrated typed
-    // `AlterCollection` dispatch.
+    // VECTOR_METADATA(...)` parse into no typed DDL AST at all. The router
+    // recognizes all three by string prefix from the raw SQL, before the parse
+    // gate. The `SET VECTOR METADATA ON` guard precedes the typed parse gate
+    // below, so the typed `AlterCollection` dispatch never shadows it.
     if upper.starts_with("ALTER COLLECTION ") && upper.contains("SET VECTOR METADATA ON") {
-        return Some(collection::handle_set_vector_metadata(
-            state,
-            identity,
-            sql,
-            database_id,
-        ));
+        return Some(
+            collection::handle_set_vector_metadata(state, identity, sql, database_id).await,
+        );
     }
     if upper.starts_with("SHOW VECTOR MODELS") {
         return Some(collection::handle_show_vector_models(
@@ -244,19 +232,36 @@ pub(super) async fn try_string(
 
     // Graph index and tree operations: CREATE GRAPH INDEX / TREE_SUM /
     // TREE_CHILDREN. None of these are dispatched from a typed AST arm — the
-    // pgwire engine_ops router recognized all three by string prefix from the
-    // raw SQL (the `SELECT TREE_SUM` / bare `TREE_SUM` and `SELECT
+    // router recognizes all three by string prefix from the raw SQL, before the
+    // parse gate (the `SELECT TREE_SUM` / bare `TREE_SUM` and `SELECT
     // TREE_CHILDREN` / bare `TREE_CHILDREN` forms never parse into a typed DDL
-    // AST). Replicate that exactly here, before the parse gate, so the prefix
-    // recognition and syntax messages stay byte-identical.
+    // AST).
     if upper.starts_with("CREATE GRAPH INDEX ") {
         return Some(tree_ops::create_graph_index(state, identity, database_id, sql).await);
     }
     if upper.starts_with("SELECT TREE_SUM") || upper.starts_with("TREE_SUM") {
-        return Some(tree_ops::tree_sum(state, identity, database_id, sql).await);
+        return Some(
+            tree_ops::tree_sum(
+                state,
+                identity,
+                database_id,
+                sql,
+                txn_ctx.linearizable_reads(),
+            )
+            .await,
+        );
     }
     if upper.starts_with("SELECT TREE_CHILDREN") || upper.starts_with("TREE_CHILDREN") {
-        return Some(tree_ops::tree_children(state, identity, database_id, sql).await);
+        return Some(
+            tree_ops::tree_children(
+                state,
+                identity,
+                database_id,
+                sql,
+                txn_ctx.linearizable_reads(),
+            )
+            .await,
+        );
     }
 
     None

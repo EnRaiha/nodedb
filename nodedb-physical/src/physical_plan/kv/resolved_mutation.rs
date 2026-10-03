@@ -29,7 +29,8 @@ use nodedb_types::{QualifiedCollection, Surrogate};
     zerompk::FromMessagePack,
 )]
 pub enum KvResolvedMutation {
-    /// Write `value` under `key`, replacing whatever is there.
+    /// Write `value` under `key`, replacing whatever is there. `surrogate`
+    /// is the row's bound identity and is never `Surrogate::ZERO`.
     Put {
         collection: QualifiedCollection,
         key: Vec<u8>,
@@ -44,6 +45,20 @@ pub enum KvResolvedMutation {
         expire_at_ms: u64,
         surrogate: Surrogate,
         precondition: Option<Vec<u8>>,
+    },
+    /// Replace the value of the row `key` already holds, keeping its bound
+    /// identity. The row must be present and hold exactly `precondition`. A
+    /// predicate update resolves to this: it rewrites existing rows and
+    /// allocates no identity.
+    Rewrite {
+        collection: QualifiedCollection,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        /// See `Put::ttl_ms`.
+        ttl_ms: u64,
+        /// See `Put::expire_at_ms`.
+        expire_at_ms: u64,
+        precondition: Vec<u8>,
     },
     /// Remove `key`.
     Delete {
@@ -75,6 +90,7 @@ impl KvResolvedMutation {
     pub fn collection(&self) -> &QualifiedCollection {
         match self {
             KvResolvedMutation::Put { collection, .. }
+            | KvResolvedMutation::Rewrite { collection, .. }
             | KvResolvedMutation::Delete { collection, .. }
             | KvResolvedMutation::Expire { collection, .. }
             | KvResolvedMutation::Persist { collection, .. } => collection,
@@ -85,6 +101,7 @@ impl KvResolvedMutation {
     pub fn key(&self) -> &[u8] {
         match self {
             KvResolvedMutation::Put { key, .. }
+            | KvResolvedMutation::Rewrite { key, .. }
             | KvResolvedMutation::Delete { key, .. }
             | KvResolvedMutation::Expire { key, .. }
             | KvResolvedMutation::Persist { key, .. } => key.as_slice(),
@@ -98,6 +115,7 @@ impl KvResolvedMutation {
             | KvResolvedMutation::Delete { precondition, .. }
             | KvResolvedMutation::Expire { precondition, .. }
             | KvResolvedMutation::Persist { precondition, .. } => precondition.as_deref(),
+            KvResolvedMutation::Rewrite { precondition, .. } => Some(precondition.as_slice()),
         }
     }
 }

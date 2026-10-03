@@ -99,6 +99,8 @@ pub enum DescriptorKind {
     Tenant,
     ApiKey,
     AuditRetention,
+    /// An ND array. Its drain gates array DDL and cell writes.
+    Array,
 }
 
 /// Common header embedded in every descriptor.

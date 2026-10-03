@@ -8,14 +8,13 @@
 
 use std::sync::Arc;
 
-use redb::Database;
-
 use nodedb_fts::backend::FtsBackend;
 use nodedb_fts::posting::Posting;
 use nodedb_types::Surrogate;
 
 use super::segments::CompactCommit;
 use super::shared::redb_err;
+use crate::engine::durability_gate::GatedDatabase;
 use crate::engine::sparse::fts_redb::tables::{
     DOC_LENGTHS, DOC_TERMS, INDEX_META, POSTINGS, SEGMENTS, STATS,
 };
@@ -27,7 +26,8 @@ use crate::storage::quarantine::QuarantineRegistry;
 /// `(database_id, tenant_id, collection, …)` — database and tenant isolation
 /// are enforced by the table schema, never by lexical-prefix ordering.
 pub struct RedbFtsBackend {
-    pub(super) db: Arc<Database>,
+    /// The sparse engine's gated database, shared.
+    pub(super) db: Arc<GatedDatabase>,
     /// Shared quarantine registry for corrupt FTS segment bytes.
     /// `None` until wired by the server bootstrap.
     pub(super) quarantine_registry: Option<Arc<QuarantineRegistry>>,
@@ -35,7 +35,7 @@ pub struct RedbFtsBackend {
 
 impl RedbFtsBackend {
     /// Open or create redb tables for FTS.
-    pub fn open(db: Arc<Database>) -> crate::Result<Self> {
+    pub fn open(db: Arc<GatedDatabase>) -> crate::Result<Self> {
         let write_txn = db.begin_write().map_err(|e| redb_err("init tables", e))?;
         {
             write_txn
@@ -65,8 +65,9 @@ impl RedbFtsBackend {
         })
     }
 
-    /// Access the underlying database.
-    pub fn db(&self) -> &Database {
+    /// Access the underlying database. Its write transactions begin through
+    /// the durability gate.
+    pub fn db(&self) -> &GatedDatabase {
         &self.db
     }
 

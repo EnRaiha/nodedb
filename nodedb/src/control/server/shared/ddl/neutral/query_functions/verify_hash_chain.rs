@@ -2,20 +2,21 @@
 
 //! `SELECT VERIFY_HASH_CHAIN('collection')`
 //!
-//! Scans documents in the collection, verifies each hash chain link.
-//! Returns `{valid: true/false, entries: N, broken_at: index, last_hash: ...}`.
-
-use sonic_rs;
+//! Dispatches `MetaOp::VerifyHashChain` to the core that owns the collection.
+//! The Data Plane walks the chain over the raw stored rows. This handler only
+//! authorizes the call and shapes the verdict as
+//! `{valid, entries, last_hash, broken_at, document_id, expected, found}`.
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::dispatch_utils;
 use crate::control::state::SharedState;
+use crate::types::hash_chain::ChainVerdict;
 use crate::types::{DatabaseId, TraceId};
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::read_gate::CollectionReadGate;
-use super::helpers::{err, extract_function_args, single_result, unwrap_scan_doc_with_id};
+use super::helpers::{clean_arg, err, extract_function_args, single_result};
 
 pub async fn verify_hash_chain(
     state: &SharedState,
@@ -25,121 +26,87 @@ pub async fn verify_hash_chain(
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
     let args = extract_function_args(sql, "VERIFY_HASH_CHAIN")?;
-    if args.is_empty() {
+    let collection = args.first().map(|arg| clean_arg(arg).to_lowercase());
+    let Some(collection) = collection.filter(|name| !name.is_empty()) else {
         return Err(err("42601", "VERIFY_HASH_CHAIN requires (collection)"));
-    }
+    };
 
-    let collection = args[0]
-        .trim()
-        .trim_matches('\'')
-        .trim_matches('"')
-        .to_lowercase();
-
-    // `collection` is a caller argument, so the scan it names is authorized and
-    // row-filtered here. Each link is recomputed over the whole document body,
-    // so any redaction rule on the collection is refused: hashing a masked row
-    // would report an intact chain as broken.
+    // Each link covers its whole stored row, so a caller that cannot read
+    // every row of the collection is refused rather than handed a verdict
+    // over rows it cannot see.
     let gate = CollectionReadGate::open(state, identity, database_id, &collection)?;
     gate.require_document_engine(&collection, "VERIFY_HASH_CHAIN")?;
     gate.refuse_if_any_redaction(&collection, "the hash chain")?;
 
-    // Scan all documents.
     let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
-    let mut scan_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
+    let mut plan = PhysicalPlan::Meta(nodedb_physical::physical_plan::MetaOp::VerifyHashChain {
         collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
-        limit: usize::MAX,
-        offset: 0,
-        sort_keys: Vec::new(),
-        filters: Vec::new(),
-        distinct: false,
-        projection: Vec::new(),
-        computed_columns: Vec::new(),
-        window_functions: Vec::new(),
-        system_time: nodedb_types::SystemTimeScope::Current,
-        valid_at_ms: None,
-        prefilter: None,
     });
-    gate.inject_rls(&mut scan_plan)?;
+    gate.inject_rls(&mut plan)?;
 
-    let scan_resp = dispatch_utils::dispatch_to_data_plane(
+    let response = dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
         database_id,
         vshard,
-        scan_plan,
+        plan,
         TraceId::ZERO,
     )
     .await
-    .map_err(|e| DdlError::from_error_in_context("scan failed", &e))?;
+    .map_err(|e| DdlError::from_error_in_context("hash-chain verification failed", &e))?;
 
-    let payload_json =
-        crate::data::executor::response_codec::decode_payload_to_json(&scan_resp.payload);
-    let docs: Vec<serde_json::Value> = sonic_rs::from_str(&payload_json)
-        .map_err(|e| err("22P02", &format!("invalid JSON in scan response: {e}")))?;
+    let verdict: ChainVerdict = zerompk::from_msgpack(response.payload.as_ref())
+        .map_err(|e| DdlError::internal(format!("hash-chain verdict does not decode: {e}")))?;
+    Ok(single_result(&verdict_json(&verdict).to_string()))
+}
 
-    // Walk the chain: each doc should have `_chain_hash` field.
-    let mut prev_hash = crate::data::executor::enforcement::hash_chain::GENESIS_HASH.to_string();
-    let mut entries = 0usize;
-    let mut valid = true;
-    let mut broken_at: Option<usize> = None;
+/// The verdict as the JSON the API boundary returns.
+fn verdict_json(verdict: &ChainVerdict) -> serde_json::Value {
+    let brk = verdict.broken.as_ref();
+    serde_json::json!({
+        "valid": brk.is_none(),
+        "entries": verdict.entries,
+        "last_hash": verdict.last_hash,
+        "broken_at": brk.map(|b| b.index),
+        "document_id": brk.and_then(|b| b.document_id.clone()),
+        "expected": brk.and_then(|b| b.expected.clone()),
+        "found": brk.and_then(|b| b.found.clone()),
+    })
+}
 
-    for (i, doc) in docs.into_iter().enumerate() {
-        // The raw document-scan codec wraps each row as `{"id": <doc PK>,
-        // "data": {..fields incl. _chain_hash..}}`. `doc_id` must be the
-        // *wrapper's* id — the same `document_id` the original INSERT fed
-        // into `compute_chain_hash` — not a same-named field inside the
-        // document body, which may not exist.
-        let (wrapper_id, obj) = unwrap_scan_doc_with_id(doc);
-        let doc_id = if !wrapper_id.is_empty() {
-            wrapper_id
-        } else {
-            obj.get("id")
-                .or_else(|| obj.get("_id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::hash_chain::ChainBreak;
 
-        let stored_hash = obj
-            .get("_chain_hash")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        if stored_hash.is_empty() {
-            valid = false;
-            broken_at = Some(i);
-            break;
-        }
-
-        // Recompute the hash from the document contents (without _chain_hash).
-        let mut doc_for_hash = serde_json::Value::Object(obj);
-        if let Some(obj) = doc_for_hash.as_object_mut() {
-            obj.remove("_chain_hash");
-        }
-        let doc_bytes = sonic_rs::to_vec(&doc_for_hash)
-            .map_err(|e| DdlError::internal(format!("failed to serialize document: {e}")))?;
-
-        let expected = crate::data::executor::enforcement::hash_chain::compute_chain_hash(
-            &prev_hash, &doc_id, &doc_bytes,
-        );
-
-        if expected != stored_hash {
-            valid = false;
-            broken_at = Some(i);
-            break;
-        }
-
-        prev_hash = stored_hash;
-        entries += 1;
+    #[test]
+    fn an_intact_verdict_is_valid_with_no_break_fields() {
+        let json = verdict_json(&ChainVerdict {
+            entries: 3,
+            last_hash: "ab".into(),
+            broken: None,
+        });
+        assert_eq!(json["valid"], true);
+        assert_eq!(json["entries"], 3);
+        assert!(json["broken_at"].is_null());
     }
 
-    let result = serde_json::json!({
-        "valid": valid,
-        "entries": entries,
-        "broken_at": broken_at,
-        "last_hash": prev_hash,
-    });
-
-    Ok(single_result(&result.to_string()))
+    #[test]
+    fn a_break_names_its_position_row_and_links() {
+        let json = verdict_json(&ChainVerdict {
+            entries: 1,
+            last_hash: "h1".into(),
+            broken: Some(ChainBreak {
+                index: 1,
+                document_id: Some("00000002".into()),
+                expected: Some("e".into()),
+                found: Some("f".into()),
+            }),
+        });
+        assert_eq!(json["valid"], false);
+        assert_eq!(json["broken_at"], 1);
+        assert_eq!(json["document_id"], "00000002");
+        assert_eq!(json["expected"], "e");
+        assert_eq!(json["found"], "f");
+    }
 }

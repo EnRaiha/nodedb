@@ -79,7 +79,7 @@ fn object(fields: &[(&str, Value)]) -> Vec<u8> {
         .iter()
         .map(|(k, v)| ((*k).to_string(), v.clone()))
         .collect();
-    zerompk::to_msgpack_vec(&Value::Object(map)).expect("encode object")
+    nodedb_types::value_to_msgpack(&Value::Object(map)).expect("encode object")
 }
 
 // ── Document ─────────────────────────────────────────────────────────────
@@ -118,16 +118,18 @@ fn a_document_write_lands_and_a_refused_install_removes_it() {
 // ── KV predicate form ────────────────────────────────────────────────────
 
 fn seed_kv(core: &mut CoreLoop) {
-    core.kv_engine.put(crate::engine::kv::KvPutParams {
-        database_id: 0,
-        tenant_id: TID,
-        collection: "cache",
-        key: b"k",
-        value: &object(&[("n", Value::Integer(1))]),
-        ttl_ms: 0,
-        now_ms: crate::engine::kv::current_ms(),
-        surrogate: Surrogate::new(51),
-    });
+    core.kv_engine
+        .put(crate::engine::kv::KvPutParams {
+            database_id: 0,
+            tenant_id: TID,
+            collection: "cache",
+            key: b"k",
+            value: &object(&[("n", Value::Integer(1))]),
+            ttl_ms: 0,
+            now_ms: crate::engine::kv::current_ms(),
+            surrogate: Surrogate::new(51),
+        })
+        .expect("a bound row writes");
 }
 
 fn kv_predicate_delete() -> PhysicalPlan {
@@ -285,7 +287,7 @@ fn array_put() -> PhysicalPlan {
     let cells = vec![ArrayPutCell {
         coord: vec![CoordValue::Int64(3)],
         attrs: vec![CellValue::Int64(9)],
-        surrogate: Surrogate::ZERO,
+        surrogate: Surrogate::new(1),
         system_from_ms: 1,
         valid_from_ms: 0,
         valid_until_ms: i64::MAX,
@@ -295,6 +297,7 @@ fn array_put() -> PhysicalPlan {
         cells_msgpack: zerompk::to_msgpack_vec(&cells).expect("encode cells"),
         wal_lsn: 0,
         provenance: None,
+        vshard_id: 0,
     })
 }
 
@@ -344,26 +347,32 @@ fn fts_documents(refuse: bool) -> u32 {
             .expect("encode lines");
         ops.push(RedoSubRecord {
             record_type: nodedb_wal::record::RecordType::TimeseriesBatch as u32,
-            payload:
-                crate::control::server::wal_dispatch::encode_timeseries_batch_payload_with_format(
-                    "refusal_probe",
-                    &lines,
-                    None,
-                    "ilp-msgpack",
-                )
-                .expect("encode ingest"),
+            payload: crate::control::server::wal_dispatch::encode_timeseries_ingest_payload(
+                crate::control::server::wal_dispatch::TimeseriesIngestRecord {
+                    collection: "refusal_probe",
+                    payload: &lines,
+                    provenance: None,
+                    format: "ilp-msgpack",
+                    default_timestamp_ms: 0,
+                },
+            )
+            .expect("encode ingest"),
         });
     }
     let redo = RedoRecord {
         version: 1,
         ops,
         calvin_stamp: None,
+        cross_shard_applied: None,
+        row_sources: Vec::new(),
+        publishes: Vec::new(),
+        row_changes: Vec::new(),
     }
     .to_bytes()
     .expect("encode redo");
     let mut task = make_default_task();
     task.wal_lsn = Some(Lsn::new(210));
-    let response = core.install_committed_redo(
+    let response = core.execute_apply_transaction_redo(
         &task,
         TID,
         CommittedRedo {
@@ -452,17 +461,17 @@ fn a_refused_install_withdraws_the_index_side_effects_of_a_document_write() {
 fn a_committed_record_carrying_a_raw_crdt_delta_is_refused_before_any_write() {
     use crate::data::executor::handlers::transaction::redo_apply::CommittedRedo;
     use crate::types::Lsn;
-    use crate::wal::{CrdtDeltaWalPayload, RedoRecord, RedoSubRecord};
+    use crate::wal::{CrdtDeltaTarget, CrdtDeltaWalPayload, RedoRecord, RedoSubRecord};
 
     let dir = tempfile::tempdir().expect("tempdir");
     let (mut core, _req, _resp) = make_core_with_dir(dir.path());
     let delta = CrdtDeltaWalPayload::new(
         vec![0u8; 8],
-        Some("tasks".to_string()),
+        "tasks".to_string(),
         None,
         None,
-        Some("t1".to_string()),
-        Some(1),
+        CrdtDeltaTarget::document("t1".to_string(), nodedb_types::Surrogate::new(1))
+            .expect("bound document target"),
     )
     .encode()
     .expect("encode delta");
@@ -473,13 +482,17 @@ fn a_committed_record_carrying_a_raw_crdt_delta_is_refused_before_any_write() {
             payload: delta,
         }],
         calvin_stamp: None,
+        cross_shard_applied: None,
+        row_sources: Vec::new(),
+        publishes: Vec::new(),
+        row_changes: Vec::new(),
     }
     .to_bytes()
     .expect("encode redo");
     let mut task = make_default_task();
     task.wal_lsn = Some(Lsn::new(220));
 
-    let response = core.install_committed_redo(
+    let response = core.execute_apply_transaction_redo(
         &task,
         TID,
         CommittedRedo {

@@ -27,6 +27,9 @@ pub(super) struct SystemTxnDataPlane<'a> {
     /// re-enter the Event Plane. Stamping them as `Trigger` is what stops a
     /// trigger's own output from firing that same trigger again.
     pub(super) event_source: crate::event::EventSource,
+    /// The cross-shard request key the commit's redo record carries, with the
+    /// vShard its request addresses.
+    pub(super) applied_key: Option<(crate::wal::CrossShardAppliedKey, u32)>,
 }
 
 impl TxnDataPlane for SystemTxnDataPlane<'_> {
@@ -58,5 +61,13 @@ impl TxnDataPlane for SystemTxnDataPlane<'_> {
 
     fn event_source(&self) -> crate::event::EventSource {
         self.event_source
+    }
+
+    fn applied_key(&self) -> Option<crate::wal::CrossShardAppliedKey> {
+        self.applied_key.as_ref().map(|(key, _)| key.clone())
+    }
+
+    fn applied_key_vshard(&self) -> Option<u32> {
+        self.applied_key.as_ref().map(|(_, vshard)| *vshard)
     }
 }

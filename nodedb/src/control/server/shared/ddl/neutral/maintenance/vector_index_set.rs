@@ -74,17 +74,7 @@ pub async fn handle_alter_vector_index_set(
 
     let merged = merge(current, &overlay);
     validate(&merged, &overlay)?;
-    let outcome = super::super::vector_replicate::propose_put_params(state, &merged)?;
-
-    // Single node: no applier runs, so post-apply never fires. Run the
-    // per-node install the post-apply lane runs everywhere else.
-    if outcome.needs_local_apply() {
-        let shared = state
-            .self_arc()
-            .map_err(|e| DdlError::from_error_in_context("install vector index params", &e))?;
-        crate::control::catalog_entry::post_apply::install_vector_index_params(merged, shared)
-            .await;
-    }
+    super::super::vector_replicate::propose_put_params(state, &merged).await?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -151,7 +141,7 @@ fn merge(stored: StoredVectorIndexParams, overlay: &ParamOverlay) -> StoredVecto
 /// Refuse a merged row the engine cannot build, before it replicates.
 ///
 /// Apply writes the row on every node and cannot reject, so a row that fails
-/// these rules would reach every node and break each one's build. CREATE
+/// these rules will reach every node and break each one's build. CREATE
 /// enforces the same three rules on its own row.
 ///
 /// The first rule reads the overlay, not the merged row: an index moving from
@@ -226,7 +216,7 @@ fn parse_set_clause(sql: &str) -> Result<ParamOverlay, DdlError> {
     for pair in inner.split(',') {
         let pair = pair.trim();
         // A list item with no `=` must not be skipped — silently dropping a
-        // typo'd item would report success for the ones around it.
+        // typo'd item will report success for the ones around it.
         let Some((key, val)) = pair.split_once('=') else {
             return Err(ddl_err(
                 "42601",
@@ -253,7 +243,7 @@ fn parse_set_clause(sql: &str) -> Result<ParamOverlay, DdlError> {
             "ivf_nprobe" => overlay.ivf_nprobe = uint(val, "ivf_nprobe")?,
             // `m0` is derived as `2 * m` by every path that installs an index —
             // CREATE, the boot seed, and WAL replay alike. A row cannot carry a
-            // different ratio, so honouring one here would hold only until the
+            // different ratio, so honouring one here will hold only until the
             // next restart, on the one node that ran the statement.
             "m0" => {
                 return Err(ddl_err(
@@ -312,6 +302,7 @@ mod tests {
             pq_m: 0,
             ivf_cells: 0,
             ivf_nprobe: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 
@@ -345,7 +336,7 @@ mod tests {
         assert_eq!(merged("index_type = 'ivf_pq', ivf_cells = 64").dim, 384);
     }
 
-    /// The row keys the catalog write, so a merge that moved it would land the
+    /// The row keys the catalog write, so a merge that moved it will land the
     /// altered parameters on a different index.
     #[test]
     fn the_identity_fields_survive_every_clause() {
@@ -418,7 +409,7 @@ mod tests {
         assert!(parse("m = 0").is_err());
     }
 
-    /// `m0` cannot be made durable, so accepting it would apply the ratio on
+    /// `m0` cannot be made durable, so accepting it will apply the ratio on
     /// one node until its next restart.
     #[test]
     fn m0_is_rejected_rather_than_dropped() {

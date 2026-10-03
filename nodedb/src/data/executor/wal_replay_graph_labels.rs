@@ -130,6 +130,9 @@ impl CoreLoop {
         let mut replayed = 0usize;
 
         for record in records {
+            if self.replay_halted() {
+                break;
+            }
             let vshard_id = record.header.vshard_id as usize;
             let target_core = if num_cores > 0 {
                 vshard_id % num_cores

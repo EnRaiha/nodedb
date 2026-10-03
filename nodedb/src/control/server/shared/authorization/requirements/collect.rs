@@ -98,6 +98,7 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                 | MetaOp::TemporalPurgeCrdt { collection, .. }
                 | MetaOp::QueryLastValues { collection }
                 | MetaOp::QueryLastValue { collection, .. }
+                | MetaOp::VerifyHashChain { collection }
                 | MetaOp::RebuildIndex { collection, .. },
             ) => add_collection_requirement(collection.as_str(), required_permission(plan), out),
             PhysicalPlan::Meta(
@@ -105,15 +106,6 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                 | MetaOp::UnregisterMaterializedView { name, .. }
                 | MetaOp::QueryCollectionSize { name, .. },
             ) => add_collection_requirement(name, required_permission(plan), out),
-            PhysicalPlan::Meta(MetaOp::RenameCollection {
-                old_collection,
-                new_collection,
-                ..
-            }) => {
-                let permission = required_permission(plan);
-                add_collection_requirement(old_collection.as_str(), permission, out);
-                add_collection_requirement(new_collection.as_str(), permission, out);
-            }
             PhysicalPlan::Meta(MetaOp::TransactionBatch { plans, .. })
             | PhysicalPlan::Meta(MetaOp::ResolveTxn { plans, .. })
             | PhysicalPlan::Meta(MetaOp::RecordCalvinWriteVersions { plans, .. })

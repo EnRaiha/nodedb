@@ -115,7 +115,7 @@ pub fn replay_sync_hwm_records(
             | RecordType::TransactionRedo
             | RecordType::Checkpoint
             | RecordType::CollectionTombstoned
-            | RecordType::LsnMsAnchor
+            | RecordType::TimeAnchor
             | RecordType::TemporalPurge
             | RecordType::CalvinApplied
             | RecordType::SurrogateAlloc
@@ -129,7 +129,15 @@ pub fn replay_sync_hwm_records(
             // WriteAborted carries only a refused write's LSN, no sync HWM.
             | RecordType::WriteAborted
             // ProposalApplied carries only an applied Raft proposal's identity.
-            | RecordType::ProposalApplied => {}
+            | RecordType::ProposalApplied
+            // ChangePosition carries only a replicated log position.
+            | RecordType::ChangePosition
+            | RecordType::RestorePoint
+            // None of these carries a sync HWM.
+            | RecordType::GraphNodeCascade
+            | RecordType::GraphEdgeCut
+            | RecordType::SnapshotInstalled
+            | RecordType::WriteGroup => {}
         }
     }
 

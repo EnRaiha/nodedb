@@ -3,10 +3,8 @@
 //! Protocol-neutral user / role / session introspection: SHOW USERS,
 //! SHOW ROLES, SHOW SESSION.
 //!
-//! Ported from the pgwire `ddl::inspect` handlers. The credential / role /
-//! identity reads are preserved verbatim; only the result construction
-//! changed from pgwire `Response` / `QueryResponse` to the protocol-neutral
-//! `DdlResult` over `ShapedRows`.
+//! The credential / role / identity reads run here. The result is the
+//! protocol-neutral `DdlResult` over `ShapedRows`.
 
 use serde_json::{Map, Value as JsonValue};
 

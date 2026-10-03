@@ -4,7 +4,7 @@
 //! own.
 //!
 //! Once a write is enqueued, its records close from the core's final
-//! response. A caller future dropped mid-wait would drop the records with it
+//! response. A caller future dropped mid-wait will drop the records with it
 //! and leak their window. The wait and the close run in a spawned task
 //! instead. The caller awaits what the task reports, and a dropped caller
 //! leaves the task running until the records close.
@@ -27,9 +27,6 @@ use super::resolve::{resolve_at_final, resolve_on_response};
 pub(crate) enum Collect {
     /// Every frame up to the final one, merged, under a byte budget.
     Merged { max_result_bytes: usize },
-    /// The first frame. A partial first frame leaves the task closing the
-    /// records from the final one.
-    First,
 }
 
 /// Where the owned task waits, and how the records close.
@@ -42,6 +39,9 @@ pub(crate) struct OwnedWait {
     /// The instant the caller stops waiting.
     pub deadline: Instant,
     pub collect: Collect,
+    /// Where the final response goes when it arrives after the caller
+    /// stopped waiting.
+    pub late: Option<oneshot::Sender<Response>>,
 }
 
 /// What the owned task reports to the caller.
@@ -64,20 +64,38 @@ pub(crate) enum OwnedResponse {
     ChannelClosed,
 }
 
-/// Wait for `rx`'s response in a spawned task that owns `minted`, and
-/// return what it reports.
-pub(crate) async fn await_response_owned(
+/// What a task that owns a dispatched write's records reports. Dropping it
+/// leaves the task to close the records.
+pub(crate) struct OwnedReport {
+    rx: oneshot::Receiver<OwnedResponse>,
+}
+
+impl OwnedReport {
+    /// Wait for what the task reports.
+    pub(crate) async fn recv(self) -> crate::Result<OwnedResponse> {
+        self.rx.await.map_err(|_| crate::Error::Internal {
+            detail: "the task waiting for a dispatched write's response ended without \
+                     reporting"
+                .into(),
+        })
+    }
+}
+
+/// Mark `minted` sent and hand it to a spawned task that waits for `rx`'s
+/// response and closes the records from it.
+///
+/// Call it in the same synchronous step as the enqueue of the request that
+/// carries the records. No caller future owns them after that, so no drop
+/// at a later await leaks their window.
+pub(crate) fn spawn_owned_wait(
     wait: OwnedWait,
     rx: ResponseReceiver,
     minted: MintedRecords,
-) -> crate::Result<OwnedResponse> {
+) -> OwnedReport {
+    minted.mark_sent();
     let (report_tx, report_rx) = oneshot::channel();
     tokio::spawn(wait_and_close(wait, rx, minted, report_tx));
-    report_rx.await.map_err(|_| crate::Error::Internal {
-        detail: "the task waiting for a dispatched write's response ended without \
-                 reporting"
-            .into(),
-    })
+    OwnedReport { rx: report_rx }
 }
 
 async fn wait_and_close(
@@ -92,18 +110,18 @@ async fn wait_and_close(
         final_refusal_key,
         deadline,
         collect,
+        late,
     } = wait;
+    let forward = |final_response: Option<Response>| {
+        if let (Some(late), Some(response)) = (late, final_response) {
+            let _ = late.send(response);
+        }
+    };
     let until = tokio::time::Instant::from_std(deadline);
     let collected = match collect {
         Collect::Merged { max_result_bytes } => {
             tokio::time::timeout_at(until, collect_bounded_response(&mut rx, max_result_bytes))
                 .await
-        }
-        Collect::First => {
-            tokio::time::timeout_at(until, async {
-                rx.recv().await.ok_or(DispatchCollectError::ChannelClosed)
-            })
-            .await
         }
     };
     match collected {
@@ -112,7 +130,7 @@ async fn wait_and_close(
                 response,
                 closed: Ok(()),
             });
-            resolve_at_final(&wal, owner, final_refusal_key, rx, minted).await;
+            forward(resolve_at_final(&wal, owner, final_refusal_key, rx, minted).await);
         }
         Ok(Ok(response)) => {
             let closed =
@@ -121,7 +139,7 @@ async fn wait_and_close(
         }
         Ok(Err(DispatchCollectError::OverBudget { bytes })) => {
             let _ = report.send(OwnedResponse::OverBudget { bytes });
-            resolve_at_final(&wal, owner, final_refusal_key, rx, minted).await;
+            forward(resolve_at_final(&wal, owner, final_refusal_key, rx, minted).await);
         }
         Ok(Err(DispatchCollectError::ChannelClosed)) => {
             minted.hold();
@@ -129,7 +147,7 @@ async fn wait_and_close(
         }
         Err(_) => {
             let _ = report.send(OwnedResponse::DeadlineExceeded);
-            resolve_at_final(&wal, owner, final_refusal_key, rx, minted).await;
+            forward(resolve_at_final(&wal, owner, final_refusal_key, rx, minted).await);
         }
     }
 }
@@ -195,7 +213,38 @@ mod tests {
             collect: Collect::Merged {
                 max_result_bytes: 1 << 20,
             },
+            late: None,
         }
+    }
+
+    /// A final response that arrives after the deadline goes to the late
+    /// receiver, once the records closed from it.
+    #[tokio::test]
+    async fn a_late_final_response_is_forwarded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = Arc::new(WalManager::open_for_testing(&dir.path().join("wal")).expect("wal"));
+        let floor = OutcomeFloor::new();
+        let tracker = RequestTracker::new();
+        let rx = tracker.register(RequestId::new(3));
+        let (minted, _lsn) = minted_record(&wal, &floor);
+        let (late_tx, late_rx) = oneshot::channel();
+        let report = spawn_owned_wait(
+            OwnedWait {
+                late: Some(late_tx),
+                ..wait(&wal, Instant::now() + Duration::from_millis(20))
+            },
+            rx,
+            minted,
+        );
+        let outcome = report.recv().await.expect("report");
+        assert!(matches!(outcome, OwnedResponse::DeadlineExceeded));
+
+        let mut ok = refusal(3);
+        ok.status = Status::Ok;
+        ok.error_code = None;
+        assert!(tracker.complete(ok));
+        let late = late_rx.await.expect("the late response is forwarded");
+        assert_eq!(late.status, Status::Ok);
     }
 
     /// The caller future is dropped while it waits. The task still closes
@@ -212,7 +261,7 @@ mod tests {
 
         let caller = tokio::time::timeout(
             Duration::from_millis(10),
-            await_response_owned(wait(&wal, deadline), rx, minted),
+            spawn_owned_wait(wait(&wal, deadline), rx, minted).recv(),
         )
         .await;
         assert!(
@@ -243,7 +292,8 @@ mod tests {
         let tracker = RequestTracker::new();
         let rx = tracker.register(RequestId::new(2));
 
-        let outcome = await_response_owned(wait(&wal, Instant::now()), rx, minted)
+        let outcome = spawn_owned_wait(wait(&wal, Instant::now()), rx, minted)
+            .recv()
             .await
             .expect("report");
         assert!(matches!(outcome, OwnedResponse::DeadlineExceeded));
@@ -257,5 +307,43 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(floor.floor() >= lsn);
+    }
+
+    /// The report is dropped before anyone polls it. The task owns the
+    /// records from the spawn, so the answer still settles them, once.
+    #[tokio::test]
+    async fn a_report_dropped_unpolled_still_settles_the_records_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = Arc::new(WalManager::open_for_testing(&dir.path().join("wal")).expect("wal"));
+        let floor = OutcomeFloor::new();
+        let (minted, lsn) = minted_record(&wal, &floor);
+        let tracker = RequestTracker::new();
+        let rx = tracker.register(RequestId::new(3));
+        let deadline = Instant::now() + Duration::from_secs(30);
+
+        drop(spawn_owned_wait(wait(&wal, deadline), rx, minted));
+        assert!(floor.floor() < lsn, "the window holds while the core works");
+
+        let mut applied = refusal(3);
+        applied.status = Status::Ok;
+        applied.error_code = None;
+        assert!(tracker.complete(applied));
+        for _ in 0..200 {
+            if floor.floor() >= lsn {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(floor.floor() >= lsn, "the answer settled the records");
+        wal.sync().expect("sync");
+        let replayed: Vec<u64> = wal
+            .replay()
+            .expect("replay")
+            .iter()
+            .map(|record| record.header.lsn)
+            .collect();
+        assert!(replayed.contains(&lsn.as_u64()), "no marker names it");
+        assert_eq!(floor.leaked_windows(), 0);
+        assert_eq!(floor.held_windows(), 0);
     }
 }

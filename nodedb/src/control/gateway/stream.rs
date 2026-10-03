@@ -16,9 +16,9 @@ use nodedb_physical::physical_plan::PhysicalPlan;
 
 use super::core::{Gateway, QueryContext, authorized_plan_for_context};
 use super::dispatcher::{DispatchRouteStreamParams, dispatch_route_stream, statement_deadline_ms};
+use super::live_leaders::resolve_live_decision;
 use super::retry::retry_not_leader;
 use super::route::TaskRoute;
-use super::router::resolve_decision;
 
 impl Gateway {
     /// Streaming sibling of [`execute`](Gateway::execute).
@@ -45,7 +45,9 @@ impl Gateway {
         ctx: &QueryContext,
         checked: CloneCheckedTask,
     ) -> Result<ResultStream, Error> {
-        let plan = authorized_plan_for_context(ctx, checked)?;
+        // Every streamed plan is an unordered scan (`streamable_gather_child`),
+        // so it carries no write lease to hold for the stream's lifetime.
+        let (plan, _lease) = authorized_plan_for_context(ctx, checked)?;
         self.execute_stream_internal(ctx, plan).await
     }
 
@@ -85,35 +87,10 @@ impl Gateway {
                 let tenant_id = ctx.tenant_id;
                 let database_id = ctx.database_id;
                 let trace_id = ctx.trace_id;
+                let linearizable = ctx.linearizable;
                 let version_set = version_set_for_route.clone();
                 async move {
-                    let decision = {
-                        let routing_guard = shared
-                            .cluster_routing
-                            .as_ref()
-                            .map(|rw| rw.read().unwrap_or_else(|p| p.into_inner()));
-                        let raft_snapshot: Vec<nodedb_cluster::GroupStatus> =
-                            shared.raft_status_fn.get().map(|f| f()).unwrap_or_default();
-                        let live_leader = move |group_id: u64| -> u64 {
-                            raft_snapshot
-                                .iter()
-                                .find(|gs| gs.group_id == group_id)
-                                .map(|gs| gs.leader_id)
-                                .unwrap_or(0)
-                        };
-                        let live_lookup: Option<&dyn Fn(u64) -> u64> =
-                            if shared.raft_status_fn.get().is_some() {
-                                Some(&live_leader)
-                            } else {
-                                None
-                            };
-                        resolve_decision(
-                            vshard_id_u32,
-                            shared.node_id,
-                            routing_guard.as_deref(),
-                            live_lookup,
-                        )
-                    };
+                    let decision = resolve_live_decision(&shared, vshard_id_u32);
                     let route = TaskRoute {
                         plan,
                         decision,
@@ -127,6 +104,7 @@ impl Gateway {
                         trace_id,
                         deadline_ms,
                         version_set: &version_set,
+                        linearizable,
                     })
                     .await
                 }

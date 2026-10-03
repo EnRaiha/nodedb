@@ -37,7 +37,7 @@ pub(super) struct SnapshotRequest<'a> {
 /// Dispatches into the Data Plane for Document shapes; returns lightweight or
 /// empty payloads for Vector / Graph / Array (see inline comments).
 ///
-/// Returns `None` when the snapshot could not be produced — a policy refusal or
+/// Returns `None` when the snapshot cannot be produced — a policy refusal or
 /// a failed query. The caller sends no `ShapeSnapshot` at all in that case: an
 /// empty snapshot is an assertion that the shape matches nothing, and a client
 /// that believes it has a complete empty baseline will never ask again. An
@@ -122,10 +122,10 @@ struct DocumentSnapshot<'a> {
 /// Scan a document collection for the subscription's initial dataset.
 ///
 /// The scan carries row-level security: it is a read on the subscriber's
-/// behalf, so the subscriber's policies apply to it exactly as they would to
+/// behalf, so the subscriber's policies apply to it exactly as they do to
 /// the same rows fetched over SQL. A `RangeScan` has no filter slot, so a
 /// collection carrying a read policy refuses here rather than streaming
-/// unfiltered rows into a client's local replica — where the policy would have
+/// unfiltered rows into a client's local replica — where the policy will have
 /// no further chance to apply.
 ///
 /// Column redaction applies for the same reason, and is applied to the
@@ -189,6 +189,9 @@ async fn document_snapshot(req: DocumentSnapshot<'_>) -> Option<ShapeSnapshotDat
             admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::NotYetAdmitted {
                 peer_addr: req.peer_addr,
             },
+            // A sync client's snapshot has no read-consistency setting, so it
+            // takes the strong default.
+            linearizable: true,
         },
     )
     .await

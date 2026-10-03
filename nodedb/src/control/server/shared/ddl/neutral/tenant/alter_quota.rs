@@ -22,11 +22,11 @@ use crate::types::TenantId;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::database::gate::require_tenant_admin;
-use super::super::replicate::propose_and_apply;
+use super::super::replicate::propose_and_apply_async;
 use super::support::{ddl_err, status};
 
 /// Handle `ALTER TENANT <name> IN DATABASE <db> SET QUOTA (...)`.
-pub fn handle_alter_tenant_quota(
+pub async fn handle_alter_tenant_quota(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     name: &str,
@@ -71,23 +71,15 @@ pub fn handle_alter_tenant_quota(
 
     // Replicated: every node writes the row and installs the quota in its live
     // enforcement components via post-apply.
-    propose_and_apply(
+    propose_and_apply_async(
         state,
         &CatalogEntry::PutTenantQuota {
             db_id: db_id.as_u64(),
             tenant_id: tenant_id.as_u64(),
             record: Box::new(record.clone()),
         },
-        || {
-            catalog
-                .write_tenant_quota(db_id, tenant_id, &record)
-                .map_err(|e| DdlError::from_error(&e))?;
-            crate::control::catalog_entry::post_apply::quota::put_tenant(
-                db_id, tenant_id, &record, state,
-            );
-            Ok(())
-        },
-    )?;
+    )
+    .await?;
 
     state.audit_record(
         AuditEvent::AdminAction,

@@ -232,7 +232,7 @@ impl From<nodedb_cluster::rpc_codec::TypedClusterError> for Error {
                 group_id,
                 leader_node_id,
                 leader_addr,
-                ..
+                term,
             } => Error::NotLeader {
                 // Clamp cluster-managed group IDs for vShard display.
                 vshard_id: crate::types::VShardId::new(
@@ -240,6 +240,7 @@ impl From<nodedb_cluster::rpc_codec::TypedClusterError> for Error {
                 ),
                 leader_node: leader_node_id.unwrap_or(0),
                 leader_addr: leader_addr.unwrap_or_default(),
+                leader_term: term,
             },
             TypedClusterError::DescriptorMismatch { collection, .. } => {
                 Error::RetryableSchemaChanged {
@@ -263,6 +264,11 @@ impl From<nodedb_cluster::rpc_codec::TypedClusterError> for Error {
                 constraint,
                 detail,
             },
+            // A routed Calvin abort, rebuilt as the error a local submit
+            // returns for the same verdict.
+            TypedClusterError::CalvinAborted { reason } => {
+                crate::control::planner::calvin::calvin_abort_error(reason)
+            }
             TypedClusterError::Internal { code, message } => {
                 // Legacy or unknown codes retain their message without panicking.
                 match u16::try_from(code) {
@@ -286,6 +292,7 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
                 vshard_id,
                 leader_node,
                 leader_addr,
+                leader_term,
             } => TypedClusterError::NotLeader {
                 group_id: vshard_id.as_u32() as u64,
                 leader_node_id: if leader_node == 0 {
@@ -298,7 +305,7 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
                 } else {
                     Some(leader_addr)
                 },
-                term: 0,
+                term: leader_term,
             },
             Error::DeadlineExceeded { .. } => TypedClusterError::DeadlineExceeded { elapsed_ms: 0 },
             Error::RemoteTyped { code, message } => TypedClusterError::Internal {
@@ -319,14 +326,27 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
                 constraint,
                 detail,
             },
+            // A Calvin abort keeps its verdict, so the coordinator answers the
+            // SQLSTATE and message a local submit answers.
+            Error::CalvinSerializationConflict => TypedClusterError::CalvinAborted {
+                reason: nodedb_cluster::calvin::AbortReason::SerializationConflict,
+            },
+            Error::CalvinParticipantError => TypedClusterError::CalvinAborted {
+                reason: nodedb_cluster::calvin::AbortReason::ParticipantError,
+            },
+            // A schema change stays retryable across the hop, with its
+            // descriptor text.
+            Error::RetryableSchemaChanged { descriptor } => TypedClusterError::DescriptorMismatch {
+                collection: descriptor,
+                expected_version: 0,
+                actual_version: 0,
+            },
             // Every other error crosses as its public numeric code, so a
             // multi-hop forward keeps its class.
             other @ (Error::TxnOverlayMemoryExceeded { .. }
             | Error::RejectedAuthz { .. }
             | Error::OffsetRegression { .. }
             | Error::ConflictRetry { .. }
-            | Error::CalvinSerializationConflict
-            | Error::CalvinParticipantError
             | Error::RejectedPrevalidation { .. }
             | Error::RetryableRefusal { .. }
             | Error::AppendOnlyViolation { .. }
@@ -355,9 +375,7 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
             | Error::NotInTransactionBlock { .. }
             | Error::CrdtAdmissionTimeout { .. }
             | Error::NoLeader { .. }
-            | Error::FanOutExceeded { .. }
             | Error::CrossCollectionNotColocated { .. }
-            | Error::SourceFrozen { .. }
             | Error::CloneWriteRequiresMaterialize { .. }
             | Error::BadRequest { .. }
             | Error::BackupTenantMismatch { .. }
@@ -374,12 +392,15 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
             | Error::DivisionByZero
             | Error::DataException { .. }
             | Error::InvalidLimitValue { .. }
-            | Error::RetryableSchemaChanged { .. }
             | Error::RetryableLeaderChange { .. }
+            | Error::CommittedResultUnavailable { .. }
+            | Error::ProposalOutcomeUnknown { .. }
             | Error::GroupQuorumUnavailable { .. }
             | Error::GroupMarksUnavailable { .. }
+            | Error::BackupCaptureMoved { .. }
             | Error::MetadataLeaderUnavailable
             | Error::AuthorizationStateBehind { .. }
+            | Error::LinearizableReadRefused { .. }
             | Error::ExecutionLimitExceeded { .. }
             | Error::LimitExceeded { .. }
             | Error::Wal(_)
@@ -398,11 +419,14 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
             | Error::Encryption { .. }
             | Error::Bridge { .. }
             | Error::VersionCompat { .. }
+            | Error::RestoreTargetNotEmpty { .. }
+            | Error::RestoreVerificationFailed { .. }
             | Error::Internal { .. }
             | Error::Shaping(_)
             | Error::Ddl(_)
             | Error::DescriptorVersionAnomaly { .. }
             | Error::CollectionPurgeRowMissing { .. }
+            | Error::CollectionUnstamped { .. }
             | Error::CatalogIntegrityViolation { .. }
             | Error::Promql(_)
             | Error::DependentObjectsExist { .. }
@@ -453,6 +477,31 @@ mod tests {
         match err {
             Error::Internal { detail } => assert_eq!(detail, "boom"),
             other => panic!("expected Error::Internal, got {other:?}"),
+        }
+    }
+
+    /// A Calvin abort and a superseded collection cross a routed submit as the
+    /// same errors a local submit returns. A client retries both on 40001.
+    #[test]
+    fn calvin_aborts_and_schema_changes_survive_the_hop() {
+        use crate::control::cluster::data_plane_error_wire::execution_error_to_typed;
+
+        let rebuilt = Error::from(execution_error_to_typed(Error::CalvinSerializationConflict));
+        assert!(
+            matches!(rebuilt, Error::CalvinSerializationConflict),
+            "got {rebuilt:?}"
+        );
+        let rebuilt = Error::from(execution_error_to_typed(Error::CalvinParticipantError));
+        assert!(
+            matches!(rebuilt, Error::CalvinParticipantError),
+            "got {rebuilt:?}"
+        );
+        let rebuilt = Error::from(execution_error_to_typed(Error::RetryableSchemaChanged {
+            descriptor: "recreated".to_owned(),
+        }));
+        match rebuilt {
+            Error::RetryableSchemaChanged { descriptor } => assert_eq!(descriptor, "recreated"),
+            other => panic!("expected Error::RetryableSchemaChanged, got {other:?}"),
         }
     }
 

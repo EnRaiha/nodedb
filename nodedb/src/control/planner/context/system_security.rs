@@ -29,7 +29,7 @@ use crate::control::security::identity::{AuthenticatedIdentity, DatabaseSet};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
-use super::security::PlanSecurityContext;
+use super::security::{PermissionTreeSource, PlanSecurityContext};
 
 /// Owns the identity and auth context a server-owned plan borrows.
 ///
@@ -62,9 +62,9 @@ impl SystemPlanSecurity {
 
     /// Borrow it as a planning security context over `state`'s policy stores.
     ///
-    /// `permission_cache` is `None`: hierarchical ACL filtering narrows a
+    /// `permission_tree` is `None`: hierarchical ACL filtering narrows a
     /// requester's view of a collection, and this context has no requester
-    /// whose view could be narrowed.
+    /// whose view can be narrowed.
     pub fn context<'a>(&'a self, state: &'a SharedState) -> PlanSecurityContext<'a> {
         PlanSecurityContext {
             identity: &self.identity,
@@ -73,7 +73,7 @@ impl SystemPlanSecurity {
             redaction_store: &state.redaction,
             permissions: &state.permissions,
             roles: &state.roles,
-            permission_cache: None,
+            permission_tree: PermissionTreeSource::None,
         }
     }
 }

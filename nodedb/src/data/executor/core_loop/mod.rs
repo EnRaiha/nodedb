@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 mod accessors;
+pub(in crate::data::executor) mod apply_scope;
 mod bitemporal_time;
 pub(in crate::data::executor) mod calvin_fence;
 pub(in crate::data::executor) mod calvin_state;
@@ -12,15 +13,20 @@ mod decode_stored;
 pub(in crate::data::executor) mod deferred;
 mod doc_config_seed;
 pub(in crate::data::executor) mod event_emit;
+mod event_emit_engines;
+pub(in crate::data::executor) mod event_outlet;
+pub(in crate::data::executor) use event_emit_engines::KvWriteEvent;
 pub(in crate::data::executor) mod fail_stop;
 pub(in crate::data::executor) mod filter_match;
 mod graph_partition;
+pub(in crate::data::executor) mod idempotency;
 pub(in crate::data::executor) mod index_value_versions;
 pub(in crate::data::executor) mod maintenance;
 pub(in crate::data::executor) mod maintenance_state;
 mod open;
 pub mod pressure;
 pub(in crate::data::executor) mod priority_queues;
+pub(in crate::data::executor) mod redo_image;
 mod response;
 mod segment_keks;
 mod state;
@@ -31,6 +37,7 @@ pub(in crate::data::executor) mod vector_build_queue;
 mod vector_index_rebuild;
 mod vector_index_seed;
 pub(in crate::data::executor) mod write_index;
+pub(in crate::data::executor) mod write_set_journal;
 
 pub(in crate::data::executor) use crdt_dead_letters::crdt_rejection;
 pub use doc_config_seed::DocConfigSeedEntry;

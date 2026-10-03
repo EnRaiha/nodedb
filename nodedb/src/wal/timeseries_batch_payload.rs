@@ -62,16 +62,16 @@ pub(crate) struct DecodedBatchRecord {
     pub collection: String,
     pub payload: Vec<u8>,
     pub provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
-    /// Present in the format-preserving timeseries tuples. Absent records
-    /// use the UTF-8 heuristic.
+    /// Present in the six-element timeseries tuple. The legacy shapes carry
+    /// none and use the UTF-8 heuristic.
     pub format: Option<String>,
     /// Non-empty only for map-shaped columnar records.
     pub surrogates: Vec<nodedb_types::Surrogate>,
     /// A columnar insert's encoded [`ColumnarConflictPolicy`]. Empty for a
     /// plain insert and for every other record shape.
     pub conflict_policy: Vec<u8>,
-    /// The timestamp every untimed row takes. Present only in the six-element
-    /// autocommit ingest tuple.
+    /// The statement instant of a timeseries ingest. Present in the
+    /// six-element timeseries tuple every ingest record takes.
     pub default_timestamp_ms: Option<i64>,
 }
 
@@ -129,19 +129,6 @@ pub(crate) fn decode_batch_record(payload: &[u8]) -> Result<DecodedBatchRecord, 
                 )
             },
         )
-        .or_else(|_| {
-            zerompk::from_msgpack::<(String, String, Vec<u8>, ProvenanceField, String)>(payload)
-                .map(|(kind, collection, payload, provenance, format)| {
-                    DecodedBatchRecord::tuple(
-                        Some(kind),
-                        collection,
-                        payload,
-                        provenance,
-                        Some(format),
-                        None,
-                    )
-                })
-        })
         .or_else(|_| {
             zerompk::from_msgpack::<(String, String, Vec<u8>, ProvenanceField)>(payload).map(
                 |(kind, collection, payload, provenance)| {

@@ -45,6 +45,19 @@ impl CoreLoop {
                         );
                     }
                 };
+                // One unbound cell refuses the whole put before any cell is
+                // staged, as the autocommit handler does.
+                for cell in &cells {
+                    if let Some(refusal) =
+                        crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+                            "array",
+                            &array_id.name,
+                            cell.surrogate,
+                        )
+                    {
+                        return self.response_error(task, refusal);
+                    }
+                }
                 if let Err(e) = self.stage_array_capped(cells_msgpack.len()) {
                     return self.response_error(task, e);
                 }
@@ -129,7 +142,7 @@ impl CoreLoop {
             | ArrayOp::Compact { .. }
             | ArrayOp::SurrogateBitmapScan { .. }
             | ArrayOp::DropArray { .. }
-            | ArrayOp::RestoreArrayDrop { .. }
+            | ArrayOp::RekeyArray { .. }
             | ArrayOp::PurgeArrayDrop { .. } => self.stage_not_point_write(task),
         }
     }

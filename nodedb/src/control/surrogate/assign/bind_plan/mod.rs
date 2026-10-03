@@ -15,6 +15,7 @@ mod crdt;
 mod document;
 mod graph;
 mod kv;
+mod restore;
 mod vector;
 
 pub use binder::{IdentityBinder, bind_plan_identities};

@@ -4,18 +4,14 @@
 //! known upfront).
 
 use crate::Error;
-use crate::control::planner::calvin::dispatch::is_write_plan;
 use crate::control::server::shared::session::read_set::ReadSetEntry;
-use crate::types::VShardId;
-use nodedb_cluster::calvin::types::{EngineKeySet, ReadWriteSet, SortedVec, TxClass};
-use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
+use nodedb_cluster::calvin::types::{ReadWriteSet, TxClass};
+use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_physical::physical_task::PhysicalTask;
 use nodedb_types::{DatabaseId, TenantId};
 
-use super::shared::{
-    collection_name_from_plan, kv_write_keys, read_set_from, surrogate_from_plan,
-    vector_write_surrogates, versioned_reads_from,
-};
+use super::shared::{read_set_from, versioned_reads_from};
+use super::write_keys::task_write_keys;
 
 /// Build a **multi-vshard** `TxClass` from a static write task slice.
 ///
@@ -70,8 +66,6 @@ fn build_static_tx_class_impl(
     reads: &[ReadSetEntry],
     allow_single_vshard: bool,
 ) -> crate::Result<TxClass> {
-    use std::collections::HashMap;
-
     let database_id = tasks
         .first()
         .map_or(DatabaseId::DEFAULT, |task| task.database_id);
@@ -82,130 +76,31 @@ fn build_static_tx_class_impl(
             detail: "Calvin transaction spans multiple databases".to_owned(),
         });
     }
-
-    // Collect surrogates per collection for non-edge write tasks.
-    let mut doc_surrogates: HashMap<String, Vec<u32>> = HashMap::new();
-    // Collect edge identity (surrogate pairs) and routing homes
-    // (from_key of src/dst string keys) per collection for graph edges.
-    let mut edge_pairs: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
-    let mut edge_homes: HashMap<String, Vec<u32>> = HashMap::new();
-    // KV writes are keyed by raw bytes and Vector writes by surrogate — each
-    // needs its own EngineKeySet rather than the generic document-surrogate
-    // bucket (which would mis-key them and break lock-conflict detection).
-    let mut kv_keys: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
-    let mut vector_surrogates: HashMap<String, Vec<u32>> = HashMap::new();
-
-    for task in tasks {
-        if !is_write_plan(&task.plan) {
-            continue;
-        }
-        // Graph edges route by from_key(src)/from_key(dst), not by collection.
-        // EdgePut and EdgeDelete share identity fields so both produce an
-        // `EngineKeySet::Edge` — a cross-shard delete dual-homes (and locks)
-        // exactly like the matching insert.
-        if let PhysicalPlan::Graph(
-            GraphOp::EdgePut {
-                collection,
-                src_id,
-                dst_id,
-                src_surrogate,
-                dst_surrogate,
-                ..
-            }
-            | GraphOp::EdgeDelete {
-                collection,
-                src_id,
-                dst_id,
-                src_surrogate,
-                dst_surrogate,
-                ..
-            },
-        ) = &task.plan
-        {
-            edge_pairs
-                .entry(collection.to_string())
-                .or_default()
-                .push((src_surrogate.as_u32(), dst_surrogate.as_u32()));
-            let homes = edge_homes.entry(collection.to_string()).or_default();
-            homes.push(VShardId::from_key(src_id.as_bytes()).as_u32());
-            homes.push(VShardId::from_key(dst_id.as_bytes()).as_u32());
-            continue;
-        }
-        // KV and Vector writes carry their own key representation.
-        match &task.plan {
-            PhysicalPlan::Kv(op) => {
-                if let Some((coll, keys)) = kv_write_keys(op) {
-                    kv_keys.entry(coll).or_default().extend(keys);
-                    continue;
-                }
-            }
-            PhysicalPlan::Vector(op) => {
-                if let Some((coll, surrs)) = vector_write_surrogates(op) {
-                    vector_surrogates.entry(coll).or_default().extend(surrs);
-                    continue;
-                }
-            }
-            _ => {}
-        }
-        // Document engine (and any other statically-keyed write reaching the
-        // multishard path): bucket by surrogate.
-        let collection = collection_name_from_plan(&task.plan);
-        let surrogate = surrogate_from_plan(&task.plan);
-        doc_surrogates
-            .entry(collection)
-            .or_default()
-            .push(surrogate);
-    }
-
-    // Build write set — one EngineKeySet per collection, sorted for
-    // determinism.
-    let mut write_sets: Vec<EngineKeySet> = doc_surrogates
-        .into_iter()
-        .map(|(collection, surrogates)| EngineKeySet::Document {
-            collection,
-            surrogates: SortedVec::new(surrogates),
-        })
-        .collect();
-    // Emit one Edge keyset per collection, carrying surrogate-pair identity
-    // (for locking) and from_key routing homes (for participating vShards).
-    for (collection, pairs) in edge_pairs {
-        // `edge_pairs` and `edge_homes` are populated in lockstep in the loop
-        // above, so a collection in one is always in the other. Treat a missing
-        // homes entry as a hard error rather than silently emitting an Edge
-        // keyset with empty `home_vshards` (which would drop Calvin participant
-        // shards and misroute the cross-shard write with no diagnostic).
-        let homes = edge_homes.remove(&collection).ok_or_else(|| Error::Internal {
+    // Every replica resolves a sequenced transaction on its own, and each
+    // will accept other lines than its peers. A timeseries ingest resolves
+    // to its rows on the submitting node, before it is sequenced.
+    if let Some(task) = tasks
+        .iter()
+        .find(|task| crate::control::write_resolve::is_unresolved_ingest(&task.plan))
+    {
+        return Err(Error::Internal {
             detail: format!(
-                "build_static_tx_class invariant violated: no edge_homes for collection {collection}"
+                "internal invariant break: a timeseries ingest on '{}' reached the Calvin \
+                 sequencer unresolved; the submitter resolves it with `resolve_tasks_for_log`",
+                task.plan.collection().unwrap_or("<unknown>")
             ),
-        })?;
-        write_sets.push(EngineKeySet::Edge {
-            collection,
-            edges: SortedVec::new(pairs),
-            home_vshards: SortedVec::new(homes),
         });
     }
-    // Emit one Kv keyset per collection (raw byte keys) and one Vector keyset
-    // per collection (surrogates), so KV and Vector writes lock on their real
-    // identity rather than a bogus document surrogate.
-    for (collection, keys) in kv_keys {
-        write_sets.push(EngineKeySet::Kv {
-            collection,
-            keys: SortedVec::new(keys),
-        });
-    }
-    for (collection, surrogates) in vector_surrogates {
-        write_sets.push(EngineKeySet::Vector {
-            collection,
-            surrogates: SortedVec::new(surrogates),
-        });
-    }
-    // Sort by collection name for determinism.
-    write_sets.sort_by(|a, b| a.collection().cmp(b.collection()));
+
+    // One key set per engine and collection, ordered by collection. Every
+    // write op is matched by name: an edge locks its pair and both node
+    // pairs on both homes, a KV write its raw key, a CRDT document its id,
+    // and a row write its surrogate.
+    let write_sets = task_write_keys(tasks)?.into_key_sets();
 
     // Read-your-own-write: a SESSION read of a collection this txn also WRITES
     // must NOT enter the OCC read set. The txn's own staged write advances that
-    // collection's write floor, so validating the earlier read against it would
+    // collection's write floor, so validating the earlier read against it will
     // flag it stale and abort the commit — a false serialization conflict. This
     // mirrors the written-collection exclusion the single-shard
     // `si_conflict_abort` path already applies.
@@ -216,9 +111,9 @@ fn build_static_tx_class_impl(
     // value the transaction ships was computed from — a cross-shard
     // materialized-sum settlement folds a delta from a pre-image of the source
     // row and sends it to another shard. The source collection is one this
-    // statement always writes, so the exclusion would drop every such entry and
-    // `read_set_still_current` would validate nothing: a concurrent write
-    // between the fold and the apply would commit a total folded from an image
+    // statement always writes, so the exclusion will drop every such entry and
+    // `read_set_still_current` will validate nothing: a concurrent write
+    // between the fold and the apply will commit a total folded from an image
     // that has moved. The kind is carried on the entry rather than inferred
     // here, so no entry can be classified by accident of which collection it
     // names.
@@ -284,7 +179,7 @@ fn build_static_tx_class_impl(
 mod tests {
     use super::*;
     use crate::control::server::shared::session::read_set::{EngineTag, ReadKey, ReadOrigin};
-    use crate::types::{DatabaseId, KeyRepr, Lsn};
+    use crate::types::{DatabaseId, KeyRepr, Lsn, VShardId};
     use nodedb_physical::physical_plan::DocumentOp;
     use nodedb_types::Surrogate;
 
@@ -348,6 +243,8 @@ mod tests {
             // `versioned_reads_from` propagates; give it the same synthetic LSN.
             read_version_lsn: Lsn::new(read_lsn),
             origin,
+            home: None,
+            home_node: 0,
         }
     }
 
@@ -439,7 +336,7 @@ mod tests {
             "scan_col must be in read_set"
         );
 
-        // participating_vshards is now write ∪ read: it contains the two write
+        // participating_vshards is write ∪ read: it contains the two write
         // collections' vShards AND both read collections' vShards.
         let participants: std::collections::BTreeSet<u32> = tx
             .participating_vshards()
@@ -530,9 +427,9 @@ mod tests {
     }
 
     /// The other half: an ordinary SESSION read of a collection the transaction
-    /// writes is STILL excluded. Without this, the fix above could be "passed"
-    /// by disabling the exclusion, and every transaction that reads a row it
-    /// then writes would abort on its own staged write.
+    /// writes is excluded. Without this, disabling the exclusion will pass the
+    /// test above, and every transaction that reads a row it
+    /// then writes will abort on its own staged write.
     #[test]
     fn a_session_read_of_a_written_collection_is_still_excluded() {
         let (col_a, col_b) = two_distinct_collections();

@@ -65,8 +65,8 @@ impl RespValue {
     /// client as the code it actually is (`NOPERM` for an authorization or
     /// policy denial, `MOVED`, `TIMEOUT`, `BUSY`, …) instead of a generic `ERR`
     /// that reads like a server fault. `Error::Bridge` already carries a
-    /// RESP-shaped detail (the gateway mapping, or the local `BUSY` retry
-    /// hint), so it is passed through rather than mapped twice.
+    /// RESP-shaped detail (the gateway mapping), so it is passed through
+    /// rather than mapped twice.
     pub fn from_error(error: &crate::Error) -> Self {
         match error {
             crate::Error::Bridge { detail } => Self::Error(detail.clone()),

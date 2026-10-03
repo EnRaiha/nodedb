@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 pub mod cache_miss;
+pub mod cluster_error;
 pub mod colocation_guard;
 pub mod core;
+pub mod dispatch_local;
 pub mod dispatch_remote;
 pub mod dispatcher;
 pub mod error_map;
 pub mod fuser;
 pub mod invalidation;
 pub mod key_extractor;
+pub mod live_leaders;
 pub mod lowered_plan;
 pub mod outcome;
 pub mod plan_cache;
+pub mod read_leg;
 pub mod retry;
 pub mod route;
 pub mod router;

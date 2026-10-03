@@ -71,6 +71,18 @@ mod tests {
                     collections: Vec::new(),
                     sum_targets: Vec::new(),
                 }),
+                cross_shard_applied: None,
+                row_sources: Vec::new(),
+                publishes: vec![crate::wal::RedoPublish {
+                    owner: "trigger/5/notify".into(),
+                    database_id: 5,
+                    tenant_id: 1,
+                    topic: "orders_feed".into(),
+                    payload: "created".into(),
+                    metadata_floor: 0,
+                    position: None,
+                }],
+                row_changes: Vec::new(),
             },
             collections: vec!["accounts".into(), "entries".into()],
             sum_targets: vec![RedoSumTargets {
@@ -111,6 +123,13 @@ mod tests {
         assert_eq!(decoded.identities, original.identities);
         assert_eq!(decoded.event_source, EventSource::Trigger);
         assert_eq!(decoded.origin, RedoOrigin::Restore);
+        // Every collection the redo writes travels for its incarnation stamp.
+        let named: Vec<&str> = decoded_entry
+            .incarnations
+            .iter()
+            .map(|named| named.collection.as_str())
+            .collect();
+        assert_eq!(named, vec!["accounts", "entries"]);
     }
 
     #[test]

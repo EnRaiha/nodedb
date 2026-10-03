@@ -2,16 +2,12 @@
 
 //! Protocol-neutral `SHOW RETENTION POLICY` DDL handler.
 //!
-//! Ported from the pgwire `ddl::retention_policy::show` handler. The registry
-//! listing, the optional `ON <collection>` filter, the tier / duration
-//! formatting, and the exact column set are preserved verbatim; only the result
-//! construction changed from pgwire `Response` / `QueryResponse` /
-//! `DataRowEncoder` to the protocol-neutral [`DdlResult::Rows`] over
-//! [`ShapedRows`]. The mixed text/`int8` column OIDs (`tier_count` and
-//! `created_at` are `int8`, every other column is text) are reproduced by
-//! building `column_types` manually so the RowDescription stays byte-identical;
-//! the `int8` cells are emitted as their decimal text form, the same bytes the
-//! pgwire `DataRowEncoder::encode_field(&i64)` produced.
+//! The registry listing, the optional `ON <collection>` filter, the tier /
+//! duration formatting, and the exact column set run here. The result is the
+//! protocol-neutral [`DdlResult::Rows`] over [`ShapedRows`]. The mixed
+//! text/`int8` column OIDs (`tier_count` and `created_at` are `int8`, every
+//! other column is text) come from building `column_types` manually; the
+//! `int8` cells are emitted as their decimal text form.
 //!
 //! Syntax:
 //! ```sql

@@ -29,8 +29,8 @@ pub enum CrdtOp {
     ///
     /// Binds the user-visible `document_id` to a stable cross-engine
     /// `Surrogate`. UPSERT-aware: if the document already has a surrogate,
-    /// the assigner returns the existing one. `Surrogate::ZERO` only
-    /// appears in test fixtures.
+    /// the assigner returns the existing one. Never `Surrogate::ZERO`: an
+    /// apply that carries it is refused.
     Apply {
         collection: QualifiedCollection,
         document_id: String,
@@ -247,7 +247,9 @@ pub enum CrdtOp {
     DocDelete {
         collection: QualifiedCollection,
         document_id: String,
-        surrogate: Surrogate,
+        /// `None` when the key is unbound in its database: no row matches,
+        /// and the delete answers a count of 0.
+        surrogate: Option<Surrogate>,
         /// When `Some`, return the STORED pre-image of the deleted row —
         /// projected per spec. Carried across replication — see
         /// `DocUpsert::returning`.

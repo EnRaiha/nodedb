@@ -5,7 +5,7 @@
 //! Mirrors the `triggers.rs` shape: typed put/get/delete plus a bulk
 //! loader for startup. Keyed by `name` (already globally scoped in the
 //! `ArrayCatalogEntry` via `ArrayId`'s tenant field — a second-level
-//! tenant prefix would only duplicate that information).
+//! tenant prefix only duplicates that information).
 
 use redb::{ReadableDatabase, ReadableTable};
 
@@ -115,6 +115,29 @@ impl SystemCatalog {
         database_id: nodedb_types::DatabaseId,
         name: &str,
     ) -> crate::Result<bool> {
+        self.remove_array_row(tenant_id, database_id, name, None)
+    }
+
+    /// Atomically delete the array row under `from` and move its surrogate
+    /// bindings to `to`. The cells keep their surrogates across a MOVE
+    /// TENANT rekey.
+    pub fn move_array_surrogates_in_database(
+        &self,
+        tenant_id: nodedb_types::TenantId,
+        from: nodedb_types::DatabaseId,
+        to: nodedb_types::DatabaseId,
+        name: &str,
+    ) -> crate::Result<bool> {
+        self.remove_array_row(tenant_id, from, name, Some(to))
+    }
+
+    fn remove_array_row(
+        &self,
+        tenant_id: nodedb_types::TenantId,
+        database_id: nodedb_types::DatabaseId,
+        name: &str,
+        move_to: Option<nodedb_types::DatabaseId>,
+    ) -> crate::Result<bool> {
         let write_txn = self
             .db
             .begin_write()
@@ -160,6 +183,15 @@ impl SystemCatalog {
                 reverse
                     .remove((db_id, tid, name, surrogate))
                     .map_err(|e| catalog_err("remove surrogate_pk_rev", e))?;
+                if let Some(to) = move_to {
+                    let to = to.as_u64();
+                    forward
+                        .insert((to, tid, name, pk.as_slice()), surrogate)
+                        .map_err(|e| catalog_err("move surrogate_pk", e))?;
+                    reverse
+                        .insert((to, tid, name, surrogate), pk.as_slice())
+                        .map_err(|e| catalog_err("move surrogate_pk_rev", e))?;
+                }
             }
         }
         write_txn
@@ -242,6 +274,8 @@ mod tests {
             prefix_bits: 8,
             audit_retain_ms: None,
             minimum_audit_retain_ms: None,
+            modification_hlc: nodedb_types::Hlc::ZERO,
+            incarnation: nodedb_types::Hlc::ZERO,
         }
     }
 
@@ -319,6 +353,49 @@ mod tests {
             catalog
                 .delete_array_in_database(TenantId::new(2), DatabaseId::DEFAULT, "same")
                 .unwrap()
+        );
+    }
+
+    /// A MOVE TENANT rekey carries every surrogate binding to the target
+    /// database and leaves none under the source.
+    #[test]
+    fn move_carries_surrogates_to_the_target_database() {
+        let catalog = catalog();
+        let (from, to) = (DatabaseId::new(3), DatabaseId::new(4));
+        catalog.put_array(&entry(1, from, "cells", 1)).unwrap();
+        let key = |db| nodedb_types::CollectionKey::from_bare(db, "cells");
+        catalog
+            .put_surrogate(
+                key(from),
+                TenantId::new(1),
+                b"coord:1",
+                nodedb_types::Surrogate::new(9),
+            )
+            .unwrap();
+
+        assert!(
+            catalog
+                .move_array_surrogates_in_database(TenantId::new(1), from, to, "cells")
+                .unwrap()
+        );
+
+        assert!(
+            catalog
+                .get_array_in_database(TenantId::new(1), from, "cells")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            catalog
+                .get_surrogate_for_pk(key(from), TenantId::new(1), b"coord:1")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            catalog
+                .get_surrogate_for_pk(key(to), TenantId::new(1), b"coord:1")
+                .unwrap(),
+            Some(nodedb_types::Surrogate::new(9))
         );
     }
 }

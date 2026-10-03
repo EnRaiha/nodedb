@@ -57,7 +57,7 @@ pub enum CalvinTaskOutcome {
 pub enum CalvinFoldError {
     /// Two tasks reported verbs that cannot share one tag.
     Verb(DmlFoldError),
-    /// A task's payload could not be read as its plan kind requires.
+    /// A task's payload cannot be read as its plan kind requires.
     Shape(crate::Error),
 }
 
@@ -71,7 +71,7 @@ pub struct CalvinBatchFold {
 ///
 /// A derived implicit-edge write beside the user's own never answers the
 /// statement: it folds as opaque, as it never deposits. The rows are taken
-/// once rather than accumulated, which would repeat the identical payload per
+/// once rather than accumulated, which will repeat the identical payload per
 /// task.
 pub fn fold_calvin_batch(
     plans: &[&PhysicalPlan],
@@ -240,7 +240,7 @@ mod tests {
             key: Vec::new(),
             value: Vec::new(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -272,7 +272,7 @@ mod tests {
         let point_delete = PhysicalPlan::Document(DocumentOp::PointDelete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "items"),
             document_id: "a".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),

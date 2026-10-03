@@ -17,7 +17,7 @@ use super::types::{Grant, format_permission, owner_key, parse_permission};
 /// redb persistence.
 pub struct PermissionStore {
     pub(super) grants: RwLock<HashSet<Grant>>,
-    /// "collection:{tenant_id}:{name}" → owner username
+    /// owner key → owner username
     pub(super) owners: RwLock<HashMap<String, String>>,
 }
 
@@ -172,15 +172,18 @@ impl PermissionStore {
         out
     }
 
-    /// List all grants scoped to the given tenant ID prefix.
+    /// List every collection and function grant of `tenant_id`, across
+    /// databases.
     pub fn all_grants(&self, tenant_id: TenantId) -> Vec<Grant> {
         let tid = tenant_id.as_u64();
-        let col_prefix = format!("collection:{tid}:");
-        let func_prefix = format!("function:{tid}:");
         self.grants
             .read()
             .iter()
-            .filter(|g| g.target.starts_with(&col_prefix) || g.target.starts_with(&func_prefix))
+            .filter(|g| {
+                super::types::parse_scoped_target(&g.target).is_some_and(|t| {
+                    t.tenant_id == tid && matches!(t.kind, "collection" | "function")
+                })
+            })
             .cloned()
             .collect()
     }

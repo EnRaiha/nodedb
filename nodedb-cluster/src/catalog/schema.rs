@@ -44,6 +44,11 @@ pub(super) const KEY_CLUSTER_EPOCH: &str = "cluster_epoch";
 /// and dominate any lingering `Dead(stored)` rumour. See
 /// `crate::swim::incarnation_store`.
 pub(super) const KEY_SWIM_INCARNATION: &str = "swim_incarnation";
+/// Boot epoch (u64 LE): how many times this node has booted. Raised and made
+/// durable at every boot, before any transport sends. It opens each boot's
+/// own range of outbound frame sequence numbers. See
+/// `ClusterCatalog::advance_boot_epoch`.
+pub(super) const KEY_BOOT_EPOCH: &str = "boot_epoch";
 pub(super) const KEY_CA_CERT: &str = "ca_cert";
 /// Metadata key holding the catalog format version (u32 LE).
 /// Stored under this key in the metadata table by `ClusterCatalog::open`.

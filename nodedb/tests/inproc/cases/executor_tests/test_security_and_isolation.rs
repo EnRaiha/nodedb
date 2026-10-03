@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Phase 4 validation gate tests.
+//! Security and isolation validation tests.
 //!
 //! 1. Security regression: auth failures, privilege changes, tenant isolation
 //! 2. Linearizability: WAL append + read consistency
@@ -36,7 +36,7 @@ fn security_tenant_isolation() {
             ),
             document_id: "s1".into(),
             value: b"{\"data\":\"tenant1_secret\"}".to_vec(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: doc_surrogate("s1"),
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
@@ -58,7 +58,7 @@ fn security_tenant_isolation() {
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: Some(doc_surrogate("s1")),
             pk_bytes: Vec::new(),
         }),
     );
@@ -182,7 +182,7 @@ fn linearizability_read_after_write() {
                 ),
                 document_id: doc_id.clone(),
                 value: value.into_bytes(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: doc_surrogate(&doc_id),
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
@@ -203,7 +203,7 @@ fn linearizability_read_after_write() {
                 rls_filters: Vec::new(),
                 system_time: nodedb_types::SystemTimeScope::Current,
                 valid_at_ms: None,
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: Some(doc_surrogate(&doc_id)),
                 pk_bytes: Vec::new(),
             }),
         );
@@ -230,7 +230,7 @@ fn linearizability_delete_visibility() {
             ),
             document_id: "del1".into(),
             value: b"{\"x\":1}".to_vec(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: doc_surrogate("del1"),
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
@@ -248,7 +248,7 @@ fn linearizability_delete_visibility() {
                 "linear",
             ),
             document_id: "del1".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: Some(doc_surrogate("del1")),
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
@@ -271,7 +271,7 @@ fn linearizability_delete_visibility() {
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: Some(doc_surrogate("del1")),
             pk_bytes: Vec::new(),
         }),
     );
@@ -307,7 +307,7 @@ fn wal_replay_deterministic() {
                     ),
                     document_id: doc_id.to_string(),
                     value: value.clone(),
-                    surrogate: nodedb_types::Surrogate::ZERO,
+                    surrogate: doc_surrogate(doc_id),
                     pk_bytes: Vec::new(),
                     returning: None,
                     rls_filters: Vec::new(),
@@ -331,7 +331,7 @@ fn wal_replay_deterministic() {
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: Some(doc_surrogate("d1")),
             pk_bytes: Vec::new(),
         }),
     );
@@ -356,7 +356,7 @@ fn wal_replay_deterministic() {
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: Some(doc_surrogate("d2")),
             pk_bytes: Vec::new(),
         }),
     );
@@ -375,7 +375,7 @@ fn wal_replay_deterministic() {
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: Some(doc_surrogate("d3")),
             pk_bytes: Vec::new(),
         }),
     );
@@ -403,7 +403,7 @@ fn mixed_engine_isolation_no_cross_eviction() {
                 ),
                 document_id: format!("doc_{i}"),
                 value: format!("{{\"val\":{i}}}").into_bytes(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: doc_surrogate(&format!("doc_{i}")),
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
@@ -426,7 +426,7 @@ fn mixed_engine_isolation_no_cross_eviction() {
                 vector: vec![i as f32, 0.0, 0.0],
                 dim: 3,
                 field_name: String::new(),
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: doc_surrogate(&format!("vec_{i}")),
                 pk_bytes: None,
                 provenance: None,
             }),
@@ -448,8 +448,8 @@ fn mixed_engine_isolation_no_cross_eviction() {
                 label: "NEXT".into(),
                 dst_id: format!("doc_{}", i + 1),
                 properties: vec![],
-                src_surrogate: nodedb_types::Surrogate::ZERO,
-                dst_surrogate: nodedb_types::Surrogate::ZERO,
+                src_surrogate: doc_surrogate(&format!("doc_{i}")),
+                dst_surrogate: doc_surrogate(&format!("doc_{}", i + 1)),
             }),
         );
     }
@@ -469,7 +469,7 @@ fn mixed_engine_isolation_no_cross_eviction() {
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: Some(doc_surrogate("doc_25")),
             pk_bytes: Vec::new(),
         }),
     );

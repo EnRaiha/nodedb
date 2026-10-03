@@ -36,7 +36,8 @@ pub(super) fn bootstrap(
     let mut topology = ClusterTopology::new();
     topology.add_node(
         NodeInfo::new(config.node_id, config.listen_addr, NodeState::Active)
-            .with_spki_pin(local_spki_pin),
+            .with_spki_pin(local_spki_pin)
+            .with_swim_addr(config.swim_udp_addr),
     );
 
     // Create routing table: all groups on this single node. The configured
@@ -138,6 +139,7 @@ mod tests {
             install_snapshot_chunk_bytes: 4 * 1024 * 1024,
             orphan_partial_max_age_secs: 300,
             log_compaction_threshold: None,
+            wire_build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
         };
 
         let state = bootstrap(&config, &catalog, None).unwrap();
@@ -182,6 +184,7 @@ mod tests {
             install_snapshot_chunk_bytes: 4 * 1024 * 1024,
             orphan_partial_max_age_secs: 300,
             log_compaction_threshold: None,
+            wire_build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
         };
 
         let state = bootstrap(&config, &catalog, None).unwrap();

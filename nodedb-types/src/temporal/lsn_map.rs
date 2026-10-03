@@ -1,22 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! LSN ↔ wall-clock milliseconds interpolator.
+//! LSN ↔ commit-time map built from WAL time anchors.
 //!
-//! Bitemporal reads need a `system_from_ms` value for every LSN, but storing
-//! wall time next to every write amplifies WAL volume. Instead, the WAL writer
-//! emits periodic anchor records (`RecordType::LsnMsAnchor`) and this table
-//! interpolates between them linearly.
+//! The WAL writer appends one time anchor to every group-commit batch, inside
+//! the batch's own write. An anchor names the batch's last LSN and the HLC wall
+//! time (ns since the Unix epoch) the batch committed at. Every record at or
+//! below an anchor's LSN committed at or before the anchor's time.
 //!
-//! Anchors are strictly monotonic in both LSN and wall-clock time (enforced
-//! on insert). Lookup is O(log n) binary search.
-
-use std::cmp::Ordering;
+//! Anchors are strictly increasing in both LSN and time. The map holds at most
+//! `cap` anchors. When full, it first drops anchors that share a millisecond
+//! with their successor, which no millisecond-granular lookup can return. If
+//! that frees too little, it drops every other anchor in the older half, so
+//! recent history stays dense and old history gets coarser.
 
 use serde::{Deserialize, Serialize};
 
-use crate::lsn::Lsn;
+const NANOS_PER_MS: u64 = 1_000_000;
 
-/// A single anchor point mapping an LSN to a wall-clock millisecond.
+/// Default anchor capacity: 65,536 anchors, 1 MiB.
+pub const DEFAULT_ANCHOR_CAP: usize = 1 << 16;
+
+/// Smallest capacity a map accepts. Downsampling needs room to keep the first
+/// and last anchors plus a thinned middle.
+const MIN_ANCHOR_CAP: usize = 4;
+
+/// One WAL time anchor: every record at or below `lsn` committed at or before
+/// `hlc_wall_ns`.
 #[derive(
     Debug,
     Clone,
@@ -28,51 +37,79 @@ use crate::lsn::Lsn;
     zerompk::ToMessagePack,
     zerompk::FromMessagePack,
 )]
-pub struct LsnMsAnchor {
+pub struct LsnTimeAnchor {
     pub lsn: u64,
-    pub wall_ms: i64,
+    /// HLC wall component, in nanoseconds since the Unix epoch.
+    pub hlc_wall_ns: u64,
 }
 
-impl LsnMsAnchor {
-    pub const fn new(lsn: u64, wall_ms: i64) -> Self {
-        Self { lsn, wall_ms }
+impl LsnTimeAnchor {
+    pub const fn new(lsn: u64, hlc_wall_ns: u64) -> Self {
+        Self { lsn, hlc_wall_ns }
     }
 }
 
-/// Error produced by the LSN↔ms map.
+/// Error from the LSN ↔ time map.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
-pub enum LsnMapError {
-    /// Attempted to insert an anchor that is not strictly monotonic in LSN or wall time.
+pub enum LsnTimeError {
+    /// An anchor with a higher LSN carried a time at or below the last anchor's.
     #[error(
-        "non-monotonic anchor: prev=(lsn={prev_lsn}, ms={prev_ms}), \
-         new=(lsn={new_lsn}, ms={new_ms})"
+        "time anchor is not monotonic: last=(lsn={last_lsn}, ns={last_ns}), \
+         new=(lsn={new_lsn}, ns={new_ns})"
     )]
     NonMonotonic {
-        prev_lsn: u64,
-        prev_ms: i64,
+        last_lsn: u64,
+        last_ns: u64,
         new_lsn: u64,
-        new_ms: i64,
+        new_ns: u64,
     },
 
-    /// The map is empty — cannot interpolate.
-    #[error("LSN→ms map is empty")]
-    Empty,
+    /// The map holds no anchor, so no time maps to an LSN.
+    #[error("no WAL time anchor is known; no commit time maps to an LSN")]
+    NoAnchors,
+
+    /// The target time is before the oldest retained anchor.
+    #[error(
+        "time {target_ns}ns predates the oldest retained WAL time anchor \
+         ({first_anchor_ns}ns); no committed state is known before it"
+    )]
+    BeforeFirstAnchor {
+        target_ns: u64,
+        first_anchor_ns: u64,
+    },
 }
 
-/// In-memory LSN ↔ wall-ms interpolation table.
+/// Bounded, ordered LSN ↔ commit-time map.
 ///
-/// Not `Send + Sync` by itself — callers wrap in whatever concurrency primitive
-/// fits their plane (e.g. `Mutex` in Control Plane, per-core cell in Data Plane).
-#[derive(Debug, Clone, Default)]
-pub struct LsnMsMap {
-    anchors: Vec<LsnMsAnchor>,
+/// Not synchronized. The owner wraps it in the primitive its plane needs.
+#[derive(Debug, Clone)]
+pub struct LsnTimeMap {
+    anchors: Vec<LsnTimeAnchor>,
+    cap: usize,
 }
 
-impl LsnMsMap {
+impl Default for LsnTimeMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LsnTimeMap {
     pub const fn new() -> Self {
+        Self::with_cap(DEFAULT_ANCHOR_CAP)
+    }
+
+    /// A map holding at most `cap` anchors (raised to 4 when smaller).
+    pub const fn with_cap(cap: usize) -> Self {
+        let cap = if cap < MIN_ANCHOR_CAP {
+            MIN_ANCHOR_CAP
+        } else {
+            cap
+        };
         Self {
             anchors: Vec::new(),
+            cap,
         }
     }
 
@@ -84,173 +121,253 @@ impl LsnMsMap {
         self.anchors.is_empty()
     }
 
-    /// Return the anchors (oldest first) — useful for persistence/replay.
-    pub fn anchors(&self) -> &[LsnMsAnchor] {
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// The retained anchors, oldest first.
+    pub fn anchors(&self) -> &[LsnTimeAnchor] {
         &self.anchors
     }
 
-    /// Insert an anchor. Must be strictly monotonic relative to the last
-    /// anchor on both axes.
-    pub fn push(&mut self, anchor: LsnMsAnchor) -> Result<(), LsnMapError> {
-        if let Some(&last) = self.anchors.last()
-            && (anchor.lsn <= last.lsn || anchor.wall_ms <= last.wall_ms)
-        {
-            return Err(LsnMapError::NonMonotonic {
-                prev_lsn: last.lsn,
-                prev_ms: last.wall_ms,
-                new_lsn: anchor.lsn,
-                new_ms: anchor.wall_ms,
-            });
-        }
-        self.anchors.push(anchor);
-        Ok(())
+    pub fn last(&self) -> Option<LsnTimeAnchor> {
+        self.anchors.last().copied()
     }
 
-    /// Interpolate the wall-clock millisecond for a given LSN.
-    ///
-    /// - LSN < first anchor → clamps to first anchor's wall_ms.
-    /// - LSN > last anchor → linearly extrapolates using the last two anchors,
-    ///   or returns the last anchor's wall_ms if only one anchor exists.
-    /// - LSN between two anchors → linear interpolation.
-    /// - LSN exactly equals an anchor → that anchor's wall_ms.
-    pub fn wall_ms_for_lsn(&self, lsn: Lsn) -> Result<i64, LsnMapError> {
-        let target = lsn.as_u64();
-        match self.anchors.as_slice() {
-            [] => Err(LsnMapError::Empty),
-            [only] => Ok(only.wall_ms),
-            _ => {
-                let search = self.anchors.binary_search_by(|a| a.lsn.cmp(&target));
-                match search {
-                    Ok(idx) => Ok(self.anchors[idx].wall_ms),
-                    Err(idx) => {
-                        if idx == 0 {
-                            Ok(self.anchors[0].wall_ms)
-                        } else if idx >= self.anchors.len() {
-                            let n = self.anchors.len();
-                            Ok(Self::interpolate(
-                                self.anchors[n - 2],
-                                self.anchors[n - 1],
-                                target,
-                            ))
-                        } else {
-                            Ok(Self::interpolate(
-                                self.anchors[idx - 1],
-                                self.anchors[idx],
-                                target,
-                            ))
-                        }
-                    }
-                }
+    /// Add an anchor. Returns `Ok(false)` when its LSN is at or below the last
+    /// anchor's: replay re-reads anchors the map already holds.
+    pub fn push(&mut self, anchor: LsnTimeAnchor) -> Result<bool, LsnTimeError> {
+        if let Some(last) = self.anchors.last().copied() {
+            if anchor.lsn <= last.lsn {
+                return Ok(false);
+            }
+            if anchor.hlc_wall_ns <= last.hlc_wall_ns {
+                return Err(LsnTimeError::NonMonotonic {
+                    last_lsn: last.lsn,
+                    last_ns: last.hlc_wall_ns,
+                    new_lsn: anchor.lsn,
+                    new_ns: anchor.hlc_wall_ns,
+                });
             }
         }
+        self.anchors.push(anchor);
+        if self.anchors.len() > self.cap {
+            self.downsample();
+        }
+        Ok(true)
     }
 
-    fn interpolate(lo: LsnMsAnchor, hi: LsnMsAnchor, lsn: u64) -> i64 {
-        let lsn_span = hi.lsn.saturating_sub(lo.lsn) as i128;
-        if lsn_span == 0 {
-            return lo.wall_ms;
+    /// The highest anchored LSN whose commit time is at or before `target_ns`.
+    ///
+    /// A target past the last anchor returns the last anchor's LSN. Records
+    /// above it have no completed commit yet, so they are not part of any
+    /// past state.
+    ///
+    /// A target before the oldest anchor returns LSN 0 when that anchor names
+    /// LSN 0: nothing had committed by its time, so nothing had committed
+    /// before it either. Before an oldest anchor above LSN 0, the records at
+    /// or below it have no known commit time, and the lookup is an error.
+    pub fn lsn_at_or_before(&self, target_ns: u64) -> Result<u64, LsnTimeError> {
+        let first = self.anchors.first().ok_or(LsnTimeError::NoAnchors)?;
+        let idx = self.anchors.partition_point(|a| a.hlc_wall_ns <= target_ns);
+        if idx == 0 {
+            if first.lsn == 0 {
+                return Ok(0);
+            }
+            return Err(LsnTimeError::BeforeFirstAnchor {
+                target_ns,
+                first_anchor_ns: first.hlc_wall_ns,
+            });
         }
-        let ms_span = hi.wall_ms as i128 - lo.wall_ms as i128;
-        let delta_lsn = (lsn as i128) - (lo.lsn as i128);
-        let delta_ms = ms_span * delta_lsn / lsn_span;
-        let result = lo.wall_ms as i128 + delta_ms;
-        match result.cmp(&(i64::MAX as i128)) {
-            Ordering::Greater => i64::MAX,
-            _ if result < i64::MIN as i128 => i64::MIN,
-            _ => result as i64,
-        }
+        Ok(self.anchors[idx - 1].lsn)
     }
-}
 
-/// Convenience wrapper: look up wall-ms for a given LSN using an owning map.
-pub fn lsn_to_ms(map: &LsnMsMap, lsn: Lsn) -> Result<i64, LsnMapError> {
-    map.wall_ms_for_lsn(lsn)
+    /// [`Self::lsn_at_or_before`] for a millisecond target. The whole
+    /// millisecond `target_ms` counts, so a commit at `target_ms` + 0.5 ms is
+    /// included. A negative target is before every anchor.
+    pub fn lsn_at_or_before_ms(&self, target_ms: i64) -> Result<u64, LsnTimeError> {
+        let first = self.anchors.first().ok_or(LsnTimeError::NoAnchors)?;
+        let Ok(ms) = u64::try_from(target_ms) else {
+            if first.lsn == 0 {
+                return Ok(0);
+            }
+            return Err(LsnTimeError::BeforeFirstAnchor {
+                target_ns: 0,
+                first_anchor_ns: first.hlc_wall_ns,
+            });
+        };
+        let target_ns = ms
+            .saturating_mul(NANOS_PER_MS)
+            .saturating_add(NANOS_PER_MS - 1);
+        self.lsn_at_or_before(target_ns)
+    }
+
+    /// Commit time of the batch holding `lsn`: the time of the first anchor at
+    /// or above it. `None` when no anchor covers `lsn` yet.
+    pub fn commit_ns_of(&self, lsn: u64) -> Option<u64> {
+        let idx = self.anchors.partition_point(|a| a.lsn < lsn);
+        self.anchors.get(idx).map(|a| a.hlc_wall_ns)
+    }
+
+    fn downsample(&mut self) {
+        // Keep an anchor only when the next one falls in a later millisecond.
+        // A millisecond target resolves to the last anchor of its millisecond,
+        // so the dropped anchors were unreachable at that granularity.
+        let n = self.anchors.len();
+        let mut write = 0;
+        for read in 0..n {
+            let keep = read + 1 == n
+                || self.anchors[read].hlc_wall_ns / NANOS_PER_MS
+                    != self.anchors[read + 1].hlc_wall_ns / NANOS_PER_MS;
+            if keep {
+                self.anchors[write] = self.anchors[read];
+                write += 1;
+            }
+        }
+        self.anchors.truncate(write);
+
+        // Leave a quarter of the cap free so thinning is not re-run per push.
+        let target = self.cap - self.cap / 4;
+        if self.anchors.len() <= target {
+            return;
+        }
+        let half = self.anchors.len() / 2;
+        let mut write = 0;
+        for read in 0..self.anchors.len() {
+            if read >= half || read % 2 == 0 {
+                self.anchors[write] = self.anchors[read];
+                write += 1;
+            }
+        }
+        self.anchors.truncate(write);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn empty_map_errors() {
-        let m = LsnMsMap::new();
-        assert!(matches!(
-            m.wall_ms_for_lsn(Lsn::new(5)),
-            Err(LsnMapError::Empty)
-        ));
+    const MS: u64 = NANOS_PER_MS;
+
+    fn map_of(anchors: &[(u64, u64)]) -> LsnTimeMap {
+        let mut m = LsnTimeMap::new();
+        for &(lsn, ns) in anchors {
+            assert!(m.push(LsnTimeAnchor::new(lsn, ns)).unwrap());
+        }
+        m
     }
 
     #[test]
-    fn single_anchor_returns_its_wall_ms() {
-        let mut m = LsnMsMap::new();
-        m.push(LsnMsAnchor::new(10, 1_000)).unwrap();
-        assert_eq!(m.wall_ms_for_lsn(Lsn::new(5)).unwrap(), 1_000);
-        assert_eq!(m.wall_ms_for_lsn(Lsn::new(10)).unwrap(), 1_000);
-        assert_eq!(m.wall_ms_for_lsn(Lsn::new(999)).unwrap(), 1_000);
+    fn empty_map_is_a_typed_error() {
+        let m = LsnTimeMap::new();
+        assert_eq!(m.lsn_at_or_before(5), Err(LsnTimeError::NoAnchors));
+        assert_eq!(m.lsn_at_or_before_ms(5), Err(LsnTimeError::NoAnchors));
+        assert_eq!(m.commit_ns_of(1), None);
     }
 
     #[test]
-    fn interpolates_between_anchors() {
-        let mut m = LsnMsMap::new();
-        m.push(LsnMsAnchor::new(0, 1_000)).unwrap();
-        m.push(LsnMsAnchor::new(100, 2_000)).unwrap();
-        assert_eq!(m.wall_ms_for_lsn(Lsn::new(0)).unwrap(), 1_000);
-        assert_eq!(m.wall_ms_for_lsn(Lsn::new(50)).unwrap(), 1_500);
-        assert_eq!(m.wall_ms_for_lsn(Lsn::new(100)).unwrap(), 2_000);
+    fn floor_is_exact_at_batch_edges() {
+        let m = map_of(&[(5, 100), (9, 200), (14, 300)]);
+        assert_eq!(m.lsn_at_or_before(100).unwrap(), 5);
+        assert_eq!(m.lsn_at_or_before(199).unwrap(), 5);
+        assert_eq!(m.lsn_at_or_before(200).unwrap(), 9);
+        assert_eq!(m.lsn_at_or_before(299).unwrap(), 9);
+        assert_eq!(m.lsn_at_or_before(300).unwrap(), 14);
+        assert_eq!(m.lsn_at_or_before(u64::MAX).unwrap(), 14);
     }
 
     #[test]
-    fn clamps_below_first_anchor() {
-        let mut m = LsnMsMap::new();
-        m.push(LsnMsAnchor::new(100, 5_000)).unwrap();
-        m.push(LsnMsAnchor::new(200, 6_000)).unwrap();
-        assert_eq!(m.wall_ms_for_lsn(Lsn::new(50)).unwrap(), 5_000);
-    }
-
-    #[test]
-    fn extrapolates_beyond_last_anchor() {
-        let mut m = LsnMsMap::new();
-        m.push(LsnMsAnchor::new(0, 0)).unwrap();
-        m.push(LsnMsAnchor::new(100, 1_000)).unwrap();
-        assert_eq!(m.wall_ms_for_lsn(Lsn::new(150)).unwrap(), 1_500);
-    }
-
-    #[test]
-    fn non_monotonic_rejected() {
-        let mut m = LsnMsMap::new();
-        m.push(LsnMsAnchor::new(10, 1_000)).unwrap();
-        assert!(matches!(
-            m.push(LsnMsAnchor::new(10, 2_000)),
-            Err(LsnMapError::NonMonotonic { .. })
-        ));
-        assert!(matches!(
-            m.push(LsnMsAnchor::new(20, 1_000)),
-            Err(LsnMapError::NonMonotonic { .. })
-        ));
-        assert!(matches!(
-            m.push(LsnMsAnchor::new(5, 500)),
-            Err(LsnMapError::NonMonotonic { .. })
-        ));
-    }
-
-    #[test]
-    fn free_function_matches_method() {
-        let mut m = LsnMsMap::new();
-        m.push(LsnMsAnchor::new(0, 0)).unwrap();
-        m.push(LsnMsAnchor::new(100, 1_000)).unwrap();
+    fn target_before_first_anchor_is_an_error() {
+        let m = map_of(&[(5, 100), (9, 200)]);
         assert_eq!(
-            lsn_to_ms(&m, Lsn::new(50)).unwrap(),
-            m.wall_ms_for_lsn(Lsn::new(50)).unwrap()
+            m.lsn_at_or_before(99),
+            Err(LsnTimeError::BeforeFirstAnchor {
+                target_ns: 99,
+                first_anchor_ns: 100,
+            })
         );
+        assert!(matches!(
+            m.lsn_at_or_before_ms(-1),
+            Err(LsnTimeError::BeforeFirstAnchor { .. })
+        ));
     }
 
     #[test]
-    fn exact_match_binary_search() {
-        let mut m = LsnMsMap::new();
-        m.push(LsnMsAnchor::new(0, 0)).unwrap();
-        m.push(LsnMsAnchor::new(100, 1_000)).unwrap();
-        m.push(LsnMsAnchor::new(200, 3_000)).unwrap();
-        assert_eq!(m.wall_ms_for_lsn(Lsn::new(100)).unwrap(), 1_000);
-        assert_eq!(m.wall_ms_for_lsn(Lsn::new(200)).unwrap(), 3_000);
+    fn target_before_an_lsn_zero_anchor_is_the_empty_state() {
+        let m = map_of(&[(0, 100), (4, 200)]);
+        assert_eq!(m.lsn_at_or_before(99).unwrap(), 0);
+        assert_eq!(m.lsn_at_or_before(0).unwrap(), 0);
+        assert_eq!(m.lsn_at_or_before_ms(-1).unwrap(), 0);
+        assert_eq!(m.lsn_at_or_before(200).unwrap(), 4);
+    }
+
+    #[test]
+    fn millisecond_target_covers_the_whole_millisecond() {
+        let m = map_of(&[(5, 7 * MS + 1), (9, 7 * MS + 999_999), (12, 8 * MS)]);
+        assert!(matches!(
+            m.lsn_at_or_before_ms(6),
+            Err(LsnTimeError::BeforeFirstAnchor { .. })
+        ));
+        assert_eq!(m.lsn_at_or_before_ms(7).unwrap(), 9);
+        assert_eq!(m.lsn_at_or_before_ms(8).unwrap(), 12);
+    }
+
+    #[test]
+    fn commit_time_is_the_covering_anchor() {
+        let m = map_of(&[(5, 100), (9, 200)]);
+        assert_eq!(m.commit_ns_of(1), Some(100));
+        assert_eq!(m.commit_ns_of(5), Some(100));
+        assert_eq!(m.commit_ns_of(6), Some(200));
+        assert_eq!(m.commit_ns_of(9), Some(200));
+        assert_eq!(m.commit_ns_of(10), None);
+    }
+
+    #[test]
+    fn replayed_anchor_is_ignored_and_regression_is_rejected() {
+        let mut m = map_of(&[(10, 1_000)]);
+        assert!(!m.push(LsnTimeAnchor::new(10, 1_000)).unwrap());
+        assert!(!m.push(LsnTimeAnchor::new(5, 500)).unwrap());
+        assert!(matches!(
+            m.push(LsnTimeAnchor::new(20, 1_000)),
+            Err(LsnTimeError::NonMonotonic { .. })
+        ));
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn same_millisecond_anchors_are_dropped_first() {
+        let mut m = LsnTimeMap::with_cap(8);
+        // Two anchors per millisecond: the first of each pair is unreachable
+        // by a millisecond lookup.
+        for i in 0..9u64 {
+            m.push(LsnTimeAnchor::new(i + 1, (i / 2) * MS + (i % 2) * 10))
+                .unwrap();
+        }
+        assert!(m.len() <= m.cap());
+        for ms in 0..4i64 {
+            assert_eq!(m.lsn_at_or_before_ms(ms).unwrap(), 2 * ms as u64 + 2);
+        }
+        assert_eq!(m.lsn_at_or_before_ms(4).unwrap(), 9);
+    }
+
+    #[test]
+    fn map_stays_bounded_and_keeps_both_ends() {
+        let mut m = LsnTimeMap::with_cap(64);
+        for i in 1..=10_000u64 {
+            m.push(LsnTimeAnchor::new(i, i * MS)).unwrap();
+            assert!(m.len() <= m.cap());
+        }
+        let anchors = m.anchors();
+        assert_eq!(anchors[0], LsnTimeAnchor::new(1, MS));
+        assert_eq!(
+            anchors[anchors.len() - 1],
+            LsnTimeAnchor::new(10_000, 10_000 * MS)
+        );
+        assert!(anchors.windows(2).all(|w| w[0].lsn < w[1].lsn));
+        // Recent history keeps full resolution.
+        assert_eq!(m.lsn_at_or_before_ms(9_999).unwrap(), 9_999);
+        // Old history is coarser, but the floor never overshoots.
+        let lsn = m.lsn_at_or_before_ms(500).unwrap();
+        assert!(lsn <= 500);
     }
 }

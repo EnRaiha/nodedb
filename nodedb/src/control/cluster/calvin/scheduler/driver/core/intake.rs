@@ -14,6 +14,10 @@
 //! path then drops the next input and arms catch-up for this vShard, and the
 //! drain replays it from the committed log once the gate opens.
 //!
+//! A gate closed by the backlog bound keeps one lane open: the parts of a
+//! txn waiting for them, and the releases a blocked txn waits on, still
+//! reach the scheduler. See [`super::parts_lane`].
+//!
 //! The gate changes only when inputs are read, never the order they are
 //! processed in, so replicas stay deterministic.
 //!
@@ -34,6 +38,10 @@ pub(in crate::control::cluster::calvin::scheduler::driver::core) enum IntakeClos
     /// The in-flight backlog is at its bound, and some of it progresses
     /// without new input.
     BacklogFull,
+    /// A sequenced txn waits for this node's metadata apply to reach the
+    /// catalog its coordinator planned it against. Later input waits behind
+    /// it, so the processing order stays the log order.
+    MetadataCatchUp,
 }
 
 impl IntakeClosure {
@@ -43,6 +51,7 @@ impl IntakeClosure {
             Self::ApplyHalted => intake_closure_reason::APPLY_HALTED,
             Self::DeferredDispatch => intake_closure_reason::DEFERRED_DISPATCH,
             Self::BacklogFull => intake_closure_reason::BACKLOG_FULL,
+            Self::MetadataCatchUp => intake_closure_reason::METADATA_CATCH_UP,
         }
     }
 }
@@ -54,11 +63,14 @@ pub(in crate::control::cluster::calvin::scheduler::driver::core) struct IntakeGa
 }
 
 impl Scheduler {
-    /// Pending, blocked, and dependent-barrier txns.
+    /// Pending, blocked, dependent-barrier, and parts-awaiting txns.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) fn inflight_backlog(
         &self,
     ) -> usize {
-        self.pending.len() + self.blocked.len() + self.dependent_barrier.len()
+        self.pending.len()
+            + self.blocked.len()
+            + self.dependent_barrier.len()
+            + self.parts.awaiting_len()
     }
 
     /// Why intake must stay closed, or `None` when the gate is open.
@@ -76,8 +88,16 @@ impl Scheduler {
         if self.has_deferred_dispatch() {
             return Some(IntakeClosure::DeferredDispatch);
         }
-        let drains_without_input = !self.pending.is_empty() || !self.dependent_barrier.is_empty();
-        if drains_without_input && self.inflight_backlog() >= self.config.max_inflight_backlog {
+        if self.metadata_hold.is_some() {
+            return Some(IntakeClosure::MetadataCatchUp);
+        }
+        // A multi-part txn waiting for its parts finishes on input too. The
+        // closed gate still lets its parts through, on the backlog lane (see
+        // `super::parts_lane`), so the backlog stays bounded and it drains.
+        let drains_behind_the_gate = !self.pending.is_empty()
+            || !self.dependent_barrier.is_empty()
+            || self.parts.awaiting_len() > 0;
+        if drains_behind_the_gate && self.inflight_backlog() >= self.config.max_inflight_backlog {
             return Some(IntakeClosure::BacklogFull);
         }
         None
@@ -218,7 +238,8 @@ mod tests {
             build_test_scheduler_with_data_side(test_coll_vshard(), registry);
         let shared = Arc::clone(&scheduler.shared);
         let fillers = fill_tenant_inflight(&shared, &mut data_side, TenantId::new(1));
-        scheduler.process_scheduler_input(SchedulerInput::Txn(make_validate_only_txn(3, 0)));
+        scheduler
+            .process_scheduler_input(SchedulerInput::Txn(Box::new(make_validate_only_txn(3, 0))));
         assert!(
             scheduler.has_deferred_dispatch(),
             "the stage dispatch defers"
@@ -228,7 +249,7 @@ mod tests {
         let running = spawn_scheduler_loop(scheduler);
         running
             .input_tx()
-            .send(SchedulerInput::Txn(make_validate_only_txn(4, 0)))
+            .send(SchedulerInput::Txn(Box::new(make_validate_only_txn(4, 0))))
             .await
             .expect("the loop's input channel is open");
 
@@ -254,8 +275,9 @@ mod tests {
         );
     }
 
-    /// With the backlog at the configured bound, the run loop leaves a new
-    /// input unread.
+    /// With the backlog at the configured bound, the run loop processes no
+    /// new txn. The backlog lane can read the channel, but it holds a txn
+    /// unprocessed, so the backlog stays at the bound.
     #[tokio::test]
     async fn full_backlog_holds_new_input() {
         let registry = CalvinCompletionRegistry::new_detached();
@@ -271,17 +293,13 @@ mod tests {
         let running = spawn_scheduler_loop(scheduler);
         running
             .input_tx()
-            .send(SchedulerInput::Txn(make_validate_only_txn(4, 0)))
+            .send(SchedulerInput::Txn(Box::new(make_validate_only_txn(4, 0))))
             .await
             .expect("the loop's input channel is open");
 
-        let read_at_bound = inputs_consumed_within(running.input_tx(), HOLD_WAIT).await;
+        tokio::time::sleep(HOLD_WAIT).await;
         running.stop().await;
 
-        assert!(
-            !read_at_bound,
-            "the loop must not read input while the backlog is at its bound"
-        );
         assert_eq!(metrics.intake_gate_closed.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.intake_backlog.load(Ordering::Relaxed), 1);
         assert_eq!(
@@ -311,7 +329,7 @@ mod tests {
         let running = spawn_scheduler_loop(scheduler);
         running
             .input_tx()
-            .send(SchedulerInput::Txn(make_validate_only_txn(4, 0)))
+            .send(SchedulerInput::Txn(Box::new(make_validate_only_txn(4, 0))))
             .await
             .expect("the loop's input channel is open");
 

@@ -6,6 +6,9 @@
 //! write instead would re-fire every trigger that write matched, including the
 //! ones that already succeeded, so each of their side effects would happen
 //! twice per retry round.
+//!
+//! A trigger body runs as one transaction. Its cross-node writes commit with
+//! it as outbox messages, so a committed body owes nothing more.
 
 use std::sync::Arc;
 
@@ -15,7 +18,7 @@ use crate::control::planner::procedural::executor::core::CrossShardOrigin;
 use crate::control::security::catalog::trigger_types::TriggerExecutionMode;
 use crate::control::state::SharedState;
 use crate::control::trigger::TriggerScope;
-use crate::control::trigger::fire_common::FireErrorPolicy;
+use crate::control::trigger::fire_common::{FireErrorPolicy, FireReport};
 use crate::control::trigger::fire_statement::{FireAfterStatementParams, fire_after_statement};
 use crate::event::action::{ActionId, ActionPayload, ActionRetryQueue, FailedAction};
 use crate::types::TenantId;
@@ -74,6 +77,21 @@ impl ActionFailure {
     }
 }
 
+/// Collapse a one-trigger retry pass. A failed body applied nothing, so it
+/// can run again.
+fn settle_trigger_pass(report: FireReport) -> Result<(), ActionFailure> {
+    if report.refusal().is_some() {
+        return report.into_result().map_err(ActionFailure::retryable);
+    }
+    let Some(outcome) = report.into_failures().next() else {
+        return Ok(());
+    };
+    match outcome.error {
+        Some(error) => Err(ActionFailure::retryable(error)),
+        None => Ok(()),
+    }
+}
+
 /// Execute the action its record names, collapsing to a single result: a
 /// retry targets one action, so there is only ever one outcome to report.
 async fn run(action: &FailedAction, state: &Arc<SharedState>) -> Result<(), ActionFailure> {
@@ -89,7 +107,7 @@ async fn run(action: &FailedAction, state: &Arc<SharedState>) -> Result<(), Acti
                 old_fields,
             },
         ) => {
-            fire_for_operation(FireForOperationParams {
+            let report = fire_for_operation(FireForOperationParams {
                 operation,
                 state,
                 identity: &identity,
@@ -111,9 +129,8 @@ async fn run(action: &FailedAction, state: &Arc<SharedState>) -> Result<(), Acti
                 on_error: FireErrorPolicy::Abort,
                 only_trigger: Some(trigger_name),
             })
-            .await
-            .into_result()
-            .map_err(ActionFailure::retryable)
+            .await;
+            settle_trigger_pass(report)
         }
         (
             ActionId::TriggerStatement { trigger_name },
@@ -122,7 +139,7 @@ async fn run(action: &FailedAction, state: &Arc<SharedState>) -> Result<(), Acti
             let Some(dml_event) = dml_event_of(operation) else {
                 return Ok(());
             };
-            fire_after_statement(FireAfterStatementParams {
+            let report = fire_after_statement(FireAfterStatementParams {
                 state,
                 identity: &identity,
                 scope: TriggerScope {
@@ -133,20 +150,34 @@ async fn run(action: &FailedAction, state: &Arc<SharedState>) -> Result<(), Acti
                 event: dml_event,
                 cascade_depth: action.context.cascade_depth,
                 mode_filter: Some(TriggerExecutionMode::Async),
+                cross_shard_origin: Some(CrossShardOrigin {
+                    source_lsn: action.key.source_lsn,
+                    source_sequence: action.key.source_sequence,
+                    source_vshard: action.key.source_vshard,
+                    source_collection: action.context.collection.clone(),
+                }),
                 on_error: FireErrorPolicy::Abort,
                 only_trigger: Some(trigger_name),
+                joined: None,
             })
-            .await
-            .into_result()
-            .map_err(ActionFailure::retryable)
+            .await;
+            settle_trigger_pass(report)
         }
-        (ActionId::EventAction { event_name, .. }, ActionPayload::EventAction { sql }) => {
+        (ActionId::EventAction { event_name, index }, ActionPayload::EventAction { sql }) => {
             crate::control::event_trigger::run_event_action_sql(
                 Arc::clone(state),
                 action.context.database_id,
                 tenant_id,
                 sql,
                 event_name,
+                crate::control::event_trigger::event_action_key(
+                    action.key.source_vshard,
+                    action.key.source_lsn,
+                    action.key.source_sequence,
+                    action.context.database_id,
+                    event_name,
+                    *index,
+                ),
             )
             .await
             .map_err(|error| ActionFailure {

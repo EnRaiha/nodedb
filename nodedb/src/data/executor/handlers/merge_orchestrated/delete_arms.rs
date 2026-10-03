@@ -14,6 +14,7 @@
 
 use crate::bridge::envelope::{Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::redo_image::removed_row_image;
 use crate::data::executor::enforcement::write_hook;
 use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
 use crate::data::executor::task::ExecutionTask;
@@ -29,9 +30,6 @@ pub(super) struct MergeDeleteArms<'a> {
     pub(super) tid: u64,
     pub(super) collection: &'a str,
     pub(super) deletes: &'a [MergeDelete],
-    /// Whether the target maintains a secondary vector index — gates the
-    /// post-apply redo write-set entries.
-    pub(super) has_vectors: bool,
     /// Whether the statement carries a `RETURNING` projection.
     pub(super) returning: bool,
     /// Join-key VALUE → target row surrogate, resolved on the Control Plane.
@@ -64,7 +62,6 @@ impl CoreLoop {
             tid,
             collection,
             deletes,
-            has_vectors,
             returning,
             resolved_targets,
             declared_primary_key,
@@ -94,7 +91,6 @@ impl CoreLoop {
                     database_id,
                     tid,
                     collection,
-                    // The graph cascade keys nodes by the client key.
                     document_id: row_identity.as_str(),
                     surrogate,
                     user_roles: &task.request.user_roles,
@@ -108,7 +104,7 @@ impl CoreLoop {
                     // transaction so the debit and the removal commit
                     // together. The pre-image is the plan's captured
                     // body — the only image a delete has.
-                    match write_hook::run(
+                    let target_writes = match write_hook::run(
                         self,
                         &txn,
                         &write_hook::HookCtx {
@@ -130,12 +126,11 @@ impl CoreLoop {
                         // undone. The caller accounts every delete
                         // arm's pre-image before phase A runs and
                         // judges the whole MERGE there.
-                        Ok(enforcement) => write_set
-                            .extend(write_hook::target_write_set(&enforcement.target_writes)),
+                        Ok(enforcement) => enforcement.target_writes,
                         // Dropping `txn` un-committed reverses the
                         // removal and every target it had debited.
                         Err(e) => return Err(self.response_error(task, e)),
-                    }
+                    };
                     if let Err(e) = txn.commit() {
                         return Err(self.response_error(
                             task,
@@ -145,6 +140,16 @@ impl CoreLoop {
                             },
                         ));
                     }
+                    // Journalled only once the arm committed: the removal
+                    // and the target rows its debit rewrote.
+                    if outcome.prior_value.is_some() {
+                        write_set.push(removed_row_image(
+                            surrogate.as_u32(),
+                            row_identity.clone(),
+                            outcome.bitemporal_sys_from_ms,
+                        ));
+                    }
+                    write_set.extend(write_hook::target_write_set(&target_writes));
                     if outcome.prior_value.is_some() {
                         *affected += 1;
                         // A DELETE arm returns the PRE-image — the row
@@ -158,15 +163,6 @@ impl CoreLoop {
                                 Ok(doc) => returned_docs.push(doc),
                                 Err(e) => return Err(self.response_error(task, e)),
                             }
-                        }
-                        if has_vectors {
-                            write_set.push(WriteSetEntry {
-                                surrogate: surrogate.as_u32(),
-                                identity: row_identity.clone(),
-                                is_delete: true,
-                                value: Vec::new(),
-                                collection: None,
-                            });
                         }
                     }
                     self.emit_document_delete_event(

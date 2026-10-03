@@ -4,23 +4,26 @@
 //!
 //! When a remote node sends a `VShardEnvelope(CrossShardEvent)`, this module:
 //! 1. Deserializes the `CrossShardWriteRequest` from the payload
-//! 2. Checks HWM dedup — drops if `source_lsn <= hwm[source_vshard]`
-//! 3. Executes the SQL through the local Control Plane → Data Plane path
-//! 4. Advances the HWM on success
-//! 5. Returns a `CrossShardWriteResponse` as ACK
+//! 2. Drops it when its dedup key already applied here (see [`super::dedup`])
+//! 3. Executes the SQL block through the local Control Plane as one
+//!    transaction whose redo record carries the dedup key, so the key is
+//!    recorded atomically with the writes
+//! 4. Returns a `CrossShardWriteResponse` as ACK
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use tracing::{debug, trace, warn};
 
 use nodedb_cluster::wire::{VShardEnvelope, VShardMessageType, WIRE_VERSION};
 
-use super::dedup::HwmStore;
+use super::dedup::{CrossShardDedup, applied_key_of};
 use super::metrics::CrossShardMetrics;
 use super::types::{CrossShardWriteRequest, CrossShardWriteResponse};
 use crate::control::security::identity::{AuthenticatedIdentity, Role};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
+use crate::wal::CrossShardAppliedKey;
 
 /// Exact pre-database positional wire layout.
 ///
@@ -48,6 +51,7 @@ impl From<LegacyCrossShardWriteRequest> for CrossShardWriteRequest {
             source_vshard: legacy.source_vshard,
             source_lsn: legacy.source_lsn,
             source_sequence: legacy.source_sequence,
+            origin: String::new(),
             cascade_depth: legacy.cascade_depth,
             source_collection: legacy.source_collection,
             target_vshard: legacy.target_vshard,
@@ -70,24 +74,41 @@ fn decode_write_request(payload: &[u8]) -> Result<CrossShardWriteRequest, String
 
 /// Handles incoming cross-shard event writes.
 pub struct CrossShardReceiver {
-    hwm_store: Arc<HwmStore>,
+    dedup: Arc<CrossShardDedup>,
     shared_state: Arc<SharedState>,
     metrics: Arc<CrossShardMetrics>,
     node_id: u64,
+    /// Keys whose request is executing now. A re-send that arrives while the
+    /// first delivery still runs is refused, so it cannot apply a second time.
+    in_flight: Mutex<HashSet<CrossShardAppliedKey>>,
+}
+
+/// Removes a key from the in-flight set when its delivery ends.
+struct InFlight<'a> {
+    set: &'a Mutex<HashSet<CrossShardAppliedKey>>,
+    key: CrossShardAppliedKey,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        let mut set = self.set.lock().unwrap_or_else(|p| p.into_inner());
+        set.remove(&self.key);
+    }
 }
 
 impl CrossShardReceiver {
     pub fn new(
-        hwm_store: Arc<HwmStore>,
+        dedup: Arc<CrossShardDedup>,
         shared_state: Arc<SharedState>,
         metrics: Arc<CrossShardMetrics>,
         node_id: u64,
     ) -> Self {
         Self {
-            hwm_store,
+            dedup,
             shared_state,
             metrics,
             node_id,
+            in_flight: Mutex::new(HashSet::new()),
         }
     }
 
@@ -128,29 +149,56 @@ impl CrossShardReceiver {
 
         self.metrics.record_received();
 
-        // HWM dedup check.
-        if self
-            .hwm_store
-            .is_duplicate(request.source_vshard, request.source_lsn)
-        {
-            self.metrics.record_duplicate();
-            trace!(
-                source_vshard = request.source_vshard,
-                source_lsn = request.source_lsn,
-                "cross-shard write dropped (HWM dedup)"
-            );
-            let resp = CrossShardWriteResponse::duplicate(request.source_lsn);
-            return self.build_response(envelope.source_node, envelope.vshard_id, &resp);
+        let key = applied_key_of(&request);
+        let _in_flight = {
+            let mut set = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+            if !set.insert(key.clone()) {
+                self.metrics.record_failure();
+                let resp = CrossShardWriteResponse::error(
+                    request.source_lsn,
+                    "the same request is already executing; retry".into(),
+                );
+                return self.build_response(envelope.source_node, envelope.vshard_id, &resp);
+            }
+            InFlight {
+                set: &self.in_flight,
+                key: key.clone(),
+            }
+        };
+        match self.dedup.is_applied(&key) {
+            Ok(false) => {}
+            Ok(true) => {
+                self.metrics.record_duplicate();
+                trace!(
+                    source_vshard = request.source_vshard,
+                    source_lsn = request.source_lsn,
+                    source_sequence = request.source_sequence,
+                    origin = %request.origin,
+                    "cross-shard write dropped (already applied)"
+                );
+                let resp = CrossShardWriteResponse::duplicate(request.source_lsn);
+                return self.build_response(envelope.source_node, envelope.vshard_id, &resp);
+            }
+            // Unknown whether it applied: refuse, so the sender retries.
+            Err(e) => {
+                self.metrics.record_failure();
+                let resp = CrossShardWriteResponse::error(
+                    request.source_lsn,
+                    format!("dedup lookup failed: {e}"),
+                );
+                return self.build_response(envelope.source_node, envelope.vshard_id, &resp);
+            }
         }
 
-        // Execute the SQL through the Control Plane.
-        let result = self.execute_sql(&request).await;
-
-        match result {
+        // The commit's redo record carries `key`, and applying that record
+        // records the key: the key and the writes are durable together.
+        match self.execute_sql(&request, key.clone()).await {
             Ok(()) => {
-                // Advance HWM after successful execution.
-                self.hwm_store
-                    .advance(request.source_vshard, request.source_lsn);
+                // A block that wrote nothing commits no redo record. Nothing
+                // durable happened, so recording its key here has no window.
+                if let Err(error) = self.dedup.record_applied(&key) {
+                    warn!(%error, "recording a cross-shard key failed; held in memory");
+                }
                 debug!(
                     source_vshard = request.source_vshard,
                     source_lsn = request.source_lsn,
@@ -174,10 +222,11 @@ impl CrossShardReceiver {
         }
     }
 
-    /// Handle a NOTIFY broadcast from a remote peer.
+    /// Handle a change-stream run a partition's leader forwarded.
     ///
-    /// Deserializes the `NotifyBroadcastMsg` and delivers it to the local
-    /// `ChangeStream` so LISTEN sessions on this node receive the event.
+    /// Deserializes the `NotifyBroadcastMsg` and appends it to the local
+    /// `ChangeStream` before it acks, so the leader's next run for this node
+    /// lands after it.
     fn handle_notify_broadcast(&self, envelope: VShardEnvelope) -> Vec<u8> {
         let msg: super::types::NotifyBroadcastMsg = match zerompk::from_msgpack(&envelope.payload) {
             Ok(m) => m,
@@ -201,8 +250,9 @@ impl CrossShardReceiver {
 
         trace!(
             source_node = msg.source_node,
-            collection = %msg.collection,
-            "delivered remote NOTIFY to local subscribers"
+            partition_id = msg.partition_id,
+            changes = msg.changes.len(),
+            "appended a forwarded change-stream run"
         );
 
         self.build_ack_response(envelope.source_node, envelope.vshard_id)
@@ -225,7 +275,11 @@ impl CrossShardReceiver {
     ///
     /// Uses a system identity (SECURITY DEFINER) since the trigger body
     /// is database-defined code, not user-submitted queries.
-    async fn execute_sql(&self, request: &CrossShardWriteRequest) -> crate::Result<()> {
+    async fn execute_sql(
+        &self,
+        request: &CrossShardWriteRequest,
+        key: CrossShardAppliedKey,
+    ) -> crate::Result<()> {
         let identity = cross_shard_identity(TenantId::new(request.tenant_id));
 
         // Dispatch through the normal Control Plane query path.
@@ -233,10 +287,14 @@ impl CrossShardReceiver {
         crate::control::trigger::fire::fire_sql(
             &self.shared_state,
             &identity,
-            TenantId::new(request.tenant_id),
-            crate::types::DatabaseId::new(request.database_id),
-            &request.sql,
-            request.cascade_depth.saturating_add(1),
+            crate::control::trigger::fire::ShippedBlock {
+                tenant_id: TenantId::new(request.tenant_id),
+                database_id: crate::types::DatabaseId::new(request.database_id),
+                sql: &request.sql,
+                cascade_depth: request.cascade_depth.saturating_add(1),
+                target_vshard: request.target_vshard,
+                applied_key: key,
+            },
         )
         .await
     }
@@ -270,6 +328,51 @@ impl CrossShardReceiver {
     ) -> Vec<u8> {
         let resp = CrossShardWriteResponse::error(source_lsn, error.to_string());
         self.build_response(target_node, vshard_id, &resp)
+    }
+}
+
+/// Apply `request` on this node, as its receiver does: once per key. The
+/// committed-message outbox delivers here when this node leads the
+/// request's target vShard, since a node sends no RPC to itself.
+pub(crate) async fn apply_here(
+    state: &SharedState,
+    request: &CrossShardWriteRequest,
+) -> crate::Result<CrossShardWriteResponse> {
+    let key = applied_key_of(request);
+    let dedup = state
+        .cross_shard_dedup
+        .get()
+        .ok_or_else(|| crate::Error::Dispatch {
+            detail: "cross-shard dedup store not initialised".into(),
+        })?;
+    if dedup.is_applied(&key)? {
+        return Ok(CrossShardWriteResponse::duplicate(request.source_lsn));
+    }
+    let executed = crate::control::trigger::fire::fire_sql(
+        state,
+        &cross_shard_identity(TenantId::new(request.tenant_id)),
+        crate::control::trigger::fire::ShippedBlock {
+            tenant_id: TenantId::new(request.tenant_id),
+            database_id: crate::types::DatabaseId::new(request.database_id),
+            sql: &request.sql,
+            cascade_depth: request.cascade_depth.saturating_add(1),
+            target_vshard: request.target_vshard,
+            applied_key: key.clone(),
+        },
+    )
+    .await;
+    match executed {
+        Ok(()) => {
+            // A block that wrote nothing commits no redo record to carry it.
+            if let Err(error) = dedup.record_applied(&key) {
+                warn!(%error, "recording a cross-shard key failed; held in memory");
+            }
+            Ok(CrossShardWriteResponse::ok(request.source_lsn))
+        }
+        Err(error) => Ok(CrossShardWriteResponse::error(
+            request.source_lsn,
+            error.to_string(),
+        )),
     }
 }
 

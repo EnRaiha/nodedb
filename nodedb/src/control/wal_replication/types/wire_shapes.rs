@@ -75,7 +75,7 @@ pub struct ReplicatedSumTarget {
 }
 
 /// One row of a `ColumnarBulkDmlResolved` write: carries the resolved row
-/// image, not anything a follower would re-derive. `new_row_msgpack` is
+/// image, not anything a follower re-derives. `new_row_msgpack` is
 /// empty for a delete row.
 #[derive(
     Debug,
@@ -115,10 +115,21 @@ pub enum KvResolvedMutationWire {
         value: Vec<u8>,
         ttl_ms: u64,
         /// Absolute expiry instant resolved by the proposing node, `0` for
-        /// none. No applying node may re-derive it from its own clock.
+        /// none. No applying node re-derives it from its own clock.
         expire_at_ms: u64,
         surrogate: u32,
         precondition: Option<Vec<u8>>,
+    },
+    /// Rewrite of an existing row that keeps its bound identity. See
+    /// `KvResolvedMutation::Rewrite`.
+    Rewrite {
+        collection: String,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl_ms: u64,
+        /// See `Put::expire_at_ms`.
+        expire_at_ms: u64,
+        precondition: Vec<u8>,
     },
     Delete {
         collection: String,

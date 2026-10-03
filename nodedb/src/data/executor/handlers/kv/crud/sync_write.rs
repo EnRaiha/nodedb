@@ -120,7 +120,7 @@ mod tests {
             key: b"k1",
             value,
             ttl_ms: 0,
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
             returning: None,
             rls_filters: &[],
         }

@@ -31,6 +31,6 @@ pub mod types;
 pub use replication::prepare_owner;
 pub use store::PermissionStore;
 pub use types::{
-    Grant, OwnerRecord, collection_target, format_permission, function_target, owner_key,
-    parse_permission, procedure_target, tenant_target,
+    Grant, OwnerRecord, ScopedTarget, collection_target, format_permission, function_target,
+    owner_key, parse_permission, parse_scoped_target, procedure_target, tenant_target,
 };

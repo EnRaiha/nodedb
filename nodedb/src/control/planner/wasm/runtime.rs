@@ -102,11 +102,7 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 
 /// Format a SHA-256 hash as a hex string.
 pub fn sha256_hex(data: &[u8]) -> String {
-    hex_encode(&sha256(data))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    hex::encode(sha256(data))
 }
 
 #[cfg(test)]

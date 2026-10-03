@@ -19,8 +19,7 @@ use nodedb_types::backup_envelope::{DatabaseBlob, Envelope, SECTION_ORIGIN_DATAB
 
 use crate::Error;
 use crate::control::catalog_entry::CatalogEntry;
-use crate::control::catalog_entry::post_apply::quota as quota_apply;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::security::catalog::{DatabaseDescriptor, DatabaseStatus};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
@@ -77,12 +76,13 @@ pub(super) fn decode_databases(env: &Envelope) -> Result<Vec<DatabaseBlob>, Erro
 
 /// Map every database of `blobs` to its destination. Unless `dry_run`,
 /// create each database the destination lacks and restore the tenant's
-/// quota in each database that has none.
-pub(super) fn resolve_databases(
+/// quota in each database that has none. Every target carries `restore_id`.
+pub(super) async fn resolve_databases(
     state: &SharedState,
     tenant_id: u64,
     blobs: &[DatabaseBlob],
     dry_run: bool,
+    restore_id: u64,
 ) -> Result<DatabaseMap, Error> {
     let catalog = state.credentials.catalog();
     let mut map = DatabaseMap::default();
@@ -95,17 +95,18 @@ pub(super) fn resolve_databases(
             None if dry_run => continue,
             None => {
                 map.created += 1;
-                create_database(state, blob)?
+                create_database(state, blob).await?
             }
         };
         if !dry_run && let Some(record) = &blob.tenant_quota {
-            restore_tenant_quota(state, dest, TenantId::new(tenant_id), record)?;
+            restore_tenant_quota(state, dest, TenantId::new(tenant_id), record).await?;
         }
         map.targets.insert(
             blob.database_id,
             DatabaseTarget {
                 source: DatabaseId::new(blob.database_id),
                 dest,
+                restore_id,
             },
         );
     }
@@ -113,7 +114,11 @@ pub(super) fn resolve_databases(
 }
 
 /// A restore writes rows, so the destination database must take writes.
-fn require_writable(state: &SharedState, id: DatabaseId, name: &str) -> Result<(), Error> {
+pub(super) fn require_writable(
+    state: &SharedState,
+    id: DatabaseId,
+    name: &str,
+) -> Result<(), Error> {
     let status = state
         .credentials
         .catalog()
@@ -133,7 +138,7 @@ fn require_writable(state: &SharedState, id: DatabaseId, name: &str) -> Result<(
 
 /// Create the database `blob` describes under a fresh id, with its settings
 /// and its quota. Returns the new id.
-fn create_database(state: &SharedState, blob: &DatabaseBlob) -> Result<DatabaseId, Error> {
+async fn create_database(state: &SharedState, blob: &DatabaseBlob) -> Result<DatabaseId, Error> {
     let source: DatabaseDescriptor =
         zerompk::from_msgpack(&blob.descriptor).map_err(|_| Error::Internal {
             detail: format!(
@@ -141,8 +146,7 @@ fn create_database(state: &SharedState, blob: &DatabaseBlob) -> Result<DatabaseI
                 blob.name
             ),
         })?;
-    let catalog = state.credentials.catalog();
-    let id = state.database_registry.alloc_one();
+    let id = crate::control::database::allocate_database_id(state).await?;
     // The restored database is a new, independent database: it is active,
     // and it is no clone or mirror of a database on this cluster.
     let descriptor = DatabaseDescriptor {
@@ -154,16 +158,10 @@ fn create_database(state: &SharedState, blob: &DatabaseBlob) -> Result<DatabaseI
         mirror_origin: None,
         ..source
     };
-    let entry = CatalogEntry::PutDatabase(Box::new(descriptor.clone()));
-    if propose_catalog_entry(state, &entry)?.needs_local_apply() {
-        catalog.put_database(&descriptor)?;
-    }
-    // Persist the allocator high-water mark now, so a restart never hands
-    // the restored id to another database.
-    catalog.put_database_hwm(state.database_registry.current_hwm())?;
+    propose_catalog_entry_async(state, &CatalogEntry::PutDatabase(Box::new(descriptor))).await?;
 
     if let Some(record) = &blob.database_quota {
-        restore_database_quota(state, id, record)?;
+        restore_database_quota(state, id, record).await?;
     }
     if let Some(m) = &state.system_metrics {
         m.set_database_collections(&blob.name, 0);
@@ -185,7 +183,7 @@ fn create_database(state: &SharedState, blob: &DatabaseBlob) -> Result<DatabaseI
 }
 
 /// Install the backed-up quota of a database the restore created.
-fn restore_database_quota(
+async fn restore_database_quota(
     state: &SharedState,
     id: DatabaseId,
     record: &QuotaRecord,
@@ -196,16 +194,13 @@ fn restore_database_quota(
         db_id: id.as_u64(),
         record: Box::new(record.clone()),
     };
-    if propose_catalog_entry(state, &entry)?.needs_local_apply() {
-        catalog.write_database_quota(id, record)?;
-        quota_apply::put_database(id, record, state);
-    }
+    propose_catalog_entry_async(state, &entry).await?;
     Ok(())
 }
 
 /// Install the tenant's backed-up quota in `id`, unless the destination
 /// already sets one there.
-fn restore_tenant_quota(
+async fn restore_tenant_quota(
     state: &SharedState,
     id: DatabaseId,
     tenant: TenantId,
@@ -221,9 +216,6 @@ fn restore_tenant_quota(
         tenant_id: tenant.as_u64(),
         record: Box::new(record.clone()),
     };
-    if propose_catalog_entry(state, &entry)?.needs_local_apply() {
-        catalog.write_tenant_quota(id, tenant, record)?;
-        quota_apply::put_tenant(id, tenant, record, state);
-    }
+    propose_catalog_entry_async(state, &entry).await?;
     Ok(())
 }

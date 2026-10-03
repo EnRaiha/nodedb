@@ -1,94 +1,109 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! PITR/restore utilities: timestamp parsing, dry-run validation, and restore planning.
-//!
-//! Extracted from `snapshot.rs` — contains standalone functions and types
-//! used for Point-In-Time Recovery planning and validation.
+//! PITR/restore utilities: timestamp parsing and the archived WAL coverage
+//! check a point-in-time restore plans with.
 
-use crate::types::Lsn;
-
-use super::snapshot::SnapshotMeta;
-
-/// Result of a PITR target resolution.
-#[derive(Debug, Clone)]
-pub struct PitrTarget {
-    /// The closest base snapshot to restore from.
-    pub base_snapshot: SnapshotMeta,
-    /// Delta snapshots to apply in order (oldest first).
-    pub deltas: Vec<SnapshotMeta>,
-    /// Target LSN resolved from the requested UTC timestamp.
-    pub replay_lsn: Lsn,
-    /// Number of WAL records to replay after snapshot restore.
-    pub wal_records_to_replay: u64,
+/// Archived WAL that does not reach from a base's replay start to a target.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CoverageError {
+    #[error(
+        "archived WAL is missing LSNs {from}..={to}; replay needs every LSN from \
+         {replay_start} through the target {target}"
+    )]
+    Gap {
+        from: u64,
+        to: u64,
+        replay_start: u64,
+        target: u64,
+    },
+    #[error("archived WAL ends at LSN {archived_through}, below the target LSN {target}")]
+    EndsBeforeTarget { archived_through: u64, target: u64 },
 }
 
-/// Dry-run result for restore validation.
-#[derive(Debug, Clone)]
-pub struct RestoreDryRun {
-    /// Whether the restore plan is valid.
-    pub valid: bool,
-    /// Human-readable description of what would happen.
-    pub plan_description: String,
-    /// Estimated time for restore (microseconds).
-    pub estimated_duration_us: u64,
-    /// Number of snapshot files to read.
-    pub files_to_read: usize,
-    /// Number of WAL records to replay.
-    pub wal_records: u64,
-    /// Issues found during validation.
-    pub issues: Vec<String>,
-}
-
-/// Validate a restore plan without executing it.
-pub fn dry_run_restore(target: &PitrTarget) -> RestoreDryRun {
-    let mut issues = Vec::new();
-    let files_to_read = 1 + target.deltas.len(); // base + deltas
-
-    // Validate delta chain continuity.
-    let mut expected_lsn = target.base_snapshot.end_lsn;
-    for delta in &target.deltas {
-        if delta.begin_lsn > expected_lsn {
-            issues.push(format!(
-                "gap in delta chain: expected begin_lsn <= {}, got {}",
-                expected_lsn.as_u64(),
-                delta.begin_lsn.as_u64()
-            ));
+impl From<CoverageError> for crate::Error {
+    fn from(e: CoverageError) -> Self {
+        crate::Error::Storage {
+            engine: "snapshot".into(),
+            detail: e.to_string(),
         }
-        expected_lsn = delta.end_lsn;
+    }
+}
+
+/// Whether the walk has every LSN it needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageStep {
+    More,
+    Covered,
+}
+
+/// Walks archived segments in LSN order and checks that together they hold
+/// every LSN in `replay_start..=target`.
+///
+/// A segment's name gives its first LSN. Its highest record comes from a
+/// scan. An empty segment says nothing about where the log ends, so the
+/// boundary carries over from the last segment that held records.
+#[derive(Debug, Clone)]
+pub struct WalCoverage {
+    replay_start: u64,
+    target: u64,
+    /// The lowest LSN no fed segment holds yet.
+    next: u64,
+}
+
+impl WalCoverage {
+    pub fn new(replay_start: u64, target: u64) -> Self {
+        Self {
+            replay_start,
+            target,
+            next: replay_start,
+        }
     }
 
-    // Check that replay LSN is reachable.
-    if target.replay_lsn < target.base_snapshot.begin_lsn {
-        issues.push(format!(
-            "replay LSN {} is before base snapshot begin {}",
-            target.replay_lsn.as_u64(),
-            target.base_snapshot.begin_lsn.as_u64()
-        ));
+    pub fn is_covered(&self) -> bool {
+        self.next > self.target
     }
 
-    let plan_description = format!(
-        "Restore base snapshot #{} (LSN {}-{}), apply {} deltas, replay {} WAL records to LSN {}",
-        target.base_snapshot.snapshot_id,
-        target.base_snapshot.begin_lsn.as_u64(),
-        target.base_snapshot.end_lsn.as_u64(),
-        target.deltas.len(),
-        target.wal_records_to_replay,
-        target.replay_lsn.as_u64(),
-    );
+    /// Feed the next archived segment, whose first LSN is at or below the
+    /// target. `last_lsn` is its highest record, `None` when it holds none.
+    pub fn feed(
+        &mut self,
+        first_lsn: u64,
+        last_lsn: Option<u64>,
+    ) -> Result<CoverageStep, CoverageError> {
+        if first_lsn > self.next {
+            return Err(self.gap_to(first_lsn));
+        }
+        if let Some(last) = last_lsn {
+            self.next = self.next.max(last.saturating_add(1));
+        }
+        Ok(if self.is_covered() {
+            CoverageStep::Covered
+        } else {
+            CoverageStep::More
+        })
+    }
 
-    // Rough estimate: 100MB/s for snapshot reads + 10K WAL records/sec.
-    let total_snapshot_bytes: u64 =
-        target.base_snapshot.data_bytes + target.deltas.iter().map(|d| d.data_bytes).sum::<u64>();
-    let snapshot_us = (total_snapshot_bytes as f64 / 100_000_000.0 * 1_000_000.0) as u64;
-    let wal_us = target.wal_records_to_replay * 100; // 100us per record
+    /// The error when the archive holds no further segment at or below the
+    /// target before the walk is covered. `next_first_lsn` is the first LSN
+    /// of the next archived segment, if any.
+    pub fn missing(&self, next_first_lsn: Option<u64>) -> CoverageError {
+        match next_first_lsn {
+            Some(first) => self.gap_to(first),
+            None => CoverageError::EndsBeforeTarget {
+                archived_through: self.next.saturating_sub(1),
+                target: self.target,
+            },
+        }
+    }
 
-    RestoreDryRun {
-        valid: issues.is_empty(),
-        plan_description,
-        estimated_duration_us: snapshot_us + wal_us,
-        files_to_read,
-        wal_records: target.wal_records_to_replay,
-        issues,
+    /// The gap from the next needed LSN up to the segment starting at `first`.
+    fn gap_to(&self, first: u64) -> CoverageError {
+        CoverageError::Gap {
+            from: self.next,
+            to: first.saturating_sub(1).min(self.target),
+            replay_start: self.replay_start,
+            target: self.target,
+        }
     }
 }
 
@@ -265,6 +280,91 @@ mod tests {
     #[test]
     fn an_integer_past_the_year_2100_is_refused() {
         assert!(parse_utc_timestamp("9999999999999999999").is_err());
+    }
+
+    /// Feeds `(first_lsn, last_lsn)` segments until covered. An uncovered
+    /// walk names what the first unfed segment leaves missing.
+    fn walk(start: u64, target: u64, segments: &[(u64, Option<u64>)]) -> Result<(), CoverageError> {
+        let mut coverage = WalCoverage::new(start, target);
+        for &(first, last) in segments {
+            if first > target {
+                return Err(coverage.missing(Some(first)));
+            }
+            if coverage.feed(first, last)? == CoverageStep::Covered {
+                return Ok(());
+            }
+        }
+        Err(coverage.missing(None))
+    }
+
+    #[test]
+    fn contiguous_segments_cover_the_target() {
+        let segments = [(1, Some(10)), (11, Some(20)), (21, Some(30))];
+        assert_eq!(walk(5, 25, &segments), Ok(()));
+        assert_eq!(walk(11, 20, &segments), Ok(()));
+    }
+
+    #[test]
+    fn a_missing_segment_names_the_missing_range() {
+        let segments = [(1, Some(10)), (11, Some(20)), (31, Some(40))];
+        assert_eq!(
+            walk(5, 35, &segments),
+            Err(CoverageError::Gap {
+                from: 21,
+                to: 30,
+                replay_start: 5,
+                target: 35
+            })
+        );
+    }
+
+    #[test]
+    fn a_target_inside_the_gap_names_the_range_up_to_the_target() {
+        let segments = [(1, Some(10)), (31, Some(40))];
+        assert_eq!(
+            walk(5, 25, &segments),
+            Err(CoverageError::Gap {
+                from: 11,
+                to: 25,
+                replay_start: 5,
+                target: 25
+            })
+        );
+    }
+
+    #[test]
+    fn an_archive_starting_above_the_replay_start_is_a_gap() {
+        assert_eq!(
+            walk(5, 25, &[(20, Some(30))]),
+            Err(CoverageError::Gap {
+                from: 5,
+                to: 19,
+                replay_start: 5,
+                target: 25
+            })
+        );
+    }
+
+    #[test]
+    fn an_archive_ending_below_the_target_is_refused() {
+        assert_eq!(
+            walk(5, 15, &[(1, Some(10))]),
+            Err(CoverageError::EndsBeforeTarget {
+                archived_through: 10,
+                target: 15
+            })
+        );
+    }
+
+    #[test]
+    fn an_empty_segment_holds_no_lsn() {
+        assert_eq!(
+            walk(5, 12, &[(1, Some(10)), (11, None)]),
+            Err(CoverageError::EndsBeforeTarget {
+                archived_through: 10,
+                target: 12
+            })
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate::data::executor::checkpoint_encoding::{dec_component, enc_component};
 use crate::types::TenantId;
 
 /// Filename of the manifest that names the live generation.
-pub(super) const SPATIAL_CKPT_MANIFEST: &str = "MANIFEST";
+pub(crate) const SPATIAL_CKPT_MANIFEST: &str = "MANIFEST";
 
 /// Canonical path for a core's spatial checkpoint directory.
 ///

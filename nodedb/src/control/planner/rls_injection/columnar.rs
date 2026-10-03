@@ -97,7 +97,7 @@ pub(super) fn inject_timeseries(ctx: &RlsCtx<'_>, op: &mut TimeseriesOp) -> crat
 
         // Recurse: the resolve pass carries the ingest it is about to decide,
         // and that ingest's own slots are the ones the policy fills.
-        TimeseriesOp::ResolveIngest(inner) => inject_timeseries(ctx, inner),
+        TimeseriesOp::ResolveIngest(inner) => inject_timeseries(ctx, &mut inner.ingest),
 
         // Refuse: removes every row without reading one, so no image
         // exists to evaluate against. Mirrors `KvOp::Truncate`.
@@ -481,7 +481,7 @@ mod tests {
                 "places",
             ),
             field: "geom".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: Some(nodedb_types::Surrogate::new(1)),
             provenance: None,
         });
         assert_write_refused(inject(&mut plan, &store), "places");

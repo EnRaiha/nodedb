@@ -4,7 +4,7 @@
 
 use tracing::debug;
 
-use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::envelope::{EdgeImage, ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
@@ -52,8 +52,23 @@ impl CoreLoop {
         } = params;
         debug!(core = self.core_id, tid, %collection, %src_id, %label, %dst_id, "edge put");
         let database_id = task.request.database_id.as_u64();
+        // Both endpoints carry the surrogate their coordinator bound.
+        for surrogate in [src_surrogate, dst_surrogate] {
+            if let Some(refusal) =
+                crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+                    "graph", collection, surrogate,
+                )
+            {
+                return self.response_error(task, refusal);
+            }
+        }
 
-        if self.is_node_deleted(database_id, tid, src_id) {
+        // A decided ordinal marks a committed version that replay or a
+        // committed-redo install writes again. The dangling rule admits new
+        // writes only: replay runs the document arm before the graph arm, so
+        // the tracker already names nodes a later record deletes.
+        let committed_version = self.apply_scope.graph_system_from.is_some();
+        if !committed_version && self.is_node_deleted(database_id, tid, collection, src_id) {
             return self.response_error(
                 task,
                 ErrorCode::RejectedDanglingEdge {
@@ -61,7 +76,7 @@ impl CoreLoop {
                 },
             );
         }
-        if self.is_node_deleted(database_id, tid, dst_id) {
+        if !committed_version && self.is_node_deleted(database_id, tid, collection, dst_id) {
             return self.response_error(
                 task,
                 ErrorCode::RejectedDanglingEdge {
@@ -70,13 +85,14 @@ impl CoreLoop {
             );
         }
 
-        let ord = self
-            .active_graph_system_from
-            .unwrap_or_else(|| self.hlc.next_ordinal());
+        let stamp = match self.graph_write_stamp() {
+            Ok(stamp) => stamp,
+            Err(e) => return self.response_error(task, e),
+        };
+        let ord = stamp.system_from;
         // Under a Calvin batch, `epoch_system_ms` is the deterministic epoch
-        // timestamp; outside Calvin (every path today — no Calvin edge writes
-        // yet) it is None and we fall back to the HLC-derived wall time,
-        // identical to the prior behavior.
+        // timestamp. Outside Calvin it is None and the valid time is the
+        // ordinal's wall time.
         let valid_from_ms = match self.epoch_system_ms {
             Some(ms) => ms,
             None => nodedb_types::ordinal_to_ms(ord),
@@ -103,23 +119,31 @@ impl CoreLoop {
             )
             .with_surrogates(src_surrogate, dst_surrogate),
             properties,
-            ord,
+            stamp,
             valid_from_ms,
             i64::MAX,
             owns_logical_edge_stats(task, src_id),
         ) {
             Ok(version) => {
+                let current = version.current.clone();
                 // Edge-store version is now durable; the compensation entry is
                 // valid from here on even if the CSR mutation below fails.
                 if let (Some(undo), Some(csr)) = (undo, csr_prior) {
                     undo.push(UndoEntry::EdgeWrite(Box::new(target.undo(version, csr))));
                 }
-                let weight = crate::engine::graph::csr::extract_weight_from_properties(properties);
-                let partition = self.csr_partition_mut(database_id, tid);
-                let csr_result =
-                    partition.put_edge_in_collection(src_id, label, dst_id, collection, weight);
+                // The CSR follows what the edge resolves to: a version a
+                // TRUNCATE hides, or one below a newer version, leaves the
+                // edge as it was.
+                let csr_result = self.mirror_edge_csr(
+                    database_id,
+                    tid,
+                    (src_id, label, dst_id),
+                    collection,
+                    current.as_deref(),
+                );
                 match csr_result {
-                    Ok(_) => {
+                    Ok(()) => {
+                        let partition = self.csr_partition_mut(database_id, tid);
                         // Populate the per-node surrogates so future bitmap-gated
                         // traversals can check membership without a separate lookup.
                         partition.set_node_surrogate(src_id, src_surrogate);
@@ -136,11 +160,29 @@ impl CoreLoop {
                                 src_id,
                                 label,
                                 dst_id,
+                                src_surrogate,
+                                dst_surrogate,
                                 op: crate::event::WriteOp::Insert,
                                 properties: Some(properties),
                             },
                         );
-                        self.response_affected(task, 1)
+                        let mut response = self.response_affected(task, 1);
+                        // The version's ordinal was decided here, so the version
+                        // is journalled after apply at exactly that ordinal.
+                        response.write_set = vec![WriteSetEntry::edge(EdgeImage::Put(
+                            crate::wal::EdgePutRedo {
+                                collection: collection.to_string(),
+                                src_id: src_id.to_string(),
+                                label: label.to_string(),
+                                dst_id: dst_id.to_string(),
+                                properties: properties.to_vec(),
+                                src_surrogate: src_surrogate.as_u32(),
+                                dst_surrogate: dst_surrogate.as_u32(),
+                                system_from: Some(ord),
+                                applied: (stamp.applied != ord).then_some(stamp.applied),
+                            },
+                        ))];
+                        response
                     }
                     Err(e) => self.response_error(
                         task,
@@ -210,5 +252,43 @@ mod tests {
             "event LSN matches the edge's WAL LSN"
         );
         assert_eq!(event.new_value.as_deref(), Some(b"w=1".as_slice()));
+    }
+
+    /// An endpoint under `Surrogate::ZERO` names no node: the put is refused
+    /// and no edge version is written.
+    #[test]
+    fn an_edge_put_with_an_unbound_endpoint_is_refused_and_writes_nothing() {
+        let mut h = make_core();
+        let task = make_task_with_lsn(78);
+        let resp = h.core.execute_edge_put(
+            &task,
+            EdgePutParams {
+                tid: 1,
+                collection: "knows",
+                src_id: "a",
+                label: "KNOWS",
+                dst_id: "b",
+                properties: b"w=1",
+                src_surrogate: Surrogate::new(1),
+                dst_surrogate: Surrogate::ZERO,
+            },
+        );
+        assert!(matches!(
+            resp.error_code.as_deref(),
+            Some(ErrorCode::RejectedPrevalidation { .. })
+        ));
+        let stored = h
+            .core
+            .edge_store
+            .get_edge(
+                task.request.database_id.as_u64(),
+                TenantId::new(1),
+                "knows",
+                "a",
+                "KNOWS",
+                "b",
+            )
+            .expect("edge lookup");
+        assert!(stored.is_none(), "a refused put writes no edge");
     }
 }

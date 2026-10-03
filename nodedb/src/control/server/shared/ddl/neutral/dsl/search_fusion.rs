@@ -24,6 +24,7 @@ pub async fn search_fusion(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
+    linearizable: bool,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let (collection, params) = parse_search_using_fusion(sql).ok_or_else(|| {
         ddl_err(
@@ -31,5 +32,13 @@ pub async fn search_fusion(
             "syntax: SEARCH <collection> USING FUSION(ARRAY[...] ...)",
         )
     })?;
-    rag_fusion(state, identity, database_id, collection, params).await
+    rag_fusion(
+        state,
+        identity,
+        database_id,
+        collection,
+        params,
+        linearizable,
+    )
+    .await
 }

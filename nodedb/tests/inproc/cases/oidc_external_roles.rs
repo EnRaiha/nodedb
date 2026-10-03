@@ -11,7 +11,7 @@ use nodedb::control::security::jwks::registry::JwksRegistry;
 use nodedb::control::security::jwt::JwtError;
 use nodedb::control::security::oidc::verify_bearer_token;
 use nodedb_test_support::pgwire_auth_helpers::{
-    ddl_err, ddl_ok, make_state_with_catalog, superuser,
+    ddl_err, ddl_ok, make_state_with_catalog, make_state_with_catalog_configured, superuser,
 };
 use nodedb_types::id::DatabaseId;
 
@@ -124,7 +124,10 @@ fn signed_jwt_fixture(roles: &[&str], is_superuser: bool) -> (String, String) {
     (fixture.jwks, fixture.token)
 }
 
-async fn install_catalog_registry(state: &mut Arc<nodedb::control::state::SharedState>) {
+/// A catalog-backed state with a JWKS registry that fetches from the loopback
+/// fixture server. The registry is set before the gateway install, as
+/// production boot sets it.
+async fn state_with_catalog_registry() -> nodedb_test_support::pgwire_auth_helpers::BootedState {
     let registry = JwksRegistry::init(JwtAuthConfig {
         allow_http_jwks: true,
         allow_jwks_hosts: vec!["localhost".into()],
@@ -133,9 +136,7 @@ async fn install_catalog_registry(state: &mut Arc<nodedb::control::state::Shared
     })
     .await
     .expect("test JWKS registry must initialize");
-    Arc::get_mut(state)
-        .expect("test state must remain uniquely owned")
-        .jwks_registry = Some(Arc::new(registry));
+    make_state_with_catalog_configured(|state| state.jwks_registry = Some(Arc::new(registry)))
 }
 
 #[tokio::test]
@@ -205,7 +206,7 @@ async fn alter_oidc_provider_rejects_superuser_and_preserves_existing_mapping() 
 async fn legacy_oidc_mapping_cannot_grant_superuser() {
     let (jwks, token) = signed_jwt_fixture(&[], false);
     let jwks_uri = spawn_static_jwks(jwks).await;
-    let mut state = make_state_with_catalog();
+    let state = state_with_catalog_registry().await;
     let su = superuser();
     ddl_ok(&state, &su, "CREATE TENANT legacy_mapping_tenant ID 42").await;
     ddl_ok(
@@ -233,7 +234,6 @@ async fn legacy_oidc_mapping_cannot_grant_superuser() {
     catalog
         .put_oidc_provider(&provider)
         .expect("legacy provider fixture must persist");
-    install_catalog_registry(&mut state).await;
 
     let (identity, _claims) = verify_bearer_token(&state, &token)
         .await
@@ -252,7 +252,7 @@ async fn authenticate_catalog_token(
 ) -> nodedb::control::security::identity::AuthenticatedIdentity {
     let (jwks, token) = signed_jwt_fixture(token_roles, is_superuser);
     let jwks_uri = spawn_static_jwks(jwks).await;
-    let mut state = make_state_with_catalog();
+    let state = state_with_catalog_registry().await;
     let su = superuser();
     ddl_ok(&state, &su, "CREATE TENANT raw_claim_tenant ID 42").await;
     ddl_ok(
@@ -268,7 +268,6 @@ async fn authenticate_catalog_token(
         ),
     )
     .await;
-    install_catalog_registry(&mut state).await;
 
     let (identity, _claims) = verify_bearer_token(&state, &token)
         .await
@@ -306,7 +305,21 @@ async fn catalog_oidc_rejects_algorithm_confusion_missing_expiration_and_none() 
     // RSA key material are already available.
     let fixture = signed_jwt_fixtures(&[], false);
     let jwks_uri = spawn_static_jwks(fixture.jwks).await;
-    let mut state = make_state_with_catalog();
+    let registry = Arc::new(
+        JwksRegistry::init(JwtAuthConfig {
+            allow_http_jwks: true,
+            allow_jwks_hosts: vec!["localhost".into()],
+            allow_jwks_cidrs: vec!["127.0.0.0/8".into(), "::1/128".into()],
+            allowed_algorithms: vec!["RS256".into(), "HS256".into()],
+            ..JwtAuthConfig::default()
+        })
+        .await
+        .expect("test JWKS registry must initialize"),
+    );
+    let installed = Arc::clone(&registry);
+    let state = make_state_with_catalog_configured(move |state| {
+        state.jwks_registry = Some(installed);
+    });
     let su = superuser();
     ddl_ok(&state, &su, "CREATE TENANT negative_oidc_tenant ID 42").await;
     ddl_ok(
@@ -322,20 +335,6 @@ async fn catalog_oidc_rejects_algorithm_confusion_missing_expiration_and_none() 
         ),
     )
     .await;
-    let registry = Arc::new(
-        JwksRegistry::init(JwtAuthConfig {
-            allow_http_jwks: true,
-            allow_jwks_hosts: vec!["localhost".into()],
-            allow_jwks_cidrs: vec!["127.0.0.0/8".into(), "::1/128".into()],
-            allowed_algorithms: vec!["RS256".into(), "HS256".into()],
-            ..JwtAuthConfig::default()
-        })
-        .await
-        .expect("test JWKS registry must initialize"),
-    );
-    Arc::get_mut(&mut state)
-        .expect("test state must remain uniquely owned")
-        .jwks_registry = Some(Arc::clone(&registry));
 
     registry
         .validate_with_catalog_provider("negative_cases", &jwks_uri, &fixture.token)

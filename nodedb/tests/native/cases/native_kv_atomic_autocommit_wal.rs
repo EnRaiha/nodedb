@@ -4,9 +4,9 @@
 //! reproduces it.
 //!
 //! `KvIncr`, `KvIncrFloat`, `KvCas` and `KvGetSet` reach the gateway as direct
-//! ops. On a node with no Raft proposer the gateway applies them on its own
-//! cores, and it must give each one the durable route: the write funnel
-//! appends a WAL record for it. The harness restores a core from WAL replay
+//! ops. The gateway gives each one the durable route: the op is proposed
+//! through its data group, and the apply's write funnel appends a WAL record
+//! for it. The harness restores a core from WAL replay
 //! alone, so the value read after the restart is the value replay computed.
 //! The native protocol has no transfer opcode, so `TRANSFER` is covered by
 //! the SQL cases alone.

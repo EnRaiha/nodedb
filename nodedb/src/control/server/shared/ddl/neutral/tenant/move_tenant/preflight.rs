@@ -4,7 +4,8 @@
 //!
 //! Verifies that every collection the tenant has data in on the source
 //! database exists in the target database with a compatible schema (same
-//! engine type, same column names and types).
+//! engine type, same column names and types), and that no source array
+//! lands on an array the target already holds.
 //!
 //! No state is mutated during pre-flight. If this function returns `Err`,
 //! the move is aborted with `MOVE_TENANT_PREFLIGHT_FAILED` and no compensation
@@ -87,5 +88,11 @@ pub fn run(
         }
     }
 
-    Ok(())
+    super::arrays::preflight(
+        catalog,
+        source_db_id,
+        target_db_id,
+        tenant_name,
+        target_db_name,
+    )
 }

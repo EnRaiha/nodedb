@@ -10,6 +10,10 @@
 
 use crate::error::Result;
 
+pub use super::hooks_routed::{
+    AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, ReleaseReservation, ReserveRead,
+};
+
 /// Hook for building per-group snapshot payloads on the Raft snapshot SEND path.
 ///
 /// `nodedb-cluster` cannot depend on `nodedb` (circular), so the snapshot
@@ -20,7 +24,7 @@ use crate::error::Result;
 /// before framing the chunked `InstallSnapshot` RPC.
 ///
 /// Cluster-only tests leave the `RaftLoop` field `None`, which makes the sender
-/// fall back to the stub (empty) chunk — exactly the pre-builder behaviour.
+/// fall back to the stub (empty) chunk.
 ///
 /// The hook is **async** because the host-crate implementation dispatches the
 /// per-vshard snapshot build to the Data Plane through the existing SPSC bridge
@@ -29,13 +33,67 @@ use crate::error::Result;
 #[async_trait::async_trait]
 pub trait SnapshotBuilder: Send + Sync + 'static {
     /// Build the per-group snapshot payload (serialized engine state for the
-    /// group's vshards) to ship to a lagging/new follower. Empty Vec is a valid
-    /// "nothing to send" result (caller falls back to the stub chunk).
+    /// group's vshards) to ship to a lagging/new follower.
+    ///
+    /// The capture holds every entry of the group through a cut at or above
+    /// `last_included_index`, and nothing above it. The returned
+    /// [`BuiltGroupSnapshot::cut_index`] names that cut, and the snapshot is sent
+    /// labelled with it. So the follower resumes the log right after the cut,
+    /// with no gap of entries the state already holds.
+    ///
+    /// Empty bytes are a valid "nothing to send" result: the caller sends the
+    /// stub chunk, with the cut the builder names.
     async fn build_group_snapshot(
         &self,
         group_id: u64,
         last_included_index: u64,
         last_included_term: u64,
+    ) -> std::result::Result<BuiltGroupSnapshot, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Capture metadata group 0's state machine at `applied_index`, whose
+    /// entry has term `applied_term`.
+    ///
+    /// Called on the tick thread, between apply batches, so the capture holds
+    /// exactly the entries applied through `applied_index`. The capture must
+    /// only open read views: the caller serializes it on another task.
+    fn capture_metadata(
+        &self,
+        applied_index: u64,
+        applied_term: u64,
+    ) -> std::result::Result<
+        Box<dyn MetadataSnapshotCapture>,
+        Box<dyn std::error::Error + Send + Sync>,
+    >;
+
+    /// Capture the Calvin sequencer group's state machine at
+    /// `applied_index`, encoded as the snapshot payload.
+    ///
+    /// Called on the tick thread, between apply batches, so the capture holds
+    /// exactly the entries applied through `applied_index`. The payload is a
+    /// few scalars and the open multi-part transactions, so it is encoded in
+    /// place.
+    fn capture_sequencer(
+        &self,
+        applied_index: u64,
+    ) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// A data group snapshot built by [`SnapshotBuilder::build_group_snapshot`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BuiltGroupSnapshot {
+    /// The serialized payload. Empty when there is nothing to send.
+    pub bytes: Vec<u8>,
+    /// The highest log index the payload's state holds. At or above the
+    /// `last_included_index` the build was asked for.
+    pub cut_index: u64,
+}
+
+/// A group 0 state machine capture taken by
+/// [`SnapshotBuilder::capture_metadata`].
+pub trait MetadataSnapshotCapture: Send + 'static {
+    /// Serialize the captured state into the snapshot payload.
+    fn serialize(
+        self: Box<Self>,
     ) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
@@ -48,13 +106,14 @@ pub trait SnapshotBuilder: Send + Sync + 'static {
 /// SPSC bridge — lives in the host crate (`nodedb`) behind this `Send + Sync`
 /// hook. The install-snapshot finalize path (see
 /// [`crate::install_snapshot::finalize::commit`]) calls
-/// [`apply_snapshot`](Self::apply_snapshot) AFTER the atomic `.partial`→`.snap`
-/// rename and BEFORE advancing Raft, so the data is visible on this node before
-/// the Raft log boundary moves.
+/// [`apply_snapshot`](Self::apply_snapshot) AFTER staging the snapshot and
+/// BEFORE advancing Raft, so the data is visible on this node before the Raft
+/// log boundary moves. Boot recovery calls it again for a staged install that
+/// did not finish.
 ///
 /// Cluster-only tests leave the `RaftLoop` field `None`, which makes the
-/// follower advance Raft WITHOUT restoring engine state — the pre-applier
-/// behaviour (correct for tests that ship only the empty bootstrap stub).
+/// follower advance Raft WITHOUT restoring engine state — correct for tests
+/// that ship only the empty bootstrap stub.
 ///
 /// The hook is **async** because the host-crate implementation dispatches the
 /// per-tenant restore to the Data Plane through the SPSC bridge (an awaited
@@ -62,15 +121,23 @@ pub trait SnapshotBuilder: Send + Sync + 'static {
 /// storage directly.
 #[async_trait::async_trait]
 pub trait SnapshotApplier: Send + Sync + 'static {
-    /// Apply a per-group snapshot to the local data-plane state machine.
-    /// Called AFTER the atomic .partial→.snap rename, BEFORE handle_install_snapshot
-    /// advances Raft. Err MUST prevent the raft advance (follower retries).
-    /// group_id 0 (metadata) is a no-op (metadata restored inline).
+    /// Apply a per-group snapshot to the local state machine. Called after
+    /// staging, before Raft advances. `Ok` MUST mean the install is durable
+    /// without the WAL: the caller then moves the durable floor past it and
+    /// keeps no copy. Err MUST prevent the raft advance (follower retries).
+    /// For group 0 the bytes are the host's metadata image, captured by
+    /// [`SnapshotBuilder::capture_metadata`].
     async fn apply_snapshot(
         &self,
         group_id: u64,
         snapshot_bytes: &[u8],
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Called after the group adopted a snapshot at `last_included_index`,
+    /// while its apply gate still excludes every applier. No entry at or below
+    /// that index applies on this node afterwards, so nothing produces those
+    /// entries' results here.
+    fn snapshot_adopted(&self, _group_id: u64, _last_included_index: u64) {}
 }
 
 /// Hook for quarantine integration on the Raft snapshot receive path.
@@ -99,11 +166,11 @@ pub trait SnapshotQuarantineHook: Send + Sync + 'static {
     fn record_failure(&self, group_id: u64, last_included_index: u64, error: &str) -> bool;
 }
 
-/// Hook for the cross-node streaming-shuffle receiver registry (E1).
+/// Hook for the cross-node streaming-shuffle receiver registry.
 ///
 /// `nodedb-cluster` cannot depend on `nodedb` (circular), so the receiver
 /// registry — which is owned by `nodedb`'s `SharedState` and consumed by the
-/// `!Send` Data Plane in a later unit — lives behind this `Send + Sync` hook.
+/// `!Send` Data Plane — lives behind this `Send + Sync` hook.
 /// The transport read-loop drives a `ShufflePush` stream and calls these
 /// methods; the host crate's implementation deposits payloads into the
 /// per-`(shuffle_id, part, side)` inbox and advances the per-part build
@@ -113,7 +180,7 @@ pub trait SnapshotQuarantineHook: Send + Sync + 'static {
 /// against a node with no receiver installed returns a typed error.
 ///
 /// The hook is **async** because the host-crate implementation stages arriving
-/// rows to a Control-Plane scratch file (E3b: receive-to-spill) and must NOT
+/// rows to a Control-Plane scratch file (receive-to-spill) and must NOT
 /// block the transport reactor thread on a synchronous `std::fs` write. The
 /// awaited `tokio::fs` write inside `on_shuffle_chunk` is what lets QUIC flow
 /// control back-pressure the producer — the chunk is staged inline, never
@@ -149,7 +216,7 @@ pub trait ShuffleReceiver: Send + Sync + 'static {
     );
 }
 
-/// Hook for the cross-node shuffle PRODUCER (E4a).
+/// Hook for the cross-node shuffle PRODUCER.
 ///
 /// Sibling of [`ShuffleReceiver`]: `nodedb-cluster` cannot depend on `nodedb`
 /// (circular), so the produce logic — decode the local scan plan, run it through
@@ -182,7 +249,7 @@ pub trait ShuffleProducer: Send + Sync + 'static {
     ) -> crate::rpc_codec::ShuffleProduceResponse;
 }
 
-/// Hook for the cross-node shuffle CONSUMER (E4b).
+/// Hook for the cross-node shuffle CONSUMER.
 ///
 /// Sibling of [`ShuffleProducer`]: `nodedb-cluster` cannot depend on `nodedb`
 /// (circular), so the consume logic — wait for both staged sides of the part to
@@ -215,7 +282,7 @@ pub trait ShuffleConsumer: Send + Sync + 'static {
     ) -> crate::rpc_codec::ShuffleConsumeResponse;
 }
 
-/// Hook for the cross-node distributed GROUP BY shuffle CONSUMER (E5b).
+/// Hook for the cross-node distributed GROUP BY shuffle CONSUMER.
 ///
 /// SINGLE-SIDED aggregate sibling of [`ShuffleConsumer`]: `nodedb-cluster` cannot
 /// depend on `nodedb` (circular), so the aggregate-consume logic — wait for the
@@ -249,186 +316,4 @@ pub trait ShuffleAggregator: Send + Sync + 'static {
         &self,
         req: crate::rpc_codec::ShuffleAggregateConsumeRequest,
     ) -> crate::rpc_codec::ShuffleAggregateConsumeResponse;
-}
-
-/// Hook for routed-surrogate-exchange (F1b).
-///
-/// `nodedb-cluster` cannot depend on `nodedb` (circular), so the assign logic —
-/// run a LOCAL `SurrogateAssigner::assign` for the `(collection, pk)` endpoint
-/// key carried by the request — lives in `nodedb` behind this `Send + Sync` hook.
-/// The transport read-loop calls [`on_assign_surrogate`](Self::on_assign_surrogate)
-/// when an `AssignSurrogateRequest` arrives at the home vShard's LEADER and writes
-/// the returned [`AssignSurrogateResponse`](crate::rpc_codec::AssignSurrogateResponse)
-/// back to the coordinator.
-///
-/// Because the handler runs on the home node (the vShard leader), a LOCAL assign
-/// yields the AUTHORITATIVE surrogate: the first call allocates it and every later
-/// call for the same key returns the same value (idempotent, first-wins). The
-/// coordinator routes here precisely so the value it carries is the one the home
-/// node will store under.
-///
-/// Cluster-only tests leave the `RaftLoop` field `None`; an `AssignSurrogate`
-/// request against a node with no assigner installed returns a typed "not
-/// configured" error.
-///
-/// The hook is **async** for signature symmetry with the other one-shot hooks;
-/// the host-crate implementation performs a synchronous local assign (the
-/// `SurrogateAssigner` is a sync `Send + Sync` facade) and never touches
-/// io_uring or the Data Plane directly.
-#[async_trait::async_trait]
-pub trait AssignRemoteSurrogate: Send + Sync + 'static {
-    /// Assign-or-return the authoritative surrogate for the `(collection, pk)`
-    /// endpoint key carried by `req`. Returns an [`AssignSurrogateResponse`] with
-    /// the surrogate on success or a typed error on failure (never a silent
-    /// drop).
-    async fn on_assign_surrogate(
-        &self,
-        req: crate::rpc_codec::AssignSurrogateRequest,
-    ) -> crate::rpc_codec::AssignSurrogateResponse;
-}
-
-/// Hook for routed Calvin-submit (Cv1).
-///
-/// `nodedb-cluster` cannot depend on `nodedb` (circular), so the submit logic —
-/// decode the `TxClass`, submit it to THIS node's Calvin sequencer inbox, and
-/// await assignment + completion through the node-local `CalvinCompletionRegistry`
-/// — lives in `nodedb` behind this `Send + Sync` hook. The transport read-loop
-/// calls [`on_submit_calvin_txn`](Self::on_submit_calvin_txn) when a
-/// `SubmitCalvinTxnRequest` arrives at the SEQUENCER-GROUP leader and writes the
-/// returned [`SubmitCalvinTxnResponse`](crate::rpc_codec::SubmitCalvinTxnResponse)
-/// back to the coordinator.
-///
-/// Because the handler runs on the sequencer-group leader, the submit-and-await
-/// is correct: only the leader's sequencer service assigns transactions
-/// (`note_assigned`), and only the leader's registry receives BOTH the
-/// assignment and the replicated completion ack. The coordinator routes here
-/// precisely so the submit lands where it will actually be sequenced and acked.
-///
-/// Cluster-only tests leave the `RaftLoop` field `None`; a `SubmitCalvinTxn`
-/// request against a node with no Calvin-submit hook installed returns a typed
-/// "not configured" error.
-///
-/// The hook is **async** because the submit-and-await blocks on the assignment
-/// and completion oneshot channels (bounded by the request deadline) on the
-/// Tokio transport reactor. The actual transaction execution happens on the Data
-/// Plane via the sequencer service / per-vshard schedulers; this hook never
-/// touches io_uring or storage directly.
-#[async_trait::async_trait]
-pub trait CalvinSubmit: Send + Sync + 'static {
-    /// Submit the `TxClass` carried by `req` (msgpack-encoded) to this node's
-    /// Calvin sequencer inbox and await its completion. Returns a
-    /// [`SubmitCalvinTxnResponse`](crate::rpc_codec::SubmitCalvinTxnResponse)
-    /// with `error: None` on commit or a typed error on failure (never a silent
-    /// drop).
-    async fn on_submit_calvin_txn(
-        &self,
-        req: crate::rpc_codec::SubmitCalvinTxnRequest,
-    ) -> crate::rpc_codec::SubmitCalvinTxnResponse;
-}
-
-/// Hook for routed Calvin-INBOX submit (Cv1).
-///
-/// OLLP dependent sibling of [`CalvinSubmit`]: `nodedb-cluster` cannot depend on
-/// `nodedb` (circular), so the submit logic — decode the `TxClass`, submit it to
-/// THIS node's Calvin sequencer inbox, and await only the ASSIGNMENT (NOT
-/// completion) through the node-local `CalvinCompletionRegistry` — lives in
-/// `nodedb` behind this `Send + Sync` hook. The transport read-loop calls
-/// [`on_submit_calvin_inbox`](Self::on_submit_calvin_inbox) when a
-/// `SubmitCalvinInboxRequest` arrives at the SEQUENCER-GROUP leader and writes the
-/// returned [`SubmitCalvinInboxResponse`](crate::rpc_codec::SubmitCalvinInboxResponse)
-/// back to the coordinator.
-///
-/// Because the handler runs on the sequencer-group leader, the submit-and-assign
-/// is correct: only the leader's sequencer service assigns transactions
-/// (`note_assigned`). Unlike [`CalvinSubmit`] it returns AS SOON AS the
-/// assignment is observed — the OLLP coordinator loop drives the dependent
-/// transaction to completion itself in a later unit, so this hook must NOT block
-/// until completion.
-///
-/// Cluster-only tests leave the `RaftLoop` field `None`; a `SubmitCalvinInbox`
-/// request against a node with no Calvin-inbox hook installed returns a typed
-/// "not configured" error.
-///
-/// The hook is **async** because the submit-and-assign blocks on the assignment
-/// oneshot channel (bounded by the request deadline) on the Tokio transport
-/// reactor. The actual transaction execution happens on the Data Plane via the
-/// sequencer service / per-vshard schedulers; this hook never touches io_uring or
-/// storage directly.
-#[async_trait::async_trait]
-pub trait CalvinSubmitInbox: Send + Sync + 'static {
-    /// Submit the `TxClass` carried by `req` (msgpack-encoded) to this node's
-    /// Calvin sequencer inbox and await its ASSIGNMENT (not completion). Returns
-    /// a [`SubmitCalvinInboxResponse`](crate::rpc_codec::SubmitCalvinInboxResponse)
-    /// with `error: None` carrying the assignment on success or a typed error on
-    /// failure (never a silent drop).
-    async fn on_submit_calvin_inbox(
-        &self,
-        req: crate::rpc_codec::SubmitCalvinInboxRequest,
-    ) -> crate::rpc_codec::SubmitCalvinInboxResponse;
-}
-
-/// Hook for routed reserve-read (Calvin OLLP).
-///
-/// `nodedb-cluster` cannot depend on `nodedb` (circular), so the reserve
-/// logic — decode the `LockKey` and assign-only reserve the read lock through
-/// THIS node's Calvin sequencer scheduler — lives in `nodedb` behind this
-/// `Send + Sync` hook. The transport read-loop calls
-/// [`on_reserve_read`](Self::on_reserve_read) when a `ReserveReadRequest`
-/// arrives at the SEQUENCER-GROUP leader and writes the returned
-/// [`ReserveReadResponse`](crate::rpc_codec::ReserveReadResponse) back to the
-/// coordinator.
-///
-/// Because the handler runs on the sequencer-group leader, the reserve is
-/// correct: only the leader's scheduler holds the authoritative lock table for
-/// its local sequencer inbox. The coordinator routes here precisely so the
-/// reservation lands where it will actually be enforced.
-///
-/// Cluster-only tests leave the `RaftLoop` field `None`; a `ReserveRead`
-/// request against a node with no reserve-read hook installed returns a typed
-/// "not configured" error.
-///
-/// The hook is **async** for signature symmetry with the other one-shot
-/// hooks; the reserve itself is bounded by the request deadline on the Tokio
-/// transport reactor. It never touches io_uring or storage directly.
-#[async_trait::async_trait]
-pub trait ReserveRead: Send + Sync + 'static {
-    /// Assign-only reserve the read lock for the `LockKey` carried by `req`.
-    /// Returns a [`ReserveReadResponse`](crate::rpc_codec::ReserveReadResponse)
-    /// with the minted (or confirmed) owner on success or a typed error on
-    /// failure (never a silent drop).
-    async fn on_reserve_read(
-        &self,
-        req: crate::rpc_codec::ReserveReadRequest,
-    ) -> crate::rpc_codec::ReserveReadResponse;
-}
-
-/// Hook for routed release-reservation (Calvin OLLP).
-///
-/// Ack-only sibling of [`ReserveRead`]: `nodedb-cluster` cannot depend on
-/// `nodedb` (circular), so the release logic — decode the owner and release
-/// reason, and release the reservation through THIS node's Calvin sequencer
-/// scheduler — lives in `nodedb` behind this `Send + Sync` hook. The transport
-/// read-loop calls [`on_release_reservation`](Self::on_release_reservation)
-/// when a `ReleaseReservationRequest` arrives at the SEQUENCER-GROUP leader
-/// and writes the returned
-/// [`ReleaseReservationResponse`](crate::rpc_codec::ReleaseReservationResponse)
-/// back to the coordinator.
-///
-/// Cluster-only tests leave the `RaftLoop` field `None`; a
-/// `ReleaseReservation` request against a node with no release-reservation
-/// hook installed returns a typed "not configured" error.
-///
-/// The hook is **async** for signature symmetry with the other one-shot
-/// hooks; the release itself is bounded by the request deadline on the Tokio
-/// transport reactor. It never touches io_uring or storage directly.
-#[async_trait::async_trait]
-pub trait ReleaseReservation: Send + Sync + 'static {
-    /// Release the reservation held by the owner carried by `req`. Returns a
-    /// [`ReleaseReservationResponse`](crate::rpc_codec::ReleaseReservationResponse)
-    /// with `error: None` on success (ack) or a typed error on failure (never
-    /// a silent drop).
-    async fn on_release_reservation(
-        &self,
-        req: crate::rpc_codec::ReleaseReservationRequest,
-    ) -> crate::rpc_codec::ReleaseReservationResponse;
 }

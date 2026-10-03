@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use nodedb_types::{DatabaseId, TenantId, ms_to_ordinal_upper};
 
 use super::super::store::{EDGES, Edge, EdgeStore, REVERSE_EDGES, redb_err};
-use super::{EdgeRef, is_sentinel, parse_versioned_edge_key};
+use super::{EdgeRef, parse_versioned_edge_key};
 
 /// Parameters shared by [`EdgeStore::neighbors_out_as_of`] and
 /// [`EdgeStore::neighbors_in_as_of`]: the anchor node identity plus the
@@ -134,13 +134,15 @@ impl EdgeStore {
             .open_table(REVERSE_EDGES)
             .map_err(|e| redb_err("open reverse", e))?;
 
-        // `(label, logical_src)` base → (latest_sys ≤ cutoff, sentinel flag).
-        let mut latest: HashMap<(String, String), (i64, bool)> = HashMap::new();
+        // Distinct `(label, logical_src)` bases with a version at or below the
+        // cutoff. The forward Ceiling below decides each one: it skips the
+        // versions a TRUNCATE hides.
+        let mut bases: HashMap<(String, String), ()> = HashMap::new();
         let range = table
             .range((db, t, prefix.as_str())..)
             .map_err(|e| redb_err("range", e))?;
         for entry in range {
-            let (key, val) = entry.map_err(|e| redb_err("iter", e))?;
+            let (key, _val) = entry.map_err(|e| redb_err("iter", e))?;
             let (kd, kt, composite) = key.value();
             if kd != db || kt != t || !composite.starts_with(&prefix) {
                 break;
@@ -153,23 +155,13 @@ impl EdgeStore {
             if sys > cutoff {
                 continue;
             }
-            let is_sent = is_sentinel(val.value());
-            latest
-                .entry((rev_label.to_string(), rev_src.to_string()))
-                .and_modify(|(cur, cur_sent)| {
-                    if sys > *cur {
-                        *cur = sys;
-                        *cur_sent = is_sent;
-                    }
-                })
-                .or_insert((sys, is_sent));
+            bases.insert((rev_label.to_string(), rev_src.to_string()), ());
         }
+        drop(table);
+        drop(read_txn);
 
-        let mut edges = Vec::with_capacity(latest.len());
-        for ((label, src_id), (_sys, is_sent)) in latest {
-            if is_sent {
-                continue;
-            }
+        let mut edges = Vec::with_capacity(bases.len());
+        for ((label, src_id), _) in bases {
             let Some(props) = self.ceiling_resolve_edge(
                 EdgeRef::new(DatabaseId::new(db), tid, collection, &src_id, &label, dst),
                 cutoff,

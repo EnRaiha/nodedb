@@ -103,6 +103,9 @@ impl CoreLoop {
                 rls_write_check,
                 ..
             }) => {
+                let Some(surrogate) = surrogate else {
+                    return Self::matched_nothing_reply();
+                };
                 let ctx = StageCtx::new(
                     task,
                     tid,
@@ -123,6 +126,9 @@ impl CoreLoop {
                 declared_primary_key,
                 ..
             }) => {
+                let Some(surrogate) = surrogate else {
+                    return Self::matched_nothing_reply();
+                };
                 let ctx = StageCtx::new(
                     task,
                     tid,
@@ -302,7 +308,9 @@ impl CoreLoop {
                 | GraphOp::EdgePutBatch { .. }
                 | GraphOp::EdgeDeleteBatch { .. }
                 | GraphOp::SetNodeLabels { .. }
-                | GraphOp::RemoveNodeLabels { .. }),
+                | GraphOp::RemoveNodeLabels { .. }
+                | GraphOp::NodeEdgeGuard { .. }
+                | GraphOp::NodePresenceGuard { .. }),
             ) => {
                 let resp = self.execute_stage_graph(task, tid, txn_id, op);
                 Self::stage_result(&resp)
@@ -360,6 +368,16 @@ impl CoreLoop {
     /// Turn a staging handler's `Response` into its reply, so a staging
     /// failure propagates loudly to the Calvin caller instead of being
     /// silently swallowed.
+    /// The reply of a point write whose key is unbound in this database: it
+    /// matches no row, so it stages nothing and reports zero rows.
+    fn matched_nothing_reply() -> Result<Vec<u8>, ErrorCode> {
+        crate::data::executor::response_codec::encode_count("affected", 0).map_err(|e| {
+            ErrorCode::Internal {
+                detail: format!("calvin overlay staging reply: {e}"),
+            }
+        })
+    }
+
     fn stage_result(resp: &Response) -> Result<Vec<u8>, ErrorCode> {
         if resp.status == Status::Error {
             return Err(resp.error_code.as_deref().cloned().unwrap_or_else(|| {

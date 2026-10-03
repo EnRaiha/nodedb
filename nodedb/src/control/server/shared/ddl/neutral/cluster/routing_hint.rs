@@ -4,9 +4,7 @@
 //! node address mapping so smart clients can cache it and route writes
 //! directly to the leaseholder, skipping the gateway hop.
 //!
-//! Ported from the pgwire `ddl::cluster::routing_hint` handler. The
-//! routing / topology reads are preserved verbatim; only the result
-//! construction changed from pgwire `Response` / `QueryResponse` to the
+//! The routing / topology reads run here. The result is the
 //! protocol-neutral `DdlResult` over `ShapedRows`.
 //!
 //! Result columns: `vshard_id`, `group_id`, `leaseholder_node_id`,
@@ -19,23 +17,18 @@ use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::support::ddl_err;
+use super::support::cluster_not_started;
 
 /// SHOW ROUTING — full vshard → leaseholder → address table.
 ///
-/// Any authenticated user may call this (smart-client libs need it).
+/// Any authenticated user can call this (smart-client libs need it).
 pub fn show_routing(
     state: &SharedState,
     _identity: &AuthenticatedIdentity,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let routing = match &state.cluster_routing {
         Some(r) => r,
-        None => {
-            return Err(ddl_err(
-                "55000",
-                "cluster mode not enabled (single-node instance)",
-            ));
-        }
+        None => return Err(cluster_not_started("cluster routing table")),
     };
 
     let columns = vec![

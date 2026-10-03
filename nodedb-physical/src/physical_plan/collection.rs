@@ -91,7 +91,7 @@ impl PhysicalPlan {
             }
             // Read-only resolve wrapper: it reports the wrapped ingest's
             // collection, which is what the propose step routes on.
-            PhysicalPlan::Timeseries(TimeseriesOp::ResolveIngest(inner)) => match inner.as_ref() {
+            PhysicalPlan::Timeseries(TimeseriesOp::ResolveIngest(inner)) => match &inner.ingest {
                 TimeseriesOp::Scan { collection, .. }
                 | TimeseriesOp::Ingest { collection, .. }
                 | TimeseriesOp::Truncate { collection, .. } => Some(collection.as_str()),
@@ -162,14 +162,15 @@ impl PhysicalPlan {
     /// write several collections, so [`Self::collection`] reports none for
     /// them. A caller that keys on a collection name uses this instead.
     pub fn named_collections(&self) -> Vec<&str> {
-        if let PhysicalPlan::Meta(
-            MetaOp::ApplyTransactionRedo { collections, .. }
-            | MetaOp::CalvinFlush { collections, .. },
-        ) = self
-        {
-            collections.iter().map(String::as_str).collect()
-        } else {
-            self.collection().into_iter().collect()
+        match self {
+            PhysicalPlan::Meta(
+                MetaOp::ApplyTransactionRedo { collections, .. }
+                | MetaOp::CalvinFlush { collections, .. },
+            ) => collections.iter().map(String::as_str).collect(),
+            PhysicalPlan::Meta(MetaOp::RestoreRedo(batch)) => {
+                batch.collections.iter().map(String::as_str).collect()
+            }
+            _ => self.collection().into_iter().collect(),
         }
     }
 }

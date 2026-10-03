@@ -51,10 +51,37 @@ pub enum CircuitState {
     HalfOpen,
 }
 
+/// How [`CircuitBreaker::check`] let a request through.
+///
+/// The caller hands it back with the request's outcome. Only the probe's
+/// own failure reopens a half-open circuit.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// A request on a closed circuit.
+    Normal,
+    /// The one probe a half-open circuit lets through.
+    Probe {
+        /// Tells this probe apart from an earlier probe that expired.
+        id: u64,
+    },
+}
+
+/// The probe a half-open circuit has out.
+#[derive(Debug, Clone, Copy)]
+struct OutstandingProbe {
+    id: u64,
+    since: Instant,
+}
+
 struct PeerBreaker {
     state: CircuitState,
     consecutive_failures: u32,
     last_state_change: Instant,
+    /// The half-open probe. `None` when none is out.
+    probe: Option<OutstandingProbe>,
+    /// Id for the next probe. Ids never repeat for one peer.
+    next_probe_id: u64,
 }
 
 impl PeerBreaker {
@@ -63,6 +90,24 @@ impl PeerBreaker {
             state: CircuitState::Closed,
             consecutive_failures: 0,
             last_state_change: Instant::now(),
+            probe: None,
+            next_probe_id: 0,
+        }
+    }
+
+    /// Send out a new probe. It replaces any probe still out.
+    fn issue_probe(&mut self, now: Instant) -> Admission {
+        let id = self.next_probe_id;
+        self.next_probe_id = self.next_probe_id.wrapping_add(1);
+        self.probe = Some(OutstandingProbe { id, since: now });
+        Admission::Probe { id }
+    }
+
+    /// Whether `admission` is the probe this half-open circuit has out.
+    fn is_current_probe(&self, admission: Admission) -> bool {
+        match (admission, self.probe) {
+            (Admission::Probe { id }, Some(probe)) => probe.id == id,
+            _ => false,
         }
     }
 }
@@ -77,64 +122,109 @@ impl CircuitBreaker {
 
     /// Check if an RPC to this peer is allowed.
     ///
-    /// Returns `Ok(())` if the circuit is closed or half-open (probe allowed).
-    /// Returns `Err(CircuitOpen)` if the circuit is open and cooldown hasn't expired.
-    pub fn check(&self, peer: u64) -> Result<()> {
+    /// Returns the [`Admission`] the caller hands back with the outcome.
+    /// Returns `Err(CircuitOpen)` while the circuit is open and its cooldown
+    /// runs, and while a half-open circuit has its probe out.
+    pub fn check(&self, peer: u64) -> Result<Admission> {
         let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
         let breaker = peers.entry(peer).or_insert_with(PeerBreaker::new);
+        let now = Instant::now();
+        let refused = ClusterError::CircuitOpen {
+            node_id: peer,
+            failures: breaker.consecutive_failures,
+        };
 
+        // An open circuit refuses until its cooldown passes, then turns
+        // half-open and lets exactly one probe through. Other requests are
+        // refused while it is out. A probe that never reports, because its
+        // caller was dropped, stops counting after one cooldown. The next
+        // request then goes out as the probe, so the circuit can always
+        // recover.
         match breaker.state {
-            CircuitState::Closed => Ok(()),
-            CircuitState::HalfOpen => Ok(()), // Allow probe.
-            CircuitState::Open => {
-                // Check if cooldown has expired → transition to HalfOpen.
-                if breaker.last_state_change.elapsed() >= self.config.cooldown {
-                    breaker.state = CircuitState::HalfOpen;
-                    breaker.last_state_change = Instant::now();
-                    Ok(())
-                } else {
-                    Err(ClusterError::CircuitOpen {
-                        node_id: peer,
-                        failures: breaker.consecutive_failures,
-                    })
+            CircuitState::Closed => Ok(Admission::Normal),
+            CircuitState::HalfOpen => {
+                let probe_out = breaker.probe.is_some_and(|probe| {
+                    now.saturating_duration_since(probe.since) < self.config.cooldown
+                });
+                if probe_out {
+                    return Err(refused);
                 }
+                Ok(breaker.issue_probe(now))
+            }
+            CircuitState::Open => {
+                if now.saturating_duration_since(breaker.last_state_change) < self.config.cooldown {
+                    return Err(refused);
+                }
+                breaker.state = CircuitState::HalfOpen;
+                breaker.last_state_change = now;
+                Ok(breaker.issue_probe(now))
             }
         }
     }
 
-    /// Record a successful RPC to a peer. Resets the circuit to Closed.
-    pub fn record_success(&self, peer: u64) {
+    /// Admit a recovery probe, which the circuit never refuses.
+    ///
+    /// A closed circuit admits it as a normal request. An open or half-open
+    /// circuit turns half-open and sends it out as its probe. Its outcome
+    /// then decides the circuit: a success closes it, a failure reopens it.
+    pub fn admit_probe(&self, peer: u64) -> Admission {
+        let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
+        let breaker = peers.entry(peer).or_insert_with(PeerBreaker::new);
+        let now = Instant::now();
+        match breaker.state {
+            CircuitState::Closed => Admission::Normal,
+            CircuitState::HalfOpen => breaker.issue_probe(now),
+            CircuitState::Open => {
+                breaker.state = CircuitState::HalfOpen;
+                breaker.last_state_change = now;
+                breaker.issue_probe(now)
+            }
+        }
+    }
+
+    /// Record that the peer answered a request. Resets the circuit to Closed.
+    ///
+    /// Any answer proves the link is up, so a late answer closes the circuit
+    /// as a probe's answer does.
+    pub fn record_success(&self, peer: u64, _admission: Admission) {
         let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
         let breaker = peers.entry(peer).or_insert_with(PeerBreaker::new);
         breaker.consecutive_failures = 0;
+        breaker.probe = None;
         if breaker.state != CircuitState::Closed {
             breaker.state = CircuitState::Closed;
             breaker.last_state_change = Instant::now();
         }
     }
 
-    /// Record a failed RPC to a peer. May open the circuit.
-    pub fn record_failure(&self, peer: u64) {
+    /// Record a failed request to a peer. Enough failures open the circuit.
+    pub fn record_failure(&self, peer: u64, admission: Admission) {
         let mut peers = self.peers.write().unwrap_or_else(|p| p.into_inner());
         let breaker = peers.entry(peer).or_insert_with(PeerBreaker::new);
-        breaker.consecutive_failures += 1;
 
         match breaker.state {
             CircuitState::Closed => {
+                breaker.consecutive_failures = breaker.consecutive_failures.saturating_add(1);
                 if breaker.consecutive_failures >= self.config.failure_threshold {
                     breaker.state = CircuitState::Open;
                     breaker.last_state_change = Instant::now();
                 }
             }
+            // Only the probe's own failure reopens the circuit. A request
+            // admitted before the circuit opened can fail late. Its failure
+            // says nothing the opening failures did not already say.
             CircuitState::HalfOpen => {
-                // Probe failed → back to Open.
-                breaker.state = CircuitState::Open;
-                breaker.last_state_change = Instant::now();
+                if breaker.is_current_probe(admission) {
+                    breaker.consecutive_failures = breaker.consecutive_failures.saturating_add(1);
+                    breaker.state = CircuitState::Open;
+                    breaker.last_state_change = Instant::now();
+                    breaker.probe = None;
+                }
             }
-            CircuitState::Open => {
-                // Already open — refresh the timestamp to extend cooldown.
-                breaker.last_state_change = Instant::now();
-            }
+            // A late failure neither grows the count nor restarts the
+            // cooldown. Old requests that fail one by one cannot keep the
+            // circuit open.
+            CircuitState::Open => {}
         }
     }
 
@@ -293,6 +383,7 @@ impl RetryPolicy {
             | ClusterError::SpatialGather(_)
             | ClusterError::Bm25Gather(_)
             | ClusterError::TsGather(_)
+            | ClusterError::ShufflePush(_)
             | ClusterError::RemoteUntyped { .. }
             | ClusterError::ShardExecution { .. } => false,
         }
@@ -303,11 +394,13 @@ impl RetryPolicy {
 mod tests {
     use super::*;
 
+    use Admission::Normal;
+
     #[test]
     fn circuit_starts_closed() {
         let cb = CircuitBreaker::new(CircuitBreakerConfig::default());
         assert_eq!(cb.state(42), CircuitState::Closed);
-        cb.check(42).unwrap(); // Should succeed.
+        assert_eq!(cb.check(42).expect("closed admits"), Normal);
     }
 
     #[test]
@@ -317,12 +410,12 @@ mod tests {
             cooldown: Duration::from_secs(60),
         });
 
-        cb.check(1).unwrap();
-        cb.record_failure(1);
-        cb.record_failure(1);
+        let admission = cb.check(1).expect("closed admits");
+        cb.record_failure(1, admission);
+        cb.record_failure(1, Normal);
         assert_eq!(cb.state(1), CircuitState::Closed);
 
-        cb.record_failure(1); // 3rd failure → opens.
+        cb.record_failure(1, Normal); // 3rd failure → opens.
         assert_eq!(cb.state(1), CircuitState::Open);
         assert_eq!(cb.failure_count(1), 3);
 
@@ -338,15 +431,67 @@ mod tests {
             cooldown: Duration::from_millis(10),
         });
 
-        cb.record_failure(1); // Opens immediately (threshold=1).
+        cb.record_failure(1, Normal); // Opens immediately (threshold=1).
         assert_eq!(cb.state(1), CircuitState::Open);
 
         // Wait for cooldown.
         std::thread::sleep(Duration::from_millis(15));
 
         // Check should transition to HalfOpen and allow the probe.
-        cb.check(1).unwrap();
+        let admission = cb.check(1).expect("the probe goes out");
+        assert!(matches!(admission, Admission::Probe { .. }));
         assert_eq!(cb.state(1), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn half_open_lets_one_probe_through_until_it_reports_or_expires() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_millis(500),
+        });
+        cb.record_failure(1, Normal);
+        std::thread::sleep(Duration::from_millis(550));
+        let lost = cb.check(1).expect("the probe goes out");
+        assert!(cb.check(1).is_err(), "a second request waits for the probe");
+        // The probe never reports: after one cooldown the next request probes.
+        std::thread::sleep(Duration::from_millis(550));
+        let replacement = cb.check(1).expect("a lost probe is replaced");
+        assert_ne!(lost, replacement, "the replacement is a new probe");
+        cb.record_success(1, replacement);
+        assert_eq!(cb.state(1), CircuitState::Closed);
+    }
+
+    #[test]
+    fn late_failures_do_not_extend_an_open_circuit() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_millis(400),
+        });
+        cb.record_failure(1, Normal);
+        std::thread::sleep(Duration::from_millis(300));
+        // A request sent before the circuit opened fails now.
+        cb.record_failure(1, Normal);
+        std::thread::sleep(Duration::from_millis(150));
+        let _probe = cb
+            .check(1)
+            .expect("the cooldown ran from the opening failure");
+        assert_eq!(cb.state(1), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn failures_while_open_do_not_grow_the_count() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 2,
+            cooldown: Duration::from_secs(60),
+        });
+        cb.record_failure(1, Normal);
+        cb.record_failure(1, Normal);
+        assert_eq!(cb.state(1), CircuitState::Open);
+        for _ in 0..10 {
+            cb.record_failure(1, Normal);
+        }
+        assert_eq!(cb.failure_count(1), 2, "late failures are not counted");
+        assert_eq!(cb.state(1), CircuitState::Open);
     }
 
     #[test]
@@ -356,11 +501,11 @@ mod tests {
             cooldown: Duration::from_millis(5),
         });
 
-        cb.record_failure(1);
+        cb.record_failure(1, Normal);
         std::thread::sleep(Duration::from_millis(10));
-        cb.check(1).unwrap(); // → HalfOpen
+        let probe = cb.check(1).expect("the probe goes out"); // → HalfOpen
 
-        cb.record_success(1);
+        cb.record_success(1, probe);
         assert_eq!(cb.state(1), CircuitState::Closed);
         assert_eq!(cb.failure_count(1), 0);
     }
@@ -372,12 +517,84 @@ mod tests {
             cooldown: Duration::from_millis(5),
         });
 
-        cb.record_failure(1);
+        cb.record_failure(1, Normal);
         std::thread::sleep(Duration::from_millis(10));
-        cb.check(1).unwrap(); // → HalfOpen
+        let probe = cb.check(1).expect("the probe goes out"); // → HalfOpen
 
-        cb.record_failure(1); // Probe failed → back to Open.
+        cb.record_failure(1, probe); // Probe failed → back to Open.
         assert_eq!(cb.state(1), CircuitState::Open);
+    }
+
+    #[test]
+    fn a_normal_failure_does_not_reopen_a_half_open_circuit() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_millis(5),
+        });
+        // A request admitted while the circuit was closed is still in flight.
+        let in_flight = cb.check(1).expect("closed admits");
+        cb.record_failure(1, Normal);
+        std::thread::sleep(Duration::from_millis(10));
+        let probe = cb.check(1).expect("the probe goes out");
+
+        cb.record_failure(1, in_flight);
+        assert_eq!(
+            cb.state(1),
+            CircuitState::HalfOpen,
+            "only the probe's own failure reopens the circuit"
+        );
+        assert!(cb.check(1).is_err(), "the probe is still out");
+
+        cb.record_success(1, probe);
+        assert_eq!(cb.state(1), CircuitState::Closed);
+    }
+
+    #[test]
+    fn an_expired_probe_failure_does_not_reopen_the_circuit() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_millis(50),
+        });
+        cb.record_failure(1, Normal);
+        std::thread::sleep(Duration::from_millis(60));
+        let expired = cb.check(1).expect("the first probe goes out");
+        std::thread::sleep(Duration::from_millis(60));
+        let current = cb.check(1).expect("the expired probe is replaced");
+
+        cb.record_failure(1, expired);
+        assert_eq!(cb.state(1), CircuitState::HalfOpen);
+        cb.record_failure(1, current);
+        assert_eq!(cb.state(1), CircuitState::Open);
+    }
+
+    #[test]
+    fn admit_probe_bypasses_an_open_circuit() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_secs(60),
+        });
+        assert_eq!(cb.admit_probe(1), Normal, "a closed circuit needs no probe");
+        cb.record_failure(1, Normal);
+        assert!(cb.check(1).is_err());
+
+        let probe = cb.admit_probe(1);
+        assert!(matches!(probe, Admission::Probe { .. }));
+        assert_eq!(cb.state(1), CircuitState::HalfOpen);
+        cb.record_success(1, probe);
+        assert_eq!(cb.state(1), CircuitState::Closed);
+    }
+
+    #[test]
+    fn a_failed_forced_probe_reopens_the_circuit() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_secs(60),
+        });
+        cb.record_failure(1, Normal);
+        let probe = cb.admit_probe(1);
+        cb.record_failure(1, probe);
+        assert_eq!(cb.state(1), CircuitState::Open);
+        assert!(cb.check(1).is_err());
     }
 
     #[test]
@@ -387,11 +604,11 @@ mod tests {
             cooldown: Duration::from_secs(60),
         });
 
-        cb.record_failure(1);
-        cb.record_failure(1);
+        cb.record_failure(1, Normal);
+        cb.record_failure(1, Normal);
         assert_eq!(cb.failure_count(1), 2);
 
-        cb.record_success(1);
+        cb.record_success(1, Normal);
         assert_eq!(cb.failure_count(1), 0);
         assert_eq!(cb.state(1), CircuitState::Closed);
     }

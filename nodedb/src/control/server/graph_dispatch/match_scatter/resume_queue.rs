@@ -15,7 +15,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use crate::control::gateway::RouteDecision;
-use crate::control::server::graph_dispatch::cluster_resolve::resolve_for_vshard;
+use crate::control::gateway::live_leaders::resolve_live_decision;
 use crate::control::state::SharedState;
 use crate::engine::graph::pattern::executor::VarLenResume;
 use crate::types::VShardId;
@@ -25,7 +25,7 @@ use crate::types::VShardId;
 /// Keys on the anchor bindings (`source_row`), the frontier node identities, the
 /// triple index, and the hop depth — deliberately EXCLUDING each frontier
 /// entry's accumulating `path_so_far`, which grows one node longer every round
-/// and would otherwise make every re-emission look unique and defeat dedup.
+/// and will otherwise make every re-emission look unique and defeat dedup.
 ///
 /// Two resumes sharing a key re-expand the same frontier at the same depth from
 /// the same anchor and therefore reach the same onward bindings, so the
@@ -86,7 +86,7 @@ pub(super) fn resume_to_pending(
         return Ok(None);
     };
     let target_vshard = VShardId::from_key(node_name.as_bytes()).as_u32();
-    let remote_coords = match resolve_for_vshard(state, target_vshard) {
+    let remote_coords = match resolve_live_decision(state, target_vshard) {
         RouteDecision::Local => None,
         RouteDecision::Remote { node_id, vshard_id } => Some((node_id, vshard_id)),
         RouteDecision::LeaderUnknown { vshard_id } => {
@@ -94,11 +94,12 @@ pub(super) fn resume_to_pending(
                 vshard_id: VShardId::new((vshard_id % VShardId::COUNT as u64) as u32),
                 leader_node: 0,
                 leader_addr: String::new(),
+                leader_term: 0,
             });
         }
         RouteDecision::Broadcast { .. } => {
             return Err(crate::Error::Internal {
-                detail: "match scatter: resolve_for_vshard returned Broadcast for a \
+                detail: "match scatter: resolve_live_decision returned Broadcast for a \
                          single vShard"
                     .into(),
             });

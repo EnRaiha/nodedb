@@ -76,7 +76,11 @@ impl Scheduler {
         let completed = if committed {
             self.commit_apply_tail(txn_id, response, redo_lsn).await
         } else {
-            self.propose_sequencer_entry(txn_id, SchedulerProposal::CompletionAck);
+            // A dropped txn installed nothing, so its ack reports nothing.
+            self.propose_sequencer_entry(
+                txn_id,
+                SchedulerProposal::CompletionAck { result: Vec::new() },
+            );
             true
         };
         // `false` means the commit tail halted the scheduler: the txn stays
@@ -167,13 +171,22 @@ impl Scheduler {
         // it for a COMMIT tag anyway), and the plain-write siblings do not
         // conflict. Only a genuine cross-shard RETURNING union — two
         // participants each carrying RETURNING rows — records `Conflict`.
-        // Results travel via this in-process sidecar only — never the sequencer
-        // Raft log.
+        // The primary slice's answer, its RETURNING rows or its affected
+        // count, and the timeseries install counts also ride the replicated
+        // CompletionAck, so a coordinator on a node with no replica of this
+        // vShard reads them.
         let (has_primary_write, has_returning) = self
             .pending
             .get(&txn_id)
             .map(|p| (p.has_primary_write, p.has_returning))
             .unwrap_or((false, false));
+        let ack_result = self.ack_result_of(
+            &response,
+            crate::control::state::AckSlice {
+                primary_write: has_primary_write,
+                returning: has_returning,
+            },
+        );
         if has_primary_write {
             use std::collections::hash_map::Entry;
 
@@ -182,13 +195,8 @@ impl Scheduler {
             use crate::control::state::CalvinApplyResult;
 
             let key = nodedb_cluster::calvin::TxnId::new(txn_id.epoch, txn_id.position);
-            let mut results = self
-                .shared
-                .calvin
-                .apply_results
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            match results.entry(key) {
+            let vshard_id = self.vshard_id;
+            self.shared.calvin.apply_results.deposit_with(key, |entry| match entry {
                 Entry::Vacant(slot) => {
                     slot.insert(CalvinApplyResult::Single {
                         response,
@@ -218,7 +226,7 @@ impl Scheduler {
                         tracing::error!(
                             epoch = txn_id.epoch,
                             position = txn_id.position,
-                            vshard = self.vshard_id,
+                            vshard = vshard_id,
                             "two RETURNING-bearing participants for one Calvin txn — cross-shard \
                              RETURNING union unsupported"
                         );
@@ -234,9 +242,12 @@ impl Scheduler {
                         // Incoming is a plain write; keep the existing entry — a
                         // multi-collection cross-shard COMMIT coalesces (the
                         // coordinator discards it for a COMMIT tag anyway).
+                        // The timeseries install counts of both merge, so the
+                        // COMMIT reports every participant's apply count.
+                        merge_install_counts(slot.get_mut(), &response);
                     }
                 }
-            }
+            });
         }
         let applied_lsn = match redo_lsn {
             // The TransactionRedo record already durably marks this apply — the
@@ -251,6 +262,7 @@ impl Scheduler {
                 .shared
                 .wal
                 .appender(crate::wal::manager::NO_APPLY_KEY)
+                .with_commit_hlc(self.txn_commit_hlc(txn_id))
                 .append_calvin_applied(
                     crate::types::VShardId::new(self.vshard_id),
                     txn_id.epoch,
@@ -277,17 +289,52 @@ impl Scheduler {
         };
         let Some(lsn) = applied_lsn else {
             // The apply cannot be acknowledged without a durable participant
-            // LSN: CDC and write-version consumers would otherwise observe a
+            // LSN: CDC and write-version consumers will otherwise observe a
             // successful commit with no authoritative ordering point. The
             // scheduler halted above.
             return false;
         };
+        // The record is whole at append: the flush reports no rows, so no
+        // part follows it. A record split over the WAL record limit is
+        // durable once its last continuation is.
+        let durable_through = self
+            .pending
+            .get(&txn_id)
+            .and_then(|pending| pending.redo_records.as_ref())
+            .and_then(|records| records.last_lsn())
+            .map_or(lsn, |last| last.max(lsn));
+        // Control change-stream events are distinct from Data-Plane
+        // WriteEvents. Every replica publishes the rows this participant's
+        // redo installs at the transaction's sequencer position, which every
+        // replica shares; the vShard's leader forwards them to the nodes
+        // that do not replicate it. The publish journals them durably before
+        // the applied marker's fsync below, so a restart that finds the
+        // position applied also finds its changes.
+        if let Some(pending) = self.pending.get_mut(&txn_id) {
+            let calvin = crate::control::server::dispatch_utils::CalvinApply {
+                tenant_id: pending.txn.tx_class.tenant_id,
+                database_id: pending.txn.tx_class.database_id,
+                vshard: self.vshard_id,
+                sequencer_epoch: txn_id.epoch,
+                position: txn_id.position,
+                commit_hlc: self
+                    .cut_floors
+                    .commit_hlc(pending.txn.epoch, pending.txn.epoch_system_ms),
+            };
+            let change_sets = std::mem::take(&mut pending.change_sets);
+            crate::control::server::dispatch_utils::publish_calvin_change_sets(
+                &self.shared,
+                calvin,
+                change_sets,
+                lsn,
+            );
+        }
         // The record at `lsn` is this position's only applied marker. An
         // append only buffers it, so it is durable before the mark and the
-        // ack: a restart that lost it would take the position for unapplied,
+        // ack: a restart that lost it will take the position for unapplied,
         // run the transaction again, and never settle its ack. The wait joins
         // the WAL group commit, so concurrent Calvin commits share one fsync.
-        if let Err(e) = self.shared.wal.wait_durable(lsn).await {
+        if let Err(e) = self.shared.wal.wait_durable(durable_through).await {
             self.halt_apply(
                 txn_id,
                 HaltReason::WalAppendFailed,
@@ -296,35 +343,107 @@ impl Scheduler {
             );
             return false;
         }
-        // Control change-stream events are distinct from Data-Plane
-        // WriteEvents. Publish the participant-local logical manifests once,
-        // from the data-group leader, at the authoritative committed LSN.
-        if self.is_group_leader()
-            && let Some(pending) = self.pending.get_mut(&txn_id)
-        {
-            let tenant_id = pending.txn.tx_class.tenant_id;
-            let database_id = pending.txn.tx_class.database_id;
-            for change_set in std::mem::take(&mut pending.change_sets) {
-                crate::control::server::dispatch_utils::publish_change_set_with_lsn(
-                    &self.shared,
-                    tenant_id,
-                    database_id,
-                    change_set,
-                    lsn,
-                );
-            }
+        if let Some(origin) = redo_lsn {
+            self.note_flush_settled(origin);
+            self.record_applied_key(txn_id);
         }
         // The commit's mark lands before the ack, as a write through the
         // funnel records its mark before its response returns.
         self.record_calvin_write_mark(txn_id);
-        self.propose_sequencer_entry(txn_id, SchedulerProposal::CompletionAck);
+        self.propose_sequencer_entry(
+            txn_id,
+            SchedulerProposal::CompletionAck { result: ack_result },
+        );
         true
+    }
+}
+
+impl Scheduler {
+    /// Record the dedup key this participant's redo record carries, once the
+    /// record is durable and installed. Every replica records it, as a
+    /// Raft-applied redo's key is, so a request or trigger body sent again to
+    /// any replica applies once.
+    fn record_applied_key(&self, txn_id: TxnId) {
+        let Some(pending) = self.pending.get(&txn_id) else {
+            return;
+        };
+        let tx_class = &pending.txn.tx_class;
+        if tx_class.applied_key.is_empty()
+            || tx_class.applied_key_home().ok().flatten() != Some(self.vshard_id)
+        {
+            return;
+        }
+        let Some(dedup) = self.shared.cross_shard_dedup.get() else {
+            return;
+        };
+        match zerompk::from_msgpack::<crate::wal::CrossShardAppliedKey>(&tx_class.applied_key) {
+            Ok(key) => {
+                if let Err(error) = dedup.record_applied(&key) {
+                    tracing::error!(
+                        vshard_id = self.vshard_id,
+                        origin = %key.origin,
+                        %error,
+                        "calvin: dedup key held in memory only; the WAL restores it on restart"
+                    );
+                }
+            }
+            Err(error) => tracing::error!(
+                vshard_id = self.vshard_id,
+                %error,
+                "calvin: the applied key does not decode; it is not recorded"
+            ),
+        }
+    }
+
+    /// The report the flush `response` owes the coordinator, encoded for the
+    /// replicated `CompletionAck`: the apply's timeseries install counts, and
+    /// the rows of a `returning` slice. The rows are bounded by the query
+    /// result limit and by the ack's frame budget, whichever is lower.
+    fn ack_result_of(
+        &self,
+        response: &Response,
+        slice: crate::control::state::AckSlice,
+    ) -> Vec<u8> {
+        let limit = self
+            .shared
+            .tuning
+            .network
+            .max_query_result_bytes
+            .min(crate::control::state::ACK_ROWS_FRAME_BUDGET);
+        crate::control::state::CalvinAckResult::of(response, slice, limit)
+            .to_bytes()
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    vshard_id = self.vshard_id,
+                    %error,
+                    "calvin: the completion ack carries no report"
+                );
+                Vec::new()
+            })
     }
 }
 
 /// The response the statement drains. A flush whose install succeeded but
 /// whose reply failed to render answers `Ok` with the render error in
 /// `error_code`. The statement reports that error.
+/// Fold the timeseries install counts `incoming` answers into the plain
+/// result `held`. A RETURNING result keeps its rows untouched.
+fn merge_install_counts(held: &mut crate::control::state::CalvinApplyResult, incoming: &Response) {
+    let crate::control::state::CalvinApplyResult::Single {
+        response,
+        has_returning: false,
+    } = held
+    else {
+        return;
+    };
+    if let Some(merged) = crate::engine::timeseries::install_counts::merge_count_payloads(
+        response.payload.as_bytes(),
+        incoming.payload.as_bytes(),
+    ) {
+        response.payload = crate::bridge::envelope::Payload::from_vec(merged);
+    }
+}
+
 fn statement_reply(mut response: Response) -> Response {
     if response.status == Status::Ok && response.error_code.is_some() {
         response.status = Status::Error;
@@ -337,7 +456,7 @@ fn statement_reply(mut response: Response) -> Response {
 mod tests {
     use super::*;
     use crate::control::cluster::calvin::scheduler::driver::core::test_support::{
-        error_response, scheduler_with_pending,
+        error_response, scheduler_with_pending, staged_response,
     };
     use crate::control::cluster::calvin::scheduler::driver::types::CommitState;
 
@@ -347,8 +466,60 @@ mod tests {
         })
     }
 
+    fn flushed_with_counts(collection: &str, accepted: u64, rejected: u64) -> Response {
+        use crate::engine::timeseries::install_counts::{TsInstallCount, TsInstallCounts};
+        let mut response = staged_response(Status::Ok, None);
+        response.payload = crate::bridge::envelope::Payload::from_vec(
+            TsInstallCounts::new(vec![TsInstallCount {
+                collection: collection.into(),
+                accepted,
+                rejected,
+            }])
+            .to_bytes()
+            .expect("encode install counts"),
+        );
+        response
+    }
+
+    /// Two plain participants of one Calvin transaction each installed a
+    /// timeseries batch. The coordinator's result carries both installs'
+    /// apply counts, so COMMIT reports every participant's rejected rows. A
+    /// RETURNING result keeps its rows.
+    #[test]
+    fn plain_participants_merge_their_install_counts() {
+        use crate::control::state::CalvinApplyResult;
+        use crate::engine::timeseries::install_counts::TsInstallCounts;
+        let mut held = CalvinApplyResult::Single {
+            response: flushed_with_counts("cpu", 2, 1),
+            has_returning: false,
+        };
+        merge_install_counts(&mut held, &flushed_with_counts("mem", 3, 2));
+        let CalvinApplyResult::Single { response, .. } = &held else {
+            panic!("a merged result stays single");
+        };
+        let totals = TsInstallCounts::from_payload(response.payload.as_bytes())
+            .expect("install counts")
+            .by_collection();
+        assert_eq!(totals.get("cpu"), Some(&(2, 1)));
+        assert_eq!(totals.get("mem"), Some(&(3, 2)));
+
+        let rows = crate::bridge::envelope::Payload::from_vec(vec![0x90]);
+        let mut returning = CalvinApplyResult::Single {
+            response: Response {
+                payload: rows,
+                ..flushed_with_counts("cpu", 1, 0)
+            },
+            has_returning: true,
+        };
+        merge_install_counts(&mut returning, &flushed_with_counts("mem", 1, 1));
+        let CalvinApplyResult::Single { response, .. } = &returning else {
+            panic!("a RETURNING result stays single");
+        };
+        assert_eq!(response.payload.as_bytes(), &[0x90]);
+    }
+
     /// A flush that returns an error under a COMMIT verdict holds the txn
-    /// unapplied and halts: a second flush would apply nothing.
+    /// unapplied and halts: a second flush will apply nothing.
     #[tokio::test]
     async fn flush_error_response_holds_committed_txn_unapplied() {
         let txn_id = TxnId::new(9, 2);

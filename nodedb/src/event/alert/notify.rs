@@ -11,7 +11,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::control::planner::procedural::executor::bindings::RowBindings;
-use crate::control::planner::procedural::executor::core::StatementExecutor;
+use crate::control::planner::procedural::executor::core::{AtomicBody, StatementExecutor};
 use crate::control::security::identity::{AuthenticatedIdentity, Role};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
@@ -291,7 +291,8 @@ async fn notify_insert(
         database_id,
         0,
         crate::event::EventSource::User,
-    );
+    )
+    .with_atomic_body(AtomicBody::alert(&event.alert_name));
     let bindings = RowBindings::empty();
 
     if let Err(e) = executor.execute_block(&block, &bindings).await {

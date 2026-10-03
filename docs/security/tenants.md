@@ -85,6 +85,43 @@ COPY tenant_restore(acme) FROM STDIN;
 
 Backups cover all 7 engines: documents, indexes, vectors, graph edges, KV tables, timeseries, and CRDT state. Payloads are encrypted with AES-256-GCM under the tenant WAL key.
 
+Each backup records a row count and a digest per collection and engine. A restore checks them twice:
+
+- Before its first write, against the backup's own rows. A mismatch refuses the restore, and nothing changes.
+- After its last write, against a capture of the destination. A mismatch fails the restore with an error that names every mismatched collection. The restore does not roll back: the restored data stays in place for inspection.
+
+`DRY RUN` runs the first check only.
+
+## Database Backup/Restore
+
+`BACKUP DATABASE` writes every tenant's rows in one database to an object-store URI. `RESTORE DATABASE` reads it back through the tenant restore, with the same two checks.
+
+```sql
+BACKUP DATABASE shop TO 's3://backups/shop/nightly.ndbb';
+RESTORE DATABASE shop FROM 's3://backups/shop/nightly.ndbb' DRY RUN;
+RESTORE DATABASE shop FROM 'file:///srv/nodedb/backups/shop.ndbb' FORCE;
+```
+
+- `s3://<bucket>/<key>` uses the `[backup_storage]` endpoint, region and keys. Empty keys use IAM credentials.
+- `file:///<path>` must lie inside `[backup_storage] local_root`, with every symlink on the path followed. A symlink that leaves the root refuses the URI. Without `local_root`, every `file://` URI is refused.
+- The server reads, writes, lists and deletes a `file://` object below a directory handle of the root and follows no symlink on the way. On Linux it opens through `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`. A component swapped for a symlink after the URI resolved refuses the read or write with SQLSTATE `22023`. Scheduled-backup retention never lists a symlink under the target and never deletes through one.
+- The backup takes one cut for every tenant of the database and records it in the manifest. Each Raft data group captures the database's tenants when it applies the cut's barrier entry. The capture holds every entry at or below the barrier and none above it, so no row written after the cut is in the backup. A backup whose group changed leader before the capture was collected fails with a retryable error that names the group. On a server with no Raft groups the cut is the instant the backup dispatches its snapshots to the Data Plane cores. Every write, whatever path sends it, reaches a core through one dispatcher, so the backup holds every write dispatched before the cut and none after it. Each core runs the backup's snapshot as a barrier: it sees every request dispatched to that core before it, in any priority tier, and none after it. A write's restore-staleness mark, a RESTORE's included, lands on the same side of the cut as the write.
+- Each tenant's backup quota admits and meters the backup and the restore, as for `COPY`.
+- A restore also counts against the write quota of every collection it restores, under the name DML charges. A hard write cap on one collection refuses the restore before any write. A grant on `*` is charged once per restored row. A grant on the `tenant:<id>` marker is charged the tenant's restored rows. A `DRY RUN` charges no write quota.
+- `DEFINE SCOPE '<name>' AS BACKUP ON 'tenant:<id>'` defines a backup scope for one tenant.
+- A malformed URI, an unknown scheme, or a path outside `local_root` fails with SQLSTATE `22023` before any store is touched.
+- A backup restores only under its own database name.
+- Credentials never come from the SQL text.
+
+```toml
+[backup_storage]
+local_root = "/srv/nodedb/backups"
+endpoint = ""
+access_key = ""
+secret_key = ""
+region = "us-east-1"
+```
+
 ## Tenant Purge (GDPR Erasure)
 
 ```sql

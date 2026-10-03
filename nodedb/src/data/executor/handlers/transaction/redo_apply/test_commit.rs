@@ -121,7 +121,7 @@ impl CoreLoop {
         let install_task = ExecutionTask::new(install_request);
         let collections = written_collections(plans);
         let sum_targets = redo_sum_targets(plans);
-        self.install_committed_redo(
+        self.execute_apply_transaction_redo(
             &install_task,
             tid,
             CommittedRedo {
@@ -140,11 +140,14 @@ pub(in crate::data::executor) fn failing_install_sub_record() -> RedoSubRecord {
         .expect("encode lines");
     RedoSubRecord {
         record_type: RecordType::TimeseriesBatch as u32,
-        payload: crate::control::server::wal_dispatch::encode_timeseries_batch_payload_with_format(
-            "refusal_probe",
-            &lines,
-            None,
-            "ilp-msgpack",
+        payload: crate::control::server::wal_dispatch::encode_timeseries_ingest_payload(
+            crate::control::server::wal_dispatch::TimeseriesIngestRecord {
+                collection: "refusal_probe",
+                payload: &lines,
+                provenance: None,
+                format: "ilp-msgpack",
+                default_timestamp_ms: 0,
+            },
         )
         .expect("encode ingest"),
     }
@@ -163,10 +166,36 @@ impl CoreLoop {
         lsn: u64,
         ops: Vec<RedoSubRecord>,
     ) -> Vec<crate::data::executor::handlers::transaction::undo::UndoEntry> {
+        let (undo, error) = self.install_from_for_test(
+            tid,
+            lsn,
+            ops,
+            nodedb_physical::physical_plan::RedoOrigin::Commit,
+        );
+        assert!(error.is_none(), "install error: {error:?}");
+        undo
+    }
+
+    /// Run the install pass of a redo record from `origin` carrying `ops` at
+    /// `lsn`. Returns its undo entries and the first error an arm hit.
+    pub(in crate::data::executor) fn install_from_for_test(
+        &mut self,
+        tid: u64,
+        lsn: u64,
+        ops: Vec<RedoSubRecord>,
+        origin: nodedb_physical::physical_plan::RedoOrigin,
+    ) -> (
+        Vec<crate::data::executor::handlers::transaction::undo::UndoEntry>,
+        Option<crate::bridge::envelope::ErrorCode>,
+    ) {
         let payload = RedoRecord {
             version: 1,
             ops,
             calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
         }
         .to_bytes()
         .expect("encode redo");
@@ -181,10 +210,10 @@ impl CoreLoop {
             preamble_bytes: None,
         })
         .expect("wal record");
-        self.redo_apply.scope = Some(super::state::RedoApplyScope::new(
-            super::state::RedoApplyPass::Install,
-            Vec::new(),
-        ));
+        self.redo_apply.scope = Some(
+            super::state::RedoApplyScope::new(super::state::RedoApplyPass::Install, Vec::new())
+                .with_origin(origin),
+        );
         let applied = self.replay_engines_in_lsn_order(
             std::slice::from_ref(&record),
             self.redo_apply.num_cores,
@@ -192,8 +221,7 @@ impl CoreLoop {
         );
         let scope = self.redo_apply.scope.take().expect("install scope");
         applied.expect("install arms");
-        assert!(scope.error.is_none(), "install error: {:?}", scope.error);
-        scope.undo
+        (scope.undo, scope.error)
     }
 }
 

@@ -9,6 +9,7 @@ use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::enforcement::materialized_sum::divergence::SumTargetCheck;
 use crate::data::executor::enforcement::write_hook;
+use crate::data::executor::handlers::partial_refusal::refusal_after_rows;
 use crate::data::executor::handlers::transaction::stage_write::stored_row_identity;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
@@ -28,13 +29,14 @@ impl CoreLoop {
     /// TRUNCATE: delete all documents in a collection without filter scanning.
     ///
     /// Iterates the DOCUMENTS table prefix and deletes every key. Cascades to
-    /// inverted index, secondary indexes, graph edges, and document cache.
-    /// Returns `{"truncated": N}` payload.
+    /// inverted index, secondary indexes, and document cache. The
+    /// collection's graph edges are cut by `TruncateEdges`. Returns
+    /// `{"truncated": N}` payload.
     ///
     /// Every removed row folds its own `RowImages::Delete` through the
     /// enforcement funnel, from inside this loop. There is deliberately NO bulk
     /// aggregate: TRUNCATE must leave the stored totals exactly where N
-    /// individual deletes would, and a separate aggregate path would be a second
+    /// individual deletes leave them, and a separate aggregate path is a second
     /// implementation of the same arithmetic — free to drift from the per-row
     /// one that every other delete path uses.
     pub(in crate::data::executor) fn execute_truncate(
@@ -78,7 +80,7 @@ impl CoreLoop {
         // Control-Plane recon scan of this collection taken before execution, and
         // a row inserted since then debits a target the plan holds no surrogate
         // for. TRUNCATE must leave every bound total at exactly what N individual
-        // deletes would leave it at, so a shortfall returns OllpRetryRequired
+        // deletes leave it at, so a shortfall returns OllpRetryRequired
         // WITHOUT removing anything rather than emptying the collection and
         // leaving a total that still counts its rows.
         if self.sum_targets_diverged_for_ids(
@@ -115,7 +117,7 @@ impl CoreLoop {
 
         // BALANCED, decided over every row about to be removed and BEFORE the
         // first removal — each row below commits in its own transaction, so a
-        // check after the loop could not undo what it found. Emptying a
+        // check after the loop cannot undo what it found. Emptying a
         // collection whose journals all balance nets to zero and proceeds;
         // emptying one that holds an unbalanced group is refused with nothing
         // removed.
@@ -131,12 +133,11 @@ impl CoreLoop {
 
         // Delete each document with full cascade.
         let mut truncated = 0u64;
-        // One post-apply `Delete` redo entry per removed row on a vector
-        // collection. `wal_append_document_op` mints no per-row redo for
-        // `DocumentOp::Truncate` (row durability is redb-synchronous), so
-        // without this a WAL-only restart would replay each row's original
-        // `Put` record and resurrect its HNSW vector — mirrors
-        // `execute_bulk_delete`'s `write_set` cascade.
+        // One post-apply `Delete` redo entry per removed row, in removal
+        // order, followed by the target rows its fold rewrote.
+        // `wal_append_document_op` mints no pre-dispatch record for
+        // `DocumentOp::Truncate`, so these entries are the only record of the
+        // removals WAL replay and a point-in-time restore apply.
         let mut write_set: Vec<WriteSetEntry> = Vec::new();
         for storage_key in &all_ids {
             let doc_id = storage_key.to_string();
@@ -144,9 +145,14 @@ impl CoreLoop {
             // One transaction per removed row, shared with the materialized-sum
             // delta that row owes — identical to `execute_bulk_delete`, so a
             // TRUNCATE and a `DELETE` with no predicate leave the same totals.
+            // A refusal after a removal committed keeps the rows removed so
+            // far, and carries their entries so they are journalled.
             let row_txn = match self.sparse.begin_write() {
                 Ok(txn) => txn,
-                Err(e) => return self.response_error(task, e),
+                Err(e) => {
+                    let code = refusal_after_rows(truncated, e);
+                    return self.refusal_with_landed_rows(task, code, write_set);
+                }
             };
             let deleted_bytes = self
                 .sparse
@@ -172,20 +178,23 @@ impl CoreLoop {
                 ) {
                     // The row's BALANCED contribution was settled for the whole
                     // statement above, before any row was removed; taking it
-                    // again here would count the same removal twice.
+                    // again here counts the same removal twice.
                     Ok(outcome) => target_writes = outcome.target_writes,
-                    Err(e) => return self.response_error(task, e),
+                    Err(e) => {
+                        let code = refusal_after_rows(truncated, e);
+                        return self.refusal_with_landed_rows(task, code, write_set);
+                    }
                 }
             }
             if let Err(e) = row_txn.commit() {
-                return self.response_error(
-                    task,
+                let code = refusal_after_rows(
+                    truncated,
                     ErrorCode::Internal {
                         detail: format!("truncate commit: {e}"),
                     },
                 );
+                return self.refusal_with_landed_rows(task, code, write_set);
             }
-            write_set.extend(write_hook::target_write_set(&target_writes));
             if let Some(deleted_bytes) = deleted_bytes.as_deref() {
                 let surrogate = storage_key.surrogate();
                 // The identity INSERT minted for this row, read from the
@@ -221,20 +230,14 @@ impl CoreLoop {
                 // process (mirrors `execute_bulk_delete`'s vector cascade).
                 if has_vectors {
                     self.remove_document_vector_indexes(database_id, tid, collection, *storage_key);
-                    write_set.push(WriteSetEntry {
-                        surrogate: surrogate.as_u32(),
-                        identity: row_identity.clone(),
-                        is_delete: true,
-                        value: Vec::new(),
-                        collection: None,
-                    });
                 }
-                // The graph keys a row's node by its client key. On an error
-                // neither edge store changed: the edges stay in both, and the
-                // dangling-edge sweep retries them.
-                if let Err(e) = self.cascade_node_edges(database_id, tid, row_identity.as_str()) {
-                    warn!(core = self.core_id, %doc_id, error = %e, "truncate: edge cascade failed");
-                }
+                write_set.push(WriteSetEntry::delete(
+                    surrogate.as_u32(),
+                    row_identity.clone(),
+                ));
+                // The collection's edges keep their place here: the
+                // TRUNCATE's transaction cuts them with one `TruncateEdges`
+                // per vShard, at its ordinal.
                 self.doc_cache.invalidate(
                     task.request.database_id.as_u64(),
                     tid,
@@ -266,6 +269,7 @@ impl CoreLoop {
                 );
                 truncated += 1;
             }
+            write_set.extend(write_hook::target_write_set(&target_writes));
         }
 
         // Clear aggregate cache for this collection.
@@ -277,20 +281,18 @@ impl CoreLoop {
 
         debug!(core = self.core_id, %collection, truncated, "truncate complete");
         let result = serde_json::json!({ "truncated": truncated });
+        // Every row is removed by now, so an encode error answers with the
+        // removals' entries as well.
         let mut response = match response_codec::encode_json_as_msgpack(&result) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
+            Err(e) => self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: e.to_string(),
+                },
+            ),
         };
-        if !write_set.is_empty() {
-            response.write_set = write_set;
-        }
+        response.write_set = write_set;
         response
     }
 

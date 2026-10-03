@@ -256,6 +256,8 @@ pub(super) async fn phase3_cutover(
         proposer.propose_and_wait(entry).await?;
     } else {
         let mut routing = ex.routing.write().unwrap_or_else(|p| p.into_inner());
+        // The target is named before its election, so the hint carries no
+        // term and fills only a hint that holds none.
         routing.set_leader(group_id, req.target_node);
     }
 
@@ -335,6 +337,8 @@ mod tests {
             node.election_deadline_override(Instant::now() - Duration::from_millis(1));
         }
         mr.tick().unwrap();
+        // The no-op commits once the disk holds it.
+        mr.wait_all_durable_blocking();
         for (gid, ready) in mr.tick().unwrap().groups {
             if let Some(last) = ready.committed_entries.last() {
                 mr.advance_applied(gid, last.index).unwrap();

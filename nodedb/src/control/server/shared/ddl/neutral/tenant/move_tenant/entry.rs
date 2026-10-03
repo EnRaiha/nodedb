@@ -5,11 +5,8 @@
 //!
 //! See the module-level docs on [`super`] for the phase table.
 //!
-//! Ported verbatim from the pgwire `ddl::tenant::move_tenant::entry` handler.
-//! `require_superuser` is byte-identical to the pgwire
-//! `types::privilege::require_superuser` gate used here originally (same
-//! audit-on-denial behaviour, same SQLSTATE, same message), so it is reused
-//! directly from `neutral::database::gate` rather than duplicated.
+//! `require_superuser` is reused directly from `neutral::database::gate`
+//! (audit on denial, same SQLSTATE, same message).
 
 use std::time::Duration;
 
@@ -28,7 +25,7 @@ use super::{cutover, drain, preflight, recovery, snapshot};
 
 /// Drain timeout for phase 2: how long we wait for in-flight operations to
 /// complete after revoking sessions before aborting the drain and rolling back.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Snapshot timeout passed to the backup orchestrator.
 pub(crate) const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -43,6 +40,14 @@ pub async fn handle_move_tenant(
     from_db: &str,
     to_db: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
+    // The move re-issues rows and reclaims storage as it runs, and a ROLLBACK
+    // cannot undo either. PostgreSQL refuses CREATE DATABASE here the same way.
+    if crate::control::server::shared::session::ddl_buffer::is_active() {
+        return Err(DdlError::from_error(&crate::Error::NotInTransactionBlock {
+            statement: "MOVE TENANT".into(),
+        }));
+    }
+
     let catalog = state.credentials.catalog();
 
     // Resolve source database id first so the privilege gate can carry it
@@ -115,7 +120,7 @@ pub async fn handle_move_tenant(
     if let Err(ref e) = drain_result {
         // Compensate: remove journal entry so state is clean.
         journal::delete_journal_entry_logged(catalog, tenant_id);
-        return Err(DdlError::move_tenant_drain_timeout(e.message()));
+        return Err(DdlError::move_tenant_drain_timeout(e.message()).with_cause_of(e));
     }
 
     // Update journal to Snapshot phase.
@@ -125,11 +130,11 @@ pub async fn handle_move_tenant(
 
     // ── Phase 3: Snapshot ─────────────────────────────────────────────────────
     let snapshot_result = snapshot::run(state, tenant_id, source_db_id, SNAPSHOT_TIMEOUT).await;
-    let snapshot_bytes = match snapshot_result {
-        Ok(bytes) => bytes,
+    let capture = match snapshot_result {
+        Ok(capture) => capture,
         Err(ref e) => {
             // Compensate: release drain, remove journal.
-            drain::release(state, tenant_id, source_db_id);
+            drain::release(state, tenant_id, source_db_id).await;
             journal::delete_journal_entry_logged(catalog, tenant_id);
             return Err(DdlError::move_tenant_snapshot_failed(e.message()).with_cause_of(e));
         }
@@ -144,20 +149,12 @@ pub async fn handle_move_tenant(
         .map_err(|e| DdlError::from_error_in_context("journal update", &e))?;
 
     // ── Phase 4: Cutover ──────────────────────────────────────────────────────
-    let cutover_result = cutover::run(
-        state,
-        catalog,
-        tenant_id,
-        source_db_id,
-        target_db_id,
-        &snapshot_bytes,
-    )
-    .await;
+    let cutover_result = cutover::run(state, tenant_id, source_db_id, target_db_id, capture).await;
 
     if let Err(ref e) = cutover_result {
         // Cutover failed: single-proposal failure is all-or-nothing; source intact.
         // Release drain; clean up snapshot; remove journal.
-        drain::release(state, tenant_id, source_db_id);
+        drain::release(state, tenant_id, source_db_id).await;
         let _ = snapshot::delete_temp(state, &temp_key).await;
         journal::delete_journal_entry_logged(catalog, tenant_id);
         return Err(DdlError::move_tenant_cutover_failed(e.message()).with_cause_of(e));

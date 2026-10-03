@@ -88,7 +88,7 @@ pub(super) fn apply_timeseries(ctx: &PermCtx<'_>, op: &mut TimeseriesOp) -> crat
 
         // Recurse: the resolve pass stands in for the ingest it wraps, so it
         // needs the same write level on the same collection.
-        TimeseriesOp::ResolveIngest(inner) => apply_timeseries(ctx, inner),
+        TimeseriesOp::ResolveIngest(inner) => apply_timeseries(ctx, &mut inner.ingest),
 
         // Delete level, blanket: a truncate removes rows it never
         // enumerates, so there is no predicate to narrow.
@@ -125,8 +125,8 @@ mod tests {
     };
     use crate::bridge::envelope::PhysicalPlan;
 
-    /// A timeseries scan over a governed collection was previously unlisted
-    /// and returned every series. It is now narrowed to the readable subtree.
+    /// A timeseries scan over a governed collection narrows to the readable
+    /// subtree instead of returning every series.
     #[test]
     fn timeseries_scan_is_narrowed_to_the_readable_subtree() {
         let cache = cache_with_tree("metrics");

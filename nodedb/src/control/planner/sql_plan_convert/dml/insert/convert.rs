@@ -113,7 +113,7 @@ pub(in super::super::super) fn convert_insert(
                     row,
                 )?;
                 // One page for the whole statement: the rows of a balanced
-                // INSERT are judged together, so they may not be split across
+                // INSERT are judged together, so they must not be split across
                 // one task — one boundary — per row.
                 if is_balanced {
                     balanced_documents.push((doc_id, value_bytes));
@@ -216,7 +216,7 @@ pub(in super::super::super) fn convert_insert(
                 // Both slots are filled by later passes over the built plan —
                 // `inject_returning_spec` from the statement's RETURNING list,
                 // and the row-level-security injector from the collection's read
-                // policy. Filling either here would duplicate a decision that
+                // policy. Filling either here will duplicate a decision that
                 // has one owner.
                 returning: None,
                 rls_filters: Vec::new(),
@@ -248,16 +248,16 @@ mod tests {
             CredentialStore::open(&dir.path().join("system.redb")).expect("open credential store");
         {
             let catalog = store.catalog();
-            let mut edges = StoredCollection::new(0, "edges", "owner");
+            let mut edges = StoredCollection::stamped_for_test(0, "edges", "owner");
             edges.has_implicit_edges = true;
             catalog
                 .put_collection(crate::types::DatabaseId::DEFAULT, &edges)
                 .expect("put edges collection");
-            let plain = StoredCollection::new(0, "plain", "owner");
+            let plain = StoredCollection::stamped_for_test(0, "plain", "owner");
             catalog
                 .put_collection(crate::types::DatabaseId::DEFAULT, &plain)
                 .expect("put plain collection");
-            let mut crdt_coll = StoredCollection::new(0, "crdt_coll", "owner");
+            let mut crdt_coll = StoredCollection::stamped_for_test(0, "crdt_coll", "owner");
             crdt_coll.crdt = true;
             catalog
                 .put_collection(crate::types::DatabaseId::DEFAULT, &crdt_coll)
@@ -270,7 +270,8 @@ mod tests {
             array_catalog: None,
             credentials: Some(Arc::new(store)),
             wal: None,
-            surrogate_assigner: None,
+            surrogate_assigner:
+                crate::control::planner::sql_plan_convert::test_support::test_assigner(),
             cluster_enabled: false,
             bitemporal_retention_registry: None,
             max_vector_dim: 0,
@@ -280,6 +281,7 @@ mod tests {
             shuffle_agg_num_parts: 0,
             broadcast_threshold_bytes: 8 * 1024 * 1024,
             shuffle_agg_threshold: 10_000,
+            prefetched: Default::default(),
             database_id: crate::types::DatabaseId::DEFAULT,
             tenant_id: crate::types::TenantId::new(0),
         };

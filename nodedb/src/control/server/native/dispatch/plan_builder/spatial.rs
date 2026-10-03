@@ -9,7 +9,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::native::dispatch::DispatchCtx;
 use nodedb_physical::physical_plan::{SpatialOp, SpatialPredicate};
 
-pub(crate) fn build_scan(
+pub(crate) async fn build_scan(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,

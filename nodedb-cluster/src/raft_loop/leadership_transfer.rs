@@ -34,6 +34,9 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         let transfers: Vec<(u64, u64)> = {
             let mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
             let group_ids = mr.group_ids();
+            let preferred_map = crate::rebalancer::preferred_leaders(
+                &mr.routing().read().unwrap_or_else(|p| p.into_inner()),
+            );
             let mut out = Vec::new();
             for gid in group_ids {
                 if gid == crate::metadata_group::METADATA_GROUP_ID
@@ -66,11 +69,14 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                     continue;
                 }
                 // Pick an in-placement node that is currently a voter (so it can
-                // win the election) and is not this node.
-                let target = placement
-                    .iter()
-                    .copied()
-                    .find(|t| *t != m.leader_id && m.voters.contains(t));
+                // win the election) and is not this node. The group's preferred
+                // leader goes first, so the leader balance phase does not move
+                // the leadership again.
+                let preferred = preferred_map.get(&gid).copied();
+                let eligible = |t: &u64| *t != m.leader_id && m.voters.contains(t);
+                let target = preferred
+                    .filter(|t| placement.contains(t) && eligible(t))
+                    .or_else(|| placement.iter().copied().find(|t| eligible(t)));
                 if let Some(target) = target {
                     out.push((gid, target));
                 } else {

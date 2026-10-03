@@ -22,6 +22,7 @@ use crate::types::Lsn;
 
 use super::core_channel::{CoreChannel, CoreChannelDataSide};
 use super::dispatched_lsns::DispatchedLsns;
+use super::journal::WriteSetJournal;
 use super::outcome_floor::OutcomeFloor;
 
 /// Per-core request queue capacity of the server's bridge dispatcher.
@@ -42,15 +43,18 @@ pub struct BridgeRequest {
     /// The outcome floor when this request entered the ring: every record at
     /// or below it that any core receives has a final outcome.
     pub outcome_floor: Lsn,
+    /// The request's record group and the groups settled since the last push.
+    pub journal: WriteSetJournal,
 }
 
 impl BridgeRequest {
-    /// A request that carries no outcome floor. A core that reads it learns
-    /// nothing about the floor.
+    /// A request that carries no outcome floor and no journal. A core that
+    /// reads it learns nothing about either.
     pub fn unfloored(inner: envelope::Request) -> Self {
         Self {
             inner,
             outcome_floor: Lsn::ZERO,
+            journal: WriteSetJournal::default(),
         }
     }
 }
@@ -163,6 +167,8 @@ impl Dispatcher {
                 db_pressure: HashMap::new(),
                 wake_notifier: None,
                 outstanding: HashSet::new(),
+                journals: HashMap::new(),
+                settled_write_sets: Vec::new(),
             });
 
             data_sides.push(CoreChannelDataSide {

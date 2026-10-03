@@ -26,7 +26,7 @@ use nodedb_physical::physical_plan::MetaOp;
 /// The carve-out ops below require Write permission but stage into the
 /// transaction's overlay rather than committed base state (the real base write
 /// happens at COMMIT via `MetaOp::TransactionBatch`, which IS a write here), so
-/// they are Exempt from the gate — not a third write classification, just the
+/// they are Exempt from the gate — not a third write classification, only the
 /// overlay ops subtracted from the one write set.
 pub fn plan_is_write(plan: &PhysicalPlan) -> bool {
     if matches!(
@@ -55,7 +55,7 @@ mod tests {
                 "c",
             ),
             document_id: "d".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: None,
             pk_bytes: Vec::new(),
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
@@ -74,7 +74,7 @@ mod tests {
             key: b"k".to_vec(),
             value: b"v".to_vec(),
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,

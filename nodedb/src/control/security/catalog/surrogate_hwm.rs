@@ -18,7 +18,7 @@ pub const SURROGATE_HWM: redb::TableDefinition<&str, u32> =
 /// `SurrogateReserve` has been folded into the global watermark `G` (`u64`).
 /// Persisted ATOMICALLY with `SURROGATE_HWM` in cluster mode so a crash can
 /// never leave the seeded `G` and the applied-reserve cursor inconsistent
-/// (which would diverge `G` across nodes on the next restart replay).
+/// (which diverges `G` across nodes on the next restart replay).
 pub const SURROGATE_RESERVE_INDEX: redb::TableDefinition<&str, u64> =
     redb::TableDefinition::new("_system.surrogate_reserve_index");
 
@@ -29,6 +29,16 @@ impl SystemCatalog {
     /// Persist the surrogate allocator high-watermark. Overwrites the
     /// singleton row.
     pub fn put_surrogate_hwm(&self, hwm: u32) -> crate::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_surrogate_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(catalog_err(
+                "surrogate watermark write",
+                "injected surrogate write failure",
+            ));
+        }
         let txn = self
             .db
             .begin_write()
@@ -47,11 +57,21 @@ impl SystemCatalog {
 
     /// Cluster-mode: persist the global watermark `hwm` AND the
     /// applied-reserve cursor `reserve_index` together in a SINGLE redb write
-    /// transaction. Atomicity is mandatory: if these two values could be
-    /// written separately, a crash between them would seed the next restart
+    /// transaction. Atomicity is mandatory: if these two values were
+    /// written separately, a crash between them seeds the next restart
     /// with a mismatched `(G, cursor)` pair, causing metadata-log replay to
     /// re-apply (or wrongly skip) reservations and diverge `G` across nodes.
     pub fn put_surrogate_reserve_state(&self, hwm: u32, reserve_index: u64) -> crate::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_surrogate_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(catalog_err(
+                "surrogate watermark write",
+                "injected surrogate write failure",
+            ));
+        }
         let txn = self
             .db
             .begin_write()

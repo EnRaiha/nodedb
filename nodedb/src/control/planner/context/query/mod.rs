@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 mod context;
+mod convert_plans;
 mod functions;
 mod planning;
 mod tuning;

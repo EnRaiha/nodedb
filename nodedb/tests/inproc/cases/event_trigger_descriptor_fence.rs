@@ -16,16 +16,17 @@
 
 use nodedb::Error;
 use nodedb::control::gateway::version_check::check_descriptor_holds;
-use nodedb::control::security::catalog::{StoredCollection, SystemCatalog};
+use nodedb::control::security::catalog::SystemCatalog;
 use nodedb::types::DatabaseId;
 use nodedb_cluster::{DescriptorId, DescriptorKind};
+use nodedb_test_support::catalog_fixtures::stamped_collection;
 
 const TENANT: u64 = 11;
 
 fn catalog_with(collections: &[(&str, u64)]) -> SystemCatalog {
     let catalog = SystemCatalog::open_in_memory().expect("in-memory catalog");
     for (name, version) in collections {
-        let mut stored = StoredCollection::new(TENANT, name, "owner");
+        let mut stored = stamped_collection(TENANT, name, "owner");
         stored.descriptor_version = *version;
         catalog
             .put_collection(DatabaseId::DEFAULT, &stored)

@@ -15,5 +15,6 @@ mod restart;
 mod spawn_variants;
 mod types;
 
-pub(crate) use types::ClusterSpawnConfig;
+pub use restart::{StoppedCluster, StoppedMember, StoppedNodeInfo};
 pub use types::TestCluster;
+pub(crate) use types::{ClusterSpawnConfig, DEFAULT_NUM_GROUPS};

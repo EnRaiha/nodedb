@@ -150,6 +150,7 @@ async fn produce_side(
         deadline_remaining_ms: 15_000,
         trace_id: [0u8; 16],
         descriptor_versions: vec![],
+        read_groups: vec![],
     };
     let resp = transport
         .send_rpc_to_addr(producer_addr, RaftRpc::ShuffleProduceRequest(req))

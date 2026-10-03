@@ -4,7 +4,7 @@
 //!
 //! Field order and enum variant order are the wire ABI: append only.
 
-use nodedb_types::id::TxnId;
+use nodedb_types::id::{TxnId, VShardId};
 
 use crate::rpc_codec::data_plane_error::DataPlaneErrorCode;
 
@@ -40,6 +40,16 @@ pub struct ExecuteRequest {
     /// non-transactional dispatch. Lets the receiver resolve the per-transaction
     /// staging overlay for the id on the remote node.
     pub txn_id: Option<TxnId>,
+    /// The vShard whose owning core runs a vShard-scoped plan (a transaction
+    /// meta-op such as `StageWrite` or `ResolveTxn`). The receiver sends such a
+    /// plan to that one core. `None` for every other plan, which fans across
+    /// all local cores. Every vShard id is valid, so absence is `None`, never
+    /// a sentinel id.
+    pub vshard_id: Option<VShardId>,
+    /// Raft groups a linearizable read leg observes. The receiver takes a read
+    /// index for each and applies through it before it reads. Empty for a
+    /// write or a read that accepts this replica as it is.
+    pub read_groups: Vec<u64>,
 }
 
 /// Response to an `ExecuteRequest`.
@@ -98,6 +108,13 @@ pub enum TypedClusterError {
         collection: String,
         constraint: String,
         detail: String,
+    },
+    /// A Calvin transaction the sequencer aborted, with the verdict's reason.
+    /// The coordinator rebuilds the error a local submit returns, so a routed
+    /// abort keeps its SQLSTATE and message. Appended last: variant order is
+    /// the wire ABI.
+    CalvinAborted {
+        reason: crate::calvin::AbortReason,
     },
 }
 

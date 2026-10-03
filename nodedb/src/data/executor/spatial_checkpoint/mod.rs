@@ -47,9 +47,9 @@ mod test_support;
 mod write;
 
 pub(crate) use manifest::read_spatial_manifest_at;
-pub(crate) use paths::{spatial_checkpoint_prefix, spatial_ckpt_gen_dir};
+pub(crate) use paths::{
+    SPATIAL_CKPT_MANIFEST, spatial_checkpoint_prefix, spatial_ckpt_dir, spatial_ckpt_gen_dir,
+};
 
 #[cfg(test)]
 pub(crate) use format::test_manifest_bytes;
-#[cfg(test)]
-pub(crate) use paths::spatial_ckpt_dir;

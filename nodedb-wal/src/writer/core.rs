@@ -63,6 +63,13 @@ pub struct WalWriter {
 
     /// Records appended to this segment with no double-write copy behind them.
     pub(super) dwb_unprotected_records: u64,
+
+    /// A record was appended after the last time anchor.
+    pub(super) unanchored: bool,
+
+    /// `(lsn, hlc_wall_ns)` of an anchor in the batch whose fsync has not
+    /// succeeded yet.
+    pub(super) pending_anchor: Option<(u64, u64)>,
 }
 
 impl WalWriter {
@@ -104,6 +111,8 @@ impl WalWriter {
             dwb_path: dwb.path,
             dwb_protection: dwb.protection,
             dwb_unprotected_records: 0,
+            unanchored: false,
+            pending_anchor: None,
         })
     }
 
@@ -205,6 +214,8 @@ impl WalWriter {
             dwb_path: dwb.path,
             dwb_protection: dwb.protection,
             dwb_unprotected_records: 0,
+            unanchored: false,
+            pending_anchor: None,
         })
     }
 
@@ -261,6 +272,7 @@ impl WalWriter {
                 vshard_id,
                 database_id,
                 event_source: crate::record::NO_EVENT_SOURCE,
+                commit_hlc: 0,
             },
             payload,
             0,
@@ -276,12 +288,25 @@ impl WalWriter {
         payload: &[u8],
         apply_key: u64,
     ) -> Result<u64> {
+        self.append_reserving(target, payload, apply_key, self.anchor_reserve())
+    }
+
+    /// Append a record and leave `extra_reserve` bytes free in the buffer
+    /// beyond the padding reserve.
+    pub(super) fn append_reserving(
+        &mut self,
+        target: RecordTarget,
+        payload: &[u8],
+        apply_key: u64,
+        extra_reserve: usize,
+    ) -> Result<u64> {
         let RecordTarget {
             record_type,
             tenant_id,
             vshard_id,
             database_id,
             event_source,
+            commit_hlc,
         } = target;
         if self.sealed {
             return Err(WalError::Sealed);
@@ -304,12 +329,13 @@ impl WalWriter {
             crate::record::RecordStamp {
                 apply_key,
                 event_source,
+                commit_hlc,
             },
         )?;
 
         let header_bytes = record.header.to_bytes();
         let total_size = HEADER_SIZE + record.payload.len();
-        let reserve = self.padding_reserve();
+        let reserve = self.padding_reserve() + extra_reserve;
 
         // If the record cannot fit in an empty buffer alongside its padding,
         // no amount of flushing will make room.
@@ -341,6 +367,7 @@ impl WalWriter {
         self.mirror_into_dwb(lsn, &record);
 
         self.next_lsn.store(lsn + 1, Ordering::Relaxed);
+        self.unanchored = true;
 
         Ok(lsn)
     }
@@ -370,6 +397,9 @@ impl WalWriter {
             std::io::Error::other(format!("failpoint wal::before_dwb_flush: {detail}"))
         ));
 
+        // The anchor rides this batch's own write and fsync.
+        self.append_time_anchor()?;
+
         // Flush DWB first — records must be durable in DWB before WAL.
         self.flush_dwb();
         self.flush_buffer()?;
@@ -380,7 +410,9 @@ impl WalWriter {
             std::io::Error::other(format!("failpoint wal::before_wal_fsync: {detail}"))
         ));
 
-        fsync_and_track(&self.file, &mut self.durability)
+        fsync_and_track(&self.file, &mut self.durability)?;
+        self.publish_time_anchor();
+        Ok(())
     }
 
     /// Seal the WAL — no more writes will be accepted.
@@ -403,6 +435,21 @@ impl WalWriter {
     /// Current file size (bytes written to disk).
     pub fn file_offset(&self) -> u64 {
         self.file_offset
+    }
+
+    /// The largest payload one record takes: the write buffer, less the
+    /// padding and anchor reserves, the header and the encryption tag.
+    pub fn max_payload(&self) -> usize {
+        let tag = if self.encryption_ring().is_some() {
+            crate::crypto::AUTH_TAG_SIZE
+        } else {
+            0
+        };
+        self.buffer
+            .capacity()
+            .saturating_sub(self.padding_reserve() + self.anchor_reserve())
+            .saturating_sub(HEADER_SIZE + tag)
+            .min(crate::record::MAX_WAL_PAYLOAD_SIZE)
     }
 }
 

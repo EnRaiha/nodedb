@@ -36,6 +36,7 @@ mod event_loop;
 mod params;
 mod spawn;
 
+pub(crate) use boot_restore::load_boot_checkpoints;
 pub use config::CoreCompactionConfig;
 pub use params::SpawnCoreParams;
 pub use spawn::spawn_core;

@@ -44,7 +44,7 @@ pub async fn balance_as_of(
 
     // `collection` is a caller argument, so the read it names is authorized and
     // row-filtered here. The returned balance is arithmetic over `column`, so a
-    // redaction rule on that column has no honest answer — masking it would
+    // redaction rule on that column has no honest answer — masking it will
     // report a number no row holds.
     let gate = CollectionReadGate::open(state, identity, database_id, &collection)?;
     gate.require_document_engine(&collection, "BALANCE_AS_OF")?;
@@ -53,45 +53,51 @@ pub async fn balance_as_of(
     // Read current balance from the target document.
     let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
     let pk_bytes = key.as_bytes().to_vec();
-    let surrogate = state
-        .surrogate_assigner
-        .lookup(
-            nodedb_types::CollectionKey::from_bare(database_id, &collection),
-            tenant_id,
-            &pk_bytes,
-        )
-        .map_err(|e| DdlError::from_error_in_context("surrogate lookup failed", &e))?
-        .unwrap_or(nodedb_types::Surrogate::ZERO);
-    let mut get_plan =
-        PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::PointGet {
-            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
-            document_id: key.clone(),
-            surrogate,
-            pk_bytes,
-            rls_filters: Vec::new(),
-            system_time: nodedb_types::SystemTimeScope::Current,
-            valid_at_ms: None,
-        });
-    gate.inject_rls(&mut get_plan)?;
-
-    let get_resp = dispatch_utils::dispatch_to_data_plane(
+    let surrogate = crate::control::server::surrogate_exchange::lookup_surrogate_routed(
         state,
+        nodedb_types::CollectionKey::from_bare(database_id, &collection),
         tenant_id,
-        database_id,
-        vshard,
-        get_plan,
-        TraceId::ZERO,
+        &pk_bytes,
+        crate::types::TraceId::ZERO,
     )
     .await
-    .map_err(|e| DdlError::from_error_in_context("point get failed", &e))?;
+    .map_err(|e| DdlError::from_error_in_context("surrogate lookup failed", &e))?;
+    // A key the home never bound names no row: its current balance is zero.
+    let current_balance = match surrogate {
+        None => rust_decimal::Decimal::ZERO,
+        Some(surrogate) => {
+            let mut get_plan =
+                PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::PointGet {
+                    collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
+                    document_id: key.clone(),
+                    surrogate: Some(surrogate),
+                    pk_bytes,
+                    rls_filters: Vec::new(),
+                    system_time: nodedb_types::SystemTimeScope::Current,
+                    valid_at_ms: None,
+                });
+            gate.inject_rls(&mut get_plan)?;
 
-    let doc_json = crate::data::executor::response_codec::decode_payload_to_json(&get_resp.payload);
-    let doc: serde_json::Value = sonic_rs::from_str(&doc_json).unwrap_or(serde_json::Value::Null);
+            let get_resp = dispatch_utils::dispatch_to_data_plane(
+                state,
+                tenant_id,
+                database_id,
+                vshard,
+                get_plan,
+                TraceId::ZERO,
+            )
+            .await
+            .map_err(|e| DdlError::from_error_in_context("point get failed", &e))?;
 
-    let current_balance = doc
-        .get(&column)
-        .and_then(json_to_decimal)
-        .unwrap_or(rust_decimal::Decimal::ZERO);
+            let doc_json =
+                crate::data::executor::response_codec::decode_payload_to_json(&get_resp.payload);
+            let doc: serde_json::Value =
+                sonic_rs::from_str(&doc_json).unwrap_or(serde_json::Value::Null);
+            doc.get(&column)
+                .and_then(json_to_decimal)
+                .unwrap_or(rust_decimal::Decimal::ZERO)
+        }
+    };
 
     // Find materialized sum definitions to know the source collection and value_expr.
     let catalog = state.credentials.catalog();
@@ -109,7 +115,7 @@ pub async fn balance_as_of(
     };
 
     // The source collection is a second read, resolved from the catalog rather
-    // than the argument list, and it needs its own grant: a caller who may read
+    // than the argument list, and it needs its own grant: a caller who can read
     // the balance is not thereby entitled to the ledger it was summed from.
     // `value_expr` can name any of its columns, so a redaction rule anywhere on
     // it is refused rather than silently summed over hidden values.

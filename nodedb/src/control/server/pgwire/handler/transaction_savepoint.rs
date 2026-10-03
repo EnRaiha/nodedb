@@ -51,11 +51,11 @@ impl NodeDbPgHandler {
         let cmd = match savepoint_ops::parse_deferred_offset(sql_trimmed, upper) {
             Ok(Some(cmd)) => cmd,
             Ok(None) => return None,
-            Err(message) => {
+            Err(error) => {
                 return Some(Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_owned(),
                     "42601".to_owned(),
-                    message,
+                    error.to_string(),
                 )))));
             }
         };

@@ -131,7 +131,7 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         PhysicalPlan::Kv(op) => op.collection(),
         // Every CRDT op is scoped to exactly one collection's Loro document,
         // so all 20 variants carry a `collection` and the accessor is total.
-        // Reporting `None` for any of them would silently drop RLS injection,
+        // Reporting `None` for any of them will silently drop RLS injection,
         // redaction refusal, clone read/write interception, read-set tracking
         // and metering for that op.
         PhysicalPlan::Crdt(op) => Some(op.collection().as_str()),
@@ -140,7 +140,7 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
             inner.direct_write_collection()
         }
         // Read-only resolve wrapper: it reports the wrapped ingest's collection.
-        PhysicalPlan::Timeseries(TimeseriesOp::ResolveIngest(inner)) => match inner.as_ref() {
+        PhysicalPlan::Timeseries(TimeseriesOp::ResolveIngest(inner)) => match &inner.ingest {
             TimeseriesOp::Scan { collection, .. }
             | TimeseriesOp::Ingest { collection, .. }
             | TimeseriesOp::Truncate { collection, .. } => Some(collection.as_str()),
@@ -231,15 +231,12 @@ pub(crate) fn plan_engine(plan: &PhysicalPlan) -> EngineTag {
 /// INSERT); a KV miss keeps `Point` — its key IS the future write's key.
 pub(crate) fn read_key_of(plan: &PhysicalPlan, found: bool) -> ReadKey {
     match plan {
-        PhysicalPlan::Document(DocumentOp::PointGet { surrogate, .. }) => {
-            if found {
-                ReadKey::Point {
-                    repr: KeyRepr::Surrogate(surrogate.as_u32()),
-                }
-            } else {
-                ReadKey::Predicate
-            }
-        }
+        PhysicalPlan::Document(DocumentOp::PointGet { surrogate, .. }) => match surrogate {
+            Some(surrogate) if found => ReadKey::Point {
+                repr: KeyRepr::Surrogate(surrogate.as_u32()),
+            },
+            _ => ReadKey::Predicate,
+        },
         PhysicalPlan::Kv(KvOp::Get { key, .. }) | PhysicalPlan::Kv(KvOp::FieldGet { key, .. }) => {
             ReadKey::Point {
                 repr: KeyRepr::KvKey(key.clone().into_boxed_slice()),

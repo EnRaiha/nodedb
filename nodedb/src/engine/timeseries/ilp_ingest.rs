@@ -41,6 +41,9 @@ pub struct IngestBatchOutcome {
     /// the caller asked for it — a large batch would otherwise pay a `usize`
     /// per row for something almost every ingest discards.
     pub accepted_row_indices: Vec<usize>,
+    /// Input line index of each accepted row, index-aligned with
+    /// `accepted_row_indices`. Empty under the same condition.
+    pub accepted_line_indices: Vec<usize>,
 }
 
 /// Inputs to [`ingest_batch_with_lvc`].
@@ -101,40 +104,185 @@ pub fn ingest_batch_with_lvc(args: IngestBatchArgs<'_, '_>) -> IngestBatchOutcom
     let mut rejected = 0;
     let mut first_rejection: Option<String> = None;
     let mut accepted_row_indices: Vec<usize> = Vec::new();
+    let mut accepted_line_indices: Vec<usize> = Vec::new();
 
-    for line in lines {
-        // Build SeriesKey from measurement + tags.
-        let tags: Vec<(String, String)> = line
-            .tags
-            .iter()
-            .map(|(key, value)| (key.to_string(), value.to_string()))
-            .collect();
-        let key = SeriesKey::new(line.measurement.as_ref(), tags);
-        // Resolve through the catalog, never `to_series_id(0)` directly. The
-        // natural hash can collide, and both consumers of the ID below
-        // (`memtable.ingest_row` row-count stats and the last-value cache) key
-        // on it — a collision taken at face value silently folds one series'
-        // rows and last value into an unrelated series.
-        let resolved = catalog.resolve_detailed(&key);
-        let series_id = resolved.id;
-        if resolved.newly_registered && resolved.rehash_attempt > 0 {
-            tracing::warn!(
-                metric = %key.metric,
-                series_id,
-                rehash_attempt = resolved.rehash_attempt,
-                "SeriesId hash collision resolved by rehash"
-            );
+    for (line_index, line) in lines.iter().enumerate() {
+        // A value of another type than its column is refused whole: storing
+        // it coerces a string to NaN or 0, or a number to an empty
+        // symbol.
+        if let Some(conflict) = line_type_conflict(&schema, line) {
+            rejected += 1;
+            first_rejection.get_or_insert(conflict);
+            continue;
         }
+        let key = line_series_key(line);
+        let series_id = resolve_series(catalog, &key);
+        let (ts_ms, values) = line_row(&schema, line, default_timestamp_ms, bitemporal);
 
-        // Resolve timestamp.
-        let ts_ms = line
-            .timestamp_ns
-            .map(|ns| ns / 1_000_000) // ns → ms
-            .unwrap_or(default_timestamp_ms);
+        // `ingest_row` appends at the tail of every column and rolls the
+        // partial row back on error, so the row this call lands at is exactly
+        // the row count observed before it. Read before the call, because the
+        // count has already moved by the time it returns.
+        let landing_index = memtable.row_count() as usize;
+        match memtable.ingest_row(series_id, &values) {
+            Ok(IngestResult::Rejected) => {
+                rejected += 1;
+                first_rejection.get_or_insert_with(|| {
+                    "memtable rejected the row: memory budget exhausted".to_string()
+                });
+            }
+            Ok(_) => {
+                accepted += 1;
+                if collect_row_indices {
+                    accepted_row_indices.push(landing_index);
+                    accepted_line_indices.push(line_index);
+                }
+                if let Some(ref mut cache) = lvc {
+                    update_last_value(cache, series_id, ts_ms, &values);
+                }
+            }
+            Err(error) => {
+                rejected += 1;
+                // The engine's own message names the column and the rule it
+                // broke ("type mismatch at column N", "tag cardinality limit
+                // exceeded for column 'x'"). Keeping it is what lets a caller
+                // report why a row was dropped instead of only that one was.
+                first_rejection.get_or_insert_with(|| error.to_string());
+            }
+        }
+    }
 
-        // Build column values in schema order.
-        let mut values: Vec<ColumnValue> = Vec::with_capacity(schema.columns.len());
+    IngestBatchOutcome {
+        accepted,
+        rejected,
+        first_rejection,
+        accepted_row_indices,
+        accepted_line_indices,
+    }
+}
 
+/// Why `line` cannot be stored under `schema`: a field or tag whose value is
+/// of another type than its column. `None` when every value fits.
+///
+/// - A numeric column (`Float64`, `Int64`) takes a numeric or boolean field.
+///   A string field or a tag conflicts.
+/// - A `Symbol` column takes a tag or a string field. A numeric or boolean
+///   field conflicts.
+/// - A `Timestamp` column takes a numeric field or a datetime string.
+pub fn line_type_conflict(
+    schema: &super::columnar_memtable::ColumnarSchema,
+    line: &IlpLine<'_>,
+) -> Option<String> {
+    let column_type = |name: &str| {
+        schema
+            .columns
+            .iter()
+            .find(|(column, _)| column == name)
+            .map(|(_, column_type)| *column_type)
+    };
+    for (key, _) in &line.tags {
+        if let Some(column_type @ (ColumnType::Float64 | ColumnType::Int64)) =
+            column_type(key.as_ref())
+        {
+            return Some(format!(
+                "type conflict on '{key}': a tag cannot be stored in a {column_type:?} column"
+            ));
+        }
+    }
+    for (key, value) in &line.fields {
+        let Some(column_type) = column_type(key.as_ref()) else {
+            continue;
+        };
+        let fits = match column_type {
+            ColumnType::Float64 | ColumnType::Int64 => !matches!(value, FieldValue::Str(_)),
+            ColumnType::Symbol => matches!(value, FieldValue::Str(_)),
+            ColumnType::Timestamp(_) => true,
+        };
+        if !fits {
+            return Some(format!(
+                "type conflict on '{key}': a {} field cannot be stored in a {column_type:?} \
+                 column",
+                field_kind(value)
+            ));
+        }
+    }
+    None
+}
+
+/// The ILP type name of `value`, for a type-conflict reason.
+fn field_kind(value: &FieldValue<'_>) -> &'static str {
+    match value {
+        FieldValue::Float(_) => "float",
+        FieldValue::Int(_) => "integer",
+        FieldValue::UInt(_) => "unsigned integer",
+        FieldValue::Bool(_) => "boolean",
+        FieldValue::Str(_) => "string",
+    }
+}
+
+/// The series key of `line`: its measurement and tags.
+pub fn line_series_key(line: &IlpLine<'_>) -> SeriesKey {
+    let tags: Vec<(String, String)> = line
+        .tags
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+    SeriesKey::new(line.measurement.as_ref(), tags)
+}
+
+/// The series ID of `key`, resolved through `catalog`.
+///
+/// Resolve through the catalog, never `to_series_id(0)` directly. The natural
+/// hash can collide, and both consumers of the ID (`memtable.ingest_row`
+/// row-count stats and the last-value cache) key on it. A collision taken at
+/// face value folds one series' rows and last value into an unrelated series.
+pub fn resolve_series(
+    catalog: &mut SeriesCatalog,
+    key: &SeriesKey,
+) -> nodedb_types::timeseries::SeriesId {
+    let resolved = catalog.resolve_detailed(key);
+    if resolved.newly_registered && resolved.rehash_attempt > 0 {
+        tracing::warn!(
+            metric = %key.metric,
+            series_id = resolved.id,
+            rehash_attempt = resolved.rehash_attempt,
+            "SeriesId hash collision resolved by rehash"
+        );
+    }
+    resolved.id
+}
+
+/// Record a stored row in the last-value cache: its first Float64 value.
+pub fn update_last_value(
+    cache: &mut super::last_value_cache::LastValueCache,
+    series_id: nodedb_types::timeseries::SeriesId,
+    ts_ms: i64,
+    values: &[ColumnValue],
+) {
+    let value = values
+        .iter()
+        .find_map(|v| match v {
+            ColumnValue::Float64(f) => Some(*f),
+            _ => None,
+        })
+        .unwrap_or(0.0);
+    cache.update(series_id, ts_ms, value);
+}
+
+/// The timestamp and the column values `line` stores under `schema`, in
+/// schema order.
+pub fn line_row(
+    schema: &super::columnar_memtable::ColumnarSchema,
+    line: &IlpLine<'_>,
+    default_timestamp_ms: i64,
+    bitemporal: Option<BitempStamps>,
+) -> (i64, Vec<ColumnValue>) {
+    let ts_ms = line
+        .timestamp_ns
+        .map(|ns| ns / 1_000_000) // ns → ms
+        .unwrap_or(default_timestamp_ms);
+    let mut values: Vec<ColumnValue> = Vec::with_capacity(schema.columns.len());
+    {
         for (col_idx, (col_name, col_type)) in schema.columns.iter().enumerate() {
             match col_type {
                 // Only the designated time column takes the line's timestamp.
@@ -180,53 +328,8 @@ pub fn ingest_batch_with_lvc(args: IngestBatchArgs<'_, '_>) -> IngestBatchOutcom
                 }
             }
         }
-
-        // `ingest_row` appends at the tail of every column and rolls the
-        // partial row back on error, so the row this call lands at is exactly
-        // the row count observed before it. Read before the call, because the
-        // count has already moved by the time it returns.
-        let landing_index = memtable.row_count() as usize;
-        match memtable.ingest_row(series_id, &values) {
-            Ok(IngestResult::Rejected) => {
-                rejected += 1;
-                first_rejection.get_or_insert_with(|| {
-                    "memtable rejected the row: memory budget exhausted".to_string()
-                });
-            }
-            Ok(_) => {
-                accepted += 1;
-                if collect_row_indices {
-                    accepted_row_indices.push(landing_index);
-                }
-                // Update last-value cache with the first float64 field value.
-                if let Some(ref mut cache) = lvc {
-                    let value = values
-                        .iter()
-                        .find_map(|v| match v {
-                            ColumnValue::Float64(f) => Some(*f),
-                            _ => None,
-                        })
-                        .unwrap_or(0.0);
-                    cache.update(series_id, ts_ms, value);
-                }
-            }
-            Err(error) => {
-                rejected += 1;
-                // The engine's own message names the column and the rule it
-                // broke ("type mismatch at column N", "tag cardinality limit
-                // exceeded for column 'x'"). Keeping it is what lets a caller
-                // report why a row was dropped instead of only that one was.
-                first_rejection.get_or_insert_with(|| error.to_string());
-            }
-        }
     }
-
-    IngestBatchOutcome {
-        accepted,
-        rejected,
-        first_rejection,
-        accepted_row_indices,
-    }
+    (ts_ms, values)
 }
 
 /// Read a non-designated timestamp column's value from the line's field set.

@@ -1,17 +1,95 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Derivation of the sequencer leader's starting epoch.
+//! Derivation of the sequencer leader's starting epoch, and the service's
+//! response to a halted state machine.
 //!
-//! Split out of the service so the reasoning that guards it stays next to the
-//! one function that implements it.
+//! The reasoning that guards the seed stays next to the one function that
+//! implements it.
 
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 use tracing::{debug, info, warn};
 
 use crate::calvin::sequencer::config::SEQUENCER_GROUP_ID;
 use crate::calvin::sequencer::state_machine::SequencerStateMachine;
 use crate::multi_raft::MultiRaft;
+
+use super::core::SequencerService;
+
+impl SequencerService {
+    /// Derive the epoch seed once, then reuse it for the life of this service.
+    ///
+    /// Delegates the safety gate to [`derive_epoch_seed`]. `None` means it is
+    /// not yet safe to mint an epoch on this node and the caller must skip
+    /// minting for this tick.
+    ///
+    /// Publishes the outcome to `metrics.epoch_seeded` so the readiness probe
+    /// can tell whether a Calvin submit landing here can be sequenced.
+    pub(super) fn ensure_epoch_seeded(&mut self) -> Option<u64> {
+        let seed = self.derive_or_cached_epoch();
+        self.metrics
+            .epoch_seeded
+            .store(seed.is_some(), Ordering::Relaxed);
+        seed
+    }
+
+    /// The seed itself, without the readiness publication.
+    fn derive_or_cached_epoch(&mut self) -> Option<u64> {
+        // Checked ahead of the cached seed, not just before deriving one: a halt
+        // can land long after the seed was taken. A halted state machine refuses
+        // every epoch batch, so a minted epoch would only manufacture identities
+        // that nothing on this node will ever apply.
+        if self.state_machine_halted() {
+            return None;
+        }
+        if let Some(epoch) = self.current_epoch {
+            return Some(epoch);
+        }
+        let epoch = derive_epoch_seed(self.node_id, &self.multi_raft, &self.state_machine)?;
+        self.current_epoch = Some(epoch);
+        Some(epoch)
+    }
+
+    /// Whether this node's sequencer state machine has stopped applying epoch
+    /// batches after an unrecoverable epoch regression.
+    pub(super) fn state_machine_halted(&self) -> bool {
+        self.state_machine
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_halted()
+    }
+
+    /// Fail every queued submission fast while the state machine is halted.
+    ///
+    /// A halt scopes the fault to sequencing: reads, non-Calvin writes, metadata
+    /// and every other engine on this node are unaffected, so the node keeps
+    /// serving. What it must not do is keep accepting Calvin work — nothing will
+    /// ever sequence it. Dropping each submission's assignment makes the
+    /// awaiting Control-Plane caller observe a closed channel immediately and
+    /// surface an error, instead of every writer hanging to its deadline behind
+    /// a queue that will never drain. Reservation requests degrade to plain OCC
+    /// the same way they do on a follower.
+    pub(super) fn shed_submissions_after_halt(&mut self) {
+        let discarded = self.discard_inbox();
+        let reservations_discarded = self.reservation_receiver.drain_all_discard();
+        if !self.halt_reported {
+            self.halt_reported = true;
+            tracing::error!(
+                node_id = self.node_id,
+                "sequencer state machine halted on an epoch regression; this node has stopped \
+                 sequencing and is failing Calvin submissions fast. Every other query path \
+                 keeps serving — operator intervention is required to resume sequencing."
+            );
+        }
+        if discarded > 0 || reservations_discarded > 0 {
+            debug!(
+                node_id = self.node_id,
+                discarded, reservations_discarded, "sequencer halted; shed queued submissions"
+            );
+        }
+    }
+}
 
 /// Derive — once — the first epoch this node may propose, returning `None`
 /// while it is not yet safe to derive one.

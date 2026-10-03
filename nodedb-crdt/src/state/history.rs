@@ -90,8 +90,19 @@ impl CrdtState {
     /// Discards oplog entries before the target version. Current state and
     /// every version at or after the target, including the target itself,
     /// stays readable.
+    ///
+    /// A target at or below the current compaction boundary is a no-op. A
+    /// compaction is re-driven after a restart or a re-delivery, and it or a
+    /// newer compaction may already have moved the boundary there.
     pub fn compact_at_version(&mut self, version: &loro::VersionVector) -> Result<()> {
-        self.compact_to_frontiers(&self.doc.vv_to_frontiers(version))
+        let frontiers = self.doc.vv_to_frontiers(version);
+        if self.doc.is_shallow()
+            && (self.doc.shallow_since_vv().to_vv().includes_vv(version)
+                || self.doc.shallow_since_frontiers() == frontiers)
+        {
+            return Ok(());
+        }
+        self.compact_to_frontiers(&frontiers)
     }
 
     /// Generate a forward restore delta without changing authoritative state.
@@ -353,6 +364,49 @@ mod tests {
             matches!(error, CrdtError::VersionBeforeCompactionBoundary { .. }),
             "expected a compaction-boundary refusal, got {error:?}"
         );
+    }
+
+    /// Compacting to a target the document already discarded changes nothing
+    /// and succeeds, so a re-driven older compaction cannot fail forever.
+    #[test]
+    fn compaction_below_the_boundary_is_a_no_op() {
+        let mut history = three_versions();
+        history
+            .state
+            .compact_at_version(&history.after_v2)
+            .expect("compact");
+        history
+            .state
+            .compact_at_version(&history.after_v1)
+            .expect("an older target is already compacted");
+
+        let row = history
+            .state
+            .read_at_version("docs", "doc-1", &history.after_v2)
+            .expect("the newer target still reads")
+            .expect("row exists");
+        assert_eq!(title_of(&row), Some(LoroValue::String("v2".into())));
+    }
+
+    /// Re-running the same compaction succeeds and keeps the target readable.
+    #[test]
+    fn repeating_a_compaction_succeeds() {
+        let mut history = three_versions();
+        history
+            .state
+            .compact_at_version(&history.after_v2)
+            .expect("compact");
+        history
+            .state
+            .compact_at_version(&history.after_v2)
+            .expect("a repeated compaction");
+
+        let row = history
+            .state
+            .read_at_version("docs", "doc-1", &history.after_v2)
+            .expect("the target still reads")
+            .expect("row exists");
+        assert_eq!(title_of(&row), Some(LoroValue::String("v2".into())));
     }
 
     /// The compaction target itself stays readable. It names the shallow

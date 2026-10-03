@@ -3,10 +3,8 @@
 //! `CREATE SEARCH INDEX` / `CREATE FULLTEXT INDEX` DSL handler.
 //!
 //! The two keywords are documented as equivalents, so they share one
-//! implementation rather than two parsers that drift: they previously
-//! disagreed on whether the column list is written `(a, b)` or `FIELDS a, b`,
-//! on whether a list may name more than one column, and on whether `ANALYZER`
-//! exists at all. Both spellings of the column list are accepted here, and the
+//! implementation rather than two parsers that drift on the column list
+//! syntax, the column count, and the `ANALYZER` clause. Both spellings of the column list are accepted here, and the
 //! statement is rejected if any token goes unread.
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -125,7 +123,7 @@ async fn create_text_index(
     let fuzzy_default = stmt.options.boolean("FUZZY");
 
     // One index, under the name the statement declared. Synthesizing a
-    // per-column name and discarding the declared one would leave
+    // per-column name and discarding the declared one will leave
     // `DROP INDEX <the name I typed>` unable to match.
     let index_name = resolve_index_name(&stmt, &collection);
     if let Some(taken) = state
@@ -162,7 +160,8 @@ async fn create_text_index(
             collection: &collection,
             fields: stmt.header.columns.clone(),
         },
-    )?;
+    )
+    .await?;
     crate::control::server::shared::ddl::owner::propose_owner(
         state,
         IndexKind::FullText.owner_object_type(),
@@ -170,7 +169,8 @@ async fn create_text_index(
         tenant_id,
         &index_name,
         &identity.username,
-    )?;
+    )
+    .await?;
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
         Some(tenant_id),
@@ -232,7 +232,7 @@ async fn create_text_index(
 /// declared, or a per-collection default when the name was omitted.
 ///
 /// The parser substitutes a fixed placeholder for an omitted name; a
-/// placeholder would collide across collections, so it is replaced by a name
+/// placeholder will collide across collections, so it is replaced by a name
 /// derived from the collection.
 fn resolve_index_name(stmt: &IndexStatement, collection: &str) -> String {
     const PLACEHOLDERS: [&str; 2] = ["_auto_search", "_auto_fulltext"];

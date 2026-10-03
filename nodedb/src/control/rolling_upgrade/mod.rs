@@ -1,28 +1,21 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! N-1 rolling upgrade compatibility.
+//! Cluster wire-version view.
 //!
-//! The on-disk and in-flight wire format is versioned so a node
-//! running release N can operate in a cluster that still contains
-//! nodes running release N-1. Feature flags gate on the
-//! cluster-wide minimum version: a feature introduced at version
-//! V only activates once every node reports `wire_version >= V`,
-//! and the minimum is derived on demand from the live
-//! `ClusterTopology` (see [`view::ClusterVersionView`]).
+//! There is no rolling-upgrade window before 1.0: `nodedb_types::wire_version`
+//! pins `MIN_WIRE_FORMAT_VERSION == WIRE_FORMAT_VERSION` (floor == ceiling),
+//! and every join and wire-version handshake additionally requires exact
+//! `WIRE_BUILD_ID` equality — a cluster can only ever contain nodes on one
+//! build. No code path gates on a version.
 //!
 //! Layout:
 //!
-//! - [`versions`] — wire-version constants and static compatibility
-//!   helpers (`accept_message`, `should_compat_mode`).
+//! - [`versions`] — `should_compat_mode`.
 //! - [`view`] — `ClusterVersionView` plus `compute_from_topology`
-//!   and the feature-gate predicates. Pure functions, no shared
-//!   mutable state.
+//!   and the version predicates. Pure functions, no shared mutable state.
 
 pub mod versions;
 pub mod view;
 
-pub use versions::{
-    DESCRIPTOR_DRAIN_VERSION, DESCRIPTOR_VERSIONING_VERSION, DISTRIBUTED_CATALOG_VERSION,
-    accept_message, should_compat_mode,
-};
+pub use versions::should_compat_mode;
 pub use view::{ClusterVersionView, compute_from_topology};

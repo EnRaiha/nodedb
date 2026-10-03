@@ -52,9 +52,7 @@ fn status(command: &str) -> Vec<DdlResult> {
 
 /// Require that the identity is superuser or tenant_admin.
 ///
-/// Folded in verbatim from the pgwire `require_tenant_admin` helper: it does
-/// NOT emit an audit record on denial and returns SQLSTATE 42501 with the
-/// identical message.
+/// It does NOT emit an audit record on denial and returns SQLSTATE 42501.
 fn require_tenant_admin(identity: &AuthenticatedIdentity, action: &str) -> Result<(), DdlError> {
     if identity.is_superuser || identity.has_role(&Role::TenantAdmin) {
         Ok(())
@@ -67,7 +65,7 @@ fn require_tenant_admin(identity: &AuthenticatedIdentity, action: &str) -> Resul
 }
 
 /// Handle `CREATE TYPE <name> AS ENUM ('label1', ...)`.
-pub fn create_enum_type(
+pub async fn create_enum_type(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -97,13 +95,13 @@ pub fn create_enum_type(
         created_at,
     };
 
-    persist_and_register(state, stored)?;
+    persist_and_register(state, stored).await?;
 
     Ok(status("CREATE TYPE"))
 }
 
 /// Handle `CREATE TYPE <name> AS (<field1> <type1>, ...)`.
-pub fn create_composite_type(
+pub async fn create_composite_type(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -140,13 +138,13 @@ pub fn create_composite_type(
         created_at,
     };
 
-    persist_and_register(state, stored)?;
+    persist_and_register(state, stored).await?;
 
     Ok(status("CREATE TYPE"))
 }
 
 /// Handle `DROP TYPE [IF EXISTS] <name>`.
-pub fn drop_type(
+pub async fn drop_type(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -177,20 +175,14 @@ pub fn drop_type(
         ));
     }
 
-    let catalog = state.credentials.catalog();
-
     let entry = crate::control::catalog_entry::CatalogEntry::DeleteCustomType {
         database_id: database_id_u64,
         tenant_id,
         name: name.to_string(),
     };
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        catalog
-            .delete_custom_type(database_id_u64, tenant_id, name)
-            .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))?;
-    }
 
     state
         .custom_type_registry
@@ -200,7 +192,7 @@ pub fn drop_type(
 }
 
 /// Handle `ALTER TYPE <name> ADD VALUE 'label'`.
-pub fn alter_type_add_value(
+pub async fn alter_type_add_value(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -234,7 +226,7 @@ pub fn alter_type_add_value(
 
     labels.push(label.to_string());
 
-    persist_and_register(state, stored)?;
+    persist_and_register(state, stored).await?;
 
     Ok(status("ALTER TYPE"))
 }
@@ -280,23 +272,17 @@ pub fn show_types(
 /// Persist the entry to catalog and register in the in-memory registry.
 ///
 /// The registry takes the record the catalog wrote, never `stored`: the
-/// catalog assigns the OID and `stored` does not carry it. On the replicated
-/// path the post-apply lane registers the written record on every node, this
-/// one included, so the handler registers nothing.
-fn persist_and_register(state: &SharedState, stored: StoredCustomType) -> Result<(), DdlError> {
-    let catalog = state.credentials.catalog();
-
-    let entry =
-        crate::control::catalog_entry::CatalogEntry::PutCustomType(Box::new(stored.clone()));
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+/// catalog assigns the OID and `stored` does not carry it. The post-apply lane
+/// registers the written record on every node, this one included, so the
+/// handler registers nothing.
+async fn persist_and_register(
+    state: &SharedState,
+    stored: StoredCustomType,
+) -> Result<(), DdlError> {
+    let entry = crate::control::catalog_entry::CatalogEntry::PutCustomType(Box::new(stored));
+    crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        let written = catalog
-            .put_custom_type_assigning_oid(&stored)
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        state.custom_type_registry.register(written);
-    }
-
     Ok(())
 }
 

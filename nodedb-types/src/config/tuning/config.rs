@@ -100,6 +100,7 @@ mod tests {
         assert_eq!(parsed.cluster_transport.ghost_sweep_interval_secs, 1800);
         assert_eq!(parsed.cluster_transport.health_ping_interval_secs, 5);
         assert_eq!(parsed.cluster_transport.health_failure_threshold, 3);
+        assert_eq!(parsed.cluster_transport.change_feed_heartbeat_ms, 1_000);
         // New QueryTuning fields.
         assert_eq!(parsed.query.doc_cache_entries, 4096);
         assert_eq!(parsed.query.columnar_flush_threshold, 65_536);

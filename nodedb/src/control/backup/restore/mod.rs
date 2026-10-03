@@ -8,6 +8,8 @@
 //! resolved in `databases`; `target` maps a source collection name to its
 //! destination database.
 
+mod array_reissue;
+pub(crate) mod bind_conflicts;
 pub mod columnar_reissue;
 pub(crate) mod crdt_reissue;
 mod databases;
@@ -17,9 +19,11 @@ mod kv_reissue;
 mod orchestrate;
 mod quorum;
 mod redo_reissue;
-mod sections;
+pub(in crate::control::backup) mod sections;
+mod surrogate_floor;
 mod target;
 pub mod timeseries_reissue;
+mod validate;
 pub mod vector_reissue;
 
-pub use orchestrate::{RestoreStats, restore_tenant};
+pub use orchestrate::{CollectionRows, RestoreStats, reissue_into_database, restore_tenant};

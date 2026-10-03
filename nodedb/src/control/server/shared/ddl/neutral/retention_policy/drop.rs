@@ -42,7 +42,7 @@ pub async fn drop_retention_policy(
         .ok_or_else(|| err("42704", format!("retention policy '{name}' does not exist")))?;
 
     // Replicated: every node deletes the row and drops its registry entry.
-    propose_delete(state, &policy_def)?;
+    propose_delete(state, &policy_def).await?;
 
     // Emit CRDT tombstone delta.
     {

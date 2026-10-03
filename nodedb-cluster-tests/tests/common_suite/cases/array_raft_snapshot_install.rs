@@ -6,9 +6,10 @@
 //! schema are accepted and replicated correctly.
 //!
 //! This exercises the full path through `ReplicatedWrite::ArraySchema` in
-//! `run_apply_loop` → `apply_array_schema` → `OriginSchemaRegistry::import_snapshot`.
-//! After that, `ReplicatedWrite::ArrayOp` entries are accepted because every
-//! node now has the schema.
+//! `run_apply_loop` → `apply_array_schema` → `OriginSchemaRegistry::import_snapshot`,
+//! and the `PutArray` catalog entry the receiving node proposes. After that,
+//! `ReplicatedWrite::ArrayOp` entries are accepted because every node holds
+//! the schema and the catalog row.
 
 use crate::common;
 
@@ -23,9 +24,7 @@ use nodedb_array::types::cell_value::value::CellValue;
 use nodedb_array::types::coord::value::CoordValue;
 use nodedb_types::sync::wire::array::{ArrayDeltaMsg, ArraySchemaSyncMsg};
 
-use common::array_sync::{
-    build_schema_snapshot, hlc, import_schema_snapshot, register_catalog_entry,
-};
+use common::array_sync::{build_schema_snapshot, hlc, import_schema_snapshot};
 use common::cluster_harness::{TestCluster, wait_for};
 
 fn shareds(cluster: &TestCluster) -> Vec<&Arc<SharedState>> {
@@ -83,8 +82,9 @@ fn op_log_count(shared: &Arc<SharedState>) -> u64 {
 /// cluster/array_raft_snapshot_install
 ///
 /// Proposes a schema snapshot on node 1 only (node 2 and 3 start without
-/// the schema). After the schema proposal is committed, all nodes must have
-/// the schema. Subsequently, data ops are replicated correctly to all nodes.
+/// the schema or a catalog row). After the proposal commits, every node must
+/// hold the schema and the replicated catalog row. Subsequently, data ops are
+/// replicated correctly to all nodes.
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_array_raft_snapshot_install() {
     let cluster = TestCluster::spawn_three().await.expect("3-node cluster");
@@ -94,12 +94,6 @@ async fn cluster_array_raft_snapshot_install() {
     // Register the schema on node 1 only (nodes 2+3 start unaware).
     let (snap_bytes, schema_hlc) = build_schema_snapshot("snparray");
     import_schema_snapshot(shareds[0], "snparray", &snap_bytes, schema_hlc);
-    register_catalog_entry(shareds[0], "snparray");
-
-    // Also register catalog entries on all nodes so the Data Plane can
-    // accept ops — the catalog is local and must be pre-populated.
-    register_catalog_entry(shareds[1], "snparray");
-    register_catalog_entry(shareds[2], "snparray");
 
     let inbound = make_inbound(shareds[0]);
 
@@ -127,6 +121,30 @@ async fn cluster_array_raft_snapshot_install() {
                     .schema_hlc("snparray")
                     .map(|h| h == schema_hlc)
                     .unwrap_or(false)
+            })
+        },
+    )
+    .await;
+
+    // The catalog row replicated to every node, durable and in the mirror.
+    wait_for(
+        "all 3 nodes hold the snparray catalog row",
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || {
+            shareds.iter().all(|s| {
+                let durable = s
+                    .credentials
+                    .catalog()
+                    .load_all_arrays()
+                    .map(|rows| rows.iter().any(|a| a.name == "snparray"))
+                    .unwrap_or(false);
+                let mirror = s
+                    .array_catalog
+                    .read()
+                    .map(|c| c.all_entries().iter().any(|a| a.name == "snparray"))
+                    .unwrap_or(false);
+                durable && mirror
             })
         },
     )

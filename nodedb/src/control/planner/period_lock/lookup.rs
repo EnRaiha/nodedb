@@ -4,7 +4,7 @@
 
 use crate::control::server::surrogate_exchange::lookup_surrogate_routed;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, TraceId};
 
 /// Request scope shared by every per-row period-lock resolution call within
 /// one [`resolve_period_lock_targets`](super::resolve::resolve_period_lock_targets)
@@ -31,10 +31,8 @@ pub(super) async fn lookup_period_surrogate(
     database_id: DatabaseId,
     trace_id: TraceId,
 ) -> crate::Result<Option<nodedb_types::Surrogate>> {
-    let vshard = VShardId::from_key(period_key.as_bytes());
     lookup_surrogate_routed(
         state,
-        vshard,
         nodedb_types::CollectionKey::from_bare(database_id, ref_table),
         tenant_id,
         period_key.as_bytes(),

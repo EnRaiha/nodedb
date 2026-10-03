@@ -52,9 +52,10 @@ pub(in crate::data::executor) fn vector_sidecar_matches(
 impl CoreLoop {
     /// The surrogates `targets` names, in a deterministic order.
     ///
-    /// Point targets keep statement order with duplicates removed. Predicate
-    /// targets come back in sparse-store key order. A malformed filter
-    /// payload is an error, never an empty predicate: a silent decode
+    /// Point targets keep statement order with duplicates removed. A point
+    /// target under `Surrogate::ZERO` names no row and refuses the statement.
+    /// Predicate targets come back in sparse-store key order. A malformed
+    /// filter payload is an error, never an empty predicate: a silent decode
     /// failure would turn a `WHERE` into a whole-collection write.
     pub(in crate::data::executor) fn resolve_vector_direct_targets(
         &self,
@@ -65,11 +66,18 @@ impl CoreLoop {
     ) -> Result<Vec<Surrogate>, ErrorCode> {
         match targets {
             VectorWriteTargets::Surrogates(surrogates) => {
+                if let Some(refusal) = surrogates.iter().find_map(|s| {
+                    crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+                        "vector", collection, *s,
+                    )
+                }) {
+                    return Err(refusal);
+                }
                 let mut seen = std::collections::HashSet::with_capacity(surrogates.len());
                 Ok(surrogates
                     .iter()
                     .copied()
-                    .filter(|s| *s != Surrogate::ZERO && seen.insert(*s))
+                    .filter(|s| seen.insert(*s))
                     .collect())
             }
             VectorWriteTargets::Predicate(filter_bytes) => {

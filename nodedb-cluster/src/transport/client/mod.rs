@@ -9,6 +9,7 @@
 //!
 //! [`RaftTransport`]: nodedb_raft::transport::RaftTransport
 
+mod attempt;
 pub mod close;
 pub mod pool;
 pub mod raft_impl;

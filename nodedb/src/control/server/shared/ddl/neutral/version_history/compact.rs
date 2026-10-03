@@ -23,8 +23,8 @@ fn err(sqlstate: &str, message: String) -> DdlError {
 /// before the cutoff are deleted from the catalog.
 ///
 /// The proposed entry carries the checkpoint's version vector, so every node
-/// that applies it compacts its own oplog from post-apply. A single node has
-/// no applier, so this handler dispatches the compaction itself.
+/// that applies it compacts its own oplog from post-apply. On a node with no
+/// metadata group the proposer applies the entry and awaits that compaction.
 ///
 /// Compaction replaces the document with a shallow snapshot. `AS OF` /
 /// `AT VERSION` reads keep working for every version at or above the cutoff.
@@ -62,25 +62,13 @@ pub async fn compact_history(
     let deleted = catalog
         .count_checkpoints_before(doc, record.created_at)
         .map_err(|e| DdlError::from_error(&e))?;
-    let outcome = super::replicate::propose_compact_history(
+    super::replicate::propose_compact_history(
         state,
         doc,
         record.created_at,
         &record.version_vector_json,
-    )?;
-
-    // Single node: no applier runs, so post-apply never fires. Dispatch the
-    // compaction the post-apply lane dispatches everywhere else.
-    if outcome.needs_local_apply() {
-        crate::control::catalog_entry::post_apply::compact_async(
-            database_id.as_u64(),
-            tenant_id.as_u64(),
-            &collection,
-            &record.version_vector_json,
-            state,
-        )
-        .await;
-    }
+    )
+    .await?;
 
     state
         .audit

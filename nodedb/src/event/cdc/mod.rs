@@ -7,10 +7,12 @@ pub mod consumer_group;
 pub mod event;
 pub mod lag_warner;
 pub mod offset;
+pub mod position;
 pub mod redaction;
 mod redaction_warn;
 pub mod registry;
 pub mod router;
+pub mod sink_owner;
 pub mod stream_def;
 
 pub use consumer_group::{ConsumerGroupDef, GroupRegistry, OffsetStore};

@@ -17,8 +17,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use nodedb_types::backup_envelope::{
-    DEFAULT_MAX_TOTAL_BYTES, DatabaseBlob, DatabaseDataSection, SECTION_ORIGIN_CATALOG_ROWS,
-    SECTION_ORIGIN_DATABASES, parse_encrypted as parse_envelope,
+    CollectionVerification, DEFAULT_MAX_TOTAL_BYTES, DatabaseBlob, DatabaseDataSection,
+    SECTION_ORIGIN_CATALOG_ROWS, SECTION_ORIGIN_DATABASES, SECTION_ORIGIN_VERIFICATION,
+    VerifiedPart, parse_encrypted as parse_envelope,
 };
 
 use crate::common;
@@ -197,6 +198,42 @@ async fn three_node_backup_gathers_one_section_per_node_and_database() {
             (1..=3).contains(&nodes.len()),
             "database {database_id}: expected 1..=3 source nodes, got {nodes:?}"
         );
+    }
+
+    // The verification section counts each collection's rows once, summed
+    // over the source nodes, never once per replica.
+    let verification: Vec<CollectionVerification> = env
+        .sections
+        .iter()
+        .filter(|s| s.origin_node_id == SECTION_ORIGIN_VERIFICATION)
+        .flat_map(|s| {
+            zerompk::from_msgpack::<Vec<CollectionVerification>>(&s.body)
+                .expect("decode verification")
+        })
+        .collect();
+    for (database, rows) in DATABASES {
+        let database_id = listed
+            .iter()
+            .find(|b| b.name == database)
+            .map(|b| b.database_id)
+            .unwrap_or_else(|| panic!("database {database} is listed"));
+        for (collection, part) in [
+            ("cl_docs", VerifiedPart::Documents),
+            ("cl_kv", VerifiedPart::KeyValue),
+            ("cl_cols", VerifiedPart::Columnar),
+        ] {
+            let count = verification
+                .iter()
+                .find(|r| {
+                    r.database_id == database_id && r.collection == collection && r.part == part
+                })
+                .map(|r| r.tally.count);
+            assert_eq!(
+                count,
+                Some(rows as u64),
+                "{database}.{collection} ({part}) must record {rows} rows"
+            );
+        }
     }
 
     cluster.shutdown().await;

@@ -26,14 +26,13 @@ use nodedb_types::columnar::StrictSchema;
 use nodedb_types::{CollectionType, DocumentMode, RowIdentity, StorageKey};
 
 use crate::control::state::SharedState;
-use crate::control::surrogate::CarriedIdentity;
 use crate::data::executor::strict_format::{binary_tuple_to_msgpack, undecodable_strict_row};
 use crate::engine::sparse::btree_versioned::{TAG_LIVE, TAG_TOMBSTONE, decode_value};
 use crate::types::{DatabaseId, SurrogateBindEntry, TenantId};
 
 use super::super::target::DatabaseTarget;
-use super::sub_record::{VersionStamp, document_put, document_tombstone};
-use super::units::{CollectionUnits, RowUnit};
+use super::prepared::{PendingBody, PendingRow, PreparedRows};
+use super::sub_record::VersionStamp;
 
 /// A row as the backup stored it.
 enum StoredRow {
@@ -47,6 +46,9 @@ enum StoredRow {
 struct CollectionShape {
     strict: Option<StrictSchema>,
     declared_primary_key: Option<String>,
+    /// The collection declares `HASH_CHAIN`: its rows re-issue in their
+    /// install order, so the destination relinks the source chain.
+    hash_chain: bool,
 }
 
 fn malformed(key: &str) -> crate::Error {
@@ -70,6 +72,28 @@ fn split_key(key: &str, tenant_id: u64) -> crate::Result<(u64, &str, &str)> {
         return Err(malformed(key));
     }
     Ok((db, collection, rest))
+}
+
+/// The highest surrogate any restored row's storage key carries, `0` for
+/// none. A row the backup carries no bind for keeps its key's surrogate.
+pub(in crate::control::backup::restore) fn max_row_surrogate(
+    tenant_id: u64,
+    documents: &[(String, Vec<u8>)],
+    documents_versioned: &[(String, Vec<u8>)],
+) -> crate::Result<u32> {
+    let mut highest = 0u32;
+    for (key, _) in documents {
+        let (_, _, rest) = split_key(key, tenant_id)?;
+        let storage_key = StorageKey::parse(rest).ok_or_else(|| malformed(key))?;
+        highest = highest.max(storage_key.surrogate().as_u32());
+    }
+    for (key, _) in documents_versioned {
+        let (_, _, rest) = split_key(key, tenant_id)?;
+        let (hex, _) = rest.split_once('\x00').ok_or_else(|| malformed(key))?;
+        let storage_key = StorageKey::parse(hex).ok_or_else(|| malformed(key))?;
+        highest = highest.max(storage_key.surrogate().as_u32());
+    }
+    Ok(highest)
 }
 
 /// Group every restored row by `(database, collection)`, then by storage key.
@@ -145,7 +169,43 @@ fn collection_shape(
     Ok(CollectionShape {
         strict,
         declared_primary_key: stored.declared_primary_key,
+        hash_chain: stored.hash_chain,
     })
+}
+
+/// A `HASH_CHAIN` row's install-order position, read from its stored body:
+/// the current body, or the first live version.
+fn chain_seq(
+    shape: &CollectionShape,
+    collection: &str,
+    key: StorageKey,
+    row: &StoredRow,
+) -> crate::Result<u64> {
+    let body = match row {
+        StoredRow::Current(body) => Some(body_msgpack(shape, collection, key, body)?),
+        StoredRow::Versions(versions) => {
+            let mut live = None;
+            for (_, raw) in versions {
+                let version = decode_value(raw)?;
+                if version.tag == TAG_LIVE {
+                    live = Some(body_msgpack(shape, collection, key, version.body)?);
+                    break;
+                }
+            }
+            live
+        }
+    };
+    body.and_then(|body| nodedb_types::json_from_msgpack(&body).ok())
+        .and_then(|doc| {
+            doc.get(crate::types::hash_chain::CHAIN_SEQ_FIELD)
+                .and_then(|seq| seq.as_u64())
+        })
+        .ok_or_else(|| crate::Error::Serialization {
+            format: "backup".into(),
+            detail: format!(
+                "restore: row {key} of hash-chained '{collection}' carries no chain position"
+            ),
+        })
 }
 
 /// A stored body as the MessagePack a put carries.
@@ -162,17 +222,10 @@ fn body_msgpack(
     }
 }
 
-/// Builds each row's unit for one collection.
+/// Decodes each row of one collection and names its identity.
 struct RowBuilder<'a> {
-    state: &'a SharedState,
-    /// The destination database.
-    database_id: DatabaseId,
-    tenant: TenantId,
-    /// Bare catalog name: it keys the identity binds.
+    /// Bare catalog name.
     collection: &'a str,
-    /// The name the destination Data Plane stores the collection under: the
-    /// sub-records carry it.
-    stored: &'a str,
     shape: CollectionShape,
     /// `storage surrogate → primary key` the backup bound for this collection.
     binds: HashMap<u32, &'a [u8]>,
@@ -200,41 +253,17 @@ impl RowBuilder<'_> {
         })
     }
 
-    /// Bind the row's identity on this node. The backup's surrogate wins
-    /// unless this node already binds the identity: the row then installs
-    /// under that surrogate, over the row it names.
-    fn bind(&self, identity: &RowIdentity, key: StorageKey) -> crate::Result<CarriedIdentity> {
-        let surrogate = self.state.surrogate_assigner.bind(
-            nodedb_types::CollectionKey::from_bare(self.database_id, self.collection),
-            self.tenant,
-            identity.as_str().as_bytes(),
-            key.surrogate(),
-        )?;
-        Ok(CarriedIdentity {
-            collection: self.collection.to_string(),
-            pk_bytes: identity.as_str().as_bytes().to_vec(),
-            surrogate,
-        })
-    }
-
-    fn current(&self, key: StorageKey, body: &[u8]) -> crate::Result<RowUnit> {
+    fn current(&self, key: StorageKey, body: &[u8]) -> crate::Result<PendingRow> {
         let value = body_msgpack(&self.shape, self.collection, key, body)?;
         let identity = self.identity(key, Some(&value))?;
-        let carried = self.bind(&identity, key)?;
-        let op = document_put(
-            self.stored,
-            identity.as_str(),
-            value,
-            carried.surrogate.as_u32(),
-            None,
-        )?;
-        Ok(RowUnit {
-            ops: vec![op],
-            identities: vec![carried],
+        Ok(PendingRow {
+            key,
+            identity,
+            body: PendingBody::Current(value),
         })
     }
 
-    fn versions(&self, key: StorageKey, versions: &[(i64, Vec<u8>)]) -> crate::Result<RowUnit> {
+    fn versions(&self, key: StorageKey, versions: &[(i64, Vec<u8>)]) -> crate::Result<PendingRow> {
         // Decode every version first: the identity comes from a live body.
         let mut decoded = Vec::with_capacity(versions.len());
         for (sys_from_ms, raw) in versions {
@@ -267,44 +296,26 @@ impl RowBuilder<'_> {
         }
         let first_live = decoded.iter().find_map(|(_, body)| body.as_deref());
         let identity = self.identity(key, first_live)?;
-        let carried = self.bind(&identity, key)?;
-        let surrogate = carried.surrogate.as_u32();
-        let mut ops = Vec::with_capacity(decoded.len());
-        for (stamp, body) in decoded {
-            ops.push(match body {
-                Some(value) => document_put(
-                    self.stored,
-                    identity.as_str(),
-                    value,
-                    surrogate,
-                    Some(stamp),
-                )?,
-                None => document_tombstone(
-                    self.stored,
-                    identity.as_str(),
-                    surrogate,
-                    stamp.sys_from_ms,
-                )?,
-            });
-        }
-        Ok(RowUnit {
-            ops,
-            identities: vec![carried],
+        Ok(PendingRow {
+            key,
+            identity,
+            body: PendingBody::Versions(decoded),
         })
     }
 }
 
-/// Every restored row of `tenant_id` in one database, one unit per row,
-/// grouped by collection. Every row key must name `target.source`. `binds`
-/// is the backup's primary-key section of that database.
-pub(super) fn document_units(
+/// Every restored row of `tenant_id` in one database, decoded and identified,
+/// grouped by collection in install order. Nothing is bound yet. Every row key
+/// must name `target.source`. `binds` is the backup's primary-key section of
+/// that database.
+pub(in crate::control::backup::restore) fn prepare_documents(
     state: &SharedState,
     tenant_id: u64,
     target: DatabaseTarget,
     documents: Vec<(String, Vec<u8>)>,
     documents_versioned: Vec<(String, Vec<u8>)>,
     binds: &[SurrogateBindEntry],
-) -> crate::Result<Vec<CollectionUnits>> {
+) -> crate::Result<Vec<PreparedRows>> {
     let grouped = group_rows(tenant_id, documents, documents_versioned)?;
     let mut out = Vec::with_capacity(grouped.len());
     for ((db, stored), rows) in grouped {
@@ -320,11 +331,7 @@ pub(super) fn document_units(
         let name = target.resolve(&stored)?;
         let database_id = target.dest;
         let builder = RowBuilder {
-            state,
-            database_id,
-            tenant: TenantId::new(tenant_id),
             collection: &name.bare,
-            stored: name.stored.as_str(),
             shape: collection_shape(state, database_id, tenant_id, &name.bare)?,
             binds: binds
                 .iter()
@@ -332,17 +339,31 @@ pub(super) fn document_units(
                 .map(|b| (b.surrogate, b.pk.as_slice()))
                 .collect(),
         };
-        let mut units = Vec::with_capacity(rows.len());
-        for (key, row) in &rows {
-            units.push(match row {
+        let mut ordered: Vec<(&StorageKey, &StoredRow)> = rows.iter().collect();
+        if builder.shape.hash_chain {
+            let mut positioned = Vec::with_capacity(ordered.len());
+            for (key, row) in ordered {
+                positioned.push((chain_seq(&builder.shape, &name.bare, *key, row)?, key, row));
+            }
+            positioned.sort_by_key(|(seq, _, _)| *seq);
+            ordered = positioned
+                .into_iter()
+                .map(|(_, key, row)| (key, row))
+                .collect();
+        }
+        let mut pending = Vec::with_capacity(rows.len());
+        for (key, row) in ordered {
+            pending.push(match row {
                 StoredRow::Current(body) => builder.current(*key, body)?,
                 StoredRow::Versions(versions) => builder.versions(*key, versions)?,
             });
         }
-        out.push(CollectionUnits {
+        out.push(PreparedRows {
             database_id,
-            collection: name.bare.clone(),
-            units,
+            tenant: TenantId::new(tenant_id),
+            bare: name.bare.clone(),
+            stored: name.stored.clone(),
+            rows: pending,
         });
     }
     Ok(out)
@@ -358,6 +379,22 @@ mod tests {
         assert_eq!((db, collection, rest), (0, "users", "0000002a"));
         assert!(split_key("0:8:users:0000002a", 7).is_err());
         assert!(split_key("0:7:users", 7).is_err());
+    }
+
+    #[test]
+    fn the_highest_row_surrogate_spans_current_and_versioned_rows() {
+        let highest = max_row_surrogate(
+            7,
+            &[("0:7:plain:0000002a".into(), vec![])],
+            &[("0:7:ledger:000000ff\x0000000000000000000100".into(), vec![])],
+        )
+        .unwrap();
+        assert_eq!(
+            highest,
+            StorageKey::parse("000000ff").unwrap().surrogate().as_u32()
+        );
+        assert_eq!(max_row_surrogate(7, &[], &[]).unwrap(), 0);
+        assert!(max_row_surrogate(7, &[("0:7:plain:zz".into(), vec![])], &[]).is_err());
     }
 
     #[test]

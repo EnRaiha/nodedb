@@ -74,7 +74,7 @@ fn get_doc(
             rls_filters: Vec::new(),
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: Some(doc_surrogate(id)),
             pk_bytes: Vec::new(),
         }),
     );
@@ -115,7 +115,7 @@ fn insert_materializes_generated_column() {
                 "tax_rate": 0.08
             }))
             .unwrap(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: doc_surrogate("p1"),
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
@@ -161,7 +161,7 @@ fn insert_materializes_concat() {
                 "brand": "Nike"
             }))
             .unwrap(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: doc_surrogate("p1"),
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
@@ -209,7 +209,7 @@ fn update_recomputes_generated_column() {
                 "tax_rate": 0.08
             }))
             .unwrap(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: doc_surrogate("p1"),
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
@@ -237,7 +237,7 @@ fn update_recomputes_generated_column() {
             returning: None,
             rls_filters: Vec::new(),
             rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: Some(doc_surrogate("p1")),
             pk_bytes: Vec::new(),
             resolved_sum_targets: Vec::new(),
             declared_primary_key: None,
@@ -278,7 +278,7 @@ fn update_generated_column_directly_rejected() {
             ),
             document_id: "p1".into(),
             value: serde_json::to_vec(&serde_json::json!({"price": 100.0})).unwrap(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: doc_surrogate("p1"),
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
@@ -306,7 +306,7 @@ fn update_generated_column_directly_rejected() {
             returning: None,
             rls_filters: Vec::new(),
             rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: Some(doc_surrogate("p1")),
             pk_bytes: Vec::new(),
             resolved_sum_targets: Vec::new(),
             declared_primary_key: None,
@@ -358,7 +358,7 @@ fn chained_generated_columns() {
                 "tax_rate": 0.1
             }))
             .unwrap(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: doc_surrogate("o1"),
             pk_bytes: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),

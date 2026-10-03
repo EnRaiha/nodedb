@@ -13,8 +13,12 @@ use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 use super::database_types::DatabaseDescriptor;
 use super::types::{DATABASE_HWM, DATABASES, DATABASES_BY_NAME, SystemCatalog, catalog_err};
 
-/// Singleton row key for the hwm table.
+/// Row key of the highest issued database id.
 const HWM_KEY: &str = "global";
+
+/// Row key of the highest metadata log index whose `DatabaseIdReserve` is
+/// folded into the hwm. Replay skips every reservation at or below it.
+const RESERVE_INDEX_KEY: &str = "reserve_index";
 
 impl SystemCatalog {
     // ── database_hwm ──────────────────────────────────────────────────────
@@ -37,8 +41,40 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("database_hwm commit", e))
     }
 
+    /// Persist the hwm and the applied-reservation cursor in one write txn.
+    /// A crash between two separate writes makes the next replay count
+    /// a reservation twice or skip it.
+    pub fn put_database_reserve_state(&self, hwm: u64, reserve_index: u64) -> crate::Result<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| catalog_err("database_reserve_state write txn", e))?;
+        {
+            let mut table = txn
+                .open_table(DATABASE_HWM)
+                .map_err(|e| catalog_err("open database_hwm", e))?;
+            table
+                .insert(HWM_KEY, hwm)
+                .map_err(|e| catalog_err("insert database_hwm", e))?;
+            table
+                .insert(RESERVE_INDEX_KEY, reserve_index)
+                .map_err(|e| catalog_err("insert database reserve_index", e))?;
+        }
+        txn.commit()
+            .map_err(|e| catalog_err("database_reserve_state commit", e))
+    }
+
     /// Load the persisted database hwm, or `0` if none recorded yet.
     pub fn get_database_hwm(&self) -> crate::Result<u64> {
+        self.get_database_hwm_row(HWM_KEY)
+    }
+
+    /// Load the applied-reservation cursor, or `0` if none recorded yet.
+    pub fn get_database_reserve_index(&self) -> crate::Result<u64> {
+        self.get_database_hwm_row(RESERVE_INDEX_KEY)
+    }
+
+    fn get_database_hwm_row(&self, key: &str) -> crate::Result<u64> {
         let txn = self
             .db
             .begin_read()
@@ -47,7 +83,7 @@ impl SystemCatalog {
             .open_table(DATABASE_HWM)
             .map_err(|e| catalog_err("open database_hwm", e))?;
         match table
-            .get(HWM_KEY)
+            .get(key)
             .map_err(|e| catalog_err("get database_hwm", e))?
         {
             Some(v) => Ok(v.value()),
@@ -267,6 +303,20 @@ mod tests {
         assert_eq!(cat.get_database_hwm().unwrap(), 1024);
         cat.put_database_hwm(9999).unwrap();
         assert_eq!(cat.get_database_hwm().unwrap(), 9999);
+    }
+
+    #[test]
+    fn reserve_state_roundtrip_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("system.redb");
+        {
+            let cat = SystemCatalog::open(&path).unwrap();
+            assert_eq!(cat.get_database_reserve_index().unwrap(), 0);
+            cat.put_database_reserve_state(1030, 77).unwrap();
+        }
+        let cat = SystemCatalog::open(&path).unwrap();
+        assert_eq!(cat.get_database_hwm().unwrap(), 1030);
+        assert_eq!(cat.get_database_reserve_index().unwrap(), 77);
     }
 
     /// Opening a catalog must leave the default database resolvable.

@@ -8,7 +8,10 @@ use nodedb_types::RowIdentity;
 
 use super::constraint::OverlayPk;
 use super::context::StageCtx;
-use super::{StageBulkDeleteParams, StageBulkUpdateParams, StageSpatialInsertParams};
+use super::stage_returning::{StageReturning, StagedImage};
+use super::{
+    StageBalanceDeltaParams, StageBulkDeleteParams, StageBulkUpdateParams, StageSpatialInsertParams,
+};
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::transaction::overlay::{MAX_TXN_OVERLAY_BYTES, Staged};
@@ -34,8 +37,20 @@ impl CoreLoop {
         };
         // Every core that stages a write for this transaction holds its
         // overlay, even when the write stages no row. COMMIT's resolve refuses
-        // a transaction with staged writes whose overlay is missing.
-        self.txn_overlay_mut(txn_id);
+        // a transaction with staged writes whose overlay is missing. The
+        // overlay tags what a trigger body stages by this request's source.
+        let database_id = task.request.database_id;
+        let tenant_id = crate::types::TenantId::new(tid);
+        let collections =
+            crate::control::wal_replication::transaction_redo::collections::written_collections(
+                std::slice::from_ref(plan),
+            );
+        self.txn_overlay_mut(txn_id).begin_staging(
+            task.request.event_source,
+            collections
+                .into_iter()
+                .map(|collection| (database_id, tenant_id, collection)),
+        );
 
         let doc_op = match plan {
             PhysicalPlan::Document(op) => op,
@@ -73,7 +88,10 @@ impl CoreLoop {
                 | GraphOp::EdgePutBatch { .. }
                 | GraphOp::EdgeDeleteBatch { .. }
                 | GraphOp::SetNodeLabels { .. }
-                | GraphOp::RemoveNodeLabels { .. }),
+                | GraphOp::RemoveNodeLabels { .. }
+                | GraphOp::NodeEdgeGuard { .. }
+                | GraphOp::NodePresenceGuard { .. }
+                | GraphOp::TruncateEdges { .. }),
             ) => return self.execute_stage_graph(task, tid, txn_id, op),
             PhysicalPlan::Graph(
                 GraphOp::Hop { .. }
@@ -91,6 +109,7 @@ impl CoreLoop {
                 | GraphOp::TemporalNeighbors { .. }
                 | GraphOp::TemporalAlgorithm { .. }
                 | GraphOp::Stats { .. }
+                | GraphOp::NodePresenceRead { .. }
                 // Autocommit-then-Raft, never staged in a transaction.
                 | GraphOp::ResolveEdgeDelete(_),
             ) => return self.stage_not_point_write(task),
@@ -111,7 +130,7 @@ impl CoreLoop {
                 | ArrayOp::Compact { .. }
                 | ArrayOp::SurrogateBitmapScan { .. }
                 | ArrayOp::DropArray { .. }
-                | ArrayOp::RestoreArrayDrop { .. }
+                | ArrayOp::RekeyArray { .. }
                 | ArrayOp::PurgeArrayDrop { .. },
             ) => return self.stage_not_point_write(task),
             PhysicalPlan::Crdt(op) => return self.execute_stage_crdt(task, tid, txn_id, op),
@@ -134,6 +153,8 @@ impl CoreLoop {
                 value,
                 if_absent,
                 surrogate,
+                returning,
+                rls_filters,
                 ..
             } => {
                 let ctx = StageCtx::new(
@@ -144,13 +165,20 @@ impl CoreLoop {
                     RowIdentity::from_user_key(document_id.as_str()),
                     *surrogate,
                 );
-                self.stage_point_insert(&ctx, value, *if_absent)
+                self.stage_point_returning(
+                    &ctx,
+                    StageReturning::of(returning, rls_filters),
+                    StagedImage::After,
+                    |core, ctx| core.stage_point_insert(ctx, value, *if_absent),
+                )
             }
             DocumentOp::PointPut {
                 collection,
                 document_id,
                 value,
                 surrogate,
+                returning,
+                rls_filters,
                 ..
             } => {
                 let ctx = StageCtx::new(
@@ -161,15 +189,30 @@ impl CoreLoop {
                     RowIdentity::from_user_key(document_id.as_str()),
                     *surrogate,
                 );
-                self.stage_point_put(&ctx, value)
+                self.stage_point_returning(
+                    &ctx,
+                    StageReturning::of(returning, rls_filters),
+                    StagedImage::After,
+                    |core, ctx| core.stage_point_put(ctx, value),
+                )
             }
             DocumentOp::PointDelete {
                 collection,
                 document_id,
                 surrogate,
                 rls_write_check,
+                returning,
+                rls_filters,
                 ..
             } => {
+                let Some(surrogate) = surrogate else {
+                    return self.stage_point_matched_nothing(
+                        task,
+                        tid,
+                        collection.as_str(),
+                        StageReturning::of(returning, rls_filters),
+                    );
+                };
                 let ctx = StageCtx::new(
                     task,
                     tid,
@@ -178,7 +221,12 @@ impl CoreLoop {
                     RowIdentity::from_user_key(document_id.as_str()),
                     *surrogate,
                 );
-                self.stage_point_delete(&ctx, rls_write_check)
+                self.stage_point_returning(
+                    &ctx,
+                    StageReturning::of(returning, rls_filters),
+                    StagedImage::Before,
+                    |core, ctx| core.stage_point_delete(ctx, rls_write_check),
+                )
             }
             DocumentOp::PointUpdate {
                 collection,
@@ -187,8 +235,18 @@ impl CoreLoop {
                 updates,
                 rls_write_check,
                 declared_primary_key,
+                returning,
+                rls_filters,
                 ..
             } => {
+                let Some(surrogate) = surrogate else {
+                    return self.stage_point_matched_nothing(
+                        task,
+                        tid,
+                        collection.as_str(),
+                        StageReturning::of(returning, rls_filters),
+                    );
+                };
                 let ctx = StageCtx::new(
                     task,
                     tid,
@@ -197,18 +255,31 @@ impl CoreLoop {
                     RowIdentity::from_user_key(document_id.as_str()),
                     *surrogate,
                 );
-                self.stage_point_update(&ctx, updates, rls_write_check, declared_primary_key.as_deref())
+                self.stage_point_returning(
+                    &ctx,
+                    StageReturning::of(returning, rls_filters),
+                    StagedImage::After,
+                    |core, ctx| {
+                        core.stage_point_update(
+                            ctx,
+                            updates,
+                            rls_write_check,
+                            declared_primary_key.as_deref(),
+                        )
+                    },
+                )
             }
             // Predicate UPDATE staged like a point update, resolved against
-            // base ∪ overlay. RETURNING doesn't change staging.
+            // base ∪ overlay. A RETURNING spec projects the staged
+            // post-images.
             DocumentOp::BulkUpdate {
                 collection,
                 filters,
                 updates,
-                returning: _,
+                returning,
                 ollp_predicted_surrogates: _,
                 ollp_predicted_edges: _,
-                rls_filters: _,
+                rls_filters,
                 rls_write_check,
                 // Staged post-images become concrete point ops at commit.
                 resolved_sum_targets: _,
@@ -222,17 +293,18 @@ impl CoreLoop {
                 updates,
                 rls_write_check,
                 declared_primary_key: declared_primary_key.as_deref(),
+                returning: StageReturning::of(returning, rls_filters),
             }),
 
             // Predicate DELETE staged like a point delete, resolved against
-            // base ∪ overlay. Same RETURNING behavior as `BulkUpdate`.
+            // base ∪ overlay. A RETURNING spec projects the removed rows.
             DocumentOp::BulkDelete {
                 collection,
                 filters,
-                returning: _,
+                returning,
                 ollp_predicted_surrogates: _,
                 ollp_predicted_edges: _,
-                rls_filters: _,
+                rls_filters,
                 rls_write_check,
                 // See the `BulkUpdate` arm: staging carries no delta.
                 resolved_sum_targets: _,
@@ -245,11 +317,13 @@ impl CoreLoop {
                 filter_bytes: filters,
                 rls_write_check,
                 declared_primary_key: declared_primary_key.as_deref(),
+                returning: StageReturning::of(returning, rls_filters),
             }),
 
             // `UPSERT INTO`: resolve the current body under base ∪ overlay,
-            // mirroring `execute_upsert`. No `RETURNING` variant exists, so
-            // it is always stageable.
+            // mirroring `execute_upsert`. A RETURNING spec projects the row
+            // it staged: the merged row on conflict, the inserted one
+            // otherwise.
             DocumentOp::Upsert {
                 collection,
                 document_id,
@@ -257,6 +331,8 @@ impl CoreLoop {
                 on_conflict_updates,
                 surrogate,
                 rls_write_check,
+                returning,
+                rls_filters,
                 ..
             } => {
                 let ctx = StageCtx::new(
@@ -267,12 +343,44 @@ impl CoreLoop {
                     RowIdentity::from_user_key(document_id.as_str()),
                     *surrogate,
                 );
-                self.stage_document_upsert(&ctx, value, on_conflict_updates, rls_write_check)
+                self.stage_point_returning(
+                    &ctx,
+                    StageReturning::of(returning, rls_filters),
+                    StagedImage::After,
+                    |core, ctx| {
+                        core.stage_document_upsert(ctx, value, on_conflict_updates, rls_write_check)
+                    },
+                )
             }
 
             DocumentOp::Truncate { collection, .. } => {
                 self.stage_collection_truncate(task, tid, txn_id, collection.as_str())
             }
+
+            // A materialized-sum move on this shard's target row: the delta is
+            // added to the row under base ∪ overlay and the new row staged.
+            DocumentOp::ApplyBalanceDelta {
+                collection,
+                document_id,
+                surrogate,
+                column,
+                delta,
+                join_column,
+                join_value,
+                declared_primary_key,
+            } => self.stage_apply_balance_delta(StageBalanceDeltaParams {
+                task,
+                tid,
+                txn_id,
+                collection: collection.as_str(),
+                document_id,
+                surrogate: *surrogate,
+                column,
+                delta,
+                join_column,
+                join_value,
+                declared_primary_key: declared_primary_key.as_deref(),
+            }),
 
             // `INSERT ... SELECT` is resolved into concrete `PointInsert` ops
             // at statement time; a raw `InsertSelect` never reaches here.
@@ -293,8 +401,7 @@ impl CoreLoop {
             | DocumentOp::MaterializeScan { .. }
             // Autocommit-then-Raft by construction: a governed write inside a
             // transaction is decided by the Data Plane gate, never resolved.
-            | DocumentOp::ResolvedWrite { .. }
-            | DocumentOp::ApplyBalanceDelta { .. } => self.stage_not_point_write(task),
+            | DocumentOp::ResolvedWrite { .. } => self.stage_not_point_write(task),
         }
     }
 
@@ -319,7 +426,7 @@ impl CoreLoop {
         {
             Some(Staged::Put(_)) => OverlayPk::Present,
             Some(Staged::Tombstone) => OverlayPk::Absent,
-            None if !self.stage_base_visible(ctx) => OverlayPk::Absent,
+            None if !self.stage_base_visible(ctx.txn_id, &ctx.coll_key) => OverlayPk::Absent,
             None => OverlayPk::Unstaged,
         }
     }

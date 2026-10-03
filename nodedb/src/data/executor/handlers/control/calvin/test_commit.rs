@@ -49,7 +49,8 @@ impl CoreLoop {
             epoch_system_ms,
             is_group_leader: true,
         };
-        let staged = self.execute_calvin_execute_static(task, ctx, &TenantId::new(tid), plans, &[]);
+        let staged =
+            self.execute_calvin_execute_static(task, ctx, &TenantId::new(tid), plans, &[], &[]);
         if staged.status != Status::Ok {
             return staged;
         }

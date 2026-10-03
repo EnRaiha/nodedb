@@ -9,7 +9,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::native::dispatch::DispatchCtx;
 use nodedb_physical::physical_plan::KvOp;
 
-pub(crate) fn build_scan(
+pub(crate) async fn build_scan(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -32,7 +32,7 @@ pub(crate) fn build_scan(
     }))
 }
 
-pub(crate) fn build_expire(
+pub(crate) async fn build_expire(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -52,7 +52,7 @@ pub(crate) fn build_expire(
     }))
 }
 
-pub(crate) fn build_persist(
+pub(crate) async fn build_persist(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -66,7 +66,7 @@ pub(crate) fn build_persist(
     }))
 }
 
-pub(crate) fn build_get_ttl(
+pub(crate) async fn build_get_ttl(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -79,7 +79,7 @@ pub(crate) fn build_get_ttl(
     }))
 }
 
-pub(crate) fn build_batch_get(
+pub(crate) async fn build_batch_get(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -104,7 +104,7 @@ pub(crate) fn build_batch_get(
     }))
 }
 
-pub(crate) fn build_batch_put(
+pub(crate) async fn build_batch_put(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -123,15 +123,12 @@ pub(crate) fn build_batch_put(
     }
     let ttl_ms = fields.ttl_ms.unwrap_or(0);
 
-    // Assign each entry's stable cross-engine surrogate the SAME way a
-    // single-key `Put` does (`assign_kv_surrogate` below): an existing key
-    // resolves to its already-bound surrogate, a new key mints a fresh one.
-    // Without this every batch-put row would land with `Surrogate::ZERO`,
-    // making it invisible to any surrogate-keyed cross-engine read/join.
-    let surrogates = entries
-        .iter()
-        .map(|(key, _value)| assign_kv_surrogate(ctx, collection, key))
-        .collect::<crate::Result<Vec<_>>>()?;
+    // Every entry's stable cross-engine surrogate, in one batch at the
+    // collection's home: an existing key resolves to its bound surrogate, a
+    // new key mints one. A row left at `Surrogate::ZERO` is invisible to any
+    // surrogate-keyed cross-engine read or join.
+    let keys: Vec<&[u8]> = entries.iter().map(|(key, _value)| key.as_slice()).collect();
+    let surrogates = super::helpers::assign_surrogates(ctx, collection, &keys).await?;
 
     Ok(PhysicalPlan::Kv(KvOp::BatchPut {
         collection: QualifiedCollection::new(ctx.database_id(), collection),
@@ -143,7 +140,7 @@ pub(crate) fn build_batch_put(
     }))
 }
 
-pub(crate) fn build_field_get(
+pub(crate) async fn build_field_get(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -165,7 +162,7 @@ pub(crate) fn build_field_get(
     }))
 }
 
-pub(crate) fn build_field_set(
+pub(crate) async fn build_field_set(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -178,7 +175,7 @@ pub(crate) fn build_field_set(
             detail: "missing 'updates'".to_string(),
         })?
         .clone();
-    let surrogate = assign_kv_surrogate(ctx, collection, &key)?;
+    let surrogate = super::helpers::assign_surrogate(ctx, collection, &key).await?;
 
     Ok(PhysicalPlan::Kv(KvOp::FieldSet {
         collection: QualifiedCollection::new(ctx.database_id(), collection),
@@ -207,7 +204,7 @@ fn require_key_bytes(fields: &TextFields) -> crate::Result<Vec<u8>> {
     })
 }
 
-pub(crate) fn build_truncate(
+pub(crate) async fn build_truncate(
     ctx: &DispatchCtx<'_>,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -217,22 +214,7 @@ pub(crate) fn build_truncate(
     }))
 }
 
-/// Resolve the stable cross-engine surrogate for a KV atomic op, content-
-/// addressed on `(collection, key)` — the same binding a normal insert of that
-/// key allocated, so an atomic op on an existing key keeps its identity.
-pub(super) fn assign_kv_surrogate(
-    ctx: &DispatchCtx<'_>,
-    collection: &str,
-    key: &[u8],
-) -> crate::Result<nodedb_types::Surrogate> {
-    ctx.state.surrogate_assigner.assign(
-        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-        ctx.tenant_id(),
-        key,
-    )
-}
-
-pub(crate) fn build_cas(
+pub(crate) async fn build_cas(
     ctx: &DispatchCtx<'_>,
     collection: &str,
     fields: &TextFields,
@@ -250,7 +232,7 @@ pub(crate) fn build_cas(
         .ok_or_else(|| crate::Error::BadRequest {
             detail: "missing 'new_value'".to_string(),
         })?;
-    let surrogate = assign_kv_surrogate(ctx, collection, key.as_bytes())?;
+    let surrogate = super::helpers::assign_surrogate(ctx, collection, key.as_bytes()).await?;
 
     Ok(PhysicalPlan::Kv(KvOp::Cas {
         collection: QualifiedCollection::new(ctx.database_id(), collection),
@@ -262,7 +244,7 @@ pub(crate) fn build_cas(
     }))
 }
 
-pub(crate) fn build_getset(
+pub(crate) async fn build_getset(
     ctx: &DispatchCtx<'_>,
     collection: &str,
     fields: &TextFields,
@@ -279,7 +261,7 @@ pub(crate) fn build_getset(
         .ok_or_else(|| crate::Error::BadRequest {
             detail: "missing 'new_value'".to_string(),
         })?;
-    let surrogate = assign_kv_surrogate(ctx, collection, key.as_bytes())?;
+    let surrogate = super::helpers::assign_surrogate(ctx, collection, key.as_bytes()).await?;
 
     Ok(PhysicalPlan::Kv(KvOp::GetSet {
         collection: QualifiedCollection::new(ctx.database_id(), collection),

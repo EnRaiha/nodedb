@@ -26,7 +26,22 @@ use nodedb_physical::physical_plan::{GraphOp, WccSuperstepPlan, WccSuperstepResu
 
 /// One owner node's decoded WCC result.
 pub(super) struct ShardWccResult {
+    pub(super) node_id: u64,
     pub(super) result: WccSuperstepResult,
+    /// The highest watermark the node's cores served the round at.
+    pub(super) watermark_lsn: crate::types::Lsn,
+}
+
+/// The inputs of one WCC round.
+pub(super) struct WccRound<'a> {
+    pub(super) tenant_id: TenantId,
+    pub(super) database_id: DatabaseId,
+    pub(super) params: &'a AlgoParams,
+    pub(super) targets: &'a [ShardTarget],
+    /// The cut marker every node resolves the round's read cut from.
+    pub(super) read_cut_marker: u64,
+    pub(super) deadline_ms: u64,
+    pub(super) linearizable: bool,
 }
 
 /// Dispatch one `WccSuperstep` to every owner node concurrently and decode each
@@ -34,12 +49,17 @@ pub(super) struct ShardWccResult {
 /// loop; the coordinator stitches the returned results globally.
 pub(super) async fn scatter_wcc_round(
     state: &crate::control::state::SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    params: &AlgoParams,
-    targets: &[ShardTarget],
-    deadline_ms: u64,
+    round: WccRound<'_>,
 ) -> crate::Result<Vec<ShardWccResult>> {
+    let WccRound {
+        tenant_id,
+        database_id,
+        params,
+        targets,
+        read_cut_marker,
+        deadline_ms,
+        linearizable,
+    } = round;
     let shared_arc = gateway_shared(state)?;
     let version_set = GatewayVersionSet::from_pairs(Vec::new());
 
@@ -50,6 +70,9 @@ pub(super) async fn scatter_wcc_round(
             // homed here in one pass and emits boundary edges only for dsts on
             // OTHER nodes.
             owned_vshards: t.owned_vshards.clone(),
+            // Every node resolves the same read cut from the marker.
+            read_cut_marker,
+            system_as_of: None,
         })));
         let version_set = version_set.clone();
         let node_id = t.node_id;
@@ -58,7 +81,7 @@ pub(super) async fn scatter_wcc_round(
         let shared_arc = shared_arc.clone();
 
         Box::pin(async move {
-            let payload = dispatch_superstep_to_node(
+            let read = dispatch_superstep_to_node(
                 &shared_arc,
                 DispatchSuperstepParams {
                     tenant_id,
@@ -69,11 +92,16 @@ pub(super) async fn scatter_wcc_round(
                     route_vshard,
                     plan,
                     version_set: &version_set,
+                    linearizable,
                 },
             )
             .await?;
-            let result = decode_wcc_from_payload(node_id, payload)?;
-            Ok::<ShardWccResult, crate::Error>(ShardWccResult { result })
+            let result = decode_wcc_from_payload(node_id, read.payload)?;
+            Ok::<ShardWccResult, crate::Error>(ShardWccResult {
+                node_id,
+                result,
+                watermark_lsn: read.watermark_lsn,
+            })
         })
     });
 

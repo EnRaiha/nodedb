@@ -77,9 +77,9 @@ async fn swim_dead_leader_clears_routing_hint() {
         guard.set_leader(3, 3);
     }
 
-    // --- Hook node A to the routing table. ---
+    // --- Hook node A (id 1, a voter of every group) to the routing table. ---
     let hook: Arc<dyn MembershipSubscriber> =
-        Arc::new(RoutingLivenessHook::new(rt.clone(), resolver_static()));
+        Arc::new(RoutingLivenessHook::new(rt.clone(), resolver_static(), 1));
 
     let h_a: SwimHandle = spawn_with_subscribers(
         fast_cfg(),

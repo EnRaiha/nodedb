@@ -30,12 +30,18 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         &self,
         req: MetadataProposeRequest,
     ) -> Result<RaftRpc> {
-        let resp = match self.propose_to_metadata_group(req.bytes) {
+        let proposed = if req.stamp {
+            self.propose_stamped_to_metadata_group(&req.bytes)
+        } else {
+            self.propose_to_metadata_group(req.bytes)
+        };
+        let resp = match proposed {
             Ok(log_index) => crate::rpc_codec::MetadataProposeResponse::ok(log_index),
             Err(crate::error::ClusterError::Raft(nodedb_raft::RaftError::NotLeader {
                 leader_hint,
-            })) => crate::rpc_codec::MetadataProposeResponse::err("not leader", leader_hint),
-            Err(e) => crate::rpc_codec::MetadataProposeResponse::err(e.to_string(), None),
+                term,
+            })) => crate::rpc_codec::MetadataProposeResponse::err("not leader", leader_hint, term),
+            Err(e) => crate::rpc_codec::MetadataProposeResponse::err(e.to_string(), None, 0),
         };
         Ok(RaftRpc::MetadataProposeResponse(resp))
     }

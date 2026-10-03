@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 use crate::error::{ClusterError, Result};
 use crate::rpc_codec::{
-    self, RaftRpc, ShufflePushChunk, ShufflePushEnd, ShufflePushRequest, TypedClusterError,
-    auth_envelope,
+    RaftRpc, ShufflePushChunk, ShufflePushEnd, ShufflePushRequest, TypedClusterError,
 };
 use crate::transport::auth_context::AuthContext;
+use crate::transport::frame_io::encode_rpc_frame;
 
 use super::transport::NexarTransport;
 
@@ -96,7 +96,7 @@ impl ShufflePushStream {
         })?;
 
         let auth = Arc::clone(transport.auth());
-        let req_envelope = wrap_with_auth(&auth, &RaftRpc::ShufflePushRequest(req))?;
+        let req_envelope = encode_rpc_frame(&RaftRpc::ShufflePushRequest(req), &auth)?;
         send.write_all(&req_envelope)
             .await
             .map_err(|e| ClusterError::Transport {
@@ -108,9 +108,9 @@ impl ShufflePushStream {
 
     /// Write one [`ShufflePushChunk`] envelope (a standalone msgpack row array).
     pub async fn push_chunk(&mut self, payload: Vec<u8>) -> Result<()> {
-        let chunk_envelope = wrap_with_auth(
-            &self.auth,
+        let chunk_envelope = encode_rpc_frame(
             &RaftRpc::ShufflePushChunk(ShufflePushChunk { payload }),
+            &self.auth,
         )?;
         self.send
             .write_all(&chunk_envelope)
@@ -123,9 +123,9 @@ impl ShufflePushStream {
     /// Write the terminal [`ShufflePushEnd`] envelope (`error: None` for a clean
     /// EOF, `Some(e)` to fail the receiver fast) and finish the send half.
     pub async fn finish(mut self, error: Option<TypedClusterError>) -> Result<()> {
-        let end_envelope = wrap_with_auth(
-            &self.auth,
+        let end_envelope = encode_rpc_frame(
             &RaftRpc::ShufflePushEnd(ShufflePushEnd { error }),
+            &self.auth,
         )?;
         self.send
             .write_all(&end_envelope)
@@ -138,15 +138,4 @@ impl ShufflePushStream {
         })?;
         Ok(())
     }
-}
-
-/// Encode `rpc` and wrap it in an authenticated envelope with a fresh outbound
-/// `seq` — the standalone form of [`NexarTransport::wrap_outbound`] for the
-/// owned-[`AuthContext`] [`ShufflePushStream`].
-fn wrap_with_auth(auth: &AuthContext, rpc: &RaftRpc) -> Result<Vec<u8>> {
-    let inner = rpc_codec::encode(rpc, &auth.epoch)?;
-    let seq = auth.peer_seq_out.next();
-    let mut out = Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + inner.len());
-    auth_envelope::write_envelope(auth.local_node_id, seq, &inner, &auth.mac_key, &mut out)?;
-    Ok(out)
 }

@@ -96,7 +96,7 @@ impl PermissionStore {
             return true;
         }
 
-        let target = collection_target(identity.tenant_id, collection);
+        let target = collection_target(database_id, identity.tenant_id, collection);
 
         for role in &identity.roles {
             if identity::role_grants_permission(role, permission) {
@@ -160,7 +160,7 @@ impl PermissionStore {
             return true;
         }
 
-        let target = function_target(identity.tenant_id, function_name);
+        let target = function_target(database_id, identity.tenant_id, function_name);
 
         for role in &identity.roles {
             if identity::role_grants_permission(role, Permission::Execute) {
@@ -410,11 +410,56 @@ mod tests {
         ));
     }
 
+    /// A grant on `orders` in one database opens no same-name collection in
+    /// another database of the same tenant.
+    #[test]
+    fn collection_grant_binds_one_database() {
+        let store = PermissionStore::new();
+        let roles = RoleStore::new();
+        let granted = DatabaseId::new(1024);
+        store
+            .grant(
+                &collection_target(granted, TenantId::new(1), "orders"),
+                "user:bob",
+                Permission::Read,
+                "admin",
+                None,
+            )
+            .unwrap();
+
+        let id = identity("bob", vec![], false);
+        assert!(store.check(&id, Permission::Read, granted, "orders", &roles, NOOP));
+        for other in [DatabaseId::new(1025), DatabaseId::DEFAULT] {
+            assert!(!store.check(&id, Permission::Read, other, "orders", &roles, NOOP));
+        }
+    }
+
+    /// The same holds for EXECUTE on a function.
+    #[test]
+    fn function_grant_binds_one_database() {
+        let store = PermissionStore::new();
+        let roles = RoleStore::new();
+        let granted = DatabaseId::new(1024);
+        store
+            .grant(
+                &function_target(granted, TenantId::new(1), "score"),
+                "user:bob",
+                Permission::Execute,
+                "admin",
+                None,
+            )
+            .unwrap();
+
+        let id = identity("bob", vec![], false);
+        assert!(store.check_function(&id, granted, "score", &roles, NOOP));
+        assert!(!store.check_function(&id, DatabaseId::new(1025), "score", &roles, NOOP));
+    }
+
     #[test]
     fn explicit_user_grant() {
         let store = PermissionStore::new();
         let roles = RoleStore::new();
-        let target = collection_target(TenantId::new(1), "orders");
+        let target = collection_target(DatabaseId::DEFAULT, TenantId::new(1), "orders");
         store
             .grant(&target, "user:bob", Permission::Read, "admin", None)
             .unwrap();
@@ -442,7 +487,7 @@ mod tests {
     fn grant_on_role() {
         let store = PermissionStore::new();
         let roles = RoleStore::new();
-        let target = collection_target(TenantId::new(1), "reports");
+        let target = collection_target(DatabaseId::DEFAULT, TenantId::new(1), "reports");
         store
             .grant(&target, "readonly", Permission::Read, "admin", None)
             .unwrap();
@@ -466,7 +511,7 @@ mod tests {
             .unwrap();
 
         let perm_store = PermissionStore::new();
-        let target = collection_target(TenantId::new(1), "data");
+        let target = collection_target(DatabaseId::DEFAULT, TenantId::new(1), "data");
         perm_store
             .grant(&target, "readonly", Permission::Read, "admin", None)
             .unwrap();
@@ -485,7 +530,7 @@ mod tests {
     #[test]
     fn revoke_removes_grant() {
         let store = PermissionStore::new();
-        let target = collection_target(TenantId::new(1), "users");
+        let target = collection_target(DatabaseId::DEFAULT, TenantId::new(1), "users");
         store
             .grant(&target, "user:bob", Permission::Read, "admin", None)
             .unwrap();
@@ -667,7 +712,7 @@ mod tests {
             &roles,
             NOOP
         ));
-        let target = collection_target(TenantId::new(1), "orders");
+        let target = collection_target(DatabaseId::DEFAULT, TenantId::new(1), "orders");
         store
             .grant(&target, "user:bob", Permission::Read, "admin", None)
             .expect("post-panic grant must succeed");

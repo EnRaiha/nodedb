@@ -8,12 +8,10 @@
 //!
 //! `ALTER VECTOR INDEX ... SET (...)` lives in [`super::vector_index_set`].
 //!
-//! Ported from the pgwire maintenance handlers. The `SHOW` result set is
-//! all-text columns (`text_field`), so the protocol-neutral [`ShapedRows`]
-//! carries `DdlColType::Text` per column and each cell as its `String` form —
-//! the same bytes `DataRowEncoder::encode_field(&str)` produced. The Data Plane
-//! dispatch paths (`dispatch_to_data_plane`, plan construction, ordering) are
-//! preserved verbatim.
+//! The `SHOW` result set is all-text columns, so the protocol-neutral
+//! [`ShapedRows`] carries `DdlColType::Text` per column and each cell as its
+//! `String` form. The Data Plane dispatch paths (`dispatch_to_data_plane`,
+//! plan construction, ordering) run here.
 
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 use serde_json::{Map, Value as JsonValue};

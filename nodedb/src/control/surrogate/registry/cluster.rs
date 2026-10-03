@@ -115,9 +115,25 @@ impl ClusterCounter {
         self.watermark.current_hwm()
     }
 
-    /// Idempotently raise the high-watermark to at least `new_hwm`.
+    /// Idempotently raise the high-watermark to at least `new_hwm`, and
+    /// retire every surrogate at or below it the reserved batch has not
+    /// handed out yet. A surrogate at or below `new_hwm` can be bound
+    /// elsewhere, by a restore, so this node never issues it.
     pub fn restore_hwm(&self, new_hwm: u32) {
         self.watermark.restore(new_hwm);
+        let floor = u64::from(new_hwm) + 1;
+        let mut next = self.reserved_next.load(Ordering::Acquire);
+        while next < floor {
+            match self.reserved_next.compare_exchange_weak(
+                next,
+                floor,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => next = actual,
+            }
+        }
     }
 }
 
@@ -191,6 +207,28 @@ mod tests {
         assert_eq!(got, expect);
         assert!(c.try_alloc_reserved().is_none());
         assert!(c.try_alloc_reserved().is_none());
+    }
+
+    /// A raise retires the unissued part of the reserved batch at or below
+    /// the new high-water mark, and later reservations carve above it.
+    #[test]
+    fn restore_hwm_retires_the_reserved_batch_below_it() {
+        let c = ClusterCounter::new(0, 0);
+        let (start, end) = c.reserve_from_global(10).unwrap();
+        c.set_reserved_batch(start, end);
+        assert_eq!(c.try_alloc_reserved().map(|s| s.as_u32()), Some(1));
+
+        c.restore_hwm(6);
+        let rest: Vec<u32> = std::iter::from_fn(|| c.try_alloc_reserved())
+            .map(|s| s.as_u32())
+            .collect();
+        assert_eq!(rest, vec![7, 8, 9, 10]);
+        assert_eq!(c.reserve_at_index(1, 2).unwrap(), Some((11, 13)));
+
+        c.restore_hwm(100);
+        assert!(c.try_alloc_reserved().is_none());
+        let (start, _) = c.reserve_at_index(2, 5).unwrap().expect("carved");
+        assert!(start > 100, "a carve after a raise starts above it");
     }
 
     #[test]

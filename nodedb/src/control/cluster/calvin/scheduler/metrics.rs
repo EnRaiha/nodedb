@@ -41,7 +41,7 @@ pub struct SchedulerMetrics {
     /// Times a staged txn parked in `AwaitingVerdict` passed its stall deadline
     /// with the durable global verdict still unknown. This is NOT an abort: the
     /// scheduler keeps waiting and holding locks (a unilateral abort while a
-    /// peer may already have flushed a commit would tear the transaction). A
+    /// peer can already have flushed a commit will tear the transaction). A
     /// non-zero, growing value flags a stuck sequencer / partitioned verdict
     /// path that needs operator attention, never a correctness action here.
     pub verdict_stall_count: AtomicU64,
@@ -70,7 +70,7 @@ pub struct SchedulerMetrics {
     pub intake_backlog: AtomicU64,
     /// Intake gate closures by reason. Indexes are the constants in
     /// [`intake_closure_reason`].
-    pub intake_gate_closed_counts: [AtomicU64; 3],
+    pub intake_gate_closed_counts: [AtomicU64; 4],
     /// Apply halt state: 1 once the scheduler halted, 0 while it applies.
     pub apply_halted: AtomicU64,
     /// Reason of the halt. An index into [`apply_halt_reason`], read only
@@ -106,8 +106,14 @@ pub mod intake_closure_reason {
     pub const DEFERRED_DISPATCH: usize = 0;
     pub const BACKLOG_FULL: usize = 1;
     pub const APPLY_HALTED: usize = 2;
+    pub const METADATA_CATCH_UP: usize = 3;
 
-    pub const LABELS: &[&str] = &["deferred_dispatch", "backlog_full", "apply_halted"];
+    pub const LABELS: &[&str] = &[
+        "deferred_dispatch",
+        "backlog_full",
+        "apply_halted",
+        "metadata_catch_up",
+    ];
 }
 
 /// Reason codes for `nodedb_calvin_apply_halted`.
@@ -120,6 +126,7 @@ pub mod apply_halt_reason {
     pub const LOCAL_STAGE_FAILED: usize = 5;
     pub const IDENTITY_BIND_FAILED: usize = 6;
     pub const WAL_APPEND_FAILED: usize = 7;
+    pub const METADATA_GROUP_GONE: usize = 8;
 
     pub const LABELS: &[&str] = &[
         "draining",
@@ -130,6 +137,7 @@ pub mod apply_halt_reason {
         "local_stage_failed",
         "identity_bind_failed",
         "wal_append_failed",
+        "metadata_group_gone",
     ];
 }
 

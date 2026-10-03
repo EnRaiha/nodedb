@@ -93,6 +93,7 @@ pub fn make_request(plan: PhysicalPlan) -> Request {
         txn_id: None,
         wal_lsn: None,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: nodedb::bridge::envelope::Admission::Admitted,
     }
 }
@@ -146,6 +147,13 @@ pub fn payload_json(payload: &[u8]) -> String {
 pub fn payload_value(payload: &[u8]) -> serde_json::Value {
     let json = payload_json(payload);
     serde_json::from_str(&json).unwrap_or(serde_json::Value::Null)
+}
+
+/// A deterministic bound surrogate for a document id, never
+/// `Surrogate::ZERO`. Executor-direct fixtures bypass the catalog, so each
+/// row threads its own binding and lands on its own storage key.
+pub fn doc_surrogate(id: &str) -> nodedb_types::Surrogate {
+    nodedb_test_support::kv_rows::kv_row_surrogate(id.as_bytes())
 }
 
 // ── Tenant-aware helpers ────────────────────────────────────────────

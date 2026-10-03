@@ -24,7 +24,7 @@ impl CoreLoop {
         {
             Some(Staged::Put(body)) => Ok(Some(body.clone())),
             Some(Staged::Tombstone) => Ok(None),
-            None if !self.stage_base_visible(ctx) => Ok(None),
+            None if !self.stage_base_visible(ctx.txn_id, &ctx.coll_key) => Ok(None),
             None => {
                 let storage_key = StorageKey::for_surrogate(ctx.surrogate);
                 if self.is_bitemporal(ctx.database_id, ctx.tid, ctx.collection) {

@@ -90,8 +90,10 @@ mod tests {
             node_id,
             listen_addr: "127.0.0.1:9400".into(),
             wire_version: 1,
+            build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
             spiffe_id: None,
             spki_pin: Some(pin.to_vec()),
+            swim_addr: None,
         })
     }
 

@@ -17,6 +17,19 @@ fn test_encryption_key() -> WalEncryptionKey {
     WalEncryptionKey::from_bytes(&[0x5A; 32]).expect("test encryption key")
 }
 
+fn make_core_bytes(floor: u64) -> Vec<u8> {
+    nodedb::data::snapshot::CoreSnapshot {
+        stamp: nodedb::types::replay_stamp::ReplayStamp::through(floor),
+        ..nodedb::data::snapshot::CoreSnapshot::empty()
+    }
+    .to_bytes()
+    .unwrap()
+}
+
+fn no_node() -> nodedb::data::snapshot::NodeSnapshot {
+    nodedb::data::snapshot::NodeSnapshot::default()
+}
+
 // ── Snapshot: InMemory backend ───────────────────────────────────────────────
 
 #[tokio::test]
@@ -26,14 +39,6 @@ async fn snapshot_write_read_delete_in_memory() {
         load_manifest, rebuild_catalog,
     };
 
-    fn make_core_bytes(watermark: u64) -> Vec<u8> {
-        let snap = nodedb::data::snapshot::CoreSnapshot {
-            watermark,
-            ..nodedb::data::snapshot::CoreSnapshot::empty()
-        };
-        snap.to_bytes().unwrap()
-    }
-
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let encryption_key = test_encryption_key();
 
@@ -41,6 +46,8 @@ async fn snapshot_write_read_delete_in_memory() {
     let (meta1, prefix1) = create_base_snapshot(
         &store,
         vec![(0, make_core_bytes(10)), (1, make_core_bytes(20))],
+        &no_node(),
+        &[],
         "node-a",
         Some(&encryption_key),
     )
@@ -50,6 +57,8 @@ async fn snapshot_write_read_delete_in_memory() {
     let (meta2, prefix2) = create_base_snapshot(
         &store,
         vec![(0, make_core_bytes(100))],
+        &no_node(),
+        &[],
         "node-a",
         Some(&encryption_key),
     )
@@ -70,20 +79,20 @@ async fn snapshot_write_read_delete_in_memory() {
     assert_eq!(m2.meta.snapshot_id, meta2.snapshot_id);
 
     // Read back core snapshots.
-    let core0 = load_core_snapshot(&store, &prefix1, 0, Some(&encryption_key))
+    let core0 = load_core_snapshot(&store, &prefix1, &m1, 0, &encryption_key)
         .await
         .unwrap();
-    assert_eq!(core0.watermark, 10);
-    let core1 = load_core_snapshot(&store, &prefix1, 1, Some(&encryption_key))
+    assert_eq!(core0.replay_floor(), 10);
+    let core1 = load_core_snapshot(&store, &prefix1, &m1, 1, &encryption_key)
         .await
         .unwrap();
-    assert_eq!(core1.watermark, 20);
+    assert_eq!(core1.replay_floor(), 20);
 
     // Discover and rebuild catalog.
     let found = discover_snapshots(&store, &encryption_key).await;
     assert_eq!(found.len(), 2);
-    // Sorted by end_lsn.
-    assert!(found[0].1.meta.end_lsn <= found[1].1.meta.end_lsn);
+    // Sorted by applied_high_lsn.
+    assert!(found[0].1.meta.applied_high_lsn <= found[1].1.meta.applied_high_lsn);
 
     let catalog = rebuild_catalog(&store, &encryption_key).await;
     assert_eq!(catalog.len(), 2);
@@ -114,14 +123,6 @@ async fn snapshot_write_read_local_filesystem() {
         create_base_snapshot, load_core_snapshot, load_manifest,
     };
 
-    fn make_core_bytes(watermark: u64) -> Vec<u8> {
-        let snap = nodedb::data::snapshot::CoreSnapshot {
-            watermark,
-            ..nodedb::data::snapshot::CoreSnapshot::empty()
-        };
-        snap.to_bytes().unwrap()
-    }
-
     let dir = tempfile::tempdir().unwrap();
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
@@ -130,6 +131,8 @@ async fn snapshot_write_read_local_filesystem() {
     let (meta, prefix) = create_base_snapshot(
         &store,
         vec![(0, make_core_bytes(77))],
+        &no_node(),
+        &[],
         "local-node",
         Some(&encryption_key),
     )
@@ -142,10 +145,10 @@ async fn snapshot_write_read_local_filesystem() {
     assert_eq!(manifest.meta.snapshot_id, meta.snapshot_id);
     assert_eq!(manifest.num_cores, 1);
 
-    let core = load_core_snapshot(&store, &prefix, 0, Some(&encryption_key))
+    let core = load_core_snapshot(&store, &prefix, &manifest, 0, &encryption_key)
         .await
         .unwrap();
-    assert_eq!(core.watermark, 77);
+    assert_eq!(core.replay_floor(), 77);
 
     // Verify the file actually exists on disk.
     let manifest_path = dir.path().join(&prefix).join("manifest.msgpack");
@@ -203,161 +206,123 @@ async fn quarantine_record_and_rebuild_in_memory() {
 
 // ── Snapshot bytes round-trip through InMemory ObjectStore ──────────────────
 //
-// Verifies that create_base_snapshot writes the expected objects into InMemory
-// (manifest + per-core .snap blobs), and that execute_restore consumes those
-// bytes and materialises the engine state into a fresh data directory —
-// including sparse documents, a vector checkpoint file, and a CRDT checkpoint
-// file.
+// Verifies that create_base_snapshot writes the manifest under the snapshot
+// prefix and the chunks of the core and node images under `chunks/`, and that
+// execute_restore lands every captured file at its
+// original path in a fresh data directory and seeds the WAL above the
+// snapshot's highest LSN.
 
 #[tokio::test]
 async fn snapshot_bytes_roundtrip_write_and_restore() {
     use futures::TryStreamExt;
-    use nodedb::data::snapshot::{CoreSnapshot, CrdtSnapshot, HnswSnapshot, KvPair};
-    use nodedb::storage::snapshot_executor::execute_restore;
-    use nodedb::storage::snapshot_writer::create_base_snapshot;
+    use nodedb::data::snapshot::{CoreSnapshot, NodeSnapshot, SnapshotComponent, SnapshotFile};
+    use nodedb::storage::snapshot_executor::{RestoreSource, execute_restore};
+    use nodedb::storage::snapshot_writer::{
+        CHUNK_DIR, create_base_snapshot, list_chunk_ids, load_manifest,
+    };
+    use nodedb::types::replay_stamp::ReplayStamp;
 
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let encryption_key = test_encryption_key();
 
-    // Build a CoreSnapshot with one sparse document, one HNSW index, and one
-    // CRDT state — enough content to verify all restore paths are exercised.
-    let hnsw_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02];
-    let crdt_bytes = vec![0xAB, 0xCD, 0xEF];
-
+    let file = |component, path: &str, bytes: &[u8]| SnapshotFile {
+        component,
+        path: path.into(),
+        bytes: bytes.to_vec(),
+    };
     let snap = CoreSnapshot {
-        watermark: 99,
-        sparse_documents: vec![KvPair {
-            key: "1:testcoll:row1".into(),
-            value: b"payload-a".to_vec(),
-        }],
-        sparse_indexes: vec![],
-        edges: vec![],
-        hnsw_indexes: vec![HnswSnapshot {
-            database_id: 0,
-            tenant_id: 1,
-            collection: "embeddings".into(),
-            checkpoint_bytes: hnsw_bytes.clone(),
-        }],
-        crdt_snapshots: vec![CrdtSnapshot {
-            database_id: 0,
-            tenant_id: 1,
-            peer_id: 42,
-            collection: "testcoll".into(),
-            snapshot_bytes: crdt_bytes.clone(),
-        }],
+        stamp: ReplayStamp::through(99),
+        files: vec![
+            file(SnapshotComponent::Sparse, "sparse/core-0.redb", b"sparse"),
+            file(
+                SnapshotComponent::Vector,
+                "vector-ckpt/core-0/MANIFEST",
+                b"vm",
+            ),
+            file(
+                SnapshotComponent::Timeseries,
+                "ts/0/1/metrics/p-0/partition.meta",
+                b"pm",
+            ),
+        ],
+        dirs: Vec::new(),
+    };
+    let node = NodeSnapshot {
+        files: vec![file(
+            SnapshotComponent::SystemCatalog,
+            "system.redb",
+            b"sys",
+        )],
+        metadata_applied_index: 0,
+        metadata_captured_index: 0,
+        metadata_timeline: 0,
     };
 
-    let snap_bytes = snap.to_bytes().unwrap();
     let (meta, prefix) = create_base_snapshot(
         &store,
-        vec![(0, snap_bytes)],
+        vec![(0, snap.to_bytes().unwrap())],
+        &node,
+        &[],
         "test-node",
         Some(&encryption_key),
     )
     .await
     .unwrap();
+    assert_eq!(meta.applied_high_lsn.as_u64(), 99);
 
     // ── Verify object-store objects ──────────────────────────────────────────
-    // The manifest and exactly one core .snap blob must be present.
     use object_store::path::Path as OPath;
     let list_prefix = OPath::from(format!("{prefix}/"));
     let objects: Vec<_> = store.list(Some(&list_prefix)).try_collect().await.unwrap();
-
-    assert_eq!(
-        objects.len(),
-        2,
-        "expected manifest + 1 core blob, got {}: {:?}",
-        objects.len(),
-        objects
-            .iter()
-            .map(|o| o.location.as_ref())
-            .collect::<Vec<_>>()
-    );
-
-    let paths: Vec<&str> = objects.iter().map(|o| o.location.as_ref()).collect();
-    assert!(
-        paths.iter().any(|p| p.ends_with("manifest.msgpack")),
-        "manifest.msgpack missing"
-    );
-    assert!(
-        paths.iter().any(|p| p.ends_with("core-0.snap")),
-        "core-0.snap missing"
-    );
-
-    // All objects must be non-empty.
-    for obj in &objects {
+    let mut names: Vec<&str> = objects
+        .iter()
+        .filter_map(|o| o.location.as_ref().rsplit('/').next())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["manifest.msgpack"]);
+    let manifest = load_manifest(&store, &prefix, &encryption_key)
+        .await
+        .unwrap();
+    let mut listed: Vec<String> = manifest.chunk_ids().map(str::to_owned).collect();
+    listed.sort_unstable();
+    listed.dedup();
+    let mut stored = list_chunk_ids(&store).await.unwrap();
+    stored.sort_unstable();
+    assert_eq!(stored, listed, "every listed chunk is stored once");
+    let chunk_dir = OPath::from(CHUNK_DIR);
+    let chunks: Vec<_> = store.list(Some(&chunk_dir)).try_collect().await.unwrap();
+    for obj in objects.iter().chain(&chunks) {
         assert!(obj.size > 0, "object {} is empty", obj.location);
     }
 
     // ── Execute restore into a fresh data directory ──────────────────────────
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("restored");
-    std::fs::create_dir_all(&data_dir).unwrap();
 
-    let result = execute_restore(&data_dir, &prefix, &store, &store, &[], &encryption_key)
-        .await
-        .unwrap();
-
+    let source = RestoreSource {
+        prefix: &prefix,
+        snapshot_store: &store,
+        cold_store: None,
+        encryption_key: &encryption_key,
+    };
+    let result = execute_restore(&data_dir, &source).await.unwrap();
     assert_eq!(result.snapshot_id, meta.snapshot_id);
     assert_eq!(result.cores_restored, 1);
-    assert_eq!(result.documents_restored, 1);
-    assert_eq!(result.vectors_restored, 1);
-    assert_eq!(result.wal_records_replayed, 0);
+    assert_eq!(result.applied_high_lsn.as_u64(), 99);
+    // Four captured files plus the WAL seed segment.
+    assert_eq!(result.files_restored, 5);
 
-    // ── Verify sparse engine state ───────────────────────────────────────────
-    let sparse_path = data_dir.join("sparse/core-0.redb");
-    assert!(
-        sparse_path.exists(),
-        "sparse redb file must exist after restore"
-    );
-    let sparse = nodedb::engine::sparse::btree::SparseEngine::open(&sparse_path).unwrap();
-    assert!(
-        sparse.get_raw("1:testcoll:row1").unwrap().is_some(),
-        "sparse document must be readable after restore"
-    );
-
-    // ── Verify HNSW checkpoint file ──────────────────────────────────────────
-    // A restore publishes its files as a GENERATION and swings the manifest, so
-    // the first restore into a fresh data dir lands in `gen-0`. The collection
-    // key is hex-encoded into the filename, so no collection name can escape the
-    // generation directory. The payload is checkpoint-framed (magic + CRC +
-    // length header), so the index bytes are the tail of the file rather than
-    // the whole of it.
-    let hnsw_key_hex: String = "embeddings:emb"
-        .bytes()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let ckpt_dir = data_dir.join("vector-ckpt").join("core-0").join("gen-0");
-    let hnsw_ckpt = ckpt_dir.join(format!("db-0-tenant-1-key-{hnsw_key_hex}.ckpt"));
-    assert!(
-        hnsw_ckpt.exists(),
-        "HNSW checkpoint file must exist after restore"
-    );
-    let on_disk = std::fs::read(&hnsw_ckpt).unwrap();
-    assert!(
-        on_disk.ends_with(&hnsw_bytes),
-        "HNSW checkpoint payload must match the snapshot's bytes"
-    );
-
-    // ── Verify CRDT checkpoint file ──────────────────────────────────────────
-    // CRDT checkpoints are per-collection, per-database and per-core, published
-    // as a generation:
-    // `crdt-ckpt/core-{id}/gen-{n}/db-{dbid}-tenant-{tid}-coll-{hex(collection)}.ckpt`.
-    // The hex encoding mirrors the engine's filename scheme (collection bytes,
-    // lowercase), and the payload is a raw Loro snapshot (self-checksumming, so
-    // it carries no extra frame).
-    let crdt_coll_hex: String = "testcoll".bytes().map(|b| format!("{b:02x}")).collect();
-    let crdt_ckpt = data_dir
-        .join("crdt-ckpt")
-        .join("core-0")
-        .join("gen-0")
-        .join(format!("db-0-tenant-1-coll-{crdt_coll_hex}.ckpt"));
-    assert!(
-        crdt_ckpt.exists(),
-        "CRDT checkpoint file must exist after restore"
-    );
-    let on_disk_crdt = std::fs::read(&crdt_ckpt).unwrap();
-    assert_eq!(on_disk_crdt, crdt_bytes, "CRDT checkpoint bytes must match");
+    for (path, bytes) in [
+        ("sparse/core-0.redb", b"sparse".as_slice()),
+        ("vector-ckpt/core-0/MANIFEST", b"vm"),
+        ("ts/0/1/metrics/p-0/partition.meta", b"pm"),
+        ("system.redb", b"sys"),
+    ] {
+        assert_eq!(std::fs::read(data_dir.join(path)).unwrap(), bytes, "{path}");
+    }
+    let segments = nodedb_wal::segment::discover_segments(&data_dir.join("wal")).unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].first_lsn, 100);
 }
 
 // ── Quarantine: rebuild with multiple engines and keys ───────────────────────

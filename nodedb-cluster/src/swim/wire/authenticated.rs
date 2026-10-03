@@ -87,6 +87,12 @@ impl SwimAuth {
         }
     }
 
+    /// Move the outbound counter into boot `epoch`'s sequence range (see
+    /// [`PeerSeqSender::enter_boot_epoch`]).
+    pub fn enter_boot_epoch(&self, epoch: u64) {
+        self.seq_out.enter_boot_epoch(epoch);
+    }
+
     /// Hash of the local bound address — used as the envelope's
     /// `from_node_id` on every outbound datagram.
     pub fn local_addr_hash(&self) -> u64 {

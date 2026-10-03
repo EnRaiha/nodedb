@@ -128,7 +128,7 @@ pub(in crate::control::server::resp) async fn handle_set(
         }
     }
 
-    let surrogate = match resp_kv_surrogate(state, session, &key) {
+    let surrogate = match resp_kv_surrogate(state, session, &key).await {
         Ok(s) => s,
         Err(e) => return e,
     };
@@ -207,7 +207,7 @@ pub(in crate::control::server::resp) async fn handle_exists(
         match dispatch_kv(state, session, plan).await {
             Ok(resp) if resp.status == Status::Ok && !resp.payload.is_empty() => count += 1,
             Ok(_) => {}
-            // A policy refusal is not an absent key: reporting it as one would
+            // A policy refusal is not an absent key: reporting it as one will
             // let EXISTS answer a question the caller is not allowed to ask.
             Err(e) => return RespValue::from_error(&e),
         }
@@ -230,10 +230,10 @@ pub(in crate::control::server::resp) async fn handle_getset(
     let new_value = cmd.args[1].clone();
 
     // Resolved once for this command: GETSET returns the row's PREVIOUS stored
-    // value, which carries exactly the disclosure a GET of it would.
+    // value, which carries exactly the disclosure a GET of it does.
     let redaction = resp_redaction(state, session);
 
-    let surrogate = match resp_kv_surrogate(state, session, &key) {
+    let surrogate = match resp_kv_surrogate(state, session, &key).await {
         Ok(s) => s,
         Err(e) => return e,
     };

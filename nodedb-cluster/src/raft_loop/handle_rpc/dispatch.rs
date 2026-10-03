@@ -24,8 +24,8 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
     async fn handle_rpc(&self, rpc: RaftRpc) -> Result<RaftRpc> {
         match rpc {
             // Raft consensus RPCs — lock MultiRaft (sync, never across await).
-            RaftRpc::AppendEntriesRequest(req) => self.handle_append_entries_rpc(req),
-            RaftRpc::RequestVoteRequest(req) => self.handle_request_vote_rpc(req),
+            RaftRpc::AppendEntriesRequest(req) => self.handle_append_entries_rpc(req).await,
+            RaftRpc::RequestVoteRequest(req) => self.handle_request_vote_rpc(req).await,
             RaftRpc::PreVoteRequest(req) => self.handle_pre_vote_rpc(req),
             RaftRpc::InstallSnapshotRequest(req) => self.handle_install_snapshot_rpc(req).await,
             // Cluster join — full orchestration in `super::join`.
@@ -43,9 +43,17 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
             RaftRpc::DataProposeRequest(req) => self.handle_data_propose_rpc(req),
             // Read index for a node that does not lead the group.
             RaftRpc::ReadIndexRequest(req) => self.handle_read_index_rpc(req).await,
+            // The leader this node knows for a group, from its own Raft state.
+            RaftRpc::LeaderStatusRequest(req) => Ok(RaftRpc::LeaderStatusResponse(
+                self.leader_status(req.group_id),
+            )),
             // Authorization lease renewal and barrier, answered by the host hook.
             RaftRpc::AuthLeaseRenewRequest(req) => self.handle_auth_lease_renew_rpc(req).await,
             RaftRpc::AuthBarrierRequest(req) => self.handle_auth_barrier_rpc(req).await,
+            // Streamed parts of a multi-part Calvin transaction.
+            RaftRpc::CalvinPartsRequest(req) => Ok(RaftRpc::CalvinPartsResponse(
+                self.on_calvin_parts_impl(req).await,
+            )),
             // VShardEnvelope — dispatch to registered handler (Event Plane, etc.).
             RaftRpc::VShardEnvelope(bytes) => self.handle_vshard_envelope_rpc(bytes).await,
             other => Err(ClusterError::Transport {
@@ -184,7 +192,7 @@ mod tests {
         let topo = Arc::new(RwLock::new(ClusterTopology::new()));
         let raft_loop = RaftLoop::new(mr, transport, topo, NoopApplier);
 
-        raft_loop.do_tick();
+        raft_loop.do_tick().await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let req = RaftRpc::AppendEntriesRequest(nodedb_raft::AppendEntriesRequest {
@@ -195,6 +203,8 @@ mod tests {
             entries: vec![],
             leader_commit: 0,
             group_id: 0,
+            round: 1,
+            replicated_floor: 0,
         });
 
         let resp = raft_loop.handle_rpc(req).await.unwrap();
@@ -214,6 +224,9 @@ mod tests {
         let rt = RoutingTable::uniform(1, &[1, 2, 3], 3);
         let mut mr = MultiRaft::new(1, rt, dir.path().to_path_buf());
         mr.add_group(0, vec![2, 3]).unwrap();
+        for node in mr.groups_mut().values_mut() {
+            node.expire_boot_vote_fence();
+        }
 
         let topo = Arc::new(RwLock::new(ClusterTopology::new()));
         let raft_loop = RaftLoop::new(mr, transport, topo, NoopApplier);
@@ -224,6 +237,7 @@ mod tests {
             last_log_index: 0,
             last_log_term: 0,
             group_id: 0,
+            transfer: false,
         });
 
         let resp = raft_loop.handle_rpc(req).await.unwrap();
@@ -265,19 +279,36 @@ mod tests {
         let topo = Arc::new(RwLock::new(topology));
 
         let raft_loop = RaftLoop::new(mr, transport, topo.clone(), NoopApplier);
-        raft_loop.do_tick();
+        raft_loop.do_tick().await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let req = RaftRpc::JoinRequest(crate::rpc_codec::JoinRequest {
             node_id: 2,
             listen_addr: "127.0.0.1:9401".into(),
             wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
+            build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
             spiffe_id: None,
             spki_pin: None,
+            swim_addr: None,
         });
 
-        let resp = raft_loop.handle_rpc(req).await.unwrap();
-        match resp {
+        // A leader commits an entry only once its own disk holds it, and the
+        // tick is what observes that write. The run loop ticks beside every
+        // RPC handler, so this test does the same while the join waits.
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let join = async {
+            let resp = raft_loop.handle_rpc(req).await;
+            done.store(true, std::sync::atomic::Ordering::Release);
+            resp
+        };
+        let ticking = async {
+            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                raft_loop.do_tick().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        let (resp, ()) = tokio::join!(join, ticking);
+        match resp.unwrap() {
             RaftRpc::JoinResponse(r) => {
                 assert!(
                     r.success,
@@ -288,18 +319,22 @@ mod tests {
                 // uniform(2, ...) creates 3 groups (metadata + 2 data).
                 assert_eq!(r.groups.len(), 3);
                 assert_eq!(r.vshard_to_group.len(), 1024);
-                // The new node should appear as a learner on every group,
-                // not as a voter — voter promotion happens asynchronously
-                // via the tick loop's promotion phase.
-                for g in &r.groups {
-                    assert!(
-                        g.learners.contains(&2),
-                        "expected node 2 as learner in group {}, got learners={:?} members={:?}",
-                        g.group_id,
-                        g.learners,
-                        g.members
-                    );
-                }
+                // The join admits the new node to the metadata group as a
+                // learner. Voter promotion happens later in the tick loop.
+                // Data groups take it only where their placement names it,
+                // through the group leader's convergence step, so the
+                // response makes no claim about them.
+                let metadata = r
+                    .groups
+                    .iter()
+                    .find(|g| g.group_id == 0)
+                    .expect("the response lists the metadata group");
+                assert!(
+                    metadata.learners.contains(&2),
+                    "metadata group: learners={:?} members={:?}",
+                    metadata.learners,
+                    metadata.members
+                );
             }
             other => panic!("expected JoinResponse, got {other:?}"),
         }

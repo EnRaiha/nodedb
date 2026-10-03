@@ -67,18 +67,17 @@ fn pg_detail(e: &tokio_postgres::Error) -> String {
     }
 }
 
-/// Reassign vshard group 1's leader to `new_leader_node_id` in the routing
-/// table on every node. This mirrors the atomic cut-over that
-/// `MigrationExecutor::phase3_cutover` achieves via `RoutingChange::LeadershipTransfer`
-/// once the vShard migration executor path is fully wired — we reproduce its
-/// externally-observable effect (routing table update) directly so the test
-/// can assert surrogate durability without requiring the executor.
+/// Point vShard group 1's routing hint at `new_leader_node_id` on every
+/// node, at one term above the hint's term. A real cut-over transfers
+/// leadership, and the transfer's election names the target at a higher
+/// term. The test reproduces that routing effect directly, so it can assert
+/// surrogate durability without the migration executor.
 fn simulate_cutover(cluster: &TestCluster, new_leader_node_id: u64) {
     for node in &cluster.nodes {
         if let Some(ref routing) = node.shared.cluster_routing {
             let mut table = routing.write().unwrap_or_else(|p| p.into_inner());
-            // Data group (group 1) leader is reassigned to the target node.
-            table.set_leader(1, new_leader_node_id);
+            let term = table.group_info(1).map_or(0, |info| info.leader_term);
+            table.observe_leader(1, new_leader_node_id, term + 1);
         }
     }
 }

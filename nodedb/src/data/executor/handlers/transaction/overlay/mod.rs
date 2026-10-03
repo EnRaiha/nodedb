@@ -8,8 +8,10 @@ mod fts_score;
 mod graph_staged;
 mod lease;
 mod merge;
+mod row_tags;
 mod spatial_merge;
 mod staged;
+mod staged_read;
 mod staged_sidecar;
 mod staged_vector;
 mod timeseries_merge;
@@ -24,6 +26,7 @@ pub(in crate::data::executor) use columnar_merge::{
 pub(in crate::data::executor) use fts_merge::FtsMergeParams;
 pub use graph_staged::{GraphCollKey, GraphTxnOverlay, NodeLabelDelta};
 pub(in crate::data::executor) use merge::IndexOverlayMergeParams;
+pub use row_tags::BodyWrites;
 pub(in crate::data::executor) use spatial_merge::SpatialOverlayMergeParams;
 pub use staged::{CollectionOverlay, MAX_TXN_OVERLAY_BYTES, Staged, TouchedSlot, TxnOverlay};
 pub use staged_sidecar::{BitemporalStamp, StagedTtl};

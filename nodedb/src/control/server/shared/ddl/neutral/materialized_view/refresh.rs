@@ -17,11 +17,9 @@
 //! specialised refresh opcode; every engine feature reachable by a normal
 //! `SELECT` is reachable by refresh.
 //!
-//! Ported from the pgwire `ddl::materialized_view::refresh` handler. The plan /
-//! Data-Plane dispatch path (`plan_sql`, `wal_append_if_write`,
+//! The plan / Data-Plane dispatch path (`plan_sql`, `wal_append_if_write`,
 //! `dispatch_to_data_plane`), the scan-row normalisation, and the INSERT
-//! synthesis are preserved verbatim; only the result construction changed from
-//! pgwire `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
+//! synthesis run here. The result is the protocol-neutral [`DdlResult`] /
 //! [`DdlError`].
 
 use nodedb_types::DatabaseId;
@@ -116,7 +114,7 @@ pub async fn refresh_materialized_view(
 }
 
 /// Plan and execute a `SELECT` via the standard SQL pipeline, collect
-/// the result rows as `serde_json::Map` objects. Response payloads may
+/// the result rows as `serde_json::Map` objects. Response payloads can
 /// come back as wrapped scan rows (`{id, data: {...}}`) or as flat
 /// aggregate/join rows — both are normalised to the logical row map.
 async fn execute_select(
@@ -306,38 +304,15 @@ async fn dispatch_sql(
                 checked
             }
         };
-        // The record's outcome-floor window opens before the append and
-        // closes from the task's outcome inside the funnel.
-        let owner = crate::control::server::dispatch_utils::RecordOwner {
-            tenant_id: identity.tenant_id,
-            database_id: checked.database_id(),
-            vshard_id: checked.vshard_id(),
-        };
-        let minted =
-            crate::control::server::dispatch_utils::MintedRecords::open(&state.outcome_floor);
-        if let Err(e) = minted.append_plan(
-            &state.wal,
-            owner,
-            checked.plan(),
-            // The refresh is dispatched as a client write.
-            crate::event::EventSource::User,
-        ) {
-            // Any record appended before the error never reaches a core.
-            minted
-                .cancel(&state.wal, owner, 0)
-                .await
-                .map_err(|c| err(sqlstate::IO_ERROR, format!("cancel refresh record: {c}")))?;
-            return Err(err(sqlstate::IO_ERROR, format!("wal append: {e}")));
-        }
-        let response =
-            crate::control::server::dispatch_utils::dispatch_authorized_minted_to_data_plane(
-                state,
-                checked,
-                TraceId::ZERO,
-                minted,
-            )
-            .await
-            .map_err(|e| err(sqlstate::CONNECTION_FAILURE, format!("dispatch: {e}")))?;
+        // The refresh write applies through its replicated entry, as every
+        // client write does.
+        let response = crate::control::server::dispatch_utils::dispatch_authorized_durable_write(
+            state,
+            checked,
+            TraceId::ZERO,
+        )
+        .await
+        .map_err(|e| err(sqlstate::CONNECTION_FAILURE, format!("dispatch: {e}")))?;
         require_ok_response(&response)?;
     }
     Ok(())

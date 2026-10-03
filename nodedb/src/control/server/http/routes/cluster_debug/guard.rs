@@ -66,7 +66,7 @@ pub fn json_response(status: StatusCode, body: String) -> Response {
 /// Serialise `value` with `sonic_rs` and wrap in a 200 response.
 /// On serialisation failure returns a 500 with a short JSON error
 /// body — the only realistic failure mode for in-memory snapshots is
-/// a non-UTF8 key, which would indicate corrupted memory, not a
+/// a non-UTF8 key, which indicates corrupted memory, not a
 /// legitimate caller error.
 pub fn ok_json<T: serde::Serialize>(value: &T) -> Response {
     match sonic_rs::to_string(value) {
@@ -81,12 +81,14 @@ pub fn ok_json<T: serde::Serialize>(value: &T) -> Response {
     }
 }
 
-/// 503 response used when the cluster subsystem required by a handler
-/// is absent (single-node mode). Kept in one place so every endpoint
-/// returns the same shape for "feature not wired on this node".
-pub fn cluster_disabled() -> Response {
+/// 500 response for a cluster handle a handler reads before `start_raft`
+/// installed it. Every node runs a cluster, a one-node cluster included,
+/// and `start_raft` runs before the startup gate admits a cluster route.
+/// Kept in one place so every endpoint returns the same shape.
+pub fn cluster_not_started() -> Response {
     json_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        r#"{"error":"cluster mode not enabled"}"#.to_string(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        r#"{"error":"cluster not started","detail":"start_raft has not run on this node"}"#
+            .to_string(),
     )
 }

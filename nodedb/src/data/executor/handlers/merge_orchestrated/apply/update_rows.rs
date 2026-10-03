@@ -7,6 +7,7 @@ use redb::WriteTransaction;
 
 use crate::bridge::envelope::{Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::redo_image::submitted_row_image;
 use crate::data::executor::enforcement::balanced::BalancedEntry;
 use crate::data::executor::enforcement::write_hook;
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
@@ -115,6 +116,7 @@ impl CoreLoop {
                     index_text: true,
                     user_roles: &task.request.user_roles,
                     enforce: true,
+                    unique: crate::data::executor::enforcement::unique::UniqueJudge::Unit,
                     wal_lsn: task.wal_lsn(),
                     resolved_targets: resolved_sum_targets,
                 },
@@ -159,15 +161,14 @@ impl CoreLoop {
                             }));
                         }
                     }
-                    if has_vectors {
-                        write_set.push(WriteSetEntry {
-                            surrogate: surrogate.as_u32(),
-                            identity: row_identity.clone(),
-                            is_delete: false,
-                            value: upd.body.clone(),
-                            collection: None,
-                        });
-                    }
+                    // The updated row, journalled after the phase-A commit
+                    // from the MessagePack body `apply_point_put` took.
+                    write_set.push(submitted_row_image(
+                        surrogate.as_u32(),
+                        row_identity.clone(),
+                        upd.body.clone(),
+                        outcome.bitemporal_sys_from_ms,
+                    ));
                     if returning {
                         match returning_doc(&upd.body, &upd.key) {
                             Ok(doc) => returned_docs.push(doc),

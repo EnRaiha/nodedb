@@ -4,5 +4,6 @@
 
 mod active_dispatch;
 mod bind_identities;
+mod incarnation;
 mod primary_write;
 mod static_dispatch;

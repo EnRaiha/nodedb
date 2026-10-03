@@ -16,8 +16,9 @@ pub(in crate::data::executor) struct PointGetParams<'a> {
     pub document_id: &'a str,
     /// Catalog-bound identity. Hex-encoded into the substrate row key
     /// at handler entry so storage addressing is independent of the
-    /// user-facing PK string.
-    pub surrogate: Surrogate,
+    /// user-facing PK string. `None` when the key is unbound in this
+    /// database: the read matches no row.
+    pub surrogate: Option<Surrogate>,
     pub rls_filters: &'a [u8],
     pub system_as_of_ms: Option<i64>,
     pub valid_at_ms: Option<i64>,
@@ -38,6 +39,10 @@ impl CoreLoop {
             system_as_of_ms,
             valid_at_ms,
         } = p;
+        // A key unbound in this database names no row here.
+        let Some(surrogate) = surrogate else {
+            return self.response_with_payload(task, Vec::new());
+        };
         let storage_key = nodedb_types::StorageKey::for_surrogate(surrogate);
         debug!(
             core = self.core_id,

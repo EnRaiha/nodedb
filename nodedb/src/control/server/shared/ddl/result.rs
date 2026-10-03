@@ -50,6 +50,13 @@ pub struct DdlError {
     pub cause: Option<Box<nodedb_types::NodeDbError>>,
 }
 
+/// A crate error keeps the SQLSTATE and class every protocol reports for it.
+impl From<crate::Error> for DdlError {
+    fn from(error: crate::Error) -> Self {
+        Self::from_error(&error)
+    }
+}
+
 impl DdlError {
     /// Build a `DdlError` from a SQLSTATE with one unambiguous `ErrorCode`
     /// meaning, deriving `code` from [`code_for_sqlstate`]. This is the
@@ -248,7 +255,6 @@ pub fn code_for_sqlstate(sqlstate_str: &str) -> ErrorCode {
         sqlstate::DIVISION_BY_ZERO => ErrorCode::DIVISION_BY_ZERO,
         sqlstate::INVALID_LIMIT_VALUE => ErrorCode::INVALID_LIMIT_VALUE,
         sqlstate::PROGRAM_LIMIT_EXCEEDED => ErrorCode::PROGRAM_LIMIT_EXCEEDED,
-        sqlstate::STATEMENT_TOO_COMPLEX => ErrorCode::FAN_OUT_EXCEEDED,
         sqlstate::CLONE_DEPTH_EXCEEDED => ErrorCode::CLONE_DEPTH_EXCEEDED,
         // Every integrity-constraint SQLSTATE is a constraint violation:
         // class `23`, the class the code renders back.
@@ -282,7 +288,7 @@ pub fn code_for_sqlstate(sqlstate_str: &str) -> ErrorCode {
         sqlstate::DATABASE_DROPPED => ErrorCode::NOT_LEADER,
         sqlstate::LOCK_NOT_AVAILABLE => ErrorCode::NO_LEADER,
         sqlstate::MOVE_TENANT_PREFLIGHT_FAILED => ErrorCode::MOVE_TENANT_PREFLIGHT_FAILED,
-        // A target the server could not reach: retriable, class `08`.
+        // A target the server cannot reach: retriable, class `08`.
         sqlstate::CONNECTION_FAILURE => ErrorCode::NODE_UNREACHABLE,
         sqlstate::PROTOCOL_VIOLATION => ErrorCode::HANDSHAKE_FAILED,
         sqlstate::SERVER_REJECTED_ESTABLISHMENT => ErrorCode::SHAPE_SUBSCRIPTION_FAILED,
@@ -496,7 +502,7 @@ mod tests {
     }
 
     /// The ambiguous constructors carry a code the bare-string derivation
-    /// could never produce, since `0A000` alone also means
+    /// can never produce, since `0A000` alone also means
     /// `SQL_NOT_ENABLED`.
     #[test]
     fn ambiguous_constructors_carry_their_explicit_code() {

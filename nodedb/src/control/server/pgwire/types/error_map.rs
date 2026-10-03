@@ -190,6 +190,11 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::AuthorizationStateBehind { .. } => {
             ("ERROR", sqlstate::STALE_READ_NOT_LEADER, err.to_string())
         }
+        // Nothing was read, and a retry succeeds once a leader confirms a read
+        // index this node has applied.
+        crate::Error::LinearizableReadRefused { .. } => {
+            ("ERROR", sqlstate::STALE_READ_NOT_LEADER, err.to_string())
+        }
         // Nothing was applied, and a retry succeeds once the group's majority
         // is reachable again.
         crate::Error::GroupQuorumUnavailable { .. } => {
@@ -200,11 +205,16 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::GroupMarksUnavailable { .. } => {
             ("ERROR", sqlstate::LOCK_NOT_AVAILABLE, err.to_string())
         }
+        // Nothing was captured, and a retry succeeds once the group's
+        // leadership settles.
+        crate::Error::BackupCaptureMoved { .. } => {
+            ("ERROR", sqlstate::LOCK_NOT_AVAILABLE, err.to_string())
+        }
         crate::Error::ConflictRetry { .. } => {
             ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
         }
         // A cross-shard Calvin OCC abort is a serialization failure — the client
-        // should retry the whole transaction.
+        // must retry the whole transaction.
         crate::Error::CalvinSerializationConflict => {
             ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
         }
@@ -213,9 +223,6 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         // (40000) keeps it in the retryable class 40 without claiming 40001.
         crate::Error::CalvinParticipantError => {
             ("ERROR", sqlstate::TRANSACTION_ROLLBACK, err.to_string())
-        }
-        crate::Error::SourceFrozen { .. } => {
-            ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
         }
         // A descriptor changed under the statement and the server's own
         // retries ran out. The client retries the statement, so it takes
@@ -248,9 +255,6 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         }
         crate::Error::MemoryExhausted { .. } => ("ERROR", sqlstate::OUT_OF_MEMORY, err.to_string()),
         crate::Error::Backpressure { .. } => ("ERROR", sqlstate::OUT_OF_MEMORY, err.to_string()),
-        crate::Error::FanOutExceeded { .. } => {
-            ("ERROR", sqlstate::STATEMENT_TOO_COMPLEX, err.to_string())
-        }
         // A cross-collection write refused because source and target are not
         // co-resident is a not-yet-supported operation, NOT a transient/internal
         // fault — surface FEATURE_NOT_SUPPORTED (0A000) so clients do not retry.
@@ -271,7 +275,7 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         ),
         // OLLP retry exhaustion is retryable only when it exhausted on real
         // drift. A pre-admission cause keeps ITS OWN sqlstate — telling a client
-        // to retry a deterministic failure just burns another round trip — and a
+        // to retry a deterministic failure burns another round trip — and a
         // refused admission gate is transient like any other load rejection.
         crate::Error::OllpExhausted { cause, .. } => match cause {
             OllpExhaustedCause::PredicateDrift => {
@@ -295,7 +299,7 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
             ("ERROR", sqlstate::BALANCE_VIOLATION, err.to_string())
         }
         // A Data Plane verdict that travelled back as a typed code keeps the
-        // SQLSTATE it would have had on the direct dispatch path.
+        // SQLSTATE it has on the direct dispatch path.
         crate::Error::DataPlane(code) => {
             crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(code)
         }
@@ -374,6 +378,15 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::StaleReadNotLeader { .. } => {
             ("ERROR", sqlstate::STALE_READ_NOT_LEADER, err.to_string())
         }
+        // The write committed and its result is gone, or its outcome is
+        // unknown. The code base has no class for either, and the standard
+        // ones (`08007`, `40003`) sit in classes drivers and pools retry.
+        // Class `XX` is never treated as transient, so no client re-proposes
+        // a write that can have committed.
+        crate::Error::CommittedResultUnavailable { .. }
+        | crate::Error::ProposalOutcomeUnknown { .. } => {
+            ("ERROR", sqlstate::INTERNAL_ERROR, err.to_string())
+        }
         // Server-side faults and system defects. The client can act on none
         // of them, and their public codes are internal classes.
         crate::Error::MaterializedSumResolutionMissing { .. }
@@ -392,10 +405,13 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         | crate::Error::Encryption { .. }
         | crate::Error::Bridge { .. }
         | crate::Error::VersionCompat { .. }
+        | crate::Error::RestoreTargetNotEmpty { .. }
+        | crate::Error::RestoreVerificationFailed { .. }
         | crate::Error::Internal { .. }
         | crate::Error::DescriptorVersionAnomaly { .. }
         | crate::Error::CatalogIntegrityViolation { .. }
         | crate::Error::CollectionPurgeRowMissing { .. }
+        | crate::Error::CollectionUnstamped { .. }
         | crate::Error::CascadeCycle { .. } => ("ERROR", sqlstate::INTERNAL_ERROR, err.to_string()),
     }
 }

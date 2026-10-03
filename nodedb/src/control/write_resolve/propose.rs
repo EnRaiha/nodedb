@@ -6,7 +6,6 @@
 use std::sync::atomic::Ordering;
 
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
-use crate::control::server::dispatch_utils::publish_origin_change_events;
 use crate::control::state::SharedState;
 use crate::control::wal_replication::{
     ReplicableWrite, propose_replicated_entry, to_replicated_entry,
@@ -25,8 +24,7 @@ pub(super) enum ProposeOutcome {
 }
 
 /// Propose `plan` — a resolved write — through the live Raft proposer and
-/// await commit + apply. Only reachable when `async_raft_proposer()` is
-/// `Some`; an absent proposer here is an internal invariant break.
+/// await commit + apply.
 pub(super) async fn propose_resolved(
     state: &SharedState,
     ctx: WriteResolveContext,
@@ -34,14 +32,7 @@ pub(super) async fn propose_resolved(
     vshard_id: VShardId,
     plan: PhysicalPlan,
 ) -> crate::Result<ProposeOutcome> {
-    let proposer = state
-        .async_raft_proposer()
-        .ok_or_else(|| crate::Error::Internal {
-            detail: format!(
-                "write-resolve orchestrator invoked for '{collection}' with no active Raft \
-                 proposer; this path is only reachable when async_raft_proposer().is_some()"
-            ),
-        })?;
+    let proposer = state.async_raft_proposer()?;
     // The resolved op stamps `DecidedEarlierInRequest`, so this never refuses.
     let replicable = ReplicableWrite::decide_for_replication(&plan)?;
     let entry = to_replicated_entry(ctx.tenant_id, ctx.database_id, vshard_id, &replicable)?
@@ -67,10 +58,6 @@ pub(super) async fn propose_resolved(
                 read_version_lsn: write_version,
                 write_set: Vec::new(),
             };
-            // Mirrors `dispatch_replicated_write`: the proposing node is the
-            // one node that handled this write exactly once, so it is the one
-            // that publishes the CDC change event.
-            publish_origin_change_events(state, ctx.tenant_id, ctx.database_id, &plan, &response);
             Ok(ProposeOutcome::Applied(response))
         }
         Err(crate::Error::DataPlane(ErrorCode::OllpRetryRequired)) => {

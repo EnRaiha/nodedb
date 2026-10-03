@@ -11,21 +11,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use nodedb::bridge::dispatch::Dispatcher;
 use nodedb::config::auth::AuthMode;
 use nodedb::control::security::apikey::CreateKeyParams;
 use nodedb::control::security::identity::Role;
 use nodedb::control::shutdown::{ShutdownHandle, ShutdownPhase};
 use nodedb::control::state::SharedState;
 use nodedb::types::{DatabaseId, TenantId};
-use nodedb::wal::WalManager;
+use nodedb_test_support::booted_state::{BootOptions, BootedState};
 
 struct TestServer {
     local_addr: std::net::SocketAddr,
-    shared: Arc<SharedState>,
+    shared: BootedState,
     shutdown_handle: ShutdownHandle,
     _server: tokio::task::JoinHandle<()>,
-    _dir: tempfile::TempDir,
 }
 
 fn create_readonly_api_key(shared: &SharedState) -> String {
@@ -56,11 +54,7 @@ fn create_readonly_api_key(shared: &SharedState) -> String {
 }
 
 async fn start_http(auth_mode: AuthMode) -> TestServer {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let wal =
-        Arc::new(WalManager::open_for_testing(&dir.path().join("health.wal")).expect("open wal"));
-    let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-    let shared = SharedState::new(dispatcher, wal).unwrap();
+    let shared = BootedState::boot(BootOptions::default());
     if auth_mode == AuthMode::Trust {
         shared
             .credentials
@@ -75,7 +69,7 @@ async fn start_http(auth_mode: AuthMode) -> TestServer {
 
     let (bus, shutdown_handle) =
         nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&shared.shutdown));
-    let shared_http = Arc::clone(&shared);
+    let shared_http = Arc::clone(&*shared);
     let handle = tokio::spawn(async move {
         nodedb::control::server::http::server::run_with_listener(
             listener,
@@ -97,7 +91,6 @@ async fn start_http(auth_mode: AuthMode) -> TestServer {
         shared,
         shutdown_handle,
         _server: handle,
-        _dir: dir,
     }
 }
 

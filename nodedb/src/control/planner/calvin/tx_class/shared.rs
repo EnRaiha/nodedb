@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Write-set-identity extractors shared by the static and dependent `TxClass`
-//! builders.
+//! Read-set projections and node lock pairs shared by the static and
+//! dependent `TxClass` builders. The write keys live in
+//! [`super::write_keys`].
 
 use crate::control::server::shared::session::read_set::{ReadKey, ReadSetEntry};
 use nodedb_cluster::calvin::types::{
     EngineKeySet, EngineTag, ReadKeyIdent, ReadWriteSet, SortedVec, VersionedReadEntry,
     VersionedReadSet,
-};
-use nodedb_physical::physical_plan::{
-    ColumnarOp, DocumentOp, GraphOp, KvOp, PhysicalPlan, TimeseriesOp, VectorOp, VectorWriteTargets,
 };
 
 /// Map the neutral session read-set into the replicated, LSN-versioned
@@ -41,6 +39,8 @@ pub(super) fn versioned_reads_from(reads: &[ReadSetEntry]) -> VersionedReadSet {
                     },
                 },
                 read_lsn: entry.read_version_lsn,
+                home_vshard: entry.home.map(|home| home.as_u32()),
+                served_by: entry.home_node,
             })
             .collect(),
     )
@@ -51,10 +51,11 @@ pub(super) fn versioned_reads_from(reads: &[ReadSetEntry]) -> VersionedReadSet {
 /// not the LSN-versioned OCC set ([`versioned_reads_from`]).
 ///
 /// A [`ReadSetEntry`] carries only `(engine, collection)`, no key identity,
-/// so it maps to a COLLECTION-homed [`EngineKeySet`] with an empty key
-/// vector — over-approximating participants, which is required and safe for
-/// a graph/edge read (no endpoint homes to build an `EngineKeySet::Edge`
-/// from): more validation, never a dropped participant.
+/// so an unhomed entry maps to a COLLECTION-homed [`EngineKeySet`] with an
+/// empty key vector. That over-approximates participants: more validation,
+/// never a dropped participant. A homed entry (one vShard of a cross-shard
+/// graph read) maps to an `EngineKeySet::Edge` with no edges and its home in
+/// `home_vshards`, so the vShard it read participates and validates it.
 pub(super) fn read_set_from(reads: &[ReadSetEntry]) -> ReadWriteSet {
     use std::collections::BTreeSet;
 
@@ -65,7 +66,18 @@ pub(super) fn read_set_from(reads: &[ReadSetEntry]) -> ReadWriteSet {
     let mut vector_colls: BTreeSet<String> = BTreeSet::new();
     let mut kv_colls: BTreeSet<String> = BTreeSet::new();
     let mut doc_colls: BTreeSet<String> = BTreeSet::new();
+    // Homed reads (cross-shard graph reads) participate on their home vShards,
+    // not on the collection's vShard. They key no edge, so they lock nothing.
+    let mut homed: std::collections::BTreeMap<String, BTreeSet<u32>> =
+        std::collections::BTreeMap::new();
     for entry in reads {
+        if let Some(home) = entry.home {
+            homed
+                .entry(entry.collection.clone())
+                .or_default()
+                .insert(home.as_u32());
+            continue;
+        }
         if entry.collection.is_empty() {
             continue;
         }
@@ -110,208 +122,31 @@ pub(super) fn read_set_from(reads: &[ReadSetEntry]) -> ReadWriteSet {
             surrogates: SortedVec::new(vec![]),
         });
     }
+    for (collection, homes) in homed {
+        sets.push(EngineKeySet::Edge {
+            collection,
+            edges: SortedVec::new(vec![]),
+            home_vshards: SortedVec::new(homes.into_iter().collect()),
+        });
+    }
     ReadWriteSet::new(sets)
 }
 
-/// Extract `(collection, raw byte keys)` from a KV write plan, or `None` for a
-/// KV op with no statically-known point keys (e.g. `BatchPut`). Single-key
-/// read-modify-write ops (`Incr`/`IncrFloat`/`Cas`/`GetSet`/`FieldSet`) key on
-/// the same `(collection, key)` pair as `Put`/`Insert`, so they sequence
-/// identically to the write-admission gate's `kv_point_key`.
-pub(super) fn kv_write_keys(op: &KvOp) -> Option<(String, Vec<Vec<u8>>)> {
-    match op {
-        KvOp::Put {
-            collection, key, ..
-        }
-        | KvOp::Insert {
-            collection, key, ..
-        }
-        | KvOp::InsertIfAbsent {
-            collection, key, ..
-        }
-        | KvOp::InsertOnConflictUpdate {
-            collection, key, ..
-        }
-        | KvOp::Incr {
-            collection, key, ..
-        }
-        | KvOp::IncrFloat {
-            collection, key, ..
-        }
-        | KvOp::Cas {
-            collection, key, ..
-        }
-        | KvOp::GetSet {
-            collection, key, ..
-        }
-        | KvOp::FieldSet {
-            collection, key, ..
-        } => Some((collection.to_string(), vec![key.clone()])),
-        KvOp::Delete {
-            collection, keys, ..
-        } => Some((collection.to_string(), keys.clone())),
-        _ => None,
-    }
-}
-
-/// Extract `(collection, surrogates)` from a Vector write plan, or `None` for a
-/// Vector op with no statically-known surrogate identity (e.g. node-id delete).
-pub(super) fn vector_write_surrogates(op: &VectorOp) -> Option<(String, Vec<u32>)> {
-    match op {
-        VectorOp::Insert {
-            collection,
-            surrogate,
-            ..
-        }
-        | VectorOp::DeleteBySurrogate {
-            collection,
-            surrogate,
-            ..
-        }
-        | VectorOp::DirectInsert {
-            collection,
-            surrogate,
-            ..
-        }
-        | VectorOp::DirectInsertIfAbsent {
-            collection,
-            surrogate,
-            ..
-        }
-        | VectorOp::DirectUpsert {
-            collection,
-            surrogate,
-            ..
-        } => Some((collection.to_string(), vec![surrogate.as_u32()])),
-        VectorOp::BatchInsert {
-            collection,
-            surrogates,
-            ..
-        }
-        | VectorOp::DirectDelete {
-            collection,
-            targets: VectorWriteTargets::Surrogates(surrogates),
-            ..
-        }
-        | VectorOp::DirectUpdate {
-            collection,
-            targets: VectorWriteTargets::Surrogates(surrogates),
-            ..
-        } => Some((
-            collection.to_string(),
-            surrogates.iter().map(|s| s.as_u32()).collect(),
-        )),
-        _ => None,
-    }
-}
-
-/// Extract the collection name from a write plan.
+/// The lock pair of node `node` within one edge collection.
 ///
-/// This name feeds the participant set (hashed by
-/// `participating_vshards_in_database`), so an empty name doesn't fail
-/// loudly — it hashes to vShard 0, gets enlisted, and aborts far from the
-/// real cause ("homes no local write plans or reads"). The document arm is
-/// exhaustive for exactly that reason: a new `DocumentOp` is a compile
-/// error here, not a silent empty name.
-pub(crate) fn collection_name_from_plan(plan: &PhysicalPlan) -> String {
-    match plan {
-        PhysicalPlan::Document(op) => document_write_collection(op),
-        PhysicalPlan::Kv(
-            KvOp::Put { collection, .. }
-            | KvOp::Insert { collection, .. }
-            | KvOp::InsertIfAbsent { collection, .. }
-            | KvOp::InsertOnConflictUpdate { collection, .. }
-            | KvOp::Delete { collection, .. }
-            | KvOp::BatchPut { collection, .. }
-            | KvOp::Incr { collection, .. }
-            | KvOp::IncrFloat { collection, .. }
-            | KvOp::Cas { collection, .. }
-            | KvOp::GetSet { collection, .. }
-            | KvOp::FieldSet { collection, .. }
-            // Predicate DML homes on the collection it names — matching
-            // `plan_vshard`'s KV routing, which the participant set must
-            // agree with.
-            | KvOp::PredicateUpdate { collection, .. }
-            | KvOp::PredicateDelete { collection, .. },
-        ) => collection.to_string(),
-        PhysicalPlan::Vector(
-            VectorOp::Insert { collection, .. }
-            | VectorOp::BatchInsert { collection, .. }
-            | VectorOp::Delete { collection, .. }
-            | VectorOp::DeleteBySurrogate { collection, .. }
-            | VectorOp::DirectTruncate { collection, .. },
-        ) => collection.to_string(),
-        PhysicalPlan::Graph(
-            GraphOp::EdgePut { collection, .. } | GraphOp::EdgeDelete { collection, .. },
-        ) => collection.to_string(),
-        PhysicalPlan::Timeseries(
-            TimeseriesOp::Ingest { collection, .. } | TimeseriesOp::Truncate { collection, .. },
-        )
-        | PhysicalPlan::Columnar(ColumnarOp::Truncate { collection, .. }) => {
-            collection.to_string()
-        }
-        _ => String::new(),
-    }
-}
-
-/// The collection a DOCUMENT write plan homes on, exhaustively.
-fn document_write_collection(op: &DocumentOp) -> String {
-    match op {
-        DocumentOp::PointPut { collection, .. }
-        | DocumentOp::PointInsert { collection, .. }
-        | DocumentOp::PointDelete { collection, .. }
-        | DocumentOp::PointUpdate { collection, .. }
-        | DocumentOp::BatchInsert { collection, .. }
-        | DocumentOp::Upsert { collection, .. }
-        | DocumentOp::BulkUpdate { collection, .. }
-        | DocumentOp::BulkDelete { collection, .. }
-        | DocumentOp::Truncate { collection, .. }
-        // Homes on the TARGET collection — same one the routing oracle uses.
-        | DocumentOp::ApplyBalanceDelta { collection, .. } => collection.to_string(),
-        DocumentOp::InsertSelect {
-            target_collection, ..
-        } => target_collection.to_string(),
-        // Cross-collection writes: Control-Plane orchestrators resolve them
-        // into concrete point writes before dispatch, so no raw plan reaches
-        // this builder; the routing oracle names them `Unroutable`.
-        DocumentOp::Merge { .. } | DocumentOp::UpdateFromJoin { .. } => String::new(),
-        // Proposed directly through Raft, so no plan reaches this builder.
-        DocumentOp::ResolvedWrite { .. } => String::new(),
-        // Reads and index DDL: caller skips non-`is_write_plan` before here.
-        DocumentOp::ResolveWrite(_)
-        | DocumentOp::PointGet { .. }
-        | DocumentOp::Scan { .. }
-        | DocumentOp::RangeScan { .. }
-        | DocumentOp::IndexLookup { .. }
-        | DocumentOp::IndexedFetch { .. }
-        | DocumentOp::EstimateCount { .. }
-        | DocumentOp::MaterializeScan { .. }
-        | DocumentOp::Register { .. }
-        | DocumentOp::DropIndex { .. }
-        | DocumentOp::BackfillIndex { .. } => String::new(),
-    }
-}
-
-/// Extract a surrogate from a write plan (returns 0 when unavailable).
-pub(super) fn surrogate_from_plan(plan: &PhysicalPlan) -> u32 {
-    match plan {
-        PhysicalPlan::Document(
-            DocumentOp::PointPut { surrogate, .. }
-            | DocumentOp::PointInsert { surrogate, .. }
-            | DocumentOp::PointDelete { surrogate, .. }
-            | DocumentOp::PointUpdate { surrogate, .. }
-            | DocumentOp::Upsert { surrogate, .. }
-            // The TARGET row's identity — two balance writes onto one row
-            // serialize; falling through to `0` would lock all of them together.
-            | DocumentOp::ApplyBalanceDelta { surrogate, .. },
-        ) => surrogate.as_u32(),
-        _ => 0,
-    }
+/// Every edge write takes it for both endpoints, and a node delete's guard
+/// takes it for its node, so a guard and every write of an edge on its node
+/// run in sequence order on the node's key home. A real edge never locks a
+/// pair with a zero destination surrogate, so the pair never aliases an
+/// edge. Two node names that hash alike only serialize together.
+pub(crate) fn node_lock_pair(node: &str) -> (u32, u32) {
+    let hash = crate::util::fnv1a_hash(node.as_bytes());
+    ((hash ^ (hash >> 32)) as u32, 0)
 }
 
 /// Lockstep proof that the write-admission gate and the Calvin scheduler
 /// derive IDENTICAL lock keys for the same op — if they diverged, a
-/// gate-fenced write and a sequenced txn would lock different keys.
+/// gate-fenced write and a sequenced txn will lock different keys.
 #[cfg(test)]
 mod lockstep_tests {
     use super::*;
@@ -320,6 +155,7 @@ mod lockstep_tests {
     use crate::control::server::shared::write_admission::lock_keys::plan_lock_keys;
     use crate::types::{DatabaseId, TenantId, VShardId};
     use nodedb_cluster::calvin::types::EngineKeySet;
+    use nodedb_physical::physical_plan::{DocumentOp, GraphOp, KvOp, PhysicalPlan};
     use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
     use nodedb_types::Surrogate;
     use std::collections::BTreeSet;
@@ -383,6 +219,13 @@ mod lockstep_tests {
                             dst,
                         });
                     }
+                }
+                EngineKeySet::Array { collection, .. } => {
+                    keys.insert(LockKey::Surrogate {
+                        collection: Arc::from(collection.as_str()),
+                        surrogate:
+                            crate::control::planner::calvin::tx_class::write_keys::COLLECTION_KEY,
+                    });
                 }
             }
         }
@@ -450,33 +293,105 @@ mod lockstep_tests {
             resolved_sum_targets: Vec::new(),
         }));
     }
+
+    /// A bound point delete on the fast path locks its surrogate and its row
+    /// id, exactly as the scheduler does, so an unbound delete sequenced
+    /// through Calvin orders against it by the row id. The fence and the
+    /// keyed order lock still name the row by its surrogate key alone.
+    #[test]
+    fn document_point_delete_gate_keys_match_scheduler_keys_with_row_id() {
+        use crate::control::server::shared::write_admission::lock_keys::plan_row_key;
+        let plan = PhysicalPlan::Document(DocumentOp::PointDelete {
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "docs",
+            ),
+            document_id: "d1".to_owned(),
+            surrogate: Some(Surrogate::new(9)),
+            pk_bytes: b"d1".to_vec(),
+            returning: None,
+            rls_filters: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+            resolved_sum_targets: Vec::new(),
+        });
+        let (_, gate_keys) = plan_lock_keys(&plan).expect("a bound point delete is fast-path");
+        assert!(gate_keys.contains(&LockKey::Kv {
+            collection: Arc::from("docs"),
+            key: Arc::from(b"d1".as_slice()),
+        }));
+        assert_eq!(
+            plan_row_key(&plan),
+            Some(LockKey::Surrogate {
+                collection: Arc::from("docs"),
+                surrogate: 9,
+            })
+        );
+        assert_gate_matches_scheduler(plan);
+    }
+
+    /// A single-home edge write on the fast path locks its edge and both
+    /// endpoints' node lock pairs, exactly as the scheduler does, so a node
+    /// delete's guard orders against it either way.
+    #[test]
+    fn edge_put_gate_keys_match_scheduler_keys_with_node_locks() {
+        let src = "n0";
+        let dst = (1u32..)
+            .map(|i| format!("n{i}"))
+            .find(|name| {
+                crate::types::VShardId::from_key(name.as_bytes())
+                    == crate::types::VShardId::from_key(src.as_bytes())
+            })
+            .expect("some node shares the source's key home");
+        let plan = PhysicalPlan::Graph(GraphOp::EdgePut {
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "g",
+            ),
+            src_id: src.to_owned(),
+            label: "L".to_owned(),
+            dst_id: dst.clone(),
+            properties: Vec::new(),
+            src_surrogate: Surrogate::new(1),
+            dst_surrogate: Surrogate::new(2),
+        });
+        let (_, gate_keys) = plan_lock_keys(&plan).expect("a single-home edge is fast-path");
+        for node in [src, dst.as_str()] {
+            let (lock_src, lock_dst) = node_lock_pair(node);
+            assert!(gate_keys.contains(&LockKey::Edge {
+                collection: Arc::from("g"),
+                src: lock_src,
+                dst: lock_dst,
+            }));
+        }
+        assert_gate_matches_scheduler(plan);
+    }
 }
 
 /// The participant set and the routing oracle must agree about where a plan
-/// lives: [`collection_name_from_plan`] feeds the participant list, the
-/// scheduler's `plan_vshard` oracle decides who actually gets the plan. A
+/// lives: the write keys' collections feed the participant list, and the
+/// scheduler's `plan_vshard` oracle decides who gets the plan. A
 /// disagreement enlists a shard, hands it nothing, and aborts far from the
-/// cause. An op missing from the extractor silently hashes to vShard 0.
-/// These tests pin the agreement directly.
+/// cause. These tests pin the agreement directly.
 #[cfg(test)]
 mod routing_agreement_tests {
-    use super::*;
     use crate::control::planner::calvin::tx_class::static_builder::build_static_tx_class;
+    use crate::control::planner::calvin::tx_class::write_keys::{WriteKeys, add_plan_write_keys};
     use crate::types::{DatabaseId, TenantId, VShardId};
+    use nodedb_cluster::calvin::types::{EngineKeySet, SortedVec};
+    use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
     use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
     use nodedb_types::Surrogate;
 
     const TENANT: TenantId = TenantId::new(1);
     const DB: DatabaseId = DatabaseId::DEFAULT;
     /// The binding's source and its balance target. Asserted to hash apart
-    /// by [`the_fixture_spans_two_vshards`] — a co-resident pair would never
+    /// by [`the_fixture_spans_two_vshards`] — a co-resident pair will never
     /// produce the two-task plan this file is about.
     const SOURCE: &str = "route_entries";
     const TARGET: &str = "route_accounts";
 
-    /// Build a task homed the way PRODUCTION homes it, not by asking
-    /// [`collection_name_from_plan`] — that would make the agreement true
-    /// by construction and prove nothing.
+    /// Build a task homed the way PRODUCTION homes it, not by asking the
+    /// write keys, which makes the agreement true by construction.
     fn task(plan: PhysicalPlan, vshard_id: VShardId) -> PhysicalTask {
         PhysicalTask {
             tenant_id: TENANT,
@@ -537,23 +452,23 @@ mod routing_agreement_tests {
         );
     }
 
-    /// A balance write reports the TARGET collection it names — an empty
-    /// name here enlisted vShard 0 while the plan went to the target's shard.
+    /// A balance write locks the TARGET row of the TARGET collection it
+    /// names: not an empty collection on vShard 0, and not the collection
+    /// key every balance write will share.
     #[test]
-    fn a_balance_write_reports_the_collection_it_mutates() {
-        assert_eq!(collection_name_from_plan(&balance_write()), TARGET);
+    fn a_balance_write_locks_the_target_row() {
+        let mut keys = WriteKeys::default();
+        add_plan_write_keys(&mut keys, &balance_write()).expect("a balance write has keys");
+        assert_eq!(
+            keys.into_key_sets(),
+            vec![EngineKeySet::Document {
+                collection: TARGET.to_owned(),
+                surrogates: SortedVec::new(vec![271]),
+            }]
+        );
     }
 
-    /// And the TARGET ROW's surrogate; falling through to `0` made every
-    /// balance write share one lock key.
-    #[test]
-    fn a_balance_write_reports_the_target_rows_surrogate() {
-        assert_eq!(surrogate_from_plan(&balance_write()), 271);
-    }
-
-    /// The pair enlists exactly the two shards that hold work — no third.
-    /// Before the extractor named `ApplyBalanceDelta`, this came back as
-    /// source-shard + vShard 0, and vShard 0 held no plan.
+    /// The pair enlists exactly the two shards that hold work, no third.
     #[test]
     fn the_pair_enlists_only_the_shards_that_hold_work() {
         let tasks = statement_tasks();

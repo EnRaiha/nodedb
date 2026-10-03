@@ -8,10 +8,9 @@
 //! spins forever re-sending one that will never land.
 //!
 //! The judgment lives here, in one place, for the same reason the CRDT delta
-//! path routes all three of its outcomes through a single function: the bug
-//! both guard against came from deciding terminality per-channel, letting two
-//! paths disagree about the same error. A shared classifier cannot disagree
-//! with itself.
+//! path routes all three of its outcomes through a single function. Deciding
+//! terminality per-channel lets two paths disagree about the same error. A
+//! shared classifier cannot disagree with itself.
 
 use nodedb_types::sync::wire::AckStatus;
 
@@ -35,7 +34,6 @@ pub(super) fn retryable_refusal_reason(error: &crate::Error) -> Option<&str> {
             | ErrorCode::RejectedAuthz { .. }
             | ErrorCode::ConflictRetry
             | ErrorCode::CrdtFrontierMismatch { .. }
-            | ErrorCode::FanOutExceeded
             | ErrorCode::ResourcesExhausted
             | ErrorCode::RejectedDanglingEdge { .. }
             | ErrorCode::DuplicateWrite
@@ -106,9 +104,7 @@ pub(super) fn retryable_refusal_reason(error: &crate::Error) -> Option<&str> {
         | crate::Error::CrdtAdmissionTimeout { .. }
         | crate::Error::NoLeader { .. }
         | crate::Error::NotLeader { .. }
-        | crate::Error::FanOutExceeded { .. }
         | crate::Error::CrossCollectionNotColocated { .. }
-        | crate::Error::SourceFrozen { .. }
         | crate::Error::CloneWriteRequiresMaterialize { .. }
         | crate::Error::BadRequest { .. }
         | crate::Error::BackupTenantMismatch { .. }
@@ -127,10 +123,14 @@ pub(super) fn retryable_refusal_reason(error: &crate::Error) -> Option<&str> {
         | crate::Error::InvalidLimitValue { .. }
         | crate::Error::RetryableSchemaChanged { .. }
         | crate::Error::RetryableLeaderChange { .. }
+        | crate::Error::CommittedResultUnavailable { .. }
+        | crate::Error::ProposalOutcomeUnknown { .. }
         | crate::Error::GroupQuorumUnavailable { .. }
         | crate::Error::GroupMarksUnavailable { .. }
+        | crate::Error::BackupCaptureMoved { .. }
         | crate::Error::MetadataLeaderUnavailable
         | crate::Error::AuthorizationStateBehind { .. }
+        | crate::Error::LinearizableReadRefused { .. }
         | crate::Error::ExecutionLimitExceeded { .. }
         | crate::Error::LimitExceeded { .. }
         | crate::Error::Wal(_)
@@ -149,12 +149,15 @@ pub(super) fn retryable_refusal_reason(error: &crate::Error) -> Option<&str> {
         | crate::Error::Encryption { .. }
         | crate::Error::Bridge { .. }
         | crate::Error::VersionCompat { .. }
+        | crate::Error::RestoreTargetNotEmpty { .. }
+        | crate::Error::RestoreVerificationFailed { .. }
         | crate::Error::Internal { .. }
         | crate::Error::Shaping(_)
         | crate::Error::RemoteTyped { .. }
         | crate::Error::Ddl(_)
         | crate::Error::DescriptorVersionAnomaly { .. }
         | crate::Error::CollectionPurgeRowMissing { .. }
+        | crate::Error::CollectionUnstamped { .. }
         | crate::Error::CatalogIntegrityViolation { .. }
         | crate::Error::Promql(_)
         | crate::Error::DependentObjectsExist { .. }
@@ -208,13 +211,14 @@ fn is_indeterminate(error: &crate::Error) -> bool {
         | crate::Error::CrdtAdmissionRetriesExhausted { .. }
         | crate::Error::CalvinSerializationConflict
         | crate::Error::CalvinParticipantError
-        | crate::Error::SourceFrozen { .. }
         // No leader or no quorum took the write: the retryable leader class.
         | crate::Error::RetryableLeaderChange { .. }
         | crate::Error::GroupQuorumUnavailable { .. }
         | crate::Error::GroupMarksUnavailable { .. }
+        | crate::Error::BackupCaptureMoved { .. }
         | crate::Error::MetadataLeaderUnavailable
         | crate::Error::AuthorizationStateBehind { .. }
+        | crate::Error::LinearizableReadRefused { .. }
         // Shed by a resource or rate gate: the class `53`.
         | crate::Error::VShardAdmissionCapacityExceeded { .. }
         | crate::Error::MemoryExhausted { .. }
@@ -225,6 +229,9 @@ fn is_indeterminate(error: &crate::Error) -> bool {
             | crate::OllpExhaustedCause::AdmissionRefused { .. } => true,
             crate::OllpExhaustedCause::PreAdmission(inner) => is_indeterminate(inner),
         },
+        // The write committed: pushing the same bytes again applies it twice.
+        crate::Error::CommittedResultUnavailable { .. }
+        | crate::Error::ProposalOutcomeUnknown { .. } => false,
         // Refused on its merits, or a fault the same bytes reproduce.
         crate::Error::RejectedConstraint { .. }
         | crate::Error::TxnOverlayMemoryExceeded { .. }
@@ -252,7 +259,6 @@ fn is_indeterminate(error: &crate::Error) -> bool {
         | crate::Error::CrdtApplyRequiresAdmission
         | crate::Error::CrdtApplyForbiddenInTransaction
         | crate::Error::NotInTransactionBlock { .. }
-        | crate::Error::FanOutExceeded { .. }
         | crate::Error::CrossCollectionNotColocated { .. }
         | crate::Error::CloneWriteRequiresMaterialize { .. }
         | crate::Error::BadRequest { .. }
@@ -285,12 +291,15 @@ fn is_indeterminate(error: &crate::Error) -> bool {
         | crate::Error::Encryption { .. }
         | crate::Error::Bridge { .. }
         | crate::Error::VersionCompat { .. }
+        | crate::Error::RestoreTargetNotEmpty { .. }
+        | crate::Error::RestoreVerificationFailed { .. }
         | crate::Error::Internal { .. }
         | crate::Error::Shaping(_)
         | crate::Error::RemoteTyped { .. }
         | crate::Error::Ddl(_)
         | crate::Error::DescriptorVersionAnomaly { .. }
         | crate::Error::CollectionPurgeRowMissing { .. }
+        | crate::Error::CollectionUnstamped { .. }
         | crate::Error::CatalogIntegrityViolation { .. }
         | crate::Error::Promql(_)
         | crate::Error::DependentObjectsExist { .. }
@@ -336,7 +345,6 @@ fn is_indeterminate_code(code: &ErrorCode) -> bool {
         | ErrorCode::SyncNotApplied { .. }
         | ErrorCode::NotFound
         | ErrorCode::RejectedAuthz { .. }
-        | ErrorCode::FanOutExceeded
         | ErrorCode::RejectedDanglingEdge { .. }
         | ErrorCode::DuplicateWrite
         | ErrorCode::AppendOnlyViolation { .. }
@@ -376,7 +384,7 @@ fn is_indeterminate_code(code: &ErrorCode) -> bool {
 /// transient failure, which are precisely the failures that do occur in normal
 /// operation.
 ///
-/// `next_seq` is the sequence the sender should resume from — its own seq for
+/// `next_seq` is the sequence the sender resumes from — its own seq for
 /// this batch, since nothing applied.
 pub(super) fn ack_status_for_dispatch_error(error: &crate::Error, next_seq: u64) -> AckStatus {
     if retryable_refusal_reason(error).is_some() || is_indeterminate(error) {
@@ -407,8 +415,8 @@ mod tests {
 
     #[test]
     fn a_retryable_refusal_becomes_a_gap_at_the_senders_own_seq() {
-        // Nothing applied, so the sender resumes at the seq it just sent —
-        // not one past it, which would skip the batch entirely.
+        // Nothing applied, so the sender resumes at the seq it sent —
+        // not one past it, which will skip the batch entirely.
         let error = crate::Error::DataPlane(ErrorCode::RetryableRefusal {
             reason: "shard is rebalancing".into(),
         });
@@ -461,6 +469,7 @@ mod tests {
             vshard_id: crate::types::VShardId::new(0),
             leader_node: 2,
             leader_addr: "10.0.0.2:9000".into(),
+            leader_term: 3,
         };
         assert_eq!(
             ack_status_for_dispatch_error(&error, 2),

@@ -73,7 +73,10 @@ pub(super) async fn dispatch_authorized_read(
             payload_or_typed_error(response).map_err(|e| DdlError::from_error(&e))
         }
         CloneCheckedOutcome::Proceed(checked) => {
-            dispatch_authorized(state, checked, collection, timeout)
+            // No session reaches this handler: the read takes the strong
+            // default (see `DmlTxnCtx::linearizable_reads`).
+            let linearizable = true;
+            dispatch_authorized(state, checked, collection, timeout, linearizable)
                 .await
                 .map_err(|e| DdlError::from_error_in_context("dispatch", &e))
         }
@@ -121,7 +124,7 @@ mod tests {
     /// State whose catalog holds `CLONE` as a `Shadowed` clone of `SOURCE`.
     ///
     /// `clone_created_at` is `ZERO` so any query LSN the resolver derives is at
-    /// or after it — otherwise the read would resolve as pre-dating the clone
+    /// or after it — otherwise the read will resolve as pre-dating the clone
     /// and never reach the rewrite this test is about.
     fn shadowed_clone_fixture(tenant_id: TenantId) -> (Arc<SharedState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("create test directory");
@@ -131,7 +134,7 @@ mod tests {
         let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
         let state = SharedState::new(dispatcher, wal).expect("construct shared state");
 
-        let mut clone = StoredCollection::new(tenant_id.as_u64(), CLONE, "owner");
+        let mut clone = StoredCollection::stamped_for_test(tenant_id.as_u64(), CLONE, "owner");
         clone.cloned_from = Some(CloneOrigin {
             source_database: DatabaseId::DEFAULT,
             source_collection: SOURCE.to_string(),
@@ -153,11 +156,8 @@ mod tests {
     ///
     /// A CRDT document read over a `Shadowed` clone has no sound source-side
     /// rewrite, so the hook refuses it by name rather than answering out of the
-    /// target — which holds post-clone writes alone. Before this door consumed
-    /// a clone-checked capability it ran no clone interception at all, so the
-    /// same call dispatched straight to the Data Plane and this refusal never
-    /// appeared. No fake responder is registered: reaching a dispatch at all
-    /// would fail the assertion below.
+    /// target — which holds post-clone writes alone. No fake responder is registered: reaching a dispatch at all
+    /// will fail the assertion below.
     #[tokio::test]
     async fn a_shadowed_clone_read_is_refused_by_the_clone_read_hook() {
         let tenant_id = TenantId::new(1);

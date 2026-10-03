@@ -35,7 +35,7 @@ mod tests {
             vec![CoordValue::Int64(1)],
             StagedCellPut {
                 attrs: vec![CellValue::Int64(7)],
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 system_from_ms: 0,
                 valid_from_ms: 0,
                 valid_until_ms: i64::MAX,

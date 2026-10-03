@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `NODEDB_NODE_ID` / `NODEDB_SEED_NODES` / `NODEDB_JOIN_RETRY_MAX_ATTEMPTS`
-//! / `NODEDB_JOIN_RETRY_MAX_BACKOFF_SECS` overrides.
+//! `NODEDB_NODE_ID` / `NODEDB_SEED_NODES` / `NODEDB_SWIM_LISTEN` /
+//! `NODEDB_JOIN_RETRY_MAX_ATTEMPTS` / `NODEDB_JOIN_RETRY_MAX_BACKOFF_SECS`
+//! overrides.
 //!
 //! Every row here needs a `[cluster]` section already in the loaded config.
 //! The process cannot invent a cluster identity for itself.
 
 use crate::config::server::ServerConfig;
 
-use super::super::parse::{parse_u32_positive, parse_u64_positive};
+use super::super::parse::{parse_socket_addr, parse_u32_positive, parse_u64_positive};
 use super::super::seed_nodes::parse_seed_nodes;
 use super::super::table::EnvRow;
 
@@ -25,6 +26,13 @@ fn apply_seed_nodes(config: &mut ServerConfig, raw: &str) -> Result<(), &'static
     let addrs = parse_seed_nodes(raw)?;
     let cluster = config.cluster.as_mut().ok_or(NO_CLUSTER)?;
     cluster.seed_nodes = addrs;
+    Ok(())
+}
+
+fn apply_swim_listen(config: &mut ServerConfig, raw: &str) -> Result<(), &'static str> {
+    let addr = parse_socket_addr(raw, "a UDP socket address such as 10.0.0.1:9401")?;
+    let cluster = config.cluster.as_mut().ok_or(NO_CLUSTER)?;
+    cluster.swim_listen = Some(addr);
     Ok(())
 }
 
@@ -54,6 +62,11 @@ pub(in super::super) const ROWS: &[EnvRow] = &[
     EnvRow {
         name: "NODEDB_SEED_NODES",
         apply: apply_seed_nodes,
+        redact: false,
+    },
+    EnvRow {
+        name: "NODEDB_SWIM_LISTEN",
+        apply: apply_swim_listen,
         redact: false,
     },
     EnvRow {
@@ -90,6 +103,7 @@ mod tests {
             log_compaction_threshold: None,
             join_retry_max_attempts: 8,
             join_retry_max_backoff_secs: 32,
+            swim_listen: None,
         }
     }
 
@@ -98,6 +112,7 @@ mod tests {
         unsafe {
             std::env::set_var("NODEDB_NODE_ID", "42");
             std::env::set_var("NODEDB_SEED_NODES", "10.0.0.1:9400,10.0.0.2:9400");
+            std::env::set_var("NODEDB_SWIM_LISTEN", "10.0.0.1:9501");
         }
         let mut cfg = ServerConfig {
             cluster: Some(make_cluster(1)),
@@ -116,9 +131,15 @@ mod tests {
         );
         assert_eq!(cluster.seed_nodes[0].to_string(), "10.0.0.1:9400");
         assert_eq!(cluster.seed_nodes[1].to_string(), "10.0.0.2:9400");
+        assert_eq!(
+            cluster.swim_listen.map(|a| a.to_string()).as_deref(),
+            Some("10.0.0.1:9501"),
+            "NODEDB_SWIM_LISTEN must override swim_listen"
+        );
         unsafe {
             std::env::remove_var("NODEDB_NODE_ID");
             std::env::remove_var("NODEDB_SEED_NODES");
+            std::env::remove_var("NODEDB_SWIM_LISTEN");
         }
     }
 }

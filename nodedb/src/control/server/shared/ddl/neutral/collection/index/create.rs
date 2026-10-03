@@ -144,7 +144,7 @@ pub async fn create_index(
     }
 
     // Reject a name already taken by an index of any kind in this database:
-    // the registry is keyed by name, so two kinds sharing one name would make
+    // the registry is keyed by name, so two kinds sharing one name will make
     // exactly one of them droppable. The registry read itself must still fail
     // loudly — only a genuine name collision is absorbed by `IF NOT EXISTS`.
     if let Some(existing) = catalog
@@ -204,7 +204,7 @@ pub async fn create_index(
         owner: index_owner.clone(),
     });
 
-    commit_collection_mutation(state, &coll, database_id).await?;
+    commit_collection_mutation(state, &coll).await?;
 
     // Phase 2 and 3: backfill on every node, then flip to Ready. Inside an
     // explicit transaction the build waits for COMMIT, after the Building
@@ -235,7 +235,8 @@ pub async fn create_index(
             collection,
             fields: vec![canonical_field.clone()],
         },
-    )?;
+    )
+    .await?;
 
     // Ownership record backs authorization for later ALTER / DROP.
     crate::control::server::shared::ddl::owner::propose_owner(
@@ -245,7 +246,8 @@ pub async fn create_index(
         tenant_id,
         &index_name,
         &index_owner,
-    )?;
+    )
+    .await?;
 
     let kind = if is_unique { "unique index" } else { "index" };
     let ci = if case_insensitive {

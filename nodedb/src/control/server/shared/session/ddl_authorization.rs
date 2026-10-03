@@ -34,12 +34,13 @@ pub(super) fn objects_bear_authorization(objects: &[PendingDdlObject]) -> crate:
 
 /// Run the authorization barrier on the metadata entry committed at
 /// `log_index`.
-pub(super) fn barrier_at(state: &SharedState, log_index: u64) -> crate::Result<()> {
-    crate::control::security::auth_lease::block_on_barrier(
+pub(super) async fn barrier_at(state: &SharedState, log_index: u64) -> crate::Result<()> {
+    crate::control::security::auth_lease::authorization_barrier(
         state,
         vec![GroupCoverage {
             group_id: METADATA_GROUP_ID,
             through: log_index,
         }],
     )
+    .await
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Single-core `TestServer::start`, plus `take_dir` for handing the data
-//! directory to a subsequent restart.
+//! Single-core `TestServer::start` on a one-node Raft cluster, plus
+//! `take_dir` for handing the data directory to a subsequent restart.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,14 +13,11 @@ use nodedb::control::state::SharedState;
 use nodedb::event::{EventPlane, EventPlaneConfig, create_event_bus};
 use nodedb::wal::WalManager;
 
-use super::read_gate::install_single_voter_read_gate;
-use super::support::{
-    bind_http_listener, bind_native_listener, init_test_memory_governor, single_routing_leader,
-};
+use super::support::{bind_http_listener, bind_native_listener, init_test_memory_governor};
 use super::types::{TestClient, TestDataDir, TestServer};
 
-/// Knobs for spawning a `TestServer`. `Default` reproduces the historical
-/// `TestServer::start` behaviour: trust-mode auth, lockout disabled.
+/// Knobs for spawning a `TestServer`. `Default` is the
+/// `TestServer::start` config: trust-mode auth, lockout disabled.
 pub(super) struct StartConfig {
     /// pgwire authentication mode.
     pub auth_mode: AuthMode,
@@ -36,12 +33,6 @@ pub(super) struct StartConfig {
     /// system default (65 536 rows).  Set to a small value (e.g. `4`) in tests
     /// that need to observe segment-flush behaviour without inserting 65k rows.
     pub columnar_flush_threshold: Option<usize>,
-    /// When `Some`, installs a cluster routing table on the node's
-    /// `SharedState` (`cluster_routing`) before the state is shared.  A
-    /// single-node `TestServer` is normally `cluster_routing == None`; the
-    /// Raft snapshot builder requires a routing table to resolve a group's
-    /// vShards, so round-trip tests inject one here.
-    pub routing: Option<nodedb_cluster::RoutingTable>,
     /// Idle session timeout in seconds applied to the node's `SharedState`
     /// before it is shared. `0` (the default) leaves the idle watchdog
     /// disabled; a small value (e.g. `1`) lets tests exercise the pgwire
@@ -63,6 +54,13 @@ pub(super) struct StartConfig {
     /// catalog-backed `quota_manager` built by `new_with_credentials` is left
     /// in place, so quota definitions stay durable.
     pub metering: Option<nodedb::control::security::metering::config::MeteringConfig>,
+    /// When `true`, installs `[backup_storage] local_root` at the data
+    /// directory's `backups` subdirectory, so `file://` backup URIs resolve
+    /// there. See [`TestServer::backup_root`].
+    pub backup_root: bool,
+    /// When `Some`, the graph tuning of the core and of `SharedState`. `None`
+    /// keeps the defaults.
+    pub graph_tuning: Option<nodedb_types::config::tuning::GraphTuning>,
 }
 
 impl Default for StartConfig {
@@ -72,16 +70,16 @@ impl Default for StartConfig {
             provision_superuser: true,
             lockout: None,
             columnar_flush_threshold: None,
-            routing: None,
             idle_timeout_secs: 0,
             session_absolute_timeout_secs: 0,
             jwks_registry: None,
             metering: None,
+            backup_root: false,
+            graph_tuning: None,
         }
     }
 }
 
-#[allow(dead_code)]
 impl TestServer {
     /// Spawn a single-core NodeDB server and connect via pgwire (trust mode).
     pub async fn start() -> Self {
@@ -169,18 +167,14 @@ impl TestServer {
         .await
     }
 
-    /// Spawn a single-core NodeDB server with a cluster routing table
-    /// installed on `SharedState::cluster_routing`.
-    ///
-    /// Single-node `TestServer`s are normally `cluster_routing == None`, but
-    /// the production Raft snapshot builder/applier resolve a group's vShards
-    /// through the routing table. Snapshot round-trip tests inject one with
-    /// `RoutingTable::uniform(...)` so the builder can filter and the applier
-    /// can rebind. All other settings stay at their defaults (trust-mode auth,
-    /// lockout disabled).
-    pub async fn start_with_routing(routing: nodedb_cluster::RoutingTable) -> Self {
+    /// Spawn a single-core NodeDB server whose core and Control Plane run with
+    /// `graph_tuning`. All other settings stay at their defaults (trust-mode
+    /// auth, lockout disabled).
+    pub async fn start_with_graph_tuning(
+        graph_tuning: nodedb_types::config::tuning::GraphTuning,
+    ) -> Self {
         Self::start_with_config(StartConfig {
-            routing: Some(routing),
+            graph_tuning: Some(graph_tuning),
             ..Default::default()
         })
         .await
@@ -188,6 +182,7 @@ impl TestServer {
 
     /// Spawn a single-core NodeDB server and connect via pgwire.
     pub(super) async fn start_with_config(cfg: StartConfig) -> Self {
+        let graph_tuning = cfg.graph_tuning.clone().unwrap_or_default();
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("test.wal");
         let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
@@ -225,21 +220,30 @@ impl TestServer {
         let mut shared =
             SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials, false)
                 .expect("build shared state");
-        // Inject a fixed test KEK so backup tests produce encrypted envelopes.
-        // Deterministic 32-byte key — same value every test run.
-        if let Some(s) = Arc::get_mut(&mut shared) {
+        // The one-node cluster a server with no `[cluster]` section runs.
+        let cluster = crate::single_node::init(dir.path())
+            .await
+            .expect("init the one-node cluster");
+        {
+            let s = Arc::get_mut(&mut shared).expect("shared state is not cloned yet");
+            crate::single_node::wire(s, &cluster, dir.path()).expect("wire the one-node cluster");
+            // Inject a fixed test KEK so backup tests produce encrypted envelopes.
+            // Deterministic 32-byte key — same value every test run.
             s.backup_kek = Some(Arc::new([0x42u8; 32]));
             s.governor = init_test_memory_governor();
-            if let Some(routing) = cfg.routing {
-                // Production takes `node_id` from the cluster handle that owns
-                // the routing table. A single-node server runs as the one node
-                // that leads every group in it, so the gateway routes locally.
-                s.node_id = single_routing_leader(&routing);
-                s.cluster_routing = Some(std::sync::Arc::new(std::sync::RwLock::new(routing)));
-            }
+            s.tuning.graph = graph_tuning.clone();
             s.jwks_registry = cfg.jwks_registry;
             if let Some(metering) = cfg.metering {
                 s.metering_config = metering;
+            }
+            if cfg.backup_root {
+                let root = dir.path().join(super::backup::BACKUP_DIR);
+                std::fs::create_dir_all(&root).expect("create backup root");
+                let root = root.canonicalize().unwrap_or(root);
+                s.backup_storage = Some(Arc::new(nodedb::config::server::BackupStorageSettings {
+                    local_root: Some(root),
+                    ..Default::default()
+                }));
             }
             s.set_session_timeouts_for_test(
                 cfg.idle_timeout_secs,
@@ -249,9 +253,7 @@ impl TestServer {
         let shared = shared;
         // The same gateway install production boot runs, after every
         // `Arc::get_mut` above.
-        nodedb::bootstrap::state_wiring::install_gateway(&shared);
-        // Production `start_raft` publishes the read gate for a routed node.
-        install_single_voter_read_gate(&shared);
+        nodedb::bootstrap::state_wiring::install_gateway(&shared).expect("install gateway");
 
         // Data Plane core. Share the SharedState's array_catalog so DDL
         // mutations made by the SQL converter are visible to the handler
@@ -277,7 +279,7 @@ impl TestServer {
                     core_metrics: shared.system_metrics.clone(),
                     governor: shared.governor.clone(),
                     replay: None,
-                    graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
+                    graph_tuning: graph_tuning.clone(),
                     query_tuning: {
                         let mut qt = nodedb_types::config::tuning::QueryTuning::default();
                         if let Some(threshold) = cfg.columnar_flush_threshold {
@@ -285,6 +287,7 @@ impl TestServer {
                         }
                         qt
                     },
+                    timeseries_tuning: nodedb_types::config::tuning::TimeseriesToning::default(),
                     // Seeded from the SAME durable catalog production reads, so a
                     // harness restart reconstructs cores the way a real one does.
                     // An empty catalog yields an empty seed, which is exactly what
@@ -292,6 +295,7 @@ impl TestServer {
                     doc_config_seed: nodedb::bootstrap::data_plane::load_doc_config_registry_from(
                         shared.credentials.catalog(),
                     ),
+                    event_interest: crate::core_loop_runner::event_interest_for(&shared),
                     stop_rx: core_stop_rx,
                 });
             core_stop_txs.push(core_stop_tx);
@@ -335,6 +339,12 @@ impl TestServer {
             shutdown: Arc::clone(&shared.shutdown),
             shutdown_bus: shutdown_bus.clone(),
         });
+
+        // Raft, the lease loop, and the readiness production waits for
+        // before it opens a listener.
+        let raft = crate::single_node::start(&cluster, &shared, dir.path())
+            .await
+            .expect("start the one-node cluster");
 
         // PgWire listener.
         let pg_listener = PgListener::bind("127.0.0.1:0".parse().unwrap())
@@ -411,6 +421,7 @@ impl TestServer {
             poller_handle: Some(poller_handle),
             core_handles: Some(core_handles),
             event_plane: Some(event_plane),
+            raft: Some(raft),
             _dir: dir,
         }
     }

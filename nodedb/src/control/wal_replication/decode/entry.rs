@@ -21,14 +21,36 @@ use crate::types::{DatabaseId, TenantId, VShardId};
 /// for every other write.
 pub type DecodedEntry = (TenantId, VShardId, PhysicalPlan, Option<u64>);
 
-/// Returns `None` if the data is not a valid ReplicatedEntry (e.g., ConfChange or no-op).
-/// `assigner`, when `Some`, installs every carried surrogate through
-/// `bind_plan_identities`, never re-allocating — except a pre-surrogate CRDT
-/// apply, which allocates loudly.
+/// Decodes a committed entry and binds every surrogate it carries.
+///
+/// Returns `None` if the data is not a valid ReplicatedEntry (e.g., ConfChange
+/// or no-op). `bind_plan_identities` installs each carried surrogate through
+/// `assigner` and never re-allocates. A write that carries
+/// `Surrogate::ZERO` is refused.
 pub fn from_replicated_entry(
     data: &[u8],
-    assigner: Option<&SurrogateAssigner>,
+    assigner: &SurrogateAssigner,
 ) -> crate::Result<Option<DecodedEntry>> {
+    let Some((database_id, (tenant_id, vshard_id, mut plan, resolved_now_ms))) =
+        decode_with_database(data)?
+    else {
+        return Ok(None);
+    };
+    bind_plan_identities(assigner, database_id, tenant_id, &mut plan)?;
+    Ok(Some((tenant_id, vshard_id, plan, resolved_now_ms)))
+}
+
+/// Decodes a committed entry into its plan without binding any identity.
+///
+/// A read-only classification uses it, such as `plan_writes_user_data` on the
+/// apply loop. Applying the plan requires [`from_replicated_entry`].
+/// Returns `None` if the data is not a valid ReplicatedEntry.
+pub fn decode_replicated_entry(data: &[u8]) -> crate::Result<Option<DecodedEntry>> {
+    Ok(decode_with_database(data)?.map(|(_, decoded)| decoded))
+}
+
+/// Shared body of both decodes: the entry's database and its decoded plan.
+fn decode_with_database(data: &[u8]) -> crate::Result<Option<(DatabaseId, DecodedEntry)>> {
     let entry = match ReplicatedEntry::from_bytes(data) {
         Some(e) => e,
         None => return Ok(None),
@@ -41,21 +63,22 @@ pub fn from_replicated_entry(
         _ => {}
     }
     let tenant_id = TenantId::new(entry.tenant_id);
-    // `0` decodes to `DatabaseId::DEFAULT` (see `LegacyReplicatedEntry`).
+    // `0` decodes to `DatabaseId::DEFAULT`.
     let database_id = DatabaseId::new(entry.database_id);
     let ctx = DecodeCtx {
         database_id,
         tenant_id,
+        vshard_id: entry.vshard_id,
     };
-    let (mut plan, resolved_now_ms) = to_physical_plan(&entry.write, &ctx)?;
-    if let Some(assigner) = assigner {
-        bind_plan_identities(assigner, database_id, tenant_id, &mut plan)?;
-    }
+    let (plan, resolved_now_ms) = to_physical_plan(&entry.write, &ctx)?;
     Ok(Some((
-        tenant_id,
-        VShardId::new(entry.vshard_id),
-        plan,
-        resolved_now_ms,
+        database_id,
+        (
+            tenant_id,
+            VShardId::new(entry.vshard_id),
+            plan,
+            resolved_now_ms,
+        ),
     )))
 }
 
@@ -188,6 +211,14 @@ fn to_physical_plan(
         ReplicatedWrite::TransactionRedo { .. } => Err(crate::Error::Internal {
             detail: "TransactionRedo reached to_physical_plan (should have been intercepted)"
                 .into(),
+        }),
+        // The apply loop appends a topic message itself; it reaches no core.
+        ReplicatedWrite::TopicPublish { .. } => Err(crate::Error::Internal {
+            detail: "TopicPublish reached to_physical_plan (should have been intercepted)".into(),
+        }),
+        // The apply loop binds the keys in the catalog; it reaches no core.
+        ReplicatedWrite::SurrogateBind { .. } => Err(crate::Error::Internal {
+            detail: "SurrogateBind reached to_physical_plan (should have been intercepted)".into(),
         }),
     }
 }

@@ -111,13 +111,13 @@ pub(crate) fn convert_slice(
 /// endpoints. Generates all 2^num_dims corner coordinates of the bounding
 /// box and computes the Hilbert prefix for each. Returns a single
 /// `(min_prefix, max_prefix)` range that conservatively covers all cells
-/// that could match the slice.
+/// that can match the slice.
 ///
 /// Falls back to an empty vec (unbounded = contact all shards) if the
-/// schema has more than 16 dimensions (2^16 corners would be excessive)
+/// schema has more than 16 dimensions (2^16 corners will be excessive)
 /// or if any Hilbert encoding fails.
 ///
-/// The result may over-estimate the shard set — the shard-side slice
+/// The result can over-estimate the shard set — the shard-side slice
 /// filter is always applied and never produces false positives.
 fn compute_slice_hilbert_ranges(
     schema: &ArraySchema,
@@ -234,6 +234,8 @@ mod tests {
             prefix_bits: 8,
             audit_retain_ms: None,
             minimum_audit_retain_ms: None,
+            modification_hlc: nodedb_types::Hlc::ZERO,
+            incarnation: nodedb_types::Hlc::ZERO,
         };
         {
             let mut cat = handle.write().expect("write lock");
@@ -245,7 +247,8 @@ mod tests {
             array_catalog: Some(handle.clone()),
             credentials: None,
             wal: None,
-            surrogate_assigner: None,
+            surrogate_assigner:
+                crate::control::planner::sql_plan_convert::test_support::test_assigner(),
             cluster_enabled,
             bitemporal_retention_registry: None,
             max_vector_dim: 0,
@@ -255,6 +258,7 @@ mod tests {
             shuffle_agg_num_parts: 0,
             broadcast_threshold_bytes: 8 * 1024 * 1024,
             shuffle_agg_threshold: 10_000,
+            prefetched: Default::default(),
             database_id: crate::types::DatabaseId::DEFAULT,
             tenant_id: crate::types::TenantId::new(0),
         };

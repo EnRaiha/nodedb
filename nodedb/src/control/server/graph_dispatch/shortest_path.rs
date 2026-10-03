@@ -1,44 +1,63 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `cross_core_shortest_path` — mirrors `cross_core_bfs` but records
-//! parent pointers so `GRAPH PATH FROM 'src' TO 'dst'` can reconstruct
-//! an ordered path across every topology (single core, single-node
-//! multi-core, clustered).
+//! `cross_core_shortest_path` — the bidirectional search of one core's
+//! `CsrIndex::shortest_path`, run hop by hop across every topology (single
+//! core, single-node multi-core, clustered), so `GRAPH PATH FROM 'src' TO
+//! 'dst'` answers the same path everywhere.
+//!
+//! Each step expands one forward level (outgoing edges of the forward
+//! frontier) and then one backward level (incoming edges of the backward
+//! frontier) through [`super::hop::execute_neighbor_hop`]: every frontier node
+//! expands at the node that owns its key vShard, and every crossed edge comes
+//! back as a `(frontier node, label, neighbour)` triple. A level relaxes its
+//! edges in `(neighbour, frontier node)` name order: a new node's parent is
+//! the smallest-named frontier node reaching it, and the search stops at the
+//! first node both sides reached. The visit cap is checked before each step.
+//! One core does all of this in the same order, so a capped search answers
+//! the same path here as there.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
-use sonic_rs;
-
-use crate::bridge::envelope::{PhysicalPlan, Response};
-use crate::control::scatter_gather;
+use crate::bridge::envelope::Response;
 use crate::control::state::SharedState;
+use crate::engine::graph::edge_store::Direction;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
-use crate::types::{DatabaseId, TenantId, TraceId};
-use nodedb_physical::physical_plan::GraphOp;
+use crate::types::{DatabaseId, TenantId};
 
+use super::bfs::{walk_visit_cap, whole_hop};
 use super::helpers::{encode_path, ok_response};
+use super::hop::{NeighborHopParams, execute_neighbor_hop};
+use super::shard_reads::ShardReadLog;
 
-/// Cross-core / cross-shard shortest-path orchestration.
-///
-/// Walks the same hop-by-hop BFS as `cross_core_bfs` but records a
-/// `parent` pointer for every newly-discovered node. When `dst` is
-/// reached, the path is reconstructed by walking parents back to
-/// `src`. Returns a JSON array `[src, hop_1, ..., dst]`, or an empty
-/// array when `dst` is unreachable within `max_depth` hops.
 /// Parameters for [`cross_core_shortest_path`].
 pub struct CrossCoreShortestPathParams {
     pub tenant_id: TenantId,
     pub database_id: DatabaseId,
-    /// Collection whose edges the path walks. Required: `GRAPH PATH` names one
-    /// so it can be authorized, and the cross-shard hop re-issues the walk as
-    /// SQL on the owning node, which needs the scope to plan the same edges.
-    pub collection: String,
+    /// Database-qualified collection whose edges the path walks, or `None` to
+    /// walk the edges of every collection, as a single node's Data Plane does
+    /// for a path plan with no collection.
+    pub collection: Option<String>,
     pub src: String,
     pub dst: String,
     pub edge_label: Option<String>,
     pub max_depth: usize,
+    /// The plan's traversal options. The visit cap is
+    /// `options.max_visited`, bounded by this node's graph tuning.
+    pub options: GraphTraversalOptions,
+    /// Each node that expands part of the walk confirms its groups first.
+    pub linearizable: bool,
 }
 
+/// Node → the node it was reached from. An endpoint maps to itself.
+type Parents = HashMap<String, String>;
+
+/// Cross-core / cross-shard shortest-path orchestration.
+///
+/// Returns a JSON array `[src, hop_1, ..., dst]`, `[src]` when `src == dst`,
+/// or an empty array when no path is found or either endpoint is absent from
+/// the graph. `GRAPH PATH` is directed: the
+/// forward side follows outgoing edges, the backward side incoming ones.
 pub async fn cross_core_shortest_path(
     shared: &SharedState,
     params: CrossCoreShortestPathParams,
@@ -51,159 +70,207 @@ pub async fn cross_core_shortest_path(
         dst,
         edge_label,
         max_depth,
+        options,
+        linearizable,
     } = params;
-    let options = GraphTraversalOptions::default();
-    let cluster_mode = shared.cluster_routing.is_some();
-    // Path semantics only make sense over outgoing edges — the
-    // docs-advertised `GRAPH PATH FROM 'a' TO 'b'` is directed.
-    let direction = crate::engine::graph::edge_store::Direction::Out;
-
-    // Empty path when src == dst; matches the natural `[src]` case.
-    if src == dst {
-        let payload = encode_path(&[src])?;
-        return Ok(ok_response(payload));
-    }
-
-    let mut parent: HashMap<String, String> = HashMap::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    visited.insert(src.clone());
-    let mut frontier: Vec<String> = vec![src.clone()];
-
-    for depth in 0..max_depth {
-        if frontier.is_empty() {
-            break;
-        }
-
-        // Local hop: single batched broadcast carrying the whole
-        // frontier. The Data Plane returns `(src, label, node)` triples
-        // so we can still record parent pointers.
-        let mut discoveries: Vec<(String, String)> = Vec::new();
-        // Cap the handler's allocation to the remaining `max_visited`
-        // budget so a wide hop can't blow out memory mid-BFS.
-        let remaining_budget = options
-            .max_visited
-            .saturating_sub(visited.len())
-            .min(u32::MAX as usize) as u32;
-        let plan = PhysicalPlan::Graph(GraphOp::NeighborsMulti {
-            collection: Some(nodedb_types::QualifiedCollection::new(
-                database_id,
-                &collection,
-            )),
-            node_ids: frontier.clone(),
-            edge_label: edge_label.clone(),
-            direction,
-            max_results: remaining_budget,
-            rls_filters: Vec::new(),
-        });
-        let resp = crate::control::server::broadcast::broadcast_to_all_cores(
-            shared,
+    let whole = whole_hop();
+    // One core finds no path when either endpoint is absent from its graph,
+    // before it compares them. The presence read spans every collection, so it
+    // joins the read-set unscoped.
+    let mut presence_reads = ShardReadLog::new();
+    let present = graph_nodes_present(
+        shared,
+        PresenceScope {
             tenant_id,
             database_id,
-            plan,
-            TraceId::ZERO,
-        )
-        .await?;
-        if !resp.payload.is_empty() {
-            let json_text =
-                crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);
-            if let Ok(arr) = sonic_rs::from_str::<Vec<serde_json::Value>>(&json_text) {
-                for item in arr {
-                    let src_node = item.get("src").and_then(|v| v.as_str());
-                    let nb = item.get("node").and_then(|v| v.as_str());
-                    if let (Some(s), Some(n)) = (src_node, nb) {
-                        discoveries.push((s.to_string(), n.to_string()));
-                    }
-                }
-            }
-        }
+            options: &whole,
+            linearizable,
+        },
+        &[src.clone(), dst.clone()],
+        &mut presence_reads,
+    )
+    .await?;
+    presence_reads.publish(shared, tenant_id, database_id, None);
+    if !present.contains(&src) || !present.contains(&dst) {
+        return Ok(ok_response(encode_path::<String>(&[])?));
+    }
+    if src == dst {
+        return Ok(ok_response(encode_path(&[src])?));
+    }
+    let mut reads = ShardReadLog::new();
+    let cap = walk_visit_cap(shared, &options);
+    let mut fwd: Parents = HashMap::from([(src.clone(), src.clone())]);
+    let mut bwd: Parents = HashMap::from([(dst.clone(), dst.clone())]);
+    let mut fwd_frontier = vec![src];
+    let mut bwd_frontier = vec![dst];
+    let mut path: Vec<String> = Vec::new();
 
-        // Cluster mode: merge cross-shard neighbor results. The
-        // cross-shard helper only returns neighbor ids (no parent),
-        // so we attribute them to the first frontier node on the
-        // same shard — sufficient for shortest-path correctness
-        // because any path through that shard is equally shortest.
-        let merged: Vec<(String, String)> = if cluster_mode {
-            let local_ids: Vec<String> = discoveries.iter().map(|(_, n)| n.clone()).collect();
-            let (local_nodes, envelope) = {
-                let routing = shared
-                    .cluster_routing
-                    .as_ref()
-                    .expect("cluster_routing checked above");
-                let rt = routing.read().unwrap_or_else(|p| p.into_inner());
-                scatter_gather::partition_local_remote(&local_ids, shared.node_id, &rt)
-            };
-            if envelope.is_empty() {
-                discoveries
+    for _depth in 0..max_depth {
+        if fwd.len() + bwd.len() >= cap {
+            break;
+        }
+        for forward in [true, false] {
+            let (frontier, direction) = if forward {
+                (&fwd_frontier, Direction::Out)
             } else {
-                let remaining = max_depth.saturating_sub(depth + 1);
-                let (remote_hits, _meta) = scatter_gather::coordinate_cross_shard_hop(
+                (&bwd_frontier, Direction::In)
+            };
+            let triples = if frontier.is_empty() {
+                Vec::new()
+            } else {
+                let hop = execute_neighbor_hop(
                     shared,
                     tenant_id,
-                    scatter_gather::CrossShardHopParams {
-                        local_nodes,
-                        envelope,
-                        options: &options,
-                        collection: &collection,
+                    database_id,
+                    NeighborHopParams {
+                        collection: collection.as_deref(),
+                        frontier,
                         edge_label: edge_label.as_deref(),
                         direction,
-                        remaining_depth: remaining,
-                        database_id,
+                        options: &whole,
+                        discovered_so_far: fwd.len() + bwd.len(),
+                        linearizable,
                     },
                 )
                 .await?;
-                let mut out = discoveries;
-                if let Some(attrib_parent) = frontier.first().cloned() {
-                    for n in remote_hits {
-                        out.push((attrib_parent.clone(), n));
-                    }
-                }
-                out
+                reads.merge(hop.reads);
+                hop.local_triples
+            };
+            let (this, other) = if forward {
+                (&mut fwd, &bwd)
+            } else {
+                (&mut bwd, &fwd)
+            };
+            let (next, meeting) = relax_level(triples, this, other);
+            if let Some(meeting) = meeting {
+                path = reconstruct(&meeting, &fwd, &bwd);
+                break;
             }
-        } else {
-            discoveries
-        };
-
-        // Record parents and build next frontier. Early-exit the
-        // moment `dst` is seen so we don't keep expanding.
-        let mut next_frontier: Vec<String> = Vec::new();
-        for (from, to) in merged {
-            if !visited.insert(to.clone()) {
-                continue;
+            if forward {
+                fwd_frontier = next;
+            } else {
+                bwd_frontier = next;
             }
-            parent.insert(to.clone(), from);
-            if to == dst {
-                let path = reconstruct(&parent, &src, &dst);
-                let payload = encode_path(&path)?;
-                return Ok(ok_response(payload));
-            }
-            next_frontier.push(to);
         }
-        frontier = next_frontier;
-
-        if visited.len() >= options.max_visited {
+        if !path.is_empty() || (fwd_frontier.is_empty() && bwd_frontier.is_empty()) {
             break;
         }
     }
 
-    // Unreachable within max_depth: empty array, same shape the
-    // client sees for a successful empty result.
-    let payload = encode_path::<String>(&[])?;
-    Ok(ok_response(payload))
+    // Every vShard the walk expanded joins the transaction read-set.
+    reads.publish(shared, tenant_id, database_id, collection);
+    Ok(ok_response(encode_path(&path)?))
 }
 
-fn reconstruct(parent: &HashMap<String, String>, src: &str, dst: &str) -> Vec<String> {
-    let mut path: Vec<String> = Vec::new();
-    let mut cursor = dst.to_string();
-    path.push(cursor.clone());
-    while cursor != src {
-        match parent.get(&cursor) {
-            Some(p) => {
-                cursor = p.clone();
-                path.push(cursor.clone());
-            }
-            None => break,
+/// The tenancy scope of a presence check.
+struct PresenceScope<'a> {
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    options: &'a GraphTraversalOptions,
+    linearizable: bool,
+}
+
+/// The nodes of `nodes` that exist in the graph: those with an edge of any
+/// label, in either direction, in any collection. One core's graph holds a
+/// node exactly while an edge names it, so this is the node set one core's
+/// path search checks its endpoints against.
+async fn graph_nodes_present(
+    shared: &SharedState,
+    scope: PresenceScope<'_>,
+    nodes: &[String],
+    reads: &mut ShardReadLog,
+) -> crate::Result<std::collections::HashSet<String>> {
+    let hop = execute_neighbor_hop(
+        shared,
+        scope.tenant_id,
+        scope.database_id,
+        NeighborHopParams {
+            collection: None,
+            frontier: nodes,
+            edge_label: None,
+            direction: Direction::Both,
+            options: scope.options,
+            discovered_so_far: 0,
+            linearizable: scope.linearizable,
+        },
+    )
+    .await?;
+    reads.merge(hop.reads);
+    Ok(hop
+        .local_triples
+        .into_iter()
+        .map(|(from, _label, _to)| from)
+        .collect())
+}
+
+/// Relax one level's `(frontier node, label, neighbour)` edges into `this`
+/// side, in `(neighbour, frontier node)` name order. Returns the level's new
+/// nodes, and the first neighbour the `other` side already reached.
+fn relax_level(
+    mut triples: Vec<(String, String, String)>,
+    this: &mut Parents,
+    other: &Parents,
+) -> (Vec<String>, Option<String>) {
+    triples.sort_by(|a, b| (&a.2, &a.0).cmp(&(&b.2, &b.0)));
+    let mut next = Vec::new();
+    for (from, _label, to) in triples {
+        if let Entry::Vacant(slot) = this.entry(to.clone()) {
+            slot.insert(from);
+            next.push(to.clone());
+        }
+        if other.contains_key(&to) {
+            return (next, Some(to));
         }
     }
+    (next, None)
+}
+
+/// The path through `meeting`: forward parents back to the source, then
+/// backward parents on to the destination.
+fn reconstruct(meeting: &str, fwd: &Parents, bwd: &Parents) -> Vec<String> {
+    let mut path = vec![meeting.to_string()];
+    let mut cursor = meeting;
+    while let Some(parent) = fwd.get(cursor).filter(|p| p.as_str() != cursor) {
+        path.push(parent.clone());
+        cursor = parent.as_str();
+    }
     path.reverse();
+    let mut cursor = meeting;
+    while let Some(parent) = bwd.get(cursor).filter(|p| p.as_str() != cursor) {
+        path.push(parent.clone());
+        cursor = parent.as_str();
+    }
     path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parents(pairs: &[(&str, &str)]) -> Parents {
+        pairs
+            .iter()
+            .map(|(child, parent)| (child.to_string(), parent.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_path_joins_both_sides_at_the_meeting_node() {
+        let fwd = parents(&[("a", "a"), ("b", "a")]);
+        let bwd = parents(&[("d", "d"), ("c", "d"), ("b", "c")]);
+        assert_eq!(reconstruct("b", &fwd, &bwd), vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn a_level_relaxes_in_name_order() {
+        let mut this = parents(&[("a", "a")]);
+        let other = parents(&[("d", "d"), ("b", "d"), ("z", "d")]);
+        let triples = vec![
+            ("a".to_string(), "L".to_string(), "z".to_string()),
+            ("a".to_string(), "L".to_string(), "b".to_string()),
+        ];
+        let (next, meeting) = relax_level(triples, &mut this, &other);
+        assert_eq!(meeting.as_deref(), Some("b"));
+        assert_eq!(next, vec!["b"]);
+    }
 }

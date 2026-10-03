@@ -60,7 +60,7 @@ impl CoreLoop {
         let mut rows = 0usize;
         let mut indexes = 0usize;
         for ((tenant_id, collection), state) in decoded {
-            let restored = self.restore_kv_checkpoint_collection(tenant_id, &collection, &state);
+            let restored = self.restore_kv_checkpoint_collection(tenant_id, &collection, &state)?;
             rows += restored.rows;
             indexes += restored.indexes;
         }
@@ -155,12 +155,13 @@ impl CoreLoop {
     }
 
     /// Install one decoded collection: its rows, then its index registrations.
+    /// A row carrying surrogate `0` fails the load: every stored row is bound.
     fn restore_kv_checkpoint_collection(
         &mut self,
         tenant_id: u64,
         collection: &str,
         state: &DecodedKvCollection,
-    ) -> RestoredCounts {
+    ) -> crate::Result<RestoredCounts> {
         let now_ms = crate::engine::kv::current_ms();
         // `hash_to_collection` stores the db-qualified name, so the database id
         // is recoverable from the name itself — the same recovery the snapshot
@@ -186,8 +187,7 @@ impl CoreLoop {
             // the instant forward by the checkpoint-to-restart delay.
             //
             // `put` — not a raw table insert — because it carries the surrogate
-            // through, so the restored row keeps the cross-engine identity a
-            // `Surrogate::ZERO` restore would sever.
+            // through, so the restored row keeps its cross-engine identity.
             self.kv_engine.put_with_absolute_expiry(
                 crate::engine::kv::KvPutParams {
                     database_id,
@@ -201,7 +201,7 @@ impl CoreLoop {
                     surrogate: nodedb_types::Surrogate(entry.surrogate),
                 },
                 entry.expire_at_ms,
-            );
+            )?;
             restored += 1;
         }
 
@@ -213,12 +213,12 @@ impl CoreLoop {
             &state.indexes,
         );
 
-        RestoredCounts {
+        Ok(RestoredCounts {
             rows: restored,
             indexes: state.indexes.fields.len()
                 + state.indexes.composites.len()
                 + state.indexes.sorted.len(),
-        }
+        })
     }
 }
 
@@ -255,19 +255,21 @@ mod tests {
     fn engine_with(rows: &[(&[u8], &[u8], u64, u32)]) -> crate::engine::kv::KvEngine {
         let mut engine = new_engine();
         for (key, value, expire_at, surrogate) in rows {
-            engine.put_with_absolute_expiry(
-                crate::engine::kv::KvPutParams {
-                    database_id: 0,
-                    tenant_id: 7,
-                    collection: "users",
-                    key,
-                    value,
-                    ttl_ms: 0,
-                    now_ms: 1_000,
-                    surrogate: Surrogate(*surrogate),
-                },
-                *expire_at,
-            );
+            engine
+                .put_with_absolute_expiry(
+                    crate::engine::kv::KvPutParams {
+                        database_id: 0,
+                        tenant_id: 7,
+                        collection: "users",
+                        key,
+                        value,
+                        ttl_ms: 0,
+                        now_ms: 1_000,
+                        surrogate: Surrogate(*surrogate),
+                    },
+                    *expire_at,
+                )
+                .expect("a bound row writes");
         }
         engine
     }
@@ -282,8 +284,7 @@ mod tests {
         let engine = engine_with(&[
             (b"alice", b"va", 0, 11),
             (b"bob", b"vb", expire, 22),
-            // A row written by an internal RMW path: surrogate unbound.
-            (b"carol", b"vc", 0, 0),
+            (b"carol", b"vc", 0, 33),
         ]);
 
         let coll = engine.live_collections().next().expect("one collection");
@@ -321,19 +322,21 @@ mod tests {
         // does.
         let mut restored = new_engine();
         for entry in &decoded.entries {
-            restored.put_with_absolute_expiry(
-                crate::engine::kv::KvPutParams {
-                    database_id: 0,
-                    tenant_id: 7,
-                    collection: "users",
-                    key: &entry.key,
-                    value: &entry.value,
-                    ttl_ms: 0,
-                    now_ms: 1_000,
-                    surrogate: Surrogate(entry.surrogate),
-                },
-                entry.expire_at_ms,
-            );
+            restored
+                .put_with_absolute_expiry(
+                    crate::engine::kv::KvPutParams {
+                        database_id: 0,
+                        tenant_id: 7,
+                        collection: "users",
+                        key: &entry.key,
+                        value: &entry.value,
+                        ttl_ms: 0,
+                        now_ms: 1_000,
+                        surrogate: Surrogate(entry.surrogate),
+                    },
+                    entry.expire_at_ms,
+                )
+                .expect("a checkpointed row is bound");
         }
 
         for (key, want) in [
@@ -349,7 +352,7 @@ mod tests {
         }
 
         // Surrogates survive: the restored row is still reachable by its stable
-        // cross-engine identity, which a `Surrogate::ZERO` restore would sever.
+        // cross-engine identity.
         assert_eq!(
             restored
                 .key_for_surrogate(0, 7, "users", Surrogate(11))

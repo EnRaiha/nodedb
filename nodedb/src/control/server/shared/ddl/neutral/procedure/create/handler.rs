@@ -2,16 +2,14 @@
 
 //! The protocol-neutral `create_procedure` handler.
 //!
-//! Ported from the pgwire `ddl::procedure::create::handler`. All non-return
-//! logic (privilege gate, parsing, or-replace pre-check, body parse validation,
+//! The privilege gate, parsing, or-replace pre-check, body parse validation,
 //! StoredProcedure build, catalog propose-and-apply, routability extraction,
-//! Lite definition-sync broadcast, and the `audit_record` call) is preserved
-//! verbatim; only the result construction changed from pgwire `Response` /
-//! `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
+//! Lite definition-sync broadcast, and the `audit_record` call run here. The
+//! result is the protocol-neutral [`DdlResult`] / [`DdlError`].
 
 use crate::control::security::catalog::procedure_types::StoredProcedure;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::ddl::catalog::propose_and_apply;
+use crate::control::server::shared::ddl::catalog::propose_and_apply_async;
 use crate::control::server::shared::ddl::neutral::auth_support::{require_tenant_admin, status};
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
@@ -20,7 +18,7 @@ use super::parse::parse_create_procedure;
 use super::routability::extract_routability;
 
 /// Handle `CREATE [OR REPLACE] PROCEDURE ...`
-pub fn create_procedure(
+pub async fn create_procedure(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sql: &str,
@@ -74,7 +72,7 @@ pub fn create_procedure(
     // applier writes the record to local redb and clears the
     // parsed block cache so the next CALL re-parses the new body.
     let entry = crate::control::catalog_entry::CatalogEntry::PutProcedure(Box::new(stored.clone()));
-    propose_and_apply(state, &entry)?;
+    propose_and_apply_async(state, &entry).await?;
 
     // Broadcast to connected Lite sessions after the catalog commit is durable.
     emit_procedure_put(state, &stored);

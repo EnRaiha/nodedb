@@ -4,9 +4,13 @@
 
 mod backup_cut;
 pub mod executor;
+mod metadata_applied;
 mod plan_decode;
+mod read_leg;
 mod request_validation;
+mod stream_events;
 mod support;
+mod surrogate_binds;
 mod tenant_marks;
 
 pub use executor::LocalPlanExecutor;

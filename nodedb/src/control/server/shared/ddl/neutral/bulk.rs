@@ -6,10 +6,8 @@
 //! reads the file under the operator's UID and streams content to
 //! the server.
 //!
-//! Ported from the pgwire `ddl::bulk` handler; only the result
-//! construction changed from a pgwire `Response` error to the
-//! protocol-neutral [`DdlError`]. The SQLSTATE and message are preserved
-//! verbatim.
+//! The result is the protocol-neutral [`DdlError`] carrying the SQLSTATE and
+//! message.
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;

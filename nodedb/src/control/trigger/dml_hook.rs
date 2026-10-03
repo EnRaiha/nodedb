@@ -204,47 +204,93 @@ fn deserialize_value_to_fields(value: &[u8]) -> HashMap<String, nodedb_types::Va
     HashMap::new()
 }
 
-/// Patch a `PhysicalTask` with mutated fields from a BEFORE trigger.
-/// Replaces the value payload in `PointPut`/`Upsert`; for `PointUpdate`,
-/// updates are re-derived from the mutated fields.
+/// Patch a `PhysicalTask` with the NEW row a BEFORE trigger left.
+///
+/// A `PointPut`, `PointInsert` or `Upsert` carries the whole row, so it takes
+/// `mutated` whole. A `PointUpdate`, and an `Upsert` with `ON CONFLICT DO
+/// UPDATE` assignments, keeps its own assignments and gains a literal
+/// assignment for each field the trigger changed: `before` is the NEW row the
+/// trigger bound, so a field equal in both keeps the statement's own
+/// assignment.
 pub fn patch_task_with_mutated_fields(
     task: &mut nodedb_physical::physical_task::PhysicalTask,
+    before: &HashMap<String, nodedb_types::Value>,
     mutated: &HashMap<String, nodedb_types::Value>,
-) {
+) -> crate::Result<()> {
     use crate::bridge::envelope::PhysicalPlan;
+    use nodedb_physical::physical_plan::UpdateValue;
 
-    let json_obj: serde_json::Map<String, serde_json::Value> = mutated
-        .iter()
-        .map(|(k, v)| (k.clone(), serde_json::Value::from(v.clone())))
-        .collect();
-    let json_val = serde_json::Value::Object(json_obj);
-    let new_bytes = match nodedb_types::value_to_msgpack(&nodedb_types::Value::from(json_val)) {
-        Ok(b) => b,
-        Err(_) => return,
+    let encode = |value: &nodedb_types::Value| {
+        nodedb_types::value_to_msgpack(value).map_err(|error| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("BEFORE trigger NEW row: {error}"),
+        })
     };
-
+    // Each field the trigger changed, as a literal assignment: a trigger's NEW
+    // field is a fully evaluated value.
+    let assign_changed = |updates: &mut Vec<(String, UpdateValue)>| -> crate::Result<()> {
+        for (field, value) in mutated {
+            if before.get(field) == Some(value) {
+                continue;
+            }
+            let literal = UpdateValue::Literal(encode(value)?);
+            match updates.iter_mut().find(|(name, _)| name == field) {
+                Some((_, rhs)) => *rhs = literal,
+                None => updates.push((field.clone(), literal)),
+            }
+        }
+        Ok(())
+    };
     match &mut task.plan {
-        PhysicalPlan::Document(DocumentOp::PointPut { value, .. })
-        | PhysicalPlan::Document(DocumentOp::PointInsert { value, .. })
-        | PhysicalPlan::Document(DocumentOp::Upsert { value, .. }) => {
-            *value = new_bytes;
+        PhysicalPlan::Document(
+            DocumentOp::PointPut { value, .. } | DocumentOp::PointInsert { value, .. },
+        ) => {
+            *value = encode(&nodedb_types::Value::Object(mutated.clone()))?;
+        }
+        PhysicalPlan::Document(DocumentOp::Upsert {
+            value,
+            on_conflict_updates,
+            ..
+        }) => {
+            *value = encode(&nodedb_types::Value::Object(mutated.clone()))?;
+            if !on_conflict_updates.is_empty() {
+                assign_changed(on_conflict_updates)?;
+            }
         }
         PhysicalPlan::Document(DocumentOp::PointUpdate { updates, .. }) => {
-            // Trigger mutations are fully-evaluated values, so they ship as `Literal`.
-            *updates = mutated
-                .iter()
-                .filter_map(|(k, v)| {
-                    nodedb_types::value_to_msgpack(v).ok().map(|b| {
-                        (
-                            k.clone(),
-                            nodedb_physical::physical_plan::UpdateValue::Literal(b),
-                        )
-                    })
-                })
-                .collect();
+            assign_changed(updates)?;
         }
         _ => {}
     }
+    Ok(())
+}
+
+/// The NEW row a `PointUpdate` writes: `old` with each assignment applied.
+/// A literal assignment decodes its value. An expression evaluates against
+/// `old`, as the Data Plane evaluates it against the stored row.
+pub fn update_new_row(
+    old: &HashMap<String, nodedb_types::Value>,
+    updates: &[(String, nodedb_physical::physical_plan::UpdateValue)],
+) -> crate::Result<HashMap<String, nodedb_types::Value>> {
+    use nodedb_physical::physical_plan::UpdateValue;
+
+    let old_row = nodedb_types::Value::Object(old.clone());
+    let mut new = old.clone();
+    for (field, rhs) in updates {
+        let value = match rhs {
+            UpdateValue::Literal(bytes) => {
+                nodedb_types::value_from_msgpack(bytes).map_err(|error| {
+                    crate::Error::Serialization {
+                        format: "msgpack".into(),
+                        detail: format!("UPDATE assignment to '{field}': {error}"),
+                    }
+                })?
+            }
+            UpdateValue::Expr(expr) => expr.eval(&old_row).map_err(crate::Error::from)?,
+        };
+        new.insert(field.clone(), value);
+    }
+    Ok(new)
 }
 
 /// Fetch the current document as a field map (for OLD row bindings).
@@ -254,6 +300,9 @@ pub fn patch_task_with_mutated_fields(
 /// `collection` is typed [`nodedb_types::QualifiedCollection`] so each caller
 /// states, and the compiler checks, whether it holds a bare or a qualified
 /// name — a bare `&str` let a caller pass either silently.
+///
+/// `txn_id` names the statement's transaction: the read sees its staged
+/// writes, so a trigger binds the row as the transaction left it.
 pub async fn fetch_old_row(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -261,6 +310,7 @@ pub async fn fetch_old_row(
     auth: &AuthContext,
     collection: &nodedb_types::QualifiedCollection,
     document_id: &str,
+    txn_id: Option<crate::types::TxnId>,
 ) -> crate::Result<HashMap<String, nodedb_types::Value>> {
     let tenant_id = identity.tenant_id;
     if auth.tenant_id != tenant_id || auth.database_id != Some(database_id) {
@@ -294,13 +344,29 @@ pub async fn fetch_old_row(
     )?;
 
     let pk_bytes = document_id.as_bytes().to_vec();
-    let Some(surrogate) = state.surrogate_assigner.lookup(key, tenant_id, &pk_bytes)? else {
+    let bound = match state
+        .surrogate_assigner
+        .lookup_bound(key, tenant_id, &pk_bytes)?
+    {
+        Some(surrogate) => Some(surrogate),
+        None => {
+            crate::control::server::surrogate_exchange::lookup_surrogate_routed(
+                state,
+                key,
+                tenant_id,
+                &pk_bytes,
+                crate::types::TraceId::ZERO,
+            )
+            .await?
+        }
+    };
+    let Some(surrogate) = bound else {
         return Ok(HashMap::new());
     };
     let mut plan = crate::bridge::envelope::PhysicalPlan::Document(DocumentOp::PointGet {
         collection: collection.clone(),
         document_id: document_id.to_string(),
-        surrogate,
+        surrogate: Some(surrogate),
         pk_bytes,
         rls_filters: Vec::new(),
         system_time: nodedb_types::SystemTimeScope::Current,
@@ -328,7 +394,7 @@ pub async fn fetch_old_row(
         vshard_id: key.vshard(),
         plan,
         post_set_op: PostSetOp::None,
-        txn_id: None,
+        txn_id,
     };
     let resp = crate::control::server::shared::clone_write::intercept_authorize_and_dispatch(
         crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {
@@ -447,6 +513,7 @@ mod tests {
             &auth,
             &nodedb_types::QualifiedCollection::new(database_id, collection),
             document_id,
+            None,
         )
         .await
         .expect_err("custom role without READ grant must not fetch OLD row");
@@ -469,7 +536,7 @@ mod tests {
         assert_eq!(
             state
                 .surrogate_assigner
-                .lookup(
+                .lookup_bound(
                     nodedb_types::CollectionKey::from_bare(database_id, collection),
                     identity.tenant_id,
                     document_id.as_bytes()
@@ -510,6 +577,7 @@ mod tests {
             &auth,
             &nodedb_types::QualifiedCollection::new(database_id, "orders"),
             "order-42",
+            None,
         )
         .await
         .expect_err("misaligned auth context must be rejected before authorization");

@@ -3,11 +3,9 @@
 //! Protocol-neutral audit-log SHOW commands: `SHOW AUDIT LOG`,
 //! `SHOW AUDIT WHERE`, `SHOW AUDIT IN DATABASE`, and `EXPORT AUDIT`.
 //!
-//! Ported from the pgwire `ddl::inspect_audit` handlers. The catalog /
-//! in-memory audit-log reads, ordering (most-recent-first), and the
-//! catalog fall-through scan are preserved verbatim; only the result
-//! construction changed from pgwire `Response` / `QueryResponse` to the
-//! protocol-neutral `DdlResult` over `ShapedRows`.
+//! The catalog / in-memory audit-log reads, ordering (most-recent-first), and
+//! the catalog fall-through scan run here. The result is the protocol-neutral
+//! `DdlResult` over `ShapedRows`.
 
 use serde_json::{Map, Value as JsonValue};
 
@@ -19,9 +17,7 @@ use super::super::result::{DdlError, DdlResult};
 
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
 ///
-/// Preserves the exact SQLSTATE / message the pgwire audit handlers
-/// produced (via `sqlstate_error`), so error parity stays byte-identical
-/// after the migration off the pgwire router.
+/// The SQLSTATE and message reach the client unchanged.
 fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
 }

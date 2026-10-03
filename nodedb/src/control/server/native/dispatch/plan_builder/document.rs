@@ -14,7 +14,7 @@ use nodedb_physical::physical_plan::{DocumentOp, KvOp, TimeseriesOp};
 use super::super::DispatchCtx;
 use super::{collection_type, declared_primary_key, require_doc_id};
 
-pub(crate) fn build_point_get(
+pub(crate) async fn build_point_get(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -41,15 +41,7 @@ pub(crate) fn build_point_get(
         }),
         Some(CollectionType::Document(_)) | None => {
             let pk_bytes = doc_id.as_bytes().to_vec();
-            let surrogate = ctx
-                .state
-                .surrogate_assigner
-                .lookup(
-                    nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-                    ctx.tenant_id(),
-                    &pk_bytes,
-                )?
-                .unwrap_or(nodedb_types::Surrogate::ZERO);
+            let surrogate = super::helpers::existing_surrogate(ctx, collection, &pk_bytes).await?;
             Ok(PhysicalPlan::Document(DocumentOp::PointGet {
                 collection: QualifiedCollection::new(ctx.database_id(), collection),
                 document_id: doc_id,
@@ -63,7 +55,7 @@ pub(crate) fn build_point_get(
     }
 }
 
-pub(crate) fn build_point_put(
+pub(crate) async fn build_point_put(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -73,11 +65,7 @@ pub(crate) fn build_point_put(
     match collection_type(ctx, collection)? {
         Some(CollectionType::KeyValue(_)) => {
             let key = doc_id.into_bytes();
-            let surrogate = ctx.state.surrogate_assigner.assign(
-                nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-                ctx.tenant_id(),
-                &key,
-            )?;
+            let surrogate = super::helpers::assign_surrogate(ctx, collection, &key).await?;
             Ok(PhysicalPlan::Kv(KvOp::Put {
                 collection: QualifiedCollection::new(ctx.database_id(), collection),
                 key,
@@ -94,10 +82,14 @@ pub(crate) fn build_point_put(
             let ilp_line = format!("{collection} value={json_str}\n");
             // The line's own surrogate keys its staged row, so a read later in
             // the same transaction observes it.
-            let (surrogate, _identity) = ctx.state.surrogate_assigner.assign_fresh(
-                nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-                ctx.tenant_id(),
-            )?;
+            let (surrogate, _identity) = ctx
+                .state
+                .surrogate_assigner
+                .assign_fresh(
+                    nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
+                    ctx.tenant_id(),
+                )
+                .await?;
             Ok(PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
                 collection: QualifiedCollection::new(ctx.database_id(), collection),
                 payload: ilp_line.into_bytes(),
@@ -117,11 +109,7 @@ pub(crate) fn build_point_put(
         }),
         Some(CollectionType::Document(_)) | None => {
             let pk_bytes = doc_id.as_bytes().to_vec();
-            let surrogate = ctx.state.surrogate_assigner.assign(
-                nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-                ctx.tenant_id(),
-                &pk_bytes,
-            )?;
+            let surrogate = super::helpers::assign_surrogate(ctx, collection, &pk_bytes).await?;
             Ok(PhysicalPlan::Document(DocumentOp::PointPut {
                 collection: QualifiedCollection::new(ctx.database_id(), collection),
                 document_id: doc_id,
@@ -138,7 +126,7 @@ pub(crate) fn build_point_put(
     }
 }
 
-pub(crate) fn build_point_delete(
+pub(crate) async fn build_point_delete(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -168,16 +156,14 @@ pub(crate) fn build_point_delete(
                 .to_string(),
         }),
         Some(CollectionType::Document(_)) | None => {
+            // A row of an edge-bearing collection is also a graph node. Its
+            // delete is a `BulkDelete` on its key, so the edge reconnaissance
+            // gate commits the node's edge tombstones with it.
+            if super::helpers::collection_is_edge_bearing(ctx, collection)? {
+                return edge_bearing_key_delete(ctx, collection, doc_id);
+            }
             let pk_bytes = doc_id.as_bytes().to_vec();
-            let surrogate = ctx
-                .state
-                .surrogate_assigner
-                .lookup(
-                    nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-                    ctx.tenant_id(),
-                    &pk_bytes,
-                )?
-                .unwrap_or(nodedb_types::Surrogate::ZERO);
+            let surrogate = super::helpers::existing_surrogate(ctx, collection, &pk_bytes).await?;
             Ok(PhysicalPlan::Document(DocumentOp::PointDelete {
                 collection: QualifiedCollection::new(ctx.database_id(), collection),
                 document_id: doc_id,
@@ -192,7 +178,45 @@ pub(crate) fn build_point_delete(
     }
 }
 
-pub(crate) fn build_range_scan(
+/// A `BulkDelete` of the one row whose identity column holds `doc_id`: the
+/// declared primary key column, else `id`.
+fn edge_bearing_key_delete(
+    ctx: &DispatchCtx<'_>,
+    collection: &str,
+    doc_id: String,
+) -> crate::Result<PhysicalPlan> {
+    use crate::bridge::scan_filter::{FilterOp, ScanFilter};
+    let declared_primary_key = declared_primary_key(ctx, collection)?;
+    let filter = ScanFilter {
+        field: declared_primary_key
+            .clone()
+            .unwrap_or_else(|| nodedb_types::DEFAULT_IDENTITY_COLUMN.to_string()),
+        op: FilterOp::Eq,
+        value: nodedb_types::Value::String(doc_id),
+        clauses: Vec::new(),
+        expr: None,
+    };
+    let key_filters: Vec<ScanFilter> = std::iter::once(filter).collect();
+    let filters =
+        zerompk::to_msgpack_vec(&key_filters).map_err(|e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("key delete filter encode: {e}"),
+        })?;
+    Ok(PhysicalPlan::Document(DocumentOp::BulkDelete {
+        collection: QualifiedCollection::new(ctx.database_id(), collection),
+        filters,
+        returning: None,
+        ollp_predicted_surrogates: None,
+        ollp_predicted_edges: None,
+        rls_filters: Vec::new(),
+        rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        // Filled in by the materialized-sum resolution pass.
+        resolved_sum_targets: Vec::new(),
+        declared_primary_key,
+    }))
+}
+
+pub(crate) async fn build_range_scan(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -215,7 +239,7 @@ pub(crate) fn build_range_scan(
     }))
 }
 
-pub(crate) fn build_batch_insert(
+pub(crate) async fn build_batch_insert(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -231,20 +255,16 @@ pub(crate) fn build_batch_insert(
             detail: "documents array is empty".to_string(),
         });
     }
+    // Every row's identity in one batch at the collection's home.
+    let pks: Vec<&[u8]> = batch_docs.iter().map(|d| d.id.as_bytes()).collect();
+    let surrogates = super::helpers::assign_surrogates(ctx, collection, &pks).await?;
     let mut documents: Vec<(String, Vec<u8>)> = Vec::with_capacity(batch_docs.len());
-    let mut surrogates: Vec<nodedb_types::Surrogate> = Vec::with_capacity(batch_docs.len());
     for d in batch_docs {
         let value_bytes = sonic_rs::to_vec(&d.fields).map_err(|e| crate::Error::Serialization {
             format: "json".into(),
             detail: format!("failed to serialize document '{}': {e}", d.id),
         })?;
-        let surrogate = ctx.state.surrogate_assigner.assign(
-            nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-            ctx.tenant_id(),
-            d.id.as_bytes(),
-        )?;
         documents.push((d.id.clone(), value_bytes));
-        surrogates.push(surrogate);
     }
     Ok(PhysicalPlan::Document(DocumentOp::BatchInsert {
         collection: QualifiedCollection::new(ctx.database_id(), collection),
@@ -258,7 +278,7 @@ pub(crate) fn build_batch_insert(
     }))
 }
 
-pub(crate) fn build_update(
+pub(crate) async fn build_update(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -279,15 +299,7 @@ pub(crate) fn build_update(
         })
         .collect();
     let pk_bytes = doc_id.as_bytes().to_vec();
-    let surrogate = ctx
-        .state
-        .surrogate_assigner
-        .lookup(
-            nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-            ctx.tenant_id(),
-            &pk_bytes,
-        )?
-        .unwrap_or(nodedb_types::Surrogate::ZERO);
+    let surrogate = super::helpers::existing_surrogate(ctx, collection, &pk_bytes).await?;
     Ok(PhysicalPlan::Document(DocumentOp::PointUpdate {
         collection: QualifiedCollection::new(ctx.database_id(), collection),
         document_id: doc_id,
@@ -308,19 +320,21 @@ pub(crate) fn build_update(
 /// above: a document scan reads the sparse store only, so every other engine
 /// takes its own scan builder. A spatial collection's plain scan is the
 /// columnar scan; the geometry query is `SpatialScan`.
-pub(crate) fn build_scan(
+pub(crate) async fn build_scan(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
     match collection_type(ctx, collection)? {
-        Some(CollectionType::KeyValue(_)) => return super::kv::build_scan(ctx, fields, collection),
+        Some(CollectionType::KeyValue(_)) => {
+            return super::kv::build_scan(ctx, fields, collection).await;
+        }
         Some(CollectionType::Columnar(ColumnarProfile::Timeseries { .. })) => {
-            return super::timeseries::build_scan(ctx, fields, collection);
+            return super::timeseries::build_scan(ctx, fields, collection).await;
         }
         Some(CollectionType::Columnar(ColumnarProfile::Plain))
         | Some(CollectionType::Columnar(ColumnarProfile::Spatial { .. })) => {
-            return super::columnar::build_scan(ctx, fields, collection);
+            return super::columnar::build_scan(ctx, fields, collection).await;
         }
         Some(CollectionType::Document(_)) | None => {}
     }
@@ -342,18 +356,14 @@ pub(crate) fn build_scan(
     }))
 }
 
-pub(crate) fn build_upsert(
+pub(crate) async fn build_upsert(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
     let doc_id = require_doc_id(fields)?;
     let value = fields.data.clone().unwrap_or_default();
-    let surrogate = ctx.state.surrogate_assigner.assign(
-        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-        ctx.tenant_id(),
-        doc_id.as_bytes(),
-    )?;
+    let surrogate = super::helpers::assign_surrogate(ctx, collection, doc_id.as_bytes()).await?;
     Ok(PhysicalPlan::Document(DocumentOp::Upsert {
         collection: QualifiedCollection::new(ctx.database_id(), collection),
         document_id: doc_id,

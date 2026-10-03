@@ -1,27 +1,18 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Counter maintenance helpers: `increment_for_insert` and `decrement_for_delete`.
+//! Counter maintenance helpers: `increment_counts` and `decrement_counts`.
 //!
 //! Both functions accept a `&redb::WriteTransaction` opened by the caller and
 //! operate fully within that transaction — no second transaction is opened.
 //! Atomicity is preserved: either the EDGES write and the GRAPH_STATS update
 //! both commit, or neither does.
 //!
-//! ## Prior-live probe
-//!
-//! Before deciding whether to increment (insert path) or decrement (delete
-//! path), each function probes the EDGES table inside the same write transaction
-//! to determine whether a prior live version of the same base edge exists. The
-//! `Table<'txn, K, V>` type returned by `write_txn.open_table()` implements
-//! `ReadableTable`, so `.range()` and `.get()` are available with the
-//! transaction's consistent snapshot.
+//! The version writer calls them when a write flips the edge's current
+//! state, which it resolves inside the same write transaction.
 
 use redb::{ReadableTable, WriteTransaction};
 
-use crate::engine::graph::edge_store::store::{EDGES, redb_err};
-use crate::engine::graph::edge_store::temporal::keys::{
-    edge_version_prefix, is_sentinel, parse_versioned_edge_key,
-};
+use crate::engine::graph::edge_store::store::redb_err;
 
 use super::table::{GRAPH_STATS, LabelRow, NodeRow, SummaryRow, label_key, node_key, summary_key};
 
@@ -39,30 +30,10 @@ pub struct EdgeStatsKey<'a> {
 
 // ── Insert path ───────────────────────────────────────────────────────────────
 
-/// Called from `put_edge_versioned` inside the same `WriteTransaction`.
-///
-/// If no prior live version exists for `(tid, collection, src, label, dst)`,
-/// increments: `summary.edge_count`, `label[label].count` (creating the row and
-/// bumping `summary.distinct_label_count` if new), and `node[src].refcount` +
+/// Count one more live edge for `key`: `summary.edge_count`,
+/// `label[label].count` (creating the row and bumping
+/// `summary.distinct_label_count` if new), and `node[src].refcount` +
 /// `node[dst].refcount` (bumping `summary.distinct_node_count` per new node).
-///
-/// If a prior live version exists this is an update — counters are unchanged.
-///
-/// Returns whether the counters changed.
-pub fn increment_for_insert(
-    write_txn: &WriteTransaction,
-    key: EdgeStatsKey<'_>,
-    current_system_from: i64,
-) -> crate::Result<bool> {
-    if prior_live_exists(write_txn, key, current_system_from)? {
-        return Ok(false);
-    }
-    increment_counts(write_txn, key)?;
-    Ok(true)
-}
-
-/// Count one more live edge for `key`: the summary, its label and both
-/// endpoints.
 pub fn increment_counts(write_txn: &WriteTransaction, key: EdgeStatsKey<'_>) -> crate::Result<()> {
     let EdgeStatsKey {
         db,
@@ -119,31 +90,12 @@ pub fn increment_counts(write_txn: &WriteTransaction, key: EdgeStatsKey<'_>) -> 
 
 // ── Delete path ───────────────────────────────────────────────────────────────
 
-/// Called from `write_sentinel` inside the same `WriteTransaction`.
-///
-/// If the immediately-preceding version was live (non-sentinel), decrements:
-/// `summary.edge_count`, `label[label].count` (deleting the row and decrementing
+/// Count one live edge fewer for `key`: `summary.edge_count`,
+/// `label[label].count` (deleting the row and decrementing
 /// `summary.distinct_label_count` when count reaches zero), and
 /// `node[src].refcount` + `node[dst].refcount` (deleting the node row and
 /// decrementing `summary.distinct_node_count` when refcount reaches zero).
-///
-/// If there was no prior live version, this is a no-op for the counters.
-///
-/// Returns whether the counters changed.
-pub fn decrement_for_delete(
-    write_txn: &WriteTransaction,
-    key: EdgeStatsKey<'_>,
-    sentinel_system_from: i64,
-) -> crate::Result<bool> {
-    if !prior_live_exists(write_txn, key, sentinel_system_from)? {
-        return Ok(false);
-    }
-    decrement_counts(write_txn, key)?;
-    Ok(true)
-}
-
-/// Count one live edge fewer for `key`. The exact inverse of
-/// [`increment_counts`].
+/// The exact inverse of [`increment_counts`].
 pub fn decrement_counts(write_txn: &WriteTransaction, key: EdgeStatsKey<'_>) -> crate::Result<()> {
     let EdgeStatsKey {
         db,
@@ -196,54 +148,6 @@ pub fn decrement_counts(write_txn: &WriteTransaction, key: EdgeStatsKey<'_>) -> 
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
-
-/// Returns `true` when a live (non-sentinel) version of the base edge exists
-/// in EDGES at any `system_from` strictly less than `exclude_system_from`,
-/// using the same `WriteTransaction`'s consistent view.
-fn prior_live_exists(
-    write_txn: &WriteTransaction,
-    key: EdgeStatsKey<'_>,
-    exclude_system_from: i64,
-) -> crate::Result<bool> {
-    let EdgeStatsKey {
-        db,
-        tid,
-        collection,
-        label,
-        src,
-        dst,
-    } = key;
-    let prefix = edge_version_prefix(collection, src, label, dst);
-    let edges = write_txn
-        .open_table(EDGES)
-        .map_err(|e| redb_err("open edges (prior_live probe)", e))?;
-
-    let range = edges
-        .range((db, tid, prefix.as_str())..)
-        .map_err(|e| redb_err("prior_live range", e))?;
-
-    for entry in range {
-        let (k, v) = entry.map_err(|e| redb_err("prior_live iter", e))?;
-        let (kd, kt, composite) = k.value();
-        if kd != db || kt != tid || !composite.starts_with(&prefix) {
-            break;
-        }
-        let Some((_c, _s, _l, _d, sys)) = parse_versioned_edge_key(composite) else {
-            continue;
-        };
-        if sys >= exclude_system_from {
-            // This is the key we're about to write (or a later one) — skip.
-            continue;
-        }
-        // Found a version before this write — is it live?
-        if !is_sentinel(v.value()) {
-            return Ok(true);
-        }
-        // Sentinel at sys < exclude → prior state was already deleted.
-        return Ok(false);
-    }
-    Ok(false)
-}
 
 fn read_summary(
     stats: &redb::Table<'_, (u64, u64, &str), &[u8]>,

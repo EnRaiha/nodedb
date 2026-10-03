@@ -49,8 +49,7 @@ pub enum ChunkOutcome {
     /// More chunks are expected.
     Pending,
     /// The final chunk was received, CRC validated, and the snapshot committed.
-    /// Contains the `InstallSnapshotResponse` from `MultiRaft::handle_install_snapshot`.
-    Committed(nodedb_raft::InstallSnapshotResponse),
+    Committed(super::finalize::CommitResult),
 }
 
 /// Process a single incoming `InstallSnapshotRequest` chunk.

@@ -2,12 +2,11 @@
 
 //! Gateway-based SQL task dispatch for the native protocol.
 //!
-//! When `SharedState.gateway` is `Some`, tasks are routed through
-//! `Gateway::execute_response` which handles cluster-aware routing, typed `NotLeader`
-//! retry, and plan caching. The `None` fallback retains the original
-//! `dispatch_to_data_plane` path for single-node boot before the gateway is
-//! wired. This is native's SQL-TEXT opcode path — distinct from
-//! `raw_dispatch.rs`, which serves only native's direct-op opcodes.
+//! Tasks route through `Gateway::execute_response`, which handles
+//! cluster-aware routing, typed `NotLeader` retry, and plan caching. A
+//! transaction meta-op runs on its own vShard's core instead. This is native's
+//! SQL-TEXT opcode path — distinct from `raw_dispatch.rs`, which serves only
+//! native's direct-op opcodes.
 
 use crate::bridge::envelope::Response;
 use std::sync::Arc;
@@ -23,7 +22,7 @@ use super::DispatchCtx;
 /// Authorize one task with no clone-write check — used only by the
 /// Control-Plane orchestrator branches ahead of this file's gateway dispatch,
 /// whose plan shapes (`InsertSelect`, `Merge`, `UpdateFromJoin`, a governed
-/// predicate resolution, `DropArray`) are never clone-write shapes.
+/// predicate resolution, array DDL) are never clone-write shapes.
 pub(super) fn authorize_native_task(
     ctx: &DispatchCtx<'_>,
     task: &PhysicalTask,
@@ -45,11 +44,10 @@ pub(super) fn authorize_native_task(
     })
 }
 
-/// Dispatch a single `PhysicalTask` through the gateway when available,
-/// falling back to the local SPSC path.
+/// Dispatch a single `PhysicalTask` through the gateway.
 ///
-/// Both paths return the Data-Plane `Response` shape, with a `NotFound`
-/// verdict as an error status.
+/// Returns the Data-Plane `Response` shape, with a `NotFound` verdict as an
+/// error status.
 pub(super) async fn dispatch_task_via_gateway(
     ctx: &DispatchCtx<'_>,
     task: PhysicalTask,
@@ -77,35 +75,28 @@ pub(super) async fn dispatch_task_via_gateway(
     let database_id = checked.database_id();
     let txn_id = checked.txn_id();
 
+    let gateway = ctx.state.installed_gateway()?;
     // A staged write and the other transaction meta-ops run on the core of
-    // the task's own vShard. The gateway would route them to vShard 0.
-    let gateway = ctx
-        .state
-        .gateway
-        .get()
-        .filter(|_| !is_task_vshard_scoped(checked.plan()));
-    match gateway {
-        Some(gw) => {
-            let gw_ctx = GatewayQueryContext {
-                tenant_id,
-                trace_id: TraceId::generate(),
-                database_id,
-                // Propagate the in-block transaction id so gateway local
-                // dispatch resolves the per-txn staging overlay.
-                txn_id,
-            };
-            // The typed error passes through unchanged. The native frame
-            // renders its SQLSTATE and numeric code from it.
-            gw.execute_response(&gw_ctx, checked).await
-        }
-        // A write takes the durable route, a read the read route.
-        None => {
-            crate::control::server::dispatch_utils::dispatch_authorized_task_by_class(
-                ctx.state,
-                checked,
-                TraceId::generate(),
-            )
-            .await
-        }
+    // the task's own vShard. The gateway will route them to vShard 0. A
+    // write takes the durable route, a read the read route.
+    if is_task_vshard_scoped(checked.plan()) {
+        return crate::control::server::dispatch_utils::dispatch_authorized_task_by_class(
+            ctx.state,
+            checked,
+            TraceId::generate(),
+        )
+        .await;
     }
+    let gw_ctx = GatewayQueryContext {
+        tenant_id,
+        trace_id: TraceId::generate(),
+        database_id,
+        // Propagate the in-block transaction id so gateway local dispatch
+        // resolves the per-txn staging overlay.
+        txn_id,
+        linearizable: true,
+    };
+    // The typed error passes through unchanged. The native frame renders its
+    // SQLSTATE and numeric code from it.
+    gateway.execute_response(&gw_ctx, checked).await
 }

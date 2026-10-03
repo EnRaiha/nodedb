@@ -5,7 +5,7 @@
 //!
 //! Both the transactional DDL buffer and the DDL audit context live for
 //! exactly one client connection and must follow its task across every
-//! `.await` — tokio may poll a connection on a different worker after any of
+//! `.await` — tokio can poll a connection on a different worker after any of
 //! them. They share one task-local so the connection future gains one layer.
 
 use std::cell::{Cell, RefCell};
@@ -15,6 +15,7 @@ use std::time::Instant;
 use super::audit_context::AuditCtx;
 use super::ddl_buffer::DdlBuffer;
 use super::ephemeral_sequence::EphemeralSequences;
+use super::graph_reads::GraphShardReads;
 
 /// Per-connection session slots. Each field is owned by its own module, which
 /// exposes the accessors; nothing outside reaches through this struct.
@@ -29,6 +30,15 @@ pub(super) struct ConnScope {
     /// at. `None` between statements, and on a connection future that has not
     /// entered a statement scope. See [`super::deadline`].
     pub(super) statement_deadline: Cell<Option<Instant>>,
+    /// Client-facing notices raised while the current statement ran, below
+    /// the response shaper (see [`super::statement_notice`]).
+    pub(super) statement_notices: RefCell<Vec<String>>,
+    /// Cross-shard graph reads the current request made, not yet recorded
+    /// into the transaction read-set (see [`super::graph_reads`]).
+    pub(super) graph_reads: RefCell<Vec<GraphShardReads>>,
+    /// The node that served each vShard the current statement read (see
+    /// [`super::served_reads`]).
+    pub(super) served_reads: RefCell<std::collections::HashMap<u32, u64>>,
 }
 
 impl ConnScope {
@@ -38,6 +48,9 @@ impl ConnScope {
             audit: RefCell::new(None),
             ephemeral_sequences: RefCell::new(EphemeralSequences::new()),
             statement_deadline: Cell::new(None),
+            statement_notices: RefCell::new(Vec::new()),
+            graph_reads: RefCell::new(Vec::new()),
+            served_reads: super::served_reads::empty(),
         }
     }
 }
@@ -54,6 +67,22 @@ tokio::task_local! {
 /// layer off the connection future's already deep state machine.
 pub fn scoped<F: Future>(future: F) -> impl Future<Output = F::Output> {
     CONN_SCOPE.scope(ConnScope::empty(), future)
+}
+
+/// Install fresh slots around `future` for a transaction the server runs on
+/// its own: a trigger, procedure, job or event body.
+///
+/// The body owns its DDL buffer, so its COMMIT or ROLLBACK never drains the
+/// transaction of a connection it runs inside. It keeps that connection's
+/// statement deadline and audit context.
+pub fn scoped_system_txn<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    let (deadline, audit) = with_scope((None, None), |scope| {
+        (scope.statement_deadline.get(), scope.audit.borrow().clone())
+    });
+    let slots = ConnScope::empty();
+    slots.statement_deadline.set(deadline);
+    *slots.audit.borrow_mut() = audit;
+    CONN_SCOPE.scope(slots, future)
 }
 
 /// Run `f` against the current connection's slots, or return `default` when
@@ -82,6 +111,25 @@ mod tests {
             }
             assert!(ddl_buffer::is_active());
             assert!(audit_context::current().is_some());
+        })
+        .await;
+    }
+
+    /// A system transaction inside a client transaction buffers its DDL on
+    /// its own. The client's buffer is untouched when the body's ends.
+    #[tokio::test]
+    async fn a_system_txn_scope_owns_its_ddl_buffer() {
+        scoped(async {
+            ddl_buffer::activate();
+            let before = ddl_buffer::buffer_len();
+            scoped_system_txn(async {
+                assert!(!ddl_buffer::is_active(), "the body starts with no buffer");
+                ddl_buffer::activate();
+                assert!(ddl_buffer::take().is_some());
+            })
+            .await;
+            assert!(ddl_buffer::is_active(), "the client's buffer survives");
+            assert_eq!(ddl_buffer::buffer_len(), before);
         })
         .await;
     }

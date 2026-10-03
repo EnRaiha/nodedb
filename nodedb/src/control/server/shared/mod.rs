@@ -1,5 +1,6 @@
 //! Protocol-neutral machinery shared by every server entrypoint (pgwire, native, http).
 pub mod authorization;
+pub(crate) mod backup_metering;
 pub mod check_constraint;
 pub mod clone_read;
 pub mod clone_write;
@@ -16,6 +17,7 @@ pub mod retry;
 pub mod returning;
 pub mod session;
 pub mod sql;
+pub mod txn_route;
 pub mod write_admission;
 
 pub use panic_isolation::{ConnectionFutureOutcome, isolate_connection_future};

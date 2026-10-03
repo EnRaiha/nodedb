@@ -26,7 +26,8 @@ use crate::transport::topology_identity_store::TopologyIdentityStore;
 /// Resilience features:
 /// - **Retry**: Transient transport failures are retried with exponential backoff.
 /// - **Circuit breaker**: Peers with consecutive failures are fast-failed until cooldown.
-/// - **Connection eviction**: Stale connections are evicted on failure and re-established on retry.
+/// - **Connection eviction**: A connection that failed is evicted and re-established on retry.
+/// - **Single-flight dial**: Concurrent sends to one peer share one dial.
 ///
 /// [`RaftTransport`]: nodedb_raft::transport::RaftTransport
 /// [`serve`]: Self::serve
@@ -38,6 +39,8 @@ pub struct NexarTransport {
     pub(super) peers: RwLock<HashMap<u64, quinn::Connection>>,
     /// Known peer addresses for connection establishment.
     pub(super) peer_addrs: RwLock<HashMap<u64, SocketAddr>>,
+    /// Per-peer gates that make dials single-flight. See [`super::pool`].
+    pub(super) dial_gates: super::pool::DialGates,
     pub(super) rpc_timeout: Duration,
     pub(super) circuit_breaker: Arc<CircuitBreaker>,
     pub(super) retry_policy: RetryPolicy,
@@ -220,6 +223,7 @@ impl NexarTransport {
             client_config,
             peers: RwLock::new(HashMap::new()),
             peer_addrs: RwLock::new(HashMap::new()),
+            dial_gates: super::pool::DialGates::default(),
             rpc_timeout,
             circuit_breaker: Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())),
             retry_policy: RetryPolicy::default(),
@@ -288,6 +292,14 @@ impl NexarTransport {
     /// node's fact rather than two counters that drift.
     pub fn cluster_epoch(&self) -> std::sync::Arc<crate::cluster_epoch::ClusterEpochState> {
         std::sync::Arc::clone(&self.auth.epoch)
+    }
+
+    /// Send every later frame in boot `epoch`'s sequence range (see
+    /// [`crate::rpc_codec::PeerSeqSender::enter_boot_epoch`]). The node calls
+    /// it once per boot, with the epoch its catalog just raised, before the
+    /// transport sends anything.
+    pub fn enter_boot_epoch(&self, epoch: u64) {
+        self.auth.peer_seq_out.enter_boot_epoch(epoch);
     }
 
     /// The cluster MAC key carried by this transport. SWIM subsystem
@@ -407,8 +419,9 @@ pub struct TransportPeerSnapshot {
 /// Unit tests for [`NexarTransport`]: end-to-end RPC roundtrips, concurrent
 /// fan-out, connection reuse, and unreachable-peer errors.
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
     use nodedb_raft::message::{
@@ -418,6 +431,7 @@ mod tests {
     };
     use nodedb_raft::transport::RaftTransport;
 
+    use crate::circuit_breaker::{Admission, CircuitBreakerConfig, CircuitState};
     use crate::error::{ClusterError, Result};
     use crate::rpc_codec::RaftRpc;
     use crate::transport::credentials::TransportCredentials;
@@ -425,17 +439,45 @@ mod tests {
 
     use super::NexarTransport;
 
+    /// The group `EchoHandler` does not host.
+    const UNHOSTED_GROUP: u64 = 404;
+
+    /// The group whose vote requests `EchoHandler` answers after [`STALL`].
+    pub(crate) const STALLED_GROUP: u64 = 503;
+
+    /// How long `EchoHandler` holds a vote request of [`STALLED_GROUP`].
+    pub(crate) const STALL: Duration = Duration::from_secs(2);
+
+    /// AppendEntries requests `EchoHandler` refused for `UNHOSTED_GROUP`.
+    static UNHOSTED_APPENDS: AtomicU32 = AtomicU32::new(0);
+
     /// Mock handler that returns fixed responses for testing.
     struct EchoHandler;
 
     impl RaftRpcHandler for EchoHandler {
         async fn handle_rpc(&self, rpc: RaftRpc) -> Result<RaftRpc> {
             match rpc {
+                RaftRpc::AppendEntriesRequest(req) if req.group_id == UNHOSTED_GROUP => {
+                    UNHOSTED_APPENDS.fetch_add(1, Ordering::SeqCst);
+                    Err(ClusterError::GroupNotFound {
+                        group_id: req.group_id,
+                    })
+                }
+                RaftRpc::Ping(req) => Ok(crate::health::handle_ping(1, 0, &req)),
                 RaftRpc::AppendEntriesRequest(req) => {
                     Ok(RaftRpc::AppendEntriesResponse(AppendEntriesResponse {
                         term: req.term,
                         success: true,
                         last_log_index: req.prev_log_index + req.entries.len() as u64,
+                        round: req.round,
+                        needs_snapshot: false,
+                    }))
+                }
+                RaftRpc::RequestVoteRequest(req) if req.group_id == STALLED_GROUP => {
+                    tokio::time::sleep(STALL).await;
+                    Ok(RaftRpc::RequestVoteResponse(RequestVoteResponse {
+                        term: req.term,
+                        vote_granted: true,
                     }))
                 }
                 RaftRpc::RequestVoteRequest(req) => {
@@ -594,7 +636,7 @@ mod tests {
         );
     }
 
-    fn make_transport(node_id: u64) -> NexarTransport {
+    pub(crate) fn make_transport(node_id: u64) -> NexarTransport {
         NexarTransport::new(
             node_id,
             "127.0.0.1:0".parse().unwrap(),
@@ -639,6 +681,8 @@ mod tests {
             ],
             leader_commit: 10,
             group_id: 7,
+            round: 1,
+            replicated_floor: 0,
         };
 
         let resp = client.append_entries(1, req).await.unwrap();
@@ -677,6 +721,8 @@ mod tests {
             trace_id: [0u8; 16],
             descriptor_versions: vec![],
             txn_id: None,
+            vshard_id: None,
+            read_groups: Vec::new(),
         });
 
         let stream = client.send_rpc_stream(1, req).await.unwrap();
@@ -721,6 +767,7 @@ mod tests {
             last_log_index: 100,
             last_log_term: 9,
             group_id: 3,
+            transfer: false,
         };
 
         let resp = client.request_vote(1, req).await.unwrap();
@@ -755,6 +802,8 @@ mod tests {
             done: true,
             group_id: 0,
             total_size: 0,
+            voters: Vec::new(),
+            learners: Vec::new(),
         };
 
         let resp = client.install_snapshot(1, req).await.unwrap();
@@ -790,6 +839,8 @@ mod tests {
                     entries: vec![],
                     leader_commit: i * 10,
                     group_id: 0,
+                    round: i,
+                    replicated_floor: 0,
                 };
                 let resp = c.append_entries(1, req).await.unwrap();
                 assert_eq!(resp.term, i);
@@ -826,6 +877,7 @@ mod tests {
                 last_log_index: 0,
                 last_log_term: 0,
                 group_id: 0,
+                transfer: false,
             };
             client.request_vote(1, req).await.unwrap();
         }
@@ -846,6 +898,8 @@ mod tests {
             entries: vec![],
             leader_commit: 0,
             group_id: 0,
+            round: 1,
+            replicated_floor: 0,
         };
 
         let err = client.append_entries(99, req).await.unwrap_err();
@@ -880,11 +934,104 @@ mod tests {
             entries: vec![],
             leader_commit: 50,
             group_id: 0,
+            round: 1,
+            replicated_floor: 0,
         };
 
         let resp = client.append_entries(1, req).await.unwrap();
         assert_eq!(resp.term, 3);
         assert!(resp.success);
         assert_eq!(resp.last_log_index, 50);
+    }
+
+    /// Start `EchoHandler` on node 1 and a client on node 2 that knows it.
+    pub(crate) async fn serve_echo() -> (
+        Arc<NexarTransport>,
+        Arc<NexarTransport>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let server = Arc::new(make_transport(1));
+        let client = Arc::new(make_transport(2));
+        client.register_peer(1, server.local_addr());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let srv = server.clone();
+        tokio::spawn(async move {
+            srv.serve(Arc::new(EchoHandler), shutdown_rx).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (server, client, shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn a_handler_refusal_is_answered_and_not_resent() {
+        let (_server, client, _shutdown) = serve_echo().await;
+        let req = AppendEntriesRequest {
+            term: 3,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+            group_id: UNHOSTED_GROUP,
+            round: 1,
+            replicated_floor: 0,
+        };
+        let before = UNHOSTED_APPENDS.load(Ordering::SeqCst);
+
+        let err = client.send_append_entries(1, req).await.unwrap_err();
+
+        assert!(
+            matches!(err, ClusterError::GroupNotFound { group_id } if group_id == UNHOSTED_GROUP),
+            "{err:?}"
+        );
+        assert!(!err.is_link_failure());
+        assert_eq!(
+            UNHOSTED_APPENDS.load(Ordering::SeqCst) - before,
+            1,
+            "a refusal is not resent"
+        );
+        let breaker = client.circuit_breaker();
+        assert_eq!(breaker.state(1), CircuitState::Closed);
+        assert_eq!(breaker.failure_count(1), 0, "a refusal is an answer");
+        assert!(
+            client.peers.read().unwrap().contains_key(&1),
+            "a refusal keeps the connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handler_error_never_reads_as_a_link_failure() {
+        let (_server, client, _shutdown) = serve_echo().await;
+        // `EchoHandler` fails a topology update with a transport error.
+        let update = RaftRpc::TopologyUpdate(crate::rpc_codec::TopologyUpdate {
+            version: 1,
+            nodes: vec![],
+        });
+
+        let err = client.send_rpc(1, update).await.unwrap_err();
+
+        assert!(matches!(err, ClusterError::RemoteUntyped { .. }), "{err:?}");
+        assert_eq!(client.circuit_breaker().failure_count(1), 0);
+    }
+
+    #[tokio::test]
+    async fn a_probe_pong_closes_an_open_breaker() {
+        let (_server, client, _shutdown) = serve_echo().await;
+        let breaker = client.circuit_breaker();
+        for _ in 0..CircuitBreakerConfig::default().failure_threshold {
+            breaker.record_failure(1, Admission::Normal);
+        }
+        assert_eq!(breaker.state(1), CircuitState::Open);
+        assert!(breaker.check(1).is_err(), "the cooldown still runs");
+
+        let ping = RaftRpc::Ping(crate::rpc_codec::PingRequest {
+            sender_id: 2,
+            topology_version: 0,
+        });
+        let reply = client.send_probe_rpc(1, ping).await.unwrap();
+
+        assert!(matches!(reply, RaftRpc::Pong(_)), "{reply:?}");
+        assert_eq!(breaker.state(1), CircuitState::Closed);
+        assert_eq!(breaker.failure_count(1), 0);
     }
 }

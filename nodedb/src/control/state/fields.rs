@@ -18,12 +18,6 @@ use crate::control::security::tenant::TenantIsolation;
 use crate::control::server::sync::dlq::SyncDlq;
 use crate::wal::WalManager;
 
-/// Atomically installed Raft proposal handles.
-pub(super) struct AsyncRaftProposerPair {
-    pub(super) sequenced: Arc<crate::control::wal_replication::AsyncRaftProposer>,
-    pub(super) raw: Arc<crate::control::wal_replication::AsyncRaftProposer>,
-}
-
 pub struct SharedState {
     pub dispatcher: Mutex<Dispatcher>,
     /// The node's outcome floor. Every write that mints a WAL LSN for the Data
@@ -101,15 +95,21 @@ pub struct SharedState {
     pub(super) idle_timeout_secs: u64,
     /// Absolute session lifetime in seconds (0 = disabled).
     pub(super) session_absolute_timeout_secs: u64,
-    /// Cluster topology (None in single-node mode).
+    /// Cluster topology. Boot wires it from the cluster handle before the
+    /// state is shared; `None` only on a state no boot wired.
     pub cluster_topology: Option<Arc<RwLock<nodedb_cluster::ClusterTopology>>>,
-    /// Cluster routing table (None in single-node mode).
+    /// Cluster routing table. Boot wires it from the cluster handle; `None`
+    /// only on a state no boot wired.
+    ///
+    /// Never call `raft_status_fn` or any `MultiRaft` path while holding this guard.
+    /// Take the Raft status first, then this guard. `LiveLeaders::snapshot` does that.
     pub cluster_routing: Option<Arc<RwLock<nodedb_cluster::RoutingTable>>>,
-    /// Cluster transport for forwarding requests (None in single-node mode).
+    /// Cluster transport for forwarding requests. Boot wires it from the
+    /// cluster handle; `None` only on a state no boot wired.
     pub cluster_transport: Option<Arc<nodedb_cluster::NexarTransport>>,
-    /// This node's ID (0 in single-node mode).
+    /// This node's ID. Boot sets it from the cluster handle.
     pub node_id: u64,
-    /// Live view of the replicated metadata catalog. Falls through to legacy redb in single-node mode.
+    /// Live view of the replicated metadata catalog.
     pub metadata_cache: Arc<RwLock<nodedb_cluster::MetadataCache>>,
     /// Broadcasts one event per committed metadata entry to subscribers (pgwire cache, CDC, etc.).
     pub catalog_change_tx: tokio::sync::broadcast::Sender<
@@ -118,53 +118,67 @@ pub struct SharedState {
     /// Per-Raft-group apply watermark registry for commit-wait and drain paths.
     pub group_watchers: Arc<nodedb_cluster::GroupAppliedWatchers>,
     /// Serializes this node's attempts to acquire the replicated descriptor
-    /// preparation lease.
-    pub metadata_ddl_lock: Mutex<()>,
-    /// Replicated preparation owner plus local monotonic apply time.
-    pub metadata_ddl_owner: Mutex<Option<(u64, std::time::Instant)>>,
+    /// preparation lease, and a local DDL through its post-apply. An async
+    /// proposer holds it across the post-apply, so it is a tokio mutex.
+    pub metadata_ddl_lock: tokio::sync::Mutex<()>,
+    /// Replicated preparation owner: its token, its node, and the local
+    /// monotonic apply time. The token and node are persisted in
+    /// `SystemCatalog` and seeded at boot.
+    pub metadata_ddl_owner: Mutex<Option<crate::control::metadata_proposer::DdlPrepareOwner>>,
     /// Most recent fenced DDL token applied while its owner remained current.
+    /// Starts at 0 on boot.
     pub metadata_ddl_applied_token: AtomicU64,
+    /// Apply-progress steps this node made on metadata entries: each batch
+    /// sub-entry and each purge-reclaim step (a core acknowledgement, a closed
+    /// scan). A proposer on a long apply reads it to tell slow from stalled.
+    pub metadata_apply_progress: AtomicU64,
     /// Per-node uniqueness component for descriptor-preparation lease tokens.
     pub metadata_ddl_token_seq: AtomicU64,
-    /// Node-local table of in-flight `DdlPendingPropose` records, rebuilt by
-    /// metadata Raft log replay like `metadata_ddl_owner` above.
+    /// Node-local table of in-flight `DdlPendingPropose` records. Persisted in
+    /// `SystemCatalog` and seeded at boot.
     pub pending_ddl: crate::control::pending_ddl::PendingDdlTable,
     /// Set once when the metadata applier halts on a failure that re-delivery
-    /// cannot clear. The readiness probe reads it so a wedged node stops
-    /// reporting itself healthy while every query dies on a lease timeout.
+    /// cannot clear. The readiness probe reads it to stop reporting a wedged
+    /// node healthy.
     pub metadata_apply_wedge: Arc<crate::control::cluster::metadata_applier::MetadataApplyWedge>,
     /// Set once when the Calvin sequencer halts on an epoch regression, and
     /// (`apply_halt()`) once when a Calvin scheduler halts a vShard. The node
     /// keeps serving every other path; the health surfaces read both markers
     /// so the lost capability never looks like an ordinary node.
     pub sequencer_halt: Arc<crate::control::cluster::SequencerHaltMarker>,
-    /// Which Data Plane cores have stopped completing event-loop iterations,
-    /// as of the last sampling window. Replaced every window rather than
-    /// latched, because a stall can recover. The health surfaces read it so a
-    /// core that wedges without panicking stops being invisible.
+    /// Data Plane cores that stopped completing event-loop iterations in the
+    /// last sampling window. Replaced every window, not latched, because a
+    /// stall can recover. The health surfaces read it.
     pub core_stall: Arc<crate::control::cluster::CoreStallMarker>,
-    /// Handle for proposing to the metadata raft group. Set by `start_raft`; None in single-node mode.
+    /// Handle for proposing to the metadata raft group. Set by `start_raft`,
+    /// which runs before any listener opens. Read it through
+    /// `SharedState::metadata_raft_handle`.
     pub metadata_raft: OnceLock<Arc<dyn crate::control::metadata_proposer::MetadataRaftHandle>>,
-    /// Propose tracker for distributed writes; absent in single-node mode.
+    /// Propose tracker for distributed writes. Set by `start_raft`.
     pub propose_tracker: OnceLock<Arc<crate::control::wal_replication::ProposeTracker>>,
-    /// Raft proposer; absent in single-node mode.
+    /// Synchronous data-group Raft proposer. Set by `start_raft`.
     pub raft_proposer: OnceLock<Arc<crate::control::wal_replication::RaftProposer>>,
     /// Atomically installed sequenced and narrowly scoped raw proposal handles.
-    pub(super) async_raft_proposer_pair: OnceLock<AsyncRaftProposerPair>,
+    pub(super) async_raft_proposer_pair: OnceLock<super::proposer_pair::AsyncRaftProposerPair>,
     pub vshard_admission_sequencer: Arc<crate::control::vshard_admission::VShardAdmissionSequencer>,
-    /// Raft log compaction after durable Data-Plane apply; absent in single-node mode.
+    /// Raft log compaction after durable Data-Plane apply. Set by `start_raft`.
     pub raft_compactor: OnceLock<Arc<crate::control::wal_replication::RaftCompactor>>,
     /// Durable post-WAL apply index; never Raft's in-memory enqueue watermark.
     pub raft_applied_index_sink:
         OnceLock<Arc<crate::control::wal_replication::RaftAppliedIndexSink>>,
+    /// Per-group gates that order the apply loop's writes against snapshot
+    /// installs. Set by `start_raft`.
+    pub raft_apply_gates: OnceLock<Arc<nodedb_cluster::GroupApplyGates>>,
     /// Answers whether a read can be served here: leadership confirmed for a
     /// linearizable read, replica freshness for a bounded-staleness one.
-    /// Unset in single-node mode, where neither question arises.
+    /// Set by `start_raft`.
     pub raft_read_gate: OnceLock<Arc<dyn crate::control::cluster::read_index::RaftReadGate>>,
-    /// This node's cluster-epoch state. Set once by `start_raft`; unset in
-    /// single-node mode, where there is no topology generation to miss.
+    /// This node's cluster-epoch state. Set once by `start_raft`.
     pub cluster_epoch: OnceLock<Arc<nodedb_cluster::ClusterEpochState>>,
-    /// Query Raft group statuses for observability (unset in single-node mode).
+    /// Query Raft group statuses for observability. Set by `start_raft`.
+    ///
+    /// Locks `MultiRaft`, which then reads `cluster_routing`.
+    /// Never call it while holding a `cluster_routing` guard.
     pub raft_status_fn:
         std::sync::OnceLock<Arc<dyn Fn() -> Vec<nodedb_cluster::GroupStatus> + Send + Sync>>,
     /// Cluster observability handle. Set once by `start_raft`.
@@ -179,7 +193,8 @@ pub struct SharedState {
     pub trace_exporter: Arc<crate::control::trace_export::TraceExporter>,
     /// Kill-switch for `/cluster/debug/*` HTTP endpoints (defaults false).
     pub debug_endpoints_enabled: bool,
-    /// Migration tracker for observability (None in single-node mode).
+    /// State of every vShard migration this node's rebalancer runs.
+    /// `wire_cluster_handle` installs the cluster handle's tracker.
     pub migration_tracker: Option<Arc<nodedb_cluster::MigrationTracker>>,
     /// Shape subscription registry for Lite client sync.
     pub shape_registry: Arc<crate::control::server::sync::shape::ShapeRegistry>,
@@ -218,14 +233,13 @@ pub struct SharedState {
     /// Cross-shard merger registry for HLC-ordered multi-shard delivery.
     pub array_merger_registry: std::sync::Arc<crate::control::array_sync::MergerRegistry>,
     /// Registry of active cross-cluster observer links for mirror databases.
-    /// One entry per mirror actively following a source cluster; consulted by
-    /// `ALTER DATABASE PROMOTE` to tear down the source link before the catalog
-    /// mutation lands. Added on mirror creation/restart-resume, removed on
-    /// promotion or `DROP DATABASE`.
+    /// One entry per mirror following a source cluster. `ALTER DATABASE PROMOTE`
+    /// tears down the source link through it. Added on mirror creation or
+    /// restart-resume, removed on promotion or `DROP DATABASE`.
     pub mirror_link_registry: Arc<crate::control::mirror::MirrorLinkRegistry>,
-    /// Database-id allocator. Threadsafe via internal atomics.
-    /// Authoritative allocation is proposed through Raft metadata group 0;
-    /// this counter is the local cache (mirrors `SurrogateAssigner` semantics).
+    /// Database-id allocator. Allocate through
+    /// `control::database::allocate_database_id`, which replicates the id
+    /// through metadata group 0 when that group runs.
     pub database_registry: crate::control::database::DatabaseRegistry,
     /// Global surrogate registry for stable cross-engine PK ↔ Surrogate allocation.
     pub surrogate_registry: crate::control::surrogate::SurrogateRegistryHandle,
@@ -270,14 +284,16 @@ pub struct SharedState {
     pub watermark_tracker: Arc<crate::event::watermark_tracker::WatermarkTracker>,
     /// Event Plane memory budget (512 MB cap).
     pub event_plane_budget: Arc<crate::event::budget::EventPlaneBudget>,
-    /// Cross-shard event dispatcher (None in single-node mode).
+    /// Cross-shard event dispatcher. Boot wires it with the cluster handle.
     pub cross_shard_dispatcher: Option<Arc<crate::event::cross_shard::CrossShardDispatcher>>,
-    /// Cross-shard dead letter queue (None in single-node mode).
+    /// Cross-shard dead letter queue. Boot wires it with the cluster handle.
     pub cross_shard_dlq: Option<Arc<Mutex<crate::event::cross_shard::CrossShardDlq>>>,
-    /// Cross-shard delivery metrics (None in single-node mode).
+    /// Cross-shard delivery metrics. Boot wires them with the cluster handle.
     pub cross_shard_metrics: Option<Arc<crate::event::cross_shard::CrossShardMetrics>>,
-    /// Cross-shard high-water-mark dedup store (None in single-node mode).
-    pub hwm_store: Option<Arc<crate::event::cross_shard::HwmStore>>,
+    /// Cross-shard applied-request dedup store, installed at Raft group
+    /// setup. Every committed redo that carries a cross-shard key records it
+    /// here as it applies.
+    pub cross_shard_dedup: OnceLock<Arc<crate::event::cross_shard::CrossShardDedup>>,
     /// Kafka bridge producer manager.
     pub kafka_manager: crate::event::kafka::KafkaManager,
     /// Definition sync fanout: broadcasts `DefinitionSync` (0x70) frames to
@@ -300,20 +316,18 @@ pub struct SharedState {
     /// Per-node monotonic request ID allocator. Starts at 1 (0 is sentinel).
     pub request_id_counter: AtomicU64,
     /// Per-node monotonic distributed-shuffle ID allocator. Starts at 1 (0 is
-    /// a sentinel). Each coordinator-driven shuffle join (`ExchangeMode::Shuffle`)
-    /// allocates one `shuffle_id` here, scoping producer fan-out inboxes and
-    /// consumer barriers on every part-owner node. Kept distinct from
-    /// `request_id_counter` so the shuffle keyspace never collides with SPSC.
+    /// a sentinel). Each `ExchangeMode::Shuffle` join allocates one `shuffle_id`,
+    /// scoping fan-out inboxes and consumer barriers on every part-owner node.
+    /// Distinct from `request_id_counter` so the keyspace never collides with SPSC.
     pub shuffle_id_counter: AtomicU64,
     /// System-wide metrics (Prometheus format).
     pub system_metrics: Option<Arc<crate::control::metrics::SystemMetrics>>,
     /// Per-database quota usage counters for Prometheus scraping.
     pub database_metrics: Arc<crate::control::metrics::DatabaseMetricsRegistry>,
     /// Global per-cluster quota ceiling enforced when database quotas are
-    /// written. Populated at startup from `[server]` config (`memory_limit`,
-    /// `max_connections`); zero on a dimension means no ceiling there. Read by
-    /// `ALTER DATABASE … SET QUOTA` to validate configured quotas stay within
-    /// cluster resources. `RwLock`-wrapped for a future `ALTER SYSTEM` mutator.
+    /// written. Set at startup from `[server]` config (`memory_limit`,
+    /// `max_connections`). Zero on a dimension means no ceiling there.
+    /// `ALTER DATABASE … SET QUOTA` reads it. `RwLock`-wrapped for `ALTER SYSTEM`.
     pub quota_ceiling: Arc<RwLock<crate::control::security::catalog::GlobalQuotaCeiling>>,
     /// Live retention settings. RwLock-wrapped for runtime ALTER SYSTEM mutation.
     pub retention_settings: Arc<std::sync::RwLock<crate::config::server::RetentionSettings>>,
@@ -340,9 +354,12 @@ pub struct SharedState {
     pub cold_storage: Option<Arc<crate::storage::cold::ColdStorage>>,
     /// Warm-tier snapshot object store (defaults to local FS).
     pub snapshot_storage: Arc<dyn object_store::ObjectStore>,
+    /// PITR node life, base snapshot catalog, and last run outcome.
+    pub pitr: crate::control::pitr::PitrState,
     /// Quarantine archive object store (defaults to local FS).
     pub quarantine_storage: Arc<dyn object_store::ObjectStore>,
     /// Hybrid Logical Clock for metadata descriptor `modification_hlc` stamps.
+    /// The same clock stamps WAL time anchors ([`crate::wal::WalManager::hlc_clock`]).
     pub hlc_clock: Arc<nodedb_types::HlcClock>,
     /// Per-tenant monotonic HLC high-water used by RESTORE for write-order safety.
     pub tenant_write_hlc: Arc<std::sync::Mutex<super::TenantWriteMarks>>,
@@ -350,20 +367,21 @@ pub struct SharedState {
     /// high-water above that RESTORE's staleness guard reads cluster-wide.
     pub tenant_marks: super::tenant_marks::TenantMarks,
     /// Serializes descriptor plan admission with local drain-start installation.
-    ///
     /// Hold this std mutex while checking drain state and changing lease
-    /// refcounts. Drain starts hold the same gate while publishing their local
-    /// replicated state, so neither path can observe a partially admitted query.
+    /// refcounts. Drain starts hold it while publishing their local state.
     /// Lease grants happen later under `lease_grant_gate`.
     pub lease_admission_gate: Mutex<()>,
-    /// Serializes raft/local descriptor lease grants and releases after
-    /// admission has completed. It is independent of `lease_admission_gate`,
-    /// so it may be held while a metadata proposal waits for apply.
-    pub lease_grant_gate: Arc<Mutex<()>>,
+    /// Serializes this node's descriptor lease grants and releases after
+    /// admission has completed. It is independent of `lease_admission_gate`
+    /// and is held across the metadata proposal and its apply, so it is an
+    /// async mutex: a waiter yields its worker instead of parking it.
+    pub lease_grant_gate: Arc<tokio::sync::Mutex<()>>,
     /// Replicated descriptor lease drain state (written by metadata applier).
     pub lease_drain: Arc<crate::control::lease::DescriptorDrainTracker>,
     /// Host-side refcount for descriptor leases (enables drain after last query).
     pub lease_refcount: Arc<crate::control::lease::LeaseRefCount>,
+    /// Lease holder liveness, in-flight holds, and metadata-leader probes.
+    pub lease_runtime: crate::control::lease::LeaseRuntime,
     /// Canonical shutdown watch — all background loops subscribe and exit on signal.
     pub shutdown: Arc<crate::control::shutdown::ShutdownWatch>,
     /// Registry of every background loop's join handle for graceful shutdown.
@@ -373,9 +391,12 @@ pub struct SharedState {
     pub data_plane_drain: Arc<crate::control::shutdown::DataPlaneDrain>,
     /// Startup phase gate — listeners block until `GatewayEnable` phase.
     pub startup: Arc<crate::control::startup::StartupGate>,
-    /// Calvin sequencer inbox for cross-shard transactions (empty in single-node mode).
+    /// Calvin sequencer inbox for cross-shard transactions. `start_raft` sets
+    /// it during boot, before any listener opens. Empty only on a
+    /// `SharedState` that never ran `start_raft`.
     pub sequencer_inbox: std::sync::OnceLock<nodedb_cluster::calvin::sequencer::inbox::Inbox>,
-    /// Calvin reservation inbox for hot-key read reservations (empty in single-node mode).
+    /// Calvin reservation inbox for hot-key read reservations. Set by
+    /// `start_raft` with [`Self::sequencer_inbox`].
     pub reservation_inbox:
         std::sync::OnceLock<nodedb_cluster::calvin::sequencer::reservation_inbox::ReservationInbox>,
     /// Sequencer metrics for Prometheus `/metrics` route.
@@ -385,7 +406,8 @@ pub struct SharedState {
     /// Calvin completion registry for sequencer submission and participant completion.
     pub calvin_completion_registry:
         std::sync::OnceLock<std::sync::Arc<nodedb_cluster::calvin::CalvinCompletionRegistry>>,
-    /// OLLP orchestrator for dependent-read Calvin transactions (empty in single-node mode).
+    /// OLLP orchestrator for dependent-read Calvin transactions. Set by
+    /// `start_raft` with [`Self::sequencer_inbox`].
     pub ollp_orchestrator: std::sync::OnceLock<
         std::sync::Arc<
             crate::control::cluster::calvin::executor::ollp::orchestrator::OllpOrchestrator,
@@ -419,8 +441,8 @@ pub struct SharedState {
     pub schema_version: crate::control::server::shared::session::plan_cache::SchemaVersion,
     /// Materialized-sum bindings indexed by SOURCE collection, cached per
     /// schema version. Keeps the plan-time target resolution off the catalog
-    /// scan that deriving it from the target-side declarations would otherwise
-    /// need on every write.
+    /// scan that deriving it from the target-side declarations otherwise
+    /// needs on every write.
     pub materialized_sum_index: crate::control::planner::materialized_sum::MaterializedSumIndex,
     /// In-memory sequence registry (nextval/currval/setval).
     pub sequence_registry: Arc<crate::control::sequence::SequenceRegistry>,
@@ -432,15 +454,15 @@ pub struct SharedState {
     /// In-process Calvin state: applied epoch, counters, apply results, lock
     /// managers and their promotion channels.
     pub calvin: super::calvin_local::CalvinLocalState,
-    /// Single-node per-key write-ordering lock. When NO Calvin scheduler is
-    /// registered for a write's vShard there is no lock table to fence against,
-    /// yet concurrent same-key autocommit writes must still serialize so
-    /// WAL-LSN order equals Data-Plane apply order per key. Hands out one
-    /// FIFO-fair async mutex per lock key: same-key writers acquire in arrival
-    /// order across [WAL append -> enqueue]; distinct keys never contend. Idle
-    /// keys are reaped, so it never grows unbounded.
+    /// Per-key write-ordering lock. With no Calvin scheduler on a write's
+    /// vShard, same-key autocommit writes still serialize so WAL-LSN order
+    /// equals Data-Plane apply order. One FIFO-fair async mutex per key spans
+    /// [WAL append -> enqueue]. Distinct keys never contend. Idle keys are
+    /// reaped.
     pub write_order_locks:
         Arc<crate::control::server::shared::write_admission::KeyedWriteOrderLock>,
+    /// Per-vShard order fence that keeps document records in apply order.
+    pub write_order_fence: crate::control::server::shared::write_admission::WriteOrderFence,
     /// Presence/Awareness manager: ephemeral user state broadcast channels.
     pub presence: Arc<tokio::sync::RwLock<crate::control::server::sync::presence::PresenceManager>>,
     /// Permission tree cache: in-memory resource hierarchy + permission grants.
@@ -455,6 +477,14 @@ pub struct SharedState {
     pub gateway: std::sync::OnceLock<Arc<crate::control::gateway::Gateway>>,
     /// Per-backup KEK for wrapping DEKs. None = unencrypted backups.
     pub backup_kek: Option<Arc<[u8; 32]>>,
+    /// Object-store access for `BACKUP DATABASE` / `RESTORE DATABASE`.
+    /// `None` = the `[backup_storage]` section is absent.
+    pub backup_storage: Option<Arc<crate::config::server::BackupStorageSettings>>,
+    /// Tenant captures a database backup's cut barriers parked on this node,
+    /// by `(request, group)`, until the backup collects them.
+    pub cut_captures: Arc<crate::control::backup::cut_capture::CutCaptures>,
+    /// `[[backup.schedule]]` entries the Event Plane scheduler runs.
+    pub backup_schedules: Vec<crate::config::server::BackupScheduleSettings>,
     /// In-process quarantine registry for corrupt segments.
     pub quarantine_registry: Arc<crate::storage::quarantine::QuarantineRegistry>,
     /// Per-database and per-tenant connection admission semaphores.
@@ -468,24 +498,9 @@ pub struct SharedState {
     /// Collection-to-database reverse mapping for DML audit routing.
     /// Updated on `CREATE COLLECTION` / `DROP COLLECTION`.
     pub collection_to_database: Arc<super::collection_to_database::CollectionToDatabase>,
-    /// LSN ↔ wall-clock millisecond interpolation map.
-    ///
-    /// Populated from WAL anchor records (`RecordType::LsnMsAnchor`) as they
-    /// are replayed or emitted.  Used by the clone CoW resolver to convert
-    /// `AS OF SYSTEM TIME <ms>` values to LSN for source-delegation clamping.
-    /// Wrapped in `Mutex` because the Control Plane is `Send + Sync`.
-    pub lsn_ms_map: Arc<Mutex<nodedb_types::temporal::LsnMsMap>>,
-    /// Set of database ids temporarily frozen against new user writes because
-    /// a clone materializer is reading from them as the source. Populated by
-    /// `clone_materializer::walker` for one sweep over a dependent clone;
-    /// concurrent materializers on different clones of the same source nest
-    /// correctly via an internal reference count.
-    pub materialize_freeze: Arc<crate::control::clone::MaterializeFreezeRegistry>,
-    /// Cross-node streaming-shuffle receiver registry. Holds one bounded
-    /// inbox per `(shuffle_id, part, side)` with a per-part build barrier. Fed
-    /// by the cluster `ShufflePush` transport read-loop via
-    /// `RegistryShuffleReceiver` and drained by the Data Plane. `Send + Sync`;
-    /// the inbox uses std primitives only (no Tokio) so the `!Send` Data
-    /// Plane can consume it.
+    /// Cross-node streaming-shuffle receiver registry. One bounded inbox per
+    /// `(shuffle_id, part, side)` with a per-part build barrier. The cluster
+    /// `ShufflePush` read-loop feeds it via `RegistryShuffleReceiver`. The Data
+    /// Plane drains it. The inbox uses std primitives only, no Tokio.
     pub shuffle_registry: Arc<crate::control::server::shuffle::ShuffleReceiverRegistry>,
 }

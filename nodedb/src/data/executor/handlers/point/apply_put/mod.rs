@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Apply-a-PointPut family: core transaction helper, index side-effects
-//! (spatial/vector/sparse), and UNIQUE-constraint check.
+//! (spatial/vector/sparse).
 
 pub(in crate::data::executor::handlers::point) mod core;
 pub(in crate::data::executor) mod enforce;
@@ -9,7 +9,6 @@ pub(in crate::data::executor::handlers::point) mod index;
 pub(in crate::data::executor::handlers::point) mod sparse;
 pub(in crate::data::executor) mod stored_body;
 pub(in crate::data::executor::handlers::point) mod types;
-pub(in crate::data::executor) mod unique;
 pub(in crate::data::executor::handlers::point) mod vector;
 
 pub(in crate::data::executor) use enforce::PutEnforcement;

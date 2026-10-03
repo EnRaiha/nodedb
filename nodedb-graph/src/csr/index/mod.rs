@@ -8,15 +8,18 @@
 //! - `mutation`  — `add_edge`, `remove_edge`, `remove_node_edges`
 //! - `lookup`    — neighbor queries, accessors, degree, iterators
 //! - `scoped`    — collection-scoped read paths (MATCH / RAG)
+//! - `label_filter` — an edge-label filter resolved against the partition
 //! - `restore`   — exact edge writes and the reversals a rollback uses
 
 pub mod interning;
+pub mod label_filter;
 pub mod lookup;
 pub mod mutation;
 pub mod restore;
 pub mod scoped;
 pub mod types;
 
+pub use label_filter::LabelFilter;
 pub use types::CsrIndex;
 // Re-export shared Direction from nodedb-types via the types submodule.
 pub use types::Direction;

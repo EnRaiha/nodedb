@@ -6,6 +6,8 @@
 mod owned;
 mod records;
 mod resolve;
+mod sent;
 
-pub(crate) use owned::{Collect, OwnedResponse, OwnedWait, await_response_owned};
+pub(crate) use owned::{Collect, OwnedReport, OwnedResponse, OwnedWait, spawn_owned_wait};
 pub(crate) use records::{MintedRecords, RecordOwner};
+pub(crate) use sent::SentRecords;

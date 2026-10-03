@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Durable topic metadata and message operations for the system catalog.
+//! Durable topic definitions for the system catalog. Messages live in
+//! `topic_messages`.
 
 use std::collections::HashMap;
 
 use redb::{ReadableDatabase, ReadableTable};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::consumer_groups::decode_consumer_group;
+use super::topic_messages::scoped_message_keys;
 use super::types::{CONSUMER_GROUPS, SystemCatalog, TOPIC_MESSAGES, TOPICS_EP, catalog_err};
-use crate::event::topic::{TopicDef, TopicMessage, validate_topic_name};
+use crate::event::topic::{TopicDef, validate_topic_name};
 use crate::types::DatabaseId;
 
 impl SystemCatalog {
@@ -31,7 +32,10 @@ impl SystemCatalog {
             let mut stored = def.clone();
             if let Some(existing) = existing {
                 stored.last_sequence = stored.last_sequence.max(existing.last_sequence);
-                stored.last_lsn = stored.last_lsn.max(existing.last_lsn);
+                if (existing.last_epoch, existing.last_lsn) > (stored.last_epoch, stored.last_lsn) {
+                    stored.last_epoch = existing.last_epoch;
+                    stored.last_lsn = existing.last_lsn;
+                }
             }
             let bytes =
                 zerompk::to_msgpack_vec(&stored).map_err(|e| catalog_err("serialize topic", e))?;
@@ -54,7 +58,7 @@ impl SystemCatalog {
     /// Insert a topic definition without re-checking its name.
     ///
     /// Replicated apply uses this: the leader validated before proposing, so a
-    /// rejection here would diverge this node from the accepted entry.
+    /// rejection here diverges this node from the accepted entry.
     pub fn create_ep_topic_unchecked(&self, def: &TopicDef) -> crate::Result<bool> {
         let key = topic_key(def.database_id, def.tenant_id, &def.name);
         let write_txn = self
@@ -78,90 +82,6 @@ impl SystemCatalog {
             .commit()
             .map_err(|e| catalog_err("commit create topic", e))?;
         Ok(true)
-    }
-
-    /// Append one exact payload to a topic and durably advance its high-water
-    /// marks in the same transaction as retention pruning.
-    pub fn append_ep_topic_message(
-        &self,
-        database_id: DatabaseId,
-        tenant_id: u64,
-        topic: &str,
-        payload: impl Into<String>,
-        event_time: u64,
-        lsn: u64,
-    ) -> crate::Result<TopicMessage> {
-        validate_topic_name(topic).map_err(|error| catalog_err("append topic", error))?;
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| catalog_err("append topic txn", e))?;
-        let message;
-        {
-            let mut definitions = write_txn
-                .open_table(TOPICS_EP)
-                .map_err(|e| catalog_err("open topics_ep", e))?;
-            let Some(mut def) = find_topic_definition(&definitions, database_id, tenant_id, topic)?
-            else {
-                return Err(catalog_err("append topic", "topic not found"));
-            };
-            let sequence = def
-                .last_sequence
-                .checked_add(1)
-                .ok_or_else(|| catalog_err("append topic", "topic sequence overflow"))?;
-            let message_lsn = lsn.max(def.last_lsn);
-            message = TopicMessage {
-                database_id,
-                tenant_id,
-                topic: topic.to_owned(),
-                sequence,
-                event_time,
-                lsn: message_lsn,
-                payload: payload.into(),
-            };
-            let bytes = zerompk::to_msgpack_vec(&message)
-                .map_err(|e| catalog_err("serialize topic message", e))?;
-            {
-                let mut messages = write_txn
-                    .open_table(TOPIC_MESSAGES)
-                    .map_err(|e| catalog_err("open topic_messages", e))?;
-                let key = topic_message_key(database_id, tenant_id, topic, sequence)?;
-                messages
-                    .insert(key.as_slice(), bytes.as_slice())
-                    .map_err(|e| catalog_err("insert topic message", e))?;
-                prune_topic_messages(&mut messages, &def, database_id, tenant_id, topic)?;
-            }
-            def.last_sequence = sequence;
-            def.last_lsn = message_lsn;
-            let bytes =
-                zerompk::to_msgpack_vec(&def).map_err(|e| catalog_err("serialize topic", e))?;
-            definitions
-                .insert(
-                    topic_key(database_id, tenant_id, topic).as_str(),
-                    bytes.as_slice(),
-                )
-                .map_err(|e| catalog_err("update topic high-water marks", e))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|e| catalog_err("commit topic append", e))?;
-        Ok(message)
-    }
-
-    /// Load messages for one exact `(database, tenant, topic)` identity.
-    pub fn load_ep_topic_messages(
-        &self,
-        database_id: DatabaseId,
-        tenant_id: u64,
-        topic: &str,
-    ) -> crate::Result<Vec<TopicMessage>> {
-        validate_topic_name(topic).map_err(|error| catalog_err("load topic messages", error))?;
-        self.load_topic_messages(Some((database_id, tenant_id, topic)))
-    }
-
-    /// Load messages for every topic, sorted by scope and sequence.
-    pub fn load_all_ep_topic_messages(&self) -> crate::Result<Vec<TopicMessage>> {
-        self.load_topic_messages(None)
     }
 
     /// Delete a topic and every one of its durable messages atomically.
@@ -195,6 +115,12 @@ impl SystemCatalog {
                     .remove(key.as_slice())
                     .map_err(|e| catalog_err("delete topic message", e))?;
             }
+            super::topic_publish_marks::forget_topic_marks(
+                &write_txn,
+                database_id,
+                tenant_id,
+                name,
+            )?;
         }
         write_txn.commit().map_err(|e| catalog_err("commit", e))?;
         Ok(existed)
@@ -255,7 +181,7 @@ impl SystemCatalog {
     /// Delete a topic and its groups without re-checking the topic name.
     ///
     /// Replicated apply uses this: the name was validated before the entry was
-    /// proposed, and a rejection here would leave the row on this node alone.
+    /// proposed, and a rejection here leaves the row on this node alone.
     pub fn delete_ep_topic_with_consumer_groups_unchecked(
         &self,
         database_id: DatabaseId,
@@ -285,6 +211,12 @@ impl SystemCatalog {
                     .remove(key.as_slice())
                     .map_err(|e| catalog_err("delete topic message", e))?;
             }
+            super::topic_publish_marks::forget_topic_marks(
+                &write_txn,
+                database_id,
+                tenant_id,
+                name,
+            )?;
             let mut groups = write_txn
                 .open_table(CONSUMER_GROUPS)
                 .map_err(|e| catalog_err("open consumer_groups", e))?;
@@ -346,64 +278,9 @@ impl SystemCatalog {
         });
         Ok(topics)
     }
-
-    fn load_topic_messages(
-        &self,
-        scope: Option<(DatabaseId, u64, &str)>,
-    ) -> crate::Result<Vec<TopicMessage>> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| catalog_err("read topic messages txn", e))?;
-        let table = read_txn
-            .open_table(TOPIC_MESSAGES)
-            .map_err(|e| catalog_err("open topic_messages", e))?;
-        let mut messages = Vec::new();
-        for entry in table
-            .range(..)
-            .map_err(|e| catalog_err("range topic_messages", e))?
-        {
-            let (key, value) = entry.map_err(|e| catalog_err("read topic message", e))?;
-            let (database_id, tenant_id, topic, sequence) = parse_topic_message_key(key.value())?;
-            let message: TopicMessage = zerompk::from_msgpack(value.value())
-                .map_err(|e| catalog_err("decode topic message", e))?;
-            if (
-                message.database_id,
-                message.tenant_id,
-                message.topic.as_str(),
-                message.sequence,
-            ) != (database_id, tenant_id, topic.as_str(), sequence)
-            {
-                return Err(catalog_err(
-                    "decode topic message",
-                    "message identity does not match key",
-                ));
-            }
-            if scope.is_none_or(|(db, tenant, name)| {
-                (db, tenant, name) == (database_id, tenant_id, topic.as_str())
-            }) {
-                messages.push(message);
-            }
-        }
-        messages.sort_by(|left, right| {
-            (
-                left.database_id.as_u64(),
-                left.tenant_id,
-                &left.topic,
-                left.sequence,
-            )
-                .cmp(&(
-                    right.database_id.as_u64(),
-                    right.tenant_id,
-                    &right.topic,
-                    right.sequence,
-                ))
-        });
-        Ok(messages)
-    }
 }
 
-fn find_topic_definition(
+pub(super) fn find_topic_definition(
     table: &redb::Table<&str, &[u8]>,
     database_id: DatabaseId,
     tenant_id: u64,
@@ -421,7 +298,7 @@ fn find_topic_definition(
     Ok(Some(def))
 }
 
-fn validate_topic_identity(
+pub(super) fn validate_topic_identity(
     def: &TopicDef,
     database_id: DatabaseId,
     tenant_id: u64,
@@ -436,172 +313,14 @@ fn validate_topic_identity(
     Ok(())
 }
 
-fn prune_topic_messages(
-    table: &mut redb::Table<&[u8], &[u8]>,
-    def: &TopicDef,
-    database_id: DatabaseId,
-    tenant_id: u64,
-    topic: &str,
-) -> crate::Result<()> {
-    let cutoff = current_time_ms().saturating_sub(def.retention.max_age_secs.saturating_mul(1_000));
-    let mut messages = Vec::new();
-    for entry in table
-        .range(..)
-        .map_err(|e| catalog_err("range topic_messages", e))?
-    {
-        let (key, value) = entry.map_err(|e| catalog_err("read topic message", e))?;
-        let (db, tenant, stored_topic, sequence) = parse_topic_message_key(key.value())?;
-        if (db, tenant, stored_topic.as_str()) == (database_id, tenant_id, topic) {
-            let message: TopicMessage = zerompk::from_msgpack(value.value())
-                .map_err(|e| catalog_err("decode topic message", e))?;
-            if (
-                message.database_id,
-                message.tenant_id,
-                message.topic.as_str(),
-                message.sequence,
-            ) != (db, tenant, stored_topic.as_str(), sequence)
-            {
-                return Err(catalog_err(
-                    "decode topic message",
-                    "message identity does not match key",
-                ));
-            }
-            messages.push((key.value().to_vec(), message));
-        }
-    }
-    messages.sort_by_key(|(_, message)| message.sequence);
-    let mut remove: Vec<Vec<u8>> = messages
-        .iter()
-        .filter(|(_, message)| message.event_time < cutoff)
-        .map(|(key, _)| key.clone())
-        .collect();
-    let retained: Vec<_> = messages
-        .into_iter()
-        .filter(|(key, _)| !remove.iter().any(|removed| removed == key))
-        .collect();
-    let overflow = retained
-        .len()
-        .saturating_sub(def.retention.max_events as usize);
-    remove.extend(retained.into_iter().take(overflow).map(|(key, _)| key));
-    for key in remove {
-        table
-            .remove(key.as_slice())
-            .map_err(|e| catalog_err("prune topic message", e))?;
-    }
-    Ok(())
-}
-
-fn scoped_message_keys(
-    table: &redb::Table<&[u8], &[u8]>,
-    database_id: DatabaseId,
-    tenant_id: u64,
-    topic: &str,
-) -> crate::Result<Vec<Vec<u8>>> {
-    let mut keys = Vec::new();
-    for entry in table
-        .range(..)
-        .map_err(|e| catalog_err("range topic_messages", e))?
-    {
-        let (key, value) = entry.map_err(|e| catalog_err("read topic message", e))?;
-        let (db, tenant, stored_topic, sequence) = parse_topic_message_key(key.value())?;
-        if (db, tenant, stored_topic.as_str()) == (database_id, tenant_id, topic) {
-            let message: TopicMessage = zerompk::from_msgpack(value.value())
-                .map_err(|e| catalog_err("decode topic message", e))?;
-            if (
-                message.database_id,
-                message.tenant_id,
-                message.topic.as_str(),
-                message.sequence,
-            ) != (db, tenant, stored_topic.as_str(), sequence)
-            {
-                return Err(catalog_err(
-                    "decode topic message",
-                    "message identity does not match key",
-                ));
-            }
-            keys.push(key.value().to_vec());
-        }
-    }
-    Ok(keys)
-}
-
-fn topic_key(database_id: DatabaseId, tenant_id: u64, name: &str) -> String {
-    let mut encoded = String::with_capacity(name.len() * 2);
-    for byte in name.as_bytes() {
-        use std::fmt::Write;
-        let _ = write!(&mut encoded, "{byte:02x}");
-    }
+pub(super) fn topic_key(database_id: DatabaseId, tenant_id: u64, name: &str) -> String {
     format!(
-        "v2/{:016x}/{:016x}/{:08x}/{encoded}",
+        "v2/{:016x}/{:016x}/{:08x}/{}",
         database_id.as_u64(),
         tenant_id,
-        name.len()
+        name.len(),
+        hex::encode(name)
     )
-}
-
-fn topic_message_key(
-    database_id: DatabaseId,
-    tenant_id: u64,
-    topic: &str,
-    sequence: u64,
-) -> crate::Result<Vec<u8>> {
-    let name_len: u16 = topic
-        .len()
-        .try_into()
-        .map_err(|_| catalog_err("topic message key", "topic name exceeds u16 length"))?;
-    let mut key = Vec::with_capacity(26 + topic.len());
-    key.extend_from_slice(&database_id.as_u64().to_be_bytes());
-    key.extend_from_slice(&tenant_id.to_be_bytes());
-    key.extend_from_slice(&name_len.to_be_bytes());
-    key.extend_from_slice(topic.as_bytes());
-    key.extend_from_slice(&sequence.to_be_bytes());
-    Ok(key)
-}
-
-fn parse_topic_message_key(key: &[u8]) -> crate::Result<(DatabaseId, u64, String, u64)> {
-    if key.len() < 26 {
-        return Err(catalog_err(
-            "topic message key",
-            "key is shorter than fixed fields",
-        ));
-    }
-    let database_id = DatabaseId::new(u64::from_be_bytes(
-        key[..8]
-            .try_into()
-            .map_err(|_| catalog_err("topic message key", "invalid database id"))?,
-    ));
-    let tenant_id = u64::from_be_bytes(
-        key[8..16]
-            .try_into()
-            .map_err(|_| catalog_err("topic message key", "invalid tenant id"))?,
-    );
-    let name_len = u16::from_be_bytes(
-        key[16..18]
-            .try_into()
-            .map_err(|_| catalog_err("topic message key", "invalid name length"))?,
-    ) as usize;
-    if key.len() != 26 + name_len {
-        return Err(catalog_err(
-            "topic message key",
-            "key length does not match topic name",
-        ));
-    }
-    let topic = std::str::from_utf8(&key[18..18 + name_len])
-        .map_err(|e| catalog_err("topic message key", e))?
-        .to_owned();
-    let sequence = u64::from_be_bytes(
-        key[18 + name_len..]
-            .try_into()
-            .map_err(|_| catalog_err("topic message key", "invalid sequence"))?,
-    );
-    Ok((database_id, tenant_id, topic, sequence))
-}
-
-fn current_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 /// Positional wire shape written before topics adopted map encoding.
@@ -626,11 +345,13 @@ impl From<LegacyTopicDef> for TopicDef {
             database_id: DatabaseId::DEFAULT,
             last_sequence: 0,
             last_lsn: 0,
+            last_epoch: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 }
 
-fn decode_topic(bytes: &[u8]) -> crate::Result<TopicDef> {
+pub(super) fn decode_topic(bytes: &[u8]) -> crate::Result<TopicDef> {
     zerompk::from_msgpack(bytes)
         .or_else(|_| zerompk::from_msgpack::<LegacyTopicDef>(bytes).map(TopicDef::from))
         .map_err(|e| catalog_err("decode topic", e))
@@ -640,6 +361,7 @@ fn decode_topic(bytes: &[u8]) -> crate::Result<TopicDef> {
 mod tests {
     use std::sync::Arc;
 
+    use super::super::topic_messages::current_time_ms;
     use super::*;
     use crate::event::cdc::consumer_group::ConsumerGroupDef;
     use crate::event::cdc::stream_def::RetentionConfig;
@@ -663,32 +385,41 @@ mod tests {
             created_at: 0,
             last_sequence: 0,
             last_lsn: 0,
+            last_epoch: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 
+    /// Append one message at the Raft entry `(0, index)`.
+    fn append_at(
+        catalog: &SystemCatalog,
+        scope: (DatabaseId, u64, &str),
+        payload: &str,
+        event_time: u64,
+        index: u64,
+    ) -> crate::event::topic::TopicMessage {
+        catalog
+            .append_replicated_topic_message(scope, payload, event_time, (0, index), None)
+            .expect("append")
+            .expect("the entry appends")
+    }
+
+    /// The apply appends a group's entries in log order: their messages take
+    /// contiguous sequences, and survive a reopen.
     #[test]
-    fn concurrent_appends_are_contiguous_and_survive_reopen() {
+    fn entry_appends_are_contiguous_and_survive_reopen() {
         let (dir, catalog) = catalog();
         catalog
             .put_ep_topic(&topic(DatabaseId::new(7), 1, "events", 100))
             .expect("topic");
-        let catalog = Arc::new(catalog);
-        let mut workers = Vec::new();
-        for number in 0..16 {
-            let catalog = Arc::clone(&catalog);
-            workers.push(std::thread::spawn(move || {
-                catalog.append_ep_topic_message(
-                    DatabaseId::new(7),
-                    1,
-                    "events",
-                    number.to_string(),
-                    current_time_ms(),
-                    number,
-                )
-            }));
-        }
-        for worker in workers {
-            worker.join().expect("worker").expect("append");
+        for index in 1..=16 {
+            append_at(
+                &catalog,
+                (DatabaseId::new(7), 1, "events"),
+                &index.to_string(),
+                current_time_ms(),
+                index,
+            );
         }
         let messages = catalog
             .load_ep_topic_messages(DatabaseId::new(7), 1, "events")
@@ -763,10 +494,14 @@ mod tests {
             .put_ep_topic(&topic(DatabaseId::DEFAULT, 1, "events", 2))
             .expect("topic");
         let now = current_time_ms();
-        for sequence in 1..=3 {
-            catalog
-                .append_ep_topic_message(DatabaseId::DEFAULT, 1, "events", "{}", now, sequence)
-                .expect("append");
+        for index in 1..=3 {
+            append_at(
+                &catalog,
+                (DatabaseId::DEFAULT, 1, "events"),
+                "{}",
+                now,
+                index,
+            );
         }
         let messages = catalog
             .load_ep_topic_messages(DatabaseId::DEFAULT, 1, "events")
@@ -800,9 +535,7 @@ mod tests {
         let mut definition = topic(DatabaseId::DEFAULT, 1, "events", 10);
         definition.retention.max_age_secs = 1;
         catalog.put_ep_topic(&definition).expect("topic");
-        catalog
-            .append_ep_topic_message(DatabaseId::DEFAULT, 1, "events", "old", 0, 1)
-            .expect("append");
+        append_at(&catalog, (DatabaseId::DEFAULT, 1, "events"), "old", 0, 1);
         assert!(
             catalog
                 .load_ep_topic_messages(DatabaseId::DEFAULT, 1, "events")
@@ -833,12 +566,17 @@ mod tests {
                     stream_name: stream_name.into(),
                     owner: "admin".into(),
                     created_at: 0,
+                    modification_hlc: nodedb_types::Hlc::ZERO,
                 })
                 .expect("group");
         }
-        catalog
-            .append_ep_topic_message(database_id, 1, "events", "before", current_time_ms(), 1)
-            .expect("message");
+        append_at(
+            &catalog,
+            (database_id, 1, "events"),
+            "before",
+            current_time_ms(),
+            1,
+        );
         assert_eq!(
             catalog
                 .topic_consumer_group_names(database_id, 1, "events")
@@ -872,9 +610,13 @@ mod tests {
         catalog
             .create_ep_topic(&topic(database_id, 1, "events", 10))
             .expect("create");
-        catalog
-            .append_ep_topic_message(database_id, 1, "events", "before", current_time_ms(), 1)
-            .expect("append");
+        append_at(
+            &catalog,
+            (database_id, 1, "events"),
+            "before",
+            current_time_ms(),
+            1,
+        );
         assert!(
             catalog
                 .delete_ep_topic(database_id, 1, "events")
@@ -885,9 +627,13 @@ mod tests {
                 .create_ep_topic(&topic(database_id, 1, "events", 10))
                 .expect("recreate")
         );
-        let message = catalog
-            .append_ep_topic_message(database_id, 1, "events", "after", current_time_ms(), 1)
-            .expect("append recreated");
+        let message = append_at(
+            &catalog,
+            (database_id, 1, "events"),
+            "after",
+            current_time_ms(),
+            1,
+        );
         assert_eq!(message.sequence, 1);
         assert_eq!(
             catalog
@@ -910,12 +656,8 @@ mod tests {
             .put_ep_topic(&topic(second.0, second.1, second.2, 10))
             .expect("second topic");
         let now = current_time_ms();
-        catalog
-            .append_ep_topic_message(first.0, first.1, first.2, "one", now, 1)
-            .expect("first append");
-        catalog
-            .append_ep_topic_message(second.0, second.1, second.2, "two", now, 1)
-            .expect("second append");
+        append_at(&catalog, first, "one", now, 1);
+        append_at(&catalog, second, "two", now, 1);
         assert!(
             catalog
                 .delete_ep_topic(first.0, first.1, first.2)

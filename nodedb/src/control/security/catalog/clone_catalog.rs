@@ -312,6 +312,31 @@ impl SystemCatalog {
         Ok(set)
     }
 
+    /// Delete every KV tombstone of `target_collection_key`.
+    pub fn delete_all_kv_clone_tombstones_for_collection(
+        &self,
+        target_collection_key: &str,
+    ) -> crate::Result<u64> {
+        let keys = self.list_kv_clone_tombstones(target_collection_key)?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| catalog_err("clone_kv_tombstones reap begin_write", e))?;
+        {
+            let mut table = txn
+                .open_table(CLONE_KV_TOMBSTONES)
+                .map_err(|e| catalog_err("open clone_kv_tombstones reap", e))?;
+            for kv_key in &keys {
+                table
+                    .remove((target_collection_key, kv_key.as_str()))
+                    .map_err(|e| catalog_err("remove clone_kv_tombstones reap", e))?;
+            }
+        }
+        txn.commit()
+            .map_err(|e| catalog_err("clone_kv_tombstones reap commit", e))?;
+        Ok(keys.len() as u64)
+    }
+
     // ── clone_lineage ─────────────────────────────────────────────────────────
 
     /// Return the list of child database ids that are clones of `source_db_id`.
@@ -335,6 +360,24 @@ impl SystemCatalog {
                 Ok(ids.into_iter().map(DatabaseId::new).collect())
             }
         }
+    }
+
+    /// The clone children of `source_db_id` whose database still exists.
+    ///
+    /// A dropped child keeps its lineage edge, because the edge marks its
+    /// clone as applied for metadata-log replay. Every user-visible listing
+    /// and every dependency check reads this instead of the raw edge.
+    pub fn get_live_clone_children(
+        &self,
+        source_db_id: DatabaseId,
+    ) -> crate::Result<Vec<DatabaseId>> {
+        let mut live = Vec::new();
+        for child in self.get_clone_children(source_db_id)? {
+            if self.get_database(child)?.is_some() {
+                live.push(child);
+            }
+        }
+        Ok(live)
     }
 
     /// Add `child_db_id` as a clone child of `source_db_id`.
@@ -527,5 +570,34 @@ mod tests {
         assert!(cat.get_clone_children(db(1)).unwrap().is_empty());
         // Idempotent — removing absent child is fine.
         cat.remove_clone_child(db(1), db(2)).unwrap();
+    }
+
+    /// A dropped child keeps its edge but leaves the live listing.
+    #[test]
+    fn live_children_skip_a_dropped_child() {
+        use crate::control::security::catalog::database_types::{
+            DatabaseDescriptor, DatabaseStatus,
+        };
+
+        let (_dir, cat) = open_catalog();
+        for child in [db(2), db(3)] {
+            cat.put_database(&DatabaseDescriptor {
+                id: child,
+                name: format!("child_{}", child.as_u64()),
+                status: DatabaseStatus::Active,
+                created_at_lsn: 0,
+                quota_ref: 0,
+                parent_clone: None,
+                mirror_origin: None,
+                audit_dml: nodedb_types::AuditDmlMode::None,
+                idle_session_timeout_secs: 0,
+            })
+            .unwrap();
+            cat.add_clone_child(db(1), child).unwrap();
+        }
+        cat.delete_database(db(2)).unwrap();
+
+        assert_eq!(cat.get_clone_children(db(1)).unwrap(), vec![db(2), db(3)]);
+        assert_eq!(cat.get_live_clone_children(db(1)).unwrap(), vec![db(3)]);
     }
 }

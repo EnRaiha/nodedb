@@ -10,6 +10,32 @@ use crate::data::executor::task::ExecutionTask;
 
 impl CoreLoop {
     pub(super) fn dispatch_crdt(&mut self, task: &ExecutionTask, op: &CrdtOp) -> Response {
+        // A list op names a bound document. One carrying `Surrogate::ZERO` is
+        // refused before it touches the document.
+        if let CrdtOp::ListInsert {
+            collection,
+            surrogate,
+            ..
+        }
+        | CrdtOp::ListDelete {
+            collection,
+            surrogate,
+            ..
+        }
+        | CrdtOp::ListMove {
+            collection,
+            surrogate,
+            ..
+        } = op
+            && let Some(refusal) =
+                crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+                    "crdt list",
+                    collection.as_str(),
+                    *surrogate,
+                )
+        {
+            return self.response_error(task, refusal);
+        }
         match op {
             CrdtOp::Read {
                 collection,

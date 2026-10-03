@@ -4378,6 +4378,7 @@ dependencies = [
  "faultbox",
  "futures",
  "getrandom 0.4.3",
+ "hex",
  "hmac 0.12.1",
  "nexar",
  "nodedb-raft",
@@ -4427,6 +4428,7 @@ dependencies = [
  "nodedb-test-support",
  "nodedb-types",
  "quinn",
+ "rdkafka",
  "redb",
  "rustls",
  "serde_json",
@@ -4568,6 +4570,7 @@ dependencies = [
 name = "nodedb-query"
 version = "0.5.0"
 dependencies = [
+ "hex",
  "nodedb-fts",
  "nodedb-spatial",
  "nodedb-types",
@@ -4620,6 +4623,7 @@ name = "nodedb-sql"
 version = "0.5.0"
 dependencies = [
  "chrono",
+ "hex",
  "nodedb-query",
  "nodedb-spatial",
  "nodedb-types",
@@ -4685,6 +4689,7 @@ dependencies = [
  "bytemuck",
  "crc32c",
  "getrandom 0.4.3",
+ "hex",
  "nanoid",
  "nodedb-codec",
  "rand 0.10.2",

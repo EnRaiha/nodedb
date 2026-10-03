@@ -16,10 +16,7 @@ impl From<Value> for serde_json::Value {
             Value::String(s) | Value::Uuid(s) | Value::Ulid(s) | Value::Regex(s) => {
                 serde_json::Value::String(s)
             }
-            Value::Bytes(b) => {
-                let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
-                serde_json::Value::String(hex)
-            }
+            Value::Bytes(b) => serde_json::Value::String(hex::encode(b)),
             Value::Array(arr) | Value::Set(arr) => {
                 serde_json::Value::Array(arr.into_iter().map(serde_json::Value::from).collect())
             }

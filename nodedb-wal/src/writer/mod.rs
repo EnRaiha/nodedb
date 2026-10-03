@@ -20,6 +20,7 @@
 //! io_uring submission can be added once the bridge crate provides the TPC
 //! event loop integration.
 
+mod anchor;
 // Crate-visible so the io_uring writer can reach `resume_offset` directly.
 // Re-exporting it here instead would be dead code whenever the `io-uring`
 // feature is off, and cfg-gating the re-export just duplicates that condition.

@@ -40,17 +40,6 @@ impl TestClusterNode {
         )
     }
 
-    /// Read the current counter of a default-database sequence from this
-    /// node's in-memory registry, if present.
-    pub fn sequence_current_value(&self, tenant_id: u64, name: &str) -> Option<i64> {
-        self.shared
-            .sequence_registry
-            .list(nodedb_types::DatabaseId::DEFAULT.as_u64(), tenant_id)
-            .into_iter()
-            .find(|(n, _, _)| n == name)
-            .map(|(_, current, _)| current)
-    }
-
     /// The value the next `nextval` call on this sequence returns:
     /// `current_value + increment`. Holds whether or not the sequence has
     /// been called yet — a restart stores `value - increment` with
@@ -239,35 +228,5 @@ impl TestClusterNode {
             .ok()
             .flatten()
             .map(|coll| (coll.descriptor_version, coll.modification_hlc))
-    }
-
-    /// Same as [`collection_descriptor`] for stored functions.
-    pub fn function_descriptor(
-        &self,
-        tenant_id: u64,
-        name: &str,
-    ) -> Option<(u64, nodedb_types::Hlc)> {
-        self.shared
-            .credentials
-            .catalog()
-            .get_function(tenant_id, name)
-            .ok()
-            .flatten()
-            .map(|f| (f.descriptor_version, f.modification_hlc))
-    }
-
-    /// Same as [`collection_descriptor`] for stored procedures.
-    pub fn procedure_descriptor(
-        &self,
-        tenant_id: u64,
-        name: &str,
-    ) -> Option<(u64, nodedb_types::Hlc)> {
-        self.shared
-            .credentials
-            .catalog()
-            .get_procedure(tenant_id, name)
-            .ok()
-            .flatten()
-            .map(|p| (p.descriptor_version, p.modification_hlc))
     }
 }

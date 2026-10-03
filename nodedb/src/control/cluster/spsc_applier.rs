@@ -10,6 +10,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::control::cluster::sequencer_compaction::SequencerCompaction;
 use crate::control::distributed_applier::DistributedApplier;
 use nodedb_cluster::calvin::{SEQUENCER_GROUP_ID, SequencerStateMachine};
 
@@ -22,6 +23,9 @@ use nodedb_cluster::calvin::{SEQUENCER_GROUP_ID, SequencerStateMachine};
 pub struct SpscCommitApplier {
     applier: Arc<DistributedApplier>,
     sequencer_state_machine: Arc<Mutex<SequencerStateMachine>>,
+    /// Compacts the sequencer log once it grew past its threshold. `None`
+    /// when the group never compacts.
+    sequencer_compaction: Option<Arc<SequencerCompaction>>,
 }
 
 impl SpscCommitApplier {
@@ -33,23 +37,43 @@ impl SpscCommitApplier {
         Self {
             applier,
             sequencer_state_machine,
+            sequencer_compaction: None,
         }
+    }
+
+    /// Compact the sequencer log through `compaction`.
+    #[must_use]
+    pub fn with_sequencer_compaction(
+        mut self,
+        compaction: Option<Arc<SequencerCompaction>>,
+    ) -> Self {
+        self.sequencer_compaction = compaction;
+        self
     }
 }
 
 impl nodedb_cluster::CommitApplier for SpscCommitApplier {
     fn apply_committed(&self, group_id: u64, entries: &[nodedb_raft::message::LogEntry]) -> u64 {
         if group_id == SEQUENCER_GROUP_ID {
-            let mut sm = self
-                .sequencer_state_machine
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            for entry in entries {
-                if !entry.data.is_empty() {
-                    sm.apply(entry.index, &entry.data);
+            {
+                let mut sm = self
+                    .sequencer_state_machine
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                for entry in entries {
+                    if !entry.data.is_empty() {
+                        sm.apply(entry.index, &entry.data);
+                    }
                 }
             }
-            return entries.last().map(|e| e.index).unwrap_or(0);
+            let applied = entries.last().map(|e| e.index).unwrap_or(0);
+            // With the state machine's lock released: the run captures it.
+            if applied > 0
+                && let Some(compaction) = self.sequencer_compaction.as_ref()
+            {
+                compaction.after_apply(applied);
+            }
+            return applied;
         }
         self.applier.apply_committed(group_id, entries)
     }

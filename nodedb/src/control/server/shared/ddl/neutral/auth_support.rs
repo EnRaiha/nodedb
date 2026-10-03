@@ -4,9 +4,7 @@
 //! the tenant-admin gate, single-tag status construction, role-name parsing,
 //! and the `IF [NOT] EXISTS` token strippers.
 //!
-//! Folded in verbatim from the pgwire `require_tenant_admin` / `parse_role`
-//! helpers and the `parse_utils` strippers; only the result/error type changed
-//! from pgwire `PgWireError` to the protocol-neutral [`DdlError`].
+//! Errors are the protocol-neutral [`DdlError`].
 
 use crate::control::security::identity::{AuthenticatedIdentity, Role};
 
@@ -22,9 +20,7 @@ pub(super) fn status(command: &str) -> Vec<DdlResult> {
 
 /// Require that the identity is superuser or tenant_admin.
 ///
-/// Folded in verbatim from the pgwire `require_tenant_admin` helper: it does
-/// NOT emit an audit record on denial and returns SQLSTATE 42501 with the
-/// identical message.
+/// It does NOT emit an audit record on denial and returns SQLSTATE 42501.
 pub(super) fn require_tenant_admin(
     identity: &AuthenticatedIdentity,
     action: &str,

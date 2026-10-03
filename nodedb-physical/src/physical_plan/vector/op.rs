@@ -124,7 +124,9 @@ pub enum VectorOp {
     /// is not found the op is a no-op (idempotent).
     DeleteBySurrogate {
         collection: QualifiedCollection,
-        surrogate: nodedb_types::Surrogate,
+        /// The row's bound surrogate. `None` when the key's home binds none:
+        /// the delete removes nothing and still commits its sync provenance.
+        surrogate: Option<nodedb_types::Surrogate>,
         /// Named vector field; empty = default field.
         field_name: String,
         /// Sync provenance: identifies the originating peer and sequence for idempotency.
@@ -246,6 +248,12 @@ pub enum VectorOp {
         field_name: String,
         /// Surrogate shared by all vectors of the document.
         document_surrogate: Surrogate,
+        /// User PK bytes of the document when it has a key; `None` for a
+        /// headless document, whose surrogate self-keys. Carried on the
+        /// replication wire so every replica binds `document_surrogate` to
+        /// this exact key, as `Insert` does.
+        #[serde(default)]
+        pk_bytes: Option<Vec<u8>>,
         /// Flat vector data: count × dim f32 values.
         vectors: Vec<f32>,
         /// Number of vectors.

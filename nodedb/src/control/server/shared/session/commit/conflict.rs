@@ -33,6 +33,11 @@ pub(super) fn si_conflict_abort(
     let current_lsn = state.wal.next_lsn();
     let current = crate::types::Lsn::new(current_lsn.as_u64().saturating_sub(1));
     for entry in read_set {
+        // A homed read's watermark can come from another node's WAL, so this
+        // node's WAL cannot judge it. `homed_reads` validates it on its home.
+        if entry.home.is_some() {
+            continue;
+        }
         let collection = &entry.collection;
         let read_lsn = entry.read_lsn;
         if written_collections.contains(collection) {

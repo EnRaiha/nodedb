@@ -3,11 +3,9 @@
 //! `ALTER COLLECTION <name> RENAME COLUMN <old> TO <new>` — rename a
 //! column in a strict-document collection's schema.
 //!
-//! Ported verbatim from the pgwire `ddl::collection::alter::rename_column`
-//! handler; only the result type changed to the protocol-neutral
-//! [`DdlResult`] / [`DdlError`]. The duplicate-name guard, positional
-//! rename + version bump, persist, and audit are unchanged, as is the
-//! `ALTER COLLECTION` command tag.
+//! The result type is the protocol-neutral [`DdlResult`] / [`DdlError`]. The
+//! duplicate-name guard, positional rename + version bump, persist, and
+//! audit run here, and the command tag is `ALTER COLLECTION`.
 
 use nodedb_types::DatabaseId;
 
@@ -79,7 +77,8 @@ pub(super) async fn alter_collection_rename_column(
         name,
         old_name,
         new_name,
-    )?;
+    )
+    .await?;
 
     state.audit_record(
         AuditEvent::AdminAction,

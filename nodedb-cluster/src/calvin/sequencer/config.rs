@@ -35,22 +35,43 @@ pub struct SequencerConfig {
     /// Default: 512.
     pub vshard_channel_depth: usize,
 
-    /// Maximum serialized byte size of the `plans` blob for a single
-    /// transaction. Transactions exceeding this cap are rejected at the inbox
-    /// with `TxnTooLarge`.
+    /// Maximum plan bytes one sequencer entry carries: a single-entry
+    /// transaction's `plans`, or one part of a multi-part transaction. A
+    /// coordinator splits a larger transaction into parts. The inbox refuses a
+    /// single entry or a part above it with `TxnTooLarge`.
     ///
     /// Default: 1 MiB (1 << 20).
     pub max_plans_bytes_per_txn: usize,
 
-    /// Maximum number of distinct vShards a single transaction may touch.
-    /// Transactions exceeding this cap are rejected at the inbox with
-    /// `FanoutTooWide`.
+    /// Maximum vShards one sequencer entry's plans target: a single-entry
+    /// transaction's participants, or one part's targets. A coordinator
+    /// splits a transaction with more participants into parts. The inbox
+    /// refuses a part above it with `FanoutTooWide`. A multi-part
+    /// transaction's participants are bounded only by the vShard count.
     ///
     /// Default: 64.
     pub max_participating_vshards_per_txn: usize,
 
+    /// Maximum part bytes the sequencer leader queues across every part
+    /// stream, streamed in and not yet proposed. A stream that finds the
+    /// queue full is told to retry, so the leader's memory stays bounded
+    /// whatever the transaction's size. An empty queue always takes one
+    /// part.
+    ///
+    /// Default: 64 MiB (64 << 20), four epochs of `max_bytes_per_epoch`.
+    pub max_queued_part_bytes: usize,
+
+    /// How long the leader keeps a part stream that sends nothing. A
+    /// coordinator that stops streaming leaves its transaction holding
+    /// locks on every participant, so the leader then abandons it.
+    ///
+    /// Default: 30 s.
+    pub part_stream_stall: Duration,
+
     /// Maximum number of transactions drained from the inbox per epoch.
-    /// The epoch tick stops draining once this count is reached.
+    /// The epoch tick stops draining once this count is reached. It must be
+    /// below [`nodedb_types::MAX_POSITIONS_PER_EPOCH`]: each position owns
+    /// one nanosecond of its epoch's system-time millisecond.
     ///
     /// Default: 1 024.
     pub max_txns_per_epoch: usize,
@@ -102,6 +123,8 @@ impl Default for SequencerConfig {
             vshard_channel_depth: 512,
             max_plans_bytes_per_txn: 1 << 20,
             max_participating_vshards_per_txn: 64,
+            max_queued_part_bytes: 64 << 20,
+            part_stream_stall: Duration::from_secs(30),
             max_txns_per_epoch: 1_024,
             max_bytes_per_epoch: 16 << 20,
             tenant_inbox_quota: (inbox_capacity / 8).max(1),
@@ -112,9 +135,20 @@ impl Default for SequencerConfig {
 }
 
 impl SequencerConfig {
-    /// Validate that all caps are `>= 1`. Returns an error describing the
-    /// first violation found.
+    /// Validate that all caps are `>= 1` and that an epoch fits its
+    /// system-time millisecond. Returns an error describing the first
+    /// violation found.
     pub fn validate(&self) -> Result<(), ClusterError> {
+        if self.max_txns_per_epoch >= nodedb_types::MAX_POSITIONS_PER_EPOCH {
+            return Err(ClusterError::Config {
+                detail: format!(
+                    "SequencerConfig.max_txns_per_epoch must be < {}, got {}: each position \
+                     owns one nanosecond of its epoch's millisecond",
+                    nodedb_types::MAX_POSITIONS_PER_EPOCH,
+                    self.max_txns_per_epoch
+                ),
+            });
+        }
         let caps: &[(&'static str, usize)] = &[
             ("inbox_capacity", self.inbox_capacity),
             ("vshard_channel_depth", self.vshard_channel_depth),
@@ -123,6 +157,7 @@ impl SequencerConfig {
                 "max_participating_vshards_per_txn",
                 self.max_participating_vshards_per_txn,
             ),
+            ("max_queued_part_bytes", self.max_queued_part_bytes),
             ("max_txns_per_epoch", self.max_txns_per_epoch),
             ("max_bytes_per_epoch", self.max_bytes_per_epoch),
             ("tenant_inbox_quota", self.tenant_inbox_quota),
@@ -188,6 +223,28 @@ mod tests {
             ..SequencerConfig::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_an_epoch_past_its_millisecond() {
+        let cfg = SequencerConfig {
+            max_txns_per_epoch: nodedb_types::MAX_POSITIONS_PER_EPOCH,
+            ..SequencerConfig::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("an epoch of 1e6 positions is refused");
+        let text = err.to_string();
+        assert!(text.contains("max_txns_per_epoch"), "{text}");
+        assert!(text.contains("1000000"), "{text}");
+
+        let at_limit = SequencerConfig {
+            max_txns_per_epoch: nodedb_types::MAX_POSITIONS_PER_EPOCH - 1,
+            ..SequencerConfig::default()
+        };
+        at_limit
+            .validate()
+            .expect("the largest epoch that fits is accepted");
     }
 
     #[test]

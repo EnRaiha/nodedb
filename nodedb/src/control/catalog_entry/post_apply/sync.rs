@@ -7,19 +7,17 @@
 //! readers are guaranteed to see every sync side effect of every
 //! entry up to N — no tokio spawn race.
 //!
-//! Previously `sync` and `async` were combined into a single
-//! `tokio::spawn`, so a freshly-applied `PutUser` could bump the
-//! watcher while its `install_replicated_user` task was still queued
-//! on the scheduler. Tests that waited on `applied_index` and then
-//! immediately polled `credentials.get_user` would flake whenever
-//! the scheduler ran them in that order. Keeping this function
+//! A `tokio::spawn` here lets a freshly-applied `PutUser` bump the
+//! watcher while its `install_replicated_user` task still sat queued on
+//! the scheduler. A reader that waited on `applied_index` then polled
+//! `credentials.get_user` misses the user. Keeping this function
 //! **sync** and inline avoids that race by construction.
 
 use std::sync::Arc;
 
 use super::gateway_invalidation::invalidate_gateway_cache_for_entry;
 use super::{
-    alert_rule, api_key, auth_user, change_stream, collection, consumer_group,
+    alert_rule, api_key, array, auth_user, change_stream, collection, consumer_group,
     continuous_aggregate, custom_type, database, function, materialized_view, owner, permission,
     procedure, quota, redaction, retention_policy, rls, role, schedule, scope_grant, scope_quota,
     sequence, streaming_materialized_view, synonym_group, tenant, topic, trigger, user,
@@ -43,7 +41,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
     match entry {
         CatalogEntry::PutCollection(stored) => {
             // Owner record install is sync; Data Plane register is
-            // the async part, handled by `spawn_post_apply_async_side_effects`.
+            // the async part, handled by `run_post_apply_async_side_effects`.
             collection::put_owner_sync(stored, Arc::clone(shared));
             collection::queue_tree_def_sync(stored, shared);
         }
@@ -54,7 +52,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             // so the read-back is Some; the carried entry is only a
             // best-effort fallback if the redb write silently failed.
             // Owner record install is sync; Data Plane register is
-            // the async part, handled by `spawn_post_apply_async_side_effects`.
+            // the async part, handled by `run_post_apply_async_side_effects`.
             let canonical = shared
                 .credentials
                 .catalog()
@@ -78,6 +76,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             collection::purge_sync(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
             collection::queue_tree_def_removal_sync(*database_id, *tenant_id, name, shared);
@@ -89,6 +88,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             sequence::delete(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
         }
@@ -102,6 +102,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             trigger::delete(*database_id, *tenant_id, name.clone(), shared);
         }
@@ -112,6 +113,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             function::delete(*database_id, *tenant_id, name.clone(), shared);
         }
@@ -122,6 +124,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             procedure::delete(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
         }
@@ -142,6 +145,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             change_stream::delete(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
         }
@@ -177,6 +181,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             materialized_view::delete(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
         }
@@ -202,6 +207,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             continuous_aggregate::delete(
                 *database_id,
@@ -308,6 +314,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             synonym_group::delete(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
         }
@@ -352,6 +359,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             // database registry so subsequent DDL within the same session can
             // resolve it by name without waiting for a read-round-trip to redb.
             database::put((**target_descriptor).clone(), Arc::clone(shared));
+            collection::clone_shadows_sync(target_descriptor.id, shared);
         }
         CatalogEntry::RecordWalTombstone { .. } => {
             // WAL replay barrier only; no in-memory cache to refresh.
@@ -411,6 +419,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             database_id,
             tenant_id,
             name,
+            ..
         } => {
             topic::delete_with_consumer_groups(*database_id, *tenant_id, name, shared);
         }
@@ -422,6 +431,7 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             tenant_id,
             stream_name,
             name,
+            ..
         } => {
             consumer_group::delete(*database_id, *tenant_id, stream_name, name, shared);
         }
@@ -448,6 +458,18 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             // no-op: column statistics have no in-memory mirror. The planner
             // reads them from the catalog, which `apply` already wrote.
         }
+        CatalogEntry::PutCloneCopyup { .. }
+        | CatalogEntry::PutCloneTombstone { .. }
+        | CatalogEntry::PutKvCloneTombstone { .. } => {
+            // no-op: clone reads look copy-on-write rows up in the catalog.
+        }
+        CatalogEntry::PutCloneSourceDrain(_) | CatalogEntry::DeleteCloneSourceDrain { .. } => {
+            // no-op: only the singleton worker's recovery reads the claims,
+            // from the catalog.
+        }
+        CatalogEntry::PutArray(stored) => array::put_sync(stored, shared),
+        // The mirror changes in the async lane, under the incarnation's gate.
+        CatalogEntry::DeleteArray { .. } => {}
         CatalogEntry::MoveTenantCutover {
             tenant_id,
             source_db_id,
@@ -462,5 +484,10 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
                 Arc::clone(shared),
             );
         }
+        CatalogEntry::CommitConsumerOffsets(commit) => {
+            consumer_group::commit_offsets(commit, shared);
+        }
+        // The scheduler reads the mark from the catalog row apply wrote.
+        CatalogEntry::PutBackupScheduleMark(_) => {}
     }
 }

@@ -110,13 +110,20 @@ SHOW CHANGE STREAMS;
 
 Consumer groups track read positions independently, enabling multiple consumers to process the same stream at their own pace.
 
+Every event carries an `offset` token `<epoch>:<index>:<sequence>`. In a cluster, `index` is the Raft log index of the write, so every replica gives an event the same offset. `epoch` rises when a partition moves to another data group, so offsets never go backwards. A committed offset is replicated to every node. A consumer can move to another node, or continue after a leader change, and resume exactly after its last commit.
+
+A node that joined a partition from a snapshot does not hold the events before the snapshot. A consumer whose offset lies below them gets a `reset_required` error naming the offset the node holds events from. It never skips events silently. When another replica still holds those events, the consume goes there instead.
+
 ```sql
 -- Create a consumer group
 CREATE CONSUMER GROUP analytics ON order_changes;
 CREATE CONSUMER GROUP billing ON order_changes;
 
 -- Commit offset for a specific partition
-COMMIT OFFSET PARTITION 0 AT 42 ON order_changes CONSUMER GROUP analytics;
+COMMIT OFFSET PARTITION 0 AT 0:42:2 ON order_changes CONSUMER GROUP analytics;
+
+-- <epoch>:<index> acknowledges every event of that write
+COMMIT OFFSET PARTITION 0 AT 0:42 ON order_changes CONSUMER GROUP analytics;
 
 -- Or batch commit all partitions at their latest consumed position
 COMMIT OFFSETS ON order_changes CONSUMER GROUP analytics;
@@ -219,7 +226,16 @@ WITH (
 );
 ```
 
-Each POST includes `X-Idempotency-Key`, `X-Event-Sequence`, `X-Partition`, and `X-LSN` headers. 4xx client errors (except 429) are not retried.
+Each POST includes `X-Idempotency-Key`, `X-Fencing-Token`, `X-CDC-Offset`, `X-Event-Sequence`, `X-Partition`, and `X-LSN` headers. 4xx client errors (except 429) are not retried.
+
+In a cluster, one node delivers a stream at a time: the node that holds the leader lease of the stream's owning Raft group. It reads every partition, including partitions whose rows live on other nodes. It checks its lease right before each POST and right before each offset commit. When that node fails, the next lease holder resumes from the committed offsets. Delivery is at-least-once: a POST can succeed after the old owner lost its lease but before it committed the offset, and the new owner then sends that event again. Two headers let an endpoint apply each event once:
+
+| Header | Value | What the endpoint does with it |
+|---|---|---|
+| `X-Idempotency-Key` | `<partition>:<epoch>:<index>:<sequence>`: the event's partition and position | Store each applied key. Drop a request whose key is already stored. Every owner and every retry sends the same key for the same event. |
+| `X-Fencing-Token` | The Raft term of the delivering node's leader lease on the owning group | Store the highest token accepted. Reject a request with a lower token: it comes from an owner a later owner replaced. Each new owner delivers with a higher token. |
+
+A single node without Raft always sends token `0`.
 
 ### Kafka Bridge
 
@@ -236,6 +252,8 @@ WITH (
 ```
 
 Supports transactional exactly-once semantics via `enable.idempotence` and `transactional.id`.
+
+In a cluster, one node publishes a stream at a time, under the same lease and checks as webhook delivery. Each record's key is the event's `<partition>:<epoch>:<index>:<sequence>`, the same for every owner and retry. Each record carries a `fencing-token` header with the publishing node's lease term, which rises with each new owner.
 
 ### SSE Streaming
 
@@ -260,11 +278,11 @@ The response includes gap-detection fields alongside the events:
 {
   "events": [...],
   "evicted_since_last_poll": 0,
-  "oldest_available_lsn": 19240
+  "oldest_available_offset": "0:19240:2"
 }
 ```
 
-`evicted_since_last_poll` is non-zero when the consumer fell behind and the stream buffer wrapped — events in that gap are lost for this consumer. `oldest_available_lsn` lets consumers detect gaps without waiting for the next event to arrive by comparing it against their last-seen LSN.
+`evicted_since_last_poll` is non-zero when the consumer fell behind and the stream buffer wrapped — events in that gap are lost for this consumer. `oldest_available_offset` lets consumers detect gaps without waiting for the next event to arrive by comparing it against their last-seen offset.
 
 The `nodedb_cdc_events_dropped_total{tenant,stream}` Prometheus counter tracks drops per named stream. Alert on this counter increasing for a stream whose consumer is active.
 

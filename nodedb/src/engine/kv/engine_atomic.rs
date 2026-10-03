@@ -11,6 +11,7 @@ use nodedb_physical::physical_plan::KvCounterShape;
 
 use super::engine::KvEngine;
 use super::engine_helpers::{expiry_key, table_key};
+use super::engine_write::{UnboundKvWrite, require_bound};
 use super::entry::NO_EXPIRY;
 use super::hash_table::KvHashTable;
 
@@ -77,6 +78,14 @@ pub enum AtomicError {
     /// The [`AtomicAdmission`] gate refused the computed post-image, so nothing
     /// was written. Boxed to keep the error small on the success path.
     Rejected(Box<crate::Error>),
+    /// The write binds its row to `Surrogate::ZERO`, so nothing was written.
+    Unbound(UnboundKvWrite),
+}
+
+impl From<UnboundKvWrite> for AtomicError {
+    fn from(error: UnboundKvWrite) -> Self {
+        Self::Unbound(error)
+    }
 }
 
 impl From<AtomicComputeError> for AtomicError {
@@ -123,7 +132,8 @@ pub struct AtomicKeyCtx<'a> {
     pub key: &'a [u8],
     /// Current time in milliseconds, used for TTL/expiry evaluation.
     pub now_ms: u64,
-    /// Global cross-engine surrogate assigned to this write.
+    /// Global cross-engine surrogate assigned to this write. Never
+    /// `Surrogate::ZERO`: every atomic refuses an unbound write.
     pub surrogate: nodedb_types::Surrogate,
 }
 
@@ -200,6 +210,7 @@ impl KvEngine {
             ttl_ms,
             shape,
         } = step;
+        require_bound(ctx.collection, ctx.surrogate)?;
         let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
         let table = self.ensure_table(tkey, ctx.tenant_id, ctx.collection);
 
@@ -241,6 +252,7 @@ impl KvEngine {
         shape: &KvCounterShape,
         admit: AtomicAdmission<'_>,
     ) -> Result<Incremented<f64>, AtomicError> {
+        require_bound(ctx.collection, ctx.surrogate)?;
         let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
         let table = self.ensure_table(tkey, ctx.tenant_id, ctx.collection);
 
@@ -268,6 +280,7 @@ impl KvEngine {
         new_value: &[u8],
         admit: AtomicAdmission<'_>,
     ) -> Result<CasResult, AtomicError> {
+        require_bound(ctx.collection, ctx.surrogate)?;
         let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
         let table = self.ensure_table(tkey, ctx.tenant_id, ctx.collection);
 
@@ -301,6 +314,7 @@ impl KvEngine {
         new_value: &[u8],
         admit: AtomicAdmission<'_>,
     ) -> Result<GetSetResult, AtomicError> {
+        require_bound(ctx.collection, ctx.surrogate)?;
         let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
         let table = self.ensure_table(tkey, ctx.tenant_id, ctx.collection);
         let old = table.get(ctx.key, ctx.now_ms).map(|v| v.to_vec());
@@ -461,6 +475,7 @@ mod tests {
     use super::super::engine_write::KvPutParams;
     use super::*;
     use crate::bridge::envelope::CounterFault;
+    use crate::engine::kv::test_support::row_surrogate;
 
     static RAW: KvCounterShape = KvCounterShape::Raw;
 
@@ -485,8 +500,22 @@ mod tests {
             collection,
             key,
             now_ms: 1000,
-            surrogate: Surrogate::ZERO,
+            surrogate: row_surrogate(key),
         }
+    }
+
+    /// An atomic that binds its row to `Surrogate::ZERO` is refused and
+    /// writes nothing.
+    #[test]
+    fn an_unbound_atomic_is_refused_and_writes_nothing() {
+        let mut engine = make_engine();
+        let unbound = AtomicKeyCtx {
+            surrogate: Surrogate::ZERO,
+            ..ctx("counters", b"hits")
+        };
+        let result = engine.incr(unbound, 1, 0, &RAW, &admit_any);
+        assert!(matches!(result, Err(AtomicError::Unbound(_))));
+        assert!(engine.get(0, 1, "counters", b"hits", 1000).is_none());
     }
 
     #[test]
@@ -558,16 +587,18 @@ mod tests {
         let mut engine = make_engine();
         // Set to MAX.
         let bytes = i64::MAX.to_string().into_bytes();
-        engine.put(KvPutParams {
-            database_id: 0,
-            tenant_id: 1,
-            collection: "counters",
-            key: b"max",
-            value: &bytes,
-            ttl_ms: 0,
-            now_ms: 1000,
-            surrogate: Surrogate::ZERO,
-        });
+        engine
+            .put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "counters",
+                key: b"max",
+                value: &bytes,
+                ttl_ms: 0,
+                now_ms: 1000,
+                surrogate: row_surrogate(b"seeded"),
+            })
+            .expect("a bound row writes");
         let result = engine.incr(ctx("counters", b"max"), 1, 0, &RAW, &admit_any);
         assert!(matches!(
             result,
@@ -579,16 +610,18 @@ mod tests {
     fn incr_on_raw_text_that_is_not_an_integer_is_refused() {
         let mut engine = make_engine();
         let bytes = b"hello".to_vec();
-        engine.put(KvPutParams {
-            database_id: 0,
-            tenant_id: 1,
-            collection: "counters",
-            key: b"str",
-            value: &bytes,
-            ttl_ms: 0,
-            now_ms: 1000,
-            surrogate: Surrogate::ZERO,
-        });
+        engine
+            .put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "counters",
+                key: b"str",
+                value: &bytes,
+                ttl_ms: 0,
+                now_ms: 1000,
+                surrogate: row_surrogate(b"seeded"),
+            })
+            .expect("a bound row writes");
         let result = engine.incr(ctx("counters", b"str"), 1, 0, &RAW, &admit_any);
         assert!(matches!(
             result,
@@ -612,16 +645,18 @@ mod tests {
         let mut engine = make_engine();
         // Set key with TTL.
         let bytes = b"50".to_vec();
-        engine.put(KvPutParams {
-            database_id: 0,
-            tenant_id: 1,
-            collection: "counters",
-            key: b"temp",
-            value: &bytes,
-            ttl_ms: 5000,
-            now_ms: 1000,
-            surrogate: Surrogate::ZERO,
-        });
+        engine
+            .put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "counters",
+                key: b"temp",
+                value: &bytes,
+                ttl_ms: 5000,
+                now_ms: 1000,
+                surrogate: row_surrogate(b"seeded"),
+            })
+            .expect("a bound row writes");
         // Incr with ttl_ms=0 should preserve existing TTL.
         engine
             .incr(ctx("counters", b"temp"), 10, 0, &RAW, &admit_any)
@@ -657,16 +692,18 @@ mod tests {
     fn incr_with_absolute_expiry_and_zero_ttl_still_preserves_existing_expiry() {
         let mut engine = make_engine();
         let bytes = b"50".to_vec();
-        engine.put(KvPutParams {
-            database_id: 0,
-            tenant_id: 1,
-            collection: "counters",
-            key: b"temp",
-            value: &bytes,
-            ttl_ms: 5000,
-            now_ms: 1000,
-            surrogate: Surrogate::ZERO,
-        });
+        engine
+            .put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "counters",
+                key: b"temp",
+                value: &bytes,
+                ttl_ms: 5000,
+                now_ms: 1000,
+                surrogate: row_surrogate(b"seeded"),
+            })
+            .expect("a bound row writes");
         let ttl_before = engine.get_ttl_ms(0, 1, "counters", b"temp", 1000);
 
         // ttl_ms == 0 must ignore the supplied absolute instant and preserve
@@ -714,16 +751,18 @@ mod tests {
         let mut engine = make_engine();
         let bytes_text = f64::MAX.to_string();
         let bytes = bytes_text.clone().into_bytes();
-        engine.put(KvPutParams {
-            database_id: 0,
-            tenant_id: 1,
-            collection: "scores",
-            key: b"big",
-            value: &bytes,
-            ttl_ms: 0,
-            now_ms: 1000,
-            surrogate: Surrogate::ZERO,
-        });
+        engine
+            .put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "scores",
+                key: b"big",
+                value: &bytes,
+                ttl_ms: 0,
+                now_ms: 1000,
+                surrogate: row_surrogate(b"seeded"),
+            })
+            .expect("a bound row writes");
         let result = engine.incr_float(ctx("scores", b"big"), &bytes_text, &RAW, &admit_any);
         assert!(matches!(
             result,
@@ -747,16 +786,18 @@ mod tests {
     #[test]
     fn cas_success() {
         let mut engine = make_engine();
-        engine.put(KvPutParams {
-            database_id: 0,
-            tenant_id: 1,
-            collection: "state",
-            key: b"p1",
-            value: b"idle",
-            ttl_ms: 0,
-            now_ms: 1000,
-            surrogate: Surrogate::ZERO,
-        });
+        engine
+            .put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "state",
+                key: b"p1",
+                value: b"idle",
+                ttl_ms: 0,
+                now_ms: 1000,
+                surrogate: row_surrogate(b"seeded"),
+            })
+            .expect("a bound row writes");
         let result = engine
             .cas(ctx("state", b"p1"), b"idle", b"in_match", &admit_any)
             .expect("cas");
@@ -769,16 +810,18 @@ mod tests {
     #[test]
     fn cas_failure() {
         let mut engine = make_engine();
-        engine.put(KvPutParams {
-            database_id: 0,
-            tenant_id: 1,
-            collection: "state",
-            key: b"p1",
-            value: b"fighting",
-            ttl_ms: 0,
-            now_ms: 1000,
-            surrogate: Surrogate::ZERO,
-        });
+        engine
+            .put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "state",
+                key: b"p1",
+                value: b"fighting",
+                ttl_ms: 0,
+                now_ms: 1000,
+                surrogate: row_surrogate(b"seeded"),
+            })
+            .expect("a bound row writes");
         let result = engine
             .cas(ctx("state", b"p1"), b"idle", b"in_match", &admit_any)
             .expect("cas");
@@ -807,16 +850,18 @@ mod tests {
     #[test]
     fn getset_existing_key() {
         let mut engine = make_engine();
-        engine.put(KvPutParams {
-            database_id: 0,
-            tenant_id: 1,
-            collection: "session",
-            key: b"tok",
-            value: b"old-token",
-            ttl_ms: 0,
-            now_ms: 1000,
-            surrogate: Surrogate::ZERO,
-        });
+        engine
+            .put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "session",
+                key: b"tok",
+                value: b"old-token",
+                ttl_ms: 0,
+                now_ms: 1000,
+                surrogate: row_surrogate(b"seeded"),
+            })
+            .expect("a bound row writes");
         let old = engine
             .getset(ctx("session", b"tok"), b"new-token", &admit_any)
             .expect("getset")

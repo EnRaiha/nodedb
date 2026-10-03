@@ -85,14 +85,15 @@ pub async fn rate_check(
 
     let actual_ttl = if key_exists { 0 } else { ttl_ms };
 
-    let surrogate = state
-        .surrogate_assigner
-        .assign(
-            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, RATE_COLLECTION),
-            tenant_id,
-            rate_key.as_bytes(),
-        )
-        .map_err(|e| DdlError::from_error_in_context("RATE_CHECK", &e))?;
+    let surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
+        state,
+        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, RATE_COLLECTION),
+        tenant_id,
+        rate_key.as_bytes(),
+        crate::types::TraceId::ZERO,
+    )
+    .await
+    .map_err(|e| DdlError::from_error_in_context("RATE_CHECK", &e))?;
     let plan = PhysicalPlan::Kv(KvOp::Incr {
         collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, RATE_COLLECTION),
         key: rate_key.as_bytes().to_vec(),

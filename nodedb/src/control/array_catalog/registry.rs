@@ -121,6 +121,8 @@ mod tests {
             prefix_bits: 8,
             audit_retain_ms: None,
             minimum_audit_retain_ms: None,
+            modification_hlc: nodedb_types::Hlc::ZERO,
+            incarnation: nodedb_types::Hlc::ZERO,
         }
     }
 

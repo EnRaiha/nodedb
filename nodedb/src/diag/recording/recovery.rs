@@ -115,9 +115,8 @@ pub fn batch_insert_without_surrogates(
     .emit();
 }
 
-/// Report a WAL segment that cold storage did not accept before the segment
-/// was due for deletion. Called only from the checkpoint's archival loop,
-/// which also holds truncation back at the segment.
+/// Report a WAL archive step that failed. Called only from the WAL archiver.
+/// Checkpoint truncation holds back at the first segment the archive lacks.
 pub fn wal_archival_failed_truncation_held(
     stage: &str,
     err: Option<&crate::Error>,

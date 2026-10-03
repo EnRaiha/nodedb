@@ -37,6 +37,7 @@ pub async fn rag_fusion(
     database_id: DatabaseId,
     collection: String,
     params: FusionParams,
+    linearizable: bool,
 ) -> Result<Vec<DdlResult>, DdlError> {
     // Gate on catalog `is_active` (see `support::ensure_collection_active`):
     // a plain `DROP COLLECTION` only flips `is_active=false` without
@@ -97,10 +98,7 @@ pub async fn rag_fusion(
     };
 
     let options = match params.max_visited {
-        Some(mv) => GraphTraversalOptions {
-            max_visited: mv,
-            ..Default::default()
-        },
+        Some(mv) => GraphTraversalOptions { max_visited: mv },
         None => GraphTraversalOptions::default(),
     };
 
@@ -118,6 +116,7 @@ pub async fn rag_fusion(
         options,
         bm25_query: params.bm25_query,
         bm25_field: params.bm25_field,
+        stage: nodedb_physical::physical_plan::RagStage::Local,
     });
 
     // Only reached through `shared::ddl::dispatch`, which native/pgwire/HTTP
@@ -132,6 +131,7 @@ pub async fn rag_fusion(
         // Admitted at this request's own transport entry; this handler has no
         // session or peer information of its own.
         admission: user_dispatch::RequestAdmission::AlreadyAdmitted,
+        linearizable,
     })
     .await
     .map_err(|e| DdlError::from_error(&e))?;

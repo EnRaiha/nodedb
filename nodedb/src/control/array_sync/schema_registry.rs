@@ -42,6 +42,12 @@ pub struct OriginSchemaRegistry {
     docs: Mutex<HashMap<SchemaKey, SchemaDoc>>,
 }
 
+impl crate::storage::RedbBacked for OriginSchemaRegistry {
+    fn redb_database(&self) -> &redb::Database {
+        &self.db
+    }
+}
+
 impl OriginSchemaRegistry {
     /// Open or create the schema registry table in `db` and cold-load its
     /// entries.

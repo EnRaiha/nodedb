@@ -120,7 +120,7 @@ mod tests {
         let change = ProposedChange {
             collection: "users".into(),
             row_id: "u1".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             fields: vec![
                 ("name".into(), LoroValue::String("Alice".into())),
                 (
@@ -156,7 +156,7 @@ mod tests {
         let change = ProposedChange {
             collection: "users".into(),
             row_id: "u1".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             fields: vec![("email".into(), LoroValue::String("a@b.com".into()))],
         };
 
@@ -180,7 +180,7 @@ mod tests {
         let change = ProposedChange {
             collection: "users".into(),
             row_id: "u1".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             fields: vec![("email".into(), LoroValue::String("a@b.com".into()))],
         };
 
@@ -204,7 +204,7 @@ mod tests {
         let first = ProposedChange {
             collection: "users".into(),
             row_id: "u1".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             fields: vec![
                 ("name".into(), LoroValue::String("Alice".into())),
                 (
@@ -226,7 +226,7 @@ mod tests {
         let second = ProposedChange {
             collection: "users".into(),
             row_id: "u2".into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(2),
             fields: vec![
                 ("name".into(), LoroValue::String("Bob".into())),
                 (
@@ -265,7 +265,7 @@ mod tests {
         let change = ProposedChange {
             collection: collection.into(),
             row_id: row_id.into(),
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             fields,
         };
         engine.validate_and_apply(

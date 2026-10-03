@@ -27,6 +27,7 @@ pub async fn tree_sum(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
+    linearizable: bool,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
     let upper = sql.to_uppercase();
@@ -60,7 +61,7 @@ pub async fn tree_sum(
     // collection named; without it the sum genuinely point-gets from every
     // collection in the tenant, so every one of them is a read the caller must
     // hold a grant for and the first denial ends the statement. Narrowing the
-    // sum to the subset a caller happens to be allowed would silently return a
+    // sum to the subset a caller happens to be allowed will silently return a
     // smaller total reported as the whole one.
     let gate = CollectionReadGate::for_request(state, identity, database_id);
     let collections_to_search: Vec<String> = if let Some(ref coll) = explicit_collection {
@@ -78,7 +79,7 @@ pub async fn tree_sum(
     for coll_name in &collections_to_search {
         gate.authorize(coll_name)?;
         // The total is arithmetic over `sum_column`, so a redaction rule on it
-        // has no honest answer: masking the total would report a figure no tree
+        // has no honest answer: masking the total will report a figure no tree
         // sums to.
         gate.refuse_if_field_redacted(coll_name, &sum_column, "the tree sum")?;
     }
@@ -98,6 +99,7 @@ pub async fn tree_sum(
             direction: dir,
             max_depth,
             options: &GraphTraversalOptions::default(),
+            linearizable,
         },
     )
     .await
@@ -128,37 +130,56 @@ pub async fn tree_sum(
     //
     // Since we don't have a collection→graph_index mapping yet, we sum
     // by looking up each node as a document ID across known collections.
-    // This is a limitation — proper graph index metadata would resolve it.
+    // This is a limitation — proper graph index metadata will resolve it.
     let mut total = rust_decimal::Decimal::ZERO;
 
     // Look up each node's document to extract the sum column value.
     // When the collection is specified (4th arg), this is O(N) point lookups.
     // Without it, we fall back to scanning all tenant collections (O(N×C)).
-    for node_id in &all_ids {
-        for coll_name in &collections_to_search {
+    //
+    // Every node's binding in each searched collection resolves first, in one
+    // batch per collection at the collection's home. A node unbound in a
+    // collection names no row there, so that collection is not read.
+    let node_keys: Vec<&[u8]> = all_ids.iter().map(|id| id.as_bytes()).collect();
+    let mut bindings: Vec<Vec<Option<nodedb_types::Surrogate>>> =
+        Vec::with_capacity(collections_to_search.len());
+    for coll_name in &collections_to_search {
+        bindings.push(
+            crate::control::server::surrogate_exchange::lookup_surrogates_routed(
+                state,
+                nodedb_types::CollectionKey::from_bare(database_id, coll_name),
+                tenant_id,
+                &node_keys,
+                TraceId::ZERO,
+            )
+            .await
+            .map_err(|e| DdlError::from_error_in_context("surrogate lookup", &e))?,
+        );
+    }
+    for (node_index, node_id) in all_ids.iter().enumerate() {
+        for (coll_index, coll_name) in collections_to_search.iter().enumerate() {
             let coll_vshard =
                 nodedb_types::CollectionKey::from_bare(database_id, coll_name).vshard();
             let pk_bytes = node_id.as_bytes().to_vec();
-            let surrogate = state
-                .surrogate_assigner
-                .lookup(
-                    nodedb_types::CollectionKey::from_bare(database_id, coll_name),
-                    tenant_id,
-                    &pk_bytes,
-                )
-                .map_err(|e| DdlError::from_error_in_context("surrogate lookup", &e))?
-                .unwrap_or(nodedb_types::Surrogate::ZERO);
+            let Some(surrogate) = bindings
+                .get(coll_index)
+                .and_then(|found| found.get(node_index).copied().flatten())
+            else {
+                continue;
+            };
             let mut get_plan =
                 PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::PointGet {
                     collection: nodedb_types::QualifiedCollection::new(database_id, coll_name),
                     document_id: node_id.clone(),
-                    surrogate,
+                    surrogate: Some(surrogate),
                     pk_bytes,
                     rls_filters: Vec::new(),
                     system_time: nodedb_types::SystemTimeScope::Current,
                     valid_at_ms: None,
                 });
             gate.inject_rls(&mut get_plan)?;
+            // The funnel serves the point read from the collection's owning
+            // group, confirmed (`dispatch_utils::owner_read`).
             if let Ok(resp) = crate::control::server::dispatch_utils::dispatch_to_data_plane(
                 state,
                 tenant_id,

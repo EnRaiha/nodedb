@@ -71,7 +71,7 @@ pub(in crate::data::executor) struct SubgraphEdge<'a> {
 
 #[derive(Serialize, zerompk::ToMessagePack)]
 #[msgpack(map)]
-pub(in crate::data::executor) struct GraphRagResult {
+pub(crate) struct GraphRagResult {
     pub node_id: String,
     pub rrf_score: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -100,6 +100,48 @@ pub(crate) struct RowsPayload {
     /// column in the same order as `columns`. `Value::Null` denotes SQL NULL
     /// (missing field or a stored null).
     pub rows: Vec<Vec<NativeCell>>,
+}
+
+/// The rows of a timeseries ingest the install rejected, reported beside a
+/// `RETURNING` row set.
+#[derive(Debug, Clone, PartialEq, Eq, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+#[msgpack(map)]
+pub(crate) struct IngestRejection {
+    pub collection: String,
+    /// The lines the resolve rejected plus the rows the install rejected.
+    pub lines: u64,
+}
+
+/// A [`RowsPayload`] that also reports the rows its ingest rejected. Only a
+/// timeseries ingest that rejected rows answers this shape.
+#[derive(zerompk::ToMessagePack)]
+#[msgpack(map)]
+pub(crate) struct RejectingRowsPayload {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<NativeCell>>,
+    pub rejected: IngestRejection,
+}
+
+/// A `RETURNING` reply as the Control Plane reads it: a [`RowsPayload`] or a
+/// [`RejectingRowsPayload`].
+#[derive(zerompk::FromMessagePack)]
+#[msgpack(map)]
+pub(crate) struct ReturningRowsReply {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<NativeCell>>,
+    #[msgpack(default)]
+    pub rejected: Option<IngestRejection>,
+}
+
+/// Reply of a staged write whose plan carries a `RETURNING` spec: the rows the
+/// write affected, and the projection of the ones the caller's read policy
+/// shows. The two differ when the policy hides an affected row.
+#[derive(zerompk::ToMessagePack, zerompk::FromMessagePack)]
+#[msgpack(map)]
+pub(crate) struct StagedReturningReply {
+    pub affected: u64,
+    /// Encoded [`RowsPayload`].
+    pub rows: Vec<u8>,
 }
 
 /// Carries the row payload alongside a flag that signals whether the
@@ -170,14 +212,14 @@ impl<'a> zerompk::ToMessagePack for HybridSearchHit<'a> {
 
 #[derive(Serialize, zerompk::ToMessagePack)]
 #[msgpack(map)]
-pub(in crate::data::executor) struct GraphRagResponse {
+pub(crate) struct GraphRagResponse {
     pub results: Vec<GraphRagResult>,
     pub metadata: GraphRagMetadata,
 }
 
 #[derive(Serialize, zerompk::ToMessagePack)]
 #[msgpack(map)]
-pub(in crate::data::executor) struct GraphRagMetadata {
+pub(crate) struct GraphRagMetadata {
     pub vector_candidates: usize,
     pub graph_expanded: usize,
     pub truncated: bool,

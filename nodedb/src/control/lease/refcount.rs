@@ -2,47 +2,36 @@
 
 //! Per-query descriptor lease refcount + scope guard.
 //!
-//! Descriptor leases are acquired at plan time and held
-//! through execute. Two concurrent queries touching the same
-//! descriptor version share a single underlying raft lease — we track
-//! per-node exact-version refcounts so only a missing or lower-version lease
-//! pays an acquire round-trip and only the last query across every version to
-//! finish pays the release round-trip. Intermediate queries hit the fast-path
-//! increment / decrement with no raft traffic.
+//! Descriptor leases are acquired at plan time, or at authorization for a
+//! write that runs no planner, and held through execute. Queries touching the
+//! same descriptor version share one underlying raft lease: per-node
+//! exact-version refcounts mean only a missing or lower-version lease pays an
+//! acquire round trip.
 //!
-//! The DDL drain path relies on this: when every in-flight
-//! query using a descriptor finishes, the refcount hits zero,
-//! the lease is actually released via a
-//! `DescriptorLeaseRelease` raft entry, and drain's poll loop
-//! observes the lease clear. Long-running queries naturally
-//! bound the drain window — if a query exceeds
-//! `DEFAULT_DRAIN_TIMEOUT` the ALTER fails with a drain-timeout
-//! error and the operator retries.
+//! A lease whose refcount returns to 0 stays granted. The next statement on
+//! the descriptor reuses it with no raft traffic. It ends one of three ways:
+//!
+//! - a `DescriptorDrainStart` applies on this node, which releases this
+//!   node's unheld leases on that descriptor at once, so the drain waits only
+//!   for statements still running;
+//! - the last statement still running under an active drain ends, which
+//!   hands the release to the background releaser;
+//! - it reaches expiry: the renewal loop renews a held lease and releases an
+//!   idle one.
 //!
 //! ## Guard semantics
 //!
-//! `QueryLeaseScope` is the owned collection of leases a
-//! single query accumulated during planning. The scope drops
-//! when the query's pgwire handler finishes executing (after
-//! every response has been returned). Drop walks the scope,
-//! decrements each exact-version refcount, and — when no version of a
-//! descriptor remains held — spawns a background task to propose the release
-//! entry. The spawn is mandatory because `Drop` cannot
-//! be async; the drop handler itself returns immediately.
-//!
-//! A dropped `QueryLeaseScope` therefore schedules (but does
-//! not await) the release. Drain's poll loop observes the
-//! release after the raft round-trip lands on the leader —
-//! sub-10ms in a healthy cluster.
+//! `QueryLeaseScope` is the owned collection of leases a single statement
+//! holds. Drop decrements each exact-version refcount and never waits.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use nodedb_cluster::DescriptorId;
-use tracing::warn;
 
-use super::release::LeaseReleaseHandle;
+use super::holders::{HolderTicket, LeaseHolders};
 use crate::control::state::SharedState;
+use crate::error::Error;
 
 /// Host-side lease reference counts. One entry per descriptor id and
 /// descriptor version this node currently holds; the value is the number of
@@ -107,6 +96,85 @@ impl LeaseRefCount {
     }
 }
 
+/// Gives back refcount units and releases a lease whose last hold ends while
+/// a drain covers it.
+///
+/// A drain start releases this node's idle leases on its descriptor once, as
+/// it installs. A lease still held then is released here, when its last hold
+/// ends: otherwise it stays granted until expiry and the drain waits for it.
+/// The drain installs before its start checks the refcount, and a hold
+/// decrements before it checks the drain, so one of the two always releases.
+#[derive(Clone)]
+pub(crate) struct HoldRelease {
+    refcounts: Arc<LeaseRefCount>,
+    drains: Arc<super::DescriptorDrainTracker>,
+    queue: super::releaser::ReleaseQueue,
+}
+
+impl HoldRelease {
+    pub(crate) fn for_state(shared: &SharedState) -> Self {
+        Self {
+            refcounts: Arc::clone(&shared.lease_refcount),
+            drains: Arc::clone(&shared.lease_drain),
+            queue: shared.lease_runtime.releaser.queue(),
+        }
+    }
+
+    /// Give back one unit of each hold. A descriptor left with no hold while
+    /// a drain covers the version it held is handed to the background
+    /// releaser.
+    fn give_back(&self, holds: impl IntoIterator<Item = (DescriptorId, u64)>) {
+        let mut drained_idle: Vec<DescriptorId> = Vec::new();
+        let mut drained_hold_ended = false;
+        for (id, version) in holds {
+            self.refcounts.decrement(&id, version);
+            if !self.drains.is_draining(&id, version) {
+                continue;
+            }
+            drained_hold_ended = true;
+            if self.refcounts.current(&id) == 0 && !drained_idle.contains(&id) {
+                drained_idle.push(id);
+            }
+        }
+        // A drain counts this node's holds directly, so it re-counts now.
+        if drained_hold_ended {
+            self.drains.wake_drain_waiters();
+        }
+        if !drained_idle.is_empty() {
+            self.queue
+                .submit(super::releaser::ReleaseRequest::UnheldDescriptors(
+                    drained_idle,
+                ));
+        }
+    }
+}
+
+/// One exact-version refcount unit a grant in flight holds. Dropping it,
+/// on return or when its future is cancelled, gives the unit back.
+pub(crate) struct RefcountReservation {
+    release: HoldRelease,
+    id: DescriptorId,
+    version: u64,
+}
+
+impl RefcountReservation {
+    /// Take one unit of `(id, version)`. The caller holds the admission gate.
+    pub(crate) fn reserve(shared: &SharedState, id: DescriptorId, version: u64) -> Self {
+        shared.lease_refcount.increment(&id, version);
+        Self {
+            release: HoldRelease::for_state(shared),
+            id,
+            version,
+        }
+    }
+}
+
+impl Drop for RefcountReservation {
+    fn drop(&mut self) {
+        self.release.give_back([(self.id.clone(), self.version)]);
+    }
+}
+
 /// Owned collection of lease holds for one query.
 ///
 /// Created by `OriginCatalog::take_lease_scope()` after
@@ -115,10 +183,11 @@ impl LeaseRefCount {
 pub struct QueryLeaseScope {
     /// Exact descriptor-version refcounts this query holds.
     descriptor_versions: Vec<(DescriptorId, u64)>,
-    /// Refcount state shared independently of the process-wide state.
-    refcounts: Option<Arc<LeaseRefCount>>,
-    /// Minimal owned capability needed to release the underlying lease.
-    releaser: Option<LeaseReleaseHandle>,
+    /// Gives the holds back on drop, independently of the process-wide state.
+    release: Option<HoldRelease>,
+    /// This query's entry in the node's holder table, which lets a lost
+    /// lease revoke it. `None` for an empty scope.
+    holder: Option<(Arc<LeaseHolders>, HolderTicket)>,
 }
 
 impl QueryLeaseScope {
@@ -128,19 +197,61 @@ impl QueryLeaseScope {
     pub fn empty() -> Self {
         Self {
             descriptor_versions: Vec::new(),
-            refcounts: None,
-            releaser: None,
+            release: None,
+            holder: None,
         }
     }
 
     /// Build a scope from exact descriptor-version holds already incremented
-    /// on the node's `lease_refcount`. Only cloneable release capabilities are
-    /// retained, so the scope neither owns nor weak-references `SharedState`.
-    pub fn new(descriptor_versions: Vec<(DescriptorId, u64)>, shared: &SharedState) -> Self {
-        Self {
+    /// on the node's `lease_refcount`, and register it in the node's holder
+    /// table. Only cloneable capabilities are retained, so the scope neither
+    /// owns nor weak-references `SharedState`.
+    ///
+    /// Fails with a retryable error when the holder table is full. The
+    /// caller still owns the refcounts and rolls them back.
+    pub fn new(
+        descriptor_versions: Vec<(DescriptorId, u64)>,
+        shared: &SharedState,
+    ) -> Result<Self, Error> {
+        let mut seen = std::collections::HashSet::new();
+        let descriptors: Vec<DescriptorId> = descriptor_versions
+            .iter()
+            .filter(|(id, _)| seen.insert(id.clone()))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let holders = Arc::clone(&shared.lease_runtime.holders);
+        let ticket = holders.register(descriptors)?;
+        Ok(Self {
             descriptor_versions,
-            refcounts: Some(Arc::clone(&shared.lease_refcount)),
-            releaser: Some(LeaseReleaseHandle::from_shared(shared)),
+            release: Some(HoldRelease::for_state(shared)),
+            holder: Some((holders, ticket)),
+        })
+    }
+
+    /// The retryable error if this node lost a lease the scope holds.
+    pub fn check_not_revoked(&self) -> Result<(), Error> {
+        match self
+            .holder
+            .as_ref()
+            .and_then(|(_, t)| t.revocation().revoked_error())
+        {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Run `fut` while the scope holds its leases. Ends early with
+    /// [`Error::RetryableSchemaChanged`] once this node loses one of them;
+    /// dropping `fut` drops its pending Data Plane requests.
+    pub async fn guard<F: std::future::Future>(&self, fut: F) -> Result<F::Output, Error> {
+        let Some((_, ticket)) = self.holder.as_ref() else {
+            return Ok(fut.await);
+        };
+        let revocation = Arc::clone(ticket.revocation());
+        tokio::select! {
+            biased;
+            error = revocation.revoked() => Err(error),
+            output = fut => Ok(output),
         }
     }
 
@@ -166,57 +277,20 @@ impl QueryLeaseScope {
 
 impl Drop for QueryLeaseScope {
     fn drop(&mut self) {
+        if let Some((holders, ticket)) = self.holder.take() {
+            holders.deregister(&ticket);
+        }
         if self.descriptor_versions.is_empty() {
             return;
         }
-        let Some(refcounts) = self.refcounts.take() else {
+        let Some(release) = self.release.take() else {
             return;
         };
-        let Some(releaser) = self.releaser.take() else {
-            return;
-        };
-        // Decrement exact-version refcounts and collect ids whose total across
-        // every version just hit zero — only those need metadata release.
-        let mut to_release = Vec::new();
-        for (id, version) in self.descriptor_versions.drain(..) {
-            refcounts.decrement(&id, version);
-            if refcounts.current(&id) == 0 {
-                to_release.push(id);
-            }
-        }
-        if to_release.is_empty() {
-            return;
-        }
-        // Release is synchronous, so run it on Tokio's blocking pool when a
-        // runtime owns this drop. Drops can also occur on non-Tokio threads
-        // (notably teardown paths); then use an independent OS thread rather
-        // than silently retaining the metadata lease. Both paths call the same
-        // conditional release, which serializes with admissions on grant_gate.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let result =
-                    tokio::task::spawn_blocking(move || releaser.release_if_unheld(to_release))
-                        .await;
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        warn!(error = %error, "QueryLeaseScope drop: background release failed");
-                    }
-                    Err(error) => {
-                        warn!(error = %error, "QueryLeaseScope drop: spawn_blocking panicked");
-                    }
-                }
-            });
-        } else if let Err(error) = std::thread::Builder::new()
-            .name("nodedb-lease-release".into())
-            .spawn(move || {
-                if let Err(error) = releaser.release_if_unheld(to_release) {
-                    warn!(error = %error, "QueryLeaseScope drop: fallback release failed");
-                }
-            })
-        {
-            warn!(error = %error, "QueryLeaseScope drop: failed to spawn fallback release");
-        }
+        // The lease stays granted at refcount 0, so the next statement on the
+        // descriptor reuses it with no Raft round trip. A drain start releases
+        // it on this node, a drain that covers it releases it when this last
+        // hold ends, and the renewal loop lets it lapse at expiry.
+        release.give_back(self.descriptor_versions.drain(..));
     }
 }
 
@@ -229,7 +303,7 @@ mod tests {
     use nodedb_cluster::DescriptorKind;
 
     use crate::bridge::dispatch::Dispatcher;
-    use crate::control::lease::{DEFAULT_LEASE_DURATION, acquire_lease_after_admission};
+    use crate::control::lease::DEFAULT_LEASE_DURATION;
     use crate::wal::WalManager;
 
     fn id(name: &str) -> DescriptorId {
@@ -308,11 +382,11 @@ mod tests {
     #[test]
     fn empty_scope_drops_cleanly() {
         let scope = QueryLeaseScope::empty();
-        drop(scope); // should not panic even without a runtime
+        drop(scope); // does not panic even without a runtime
     }
 
     #[test]
-    fn no_runtime_drop_releases_last_unheld_lease() {
+    fn dropping_the_last_holder_keeps_the_lease_granted() {
         let (state, descriptor, scope, _directory) = {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -329,14 +403,28 @@ mod tests {
                     .expect("construct lease release state");
                 let descriptor = id("no-runtime-drop");
                 state.lease_refcount.increment(&descriptor, 1);
-                acquire_lease_after_admission(
-                    &state,
-                    descriptor.clone(),
-                    1,
-                    DEFAULT_LEASE_DURATION,
-                )
-                .expect("install single-node lease");
-                let scope = QueryLeaseScope::new(vec![(descriptor.clone(), 1)], &state);
+                // The grant as the metadata applier installs it. This test
+                // covers the holder count, not the proposal.
+                let expires_at = nodedb_types::Hlc::new(
+                    state.hlc_clock.peek().wall_ns + DEFAULT_LEASE_DURATION.as_nanos() as u64,
+                    0,
+                );
+                state
+                    .metadata_cache
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .leases
+                    .insert(
+                        (descriptor.clone(), state.node_id),
+                        nodedb_cluster::DescriptorLease {
+                            descriptor_id: descriptor.clone(),
+                            version: 1,
+                            node_id: state.node_id,
+                            expires_at,
+                        },
+                    );
+                let scope = QueryLeaseScope::new(vec![(descriptor.clone(), 1)], &state)
+                    .expect("register the scope's holder");
 
                 (state, descriptor, scope, directory)
             });
@@ -347,12 +435,11 @@ mod tests {
 
         drop(scope);
 
-        for _ in 0..100 {
-            if state.lookup_lease_for_self(&descriptor).is_none() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("no-runtime fallback did not release the unheld descriptor lease");
+        assert_eq!(state.lease_refcount.current(&descriptor), 0);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            state.lookup_lease_for_self(&descriptor).is_some(),
+            "an idle lease stays granted until a drain or its expiry"
+        );
     }
 }

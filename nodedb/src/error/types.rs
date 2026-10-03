@@ -6,7 +6,19 @@
 //! per-subsystem enums, so `match crate::Error::Variant` keeps resolving.
 //! `From` impls live in [`super::conversions`]; the reverse in `crate::error_from`.
 
-use crate::types::{DatabaseId, RequestId, TenantId, VShardId};
+use crate::event::cdc::CdcOffset;
+use crate::types::{RequestId, TenantId, VShardId};
+
+/// The committed and attempted offsets of an [`Error::OffsetRegression`].
+/// The variant boxes them, so this rare error does not set the size of
+/// every `Error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegressedOffsets {
+    /// The partition's committed offset.
+    pub current: CdcOffset,
+    /// The lower offset the commit attempted.
+    pub attempted: CdcOffset,
+}
 
 /// Internal actionable errors; public conversion hides infrastructure details.
 #[derive(Debug, thiserror::Error)]
@@ -30,16 +42,15 @@ pub enum Error {
 
     #[error(
         "offset regression on stream '{stream}' group '{group}' partition {partition_id}: \
-         attempted position {attempted_lsn}:{attempted_sequence} < current committed position {current_lsn}:{current_sequence}"
+         attempted position {} < current committed position {}",
+        .offsets.attempted,
+        .offsets.current
     )]
     OffsetRegression {
         stream: String,
         group: String,
         partition_id: u32,
-        current_lsn: u64,
-        current_sequence: u64,
-        attempted_lsn: u64,
-        attempted_sequence: u64,
+        offsets: Box<RegressedOffsets>,
     },
 
     #[error("request {request_id} exceeded deadline")]
@@ -229,10 +240,10 @@ pub enum Error {
         vshard_id: VShardId,
         leader_node: u64,
         leader_addr: String,
+        /// The Raft term `leader_node` is known at, `0` when the source knows
+        /// no term. A routing hint takes it only above the term it holds.
+        leader_term: u64,
     },
-
-    #[error("query fan-out exceeded: {shards_touched} shards > limit {limit}")]
-    FanOutExceeded { shards_touched: u16, limit: u16 },
 
     /// Refuses non-colocated cross-collection writes to prevent wrong reads.
     #[error(
@@ -246,10 +257,6 @@ pub enum Error {
         source_collection: String,
         target_collection: String,
     },
-
-    /// Clone materialization freeze; mapped to retryable SQLSTATE `40001`.
-    #[error("database {database_id} is frozen for clone materialization; retry shortly")]
-    SourceFrozen { database_id: DatabaseId },
 
     /// Write refused on a `Shadowed`/`Materializing` clone. `reason` names
     /// which case: the engine has no copy-up/tombstone module at all, or it
@@ -365,6 +372,28 @@ pub enum Error {
     )]
     RetryableLeaderChange { group_id: u64, log_index: u64 },
 
+    /// The entry at the proposer's index committed, but a snapshot install on
+    /// this node covered it before it applied here. The statement's result
+    /// was never produced on this node. Never retried: a re-proposal applies
+    /// the write a second time.
+    #[error(
+        "raft entry at group {group_id} index {log_index} committed, but its result could not be \
+         returned: a snapshot install covered it on this node. Do not retry the statement; \
+         a retry applies the write again. Read the data to see its effect"
+    )]
+    CommittedResultUnavailable { group_id: u64, log_index: u64 },
+
+    /// A snapshot install on this node covered the proposer's index, and the
+    /// snapshot does not name which proposal committed there. The write
+    /// either committed or was overwritten. Never retried blindly: a retry of
+    /// a committed write applies it a second time.
+    #[error(
+        "raft entry at group {group_id} index {log_index}: the outcome of this write is unknown. \
+         A snapshot install covered it on this node and does not name the proposal that \
+         committed there. Read the data to check whether the write applied before any retry"
+    )]
+    ProposalOutcomeUnknown { group_id: u64, log_index: u64 },
+
     /// A Raft group has no reachable majority of its voters, so nothing can
     /// commit in it. The operation that needed it applied nothing. It succeeds
     /// once enough of `unreachable` rejoin.
@@ -390,6 +419,15 @@ pub enum Error {
     )]
     GroupMarksUnavailable { group_id: u64, refused_by: Vec<u64> },
 
+    /// A database backup found no node holding the capture its cut barrier
+    /// took in `group_id`: the group's leadership moved between the barrier's
+    /// apply and the collection. Nothing was written.
+    #[error(
+        "database backup: no node holds the capture of raft group {group_id} at the backup's \
+         cut; its leadership moved before the backup collected it. Retry the backup"
+    )]
+    BackupCaptureMoved { group_id: u64 },
+
     /// No leader elected on the metadata group yet. Transient — an election
     /// is in progress — so callers can wait it out instead of failing.
     #[error("metadata raft group has no elected leader yet; retry needed")]
@@ -400,6 +438,12 @@ pub enum Error {
     /// did not catch up before the deadline. Nothing ran; the client retries.
     #[error("authorization state is not current on this node: {detail}; retry")]
     AuthorizationStateBehind { detail: String },
+
+    /// A linearizable read of `group_id` cannot be served here: no read index
+    /// was confirmed, or this node did not apply through it, before the
+    /// deadline. Nothing was read; the client retries.
+    #[error("raft group {group_id} cannot serve a linearizable read here: {detail}; retry")]
+    LinearizableReadRefused { group_id: u64, detail: String },
 
     #[error("execution limit exceeded: {detail}")]
     ExecutionLimitExceeded { detail: String },
@@ -465,6 +509,25 @@ pub enum Error {
     #[error("version compatibility: {detail}")]
     VersionCompat { detail: String },
 
+    /// A snapshot restore targeted a data directory that holds entries.
+    #[error(
+        "restore target {} is not empty; restore into an empty or absent data directory",
+        path.display()
+    )]
+    RestoreTargetNotEmpty { path: std::path::PathBuf },
+
+    /// A RESTORE TENANT's recomputed row counts or digests differ from the
+    /// backup's, for every collection in `mismatches`. In the destination
+    /// phase the restore wrote its rows and does not roll them back.
+    #[error(
+        "{}",
+        nodedb_types::backup_envelope::verification_failure_message(phase, mismatches)
+    )]
+    RestoreVerificationFailed {
+        phase: nodedb_types::backup_envelope::VerificationPhase,
+        mismatches: Vec<nodedb_types::backup_envelope::VerificationMismatch>,
+    },
+
     #[error("internal error: {detail}")]
     Internal { detail: String },
 
@@ -502,6 +565,19 @@ pub enum Error {
          found no catalog row to deactivate"
     )]
     CollectionPurgeRowMissing {
+        database_id: u64,
+        tenant_id: u64,
+        name: String,
+    },
+
+    /// A collection row reached the catalog with no incarnation. Every writer
+    /// stamps the row first, so the catalog refuses it rather than commit a
+    /// row no write can route by.
+    #[error(
+        "collection '{name}' (database {database_id}, tenant {tenant_id}) carries no \
+         incarnation; the catalog refuses an unstamped collection row"
+    )]
+    CollectionUnstamped {
         database_id: u64,
         tenant_id: u64,
         name: String,
@@ -561,11 +637,12 @@ pub enum Error {
     )]
     CrossShardInExplicitTransaction,
 
-    /// The Calvin sequencer inbox is unavailable — this node is running in
-    /// embedded/local mode without a cluster deployment.
+    /// The Calvin sequencer inbox is not set on this node. `start_raft` sets
+    /// it during boot, before any listener opens, so a running server never
+    /// returns this. A `SharedState` that never ran `start_raft` does.
     #[error(
-        "cross-shard transactions require a cluster deployment with the Calvin sequencer; \
-         this node is running in embedded/local mode"
+        "the Calvin sequencer is not running on this node; \
+         cross-shard transactions are refused until cluster startup completes"
     )]
     SequencerUnavailable,
 
@@ -704,16 +781,6 @@ mod tests {
         };
         assert!(e.to_string().contains("req:42"));
         assert!(e.to_string().contains("deadline"));
-    }
-
-    #[test]
-    fn error_display_fan_out() {
-        let e = Error::FanOutExceeded {
-            shards_touched: 32,
-            limit: 16,
-        };
-        assert!(e.to_string().contains("32"));
-        assert!(e.to_string().contains("16"));
     }
 
     #[test]

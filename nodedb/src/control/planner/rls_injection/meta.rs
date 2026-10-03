@@ -23,6 +23,15 @@ pub(super) fn inject_meta(ctx: &RlsCtx<'_>, op: &mut MetaOp) -> crate::Result<()
             )
         }
 
+        // Refuse: hash-chain verification recomputes every link from every
+        // stored row. A walk over the rows the policy leaves visible is not
+        // the chain, and its verdict will expose rows the policy hides.
+        MetaOp::VerifyHashChain { collection } => ctx.refuse_if_policy(
+            collection,
+            "hash-chain verification reads every stored row, which the row filter cannot be \
+             evaluated against",
+        ),
+
         // Refuse: a byte-size estimate is derived from every stored row of the
         // collection, including the ones the policy hides, and carries no row
         // to filter. `name` is a bare collection name — qualify it against
@@ -67,7 +76,7 @@ pub(super) fn inject_meta(ctx: &RlsCtx<'_>, op: &mut MetaOp) -> crate::Result<()
         // No-op: durability, cancellation, snapshot install, purge, retention,
         // index and synonym maintenance, transaction-overlay bookkeeping, and
         // continuous-aggregate administration. None of these returns stored
-        // rows to a caller, and none writes a user row a policy predicate could
+        // rows to a caller, and none writes a user row a policy predicate can
         // be evaluated against — they are authorized by the permission check
         // that precedes this pass.
         MetaOp::WalAppend { .. }
@@ -95,14 +104,15 @@ pub(super) fn inject_meta(ctx: &RlsCtx<'_>, op: &mut MetaOp) -> crate::Result<()
         | MetaOp::RebuildIndex { .. }
         | MetaOp::PutSynonymGroup { .. }
         | MetaOp::DeleteSynonymGroup { .. }
-        | MetaOp::RenameCollection { .. }
         | MetaOp::DropTxnOverlay { .. }
         | MetaOp::MarkSavepoint { .. }
         | MetaOp::RollbackToSavepoint { .. }
         | MetaOp::CalvinFlush { .. }
         | MetaOp::CalvinDrop { .. }
         | MetaOp::CalvinResolve { .. }
-        | MetaOp::ApplyTransactionRedo { .. } => Ok(()),
+        | MetaOp::ApplyTransactionRedo { .. }
+        | MetaOp::RestoreRedo(_)
+        | MetaOp::HomeVersions { .. } => Ok(()),
     }
 }
 
@@ -138,6 +148,8 @@ mod tests {
         let mut plan = PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot {
             tenant_id: 1,
             cut_watermark: None,
+            cut_capture: None,
+            arrays: false,
         });
         assert!(matches!(
             inject(&mut plan, &store),

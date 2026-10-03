@@ -26,19 +26,23 @@
 //!
 //! Split by concern, run in this fixed order by [`driver::submit_write`]:
 //! - [`admission`]: the write-admission gate.
-//! - [`wal_append`]: Array DDL authorization and the WAL redo append/stamp.
+//! - [`wal_append`]: the array DDL refusal and the WAL redo append/stamp.
 //! - [`dispatch`]: building the wire `Request` and handing it to the Data
 //!   Plane.
+//! - [`answer`]: where the response phase reads the answer.
 //! - [`response`]: collecting the response, classifying the outcome, and the
 //!   post-apply steps a successful write still owes.
 //! - [`pending`]: the write between its enqueue and its response phase.
 
 mod admission;
+mod answer;
 mod dispatch;
 mod driver;
+mod late_parts;
 mod pending;
 mod response;
 mod wal_append;
 
+pub(crate) use dispatch::dispatch_when_capacity_frees;
 pub(crate) use driver::enqueue_write;
 pub(crate) use pending::{PendingWrite, submit_write};

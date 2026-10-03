@@ -12,10 +12,10 @@
 //! same byte key or `(src, dst)` edge must produce the same `u32` on every
 //! node, so `DefaultHasher` (RandomState) is explicitly NOT used.
 //!
-//! `EngineKeySet.collection` arrives already database-qualified —
-//! `collection_name_from_plan` reads it off the physical plan's own
-//! qualified collection field — so every `PassiveReadKeyId` below rebuilds
-//! it via `from_stored` rather than re-qualifying.
+//! `EngineKeySet.collection` arrives already database-qualified: the Calvin
+//! write-key extraction reads it off the physical plan's own qualified
+//! collection field. So every `PassiveReadKeyId` below rebuilds it via
+//! `from_stored` rather than re-qualifying.
 
 use nodedb_physical::physical_plan::meta::PassiveReadKeyId;
 use nodedb_types::Value;
@@ -103,6 +103,10 @@ impl CoreLoop {
                     )
                 })
                 .collect(),
+
+            // An array write is a static write: no dependent transaction
+            // predicts its cells, so no passive participant reads them.
+            EngineKeySet::Array { .. } => Vec::new(),
         }
     }
 

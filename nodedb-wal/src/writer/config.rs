@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::align::DEFAULT_ALIGNMENT;
 use crate::double_write::{DoubleWriteBuffer, DwbDegradation, DwbMode, DwbProtection};
+use crate::time_anchors::TimeAnchors;
 
 /// Default write buffer size: 2 MiB.
 ///
@@ -31,6 +33,11 @@ pub struct WalWriterConfig {
     /// `Direct` when `use_direct_io` is true, `Buffered` otherwise.
     /// `Some(DwbMode::Off)` disables the DWB entirely.
     pub dwb_mode: Option<DwbMode>,
+
+    /// Commit-time anchors. When set, every sync that commits new records
+    /// appends one `TimeAnchor` record to its batch and, once fsynced, records
+    /// it here. `None` writes no anchors.
+    pub time_anchors: Option<Arc<TimeAnchors>>,
 }
 
 impl Default for WalWriterConfig {
@@ -40,6 +47,7 @@ impl Default for WalWriterConfig {
             alignment: DEFAULT_ALIGNMENT,
             use_direct_io: true,
             dwb_mode: None,
+            time_anchors: None,
         }
     }
 }

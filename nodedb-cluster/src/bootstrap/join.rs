@@ -96,8 +96,10 @@ pub(super) async fn join(
         node_id: config.node_id,
         listen_addr: config.listen_addr.to_string(),
         wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
+        build_id: config.wire_build_id.clone(),
         spiffe_id: None,
         spki_pin: transport.local_spki_pin().map(|arr| arr.to_vec()),
+        swim_addr: config.swim_udp_addr.map(|a| a.to_string()),
     };
 
     let policy = config.join_retry;
@@ -263,30 +265,7 @@ fn apply_join_response(
     // 1. Reconstruct topology.
     let mut topology = ClusterTopology::new();
     for node in &resp.nodes {
-        let state = NodeState::from_u8(node.state).unwrap_or(NodeState::Active);
-        let spki_pin: Option<[u8; 32]> = node.spki_pin.as_deref().and_then(|b| {
-            if b.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(b);
-                Some(arr)
-            } else {
-                None
-            }
-        });
-        let mut info = NodeInfo::new(
-            node.node_id,
-            node.addr.parse().unwrap_or_else(|_| {
-                "0.0.0.0:0"
-                    .parse()
-                    .expect("invariant: \"0.0.0.0:0\" is a valid SocketAddr literal")
-            }),
-            state,
-        )
-        .with_wire_version(node.wire_version)
-        .with_spiffe_id(node.spiffe_id.clone())
-        .with_spki_pin(spki_pin);
-        // Override raft_groups from wire data (NodeInfo::new starts empty).
-        info.raft_groups = node.raft_groups.clone();
+        let mut info = NodeInfo::from_wire(node);
         if node.node_id == config.node_id {
             info.state = NodeState::Active;
         }
@@ -303,6 +282,7 @@ fn apply_join_response(
             g.group_id,
             GroupInfo {
                 leader: g.leader,
+                leader_term: 0,
                 members: g.members.clone(),
                 learners: g.learners.clone(),
                 // Join response carries no placement; it converges via
@@ -532,6 +512,7 @@ mod tests {
             install_snapshot_chunk_bytes: 4 * 1024 * 1024,
             orphan_partial_max_age_secs: 300,
             log_compaction_threshold: None,
+            wire_build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
         };
         let state1 = bootstrap(&config1, &catalog1, None).unwrap();
 
@@ -704,6 +685,7 @@ mod tests {
             install_snapshot_chunk_bytes: 4 * 1024 * 1024,
             orphan_partial_max_age_secs: 300,
             log_compaction_threshold: None,
+            wire_build_id: nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
         };
 
         let lifecycle = ClusterLifecycleTracker::new();

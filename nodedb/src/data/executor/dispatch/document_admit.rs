@@ -13,6 +13,13 @@ use nodedb_types::SystemTimeScope;
 
 use crate::data::executor::handlers::document::read::DocScanMode;
 
+/// The engines every document write loads, in the order the pressure gate
+/// checks them. Full-text indexing is a side effect of every document write.
+pub(super) const DOCUMENT_WRITE_ENGINES: [nodedb_mem::EngineId; 2] = [
+    nodedb_mem::EngineId::DocumentSchemaless,
+    nodedb_mem::EngineId::Fts,
+];
+
 /// Whether the op mutates stored state.
 ///
 /// Enumerated rather than inferred so a new mutating variant has to be named

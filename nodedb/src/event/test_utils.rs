@@ -45,6 +45,20 @@ pub fn event_test_deps(dir: &tempfile::TempDir) -> EventTestDeps {
         crate::data::executor::core_loop::test_governor(),
     )
     .unwrap();
+    // The gateway install production boot runs. This state runs no metadata
+    // group, so a DDL refuses on it: a test that proposes boots
+    // `control::cluster::test_one_node` instead.
+    crate::bootstrap::state_wiring::install_gateway(&shared_state).unwrap();
     let cdc_router = Arc::clone(&shared_state.cdc_router);
     (wal, watermark_store, shared_state, trigger_dlq, cdc_router)
+}
+
+/// A commit HLC at the current wall time, in nanoseconds, for a test event
+/// that must stay inside a stream's age retention.
+pub fn test_commit_hlc() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        })
 }

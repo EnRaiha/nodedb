@@ -38,7 +38,7 @@ use crate::control::security::auth_fence::cluster::{
     confirmed_read_index, hosts_group, routed_groups, wait_applied,
 };
 use crate::control::state::SharedState;
-use crate::control::state::tenant_marks::{GroupMark, LOCAL_MARK_GROUP};
+use crate::control::state::tenant_marks::GroupMark;
 use crate::types::{DatabaseId, TraceId};
 
 /// First wait before the guard asks again for the marks of groups whose
@@ -60,14 +60,19 @@ pub(super) struct NewestWrite {
 }
 
 /// One group's mark on the wire: `(group_id, commit_hlc, site_code,
-/// collection)`.
-type WireMark = (u64, u64, u8, String);
+/// collection, restore_id)`.
+type WireMark = (u64, u64, u8, String, u64);
 
 /// The newest committed write of `tenant_id` across every data group, and
 /// this node's own mark of writes no data group carries.
+///
+/// A write RESTORE `own_restore_id` re-issued is this restore's own: a retry
+/// of the same envelope skips it. Every other write counts, including one an
+/// earlier attempt of another restore re-issued.
 pub(super) async fn newest_committed_write(
     state: &Arc<SharedState>,
     tenant_id: u64,
+    own_restore_id: u64,
 ) -> Result<Option<NewestWrite>, Error> {
     let mut newest = state.tenant_write_mark(tenant_id).map(|mark| NewestWrite {
         hlc: mark.hlc,
@@ -75,6 +80,9 @@ pub(super) async fn newest_committed_write(
         collection: mark.origin.collection,
     });
     let mut consider = |mark: GroupMark| {
+        if is_own_restore_write(&mark, own_restore_id) {
+            return;
+        }
         if newest.as_ref().is_none_or(|current| mark.hlc > current.hlc) {
             newest = Some(NewestWrite {
                 hlc: mark.hlc,
@@ -83,11 +91,6 @@ pub(super) async fn newest_committed_write(
             });
         }
     };
-    // The durable mark of this node's writes while it ran with no Raft groups.
-    if let Some(mark) = state.tenant_marks.get(LOCAL_MARK_GROUP, tenant_id) {
-        consider(mark);
-    }
-
     // The statement deadline, shared by every group and every attempt.
     let deadline = tokio::time::Instant::now()
         + Duration::from_secs(state.tuning.network.default_deadline_secs);
@@ -257,7 +260,7 @@ pub(crate) async fn local_tenant_marks(
     for &group_id in group_ids {
         let index = confirmed_read_index(state, group_id, remaining(deadline)?).await?;
         wait_applied(state, group_id, index, remaining(deadline)?).await?;
-        if let Some(mark) = state.tenant_marks.get(group_id, tenant_id) {
+        for mark in state.tenant_marks.get_all(group_id, tenant_id) {
             marks.push((group_id, mark));
         }
     }
@@ -274,6 +277,7 @@ pub(crate) fn encode_marks(marks: &[(u64, GroupMark)]) -> Result<Vec<u8>, Error>
                 mark.hlc,
                 mark.site.code(),
                 mark.collection.clone().unwrap_or_default(),
+                mark.restore_id,
             )
         })
         .collect();
@@ -290,17 +294,23 @@ fn decode_marks(bytes: &[u8]) -> Result<Vec<(u64, GroupMark)>, Error> {
     })?;
     Ok(wire
         .into_iter()
-        .map(|(group_id, hlc, site, collection)| {
+        .map(|(group_id, hlc, site, collection, restore_id)| {
             (
                 group_id,
                 GroupMark {
                     hlc,
                     site: crate::control::state::tenant_marks::MarkSite::from_code(site),
                     collection: (!collection.is_empty()).then_some(collection),
+                    restore_id,
                 },
             )
         })
         .collect())
+}
+
+/// Whether RESTORE `own_restore_id` re-issued the write `mark` records.
+fn is_own_restore_write(mark: &GroupMark, own_restore_id: u64) -> bool {
+    mark.restore_id != 0 && mark.restore_id == own_restore_id
 }
 
 /// The time left before `deadline`, or the deadline error once it passed.
@@ -365,6 +375,8 @@ async fn remote_tenant_marks(
         trace_id: TraceId::generate().0,
         descriptor_versions: Vec::new(),
         txn_id: None,
+        vshard_id: None,
+        read_groups: Vec::new(),
     });
     let response = tokio::time::timeout_at(deadline, transport.send_rpc(node_id, request))
         .await
@@ -418,5 +430,40 @@ async fn remote_tenant_marks(
             ),
         }
         .into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::state::tenant_marks::MarkSite;
+
+    fn mark(restore_id: u64) -> GroupMark {
+        GroupMark {
+            hlc: 10,
+            site: MarkSite::Restore,
+            collection: None,
+            restore_id,
+        }
+    }
+
+    #[test]
+    fn only_the_same_restore_owns_a_mark() {
+        assert!(is_own_restore_write(&mark(7), 7));
+        assert!(
+            !is_own_restore_write(&mark(8), 7),
+            "another restore's write counts"
+        );
+        assert!(
+            !is_own_restore_write(&mark(0), 0),
+            "a user write always counts"
+        );
+    }
+
+    #[test]
+    fn marks_keep_their_restore_id_on_the_wire() {
+        let marks = vec![(3, mark(7)), (4, mark(0))];
+        let bytes = encode_marks(&marks).expect("encode");
+        assert_eq!(decode_marks(&bytes).expect("decode"), marks);
     }
 }

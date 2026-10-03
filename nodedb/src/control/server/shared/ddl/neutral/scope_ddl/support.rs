@@ -4,8 +4,7 @@
 
 use super::super::super::result::{DdlError, DdlResult};
 
-/// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
-/// the pgwire scope handlers produced (via `sqlstate_error`).
+/// Construct a [`DdlError`] from a SQLSTATE code and a message.
 pub(super) fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
 }

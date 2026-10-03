@@ -7,10 +7,8 @@
 //! EXPLAIN SCOPE FOR AUTH USER 'user_123'
 //! ```
 //!
-//! Ported from the pgwire `ddl::explain_ddl` handlers. The permission /
-//! scope evaluation reads and the synthetic-identity construction are
-//! preserved verbatim; only the result construction changed from pgwire
-//! `Response` / `QueryResponse` to the protocol-neutral `DdlResult` over
+//! The permission / scope evaluation reads and the synthetic-identity
+//! construction run here. The result is the protocol-neutral `DdlResult` over
 //! `ShapedRows`.
 
 use serde_json::{Map, Value as JsonValue};
@@ -24,9 +22,7 @@ use super::super::result::{DdlError, DdlResult};
 
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
 ///
-/// Preserves the exact SQLSTATE / message the pgwire explain handlers
-/// produced (via `sqlstate_error`), so error parity stays byte-identical
-/// after the migration off the pgwire router.
+/// The SQLSTATE and message reach the client unchanged.
 fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
 }

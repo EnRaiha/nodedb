@@ -85,16 +85,11 @@ async fn spawned_forwarder_observes_shutdown_abort() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_disconnect_drops_active_subscriptions() {
     use futures::{SinkExt, StreamExt};
-    use nodedb::bridge::dispatch::Dispatcher;
     use nodedb::config::auth::AuthMode;
-    use nodedb::control::state::SharedState;
-    use nodedb::wal::WalManager;
+    use nodedb_test_support::booted_state::{BootOptions, BootedState};
     use tokio_tungstenite::tungstenite::Message;
 
-    let dir = tempfile::tempdir().unwrap();
-    let wal = Arc::new(WalManager::open_for_testing(&dir.path().join("ws.wal")).unwrap());
-    let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-    let shared = SharedState::new(dispatcher, wal).unwrap();
+    let shared = BootedState::boot(BootOptions::default());
     shared
         .credentials
         .bootstrap_trust_superuser("nodedb")
@@ -104,7 +99,7 @@ async fn ws_disconnect_drops_active_subscriptions() {
     let local_addr = listener.local_addr().unwrap();
 
     let (bus, _) = nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&shared.shutdown));
-    let shared_http = Arc::clone(&shared);
+    let shared_http = Arc::clone(&*shared);
     let server_handle = tokio::spawn(async move {
         nodedb::control::server::http::server::run_with_listener(
             listener,
@@ -120,7 +115,8 @@ async fn ws_disconnect_drops_active_subscriptions() {
     // Give the server a tick to start accepting.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    assert_eq!(shared.change_stream.subscriber_count(), 0);
+    // The node's own subscribers, if any, stay throughout.
+    let baseline = shared.change_stream.subscriber_count();
 
     // Open a WS connection, register 5 LIVE subscriptions.
     let url = format!("ws://{local_addr}/v1/ws");
@@ -141,18 +137,18 @@ async fn ws_disconnect_drops_active_subscriptions() {
     // All 5 subscriptions registered on the server.
     assert_eq!(
         shared.change_stream.subscriber_count(),
-        5,
+        baseline + 5,
         "server must have 5 active subscriptions while the WS client is connected"
     );
 
     // Abruptly drop the client. The server's `handle_ws_connection` drops
     // `LiveSubscriptionSet`, which aborts the 5 forwarder tasks, dropping
-    // each `Subscription` — counter must return to 0.
+    // each `Subscription` — the counter must return to its baseline.
     drop(ws);
 
     // Give the server a moment to observe the close and drop the set.
     for _ in 0..20 {
-        if shared.change_stream.subscriber_count() == 0 {
+        if shared.change_stream.subscriber_count() == baseline {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -160,9 +156,9 @@ async fn ws_disconnect_drops_active_subscriptions() {
 
     assert_eq!(
         shared.change_stream.subscriber_count(),
-        0,
-        "disconnect must abort every LIVE forwarder and return active_subscriptions to 0 — \
-         detached spawn would leak 5 subscriptions here"
+        baseline,
+        "disconnect must abort every LIVE forwarder and return active_subscriptions to its \
+         baseline — detached spawn would leak 5 subscriptions here"
     );
 
     server_handle.abort();

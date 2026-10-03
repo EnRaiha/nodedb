@@ -4,7 +4,7 @@
 //!
 //! Writes only. The leader checks the topic name and the duplicate before
 //! proposing, so apply runs the unvalidated catalog path: a rejection here
-//! would leave followers without a topic the leader already accepted.
+//! leaves followers without a topic the leader already accepted.
 
 use crate::control::security::catalog::{SystemCatalog, catalog_err};
 use crate::event::topic::TopicDef;
@@ -70,6 +70,8 @@ mod tests {
             created_at: 1_000,
             last_sequence: 0,
             last_lsn: 0,
+            last_epoch: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 
@@ -78,6 +80,7 @@ mod tests {
             database_id: DB,
             tenant_id: TENANT,
             name: NAME.to_string(),
+            target_hlc: nodedb_types::Hlc::new(7, 1),
         }
     }
 
@@ -106,7 +109,9 @@ mod tests {
                 database_id,
                 tenant_id,
                 name,
+                target_hlc,
             } => {
+                assert_eq!(target_hlc, nodedb_types::Hlc::new(7, 1));
                 assert_eq!(database_id, DB);
                 assert_eq!(tenant_id, TENANT);
                 assert_eq!(name, NAME);
@@ -164,6 +169,7 @@ mod tests {
                 stream_name: format!("topic:{NAME}"),
                 owner: "admin".to_string(),
                 created_at: 1_000,
+                modification_hlc: nodedb_types::Hlc::ZERO,
             })
             .expect("seed group");
 

@@ -2,13 +2,55 @@
 
 //! Name / flag validation for `build_and_persist`: collection-name shape,
 //! the `WITH (crdt=...)` boolean, and `SIGNED_DELTAS` ⇒ CRDT + authenticated
-//! WAL. Relocated verbatim from the pgwire
-//! `pgwire::ddl::collection::create::build` module (now deleted).
+//! WAL.
 
 use super::super::super::super::result::DdlError;
 
 pub(super) fn err(sqlstate: &str, message: String) -> DdlError {
     DdlError::new(sqlstate, message)
+}
+
+/// Declare the hash-chain system columns on a strict `HASH_CHAIN` collection.
+///
+/// A strict row stores only declared columns, and the chain writes
+/// `_chain_hash` and `_chain_seq` into every row. They are nullable because a
+/// transaction encodes its staged rows before the install links them. A user
+/// column with either name is refused. Other collection types are unchanged.
+pub(super) fn declare_hash_chain_columns(
+    collection_type: &mut nodedb_types::CollectionType,
+    hash_chain: bool,
+) -> Result<(), DdlError> {
+    use crate::types::hash_chain::{CHAIN_HASH_FIELD, CHAIN_SEQ_FIELD};
+    use nodedb_types::columnar::{ColumnDef, ColumnType};
+
+    let nodedb_types::CollectionType::Document(nodedb_types::DocumentMode::Strict(schema)) =
+        collection_type
+    else {
+        return Ok(());
+    };
+    if !hash_chain {
+        return Ok(());
+    }
+    if let Some(column) = schema
+        .columns
+        .iter()
+        .find(|column| column.name == CHAIN_HASH_FIELD || column.name == CHAIN_SEQ_FIELD)
+    {
+        return Err(err(
+            "42939",
+            format!(
+                "column '{}' is a hash-chain system column; HASH_CHAIN declares it",
+                column.name
+            ),
+        ));
+    }
+    schema
+        .columns
+        .push(ColumnDef::nullable(CHAIN_HASH_FIELD, ColumnType::String));
+    schema
+        .columns
+        .push(ColumnDef::nullable(CHAIN_SEQ_FIELD, ColumnType::Int64));
+    Ok(())
 }
 
 /// Parse a `WITH (crdt=...)` option value as a boolean, accepting
@@ -30,7 +72,7 @@ fn parse_crdt_flag(value: &str) -> Result<bool, DdlError> {
 /// A missing `crdt` option defaults to `false`. CRDT (Loro) storage is a
 /// document-engine capability, so `crdt=true` is rejected with SQLSTATE
 /// 42601 on any non-document collection rather than persisting a flag no
-/// engine would honor.
+/// engine will honor.
 pub(super) fn resolve_crdt_flag(
     options: &[(String, String)],
     collection_type: &nodedb_types::CollectionType,
@@ -88,8 +130,7 @@ pub(super) fn validate_name(name: &str, label: &str) -> Result<(), DdlError> {
 
 #[cfg(test)]
 mod tests {
-    //! Collection name validation tests. Relocated verbatim from the pgwire
-    //! `pgwire::ddl::collection::create::tests` module (now deleted).
+    //! Collection name validation tests.
 
     use super::{resolve_crdt_flag, validate_crdt_signing_storage};
 

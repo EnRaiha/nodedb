@@ -6,14 +6,40 @@ use std::time::{Duration, Instant};
 
 use super::scheduler::Scheduler;
 use crate::bridge::envelope::{Admission, ExemptReason, Priority, Request};
+use crate::control::cluster::calvin::scheduler::lock_manager::TxnId;
 use crate::types::{DatabaseId, Lsn, ReadConsistency, RequestId, TenantId, VShardId};
 use nodedb_physical::physical_plan::PhysicalPlan;
 
-/// The event source every Calvin sub-operation runs with. The redo record a
-/// committed Calvin transaction appends carries the same source, so WAL
-/// replay rebuilds the events its flush emits.
+/// The event source a Calvin sub-operation runs with when its transaction
+/// names none: a client transaction's.
 pub(in crate::control::cluster::calvin::scheduler::driver::core) const CALVIN_EVENT_SOURCE:
     crate::event::EventSource = crate::event::EventSource::User;
+
+/// The event source a sequenced transaction's writes carry. Its redo record
+/// and its flush both carry it, so WAL replay rebuilds the events the flush
+/// emits, and a server-run body's writes fire no triggers.
+pub(in crate::control::cluster::calvin::scheduler::driver::core) fn txn_event_source(
+    tx_class: &nodedb_cluster::calvin::types::TxClass,
+) -> crate::event::EventSource {
+    crate::event::EventSource::from_wal_code(tx_class.event_source).unwrap_or(CALVIN_EVENT_SOURCE)
+}
+
+/// The event source this vShard's slice of a sequenced transaction commits
+/// under. A slice only trigger bodies wrote, in a transaction a client also
+/// wrote, takes the source a body's row takes in one overlay. Every other
+/// slice takes the transaction's source. The stage, the resolve, the redo
+/// record and the flush all carry it.
+pub(in crate::control::cluster::calvin::scheduler::driver::core) fn slice_event_source(
+    tx_class: &nodedb_cluster::calvin::types::TxClass,
+    flush_scope: &super::super::types::FlushScope,
+) -> crate::event::EventSource {
+    let source = txn_event_source(tx_class);
+    if flush_scope.body_only {
+        source.committed_row_override(crate::event::EventSource::Trigger)
+    } else {
+        source
+    }
+}
 
 impl Scheduler {
     /// Builds a `Request` for an already-sequenced Calvin sub-operation.
@@ -50,6 +76,7 @@ impl Scheduler {
             txn_id: None,
             wal_lsn,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: Admission::Exempt(ExemptReason::AlreadyOrdered),
         }
     }
@@ -64,5 +91,32 @@ impl Scheduler {
             + Duration::from_millis(
                 self.config.epoch_duration_ms * u64::from(self.config.txn_deadline_multiplier),
             )
+    }
+
+    /// Spawn a bridge task that awaits a single executor response and forwards
+    /// it to the scheduler's fan-in completion channel.
+    ///
+    /// The bridge task is cancel-safe: it holds only a cloned sender and the
+    /// per-request receiver. Dropping the scheduler's `completion_rx` causes
+    /// the bridge's `send` to fail silently, which is fine on shutdown.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn spawn_response_bridge(
+        &self,
+        txn_id: TxnId,
+        request_id: RequestId,
+        mut response_rx: crate::control::ResponseReceiver,
+    ) {
+        let tx = self.completion_tx.clone();
+        tokio::spawn(async move {
+            let result = response_rx.recv().await;
+            // Ignore send error: scheduler has shut down.
+            let _ = tx.send((txn_id, request_id, result)).await;
+        });
+    }
+
+    /// Allocate a fresh request ID for a dispatch.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn next_request_id(
+        &self,
+    ) -> RequestId {
+        self.shared.next_request_id()
     }
 }

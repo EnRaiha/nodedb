@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use nodedb_types::RowIdentity;
+use nodedb_types::{RowIdentity, Surrogate};
 use sonic_rs;
 
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
@@ -25,7 +25,9 @@ use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 pub enum RowId {
     /// A document, KV, or graph-node row.
     Row(RowIdentity),
-    /// A KV batch op that names no single row.
+    /// A write that names no single row: a KV batch op, a published message,
+    /// or a timeseries row, which has no identity of its own. The event's
+    /// record occurrence tells two such events of one record apart.
     Batch,
     /// A graph edge, named by its endpoints and label. Boxed so every
     /// event on the ring pays for one identity, not four strings.
@@ -37,16 +39,30 @@ pub enum RowId {
 /// Text a [`RowId::Batch`] renders as.
 const BATCH_ROW_ID: &str = "_batch";
 
-/// A graph edge's `(src, label, dst)` identity with its composite text.
+/// A graph edge's `(src, label, dst)` identity with its composite text and
+/// the endpoints' bound surrogates.
 ///
 /// The text is what [`crate::event::graph_cdc::edge_row_id`] builds, rendered
-/// once at construction so `as_str` allocates nothing.
+/// once at construction so `as_str` allocates nothing. The surrogates are the
+/// endpoints' cross-engine identity: the forward emit takes them from the
+/// plan, and WAL replay from the record.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EdgeRowId {
     src: String,
     label: String,
     dst: String,
+    src_surrogate: Surrogate,
+    dst_surrogate: Surrogate,
     rendered: String,
+}
+
+/// The two endpoints of an edge: each user-visible id with its bound
+/// surrogate. Input to [`RowId::edge`].
+pub struct EdgeEndpoints<S> {
+    pub src: S,
+    pub src_surrogate: Surrogate,
+    pub dst: S,
+    pub dst_surrogate: Surrogate,
 }
 
 impl EdgeRowId {
@@ -62,6 +78,16 @@ impl EdgeRowId {
         &self.dst
     }
 
+    /// The source endpoint's bound surrogate.
+    pub fn src_surrogate(&self) -> Surrogate {
+        self.src_surrogate
+    }
+
+    /// The destination endpoint's bound surrogate.
+    pub fn dst_surrogate(&self) -> Surrogate {
+        self.dst_surrogate
+    }
+
     /// The composite `src\u{1}label\u{1}dst` text.
     pub fn as_str(&self) -> &str {
         &self.rendered
@@ -74,8 +100,15 @@ impl RowId {
         Self::Row(identity)
     }
 
-    /// Name a graph edge by its `(src, label, dst)` triple.
-    pub fn edge(src: impl Into<String>, label: impl Into<String>, dst: impl Into<String>) -> Self {
+    /// Name a graph edge by its `(src, label, dst)` triple and its endpoints'
+    /// bound surrogates.
+    pub fn edge<S: Into<String>>(endpoints: EdgeEndpoints<S>, label: impl Into<String>) -> Self {
+        let EdgeEndpoints {
+            src,
+            src_surrogate,
+            dst,
+            dst_surrogate,
+        } = endpoints;
         let src = src.into();
         let label = label.into();
         let dst = dst.into();
@@ -84,6 +117,8 @@ impl RowId {
             src,
             label,
             dst,
+            src_surrogate,
+            dst_surrogate,
             rendered,
         }))
     }
@@ -182,6 +217,13 @@ pub struct WriteEvent {
     /// Populated from `Request.statement_digest` (which reuses the plan digest
     /// already computed by nodedb-sql). `None` for non-user writes.
     pub statement_digest: Option<Arc<str>>,
+
+    /// HLC wall time, in nanoseconds, at which the write committed, from
+    /// `Request.commit_hlc`. It dates the write's CDC event on every path,
+    /// including a write that has no WAL record of its own. `None` for an
+    /// event rebuilt from a WAL record, which the record's commit HLC dates,
+    /// and for a heartbeat.
+    pub commit_hlc: Option<u64>,
 }
 
 /// Where an event sits in the WAL record it reproduces.
@@ -222,13 +264,17 @@ pub enum WriteOp {
     /// for >1 second. Carries the current LSN and wall-clock timestamp.
     /// Advances partition watermarks without triggering CDC/triggers/MVs.
     Heartbeat,
+    /// A `PUBLISH TO` message a committed transaction owes its topic. The
+    /// event's `new_value` holds the encoded [`crate::wal::RedoPublish`].
+    /// The Event Plane sends it to the topic. It writes no row.
+    Publish,
 }
 
 impl WriteOp {
     /// Whether this operation should trigger CDC routing, triggers, and MVs.
-    /// Heartbeats only advance watermarks — they are NOT data events.
+    /// Heartbeats and publishes write no row, so they are not data events.
     pub fn is_data_event(&self) -> bool {
-        !matches!(self, Self::Heartbeat)
+        !matches!(self, Self::Heartbeat | Self::Publish)
     }
 }
 
@@ -241,6 +287,7 @@ impl std::fmt::Display for WriteOp {
             Self::BulkInsert { count } => write!(f, "BULK_INSERT({count})"),
             Self::BulkDelete { count } => write!(f, "BULK_DELETE({count})"),
             Self::Heartbeat => write!(f, "HEARTBEAT"),
+            Self::Publish => write!(f, "PUBLISH"),
         }
     }
 }
@@ -269,6 +316,11 @@ pub enum EventSource {
     /// event tagged `restore`. Consumers that keep derived state in step
     /// with the base data process it.
     Restore,
+    /// A client statement committed in an implicit transaction together with
+    /// the BEFORE and SYNC AFTER bodies it fired. The transaction's own
+    /// source: its rows carry `User` and fire ASYNC triggers, as an
+    /// autocommit write's do. No event carries this source.
+    ImplicitClient,
 }
 
 impl EventSource {
@@ -281,6 +333,7 @@ impl EventSource {
             Self::CrdtSync => "crdt_sync",
             Self::Deferred => "deferred",
             Self::Restore => "restore",
+            Self::ImplicitClient => "implicit_client",
         }
     }
 
@@ -288,17 +341,41 @@ impl EventSource {
     /// record whose writes ran with `self`.
     ///
     /// A client transaction's rows fire DEFERRED-mode triggers, so they carry
-    /// `Deferred`. Every other source keeps its own: a trigger's transaction
-    /// does not re-fire triggers, and a restored row fired its triggers when
-    /// it was first written. The live apply and WAL replay both use this.
+    /// `Deferred`. An implicit statement transaction's rows fire ASYNC
+    /// triggers, so they carry `User`. Every other source keeps its own: a
+    /// trigger's transaction does not re-fire triggers, and a restored row
+    /// fired its triggers when it was first written. The live apply and WAL
+    /// replay both use this.
     pub const fn committed_row_source(self) -> Self {
         match self {
             Self::User => Self::Deferred,
+            Self::ImplicitClient => Self::User,
             Self::Trigger => Self::Trigger,
             Self::RaftFollower => Self::RaftFollower,
             Self::CrdtSync => Self::CrdtSync,
             Self::Deferred => Self::Deferred,
             Self::Restore => Self::Restore,
+        }
+    }
+
+    /// The source a committed transaction's KV, graph and CRDT rows carry.
+    /// Every source keeps its own, except an implicit statement transaction,
+    /// whose rows carry `User`.
+    pub const fn committed_other_source(self) -> Self {
+        match self {
+            Self::ImplicitClient => Self::User,
+            other => other,
+        }
+    }
+
+    /// The source a row of a committed record carries, when the record lists
+    /// the row under `row_source`. The override applies only to a record whose
+    /// rows fire triggers: a replicated, synced or restored record keeps its
+    /// own source for every row.
+    pub const fn committed_row_override(self, row_source: Self) -> Self {
+        match self {
+            Self::User | Self::Deferred | Self::ImplicitClient | Self::Trigger => row_source,
+            Self::RaftFollower | Self::CrdtSync | Self::Restore => self,
         }
     }
 
@@ -313,6 +390,7 @@ impl EventSource {
             Self::CrdtSync => 4,
             Self::Deferred => 5,
             Self::Restore => 6,
+            Self::ImplicitClient => 7,
         }
     }
 
@@ -326,6 +404,7 @@ impl EventSource {
             4 => Some(Self::CrdtSync),
             5 => Some(Self::Deferred),
             6 => Some(Self::Restore),
+            7 => Some(Self::ImplicitClient),
             _ => None,
         }
     }
@@ -339,6 +418,7 @@ impl EventSource {
             "crdt_sync" => Some(Self::CrdtSync),
             "deferred" => Some(Self::Deferred),
             "restore" => Some(Self::Restore),
+            "implicit_client" => Some(Self::ImplicitClient),
             _ => None,
         }
     }
@@ -393,7 +473,15 @@ mod tests {
 
     #[test]
     fn row_id_edge_matches_graph_cdc_composition() {
-        let id = RowId::edge("a", "KNOWS", "b");
+        let id = RowId::edge(
+            EdgeEndpoints {
+                src: "a",
+                src_surrogate: Surrogate::new(1),
+                dst: "b",
+                dst_surrogate: Surrogate::new(2),
+            },
+            "KNOWS",
+        );
         assert_eq!(
             id.as_str(),
             crate::event::graph_cdc::edge_row_id("a", "KNOWS", "b").as_str()
@@ -403,6 +491,8 @@ mod tests {
                 assert_eq!(edge.src(), "a");
                 assert_eq!(edge.label(), "KNOWS");
                 assert_eq!(edge.dst(), "b");
+                assert_eq!(edge.src_surrogate(), Surrogate::new(1));
+                assert_eq!(edge.dst_surrogate(), Surrogate::new(2));
             }
             other => panic!("expected edge row id, got {other:?}"),
         }
@@ -433,6 +523,7 @@ mod tests {
             EventSource::CrdtSync,
             EventSource::Deferred,
             EventSource::Restore,
+            EventSource::ImplicitClient,
         ] {
             assert_eq!(EventSource::from_name(source.as_str()), Some(source));
             let json = sonic_rs::to_string(&source).expect("encode source");
@@ -452,6 +543,7 @@ mod tests {
             EventSource::CrdtSync,
             EventSource::Deferred,
             EventSource::Restore,
+            EventSource::ImplicitClient,
         ] {
             assert_ne!(source.wal_code(), nodedb_wal::NO_EVENT_SOURCE);
             assert_eq!(EventSource::from_wal_code(source.wal_code()), Some(source));
@@ -459,6 +551,28 @@ mod tests {
         assert_eq!(
             EventSource::from_wal_code(nodedb_wal::NO_EVENT_SOURCE),
             None
+        );
+    }
+
+    /// An implicit statement transaction's rows fire ASYNC triggers, as an
+    /// autocommit write's do, and never DEFERRED ones.
+    #[test]
+    fn an_implicit_client_transaction_fires_async_triggers() {
+        assert_eq!(
+            EventSource::ImplicitClient.committed_row_source(),
+            EventSource::User
+        );
+        assert_eq!(
+            EventSource::ImplicitClient.committed_other_source(),
+            EventSource::User
+        );
+        assert_eq!(
+            EventSource::ImplicitClient.committed_row_override(EventSource::Trigger),
+            EventSource::Trigger
+        );
+        assert_eq!(
+            EventSource::RaftFollower.committed_row_override(EventSource::Trigger),
+            EventSource::RaftFollower
         );
     }
 
@@ -498,6 +612,7 @@ mod tests {
             valid_time_ms: None,
             user_id: None,
             statement_digest: None,
+            commit_hlc: Some(crate::event::test_utils::test_commit_hlc()),
         };
         assert_eq!(event.sequence, 1);
         assert_eq!(event.op, WriteOp::Insert);

@@ -73,8 +73,9 @@ impl CoreLoop {
     }
 
     /// Release all staging state for `txn_id`: the value/TTL overlay, the
-    /// parallel GRAPH and ARRAY overlays, and any still-empty columnar engines this
-    /// transaction auto-created during staging. Decrements the
+    /// parallel GRAPH and ARRAY overlays, its timeseries resolve holds, and any
+    /// still-empty columnar engines this transaction auto-created during
+    /// staging. Decrements the
     /// `active_txn_overlays` gauge by the number of overlays removed and
     /// returns that count.
     ///
@@ -93,6 +94,10 @@ impl CoreLoop {
         {
             m.active_txn_overlays.fetch_sub(removed, Ordering::Relaxed);
         }
+        self.ts_resolve_holds.retain(|_, holders| {
+            holders.remove(&txn_id);
+            !holders.is_empty()
+        });
         if let Some(created) = self.txn_created_columnar_engines.remove(&txn_id) {
             for engine_key in created {
                 let still_empty = self

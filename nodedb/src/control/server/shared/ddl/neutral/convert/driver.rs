@@ -43,6 +43,13 @@ pub async fn convert_collection(
         .get_collection(database_id, tenant_id.as_u64(), &collection)
         .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", format!("collection '{collection}' does not exist")))?;
+    if coll.hash_chain {
+        let refusal =
+            crate::control::server::shared::ddl::neutral::collection::enforcement::EnforcementDeclError::HashChainConvert {
+                collection: collection.clone(),
+            };
+        return Err(err(refusal.sqlstate(), refusal.to_string()));
+    }
 
     // Build columns before dispatch — needed for both Data Plane and catalog.
     let columns: Option<Vec<nodedb_types::columnar::ColumnDef>> = match target_type.as_str() {
@@ -72,7 +79,7 @@ pub async fn convert_collection(
     // Resolve the SOURCE storage mode from the catalog row read above, before
     // this DDL mutates `coll.collection_type`. Mirrors the exhaustive match in
     // `build_doc_config_from_stored`, so the Data Plane handler decodes the
-    // scanned rows the same way the collection's own register path would.
+    // scanned rows the same way the collection's own register path does.
     let source_storage_mode = match &coll.collection_type {
         nodedb_types::CollectionType::Document(nodedb_types::DocumentMode::Strict(schema)) => {
             nodedb_physical::physical_plan::StorageMode::Strict {
@@ -135,9 +142,11 @@ pub async fn convert_collection(
     let new_type = match target_type.as_str() {
         "document_schemaless" => nodedb_types::CollectionType::document(),
         "document_strict" | "kv" => {
-            let columns = columns.expect(
-                "invariant: columns is Some for document_strict/kv targets, validated above",
-            );
+            let Some(columns) = columns else {
+                return Err(DdlError::internal(
+                    "columns missing for a document_strict/kv target",
+                ));
+            };
             let schema = nodedb_types::columnar::StrictSchema {
                 columns,
                 version: 1,
@@ -181,14 +190,16 @@ pub async fn convert_collection(
         coll.type_guards.clear();
     }
 
-    persist_collection_replicated(state, database_id, &coll)
+    let outcome = persist_collection_replicated(state, &coll)
+        .await
         .map_err(|e| DdlError::from_error(&e))?;
 
     // Refresh this node's Data Plane `doc_configs` entry to the NEW storage
     // mode. Without this, every later read of the collection resolves its
     // body format from the pre-conversion entry until the process restarts.
-    crate::control::server::shared::ddl::neutral::collection::dispatch_register_from_stored(
-        state, &coll,
+    // A durable apply refreshed it in its post-apply.
+    crate::control::server::shared::ddl::neutral::collection::register_proposed_collection(
+        state, outcome, &coll,
     )
     .await
     .map_err(|e| DdlError::from_error(&e))?;

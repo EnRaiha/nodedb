@@ -107,14 +107,13 @@ impl ArrayStore {
                 match ceiling_resolve_cell(iter, coord, &params)? {
                     CeilingResult::Live(payload) => {
                         builder
-                            .push_row(nodedb_array::tile::sparse_tile::SparseRow {
+                            .push_row(nodedb_array::tile::sparse_tile::SparseRow::live(
                                 coord,
-                                attrs: &payload.attrs,
-                                surrogate: payload.surrogate,
-                                valid_from_ms: payload.valid_from_ms,
-                                valid_until_ms: payload.valid_until_ms,
-                                kind: nodedb_array::tile::sparse_tile::RowKind::Live,
-                            })
+                                &payload.attrs,
+                                payload.surrogate,
+                                payload.valid_from_ms,
+                                payload.valid_until_ms,
+                            ))
                             .map_err(|e| nodedb_array::ArrayError::SegmentCorruption {
                                 detail: format!("scan_tiles_at builder: {e}"),
                             })?;
@@ -397,7 +396,8 @@ mod tests {
             vec![crate::engine::array::wal::ArrayPutCell {
                 coord: coord(1, 1),
                 attrs: vec![nodedb_array::types::cell_value::value::CellValue::Int64(8)],
-                surrogate: nodedb_types::Surrogate::ZERO,
+                // The surrogate `put_one` binds to (1, 1).
+                surrogate: nodedb_types::Surrogate::new(102),
                 system_from_ms: 20,
                 valid_from_ms: 0,
                 valid_until_ms: i64::MAX,

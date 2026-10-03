@@ -2,12 +2,10 @@
 
 //! Handler for `SHOW DATABASE USAGE FOR <name>`.
 //!
-//! Ported from the pgwire `ddl::database::show_usage` handler. The tenant-admin
-//! gate, catalog lookup, live-gauge reads from `SystemMetrics`, and per-dimension
-//! row rendering (`unlimited` limit + `percent_used`) are preserved verbatim;
-//! only the result construction changed from pgwire `QueryResponse` to the
-//! protocol-neutral [`DdlResult`] over `ShapedRows`. Every column is a
-//! `text_field` in the original, so all columns stay `Text`.
+//! The tenant-admin gate, catalog lookup, live-gauge reads from
+//! `SystemMetrics`, and per-dimension row rendering (`unlimited` limit +
+//! `percent_used`) run here. The result is the protocol-neutral
+//! [`DdlResult`] over `ShapedRows`. Every column is `Text`.
 
 use serde_json::{Map, Value as JsonValue};
 

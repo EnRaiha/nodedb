@@ -2,26 +2,22 @@
 
 //! UPSERT INTO dispatch for schemaless and KV collections.
 //!
-//! Relocated verbatim from the pgwire `ddl::collection::upsert` handler (now
-//! deleted) except for the result type, which is [`DdlError`] / [`DdlResult`]
-//! instead of pgwire `Response` / `PgWireResult`.
+//! The result type is [`DdlError`] / [`DdlResult`].
 
 use nodedb_types::DatabaseId;
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
 
+use super::parse::ParsedInsert;
 use super::parse::{
     authorize_write_target, fields_to_upsert_sql, parse_write_statement, plan_and_dispatch,
 };
-use super::triggers::{
-    fire_before_triggers, fire_instead_triggers, fire_sync_after_triggers,
-    fire_sync_after_update_triggers,
-};
+use crate::control::trigger::statement_txn::{fires_joined_body, in_block, with_statement_txn};
+use crate::control::trigger::{DmlEvent, TriggerScope};
 
 /// UPSERT INTO <collection> (col1, col2, ...) VALUES (val1, val2, ...)
 ///
@@ -43,39 +39,57 @@ pub async fn upsert_document(
         return Some(Err(error));
     }
 
-    let tenant_id = identity.tenant_id;
-
-    // Fire INSTEAD OF INSERT triggers (upsert treated as INSERT for triggers).
-    if let Some(result) = fire_instead_triggers(
-        state,
-        identity,
+    // A write that fires a BEFORE, INSTEAD OF or SYNC AFTER body runs in its
+    // statement's transaction together with the bodies. An UPSERT fires the
+    // INSERT family before its probe and either family after it.
+    let scope = TriggerScope {
         database_id,
-        tenant_id,
-        &parsed.coll_name,
-        &parsed.fields,
-        "UPSERT",
-    )
-    .await
-    {
-        return Some(result);
-    }
-
-    // Fire BEFORE INSERT triggers — may mutate NEW fields.
-    let mut fields = match fire_before_triggers(
-        state,
-        identity,
-        database_id,
-        tenant_id,
-        &parsed.coll_name,
-        &parsed.fields,
-    )
-    .await
-    {
-        Ok(f) => f,
-        Err(e) => return Some(e),
+        tenant_id: identity.tenant_id,
     };
+    let implicit = !in_block(txn_ctx)
+        && [DmlEvent::Insert, DmlEvent::Update]
+            .into_iter()
+            .any(|event| fires_joined_body(state, scope, &parsed.coll_name, event));
+    Some(
+        with_statement_txn(
+            state,
+            identity,
+            txn_ctx,
+            implicit,
+            async |ctx: &DmlTxnCtx<'_>| {
+                upsert_parsed(state, identity, database_id, &parsed, ctx).await
+            },
+        )
+        .await,
+    )
+}
 
-    // Enforce type guards and CHECK constraints (after BEFORE trigger).
+/// Upsert one parsed document on the statement's transaction `txn_ctx`.
+///
+/// The write takes the shared transaction route with its triggers: the route
+/// reads the row the upsert finds, fires the INSERT or the UPDATE family's
+/// INSTEAD OF and BEFORE bodies to match, checks the NEW row the BEFORE
+/// bodies left against the CHECK constraints, and fires the matching SYNC
+/// AFTER bodies once the write staged.
+async fn upsert_parsed(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
+    parsed: &ParsedInsert,
+    txn_ctx: &DmlTxnCtx<'_>,
+) -> Result<Vec<DdlResult>, DdlError> {
+    let tenant_id = identity.tenant_id;
+    let scope = TriggerScope {
+        database_id,
+        tenant_id,
+    };
+    let fires_row_body = [DmlEvent::Insert, DmlEvent::Update]
+        .into_iter()
+        .any(|event| fires_joined_body(state, scope, &parsed.coll_name, event));
+    let mut fields = parsed.fields.clone();
+
+    // Inject defaults and enforce type guards and CHECK constraints. The
+    // route checks a write that fires a row body, after its BEFORE bodies.
     let catalog = state.credentials.catalog();
     if let Ok(Some(coll_def)) =
         catalog.get_collection(database_id, tenant_id.as_u64(), &parsed.coll_name)
@@ -90,11 +104,12 @@ pub async fn upsert_document(
                 )
         {
             let (_severity, code, message) = error_code_to_sqlstate(&violation);
-            return Some(Err(DdlError::new(code.to_owned(), message)));
+            return Err(DdlError::new(code.to_owned(), message));
         }
 
-        // General CHECK constraints (Control Plane enforcement, may have subqueries).
-        if !coll_def.check_constraints.is_empty()
+        // General CHECK constraints (Control Plane enforcement, can have subqueries).
+        if !fires_row_body
+            && !coll_def.check_constraints.is_empty()
             && let Err(e) =
                 crate::control::server::shared::check_constraint::enforce_check_constraints(
                     state,
@@ -105,7 +120,7 @@ pub async fn upsert_document(
                 )
                 .await
         {
-            return Some(Err(e));
+            return Err(e);
         }
     }
 
@@ -126,54 +141,11 @@ pub async fn upsert_document(
                     type_name,
                     label,
                 ) {
-                    return Some(Err(ddl_err("22P02", msg)));
+                    return Err(ddl_err("22P02", msg));
                 }
             }
         }
     }
-
-    // Probe for an existing row BEFORE dispatch so the correct AFTER
-    // trigger class fires: UPSERT onto an existing primary key is an
-    // UPDATE from every downstream consumer's perspective (AFTER UPDATE
-    // triggers, CDC, materialized views). Probing ahead of dispatch is
-    // safe because the document primary key acts as the upsert key and
-    // the probe + dispatch + AFTER-fire all run serially on this
-    // connection.
-    let pk_for_probe = fields
-        .get("id")
-        .or_else(|| fields.get("document_id"))
-        .or_else(|| fields.get("key"))
-        .map(|v| match v {
-            nodedb_types::Value::String(s) => s.clone(),
-            nodedb_types::Value::Integer(i) => i.to_string(),
-            other => format!("{other:?}"),
-        });
-    let old_fields = if let Some(ref pk) = pk_for_probe {
-        // The neutral DDL entry point receives an explicit selected database;
-        // keep `$auth.database_id` identical to the task being probed.
-        let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
-        let row = crate::control::trigger::dml_hook::fetch_old_row(
-            state,
-            identity,
-            database_id,
-            scope.auth(),
-            &nodedb_types::QualifiedCollection::new(database_id, &parsed.coll_name),
-            pk,
-        )
-        .await
-        .map_err(|error| {
-            let (_, sqlstate, message) =
-                crate::control::server::pgwire::types::error_to_sqlstate(&error);
-            DdlError::new(sqlstate.to_owned(), message)
-        });
-        match row {
-            Ok(row) if row.is_empty() => None,
-            Ok(row) => Some(row),
-            Err(error) => return Some(Err(error)),
-        }
-    } else {
-        None
-    };
 
     // Build SQL and route through nodedb-sql → EngineRules → sql_plan_convert.
     //
@@ -193,55 +165,26 @@ pub async fn upsert_document(
         database_id,
         &upsert_sql,
         txn_ctx,
+        // The route fires the write's row bodies for the family the row it
+        // finds makes the upsert.
+        true,
     )
     .await
     {
         Ok(rows) => rows,
-        Err(e) => return Some(Err(e)),
+        Err(e) => return Err(e),
     };
 
-    // Fire the AFTER trigger family that matches the actual mutation:
-    // AFTER UPDATE when a prior row existed, AFTER INSERT otherwise.
-    // Firing AFTER INSERT unconditionally would silently skip AFTER
-    // UPDATE subscribers on overwrites — the exact bug this routing
-    // fixes.
-    if let Some(ref old) = old_fields {
-        if let Some(err) = fire_sync_after_update_triggers(
-            state,
-            identity,
-            database_id,
-            tenant_id,
-            &parsed.coll_name,
-            old,
-            &fields,
-        )
-        .await
-        {
-            return Some(err);
-        }
-    } else if let Some(err) = fire_sync_after_triggers(
-        state,
-        identity,
-        database_id,
-        tenant_id,
-        &parsed.coll_name,
-        &fields,
-    )
-    .await
-    {
-        return Some(err);
-    }
-
     if !returned_rows.is_empty() {
-        return Some(Ok(returned_rows));
+        return Ok(returned_rows);
     }
 
     // A single-document `{ ... }` upsert without RETURNING always applies
     // exactly one row — carry a real count rather than a bare tag.
-    Some(Ok(vec![DdlResult::Status {
+    Ok(vec![DdlResult::Status {
         command: "UPSERT".to_string(),
         rows_affected: Some(1),
-    }]))
+    }])
 }
 
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.

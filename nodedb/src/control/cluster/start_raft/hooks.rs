@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Phase 2 of `start_raft`: build the snapshot quarantine hook, the
-//! per-group snapshot builder/applier (including follower boot-restore of
-//! any persisted `.snap` files), and the cross-node shuffle / surrogate /
+//! per-group snapshot builder/applier (including boot completion of any
+//! interrupted snapshot install), and the cross-node shuffle / surrogate /
 //! Calvin routing hooks that bridge `RaftLoop` callbacks to `SharedState`.
 
 use std::sync::Arc;
@@ -28,19 +28,22 @@ pub(super) struct Hooks {
     pub(super) calvin_submit_inbox: Arc<dyn nodedb_cluster::CalvinSubmitInbox>,
     pub(super) reserve_read: Arc<dyn nodedb_cluster::ReserveRead>,
     pub(super) release_reservation: Arc<dyn nodedb_cluster::ReleaseReservation>,
+    /// The sequencer group's kept snapshot, which its own compaction writes.
+    pub(super) sequencer_snapshots:
+        Arc<crate::control::cluster::sequencer_snapshot::SequencerSnapshotStore>,
 }
 
-/// Build every cross-plane hook `RaftLoop` needs, including the follower
-/// boot-restore of persisted snapshots (which must run before
-/// `run_apply_loop` is spawned, since the leader's log-compaction discards
-/// the pre-snapshot log prefix the apply loop would otherwise need to
-/// replay). `start_raft` itself is sync, so the async restore call is driven
-/// via `block_in_place` + `block_on`, matching the surrounding style used
-/// for other cluster subsystems rather than introducing a new runtime entry.
-pub(super) fn build_hooks(
+/// Build every cross-plane hook `RaftLoop` needs, including the boot
+/// completion of interrupted snapshot installs, which must run before
+/// `run_apply_loop` is spawned. The recovery is awaited, so the boot runs
+/// on any runtime flavor.
+pub(super) async fn build_hooks(
     handle: &ClusterHandle,
     shared: &Arc<SharedState>,
     data_dir: &std::path::Path,
+    multi_raft: &mut nodedb_cluster::multi_raft::MultiRaft,
+    token_state: &nodedb_cluster::SharedTokenStateMirror,
+    sequencer_state_machine: &Arc<std::sync::Mutex<nodedb_cluster::calvin::SequencerStateMachine>>,
 ) -> crate::Result<Hooks> {
     let quarantine_hook = Arc::new(
         crate::control::cluster::snapshot_hook::RaftSnapshotQuarantineHook {
@@ -48,43 +51,74 @@ pub(super) fn build_hooks(
         },
     );
 
+    // The sequencer group's snapshot: its state machine, captured on the
+    // send path and kept durably on the receive path. A node whose sequencer
+    // log starts right after an installed snapshot restores the state
+    // machine from it before any entry applies.
+    let sequencer_snapshots = Arc::new(
+        crate::control::cluster::sequencer_snapshot::SequencerSnapshotStore::new(
+            Arc::clone(sequencer_state_machine),
+            data_dir,
+        ),
+    );
+    if sequencer_snapshots.restore_at_boot(multi_raft)? {
+        info!(
+            node_id = handle.node_id,
+            "restored the sequencer state machine from its installed snapshot"
+        );
+    }
+
+    // A data group mounted here takes log entries only once its vShards'
+    // Calvin state reaches the sequencer log. Until then its leader sends a
+    // snapshot, which carries the Calvin cut its storage holds.
+    crate::control::cluster::calvin_snapshot::install_snapshot_requirement(
+        shared,
+        Arc::clone(&handle.routing),
+        multi_raft,
+    )?;
+
     // Per-group snapshot builder for the SEND path: on the leader, build the
     // real serialized engine state for a lagging follower's group vshards
     // (replacing the prior empty stub bytes).
     let snapshot_builder: Arc<dyn nodedb_cluster::SnapshotBuilder> = Arc::new(
-        crate::control::cluster::snapshot_builder::DataPlaneSnapshotBuilder::new(shared.clone()),
+        crate::control::cluster::snapshot_builder::DataPlaneSnapshotBuilder::new(shared.clone())
+            .with_sequencer(Arc::clone(&sequencer_snapshots)),
     );
 
     // Per-group snapshot applier for the RECEIVE path: on the follower, apply a
     // received per-group snapshot to the local Data-Plane state machine (via the
     // existing restore handler with replace_mode = true) before Raft advances.
-    let snapshot_applier_concrete =
-        crate::control::cluster::snapshot_applier::DataPlaneSnapshotApplier::new(shared.clone());
+    let snapshot_applier: Arc<dyn nodedb_cluster::SnapshotApplier> = Arc::new(
+        crate::control::cluster::snapshot_applier::DataPlaneSnapshotApplier::new(shared.clone())
+            .with_metadata(
+                Arc::clone(&handle.catalog),
+                crate::control::cluster::metadata_image::RaftOwnedState {
+                    token_state: Arc::clone(token_state),
+                    transport: Some(Arc::clone(&handle.transport)),
+                },
+            )
+            .with_sequencer(Arc::clone(&sequencer_snapshots)),
+    );
 
-    // Follower boot-restore: re-install any persisted `.snap` snapshots from a
-    // prior run BEFORE the apply loop is spawned. The leader's log-compaction
-    // discards the pre-snapshot prefix, so the post-snapshot log tail the apply
-    // loop will replay can NOT reconstruct that prefix — the persisted snapshot
-    // is the only source for it. Must precede `run_apply_loop` for that reason.
-    // Match the surrounding block_in_place style used for other cluster
-    // subsystems rather than introducing a new runtime entry.
-    let restored = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(
-            crate::control::cluster::boot_restore::restore_persisted_snapshots(
-                data_dir,
-                &snapshot_applier_concrete,
-            ),
-        )
+    // Complete every snapshot install a crash interrupted, before the apply
+    // loop starts: an install whose Raft boundary never moved is applied
+    // again, then adopted. A finished install is durable on its own and is
+    // never applied at boot.
+    let completed = nodedb_cluster::install_snapshot::recover_staged_installs(
+        data_dir,
+        multi_raft,
+        Some(snapshot_applier.as_ref()),
+    )
+    .await
+    .map_err(|e| crate::Error::Internal {
+        detail: format!("boot recovery of staged snapshot installs: {e}"),
     })?;
-    if restored > 0 {
+    if completed > 0 {
         info!(
             node_id = handle.node_id,
-            restored, "follower boot-restore re-installed persisted snapshots"
+            completed, "completed interrupted snapshot installs"
         );
     }
-
-    let snapshot_applier: Arc<dyn nodedb_cluster::SnapshotApplier> =
-        Arc::new(snapshot_applier_concrete);
 
     // Cross-node streaming-shuffle receiver (E1): bridge the cluster
     // `ShufflePush` read-loop to the in-process registry on `SharedState`.
@@ -160,5 +194,6 @@ pub(super) fn build_hooks(
         calvin_submit_inbox,
         reserve_read,
         release_reservation,
+        sequencer_snapshots,
     })
 }

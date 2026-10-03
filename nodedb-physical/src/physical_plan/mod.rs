@@ -18,6 +18,9 @@ pub mod graph;
 pub mod kv;
 pub mod meta;
 pub mod meta_calvin;
+pub mod meta_home;
+pub mod meta_restore;
+pub mod meta_snapshot;
 pub mod plan;
 pub mod query;
 pub mod redo_origin;
@@ -47,12 +50,16 @@ pub use document::{
 };
 pub use exchange::{ExchangeMode, ExchangeOp};
 pub use graph::{
-    BatchEdge, BspSuperstepPlan, BspSuperstepResult, GraphOp, WccSuperstepPlan, WccSuperstepResult,
+    AlgoEdge, AlgoStage, BatchEdge, BspSuperstepPlan, BspSuperstepResult, GraphOp, RagBindingRow,
+    RagLegs, RagStage, RagTextHit, RagVectorHit, WccSuperstepPlan, WccSuperstepResult,
 };
 pub use kv::{
     KvCounterShape, KvOp, KvResolveOutcome, KvResolvedMutation, SortedIndexRead, SortedIndexSpec,
 };
 pub use meta::{MetaOp, SAVEPOINT_MARKER_BYTES};
+pub use meta_home::{HomeAnswer, HomeVersion, HomeVersionProbe};
+pub use meta_restore::{RestoredEdgeVersion, RestoredIdentity, RestoredRedo, RestoredRow};
+pub use meta_snapshot::{CutCaptureRequest, SnapshotClearTarget};
 pub use plan::PhysicalPlan;
 pub use query::{AggregateSpec, GroupKeySpec, JoinProjection, QueryOp};
 pub use redo_origin::RedoOrigin;
@@ -61,7 +68,7 @@ pub use set_op::SetOpKind;
 pub use sort_key::SortKeySpec;
 pub use spatial::{SpatialOp, SpatialPredicate};
 pub use text::TextOp;
-pub use timeseries::{TimeseriesOp, UNBOUNDED_TIME_RANGE};
+pub use timeseries::{TimeseriesOp, TimeseriesResolve, UNBOUNDED_TIME_RANGE};
 pub use vector::{
     VectorDirectWriteIntent, VectorOp, VectorResolveOutcome, VectorResolvedMutation,
     VectorWriteTargets,

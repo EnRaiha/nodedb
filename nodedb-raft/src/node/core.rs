@@ -21,6 +21,7 @@ use crate::state::{
 use crate::storage::LogStorage;
 
 use super::config::RaftConfig;
+use super::leader_lease::LeaseState;
 use tracing::info;
 
 /// Output actions produced by a tick or RPC handler.
@@ -46,6 +47,9 @@ pub struct Ready {
     /// Peers that need an InstallSnapshot RPC because their next_index
     /// falls behind the leader's snapshot_index (log compacted).
     pub snapshots_needed: Vec<u64>,
+    /// Set when the next committed range to deliver is no longer in the log.
+    /// Delivery for the group halts until a snapshot covers the gap.
+    pub committed_read_error: Option<RaftError>,
 }
 
 impl Ready {
@@ -57,6 +61,7 @@ impl Ready {
             && self.timeout_now.is_empty()
             && self.committed_entries.is_empty()
             && self.snapshots_needed.is_empty()
+            && self.committed_read_error.is_none()
     }
 }
 
@@ -104,14 +109,32 @@ pub struct RaftNode<S: LogStorage> {
     /// that measure, and a fully caught-up follower in an idle cluster looks
     /// stale. Heartbeats refresh this even when nothing is being written.
     pub(super) leader_contact: Option<LeaderContact>,
-    /// When a quorum of voters last answered this leader. `None` off the
-    /// leader path. Drives check-quorum step-down (see
-    /// [`super::quorum_contact`]).
+    /// Latest instant by which a quorum of voters answered this term, or the
+    /// election win before any. `None` off the leader path. Drives
+    /// check-quorum step-down (see [`super::quorum_contact`]).
     pub(super) last_quorum_contact: Option<Instant>,
-    /// Per-voter `ack_count` readings taken when the current contact window
-    /// opened. A voter whose count has risen above its reading has answered
-    /// inside the window.
-    pub(super) quorum_window: Vec<(u64, u64)>,
+    /// Per-voter highest lease round acknowledged in the current term, and
+    /// when the latest answer arrived. Cleared on step-down.
+    pub(super) quorum_window: Vec<super::quorum_contact::VoterAck>,
+    /// Leader-lease rounds and anchor (see [`super::leader_lease`]).
+    pub(super) lease: LeaseState,
+    /// Until this instant the node refuses every vote but a transfer vote.
+    ///
+    /// Set to `election_timeout_max` after construction. A restarted node has
+    /// forgotten its leader contact, and a lease the leader took before the
+    /// restart can still be live. Kept apart from `leader_contact`, which
+    /// also feeds the staleness bound: a boot is no contact with any leader.
+    pub(super) boot_vote_fence: Instant,
+    /// An outside bound on compaction: the log never discards an entry above
+    /// it. An archiver that must copy entries before they go raises it.
+    pub(super) compaction_ceiling: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Whether this follower holds no state it can resume the log from. It
+    /// then refuses every `AppendEntries` with `needs_snapshot`, and its
+    /// leader sends a snapshot instead. The driver sets and clears it.
+    pub(super) snapshot_required: bool,
+    /// The highest `replicated_floor` a leader sent this node, or this
+    /// node's own as leader. See [`Self::replicated_floor`].
+    pub(super) replicated_floor: u64,
 }
 
 /// A leader's commit index as of its last contact with this node.
@@ -155,8 +178,24 @@ impl<S: LogStorage> RaftNode<S> {
             leader_contact: None,
             last_quorum_contact: None,
             quorum_window: Vec::new(),
+            lease: LeaseState::new(),
+            boot_vote_fence: now + config.election_timeout_max,
+            compaction_ceiling: None,
+            snapshot_required: false,
+            replicated_floor: 0,
             config,
         }
+    }
+
+    /// Require a snapshot before this follower takes log entries again, or
+    /// lift the requirement. See [`Self::snapshot_required`].
+    pub fn set_snapshot_required(&mut self, required: bool) {
+        self.snapshot_required = required;
+    }
+
+    /// Whether this follower refuses log entries until a snapshot installs.
+    pub fn snapshot_required(&self) -> bool {
+        self.snapshot_required
     }
 
     /// Restore state from persistent storage. Must be called before ticking.
@@ -180,6 +219,11 @@ impl<S: LogStorage> RaftNode<S> {
 
     pub fn group_id(&self) -> u64 {
         self.config.group_id
+    }
+
+    /// The log storage this node writes through.
+    pub fn storage(&self) -> &S {
+        self.log.storage()
     }
 
     pub fn role(&self) -> NodeRole {
@@ -218,6 +262,13 @@ impl<S: LogStorage> RaftNode<S> {
         }
     }
 
+    /// End the boot-time vote refusal now (for testing). A test that builds
+    /// nodes and votes at once calls this in place of waiting out
+    /// `election_timeout_max`.
+    pub fn expire_boot_vote_fence(&mut self) {
+        self.boot_vote_fence = Instant::now();
+    }
+
     /// Whether a leadership transfer is currently in progress.
     pub fn leadership_transfer_in_progress(&self) -> bool {
         self.leadership_transfer.is_some()
@@ -228,6 +279,17 @@ impl<S: LogStorage> RaftNode<S> {
     pub fn transfer_deadline_override(&mut self, deadline: Instant) {
         if let Some(t) = self.leadership_transfer.as_mut() {
             t.deadline = deadline;
+        }
+    }
+
+    /// Commit what a quorum holds now that storage made more of this node's
+    /// log durable. A leader counts its own entries only once they are
+    /// durable (see [`crate::RaftLog::stable_index`]), so a driver whose
+    /// storage stages writes calls this after its disk advances. A no-op on a
+    /// node that does not lead.
+    pub fn on_storage_progress(&mut self) {
+        if self.leader_state.is_some() {
+            self.try_advance_commit_index();
         }
     }
 
@@ -262,6 +324,18 @@ impl<S: LogStorage> RaftNode<S> {
 
     pub fn log_snapshot_term(&self) -> u64 {
         self.log.snapshot_term()
+    }
+
+    /// Term of the entry at `index`, or `None` when the log no longer holds
+    /// it.
+    pub fn log_term_at(&self, index: u64) -> Option<u64> {
+        self.log.term_at(index)
+    }
+
+    /// The entry at `index`, committed or not, or `None` when the log does
+    /// not hold it.
+    pub fn log_entry_at(&self, index: u64) -> Option<&crate::message::LogEntry> {
+        self.log.entry_at(index)
     }
 
     /// Return committed log entries in the inclusive range `[lo, hi]`.
@@ -367,6 +441,7 @@ impl<S: LogStorage> RaftNode<S> {
                 } else {
                     None
                 },
+                term: self.hard_state.current_term,
             });
         }
 
@@ -387,10 +462,10 @@ impl<S: LogStorage> RaftNode<S> {
         self.log.append(entry)?;
         self.replicate_to_all();
 
-        // Single-voter cluster: commit immediately. Learners do not count.
+        // Single-voter cluster: the entry commits once it is durable here.
+        // Learners do not count.
         if self.config.cluster_size() == 1 {
-            self.volatile.commit_index = index;
-            self.collect_committed_entries();
+            self.try_advance_commit_index();
         }
 
         Ok(index)
@@ -465,7 +540,7 @@ mod tests {
         }
         let _ = node.take_ready();
 
-        node.log.apply_snapshot(8, 1);
+        node.log.apply_snapshot(8, 1).unwrap();
 
         node.replicate_to_all();
         let ready = node.take_ready();

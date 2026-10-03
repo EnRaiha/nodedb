@@ -7,7 +7,7 @@
 //! resolves on all of them without a restart.
 
 use crate::control::state::SharedState;
-use crate::event::cdc::consumer_group::ConsumerGroupDef;
+use crate::event::cdc::consumer_group::{ConsumerGroupDef, OffsetCommit};
 use crate::types::DatabaseId;
 
 /// Install an applied consumer group. An existing registration is kept, so the
@@ -63,6 +63,41 @@ pub fn migrate_stream(def: &ConsumerGroupDef, legacy_stream: &str, shared: &Shar
             legacy_stream,
             &def.name,
             "migrate_group_stream",
+        );
+    }
+}
+
+/// Raise an applied commit's offsets on this node, when the registered group
+/// is the incarnation the commit targets. The committed-message delivery
+/// cursors and the trigger firing cursors have no registered group: every
+/// node keeps them.
+pub fn commit_offsets(commit: &OffsetCommit, shared: &SharedState) {
+    let current = shared.group_registry.get(
+        commit.database_id,
+        commit.tenant_id,
+        &commit.stream_name,
+        &commit.group_name,
+    );
+    let system_cursor = crate::event::topic::committed::is_publish_cursor(commit)
+        || crate::event::trigger::lane::is_action_cursor(commit);
+    if !system_cursor && current.is_none_or(|def| def.modification_hlc != commit.group_hlc) {
+        return;
+    }
+    if let Err(error) = shared.offset_store.advance_offsets(
+        commit.database_id,
+        commit.tenant_id,
+        &commit.stream_name,
+        &commit.group_name,
+        &commit.offsets,
+    ) {
+        tracing::error!(
+            database_id = commit.database_id.as_u64(),
+            tenant_id = commit.tenant_id,
+            stream = %commit.stream_name,
+            group = %commit.group_name,
+            %error,
+            "replicated consumer offset commit did not persist on this node; \
+             a consumer served here re-reads events after its previous commit"
         );
     }
 }

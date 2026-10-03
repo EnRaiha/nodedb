@@ -124,7 +124,7 @@ impl NodeDbPgHandler {
     ///
     /// The override is installed via `SET TENANT = '<name>' | <id> | DEFAULT`
     /// or `SET nodedb.tenant_id = <id>`; the SET handler enforces that only
-    /// superuser sessions may install one and that no active transaction is
+    /// superuser sessions can install one and that no active transaction is
     /// in flight. Honoring it here — at the single chokepoint every query
     /// path passes through immediately after authentication — keeps every
     /// downstream `identity.tenant_id` read correct without threading the
@@ -180,13 +180,25 @@ impl ExtendedQueryHandler for NodeDbPgHandler {
 
         let result = self.execute_prepared(client, portal, max_rows).await;
         // Mirror the simple-query path: surface any queued NOTICE messages
-        // (e.g. `truncated_before_horizon`) before returning.
-        for message in self.sessions.drain_notices(session_id) {
+        // (e.g. `truncated_before_horizon`), shaped or raised below the
+        // shaper, before returning.
+        for message in self
+            .sessions
+            .drain_notices(session_id)
+            .into_iter()
+            .chain(crate::control::server::shared::session::statement_notice::take())
+        {
             let notice = notice_warning(&message);
             let _ = client
                 .send(PgWireBackendMessage::NoticeResponse(notice))
                 .await;
         }
+        // Cross-shard graph reads the statement made join the transaction's
+        // read-set.
+        crate::control::server::shared::session::graph_reads::record_pending(
+            &self.sessions,
+            session_id,
+        );
         result
     }
 

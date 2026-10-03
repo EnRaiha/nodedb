@@ -135,6 +135,40 @@ pub struct TenantDataSnapshot {
     #[serde(default)]
     pub tenant_edges: Vec<(u64, u64, String, Vec<u8>)>,
 
+    /// Graph edge versions a TRUNCATE hides from a current read, keyed like
+    /// `edges`. A read as of an earlier system time still reaches one, so a
+    /// snapshot carries them with the cuts and applied ordinals. Empty in a
+    /// backup: its RESTORE re-issues the versions a current read reaches.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub edge_hidden: Vec<(String, Vec<u8>)>,
+
+    /// Every TRUNCATE cut of an edge collection, as `(collection, cut)`.
+    /// Empty in a backup.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub edge_cuts: Vec<(String, i64)>,
+
+    /// The applied ordinal of every edge version applied at another ordinal
+    /// than its system time, as `(edge_key, applied)`. Empty in a backup.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub edge_applied: Vec<(String, i64)>,
+
+    /// `edge_cuts` with each cut's database and tenant, for the per-group
+    /// Raft snapshot, as `(database_id, tenant_id, collection, cut)`. The
+    /// group's hidden edge versions travel in `tenant_edges`.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub tenant_edge_cuts: Vec<(u64, u64, String, i64)>,
+
+    /// `edge_applied` with each entry's database and tenant, for the
+    /// per-group Raft snapshot, as `(database_id, tenant_id, edge_key,
+    /// applied)`.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub tenant_edge_applied: Vec<(u64, u64, String, i64)>,
+
     /// CRDT constraint state, one entry per `(tenant, collection)` that has an
     /// installed constraint set: `[(tenant_id, collection, constraint_version,
     /// per_constraint_zerompk_bytes), ...]`. Each inner `Vec<u8>` is one
@@ -159,14 +193,32 @@ pub struct TenantDataSnapshot {
     pub crdt_constraints: Vec<CrdtConstraintEntry>,
 
     /// The group's tenant write marks, for the per-group Raft snapshot:
-    /// `[(tenant_id, commit_hlc, site_code, collection), ...]`. A follower
+    /// `[(tenant_id, commit_hlc, site_code, collection, restore_id), ...]`,
+    /// with `restore_id` `0` for a user write's mark. A follower
     /// caught up by the snapshot never applies the entries it covers, so it
     /// takes their marks from here, and RESTORE's staleness guard reads the
     /// same marks on it as on every other replica. Empty in a backup: the
     /// guard reads the marks of the destination cluster.
     #[msgpack(default)]
     #[serde(default)]
-    pub group_write_marks: Vec<(u64, u64, u8, String)>,
+    pub group_write_marks: Vec<(u64, u64, u8, String, u64)>,
+
+    /// `(log_index, proposal_key)` of the group's committed entries at or
+    /// below the Raft snapshot index, for the window a propose waiter can
+    /// exist in. The follower that installs the snapshot never applies those
+    /// entries. It takes their keys from here, so its duplicate check skips a
+    /// later copy of the same proposal, and a waiter learns whether its own
+    /// proposal committed. Empty in a backup.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub group_proposal_keys: Vec<(u64, u64)>,
+
+    /// Lowest index from which `group_proposal_keys` is complete. `0` when
+    /// every key in the window is present. Below it a missing key proves
+    /// nothing, so a waiter there learns its outcome is unknown.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub group_proposal_keys_complete_from: u64,
 
     /// Document versions of `bitemporal=true` collections:
     /// `[("{db}:{tid}:{collection}:{doc_id}\x00{system_from:020}", versioned_value), ...]`.
@@ -181,6 +233,123 @@ pub struct TenantDataSnapshot {
     #[msgpack(default)]
     #[serde(default)]
     pub indexes_versioned: Vec<(String, Vec<u8>)>,
+
+    /// Multi-vector documents per vector index:
+    /// `[("{db}:{tid}:{coll_key}", document_surrogates), ...]`, keyed like
+    /// `vectors`. A `vectors` row carries no membership, and a one-vector
+    /// multi-vector document is otherwise indistinguishable from a
+    /// single-vector row.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub vector_multi_documents: Vec<(String, Vec<nodedb_types::Surrogate>)>,
+
+    /// Array cell versions, one blob per `(array, vShard)` on each core.
+    /// Every version keeps its system time, tombstones and erasures included.
+    /// Only a snapshot requested with `arrays` carries them: a backup and a
+    /// Raft group snapshot.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub arrays: Vec<ArrayCellsBlob>,
+
+    /// The metadata group index the builder had applied when it captured a
+    /// Raft group snapshot. Every row it carries belongs to a collection
+    /// incarnation created at or below this index. The installing follower
+    /// waits until its own metadata group applied this index. A new
+    /// incarnation's storage clear then runs before the rows land, never
+    /// after. `0` holds nothing: a backup and a per-core part carry `0`.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub metadata_floor: u64,
+
+    /// The group's applied index a Raft group snapshot was captured at. The
+    /// builder fences the group's apply for the capture, so every section,
+    /// the write marks and the proposal keys hold exactly the entries at or
+    /// below it. It is at or above the Raft snapshot index. The installing
+    /// follower treats the entries between the two as covered and never
+    /// applies them. `0` holds nothing: a backup and a per-core part carry
+    /// `0`.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub group_cut_index: u64,
+
+    /// The Event Plane lane state of a Raft group snapshot's vShards: the
+    /// held trigger actions and committed messages, and their cursors. A
+    /// follower caught up by the snapshot never applies the entries it
+    /// covers, so it holds their events from here and can own the vShards'
+    /// firing and delivery. Empty in a backup and a per-core part.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub group_event_lane: GroupEventLane,
+
+    /// The Calvin cut of a Raft group snapshot: the sequencer index its
+    /// Calvin state holds every input through, and each vShard's applied
+    /// positions. `None` in a backup and a per-core part.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub group_calvin: Option<super::snapshot_calvin::GroupCalvinCut>,
+}
+
+/// One `(partition, epoch, index, sequence)` position with its held row.
+pub type HeldAtPosition = (u32, u64, u64, u64, Vec<u8>);
+
+/// One partition's cursor, as `(partition, epoch, index, sequence)`.
+pub type PartitionCursor = (u32, u64, u64, u64);
+
+/// The Event Plane lane state a Raft group snapshot carries for its vShards.
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+#[msgpack(map)]
+pub struct GroupEventLane {
+    /// Held trigger actions, each an encoded held event.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub held_actions: Vec<HeldAtPosition>,
+    /// The trigger firing cursors of the group's partitions.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub action_cursors: Vec<PartitionCursor>,
+    /// Held committed messages, each an encoded `RedoPublish`.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub held_publishes: Vec<HeldAtPosition>,
+    /// The message delivery cursors of the group's partitions.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub publish_cursors: Vec<PartitionCursor>,
+}
+
+/// One array's cell versions whose Hilbert prefixes route to one vShard.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+    Default,
+)]
+pub struct ArrayCellsBlob {
+    /// Database the array lives in.
+    pub database_id: u64,
+    /// Tenant owning the array.
+    pub tenant_id: u64,
+    /// Bare array name.
+    pub array: String,
+    /// The vShard the cells route to.
+    pub vshard: u32,
+    /// zerompk-encoded `Vec<crate::engine::array::export::ArrayCellVersion>`.
+    pub cells: Vec<u8>,
 }
 
 /// One collection's CRDT constraint set plus its installed version, carried

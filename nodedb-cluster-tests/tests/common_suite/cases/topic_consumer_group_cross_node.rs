@@ -11,7 +11,8 @@
 //! follower. Each test asserts the follower's durable row AND its live
 //! registry entry separately.
 //!
-//! Message publication is out of scope: it is a node-local data path.
+//! Message publication is out of scope here; `topic_publish_across_home_change`
+//! covers it.
 
 use crate::common;
 

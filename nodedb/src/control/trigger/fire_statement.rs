@@ -17,10 +17,12 @@ use super::fire_common::{
 };
 use super::registry::DmlEvent;
 use crate::control::planner::procedural::executor::bindings::RowBindings;
+use crate::control::planner::procedural::executor::core::CrossShardOrigin;
 use crate::control::security::catalog::trigger_types::{
     TriggerExecutionMode, TriggerGranularity, TriggerTiming,
 };
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
 
 /// Parameters for [`fire_after_statement`].
@@ -39,12 +41,17 @@ pub struct FireAfterStatementParams<'a> {
     pub cascade_depth: u32,
     /// Restricts firing to a single execution mode; `None` fires all modes.
     pub mode_filter: Option<TriggerExecutionMode>,
+    /// Cross-shard origin context (Event-Plane fire path only).
+    pub cross_shard_origin: Option<CrossShardOrigin>,
     /// What a failing trigger does to the triggers queued behind it.
     pub on_error: FireErrorPolicy,
     /// Restricts firing to the one named trigger; `None` fires every match.
     ///
     /// A retry sets this so it re-runs only the trigger that failed.
     pub only_trigger: Option<&'a str>,
+    /// The triggering statement's transaction, which a SYNC body joins.
+    /// `None` on the Event Plane: each body runs its own transaction.
+    pub joined: Option<&'a DmlTxnCtx<'a>>,
 }
 
 /// Fire AFTER STATEMENT triggers for the given operation.
@@ -67,8 +74,10 @@ pub async fn fire_after_statement(params: FireAfterStatementParams<'_>) -> FireR
         event,
         cascade_depth,
         mode_filter,
+        cross_shard_origin,
         on_error,
         only_trigger,
+        joined,
     } = params;
     let triggers = state.trigger_registry.get_matching(
         scope.database_id,
@@ -104,10 +113,9 @@ pub async fn fire_after_statement(params: FireAfterStatementParams<'_>) -> FireR
         triggers: &statement_triggers,
         bindings: &bindings,
         cascade_depth,
-        // STATEMENT triggers are outside the Event-Plane async ROW-trigger
-        // cross-shard sender path (see tracked follow-up).
-        cross_shard_origin: None,
+        cross_shard_origin,
         on_error,
+        joined,
     })
     .await
 }

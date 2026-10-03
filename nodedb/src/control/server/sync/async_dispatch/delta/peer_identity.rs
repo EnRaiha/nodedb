@@ -36,7 +36,7 @@ pub(super) enum PeerIdentity {
     /// reaches the merge. What catches it there is the zero-import accounting
     /// on the apply — a refusal it cannot make, but a fact it can report.
     Unbound,
-    /// Another producer owns this peer id. Writing under it would have the
+    /// Another producer owns this peer id. Writing under it will have the
     /// merge discard the delta.
     Collision { owner_producer_id: u64 },
 }
@@ -53,7 +53,7 @@ pub(super) struct PeerIdentityRequest<'a> {
 /// producer that already holds it.
 ///
 /// A newly created binding is replicated before the delta is admitted. Trusting
-/// the local claim alone would let two nodes each admit writes under the same
+/// the local claim alone will let two nodes each admit writes under the same
 /// peer id during the proposal window — the collision this exists to prevent,
 /// moved from between two clients to between two nodes.
 pub(super) async fn admit_peer_identity(
@@ -101,15 +101,16 @@ pub(super) async fn admit_peer_identity(
     }
 
     // Replicate, then re-read: the apply is lowest-producer-id-wins, so a node
-    // that lost a race it could not see locally learns the real owner only once
+    // that lost a race it cannot see locally learns the real owner only once
     // the entry lands.
-    crate::control::metadata_proposer::propose_sync_peer_bind(shared, &key, producer_id, now_ms)?;
+    crate::control::metadata_proposer::propose_sync_peer_bind(shared, &key, producer_id, now_ms)
+        .await?;
     registry.mark_peer_binding_converged(&key);
     match registry.peer_owner(&key)? {
         Some(owner) if owner == producer_id => Ok(PeerIdentity::Owned),
         Some(owner_producer_id) => Ok(PeerIdentity::Collision { owner_producer_id }),
-        // The row this call just wrote cannot be absent; treating a missing one
-        // as owned would admit a write under a peer id nothing claims.
+        // The row this call wrote cannot be absent; treating a missing one
+        // as owned will admit a write under a peer id nothing claims.
         None => Err(crate::Error::Internal {
             detail: format!(
                 "peer binding for {collection}/{peer_id} vanished between claim and read"

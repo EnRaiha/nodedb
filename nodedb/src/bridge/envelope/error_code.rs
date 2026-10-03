@@ -57,8 +57,6 @@ pub enum ErrorCode {
         expected: [u8; 32],
         actual: [u8; 32],
     },
-    /// Fan-out limit exceeded for graph/scatter queries.
-    FanOutExceeded,
     /// Memory budget exhausted — DataFusion should spill.
     ResourcesExhausted,
     /// Edge creation rejected: source or destination node does not exist.
@@ -201,6 +199,16 @@ impl From<nodedb_query::EvalError> for ErrorCode {
     }
 }
 
+/// A KV write that binds a row to `Surrogate::ZERO` fails prevalidation, the
+/// same refusal the dispatch-time check returns.
+impl From<crate::engine::kv::UnboundKvWrite> for ErrorCode {
+    fn from(e: crate::engine::kv::UnboundKvWrite) -> Self {
+        Self::RejectedPrevalidation {
+            reason: e.to_string(),
+        }
+    }
+}
+
 impl From<crate::Error> for ErrorCode {
     fn from(e: crate::Error) -> Self {
         match e {
@@ -216,11 +224,10 @@ impl From<crate::Error> for ErrorCode {
             | crate::Error::CollectionDeactivated { .. }
             | crate::Error::DocumentNotFound { .. } => Self::NotFound,
             crate::Error::RejectedAuthz { resource, .. } => Self::RejectedAuthz { resource },
-            // The Control Plane gives all three `40001` (serialization_failure).
-            crate::Error::ConflictRetry { .. }
-            | crate::Error::CalvinSerializationConflict
-            | crate::Error::SourceFrozen { .. } => Self::ConflictRetry,
-            crate::Error::FanOutExceeded { .. } => Self::FanOutExceeded,
+            // The Control Plane gives both `40001` (serialization_failure).
+            crate::Error::ConflictRetry { .. } | crate::Error::CalvinSerializationConflict => {
+                Self::ConflictRetry
+            }
             crate::Error::MemoryExhausted { .. } => Self::ResourcesExhausted,
             crate::Error::Backpressure { .. } => Self::ResourcesExhausted,
             crate::Error::AppendOnlyViolation { collection, .. } => {
@@ -363,7 +370,9 @@ impl From<crate::Error> for ErrorCode {
             e @ (crate::Error::NoLeader { .. }
             | crate::Error::GroupQuorumUnavailable { .. }
             | crate::Error::GroupMarksUnavailable { .. }
+            | crate::Error::BackupCaptureMoved { .. }
             | crate::Error::AuthorizationStateBehind { .. }
+            | crate::Error::LinearizableReadRefused { .. }
             | crate::Error::StaleReadNotLeader { .. }) => Self::RetryableRefusal {
                 reason: e.to_string(),
             },
@@ -428,6 +437,8 @@ impl From<crate::Error> for ErrorCode {
             // Data-Plane twin, and none is raised on the Data Plane.
             e @ (crate::Error::MaterializedSumResolutionMissing { .. }
             | crate::Error::RetryableLeaderChange { .. }
+            | crate::Error::CommittedResultUnavailable { .. }
+            | crate::Error::ProposalOutcomeUnknown { .. }
             | crate::Error::MetadataLeaderUnavailable
             | crate::Error::Wal(_)
             | crate::Error::Dispatch { .. }
@@ -442,12 +453,15 @@ impl From<crate::Error> for ErrorCode {
             | crate::Error::Encryption { .. }
             | crate::Error::Bridge { .. }
             | crate::Error::VersionCompat { .. }
+            | crate::Error::RestoreTargetNotEmpty { .. }
+            | crate::Error::RestoreVerificationFailed { .. }
             | crate::Error::Internal { .. }
             | crate::Error::Shaping(_)
             | crate::Error::RemoteTyped { .. }
             | crate::Error::Ddl(_)
             | crate::Error::DescriptorVersionAnomaly { .. }
             | crate::Error::CollectionPurgeRowMissing { .. }
+            | crate::Error::CollectionUnstamped { .. }
             | crate::Error::CatalogIntegrityViolation { .. }
             | crate::Error::CascadeCycle { .. }) => Self::Internal {
                 detail: e.to_string(),

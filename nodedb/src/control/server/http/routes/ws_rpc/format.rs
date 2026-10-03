@@ -4,16 +4,21 @@
 
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 
-use crate::control::change_stream::SequencedChangeEvent;
+use crate::control::change_stream::{ChangeCursor, SequencedChangeEvent};
 use crate::control::gateway::GatewayErrorMap;
 
-/// Format a cursor-aware LIVE SELECT notification.
-pub fn format_sequenced_live_notification(sub_id: u64, event: &SequencedChangeEvent) -> String {
+/// Format a cursor-aware LIVE SELECT notification. `cursor` resumes right
+/// after the event.
+pub fn format_sequenced_live_notification(
+    sub_id: u64,
+    event: &SequencedChangeEvent,
+    cursor: &ChangeCursor,
+) -> String {
     serde_json::json!({
         "method": "live",
         "params": {
             "subscription_id": sub_id,
-            "cursor": event.cursor().to_string(),
+            "cursor": cursor.to_string(),
             "wal_lsn": event.lsn.as_u64(),
             "database_id": event.database_id().as_u64(),
             "collection": event.collection,
@@ -25,10 +30,11 @@ pub fn format_sequenced_live_notification(sub_id: u64, event: &SequencedChangeEv
     .to_string()
 }
 
-/// Format a cursor-aware connection resume notification.
-pub fn format_resume_notification(event: &SequencedChangeEvent) -> String {
+/// Format a cursor-aware connection resume notification. `cursor` resumes
+/// right after the event.
+pub fn format_resume_notification(event: &SequencedChangeEvent, cursor: &ChangeCursor) -> String {
     serde_json::json!({"method": "change", "params": {
-        "cursor": event.cursor().to_string(), "wal_lsn": event.lsn.as_u64(),
+        "cursor": cursor.to_string(), "wal_lsn": event.lsn.as_u64(),
         "database_id": event.database_id().as_u64(), "collection": event.collection, "operation": event.operation.as_str(),
         "document_id": event.document_id.as_str(), "timestamp_ms": event.timestamp_ms,
     }})

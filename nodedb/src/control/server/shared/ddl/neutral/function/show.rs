@@ -4,11 +4,9 @@
 //!
 //! Lists all user-defined functions for the current tenant, plus system functions.
 //!
-//! Ported from the pgwire `ddl::function::show` handler. The catalog reads and
-//! row ordering (user-defined functions first, then system functions) are
-//! preserved verbatim; only the result construction changed from a pgwire
-//! `QueryResponse` (6 text columns) to a protocol-neutral [`DdlResult::Rows`]
-//! carrying the same columns and per-row values.
+//! The catalog reads and row ordering (user-defined functions first, then
+//! system functions) run here. The result is a protocol-neutral
+//! [`DdlResult::Rows`] with six text columns.
 
 use serde_json::{Map, Value as JsonValue};
 

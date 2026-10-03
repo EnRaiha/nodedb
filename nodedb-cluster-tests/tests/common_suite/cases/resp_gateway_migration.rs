@@ -28,6 +28,7 @@ fn test_ctx() -> QueryContext {
         trace_id: nodedb_types::TraceId::ZERO,
         database_id: nodedb_types::id::DatabaseId::DEFAULT,
         txn_id: None,
+        linearizable: false,
     }
 }
 
@@ -71,7 +72,7 @@ async fn resp_gateway_migration_single_node_set_get() {
         key: b"mykey".to_vec(),
         value: mp_string("myvalue"),
         ttl_ms: 0,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"mykey".as_ref()),
         returning: None,
         rls_filters: Vec::new(),
         provenance: None,
@@ -144,7 +145,7 @@ async fn resp_gateway_migration_cross_node_get() {
         key: b"cross-key".to_vec(),
         value: mp_string("cross-value"),
         ttl_ms: 0,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"cross-key".as_ref()),
         returning: None,
         rls_filters: Vec::new(),
         provenance: None,
@@ -213,6 +214,7 @@ fn resp_gateway_error_not_leader_is_moved() {
         vshard_id: VShardId::new(1),
         leader_node: 2,
         leader_addr: "10.0.0.2:9000".into(),
+        leader_term: 1,
     };
     let msg = GatewayErrorMap::to_resp(&err);
     assert!(

@@ -21,10 +21,11 @@
 //!    cluster-partitioned child (graph traversal by node-id, array by tile) is
 //!    broadcast to every vShard; a single-vShard-homed child (document / kv /
 //!    columnar / timeseries / spatial / vector / text, and joins/aggregates over
-//!    them) is routed to its ONE owning vShard — broadcasting it would duplicate
+//!    them) is routed to its ONE owning vShard — broadcasting it duplicates
 //!    rows, since the data-plane scan is not vshard-scoped.
 //!
-//! In single-node mode (routing table = `None`), all plans route locally.
+//! A state with no routing table routes every plan locally. Every booted
+//! node has one. A pure-logic fixture builds a state without it.
 
 use nodedb_cluster::routing::{RoutingTable, vshard_for_collection};
 use nodedb_types::PartitionStrategy;
@@ -72,7 +73,7 @@ pub fn route_plan(
         });
     }
 
-    // In single-node mode every plan runs locally.
+    // With no routing table every plan runs locally.
     let Some(routing) = routing else {
         let vshard_id = primary_vshard(&plan, database_id)?;
         return Ok(vec![TaskRoute {
@@ -86,7 +87,7 @@ pub fn route_plan(
     // The coordinator strips the Exchange here: its child is the plan that runs
     // on each vShard, and the per-vShard payloads are fused on return (see
     // `fuse_payloads` in the gateway core). Shipping the Exchange wrapper itself
-    // would let it reach a Data-Plane core, which rejects unresolved Exchange
+    // lets it reach a Data-Plane core, which rejects unresolved Exchange
     // nodes ("Exchange must be resolved by the coordinator before dispatch").
     use nodedb_physical::physical_plan::{
         ExchangeMode, ExchangeOp, QueryOp, plan_contains_cluster_partitioned_leaf,
@@ -105,8 +106,8 @@ pub fn route_plan(
             //   payloads.
             // - A single-vShard-homed source (document/kv/columnar/timeseries/
             //   spatial/vector/text, and joins/aggregates over them) lives on
-            //   exactly ONE vShard. Broadcasting it to all 1024 vShards would
-            //   return the full result from the owning node once per route that
+            //   exactly ONE vShard. Broadcasting it to all 1024 vShards
+            //   returns the full result from the owning node once per route that
             //   lands there (the data-plane scan is NOT vshard-scoped) → N-fold
             //   duplication. Route it to its single owning vShard instead. Any
             //   nested build-side data movement is resolved at the dispatch site
@@ -208,7 +209,7 @@ fn route_single_collection(
 ///    `LeaderUnknown` (surfaced as `Error::NotLeader` by dispatch so the
 ///    gateway retry loop sleeps and re-resolves).
 ///
-/// Single-node mode (`routing == None`) always routes locally.
+/// With no routing table (`routing == None`) it always routes locally.
 pub fn resolve_decision(
     vshard_id: u32,
     local_node_id: u64,
@@ -237,13 +238,21 @@ pub fn resolve_decision(
             };
         }
         // Live state has no leader for this group yet — fall through to
-        // routing-table hint (it may have a stale-but-usable forwarding
+        // routing-table hint (it can have a stale-but-usable forwarding
         // target from the last term).
     }
 
     match routing.leader_for_vshard(vshard_id) {
         Ok(0) => unknown,
-        Ok(leader) if leader == local_node_id => RouteDecision::Local,
+        // A hint naming this node is stale once this node holds no replica
+        // of the group: it left the group, so it cannot serve it.
+        Ok(leader) if leader == local_node_id => {
+            if routing.is_replica_of_vshard(vshard_id, local_node_id) {
+                RouteDecision::Local
+            } else {
+                unknown
+            }
+        }
         Ok(leader) => RouteDecision::Remote {
             node_id: leader,
             vshard_id: vshard_id as u64,
@@ -278,8 +287,8 @@ fn route_broadcast(
 /// task's own `vshard_id`.
 ///
 /// These ops name no collection, so the router cannot derive their vShard. The
-/// `primary_vshard` fallback would send them to vShard 0: a staged write would
-/// land in an overlay the commit never reads, and a commit would apply on the
+/// `primary_vshard` fallback sends them to vShard 0: a staged write
+/// lands in an overlay the commit never reads, and a commit applies on the
 /// wrong core. Callers dispatch them with the task's `vshard_id`, never
 /// through the gateway.
 pub fn is_task_vshard_scoped(plan: &PhysicalPlan) -> bool {
@@ -359,7 +368,7 @@ mod tests {
             key: vec![],
             value: vec![],
             ttl_ms: 0,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             returning: None,
             rls_filters: Vec::new(),
             provenance: None,
@@ -429,8 +438,8 @@ mod tests {
         // A single-vShard-homed read reaches the router wrapped in
         // Exchange{Gather} (the shape `convert()` produces). The router must
         // strip the Exchange and route the child to its ONE owning vShard — NOT
-        // broadcast to every vShard. Broadcasting a single-homed source would
-        // return the full collection from the owning node once per route that
+        // broadcast to every vShard. Broadcasting a single-homed source
+        // returns the full collection from the owning node once per route that
         // lands there (the data-plane scan is not vshard-scoped) → N-fold
         // duplication.
         let plan = PhysicalPlan::Query(nodedb_physical::physical_plan::QueryOp::Exchange(
@@ -467,7 +476,7 @@ mod tests {
             routes[0].plan
         );
         // It routes to the same single vShard a bare scan of the same collection
-        // would (the collection's owner).
+        // routes to (the collection's owner).
         assert_eq!(
             routes[0].vshard_id,
             vshard_for_collection(CollectionKey::from_bare(DatabaseId::DEFAULT, "events"))

@@ -3,7 +3,7 @@
 //! Statement-time staging for predicate `UPDATE ... WHERE <predicate>`
 //! (`DocumentOp::BulkUpdate`) inside a transaction. A `RETURNING` clause does
 //! not change what is staged — the matched rows' post-images are recorded
-//! identically; the clause only governs the client response shape.
+//! identically; the reply projects those post-images per the clause.
 //!
 //! Mirrors the point-write staging in `dispatch.rs`: the matched rows are
 //! evaluated against BASE ∪ OVERLAY (via [`CoreLoop::merge_overlay_into_scan`])
@@ -17,6 +17,8 @@ use nodedb_physical::physical_plan::UpdateValue;
 use nodedb_types::{RowIdentity, StorageKey};
 
 use super::body::stored_row_identity;
+use super::constraint::StagedStatement;
+use super::stage_returning::{StageReturning, StagedRowsOf};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
@@ -40,6 +42,8 @@ pub(in crate::data::executor) struct StageBulkUpdateParams<'a> {
     /// Declared `PRIMARY KEY` column of a schemaless collection, `None`
     /// otherwise — see `stage_apply_update`'s post-image guard.
     pub declared_primary_key: Option<&'a str>,
+    /// The plan's `RETURNING` spec, `None` when it carries none.
+    pub returning: Option<StageReturning<'a>>,
 }
 
 impl CoreLoop {
@@ -60,6 +64,7 @@ impl CoreLoop {
             updates,
             rls_write_check,
             declared_primary_key,
+            returning,
         } = params;
         let database_id = task.request.database_id;
         let coll_key: (DatabaseId, TenantId, String) =
@@ -132,7 +137,7 @@ impl CoreLoop {
         }
 
         let strict_schema = self.resolve_strict_schema(database_id.as_u64(), tid, collection);
-        let mut affected = 0u64;
+        let mut post_images: Vec<(u32, RowIdentity, Vec<u8>)> = Vec::with_capacity(rows.len());
         for (row_key, current_body) in &rows {
             let surrogate = row_key.surrogate().as_u32();
             let new_body = match self.stage_apply_update(
@@ -166,12 +171,58 @@ impl CoreLoop {
             ) {
                 return self.response_error(task, e);
             }
+            post_images.push((surrogate, identity, new_body));
+        }
+
+        // UNIQUE holds at the end of the statement: the matched rows are
+        // judged together, so a value one of them releases is free for
+        // another.
+        let judged: Vec<(u32, &[u8])> = post_images
+            .iter()
+            .map(|(surrogate, _, body)| (*surrogate, body.as_slice()))
+            .collect();
+        if let Err(e) = self.stage_stored_unique_check(
+            &StagedStatement {
+                database_id: database_id.as_u64(),
+                tid,
+                txn_id,
+                coll_key: &coll_key,
+            },
+            &judged,
+        ) {
+            return self.response_error(task, e);
+        }
+
+        let mut affected = 0u64;
+        let mut staged: Vec<(RowIdentity, Vec<u8>)> = Vec::new();
+        for (surrogate, identity, new_body) in post_images {
+            if returning.is_some() {
+                staged.push((identity.clone(), new_body.clone()));
+            }
             if let Err(e) =
                 self.stage_bulk_put_capped(txn_id, &coll_key, surrogate, &identity, new_body)
             {
                 return self.response_error(task, e);
             }
             affected += 1;
+        }
+
+        if let Some(returning) = returning {
+            let rows: Vec<(&RowIdentity, &[u8])> = staged
+                .iter()
+                .map(|(identity, body)| (identity, body.as_slice()))
+                .collect();
+            return self.staged_returning_response(
+                StagedRowsOf {
+                    task,
+                    database_id: database_id.as_u64(),
+                    tid,
+                    collection,
+                },
+                returning,
+                affected,
+                &rows,
+            );
         }
 
         match response_codec::encode_json_as_msgpack(&serde_json::json!({ "affected": affected })) {

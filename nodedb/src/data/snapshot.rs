@@ -1,267 +1,266 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Data Plane core snapshot — serializes all engine state for transfer.
+//! Physical snapshot format.
 //!
-//! Used by InstallSnapshot (lagging follower recovery) and vShard migration
-//! (Phase 1 base copy). Captures the full state of a Data Plane core:
-//! - SparseEngine documents and indexes (from redb)
-//! - EdgeStore edges and reverse edges (from redb)
-//! - VectorCollection checkpoint bytes (in-memory, multi-segment)
-//! - CRDT engine state per tenant (loro export)
-//! - Watermark LSN
+//! A [`CoreSnapshot`] is the image of one Data Plane core's durable files,
+//! taken right after a forced checkpoint. A [`NodeSnapshot`] is the image of
+//! the node-level stores: the catalogs, the Event Plane stores, the array
+//! sync stores, and the WAL-wrapped CRDT signing root. Restore writes every file back to the same path under an
+//! empty data directory, and the normal boot path opens it.
 
-/// Serializable snapshot of a single vector collection.
-///
-/// The collection state is stored as opaque checkpoint bytes produced by
-/// `VectorCollection::checkpoint_to_bytes()`. This handles the multi-segment
-/// lifecycle (growing + sealed + building) transparently.
+use crate::types::replay_stamp::ReplayStamp;
+
+/// The store a snapshot file belongs to.
 #[derive(
     Debug,
     Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
     serde::Serialize,
     serde::Deserialize,
     zerompk::ToMessagePack,
     zerompk::FromMessagePack,
 )]
-pub struct HnswSnapshot {
-    /// Database owner. `#[serde(default)]` → legacy snapshots decode as
-    /// `DatabaseId::DEFAULT` (0).
-    #[serde(default)]
-    pub database_id: u64,
-    /// Tenant owner.
-    #[serde(default)]
-    pub tenant_id: u64,
-    /// Collection name (without tenant prefix).
-    pub collection: String,
-    /// Checkpoint bytes from `VectorCollection::checkpoint_to_bytes()`.
-    pub checkpoint_bytes: Vec<u8>,
+#[repr(u8)]
+#[msgpack(c_enum)]
+pub enum SnapshotComponent {
+    /// `system.redb`: the node's system catalog.
+    SystemCatalog = 0,
+    /// `cluster.redb`: the node's cluster catalog.
+    ClusterCatalog = 1,
+    /// The core's sparse redb store: documents, secondary indexes, full-text
+    /// postings, column statistics, and hash-chain heads.
+    Sparse = 2,
+    /// The core's graph edge redb store.
+    Graph = 3,
+    Kv = 4,
+    SparseVector = 5,
+    SyncHwm = 6,
+    Columnar = 7,
+    GraphLabel = 8,
+    Array = 9,
+    Timeseries = 10,
+    Vector = 11,
+    Crdt = 12,
+    Spatial = 13,
+    /// A durable Event Plane redb store under `event_plane/`.
+    EventPlane = 14,
+    /// A durable array sync redb store under `array_sync/`.
+    ArraySync = 15,
+    /// `wal/crdt_signing_root.enc`: the CRDT signing root wrapped by the WAL
+    /// key. `system.redb` holds its fingerprint, and boot refuses a root
+    /// that does not match.
+    WalKeys = 16,
 }
 
-/// Serializable snapshot of a single CRDT collection's state.
+impl SnapshotComponent {
+    /// Whether the component is node-level rather than owned by one core.
+    pub fn is_node_level(self) -> bool {
+        matches!(
+            self,
+            Self::SystemCatalog
+                | Self::ClusterCatalog
+                | Self::EventPlane
+                | Self::ArraySync
+                | Self::WalKeys
+        )
+    }
+}
+
+/// One captured file.
 #[derive(
     Debug,
     Clone,
+    PartialEq,
+    Eq,
     serde::Serialize,
     serde::Deserialize,
     zerompk::ToMessagePack,
     zerompk::FromMessagePack,
 )]
-pub struct CrdtSnapshot {
-    pub database_id: u64,
-    pub tenant_id: u64,
-    pub peer_id: u64,
-    /// Collection this snapshot belongs to.
-    pub collection: String,
-    /// Loro binary snapshot (from LoroDoc::export_snapshot).
-    pub snapshot_bytes: Vec<u8>,
+pub struct SnapshotFile {
+    pub component: SnapshotComponent,
+    /// Path relative to the data directory, `/`-separated.
+    pub path: String,
+    pub bytes: Vec<u8>,
 }
 
-/// Serializable key-value pair from a redb table.
+/// One captured directory that boot requires to exist, even with no file in
+/// it. A checkpoint generation with nothing to hold is such a directory: its
+/// MANIFEST names it, and the loader lists it.
 #[derive(
     Debug,
     Clone,
+    PartialEq,
+    Eq,
     serde::Serialize,
     serde::Deserialize,
     zerompk::ToMessagePack,
     zerompk::FromMessagePack,
 )]
-pub struct KvPair {
-    pub key: String,
-    pub value: Vec<u8>,
+pub struct SnapshotDir {
+    pub component: SnapshotComponent,
+    /// Path relative to the data directory, `/`-separated.
+    pub path: String,
 }
 
-/// Tenant-tagged key-value pair from a structurally-partitioned redb
-/// table (e.g. the graph edge store). The tenant id is carried
-/// explicitly — no lexical encoding.
+/// The physical image of one Data Plane core.
 #[derive(
     Debug,
     Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    zerompk::ToMessagePack,
-    zerompk::FromMessagePack,
-)]
-pub struct TenantKvPair {
-    pub database_id: u64,
-    pub tenant_id: u64,
-    pub key: String,
-    pub value: Vec<u8>,
-}
-
-/// Complete snapshot of a Data Plane core's state.
-///
-/// Designed for serialization via MessagePack and transfer over the network
-/// as InstallSnapshot data or VShardEnvelope::SegmentChunk payloads.
-#[derive(
-    Debug,
-    Clone,
+    PartialEq,
+    Eq,
     serde::Serialize,
     serde::Deserialize,
     zerompk::ToMessagePack,
     zerompk::FromMessagePack,
 )]
 pub struct CoreSnapshot {
-    /// The core's checkpoint floor when the snapshot was taken: every record
-    /// at or below it that the core applied is in the snapshot. A record
-    /// above it can be missing, so restore replays the WAL above it.
-    pub watermark: u64,
-
-    /// All documents from SparseEngine.
-    pub sparse_documents: Vec<KvPair>,
-    /// All secondary indexes from SparseEngine.
-    pub sparse_indexes: Vec<KvPair>,
-
-    /// All edges from EdgeStore, tenant-tagged. The reverse-edge
-    /// index is rebuilt on restore from the forward records — not
-    /// shipped separately.
-    pub edges: Vec<TenantKvPair>,
-
-    /// All HNSW vector indexes.
-    pub hnsw_indexes: Vec<HnswSnapshot>,
-
-    /// All CRDT tenant states.
-    pub crdt_snapshots: Vec<CrdtSnapshot>,
+    /// The records the captured files hold: every record at or below
+    /// `stamp.prefix` that this core applied, plus the ranges above it.
+    pub stamp: ReplayStamp,
+    pub files: Vec<SnapshotFile>,
+    /// Directories restore creates beside `files`: every live checkpoint
+    /// generation directory, so an empty one comes back too.
+    pub dirs: Vec<SnapshotDir>,
 }
 
 impl CoreSnapshot {
     pub fn empty() -> Self {
         Self {
-            watermark: 0,
-            sparse_documents: Vec::new(),
-            sparse_indexes: Vec::new(),
-            edges: Vec::new(),
-            hnsw_indexes: Vec::new(),
-            crdt_snapshots: Vec::new(),
+            stamp: ReplayStamp::default(),
+            files: Vec::new(),
+            dirs: Vec::new(),
         }
     }
 
-    /// Serialize to bytes for network transfer.
+    /// The lowest LSN the WAL must keep above to bring this core forward.
+    pub fn replay_floor(&self) -> u64 {
+        self.stamp.prefix
+    }
+
+    /// The highest LSN whose effect the captured files include.
+    pub fn applied_high_lsn(&self) -> u64 {
+        self.stamp.highest()
+    }
+
     pub fn to_bytes(&self) -> crate::Result<Vec<u8>> {
-        zerompk::to_msgpack_vec(self).map_err(|e| crate::Error::Serialization {
-            format: "msgpack".into(),
-            detail: format!("CoreSnapshot: {e}"),
-        })
+        encode("CoreSnapshot", self)
     }
 
-    /// Deserialize from bytes.
-    pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        zerompk::from_msgpack(data).ok()
+    pub fn from_bytes(data: &[u8]) -> crate::Result<Self> {
+        decode("CoreSnapshot", data)
     }
 
-    /// Approximate size in bytes (for progress tracking).
+    /// Total captured file bytes.
     pub fn approx_size(&self) -> usize {
-        let sparse = self
-            .sparse_documents
+        self.files
             .iter()
-            .map(|kv| kv.key.len() + kv.value.len())
-            .sum::<usize>()
-            + self
-                .sparse_indexes
-                .iter()
-                .map(|kv| kv.key.len() + kv.value.len())
-                .sum::<usize>();
-        let edges = self
-            .edges
-            .iter()
-            .map(|kv| kv.key.len() + kv.value.len() + 4)
-            .sum::<usize>();
-        let vectors: usize = self
-            .hnsw_indexes
-            .iter()
-            .map(|h| h.checkpoint_bytes.len())
-            .sum();
-        let crdt: usize = self
-            .crdt_snapshots
-            .iter()
-            .map(|c| c.snapshot_bytes.len())
-            .sum();
-        sparse + edges + vectors + crdt
+            .map(|f| f.path.len() + f.bytes.len())
+            .sum()
     }
+}
+
+/// The physical image of the node-level redb stores.
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct NodeSnapshot {
+    pub files: Vec<SnapshotFile>,
+    /// The metadata group's applied index when capture began, `0` with no
+    /// cluster. The catalog images hold every entry at or below it, so a
+    /// cluster restore replays the metadata log from the entry above it.
+    pub metadata_applied_index: u64,
+    /// The metadata group's applied index when capture ended. The catalog
+    /// images hold no entry above it.
+    pub metadata_captured_index: u64,
+    /// The metadata timeline the catalog images belong to (see
+    /// `storage::metadata_timeline`).
+    pub metadata_timeline: u64,
+}
+
+impl NodeSnapshot {
+    pub fn to_bytes(&self) -> crate::Result<Vec<u8>> {
+        encode("NodeSnapshot", self)
+    }
+
+    pub fn from_bytes(data: &[u8]) -> crate::Result<Self> {
+        decode("NodeSnapshot", data)
+    }
+}
+
+fn encode<T: zerompk::ToMessagePack>(what: &str, value: &T) -> crate::Result<Vec<u8>> {
+    zerompk::to_msgpack_vec(value).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("{what} encode: {e}"),
+    })
+}
+
+fn decode<T: for<'a> zerompk::FromMessagePack<'a>>(what: &str, data: &[u8]) -> crate::Result<T> {
+    zerompk::from_msgpack(data).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("{what} decode: {e}"),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::replay_stamp::LsnRange;
 
     #[test]
     fn empty_snapshot_roundtrip() {
-        let snap = CoreSnapshot::empty();
-        let bytes = snap.to_bytes().unwrap();
+        let bytes = CoreSnapshot::empty().to_bytes().unwrap();
         let decoded = CoreSnapshot::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded.watermark, 0);
-        assert!(decoded.sparse_documents.is_empty());
-        assert!(decoded.hnsw_indexes.is_empty());
+        assert_eq!(decoded, CoreSnapshot::empty());
+        assert_eq!(decoded.replay_floor(), 0);
+        assert_eq!(decoded.applied_high_lsn(), 0);
     }
 
     #[test]
-    fn snapshot_with_data_roundtrip() {
+    fn snapshot_with_files_roundtrip() {
         let snap = CoreSnapshot {
-            watermark: 42,
-            sparse_documents: vec![
-                KvPair {
-                    key: "users:u1".into(),
-                    value: b"alice".to_vec(),
+            stamp: ReplayStamp {
+                prefix: 40,
+                applied_above: vec![LsnRange { start: 42, end: 45 }],
+            },
+            files: vec![
+                SnapshotFile {
+                    component: SnapshotComponent::Sparse,
+                    path: "sparse/core-0.redb".into(),
+                    bytes: vec![1, 2, 3],
                 },
-                KvPair {
-                    key: "users:u2".into(),
-                    value: b"bob".to_vec(),
+                SnapshotFile {
+                    component: SnapshotComponent::Kv,
+                    path: "kv-ckpt/core-0/MANIFEST".into(),
+                    bytes: vec![4],
                 },
             ],
-            sparse_indexes: vec![KvPair {
-                key: "users:name:alice:u1".into(),
-                value: vec![],
-            }],
-            edges: vec![TenantKvPair {
-                database_id: 0,
-                tenant_id: 1,
-                key: "u1\0knows\0u2".into(),
-                value: b"{}".to_vec(),
-            }],
-            hnsw_indexes: vec![HnswSnapshot {
-                database_id: 0,
-                tenant_id: 1,
-                collection: "embeddings".into(),
-                checkpoint_bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
-            }],
-            crdt_snapshots: vec![CrdtSnapshot {
-                database_id: 0,
-                tenant_id: 1,
-                peer_id: 100,
-                collection: "notes".into(),
-                snapshot_bytes: vec![0xAB, 0xCD],
+            dirs: vec![SnapshotDir {
+                component: SnapshotComponent::Kv,
+                path: "kv-ckpt/core-0/gen-0".into(),
             }],
         };
-
-        let bytes = snap.to_bytes().unwrap();
-        let decoded = CoreSnapshot::from_bytes(&bytes).unwrap();
-
-        assert_eq!(decoded.watermark, 42);
-        assert_eq!(decoded.sparse_documents.len(), 2);
-        assert_eq!(decoded.sparse_documents[0].key, "users:u1");
-        assert_eq!(decoded.edges.len(), 1);
-        assert_eq!(decoded.hnsw_indexes.len(), 1);
-        assert_eq!(decoded.hnsw_indexes[0].collection, "embeddings");
-        assert_eq!(decoded.hnsw_indexes[0].tenant_id, 1);
-        assert_eq!(decoded.crdt_snapshots.len(), 1);
+        let decoded = CoreSnapshot::from_bytes(&snap.to_bytes().unwrap()).unwrap();
+        assert_eq!(decoded, snap);
+        assert_eq!(decoded.replay_floor(), 40);
+        assert_eq!(decoded.applied_high_lsn(), 45);
         assert!(decoded.approx_size() > 0);
     }
 
     #[test]
-    fn hnsw_snapshot_checkpoint_bytes_roundtrip() {
-        // Verify that checkpoint_bytes survive serialization/deserialization.
-        let ckpt = vec![0x01u8, 0x02, 0x03, 0x04, 0x05];
-        let snap = CoreSnapshot {
-            hnsw_indexes: vec![HnswSnapshot {
-                database_id: 0,
-                tenant_id: 1,
-                collection: "test".into(),
-                checkpoint_bytes: ckpt.clone(),
-            }],
-            ..CoreSnapshot::empty()
-        };
-        let bytes = snap.to_bytes().unwrap();
-        let decoded = CoreSnapshot::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded.hnsw_indexes[0].collection, "test");
-        assert_eq!(decoded.hnsw_indexes[0].checkpoint_bytes, ckpt);
+    fn garbage_is_a_decode_error() {
+        assert!(CoreSnapshot::from_bytes(&[0xC1, 0xFF]).is_err());
+        assert!(NodeSnapshot::from_bytes(&[0xC1, 0xFF]).is_err());
     }
 }

@@ -136,6 +136,31 @@ pub async fn broadcast_count_to_all_cores(
     trace_id: TraceId,
     count_key: &str,
 ) -> crate::Result<Response> {
+    // One statement, one deadline instant — every core waits to the same one.
+    let deadline = statement_deadline(shared.tuning.network.default_deadline_secs);
+    broadcast_count_to_all_cores_until(
+        shared,
+        tenant_id,
+        database_id,
+        plan,
+        trace_id,
+        count_key,
+        deadline,
+    )
+    .await
+}
+
+/// [`broadcast_count_to_all_cores`] with every core bounded by `deadline`.
+/// A caller outside the statement's task picks its own deadline.
+pub(crate) async fn broadcast_count_to_all_cores_until(
+    shared: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    plan: PhysicalPlan,
+    trace_id: TraceId,
+    count_key: &str,
+    deadline: std::time::Instant,
+) -> crate::Result<Response> {
     BROADCAST_CALLS.fetch_add(1, Ordering::Relaxed);
     let num_cores = shared
         .dispatcher
@@ -154,7 +179,7 @@ pub async fn broadcast_count_to_all_cores(
             database_id,
             vshard_id,
             plan: plan.clone(),
-            deadline: statement_deadline(shared.tuning.network.default_deadline_secs),
+            deadline,
             priority: Priority::Normal,
             trace_id,
             consistency: ReadConsistency::Strong,
@@ -166,15 +191,21 @@ pub async fn broadcast_count_to_all_cores(
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission,
         };
 
         let rx = shared.tracker.register(request_id);
-        shared
+        let dispatched = shared
             .dispatcher
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .dispatch_to_core(core_id, request)?;
+            .dispatch_to_core(core_id, request);
+        if let Err(error) = dispatched {
+            // No response ever arrives for a refused request.
+            shared.tracker.cancel(&request_id);
+            return Err(error);
+        }
         receivers.push((request_id, rx));
     }
 
@@ -184,8 +215,6 @@ pub async fn broadcast_count_to_all_cores(
     // out of time reports the statement's deadline rather than collapsing into
     // a generic dispatch failure.
     let mut first_error: Option<crate::Error> = None;
-    // One statement, one deadline instant — every core waits to the same one.
-    let deadline = statement_deadline(shared.tuning.network.default_deadline_secs);
 
     for (request_id, mut rx) in receivers {
         let resp = match tokio::time::timeout_at(
@@ -223,7 +252,7 @@ pub async fn broadcast_count_to_all_cores(
     }
 
     // A broadcast is an all-core barrier. Returning success after even one
-    // error would let callers finalize control-plane state while that core
+    // error will let callers finalize control-plane state while that core
     // still retains the old Array store.
     if let Some(error) = first_error {
         return Err(error);
@@ -293,6 +322,7 @@ pub async fn broadcast_register_to_all_cores(
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission,
         };
 

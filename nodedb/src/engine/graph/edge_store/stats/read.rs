@@ -26,6 +26,7 @@ use nodedb_types::TenantId;
 
 use crate::engine::graph::edge_store::store::{EDGES, EdgeStore, redb_err};
 use crate::engine::graph::edge_store::temporal::keys::{is_sentinel, parse_versioned_edge_key};
+use crate::engine::graph::edge_store::temporal::visibility::{ReadVisibility, read_visibility};
 
 use super::table::{CollectionStats, GRAPH_STATS, LabelRow, SummaryRow, label_prefix, summary_key};
 
@@ -207,7 +208,17 @@ impl EdgeStore {
             .open_table(EDGES)
             .map_err(|e| redb_err("open edges (historical)", e))?;
 
-        let stats = materialise_collection_stats(collection, &edges, db, t, &prefix, as_of)?;
+        let mut visibility = read_visibility(&read_txn)?;
+
+        let stats = materialise_collection_stats(
+            collection,
+            &edges,
+            &mut visibility,
+            db,
+            t,
+            &prefix,
+            as_of,
+        )?;
         Ok(stats)
     }
 
@@ -225,6 +236,7 @@ impl EdgeStore {
         let edges = read_txn
             .open_table(EDGES)
             .map_err(|e| redb_err("open edges (tenant_stats_hist)", e))?;
+        let mut visibility = read_visibility(&read_txn)?;
 
         // One pass across all (db, tenant) edges — collect per-collection accumulators.
         let mut per_coll: HashMap<String, CollectionAccum> = HashMap::new();
@@ -239,7 +251,7 @@ impl EdgeStore {
             let Some((coll, src, label, dst, sys)) = parse_versioned_edge_key(composite) else {
                 continue;
             };
-            if sys > as_of {
+            if sys > as_of || visibility.hidden(db, t, coll, composite, sys, as_of)? {
                 continue;
             }
             let bytes = v.value();
@@ -326,6 +338,7 @@ fn read_labels_from_table(
 fn materialise_collection_stats(
     collection: &str,
     edges: &redb::ReadOnlyTable<(u64, u64, &str), &[u8]>,
+    visibility: &mut ReadVisibility,
     db: u64,
     t: u64,
     prefix: &str,
@@ -355,7 +368,7 @@ fn materialise_collection_stats(
         let Some((_c, src, label, dst, sys)) = parse_versioned_edge_key(composite) else {
             continue;
         };
-        if sys > as_of {
+        if sys > as_of || visibility.hidden(db, t, collection, composite, sys, as_of)? {
             continue;
         }
         let base = format!("{src}\x00{label}\x00{dst}");

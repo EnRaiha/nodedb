@@ -15,7 +15,7 @@ use nodedb_cluster::{
     METADATA_GROUP_ID, RaftRpc, RoutingTable, ShuffleProduceRequest, ShuffleProduceResponse,
 };
 
-use crate::types::DatabaseId;
+use crate::types::{DatabaseId, TraceId};
 
 /// Producer nodes that own `collection`'s data. `collection` is the plan's
 /// database-qualified name. Resolve its canonical key's vShard → owning
@@ -26,14 +26,7 @@ pub(super) fn producer_nodes(
     database_id: DatabaseId,
     collection: &str,
 ) -> crate::Result<Vec<u64>> {
-    let vshard = nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?
-        .vshard()
-        .as_u32();
-    let group = routing
-        .group_for_vshard(vshard)
-        .map_err(|e| crate::Error::Internal {
-            detail: format!("shuffle: no group for vshard {vshard} ({collection}): {e}"),
-        })?;
+    let group = collection_group(routing, database_id, collection)?;
     let leader = routing
         .group_info(group)
         .map(|g| g.leader)
@@ -42,6 +35,44 @@ pub(super) fn producer_nodes(
             detail: format!("shuffle: no leader for group {group} ({collection})"),
         })?;
     Ok(vec![leader])
+}
+
+/// The Raft group that homes `collection`.
+fn collection_group(
+    routing: &RoutingTable,
+    database_id: DatabaseId,
+    collection: &str,
+) -> crate::Result<u64> {
+    let vshard = nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?
+        .vshard()
+        .as_u32();
+    routing
+        .group_for_vshard(vshard)
+        .map_err(|e| crate::Error::Internal {
+            detail: format!("shuffle: no group for vshard {vshard} ({collection}): {e}"),
+        })
+}
+
+/// How a shuffle's producers read: the statement's trace, and whether each
+/// producer scan is a linearizable read.
+#[derive(Debug, Clone, Copy)]
+pub struct ShuffleRead {
+    pub trace_id: TraceId,
+    pub linearizable: bool,
+}
+
+/// Groups a producer scanning `collection` confirms before it reads: the
+/// collection's group for a linearizable read, none otherwise.
+pub(super) fn producer_read_groups(
+    routing: &RoutingTable,
+    database_id: DatabaseId,
+    collection: &str,
+    linearizable: bool,
+) -> crate::Result<Vec<u64>> {
+    if !linearizable {
+        return Ok(Vec::new());
+    }
+    collection_group(routing, database_id, collection).map(|group| vec![group])
 }
 
 /// Count distinct data-group leaders (the cluster's data-node count), excluding

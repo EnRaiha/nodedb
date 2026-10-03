@@ -16,7 +16,7 @@ pub(super) const GRAPH_LABEL_CKPT_STATE: &str = "STATE";
 /// cores and a core only owns the CSR partitions routed to its vShards; without
 /// it, cores would race-overwrite each other's file and every core but the last
 /// would restore labels belonging to another core's partitions.
-pub(super) fn graph_label_ckpt_dir(
+pub(crate) fn graph_label_ckpt_dir(
     data_dir: &std::path::Path,
     core_id: usize,
 ) -> std::path::PathBuf {
@@ -26,7 +26,7 @@ pub(super) fn graph_label_ckpt_dir(
 }
 
 /// Path of the state file itself.
-pub(super) fn graph_label_ckpt_state_path(ckpt_dir: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn graph_label_ckpt_state_path(ckpt_dir: &std::path::Path) -> std::path::PathBuf {
     ckpt_dir.join(GRAPH_LABEL_CKPT_STATE)
 }
 

@@ -90,7 +90,7 @@ async fn pgwire_ddl_roundtrip() {
 
     let (shutdown_bus, _) =
         nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&state.shutdown));
-    let shared_pg = Arc::clone(&state);
+    let shared_pg = Arc::clone(&*state);
     let test_startup_gate = Arc::clone(&state.startup);
     let bus_pg = shutdown_bus.clone();
     let listener_handle = tokio::spawn(async move {

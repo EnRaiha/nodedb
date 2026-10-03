@@ -94,52 +94,48 @@ impl<S: LogStorage> RaftLog<S> {
         Ok(&self.entries[start..end])
     }
 
-    /// Append new entries from a leader's AppendEntries RPC.
+    /// Append new entries from a leader's AppendEntries RPC. Returns whether
+    /// storage took a write.
     ///
     /// Handles conflict detection per Raft paper §5.3:
     /// - If an existing entry conflicts with a new one (same index, different
     ///   terms), delete the existing entry and all that follow it.
     /// - Append any new entries not already in the log.
     ///
-    /// Persistence happens BEFORE the in-memory log is mutated. The response to
-    /// an `AppendEntries` RPC reports `last_index()` from the in-memory log, and
-    /// the leader treats that number as "durably held by this peer" — it counts
-    /// toward quorum on success and rewinds `next_index` past it on failure. If
-    /// the in-memory log were advanced first and the storage write then failed,
-    /// this node would report entries it does not hold, the leader would never
-    /// resend them, and they would disappear on restart. Mutating memory only
-    /// after storage has accepted the write makes that state unreachable: a
-    /// failed persist leaves `last_index()` covering exactly what is on disk.
-    pub fn append_entries(&mut self, _prev_index: u64, entries: &[LogEntry]) -> Result<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
+    /// An entry this log already holds at the same term is not written again.
+    /// A leader resends a range until it is acknowledged, and a rewrite of a
+    /// held range only delays the reply.
+    ///
+    /// Persistence happens BEFORE the in-memory log is mutated. A success
+    /// reply claims the matched entries as durable on this node. A storage
+    /// write that fails after memory moved leaves a claim on entries storage
+    /// never took, and a restart loses them. A failed persist therefore
+    /// leaves memory covering exactly what storage took.
+    /// Storage that stages writes accepts them at once. When this returns
+    /// `true`, the caller makes them durable before the reply leaves.
+    pub fn append_entries(&mut self, _prev_index: u64, entries: &[LogEntry]) -> Result<bool> {
+        // The first entry this log does not hold at the same term. Detection
+        // mutates nothing: the durable writes below can still fail.
+        let Some(first_new) = entries.iter().position(|e| {
+            e.index > self.snapshot_index
+                && self
+                    .entry_at(e.index)
+                    .is_none_or(|existing| existing.term != e.term)
+        }) else {
+            return Ok(false);
+        };
+        let new = &entries[first_new..];
 
-        // Locate the first conflicting index (same index, different term) without
-        // mutating anything — detection must not be destructive, because the
-        // durable writes below may still fail.
-        let conflict = entries
-            .iter()
-            .find(|e| matches!(self.entry_at(e.index), Some(existing) if existing.term != e.term))
+        let conflict = new
+            .first()
+            .filter(|e| self.entry_at(e.index).is_some())
             .map(|e| e.index);
-
         if let Some(index) = conflict {
             self.truncate_from(index)?;
         }
-        self.storage.append(entries)?;
-
-        for entry in entries {
-            if entry.index <= self.snapshot_index {
-                // Already covered by the snapshot; pushing it would break the
-                // `entries[0].index == snapshot_index + 1` offset invariant.
-                continue;
-            }
-            if self.entry_at(entry.index).is_none() {
-                self.entries.push(entry.clone());
-            }
-            // Same index AND same term = already present, nothing to do.
-        }
-        Ok(())
+        self.storage.append(new)?;
+        self.entries.extend_from_slice(new);
+        Ok(true)
     }
 
     /// Append a single entry proposed by the leader.
@@ -166,17 +162,43 @@ impl<S: LogStorage> RaftLog<S> {
     }
 
     /// Apply a snapshot: discard all entries up to `last_included_index`.
-    pub fn apply_snapshot(&mut self, last_included_index: u64, last_included_term: u64) {
-        // Remove entries already covered by the snapshot.
-        if last_included_index > self.snapshot_index {
-            let new_start = last_included_index + 1;
-            self.entries.retain(|e| e.index >= new_start);
-            self.snapshot_index = last_included_index;
-            self.snapshot_term = last_included_term;
-            let _ = self
-                .storage
-                .compact(last_included_index, last_included_term);
+    ///
+    /// Storage compacts first. A storage error leaves the in-memory log
+    /// untouched, so memory never claims a boundary storage does not hold.
+    pub fn apply_snapshot(
+        &mut self,
+        last_included_index: u64,
+        last_included_term: u64,
+    ) -> Result<()> {
+        if last_included_index <= self.snapshot_index {
+            return Ok(());
         }
+        self.storage
+            .compact(last_included_index, last_included_term)?;
+        let new_start = last_included_index + 1;
+        self.entries.retain(|e| e.index >= new_start);
+        self.snapshot_index = last_included_index;
+        self.snapshot_term = last_included_term;
+        Ok(())
+    }
+
+    /// The last index of this log that storage holds durably.
+    ///
+    /// Storage whose writes are durable on return holds the whole log. Storage
+    /// that stages writes reports its last durable entry `(index, term)`. That
+    /// entry counts only when this log holds the same entry: Raft logs that
+    /// agree on one entry agree on every entry before it. A durable entry this
+    /// log no longer holds, or holds at another term, means a truncation is
+    /// still on its way to disk. The durable prefix is then not known past the
+    /// snapshot boundary, and the smaller of the two answers.
+    pub fn stable_index(&self) -> u64 {
+        let Some((index, term)) = self.storage.stable_through() else {
+            return self.last_index();
+        };
+        if index <= self.last_index() && self.term_at(index) == Some(term) {
+            return index;
+        }
+        index.min(self.snapshot_index)
     }
 
     pub fn snapshot_index(&self) -> u64 {
@@ -266,7 +288,7 @@ mod tests {
             log.append(make_entry(1, i)).unwrap();
         }
 
-        log.apply_snapshot(5, 1);
+        log.apply_snapshot(5, 1).unwrap();
         assert_eq!(log.snapshot_index(), 5);
         assert_eq!(log.last_index(), 10);
         // Compacted entries are gone.
@@ -359,6 +381,30 @@ mod tests {
         log.append_entries(1, &[make_entry(1, 2), make_entry(1, 3)])
             .expect("resend after recovery");
         assert_eq!(log.last_index(), 3);
+    }
+
+    /// A resent range this log already holds takes no storage write. Only the
+    /// entries past it are written.
+    #[test]
+    fn a_resent_held_range_writes_nothing() {
+        let mut log = RaftLog::new(FlakyStorage::default());
+        let held = [make_entry(1, 1), make_entry(1, 2)];
+        assert!(log.append_entries(0, &held).expect("first delivery"));
+
+        log.storage_mut().fail_append = true;
+        let wrote = log
+            .append_entries(0, &held)
+            .expect("a held range needs no write");
+        assert!(!wrote);
+
+        log.storage_mut().fail_append = false;
+        let wrote = log
+            .append_entries(0, &[make_entry(1, 1), make_entry(1, 2), make_entry(1, 3)])
+            .expect("extend past the held range");
+        assert!(wrote);
+        assert_eq!(log.last_index(), 3);
+        let persisted = log.storage().load_entries_after(0).expect("load");
+        assert_eq!(persisted.len(), 3);
     }
 
     /// A failed truncate must leave the conflicting suffix in memory, matching

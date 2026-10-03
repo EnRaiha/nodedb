@@ -3,10 +3,8 @@
 //! Protocol-neutral scope query DDL commands: ALTER SCOPE, SHOW MY SCOPES,
 //! SHOW SCOPES FOR.
 //!
-//! Ported from the pgwire `ddl::scope_query_ddl` handlers. The superuser gate,
-//! `scope_defs` / `scope_grants` / `orgs` catalog reads and mutations, and
-//! `audit_record` side effects are preserved verbatim; only the result
-//! construction changed from pgwire `Response` / `QueryResponse` / `Tag` to the
+//! The superuser gate, `scope_defs` / `scope_grants` / `orgs` catalog reads
+//! and mutations, and `audit_record` side effects run here. The result is the
 //! protocol-neutral [`DdlResult`] over [`ShapedRows`].
 
 use serde_json::{Map, Value as JsonValue};
@@ -17,8 +15,7 @@ use crate::control::state::SharedState;
 
 use super::super::result::{DdlError, DdlResult};
 
-/// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
-/// the pgwire handlers produced (via `sqlstate_error`).
+/// Construct a [`DdlError`] from a SQLSTATE code and a message.
 fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
 }

@@ -30,7 +30,7 @@
 //! Unlike the sibling markers
 //! [`MetadataApplyWedge`](super::metadata_applier::MetadataApplyWedge) and
 //! [`SequencerHaltMarker`](super::SequencerHaltMarker), which latch
-//! first-writer-wins because their conditions never clear, a stall can
+//! first-writer-wins and clear only through their own writer, a stall can
 //! recover on its own. [`CoreStallMarker`] is therefore replaced on every
 //! sampling window and reports the current set of stalled cores.
 
@@ -190,7 +190,7 @@ mod tests {
         //
         // This test does NOT assert the detector can tell the two causes
         // apart — it asserts the opposite: the same (previous, current)
-        // pair, which could equally have come from either cause, always
+        // pair, which can equally have come from either cause, always
         // produces the same "stalled" verdict. Do not read a passing test
         // here as proof of stall detection; it is proof of the ambiguity.
         let previous = vec![42u64];
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn marker_replaces_rather_than_accumulates_across_samples() {
         // Unlike `MetadataApplyWedge` / `SequencerHaltMarker` (first writer
-        // wins, never clears), a stall can recover, so each new sampling
+        // wins), a stall can recover, so each new sampling
         // window's `set` must replace — not merge with — the previous
         // report.
         let marker = CoreStallMarker::default();

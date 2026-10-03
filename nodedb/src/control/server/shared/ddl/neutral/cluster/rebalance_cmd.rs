@@ -2,10 +2,8 @@
 
 //! Protocol-neutral rebalance DDL command: REBALANCE.
 //!
-//! Ported from the pgwire `ddl::cluster::rebalance_cmd` handler. The
-//! routing / topology reads and the `compute_plan` call are preserved
-//! verbatim; only the result construction changed from pgwire `Response` /
-//! `QueryResponse` to the protocol-neutral `DdlResult` over `ShapedRows`.
+//! The routing / topology reads and the `compute_plan` call run here.
+//! The result is the protocol-neutral `DdlResult` over `ShapedRows`.
 
 use serde_json::{Map, Value as JsonValue};
 
@@ -14,7 +12,7 @@ use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::support::ddl_err;
+use super::support::{cluster_not_started, ddl_err};
 
 /// REBALANCE — compute and display a rebalance plan.
 ///
@@ -33,18 +31,11 @@ pub fn rebalance(
 
     let routing = match &state.cluster_routing {
         Some(r) => r,
-        None => {
-            return Err(ddl_err(
-                "55000",
-                "cluster mode not enabled (single-node instance)",
-            ));
-        }
+        None => return Err(cluster_not_started("cluster routing table")),
     };
     let topo = match &state.cluster_topology {
         Some(t) => t,
-        None => {
-            return Err(ddl_err("55000", "cluster topology not available"));
-        }
+        None => return Err(cluster_not_started("cluster topology")),
     };
 
     let routing = routing.read().unwrap_or_else(|p| p.into_inner());

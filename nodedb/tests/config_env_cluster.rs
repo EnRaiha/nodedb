@@ -29,6 +29,7 @@ fn cluster_config(node_id: u64) -> ServerConfig {
             log_compaction_threshold: None,
             join_retry_max_attempts: 8,
             join_retry_max_backoff_secs: 32,
+            swim_listen: None,
         }),
         ..Default::default()
     }
@@ -123,5 +124,27 @@ fn malformed_join_retry_max_backoff_fails_startup() {
         apply_env_overrides(&mut cfg),
         "NODEDB_JOIN_RETRY_MAX_BACKOFF_SECS",
         "30s",
+    );
+}
+
+#[test]
+fn malformed_swim_listen_fails_startup() {
+    let _guard = EnvGuard::set("NODEDB_SWIM_LISTEN", "10.0.0.1");
+    let mut cfg = cluster_config(1);
+    assert_rejected(
+        apply_env_overrides(&mut cfg),
+        "NODEDB_SWIM_LISTEN",
+        "10.0.0.1",
+    );
+}
+
+#[test]
+fn swim_listen_without_cluster_section_fails_startup() {
+    let _guard = EnvGuard::set("NODEDB_SWIM_LISTEN", "10.0.0.1:9401");
+    let mut cfg = ServerConfig::default();
+    assert_rejected(
+        apply_env_overrides(&mut cfg),
+        "NODEDB_SWIM_LISTEN",
+        "10.0.0.1:9401",
     );
 }

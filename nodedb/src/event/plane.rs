@@ -13,12 +13,13 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::bus::EventConsumerRx;
 use super::cdc::CdcRouter;
-use super::consumer::{ConsumerConfig, ConsumerHandle, spawn_consumer};
+use super::consumer::ConsumerHandle;
 use super::metrics::{AggregateMetrics, CoreMetrics};
+use super::plane_loops as loops;
 use super::trigger::dlq::TriggerDlq;
 use super::watermark::WatermarkStore;
 use crate::control::shutdown::ShutdownWatch;
@@ -81,21 +82,7 @@ impl EventPlane {
         } = config;
         let num_cores = consumers_rx.len();
 
-        // Publish the requeue inbox before any consumer starts, sized to the
-        // consumers actually being spawned: an operator's requeue is routed by
-        // the same `vshard % cores` mapping the consumers use, so a wrong
-        // width would park actions on a core that never collects them.
-        let _ = shared_state.action_requeue.set(Arc::new(
-            super::action::ActionRequeueInbox::for_cores(num_cores),
-        ));
-        let _ = shared_state.trigger_dlq.set(Arc::clone(&trigger_dlq));
-        // Coverage waits for the permission step up to these counters.
-        if !shared_state
-            .authorization_fence
-            .install_emit_progress(consumers_rx.iter().map(|rx| rx.progress()).collect())
-        {
-            tracing::warn!("event emit counters already installed; the Event Plane started twice");
-        }
+        publish_operator_surfaces(&shared_state, &trigger_dlq, &consumers_rx);
 
         // Every sink's durable state loads before a consumer delivers an
         // event: the streaming views with their applied keys, and the audit
@@ -108,176 +95,29 @@ impl EventPlane {
             drop(shutdown_bus.initiate());
         }
 
-        let slab_budget = Arc::new(super::slab_budget::SlabBudget::for_cores(num_cores));
-        let mut slab_accounts: Vec<Arc<super::slab_budget::ConsumerSlabAccount>> = Vec::new();
-
-        let consumers: Vec<ConsumerHandle> = consumers_rx
-            .into_iter()
-            .enumerate()
-            .map(|(i, rx)| {
-                let account = Arc::new(super::slab_budget::ConsumerSlabAccount::new(i));
-                slab_accounts.push(Arc::clone(&account));
-                spawn_consumer(ConsumerConfig {
-                    rx,
-                    shutdown: shutdown.raw_receiver(),
-                    shutdown_bus: shutdown_bus.clone(),
-                    wal: Arc::clone(&wal),
-                    watermark_store: Arc::clone(&watermark_store),
-                    shared_state: Arc::clone(&shared_state),
-                    trigger_dlq: Arc::clone(&trigger_dlq),
-                    cdc_router: Arc::clone(&cdc_router),
-                    num_cores,
-                    slab_account: account,
-                })
-            })
-            .collect();
-
-        // Spawn periodic slab budget enforcement (every 5s).
-        {
-            let budget = Arc::clone(&slab_budget);
-            let accounts = slab_accounts.clone();
-            let mut shutdown_rx = shutdown.raw_receiver();
-            let slab_budget_handle = tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                            let refs: Vec<&super::slab_budget::ConsumerSlabAccount> =
-                                accounts.iter().map(|a| a.as_ref()).collect();
-                            budget.check_and_shed(&refs);
-                        }
-                        _ = shutdown_rx.changed() => {
-                            if *shutdown_rx.borrow() { return; }
-                        }
-                    }
-                }
-            });
-            let _ = shared_state.loop_registry.register(
-                "event_plane::slab_budget",
-                crate::control::shutdown::ShutdownPhase::DrainingEventPlane,
-                crate::control::shutdown::LoopHandle::Async(slab_budget_handle),
-            );
-        }
-
-        // Spawn the cron scheduler loop on the Event Plane.
-        let scheduler_handle = super::scheduler::executor::spawn_scheduler(
-            Arc::clone(&shared_state),
-            Arc::clone(&shared_state.schedule_registry),
-            Arc::clone(&shared_state.job_history),
-            shutdown.raw_receiver(),
+        let (consumers, slab_accounts) = loops::spawn_consumers(
+            consumers_rx,
+            &loops::ConsumerDeps {
+                wal: &wal,
+                watermark_store: &watermark_store,
+                shared_state: &shared_state,
+                trigger_dlq: &trigger_dlq,
+                cdc_router: &cdc_router,
+                shutdown: &shutdown,
+                shutdown_bus: &shutdown_bus,
+            },
         );
-        // Joined at the Control Plane drain: a due schedule dispatches SQL
-        // through Control -> Data and needs the enqueue gate still open.
-        let _ = shared_state.loop_registry.register(
-            "event_plane::scheduler",
-            crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
-            crate::control::shutdown::LoopHandle::Async(scheduler_handle),
-        );
-
-        // Spawn the retention policy enforcement loop.
-        let retention_handle =
-            crate::engine::timeseries::retention_policy::enforcement::spawn_enforcement_loop(
-                Arc::clone(&shared_state),
-                Arc::clone(&shared_state.retention_policy_registry),
-                shutdown.raw_receiver(),
-            );
-        // Joined at the Control Plane drain: enforcement dispatches MetaOp
-        // plans to the Data Plane.
-        let _ = shared_state.loop_registry.register(
-            "event_plane::retention_policy",
-            crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
-            crate::control::shutdown::LoopHandle::Async(retention_handle),
-        );
-
-        // Spawn the bitemporal audit-retention enforcement loop.
-        // Tick interval comes from server tuning config so operators
-        // control cadence declaratively; no code change needed to adjust.
-        let bitemporal_retention_handle =
-            crate::engine::bitemporal::spawn_bitemporal_retention_loop(
-                Arc::clone(&shared_state),
-                Arc::clone(&shared_state.bitemporal_retention_registry),
-                shutdown.raw_receiver(),
-                shared_state.tuning.bitemporal_retention_tick(),
-            );
-        // Joined at the Control Plane drain: a purge pass dispatches
-        // `TemporalPurge` plans to the Data Plane.
-        let _ = shared_state.loop_registry.register(
-            "event_plane::bitemporal_retention",
-            crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
-            crate::control::shutdown::LoopHandle::Async(bitemporal_retention_handle),
-        );
-
-        // Spawn the alert evaluation loop.
-        let alert_handle = super::alert::executor::spawn_alert_eval_loop(
-            Arc::clone(&shared_state),
-            Arc::clone(&shared_state.alert_registry),
-            shutdown.raw_receiver(),
-        );
-        // Joined at the Control Plane drain: each evaluation dispatches a
-        // scan to the Data Plane.
-        let _ = shared_state.loop_registry.register(
-            "event_plane::alert_eval",
-            crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
-            crate::control::shutdown::LoopHandle::Async(alert_handle),
-        );
-
-        // Spawn the CDC log compaction background task.
-        let compaction_handle = super::cdc::compaction::spawn_compaction_task(
-            Arc::clone(&shared_state.stream_registry),
-            Arc::clone(&cdc_router),
-            shutdown.raw_receiver(),
-        );
-        let _ = shared_state.loop_registry.register(
-            "event_plane::cdc_compaction",
-            crate::control::shutdown::ShutdownPhase::DrainingEventPlane,
-            crate::control::shutdown::LoopHandle::Async(compaction_handle),
-        );
-
-        // Spawn MV state persistence task (flush to redb every 30s).
-        let mv_persist_handle = super::streaming_mv::persist::spawn_persist_task(
-            Arc::clone(&shared_state.mv_persistence),
-            Arc::clone(&shared_state.mv_registry),
-            Arc::clone(&shared_state.watermark_tracker),
-            shutdown.raw_receiver(),
-        );
-        let _ = shared_state.loop_registry.register(
-            "event_plane::mv_persist",
-            crate::control::shutdown::ShutdownPhase::DrainingEventPlane,
-            crate::control::shutdown::LoopHandle::Async(mv_persist_handle),
-        );
-
-        // Spawn cross-shard dispatcher task (cluster mode only).
-        if let (Some(dispatcher), Some(transport), Some(metrics), Some(dlq)) = (
-            shared_state.cross_shard_dispatcher.as_ref(),
-            shared_state.cluster_transport.as_ref(),
-            shared_state.cross_shard_metrics.as_ref(),
-            shared_state.cross_shard_dlq.as_ref(),
-        ) {
-            let cross_shard_handle = super::cross_shard::dispatcher::spawn_dispatcher_task(
-                Arc::clone(dispatcher),
-                Arc::clone(transport),
-                Arc::clone(metrics),
-                Arc::clone(dlq),
-                Arc::clone(&shared_state.event_plane_budget),
-                shutdown.raw_receiver(),
-            );
-            let _ = shared_state.loop_registry.register(
-                "event_plane::cross_shard_dispatcher",
-                crate::control::shutdown::ShutdownPhase::DrainingEventPlane,
-                crate::control::shutdown::LoopHandle::Async(cross_shard_handle),
-            );
-            info!("cross-shard dispatcher task started");
-        }
-
-        // Spawn CRDT sync delivery maintenance task.
-        let crdt_sync_handle = super::crdt_sync::delivery::spawn_delivery_task(
-            Arc::clone(&shared_state.crdt_sync_delivery),
-            shutdown.raw_receiver(),
-        );
-        let _ = shared_state.loop_registry.register(
-            "event_plane::crdt_sync_delivery",
-            crate::control::shutdown::ShutdownPhase::DrainingEventPlane,
-            crate::control::shutdown::LoopHandle::Async(crdt_sync_handle),
-        );
+        loops::spawn_slab_budget(&shared_state, &shutdown, num_cores, slab_accounts);
+        loops::spawn_scheduler(&shared_state, &shutdown);
+        loops::spawn_publish_delivery(&shared_state, &shutdown);
+        loops::spawn_action_firing(&shared_state, &shutdown);
+        loops::spawn_retention_policy(&shared_state, &shutdown);
+        loops::spawn_bitemporal_retention(&shared_state, &shutdown);
+        loops::spawn_alert_eval(&shared_state, &shutdown);
+        loops::spawn_cdc_compaction(&shared_state, &cdc_router, &shutdown);
+        loops::spawn_mv_persist(&shared_state, &shutdown);
+        loops::spawn_cross_shard_dispatcher(&shared_state, &shutdown);
+        loops::spawn_crdt_sync_delivery(&shared_state, &shutdown);
 
         // Set the origin peer ID for CRDT delta packaging.
         super::crdt_sync::packager::set_origin_peer_id(shared_state.node_id);
@@ -386,6 +226,37 @@ impl EventPlane {
     }
 }
 
+/// Publish the handles operators and coverage reach the Event Plane through.
+/// Runs before any consumer starts.
+fn publish_operator_surfaces(
+    shared_state: &SharedState,
+    trigger_dlq: &Arc<std::sync::Mutex<TriggerDlq>>,
+    consumers_rx: &[EventConsumerRx],
+) {
+    // The requeue inbox is sized to the consumers being spawned: an
+    // operator's requeue is routed by the same `vshard % cores` mapping the
+    // consumers use, so a wrong width parks actions on a core that
+    // never collects them.
+    let inbox = super::action::ActionRequeueInbox::for_cores(consumers_rx.len());
+    if shared_state.action_requeue.set(Arc::new(inbox)).is_err() {
+        warn!("action requeue inbox already published; the Event Plane started twice");
+    }
+    if shared_state
+        .trigger_dlq
+        .set(Arc::clone(trigger_dlq))
+        .is_err()
+    {
+        warn!("trigger DLQ already published; the Event Plane started twice");
+    }
+    // Coverage waits for the permission step up to these counters.
+    if !shared_state
+        .authorization_fence
+        .install_emit_progress(consumers_rx.iter().map(|rx| rx.progress()).collect())
+    {
+        warn!("event emit counters already installed; the Event Plane started twice");
+    }
+}
+
 async fn shutdown_consumers_after_flat_signal(
     consumers: &mut Vec<ConsumerHandle>,
     deadline: Duration,
@@ -447,6 +318,7 @@ mod tests {
             valid_time_ms: None,
             user_id: None,
             statement_digest: None,
+            commit_hlc: Some(crate::event::test_utils::test_commit_hlc()),
         }
     }
 

@@ -20,7 +20,7 @@ use crate::control::state::SharedState;
 use super::super::super::vector_replicate::{propose_delete_model, propose_put_model};
 
 /// Drop `column`'s embedding-model row on every node.
-pub(super) fn drop_vector_model_row(
+pub(super) async fn drop_vector_model_row(
     state: &SharedState,
     database_id: DatabaseId,
     tenant_id: u64,
@@ -31,14 +31,14 @@ pub(super) fn drop_vector_model_row(
     if !model_row_exists(state, db, tenant_id, collection, column)? {
         return Ok(());
     }
-    propose_delete_model(state, db, tenant_id, collection, column)
+    propose_delete_model(state, db, tenant_id, collection, column).await
 }
 
 /// Re-key `old_column`'s embedding-model row onto `new_column` on every node.
 ///
 /// The write lands before the delete, so an interrupted rename leaves the row
 /// readable under one of the two names. The reverse order can lose it.
-pub(super) fn move_vector_model_row(
+pub(super) async fn move_vector_model_row(
     state: &SharedState,
     database_id: DatabaseId,
     tenant_id: u64,
@@ -57,8 +57,8 @@ pub(super) fn move_vector_model_row(
     };
 
     entry.column = new_column.to_string();
-    propose_put_model(state, &entry)?;
-    propose_delete_model(state, db, tenant_id, collection, old_column)
+    propose_put_model(state, &entry).await?;
+    propose_delete_model(state, db, tenant_id, collection, old_column).await
 }
 
 fn model_row_exists(
@@ -95,6 +95,7 @@ mod tests {
             Arc::new(WalManager::open_for_testing(&dir.path().join(name)).expect("open test WAL"));
         let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
         let state = SharedState::new(dispatcher, wal).expect("construct shared state");
+        crate::bootstrap::state_wiring::install_gateway(&state).expect("install gateway");
         (dir, state)
     }
 
@@ -113,20 +114,22 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_rename_moves_the_model_row_instead_of_duplicating_it() {
-        let (_dir, state) = test_state("vector-model-move.wal");
+        let cluster = crate::control::cluster::test_one_node::boot().await;
+        let state = &cluster.state;
         let catalog = state.credentials.catalog();
         catalog.put_vector_model(&model("embedding")).expect("seed");
 
         move_vector_model_row(
-            &state,
+            state,
             DatabaseId::DEFAULT,
             TENANT,
             COLLECTION,
             "embedding",
             "vector",
         )
+        .await
         .expect("move the row");
 
         let db = DatabaseId::DEFAULT.as_u64();
@@ -143,6 +146,7 @@ mod tests {
             .expect("the row lands under the new column");
         assert_eq!(moved.metadata.dimensions, 384);
         assert_eq!(moved.column, "vector");
+        cluster.shutdown().await;
     }
 
     #[tokio::test]
@@ -157,6 +161,7 @@ mod tests {
             "quantity",
             "amount",
         )
+        .await
         .expect("no row to move");
 
         let db = DatabaseId::DEFAULT.as_u64();
@@ -169,13 +174,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_drop_removes_the_model_row() {
-        let (_dir, state) = test_state("vector-model-drop.wal");
+        let cluster = crate::control::cluster::test_one_node::boot().await;
+        let state = &cluster.state;
         let catalog = state.credentials.catalog();
         catalog.put_vector_model(&model("embedding")).expect("seed");
 
-        drop_vector_model_row(&state, DatabaseId::DEFAULT, TENANT, COLLECTION, "embedding")
+        drop_vector_model_row(state, DatabaseId::DEFAULT, TENANT, COLLECTION, "embedding")
+            .await
             .expect("drop the row");
 
         assert!(
@@ -189,5 +196,6 @@ mod tests {
                 .expect("read")
                 .is_none()
         );
+        cluster.shutdown().await;
     }
 }

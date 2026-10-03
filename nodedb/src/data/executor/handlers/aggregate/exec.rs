@@ -423,7 +423,6 @@ mod tests {
 
     use nodedb_bridge::buffer::RingBuffer;
     use nodedb_physical::physical_plan::VectorOp;
-    use nodedb_types::Surrogate;
 
     use super::*;
     use crate::bridge::envelope::{Admission, ExemptReason, PhysicalPlan, Priority, Request};
@@ -484,6 +483,7 @@ mod tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: Admission::Exempt(ExemptReason::Read),
         })
     }
@@ -520,16 +520,18 @@ mod tests {
     }
 
     fn put_kv_row(core: &mut CoreLoop, key: &[u8]) {
-        core.kv_engine.put(KvPutParams {
-            database_id: 0,
-            tenant_id: 1,
-            collection: "kvcoll",
-            key,
-            value: b"v",
-            ttl_ms: 0,
-            now_ms: 1_000,
-            surrogate: Surrogate::ZERO,
-        });
+        core.kv_engine
+            .put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "kvcoll",
+                key,
+                value: b"v",
+                ttl_ms: 0,
+                now_ms: 1_000,
+                surrogate: crate::engine::kv::test_support::row_surrogate(key),
+            })
+            .expect("a bound row writes");
     }
 
     /// An aggregate cache entry stamped with an older KV write epoch is a

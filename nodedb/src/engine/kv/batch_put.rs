@@ -11,9 +11,8 @@ use nodedb_types::Surrogate;
 /// `surrogates` carries each entry's stable cross-engine identity, same
 /// order and length as `entries` -- assigned by the CP-side
 /// `SurrogateAssigner` from `(collection, key)`, same mechanism as a
-/// single-key `put`. Pass `Surrogate::ZERO` per-entry only from internal
-/// RMW callers that do not allocate one (existing entries preserve their
-/// bound surrogate either way, per `put`'s semantics).
+/// single-key `put`. Never `Surrogate::ZERO`: a batch that carries it is
+/// refused before any entry is written.
 pub struct KvBatchPutParams<'a> {
     pub database_id: u64,
     pub tenant_id: u64,

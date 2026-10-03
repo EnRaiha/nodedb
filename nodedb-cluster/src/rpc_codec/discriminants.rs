@@ -18,13 +18,9 @@ pub const RPC_PING: u8 = 9;
 pub const RPC_PONG: u8 = 10;
 pub const RPC_TOPOLOGY_UPDATE: u8 = 11;
 pub const RPC_TOPOLOGY_ACK: u8 = 12;
-/// Retired in Phase C-δ.6: reserved, do not reuse — was ForwardRequest/Response
-/// (SQL-string forwarding path replaced by gateway.execute / ExecuteRequest).
-#[allow(dead_code)]
+/// Reserved, do not reuse. Number 13 belongs to a retired SQL-string forwarding request.
 pub const RPC_FORWARD_REQ: u8 = 13;
-/// Retired in Phase C-δ.6: reserved, do not reuse — was ForwardRequest/Response
-/// (SQL-string forwarding path replaced by gateway.execute / ExecuteRequest).
-#[allow(dead_code)]
+/// Reserved, do not reuse. Number 14 belongs to a retired SQL-string forwarding response.
 pub const RPC_FORWARD_RESP: u8 = 14;
 pub const RPC_VSHARD_ENVELOPE: u8 = 15;
 pub const RPC_METADATA_PROPOSE_REQ: u8 = 16;
@@ -41,7 +37,7 @@ pub const RPC_DATA_PROPOSE_RESP: u8 = 21;
 pub const RPC_EXECUTE_STREAM_REQ: u8 = 22;
 pub const RPC_EXECUTE_STREAM_CHUNK: u8 = 23;
 pub const RPC_EXECUTE_STREAM_END: u8 = 24;
-/// Cross-node streaming shuffle (E1). A producer opens one bidi stream per
+/// Cross-node streaming shuffle. A producer opens one bidi stream per
 /// target partition and writes a `RPC_SHUFFLE_PUSH_REQ` envelope, then a
 /// sequence of `RPC_SHUFFLE_PUSH_CHUNK` envelopes terminated by exactly one
 /// `RPC_SHUFFLE_PUSH_END` envelope on the same QUIC stream. Direction is
@@ -49,7 +45,7 @@ pub const RPC_EXECUTE_STREAM_END: u8 = 24;
 pub const RPC_SHUFFLE_PUSH_REQ: u8 = 25;
 pub const RPC_SHUFFLE_PUSH_CHUNK: u8 = 26;
 pub const RPC_SHUFFLE_PUSH_END: u8 = 27;
-/// Cross-node shuffle PRODUCER trigger (E4a). A coordinator sends a
+/// Cross-node shuffle PRODUCER trigger. A coordinator sends a
 /// `RPC_SHUFFLE_PRODUCE_REQ` to a producer node; that node executes a local
 /// scan fragment, hash-partitions each output row, and fans the rows out to the
 /// per-part owners as `RPC_SHUFFLE_PUSH_*` streams (looping back into its own
@@ -58,7 +54,7 @@ pub const RPC_SHUFFLE_PUSH_END: u8 = 27;
 /// does NOT stream the scanned rows back to the coordinator.
 pub const RPC_SHUFFLE_PRODUCE_REQ: u8 = 28;
 pub const RPC_SHUFFLE_PRODUCE_RESP: u8 = 29;
-/// Cross-node shuffle CONSUMER trigger (E4b). A coordinator sends a
+/// Cross-node shuffle CONSUMER trigger. A coordinator sends a
 /// `RPC_SHUFFLE_CONSUME_REQ` to a part-owner node; that node waits for both
 /// staged sides of its `(shuffle_id, part)` to finalize, runs the node-local
 /// grace-hash join over them, and replies with exactly one
@@ -66,7 +62,7 @@ pub const RPC_SHUFFLE_PRODUCE_RESP: u8 = 29;
 /// One-shot request/response — no streaming.
 pub const RPC_SHUFFLE_CONSUME_REQ: u8 = 30;
 pub const RPC_SHUFFLE_CONSUME_RESP: u8 = 31;
-/// Cross-node distributed GROUP BY shuffle CONSUMER trigger (E5b). A coordinator
+/// Cross-node distributed GROUP BY shuffle CONSUMER trigger. A coordinator
 /// sends a `RPC_SHUFFLE_AGG_CONSUME_REQ` to a part-owner node; that node waits
 /// for its part's single staged producer side (side 0) to finalize, merges the
 /// staged partial `GroupState`s, finalizes / HAVING-filters / sorts / LIMITs, and
@@ -154,6 +150,22 @@ pub const RPC_AUTH_BARRIER_RESP: u8 = 52;
 /// Answer to an `RPC_VSHARD_ENVELOPE` request whose handler failed. It
 /// carries the handler's typed error in place of a response envelope.
 pub const RPC_VSHARD_REFUSAL: u8 = 53;
+/// Streamed parts of a multi-part Calvin transaction: a coordinator sends a
+/// batch in `RPC_CALVIN_PARTS_REQ` to the sequencer leader and receives one
+/// `RPC_CALVIN_PARTS_RESP` naming how far the stream got.
+pub const RPC_CALVIN_PARTS_REQ: u8 = 54;
+pub const RPC_CALVIN_PARTS_RESP: u8 = 55;
+/// Leader status: a node asks another which leader it knows for a Raft
+/// group in `RPC_LEADER_STATUS_REQ`, and the receiver answers from its own
+/// Raft state, with no quorum round, in one `RPC_LEADER_STATUS_RESP`.
+pub const RPC_LEADER_STATUS_REQ: u8 = 56;
+pub const RPC_LEADER_STATUS_RESP: u8 = 57;
+/// The answer to a request frame the receiver's replay window refused. The
+/// sender retries the request under a fresh sequence number.
+pub const RPC_FRAME_REFUSAL: u8 = 58;
+/// The answer to a request whose handler failed. It carries the typed
+/// reason, so the sender learns the peer is up and refused this request.
+pub const RPC_REQUEST_REFUSAL: u8 = 59;
 
 // VShardMessageType discriminants for distributed array ops (u16, range 80-89).
 // These mirror `crate::wire::VShardMessageType` repr values and are declared

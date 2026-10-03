@@ -95,11 +95,21 @@ impl CoreLoop {
                     );
                 }
             };
-            for sur in &filtered.surrogates {
-                if sur.as_u32() == 0 {
-                    continue;
-                }
-                let hex = StorageKey::for_surrogate(*sur).to_string();
+            // A slice holds live rows only, and a stored live row always holds
+            // its bound surrogate.
+            for row in 0..filtered.row_count() {
+                let sur = match filtered.live_surrogate(row) {
+                    Ok(sur) => sur,
+                    Err(e) => {
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: format!("array surrogate-scan: {e}"),
+                            },
+                        );
+                    }
+                };
+                let hex = StorageKey::for_surrogate(sur).to_string();
                 // Empty msgpack map as the row body — the consumer
                 // (`collect_surrogates`) only reads `id`.
                 rows.push((hex, vec![0x80]));
@@ -162,6 +172,7 @@ mod tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: crate::bridge::envelope::Admission::Admitted,
         }
     }
@@ -250,6 +261,7 @@ mod tests {
                 cells_msgpack: bytes,
                 wal_lsn: lsn,
                 provenance: None,
+                vshard_id: 0,
             });
             assert_eq!(r.status, Status::Ok, "put failed: {r:?}");
         }

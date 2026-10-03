@@ -13,12 +13,13 @@ use nodedb_types::columnar::StrictSchema;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
+use crate::engine::document::store::StorageKey;
 use crate::types::{DatabaseId, TenantId};
 
 /// One matched row and everything the apply loop needs to land it.
 pub(in crate::data::executor) struct ProjectedUpdateRow {
     /// The row's storage key.
-    pub(in crate::data::executor) key: crate::engine::document::store::StorageKey,
+    pub(in crate::data::executor) key: StorageKey,
     /// The row as stored before the update — the `old_value` of the emitted
     /// event and the old side of the secondary-index diff.
     pub(in crate::data::executor) current_bytes: Vec<u8>,
@@ -36,13 +37,34 @@ pub(in crate::data::executor) struct ProjectUpdateRows<'a> {
     pub(in crate::data::executor) tid: u64,
     pub(in crate::data::executor) collection: &'a str,
     /// The settled apply set, in statement order.
-    pub(in crate::data::executor) doc_ids: &'a [crate::engine::document::store::StorageKey],
+    pub(in crate::data::executor) rows: MatchedRows<'a>,
     pub(in crate::data::executor) updates: &'a [(String, UpdateValue)],
     /// `Some` for a strict collection, whose bodies are Binary Tuples.
     pub(in crate::data::executor) strict_schema: Option<&'a StrictSchema>,
     /// Declared `PRIMARY KEY` column of a schemaless collection, `None`
     /// otherwise. `Some` makes the post-image guard below run.
     pub(in crate::data::executor) declared_primary_key: Option<&'a str>,
+}
+
+/// What every row of one update projects under.
+#[derive(Clone, Copy)]
+struct RowShape<'a> {
+    database_id: u64,
+    tid: u64,
+    collection: &'a str,
+    updates: &'a [(String, UpdateValue)],
+    strict_schema: Option<&'a StrictSchema>,
+    declared_primary_key: Option<&'a str>,
+}
+
+/// The rows an update projects.
+pub(in crate::data::executor) enum MatchedRows<'a> {
+    /// Row keys whose current bodies are read from the store. A key whose
+    /// row is gone is skipped.
+    Stored(&'a [StorageKey]),
+    /// Rows with the current bodies the caller already read, such as a
+    /// transaction's own staged writes merged over the store.
+    Read(Vec<(StorageKey, Vec<u8>)>),
 }
 
 impl CoreLoop {
@@ -57,71 +79,108 @@ impl CoreLoop {
             database_id,
             tid,
             collection,
-            doc_ids,
+            rows,
             updates,
             strict_schema,
             declared_primary_key,
         } = p;
+        let shape = RowShape {
+            database_id,
+            tid,
+            collection,
+            updates,
+            strict_schema,
+            declared_primary_key,
+        };
+        let rows = match rows {
+            MatchedRows::Read(rows) => rows,
+            MatchedRows::Stored(keys) => {
+                let mut rows = Vec::with_capacity(keys.len());
+                for key in keys {
+                    if let Some(current) = self.sparse.get(database_id, tid, collection, key)? {
+                        rows.push((*key, current));
+                    }
+                }
+                rows
+            }
+        };
+        let mut projected = Vec::with_capacity(rows.len());
+        for (key, current_bytes) in rows {
+            projected.push(self.project_update_row(shape, key, current_bytes)?);
+        }
+        Ok(projected)
+    }
+
+    /// The post-image of one matched row whose current body is
+    /// `current_bytes`.
+    fn project_update_row(
+        &self,
+        shape: RowShape<'_>,
+        key: StorageKey,
+        current_bytes: Vec<u8>,
+    ) -> crate::Result<ProjectedUpdateRow> {
+        let RowShape {
+            database_id,
+            tid,
+            collection,
+            updates,
+            strict_schema,
+            declared_primary_key,
+        } = shape;
         let config_key = (
             DatabaseId::new(database_id),
             TenantId::new(tid),
             collection.to_string(),
         );
+        let doc_id_owned = key.to_string();
+        let doc_id = doc_id_owned.as_str();
 
-        let mut projected = Vec::with_capacity(doc_ids.len());
-        for key in doc_ids {
-            let doc_id_owned = key.to_string();
-            let doc_id = doc_id_owned.as_str();
-            let Some(current_bytes) = self.sparse.get(database_id, tid, collection, key)? else {
-                continue;
-            };
-
-            // Decode current value — format depends on storage mode, with the
-            // storage key attached as `id` for a schemaless row whose body
-            // carries none, so this image matches the one DELETE's
-            // write-gate judges. A row the statement matched but cannot
-            // decode fails the statement rather than under-reporting the
-            // affected count.
-            let mut doc = match strict_schema {
-                Some(schema) => crate::data::executor::strict_format::binary_tuple_to_json(
-                    &current_bytes,
-                    schema,
-                )
-                .ok_or_else(|| {
+        // Decode current value — format depends on storage mode, with the
+        // storage key attached as `id` for a schemaless row whose body
+        // carries none, so this image matches the one DELETE's
+        // write-gate judges. A row the statement matched but cannot
+        // decode fails the statement rather than under-reporting the
+        // affected count.
+        let mut doc = match strict_schema {
+            Some(schema) => {
+                crate::data::executor::strict_format::binary_tuple_to_json(&current_bytes, schema)
+                    .ok_or_else(|| {
                     crate::diag::strict_row_undecodable(collection, doc_id, "bulk_update_project");
                     let identity = key.to_identity();
                     crate::data::executor::strict_format::undecodable_strict_row(
                         collection,
                         identity.as_str(),
                     )
-                })?,
-                None => {
-                    // `key` is the storage key from the apply set. The
-                    // decoded document's `id` is the row's client-visible
-                    // identity, not the storage key.
-                    let identity = key.to_identity();
-                    crate::data::executor::handlers::returning_doc::from_stored_json(
-                        &current_bytes,
-                        &identity,
-                        None,
-                    )?
-                }
-            };
+                })?
+            }
+            None => {
+                // `key` is the storage key from the apply set. The
+                // decoded document's `id` is the row's client-visible
+                // identity, not the storage key.
+                let identity = key.to_identity();
+                crate::data::executor::handlers::returning_doc::from_stored_json(
+                    &current_bytes,
+                    &identity,
+                    None,
+                )?
+            }
+        };
 
-            // Feeds the secondary-index SET diff for values the UPDATE drops.
-            let old_doc = doc.clone();
-            // All assignments see this pre-update snapshot — they don't
-            // observe each other, matching PostgreSQL semantics.
-            let eval_doc: nodedb_types::Value = doc.clone().into();
-            if let Some(obj) = doc.as_object_mut() {
-                for (field, update_val) in updates {
-                    let val: serde_json::Value = match update_val {
+        // Feeds the secondary-index SET diff for values the UPDATE drops.
+        let old_doc = doc.clone();
+        // All assignments see this pre-update snapshot — they don't
+        // observe each other, matching PostgreSQL semantics.
+        let eval_doc: nodedb_types::Value = doc.clone().into();
+        if let Some(obj) = doc.as_object_mut() {
+            for (field, update_val) in updates {
+                let val: serde_json::Value =
+                    match update_val {
                         UpdateValue::Literal(bytes) => nodedb_types::json_from_msgpack(bytes)
                             .map_err(|e| crate::Error::Serialization {
                                 format: "msgpack".into(),
                                 detail: format!(
                                     "literal assigned to \"{field}\" for document \"{doc_id}\" \
-                                     of collection \"{collection}\" does not decode: {e}"
+                                 of collection \"{collection}\" does not decode: {e}"
                                 ),
                             })?,
                         // Division or modulo by zero fails the statement.
@@ -130,59 +189,57 @@ impl CoreLoop {
                             result.into()
                         }
                     };
-                    obj.insert(field.clone(), val);
-                }
+                obj.insert(field.clone(), val);
             }
-
-            // Only schemaless needs this check, and only here does a computed
-            // RHS resolve to NULL — a strict collection already refuses one
-            // at encode time.
-            if strict_schema.is_none() {
-                super::super::merge_helpers::check_declared_pk_not_null(
-                    collection,
-                    &doc,
-                    declared_primary_key,
-                )?;
-            }
-
-            // Recompute generated columns if any dependency changed. A column
-            // the engine cannot recompute fails the statement.
-            if let Some(config) = self.doc_configs.get(&config_key)
-                && !config.enforcement.generated_columns.is_empty()
-                && super::super::generated::needs_recomputation(
-                    updates,
-                    &config.enforcement.generated_columns,
-                )
-            {
-                super::super::generated::evaluate_generated_columns(
-                    &mut doc,
-                    &config.enforcement.generated_columns,
-                )
-                .map_err(crate::Error::DataPlane)?;
-            }
-
-            // Re-encode — format depends on storage mode. An encode error
-            // carries its own typed cause, such as a field the strict schema
-            // does not declare.
-            let updated_bytes = match strict_schema {
-                Some(schema) => {
-                    let ndb_val: nodedb_types::Value = doc.clone().into();
-                    crate::data::executor::strict_format::value_to_binary_tuple(
-                        &ndb_val, schema, collection,
-                    )?
-                }
-                None => doc_format::encode_to_msgpack(&doc),
-            };
-
-            projected.push(ProjectedUpdateRow {
-                key: *key,
-                current_bytes,
-                old_doc,
-                doc,
-                updated_bytes,
-            });
         }
-        Ok(projected)
+
+        // Only schemaless needs this check, and only here does a computed
+        // RHS resolve to NULL — a strict collection already refuses one
+        // at encode time.
+        if strict_schema.is_none() {
+            super::super::merge_helpers::check_declared_pk_not_null(
+                collection,
+                &doc,
+                declared_primary_key,
+            )?;
+        }
+
+        // Recompute generated columns if any dependency changed. A column
+        // the engine cannot recompute fails the statement.
+        if let Some(config) = self.doc_configs.get(&config_key)
+            && !config.enforcement.generated_columns.is_empty()
+            && super::super::generated::needs_recomputation(
+                updates,
+                &config.enforcement.generated_columns,
+            )
+        {
+            super::super::generated::evaluate_generated_columns(
+                &mut doc,
+                &config.enforcement.generated_columns,
+            )
+            .map_err(crate::Error::DataPlane)?;
+        }
+
+        // Re-encode — format depends on storage mode. An encode error
+        // carries its own typed cause, such as a field the strict schema
+        // does not declare.
+        let updated_bytes = match strict_schema {
+            Some(schema) => {
+                let ndb_val: nodedb_types::Value = doc.clone().into();
+                crate::data::executor::strict_format::value_to_binary_tuple(
+                    &ndb_val, schema, collection,
+                )?
+            }
+            None => doc_format::encode_to_msgpack(&doc),
+        };
+
+        Ok(ProjectedUpdateRow {
+            key,
+            current_bytes,
+            old_doc,
+            doc,
+            updated_bytes,
+        })
     }
 }
 

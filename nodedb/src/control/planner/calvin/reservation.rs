@@ -71,7 +71,9 @@ pub(crate) async fn submit_local_reserve_read(
 ///
 /// Routing logic mirrors [`super::submit::submit_calvin_routed_assign`]
 /// exactly:
-/// - **Not cluster mode** OR **leader is self**: submit locally.
+/// - **No `cluster_transport`**: this `SharedState` never ran `start_raft`,
+///   so no sequencer runs here. Return `SequencerUnavailable`.
+/// - **Leader is self**: submit locally.
 /// - **No leader elected (0 / none)**: return a typed error — never submit
 ///   locally, since a non-leader submit is silently discarded.
 /// - **Leader is a remote node**: register the leader's address from the live
@@ -86,13 +88,10 @@ pub(crate) async fn submit_reserve_read(
 ) -> crate::Result<TxnIdWire> {
     let local_timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
 
-    // Not cluster mode — single-node is the only sequencer member, hence the
-    // leader. Submit locally.
-    let (Some(transport), Some(_routing)) = (
-        state.cluster_transport.as_ref(),
-        state.cluster_routing.as_ref(),
-    ) else {
-        return submit_local_reserve_read(state, key, vshard, owner, local_timeout).await;
+    // Every running server has a cluster transport, the synthesized one-node
+    // cluster included. Without one, `start_raft` never ran here.
+    let Some(transport) = state.cluster_transport.as_ref() else {
+        return Err(Error::SequencerUnavailable);
     };
 
     // Resolve the sequencer-group leader from THIS node's live Raft status.
@@ -114,7 +113,7 @@ pub(crate) async fn submit_reserve_read(
         });
     }
 
-    // Leader is self: submit locally (a self-RPC would be a pointless extra
+    // Leader is self: submit locally (a self-RPC will be a pointless extra
     // hop and the local inbox is the one that gets the assignment).
     if leader == state.node_id {
         return submit_local_reserve_read(state, key, vshard, owner, local_timeout).await;
@@ -155,7 +154,7 @@ pub(crate) async fn submit_reserve_read(
 
     // The leader-side handler holds this RPC open until the reservation is
     // assigned (up to `deadline_remaining_ms`). The generic short `rpc_timeout`
-    // would abort the call long before that, so bound the response read by the
+    // will abort the call long before that, so bound the response read by the
     // forwarded deadline plus a margin for the round-trip itself.
     let read_timeout = Duration::from_millis(deadline_remaining_ms.saturating_add(2_000));
     match transport
@@ -223,11 +222,10 @@ pub(crate) async fn release_reservation(
     vshard: u32,
     reason: ReleaseReason,
 ) -> crate::Result<()> {
-    let (Some(transport), Some(_routing)) = (
-        state.cluster_transport.as_ref(),
-        state.cluster_routing.as_ref(),
-    ) else {
-        return submit_local_release(state, owner, vshard, reason).await;
+    // Without a cluster transport `start_raft` never ran here, so no
+    // reservation this release can name was ever granted.
+    let Some(transport) = state.cluster_transport.as_ref() else {
+        return Err(Error::SequencerUnavailable);
     };
 
     let status_fn = match state.raft_status_fn.get() {

@@ -17,17 +17,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use nodedb::bridge::dispatch::Dispatcher;
-use nodedb::config::auth::AuthConfig;
 use nodedb::control::shutdown::{PHASE_BUDGET, ShutdownBus, ShutdownPhase, ShutdownWatch};
-use nodedb::control::state::SharedState;
 use nodedb::event::bus::create_event_bus_with_capacity;
 use nodedb::event::trigger::TriggerDlq;
 use nodedb::event::types::{EventSource, RowId, WriteEvent, WriteOp};
 use nodedb::event::watermark::WatermarkStore;
 use nodedb::event::{EventPlane, EventPlaneConfig};
 use nodedb::types::{DatabaseId, Lsn, TenantId, VShardId};
-use nodedb::wal::WalManager;
+use nodedb_test_support::booted_state::{BootOptions, BootedState};
 
 fn make_write_event(seq: u64, lsn_val: u64) -> WriteEvent {
     WriteEvent {
@@ -47,6 +44,11 @@ fn make_write_event(seq: u64, lsn_val: u64) -> WriteEvent {
         valid_time_ms: None,
         user_id: None,
         statement_digest: None,
+        // The write committed now, so the event stays in age retention.
+        commit_hlc: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_nanos()).ok()),
     }
 }
 
@@ -57,30 +59,18 @@ async fn event_plane_watermarks_persisted_through_shutdown() {
     // ── Phase 1: Run and process events ──────────────────────────────────────
 
     let (final_lsn, core_count) = {
-        let wal_dir = dir.path().join("wal");
-        std::fs::create_dir_all(&wal_dir).expect("create wal dir");
-        let wal = Arc::new(WalManager::open_for_testing(&wal_dir).expect("wal"));
+        // A node runs exactly one Event Plane. The node boots without its
+        // own, so the plane under test is the node's only plane, with its
+        // own bus, watermark store and shutdown sequencer.
+        let shared = BootedState::boot(BootOptions {
+            event_plane: false,
+            ..BootOptions::default()
+        });
+        let wal = Arc::clone(&shared.wal);
         let watermark_store = Arc::new(WatermarkStore::open(dir.path()).expect("watermark_store"));
         let trigger_dlq = Arc::new(std::sync::Mutex::new(
             TriggerDlq::open(dir.path()).expect("trigger_dlq"),
         ));
-        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-        let catalog_path = dir.path().join("catalog.redb");
-        let shared = SharedState::open(
-            nodedb::control::state::DataPlaneHandles {
-                dispatcher,
-                quiesce: nodedb::bridge::quiesce::CollectionQuiesce::new(),
-                array_catalog: nodedb::control::array_catalog::ArrayCatalog::handle(),
-                system_metrics: Arc::new(nodedb::control::metrics::SystemMetrics::new()),
-            },
-            Arc::clone(&wal),
-            &catalog_path,
-            &AuthConfig::default(),
-            Default::default(),
-            false,
-            nodedb::data::executor::core_loop::test_governor(),
-        )
-        .expect("shared_state");
         let cdc_router = Arc::clone(&shared.cdc_router);
         let outcome_floor = Arc::clone(&shared.outcome_floor);
         let shutdown = Arc::new(ShutdownWatch::new());
@@ -93,7 +83,7 @@ async fn event_plane_watermarks_persisted_through_shutdown() {
             consumers_rx: consumers,
             wal: Arc::clone(&wal),
             watermark_store: Arc::clone(&watermark_store),
-            shared_state: shared,
+            shared_state: Arc::clone(&*shared),
             trigger_dlq,
             cdc_router,
             shutdown: Arc::clone(&shutdown),

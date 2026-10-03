@@ -553,36 +553,21 @@ async fn native_kv_batch_put_in_txn_is_staged_and_rolled_back() {
     );
 }
 
-/// Regression test: a native `KvBatchPut` (`build_batch_put` in
-/// `control/server/native/dispatch/plan_builder/kv.rs`) never called the
-/// CP-side `SurrogateAssigner`, so `execute_kv_batch_put`
-/// (`data/executor/handlers/kv/batch.rs`) wrote every batch-put row through
-/// `KvEngine::batch_put` with `Surrogate::ZERO` -- the unbound sentinel --
-/// unlike a single-key `Put`/`Insert`/`PointPut`, which always plans a real
-/// surrogate via `assign_kv_surrogate`. A `Surrogate::ZERO` row is invisible
-/// to any cross-engine surrogate-keyed prefilter/join (real bitmaps never
-/// contain the reserved `0` element), a correctness gap versus single-key
-/// puts.
+/// A native `KvBatchPut` (`build_batch_put` in
+/// `control/server/native/dispatch/plan_builder/kv.rs`) assigns every entry
+/// its surrogate through the CP-side `SurrogateAssigner`, as a single-key
+/// `Put`/`Insert`/`PointPut` does. `KvEngine::batch_put` refuses a batch
+/// with an entry under `Surrogate::ZERO`.
 ///
-/// No client-facing read in this codebase currently surfaces or gates on a
-/// KV row's per-row surrogate: `KvOp::Scan`'s `surrogate_ceiling` treats
-/// `s == 0` as *always visible* by design (so it cannot distinguish
-/// zero from non-zero), and no native opcode exposes
-/// `KvEngine::get_with_surrogate` / `key_for_surrogate`. So this test
-/// cannot observe the surrogate value itself over the wire; the direct,
-/// fails-pre-fix-passes-post-fix observable for the surrogate value lives
-/// in `nodedb::engine::kv::engine::tests::batch_put_stores_real_per_entry_surrogates`
-/// (`src/engine/kv/engine.rs`), which asserts `KvEngine::batch_put` stores
-/// each entry's real assigned surrogate via `get_with_surrogate` (pre-fix,
-/// that call took no `surrogates` parameter and hardcoded
-/// `Surrogate::ZERO` for every entry).
+/// No native opcode exposes `KvEngine::get_with_surrogate` /
+/// `key_for_surrogate`, so this test cannot observe the surrogate value over
+/// the wire. The direct check of the stored value lives in
+/// `nodedb::engine::kv::engine::tests::batch_put_stores_real_per_entry_surrogates`.
 ///
-/// What this test covers instead, end-to-end over the native wire: a
-/// `KvBatchPut` writes rows that are functionally indistinguishable from
-/// rows written by single-key `PointPut` calls on the same collection --
-/// both are fully visible via `KvScan` and `KvBatchGet` immediately
-/// afterward, i.e. the fix does not regress the batch path's observable
-/// read behavior while it starts assigning real surrogates underneath.
+/// This test covers the native wire end to end: a `KvBatchPut` writes rows
+/// that are functionally indistinguishable from rows written by single-key
+/// `PointPut` calls on the same collection. Both are fully visible via
+/// `KvScan` and `KvBatchGet` immediately afterward.
 #[tokio::test]
 async fn native_kv_batch_put_rows_visible_same_as_single_put() {
     let server = NativeTestServer::start().await;

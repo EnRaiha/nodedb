@@ -29,7 +29,6 @@
 //!
 //! [`CalvinLocalState::lock_managers`]: crate::control::state::CalvinLocalState::lock_managers
 
-use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -43,7 +42,7 @@ use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, VShardId};
 use nodedb_physical::physical_plan::MetaOp;
 
-use super::lock_keys::plan_lock_keys;
+use super::lock_keys::{plan_lock_keys, plan_row_key};
 use super::predicate::plan_is_write;
 use super::write_order_lock::KeyedWriteOrderLock;
 
@@ -78,7 +77,7 @@ pub enum WriteAdmission {
     /// key to serialize on (predicate / bulk / uncovered shapes — left unordered
     /// for now). Either way the caller holds it across enqueue + response.
     FastPath { guard: Option<WriteAdmissionGuard> },
-    /// Single-node (no Calvin scheduler for this vShard) POINT write. There is no
+    /// POINT write on a vShard with no Calvin scheduler registered. There is no
     /// lock table to fence against, but concurrent same-key writes must still
     /// serialize so WAL-LSN order equals apply order per key. The caller awaits
     /// `keyed_lock.lock_owned(key)` — a FIFO-fair per-key async lock — BEFORE the
@@ -110,7 +109,7 @@ pub enum WriteAdmission {
 /// inside the owning vShard's scheduler task, so it forwards the promoted ids
 /// over `promotion_sender` to the scheduler, which runs its normal
 /// promotion -> dispatch path. Without this hand-off a promoted scheduler txn
-/// would sit in the scheduler's `blocked` map forever, holding the key and
+/// will sit in the scheduler's `blocked` map forever, holding the key and
 /// stalling every later txn behind a zombie holder.
 ///
 /// [`LockManager::release`]: crate::control::cluster::calvin::scheduler::lock_manager::LockManager::release
@@ -119,8 +118,8 @@ pub struct WriteAdmissionGuard {
     txn: TxnId,
     /// Promotion channel to the owning vShard's scheduler. `Some` when a Calvin
     /// scheduler is registered for this vShard (the only case in which a waiter
-    /// can queue behind a fast-path key); `None` in single-node / no-Calvin
-    /// deployments, where `release` never promotes anything.
+    /// can queue behind a fast-path key); `None` when no scheduler is
+    /// registered, where `release` never promotes anything.
     promotion_sender: Option<UnboundedSender<Vec<TxnId>>>,
 }
 
@@ -220,7 +219,7 @@ pub fn admit(shared: &SharedState, target: &WriteTarget<'_>) -> WriteAdmission {
         .get(&vshard.as_u32())
         .map(Arc::clone)
     else {
-        return match point_keys.and_then(|(_v, keys)| single_point_key(keys)) {
+        return match point_keys.and_then(|_| plan_row_key(target.plan)) {
             Some(key) => WriteAdmission::FastPathBlocking {
                 key,
                 keyed_lock: Arc::clone(&shared.write_order_locks),
@@ -240,7 +239,7 @@ pub fn admit(shared: &SharedState, target: &WriteTarget<'_>) -> WriteAdmission {
     // with a real Calvin schedule position, then probe the exact keys WITHOUT
     // blocking. `try_acquire` never enqueues a waiter on the contended path, so a
     // routed write leaves no orphaned autocommit holder that a later `release`
-    // could promote to an unowned (never-released) lock.
+    // can promote to an unowned (never-released) lock.
     let txn = TxnId::new(
         TxnId::AUTOCOMMIT_EPOCH,
         shared
@@ -256,7 +255,7 @@ pub fn admit(shared: &SharedState, target: &WriteTarget<'_>) -> WriteAdmission {
         // Look up this vShard's promotion channel so the guard can hand any
         // scheduler waiter it promotes on drop back to the scheduler for
         // dispatch. `None` only if no scheduler is registered — but a registered
-        // lock manager without a promotion sender should not happen, since both
+        // lock manager without a promotion sender must not happen, since both
         // are inserted together per vShard.
         let promotion_sender = shared
             .calvin
@@ -277,17 +276,5 @@ pub fn admit(shared: &SharedState, target: &WriteTarget<'_>) -> WriteAdmission {
         // it via the scheduler. Nothing was acquired or enqueued here.
         ROUTED_TO_CALVIN.fetch_add(1, Ordering::Relaxed);
         WriteAdmission::RouteToCalvin
-    }
-}
-
-/// The single point key of an eligible fast-path write, or `None` if the set is
-/// not exactly one key. [`plan_lock_keys`] always yields a one-key set for a
-/// point write; anything else is not a single-identity write and stays
-/// unordered on the single-node fast path.
-fn single_point_key(keys: BTreeSet<LockKey>) -> Option<LockKey> {
-    let mut it = keys.into_iter();
-    match (it.next(), it.next()) {
-        (Some(key), None) => Some(key),
-        _ => None,
     }
 }

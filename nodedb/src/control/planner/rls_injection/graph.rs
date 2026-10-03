@@ -7,7 +7,7 @@
 //! fusion returns fused rows. Each refuses while a read policy restricts
 //! the collection, rather than return rows the policy hides — including
 //! algorithm/stats/RAG-fusion shapes the redaction pass permits, since RLS
-//! restricts the row set itself, not just column values.
+//! restricts the row set itself, not only column values.
 
 use nodedb_physical::physical_plan::GraphOp;
 
@@ -43,7 +43,7 @@ pub(super) fn inject_graph(ctx: &RlsCtx<'_>, op: &mut GraphOp) -> crate::Result<
         }
 
         // Refuse: returns bindings with no filter slot; its own `WHERE`
-        // could probe a hidden row's field one predicate at a time.
+        // can probe a hidden row's field one predicate at a time.
         GraphOp::Match { query, .. }
         | GraphOp::MatchContinuation { query, .. }
         | GraphOp::MatchVarLenResume { query, .. } => refuse_match(ctx, query),
@@ -68,7 +68,7 @@ pub(super) fn inject_graph(ctx: &RlsCtx<'_>, op: &mut GraphOp) -> crate::Result<
         ),
 
         // Refuse: the fusion envelope has no filter slot and no sub-plan
-        // to recurse into — hidden rows would be ranked and returned.
+        // to recurse into — hidden rows will be ranked and returned.
         GraphOp::RagFusion { collection, .. } => ctx.refuse_if_policy(
             collection,
             "fusion returns ranked document rows through a fused response shape that carries no \
@@ -121,6 +121,15 @@ pub(super) fn inject_graph(ctx: &RlsCtx<'_>, op: &mut GraphOp) -> crate::Result<
                 "a node-label write is keyed on a node id that names no collection, and it carries \
                  no row body for the policy to be evaluated against",
             ),
+
+        // Admit: these derive from a document delete or TRUNCATE the policy
+        // on the same collection already decided. The guards write nothing,
+        // and each edge a TRUNCATE removes goes with the rows it removes.
+        // A delete's planner reads which ids are stored, for that delete.
+        GraphOp::NodeEdgeGuard { .. }
+        | GraphOp::NodePresenceGuard { .. }
+        | GraphOp::TruncateEdges { .. }
+        | GraphOp::NodePresenceRead { .. } => Ok(()),
     }
 }
 
@@ -172,6 +181,7 @@ mod tests {
                 mode: None,
                 personalization_vector: None,
             },
+            stage: nodedb_physical::physical_plan::AlgoStage::Local,
         })
     }
 
@@ -208,7 +218,7 @@ mod tests {
         assert!(inject(&mut plan, &store).is_ok());
     }
 
-    /// An unscoped match may traverse anything the tenant holds, so it falls
+    /// An unscoped match can traverse anything the tenant holds, so it falls
     /// back to the tenant-wide question.
     #[test]
     fn unscoped_match_falls_back_to_the_tenant_wide_question() {
@@ -241,8 +251,8 @@ mod tests {
             label: "knows".into(),
             dst_id: "b".into(),
             properties: properties.as_bytes().to_vec(),
-            src_surrogate: nodedb_types::Surrogate::ZERO,
-            dst_surrogate: nodedb_types::Surrogate::ZERO,
+            src_surrogate: nodedb_types::Surrogate::new(1),
+            dst_surrogate: nodedb_types::Surrogate::new(2),
         })
     }
 
@@ -255,8 +265,8 @@ mod tests {
             src_id: "a".into(),
             label: "knows".into(),
             dst_id: "b".into(),
-            src_surrogate: nodedb_types::Surrogate::ZERO,
-            dst_surrogate: nodedb_types::Surrogate::ZERO,
+            src_surrogate: nodedb_types::Surrogate::new(1),
+            dst_surrogate: nodedb_types::Surrogate::new(2),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
         })
     }

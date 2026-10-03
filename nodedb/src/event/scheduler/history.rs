@@ -67,6 +67,12 @@ pub struct JobHistoryStore {
     next_id: std::sync::atomic::AtomicU64,
 }
 
+impl crate::storage::RedbBacked for JobHistoryStore {
+    fn redb_database(&self) -> &redb::Database {
+        &self.db
+    }
+}
+
 impl JobHistoryStore {
     /// Open or create the history store at `{data_dir}/event_plane/job_history.redb`.
     pub fn open(data_dir: &Path) -> crate::Result<Self> {

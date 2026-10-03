@@ -34,26 +34,22 @@ impl CoreLoop {
                 collection,
                 key,
                 prior,
-            } => {
-                self.kv_engine.reinstate_entry(
+            } => self
+                .kv_engine
+                .reinstate_entry(
                     kv_key(did, tid, &collection, &key),
                     prior.as_ref(),
                     current_ms(),
-                );
-                Ok(())
-            }
+                )
+                .map_err(|e| (entry_index, e.to_string())),
             UndoEntry::KvDelete {
                 collection,
                 key,
                 prior,
-            } => {
-                self.kv_engine.restore_entry_image(
-                    kv_key(did, tid, &collection, &key),
-                    &prior,
-                    current_ms(),
-                );
-                Ok(())
-            }
+            } => self
+                .kv_engine
+                .restore_entry_image(kv_key(did, tid, &collection, &key), &prior, current_ms())
+                .map_err(|e| (entry_index, e.to_string())),
             UndoEntry::KvTtl {
                 collection,
                 key,
@@ -79,15 +75,17 @@ impl CoreLoop {
                 let now_ms = current_ms();
                 self.kv_engine.truncate(did, tid, &collection);
                 for row in rows {
-                    self.kv_engine.restore_entry_image(
-                        kv_key(did, tid, &collection, &row.key),
-                        &crate::engine::kv::KvEntryImage {
-                            value: row.value,
-                            expire_at_ms: row.expire_at_ms,
-                            surrogate: row.surrogate,
-                        },
-                        now_ms,
-                    );
+                    self.kv_engine
+                        .restore_entry_image(
+                            kv_key(did, tid, &collection, &row.key),
+                            &crate::engine::kv::KvEntryImage {
+                                value: row.value,
+                                expire_at_ms: row.expire_at_ms,
+                                surrogate: row.surrogate,
+                            },
+                            now_ms,
+                        )
+                        .map_err(|e| (entry_index, e.to_string()))?;
                 }
                 Ok(())
             }
@@ -112,16 +110,18 @@ mod tests {
     const TID: u64 = 1;
 
     fn put_kv(core: &mut CoreLoop, collection: &str, key: &[u8], value: &[u8], ttl_ms: u64) {
-        core.kv_engine.put(crate::engine::kv::KvPutParams {
-            database_id: DB,
-            tenant_id: TID,
-            collection,
-            key,
-            value,
-            ttl_ms,
-            now_ms: current_ms(),
-            surrogate: nodedb_types::Surrogate::ZERO,
-        });
+        core.kv_engine
+            .put(crate::engine::kv::KvPutParams {
+                database_id: DB,
+                tenant_id: TID,
+                collection,
+                key,
+                value,
+                ttl_ms,
+                now_ms: current_ms(),
+                surrogate: crate::engine::kv::test_support::row_surrogate(key),
+            })
+            .expect("a bound row writes");
     }
 
     fn ttl_ms(core: &CoreLoop, collection: &str, key: &[u8]) -> Option<i64> {
@@ -288,19 +288,21 @@ mod tests {
 
     fn seed_with_expiry_and_surrogate(core: &mut CoreLoop) -> crate::engine::kv::KvEntryImage {
         let now_ms = current_ms();
-        core.kv_engine.put_with_absolute_expiry(
-            crate::engine::kv::KvPutParams {
-                database_id: DB,
-                tenant_id: TID,
-                collection: "cache",
-                key: b"k",
-                value: b"old",
-                ttl_ms: 0,
-                now_ms,
-                surrogate: nodedb_types::Surrogate::new(9),
-            },
-            now_ms + 3_600_000,
-        );
+        core.kv_engine
+            .put_with_absolute_expiry(
+                crate::engine::kv::KvPutParams {
+                    database_id: DB,
+                    tenant_id: TID,
+                    collection: "cache",
+                    key: b"k",
+                    value: b"old",
+                    ttl_ms: 0,
+                    now_ms,
+                    surrogate: nodedb_types::Surrogate::new(9),
+                },
+                now_ms + 3_600_000,
+            )
+            .expect("a bound row writes");
         core.kv_engine
             .entry_image(DB, TID, "cache", b"k", now_ms)
             .expect("seeded key")

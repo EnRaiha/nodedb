@@ -128,3 +128,60 @@ fn conclude_unapplied(
         result: Some(applied),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::wal::WalManager;
+
+    /// A follower whose metadata apply lags a collection's creation holds a
+    /// data entry for that collection until the creation applied. The
+    /// metadata watcher bumps only after the applier returned, and its
+    /// return includes the creation's post-apply storage clear. The write
+    /// therefore lands after the clear, and survives it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lagging_followers_write_waits_for_the_create() {
+        let directory = tempfile::tempdir().expect("temporary WAL directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("hold.wal")).expect("test WAL"),
+        );
+        let (dispatcher, _sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).expect("shared state");
+        let tracker = Arc::new(ProposeTracker::new());
+        let watcher = state.applied_index_watcher(METADATA_GROUP_ID);
+        let create_index = watcher.current() + 2;
+
+        let enqueued = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&enqueued);
+        let write = Prepared::Enqueue(Box::pin(async move {
+            flag.store(true, Ordering::SeqCst);
+            StartedEntry::concluded(EntryOutcome::Skipped)
+        }));
+        let held = HeldEntry {
+            group_id: 7,
+            log_index: 1,
+            proposal_key: 0,
+            metadata_floor: create_index,
+        };
+        let Prepared::Enqueue(mut hold) = hold_for_metadata(&state, &tracker, held, write) else {
+            panic!("a write below its floor stays an enqueue behind the hold");
+        };
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut hold)
+                .await
+                .is_err(),
+            "the write waits while the create is unapplied"
+        );
+        assert!(!enqueued.load(Ordering::SeqCst));
+
+        watcher.bump(create_index);
+        tokio::time::timeout(Duration::from_secs(10), hold)
+            .await
+            .expect("the write proceeds once the create applied");
+        assert!(enqueued.load(Ordering::SeqCst));
+    }
+}

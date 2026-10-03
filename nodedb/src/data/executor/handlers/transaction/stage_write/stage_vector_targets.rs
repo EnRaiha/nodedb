@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use nodedb_physical::physical_plan::{UpdateValue, VectorWriteTargets};
 use nodedb_types::{RlsWriteCheck, StorageKey, Surrogate, Value};
 
-use super::context::StageCtx;
+use super::context::{StageCtx, StageScope};
 use super::stage_vector::{VectorCurrentRow, encode_staged_vector_row, staged_vector_row_identity};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
@@ -64,7 +64,7 @@ impl CoreLoop {
     /// each row's current image, in ascending surrogate order.
     fn stage_vector_targets(
         &self,
-        ctx: &StageCtx<'_>,
+        scope: &StageScope<'_>,
         index_key: &VectorIndexKey,
         targets: &VectorWriteTargets,
     ) -> Result<Vec<(Surrogate, VectorCurrentRow)>, ErrorCode> {
@@ -73,43 +73,57 @@ impl CoreLoop {
             VectorWriteTargets::Surrogates(surrogates) => {
                 let mut seen = HashSet::with_capacity(surrogates.len());
                 for surrogate in surrogates {
-                    if *surrogate == Surrogate::ZERO || !seen.insert(*surrogate) {
+                    // A target names a bound row. `Surrogate::ZERO` names
+                    // none, so the statement is refused before any row stages.
+                    if let Some(refusal) =
+                        crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
+                            "vector",
+                            scope.collection,
+                            *surrogate,
+                        )
+                    {
+                        return Err(refusal);
+                    }
+                    if !seen.insert(*surrogate) {
                         continue;
                     }
-                    if let Some(row) = self.stage_vector_current_row(ctx, index_key, *surrogate)? {
+                    if let Some(row) =
+                        self.stage_vector_current_row(scope, index_key, *surrogate)?
+                    {
                         out.push((*surrogate, row));
                     }
                 }
             }
             VectorWriteTargets::Predicate(filter_bytes) => {
-                let filters = decode_vector_write_filters(ctx.collection, filter_bytes)?;
-                let overlay = self.txn_overlays.get(&ctx.txn_id);
+                let filters = decode_vector_write_filters(scope.collection, filter_bytes)?;
+                let overlay = self.txn_overlays.get(&scope.txn_id);
                 // Base rows the filters match, minus every row the overlay
                 // superseded: those are decided from their staged image below.
                 for surrogate in self.scan_vector_sidecar_matches(
-                    ctx.database_id,
-                    ctx.tid,
-                    ctx.collection,
+                    scope.database_id,
+                    scope.tid,
+                    scope.collection,
                     &filters,
                 )? {
                     let superseded =
-                        overlay.is_some_and(|o| o.get(&ctx.coll_key, surrogate.0).is_some());
+                        overlay.is_some_and(|o| o.get(&scope.coll_key, surrogate.0).is_some());
                     if superseded {
                         continue;
                     }
-                    if let Some(row) = self.stage_vector_current_row(ctx, index_key, surrogate)? {
+                    if let Some(row) = self.stage_vector_current_row(scope, index_key, surrogate)? {
                         out.push((surrogate, row));
                     }
                 }
                 // Staged puts whose sidecar matches; a staged tombstone is a
                 // row that is gone.
                 if let Some(overlay) = overlay {
-                    for (surrogate, staged) in overlay.iter_for_collection(&ctx.coll_key) {
+                    for (surrogate, staged) in overlay.iter_for_collection(&scope.coll_key) {
                         let Staged::Put(_) = staged else {
                             continue;
                         };
                         let surrogate = Surrogate::new(surrogate);
-                        let Some(row) = self.stage_vector_current_row(ctx, index_key, surrogate)?
+                        let Some(row) =
+                            self.stage_vector_current_row(scope, index_key, surrogate)?
                         else {
                             continue;
                         };
@@ -136,16 +150,9 @@ impl CoreLoop {
             targets,
             rls_write_check,
         } = params;
-        let ctx = StageCtx::new(
-            task,
-            tid,
-            txn_id,
-            collection,
-            StorageKey::for_surrogate(Surrogate::ZERO).to_identity(),
-            Surrogate::ZERO,
-        );
-        let index_key = CoreLoop::vector_index_key(ctx.database_id, tid, collection, field);
-        let rows = match self.stage_vector_targets(&ctx, &index_key, targets) {
+        let scope = StageScope::new(task, tid, txn_id, collection);
+        let index_key = CoreLoop::vector_index_key(scope.database_id, tid, collection, field);
+        let rows = match self.stage_vector_targets(&scope, &index_key, targets) {
             Ok(rows) => rows,
             Err(e) => return self.response_error(task, e),
         };
@@ -172,7 +179,7 @@ impl CoreLoop {
             let key = StorageKey::for_surrogate(surrogate);
             let identity = staged_vector_row_identity(&row.sidecar.bytes, key);
             self.txn_overlay_mut(txn_id).insert_tombstone(
-                ctx.coll_key.clone(),
+                scope.coll_key.clone(),
                 surrogate.0,
                 &identity,
             );
@@ -197,18 +204,11 @@ impl CoreLoop {
             payload_indexes,
             rls_write_check,
         } = params;
-        let ctx = StageCtx::new(
-            task,
-            tid,
-            txn_id,
-            collection,
-            StorageKey::for_surrogate(Surrogate::ZERO).to_identity(),
-            Surrogate::ZERO,
-        );
+        let scope = StageScope::new(task, tid, txn_id, collection);
         // A re-embed must fit the index the rows live in.
         let index_key = match new_vector {
             Some(vector) => match self.stage_vector_index_key(
-                &ctx,
+                &scope,
                 &VectorDirectIndexSpec {
                     collection,
                     field,
@@ -221,9 +221,9 @@ impl CoreLoop {
                 Ok(key) => key,
                 Err(e) => return self.response_error(task, e),
             },
-            None => CoreLoop::vector_index_key(ctx.database_id, tid, collection, field),
+            None => CoreLoop::vector_index_key(scope.database_id, tid, collection, field),
         };
-        let rows = match self.stage_vector_targets(&ctx, &index_key, targets) {
+        let rows = match self.stage_vector_targets(&scope, &index_key, targets) {
             Ok(rows) => rows,
             Err(e) => return self.response_error(task, e),
         };
@@ -231,7 +231,7 @@ impl CoreLoop {
         // Every post-image is merged and decided before the first row is
         // staged, so one rejected row leaves the statement without effect.
         let patch = VectorPayloadPatch {
-            database_id: ctx.database_id,
+            database_id: scope.database_id,
             tid,
             collection,
             field,

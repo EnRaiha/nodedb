@@ -14,6 +14,9 @@ use nodedb::data::executor::core_loop::CoreLoop;
 use nodedb::event::{EventPlane, EventPlaneConfig, create_event_bus};
 use nodedb::wal::WalManager;
 
+/// The backup KEK every native test server wraps backups with.
+pub const NATIVE_TEST_BACKUP_KEK: [u8; 32] = [0x24u8; 32];
+
 /// A running native-protocol test server.
 pub struct NativeTestServer {
     pub addr: std::net::SocketAddr,
@@ -27,6 +30,8 @@ pub struct NativeTestServer {
     pub(super) _poller_handle: tokio::task::JoinHandle<()>,
     pub(super) _core_handle: tokio::task::JoinHandle<()>,
     pub(super) _event_plane: EventPlane,
+    /// The one-node cluster's Raft side: its lease loop and subsystems.
+    pub(super) raft: crate::single_node::OneNodeRaft,
     pub(super) _dir: tempfile::TempDir,
 }
 
@@ -51,7 +56,7 @@ impl NativeTestServer {
         let (event_producers, event_consumers) = create_event_bus(1);
 
         // Use catalog-backed credential store (mirrors pgwire_harness::start)
-        // so DDL apply (`apply_locally_if_needed`) and planner reads
+        // so the proposer's apply on this node and planner reads
         // (`OriginCatalog::get_collection`) resolve against a real catalog and
         // collections created over the native protocol are visible.
         let catalog_path = dir.path().join("system.redb");
@@ -74,11 +79,29 @@ impl NativeTestServer {
         // Ensure the built-in `default` database (id 0) is present in the
         // catalog so the default connection database works in tests.
         let _ = credentials.catalog().bootstrap_default_database();
-        let shared =
+        let mut shared =
             SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials, false)
                 .expect("build shared state");
+        // What production boot wires from `[backup_encryption]` and
+        // `[backup_storage]`: `file://` backup URIs resolve inside the
+        // server's `backups` directory.
+        let backup_root = dir.path().join("backups");
+        std::fs::create_dir_all(&backup_root).expect("create backup root");
+        let cluster = crate::single_node::init(dir.path())
+            .await
+            .expect("init the one-node cluster");
+        {
+            let state = Arc::get_mut(&mut shared).expect("state is not shared yet");
+            crate::single_node::wire(state, &cluster, dir.path())
+                .expect("wire the one-node cluster");
+            state.backup_kek = Some(Arc::new(NATIVE_TEST_BACKUP_KEK));
+            state.backup_storage = Some(Arc::new(nodedb::config::server::BackupStorageSettings {
+                local_root: Some(backup_root),
+                ..Default::default()
+            }));
+        }
         // The same gateway install production boot runs.
-        nodedb::bootstrap::state_wiring::install_gateway(&shared);
+        nodedb::bootstrap::state_wiring::install_gateway(&shared).expect("install gateway");
 
         let data_side = data_sides.into_iter().next().expect("data side");
         let core_dir = dir.path().to_path_buf();
@@ -144,6 +167,10 @@ impl NativeTestServer {
             shutdown_bus: shutdown_bus.clone(),
         });
 
+        let raft = crate::single_node::start(&cluster, &shared, dir.path())
+            .await
+            .expect("start the one-node cluster");
+
         let listener = Listener::bind("127.0.0.1:0".parse().expect("addr"))
             .await
             .expect("bind");
@@ -183,15 +210,25 @@ impl NativeTestServer {
             _poller_handle,
             _core_handle,
             _event_plane,
+            raft,
             _dir: dir,
         }
     }
 
+    /// A `file://` URI of `name` inside this server's backup root.
+    pub fn backup_uri(&self, name: &str) -> String {
+        format!(
+            "file://{}/{name}",
+            self._dir.path().join("backups").display()
+        )
+    }
+
     /// Shut down the server and give background tasks time to unwind.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         self.shutdown_bus.initiate();
         let _ = self.poller_shutdown_tx.send(true);
         let _ = self.core_stop_tx.send(());
+        self.raft.shutdown(&self.shared).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use nodedb::control::catalog_entry::post_apply::{
-    apply_post_apply_side_effects_sync, spawn_post_apply_async_side_effects,
+    apply_post_apply_side_effects_sync, run_post_apply_async_side_effects,
 };
 use nodedb::control::catalog_entry::{CatalogEntry, apply};
 use nodedb_test_support::pgwire_harness::TestServer;
@@ -38,15 +38,18 @@ fn params() -> StoredVectorIndexParams {
         pq_m: 0,
         ivf_cells: 0,
         ivf_nprobe: 0,
+        modification_hlc: nodedb_types::Hlc::ZERO,
     }
 }
 
 /// Apply an entry the way a node applying a committed raft entry does:
 /// durable write, synchronous install, then the async dispatch lane.
-fn apply_entry(server: &TestServer, entry: &CatalogEntry) {
+async fn apply_entry(server: &TestServer, entry: &CatalogEntry) {
     apply::apply_to(entry, server.shared.credentials.catalog()).expect("apply catalog entry");
     apply_post_apply_side_effects_sync(entry, &server.shared);
-    spawn_post_apply_async_side_effects(entry.clone(), Arc::clone(&server.shared));
+    run_post_apply_async_side_effects(entry.clone(), Arc::clone(&server.shared))
+        .await
+        .expect("post-apply dispatch");
 }
 
 /// SQL for one row carrying an `embedding` array of `dim` components.
@@ -79,7 +82,8 @@ async fn post_apply_installs_the_declared_dimension_on_this_node() {
     apply_entry(
         &server,
         &CatalogEntry::PutVectorIndexParams(Box::new(params())),
-    );
+    )
+    .await;
 
     let rejected = server
         .exec(&insert_sql("after", 4))
@@ -110,7 +114,8 @@ async fn post_apply_drops_the_index_on_this_node() {
     apply_entry(
         &server,
         &CatalogEntry::PutVectorIndexParams(Box::new(params())),
-    );
+    )
+    .await;
     server
         .exec(&insert_sql("gated", 4))
         .await
@@ -123,8 +128,10 @@ async fn post_apply_drops_the_index_on_this_node() {
             tenant_id: TENANT,
             collection: COLLECTION.to_string(),
             field_name: FIELD.to_string(),
+            target_hlc: nodedb_types::Hlc::ZERO,
         },
-    );
+    )
+    .await;
 
     server
         .exec(&insert_sql("after_drop", 4))

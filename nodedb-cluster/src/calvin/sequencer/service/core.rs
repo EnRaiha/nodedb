@@ -31,12 +31,10 @@ use tokio::sync::mpsc;
 use crate::calvin::sequencer::config::SEQUENCER_GROUP_ID;
 use crate::calvin::sequencer::config::SequencerConfig;
 use crate::calvin::sequencer::entry::SequencerEntry;
-use crate::calvin::sequencer::inbox::{AdmittedTx, InboxReceiver};
+use crate::calvin::sequencer::inbox::InboxReceiver;
 use crate::calvin::sequencer::reservation_inbox::ReservationInboxReceiver;
 use crate::calvin::sequencer::service::verdict_entry::verdict_entry;
 use crate::calvin::sequencer::state_machine::SequencerStateMachine;
-use crate::calvin::sequencer::validator::validate_batch_with_assignments;
-use crate::calvin::types::EpochBatch;
 use crate::calvin::{CalvinCompletionRegistry, TxnId, VerdictOutcome};
 use crate::error::ClusterError;
 use crate::multi_raft::MultiRaft;
@@ -66,10 +64,10 @@ pub struct SequencerReceivers {
 /// Drives the epoch ticker. Must be spawned as a Tokio task on the Control
 /// Plane. `Send + Sync`.
 pub struct SequencerService {
-    config: SequencerConfig,
-    node_id: u64,
-    multi_raft: Arc<Mutex<MultiRaft>>,
-    inbox_receiver: InboxReceiver,
+    pub(super) config: SequencerConfig,
+    pub(super) node_id: u64,
+    pub(super) multi_raft: Arc<Mutex<MultiRaft>>,
+    pub(super) inbox_receiver: InboxReceiver,
     /// Carries hot-key read-reservation requests from the Control Plane. Only
     /// the leader services it (see `process_reservations`); a follower drains
     /// and discards it so awaiting callers fall back to plain OCC.
@@ -89,17 +87,21 @@ pub struct SequencerService {
     /// sequencer group's log has been replayed into the state machine. On
     /// leader failover, `inbox_receiver` is simply dropped (in-flight
     /// submissions are not in the log and will be retried).
-    current_epoch: Option<u64>,
+    pub(super) current_epoch: Option<u64>,
+    /// The `epoch_system_ms` this service last minted, or `None` before its
+    /// first mint. A proposed batch applies later, so the next mint reads
+    /// this as well as the state machine's applied instant.
+    pub(super) last_minted_ms: Option<i64>,
     /// The state machine committed sequencer entries are applied into on this
     /// node. Read to derive the epoch seed, and on every tick to see whether it
     /// has halted.
-    state_machine: Arc<Mutex<SequencerStateMachine>>,
+    pub(super) state_machine: Arc<Mutex<SequencerStateMachine>>,
     /// Whether the halt has already been reported. The tick runs at epoch
     /// cadence (milliseconds), so the report is latched to one line rather than
     /// burying the original cause under a per-tick repeat.
-    halt_reported: bool,
+    pub(super) halt_reported: bool,
     pub metrics: Arc<SequencerMetrics>,
-    completion_registry: Arc<CalvinCompletionRegistry>,
+    pub(super) completion_registry: Arc<CalvinCompletionRegistry>,
     /// Receives `(txn, commit)` verdict signals emitted by this node's
     /// completion registry when a staged cross-shard txn's vote tally becomes
     /// complete. Only the leader turns a signal into a `Verdict` proposal.
@@ -107,6 +109,13 @@ pub struct SequencerService {
     /// local, avoiding a borrow conflict with `self.tick()` in a sibling
     /// `select!` arm; it is always `Some` after construction.
     verdict_rx: Option<mpsc::Receiver<(TxnId, VerdictOutcome)>>,
+    /// The streamed parts of the multi-part transactions this leader
+    /// sequenced, shared with the inbox that takes them (see
+    /// [`super::parts`]).
+    pub(super) parts_intake: Arc<crate::calvin::sequencer::parts_intake::PartsIntake>,
+    /// Abandonments proposed in the current term and not yet applied, so
+    /// each is proposed once per term.
+    pub(super) abandoning: super::parts::Abandoning,
 }
 
 impl SequencerService {
@@ -130,6 +139,7 @@ impl SequencerService {
             inbox,
             reservations,
         } = receivers;
+        let parts_intake = inbox.parts_intake();
         Self {
             config,
             node_id,
@@ -139,11 +149,14 @@ impl SequencerService {
             next_reservation_position: RESERVATION_POSITION_BAND,
             reservation_epoch: 0,
             current_epoch: None,
+            last_minted_ms: None,
             state_machine,
             halt_reported: false,
             metrics: SequencerMetrics::new(),
             completion_registry,
             verdict_rx: Some(verdict_rx),
+            parts_intake,
+            abandoning: super::parts::Abandoning::default(),
         }
     }
 
@@ -224,11 +237,14 @@ impl SequencerService {
         // multi_raft is_leader API directly.
         if !self.is_leader() {
             // Drain and discard: clients will retry against the real leader.
-            let discarded = self.inbox_receiver.drain_all_discard();
+            let discarded = self.discard_inbox();
             // Discard reservation requests too: dropping each `Reserve`'s `reply`
             // sender makes the CP awaiter observe a closed channel and fall back
             // to plain OCC — correct degradation when this node is not leader.
             let reservations_discarded = self.reservation_receiver.drain_all_discard();
+            // Parts held here are gone with the leadership. The next leader
+            // abandons their transactions.
+            self.drop_part_streams();
             debug!(
                 node_id = self.node_id,
                 "not sequencer leader; discarding {discarded} inbox items \
@@ -285,171 +301,21 @@ impl SequencerService {
             }
             return;
         };
-
-        // Drain inbox up to per-epoch caps.
-        let mut candidates: Vec<AdmittedTx> = Vec::new();
-        let drained = self.inbox_receiver.drain_into_capped(
-            &mut candidates,
-            self.config.max_txns_per_epoch,
-            self.config.max_bytes_per_epoch,
-        );
-        if drained == 0 {
-            debug!(
-                node_id = self.node_id,
-                epoch, "epoch tick: inbox empty, no proposal"
-            );
-            return;
-        }
-
-        // Pre-validation.
-        let (admitted, rejected) = validate_batch_with_assignments(epoch, candidates);
-
-        self.metrics
-            .admitted_total
-            .fetch_add(admitted.len() as u64, Ordering::Relaxed);
-
-        // Record per-conflict metrics and increment the aggregate counter.
-        for r in &rejected {
-            self.metrics
-                .rejected_conflict_total
-                .fetch_add(1, Ordering::Relaxed);
-            if let Some(ctx) = r.conflict_context.clone() {
-                self.metrics.record_conflict(ctx);
-            }
-        }
-
-        if admitted.is_empty() {
-            debug!(
-                epoch,
-                rejected = rejected.len(),
-                "epoch tick: all candidates rejected, no proposal"
-            );
-            self.current_epoch = Some(epoch + 1);
-            return;
-        }
-
-        // Read wall clock ONCE on the sequencer leader. This is the single
-        // deterministic timestamp source for every transaction in this epoch.
-        // All replicas receive this value via Raft replication; engine handlers
-        // use it instead of reading the wall clock independently.
-        let epoch_system_ms = std::time::SystemTime::now() // no-determinism: read once on leader; replicated to all replicas via Raft
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-
-        // Encode and propose.
-        let batch = EpochBatch {
-            epoch,
-            txns: admitted.iter().map(|(_, txn)| txn.clone()).collect(),
-            epoch_system_ms,
-        };
-        for (inbox_seq, txn) in &admitted {
-            self.completion_registry.note_assigned(
-                *inbox_seq,
-                crate::calvin::TxnId::new(epoch, txn.position),
-                txn.tx_class.participating_vshards().len(),
-            );
-        }
-        let entry = SequencerEntry::EpochBatch { batch };
-        let txns_count = entry_txn_count(&entry);
-        let _replicate_span =
-            tracing::info_span!("sequencer_replicate", epoch, txns_count,).entered();
-        match self.propose_entry(&entry) {
-            Ok(log_index) => {
-                debug!(
-                    epoch,
-                    log_index,
-                    admitted = entry_txn_count(&entry),
-                    rejected = rejected.len(),
-                    "sequencer proposed epoch batch"
-                );
-            }
-            Err(e) => {
-                warn!(epoch, error = %e, "sequencer propose failed; epoch will be retried on next tick if still leader");
-                // Do NOT advance epoch on propose failure — the same epoch
-                // will be re-attempted on the next tick if the node is still
-                // the leader. This is safe because the epoch has not been
-                // committed to the Raft log.
-                return;
-            }
-        }
-        self.current_epoch = Some(epoch + 1);
+        self.mint_epoch(epoch);
+        // Parts follow their headers' batches, this tick's included.
+        self.propose_parts();
+        self.abandon_orphaned_parts();
     }
 
-    /// Derive the epoch seed once, then reuse it for the life of this service.
-    ///
-    /// Delegates the (heavily reasoned) safety gate to
-    /// [`super::epoch_seed::derive_epoch_seed`]; `None` means it is not yet
-    /// safe to mint an epoch on this node and the caller must skip the tick.
-    ///
-    /// Publishes the outcome to `metrics.epoch_seeded` so the readiness probe
-    /// can tell whether a Calvin submit landing here can be sequenced.
-    fn ensure_epoch_seeded(&mut self) -> Option<u64> {
-        let seed = self.derive_or_cached_epoch();
-        self.metrics
-            .epoch_seeded
-            .store(seed.is_some(), Ordering::Relaxed);
-        seed
-    }
-
-    /// The seed itself, without the readiness publication.
-    fn derive_or_cached_epoch(&mut self) -> Option<u64> {
-        // Checked ahead of the cached seed, not just before deriving one: a halt
-        // can land long after the seed was taken. A halted state machine refuses
-        // every epoch batch, so a minted epoch would only manufacture identities
-        // that nothing on this node will ever apply.
-        if self.state_machine_halted() {
-            return None;
-        }
-        if let Some(epoch) = self.current_epoch {
-            return Some(epoch);
-        }
-        let epoch = super::epoch_seed::derive_epoch_seed(
-            self.node_id,
-            &self.multi_raft,
-            &self.state_machine,
-        )?;
-        self.current_epoch = Some(epoch);
-        Some(epoch)
-    }
-
-    /// Whether this node's sequencer state machine has stopped applying epoch
-    /// batches after an unrecoverable epoch regression.
-    fn state_machine_halted(&self) -> bool {
-        self.state_machine
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_halted()
-    }
-
-    /// Fail every queued submission fast while the state machine is halted.
-    ///
-    /// A halt scopes the fault to sequencing: reads, non-Calvin writes, metadata
-    /// and every other engine on this node are unaffected, so the node keeps
-    /// serving. What it must not do is keep accepting Calvin work — nothing will
-    /// ever sequence it. Dropping each submission's reply channel makes the
-    /// awaiting Control-Plane caller observe a closed channel immediately and
-    /// surface an error, instead of every writer hanging to its deadline behind
-    /// a queue that will never drain. Reservation requests degrade to plain OCC
-    /// the same way they do on a follower.
-    fn shed_submissions_after_halt(&mut self) {
+    /// Drain and discard every queued submission, and drop each one's
+    /// assignment so its caller reads a closed channel at once. Returns how
+    /// many were discarded.
+    pub(super) fn discard_inbox(&mut self) -> usize {
         let discarded = self.inbox_receiver.drain_all_discard();
-        let reservations_discarded = self.reservation_receiver.drain_all_discard();
-        if !self.halt_reported {
-            self.halt_reported = true;
-            tracing::error!(
-                node_id = self.node_id,
-                "sequencer state machine halted on an epoch regression; this node has stopped \
-                 sequencing and is failing Calvin submissions fast. Every other query path \
-                 keeps serving — operator intervention is required to resume sequencing."
-            );
+        for inbox_seq in &discarded {
+            self.completion_registry.drop_assignment(*inbox_seq);
         }
-        if discarded > 0 || reservations_discarded > 0 {
-            debug!(
-                node_id = self.node_id,
-                discarded, reservations_discarded, "sequencer halted; shed queued submissions"
-            );
-        }
+        discarded.len()
     }
 
     /// Re-propose every complete-but-unstored cross-shard verdict.
@@ -497,32 +363,18 @@ impl SequencerService {
     }
 }
 
-fn entry_txn_count(entry: &SequencerEntry) -> usize {
-    match entry {
-        SequencerEntry::EpochBatch { batch } => batch.txns.len(),
-        SequencerEntry::CompletionAck { .. } => 0,
-        SequencerEntry::OllpMismatch { .. } => 0,
-        SequencerEntry::TxnRoutingFailed { .. } => 0,
-        SequencerEntry::Vote { .. } => 0,
-        SequencerEntry::Verdict { .. } => 0,
-        SequencerEntry::AbortVote { .. } => 0,
-        SequencerEntry::AbortVerdict { .. } => 0,
-        SequencerEntry::ReserveRead { .. } => 0,
-        SequencerEntry::ReleaseReservation { .. } => 0,
-        SequencerEntry::CutMarker { .. } => 0,
-    }
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
+    use tokio::sync::oneshot;
+
     use super::*;
     use crate::calvin::sequencer::config::SequencerConfig;
-    use crate::calvin::sequencer::inbox::{Inbox, new_inbox};
+    use crate::calvin::sequencer::inbox::{AdmittedTx, Inbox, new_inbox};
     use crate::calvin::sequencer::reservation_inbox::{ReservationInbox, new_reservation_inbox};
     use crate::calvin::sequencer::validator::validate_batch;
     use crate::calvin::types::{
@@ -553,7 +405,10 @@ mod tests {
         panic!("could not find two distinct-vshard collections in 512 tries");
     }
 
-    fn make_tx_class(surr_a: u32, surr_b: u32) -> TxClass {
+    pub(in crate::calvin::sequencer::service) fn make_tx_class(
+        surr_a: u32,
+        surr_b: u32,
+    ) -> TxClass {
         let (col_a, col_b) = find_two_distinct_collections();
         let write_set = ReadWriteSet::new(vec![
             EngineKeySet::Document {
@@ -716,11 +571,11 @@ mod tests {
 
     /// Live parts of a service under test. The inboxes are kept alive because
     /// dropping them would close the receivers the service holds.
-    struct Harness {
-        service: SequencerService,
-        state_machine: Arc<Mutex<SequencerStateMachine>>,
-        multi_raft: Arc<Mutex<MultiRaft>>,
-        _inbox: Inbox,
+    pub(in crate::calvin::sequencer::service) struct Harness {
+        pub(in crate::calvin::sequencer::service) service: SequencerService,
+        pub(in crate::calvin::sequencer::service) state_machine: Arc<Mutex<SequencerStateMachine>>,
+        pub(in crate::calvin::sequencer::service) multi_raft: Arc<Mutex<MultiRaft>>,
+        pub(in crate::calvin::sequencer::service) inbox: Inbox,
         /// Kept alive so the service's receiver stays open, and used directly by
         /// the tests that submit reservation requests to a leader tick.
         reservations: ReservationInbox,
@@ -728,7 +583,7 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
-    fn make_harness() -> Harness {
+    pub(in crate::calvin::sequencer::service) fn make_harness() -> Harness {
         let dir = tempfile::tempdir().expect("tempdir");
         let routing = RoutingTable::uniform(1, &[1], 1);
         let mut mr = MultiRaft::new(1, routing, dir.path().to_path_buf());
@@ -762,7 +617,7 @@ mod tests {
             service,
             state_machine,
             multi_raft,
-            _inbox: inbox,
+            inbox,
             reservations,
             _verdict_tx: verdict_tx,
             _dir: dir,
@@ -787,7 +642,7 @@ mod tests {
 
     /// Drive the single-voter sequencer group to leadership so proposals append
     /// to its log.
-    fn elect(multi_raft: &Arc<Mutex<MultiRaft>>) {
+    pub(in crate::calvin::sequencer::service) fn elect(multi_raft: &Arc<Mutex<MultiRaft>>) {
         let mut mr = multi_raft.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(node) = mr.groups_mut().get_mut(&SEQUENCER_GROUP_ID) {
             // no-determinism: test-only forced election deadline so the single
@@ -838,6 +693,56 @@ mod tests {
         // over epochs this leader has already proposed.
         harness.service.current_epoch = Some(9);
         assert_eq!(harness.service.ensure_epoch_seeded(), Some(9));
+    }
+
+    /// Epoch instants order Calvin versions, so a leader mints each one
+    /// strictly above every instant it minted and every one its state
+    /// machine applied. A wall clock that steps back, a restart that replays
+    /// the log, and a new leader with a slower clock all mint above history.
+    #[test]
+    fn epoch_instants_stay_monotonic_across_clock_steps_and_leader_changes() {
+        let mut harness = make_harness();
+        let first = harness.service.next_epoch_system_ms(2_000_000_000_000);
+        assert_eq!(first, 2_000_000_000_000);
+        let stepped_back = harness.service.next_epoch_system_ms(1_999_999_999_000);
+        assert_eq!(stepped_back, first + 1, "a clock step back mints above");
+
+        // A node that replayed a batch minted at 1_700_000_000_000 by an
+        // earlier leader, now leading with a clock behind that instant.
+        let mut successor = make_harness();
+        successor
+            .state_machine
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .apply(1, &epoch_batch_bytes(0));
+        let minted = successor.service.next_epoch_system_ms(1_600_000_000_000);
+        assert_eq!(
+            minted, 1_700_000_000_001,
+            "a new leader mints above history"
+        );
+        let next = successor.service.next_epoch_system_ms(1_600_000_000_000);
+        assert_eq!(next, minted + 1, "an unapplied mint still counts");
+
+        // A log a cluster restore rebuilt opens with the point's epoch
+        // floor. Its leader mints above the point's instant.
+        let mut restored = make_harness();
+        restored
+            .state_machine
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .apply(
+                1,
+                &zerompk::to_msgpack_vec(&SequencerEntry::EpochFloor {
+                    next_epoch: 4,
+                    epoch_system_ms: 1_900_000_000_000,
+                })
+                .expect("encode"),
+            );
+        assert_eq!(
+            restored.service.next_epoch_system_ms(1_600_000_000_000),
+            1_900_000_000_001,
+            "a restored leader mints above the restore point"
+        );
     }
 
     /// A brand-new node has an empty log and an empty state machine. Nothing
@@ -980,6 +885,129 @@ mod tests {
             None,
             "nothing on this tick may have minted an epoch"
         );
+    }
+
+    // ── Unsequenced submissions ──────────────────────────────────────────────
+
+    /// A single-vshard class that reads `read_col` and writes `write_col`.
+    fn make_rw_class(read_col: &str, write_col: &str) -> TxClass {
+        TxClass::new_single_vshard(
+            ReadWriteSet::new(vec![EngineKeySet::Document {
+                collection: read_col.to_owned(),
+                surrogates: SortedVec::new(vec![1]),
+            }]),
+            ReadWriteSet::new(vec![EngineKeySet::Document {
+                collection: write_col.to_owned(),
+                surrogates: SortedVec::new(vec![1]),
+            }]),
+            vec![],
+            TenantId::new(1),
+            None,
+            crate::calvin::types::VersionedReadSet::default(),
+        )
+        .expect("valid TxClass")
+    }
+
+    fn closed(rx: &mut crate::calvin::AssignmentReceiver) -> bool {
+        rx.try_recv() == Err(oneshot::error::TryRecvError::Closed)
+    }
+
+    /// A follower discards its inbox. Each discarded caller must read a closed
+    /// channel at once instead of waiting out its timeout.
+    #[test]
+    fn non_leader_discard_fails_each_submission_at_once() {
+        let mut harness = make_harness();
+        let registry = Arc::clone(&harness.service.completion_registry);
+        let (_, mut rx) = harness
+            .inbox
+            .submit_with(make_tx_class(1, 2), &registry)
+            .expect("submit");
+
+        harness.service.tick();
+
+        assert!(closed(&mut rx));
+        assert_eq!(registry.pending_assignments_len(), 0);
+    }
+
+    /// The validator rejects the later txn of a read/write cycle. Its caller
+    /// reads a closed channel. The admitted txn's caller gets its assignment.
+    #[test]
+    fn validator_rejection_fails_the_rejected_submission_at_once() {
+        let mut harness = make_harness();
+        elect(&harness.multi_raft);
+        let registry = Arc::clone(&harness.service.completion_registry);
+        let (col_a, col_b) = find_two_distinct_collections();
+        let (_, mut winner) = harness
+            .inbox
+            .submit_with(make_rw_class(&col_a, &col_b), &registry)
+            .expect("submit");
+        let (_, mut loser) = harness
+            .inbox
+            .submit_with(make_rw_class(&col_b, &col_a), &registry)
+            .expect("submit");
+
+        harness.service.mint_epoch(4);
+
+        assert!(closed(&mut loser));
+        // Two participants: the vShard it writes and the vShard it reads.
+        assert_eq!(winner.try_recv(), Ok((4, 0, 2)));
+        assert_eq!(registry.pending_assignments_len(), 0);
+        assert_eq!(harness.service.current_epoch, Some(5));
+    }
+
+    /// A batch whose proposal failed is not in the log. Its callers must fail
+    /// at once, not hold an `(epoch, position)` the next tick hands to another
+    /// transaction.
+    #[test]
+    fn failed_proposal_fails_every_submission_of_the_batch() {
+        let mut harness = make_harness();
+        let registry = Arc::clone(&harness.service.completion_registry);
+        let (_, mut first) = harness
+            .inbox
+            .submit_with(make_tx_class(1, 2), &registry)
+            .expect("submit");
+        let (_, mut second) = harness
+            .inbox
+            .submit_with(make_tx_class(3, 4), &registry)
+            .expect("submit");
+
+        // Not elected: the proposal fails.
+        harness.service.mint_epoch(0);
+
+        assert!(closed(&mut first));
+        assert!(closed(&mut second));
+        assert_eq!(registry.pending_assignments_len(), 0);
+        assert_eq!(
+            harness.service.current_epoch, None,
+            "a failed proposal must not consume the epoch"
+        );
+    }
+
+    /// A halted state machine sheds the inbox. Each shed caller must read a
+    /// closed channel at once.
+    #[test]
+    fn halted_shed_fails_each_submission_at_once() {
+        let mut harness = make_harness();
+        elect(&harness.multi_raft);
+        {
+            let mut sm = harness
+                .state_machine
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            sm.apply(1, &epoch_batch_bytes(0));
+            sm.apply(2, &epoch_batch_bytes(0));
+            assert!(sm.is_halted());
+        }
+        let registry = Arc::clone(&harness.service.completion_registry);
+        let (_, mut rx) = harness
+            .inbox
+            .submit_with(make_tx_class(1, 2), &registry)
+            .expect("submit");
+
+        harness.service.tick();
+
+        assert!(closed(&mut rx));
+        assert_eq!(registry.pending_assignments_len(), 0);
     }
 
     /// The seed must not be taken while the sequencer group is still replaying:

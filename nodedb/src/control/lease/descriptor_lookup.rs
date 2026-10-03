@@ -6,20 +6,20 @@
 
 use nodedb_types::DatabaseId;
 
-use nodedb_cluster::{DescriptorId, DescriptorKind};
+use nodedb_cluster::{DescriptorId, DescriptorKind, DrainOwner};
 
 use crate::control::catalog_entry::CatalogEntry;
 use crate::control::state::SharedState;
 
 /// For a `Put*` entry that carries `descriptor_version`, return
-/// the `DescriptorId` whose drain should be implicitly cleared
+/// the `DescriptorId` whose drain ends implicitly
 /// after the entry applies. Returns `None` for variants without
 /// descriptor versioning (auth, schedules, change streams, etc.).
 ///
 /// Called from `MetadataCommitApplier::apply_host_side_effects`
 /// on every node — after the `apply_to` succeeds, the applier
-/// looks up the drained id via this helper and calls
-/// `shared.lease_drain.install_end` on it. This is how drain
+/// looks up the drained id via this helper and ends the
+/// [`DrainOwner::Ddl`] drain on it. This is how drain
 /// clears implicitly on the happy path without a second raft
 /// round-trip.
 pub fn descriptor_id_for_implicit_clear(entry: &CatalogEntry) -> Option<DescriptorId> {
@@ -85,13 +85,88 @@ pub fn descriptor_id_for_implicit_clear(entry: &CatalogEntry) -> Option<Descript
     }
 }
 
+/// Every `(descriptor, owner)` drain that ends once `entry` applies.
+///
+/// `MoveTenantCutover` ends its own move's drain on every moved collection,
+/// and a moved array's `DeleteArray` ends it on that array.
+/// Every other entry ends at most the [`DrainOwner::Ddl`] drain on the one id
+/// of [`descriptor_id_for_implicit_clear`]. No entry ends a drain another
+/// owner holds.
+pub fn drains_for_implicit_clear(entry: &CatalogEntry) -> Vec<(DescriptorId, DrainOwner)> {
+    match entry {
+        CatalogEntry::MoveTenantCutover {
+            tenant_id,
+            source_db_id,
+            collections,
+            ..
+        } => {
+            let owner = move_tenant_drain_owner(*tenant_id, *source_db_id);
+            collections
+                .iter()
+                .map(|coll| {
+                    (
+                        move_source_descriptor(*source_db_id, coll.tenant_id, &coll.name),
+                        owner.clone(),
+                    )
+                })
+                .collect()
+        }
+        // The source side of a moved array ends the move's drain on it.
+        CatalogEntry::DeleteArray {
+            database_id,
+            tenant_id,
+            name,
+            moved_to: Some(moved),
+            ..
+        } => vec![(
+            DescriptorId::new(
+                *database_id,
+                *tenant_id,
+                DescriptorKind::Array,
+                name.clone(),
+            ),
+            move_tenant_drain_owner(moved.mover_tenant_id, *database_id),
+        )],
+        other => descriptor_id_for_implicit_clear(other)
+            .map(|id| (id, DrainOwner::Ddl))
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// End on this node every drain [`drains_for_implicit_clear`] names for
+/// `entry`, rows first.
+pub fn clear_implicit_drains(shared: &SharedState, entry: &CatalogEntry) -> crate::Result<()> {
+    super::drain_apply::apply_drain_ends(shared, &drains_for_implicit_clear(entry))
+}
+
+/// The owner of a `MOVE TENANT`'s drain. One tenant moves at most once at a
+/// time out of one database, so the pair names the move.
+pub fn move_tenant_drain_owner(tenant_id: u64, source_db_id: u64) -> DrainOwner {
+    DrainOwner::MoveTenant {
+        tenant_id,
+        source_db_id,
+    }
+}
+
+/// The descriptor a `MOVE TENANT` drains for one collection of its source
+/// database.
+pub fn move_source_descriptor(source_db_id: u64, tenant_id: u64, name: &str) -> DescriptorId {
+    DescriptorId::new(
+        source_db_id,
+        tenant_id,
+        DescriptorKind::Collection,
+        name.to_string(),
+    )
+}
+
 /// For a `Put*` entry that carries `descriptor_version`, return
 /// `(descriptor_id, prior_persisted_version)` so the proposer can
 /// decide whether to run drain. `prior_persisted_version` is `0`
-/// on create (no prior record) and causes `drain_for_ddl` to
+/// on create (no prior record) and causes `drain_for_ddl_async` to
 /// return immediately.
 ///
-/// Called from `metadata_proposer::propose_catalog_entry_with_timeout`
+/// Called from `metadata_proposer::propose_catalog_entry_async`
 /// BEFORE the raft propose path. Reads from `SystemCatalog` under
 /// a short read txn — the read is consistent with the subsequent
 /// propose because the stamp logic in the applier increments

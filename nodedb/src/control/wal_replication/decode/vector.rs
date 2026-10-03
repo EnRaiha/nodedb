@@ -97,17 +97,19 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<PhysicalPlan>
             collection,
             field_name,
             document_surrogate,
+            pk_bytes,
             vectors,
             count,
             dim,
-        } => Ok(multi_vector_insert(
+        } => Ok(multi_vector_insert(MultiVectorInsertFields {
             collection,
             field_name,
-            *document_surrogate,
+            document_surrogate: *document_surrogate,
+            pk_bytes,
             vectors,
-            *count,
-            *dim,
-        )),
+            count: *count,
+            dim: *dim,
+        })),
         ReplicatedWrite::MultiVectorDelete {
             collection,
             field_name,
@@ -259,8 +261,8 @@ pub(super) fn batch_insert(
 ) -> crate::Result<PhysicalPlan> {
     // The carried surrogate vector MUST be 1:1 with the vectors.
     // A mismatch is a corrupt/incompatible entry — fail loud rather
-    // than truncate or zip-shorten (which would silently drop rows
-    // or mis-bind identities).
+    // than truncate or zip-shorten (which silently drops rows
+    // or mis-binds identities).
     if surrogates.len() != vectors.len() {
         return Err(crate::Error::Serialization {
             format: "msgpack".into(),
@@ -346,21 +348,28 @@ pub(super) fn sparse_delete(collection: &str, field_name: &str, doc_id: &str) ->
     })
 }
 
-pub(super) fn multi_vector_insert(
-    collection: &str,
-    field_name: &str,
-    document_surrogate: u32,
-    vectors: &[f32],
-    count: usize,
-    dim: usize,
-) -> PhysicalPlan {
+/// Fields of the `MultiVectorInsert` wire variant, bundled so
+/// [`multi_vector_insert`] stays under the `too_many_arguments` clippy
+/// threshold.
+pub(super) struct MultiVectorInsertFields<'a> {
+    pub(super) collection: &'a str,
+    pub(super) field_name: &'a str,
+    pub(super) document_surrogate: u32,
+    pub(super) pk_bytes: &'a Option<Vec<u8>>,
+    pub(super) vectors: &'a [f32],
+    pub(super) count: usize,
+    pub(super) dim: usize,
+}
+
+pub(super) fn multi_vector_insert(f: MultiVectorInsertFields<'_>) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
-        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
-        field_name: field_name.to_owned(),
-        document_surrogate: Surrogate::new(document_surrogate),
-        vectors: vectors.to_vec(),
-        count,
-        dim,
+        collection: nodedb_types::QualifiedCollection::from_stored(f.collection.to_owned()),
+        field_name: f.field_name.to_owned(),
+        document_surrogate: Surrogate::new(f.document_surrogate),
+        pk_bytes: f.pk_bytes.clone(),
+        vectors: f.vectors.to_vec(),
+        count: f.count,
+        dim: f.dim,
     })
 }
 
@@ -379,15 +388,15 @@ pub(super) fn multi_vector_delete(
 
 pub(super) fn delete_by_surrogate(
     collection: &str,
-    surrogate: u32,
+    surrogate: Option<u32>,
     field_name: &str,
     provenance: &Option<Vec<u8>>,
 ) -> crate::Result<PhysicalPlan> {
     let provenance = decode_sync_engines::decode_provenance(provenance)?;
     Ok(PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
         collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
-        // Deletes an already-bound identity; no re-binding needed.
-        surrogate: Surrogate::new(surrogate),
+        // Deletes an already-bound identity, or none; no re-binding needed.
+        surrogate: surrogate.map(Surrogate::new),
         field_name: field_name.to_owned(),
         provenance,
     }))
@@ -438,7 +447,7 @@ mod tests {
             vector: vec![0.1, 0.2, 0.3],
             dim: 3,
             field_name: "emb".into(),
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
             pk_bytes: None,
             provenance: Some(prov.clone()),
         });
@@ -447,9 +456,9 @@ mod tests {
             .expect("VectorInsert should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
         let decoded_entry = ReplicatedEntry::from_bytes(&bytes).expect("decode failed");
-        let decoded_plan = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let decoded_plan = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         let (_, _, decoded_plan, _) = decoded_plan;
         match decoded_plan {
             PhysicalPlan::Vector(VectorOp::Insert { provenance, .. }) => {
@@ -469,7 +478,7 @@ mod tests {
             vector: vec![0.1, 0.2, 0.3],
             dim: 3,
             field_name: "emb".into(),
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
             pk_bytes: None,
             provenance: None,
         });
@@ -477,9 +486,9 @@ mod tests {
             .expect("encode must not error")
             .expect("VectorInsert(no provenance) should produce a ReplicatedEntry");
         let bytes_none = entry_none.to_bytes();
-        let (_, _, decoded_none, _) = decode::from_replicated_entry(&bytes_none, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_none, _) = decode::decode_replicated_entry(&bytes_none)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_none {
             PhysicalPlan::Vector(VectorOp::Insert { provenance, .. }) => {
                 assert_eq!(
@@ -505,9 +514,9 @@ mod tests {
             .expect("encode must not error")
             .expect("SparseInsert should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         assert_eq!(decoded_plan, plan, "SparseInsert must round-trip exactly");
     }
 
@@ -524,9 +533,9 @@ mod tests {
             .expect("encode must not error")
             .expect("SparseDelete should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         assert_eq!(decoded_plan, plan, "SparseDelete must round-trip exactly");
     }
 
@@ -540,6 +549,8 @@ mod tests {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
             field_name: "colbert".into(),
             document_surrogate: shared_surrogate,
+            // The key rides the wire, so a follower binds by it.
+            pk_bytes: Some(b"doc-1".to_vec()),
             vectors: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
             count: 3,
             dim: 2,
@@ -568,9 +579,9 @@ mod tests {
             other => panic!("expected MultiVectorInsert, got {other:?}"),
         }
 
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match &decoded_plan {
             PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
                 document_surrogate,
@@ -604,9 +615,9 @@ mod tests {
             .expect("encode must not error")
             .expect("MultiVectorDelete should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match &decoded_plan {
             PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
                 document_surrogate, ..
@@ -633,7 +644,7 @@ mod tests {
         };
         let plan = PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
-            surrogate: Surrogate::new(555),
+            surrogate: Some(Surrogate::new(555)),
             field_name: "emb".into(),
             provenance: Some(prov.clone()),
         });
@@ -641,16 +652,16 @@ mod tests {
             .expect("encode must not error")
             .expect("DeleteBySurrogate should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match &decoded_plan {
             PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
                 surrogate,
                 provenance,
                 ..
             }) => {
-                assert_eq!(*surrogate, Surrogate::new(555));
+                assert_eq!(*surrogate, Some(Surrogate::new(555)));
                 assert_eq!(*provenance, Some(prov));
             }
             other => panic!("expected Vector(DeleteBySurrogate), got {other:?}"),
@@ -687,9 +698,9 @@ mod tests {
             .expect("encode must not error")
             .expect("DirectUpsert should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match &decoded_plan {
             PhysicalPlan::Vector(VectorOp::DirectUpsert {
                 surrogate,
@@ -742,9 +753,9 @@ mod tests {
             .expect("encode must not error")
             .expect("VectorOp::DirectUpsert should produce a ReplicatedEntry");
         let bytes = entry.to_bytes();
-        let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
-            .expect("from_replicated_entry error")
-            .expect("from_replicated_entry returned None");
+        let (_, _, decoded_plan, _) = decode::decode_replicated_entry(&bytes)
+            .expect("decode_replicated_entry error")
+            .expect("decode_replicated_entry returned None");
         match decoded_plan {
             PhysicalPlan::Vector(VectorOp::DirectUpsert {
                 returning,

@@ -58,14 +58,19 @@ pub(super) struct LoopBuild {
 /// Build the `RaftLoop`, consume `pending_subsystems`, build the sequencer
 /// service + OLLP orchestrator, spawn the vShard schedulers, and start the
 /// cluster subsystems that share the loop's `MultiRaft`.
-pub(super) fn build_raft_loop(
+pub(super) async fn build_raft_loop(
     handle: &ClusterHandle,
     shared: &Arc<SharedState>,
     data_dir: &std::path::Path,
-    multi_raft: nodedb_cluster::multi_raft::MultiRaft,
+    mut multi_raft: nodedb_cluster::multi_raft::MultiRaft,
     setup: GroupSetup,
     hooks: Hooks,
 ) -> crate::Result<LoopBuild> {
+    // Metadata entries this node stamps as leader carry its HLC. The clock
+    // starts above every stamp this node applied, so a stamp it takes rises
+    // above entries compacted out of its log.
+    crate::control::cluster::metadata_stamp::fold_metadata_stamp_hwm(shared)?;
+    multi_raft.set_metadata_clock(Arc::clone(&shared.hlc_clock));
     let GroupSetup {
         tracker,
         data_applier,
@@ -112,6 +117,16 @@ pub(super) fn build_raft_loop(
     // ack against this node's schedulers.
     calvin_completion_registry.applied_acks.enable();
 
+    // The sequencer log compacts at the threshold every group runs with,
+    // once its state machine's capture is durable.
+    let data_applier = data_applier.with_sequencer_compaction(
+        crate::control::cluster::sequencer_compaction::SequencerCompaction::new(
+            Arc::clone(&hooks.sequencer_snapshots),
+            shared,
+            multi_raft.log_compaction_threshold(),
+        ),
+    );
+
     let raft_loop = Arc::new(
         nodedb_cluster::RaftLoop::new(
             multi_raft,
@@ -122,8 +137,12 @@ pub(super) fn build_raft_loop(
         .with_plan_executor(plan_executor)
         .with_metadata_applier(metadata_applier)
         .with_metadata_cache(shared.metadata_cache.clone())
+        .with_lease_holder_liveness(Arc::clone(&shared.lease_runtime.holder_liveness))
         .with_vshard_handler(vshard_handler)
         .with_tick_interval(tick_interval)
+        // The routing table, the cluster epoch and a join's topology are
+        // saved to the same catalog the node restarts from.
+        .with_catalog(Arc::clone(&handle.catalog))
         .with_group_watchers(handle.group_watchers.clone())
         .with_snapshot_quarantine_hook(hooks.quarantine_hook)
         .with_snapshot_builder(hooks.snapshot_builder)
@@ -158,8 +177,14 @@ pub(super) fn build_raft_loop(
             detail: "start_raft called twice: pending_subsystems already consumed".into(),
         })?;
     let raft_loop_handle = raft_loop.multi_raft_handle();
+    crate::control::pitr::spawn_metadata_log_archiver(shared, raft_loop_handle.clone());
 
     let sequencer_config = SequencerConfig::default();
+    sequencer_config
+        .validate()
+        .map_err(|e| crate::Error::Config {
+            detail: e.to_string(),
+        })?;
     let (sequencer_inbox, sequencer_inbox_rx) = new_inbox(10_000, &sequencer_config);
     let (reservation_inbox, reservation_inbox_rx) = new_reservation_inbox(10_000);
     let ollp_orchestrator = Arc::new(OllpOrchestrator::new(OllpConfig::default()));
@@ -194,16 +219,23 @@ pub(super) fn build_raft_loop(
         scheduler_config: &scheduler_config,
     })?;
 
-    let running = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(nodedb_cluster::start_cluster_subsystems(
-            &pending.config,
-            Arc::clone(&handle.topology),
-            Arc::clone(&handle.routing),
-            Arc::clone(&handle.transport),
-            raft_loop_handle,
-            &handle.catalog,
-        ))
-    })
+    let running = nodedb_cluster::start_cluster_subsystems(
+        &pending.config,
+        nodedb_cluster::SubsystemHandles {
+            topology: Arc::clone(&handle.topology),
+            routing: Arc::clone(&handle.routing),
+            transport: Arc::clone(&handle.transport),
+            raft_multi_raft: raft_loop_handle,
+        },
+        &handle.catalog,
+        nodedb_cluster::SwimWiring {
+            transport: Arc::clone(&pending.swim_transport),
+            subscribers: vec![Arc::clone(&shared.lease_runtime.holder_liveness)
+                as Arc<dyn nodedb_cluster::MembershipSubscriber>],
+        },
+        Arc::clone(&handle.migration_tracker),
+    )
+    .await
     .map_err(|e| crate::Error::Config {
         detail: format!("cluster subsystem start: {e}"),
     })?;

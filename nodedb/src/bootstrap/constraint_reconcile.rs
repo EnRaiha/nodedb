@@ -2,9 +2,8 @@
 
 //! Singleton CRDT constraint reconcile loop.
 //!
-//! Exactly one node runs it — the metadata-group leader in a cluster, and the
-//! sole node in a standalone deployment, which has no group to elect from.
-//! That node periodically re-derives each collection's
+//! Exactly one node runs it — the metadata-group leader. A one-node cluster
+//! leads its own metadata group. That node periodically re-derives each collection's
 //! constraint set from the catalog and replicates it to every data-group
 //! replica via a `ConstraintChange` entry on the collection's vshard data
 //! Raft log. Each replica installs the set into its per-core CRDT validator,
@@ -92,9 +91,8 @@ pub async fn reconcile_once(
     delivered: &mut HashMap<(TenantId, String), u64>,
 ) -> usize {
     // Only one node reconciles — every replica installing would duplicate
-    // proposals onto the data log for no gain. In a cluster that node is the
-    // metadata leader; standalone has no group to elect from, so the sole
-    // node does it.
+    // proposals onto the data log for no gain. That node is the metadata
+    // leader; a one-node cluster leads its own metadata group.
     if !shared.is_singleton_worker() {
         return 0;
     }
@@ -111,10 +109,13 @@ pub async fn reconcile_once(
             return 0;
         }
     };
-    // No proposer installed yet (still bootstrapping the Raft layer):
-    // skip this pass and retry next tick.
-    let Some(proposer) = shared.async_raft_proposer() else {
-        return 0;
+    // Boot spawns this loop after `start_raft` installed the proposer.
+    let proposer = match shared.async_raft_proposer() {
+        Ok(proposer) => proposer,
+        Err(error) => {
+            warn!(%error, "constraint reconcile: no raft proposer");
+            return 0;
+        }
     };
     let proposer = Arc::clone(proposer);
 

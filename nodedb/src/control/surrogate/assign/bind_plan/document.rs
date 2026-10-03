@@ -21,18 +21,6 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut DocumentOp) -> crate::R
             surrogate,
             ..
         }
-        | DocumentOp::PointDelete {
-            collection,
-            document_id,
-            surrogate,
-            ..
-        }
-        | DocumentOp::PointUpdate {
-            collection,
-            document_id,
-            surrogate,
-            ..
-        }
         | DocumentOp::Upsert {
             collection,
             document_id,
@@ -43,13 +31,31 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut DocumentOp) -> crate::R
             document_id.as_bytes(),
             surrogate,
         ),
+        // A delete or update mutates a row it never creates: a key its
+        // coordinator found unbound stays unbound unless the catalog binds it.
+        DocumentOp::PointDelete {
+            collection,
+            document_id,
+            surrogate,
+            ..
+        }
+        | DocumentOp::PointUpdate {
+            collection,
+            document_id,
+            surrogate,
+            ..
+        } => binder.resolve_existing_in_place(
+            binder.plan_key(collection.as_str())?,
+            document_id.as_bytes(),
+            surrogate,
+        ),
         DocumentOp::BatchInsert {
             collection,
             documents,
             surrogates,
             ..
         } => {
-            // `zip` would truncate silently; a row with no identity is a
+            // `zip` truncates silently; a row with no identity is a
             // malformed plan, refused here.
             if documents.len() != surrogates.len() {
                 return Err(crate::Error::Serialization {

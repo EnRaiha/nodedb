@@ -3,10 +3,8 @@
 //! Protocol-neutral grant / permission introspection: SHOW GRANTS,
 //! SHOW PERMISSIONS.
 //!
-//! Ported from the pgwire `ddl::inspect` handlers. The credential /
-//! permission-store reads and the target-key rendering are preserved
-//! verbatim; only the result construction changed from pgwire `Response` /
-//! `QueryResponse` to the protocol-neutral `DdlResult` over `ShapedRows`.
+//! The credential / permission-store reads and the target-key rendering run
+//! here. The result is the protocol-neutral `DdlResult` over `ShapedRows`.
 
 use serde_json::{Map, Value as JsonValue};
 
@@ -81,7 +79,7 @@ pub fn show_permissions(
     on_collection: Option<&str>,
     for_grantee: Option<&str>,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    // Non-admins may only view their own grants.
+    // Non-admins can only view their own grants.
     if let Some(grantee) = for_grantee
         && grantee != identity.username
         && !identity.is_superuser
@@ -102,7 +100,11 @@ pub fn show_permissions(
     let mut rows = Vec::new();
 
     if let Some(collection) = on_collection {
-        let target = format!("collection:{}:{collection}", identity.tenant_id.as_u64());
+        let target = crate::control::security::permission::collection_target(
+            database_id,
+            identity.tenant_id,
+            collection,
+        );
 
         // Show owner row (only when collection is specified).
         if for_grantee.is_none()
@@ -158,14 +160,12 @@ pub fn show_permissions(
         // All grants for a specific grantee (direct grants only, no inheritance walk).
         let grants = state.permissions.grants_for(grantee);
         for grant in &grants {
-            // Extract a human-readable target from the internal target key
-            // (e.g. "collection:1:users" → "users").
-            let display_target = grant
-                .target
-                .rsplit(':')
-                .next()
-                .unwrap_or(&grant.target)
-                .to_string();
+            // Show the object name of a scoped target ("collection:0:1:users"
+            // shows "users"), and any other target as stored.
+            let display_target =
+                crate::control::security::permission::parse_scoped_target(&grant.target)
+                    .map_or(grant.target.as_str(), |t| t.name)
+                    .to_string();
             let mut row = Map::new();
             row.insert(
                 "grantee".to_string(),
@@ -190,12 +190,10 @@ pub fn show_permissions(
             state.permissions.grants_for(&identity.username)
         };
         for grant in &all_grants {
-            let display_target = grant
-                .target
-                .rsplit(':')
-                .next()
-                .unwrap_or(&grant.target)
-                .to_string();
+            let display_target =
+                crate::control::security::permission::parse_scoped_target(&grant.target)
+                    .map_or(grant.target.as_str(), |t| t.name)
+                    .to_string();
             let mut row = Map::new();
             row.insert(
                 "grantee".to_string(),

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Replay arms for the two absolute-overwrite KV record classes, `kv_put` and
-//! `kv_batch_put`.
+//! Replay arms for the absolute-overwrite KV record classes, `kv_put`,
+//! `kv_batch_put`, and `kv_rewrite`.
 //!
 //! ## Why the record carries the surrogate
 //!
@@ -14,14 +14,17 @@
 //! unconditionally visible, so snapshot isolation would silently weaken after a
 //! crash but not before.
 //!
-//! ## Pre-surrogate shapes
+//! ## One shape per record class
 //!
-//! Two shorter arities per record class predate the carried surrogate. zerompk
-//! enforces a strict array length, so none of the three shapes can alias
-//! another. A tail written before the upgrade can still be retained across it,
-//! and a Data Plane core has no Control Plane catalog handle to recover the
-//! identity from, so those rows replay unbound — exactly the state a
-//! pre-upgrade restart left them in, never worse.
+//! Each record class has exactly one shape, the one its encoder
+//! (`wal_dispatch_kv::encode`) writes. A `kv_put` or `kv_batch_put` record
+//! whose surrogate is `Surrogate::ZERO` matches no shape. A payload that opens
+//! with a KV put discriminator but matches no shape is refused through
+//! [`kv_put_family_discriminator`] and `replay_record_unapplied`, never
+//! replayed unbound.
+//!
+//! A `kv_rewrite` record carries no surrogate: it replaces the value of a row
+//! the table already holds, and the row keeps its bound identity.
 //!
 //! ## Absolute expiry
 //!
@@ -93,10 +96,14 @@ impl CoreLoop {
             surrogate,
         };
         // The prior value the put displaced is of no interest to replay.
-        let _displaced = match expire_at_ms {
+        let written = match expire_at_ms {
             Some(instant) => self.kv_engine.put_with_absolute_expiry(params, instant),
             None => self.kv_engine.put(params),
         };
+        if let Err(e) = written {
+            self.replay_record_unapplied("kv", "put_identity", record_lsn, &e.to_string());
+            return Some(0);
+        }
         self.note_replay_write_lsn(
             database_id,
             tenant_id,
@@ -105,6 +112,63 @@ impl CoreLoop {
             record_lsn,
         );
         Some(1)
+    }
+
+    /// Replay a `kv_rewrite` record. `None` when the payload is not one.
+    ///
+    /// The row keeps its bound surrogate. A row the table no longer holds is
+    /// not written: a rewrite never creates a row without identity.
+    pub(in crate::data::executor) fn try_replay_kv_rewrite(
+        &mut self,
+        rec: &KvReplayRecord<'_>,
+        tombstones: &nodedb_wal::DatabaseTombstones<'_>,
+    ) -> Option<usize> {
+        let KvReplayRecord {
+            payload,
+            tenant_id,
+            database_id,
+            now_ms,
+            record_lsn,
+        } = *rec;
+
+        let (collection, key, value, ttl_ms, expire_at_ms) = decode_kv_rewrite(payload)?;
+
+        if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
+            return Some(0);
+        }
+        if self.claim_for_validation() {
+            return Some(0);
+        }
+        if self.recording_redo_undo() {
+            let prior =
+                self.kv_engine
+                    .entry_image(database_id, tenant_id, &collection, &key, now_ms);
+            self.record_redo_undo([UndoEntry::KvPut {
+                collection: collection.clone(),
+                key: key.clone(),
+                prior,
+            }]);
+        }
+        let rewritten = self.kv_engine.rewrite_with_absolute_expiry(
+            crate::engine::kv::KvRewriteParams {
+                database_id,
+                tenant_id,
+                collection: &collection,
+                key: &key,
+                value: &value,
+                ttl_ms,
+                now_ms,
+            },
+            expire_at_ms,
+        );
+        self.note_replay_write_lsn(
+            database_id,
+            tenant_id,
+            &collection,
+            Some(KeyRepr::KvKey(Box::from(key.as_slice()))),
+            record_lsn,
+        );
+        Some(usize::from(rewritten.is_some()))
     }
 
     /// Replay a `kv_batch_put` record. `None` when the payload is not one.
@@ -155,12 +219,16 @@ impl CoreLoop {
         };
         // The engine's own write count is redundant here: the caller counts the
         // entries it handed over.
-        let _written = match expire_at_ms {
+        let written = match expire_at_ms {
             Some(instant) => self
                 .kv_engine
                 .batch_put_with_absolute_expiry(params, instant),
             None => self.kv_engine.batch_put(params),
         };
+        if let Err(e) = written {
+            self.replay_record_unapplied("kv", "batch_put_identity", record_lsn, &e.to_string());
+            return Some(0);
+        }
         for (entry_key, _entry_value) in &entries {
             self.note_replay_write_lsn(
                 database_id,
@@ -174,15 +242,26 @@ impl CoreLoop {
     }
 }
 
-/// One `kv_put` record's fields, normalized across the current and the two
-/// pre-surrogate shapes.
+/// One `kv_rewrite` record's fields:
+/// `(collection, key, value, ttl_ms, expire_at_ms)`.
+type KvRewriteFields = (String, Vec<u8>, Vec<u8>, u64, u64);
+
+fn decode_kv_rewrite(payload: &[u8]) -> Option<KvRewriteFields> {
+    // ("kv_rewrite", collection, key, value, ttl_ms, expire_at_ms)
+    let (disc, collection, key, value, ttl_ms, expire_at_ms) =
+        zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, u64)>(payload).ok()?;
+    (disc == "kv_rewrite").then_some((collection, key, value, ttl_ms, expire_at_ms))
+}
+
+/// One `kv_put` record's fields.
 type KvPutFields = (String, Vec<u8>, Vec<u8>, u64, Option<u64>, Surrogate);
 
 fn decode_kv_put(payload: &[u8]) -> Option<KvPutFields> {
-    // Current: ("kv_put", collection, key, value, ttl_ms, expire_at_ms, surrogate)
+    // ("kv_put", collection, key, value, ttl_ms, expire_at_ms, surrogate)
     if let Ok((disc, collection, key, value, ttl_ms, expire_at_ms, surrogate)) =
         zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, Option<u64>, u32)>(payload)
         && disc == "kv_put"
+        && surrogate != 0
     {
         return Some((
             collection,
@@ -193,32 +272,10 @@ fn decode_kv_put(payload: &[u8]) -> Option<KvPutFields> {
             Surrogate::new(surrogate),
         ));
     }
-    // Pre-surrogate, with absolute expiry.
-    if let Ok((disc, collection, key, value, ttl_ms, expire_at_ms)) =
-        zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, u64)>(payload)
-        && disc == "kv_put"
-    {
-        return Some((
-            collection,
-            key,
-            value,
-            ttl_ms,
-            Some(expire_at_ms),
-            Surrogate::ZERO,
-        ));
-    }
-    // Pre-surrogate, no absolute expiry.
-    if let Ok((disc, collection, key, value, ttl_ms)) =
-        zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64)>(payload)
-        && disc == "kv_put"
-    {
-        return Some((collection, key, value, ttl_ms, None, Surrogate::ZERO));
-    }
     None
 }
 
-/// One `kv_batch_put` record's fields, normalized across the current and the
-/// two pre-surrogate shapes.
+/// One `kv_batch_put` record's fields.
 type KvBatchPutFields = (
     String,
     Vec<(Vec<u8>, Vec<u8>)>,
@@ -228,7 +285,7 @@ type KvBatchPutFields = (
 );
 
 fn decode_kv_batch_put(payload: &[u8]) -> Option<KvBatchPutFields> {
-    // Current: ("kv_batch_put", collection, entries, ttl_ms, expire_at_ms, surrogates)
+    // ("kv_batch_put", collection, entries, ttl_ms, expire_at_ms, surrogates)
     if let Ok((disc, collection, entries, ttl_ms, expire_at_ms, surrogates)) =
         zerompk::from_msgpack::<(
             &str,
@@ -239,33 +296,46 @@ fn decode_kv_batch_put(payload: &[u8]) -> Option<KvBatchPutFields> {
             Vec<u32>,
         )>(payload)
         && disc == "kv_batch_put"
+        && !surrogates.contains(&0)
     {
         let surrogates = surrogates.into_iter().map(Surrogate::new).collect();
         return Some((collection, entries, ttl_ms, expire_at_ms, surrogates));
     }
-    // Pre-surrogate, with absolute expiry.
-    if let Ok((disc, collection, entries, ttl_ms, expire_at_ms)) =
-        zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64, u64)>(payload)
-        && disc == "kv_batch_put"
-    {
-        let surrogates = vec![Surrogate::ZERO; entries.len()];
-        return Some((collection, entries, ttl_ms, Some(expire_at_ms), surrogates));
-    }
-    // Pre-surrogate, no absolute expiry.
-    if let Ok((disc, collection, entries, ttl_ms)) =
-        zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64)>(payload)
-        && disc == "kv_batch_put"
-    {
-        let surrogates = vec![Surrogate::ZERO; entries.len()];
-        return Some((collection, entries, ttl_ms, None, surrogates));
-    }
     None
+}
+
+/// The KV put-family discriminators whose records carry a row's surrogate.
+const KV_PUT_FAMILY: [&str; 4] = [
+    "kv_put",
+    "kv_batch_put",
+    "kv_insert_on_conflict_update",
+    "kv_rewrite",
+];
+
+/// The KV put-family discriminator `payload` opens with, when it is a
+/// msgpack array whose first element names one. The KV replay pass asks this
+/// only of a `Put` payload no KV arm decoded, so a match is a KV record of no
+/// current shape.
+pub(in crate::data::executor) fn kv_put_family_discriminator(
+    payload: &[u8],
+) -> Option<&'static str> {
+    let nodedb_types::Value::Array(items) = nodedb_types::value_from_msgpack(payload).ok()? else {
+        return None;
+    };
+    let Some(nodedb_types::Value::String(first)) = items.first() else {
+        return None;
+    };
+    KV_PUT_FAMILY
+        .into_iter()
+        .find(|discriminator| *discriminator == first.as_str())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::server::wal_dispatch_kv::encode::{encode_kv_batch_put, encode_kv_put};
+    use crate::control::server::wal_dispatch_kv::encode::{
+        encode_kv_batch_put, encode_kv_put, encode_kv_rewrite,
+    };
 
     #[test]
     fn current_kv_put_shape_round_trips_the_real_surrogate() {
@@ -296,23 +366,37 @@ mod tests {
         assert_eq!(surrogate, Surrogate::new(7));
     }
 
-    /// A tail written before the surrogate was carried must still replay, and
-    /// must not be mistaken for the current shape.
+    /// The retired identity-less shapes decode as no KV record, and open
+    /// with a KV put discriminator, so replay refuses them.
     #[test]
-    fn pre_surrogate_kv_put_shapes_still_decode_unbound() {
-        let five = zerompk::to_msgpack_vec(&("kv_put", "users", b"k1", b"v1", 0u64)).expect("enc");
-        let (_, _, _, ttl_ms, expire_at_ms, surrogate) =
-            decode_kv_put(&five).expect("five-element shape decodes");
-        assert_eq!(ttl_ms, 0);
-        assert_eq!(expire_at_ms, None);
-        assert_eq!(surrogate, Surrogate::ZERO);
+    fn retired_kv_put_shapes_are_refused_not_replayed_unbound() {
+        let entries = vec![(b"k1".to_vec(), b"v1".to_vec())];
+        let retired = [
+            zerompk::to_msgpack_vec(&("kv_put", "users", b"k1", b"v1", 0u64)).expect("enc"),
+            zerompk::to_msgpack_vec(&("kv_put", "users", b"k1", b"v1", 0u64, 99u64)).expect("enc"),
+            zerompk::to_msgpack_vec(&("kv_batch_put", "users", &entries, 0u64)).expect("enc"),
+        ];
+        for payload in retired {
+            assert!(decode_kv_put(&payload).is_none());
+            assert!(decode_kv_batch_put(&payload).is_none());
+            assert!(kv_put_family_discriminator(&payload).is_some());
+        }
+    }
 
-        let six =
-            zerompk::to_msgpack_vec(&("kv_put", "users", b"k1", b"v1", 0u64, 99u64)).expect("enc");
-        let (_, _, _, _, expire_at_ms, surrogate) =
-            decode_kv_put(&six).expect("six-element shape decodes");
-        assert_eq!(expire_at_ms, Some(99));
-        assert_eq!(surrogate, Surrogate::ZERO);
+    /// A put-family record whose surrogate is `0` matches no shape, and its
+    /// discriminator makes replay refuse it as unapplied.
+    #[test]
+    fn unbound_kv_put_records_are_refused_not_replayed() {
+        let entries = vec![
+            (b"k1".to_vec(), b"v1".to_vec()),
+            (b"k2".to_vec(), b"v2".to_vec()),
+        ];
+        let put = encode_kv_put("users", b"k1", b"v1", 0, None, 0).expect("encode");
+        let batch = encode_kv_batch_put("users", &entries, 0, None, &[3, 0]).expect("encode");
+        assert!(decode_kv_put(&put).is_none());
+        assert!(decode_kv_batch_put(&batch).is_none());
+        assert_eq!(kv_put_family_discriminator(&put), Some("kv_put"));
+        assert_eq!(kv_put_family_discriminator(&batch), Some("kv_batch_put"));
     }
 
     #[test]
@@ -331,18 +415,6 @@ mod tests {
         assert_eq!(surrogates, vec![Surrogate::new(11), Surrogate::new(12)]);
     }
 
-    #[test]
-    fn pre_surrogate_kv_batch_put_shapes_still_decode_unbound() {
-        let entries = vec![(b"k1".to_vec(), b"v1".to_vec())];
-        let four =
-            zerompk::to_msgpack_vec(&("kv_batch_put", "users", &entries, 0u64)).expect("enc");
-        let (_, decoded, _, expire_at_ms, surrogates) =
-            decode_kv_batch_put(&four).expect("four-element shape decodes");
-        assert_eq!(decoded, entries);
-        assert_eq!(expire_at_ms, None);
-        assert_eq!(surrogates, vec![Surrogate::ZERO]);
-    }
-
     /// A non-KV `Put` payload must fall through both arms so the document and
     /// graph decoders still get a chance at it.
     #[test]
@@ -350,6 +422,7 @@ mod tests {
         let doc = zerompk::to_msgpack_vec(&("notes", "doc1", b"body".to_vec())).expect("enc");
         assert!(decode_kv_put(&doc).is_none());
         assert!(decode_kv_batch_put(&doc).is_none());
+        assert!(kv_put_family_discriminator(&doc).is_none());
     }
 
     mod replay {
@@ -460,6 +533,35 @@ mod tests {
                     .kv_engine
                     .key_for_surrogate(did, TID, "carts", Surrogate::new(8)),
                 Some(b"k2".to_vec())
+            );
+        }
+
+        /// A replayed `kv_rewrite` replaces the value and keeps the identity
+        /// the row was bound under. A rewrite of an absent row writes nothing.
+        #[test]
+        fn replayed_rewrite_keeps_the_rows_identity() {
+            let put = encode_kv_put("users", b"alice", b"old", 0, None, 77).expect("encode");
+            let rewrite = encode_kv_rewrite("users", b"alice", b"new", 0, 0).expect("encode");
+            let orphan = encode_kv_rewrite("users", b"bob", b"new", 0, 0).expect("encode");
+            let (_dir, records) = wal_records(&[put, rewrite, orphan]);
+
+            let mut h = make_core();
+            h.core.replay_kv_wal(&records, 1, &TombstoneSet::new());
+
+            let did = DatabaseId::DEFAULT.as_u64();
+            assert_eq!(
+                h.core
+                    .kv_engine
+                    .get_with_surrogate(did, TID, "users", b"alice", 0),
+                Some((b"new".to_vec(), Surrogate::new(77))),
+                "the rewrite replaces the value under the row's bound surrogate"
+            );
+            assert!(
+                h.core
+                    .kv_engine
+                    .get_with_surrogate(did, TID, "users", b"bob", 0)
+                    .is_none(),
+                "a rewrite never creates a row without identity"
             );
         }
 

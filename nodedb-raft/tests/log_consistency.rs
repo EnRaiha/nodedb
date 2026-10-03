@@ -113,6 +113,8 @@ fn ae_prev_log_mismatch_returns_backtrack_hint() {
         entries: vec![entry_with(1, 1, b"x")],
         leader_commit: 0,
         group_id: 1,
+        round: 1,
+        replicated_floor: 0,
     };
     let resp = node.handle_append_entries(&bootstrap);
     assert!(resp.success);
@@ -126,6 +128,8 @@ fn ae_prev_log_mismatch_returns_backtrack_hint() {
         entries: vec![entry_with(1, 6, b"y")],
         leader_commit: 0,
         group_id: 1,
+        round: 1,
+        replicated_floor: 0,
     };
     let resp = node.handle_append_entries(&stale);
     assert!(!resp.success, "AE with bad prev must be rejected");
@@ -149,6 +153,8 @@ fn ae_prev_log_term_mismatch_returns_backtrack_hint() {
         entries: vec![entry_with(2, 1, b"a"), entry_with(2, 2, b"b")],
         leader_commit: 0,
         group_id: 1,
+        round: 1,
+        replicated_floor: 0,
     };
     assert!(node.handle_append_entries(&bootstrap).success);
 
@@ -161,6 +167,8 @@ fn ae_prev_log_term_mismatch_returns_backtrack_hint() {
         entries: vec![entry_with(5, 3, b"c")],
         leader_commit: 0,
         group_id: 1,
+        round: 1,
+        replicated_floor: 0,
     };
     let resp = node.handle_append_entries(&bad_term);
     assert!(!resp.success);
@@ -177,7 +185,8 @@ fn append_then_snapshot_then_appendentries_post_boundary() {
     for i in 1..=5 {
         log.append(entry(1, i)).unwrap();
     }
-    log.apply_snapshot(3, 1);
+    log.apply_snapshot(3, 1)
+        .expect("MemStorage compacts to the snapshot boundary");
 
     // Boundary semantics.
     assert_eq!(log.snapshot_index(), 3);
@@ -239,6 +248,8 @@ fn leader_commit_clamped_to_last_index() {
         entries: vec![entry(1, 1), entry(1, 2)],
         leader_commit: 99, // way past tail
         group_id: 1,
+        round: 1,
+        replicated_floor: 0,
     };
     let resp = node.handle_append_entries(&req);
     assert!(resp.success);

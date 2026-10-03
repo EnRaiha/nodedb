@@ -24,13 +24,13 @@
 //! storage layer. A single `ColumnarOp::MaterializeScan` handler (and this
 //! Control Plane loop) serves all three profiles.
 
-use nodedb_types::{CloneStatus, DatabaseId, Lsn, RlsWriteCheck, TenantId};
+use std::collections::HashSet;
 
-use super::dispatch::dispatch_local;
+use nodedb_types::{DatabaseId, Lsn, RlsWriteCheck, Surrogate, TenantId};
+
+use super::dispatch::dispatch_to_owner;
 use super::reaper::{ReapParams, reap_materialized_collection};
-use crate::bridge::envelope::Status;
-use crate::control::catalog_entry::entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use super::status::{check_bound_surrogates, checkpoint_progress, mark_materializing};
 use crate::control::planner::sql_plan_convert::convert::db_qualified;
 use crate::control::security::catalog::{StoredCollection, SystemCatalog};
 use crate::control::state::SharedState;
@@ -52,217 +52,214 @@ pub(super) async fn materialize_columnar_collection(
     let Some(ref origin) = coll.cloned_from else {
         return Ok(());
     };
+    mark_materializing(state, coll).await?;
 
     let target_qualified = db_qualified(db_id, &coll.name);
-    let source_qualified = db_qualified(origin.source_database, &origin.source_collection);
-    let tenant_id = TenantId::new(coll.tenant_id);
-
-    // Flip status to `Materializing` if still `Shadowed`.
-    if matches!(coll.clone_status, CloneStatus::Shadowed) {
-        let mut updated = coll.clone();
-        updated.clone_status = CloneStatus::Materializing {
-            progress_lsn: Lsn::new(0),
-            bytes_done: 0,
-            bytes_total: 0,
-        };
-        let outcome = propose_catalog_entry(
-            state,
-            &CatalogEntry::PutCollection(Box::new(updated.clone())),
-        )?;
-        if outcome.needs_local_apply() {
-            catalog.put_collection(db_id, &updated)?;
-        }
-    }
-
     // Tombstones: synthetic source surrogates deleted from the clone before
     // materialization. The Data Plane scan encodes a unique u32 per row as the
     // surrogate (segment_id in upper 16 bits, row_idx in lower 16 bits).
     let tombstoned = catalog.list_clone_tombstones(&target_qualified)?;
-
     // Convert as_of_lsn to milliseconds for the source-side scan.
-    let system_as_of_ms = state.ms_to_lsn_inverse(origin.as_of_lsn);
-
-    // Detect target engine profile so INSERT dispatches to the right handler.
-    // Timeseries collections use `TimeseriesOp::Ingest` (msgpack array format)
-    // so rows land in `columnar_memtables` — not `columnar_engines` (plain
-    // columnar). Plain / Spatial use `ColumnarOp::Insert`.
-    let target_is_timeseries = coll.collection_type.is_timeseries();
-
-    let mut cursor: Vec<u8> = Vec::new();
-    let mut copied: u64 = 0;
-    let mut total_seen: u64 = 0;
-
-    loop {
-        let (entries, next_cursor) = scan_source_page(
-            state,
-            tenant_id,
-            origin.source_database,
-            &source_qualified,
-            &cursor,
-            system_as_of_ms,
-        )
-        .await?;
-
-        for (source_surrogate_u32, value_bytes) in entries {
-            total_seen += 1;
-
-            // Skip rows deleted from the clone (CoW tombstone).
-            if tombstoned.contains(&source_surrogate_u32) {
-                continue;
-            }
-
-            // Skip rows already copy-up'd into target by the CoW write path.
-            if catalog
-                .get_clone_copyup(&target_qualified, source_surrogate_u32)?
-                .is_some()
-            {
-                continue;
-            }
-
-            // Allocate target surrogate using a synthetic key derived from the
-            // source surrogate bytes so allocation is deterministic across
-            // retries. The source surrogate encodes (segment_id, row_idx) and
-            // is unique per source row within the collection.
-            let target_surrogate = state
-                .surrogate_assigner
-                .assign(
-                    nodedb_types::CollectionKey::from_bare(db_id, &coll.name),
-                    tenant_id,
-                    &source_surrogate_u32.to_be_bytes(),
-                )
-                .map_err(|e| crate::Error::Storage {
-                    engine: "clone_materializer".into(),
-                    detail: format!(
-                        "surrogate assign failed for source surrogate {source_surrogate_u32} in \
-                         '{target_qualified}': {e}"
-                    ),
-                })?;
-
-            // Wrap the value_bytes (msgpack Value::Object) in a msgpack array
-            // so the Insert / Ingest handler can decode it as a row sequence.
-            let payload = wrap_in_array(value_bytes)?;
-
-            let plan = if target_is_timeseries {
-                // Timeseries target: use TimeseriesOp::Ingest so rows land in
-                // `columnar_memtables` (the timeseries scan path reads from
-                // there, not from `columnar_engines`).
-                // Format "msgpack" = msgpack array-of-maps (same layout as
-                // SQL VALUES ingest produced by the planner).
-                PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-                    collection: nodedb_types::QualifiedCollection::new(db_id, &coll.name),
-                    payload,
-                    format: "msgpack".into(),
-                    wal_lsn: None,
-                    surrogates: vec![target_surrogate],
-                    provenance: None,
-                    // `materialize_one` (walker.rs) already refused this
-                    // materialization if either side carried an RLS policy,
-                    // so no policy applies to source or target here — this
-                    // reflects a check that ran, not an assumption.
-                    rls_write_check: RlsWriteCheck::NoPolicyApplies,
-                    returning: None,
-                    rls_filters: Vec::new(),
-                })
-            } else {
-                PhysicalPlan::Columnar(ColumnarOp::Insert {
-                    collection: nodedb_types::QualifiedCollection::new(db_id, &coll.name),
-                    payload,
-                    format: "msgpack".into(),
-                    intent: ColumnarInsertIntent::InsertIfAbsent,
-                    on_conflict_updates: Vec::<(String, UpdateValue)>::new(),
-                    surrogates: vec![target_surrogate],
-                    schema_bytes: Vec::new(),
-                    provenance: None,
-                    wal_lsn: None,
-                    // `materialize_one` (walker.rs) already refused this
-                    // materialization if either side carried an RLS policy,
-                    // so no policy applies to source or target here — this
-                    // reflects a check that ran, not an assumption.
-                    rls_write_check: RlsWriteCheck::NoPolicyApplies,
-                    // Internal row copy — nothing is projected back and no
-                    // caller identity's reads are being gated.
-                    returning: None,
-                    rls_filters: Vec::new(),
-                })
-            };
-
-            let resp =
-                dispatch_local(state, tenant_id, db_id, &target_qualified, plan, None).await?;
-            if resp.status != Status::Ok {
-                return Err(crate::Error::Storage {
-                    engine: "clone_materializer".into(),
-                    detail: format!(
-                        "columnar insert on target '{target_qualified}' for source surrogate \
-                         {source_surrogate_u32} returned status {:?}",
-                        resp.status
-                    ),
-                });
-            }
-            copied += 1;
-        }
-
-        // Per-page progress checkpoint.
-        checkpoint_progress(
-            state,
-            catalog,
-            db_id,
-            coll,
-            origin.as_of_lsn,
-            copied,
-            total_seen,
-        )?;
-
-        if next_cursor.is_empty() {
-            break;
-        }
-        cursor = next_cursor;
-    }
-
-    tracing::info!(
-        db_id = db_id.as_u64(),
-        collection = %coll.name,
-        copied,
-        skipped_tombstoned = tombstoned.len(),
-        source_total = total_seen,
-        "columnar materialize: source rows copied to target",
+    let system_as_of_ms = crate::control::clone::lsn_resolve::source_as_of_ms(
+        state,
+        coll.bitemporal,
+        origin.as_of_lsn,
     );
 
+    ColumnarCopy {
+        state,
+        catalog,
+        db_id,
+        coll,
+        tenant_id: TenantId::new(coll.tenant_id),
+        source_db_id: origin.source_database,
+        source_qualified: db_qualified(origin.source_database, &origin.source_collection),
+        target_qualified: &target_qualified,
+        tombstoned: &tombstoned,
+        system_as_of_ms,
+        as_of_lsn: origin.as_of_lsn,
+    }
+    .run()
+    .await?;
+
     reap_materialized_collection(ReapParams {
-        target_collection_qualified: &target_qualified,
         db_id,
         tenant_id: coll.tenant_id,
         name: &coll.name,
         state,
         catalog,
-    })?;
-
+    })
+    .await?;
     Ok(())
 }
 
-/// Persist a `Materializing { progress_lsn, .. }` checkpoint between scan pages.
-fn checkpoint_progress(
-    state: &SharedState,
-    catalog: &SystemCatalog,
+/// The row copy of one columnar clone collection.
+struct ColumnarCopy<'a> {
+    state: &'a SharedState,
+    catalog: &'a SystemCatalog,
     db_id: DatabaseId,
-    coll: &StoredCollection,
+    coll: &'a StoredCollection,
+    tenant_id: TenantId,
+    source_db_id: DatabaseId,
+    source_qualified: String,
+    target_qualified: &'a str,
+    tombstoned: &'a HashSet<u32>,
+    system_as_of_ms: Option<i64>,
     as_of_lsn: Lsn,
-    copied: u64,
-    total_seen: u64,
-) -> crate::Result<()> {
-    let mut updated = coll.clone();
-    updated.clone_status = CloneStatus::Materializing {
-        progress_lsn: as_of_lsn,
-        bytes_done: copied,
-        bytes_total: total_seen,
-    };
-    let outcome = propose_catalog_entry(
-        state,
-        &CatalogEntry::PutCollection(Box::new(updated.clone())),
-    )?;
-    if outcome.needs_local_apply() {
-        catalog.put_collection(db_id, &updated)?;
+}
+
+impl ColumnarCopy<'_> {
+    /// Copy every source page, with a progress checkpoint after each one.
+    async fn run(&self) -> crate::Result<()> {
+        let mut cursor: Vec<u8> = Vec::new();
+        let mut copied: u64 = 0;
+        let mut total_seen: u64 = 0;
+        loop {
+            let (entries, next_cursor) = scan_source_page(
+                self.state,
+                self.tenant_id,
+                self.source_db_id,
+                &self.source_qualified,
+                &cursor,
+                self.system_as_of_ms,
+            )
+            .await?;
+            total_seen += entries.len() as u64;
+            let pending = self.pending_rows(entries)?;
+            copied += self.copy_rows(pending).await?;
+            checkpoint_progress(self.state, self.coll, self.as_of_lsn, copied, total_seen).await?;
+            if next_cursor.is_empty() {
+                break;
+            }
+            cursor = next_cursor;
+        }
+        tracing::info!(
+            db_id = self.db_id.as_u64(),
+            collection = %self.coll.name,
+            copied,
+            skipped_tombstoned = self.tombstoned.len(),
+            source_total = total_seen,
+            "columnar materialize: source rows copied to target",
+        );
+        Ok(())
     }
-    Ok(())
+
+    /// The rows of one page still to copy. A row deleted from the clone (CoW
+    /// tombstone) or already copied up by the CoW write path is skipped.
+    fn pending_rows(&self, entries: Vec<(u32, Vec<u8>)>) -> crate::Result<Vec<(u32, Vec<u8>)>> {
+        let mut pending = Vec::with_capacity(entries.len());
+        for (source_surrogate, value_bytes) in entries {
+            if self.tombstoned.contains(&source_surrogate)
+                || self
+                    .catalog
+                    .get_clone_copyup(self.target_qualified, source_surrogate)?
+                    .is_some()
+            {
+                continue;
+            }
+            pending.push((source_surrogate, value_bytes));
+        }
+        Ok(pending)
+    }
+
+    /// Bind target surrogates for `pending` and insert each row into the
+    /// target. Returns the rows copied.
+    async fn copy_rows(&self, pending: Vec<(u32, Vec<u8>)>) -> crate::Result<u64> {
+        // Target surrogates for the page in one batch at the target
+        // collection's home. Each keys on the source surrogate's bytes, so the
+        // allocation is deterministic across retries: the source surrogate
+        // encodes (segment_id, row_idx) and is unique per source row.
+        let keys: Vec<[u8; 4]> = pending.iter().map(|(s, _)| s.to_be_bytes()).collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let target_surrogates =
+            crate::control::server::surrogate_exchange::assign_surrogates_routed(
+                self.state,
+                nodedb_types::CollectionKey::from_bare(self.db_id, &self.coll.name),
+                self.tenant_id,
+                &key_refs,
+                crate::types::TraceId::ZERO,
+            )
+            .await
+            .map_err(|e| crate::Error::Storage {
+                engine: "clone_materializer".into(),
+                detail: format!(
+                    "surrogate assign failed for a page of '{}': {e}",
+                    self.target_qualified
+                ),
+            })?;
+        check_bound_surrogates(
+            self.target_qualified,
+            target_surrogates.len(),
+            pending.len(),
+        )?;
+        let mut copied = 0;
+        for ((_, value_bytes), target_surrogate) in pending.into_iter().zip(target_surrogates) {
+            let plan = self.insert_plan(value_bytes, target_surrogate);
+            dispatch_to_owner(
+                self.state,
+                self.tenant_id,
+                self.db_id,
+                self.target_qualified,
+                plan,
+            )
+            .await?;
+            copied += 1;
+        }
+        Ok(copied)
+    }
+
+    /// The plan that inserts one row into the target unless it is present.
+    ///
+    /// A timeseries target uses `TimeseriesOp::Ingest` (msgpack array format)
+    /// so rows land in `columnar_memtables`, which the timeseries scan path
+    /// reads. Plain / Spatial use `ColumnarOp::Insert` into
+    /// `columnar_engines`.
+    fn insert_plan(&self, value_bytes: Vec<u8>, target_surrogate: Surrogate) -> PhysicalPlan {
+        // Wrap the value_bytes (msgpack Value::Object) in a msgpack array
+        // so the Insert / Ingest handler can decode it as a row sequence.
+        let payload = wrap_in_array(value_bytes);
+        let collection = nodedb_types::QualifiedCollection::new(self.db_id, &self.coll.name);
+        if self.coll.collection_type.is_timeseries() {
+            // Format "msgpack" = msgpack array-of-maps (same layout as SQL
+            // VALUES ingest produced by the planner).
+            PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+                collection,
+                payload,
+                format: "msgpack".into(),
+                wal_lsn: None,
+                surrogates: vec![target_surrogate],
+                provenance: None,
+                // `materialize_one` (walker.rs) already refused this
+                // materialization if either side carried an RLS policy,
+                // so no policy applies to source or target here — this
+                // reflects a check that ran, not an assumption.
+                rls_write_check: RlsWriteCheck::NoPolicyApplies,
+                returning: None,
+                rls_filters: Vec::new(),
+            })
+        } else {
+            PhysicalPlan::Columnar(ColumnarOp::Insert {
+                collection,
+                payload,
+                format: "msgpack".into(),
+                intent: ColumnarInsertIntent::InsertIfAbsent,
+                on_conflict_updates: Vec::<(String, UpdateValue)>::new(),
+                surrogates: vec![target_surrogate],
+                schema_bytes: Vec::new(),
+                provenance: None,
+                wal_lsn: None,
+                // `materialize_one` (walker.rs) already refused this
+                // materialization if either side carried an RLS policy,
+                // so no policy applies to source or target here — this
+                // reflects a check that ran, not an assumption.
+                rls_write_check: RlsWriteCheck::NoPolicyApplies,
+                // Internal row copy — nothing is projected back and no
+                // caller identity's reads are being gated.
+                returning: None,
+                rls_filters: Vec::new(),
+            })
+        }
+    }
 }
 
 /// `(source_surrogate_u32, value_bytes)` returned by one scan page.
@@ -283,17 +280,8 @@ async fn scan_source_page(
         count: SCAN_PAGE,
         system_as_of_ms,
     });
-    let resp = dispatch_local(state, tenant_id, source_db_id, source_qualified, plan, None).await?;
-    if resp.status != Status::Ok {
-        return Err(crate::Error::Storage {
-            engine: "clone_materializer".into(),
-            detail: format!(
-                "columnar materialize-scan on source '{source_qualified}' returned status {:?}",
-                resp.status
-            ),
-        });
-    }
-    parse_materialize_scan_payload(resp.payload.as_ref())
+    let payload = dispatch_to_owner(state, tenant_id, source_db_id, source_qualified, plan).await?;
+    parse_materialize_scan_payload(&payload)
 }
 
 /// Parse the msgpack payload emitted by `execute_columnar_materialize_scan`:
@@ -343,10 +331,10 @@ fn parse_materialize_scan_payload(payload: &[u8]) -> crate::Result<ScanPage> {
 
 /// Wrap a single msgpack Value::Object blob in a msgpack fixarray of length 1
 /// so the columnar insert handler can decode it as `Vec<Value>`.
-fn wrap_in_array(value_bytes: Vec<u8>) -> crate::Result<Vec<u8>> {
+fn wrap_in_array(value_bytes: Vec<u8>) -> Vec<u8> {
     // fixarray header for 1 element: 0x91
     let mut out = Vec::with_capacity(1 + value_bytes.len());
     out.push(0x91);
     out.extend_from_slice(&value_bytes);
-    Ok(out)
+    out
 }

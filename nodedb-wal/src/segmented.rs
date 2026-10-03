@@ -24,9 +24,11 @@ use tracing::info;
 use crate::crypto::KeyRing;
 use crate::error::{Result, WalError};
 use crate::record::{RecordTarget, WalRecord};
+use crate::segment::orphan::discard_unused_segment;
 use crate::segment::{
     DEFAULT_SEGMENT_TARGET_SIZE, SegmentContinuity, SegmentMeta, TruncateResult,
-    check_retained_floor, discover_segments, segment_path, truncate_segments,
+    check_resume_above_previous, check_retained_floor, discover_segments, segment_path,
+    truncate_segments,
 };
 use crate::writer::{WalWriter, WalWriterConfig};
 
@@ -123,6 +125,7 @@ impl SegmentedWal {
             let last = &segments[segments.len() - 1];
             let writer =
                 WalWriter::open_resuming(&last.path, config.writer_config.clone(), last.first_lsn)?;
+            check_resume_above_previous(&segments, writer.next_lsn())?;
             (writer, last.first_lsn)
         };
 
@@ -198,6 +201,7 @@ impl SegmentedWal {
                 vshard_id,
                 database_id,
                 event_source: crate::record::NO_EVENT_SOURCE,
+                commit_hlc: 0,
             },
             payload,
             0,
@@ -226,9 +230,24 @@ impl SegmentedWal {
         self.writer.sync()
     }
 
+    /// Seal the active segment and start the next one, so every record
+    /// appended so far sits in a sealed segment. A no-op when the active
+    /// segment holds no record.
+    pub fn seal_active_segment(&mut self) -> Result<()> {
+        if self.writer.next_lsn() == self.active_first_lsn {
+            return Ok(());
+        }
+        self.roll_segment()
+    }
+
     /// The next LSN that will be assigned.
     pub fn next_lsn(&self) -> u64 {
         self.writer.next_lsn()
+    }
+
+    /// The largest payload one record takes (see [`WalWriter::max_payload`]).
+    pub fn max_payload(&self) -> usize {
+        self.writer.max_payload()
     }
 
     /// First LSN of the active (currently written) segment.
@@ -331,24 +350,21 @@ impl SegmentedWal {
     /// the install, so no record is acknowledged into a segment whose name
     /// might not survive a crash.
     fn roll_segment_with_ring(&mut self, next_ring: Option<crate::crypto::KeyRing>) -> Result<()> {
-        // Reading the next LSN does not consume it, so this is the same value
-        // the seal below would leave behind — nothing appends in between.
+        // A sync can append the batch's time anchor, so it runs before the
+        // new segment's first LSN is read. The seal below then has nothing
+        // left to append, and the LSN read here is the one it leaves behind.
+        self.writer.sync()?;
         let new_first_lsn = self.writer.next_lsn();
         let new_path = segment_path(&self.wal_dir, new_first_lsn);
-        let mut new_writer =
-            WalWriter::open_with_start_lsn(&new_path, self.writer_config.clone(), new_first_lsn)?;
-
-        crate::segment::fsync_directory(&self.wal_dir)?;
-
-        if let Some(ref ring) = next_ring {
-            new_writer.set_encryption_ring(ring.clone())?;
-        }
-
-        // Last fallible step. A seal is a durability barrier over the old
-        // segment's buffered records; if it fails those records were never
-        // made durable, and the writer reports that on every later call — a
-        // real data-loss error, not a bookkeeping state this roll created.
-        self.writer.seal()?;
+        // Every failure from here on removes the new file before returning.
+        // Left on disk, it names LSNs the still-active old segment goes on to
+        // write, and a restart would resume from it and reissue them.
+        let new_writer = match self.open_and_seal(&new_path, new_first_lsn, next_ring.as_ref()) {
+            Ok(new_writer) => new_writer,
+            Err(roll_err) => {
+                return Err(discard_unused_segment(&self.wal_dir, &new_path, roll_err));
+            }
+        };
 
         // Everything past here is infallible, so no failure can strand a
         // sealed writer that was never replaced.
@@ -362,6 +378,34 @@ impl SegmentedWal {
             "rolled to new WAL segment"
         );
         Ok(())
+    }
+
+    /// Create the next segment at `new_path`, then seal the old writer.
+    fn open_and_seal(
+        &mut self,
+        new_path: &Path,
+        new_first_lsn: u64,
+        next_ring: Option<&KeyRing>,
+    ) -> Result<WalWriter> {
+        let mut new_writer =
+            WalWriter::open_with_start_lsn(new_path, self.writer_config.clone(), new_first_lsn)?;
+
+        crate::segment::fsync_directory(&self.wal_dir)?;
+
+        if let Some(ring) = next_ring {
+            new_writer.set_encryption_ring(ring.clone())?;
+        }
+
+        nodedb_types::fail_point_err!("wal::roll_before_seal", |detail: String| WalError::Io(
+            std::io::Error::other(format!("failpoint wal::roll_before_seal: {detail}"))
+        ));
+
+        // Last fallible step. A seal is a durability barrier over the old
+        // segment's buffered records; if it fails those records were never
+        // made durable, and the writer reports that on every later call — a
+        // real data-loss error, not a bookkeeping state this roll created.
+        self.writer.seal()?;
+        Ok(new_writer)
     }
 }
 
@@ -1019,5 +1063,110 @@ mod tests {
         let next_lsn = records.last().unwrap().header.lsn + 1;
         let (records2, _) = wal.replay_from_limit(next_lsn, 200).unwrap();
         assert_eq!(records2.len(), 15); // 20 - 5 = 15 remaining
+    }
+
+    /// Anchors ride every batch, keep LSNs unique across a rollover, and come
+    /// back from disk after a restart.
+    #[test]
+    fn time_anchors_survive_rollover_and_restart() {
+        use std::sync::Arc;
+
+        use crate::time_anchors::TimeAnchors;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let config = |anchors: &Arc<TimeAnchors>| SegmentedWalConfig {
+            wal_dir: wal_dir.clone(),
+            segment_target_size: 200,
+            writer_config: WalWriterConfig {
+                use_direct_io: false,
+                time_anchors: Some(Arc::clone(anchors)),
+                ..Default::default()
+            },
+        };
+
+        let live = Arc::new(TimeAnchors::new(Arc::new(nodedb_types::HlcClock::new())));
+        {
+            let mut wal = SegmentedWal::open(config(&live)).unwrap();
+            for i in 0..12u32 {
+                wal.append(RecordType::Put as u32, 1, 0, 0, format!("r{i}").as_bytes())
+                    .unwrap();
+                if i % 3 == 2 {
+                    wal.sync().unwrap();
+                }
+            }
+            wal.sync().unwrap();
+            assert!(wal.list_segments().unwrap().len() > 1);
+        }
+        let live_anchors = live.anchors();
+        assert!(live_anchors.len() >= 4);
+
+        let records = replay_all_segments(&wal_dir, None).unwrap();
+        let lsns: Vec<u64> = records.iter().map(|r| r.header.lsn).collect();
+        assert!(lsns.windows(2).all(|w| w[1] == w[0] + 1), "{lsns:?}");
+        let puts = records
+            .iter()
+            .filter(|r| RecordType::from_raw(r.logical_record_type()) == Some(RecordType::Put))
+            .count();
+        assert_eq!(puts, 12);
+
+        let restarted = TimeAnchors::new(Arc::new(nodedb_types::HlcClock::new()));
+        restarted.absorb_replayed(&records).unwrap();
+        assert_eq!(restarted.anchors(), live_anchors);
+    }
+
+    /// A roll that fails after creating the next segment removes it. The old
+    /// writer stays active, and a retried roll succeeds.
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn an_injected_seal_failure_leaves_no_new_segment_file() {
+        use nodedb_types::fail_point::FailGuard;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = SegmentedWal::open(test_config(dir.path())).unwrap();
+        wal.append(RecordType::Put as u32, 1, 0, 0, b"a").unwrap();
+        wal.sync().unwrap();
+        let before = wal.list_segments().unwrap();
+        {
+            let _guard = FailGuard::fail("wal::roll_before_seal", "injected");
+            assert!(wal.roll_segment().is_err());
+        }
+        assert_eq!(wal.list_segments().unwrap(), before);
+        assert_eq!(wal.active_segment_first_lsn(), 1);
+
+        wal.append(RecordType::Put as u32, 1, 0, 0, b"b").unwrap();
+        wal.roll_segment().unwrap();
+        assert_eq!(wal.list_segments().unwrap().len(), 2);
+        assert_eq!(wal.active_segment_first_lsn(), 3);
+    }
+
+    /// A segment file left by an interrupted roll starts inside LSNs the
+    /// previous segment holds. Opening the WAL refuses it instead of
+    /// resuming there and reissuing those LSNs.
+    #[test]
+    fn open_refuses_a_segment_left_by_an_interrupted_roll() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut wal = SegmentedWal::open(test_config(dir.path())).unwrap();
+            for i in 0..5u8 {
+                wal.append(RecordType::Put as u32, 1, 0, 0, &[i]).unwrap();
+            }
+            wal.sync().unwrap();
+        }
+        let orphan = segment_path(dir.path(), 3);
+        WalWriter::open_with_start_lsn(&orphan, test_config(dir.path()).writer_config, 3).unwrap();
+
+        match SegmentedWal::open(test_config(dir.path())) {
+            Err(WalError::SegmentOverlapsPrevious {
+                first_lsn,
+                previous_last_lsn,
+                ..
+            }) => {
+                assert_eq!(first_lsn, 3);
+                assert_eq!(previous_last_lsn, 5);
+            }
+            Err(other) => panic!("expected SegmentOverlapsPrevious, got {other}"),
+            Ok(_) => panic!("opened a WAL whose last segment reissues LSNs"),
+        }
     }
 }

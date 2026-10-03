@@ -34,14 +34,14 @@ const HEADER: HeaderSpec = HeaderSpec {
 const DEFAULT_FIELD: &str = "_sparse";
 
 /// `CREATE SPARSE INDEX [IF NOT EXISTS] [<name>] ON <collection> [(<field>)]`
-pub fn create_sparse_index(
+pub async fn create_sparse_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     // This surface carries no options, so any trailing token is a statement
-    // the handler does not implement rather than one it may ignore.
+    // the handler does not implement rather than one it can ignore.
     let stmt = parse_index_statement(sql, LEADING, &HEADER, &[], CONTEXT)?;
 
     let index_name = &stmt.header.name;
@@ -53,7 +53,7 @@ pub fn create_sparse_index(
     let tenant_id = identity.tenant_id;
 
     // The parser substitutes a placeholder when the name is omitted; a
-    // tenant-global placeholder would collide across collections and leave
+    // tenant-global placeholder will collide across collections and leave
     // only one of them droppable, so it resolves per collection and field.
     let index_name = if index_name == PLACEHOLDER_NAME {
         format!("{collection}_{field}_sparse_idx")
@@ -94,7 +94,8 @@ pub fn create_sparse_index(
             collection,
             fields: vec![field.to_string()],
         },
-    )?;
+    )
+    .await?;
     crate::control::server::shared::ddl::owner::propose_owner(
         state,
         IndexKind::Sparse.owner_object_type(),
@@ -102,7 +103,8 @@ pub fn create_sparse_index(
         tenant_id,
         &index_name,
         &identity.username,
-    )?;
+    )
+    .await?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

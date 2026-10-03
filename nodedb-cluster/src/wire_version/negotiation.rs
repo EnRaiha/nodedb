@@ -88,6 +88,9 @@ pub struct VersionHandshake {
     /// capabilities) so older peers that do not set this field remain compatible.
     #[serde(default)]
     pub capabilities: u64,
+    /// Sender's `nodedb_types::wire_version::WIRE_BUILD_ID`. Compared for
+    /// exact equality by the receiver — see `handshake_io::perform_version_handshake_server`.
+    pub build_id: String,
 }
 
 /// Server-side acknowledgement returned after negotiation succeeds.
@@ -107,14 +110,18 @@ pub struct VersionHandshakeAck {
     /// Unknown bits are ignored by the receiver.  Defaults to `0`.
     #[serde(default)]
     pub capabilities: u64,
+    /// Server's `nodedb_types::wire_version::WIRE_BUILD_ID`, echoed so the
+    /// client can also refuse a build mismatch the server failed to catch.
+    pub build_id: String,
 }
 
 impl VersionHandshake {
-    /// Build a handshake from a [`VersionRange`].
-    pub fn from_range(range: VersionRange) -> Self {
+    /// Build a handshake from a [`VersionRange`] and this build's identity.
+    pub fn from_range(range: VersionRange, build_id: String) -> Self {
         Self {
             range: (range.min.0, range.max.0),
             capabilities: 0,
+            build_id,
         }
     }
 
@@ -125,11 +132,12 @@ impl VersionHandshake {
 }
 
 impl VersionHandshakeAck {
-    /// Construct an ack for the given agreed wire version.
-    pub fn new(agreed: WireVersion) -> Self {
+    /// Construct an ack for the given agreed wire version and build identity.
+    pub fn new(agreed: WireVersion, build_id: String) -> Self {
         Self {
             agreed: agreed.0,
             capabilities: 0,
+            build_id,
         }
     }
 
@@ -183,9 +191,10 @@ mod tests {
     #[test]
     fn handshake_roundtrip() {
         let r = range(1, 2);
-        let hs = VersionHandshake::from_range(r);
+        let hs = VersionHandshake::from_range(r, "test-build".to_owned());
         let bytes = zerompk::to_msgpack_vec(&hs).unwrap();
         let decoded: VersionHandshake = zerompk::from_msgpack(&bytes).unwrap();
         assert_eq!(decoded.to_range(), r);
+        assert_eq!(decoded.build_id, "test-build");
     }
 }

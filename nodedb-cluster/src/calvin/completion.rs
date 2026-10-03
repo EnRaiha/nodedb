@@ -1,11 +1,22 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::calvin::completion_entry::{PendingCompletion, outcome_for};
+use crate::calvin::completion_waiter::{CompletionReport, CompletionWaiter};
 use crate::calvin::sequencer::AbortReason;
+
+/// The sequencer assignment of one submission: `(epoch, position,
+/// participants)`.
+pub type Assignment = (u64, u32, usize);
+
+/// Receives one submission's [`Assignment`]. It reads a closed channel when
+/// the sequencer rejected or discarded the submission without sequencing it.
+pub type AssignmentReceiver = oneshot::Receiver<Assignment>;
 
 /// Calvin transaction identity in the sequencer-assigned coordinate space.
 ///
@@ -31,15 +42,15 @@ impl TxnId {
 /// all expected vshards acked but the global cross-shard verdict was ABORT
 /// (`Aborted`), the executor reported an OLLP prediction mismatch that forces a
 /// retry (`Mismatch`), or the scheduler rejected the transaction's routing as
-/// terminally broken (`Failed`). `Aborted` and `Failed` are NEVER retried,
-/// unlike `Mismatch`.
+/// terminally broken (`Failed`). `Failed` is never retried. `Aborted` retries
+/// only for `AbortReason::PredictionDrift`, which is the same drift as
+/// `Mismatch`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttemptOutcome {
     Completed,
-    /// The global cross-shard verdict was ABORT. `reason` names the cause; it is
-    /// `None` for a pre-existing durable verdict that recorded no reason.
+    /// The global cross-shard verdict was ABORT. `reason` names the cause.
     Aborted {
-        reason: Option<AbortReason>,
+        reason: AbortReason,
     },
     Mismatch,
     Failed {
@@ -47,22 +58,19 @@ pub enum AttemptOutcome {
     },
 }
 
-/// One participant vShard's durable commit vote. `Abort(None)` is a
-/// pre-existing durable `SequencerEntry::Vote { commit: false }`, written before
-/// abort reasons existed on the wire.
+/// One participant vShard's durable commit vote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParticipantVote {
     Commit,
-    Abort(Option<AbortReason>),
+    Abort(AbortReason),
 }
 
 /// A commit/abort decision: the tally aggregated from votes, and the
-/// authoritative verdict stored on a `PendingCompletion`. `Abort(None)` carries
-/// no reason, either from a legacy vote or a legacy stored verdict.
+/// authoritative verdict stored on a `PendingCompletion`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerdictOutcome {
     Commit,
-    Abort(Option<AbortReason>),
+    Abort(AbortReason),
 }
 
 impl VerdictOutcome {
@@ -91,88 +99,11 @@ pub struct ParticipantProgress {
     pub routing_failed: bool,
 }
 
-pub(crate) struct PendingCompletion {
-    /// `pub(crate)`: also read/written by the vote/verdict-tally methods in
-    /// `completion_verdict.rs` (a sibling module in the same crate).
-    pub(crate) expected_participants: usize,
-    acked_vshards: BTreeSet<u32>,
-    completion_tx: Option<oneshot::Sender<AttemptOutcome>>,
-    /// Set when an OLLP mismatch is observed before the coordinator registers
-    /// its waiter, so the outcome is not lost across registration order (mirrors
-    /// how `acked_vshards` persists ack state regardless of registration order).
-    mismatched: bool,
-    /// Set when a terminal routing failure is observed before the coordinator
-    /// registers its waiter, mirroring `mismatched`. Takes precedence over both
-    /// `mismatched` and completion: a routing failure is never retried and never
-    /// falsely reported as success.
-    routing_failed: Option<String>,
-    /// Durable per-participant commit votes tallied from `SequencerEntry::Vote`
-    /// and `SequencerEntry::AbortVote`, keyed by vshard so a re-proposed vote (retry) overwrites deterministically.
-    /// Once complete, the leader aggregates the tally into the global `verdict`
-    /// that gates each participant's flush/drop at the cross-shard commit barrier.
-    pub(crate) votes: BTreeMap<u32, ParticipantVote>,
-    /// The authoritative commit/abort verdict, applied from a replicated
-    /// `SequencerEntry::Verdict` or `AbortVerdict`; `None` until applied. This is the durable
-    /// barrier gate: a participant parked in `AwaitingVerdict` resumes into its
-    /// flush (commit) or drop (abort) once it is set. It is also the ONLY
-    /// authority for "already decided" — a post-failover leader re-proposes from
-    /// `votes` until it is stored (see `drain_unproposed_verdicts`).
-    pub(crate) verdict: Option<VerdictOutcome>,
-    /// Dedup guard for the LOCAL emit path: set the first time the tally becomes
-    /// complete so the verdict signal is emitted exactly once across vote
-    /// re-proposals. Per-node, non-durable, never reset on failover — so it is
-    /// NOT consulted by `drain_unproposed_verdicts` (which trusts only the
-    /// durable `verdict`, letting a promoted leader re-propose a still-unstored one).
-    pub(crate) verdict_proposed: bool,
-}
-
-/// Choose the terminal outcome for a COMPLETED entry (all expected vshards
-/// acked) by consulting the durable global verdict.
-///
-/// The verdict is applied from a replicated `SequencerEntry::Verdict` that is
-/// strictly ordered BEFORE the abort's `CompletionAck` in the sequencer Raft
-/// log, so an ABORT verdict is always stored by the time this entry's
-/// completion fires. A stored abort becomes `Aborted`, carrying the reason the
-/// verdict recorded; `None` (single-shard / no-verdict paths) and a commit
-/// verdict are `Completed`. We deliberately do NOT gate on `verdict.is_some()`
-/// — that would stall the no-verdict completion paths.
-fn outcome_for(entry: &PendingCompletion) -> AttemptOutcome {
-    match entry.verdict {
-        Some(VerdictOutcome::Abort(reason)) => AttemptOutcome::Aborted { reason },
-        _ => AttemptOutcome::Completed,
-    }
-}
-
-impl PendingCompletion {
-    pub(crate) fn new(expected_participants: usize) -> Self {
-        Self {
-            expected_participants,
-            acked_vshards: BTreeSet::new(),
-            completion_tx: None,
-            mismatched: false,
-            routing_failed: None,
-            votes: BTreeMap::new(),
-            verdict: None,
-            verdict_proposed: false,
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        // Require a KNOWN participant count (>0). The `expected_participants == 0`
-        // default means "not yet seeded" — completion must not fire until the
-        // count is known (via `note_assigned` on the leader, or `register_completion`
-        // from the routed assignment on a remote coordinator). Without this guard a
-        // replicated ack that races ahead of seeding, or a bare `register_completion`,
-        // would spuriously report `Completed` with zero acks.
-        self.expected_participants > 0 && self.acked_vshards.len() >= self.expected_participants
-    }
-}
-
 /// `pub(crate)`: also read by the vote/verdict-tally methods in
 /// `completion_verdict.rs` (a sibling module in the same crate).
 #[derive(Default)]
 pub(crate) struct Inner {
-    assignments: BTreeMap<u64, oneshot::Sender<(u64, u32, usize)>>,
+    assignments: BTreeMap<u64, oneshot::Sender<Assignment>>,
     pub(crate) completions: BTreeMap<TxnId, PendingCompletion>,
     /// Per-vShard senders for the verdict push, keyed by vShard id. Each local
     /// Calvin scheduler registers its receiver's sender here at construction;
@@ -181,6 +112,36 @@ pub(crate) struct Inner {
     /// notification never disagree.
     pub(crate) verdict_signal_senders:
         BTreeMap<u32, mpsc::Sender<super::completion_verdict::VerdictSignal>>,
+    /// Terminal entries with no waiter, oldest first, with the instant each
+    /// became one (`completion_gc`).
+    pub(crate) waiterless: VecDeque<(Instant, TxnId)>,
+    /// How long a terminal entry waits for a waiter before eviction. `None`
+    /// takes [`super::completion_gc::DEFAULT_WAITERLESS_TTL`].
+    pub(crate) waiterless_ttl: Option<Duration>,
+}
+
+impl Inner {
+    /// Remove `txn`'s entry and deliver `outcome` to `waiter`. `signal` names
+    /// the event in the warning logged when the receiver is gone.
+    pub(crate) fn fire(
+        &mut self,
+        txn: TxnId,
+        waiter: CompletionWaiter,
+        outcome: AttemptOutcome,
+        ack_results: Vec<Vec<u8>>,
+        signal: &'static str,
+    ) {
+        self.completions.remove(&txn);
+        if !waiter.send(outcome, ack_results) {
+            tracing::warn!(
+                epoch = txn.epoch,
+                position = txn.position,
+                signal,
+                "calvin completion receiver dropped before its outcome fired; \
+                 client likely timed out on completion wait"
+            );
+        }
+    }
 }
 
 pub struct CalvinCompletionRegistry {
@@ -219,7 +180,11 @@ impl CalvinCompletionRegistry {
         Self::new(verdict_tx)
     }
 
-    pub fn register_submission(&self, inbox_seq: u64) -> oneshot::Receiver<(u64, u32, usize)> {
+    /// Register interest in the assignment of submission `inbox_seq`.
+    ///
+    /// Call it before the submission reaches the inbox channel, so the tick
+    /// that drains it always finds the sender. `Inbox::submit_with` does so.
+    pub fn register_submission(&self, inbox_seq: u64) -> AssignmentReceiver {
         let (tx, rx) = oneshot::channel();
         self.inner
             .lock()
@@ -227,6 +192,20 @@ impl CalvinCompletionRegistry {
             .assignments
             .insert(inbox_seq, tx);
         rx
+    }
+
+    /// Drop the assignment sender of submission `inbox_seq`, if one is held.
+    ///
+    /// The sequencer calls it for every submission it rejects or discards
+    /// without sequencing. The waiting caller then reads a closed channel at
+    /// once. A caller that gives up waiting calls it too, so no sender stays
+    /// behind.
+    pub fn drop_assignment(&self, inbox_seq: u64) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .assignments
+            .remove(&inbox_seq);
     }
 
     pub fn note_assigned(&self, inbox_seq: u64, txn: TxnId, expected_participants: usize) {
@@ -263,6 +242,25 @@ impl CalvinCompletionRegistry {
         expected_participants: usize,
     ) -> oneshot::Receiver<AttemptOutcome> {
         let (tx, rx) = oneshot::channel();
+        self.register_waiter(txn, expected_participants, CompletionWaiter::Outcome(tx));
+        rx
+    }
+
+    /// [`Self::register_completion`] for a coordinator that also reads each
+    /// participant's apply result, as its `CompletionAck` carried it. The
+    /// acks reach every sequencer replica, so the results arrive whether or
+    /// not this node hosts a replica of each participant.
+    pub fn register_completion_report(
+        &self,
+        txn: TxnId,
+        expected_participants: usize,
+    ) -> oneshot::Receiver<CompletionReport> {
+        let (tx, rx) = oneshot::channel();
+        self.register_waiter(txn, expected_participants, CompletionWaiter::Report(tx));
+        rx
+    }
+
+    fn register_waiter(&self, txn: TxnId, expected_participants: usize, tx: CompletionWaiter) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let entry = inner
             .completions
@@ -272,52 +270,54 @@ impl CalvinCompletionRegistry {
         // Routing failure takes precedence over everything else: it is terminal
         // and must never be masked by a later ack or mismatch signal.
         if let Some(detail) = entry.routing_failed.take() {
-            inner.completions.remove(&txn);
-            if tx.send(AttemptOutcome::Failed { detail }).is_err() {
-                tracing::warn!(
-                    epoch = txn.epoch,
-                    position = txn.position,
-                    "calvin completion receiver dropped before routing-failure signal; \
-                     client likely timed out on completion wait"
-                );
-            }
+            inner.fire(
+                txn,
+                tx,
+                AttemptOutcome::Failed { detail },
+                Vec::new(),
+                "routing failure",
+            );
+        } else if entry.abandoned {
+            // The entry keeps its stored verdict for the participants that
+            // still probe it, and parks as a waiterless one.
+            super::completion_parts::send_parts_lost(txn, tx);
+            inner.settle_waiterless(txn);
         } else if entry.mismatched {
-            inner.completions.remove(&txn);
-            if tx.send(AttemptOutcome::Mismatch).is_err() {
-                tracing::warn!(
-                    epoch = txn.epoch,
-                    position = txn.position,
-                    "calvin completion receiver dropped before OLLP-mismatch signal; \
-                     client likely timed out on completion wait"
-                );
-            }
+            inner.fire(
+                txn,
+                tx,
+                AttemptOutcome::Mismatch,
+                Vec::new(),
+                "OLLP mismatch",
+            );
         } else if entry.is_complete() {
             // Acks raced ahead of waiter registration: consult the stored
             // verdict so an already-complete ABORT surfaces as `Aborted`, not a
             // false `Completed`.
             let outcome = outcome_for(entry);
-            inner.completions.remove(&txn);
-            if tx.send(outcome).is_err() {
-                tracing::warn!(
-                    epoch = txn.epoch,
-                    position = txn.position,
-                    "calvin completion receiver dropped before all-acked signal; \
-                     client likely timed out on completion wait"
-                );
-            }
+            let results = entry.take_ack_results();
+            inner.fire(txn, tx, outcome, results, "all acked");
         } else {
             entry.completion_tx = Some(tx);
         }
-        rx
     }
 
     pub fn note_completion_ack(&self, txn: TxnId, vshard_id: u32) {
+        self.note_completion_ack_with(txn, vshard_id, Vec::new());
+    }
+
+    /// Record `vshard_id`'s `CompletionAck` for `txn`, with the apply result
+    /// it carried. An empty `result` records none.
+    pub fn note_completion_ack_with(&self, txn: TxnId, vshard_id: u32, result: Vec<u8>) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let entry = inner
             .completions
             .entry(txn)
             .or_insert_with(|| PendingCompletion::new(0));
         entry.acked_vshards.insert(vshard_id);
+        if !result.is_empty() {
+            entry.ack_results.insert(vshard_id, result);
+        }
         if entry.is_complete() {
             // Consult the stored global verdict: `Verdict` is applied strictly
             // before this abort's `CompletionAck` in the sequencer Raft log, so
@@ -334,18 +334,11 @@ impl CalvinCompletionRegistry {
             // `mismatched`/`routing_failed` persist across the same race.
             if let Some(tx) = entry.completion_tx.take() {
                 let outcome = outcome_for(entry);
-                inner.completions.remove(&txn);
-                if tx.send(outcome).is_err() {
-                    tracing::warn!(
-                        epoch = txn.epoch,
-                        position = txn.position,
-                        vshard_id,
-                        "calvin completion receiver dropped before final ack; \
-                         client likely timed out on completion wait"
-                    );
-                }
+                let results = entry.take_ack_results();
+                inner.fire(txn, tx, outcome, results, "final ack");
             }
         }
+        inner.settle_waiterless(txn);
     }
 
     /// Record an OLLP prediction mismatch for `txn`, the second terminal outcome
@@ -363,16 +356,15 @@ impl CalvinCompletionRegistry {
             .or_insert_with(|| PendingCompletion::new(0));
         entry.mismatched = true;
         if let Some(tx) = entry.completion_tx.take() {
-            inner.completions.remove(&txn);
-            if tx.send(AttemptOutcome::Mismatch).is_err() {
-                tracing::warn!(
-                    epoch = txn.epoch,
-                    position = txn.position,
-                    "calvin completion receiver dropped before OLLP-mismatch signal; \
-                     client likely timed out on completion wait"
-                );
-            }
+            inner.fire(
+                txn,
+                tx,
+                AttemptOutcome::Mismatch,
+                Vec::new(),
+                "OLLP mismatch",
+            );
         }
+        inner.settle_waiterless(txn);
     }
 
     /// Record a terminal, NON-retryable routing failure for `txn` — the
@@ -393,16 +385,24 @@ impl CalvinCompletionRegistry {
             .or_insert_with(|| PendingCompletion::new(0));
         entry.routing_failed = Some(detail.clone());
         if let Some(tx) = entry.completion_tx.take() {
-            inner.completions.remove(&txn);
-            if tx.send(AttemptOutcome::Failed { detail }).is_err() {
-                tracing::warn!(
-                    epoch = txn.epoch,
-                    position = txn.position,
-                    "calvin completion receiver dropped before routing-failure signal; \
-                     client likely timed out on completion wait"
-                );
-            }
+            inner.fire(
+                txn,
+                tx,
+                AttemptOutcome::Failed { detail },
+                Vec::new(),
+                "routing failure",
+            );
         }
+        inner.settle_waiterless(txn);
+    }
+
+    /// Set how long a terminal entry with no waiter stays for one to
+    /// register. The host sets it longer than its statement deadline.
+    pub fn set_waiterless_ttl(&self, ttl: Duration) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .waiterless_ttl = Some(ttl);
     }
 
     /// What this registry holds for participant `vshard` of `txn`.
@@ -434,11 +434,84 @@ impl CalvinCompletionRegistry {
             .completions
             .len()
     }
+
+    /// Test-only: the number of assignment senders held.
+    #[cfg(test)]
+    pub fn pending_assignments_len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .assignments
+            .len()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A replica on which no coordinator waits keeps no completion entry,
+    /// and no ack result, past the eviction window. An entry that has a
+    /// waiter stays until its outcome fires.
+    #[tokio::test]
+    async fn waiterless_terminal_entries_are_evicted_with_their_results() {
+        let reg = CalvinCompletionRegistry::new_detached();
+        reg.set_waiterless_ttl(Duration::ZERO);
+
+        let acked = TxnId::new(3, 0);
+        reg.note_assigned(1, acked, 1);
+        reg.note_completion_ack_with(acked, 5, vec![0xAB; 4096]);
+        assert_eq!(
+            reg.pending_completions_len(),
+            0,
+            "a complete entry nobody waits for is evicted with its result"
+        );
+
+        let mismatched = TxnId::new(3, 1);
+        reg.note_ollp_mismatch(mismatched);
+        assert_eq!(reg.pending_completions_len(), 0);
+
+        let awaited = TxnId::new(3, 2);
+        let rx = reg.register_completion_report(awaited, 2);
+        reg.note_completion_ack_with(awaited, 5, b"five".to_vec());
+        reg.note_completion_ack_with(TxnId::new(3, 3), 6, b"other".to_vec());
+        assert!(
+            reg.participant_progress(awaited, 5).is_some(),
+            "an entry with a waiter is never evicted"
+        );
+        reg.note_completion_ack_with(awaited, 6, b"six".to_vec());
+        let report = rx.await.expect("completion fires");
+        assert_eq!(report.ack_results, vec![b"five".to_vec(), b"six".to_vec()]);
+    }
+
+    /// The coordinator hosts no replica of either participant: it learns
+    /// their apply results only from the `CompletionAck`s its sequencer
+    /// replica applies. The report carries each participant's result, in
+    /// vShard order, whether the acks land before or after it registers.
+    #[tokio::test]
+    async fn a_report_carries_every_participants_ack_result() {
+        let reg = CalvinCompletionRegistry::new_detached();
+        let txn = TxnId::new(11, 4);
+        reg.note_completion_ack_with(txn, 20, b"twenty".to_vec());
+        let rx = reg.register_completion_report(txn, 3);
+        reg.note_completion_ack_with(txn, 10, b"ten".to_vec());
+        reg.note_completion_ack_with(txn, 30, Vec::new());
+        let report = rx.await.expect("completion fires");
+        assert_eq!(report.outcome, AttemptOutcome::Completed);
+        assert_eq!(
+            report.ack_results,
+            vec![b"ten".to_vec(), b"twenty".to_vec()]
+        );
+        assert_eq!(reg.pending_completions_len(), 0);
+
+        let late = TxnId::new(11, 5);
+        reg.note_completion_ack_with(late, 7, b"seven".to_vec());
+        let report = reg
+            .register_completion_report(late, 1)
+            .await
+            .expect("an already complete txn fires on registration");
+        assert_eq!(report.ack_results, vec![b"seven".to_vec()]);
+    }
 
     #[tokio::test]
     async fn completion_entry_removed_after_all_acks() {
@@ -644,7 +717,7 @@ mod tests {
         reg.note_assigned(1, txn, 2);
         reg.note_verdict(
             txn,
-            VerdictOutcome::Abort(Some(AbortReason::SerializationConflict)),
+            VerdictOutcome::Abort(AbortReason::SerializationConflict),
         );
         let rx = reg.register_completion(txn, 2);
         reg.note_completion_ack(txn, 10);
@@ -653,7 +726,7 @@ mod tests {
         assert_eq!(
             outcome,
             AttemptOutcome::Aborted {
-                reason: Some(AbortReason::SerializationConflict)
+                reason: AbortReason::SerializationConflict
             },
             "a stored ABORT verdict must surface as Aborted, not Completed"
         );
@@ -668,10 +741,7 @@ mod tests {
         let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(32, 1);
         reg.note_assigned(1, txn, 2);
-        reg.note_verdict(
-            txn,
-            VerdictOutcome::Abort(Some(AbortReason::ParticipantError)),
-        );
+        reg.note_verdict(txn, VerdictOutcome::Abort(AbortReason::ParticipantError));
         reg.note_completion_ack(txn, 10);
         reg.note_completion_ack(txn, 20);
         let rx = reg.register_completion(txn, 2);
@@ -679,7 +749,7 @@ mod tests {
         assert_eq!(
             outcome,
             AttemptOutcome::Aborted {
-                reason: Some(AbortReason::ParticipantError)
+                reason: AbortReason::ParticipantError
             }
         );
         assert_eq!(reg.pending_completions_len(), 0);
@@ -700,21 +770,30 @@ mod tests {
         assert_eq!(reg.pending_completions_len(), 0);
     }
 
-    #[tokio::test]
-    async fn legacy_abort_verdict_reports_aborted_with_no_reason() {
-        // A durable `SequencerEntry::Verdict { commit: false }` written before
-        // abort reasons existed applies as `Abort(None)`. The coordinator must
-        // still get `Aborted`, with `reason: None` marking the unknown cause.
+    /// A dropped assignment closes the caller's channel at once and leaves no
+    /// sender behind. A later `note_assigned` for the seq finds none.
+    #[test]
+    fn drop_assignment_closes_the_callers_channel_and_frees_the_sender() {
         let reg = CalvinCompletionRegistry::new_detached();
-        let txn = TxnId::new(35, 0);
-        reg.note_assigned(1, txn, 2);
-        reg.note_verdict(txn, VerdictOutcome::Abort(None));
-        let rx = reg.register_completion(txn, 2);
-        reg.note_completion_ack(txn, 10);
-        reg.note_completion_ack(txn, 20);
-        let outcome = rx.await.expect("completion fires");
-        assert_eq!(outcome, AttemptOutcome::Aborted { reason: None });
-        assert_eq!(reg.pending_completions_len(), 0);
+        let mut rejected = reg.register_submission(4);
+        let mut kept = reg.register_submission(5);
+        assert_eq!(reg.pending_assignments_len(), 2);
+
+        reg.drop_assignment(4);
+        assert_eq!(
+            rejected.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed),
+            "the caller must see a closed channel, not wait out its timeout"
+        );
+        assert_eq!(reg.pending_assignments_len(), 1);
+
+        reg.note_assigned(5, TxnId::new(2, 0), 3);
+        assert_eq!(kept.try_recv(), Ok((2, 0, 3)));
+        assert_eq!(reg.pending_assignments_len(), 0);
+
+        // Dropping a seq with no sender is a no-op.
+        reg.drop_assignment(4);
+        assert_eq!(reg.pending_assignments_len(), 0);
     }
 
     #[tokio::test]

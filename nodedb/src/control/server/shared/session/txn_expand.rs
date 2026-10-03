@@ -110,6 +110,7 @@ fn expand_put(
                     // on the single-node planner path.
                     wal_lsn: 0,
                     provenance: None,
+                    vshard_id: bucket.vshard_id,
                 }),
             ))
         })
@@ -139,6 +140,7 @@ fn expand_delete(
                     coords_msgpack,
                     wal_lsn: 0,
                     provenance: None,
+                    vshard_id: bucket.vshard_id,
                 }),
             ))
         })

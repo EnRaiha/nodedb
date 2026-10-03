@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+pub mod journal;
 pub mod live_set;
 pub mod stream;
 
+pub use journal::ChangeJournal;
 pub use live_set::LiveSubscriptionSet;
 pub use stream::{
-    ChangeCursor, ChangeEvent, ChangeOperation, ChangeStream, CursorParseError, ReplayError,
-    ReplaySnapshot, ReplayStart, SequencedChangeEvent, Subscription, broadcast_notify_to_cluster,
+    ChangeCursor, ChangeEvent, ChangeOperation, ChangePartition, ChangeStream, ChangeStreamError,
+    CursorParseError, CursorStep, ReplayError, ReplaySnapshot, ReplayStart, ReplayedChange,
+    SequencedChangeEvent, Subscription,
 };
+pub(crate) use stream::{ChangeRun, PositionedChange};

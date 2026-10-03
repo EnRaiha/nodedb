@@ -84,7 +84,7 @@ pub fn subscribe_to(
     }
 
     // The catalog is the durable authority for SINCE. The buffer is retained
-    // for delivery and may be rebuilt on startup, so it must not be treated as
+    // for delivery and can be rebuilt on startup, so it must not be treated as
     // an independent source or cause a subscription side effect here.
     let backlog = if since_seq == 0 {
         Vec::new()
@@ -177,6 +177,8 @@ mod tests {
             created_at: 0,
             last_sequence: 0,
             last_lsn: 0,
+            last_epoch: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         };
         state
             .credentials
@@ -187,19 +189,19 @@ mod tests {
         state
             .credentials
             .catalog()
-            .append_ep_topic_message(
-                DatabaseId::DEFAULT,
-                identity.tenant_id.as_u64(),
-                "orders",
+            .append_replicated_topic_message(
+                (DatabaseId::DEFAULT, identity.tenant_id.as_u64(), "orders"),
                 "exact durable payload",
                 u64::MAX,
-                1,
+                (0, 1),
+                None,
             )
-            .expect("persist message");
+            .expect("persist message")
+            .expect("the entry appends");
         state
             .permissions
             .grant(
-                &collection_target(identity.tenant_id, "topic:orders"),
+                &collection_target(DatabaseId::DEFAULT, identity.tenant_id, "topic:orders"),
                 "user:alice",
                 Permission::Read,
                 "test",

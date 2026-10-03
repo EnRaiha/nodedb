@@ -8,7 +8,7 @@
 //! sequence of `open_table` calls in `open`, makes it structurally
 //! impossible to declare a table and read it in production code without
 //! also creating it at startup: a table that is consulted on a fresh
-//! catalog but missing from this list would fail the first reader with
+//! catalog but missing from this list fails the first reader with
 //! `Table '…' does not exist`. The `bootstrap_creates_every_registered_table`
 //! unit test re-opens every entry read-only against a freshly-bootstrapped
 //! catalog to keep the registry and the init path in lockstep.
@@ -18,7 +18,7 @@
 //! `_system.surrogate_pk_rev_v2` — superseded key layouts) are intentionally
 //! absent: they are read only by the idempotent migration path, which already
 //! tolerates their absence, and materialising empty copies on every fresh
-//! server would misrepresent the catalog state.
+//! server misrepresents the catalog state.
 
 use redb::{ReadTransaction, TableError, WriteTransaction};
 
@@ -61,6 +61,7 @@ pub(super) const BOOTSTRAP_TABLES: &[BootstrapTable] = bootstrap_tables![
     "permissions" => PERMISSIONS,
     "owners" => OWNERS,
     "tenants" => TENANTS,
+    "tenant_id_hwm" => super::tenant_id_hwm::TENANT_ID_HWM,
     "audit_log" => AUDIT_LOG,
     "blacklist" => BLACKLIST,
     "auth_users" => AUTH_USERS,
@@ -76,9 +77,20 @@ pub(super) const BOOTSTRAP_TABLES: &[BootstrapTable] = bootstrap_tables![
     "metadata" => METADATA,
     "wal_tombstones" => WAL_TOMBSTONES,
     "tenant_group_marks" => super::tenant_group_marks::TENANT_GROUP_MARKS,
+    "tenant_group_restore_marks" => super::tenant_group_marks::TENANT_GROUP_RESTORE_MARKS,
     "calvin_applied" => super::calvin_applied::CALVIN_APPLIED,
+    "calvin_base" => super::calvin_base::CALVIN_BASE,
+    "calvin_sequencer_install" => super::calvin_base::CALVIN_SEQUENCER_INSTALL,
     "l2_cleanup_queue" => L2_CLEANUP_QUEUE,
     "pending_reclaim" => PENDING_RECLAIM,
+    // ── Metadata-group host state ──
+    "metadata_leases" => super::metadata_host::leases::METADATA_LEASES,
+    "metadata_drains" => super::metadata_host::drains::METADATA_DRAINS,
+    "metadata_host_scalars" => super::metadata_host::scalars::METADATA_HOST_SCALARS,
+    "pending_ddl" => super::metadata_host::ddl::PENDING_DDL,
+    "pending_history_compaction" => super::pending_history_compaction::PENDING_HISTORY_COMPACTION,
+    "crdt_compaction_points" => super::crdt_compaction_points::CRDT_COMPACTION_POINTS,
+    "pending_leave_cleanup" => super::pending_leave_cleanup::PENDING_LEAVE_CLEANUP,
     "column_stats" => COLUMN_STATS,
     "vector_model_metadata" => VECTOR_MODEL_METADATA,
     "vector_index_params" => VECTOR_INDEX_PARAMS,
@@ -121,6 +133,7 @@ pub(super) const BOOTSTRAP_TABLES: &[BootstrapTable] = bootstrap_tables![
     "alert_rules" => ALERT_RULES,
     "topics_ep" => TOPICS_EP,
     "topic_messages" => TOPIC_MESSAGES,
+    "topic_publish_marks" => super::topic_publish_marks::TOPIC_PUBLISH_MARKS,
     "streaming_mvs" => STREAMING_MVS,
     // ── Database catalog + quotas ──
     "databases" => DATABASES,
@@ -134,6 +147,12 @@ pub(super) const BOOTSTRAP_TABLES: &[BootstrapTable] = bootstrap_tables![
     "clone_tombstones" => CLONE_TOMBSTONES,
     "clone_kv_tombstones" => CLONE_KV_TOMBSTONES,
     "clone_lineage" => CLONE_LINEAGE,
+    "clone_source_drains" => super::clone_source_drains::CLONE_SOURCE_DRAINS,
+    // ── Cluster restore points ──
+    "restore_points" => super::restore_points::RESTORE_POINTS,
+    "cut_floors" => super::cut_floors::CUT_FLOORS,
+    // ── Scheduled backups ──
+    "backup_schedule_marks" => super::backup_schedule_marks::BACKUP_SCHEDULE_MARKS,
     "mirror_collection_map" => MIRROR_COLLECTION_MAP,
     "mirror_lag" => MIRROR_LAG,
     // ── Tenant relocation ──

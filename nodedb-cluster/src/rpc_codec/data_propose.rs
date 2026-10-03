@@ -35,7 +35,7 @@ pub struct DataProposeRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum ForwardedProposeRefusal {
     /// The node does not lead the target group. `leader_hint` names the
-    /// leader it knows, if any.
+    /// leader it knows, if any, at `leader_term`.
     NotLeader,
     /// A leadership transfer of the target group is in flight.
     LeadershipTransferInProgress,
@@ -50,6 +50,9 @@ pub struct DataProposeResponse {
     pub group_id: u64,
     pub log_index: u64,
     pub leader_hint: Option<u64>,
+    /// The refusing node's term, which `leader_hint` is known at. `0` on
+    /// success and on a refusal that is not `NotLeader`.
+    pub leader_term: u64,
     /// The typed reason of a refusal. `None` on success.
     pub refusal: Option<ForwardedProposeRefusal>,
     pub error_message: String,
@@ -62,6 +65,7 @@ impl DataProposeResponse {
             group_id,
             log_index,
             leader_hint: None,
+            leader_term: 0,
             refusal: None,
             error_message: String::new(),
         }
@@ -69,13 +73,15 @@ impl DataProposeResponse {
 
     /// The response for a proposal the leader refused with `error`.
     pub fn refused(error: &ClusterError) -> Self {
-        let (refusal, leader_hint) = match error {
-            ClusterError::Raft(nodedb_raft::RaftError::NotLeader { leader_hint }) => {
-                (ForwardedProposeRefusal::NotLeader, *leader_hint)
+        let (refusal, leader_hint, leader_term) = match error {
+            ClusterError::Raft(nodedb_raft::RaftError::NotLeader { leader_hint, term }) => {
+                (ForwardedProposeRefusal::NotLeader, *leader_hint, *term)
             }
-            ClusterError::Raft(nodedb_raft::RaftError::LeadershipTransferInProgress) => {
-                (ForwardedProposeRefusal::LeadershipTransferInProgress, None)
-            }
+            ClusterError::Raft(nodedb_raft::RaftError::LeadershipTransferInProgress) => (
+                ForwardedProposeRefusal::LeadershipTransferInProgress,
+                None,
+                0,
+            ),
             // A refusal with no retry contract. The forwarding node reads it
             // as a transport error carrying the leader's message.
             ClusterError::Raft(
@@ -125,14 +131,16 @@ impl DataProposeResponse {
             | ClusterError::SpatialGather(_)
             | ClusterError::Bm25Gather(_)
             | ClusterError::TsGather(_)
+            | ClusterError::ShufflePush(_)
             | ClusterError::RemoteUntyped { .. }
-            | ClusterError::ShardExecution { .. } => (ForwardedProposeRefusal::Failed, None),
+            | ClusterError::ShardExecution { .. } => (ForwardedProposeRefusal::Failed, None, 0),
         };
         Self {
             success: false,
             group_id: 0,
             log_index: 0,
             leader_hint,
+            leader_term,
             refusal: Some(refusal),
             error_message: error.to_string(),
         }
@@ -146,6 +154,7 @@ impl DataProposeResponse {
             Some(ForwardedProposeRefusal::NotLeader) => {
                 ClusterError::Raft(nodedb_raft::RaftError::NotLeader {
                     leader_hint: self.leader_hint,
+                    term: self.leader_term,
                 })
             }
             Some(ForwardedProposeRefusal::LeadershipTransferInProgress) => {
@@ -261,11 +270,13 @@ mod tests {
         let error =
             refusal_across_the_wire(ClusterError::Raft(nodedb_raft::RaftError::NotLeader {
                 leader_hint: Some(3),
+                term: 9,
             }));
         assert!(matches!(
             error,
             ClusterError::Raft(nodedb_raft::RaftError::NotLeader {
-                leader_hint: Some(3)
+                leader_hint: Some(3),
+                term: 9,
             })
         ));
     }

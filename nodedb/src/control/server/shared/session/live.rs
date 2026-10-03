@@ -2,7 +2,7 @@
 
 //! LIVE SELECT subscription methods on SessionStore.
 
-use crate::control::change_stream::{ChangeCursor, SequencedChangeEvent, Subscription};
+use crate::control::change_stream::{ChangeCursor, CursorStep, SequencedChangeEvent, Subscription};
 
 use super::connection::SessionId;
 use super::store::SessionStore;
@@ -15,36 +15,29 @@ const LIVE_RESET_REQUIRED_CONTINUITY: &str = "RESET_REQUIRED:continuity";
 pub struct LiveSubscription {
     pub channel: String,
     pub subscription: Subscription,
-    last_cursor: Option<ChangeCursor>,
+    cursor: ChangeCursor,
 }
 
 impl LiveSubscription {
     fn new(channel: String, subscription: Subscription) -> Self {
+        let cursor = subscription.start_cursor().clone();
         Self {
             channel,
             subscription,
-            last_cursor: None,
+            cursor,
         }
     }
 
-    /// Accept the first cursor, then strictly increasing cursors in its epoch.
-    /// A LIVE subscription filters the globally sequenced stream, so unrelated
-    /// publications create legitimate sequence gaps. Older same-epoch
-    /// duplicates are harmless queued overlap and are skipped.
+    /// Advance the cursor past a new event. A LIVE subscription filters the
+    /// stream, so gaps between the positions it sees are legitimate. An
+    /// event the cursor covers is queued overlap and is skipped. A gap in
+    /// this node's feed above the cursor requires a reset.
     fn accept(&mut self, event: SequencedChangeEvent) -> LiveCursorResult {
-        let cursor = event.cursor();
-        let Some(previous) = self.last_cursor else {
-            self.last_cursor = Some(cursor);
-            return LiveCursorResult::Deliver(event);
-        };
-        if !cursor.same_epoch(previous) {
-            return LiveCursorResult::Reset;
+        match self.cursor.accept(&event) {
+            CursorStep::Deliver => LiveCursorResult::Deliver(event),
+            CursorStep::Skip => LiveCursorResult::Skip,
+            CursorStep::Reset => LiveCursorResult::Reset,
         }
-        if cursor.sequence() <= previous.sequence() {
-            return LiveCursorResult::Skip;
-        }
-        self.last_cursor = Some(cursor);
-        LiveCursorResult::Deliver(event)
     }
 }
 
@@ -57,12 +50,12 @@ enum LiveCursorResult {
 /// The payload preserves the established `OPERATION:document_id` prefix.
 /// New clients can parse the appended `;cursor=<opaque ChangeCursor>` suffix
 /// to persist a precise delivery position without interpreting the token.
-fn live_payload(event: &SequencedChangeEvent) -> String {
+fn live_payload(event: &SequencedChangeEvent, cursor: &ChangeCursor) -> String {
     format!(
         "{}:{};cursor={}",
         event.operation.as_str(),
         event.document_id,
-        event.cursor()
+        cursor
     )
 }
 
@@ -103,8 +96,10 @@ impl SessionStore {
                         match live.subscription.try_recv_sequenced() {
                             Ok(event) => match live.accept(event) {
                                 LiveCursorResult::Deliver(event) => {
-                                    notifications
-                                        .push((live.channel.clone(), live_payload(&event)));
+                                    notifications.push((
+                                        live.channel.clone(),
+                                        live_payload(&event, &live.cursor),
+                                    ));
                                 }
                                 LiveCursorResult::Skip => {}
                                 LiveCursorResult::Reset => {
@@ -207,15 +202,20 @@ mod tests {
         store.add_live_subscription(addr, "live_orders".into(), sub);
 
         // Publish a matching event.
-        stream.publish(ChangeEvent {
-            lsn: Lsn::new(1),
-            tenant_id: TenantId::new(1),
-            collection: "orders".into(),
-            document_id: RowIdentity::from_user_key("o42"),
-            operation: ChangeOperation::Insert,
-            timestamp_ms: 0,
-            after: None,
-        });
+        stream.settle_entry(
+            1,
+            1,
+            DatabaseId::DEFAULT,
+            vec![ChangeEvent {
+                lsn: Lsn::new(1),
+                tenant_id: TenantId::new(1),
+                collection: "orders".into(),
+                document_id: RowIdentity::from_user_key("o42"),
+                operation: ChangeOperation::Insert,
+                timestamp_ms: 0,
+                after: None,
+            }],
+        );
 
         let notifications = store.drain_live_notifications(addr);
         assert_eq!(notifications.len(), 1);
@@ -240,16 +240,21 @@ mod tests {
         let sub = stream.subscribe(Some("orders".into()), None);
         store.add_live_subscription(addr, "live_orders".into(), sub);
 
-        // Publish event for a different collection — should be filtered out.
-        stream.publish(ChangeEvent {
-            lsn: Lsn::new(1),
-            tenant_id: TenantId::new(1),
-            collection: "users".into(),
-            document_id: RowIdentity::from_user_key("u1"),
-            operation: ChangeOperation::Update,
-            timestamp_ms: 0,
-            after: None,
-        });
+        // Publish event for a different collection — must be filtered out.
+        stream.settle_entry(
+            1,
+            1,
+            DatabaseId::DEFAULT,
+            vec![ChangeEvent {
+                lsn: Lsn::new(1),
+                tenant_id: TenantId::new(1),
+                collection: "users".into(),
+                document_id: RowIdentity::from_user_key("u1"),
+                operation: ChangeOperation::Update,
+                timestamp_ms: 0,
+                after: None,
+            }],
+        );
 
         let notifications = store.drain_live_notifications(addr);
         assert!(notifications.is_empty());
@@ -259,7 +264,7 @@ mod tests {
     fn live_subscription_no_session_returns_empty() {
         let store = SessionStore::new();
         let addr: std::net::SocketAddr = "127.0.0.1:5005".parse().unwrap();
-        // No session created — should return empty, not panic.
+        // No session created — must return empty, not panic.
         let notifications = store.drain_live_notifications(addr);
         assert!(notifications.is_empty());
         assert!(!store.has_live_subscriptions(addr));
@@ -281,13 +286,15 @@ mod tests {
         );
         sessions.add_live_subscription(session, "live_orders".into(), subscription);
 
-        for (database_id, lsn, document_id) in [
-            (DatabaseId::DEFAULT, Lsn::new(1), "default-order"),
-            (selected_database, Lsn::new(2), "selected-order"),
+        for (index, database_id, lsn, document_id) in [
+            (1, DatabaseId::DEFAULT, Lsn::new(1), "default-order"),
+            (2, selected_database, Lsn::new(2), "selected-order"),
         ] {
-            stream.publish_in_database(
+            stream.settle_entry(
+                1,
+                index,
                 database_id,
-                ChangeEvent {
+                vec![ChangeEvent {
                     lsn,
                     tenant_id: TenantId::new(1),
                     collection: "orders".into(),
@@ -295,7 +302,7 @@ mod tests {
                     operation: ChangeOperation::Insert,
                     timestamp_ms: 1,
                     after: None,
-                },
+                }],
             );
         }
 
@@ -314,7 +321,7 @@ mod tests {
                         )
                         .expect("selected event cursor")
                         .events[0]
-                        .cursor()
+                        .cursor
                         .to_string(),
             )]
         );
@@ -334,16 +341,24 @@ mod tests {
             stream.subscribe(Some("orders".into()), Some(TenantId::new(1))),
         );
 
-        for (lsn, document_id) in [(Lsn::new(1), "dropped-order"), (Lsn::new(2), "gap-order")] {
-            stream.publish(ChangeEvent {
-                lsn,
-                tenant_id: TenantId::new(1),
-                collection: "orders".into(),
-                document_id: RowIdentity::from_user_key(document_id),
-                operation: ChangeOperation::Insert,
-                timestamp_ms: 1,
-                after: None,
-            });
+        for (index, lsn, document_id) in [
+            (1, Lsn::new(1), "dropped-order"),
+            (2, Lsn::new(2), "gap-order"),
+        ] {
+            stream.settle_entry(
+                1,
+                index,
+                DatabaseId::DEFAULT,
+                vec![ChangeEvent {
+                    lsn,
+                    tenant_id: TenantId::new(1),
+                    collection: "orders".into(),
+                    document_id: RowIdentity::from_user_key(document_id),
+                    operation: ChangeOperation::Insert,
+                    timestamp_ms: 1,
+                    after: None,
+                }],
+            );
         }
 
         assert_eq!(
@@ -353,15 +368,20 @@ mod tests {
         assert!(!sessions.has_live_subscriptions(session));
         assert_eq!(stream.subscriber_count(), 0);
 
-        stream.publish(ChangeEvent {
-            lsn: Lsn::new(3),
-            tenant_id: TenantId::new(1),
-            collection: "orders".into(),
-            document_id: RowIdentity::from_user_key("later-order"),
-            operation: ChangeOperation::Insert,
-            timestamp_ms: 1,
-            after: None,
-        });
+        stream.settle_entry(
+            1,
+            3,
+            DatabaseId::DEFAULT,
+            vec![ChangeEvent {
+                lsn: Lsn::new(3),
+                tenant_id: TenantId::new(1),
+                collection: "orders".into(),
+                document_id: RowIdentity::from_user_key("later-order"),
+                operation: ChangeOperation::Insert,
+                timestamp_ms: 1,
+                after: None,
+            }],
+        );
         assert!(sessions.drain_live_notifications(session).is_empty());
     }
 
@@ -385,26 +405,36 @@ mod tests {
             healthy_stream.subscribe(Some("orders".into()), Some(TenantId::new(1))),
         );
 
-        for lsn in [Lsn::new(1), Lsn::new(2)] {
-            lagged_stream.publish(ChangeEvent {
-                lsn,
+        for index in [1, 2] {
+            lagged_stream.settle_entry(
+                1,
+                index,
+                DatabaseId::DEFAULT,
+                vec![ChangeEvent {
+                    lsn: Lsn::new(index),
+                    tenant_id: TenantId::new(1),
+                    collection: "orders".into(),
+                    document_id: RowIdentity::from_user_key("lagged-order"),
+                    operation: ChangeOperation::Insert,
+                    timestamp_ms: 1,
+                    after: None,
+                }],
+            );
+        }
+        healthy_stream.settle_entry(
+            1,
+            1,
+            DatabaseId::DEFAULT,
+            vec![ChangeEvent {
+                lsn: Lsn::new(3),
                 tenant_id: TenantId::new(1),
                 collection: "orders".into(),
-                document_id: RowIdentity::from_user_key("lagged-order"),
+                document_id: RowIdentity::from_user_key("healthy-order"),
                 operation: ChangeOperation::Insert,
                 timestamp_ms: 1,
                 after: None,
-            });
-        }
-        healthy_stream.publish(ChangeEvent {
-            lsn: Lsn::new(3),
-            tenant_id: TenantId::new(1),
-            collection: "orders".into(),
-            document_id: RowIdentity::from_user_key("healthy-order"),
-            operation: ChangeOperation::Insert,
-            timestamp_ms: 1,
-            after: None,
-        });
+            }],
+        );
 
         assert_eq!(
             sessions.drain_live_notifications(session),
@@ -422,7 +452,7 @@ mod tests {
                             )
                             .expect("healthy event cursor")
                             .events[0]
-                            .cursor()
+                            .cursor
                             .to_string(),
                 ),
             ]
@@ -433,13 +463,18 @@ mod tests {
     }
 
     #[test]
-    fn filtered_sequence_gaps_are_accepted_but_epoch_rotation_resets() {
+    fn filtered_position_gaps_are_accepted_but_a_feed_gap_resets() {
+        use crate::control::change_stream::ChangePartition;
+        use crate::event::cdc::CdcOffset;
+
         let stream = ChangeStream::new(8);
         let subscription = stream.subscribe(Some("orders".into()), Some(TenantId::new(1)));
         let mut live = LiveSubscription::new("live_orders".into(), subscription);
-        let event = |cursor| {
+        let event = |index, floor| {
             SequencedChangeEvent::new(
-                cursor,
+                ChangePartition::Group(2),
+                CdcOffset::data_event(0, index, 1),
+                floor,
                 DatabaseId::DEFAULT,
                 ChangeEvent {
                     lsn: Lsn::new(1),
@@ -453,24 +488,19 @@ mod tests {
             )
         };
         assert!(matches!(
-            live.accept(event(ChangeCursor::new(7, 1))),
+            live.accept(event(7, CdcOffset::ZERO)),
             LiveCursorResult::Deliver(_)
         ));
         assert!(matches!(
-            live.accept(event(ChangeCursor::new(7, 3))),
-            LiveCursorResult::Deliver(_)
-        ));
-
-        let mut rotated = LiveSubscription::new(
-            "rotated".into(),
-            stream.subscribe(Some("orders".into()), Some(TenantId::new(1))),
-        );
-        assert!(matches!(
-            rotated.accept(event(ChangeCursor::new(7, 1))),
+            live.accept(event(9, CdcOffset::ZERO)),
             LiveCursorResult::Deliver(_)
         ));
         assert!(matches!(
-            rotated.accept(event(ChangeCursor::new(8, 2))),
+            live.accept(event(9, CdcOffset::ZERO)),
+            LiveCursorResult::Skip
+        ));
+        assert!(matches!(
+            live.accept(event(20, CdcOffset::whole_index(15))),
             LiveCursorResult::Reset
         ));
     }
@@ -491,9 +521,11 @@ mod tests {
         assert_eq!(stream.subscriber_count(), 1);
 
         sessions.reset_for_database_switch(session, database_b);
-        stream.publish_in_database(
+        stream.settle_entry(
+            1,
+            1,
             database_a,
-            ChangeEvent {
+            vec![ChangeEvent {
                 lsn: Lsn::new(3),
                 tenant_id: TenantId::new(1),
                 collection: "orders".into(),
@@ -501,7 +533,7 @@ mod tests {
                 operation: ChangeOperation::Insert,
                 timestamp_ms: 1,
                 after: None,
-            },
+            }],
         );
 
         assert_eq!(stream.subscriber_count(), 0);

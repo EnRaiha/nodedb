@@ -122,6 +122,31 @@ impl TestNode {
         Self::spawn_with_transport(node_id, transport, seed_nodes).await
     }
 
+    /// Like [`TestNode::spawn`], but with the `JoinRequest` build identity
+    /// overridden to `wire_build_id` instead of the real
+    /// `nodedb_types::wire_version::WIRE_BUILD_ID`. Used to exercise
+    /// `handle_join_request`'s build-id rejection path end to end: the
+    /// joiner's `start_cluster` call is expected to return `Err` once the
+    /// seed rejects the mismatched build.
+    pub async fn spawn_with_wire_build_id(
+        node_id: u64,
+        seed_nodes: Vec<SocketAddr>,
+        wire_build_id: String,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let transport = Arc::new(test_transport(node_id)?);
+        let data_dir = tempfile::tempdir()?;
+        let data_dir_path = data_dir.path().to_path_buf();
+        Self::spawn_inner(
+            node_id,
+            transport,
+            seed_nodes,
+            data_dir_path,
+            Some(data_dir),
+            wire_build_id,
+        )
+        .await
+    }
+
     /// Use a pre-bound transport so the caller knows the listen
     /// address before start_cluster runs. Fresh temp data dir.
     pub async fn spawn_with_transport(
@@ -137,6 +162,7 @@ impl TestNode {
             seed_nodes,
             data_dir_path,
             Some(data_dir),
+            nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
         )
         .await
     }
@@ -155,7 +181,15 @@ impl TestNode {
         seed_nodes: Vec<SocketAddr>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let transport = Arc::new(test_transport(node_id)?);
-        Self::spawn_inner(node_id, transport, seed_nodes, data_dir.to_path_buf(), None).await
+        Self::spawn_inner(
+            node_id,
+            transport,
+            seed_nodes,
+            data_dir.to_path_buf(),
+            None,
+            nodedb_types::wire_version::WIRE_BUILD_ID.to_owned(),
+        )
+        .await
     }
 
     pub async fn spawn_inner(
@@ -164,6 +198,7 @@ impl TestNode {
         seed_nodes: Vec<SocketAddr>,
         data_dir_path: PathBuf,
         owned_data_dir: Option<TempDir>,
+        wire_build_id: String,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let catalog = Arc::new(ClusterCatalog::open(&data_dir_path.join("cluster.redb"))?);
         let listen_addr = transport.local_addr();
@@ -207,6 +242,7 @@ impl TestNode {
             install_snapshot_chunk_bytes: 4 * 1024 * 1024,
             orphan_partial_max_age_secs: 300,
             log_compaction_threshold: None,
+            wire_build_id,
         };
 
         let lifecycle = ClusterLifecycleTracker::new();

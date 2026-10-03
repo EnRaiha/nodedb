@@ -2,9 +2,8 @@
 
 //! RESP gateway dispatch helpers.
 //!
-//! Routes KV operations through `Gateway::execute_response` when the gateway is
-//! available (cluster-aware routing), falling back to direct local SPSC
-//! dispatch on single-node boot.
+//! Routes KV operations through `Gateway::execute_response`, which sends each
+//! one to the node that owns its vShard.
 //!
 //! All helpers return `crate::Result<Response>` so the existing sub-handler
 //! code (`handler_kv`, `handler_hash`, `handler_sorted`) is unchanged.
@@ -16,7 +15,6 @@ use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::ClientRequestScope;
-use crate::control::server::dispatch_utils;
 use crate::control::server::shared::clone_write::CloneCheckedOutcome;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
@@ -26,13 +24,10 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::session::RespSession;
 
-/// Dispatch a read-only KV operation.
+/// Dispatch a read-only KV operation through the gateway.
 ///
-/// Routes through the gateway when available (cluster-aware routing), falling
-/// back to direct local SPSC dispatch on single-node boot.
-///
-/// Bridge/dispatch errors are mapped to `Error::Bridge` with a `BUSY` detail
-/// so the RESP handler can return `-BUSY` to the Redis client.
+/// A full dispatch queue reaches the Redis client as `-BUSY`
+/// (`GatewayErrorMap::to_resp`), which Redis clients retry.
 pub(super) async fn dispatch_kv(
     state: &SharedState,
     session: &RespSession,
@@ -66,24 +61,7 @@ pub(super) async fn dispatch_kv(
         CloneCheckedOutcome::Handled(resp) => return Ok(resp),
         CloneCheckedOutcome::Proceed(checked) => checked,
     };
-    let result = match state.gateway.get() {
-        Some(gw) => {
-            let gw_ctx = QueryContext {
-                tenant_id: session.tenant_id,
-                trace_id: TraceId::generate(),
-                database_id: checked.database_id(),
-                txn_id: None,
-            };
-            gw.execute_response(&gw_ctx, checked)
-                .await
-                .map_err(|e| crate::Error::Bridge {
-                    detail: GatewayErrorMap::to_resp(&e),
-                })
-        }
-        None => dispatch_utils::dispatch_authorized_to_data_plane(state, checked, TraceId::ZERO)
-            .await
-            .map_err(map_busy_error),
-    };
+    let result = execute_through_gateway(state, session, checked).await;
     if result.is_ok()
         && let Some(info) = &plan_metering_info
     {
@@ -92,13 +70,10 @@ pub(super) async fn dispatch_kv(
     result
 }
 
-/// Dispatch a KV write operation through the gateway or the local Data Plane.
+/// Dispatch a KV write operation through the gateway.
 ///
-/// Routes through the gateway when available (cluster-aware routing) — where the
-/// gateway owns WAL durability on the target node — falling back to direct local
-/// SPSC dispatch on single-node boot. On the local path the WAL append is
-/// performed inside the dispatch core, under the write-admission guard and just
-/// before the enqueue, so LSN order matches apply order.
+/// The gateway routes the write to the node that owns its vShard and owns WAL
+/// durability there.
 pub(super) async fn dispatch_kv_write(
     state: &SharedState,
     session: &RespSession,
@@ -127,30 +102,38 @@ pub(super) async fn dispatch_kv_write(
         CloneCheckedOutcome::Handled(resp) => return Ok(resp),
         CloneCheckedOutcome::Proceed(checked) => checked,
     };
-    let result = match state.gateway.get() {
-        Some(gw) => {
-            let gw_ctx = QueryContext {
-                tenant_id: session.tenant_id,
-                trace_id: TraceId::generate(),
-                database_id: checked.database_id(),
-                txn_id: None,
-            };
-            gw.execute_response(&gw_ctx, checked)
-                .await
-                .map_err(|e| crate::Error::Bridge {
-                    detail: GatewayErrorMap::to_resp(&e),
-                })
-        }
-        None => dispatch_utils::dispatch_authorized_durable_write(state, checked, TraceId::ZERO)
-            .await
-            .map_err(map_busy_error),
-    };
+    let result = execute_through_gateway(state, session, checked).await;
     if result.is_ok()
         && let Some(info) = &plan_metering_info
     {
         meter_resp_dispatch(state, session, database_id, info);
     }
     result
+}
+
+/// Run one checked RESP task through the gateway.
+///
+/// A gateway error reaches the client as `Error::Bridge` carrying its RESP
+/// rendering.
+async fn execute_through_gateway(
+    state: &SharedState,
+    session: &RespSession,
+    checked: crate::control::server::shared::clone_write::CloneCheckedTask,
+) -> crate::Result<Response> {
+    let gateway = state.installed_gateway()?;
+    let gw_ctx = QueryContext {
+        tenant_id: session.tenant_id,
+        trace_id: TraceId::generate(),
+        database_id: checked.database_id(),
+        txn_id: None,
+        linearizable: true,
+    };
+    gateway
+        .execute_response(&gw_ctx, checked)
+        .await
+        .map_err(|e| crate::Error::Bridge {
+            detail: GatewayErrorMap::to_resp(&e),
+        })
 }
 
 /// Refuse the command when a covering scope's hard quota is already spent.
@@ -262,7 +245,7 @@ fn authorize_resp_task(
 
     // Reads whose results column redaction cannot rewrite (an aggregate over a
     // redacted column, a graph traversal) are refused on the same seam, so the
-    // capability is never minted for a plan that would leak them.
+    // capability is never minted for a plan that will leak them.
     crate::control::planner::redaction_refusal::refuse_unredactable_plan(
         &plan,
         session.tenant_id,
@@ -339,30 +322,13 @@ fn resp_auth_scope<'a, 'p>(
     ClientRequestScope::for_database(identity, stores, database_id, peer_addr)
 }
 
-/// Map bridge/dispatch errors to a BUSY error for Redis client compatibility.
-///
-/// When the SPSC ring buffer is full or the Data Plane core is overloaded,
-/// the Redis client receives `-BUSY NodeDB is processing requests, retry later`
-/// which Redis clients handle with automatic retry (same as Redis Cluster BUSY).
-fn map_busy_error(e: crate::Error) -> crate::Error {
-    match &e {
-        crate::Error::Bridge { .. }
-        | crate::Error::Dispatch { .. }
-        | crate::Error::DispatchCapacity { .. } => crate::Error::Bridge {
-            detail: "BUSY NodeDB is processing requests, retry later".into(),
-        },
-        _ => e,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::bridge::envelope::{Payload, Status};
     use crate::control::security::identity::{AuthMethod, DatabaseSet, Role};
     use crate::control::security::metering::quota::QuotaManager;
     use crate::control::security::request_scope::AuthStores;
     use crate::control::security::scope::grant::ScopeGrantStore;
-    use crate::types::{Lsn, TenantId};
+    use crate::types::TenantId;
 
     use super::*;
 
@@ -472,73 +438,13 @@ mod tests {
         );
     }
 
-    /// Returns state plus the fake Data-Plane data-side and the backing
-    /// `TempDir` guard — the caller must keep the guard alive for as long as
-    /// `state` is in use.
-    fn metering_fixture() -> (
-        Arc<SharedState>,
-        crate::bridge::dispatch::CoreChannelDataSide,
-        tempfile::TempDir,
-    ) {
-        use crate::bridge::dispatch::Dispatcher;
-        use crate::wal::WalManager;
-
-        let dir = tempfile::tempdir().expect("create test directory");
-        let wal = Arc::new(
-            WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open test WAL"),
-        );
-        let (dispatcher, mut sides) = Dispatcher::new(1, 64);
-        let side = sides.pop().expect("one data side");
-        let state = SharedState::new(dispatcher, wal).expect("construct shared state");
-        (state, side, dir)
-    }
-
-    /// `metering_config` has no live-mutation path by design — reach in via
-    /// `Arc::get_mut` while the test is still the sole owner of the freshly
-    /// constructed state, before any clone escapes into a spawned responder
-    /// task. Same pattern as `metering::tests::enable_metering`.
-    fn enable_metering(state: &mut Arc<SharedState>) {
-        Arc::get_mut(state)
-            .expect("sole owner in test")
-            .metering_config
-            .enabled = true;
-    }
-
-    /// Fake Data-Plane responder: pops the one dispatched request off `side`
-    /// and answers it `Ok` with an empty payload, so `dispatch_kv` /
-    /// `dispatch_kv_write` complete their round trip without a real Data-Plane
-    /// core (mirrors the responder in `dispatch_utils::dispatch::tests`).
-    async fn respond_ok_once(
-        mut side: crate::bridge::dispatch::CoreChannelDataSide,
-        state: Arc<SharedState>,
-    ) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut handled = false;
-        while !handled && std::time::Instant::now() < deadline {
-            if let Ok(request) = side.request_rx.try_pop() {
-                side.response_tx
-                    .try_push(crate::bridge::dispatch::BridgeResponse {
-                        inner: Response {
-                            request_id: request.inner.request_id,
-                            status: Status::Ok,
-                            attempt: 1,
-                            partial: false,
-                            payload: Payload::empty(),
-                            watermark_lsn: Lsn::new(0),
-                            error_code: None,
-                            read_set_valid: None,
-                            read_version_lsn: Lsn::ZERO,
-                            write_set: Vec::new(),
-                        },
-                    })
-                    .expect("fake data-plane response queue has capacity");
-                handled = true;
-            }
-            state.poll_and_route_responses();
-            tokio::task::yield_now().await;
-        }
-        assert!(handled, "fake data plane received the dispatched request");
-        state.poll_and_route_responses();
+    /// A booted one-node cluster with metering on. `metering_config` has no
+    /// live-mutation path, so it is set before the state is shared.
+    async fn metered_cluster() -> crate::control::cluster::test_one_node::OneNodeCluster {
+        crate::control::cluster::test_one_node::boot_with(|state| {
+            state.metering_config.enabled = true;
+        })
+        .await
     }
 
     fn resp_session_with_identity(identity: AuthenticatedIdentity) -> RespSession {
@@ -574,19 +480,16 @@ mod tests {
 
     /// A successful RESP KV dispatch records exactly one usage event,
     /// attributed to the RESP session's selected collection.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn successful_kv_dispatch_records_one_event_for_session_collection() {
-        let (mut state, side, _dir) = metering_fixture();
-        enable_metering(&mut state);
+        let cluster = metered_cluster().await;
         let session = resp_session_with_identity(regular_identity(1));
         let plan = kv_get_plan(&session.collection);
 
-        let responder = tokio::spawn(respond_ok_once(side, Arc::clone(&state)));
-        let result = dispatch_kv(&state, &session, plan).await;
-        responder.await.expect("responder completes");
+        let result = dispatch_kv(&cluster.state, &session, plan).await;
 
-        assert!(result.is_ok(), "RESP KV dispatch must succeed");
-        let events = state.usage_counter.drain();
+        assert!(result.is_ok(), "RESP KV dispatch must succeed: {result:?}");
+        let events = cluster.state.usage_counter.drain();
         assert_eq!(
             events.len(),
             1,
@@ -594,15 +497,16 @@ mod tests {
         );
         assert_eq!(events[0].collection, "widgets");
         assert_eq!(events[0].engine, "kv");
+        cluster.shutdown().await;
     }
 
     /// A denied RESP dispatch — rejected before reaching the Data Plane —
     /// performed no billable work and must record nothing.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn denied_kv_dispatch_records_nothing() {
-        let (mut state, _side, _dir) = metering_fixture();
-        enable_metering(&mut state);
-        state
+        let cluster = metered_cluster().await;
+        cluster
+            .state
             .blacklist
             .blacklist_ip("10.0.0.0/8", "test ip ban", "admin", 0)
             .expect("blacklist CIDR range");
@@ -610,29 +514,32 @@ mod tests {
         session.peer_addr = "10.1.2.3:54321".into();
         let plan = kv_get_plan(&session.collection);
 
-        let result = dispatch_kv(&state, &session, plan).await;
+        let result = dispatch_kv(&cluster.state, &session, plan).await;
 
         assert!(result.is_err(), "a blacklisted peer must be denied");
-        assert_eq!(state.usage_counter.total_tokens(), 0);
+        assert_eq!(cluster.state.usage_counter.total_tokens(), 0);
+        cluster.shutdown().await;
     }
 
     /// Metering disabled (the default) records nothing on a successful RESP
     /// dispatch — proves this change is inert for the existing RESP suite.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn metering_disabled_by_default_records_nothing_on_resp_success() {
-        let (state, side, _dir) = metering_fixture();
-        assert!(!state.metering_config.enabled, "default config is disabled");
+        let cluster = crate::control::cluster::test_one_node::boot().await;
+        assert!(
+            !cluster.state.metering_config.enabled,
+            "default config is disabled"
+        );
         let session = resp_session_with_identity(regular_identity(3));
         let plan = kv_get_plan(&session.collection);
 
-        let responder = tokio::spawn(respond_ok_once(side, Arc::clone(&state)));
-        let result = dispatch_kv(&state, &session, plan).await;
-        responder.await.expect("responder completes");
+        let result = dispatch_kv(&cluster.state, &session, plan).await;
 
         assert!(
             result.is_ok(),
-            "dispatch must still succeed with metering disabled"
+            "dispatch must still succeed with metering disabled: {result:?}"
         );
-        assert_eq!(state.usage_counter.total_tokens(), 0);
+        assert_eq!(cluster.state.usage_counter.total_tokens(), 0);
+        cluster.shutdown().await;
     }
 }

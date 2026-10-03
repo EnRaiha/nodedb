@@ -49,11 +49,6 @@ pub(super) struct TuningOverrides {
     /// Overrides `[tuning.vector] seal_threshold` so a test can observe HNSW
     /// segment builds on a few hundred vectors.
     pub(super) vector_seal_threshold: Option<usize>,
-    /// Sets `[server] single_node_calvin = false` so the server boots with no
-    /// cluster topology. The planner then emits the single-node plan forms
-    /// (`ArrayOp::{Put, Delete, Slice, ...}`) instead of the `ClusterArrayOp`
-    /// routing wrappers a Calvin-backed node plans.
-    pub(super) standalone: bool,
 }
 
 impl TuningOverrides {
@@ -101,14 +96,6 @@ impl TuningOverrides {
             ..Self::default()
         }
     }
-
-    /// Boot without the single-node Calvin stack (no cluster topology).
-    pub(super) fn standalone() -> Self {
-        Self {
-            standalone: true,
-            ..Self::default()
-        }
-    }
 }
 
 /// Write `nodedb.toml` into `dir` and return its path.
@@ -129,9 +116,6 @@ pub(super) fn write_config(dir: &Path, auth_mode: AuthMode, tuning: TuningOverri
          password_expiry_days = 0\n\
          audit_retention_days = 0\n"
     );
-    if tuning.standalone {
-        toml.push_str("\n[server]\nsingle_node_calvin = false\n");
-    }
     // A test's own client connections are still open at shutdown. The
     // production drain outlives the harness's 20s SIGTERM patience, so the
     // server would be force-killed instead of exiting gracefully.
@@ -161,6 +145,10 @@ pub(super) fn write_config(dir: &Path, auth_mode: AuthMode, tuning: TuningOverri
         "\n[backup_encryption]\nkey_path = {}\n",
         toml_quote(&write_backup_kek(dir))
     ));
+    toml.push_str(&format!(
+        "\n[backup_storage]\nlocal_root = {}\n",
+        toml_quote(&backup_root(dir))
+    ));
     let path = dir.join("nodedb.toml");
     std::fs::write(&path, toml).expect("write test server config file");
     path
@@ -175,6 +163,25 @@ fn write_backup_kek(dir: &Path) -> PathBuf {
     let path = dir.join("backup.key");
     std::fs::write(&path, TEST_BACKUP_KEK).expect("write backup key file");
     path
+}
+
+/// The directory `file://` backup URIs of this server resolve inside.
+pub(crate) fn backup_root(dir: &Path) -> PathBuf {
+    let path = dir.join("backups");
+    std::fs::create_dir_all(&path).expect("create backup root");
+    path
+}
+
+impl super::TestServer {
+    /// The `[backup_storage] local_root` of this server.
+    pub fn backup_root(&self) -> PathBuf {
+        self._dir.path().join("backups")
+    }
+
+    /// A `file://` URI of `name` inside this server's backup root.
+    pub fn backup_uri(&self, name: &str) -> String {
+        format!("file://{}/{name}", self.backup_root().display())
+    }
 }
 
 /// Render a path as a TOML string. Temp dir names come from the OS, so do not

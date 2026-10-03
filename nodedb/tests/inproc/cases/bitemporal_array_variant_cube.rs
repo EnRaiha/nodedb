@@ -117,7 +117,7 @@ fn variant_cell(
     ArrayPutCell {
         coord: coord(sample_id, 1, 0),
         attrs: vec![CellValue::Int64(classification)],
-        surrogate: Surrogate::ZERO,
+        surrogate: Surrogate::new(sample_id as u32 + 1),
         system_from_ms,
         valid_from_ms,
         valid_until_ms: OPEN_UPPER,

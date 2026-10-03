@@ -10,6 +10,7 @@
 //! detector without touching its logic.
 
 pub mod probe_round;
+mod round_slot;
 pub mod runner;
 pub mod scheduler;
 pub mod suspicion;

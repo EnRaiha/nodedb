@@ -53,7 +53,161 @@ pub(in crate::data::executor) struct NonbitemporalUpdateReindex<'a> {
     pub new_doc: &'a serde_json::Value,
 }
 
+/// Inputs for [`CoreLoop::update_body_in_txn`].
+pub(in crate::data::executor) struct UpdateBody<'a> {
+    pub config_key: &'a (crate::types::DatabaseId, crate::types::TenantId, String),
+    pub database_id: u64,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub storage_key: &'a crate::engine::document::store::StorageKey,
+    /// The row as stored before the update.
+    pub current_bytes: &'a [u8],
+    /// The row as it will be stored.
+    pub updated_bytes: &'a [u8],
+    /// The system time of the new version on a bitemporal collection, `None`
+    /// on any other.
+    pub bitemporal_sys_from_ms: Option<i64>,
+}
+
 impl CoreLoop {
+    /// Write a row's post-update body within `txn`, with the secondary-index
+    /// diff between its two images. Every update of a stored row lands
+    /// through here, so no path writes a body its secondary index still
+    /// describes by the old value. Does NOT commit.
+    ///
+    /// A bitemporal collection appends a version valid for all time at the
+    /// given system time, and diffs the versioned index. Any other collection
+    /// overwrites the body and diffs the plain `INDEXES` table. A collection
+    /// with index paths decodes both images by its storage mode, and an image
+    /// that does not decode fails the write: the body never lands without its
+    /// diff.
+    ///
+    /// Returns the `(field, value)` tuples the diff touched. The caller
+    /// publishes them with `note_index_write_values` once its commit succeeds.
+    pub(in crate::data::executor) fn update_body_in_txn(
+        &mut self,
+        txn: &WriteTransaction,
+        p: UpdateBody<'_>,
+    ) -> crate::Result<Vec<(String, String)>> {
+        match p.bitemporal_sys_from_ms {
+            Some(sys_from_ms) => self.bitemporal_update_body_in_txn(txn, &p, sys_from_ms),
+            None => self.plain_update_body_in_txn(txn, &p),
+        }
+    }
+
+    fn bitemporal_update_body_in_txn(
+        &mut self,
+        txn: &WriteTransaction,
+        p: &UpdateBody<'_>,
+        sys_from_ms: i64,
+    ) -> crate::Result<Vec<(String, String)>> {
+        let Some(cfg) = self.doc_configs.get(p.config_key) else {
+            // An unregistered collection has no index paths to maintain.
+            self.sparse.versioned_put_in_txn(
+                txn,
+                VersionedPut {
+                    database_id: p.database_id,
+                    tenant: p.tid,
+                    coll: p.collection,
+                    doc_id: p.storage_key,
+                    sys_from_ms,
+                    valid_from_ms: i64::MIN,
+                    valid_until_ms: i64::MAX,
+                    body: p.updated_bytes,
+                },
+            )?;
+            return Ok(Vec::new());
+        };
+        let index_paths = cfg.index_paths.clone();
+        let images = self
+            .decode_stored_document(cfg, p.current_bytes)
+            .and_then(|old| {
+                self.decode_stored_document(cfg, p.updated_bytes)
+                    .map(|new| (old, new))
+            });
+        let (old_doc, new_doc) = images.map_err(|e| crate::Error::Storage {
+            engine: "sparse".into(),
+            detail: format!(
+                "bitemporal update: document failed to decode for versioned-index diff \
+                 (collection {}, id {}): {e}",
+                p.collection, p.storage_key
+            ),
+        })?;
+        self.bitemporal_update_reindex(
+            txn,
+            BitemporalUpdateReindex {
+                database_id: p.database_id,
+                tid: p.tid,
+                collection: p.collection,
+                doc_id: p.storage_key,
+                sys_from_ms,
+                valid_from_ms: i64::MIN,
+                valid_until_ms: i64::MAX,
+                new_body: p.updated_bytes,
+                index_paths: &index_paths,
+                old_doc: Some(&old_doc),
+                new_doc: &new_doc,
+            },
+        )
+    }
+
+    fn plain_update_body_in_txn(
+        &mut self,
+        txn: &WriteTransaction,
+        p: &UpdateBody<'_>,
+    ) -> crate::Result<Vec<(String, String)>> {
+        let index_paths: Vec<IndexPath> = self
+            .doc_configs
+            .get(p.config_key)
+            .map(|c| c.index_paths.clone())
+            .unwrap_or_default();
+        if index_paths.is_empty() {
+            return self
+                .sparse
+                .put_in_txn(
+                    txn,
+                    p.database_id,
+                    p.tid,
+                    p.collection,
+                    p.storage_key,
+                    p.updated_bytes,
+                )
+                .map(|_prior| Vec::new());
+        }
+        let images = match self.doc_configs.get(p.config_key) {
+            Some(cfg) => {
+                let old = self.decode_stored_document(cfg, p.current_bytes);
+                let new = self.decode_stored_document(cfg, p.updated_bytes);
+                old.and_then(|o| new.map(|n| (o, n)))
+            }
+            None => Err(crate::Error::Storage {
+                engine: "sparse".into(),
+                detail: "collection has index paths but no registered config".into(),
+            }),
+        };
+        let (old_doc, new_doc) = images.map_err(|e| crate::Error::Storage {
+            engine: "sparse".into(),
+            detail: format!(
+                "non-bitemporal update: document failed to decode for secondary-index diff \
+                 (collection {}, id {}): {e}",
+                p.collection, p.storage_key
+            ),
+        })?;
+        self.nonbitemporal_update_reindex(
+            txn,
+            NonbitemporalUpdateReindex {
+                database_id: p.database_id,
+                tid: p.tid,
+                collection: p.collection,
+                storage_key: p.storage_key,
+                new_body: p.updated_bytes,
+                index_paths: &index_paths,
+                old_doc: &old_doc,
+                new_doc: &new_doc,
+            },
+        )
+    }
+
     /// Extract the indexed values a document contributes for one path, honoring
     /// the path's partial predicate and case-folding — matching the put-time
     /// semantics in `apply_point_put`.
@@ -168,7 +322,8 @@ impl CoreLoop {
     /// `INDEXES` secondary index within an externally-owned WriteTransaction.
     /// Does NOT commit.
     ///
-    /// The autocommit bulk-UPDATE path uses this instead of the
+    /// The bulk-UPDATE path and [`Self::update_body_in_txn`] use this
+    /// instead of the
     /// self-committing [`SparseEngine::put`](crate::engine::sparse::SparseEngine::put):
     /// the primary row and the secondary-index SET diff land in ONE redb
     /// transaction, closing the crash window in which the index would still

@@ -135,7 +135,8 @@ impl From<ClusterError> for ShardErrorWire {
             | ClusterError::VectorGather(_)
             | ClusterError::SpatialGather(_)
             | ClusterError::Bm25Gather(_)
-            | ClusterError::TsGather(_)) => Self::Untyped {
+            | ClusterError::TsGather(_)
+            | ClusterError::ShufflePush(_)) => Self::Untyped {
                 detail: other.to_string(),
             },
         }

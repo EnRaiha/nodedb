@@ -53,7 +53,7 @@ pub async fn drop_topic(
 
     // Enumerate every durable and runtime group before changing either store.
     // A catalog-read failure is fatal: reporting success without identifying a
-    // legacy group would let it attach to a recreated topic.
+    // legacy group will let it attach to a recreated topic.
     let mut group_names = std::collections::BTreeSet::new();
     for stream in [&buffer_key, &name] {
         for group in state
@@ -89,7 +89,7 @@ pub async fn drop_topic(
     // The offsets live in a separate redb database. Commit their complete
     // cleanup first; any failure leaves the catalog topic and groups intact and
     // returns an error, so DROP TOPIC can never claim success with cursors that
-    // could revive on a recreate.
+    // can revive on a recreate.
     let offset_groups: Vec<(String, String)> = group_names
         .iter()
         .flat_map(|group| {
@@ -107,7 +107,7 @@ pub async fn drop_topic(
     // Definition, retained messages, and both consumer-group identities share
     // one catalog transaction, and the registry teardown rides the same entry
     // to every node. There is no best-effort path after this point.
-    super::replicate::propose_delete(state, database_id, tenant_id, &name)?;
+    super::replicate::propose_delete(state, database_id, tenant_id, &name).await?;
     drop(group_guards);
 
     state.audit_record(

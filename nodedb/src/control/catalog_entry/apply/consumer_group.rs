@@ -91,6 +91,7 @@ mod tests {
             stream_name: STREAM.to_string(),
             owner: "admin".to_string(),
             created_at: 1_000,
+            modification_hlc: nodedb_types::Hlc::ZERO,
         }
     }
 
@@ -100,6 +101,7 @@ mod tests {
             tenant_id: TENANT,
             stream_name: STREAM.to_string(),
             name: GROUP.to_string(),
+            target_hlc: nodedb_types::Hlc::new(7, 0),
         }
     }
 
@@ -129,11 +131,13 @@ mod tests {
                 tenant_id,
                 stream_name,
                 name,
+                target_hlc,
             } => {
                 assert_eq!(database_id, DB);
                 assert_eq!(tenant_id, TENANT);
                 assert_eq!(stream_name, STREAM);
                 assert_eq!(name, GROUP);
+                assert_eq!(target_hlc, nodedb_types::Hlc::new(7, 0));
             }
             other => panic!("unexpected variant: {}", other.kind()),
         }

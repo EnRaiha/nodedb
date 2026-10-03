@@ -23,8 +23,8 @@ pub(super) enum FencingDecision {
     /// LiteId. Surfaced to the client as `fork_detected = true`.
     Reject,
     /// Reject: a transient server-side error (registry I/O, Raft propose
-    /// failure / leader mid-election). NOT a fork — the client should simply
-    /// retry the handshake. Surfaced as `success = false, fork_detected = false`
+    /// failure / leader mid-election). NOT a fork — the client retries
+    /// the handshake. Surfaced as `success = false, fork_detected = false`
     /// so the client never wipes its state over a momentary server hiccup.
     RejectTransient,
 }
@@ -52,7 +52,7 @@ impl SyncSession {
     ///
     /// On registry operation errors the decision is `Reject` (fail-closed) rather
     /// than silently accepting.
-    pub(super) fn durable_fencing_decision(
+    pub(super) async fn durable_fencing_decision(
         &self,
         msg: &HandshakeMsg,
         shared: Option<&Arc<SharedState>>,
@@ -69,7 +69,7 @@ impl SyncSession {
             Some(reg) => {
                 // `shared` is always `Some` when `registry` is `Some` (the
                 // registry was obtained via `shared.and_then(...)`); the `?`
-                // is just to recover the handle.
+                // is only to recover the handle.
                 let shared_ref = shared?;
 
                 let now_ms = std::time::SystemTime::now()
@@ -117,7 +117,9 @@ impl SyncSession {
                     existing.user_id,
                     existing.current_epoch,
                     existing.created_ms,
-                ) {
+                )
+                .await
+                {
                     warn!(
                         session = %self.session_id,
                         lite_id = %msg.lite_id,
@@ -151,14 +153,16 @@ impl SyncSession {
                 }
 
                 // Re-propose even when the requested epoch already matches the
-                // local row. A prior proposal may have failed after the local
+                // local row. A prior proposal can have failed after the local
                 // fence was persisted; the idempotent max-wins Raft entry must
                 // reach followers before this node accepts the retry.
                 if let Err(e) = crate::control::metadata_proposer::propose_sync_producer_fence(
                     shared_ref.as_ref(),
                     &msg.lite_id,
                     msg.epoch,
-                ) {
+                )
+                .await
+                {
                     warn!(
                         session = %self.session_id,
                         lite_id = %msg.lite_id,

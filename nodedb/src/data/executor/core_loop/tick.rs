@@ -34,6 +34,7 @@ impl CoreLoop {
             self.floors
                 .applied_prefix
                 .observe_outcome_floor(br.outcome_floor);
+            self.keep_write_set_journal(br.inner.request_id.as_u64(), br.journal);
             self.task_queue.push(ExecutionTask::new(br.inner));
         }
     }
@@ -71,8 +72,9 @@ impl CoreLoop {
     /// Execute `task` and send its response: an idempotent replay answers
     /// from the cache, and an expired task answers that it never started.
     pub(in crate::data::executor) fn run_task(&mut self, mut task: ExecutionTask) {
+        let journal = self.take_journal_group(&task);
         if let Some(key) = task.request.idempotency_key
-            && let Some(&succeeded) = self.idempotency_cache.get(&key)
+            && let Some(succeeded) = self.idempotency.outcome(key)
         {
             let response = if succeeded {
                 self.response_ok(&task)
@@ -105,6 +107,9 @@ impl CoreLoop {
             }
         } else {
             task.state = TaskState::Running;
+            if journal.is_some() {
+                self.begin_journalled();
+            }
             let resp = self.execute(&task);
             // Every engine's next checkpoint, flush or manifest stamps what
             // this core applied, so a record applied here is noted whichever
@@ -118,11 +123,21 @@ impl CoreLoop {
             // A crash test kills the process here: one collection's logged
             // write applied, and its response never leaves the core. A
             // committed redo matches each collection it writes. A task with
-            // no WAL record never matches.
+            // no WAL record never matches. A journalled write's sparse and
+            // edge store effects are not durable yet here.
             #[cfg(feature = "failpoints")]
             if task.wal_lsn().is_some() {
                 for collection in task.plan().named_collections() {
                     crate::fail_point!(&format!("core::after_apply::{collection}"));
+                }
+            }
+            if let Some(group) = journal {
+                self.finish_journalled_task(&task, group, &resp);
+                // A crash test kills the process here: the write's write set
+                // is stored and its parts are not journalled yet.
+                #[cfg(feature = "failpoints")]
+                for collection in task.plan().named_collections() {
+                    crate::fail_point!(&format!("core::after_capture::{collection}"));
                 }
             }
             task.state = TaskState::Completed;
@@ -132,14 +147,7 @@ impl CoreLoop {
         };
 
         if let Some(key) = task.request.idempotency_key {
-            let succeeded = response.status == Status::Ok;
-            if self.idempotency_cache.len() >= 16_384
-                && let Some(oldest_key) = self.idempotency_order.pop_front()
-            {
-                self.idempotency_cache.remove(&oldest_key);
-            }
-            self.idempotency_cache.insert(key, succeeded);
-            self.idempotency_order.push_back(key);
+            self.idempotency.record(key, response.status == Status::Ok);
         }
 
         // Bound the dangling-edge tracker across all tenants. Count
@@ -147,7 +155,12 @@ impl CoreLoop {
         // whole map — callers are tolerant of false negatives (an
         // `EdgePut` to a recently-deleted node races the tracker, so
         // the semantics are advisory regardless).
-        let total: usize = self.deleted_nodes.values().map(|s| s.len()).sum();
+        let total: usize = self
+            .deleted_nodes
+            .values()
+            .flat_map(|collections| collections.values())
+            .map(|nodes| nodes.len())
+            .sum();
         if total > 100_000 {
             self.deleted_nodes.clear();
         }
@@ -257,6 +270,7 @@ mod tests {
             txn_id: None,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: crate::bridge::envelope::Admission::Admitted,
         }
     }
@@ -276,7 +290,7 @@ mod tests {
                 ..make_request(PhysicalPlan::Document(DocumentOp::PointGet {
                     collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
                     document_id: "y".into(),
-                    surrogate: nodedb_types::Surrogate::ZERO,
+                    surrogate: None,
                     pk_bytes: Vec::new(),
                     rls_filters: Vec::new(),
                     system_time: nodedb_types::SystemTimeScope::Current,
@@ -306,7 +320,7 @@ mod tests {
                     PhysicalPlan::Document(DocumentOp::PointGet {
                         collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
                         document_id: "y".into(),
-                        surrogate: nodedb_types::Surrogate::ZERO,
+                        surrogate: None,
                         pk_bytes: Vec::new(),
                         rls_filters: Vec::new(),
                         system_time: nodedb_types::SystemTimeScope::Current,
@@ -349,7 +363,7 @@ mod tests {
                 PhysicalPlan::Document(DocumentOp::PointGet {
                     collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
                     document_id: "y".into(),
-                    surrogate: nodedb_types::Surrogate::ZERO,
+                    surrogate: None,
                     pk_bytes: Vec::new(),
                     rls_filters: Vec::new(),
                     system_time: nodedb_types::SystemTimeScope::Current,
@@ -372,7 +386,7 @@ mod tests {
                 ..make_request(PhysicalPlan::Document(DocumentOp::PointGet {
                     collection: QualifiedCollection::new(DatabaseId::DEFAULT, "x"),
                     document_id: "y".into(),
-                    surrogate: nodedb_types::Surrogate::ZERO,
+                    surrogate: None,
                     pk_bytes: Vec::new(),
                     rls_filters: Vec::new(),
                     system_time: nodedb_types::SystemTimeScope::Current,
@@ -421,7 +435,7 @@ mod tests {
                     collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
                     document_id: "o1".into(),
                     value: tagged,
-                    surrogate: nodedb_types::Surrogate::ZERO,
+                    surrogate: nodedb_types::Surrogate::new(1),
                     pk_bytes: Vec::new(),
                     returning: None,
                     rls_filters: Vec::new(),
@@ -434,15 +448,14 @@ mod tests {
         assert_eq!(resp.inner.status, Status::Ok);
 
         // The handler hex-encodes the surrogate to compute the substrate
-        // row key; this fixture used `Surrogate::ZERO`, which renders to
-        // "00000000".
+        // row key.
         let stored = core
             .sparse
             .get(
                 0,
                 1,
                 "orders",
-                &nodedb_types::StorageKey::for_surrogate(nodedb_types::Surrogate::ZERO),
+                &nodedb_types::StorageKey::for_surrogate(nodedb_types::Surrogate::new(1)),
             )
             .unwrap()
             .unwrap();

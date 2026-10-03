@@ -2,10 +2,8 @@
 
 //! Append the WAL record for a vector-engine physical op.
 //!
-//! The sync helpers ([`wal_append_vector_put`],
-//! [`wal_append_vector_delete_by_surrogate`]) and the autocommit dispatcher
-//! ([`wal_append_vector_op`]) all encode through [`super::encode`], so every
-//! path writes the same record shapes.
+//! [`wal_append_vector_op`] encodes through [`super::encode`], the encoders
+//! transaction resolve shares, so every path writes the same record shapes.
 
 use nodedb_physical::physical_plan::VectorOp;
 
@@ -24,64 +22,13 @@ use super::encode::{
 };
 use nodedb_physical::physical_plan::VectorDirectWriteIntent;
 
-/// Operation fields for a vector put WAL record.
-///
-/// Groups the vector-identity and provenance fields that together describe a
-/// single vector insert, reducing the call-site argument count.
-pub struct VectorPutWalArgs<'a> {
-    pub collection: &'a str,
-    pub vector: &'a [f32],
-    pub dim: usize,
-    pub field_name: &'a str,
-    pub surrogate: nodedb_types::Surrogate,
-    pub provenance: Option<&'a nodedb_types::sync::wire::SyncProvenance>,
-}
-
-/// Operation fields for a vector delete-by-surrogate WAL record.
-///
-/// Groups the collection, surrogate, field, and provenance fields that
-/// together identify a single vector deletion.
-pub struct VectorDeleteWalArgs<'a> {
-    pub collection: &'a str,
-    pub surrogate: nodedb_types::Surrogate,
-    pub field_name: &'a str,
-    pub provenance: Option<&'a nodedb_types::sync::wire::SyncProvenance>,
-}
-
-/// Append a vector put (insert) to the WAL and return the assigned LSN.
-///
-/// Encodes `(collection, vector, dim, field_name, doc_id_compat, surrogate_u32, provenance)`
-/// exactly as the non-sync `VectorOp::Insert` arm in `wal_append_if_write_with_creds` does,
-/// so replay decodes both paths with the same 7-element shape.
-pub fn wal_append_vector_put(
-    wal: WalAppender<'_>,
-    tenant_id: TenantId,
-    vshard_id: VShardId,
-    database_id: DatabaseId,
-    args: VectorPutWalArgs<'_>,
-) -> crate::Result<nodedb_types::Lsn> {
-    let VectorPutWalArgs {
-        collection,
-        vector,
-        dim,
-        field_name,
-        surrogate,
-        provenance,
-    } = args;
-    let entry =
-        encode_vector_put_payload(collection, vector, dim, field_name, surrogate, provenance)?;
-    let lsn = wal.append_vector_put(tenant_id, vshard_id, database_id, &entry)?;
-    Ok(lsn)
-}
-
 /// Append the WAL record for a single vector-engine physical op, returning the
 /// allocated LSN for writes (`Some`) or `None` for reads / index-maintenance
 /// ops that carry no durable per-write effect.
 ///
 /// The match over [`VectorOp`] is **exhaustive**: a new variant fails to
 /// compile until its durability is decided here, so a future write can never
-/// silently become non-durable (the class of bug this function was hardened
-/// against). Read and maintenance ops map to `None` explicitly, by name.
+/// silently become non-durable. Read and maintenance ops map to `None` explicitly, by name.
 pub(crate) fn wal_append_vector_op(
     wal: WalAppender<'_>,
     tenant_id: TenantId,
@@ -100,8 +47,7 @@ pub(crate) fn wal_append_vector_op(
             provenance,
         } => {
             // The local-WAL record carries the surrogate as a u32 so recovery
-            // can rebind without consulting the catalog. See
-            // `encode_vector_put_payload` for the compatibility slot.
+            // can rebind without consulting the catalog.
             let entry = encode_vector_put_payload(
                 collection.as_str(),
                 vector,
@@ -116,9 +62,10 @@ pub(crate) fn wal_append_vector_op(
             collection,
             vectors,
             dim,
-            surrogates: _,
+            surrogates,
         } => {
-            let entry = encode_vector_batch_put_payload(collection.as_str(), vectors, *dim)?;
+            let entry =
+                encode_vector_batch_put_payload(collection.as_str(), vectors, *dim, surrogates)?;
             Some(wal.append_vector_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         VectorOp::Delete {
@@ -134,10 +81,7 @@ pub(crate) fn wal_append_vector_op(
             field_name,
             provenance,
         } => {
-            // Durable by node-independent surrogate. The sync-inbound path logs
-            // this via `wal_append_vector_delete_by_surrogate` before dispatch;
-            // logging it here too keeps every path that reaches this function
-            // durable without double-logging (the sync path bypasses it).
+            // Durable by node-independent surrogate.
             let entry = encode_vector_delete_by_surrogate_payload(
                 collection.as_str(),
                 *surrogate,
@@ -354,7 +298,7 @@ pub(crate) fn wal_append_vector_op(
                 &entry,
             )?)
         }
-        // Read-only: it reports what the wrapped write would do and mutates
+        // Read-only: it reports what the wrapped write will do and mutates
         // nothing.
         VectorOp::ResolveDirectWrite(_) => None,
         VectorOp::SparseInsert {
@@ -376,10 +320,12 @@ pub(crate) fn wal_append_vector_op(
                 encode_sparse_vector_delete_payload(collection.as_str(), field_name, doc_id)?;
             Some(wal.append_sparse_vector_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
+        // The record carries the bound surrogate. Replay needs no key.
         VectorOp::MultiVectorInsert {
             collection,
             field_name,
             document_surrogate,
+            pk_bytes: _,
             vectors,
             count,
             dim,
@@ -418,29 +364,4 @@ pub(crate) fn wal_append_vector_op(
         VectorOp::Seal { .. } | VectorOp::CompactIndex { .. } | VectorOp::Rebuild { .. } => None,
     };
     Ok(appended)
-}
-
-/// Append a vector delete-by-surrogate to the WAL and return the assigned LSN.
-///
-/// Encodes `(collection, surrogate_u32, field_name, provenance)` as a `VectorDelete`
-/// record. The replay decoder uses a surrogate-aware arm (4-element shape) that maps
-/// back to `execute_vector_delete_by_surrogate`; the legacy 2-element and 3-element
-/// delete arms fall through to direct node-id deletion and remain backward-compatible.
-pub fn wal_append_vector_delete_by_surrogate(
-    wal: WalAppender<'_>,
-    tenant_id: TenantId,
-    vshard_id: VShardId,
-    database_id: DatabaseId,
-    args: VectorDeleteWalArgs<'_>,
-) -> crate::Result<nodedb_types::Lsn> {
-    let VectorDeleteWalArgs {
-        collection,
-        surrogate,
-        field_name,
-        provenance,
-    } = args;
-    let entry =
-        encode_vector_delete_by_surrogate_payload(collection, surrogate, field_name, provenance)?;
-    let lsn = wal.append_vector_delete(tenant_id, vshard_id, database_id, &entry)?;
-    Ok(lsn)
 }

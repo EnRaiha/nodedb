@@ -144,6 +144,9 @@ impl CoreLoop {
         let mut in_flight = 0usize;
 
         for record in records {
+            if self.replay_halted() {
+                break;
+            }
             let logical_type = record.logical_record_type();
             let record_type = RecordType::from_raw(logical_type);
             let is_put = record_type == Some(RecordType::ArrayPut);

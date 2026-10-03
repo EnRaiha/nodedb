@@ -13,8 +13,20 @@ pub(in crate::data::executor) struct GraphEdgeEvent<'a> {
     pub src_id: &'a str,
     pub label: &'a str,
     pub dst_id: &'a str,
+    /// The endpoints' bound identities, from the plan.
+    pub src_surrogate: nodedb_types::Surrogate,
+    pub dst_surrogate: nodedb_types::Surrogate,
     pub op: crate::event::WriteOp,
     pub properties: Option<&'a [u8]>,
+}
+
+/// Bundled arguments for [`CoreLoop::emit_event_with_row_id_as`].
+pub(in crate::data::executor) struct RowWriteEvent<'a> {
+    pub collection: &'a str,
+    pub op: crate::event::WriteOp,
+    pub row_id: crate::event::types::RowId,
+    pub new_value: Option<&'a [u8]>,
+    pub old_value: Option<&'a [u8]>,
 }
 
 impl CoreLoop {
@@ -44,32 +56,6 @@ impl CoreLoop {
         } else {
             None
         }
-    }
-
-    /// Emit a KV write event. Both row images are shaped into the
-    /// `{key, value}` row every KV read returns (`msgpack_scan::kv_row_msgpack`),
-    /// so the Event Plane decodes a KV row the same way as any other row.
-    /// `new_stored` and `old_stored` are the bodies as the engine stores them.
-    pub(in crate::data::executor) fn emit_kv_write_event(
-        &mut self,
-        task: &super::super::task::ExecutionTask,
-        collection: &str,
-        op: crate::event::WriteOp,
-        key: &[u8],
-        new_stored: Option<&[u8]>,
-        old_stored: Option<&[u8]>,
-    ) {
-        let key_str = String::from_utf8_lossy(key);
-        let new_row = new_stored.map(|body| msgpack_scan::kv_row_msgpack(&key_str, body));
-        let old_row = old_stored.map(|body| msgpack_scan::kv_row_msgpack(&key_str, body));
-        self.emit_write_event(
-            task,
-            collection,
-            op,
-            crate::engine::document::store::RowIdentity::from_user_key(key_str.as_ref()),
-            new_row.as_deref(),
-            old_row.as_deref(),
-        );
     }
 
     /// A stored document row as the Event Plane reads it. A strict Binary
@@ -218,74 +204,9 @@ impl CoreLoop {
         );
     }
 
-    /// Emit a CDC write event for a node-label mutation on the nameable
-    /// `__graph_node_labels__` stream ([`crate::event::graph_cdc::GRAPH_LABEL_STREAM`]).
-    ///
-    /// `SetNodeLabels` maps to [`crate::event::WriteOp::Insert`] with the added
-    /// labels as `new_value`; `RemoveNodeLabels` maps to
-    /// [`crate::event::WriteOp::Delete`] with the removed labels as `old_value`.
-    /// The `row_id` is the (stable) node id. The label delta is serialized by
-    /// [`crate::event::graph_cdc::graph_label_delta_value`] — the same encoder the
-    /// WAL-replay path uses — so forward and replayed events are byte-identical.
-    ///
-    /// The node-label write is already durable at its WAL LSN by the time this
-    /// runs (the record was appended in the Control Plane before dispatch), so we
-    /// advance the core watermark to it — exactly as every other write chokepoint
-    /// does via `note_write_lsn` — before emitting. That makes the forward
-    /// event's LSN equal the WAL record's LSN the Event-Plane replay uses,
-    /// satisfying watermark dedup.
-    pub(in crate::data::executor) fn emit_graph_label_event(
-        &mut self,
-        task: &super::super::task::ExecutionTask,
-        node_id: &str,
-        labels: &[String],
-        op: crate::event::WriteOp,
-    ) {
-        // A committed-redo apply moves the watermark once the record settled.
-        if self.redo_apply.scope.is_none()
-            && let Some(lsn) = task.wal_lsn()
-            && lsn > self.watermark
-        {
-            self.watermark = lsn;
-        }
-        let value = crate::event::graph_cdc::graph_label_delta_value(labels);
-        let stream = crate::event::graph_cdc::GRAPH_LABEL_STREAM;
-        let (new_value, old_value): (Option<&[u8]>, Option<&[u8]>) =
-            if matches!(op, crate::event::WriteOp::Delete) {
-                (None, Some(value.as_slice()))
-            } else {
-                (Some(value.as_slice()), None)
-            };
-        let identity = crate::engine::document::store::RowIdentity::from_user_key(node_id);
-        self.emit_write_event(task, stream, op, identity, new_value, old_value);
-    }
-
-    /// Emit a CDC write event for a graph edge mutation on the edge's own
-    /// `collection`. The stable `row_id` is composed from the `(src, label, dst)`
-    /// identity triple via [`crate::event::graph_cdc::edge_row_id`] — the same
-    /// composition the WAL-replay path uses.
-    ///
-    /// The caller MUST have advanced the core watermark to this edge's WAL LSN
-    /// (via `note_edge_write_lsn`) before calling, so the forward event's LSN
-    /// matches the WAL-replay reconstruction.
-    pub(in crate::data::executor) fn emit_graph_edge_event(
-        &mut self,
-        task: &super::super::task::ExecutionTask,
-        edge: GraphEdgeEvent<'_>,
-    ) {
-        let row_id = crate::event::types::RowId::edge(edge.src_id, edge.label, edge.dst_id);
-        let (new_value, old_value): (Option<&[u8]>, Option<&[u8]>) =
-            if matches!(edge.op, crate::event::WriteOp::Delete) {
-                (None, None)
-            } else {
-                (edge.properties, None)
-            };
-        self.emit_event_with_row_id(task, edge.collection, edge.op, row_id, new_value, old_value);
-    }
-
     /// Set the Event Plane producer (called after open, before event loop).
     pub fn set_event_producer(&mut self, producer: crate::event::bus::EventProducer) {
-        self.event_producer = Some(producer);
+        self.events.producer = Some(producer);
     }
 
     /// Emit a write event for one row to the Event Plane.
@@ -335,7 +256,35 @@ impl CoreLoop {
         new_value: Option<&[u8]>,
         old_value: Option<&[u8]>,
     ) {
-        if self.event_producer.is_none() {
+        self.emit_event_with_row_id_as(
+            task,
+            task.request.event_source,
+            RowWriteEvent {
+                collection,
+                op,
+                row_id,
+                new_value,
+                old_value,
+            },
+        );
+    }
+
+    /// [`Self::emit_event_with_row_id`] under `source` instead of the
+    /// request's.
+    pub(in crate::data::executor) fn emit_event_with_row_id_as(
+        &mut self,
+        task: &super::super::task::ExecutionTask,
+        source: crate::event::EventSource,
+        event: RowWriteEvent<'_>,
+    ) {
+        let RowWriteEvent {
+            collection,
+            op,
+            row_id,
+            new_value,
+            old_value,
+        } = event;
+        if self.events.producer.is_none() {
             return; // Event Plane not configured.
         }
 
@@ -356,13 +305,14 @@ impl CoreLoop {
             database_id: task.request.database_id,
             tenant_id: task.request.tenant_id,
             vshard_id: task.request.vshard_id,
-            source: task.request.event_source,
+            source,
             new_value: new_value.map(Arc::from),
             old_value: old_value.map(Arc::from),
             system_time_ms,
             valid_time_ms,
             user_id: task.request.user_id.clone(),
             statement_digest: task.request.statement_digest.clone(),
+            commit_hlc: task.request.commit_hlc,
         };
 
         // The install pass of a committed-redo apply holds its events until
@@ -378,15 +328,21 @@ impl CoreLoop {
     }
 
     /// Number `event` with the next sequence and hand it to the Event Plane.
+    /// A journalled task's events wait until its write set is stored (see
+    /// `write_set_journal`).
     pub(in crate::data::executor) fn send_write_event(
         &mut self,
         mut event: crate::event::WriteEvent,
     ) {
-        let Some(producer) = self.event_producer.as_mut() else {
+        if let Some(held) = self.write_set_journal.held_events.as_mut() {
+            held.push(event);
+            return;
+        }
+        let Some(producer) = self.events.producer.as_mut() else {
             return;
         };
-        self.event_sequence += 1;
-        event.sequence = self.event_sequence;
+        self.events.sequence += 1;
+        event.sequence = self.events.sequence;
         producer.emit(event);
     }
 
@@ -396,15 +352,15 @@ impl CoreLoop {
     /// the current watermark LSN so the Event Plane can advance its partition
     /// watermark without waiting for user writes.
     pub fn emit_heartbeat(&mut self) {
-        let producer = match self.event_producer.as_mut() {
+        let producer = match self.events.producer.as_mut() {
             Some(p) => p,
             None => return,
         };
 
-        self.event_sequence += 1;
+        self.events.sequence += 1;
 
         let event = crate::event::WriteEvent {
-            sequence: self.event_sequence,
+            sequence: self.events.sequence,
             collection: Arc::from("_heartbeat"),
             op: crate::event::WriteOp::Heartbeat,
             row_id: crate::event::types::RowId::Heartbeat,
@@ -427,6 +383,7 @@ impl CoreLoop {
             valid_time_ms: None,
             user_id: None,
             statement_digest: None,
+            commit_hlc: None,
         };
 
         producer.emit(event);

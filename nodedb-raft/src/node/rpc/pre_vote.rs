@@ -7,6 +7,8 @@
 //! recorded, no election deadline is reset. Only a granting quorum promotes
 //! the prober to a real election.
 
+use std::time::Instant;
+
 use tracing::debug;
 
 use crate::message::{PreVoteRequest, PreVoteResponse};
@@ -21,6 +23,12 @@ impl<S: LogStorage> RaftNode<S> {
     /// `leader_id`, or the role. Resetting the deadline for a probe would let
     /// any peer suppress a legitimate election just by probing.
     pub fn handle_pre_vote(&mut self, req: &PreVoteRequest) -> PreVoteResponse {
+        self.handle_pre_vote_at(req, Instant::now())
+    }
+
+    /// [`Self::handle_pre_vote`] with the vote-refusal window measured at
+    /// `now`.
+    pub fn handle_pre_vote_at(&mut self, req: &PreVoteRequest, now: Instant) -> PreVoteResponse {
         let term = self.hard_state.current_term;
         let refuse = PreVoteResponse {
             term,
@@ -45,12 +53,10 @@ impl<S: LogStorage> RaftNode<S> {
         // Leader stickiness, bounded by TIME. A leader that is still reaching
         // us needs no replacement. The bound is what makes the check safe: once
         // a real leader crashes, contact ages past `election_timeout_min` and
-        // every follower starts granting again. A node that has never heard a
-        // leader is never blocked here, so a fresh cluster still elects.
-        let leader_is_live = self
-            .leader_contact
-            .is_some_and(|c| c.at.elapsed() < self.config.election_timeout_min);
-        if leader_is_live {
+        // every follower starts granting again. A freshly booted node refuses
+        // until `election_timeout_max` after boot, the same window as the real
+        // vote, so a probe it grants is never followed by a vote it refuses.
+        if self.vote_refusal_active(now) {
             return refuse;
         }
 
@@ -153,8 +159,12 @@ mod tests {
             entries: vec![],
             leader_commit: 0,
             group_id: 1,
+            round: 1,
+            replicated_floor: 0,
         });
         assert_eq!(node.role(), NodeRole::Follower);
+        // Leader contact, not the boot fence, is what these tests exercise.
+        node.expire_boot_vote_fence();
         node
     }
 
@@ -183,6 +193,7 @@ mod tests {
         assert_eq!(ready.pre_vote_requests[0].1.term, 1);
 
         let mut peer = RaftNode::new(test_config(2, vec![1, 3]), MemStorage::new());
+        peer.expire_boot_vote_fence();
         let resp = peer.handle_pre_vote(&ready.pre_vote_requests[0].1);
         assert!(resp.vote_granted);
         assert_eq!(peer.current_term(), 0, "answering must not adopt a term");
@@ -213,6 +224,8 @@ mod tests {
             entries: vec![],
             leader_commit: 0,
             group_id: 1,
+            round: 1,
+            replicated_floor: 0,
         });
         prober.election_deadline_override(Instant::now() - Duration::from_millis(1));
         prober.tick();
@@ -249,9 +262,25 @@ mod tests {
         assert_eq!(follower.current_term(), 1);
     }
 
+    /// A booted node has no record of the leader it may have followed before
+    /// a restart. It refuses until the boot fence passes, then grants.
+    #[test]
+    fn a_booted_node_refuses_until_its_fence_passes() {
+        let mut node = RaftNode::new(test_config(2, vec![1, 3]), MemStorage::new());
+        let fence = node.boot_vote_fence;
+        let just_before = fence - Duration::from_nanos(1);
+        assert!(
+            !node
+                .handle_pre_vote_at(&probe(1, 0, 0), just_before)
+                .vote_granted
+        );
+        assert!(node.handle_pre_vote_at(&probe(1, 0, 0), fence).vote_granted);
+    }
+
     #[test]
     fn a_node_that_never_heard_a_leader_grants() {
         let mut node = RaftNode::new(test_config(2, vec![1, 3]), MemStorage::new());
+        node.expire_boot_vote_fence();
         let deadline_before = node.election_deadline;
 
         assert!(node.handle_pre_vote(&probe(1, 0, 0)).vote_granted);
@@ -308,8 +337,11 @@ mod tests {
             }],
             leader_commit: 0,
             group_id: 1,
+            round: 1,
+            replicated_floor: 0,
         });
         node.leader_contact_at_override(Instant::now() - Duration::from_secs(1));
+        node.expire_boot_vote_fence();
 
         // Older last term.
         assert!(!node.handle_pre_vote(&probe(3, 5, 1)).vote_granted);
@@ -322,12 +354,14 @@ mod tests {
     #[test]
     fn a_hypothetical_term_at_or_below_the_current_one_is_refused() {
         let mut node = RaftNode::new(test_config(2, vec![1, 3]), MemStorage::new());
+        node.expire_boot_vote_fence();
         node.handle_request_vote(&RequestVoteRequest {
             term: 5,
             candidate_id: 1,
             last_log_index: 0,
             last_log_term: 0,
             group_id: 1,
+            transfer: false,
         });
         assert_eq!(node.current_term(), 5);
 

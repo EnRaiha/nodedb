@@ -191,12 +191,27 @@ impl CoreLoop {
                 );
             }
         };
-        match engine.compact_at_version(collection, target_version_json) {
-            Ok(()) => self.response_ok(task),
-            Err(e) => self.response_error(
+        if let Err(e) = engine.compact_at_version(collection, target_version_json) {
+            return self.response_error(
                 task,
                 ErrorCode::Internal {
                     detail: e.to_string(),
+                },
+            );
+        }
+        // The Loro docs are in-memory, and boot restores them from the last
+        // checkpoint plus WAL deltas. Without a publish here, a crash restores
+        // the discarded history. The Ok answer means the compaction is durable.
+        match self.checkpoint_crdt_engines() {
+            Ok(outcome) => {
+                self.checkpoint_coordinator
+                    .record_flush("crdt", outcome.files_written);
+                self.response_ok(task)
+            }
+            Err(e) => self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("history compaction applied but not checkpointed: {e}"),
                 },
             ),
         }
@@ -233,8 +248,7 @@ impl CoreLoop {
         match engine.apply_committed_delta_validated(
             collection,
             bytes,
-            nodedb_types::Surrogate::ZERO,
-            "",
+            crate::engine::crdt::tenant_state::ApplyTarget::Collection,
             0,
         ) {
             crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Clean { .. } => {

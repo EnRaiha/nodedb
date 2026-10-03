@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! In-transaction ARRAY reads (`ARRAY_SLICE`, `ARRAY_AGG`) observe the
-//! transaction's own uncommitted cell writes (read-your-own-writes), and
-//! `INSERT INTO ARRAY` / `DELETE FROM ARRAY` answer with a real affected
-//! count at statement time, on the CLUSTER plan path.
+//! In-transaction ARRAY reads (`ARRAY_SLICE`, `ARRAY_PROJECT`, `ARRAY_AGG`)
+//! observe the transaction's own uncommitted cell writes
+//! (read-your-own-writes), and `INSERT INTO ARRAY` / `DELETE FROM ARRAY`
+//! answer with a real affected count at statement time, on the CLUSTER plan
+//! path.
 //!
-//! Every case runs on the default `TestServer::start()`: `single_node_calvin`
-//! is on, so `plan_sql()` emits the `ClusterArrayOp::{Put, Delete, Slice,
-//! Agg}` routing wrappers. The staging gate fans a `Put` / `Delete` out into
+//! Every case runs on the default `TestServer::start()`. Every server runs a
+//! cluster topology, so `plan_sql()` emits the `ClusterArrayOp::{Put, Delete,
+//! Slice, Agg}` routing wrappers. The staging gate fans a `Put` / `Delete` out into
 //! one `ArrayOp::{Put, Delete}` per owning vShard (`session::txn_expand`),
 //! buffers every per-shard task, and stages each into its shard's
 //! `ArrayTxnOverlay` on that shard's leader (`session::array_fanout_stage`).
@@ -15,8 +16,7 @@
 //! (`ArrayShardSliceReq::txn_id`, `ArrayShardAggReq::txn_id`), so each
 //! shard folds its own staged cells into its rows or partial. COMMIT
 //! replays the buffered per-shard tasks; ROLLBACK drops every shard's
-//! overlay. The single-node form is covered by
-//! `sql_transactions_array_overlay.rs`.
+//! overlay.
 
 use crate::harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;
@@ -322,7 +322,7 @@ async fn cluster_in_txn_array_dml_answers_real_command_tags() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cluster_staged_put_visible_to_same_txn_agg() {
+async fn cluster_staged_put_visible_to_same_txn_project_and_agg() {
     let server = TestServer::start().await;
     create_array(&server, "carr_ov_agg").await;
     server
@@ -335,6 +335,16 @@ async fn cluster_staged_put_visible_to_same_txn_agg() {
         .exec("INSERT INTO ARRAY carr_ov_agg COORDS (2, 2) VALUES (5.0)")
         .await
         .unwrap();
+
+    let projected = server
+        .query_rows("SELECT * FROM ARRAY_PROJECT('carr_ov_agg', ['value'])")
+        .await
+        .unwrap();
+    assert_eq!(
+        projected.len(),
+        2,
+        "ARRAY_PROJECT must return the base cell and the staged cell, got {projected:?}"
+    );
 
     // Each shard folds only its own staged cells into its partial, so the
     // coordinator's merge counts the staged cell exactly once.

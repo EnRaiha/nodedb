@@ -121,11 +121,7 @@ fn append_value_at(buf: &mut String, doc: &[u8], start: usize, end: usize) {
         let _ = write!(buf, "{n}");
     } else {
         // Complex value (array/map/bin) — hex-encode raw bytes as key.
-        let bytes = &doc[start..end];
-        for b in bytes {
-            use std::fmt::Write;
-            let _ = write!(buf, "{b:02x}");
-        }
+        buf.push_str(&hex::encode(&doc[start..end]));
     }
 }
 

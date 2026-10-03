@@ -36,10 +36,9 @@ pub async fn plan_authorized_sql(
 ) -> Result<(Vec<PhysicalTask>, OutputSchema, QueryLeaseScope), DdlError> {
     // Internal DDL scans still plan in the caller-selected database context.
     let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
-    let permission_cache =
-        crate::control::security::auth_fence::permission_view(state, identity.tenant_id)
-            .await
-            .map_err(|error| DdlError::from_error(&error))?;
+    crate::control::security::auth_fence::admit_permission_view(state, identity.tenant_id)
+        .await
+        .map_err(|error| DdlError::from_error(&error))?;
     let sec = PlanSecurityContext {
         identity,
         auth: scope.auth(),
@@ -47,7 +46,9 @@ pub async fn plan_authorized_sql(
         redaction_store: &state.redaction,
         permissions: &state.permissions,
         roles: &state.roles,
-        permission_cache: Some(&*permission_cache),
+        permission_tree: crate::control::planner::context::PermissionTreeSource::Live(
+            &state.permission_cache,
+        ),
     };
     let query_ctx = QueryContext::for_state(state);
     let (tasks, output_schema, versions, _) = query_ctx
@@ -72,11 +73,14 @@ pub async fn plan_authorized_sql(
     // Admission follows authorization so denied requests never consume
     // descriptor leases. Callers retain this scope through dispatch and
     // response consumption.
-    let lease_scope = state.acquire_plan_lease_scope(&versions).map_err(|error| {
-        let (_, sqlstate, message) =
-            crate::control::server::pgwire::types::error_to_sqlstate(&error);
-        DdlError::new(sqlstate.to_string(), message)
-    })?;
+    let lease_scope = state
+        .acquire_plan_lease_scope(&versions)
+        .await
+        .map_err(|error| {
+            let (_, sqlstate, message) =
+                crate::control::server::pgwire::types::error_to_sqlstate(&error);
+            DdlError::new(sqlstate.to_string(), message)
+        })?;
 
     Ok((tasks, output_schema, lease_scope))
 }

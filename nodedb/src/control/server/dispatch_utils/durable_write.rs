@@ -4,12 +4,15 @@
 //!
 //! A planned autocommit write reaches its engine one of two ways:
 //!
-//! - Cluster mode, replicable write: the write is proposed through Raft. Every
-//!   replica applies the committed entry through the funnel, which appends the
-//!   redo record. The proposing node publishes the change event.
-//! - Otherwise: the write enters the funnel with `WalDurability::AppendHere`.
-//!   The funnel appends the redo record under the write-admission guard, inside
-//!   the write's outcome-floor window.
+//! - Replicable write: the write is proposed through Raft. Every replica
+//!   applies the committed entry through the funnel, which appends the redo
+//!   record. The proposing node publishes the change event. An edge write
+//!   runs as a Calvin transaction at that seam instead
+//!   (`planner::calvin::edge_sequencing`).
+//! - A write inside a transaction block, or a plan with no replicated form:
+//!   the write enters the funnel with `WalDurability::AppendHere`. The funnel
+//!   appends the redo record under the write-admission guard, inside the
+//!   write's outcome-floor window.
 //!
 //! A write dispatched any other way applies with no WAL record. A crash loses
 //! it, and no replica sees it. Every caller that holds an autocommit write
@@ -26,7 +29,6 @@ use crate::control::wal_replication::{
 };
 use crate::types::{DatabaseId, Lsn, RequestId, TenantId, TraceId, VShardId};
 
-use super::change_events::{extract_write_change_set, publish_change_set_with_lsn};
 use super::dispatch::{
     dispatch_authorized_autocommit_write, dispatch_authorized_to_data_plane,
     dispatch_autocommit_write,
@@ -65,24 +67,22 @@ pub(crate) async fn dispatch_durable_autocommit_write(
 /// Same routing as [`dispatch_durable_autocommit_write`], for a task that
 /// passed the clone-write gate and authorization.
 ///
-/// In cluster mode a write whose RLS write policy is decided per row cannot
-/// be proposed bare: a follower has no writing identity to decide the policy
-/// against. It resolves to a concrete row set first, on this node, and the
-/// resolved write is proposed (`control::write_resolve`), as the planned
-/// pgwire and native writes do.
+/// A write whose RLS write policy is decided per row cannot be proposed
+/// bare: a follower has no writing identity to decide the policy against. It
+/// resolves to a concrete row set first, on this node, and the resolved write
+/// is proposed (`control::write_resolve`), as the planned pgwire and native
+/// writes do.
 pub(crate) async fn dispatch_authorized_durable_write(
     shared: &SharedState,
     checked: CloneCheckedTask,
     trace_id: TraceId,
 ) -> crate::Result<Response> {
     if checked.txn_id().is_none()
-        && shared.async_raft_proposer().is_some()
         && let Some(resolver) = crate::control::write_resolve::resolver_for_plan(checked.plan())
     {
+        let (authorized, _lease) = checked.into_parts();
         return crate::control::write_resolve::run_authorized_write_resolve(
-            shared,
-            checked.into_authorized(),
-            resolver,
+            shared, authorized, resolver,
         )
         .await;
     }
@@ -112,9 +112,9 @@ pub(crate) async fn dispatch_authorized_durable_write(
 /// replica stamps the source on the write's events, so a synced write does
 /// not re-fire AFTER triggers.
 ///
-/// A clustered write whose RLS write policy must resolve against current rows
-/// before it is proposed is refused: the resolved write carries none of the
-/// plan's sync provenance, so the idempotency gate could not run.
+/// A write whose RLS write policy must resolve against current rows before it
+/// is proposed is refused: the resolved write carries none of the plan's sync
+/// provenance, so the idempotency gate cannot run.
 pub(crate) async fn dispatch_authorized_durable_write_with_source(
     shared: &SharedState,
     checked: CloneCheckedTask,
@@ -122,7 +122,6 @@ pub(crate) async fn dispatch_authorized_durable_write_with_source(
     event_source: crate::event::EventSource,
 ) -> crate::Result<Response> {
     if checked.txn_id().is_none()
-        && shared.async_raft_proposer().is_some()
         && crate::control::write_resolve::resolver_for_plan(checked.plan()).is_some()
     {
         return Err(crate::Error::PlanError {
@@ -160,8 +159,8 @@ pub(crate) async fn dispatch_authorized_durable_write_with_source(
 /// Dispatch one authorized task by its class: a write on the durable route,
 /// anything else on the read route.
 ///
-/// For a transport fallback that dispatches reads and writes through one call
-/// site with no gateway installed.
+/// For a call site that carries both reads and writes on this node's cores:
+/// the transaction meta-ops and the DML statement dispatch.
 pub(crate) async fn dispatch_authorized_task_by_class(
     shared: &SharedState,
     checked: CloneCheckedTask,
@@ -181,8 +180,8 @@ struct WriteTarget {
     vshard_id: VShardId,
 }
 
-/// Propose `plan` through Raft when this node runs a proposer and the plan
-/// encodes to a replicated entry. `None` means the write takes the local route.
+/// Propose `plan` through Raft when the plan encodes to a replicated entry.
+/// `None` means the plan has no replicated form and takes the local route.
 ///
 /// A Data-Plane verdict comes back as `Err(Error::DataPlane(code))`, the shape
 /// the pgwire replicated path returns.
@@ -192,29 +191,31 @@ async fn propose_if_replicable(
     plan: &PhysicalPlan,
     event_source: crate::event::EventSource,
 ) -> crate::Result<Option<Response>> {
-    let Some(proposer) = shared.async_raft_proposer() else {
-        return Ok(None);
-    };
+    let proposer = shared.async_raft_proposer()?;
     let WriteTarget {
         tenant_id,
         database_id,
         vshard_id,
     } = target;
+    // The entry carries resolved rows: a timeseries ingest resolves here,
+    // on the proposer, before the entry exists.
+    let resolved = crate::control::write_resolve::resolve_for_log(
+        shared,
+        crate::control::write_resolve::WriteResolveContext {
+            tenant_id,
+            database_id,
+        },
+        vshard_id,
+        plan,
+    )
+    .await?;
+    let plan = resolved.as_ref().unwrap_or(plan);
     let replicable = ReplicableWrite::decide_for_replication(plan)?;
     let Some(entry) = to_replicated_entry(tenant_id, database_id, vshard_id, &replicable)? else {
         return Ok(None);
     };
     let entry = entry.with_event_source(event_source);
     let (payload, write_version) = propose_replicated_entry(shared, proposer, entry).await?;
-    // Replicas apply with `ChangeFeedOwner::Unowned`. The proposing node
-    // handled the write once, so it publishes the change event.
-    publish_change_set_with_lsn(
-        shared,
-        tenant_id,
-        database_id,
-        extract_write_change_set(plan, tenant_id),
-        write_version,
-    );
     Ok(Some(replicated_write_response(
         shared,
         payload,

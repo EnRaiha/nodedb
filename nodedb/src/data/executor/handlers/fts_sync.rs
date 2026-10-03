@@ -35,6 +35,11 @@ impl CoreLoop {
         text: &str,
         provenance: Option<&SyncProvenance>,
     ) -> Response {
+        if let Some(refusal) =
+            super::unbound_surrogate::refuse_unbound("fts", collection, surrogate)
+        {
+            return self.response_error(task, refusal);
+        }
         // ── Idempotency gate ────────────────────────────────────────────────
         if let Some(prov) = provenance {
             match self.sync_admit(prov) {
@@ -82,15 +87,15 @@ impl CoreLoop {
     }
 
     /// Remove a document from the inverted BM25 index, optionally gating on
-    /// `SyncProvenance` for idempotent replay.
-    ///
-    /// Without provenance behaves identically to the pre-gate implementation.
+    /// `SyncProvenance` for idempotent replay. `None` names a key its home
+    /// never bound: the delete removes nothing and still commits the
+    /// producer's sequence.
     pub(in crate::data::executor) fn execute_fts_delete_doc(
         &mut self,
         task: &ExecutionTask,
         tid: u64,
         collection: &str,
-        surrogate: Surrogate,
+        surrogate: Option<Surrogate>,
         provenance: Option<&SyncProvenance>,
     ) -> Response {
         // ── Idempotency gate ────────────────────────────────────────────────
@@ -107,6 +112,14 @@ impl CoreLoop {
                 }
             }
         }
+
+        let Some(surrogate) = surrogate else {
+            if let Some(prov) = provenance {
+                self.sync_commit(prov);
+                return self.sync_ack_response(task, AckStatus::Applied, prov.seq);
+            }
+            return self.response_ok(task);
+        };
 
         // ── Engine write ────────────────────────────────────────────────────
         let tenant_id = nodedb_types::TenantId::new(tid);
@@ -135,5 +148,96 @@ impl CoreLoop {
                 self.response_error(task, e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::sync::wire::{SyncAckResult, SyncOutcome};
+
+    use super::*;
+    use crate::bridge::envelope::Status;
+    use crate::data::executor::core_loop::tests::{make_core_with_dir, make_default_task};
+
+    const TID: u64 = 1;
+
+    fn prov(seq: u64) -> SyncProvenance {
+        SyncProvenance {
+            producer_id: 7,
+            epoch: 1,
+            stream_id: 42,
+            seq,
+        }
+    }
+
+    fn assert_applied(response: &Response, seq: u64) {
+        assert_eq!(response.status, Status::Ok);
+        let ack: SyncAckResult = zerompk::from_msgpack(&response.payload).expect("sync ack");
+        assert_eq!(ack.outcome, SyncOutcome::Ack(AckStatus::Applied));
+        assert_eq!(ack.applied_seq, seq);
+    }
+
+    /// Two documents under bound surrogates.
+    fn index_documents(core: &mut CoreLoop, task: &ExecutionTask) {
+        for surrogate in [Surrogate::new(5), Surrogate::new(6)] {
+            let response =
+                core.execute_fts_index_doc(task, TID, "notes", surrogate, "hello world", None);
+            assert_eq!(response.status, Status::Ok);
+        }
+    }
+
+    /// The indexed document count of `notes`.
+    fn doc_count(core: &CoreLoop) -> u32 {
+        core.inverted
+            .corpus_stats(
+                nodedb_types::DatabaseId::DEFAULT.as_u64(),
+                nodedb_types::TenantId::new(TID),
+                "notes",
+            )
+            .expect("corpus stats")
+            .0
+    }
+
+    #[test]
+    fn an_index_without_a_surrogate_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        let task = make_default_task();
+
+        let response =
+            core.execute_fts_index_doc(&task, TID, "notes", Surrogate::ZERO, "hello", None);
+        assert!(matches!(
+            response.error_code.as_deref(),
+            Some(crate::bridge::envelope::ErrorCode::RejectedPrevalidation { .. })
+        ));
+        assert_eq!(doc_count(&core), 0, "nothing is indexed");
+    }
+
+    #[test]
+    fn unbound_delete_with_provenance_commits_the_sequence_and_removes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        let task = make_default_task();
+        index_documents(&mut core, &task);
+        let before = doc_count(&core);
+        assert_eq!(before, 2);
+
+        let response = core.execute_fts_delete_doc(&task, TID, "notes", None, Some(&prov(1)));
+        assert_applied(&response, 1);
+        assert_eq!(core.sync_hwm_value(7, 42), 1, "the sequence commits");
+        assert_eq!(doc_count(&core), before, "no document is removed");
+    }
+
+    #[test]
+    fn unbound_delete_without_provenance_is_ok_and_removes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        let task = make_default_task();
+        index_documents(&mut core, &task);
+
+        let response = core.execute_fts_delete_doc(&task, TID, "notes", None, None);
+        assert_eq!(response.status, Status::Ok);
+        assert!(response.payload.is_empty());
+        assert_eq!(doc_count(&core), 2);
     }
 }

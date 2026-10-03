@@ -25,6 +25,7 @@
 
 pub mod driver;
 pub mod elastic;
+pub mod leader_preference;
 pub mod metrics;
 pub mod placement;
 pub mod plan;
@@ -33,5 +34,6 @@ pub use driver::{
     AlwaysReadyGate, ElectionGate, MigrationDispatcher, RebalancerLoop, RebalancerLoopConfig,
 };
 pub use elastic::RebalancerKickHook;
+pub use leader_preference::preferred_leaders;
 pub use metrics::{LoadMetrics, LoadMetricsProvider, LoadWeights, normalized_score};
 pub use plan::{RebalancerPlanConfig, compute_load_based_plan};

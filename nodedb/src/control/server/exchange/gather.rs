@@ -17,9 +17,11 @@
 
 use futures::future::join_all;
 
-use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response, Status};
+use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response};
 use crate::control::arrow_convert;
 use crate::control::gateway::core::QueryContext;
+use crate::control::server::exchange::core_outcome::{classify_core_response, require_every_core};
+use crate::control::server::exchange::read_scope::ReadScope;
 use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
 use crate::control::server::result_stream::ResultStream;
 use crate::control::server::shared::session::statement_deadline;
@@ -44,7 +46,7 @@ pub(crate) use super::response::stream_to_response;
 /// task ran inside a transaction block); it is threaded onto every per-core
 /// `Request` so the Data-Plane scan handler can merge the transaction's
 /// staging overlay (read-your-own-writes). Autocommit / non-transactional
-/// callers pass `None`, which reproduces prior behaviour exactly.
+/// callers pass `None`, which merges no overlay.
 ///
 /// Each entry is `(core_id, request_id, receiver)`. The request id travels
 /// with the receiver so a collect that ends at the deadline can name the
@@ -64,10 +66,37 @@ pub(crate) fn eager_dispatch_to_all_cores(
     )>,
 > {
     // Every core in this fan-out belongs to ONE statement, so all of them
-    // carry that statement's deadline. Resolving per core would give each core
+    // carry that statement's deadline. Resolving per core will give each core
     // its own budget and leave the statement unbounded in aggregate.
     let deadline = statement_deadline(state.tuning.network.default_deadline_secs);
+    eager_dispatch_to_all_cores_until(
+        state,
+        tenant_id,
+        database_id,
+        trace_id,
+        txn_id,
+        deadline,
+        plan_for_core,
+    )
+}
 
+/// [`eager_dispatch_to_all_cores`] with an explicit deadline on every core's
+/// request, for a background task that runs outside any statement.
+pub(crate) fn eager_dispatch_to_all_cores_until(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    trace_id: TraceId,
+    txn_id: Option<TxnId>,
+    deadline: std::time::Instant,
+    plan_for_core: impl Fn(usize) -> PhysicalPlan,
+) -> crate::Result<
+    Vec<(
+        usize,
+        crate::types::RequestId,
+        crate::control::ResponseReceiver,
+    )>,
+> {
     let num_cores = state
         .dispatcher
         .lock()
@@ -96,6 +125,7 @@ pub(crate) fn eager_dispatch_to_all_cores(
             txn_id,
             wal_lsn: None,
             resolved_now_ms: None,
+            commit_hlc: None,
             admission: crate::bridge::envelope::Admission::Exempt(
                 crate::bridge::envelope::ExemptReason::Read,
             ),
@@ -142,10 +172,8 @@ pub struct GatherOutcome {
 ///
 /// All per-core sends are issued before any response is awaited (`join_all`).
 /// `NotFound` errors from individual cores are treated as "no rows" (the
-/// collection shard simply has no matching data on that core).  Any other
-/// error status from a core fails the whole gather: a fan-out that lost one
-/// core's contribution answers a different question than the one asked, so a
-/// truncated row set must never reach the client as a success.
+/// collection shard has no matching data on that core). Any other core
+/// error fails the whole gather through `core_outcome::require_every_core`.
 pub(crate) async fn gather_all_cores(
     state: &SharedState,
     tenant_id: TenantId,
@@ -168,9 +196,9 @@ pub(crate) async fn gather_all_cores(
         })?;
 
     // Await all responses in parallel using join_all. Each core's scan result
-    // may stream as several `Partial` frames before its terminal frame, so drain
+    // can stream as several `Partial` frames before its terminal frame, so drain
     // and concatenate the full bounded response per core — taking only the first
-    // frame would silently truncate that core's contribution to `stream_chunk_size`
+    // frame will silently truncate that core's contribution to `stream_chunk_size`
     // rows.
     let max_result_bytes = state.tuning.network.max_query_result_bytes as usize;
     let response_futures = receivers
@@ -191,6 +219,9 @@ pub(crate) async fn gather_all_cores(
         });
 
     let results: Vec<(usize, crate::Result<Response>)> = join_all(response_futures).await;
+    let answered = require_every_core(results.into_iter().map(|(core_id, result)| {
+        classify_core_response(result).map(|resp| resp.map(|resp| (core_id, resp)))
+    }))?;
 
     let mut raw = Vec::new();
     let mut all_elements: Vec<Vec<u8>> = Vec::new();
@@ -201,31 +232,8 @@ pub(crate) async fn gather_all_cores(
     // the read plan targets one collection, so one non-zero value survives.
     let mut max_read_version = Lsn::ZERO;
     let mut shard_watermarks: Vec<(VShardId, Lsn)> = Vec::new();
-    // First error seen across cores, kept as a TYPED `crate::Error` so a code
-    // like `DivisionByZero` surfaces as SQLSTATE 22012 rather than collapsing
-    // to a generic `Dispatch` (XX000).
-    let mut first_error: Option<crate::Error> = None;
 
-    for (core_id, result) in results {
-        let resp = match result {
-            Ok(r) => r,
-            Err(e) => {
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
-                continue;
-            }
-        };
-
-        if resp.status == Status::Error {
-            if let Err(e) = crate::control::local_dispatch::reject_data_plane_error(&resp)
-                && first_error.is_none()
-            {
-                first_error = Some(e);
-            }
-            continue;
-        }
-
+    for (core_id, resp) in answered {
         // Record this core's own watermark as a participating-shard version,
         // even when its payload is empty — an empty scan slice is still a
         // validatable observation at that shard's version (phantom safety).
@@ -245,10 +253,6 @@ pub(crate) async fn gather_all_cores(
         let payload_bytes: &[u8] = resp.payload.as_ref();
         raw.extend_from_slice(payload_bytes);
         all_elements.extend(extract_msgpack_elements(payload_bytes));
-    }
-
-    if let Some(err) = first_error {
-        return Err(err);
     }
 
     let merged_array = encode_msgpack_array(&all_elements);
@@ -272,7 +276,7 @@ pub(crate) async fn gather_all_cores(
 ///
 /// NotFound tolerance matches `gather_all_cores`: a per-core terminal
 /// `Status::Error` with `ErrorCode::NotFound` ends that core's stream cleanly
-/// (the collection shard simply has no rows on that core) rather than failing
+/// (the collection shard has no rows on that core) rather than failing
 /// the whole stream. Any other error status propagates as a stream `Err`. This
 /// is handled by passing `tolerate_not_found: true` to
 /// [`stream_response_channel`], which centralizes the NotFound-vs-error
@@ -283,23 +287,6 @@ pub(crate) async fn gather_all_cores(
 /// connection-level deadline, and a streamed result has no single point at
 /// which to apply a fan-out timeout without buffering. The request deadline in
 /// each per-core `Request` envelope still bounds Data-Plane work.
-/// Consume an authorized scan before entering the internal all-core fan-out.
-pub fn gather_all_cores_stream_authorized(
-    state: &SharedState,
-    authorized: crate::control::server::shared::authorization::AuthorizedTask,
-    trace_id: TraceId,
-) -> crate::Result<ResultStream> {
-    let task = authorized.into_physical_task();
-    gather_all_cores_stream(
-        state,
-        task.tenant_id,
-        task.database_id,
-        task.plan,
-        trace_id,
-        task.txn_id,
-    )
-}
-
 pub(crate) fn gather_all_cores_stream(
     state: &SharedState,
     tenant_id: TenantId,
@@ -331,13 +318,8 @@ pub(crate) fn gather_all_cores_stream(
 
 /// Cluster-wide gather with routing awareness.
 ///
-/// # Single-node mode
-///
-/// If `state.gateway` is `None`, routing is delegated to
-/// [`super::owning_core::gather_single_node`] (same shape-based routing).
-///
-/// # Cluster mode — single-vShard-homed sources (document, kv, columnar,
-/// timeseries, spatial, vector, text)
+/// # Single-vShard-homed sources (document, kv, columnar, timeseries,
+/// spatial, vector, text)
 ///
 /// Standard collections are *single-vShard-homed*: all rows for a collection
 /// live on exactly one vShard determined by `vshard_for_collection` over the
@@ -349,63 +331,46 @@ pub(crate) fn gather_all_cores_stream(
 /// `route_plan` `other` arm, which sends it directly to the single owning
 /// vShard (local or remote) and returns exactly the right rows.
 ///
-/// # Cluster mode — cluster-partitioned sources (graph traversal, array)
+/// # Cluster-partitioned sources (array, graph)
 ///
-/// Graph traversal ops and Array ops distribute data across vShards by node-id
-/// or tile-id.  Cross-node gather for these sources requires a dedicated
-/// scatter-gather path that does not yet exist.  To avoid producing wrong
-/// results we fall back to the local `gather_all_cores` path.
+/// A cluster array read spreads its rows across shards by tile. It runs
+/// through the array executor, which reads each tile from the shard that owns
+/// it (`cluster_leaf`). A graph read never reaches a gather: the SQL planner
+/// emits no graph leaf, and graph reads run through `graph_dispatch`.
 ///
-/// TRACKED DEBT: cross-node gather for genuinely vShard-partitioned sources
-/// (graph traversal / array) needs its own broadcast + vshard-scoped path.
 /// The Exchange{Gather} broadcast approach is NOT correct for single-vShard-
 /// homed collections and must not be reinstated for them.
 pub(crate) async fn gather_all_vshards(
     state: &SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
     plan: PhysicalPlan,
-    trace_id: TraceId,
-    txn_id: Option<TxnId>,
+    scope: ReadScope,
 ) -> crate::Result<GatherOutcome> {
-    let Some(gateway) = state.gateway.get() else {
-        // Single-node: route by plan shape (cluster-partitioned leaf → broadcast;
-        // single-vShard-homed collection → its one owning core; else broadcast
-        // fallback), mirroring the cluster branch below.
-        return super::owning_core::gather_single_node(
-            state,
-            tenant_id,
-            database_id,
-            plan,
-            trace_id,
-            txn_id,
-        )
-        .await;
-    };
+    let ReadScope {
+        database_id,
+        tenant_id,
+        trace_id,
+        txn_id,
+        linearizable,
+    } = scope;
+    let gateway = state.installed_gateway()?;
 
     if nodedb_physical::physical_plan::plan_contains_cluster_partitioned_leaf(&plan) {
-        // Graph node-id / array tile partitioning: cross-node gather via this
-        // primitive is NOT yet correct (these engines have dedicated scatter-
-        // gather paths). Fall back to the prior local fan to avoid introducing
-        // wrong results.
-        // TRACKED DEBT: cross-node gather for genuinely vShard-partitioned
-        // sources (graph traversal / array) needs its own broadcast +
-        // vshard-scoped path. Do not replace this fallback with Exchange{Gather}
-        // broadcasting — that path is only correct for single-vShard-homed
-        // collections.
-        return gather_all_cores(state, tenant_id, database_id, plan, trace_id, txn_id).await;
+        // Array rows are spread by tile: the array executor reads each tile
+        // from its owning shard (`cluster_leaf`).
+        return super::cluster_leaf::gather_cluster_partitioned(state, plan, scope).await;
     }
 
     // Single-vShard-homed source (document/kv/columnar/ts/spatial/vector/text):
     // the whole collection lives on ONE vShard. Route the BARE plan through the
     // gateway so route_plan's `other` arm sends it to that single owning vShard
-    // (local or remote). Do NOT wrap in Exchange{Gather} — broadcasting would
+    // (local or remote). Do NOT wrap in Exchange{Gather} — broadcasting will
     // duplicate rows because the data-plane scan is not vshard-scoped.
     let ctx = QueryContext {
         tenant_id,
         trace_id,
         database_id,
         txn_id,
+        linearizable,
     };
 
     // `Box::pin` breaks an async-fn recursion cycle: the gateway dispatches the
@@ -415,7 +380,7 @@ pub(crate) async fn gather_all_vshards(
     // resolve is a no-op), but the future must be heap-indirected so its size
     // is finite.
     // The gateway already fails with a typed `crate::Error` — a shard's
-    // `Error::DataPlane` code included. Re-wrapping it in `Dispatch` would
+    // `Error::DataPlane` code included. Re-wrapping it in `Dispatch` will
     // rewrite every such verdict as SQLSTATE XX000, so it passes through.
     let (payloads, shard_watermarks, read_version_lsn): (Vec<Vec<u8>>, Vec<(VShardId, Lsn)>, Lsn) =
         Box::pin(gateway.execute_internal_with_watermarks(&ctx, plan)).await?;

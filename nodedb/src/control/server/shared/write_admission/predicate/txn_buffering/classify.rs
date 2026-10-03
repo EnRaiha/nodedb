@@ -12,7 +12,7 @@ use nodedb_physical::physical_plan::{
 };
 
 /// Whether an in-transaction statement's plan must be buffered for COMMIT-time
-/// replay (`true`) or may execute as a read (`false`). Mirrors
+/// replay (`true`) or can execute as a read (`false`). Mirrors
 /// `to_replicated_entry(..).is_some()`, except the flipped variants below.
 pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
     match plan {
@@ -23,7 +23,10 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | DocumentOp::PointDelete { .. }
             | DocumentOp::PointUpdate { .. }
             | DocumentOp::Upsert { .. }
-            | DocumentOp::InsertSelect { .. },
+            | DocumentOp::InsertSelect { .. }
+            // A cross-shard materialized-sum move: staged as the target row's
+            // post-image, which the transaction's redo record carries.
+            | DocumentOp::ApplyBalanceDelta { .. },
         ) => true,
 
         // Encoded only when there's no predicted surrogate/edge set to verify against;
@@ -55,8 +58,6 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | DocumentOp::MaterializeScan { .. }
             // Read-only classification pass issued by the Control-Plane expander itself.
             | DocumentOp::ResolveWrite(_)
-            // Appended by the planner after statement admission as its own task.
-            | DocumentOp::ApplyBalanceDelta { .. }
             // Built by write-resolve on the autocommit path, proposed straight through Raft.
             | DocumentOp::ResolvedWrite { .. },
         ) => false,
@@ -164,8 +165,16 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | GraphOp::SetNodeLabels { .. }
             | GraphOp::RemoveNodeLabels { .. }
             | GraphOp::EdgePutBatch { .. }
-            | GraphOp::EdgeDeleteBatch { .. },
+            | GraphOp::EdgeDeleteBatch { .. }
+            | GraphOp::TruncateEdges { .. },
         ) => true,
+
+        // ---- Graph: a node delete's guards, buffered though not encoded ----
+        // They write nothing and replicate nothing, but COMMIT runs them
+        // against the state the transaction commits on.
+        PhysicalPlan::Graph(GraphOp::NodeEdgeGuard { .. } | GraphOp::NodePresenceGuard { .. }) => {
+            true
+        }
 
         // ---- Graph: reads, not encoded ----
         PhysicalPlan::Graph(
@@ -185,7 +194,8 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | GraphOp::WccSuperstep(_)
             | GraphOp::TemporalNeighbors { .. }
             | GraphOp::TemporalAlgorithm { .. }
-            | GraphOp::Stats { .. },
+            | GraphOp::Stats { .. }
+            | GraphOp::NodePresenceRead { .. },
         ) => false,
 
         // ---- Kv: encoded (buffered) ----
@@ -224,7 +234,7 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | KvOp::SortedIndexScore { .. }
             | KvOp::SortedIndexTxnRead { .. }
             | KvOp::MaterializeScan { .. }
-            // Read-only: reports what a governed write would apply; encodes nothing.
+            // Read-only: reports what a governed write will apply; encodes nothing.
             | KvOp::ResolveWrite(_),
         ) => false,
 
@@ -338,13 +348,13 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | MetaOp::QueryAggregateWatermark { .. }
             | MetaOp::QueryLastValues { .. }
             | MetaOp::QueryLastValue { .. }
+            | MetaOp::VerifyHashChain { .. }
             | MetaOp::CalvinExecuteStatic { .. }
             | MetaOp::CalvinExecutePassive { .. }
             | MetaOp::CalvinExecuteActive { .. }
             | MetaOp::RebuildIndex { .. }
             | MetaOp::PutSynonymGroup { .. }
             | MetaOp::DeleteSynonymGroup { .. }
-            | MetaOp::RenameCollection { .. }
             | MetaOp::StageWrite { .. }
             | MetaOp::DropTxnOverlay { .. }
             | MetaOp::MarkSavepoint { .. }
@@ -354,7 +364,9 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | MetaOp::CalvinDrop { .. }
             | MetaOp::CalvinResolve { .. }
             | MetaOp::ResolveTxn { .. }
-            | MetaOp::ApplyTransactionRedo { .. },
+            | MetaOp::ApplyTransactionRedo { .. }
+            | MetaOp::RestoreRedo(_)
+            | MetaOp::HomeVersions { .. },
         ) => false,
 
         // ---- Array reads / DDL / Flush: `to_replicated_entry` returns `None` — matches oracle.
@@ -368,7 +380,7 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | ArrayOp::Compact { .. }
             | ArrayOp::SurrogateBitmapScan { .. }
             | ArrayOp::DropArray { .. }
-            | ArrayOp::RestoreArrayDrop { .. }
+            | ArrayOp::RekeyArray { .. }
             | ArrayOp::PurgeArrayDrop { .. },
         ) => false,
         // Buffered and encoded — matches oracle. `to_replicated_entry` emits
@@ -505,7 +517,7 @@ mod tests {
             PhysicalPlan::Document(DocumentOp::PointGet {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
-                surrogate: Surrogate::ZERO,
+                surrogate: None,
                 pk_bytes: Vec::new(),
                 rls_filters: Vec::new(),
                 system_time: SystemTimeScope::Current,
@@ -515,7 +527,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 value: Vec::new(),
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
@@ -526,7 +538,7 @@ mod tests {
                 document_id: "d".into(),
                 value: Vec::new(),
                 if_absent: false,
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 returning: None,
                 rls_filters: Vec::new(),
                 resolved_sum_targets: Vec::new(),
@@ -535,7 +547,7 @@ mod tests {
             PhysicalPlan::Document(DocumentOp::PointDelete {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
-                surrogate: Surrogate::ZERO,
+                surrogate: None,
                 pk_bytes: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
@@ -545,7 +557,7 @@ mod tests {
             PhysicalPlan::Document(DocumentOp::PointUpdate {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
-                surrogate: Surrogate::ZERO,
+                surrogate: None,
                 pk_bytes: Vec::new(),
                 updates: Vec::new(),
                 returning: None,
@@ -629,7 +641,7 @@ mod tests {
                 document_id: "d".into(),
                 value: Vec::new(),
                 on_conflict_updates: Vec::new(),
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 returning: None,
                 rls_filters: Vec::new(),
@@ -724,6 +736,17 @@ mod tests {
                 cursor: Vec::new(),
                 count: 0,
                 system_as_of_ms: None,
+                raw_bodies: false,
+            }),
+            PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
+                document_id: "d".into(),
+                surrogate: Surrogate::new(1),
+                column: "balance".into(),
+                delta: "1".into(),
+                join_column: "id".into(),
+                join_value: "d".into(),
+                declared_primary_key: None,
             }),
             // Predicate `true` and encoder `Some` agree for `BatchInsert`.
             PhysicalPlan::Document(DocumentOp::BatchInsert {
@@ -763,7 +786,7 @@ mod tests {
                 vector: Vec::new(),
                 dim: 0,
                 field_name: String::new(),
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 pk_bytes: None,
                 provenance: None,
             }),
@@ -821,7 +844,7 @@ mod tests {
             // Encoder covers these six, so predicate and encoder agree — oracle-matching set.
             PhysicalPlan::Vector(VectorOp::DeleteBySurrogate {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
-                surrogate: Surrogate::ZERO,
+                surrogate: None,
                 field_name: String::new(),
                 provenance: None,
             }),
@@ -839,7 +862,8 @@ mod tests {
             PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field_name: String::new(),
-                document_surrogate: Surrogate::ZERO,
+                document_surrogate: Surrogate::new(1),
+                pk_bytes: None,
                 vectors: Vec::new(),
                 count: 0,
                 dim: 0,
@@ -847,12 +871,12 @@ mod tests {
             PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field_name: String::new(),
-                document_surrogate: Surrogate::ZERO,
+                document_surrogate: Surrogate::new(1),
             }),
             PhysicalPlan::Vector(VectorOp::DirectUpsert {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: String::new(),
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 pk_bytes: Vec::new(),
                 vector: Vec::new(),
                 payload: Vec::new(),
@@ -867,7 +891,7 @@ mod tests {
             PhysicalPlan::Vector(VectorOp::DirectInsert {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: String::new(),
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 pk_bytes: Vec::new(),
                 vector: Vec::new(),
                 payload: Vec::new(),
@@ -880,7 +904,7 @@ mod tests {
             PhysicalPlan::Vector(VectorOp::DirectInsertIfAbsent {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: String::new(),
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 pk_bytes: Vec::new(),
                 vector: Vec::new(),
                 payload: Vec::new(),
@@ -925,7 +949,7 @@ mod tests {
             delta: Vec::new(),
             peer_id: 0,
             mutation_id: 0,
-            surrogate: Surrogate::ZERO,
+            surrogate: Surrogate::new(1),
             provenance: None,
             constraint_version_required: 0,
             expected_frontier_digest: None,
@@ -977,14 +1001,14 @@ mod tests {
                 list_path: "$.l".into(),
                 index: 0,
                 fields_json: "{}".into(),
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
             }),
             PhysicalPlan::Crdt(CrdtOp::ListDelete {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 list_path: "$.l".into(),
                 index: 0,
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
             }),
             PhysicalPlan::Crdt(CrdtOp::ListMove {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
@@ -992,7 +1016,7 @@ mod tests {
                 list_path: "$.l".into(),
                 from_index: 0,
                 to_index: 1,
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
             }),
             // `to_replicated_entry` has encoder arms for these — predicate and encoder agree.
             PhysicalPlan::Crdt(CrdtOp::SetConstraints {
@@ -1008,7 +1032,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 fields_json: "{}".into(),
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 partial: false,
                 verb: nodedb_physical::physical_plan::CrdtWriteVerb::Insert,
                 returning: None,
@@ -1017,7 +1041,7 @@ mod tests {
             PhysicalPlan::Crdt(CrdtOp::DocDelete {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
-                surrogate: Surrogate::ZERO,
+                surrogate: Some(Surrogate::new(1)),
                 returning: None,
                 rls_filters: Vec::new(),
             }),
@@ -1036,8 +1060,8 @@ mod tests {
                 label: "L".into(),
                 dst_id: "b".into(),
                 properties: Vec::new(),
-                src_surrogate: Surrogate::ZERO,
-                dst_surrogate: Surrogate::ZERO,
+                src_surrogate: Surrogate::new(1),
+                dst_surrogate: Surrogate::new(2),
             }),
             PhysicalPlan::Graph(GraphOp::EdgePutBatch {
                 edges: Vec::<BatchEdge>::new(),
@@ -1047,8 +1071,8 @@ mod tests {
                 src_id: "a".into(),
                 label: "L".into(),
                 dst_id: "b".into(),
-                src_surrogate: Surrogate::ZERO,
-                dst_surrogate: Surrogate::ZERO,
+                src_surrogate: Surrogate::new(1),
+                dst_surrogate: Surrogate::new(2),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
             PhysicalPlan::Graph(GraphOp::EdgeDeleteBatch {
@@ -1111,10 +1135,12 @@ mod tests {
                 options: GraphTraversalOptions::default(),
                 bm25_query: None,
                 bm25_field: None,
+                stage: nodedb_physical::physical_plan::RagStage::Local,
             }),
             PhysicalPlan::Graph(GraphOp::Algo {
                 algorithm: GraphAlgorithm::PageRank,
                 params: AlgoParams::default(),
+                stage: nodedb_physical::physical_plan::AlgoStage::Local,
             }),
             PhysicalPlan::Graph(GraphOp::Match {
                 query: Vec::new(),
@@ -1142,10 +1168,14 @@ mod tests {
                 rank_seed: Vec::new(),
                 global_dangling: 0.0,
                 personalization_sum: 0.0,
+                read_cut_marker: 0,
+                system_as_of: None,
             }))),
             PhysicalPlan::Graph(GraphOp::WccSuperstep(Box::new(WccSuperstepPlan {
                 params: AlgoParams::default(),
                 owned_vshards: Vec::new(),
+                read_cut_marker: 0,
+                system_as_of: None,
             }))),
             PhysicalPlan::Graph(GraphOp::SetNodeLabels {
                 node_id: "n".into(),
@@ -1193,7 +1223,7 @@ mod tests {
                 key: Vec::new(),
                 value: Vec::new(),
                 ttl_ms: 0,
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 returning: None,
                 rls_filters: Vec::new(),
                 provenance: None,
@@ -1203,7 +1233,7 @@ mod tests {
                 key: Vec::new(),
                 value: Vec::new(),
                 ttl_ms: 0,
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 returning: None,
                 rls_filters: Vec::new(),
             }),
@@ -1212,7 +1242,7 @@ mod tests {
                 key: Vec::new(),
                 value: Vec::new(),
                 ttl_ms: 0,
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 returning: None,
                 rls_filters: Vec::new(),
             }),
@@ -1222,7 +1252,7 @@ mod tests {
                 value: Vec::new(),
                 ttl_ms: 0,
                 updates: Vec::new(),
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 returning: None,
                 rls_filters: Vec::new(),
@@ -1299,7 +1329,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: Vec::new(),
                 updates: Vec::new(),
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 if_present: false,
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 returning: None,
@@ -1310,7 +1340,7 @@ mod tests {
                 key: Vec::new(),
                 delta: 0,
                 ttl_ms: 0,
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 shape: nodedb_physical::physical_plan::KvCounterShape::Raw,
             }),
@@ -1318,7 +1348,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: Vec::new(),
                 delta: "0".into(),
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 shape: nodedb_physical::physical_plan::KvCounterShape::Raw,
             }),
@@ -1327,14 +1357,14 @@ mod tests {
                 key: Vec::new(),
                 expected: Vec::new(),
                 new_value: Vec::new(),
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
             PhysicalPlan::Kv(KvOp::GetSet {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 key: Vec::new(),
                 new_value: Vec::new(),
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 rls_filters: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
@@ -1344,8 +1374,8 @@ mod tests {
                 dest_key: Vec::new(),
                 field: "f".into(),
                 amount: 0.0,
-                debit_surrogate: Surrogate::ZERO,
-                credit_surrogate: Surrogate::ZERO,
+                debit_surrogate: Surrogate::new(1),
+                credit_surrogate: Surrogate::new(2),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
             PhysicalPlan::Kv(KvOp::TransferItem {
@@ -1353,7 +1383,7 @@ mod tests {
                 dest_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "d"),
                 item_key: Vec::new(),
                 dest_key: Vec::new(),
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 source_rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 dest_rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
             }),
@@ -1476,7 +1506,7 @@ mod tests {
             PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 payload: Vec::new(),
-                format: "ilp".into(),
+                format: crate::engine::timeseries::resolved_ingest::RESOLVED_INGEST_FORMAT.into(),
                 wal_lsn: None,
                 surrogates: Vec::new(),
                 provenance: None,
@@ -1487,14 +1517,14 @@ mod tests {
             PhysicalPlan::Spatial(SpatialOp::Insert {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: "f".into(),
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 geometry: Geometry::point(0.0, 0.0),
                 provenance: None,
             }),
             PhysicalPlan::Spatial(SpatialOp::Delete {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: "f".into(),
-                surrogate: Surrogate::ZERO,
+                surrogate: None,
                 provenance: None,
             }),
             PhysicalPlan::Spatial(SpatialOp::Scan {
@@ -1552,13 +1582,13 @@ mod tests {
             }),
             PhysicalPlan::Text(TextOp::FtsIndexDoc {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
                 text: "t".into(),
                 provenance: None,
             }),
             PhysicalPlan::Text(TextOp::FtsDeleteDoc {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
-                surrogate: Surrogate::ZERO,
+                surrogate: None,
                 provenance: None,
             }),
             PhysicalPlan::Text(TextOp::HybridSearchTriple {
@@ -1785,13 +1815,15 @@ mod tests {
             PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot {
                 tenant_id: 1,
                 cut_watermark: None,
+                cut_capture: None,
+                arrays: false,
             }),
             PhysicalPlan::Meta(MetaOp::RestoreTenantSnapshot {
                 tenant_id: 1,
                 snapshot: Vec::new(),
                 replace_mode: false,
-                clear_vshards: Vec::new(),
                 collections_to_clear: Vec::new(),
+                group_vshards: Vec::new(),
             }),
             PhysicalPlan::Meta(MetaOp::PurgeTenant { tenant_id: 1 }),
             PhysicalPlan::Meta(MetaOp::UnregisterCollection {
@@ -1807,6 +1839,9 @@ mod tests {
             PhysicalPlan::Meta(MetaOp::QueryCollectionSize {
                 tenant_id: 1,
                 name: "c".into(),
+            }),
+            PhysicalPlan::Meta(MetaOp::VerifyHashChain {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             }),
             PhysicalPlan::Meta(MetaOp::EnforceTimeseriesRetention {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
@@ -1865,7 +1900,10 @@ mod tests {
                     collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c").to_string(),
                     key: ReadKeyIdent::Predicate,
                     read_lsn: Lsn::ZERO,
+                    home_vshard: None,
+                    served_by: 0,
                 }],
+                body_plans: Vec::new(),
             }),
             PhysicalPlan::Meta(MetaOp::CalvinExecutePassive {
                 epoch: 0,
@@ -1899,13 +1937,6 @@ mod tests {
             PhysicalPlan::Meta(MetaOp::DeleteSynonymGroup {
                 tenant_id: 1,
                 name: "syn".into(),
-            }),
-            PhysicalPlan::Meta(MetaOp::RenameCollection {
-                tenant_id: 1,
-                old_database_id: 0,
-                new_database_id: 1,
-                old_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "old"),
-                new_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "new"),
             }),
             PhysicalPlan::Meta(MetaOp::StageWrite {
                 plan: Box::new(trivial_read_plan()),
@@ -2013,12 +2044,14 @@ mod tests {
                 cells_msgpack: Vec::new(),
                 wal_lsn: 0,
                 provenance: None,
+                vshard_id: 0,
             }),
             PhysicalPlan::Array(ArrayOp::Delete {
                 array_id: array_id.clone(),
                 coords_msgpack: Vec::new(),
                 wal_lsn: 0,
                 provenance: None,
+                vshard_id: 0,
             }),
             PhysicalPlan::ClusterArray(ClusterArrayOp::Slice {
                 array_id: array_id.clone(),
@@ -2089,7 +2122,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 target_version_json: "{}".into(),
-                surrogate: Surrogate::ZERO,
+                surrogate: Surrogate::new(1),
             }),
             // `session::txn_expand` reshapes these into per-shard `ArrayOp`
             // writes before they enter the buffer, so the wrapper itself needs

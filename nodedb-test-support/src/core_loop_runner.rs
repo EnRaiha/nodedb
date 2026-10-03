@@ -29,8 +29,10 @@ use std::time::Duration;
 use nodedb::bridge::dispatch::CoreChannelDataSide;
 use nodedb::control::array_catalog::ArrayCatalog;
 use nodedb::control::metrics::SystemMetrics;
+use nodedb::control::state::SharedState;
 use nodedb::data::executor::core_loop::CoreLoop;
 use nodedb::event::EventProducer;
+use nodedb::event::interest::EventInterest;
 use nodedb_mem::MemoryGovernor;
 use nodedb_types::OrdinalClock;
 use nodedb_wal::{TombstoneSet, WalRecord};
@@ -91,6 +93,11 @@ pub struct CoreLoopSpawn {
     /// unless a test overrides e.g. `columnar_flush_threshold` to drive flush
     /// on a small dataset.
     pub query_tuning: nodedb_types::config::tuning::QueryTuning,
+    /// Timeseries engine tuning wired via `core.set_timeseries_tuning`.
+    /// Production (`data::runtime`) wires this from the node's config. The
+    /// harness passes `TimeseriesToning::default()` unless a test lowers one
+    /// node's memtable budget or tag cardinality.
+    pub timeseries_tuning: nodedb_types::config::tuning::TimeseriesToning,
     /// Catalog-sourced `doc_configs` seed, applied BEFORE WAL replay exactly as
     /// production's `seed_catalog_state` does.
     ///
@@ -101,8 +108,19 @@ pub struct CoreLoopSpawn {
     /// `timestamp`. That made every restart test here quietly weaker than it
     /// looked — none of them exercised the seeded path production always takes.
     pub doc_config_seed: Vec<nodedb::data::executor::core_loop::DocConfigSeedEntry>,
+    /// The collections some Event Plane consumer reads, as production boot
+    /// wires them. Build it with [`event_interest_for`].
+    pub event_interest: Arc<EventInterest>,
     /// Stop signal for the tick loop. Sender lives in the harness shutdown path.
     pub stop_rx: std::sync::mpsc::Receiver<()>,
+}
+
+/// The consumed-collection set of `shared`'s registries, as production boot
+/// installs it once `SharedState` exists.
+pub fn event_interest_for(shared: &SharedState) -> Arc<EventInterest> {
+    let interest = EventInterest::new();
+    interest.install(shared.event_interest_sources());
+    interest
 }
 
 /// Spawn a `CoreLoop` for one Data Plane core inside `tokio::spawn_blocking`.
@@ -123,7 +141,9 @@ pub fn spawn_core_loop(spawn: CoreLoopSpawn) -> tokio::task::JoinHandle<()> {
         replay,
         graph_tuning,
         query_tuning,
+        timeseries_tuning,
         doc_config_seed,
+        event_interest,
         stop_rx,
     } = spawn;
 
@@ -143,9 +163,11 @@ pub fn spawn_core_loop(spawn: CoreLoopSpawn) -> tokio::task::JoinHandle<()> {
                 )
                 .expect("CoreLoop::open_with_array_catalog");
                 core.set_event_producer(event_producer);
+                core.set_event_interest(event_interest);
                 core.set_num_cores(num_cores);
                 core.set_query_tuning(query_tuning);
                 core.set_graph_tuning(graph_tuning);
+                core.set_timeseries_tuning(timeseries_tuning);
                 if let Some(m) = core_metrics {
                     core.set_metrics(m);
                 }
@@ -159,7 +181,8 @@ pub fn spawn_core_loop(spawn: CoreLoopSpawn) -> tokio::task::JoinHandle<()> {
                     num_cores: replay_num_cores,
                 }) = replay
                 {
-                    core.replay_all_wal(&records, replay_num_cores, &tombstones);
+                    core.replay_all_wal(&records, replay_num_cores, &tombstones)
+                        .expect("WAL replay of the test core");
                 }
                 while matches!(
                     stop_rx.try_recv(),

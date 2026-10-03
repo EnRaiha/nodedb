@@ -13,7 +13,7 @@
 //! `_system.auth_users` record, which [`check_blacklist`](crate::control::server::session_auth::guards::check_blacklist)
 //! consults on every subsequent request — and replicated as a
 //! [`CatalogEntry::PutAuthUser`]. A suspension that lived only in a
-//! process-local map would evaporate on restart, which is a security control
+//! process-local map evaporates on restart, which is a security control
 //! that silently stops working.
 
 use tracing::warn;
@@ -43,7 +43,7 @@ pub enum ViolationSubject<'a> {
     /// Record the audit entry and nothing else. Used where no principal is
     /// attributable, and where the rejection *is* the previous verdict being
     /// enforced (an already-suspended account, a blacklisted org) — counting
-    /// those would let a client in a retry loop drive the ladder from its own
+    /// those lets a client in a retry loop drive the ladder from its own
     /// rejections.
     AuditOnly,
 }
@@ -120,14 +120,50 @@ pub fn record_auth_violation(state: &SharedState, violation: AuthViolation<'_>) 
         }
     };
 
-    let entry = CatalogEntry::PutAuthUser(Box::new(stored));
-    if let Err(e) = crate::control::metadata_proposer::propose_catalog_entry(state, &entry) {
+    replicate_verdict(
+        state,
+        CatalogEntry::PutAuthUser(Box::new(stored)),
+        subject.log_id,
+    );
+}
+
+/// Propose the locally installed verdict `entry` on its own task.
+///
+/// The authentication paths that record a violation are synchronous and hold
+/// no proposer budget: the verdict already binds this node, so its
+/// replication runs off the rejected request. The task has no connection
+/// scope, so an open transactional-DDL block never buffers it.
+fn replicate_verdict(state: &SharedState, entry: CatalogEntry, log_id: String) {
+    let owner = match state.self_arc() {
+        Ok(owner) => owner,
+        Err(e) => {
+            warn!(
+                user_id = %log_id,
+                error = %e,
+                "escalation verdict persisted locally but could not be replicated"
+            );
+            return;
+        }
+    };
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         warn!(
-            user_id = %subject.log_id,
-            error = %e,
-            "escalation verdict persisted locally but could not be replicated"
+            user_id = %log_id,
+            "escalation verdict persisted locally but could not be replicated: \
+             no tokio runtime runs on this thread"
         );
-    }
+        return;
+    };
+    runtime.spawn(async move {
+        if let Err(e) =
+            crate::control::metadata_proposer::propose_catalog_entry_async(&owner, &entry).await
+        {
+            warn!(
+                user_id = %log_id,
+                error = %e,
+                "escalation verdict persisted locally but could not be replicated"
+            );
+        }
+    });
 }
 
 /// The account an escalation applies to.

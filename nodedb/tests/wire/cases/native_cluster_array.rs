@@ -7,7 +7,7 @@
 //! in-transaction write is staged and read-your-own-writes visible until
 //! `ROLLBACK` discards it.
 //!
-//! Runs on the full-boot `TestServer` (`single_node_calvin = true`), so
+//! Runs on the full-boot `TestServer`, which runs a cluster topology, so
 //! `plan_sql()` emits the `ClusterArrayOp` routing wrappers pgwire's overlay
 //! tests exercise (see `sql_transactions_cluster_array_overlay.rs`) — this
 //! file drives the same plans over the native wire instead of pgwire.

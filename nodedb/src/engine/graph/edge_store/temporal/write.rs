@@ -7,17 +7,58 @@ use redb::{ReadableDatabase, ReadableTable, WriteTransaction};
 
 use super::keys::{
     EdgeRef, GDPR_ERASURE_SENTINEL, TOMBSTONE_SENTINEL, edge_version_prefix, is_sentinel,
-    versioned_edge_key,
+    parse_versioned_edge_key, versioned_edge_key,
 };
 use super::payload::EdgeValuePayload;
 use super::revert::{EdgeCountChange, EdgeVersionWrite};
+use super::visibility::{read_visibility, visible_version, write_visibility};
 use crate::engine::graph::edge_store::stats::table::{GRAPH_STATS, SummaryRow, summary_key};
 use crate::engine::graph::edge_store::stats::update::{
-    EdgeStatsKey, decrement_for_delete, increment_for_insert,
+    EdgeStatsKey, decrement_counts, increment_counts,
 };
 use crate::engine::graph::edge_store::store::{
     EDGES, EdgeStore, NODE_SURROGATES, REVERSE_EDGES, redb_err,
 };
+
+/// The system time one edge version is stamped at, and the ordinal it is
+/// applied at: its Calvin transaction's ordinal. A restored version keeps
+/// its historical `system_from`. A version raised above a stored version of
+/// the same edge takes a `system_from` above its ordinal. Every other version
+/// is stamped at its applied ordinal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionStamp {
+    pub system_from: i64,
+    pub applied: i64,
+}
+
+impl VersionStamp {
+    /// A version applied at its own system time.
+    pub const fn at(system_from: i64) -> Self {
+        Self {
+            system_from,
+            applied: system_from,
+        }
+    }
+
+    /// A version stamped at `system_from` and applied at `applied`, when the
+    /// record carries an applied ordinal. An ordinal is never negative, so a
+    /// negative one is refused.
+    pub fn applied_at(system_from: i64, applied: Option<i64>) -> crate::Result<Self> {
+        match applied {
+            None => Ok(Self::at(system_from)),
+            Some(applied) if applied >= 0 => Ok(Self {
+                system_from,
+                applied,
+            }),
+            Some(applied) => Err(crate::Error::BadRequest {
+                detail: format!(
+                    "edge version at system time {system_from} carries negative applied \
+                     ordinal {applied}"
+                ),
+            }),
+        }
+    }
+}
 
 impl EdgeStore {
     /// Write a new version of an edge at `system_from`. Maintains
@@ -61,7 +102,7 @@ impl EdgeStore {
         self.put_edge_version_recorded(
             edge,
             properties,
-            system_from,
+            VersionStamp::at(system_from),
             valid_from_ms,
             valid_until_ms,
             account_stats,
@@ -69,20 +110,18 @@ impl EdgeStore {
         .map(drop)
     }
 
-    /// Write a version like [`Self::put_edge_versioned_with_stats`] and
-    /// return what it changed, so [`Self::remove_edge_version`] can remove it.
+    /// Write a version like [`Self::put_edge_versioned_with_stats`], at the
+    /// system time and applied ordinal of `stamp`, and return what it
+    /// changed, so [`Self::remove_edge_version`] can remove it.
     pub fn put_edge_version_recorded(
         &self,
         edge: EdgeRef<'_>,
         properties: &[u8],
-        system_from: i64,
+        stamp: VersionStamp,
         valid_from_ms: i64,
         valid_until_ms: i64,
         account_stats: bool,
     ) -> crate::Result<EdgeVersionWrite> {
-        let mut written = EdgeVersionWrite::at(system_from);
-        let fwd = versioned_edge_key(edge.collection, edge.src, edge.label, edge.dst, system_from)?;
-        let rev = versioned_edge_key(edge.collection, edge.dst, edge.label, edge.src, system_from)?;
         let payload =
             EdgeValuePayload::new(valid_from_ms, valid_until_ms, properties.to_vec()).encode()?;
         let d = edge.db.as_u64();
@@ -92,40 +131,9 @@ impl EdgeStore {
             .db
             .begin_write()
             .map_err(|e| redb_err("begin_write", e))?;
+        let mut written = write_version_in(&write_txn, edge, stamp, &payload, account_stats)?;
         {
-            let mut edges = write_txn
-                .open_table(EDGES)
-                .map_err(|e| redb_err("open edges", e))?;
-            written.prior_forward = edges
-                .insert((d, t, fwd.as_str()), payload.as_slice())
-                .map_err(|e| redb_err("insert versioned edge", e))?
-                .map(|prior| prior.value().to_vec());
-            drop(edges);
-
-            let mut rev_t = write_txn
-                .open_table(REVERSE_EDGES)
-                .map_err(|e| redb_err("open reverse", e))?;
-            written.prior_reverse = rev_t
-                .insert((d, t, rev.as_str()), &[] as &[u8])
-                .map_err(|e| redb_err("insert reverse", e))?
-                .map(|prior| prior.value().to_vec());
-            drop(rev_t);
-
-            if account_stats {
-                written.counted = increment_for_insert(
-                    &write_txn,
-                    EdgeStatsKey {
-                        db: d,
-                        tid: t,
-                        collection: edge.collection,
-                        label: edge.label,
-                        src: edge.src,
-                        dst: edge.dst,
-                    },
-                    system_from,
-                )?
-                .then_some(EdgeCountChange::Added);
-            } else {
+            if !account_stats {
                 // Suppress the lazy edge-scan rebuild on a destination-only
                 // replica: absence of a summary means "legacy stats missing",
                 // while an explicit zero summary means "this shard owns no
@@ -160,10 +168,10 @@ impl EdgeStore {
                 (edge.src, edge.src_surrogate),
                 (edge.dst, edge.dst_surrogate),
             ] {
-                let raw = surrogate.as_u32();
-                if raw == 0 {
+                let Some(surrogate) = surrogate else {
                     continue;
-                }
+                };
+                let raw = surrogate.as_u32();
                 let prior = surrogates
                     .insert((d, t, node), raw)
                     .map_err(|e| redb_err("insert node surrogate", e))?
@@ -207,6 +215,7 @@ impl EdgeStore {
             let table = read_txn
                 .open_table(EDGES)
                 .map_err(|e| redb_err("open edges", e))?;
+            let mut visibility = read_visibility(&read_txn)?;
             let range = table
                 .range((d, t, prefix.as_str())..=(d, t, upper.as_str()))
                 .map_err(|e| redb_err("close referrer range", e))?;
@@ -216,6 +225,12 @@ impl EdgeStore {
                 let (kd, kt, composite) = k.value();
                 if kd != d || kt != t || !composite.starts_with(&prefix) {
                     break;
+                }
+                let Some((_, _, _, _, sys)) = parse_versioned_edge_key(composite) else {
+                    continue;
+                };
+                if visibility.hidden(d, t, edge.collection, composite, sys, system_from)? {
+                    continue;
                 }
                 let bytes = v.value();
                 if is_sentinel(bytes) {
@@ -245,8 +260,13 @@ impl EdgeStore {
 
     /// Append a tombstone version at `system_from`.
     pub fn soft_delete_edge(&self, edge: EdgeRef<'_>, system_from: i64) -> crate::Result<()> {
-        self.write_sentinel(edge, system_from, TOMBSTONE_SENTINEL, true)
-            .map(drop)
+        self.write_sentinel(
+            edge,
+            VersionStamp::at(system_from),
+            TOMBSTONE_SENTINEL,
+            true,
+        )
+        .map(drop)
     }
 
     /// Append a tombstone without double-decrementing global statistics on the
@@ -257,32 +277,38 @@ impl EdgeStore {
         system_from: i64,
         account_stats: bool,
     ) -> crate::Result<()> {
-        self.soft_delete_edge_recorded(edge, system_from, account_stats)
+        self.soft_delete_edge_recorded(edge, VersionStamp::at(system_from), account_stats)
             .map(drop)
     }
 
-    /// Append a tombstone like [`Self::soft_delete_edge_with_stats`] and
-    /// return what it changed, so [`Self::remove_edge_version`] can remove it.
+    /// Append a tombstone like [`Self::soft_delete_edge_with_stats`], at the
+    /// system time and applied ordinal of `stamp`, and return what it
+    /// changed, so [`Self::remove_edge_version`] can remove it.
     pub fn soft_delete_edge_recorded(
         &self,
         edge: EdgeRef<'_>,
-        system_from: i64,
+        stamp: VersionStamp,
         account_stats: bool,
     ) -> crate::Result<EdgeVersionWrite> {
-        self.write_sentinel(edge, system_from, TOMBSTONE_SENTINEL, account_stats)
+        self.write_sentinel(edge, stamp, TOMBSTONE_SENTINEL, account_stats)
     }
 
     /// Append a GDPR-erasure version — distinct from a soft-delete so audits
     /// can distinguish user-visible removal from regulatory erasure.
     pub fn gdpr_erase_edge(&self, edge: EdgeRef<'_>, system_from: i64) -> crate::Result<()> {
-        self.write_sentinel(edge, system_from, GDPR_ERASURE_SENTINEL, true)
-            .map(drop)
+        self.write_sentinel(
+            edge,
+            VersionStamp::at(system_from),
+            GDPR_ERASURE_SENTINEL,
+            true,
+        )
+        .map(drop)
     }
 
     fn write_sentinel(
         &self,
         edge: EdgeRef<'_>,
-        system_from: i64,
+        stamp: VersionStamp,
         sentinel: &[u8],
         account_stats: bool,
     ) -> crate::Result<EdgeVersionWrite> {
@@ -290,7 +316,7 @@ impl EdgeStore {
             .db
             .begin_write()
             .map_err(|e| redb_err("begin_write", e))?;
-        let written = write_sentinel_in(&write_txn, edge, system_from, sentinel, account_stats)?;
+        let written = write_version_in(&write_txn, edge, stamp, sentinel, account_stats)?;
         write_txn
             .commit()
             .map_err(|e| redb_err("commit sentinel", e))?;
@@ -298,57 +324,98 @@ impl EdgeStore {
     }
 }
 
-/// Append a sentinel version at `system_from` inside `write_txn`, and return
-/// what it changed. The caller commits.
-pub(in crate::engine::graph::edge_store) fn write_sentinel_in(
+/// The properties a resolved version carries, `None` when there is no
+/// version or it is a sentinel: the edge is not live.
+pub(in crate::engine::graph::edge_store) fn live_properties(
+    version: Option<(i64, Vec<u8>)>,
+) -> crate::Result<Option<Vec<u8>>> {
+    match version {
+        Some((_, bytes)) if !is_sentinel(&bytes) => {
+            Ok(Some(EdgeValuePayload::decode(&bytes)?.properties))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Append the version `stamp` names, holding `value` (a payload or a
+/// sentinel), inside `write_txn`, and return what it changed. The caller
+/// commits.
+///
+/// The version key records the applied ordinal when it differs from the
+/// system time. When `account_stats`, the counters follow the edge's current
+/// state: a write that makes the edge live counts one more edge, and one that
+/// ends it counts one fewer. A version below the newest one, or one a
+/// TRUNCATE hides, changes neither the current state nor the counters.
+pub(in crate::engine::graph::edge_store) fn write_version_in(
     write_txn: &WriteTransaction,
     edge: EdgeRef<'_>,
-    system_from: i64,
-    sentinel: &[u8],
+    stamp: VersionStamp,
+    value: &[u8],
     account_stats: bool,
 ) -> crate::Result<EdgeVersionWrite> {
+    let system_from = stamp.system_from;
     let mut written = EdgeVersionWrite::at(system_from);
-    debug_assert!(
-        is_sentinel(sentinel),
-        "write_sentinel called with non-sentinel bytes"
-    );
     let fwd = versioned_edge_key(edge.collection, edge.src, edge.label, edge.dst, system_from)?;
     let rev = versioned_edge_key(edge.collection, edge.dst, edge.label, edge.src, system_from)?;
+    let reverse: &[u8] = if is_sentinel(value) { value } else { &[] };
     let d = edge.db.as_u64();
     let t = edge.tid.as_u64();
 
-    let mut edges = write_txn
-        .open_table(EDGES)
-        .map_err(|e| redb_err("open edges", e))?;
-    written.prior_forward = edges
-        .insert((d, t, fwd.as_str()), sentinel)
-        .map_err(|e| redb_err("insert sentinel edge", e))?
-        .map(|prior| prior.value().to_vec());
-    drop(edges);
+    let was_live = {
+        let mut edges = write_txn
+            .open_table(EDGES)
+            .map_err(|e| redb_err("open edges", e))?;
+        let mut visibility = write_visibility(write_txn)?;
+        let was_live =
+            live_properties(visible_version(&edges, &mut visibility, &edge, i64::MAX)?)?.is_some();
+        written.prior_forward = edges
+            .insert((d, t, fwd.as_str()), value)
+            .map_err(|e| redb_err("insert edge version", e))?
+            .map(|prior| prior.value().to_vec());
+        let prior_applied = if stamp.applied == system_from {
+            visibility.applied.remove((d, t, fwd.as_str()))
+        } else {
+            visibility
+                .applied
+                .insert((d, t, fwd.as_str()), stamp.applied)
+        };
+        written.prior_applied = prior_applied
+            .map_err(|e| redb_err("write edge applied ordinal", e))?
+            .map(|prior| prior.value());
+        written.current =
+            live_properties(visible_version(&edges, &mut visibility, &edge, i64::MAX)?)?;
+        was_live
+    };
 
     let mut rev_t = write_txn
         .open_table(REVERSE_EDGES)
         .map_err(|e| redb_err("open reverse", e))?;
     written.prior_reverse = rev_t
-        .insert((d, t, rev.as_str()), sentinel)
-        .map_err(|e| redb_err("insert sentinel reverse", e))?
+        .insert((d, t, rev.as_str()), reverse)
+        .map_err(|e| redb_err("insert reverse edge version", e))?
         .map(|prior| prior.value().to_vec());
     drop(rev_t);
 
     if account_stats {
-        written.counted = decrement_for_delete(
-            write_txn,
-            EdgeStatsKey {
-                db: d,
-                tid: t,
-                collection: edge.collection,
-                label: edge.label,
-                src: edge.src,
-                dst: edge.dst,
-            },
-            system_from,
-        )?
-        .then_some(EdgeCountChange::Removed);
+        let key = EdgeStatsKey {
+            db: d,
+            tid: t,
+            collection: edge.collection,
+            label: edge.label,
+            src: edge.src,
+            dst: edge.dst,
+        };
+        written.counted = match (was_live, written.current.is_some()) {
+            (false, true) => {
+                increment_counts(write_txn, key)?;
+                Some(EdgeCountChange::Added)
+            }
+            (true, false) => {
+                decrement_counts(write_txn, key)?;
+                Some(EdgeCountChange::Removed)
+            }
+            _ => None,
+        };
     }
     Ok(written)
 }

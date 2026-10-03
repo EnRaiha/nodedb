@@ -25,6 +25,9 @@ pub async fn dispatch_graph(
     stmt: NodedbStatement,
     txn_ctx: &DmlTxnCtx<'_>,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
+    // Graph reads honour the session's read consistency, like every other
+    // read (see `DmlTxnCtx::linearizable_reads` for the default).
+    let linearizable = txn_ctx.linearizable_reads();
     match stmt {
         NodedbStatement::Graph(GraphStmt::GraphInsertEdge {
             collection,
@@ -90,6 +93,7 @@ pub async fn dispatch_graph(
                     depth,
                     edge_label,
                     direction,
+                    linearizable,
                 },
             )
             .await,
@@ -116,6 +120,7 @@ pub async fn dispatch_graph(
                         edge_label,
                         direction,
                         txn_id,
+                        linearizable,
                     },
                 )
                 .await,
@@ -138,6 +143,7 @@ pub async fn dispatch_graph(
                     dst,
                     max_depth,
                     edge_label,
+                    linearizable,
                 },
             )
             .await,
@@ -173,19 +179,37 @@ pub async fn dispatch_graph(
                     direction,
                     mode,
                     personalization,
+                    linearizable,
                 },
             )
             .await,
         ),
-        NodedbStatement::Graph(GraphStmt::GraphRagFusion { collection, params }) => {
-            Some(rag_fusion::rag_fusion(state, identity, database_id, collection, params).await)
-        }
+        NodedbStatement::Graph(GraphStmt::GraphRagFusion { collection, params }) => Some(
+            rag_fusion::rag_fusion(
+                state,
+                identity,
+                database_id,
+                collection,
+                params,
+                linearizable,
+            )
+            .await,
+        ),
         NodedbStatement::Graph(GraphStmt::ShowGraphStats {
             collection,
             verbose,
             as_of,
         }) => Some(
-            stats::show_graph_stats(state, identity, database_id, collection, verbose, as_of).await,
+            stats::show_graph_stats(
+                state,
+                identity,
+                database_id,
+                collection,
+                verbose,
+                as_of,
+                linearizable,
+            )
+            .await,
         ),
         // `MatchQuery` (handled by the router's typed arm → neutral `match_ops`)
         // and every non-graph-overlay variant return None so the caller can route

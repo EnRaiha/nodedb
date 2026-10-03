@@ -67,7 +67,7 @@ const DEFAULT_GEOHASH_PRECISION: usize = 6;
 
 /// `CREATE SPATIAL INDEX [IF NOT EXISTS] [<name>] ON <collection>(<field>)
 ///  [USING RTREE|GEOHASH] [PRECISION <n>]`
-pub fn create_spatial_index(
+pub async fn create_spatial_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -88,7 +88,7 @@ pub fn create_spatial_index(
     let tenant_id = identity.tenant_id;
 
     // The parser substitutes a placeholder when the name is omitted; a
-    // tenant-global placeholder would collide across collections and leave
+    // tenant-global placeholder will collide across collections and leave
     // only one of them droppable, so it resolves per collection and field.
     let index_name = if index_name == PLACEHOLDER_NAME {
         format!("{collection}_{field}_spatial_idx")
@@ -129,7 +129,8 @@ pub fn create_spatial_index(
             collection,
             fields: vec![field.to_string()],
         },
-    )?;
+    )
+    .await?;
     owner::propose_owner(
         state,
         IndexKind::Spatial.owner_object_type(),
@@ -137,7 +138,8 @@ pub fn create_spatial_index(
         tenant_id,
         &index_name,
         &identity.username,
-    )?;
+    )
+    .await?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

@@ -9,8 +9,7 @@
 //! **every** node that applies the Raft entry, exactly as it does for a
 //! local `CREATE COLLECTION`. This handler is therefore symmetric with the
 //! pgwire CREATE handler: it only `stored_from_descriptor` → propose
-//! `PutCollectionIfAbsent` → `apply_locally_if_needed`, and never dispatches
-//! the register itself.
+//! `PutCollectionIfAbsent`, and never dispatches the register itself.
 
 use std::sync::Arc;
 
@@ -32,7 +31,7 @@ impl SyncSession {
     /// Materialize a peer-announced collection descriptor into the local
     /// catalog. Returns `None`: this is a fire-and-forget announce with no
     /// ack frame (mirrors `ShapeUnsubscribe`).
-    pub fn handle_collection_schema(
+    pub async fn handle_collection_schema(
         &mut self,
         msg: &CollectionSchemaSyncMsg,
         shared: Option<&Arc<SharedState>>,
@@ -130,23 +129,17 @@ impl SyncSession {
             );
 
         let entry = CatalogEntry::PutCollectionIfAbsent(Box::new(stored));
-        let outcome = match crate::control::metadata_proposer::propose_catalog_entry(shared, &entry)
+        if let Err(e) =
+            crate::control::metadata_proposer::propose_catalog_entry_async(shared, &entry).await
         {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                warn!(
-                    session = %self.session_id,
-                    collection = %msg.descriptor.name,
-                    error = %e,
-                    "CollectionSchema: failed to propose PutCollectionIfAbsent; \
-                     collection not materialized"
-                );
-                return None;
-            }
-        };
-        crate::control::catalog_entry::apply::local::apply_locally_if_needed(
-            shared, &entry, outcome,
-        );
+            warn!(
+                session = %self.session_id,
+                collection = %msg.descriptor.name,
+                error = %e,
+                "CollectionSchema: failed to propose PutCollectionIfAbsent; \
+                 collection not materialized"
+            );
+        }
         None
     }
 }
@@ -194,10 +187,9 @@ mod tests {
                 .expect("open test WAL"),
         );
         let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-        (
-            SharedState::new(dispatcher, wal).expect("construct shared state"),
-            tempdir,
-        )
+        let shared = SharedState::new(dispatcher, wal).expect("construct shared state");
+        crate::bootstrap::state_wiring::install_gateway(&shared).expect("install gateway");
+        (shared, tempdir)
     }
 
     fn message(tenant_id: u64, database_id: DatabaseId, name: &str) -> CollectionSchemaSyncMsg {
@@ -263,6 +255,7 @@ mod tests {
         assert!(
             session
                 .handle_collection_schema(&msg, Some(&shared))
+                .await
                 .is_none()
         );
         assert!(collection_is_absent(
@@ -285,6 +278,7 @@ mod tests {
         assert!(
             session
                 .handle_collection_schema(&msg, Some(&shared))
+                .await
                 .is_none()
         );
         assert!(collection_is_absent(
@@ -307,6 +301,7 @@ mod tests {
         assert!(
             session
                 .handle_collection_schema(&msg, Some(&shared))
+                .await
                 .is_none()
         );
         assert!(collection_is_absent(
@@ -325,6 +320,7 @@ mod tests {
         assert!(
             session
                 .handle_collection_schema(&msg, Some(&shared))
+                .await
                 .is_none()
         );
         assert!(collection_is_absent(
@@ -343,9 +339,12 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    /// An authorized descriptor commits through the metadata group, so the
+    /// test runs on a one-node cluster.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn selected_identity_database_with_create_permission_materializes_schema() {
-        let (shared, _tempdir) = shared_state();
+        let cluster = crate::control::cluster::test_one_node::boot().await;
+        let shared = Arc::clone(&cluster.state);
         let selected_database = DatabaseId::new(9);
         let mut session = authenticated_session(identity(
             selected_database,
@@ -357,11 +356,13 @@ mod tests {
         assert!(
             session
                 .handle_collection_schema(&msg, Some(&shared))
+                .await
                 .is_none()
         );
         assert!(
             !collection_is_absent(&shared, selected_database, "selected_database_schema"),
             "the authorized selected-database descriptor must be materialized"
         );
+        cluster.shutdown().await;
     }
 }

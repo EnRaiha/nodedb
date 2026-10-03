@@ -34,9 +34,9 @@ pub enum ResolvedRows {
         mutations: Vec<VectorResolvedMutation>,
         response_payload: Vec<u8>,
     },
-    /// Canonical line-protocol lines a governed ingest resolved to, every
-    /// timestamp stamped — an ingest has no rows until rewritten to lines.
-    Timeseries { lines: Vec<String> },
+    /// The encoded `ResolvedTsBatch` a governed ingest resolved to: the exact
+    /// rows it stores, every timestamp stamped.
+    Timeseries { batch: Vec<u8> },
     /// The governed edge delete's pre-image satisfied the policy; the delete
     /// already names its edge in full, so nothing else travels back.
     GraphEdgeDeleteAdmitted,

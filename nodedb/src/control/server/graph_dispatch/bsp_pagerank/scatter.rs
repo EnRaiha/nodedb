@@ -48,12 +48,19 @@ pub(super) struct ShardDispatch {
     /// seed map. `0.0` = uniform PageRank; `> 0.0` activates PPR on every shard.
     /// Constant across all dispatches within a run (it is a cluster-wide scalar).
     pub(super) personalization_sum: f64,
+    /// The cut marker the node resolves the run's read cut from: set on the
+    /// count phase only, `0` after (see `BspSuperstepPlan::read_cut_marker`).
+    pub(super) read_cut_marker: u64,
+    /// The run's read cut, once the count phase resolved it.
+    pub(super) system_as_of: Option<i64>,
 }
 
 /// One node's decoded superstep result, tagged with its owner node id.
 pub(super) struct ShardResult {
     pub(super) node_id: u64,
     pub(super) result: BspSuperstepResult,
+    /// The highest watermark the node's cores served the superstep at.
+    pub(super) watermark_lsn: crate::types::Lsn,
 }
 
 /// Parameters for [`scatter_superstep`].
@@ -66,6 +73,7 @@ pub(super) struct ScatterSuperstepParams<'a> {
     pub(super) global_n: usize,
     pub(super) dispatches: Vec<ShardDispatch>,
     pub(super) deadline_ms: u64,
+    pub(super) linearizable: bool,
 }
 
 /// Dispatch one `BspSuperstep` to every owner node concurrently and decode each
@@ -84,6 +92,7 @@ pub(super) async fn scatter_superstep(
         global_n,
         dispatches,
         deadline_ms,
+        linearizable,
     } = args;
     let shared_arc = gateway_shared(state)?;
     let version_set = GatewayVersionSet::from_pairs(Vec::new());
@@ -101,6 +110,8 @@ pub(super) async fn scatter_superstep(
             rank_seed: d.rank_seed,
             global_dangling: d.global_dangling,
             personalization_sum: d.personalization_sum,
+            read_cut_marker: d.read_cut_marker,
+            system_as_of: d.system_as_of,
         })));
         let version_set = version_set.clone();
         let node_id = d.node_id;
@@ -109,7 +120,7 @@ pub(super) async fn scatter_superstep(
         let shared_arc = shared_arc.clone();
 
         Box::pin(async move {
-            let payload = dispatch_superstep_to_node(
+            let read = dispatch_superstep_to_node(
                 &shared_arc,
                 DispatchSuperstepParams {
                     tenant_id,
@@ -120,11 +131,16 @@ pub(super) async fn scatter_superstep(
                     route_vshard,
                     plan,
                     version_set: &version_set,
+                    linearizable,
                 },
             )
             .await?;
-            let result = decode_single_result_from_payload(node_id, payload)?;
-            Ok::<ShardResult, crate::Error>(ShardResult { node_id, result })
+            let result = decode_single_result_from_payload(node_id, read.payload)?;
+            Ok::<ShardResult, crate::Error>(ShardResult {
+                node_id,
+                result,
+                watermark_lsn: read.watermark_lsn,
+            })
         })
     });
 

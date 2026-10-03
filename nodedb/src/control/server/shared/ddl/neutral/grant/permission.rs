@@ -3,27 +3,26 @@
 //! Protocol-neutral `GRANT/REVOKE <perm> ON <object> TO/FROM <grantee>`
 //! handlers.
 //!
-//! Ported from the pgwire `ddl::grant::permission` handlers. All non-return
-//! logic (grantee canonicalization, target resolution incl. the cross-tenant
+//! The grantee canonicalization, target resolution incl. the cross-tenant
 //! superuser gate, `ALL` expansion, tenant-admin gate, `prepare_permission`,
 //! catalog propose + single-node fallback, `install_replicated_permission` /
-//! `install_replicated_revoke`, and `audit_record`) is preserved verbatim;
-//! only the result construction changed from pgwire `Response` / `PgWireError`
-//! to the protocol-neutral [`DdlResult`] / [`DdlError`].
+//! `install_replicated_revoke`, and `audit_record` run here. The result is the
+//! protocol-neutral [`DdlResult`] / [`DdlError`].
 //!
 //! Proposes `CatalogEntry::{PutPermission, DeletePermission}` so every
 //! follower's `PermissionStore` and `OWNERS` redb stay in sync.
 
 use crate::control::catalog_entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission, Role};
 use crate::control::security::permission::{
-    format_permission, function_target, parse_permission, procedure_target, tenant_target,
+    collection_target, format_permission, function_target, parse_permission, procedure_target,
+    tenant_target,
 };
 use crate::control::server::shared::ddl::sql_parse::{parse_ident_token, parse_relation_token};
 use crate::control::state::SharedState;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::support::{require_tenant_admin, status};
@@ -55,7 +54,7 @@ fn canonicalize_grantee(state: &SharedState, raw: &str) -> Result<String, DdlErr
     ))
 }
 
-fn propose_grant(
+async fn propose_grant(
     state: &SharedState,
     target: &str,
     grantee: &str,
@@ -65,46 +64,27 @@ fn propose_grant(
     let stored = state
         .permissions
         .prepare_permission(target, grantee, perm, granted_by);
-    let entry = CatalogEntry::PutPermission(Box::new(stored.clone()));
-    let outcome = propose_catalog_entry(state, &entry)
+    let entry = CatalogEntry::PutPermission(Box::new(stored));
+    propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        {
-            let catalog = state.credentials.catalog();
-            catalog
-                .put_permission(&stored)
-                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        }
-        state.permissions.install_replicated_permission(&stored);
-    }
     Ok(())
 }
 
-fn propose_revoke(
+async fn propose_revoke(
     state: &SharedState,
     target: &str,
     grantee: &str,
     perm: Permission,
 ) -> Result<(), DdlError> {
-    let perm_str = format_permission(perm);
     let entry = CatalogEntry::DeletePermission {
         target: target.to_string(),
         grantee: grantee.to_string(),
-        permission: perm_str.clone(),
+        permission: format_permission(perm),
     };
-    let outcome = propose_catalog_entry(state, &entry)
+    propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        {
-            let catalog = state.credentials.catalog();
-            catalog
-                .delete_permission(target, grantee, &perm_str)
-                .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-        }
-        state
-            .permissions
-            .install_replicated_revoke(target, grantee, &perm_str);
-    }
     Ok(())
 }
 
@@ -135,24 +115,25 @@ fn resolve_tenant_id(state: &SharedState, name: &str) -> Result<TenantId, DdlErr
 fn resolve_target(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     target_type: &str,
     target_name: &str,
 ) -> Result<(String, String), DdlError> {
     if target_type.eq_ignore_ascii_case("FUNCTION") {
         let name = parse_ident_token(target_name)?;
         Ok((
-            function_target(identity.tenant_id, &name),
+            function_target(database_id, identity.tenant_id, &name),
             format!("function '{name}'"),
         ))
     } else if target_type.eq_ignore_ascii_case("PROCEDURE") {
         let name = parse_ident_token(target_name)?;
         Ok((
-            procedure_target(identity.tenant_id, &name),
+            procedure_target(database_id, identity.tenant_id, &name),
             format!("procedure '{name}'"),
         ))
     } else if target_type.eq_ignore_ascii_case("TENANT") {
         let tenant_id = resolve_tenant_id(state, target_name)?;
-        // A tenant admin may only manage grants within their own tenant;
+        // A tenant admin can only manage grants within their own tenant;
         // granting across tenant boundaries requires superuser.
         if tenant_id != identity.tenant_id && !identity.is_superuser {
             return Err(DdlError::new(
@@ -167,7 +148,7 @@ fn resolve_target(
         // resolves them.
         let name = parse_relation_token(target_name)?;
         Ok((
-            format!("collection:{}:{name}", identity.tenant_id.as_u64()),
+            collection_target(database_id, identity.tenant_id, &name),
             format!("collection '{name}'"),
         ))
     }
@@ -198,15 +179,17 @@ fn resolve_permissions(permissions: &[String]) -> Result<Vec<Permission>, DdlErr
 /// `GRANT <perm>[, ...] ON <collection|FUNCTION|PROCEDURE|TENANT name> TO <grantee>`
 ///
 /// Called with typed fields from the AST router.
-pub fn grant_permission(
+pub async fn grant_permission(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     permissions: &[String],
     target_type: &str,
     target_name: &str,
     grantee: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let (target, object_desc) = resolve_target(state, identity, target_type, target_name)?;
+    let (target, object_desc) =
+        resolve_target(state, identity, database_id, target_type, target_name)?;
 
     require_tenant_admin(identity, "grant permissions")?;
 
@@ -214,7 +197,7 @@ pub fn grant_permission(
     let canonical = canonicalize_grantee(state, grantee)?;
 
     for perm in &perms {
-        propose_grant(state, &target, &canonical, *perm, &identity.username)?;
+        propose_grant(state, &target, &canonical, *perm, &identity.username).await?;
     }
 
     state.audit_record(
@@ -233,15 +216,17 @@ pub fn grant_permission(
 /// `REVOKE <perm>[, ...] ON <collection|FUNCTION|PROCEDURE|TENANT name> FROM <grantee>`
 ///
 /// Called with typed fields from the AST router.
-pub fn revoke_permission(
+pub async fn revoke_permission(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     permissions: &[String],
     target_type: &str,
     target_name: &str,
     grantee: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let (target, object_desc) = resolve_target(state, identity, target_type, target_name)?;
+    let (target, object_desc) =
+        resolve_target(state, identity, database_id, target_type, target_name)?;
 
     require_tenant_admin(identity, "revoke permissions")?;
 
@@ -249,7 +234,7 @@ pub fn revoke_permission(
     let canonical = canonicalize_grantee(state, grantee)?;
 
     for perm in &perms {
-        propose_revoke(state, &target, &canonical, *perm)?;
+        propose_revoke(state, &target, &canonical, *perm).await?;
     }
 
     state.audit_record(

@@ -14,7 +14,7 @@
 //! | sparse    | none beyond the registry + ownership rows           |
 //! | sorted    | an order-statistic tree on the core holding the collection's rows |
 //!
-//! Every failure here propagates. A teardown that logs and continues would
+//! Every failure here propagates. A teardown that logs and continues will
 //! report a successful drop over state that is still live — the same silent
 //! success that made a vector index undroppable in the first place.
 //!
@@ -23,7 +23,7 @@
 //! cannot propagate and files a `Capture` instead.
 
 use crate::control::security::catalog::{IndexKind, StoredIndexRecord};
-use crate::control::server::dispatch_utils::{MintedRecords, RecordOwner};
+use crate::control::server::dispatch_utils::MintedRecords;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId};
 
@@ -106,7 +106,7 @@ async fn secondary(
         .find(|i| i.name == record.name)
         .map(|i| i.field.clone());
     coll.indexes.retain(|i| i.name != record.name);
-    commit_collection_mutation(state, &coll, database_id).await?;
+    commit_collection_mutation(state, &coll).await?;
 
     // Purge existing index entries from the sparse engine so stale rows
     // cannot leak into lookups on a re-created index of the same name.
@@ -148,90 +148,19 @@ async fn secondary(
 ///
 /// The catalog row is replicated, and the WAL drop record plus the Data Plane
 /// drop are node-local physical state, so every node runs them from its own
-/// post-apply lane. Only the single-node path has no applier to do that.
+/// post-apply lane, this one included, before the propose returns.
 async fn vector(
     state: &SharedState,
     record: &StoredIndexRecord,
     database_id: DatabaseId,
     tenant_id: TenantId,
 ) -> Result<(), DdlError> {
-    let field_name = record.primary_field().to_string();
-    let outcome = super::super::super::vector_replicate::propose_delete_params(
+    super::super::super::vector_replicate::propose_delete_params(
         state,
         database_id.as_u64(),
         tenant_id.as_u64(),
         &record.collection,
-        &field_name,
-    )?;
-    // Only the single-node path continues: everywhere else the post-apply
-    // lane has already appended, fsynced, and dropped on this node.
-    if !outcome.needs_local_apply() {
-        return Ok(());
-    }
-
-    let plan = crate::bridge::envelope::PhysicalPlan::Vector(
-        nodedb_physical::physical_plan::VectorOp::DropIndex {
-            collection: nodedb_types::QualifiedCollection::new(database_id, &record.collection),
-            field_name: field_name.clone(),
-        },
-    );
-
-    // WAL first: the `VectorParams` record that created this index is still
-    // in the log, so without a durable drop record a restart rebuilds the
-    // index the user just dropped.
-    //
-    // The record's outcome-floor window opens before the append and closes
-    // from the drop's outcome.
-    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &record.collection).vshard();
-    let owner = RecordOwner {
-        tenant_id,
-        database_id,
-        vshard_id: vshard,
-    };
-    let minted = MintedRecords::open(&state.outcome_floor);
-    let appended = match minted.append_plan(
-        &state.wal,
-        owner,
-        &plan,
-        // The drop is dispatched as a client statement.
-        crate::event::EventSource::User,
-    ) {
-        Ok(appended) => appended,
-        Err(e) => {
-            // Any record appended before the error never reaches a core.
-            minted.cancel(&state.wal, owner, 0).await.map_err(|c| {
-                DdlError::from_error_in_context("cancel vector index drop record", &c)
-            })?;
-            return Err(DdlError::from_error_in_context(
-                "persist vector index drop to WAL",
-                &e,
-            ));
-        }
-    };
-
-    // An append only buffers. The records this drop cancels were already
-    // fsynced by the writes that acked them, so a buffered-only drop is lost on
-    // restart while replay still rebuilds the index from those records.
-    let Some(lsn) = appended.lsn else {
-        minted.settle();
-        return Err(DdlError::internal("vector index drop minted no WAL record"));
-    };
-    if let Err(e) = state.wal.wait_durable(lsn).await {
-        // The record can still be on disk, so restart replay can reach it.
-        minted.hold();
-        return Err(DdlError::from_error_in_context(
-            "fsync vector index drop",
-            &e,
-        ));
-    }
-
-    dispatch(
-        state,
-        tenant_id,
-        database_id,
-        &record.collection,
-        plan,
-        Some(minted),
+        record.primary_field(),
     )
     .await
 }

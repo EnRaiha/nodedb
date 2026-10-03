@@ -66,39 +66,37 @@ impl CoreLoop {
             system_as_of_ms,
             valid_at_ms,
         };
-        let edges_result = match direction {
-            Direction::Out => self.edge_store.neighbors_out_as_of(as_of_params),
-            Direction::In => self.edge_store.neighbors_in_as_of(as_of_params),
-            Direction::Both => {
-                let out = self.edge_store.neighbors_out_as_of(as_of_params);
-                match out {
-                    Ok(mut out) => match self.edge_store.neighbors_in_as_of(as_of_params) {
-                        Ok(inbound) => {
-                            out.extend(inbound);
-                            Ok(out)
-                        }
-                        Err(e) => Err(e),
-                    },
-                    Err(e) => Err(e),
-                }
-            }
-        };
-
-        let edges = match edges_result {
-            Ok(e) => e,
+        let edges = match self.edge_store.node_edges_as_of(as_of_params, direction) {
+            Ok(edges) => edges,
             Err(e) => return self.response_error(task, ErrorCode::from(e)),
+        };
+        // A current-state read inside a transaction sees that transaction's
+        // own staged edge writes in this collection.
+        let edges = match (system_as_of_ms, task.request.txn_id) {
+            (None, Some(txn_id)) => {
+                self.touch_overlay(txn_id);
+                super::graph::graph_txn_merge::merge_graph_txn_overlay_collection_edges(
+                    self.graph_txn_overlays.get(&txn_id),
+                    &(task.request.database_id, tenant, collection.to_string()),
+                    node_id,
+                    edge_label.as_deref(),
+                    direction,
+                    edges,
+                )
+            }
+            _ => edges,
         };
 
         let entries: Vec<super::super::response_codec::NeighborEntry<'_>> = edges
             .iter()
-            .map(|e| {
-                let opposite = if e.src_id == node_id {
-                    e.dst_id.as_str()
+            .map(|(src, label, dst)| {
+                let opposite = if src == node_id {
+                    dst.as_str()
                 } else {
-                    e.src_id.as_str()
+                    src.as_str()
                 };
                 super::super::response_codec::NeighborEntry {
-                    label: e.label.as_str(),
+                    label: label.as_str(),
                     node: opposite,
                 }
             })

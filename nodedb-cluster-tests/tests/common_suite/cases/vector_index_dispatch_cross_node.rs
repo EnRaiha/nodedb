@@ -121,6 +121,8 @@ async fn execute_on_node(node: &TestClusterNode, plan: PhysicalPlan) -> ExecuteR
         // Empty: the probe binds no descriptor version, so nothing is fenced.
         descriptor_versions: Vec::new(),
         txn_id: None,
+        vshard_id: None,
+        read_groups: Vec::new(),
     };
     match transport
         .send_rpc_to_addr(node.listen_addr, RaftRpc::ExecuteRequest(request))

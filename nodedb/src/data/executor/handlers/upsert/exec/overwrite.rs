@@ -4,8 +4,9 @@
 //! incoming value into it (or apply `ON CONFLICT DO UPDATE SET`), persist,
 //! and respond.
 
-use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
+use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::redo_image::submitted_row_image;
 use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::handlers::rls_write_gate;
@@ -204,6 +205,7 @@ impl CoreLoop {
                 index_text: true,
                 user_roles: &task.request.user_roles,
                 enforce: true,
+                unique: crate::data::executor::enforcement::unique::UniqueJudge::Row,
                 wal_lsn: task.wal_lsn(),
                 resolved_targets: hook_ctx.resolved_targets,
             },
@@ -275,11 +277,6 @@ impl CoreLoop {
             Some(&current_bytes),
         );
 
-        // Carry the surrogate + post-image back so the Control Plane
-        // can mint a post-apply `Put` redo. The autocommit WAL path
-        // mints none for an Upsert overwrite, so without this a WAL-only
-        // restart rebuilds the HNSW from the pre-upsert body and
-        // resurrects the old embedding.
         // An upsert always writes the row: one row affected.
         let mut response = match returning {
             // The MERGED body, not the caller's: on a conflict the
@@ -294,15 +291,15 @@ impl CoreLoop {
             ),
             None => self.response_affected(task, 1),
         };
-        if has_vectors {
-            response.write_set = vec![WriteSetEntry {
-                surrogate: surrogate.as_u32(),
-                identity: document_identity,
-                is_delete: false,
-                value: merged_body,
-                collection: None,
-            }];
-        }
+        // `wal_append_document_op` mints no pre-dispatch record for an
+        // upsert, so the merged row is journalled after apply, from the body
+        // `apply_point_put` took.
+        response.write_set = vec![submitted_row_image(
+            surrogate.as_u32(),
+            document_identity,
+            merged_body,
+            outcome.bitemporal_sys_from_ms,
+        )];
         // Derived target rows live in a different collection, so each
         // carries its own `Some(collection)` and homes to that
         // collection's vShard.

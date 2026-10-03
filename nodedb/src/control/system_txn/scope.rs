@@ -10,6 +10,9 @@ use crate::control::state::SharedState;
 /// Client transactions live on a connection; a trigger or event action has no
 /// connection, so it brings its own session. The store is private to this
 /// scope, so the fixed session identity never collides with another scope's.
+///
+/// Open it inside `conn_scope::scoped_system_txn`. Its COMMIT and ROLLBACK
+/// drain the DDL buffer of the connection scope they run in.
 pub struct SystemTxnScope {
     sessions: SessionStore,
     session_id: SessionId,
@@ -34,11 +37,9 @@ impl SystemTxnScope {
             .last_applied_epoch
             .load(std::sync::atomic::Ordering::Acquire);
 
-        // Deliberately no `ddl_buffer::activate()`, unlike the client BEGIN
-        // path. That buffer is scoped to a client connection future, and a
-        // system transaction runs on the Event Plane outside any such scope.
-        // A system action carries DML, so DDL buffering has nothing to do
-        // here and any DDL it did contain proposes through the normal path.
+        // DDL buffers into the slots `conn_scope::scoped_system_txn` installs
+        // around the transaction, and COMMIT applies it with the writes.
+        crate::control::server::shared::session::ddl_buffer::activate();
         sessions
             .begin(session_id, snapshot_lsn, snapshot_epoch)
             .map_err(|detail| crate::Error::BadRequest {

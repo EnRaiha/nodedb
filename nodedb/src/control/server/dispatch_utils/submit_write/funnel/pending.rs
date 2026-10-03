@@ -9,9 +9,13 @@
 //! order and collects each outcome independently, so one parked write never
 //! holds back the writes behind it.
 
+use crate::bridge::envelope::{ErrorCode, Status};
 use crate::control::state::SharedState;
+use crate::control::write_resolve::MAX_WRITE_RESOLVE_RETRIES;
 
-use super::super::params::{SubmitOutcome, SubmitWrite};
+use super::super::params::{
+    ChangeFeedOwner, SubmitOutcome, SubmitWrite, WalDurability, WriteOrdering,
+};
 use super::driver::enqueue_write;
 use super::response::{ResponsePhaseInput, collect_classify_and_finish};
 
@@ -24,12 +28,7 @@ enum Stage {
     /// The write has its outcome already: the Calvin scheduler applied it.
     Done(SubmitOutcome),
     /// A core holds the write. The response phase collects its outcome.
-    Dispatched {
-        input: Box<ResponsePhaseInput>,
-        /// The write changes a permission-tree source on a node with no
-        /// lease, so its ack waits until the local permission cache holds it.
-        binds_authorization: bool,
-    },
+    Dispatched(Box<ResponsePhaseInput>),
 }
 
 impl PendingWrite {
@@ -39,12 +38,9 @@ impl PendingWrite {
         }
     }
 
-    pub(super) fn dispatched(input: ResponsePhaseInput, binds_authorization: bool) -> Self {
+    pub(super) fn dispatched(input: ResponsePhaseInput) -> Self {
         Self {
-            stage: Stage::Dispatched {
-                input: Box::new(input),
-                binds_authorization,
-            },
+            stage: Stage::Dispatched(Box::new(input)),
         }
     }
 
@@ -53,33 +49,88 @@ impl PendingWrite {
     ///
     /// See [`SubmitOutcome`] for what comes back.
     pub(crate) async fn finish(self, shared: &SharedState) -> crate::Result<SubmitOutcome> {
-        let (input, binds_authorization) = match self.stage {
-            Stage::Done(outcome) => return Ok(outcome),
-            Stage::Dispatched {
-                input,
-                binds_authorization,
-            } => (input, binds_authorization),
-        };
-        let max_result_bytes = shared.tuning.network.max_query_result_bytes as usize;
-        let outcome = collect_classify_and_finish(shared, max_result_bytes, *input).await?;
-        if binds_authorization {
-            crate::control::security::auth_lease::await_local_coverage(
-                shared,
-                std::time::Instant::now()
-                    + std::time::Duration::from_secs(shared.tuning.network.default_deadline_secs),
-            )
-            .await?;
+        match self.stage {
+            Stage::Done(outcome) => Ok(outcome),
+            Stage::Dispatched(input) => collect_classify_and_finish(shared, *input).await,
         }
-        Ok(outcome)
     }
 }
 
 /// Admit, make durable, enqueue, collect, and publish one write.
+///
+/// A live timeseries ingest resolves its rows before its record is appended
+/// (`driver`). Its install refuses with `OllpRetryRequired`, cancelling the
+/// record, when a concurrent write changed the collection schema since the
+/// resolve. It is then submitted again, up to
+/// [`MAX_WRITE_RESOLVE_RETRIES`] times, and resolves against the new schema.
 ///
 /// See [`SubmitOutcome`] for what comes back.
 pub(crate) async fn submit_write(
     shared: &SharedState,
     params: SubmitWrite,
 ) -> crate::Result<SubmitOutcome> {
-    enqueue_write(shared, params).await?.finish(shared).await
+    let mut params = params;
+    let mut attempt: u32 = 0;
+    loop {
+        let retry = timeseries_retry(&params);
+        let outcome = enqueue_write(shared, params).await?.finish(shared).await?;
+        match retry {
+            Some(next) if refused_for_drift(&outcome) && attempt < MAX_WRITE_RESOLVE_RETRIES => {
+                attempt += 1;
+                params = next;
+            }
+            _ => return Ok(outcome),
+        }
+    }
+}
+
+/// A copy of `params` to submit again when its install refuses for schema
+/// drift: a live, autocommit, unresolved timeseries ingest the funnel
+/// appends. `None` for every other write.
+fn timeseries_retry(params: &SubmitWrite) -> Option<SubmitWrite> {
+    let WalDurability::AppendHere {
+        now_override,
+        apply_key: 0,
+        commit_hlc,
+        change_position: None,
+    } = &params.durability
+    else {
+        return None;
+    };
+    if params.txn_id.is_some()
+        || !matches!(params.ordering, WriteOrdering::Gate)
+        || !crate::control::write_resolve::is_unresolved_ingest(&params.plan)
+    {
+        return None;
+    }
+    let change_feed = match &params.change_feed {
+        ChangeFeedOwner::LocalApply => ChangeFeedOwner::LocalApply,
+        ChangeFeedOwner::Unowned => ChangeFeedOwner::Unowned,
+        ChangeFeedOwner::Replicated { .. } => return None,
+    };
+    Some(SubmitWrite {
+        tenant_id: params.tenant_id,
+        database_id: params.database_id,
+        vshard_id: params.vshard_id,
+        plan: params.plan.clone(),
+        trace_id: params.trace_id,
+        event_source: params.event_source,
+        txn_id: None,
+        user_id: params.user_id.clone(),
+        durability: WalDurability::AppendHere {
+            now_override: *now_override,
+            apply_key: 0,
+            commit_hlc: *commit_hlc,
+            change_position: None,
+        },
+        ordering: WriteOrdering::Gate,
+        change_feed,
+    })
+}
+
+/// Whether the core refused the write because the collection schema moved
+/// between its resolve and its install.
+fn refused_for_drift(outcome: &SubmitOutcome) -> bool {
+    outcome.response.status == Status::Error
+        && outcome.response.error_code.as_deref() == Some(&ErrorCode::OllpRetryRequired)
 }

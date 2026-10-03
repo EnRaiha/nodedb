@@ -12,7 +12,7 @@ use nodedb_physical::physical_plan::CrdtOp;
 use super::super::DispatchCtx;
 use super::require_doc_id;
 
-pub(crate) fn build_read(
+pub(crate) async fn build_read(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -24,7 +24,7 @@ pub(crate) fn build_read(
     }))
 }
 
-pub(crate) fn build_apply(
+pub(crate) async fn build_apply(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -41,11 +41,8 @@ pub(crate) fn build_apply(
         crate::util::fnv1a_hash(&combined)
     });
 
-    let surrogate = ctx.state.surrogate_assigner.assign(
-        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-        ctx.tenant_id(),
-        document_id.as_bytes(),
-    )?;
+    let surrogate =
+        super::helpers::assign_surrogate(ctx, collection, document_id.as_bytes()).await?;
 
     Ok(PhysicalPlan::Crdt(CrdtOp::Apply {
         collection: QualifiedCollection::new(ctx.database_id(), collection),
@@ -80,7 +77,7 @@ fn bounded_delta(fields: &TextFields) -> crate::Result<Vec<u8>> {
     Ok(delta.clone())
 }
 
-pub(crate) fn build_alter_policy(
+pub(crate) async fn build_alter_policy(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -125,7 +122,7 @@ fn require_list_index(value: Option<u64>, field_name: &str) -> crate::Result<usi
     })
 }
 
-pub(crate) fn build_list_insert(
+pub(crate) async fn build_list_insert(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -142,11 +139,8 @@ pub(crate) fn build_list_insert(
                 detail: "missing 'list_fields_json'".to_string(),
             })?;
 
-    let surrogate = ctx.state.surrogate_assigner.assign(
-        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-        ctx.tenant_id(),
-        document_id.as_bytes(),
-    )?;
+    let surrogate =
+        super::helpers::assign_surrogate(ctx, collection, document_id.as_bytes()).await?;
 
     Ok(PhysicalPlan::Crdt(CrdtOp::ListInsert {
         collection: QualifiedCollection::new(ctx.database_id(), collection),
@@ -158,7 +152,7 @@ pub(crate) fn build_list_insert(
     }))
 }
 
-pub(crate) fn build_list_delete(
+pub(crate) async fn build_list_delete(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -167,11 +161,8 @@ pub(crate) fn build_list_delete(
     let list_path = require_list_path(fields)?;
     let index = require_list_index(fields.list_index, "list_index")?;
 
-    let surrogate = ctx.state.surrogate_assigner.assign(
-        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-        ctx.tenant_id(),
-        document_id.as_bytes(),
-    )?;
+    let surrogate =
+        super::helpers::assign_surrogate(ctx, collection, document_id.as_bytes()).await?;
 
     Ok(PhysicalPlan::Crdt(CrdtOp::ListDelete {
         collection: QualifiedCollection::new(ctx.database_id(), collection),
@@ -182,7 +173,7 @@ pub(crate) fn build_list_delete(
     }))
 }
 
-pub(crate) fn build_list_move(
+pub(crate) async fn build_list_move(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -192,11 +183,8 @@ pub(crate) fn build_list_move(
     let from_index = require_list_index(fields.list_from_index, "list_from_index")?;
     let to_index = require_list_index(fields.list_to_index, "list_to_index")?;
 
-    let surrogate = ctx.state.surrogate_assigner.assign(
-        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-        ctx.tenant_id(),
-        document_id.as_bytes(),
-    )?;
+    let surrogate =
+        super::helpers::assign_surrogate(ctx, collection, document_id.as_bytes()).await?;
 
     Ok(PhysicalPlan::Crdt(CrdtOp::ListMove {
         collection: QualifiedCollection::new(ctx.database_id(), collection),

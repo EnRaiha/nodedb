@@ -16,11 +16,19 @@ use super::super::owed::SchedulerProposal;
 use super::super::routing::PlanRouting;
 use super::super::scheduler::Scheduler;
 use super::primary_write::{
-    participant_change_sets, plans_have_primary_write, plans_have_returning,
-    txn_has_non_derived_write,
+    plans_have_primary_write, plans_have_returning, txn_has_non_derived_write,
 };
 use crate::control::cluster::calvin::scheduler::lock_manager::TxnId;
 use crate::types::DatabaseId;
+
+/// This vShard's slice of a transaction's write plans, with the indexes into
+/// it of the plans a trigger body buffered.
+struct LocalSlice {
+    plans: Vec<PhysicalPlan>,
+    body_plans: Vec<u32>,
+    /// Every local plan is a body's, and a client plan homes elsewhere.
+    body_only: bool,
+}
 
 impl Scheduler {
     /// Whether THIS node is currently the leader of the data-group owning this
@@ -51,8 +59,13 @@ impl Scheduler {
     /// waiter immediately with the reason instead of leaving it to burn the
     /// full deadline and report a generic timeout. Mirrors the OllpMismatch
     /// broadcast in `handle_executor_response`. Shared by `dispatch_txn` and
-    /// `dispatch_active_txn`.
-    pub(super) fn propose_routing_failure(&mut self, txn_id: TxnId, err: &crate::Error) {
+    /// `dispatch_active_txn`, and by a multi-part transaction whose part
+    /// fails to decode.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn propose_routing_failure(
+        &mut self,
+        txn_id: TxnId,
+        err: &crate::Error,
+    ) {
         self.propose_sequencer_entry(
             txn_id,
             SchedulerProposal::RoutingFailed {
@@ -145,7 +158,20 @@ impl Scheduler {
                 return;
             }
         };
-        let has_non_derived_write = txn_has_non_derived_write(&plans);
+        // An assembled multi-part txn carries only its local tasks. The
+        // whole-transaction facts come from its manifest.
+        let has_non_derived_write = match &txn.tx_class.multi_part {
+            Some(manifest) => manifest.user_write,
+            None => txn_has_non_derived_write(&plans),
+        };
+        let local_body_plans =
+            self.local_body_plans(&plans, txn.tx_class.database_id, &txn.tx_class.body_plans);
+        let client_wrote = match &txn.tx_class.multi_part {
+            Some(manifest) => manifest.client_write,
+            None => (0..plans.len()).any(|index| {
+                u32::try_from(index).map_or(true, |index| !txn.tx_class.body_plans.contains(&index))
+            }),
+        };
         let mut local =
             match self.local_calvin_plans(plans, txn.tx_class.database_id, epoch, position) {
                 Ok(p) => p,
@@ -202,14 +228,50 @@ impl Scheduler {
         // identical static path so each casts a real commit/abort Vote through
         // stage -> resolve -> verdict. The validate-only task stages no plans;
         // its response carries only the read-set vote.
+        let body_only = client_wrote && !local.is_empty() && local_body_plans.len() == local.len();
         self.dispatch_calvin_static(
             txn,
             txn_id,
             lock_owner,
             tenant_id,
-            local,
+            LocalSlice {
+                plans: local,
+                body_plans: local_body_plans,
+                body_only,
+            },
             has_non_derived_write,
         );
+    }
+
+    /// Indexes into this vShard's local slice of the plans a trigger body
+    /// buffered, from their indexes into the transaction's `plans`. Walks the
+    /// same homing `local_calvin_plans` does, so the two slices align.
+    fn local_body_plans(
+        &self,
+        plans: &[PhysicalPlan],
+        database_id: DatabaseId,
+        body_plans: &[u32],
+    ) -> Vec<u32> {
+        if body_plans.is_empty() {
+            return Vec::new();
+        }
+        let mut local_index: u32 = 0;
+        let mut local_body = Vec::new();
+        for (index, plan) in plans.iter().enumerate() {
+            let PlanRouting::Vshards(vshards) =
+                super::super::routing::plan_vshard_in_database(plan, database_id)
+            else {
+                continue;
+            };
+            if !vshards.iter().any(|v| v.as_u32() == self.vshard_id) {
+                continue;
+            }
+            if u32::try_from(index).is_ok_and(|index| body_plans.contains(&index)) {
+                local_body.push(local_index);
+            }
+            local_index = local_index.saturating_add(1);
+        }
+        local_body
     }
 
     /// Park the txn in `pending` as `Staged`, then build and dispatch its
@@ -230,9 +292,14 @@ impl Scheduler {
         txn_id: TxnId,
         lock_owner: TxnId,
         tenant_id: crate::types::TenantId,
-        plans: Vec<PhysicalPlan>,
+        slice: LocalSlice,
         has_non_derived_write: bool,
     ) {
+        let LocalSlice {
+            plans,
+            body_plans,
+            body_only,
+        } = slice;
         // The apply-slot identity (used in the CalvinExecuteStatic task and
         // error logs) is exactly `txn_id`; deriving it here keeps the two in
         // lockstep instead of passing the pair redundantly.
@@ -241,8 +308,8 @@ impl Scheduler {
         let request_id = self.next_request_id();
         let has_primary_write = plans_have_primary_write(&plans, has_non_derived_write);
         let has_returning = plans_have_returning(&plans);
-        let change_sets = participant_change_sets(&plans, tenant_id, self.vshard_id);
-        let flush_scope = super::super::super::types::FlushScope::of_plans(&plans);
+        let mut flush_scope = super::super::super::types::FlushScope::of_plans(&plans);
+        flush_scope.body_only = body_only;
         let database_id = txn.tx_class.database_id;
         let plan = PhysicalPlan::Meta(MetaOp::CalvinExecuteStatic {
             epoch,
@@ -255,13 +322,19 @@ impl Scheduler {
             // participant can check, at apply, whether its slice of the reads was
             // still current. Empty for pure-write / autocommit transactions.
             versioned_reads: txn.tx_class.versioned_reads.as_slice().to_vec(),
+            body_plans,
         });
 
         // Calvin allocates the CalvinApplied WAL LSN post-apply (in the
         // scheduler's response handler), so no committed LSN is known at
         // dispatch time to stamp here.
-        let request = self.build_exempt_request(request_id, tenant_id, database_id, plan, None);
+        let mut request = self.build_exempt_request(request_id, tenant_id, database_id, plan, None);
+        // The stage tags the rows it stages by the slice's source.
+        request.event_source =
+            super::super::request::slice_event_source(&txn.tx_class, &flush_scope);
 
+        // Every replica checks the transaction's collection incarnations.
+        let (superseded, gates) = self.check_incarnations(&txn.tx_class);
         self.pending.insert(
             txn_id,
             super::super::super::types::PendingTxn {
@@ -271,7 +344,8 @@ impl Scheduler {
                 dispatch_time: Instant::now(),
                 has_primary_write,
                 has_returning,
-                change_sets,
+                // The commit's resolved redo fills them.
+                change_sets: Vec::new(),
                 // This dispatch STAGES the txn (validate + buffer, no apply);
                 // its response carries the local commit vote that drives the
                 // subsequent flush-or-drop.
@@ -282,6 +356,11 @@ impl Scheduler {
                 // Set once a committed txn appends its redo record.
                 redo_records: None,
                 flush_scope,
+                superseded,
+                gates,
+                ungated: false,
+                // Taken when the flush dispatches.
+                install_permit: None,
             },
         );
 

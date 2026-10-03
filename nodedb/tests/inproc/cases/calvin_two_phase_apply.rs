@@ -67,6 +67,7 @@ fn make_request(plan: PhysicalPlan, vshard: u32, wal_lsn: Option<Lsn>) -> Reques
         txn_id: None,
         wal_lsn,
         resolved_now_ms: None,
+        commit_hlc: None,
         admission: nodedb::bridge::envelope::Admission::Admitted,
     }
 }
@@ -189,7 +190,7 @@ fn kv_put(coll: &str, key: &[u8], value: &[u8]) -> PhysicalPlan {
         key: key.to_vec(),
         value: value.to_vec(),
         ttl_ms: 0,
-        surrogate: nodedb_types::Surrogate::ZERO,
+        surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(key),
         returning: None,
         rls_filters: Vec::new(),
         provenance: None,
@@ -242,6 +243,7 @@ fn stage_static(
         epoch_system_ms: 0,
         is_group_leader: true,
         versioned_reads,
+        body_plans: Vec::new(),
     })
 }
 
@@ -348,6 +350,8 @@ fn drop_discards_invalid_staged_calvin_write() {
         collection: "dropcoll".to_string(),
         key: ReadKeyIdent::Predicate,
         read_lsn: Lsn::new(50),
+        home_vshard: None,
+        served_by: 0,
     };
 
     let staged = send(
@@ -451,6 +455,8 @@ fn point_read_at_write_lsn_commits_and_flush_applies() {
         collection: "pointcoll".to_string(),
         key: ReadKeyIdent::Point(KeyRepr::KvKey(Box::from(b"pk".as_slice()))),
         read_lsn: Lsn::new(10),
+        home_vshard: None,
+        served_by: 0,
     };
 
     let staged = send(
@@ -534,6 +540,8 @@ fn stale_point_read_of_kv_key_aborts_stage_and_drop_discards() {
         collection: "stalecoll".to_string(),
         key: ReadKeyIdent::Point(KeyRepr::KvKey(Box::from(b"pk".as_slice()))),
         read_lsn: Lsn::new(5),
+        home_vshard: None,
+        served_by: 0,
     };
 
     let staged = send(
@@ -621,6 +629,8 @@ fn absent_kv_key_phantom_insert_causes_abort() {
         collection: "phantomkv".to_string(),
         key: ReadKeyIdent::Point(KeyRepr::KvKey(Box::from(b"newkey".as_slice()))),
         read_lsn: Lsn::new(5),
+        home_vshard: None,
+        served_by: 0,
     };
 
     // Concurrently, the exact same key is inserted and commits at LSN 8.
@@ -637,7 +647,7 @@ fn absent_kv_key_phantom_insert_causes_abort() {
                 key: b"newkey".to_vec(),
                 value: b"v".to_vec(),
                 ttl_ms: 0,
-                surrogate: Surrogate::ZERO,
+                surrogate: nodedb_test_support::kv_rows::kv_row_surrogate(b"newkey".as_ref()),
                 returning: None,
                 rls_filters: Vec::new(),
             })],
@@ -698,6 +708,8 @@ fn absent_document_phantom_insert_is_caught() {
         collection: "phantomdocs".to_string(),
         key: ReadKeyIdent::Predicate,
         read_lsn: Lsn::new(5),
+        home_vshard: None,
+        served_by: 0,
     };
 
     // Concurrently, a document with the same document_id the read targeted is
@@ -771,6 +783,8 @@ fn absent_document_read_without_matching_insert_still_commits() {
         collection: "phantomdocs".to_string(),
         key: ReadKeyIdent::Predicate,
         read_lsn: Lsn::new(5),
+        home_vshard: None,
+        served_by: 0,
     };
 
     // A concurrent insert into a DIFFERENT collection commits at LSN 8. It

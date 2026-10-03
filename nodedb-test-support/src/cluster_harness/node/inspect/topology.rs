@@ -279,23 +279,6 @@ impl TestClusterNode {
         cache.applied_index
     }
 
-    /// Force the routing table on this node to point `group_id` at `fake_leader`,
-    /// creating a stale route.
-    ///
-    /// When the gateway on this node next dispatches to `group_id`, it will send
-    /// the request to `fake_leader` instead of the real leader. The remote node
-    /// (which is NOT the leader for that group) will return `TypedClusterError::NotLeader`,
-    /// causing `retry_not_leader` to update the routing table and retry against
-    /// the real leader. This is the canonical way to exercise the NotLeader retry
-    /// path in tests without needing a real leadership change (which is slow and
-    /// flaky).
-    pub fn force_stale_route_for_test(&self, group_id: u64, fake_leader: u64) {
-        if let Some(ref routing) = self.shared.cluster_routing {
-            let mut table = routing.write().unwrap_or_else(|p| p.into_inner());
-            table.set_leader(group_id, fake_leader);
-        }
-    }
-
     /// Read the current `not_leader_retry_count` from this node's shared gateway.
     ///
     /// Returns 0 if the gateway has not been constructed yet (shouldn't happen

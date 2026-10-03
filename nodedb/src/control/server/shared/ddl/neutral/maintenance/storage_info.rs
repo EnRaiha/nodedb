@@ -2,11 +2,9 @@
 
 //! `SHOW STORAGE FOR collection` and `SHOW COMPACTION STATUS` handlers.
 //!
-//! Ported from the pgwire maintenance handlers. Both result sets are all-text
-//! columns (`text_field`), so the protocol-neutral [`ShapedRows`] carries
-//! `DdlColType::Text` per column and each cell as its `String` form — the same
-//! bytes `DataRowEncoder::encode_field(&str)` produced, keeping the
-//! RowDescription and DataRow output byte-identical.
+//! Both result sets are all-text columns, so the protocol-neutral
+//! [`ShapedRows`] carries `DdlColType::Text` per column and each cell as its
+//! `String` form.
 
 use nodedb_types::DatabaseId;
 

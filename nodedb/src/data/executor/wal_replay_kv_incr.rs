@@ -18,17 +18,14 @@
 //! `now_ms + ttl_ms`, which would drift the expiry forward by the
 //! crash-to-restart delay. `ttl_ms == 0` preserves the key's existing TTL.
 //!
-//! Unlike the `Put` family, `kv_incr` carries its own surrogate in the
-//! record rather than relying on the separately-durable surrogate catalog,
-//! so replay reconstructs it from the payload's `u32` instead of using
-//! `Surrogate::ZERO`.
+//! Like every KV put-family record, `kv_incr` carries the row's surrogate,
+//! and replay binds the same one.
 
 use nodedb_physical::physical_plan::KvCounterShape;
 use tracing::warn;
 
 use super::core_loop::CoreLoop;
 use crate::data::executor::core_loop::write_index::KeyRepr;
-use crate::data::executor::replay_abort::abort_replay;
 use crate::engine::kv::{AtomicError, AtomicKeyCtx, IncrStep, Incremented};
 
 /// The decoded `kv_incr` record.
@@ -113,10 +110,10 @@ impl CoreLoop {
     /// identically), logged and skipped rather than treated as errors.
     ///
     /// `Rejected` is not one of those: it is a committed record this build
-    /// declined to apply, so it aborts recovery rather than converging — see
+    /// declined to apply, so it halts recovery rather than converging — see
     /// its arm.
     fn log_kv_incr_result(
-        &self,
+        &mut self,
         collection: &str,
         key: &[u8],
         delta: i64,
@@ -166,18 +163,26 @@ impl CoreLoop {
             // whichever identity happens to be connected at restart. Every
             // record it disagreed with would be dropped, leaving a hole in the
             // replayed suffix that no later read can tell apart from data
-            // never written. So it takes the same exit every other unapplyable
+            // never written. So it takes the same halt every other unapplyable
             // committed record takes, which files a forensic report first.
-            Err(AtomicError::Rejected(error)) => abort_replay(
-                "kv",
-                "incr_admission",
-                self.core_id,
-                record_lsn,
-                &format!(
-                    "the RLS write gate refused a committed increment on \
-                     '{collection}': {error}"
-                ),
-            ),
+            Err(AtomicError::Rejected(error)) => {
+                self.replay_record_unapplied(
+                    "kv",
+                    "incr_admission",
+                    record_lsn,
+                    &format!(
+                        "the RLS write gate refused a committed increment on \
+                         '{collection}': {error}"
+                    ),
+                );
+                0
+            }
+            // The record carries no bound surrogate, so the row cannot be
+            // installed under an identity.
+            Err(AtomicError::Unbound(error)) => {
+                self.replay_record_unapplied("kv", "incr_identity", record_lsn, &error.to_string());
+                0
+            }
         }
     }
 }

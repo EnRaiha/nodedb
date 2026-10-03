@@ -23,6 +23,26 @@ pub async fn wait_for<F: FnMut() -> bool>(
     panic!("timed out after {:?} waiting for: {}", deadline, desc);
 }
 
+/// [`wait_for`] with a check that says why it does not hold yet. The
+/// timeout message carries the last reason.
+pub async fn wait_for_report<F: FnMut() -> Result<(), String>>(
+    desc: &str,
+    deadline: Duration,
+    step: Duration,
+    mut check: F,
+) {
+    let start = Instant::now();
+    let mut last = String::new();
+    while start.elapsed() < deadline {
+        match check() {
+            Ok(()) => return,
+            Err(reason) => last = reason,
+        }
+        tokio::time::sleep(step).await;
+    }
+    panic!("timed out after {deadline:?} waiting for: {desc}; last check: {last}");
+}
+
 /// Async predicate variant of [`wait_for`]. Awaits the future returned
 /// by `pred` directly so callers don't need `block_in_place` /
 /// `Handle::block_on` gymnastics inside an async context.

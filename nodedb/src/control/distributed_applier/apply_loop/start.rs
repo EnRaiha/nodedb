@@ -12,7 +12,9 @@ use crate::control::array_sync::ArrayOpTarget;
 use crate::control::array_sync::raft_apply::{
     AppliedPosition, ArraySchemaPayload, apply_array_op, apply_array_schema,
 };
-use crate::control::wal_replication::ReplicatedWrite;
+use nodedb_raft::message::LogEntry;
+
+use crate::control::wal_replication::{ReplicatedEntry, ReplicatedWrite};
 use crate::types::{DatabaseId, TenantId};
 
 use super::calvin_read_result::{CalvinReadResultFields, forward_calvin_read_result};
@@ -20,6 +22,7 @@ use super::context::{ApplyContext, ApplyFuture, EnqueueFuture, FinishedApply};
 use super::group_watch::GroupWatch;
 use super::lane::QueuedEntry;
 use super::proposal_gate::{EntryOutcome, ProposalGate};
+use super::topic_publish::{TopicPublishEntry, prepare_topic_publish_entry};
 use super::transaction_redo::prepare_transaction_redo_entry;
 use super::write_dispatch::{EntryScope, prepare_generic_entry};
 
@@ -46,30 +49,13 @@ pub(super) fn prepare_entry<'a>(
     group_id: u64,
     queued: QueuedEntry,
 ) -> Prepared<'a> {
-    let QueuedEntry { entry, decoded } = queued;
+    let QueuedEntry { entry, mut decoded } = queued;
     let log_index = entry.index;
+    let log_term = entry.term;
     watch.note_apply(group_id, log_index);
 
-    // A leader-change no-op committed where a proposer may wait. The
-    // proposer's data is gone; firing an empty success would tell it the
-    // write applied. `RetryableLeaderChange` makes the gateway re-propose.
     if entry.data.is_empty() {
-        tracing::error!(
-            group_id,
-            log_index,
-            "leader-change no-op committed at index where a proposer was waiting; \
-             surfacing RetryableLeaderChange so the gateway re-proposes"
-        );
-        ctx.tracker.complete(
-            group_id,
-            log_index,
-            0,
-            Err(crate::Error::RetryableLeaderChange {
-                group_id,
-                log_index,
-            }),
-        );
-        return Prepared::Concluded(EntryOutcome::Skipped);
+        return conclude_leader_change_noop(ctx, group_id, log_index);
     }
 
     // `0` for unparseable / pre-key entries; the tracker treats 0 as "no key"
@@ -79,22 +65,12 @@ pub(super) fn prepare_entry<'a>(
     // before this entry. The entry's mark carries it, not the instant this
     // replica applies, so a late apply never records a write as newer than a
     // backup taken after its ack.
-    let commit_hlc = watch.commit_hlc(group_id, decoded.as_ref().map_or(0, |e| e.write_hlc));
-    // Database scope for the entry, read from the wire. The generic decode
-    // path returns no scope, so it is taken from the entry itself: a redo
-    // appended under the wrong scope replays into the wrong namespace.
-    let database_id = decoded
-        .as_ref()
-        .map_or(DatabaseId::DEFAULT, |e| DatabaseId::new(e.database_id));
-    // The source the proposer stamped. An entry that does not decode applies
-    // nothing, so its source is never read.
-    let event_source = decoded
-        .as_ref()
-        .map_or(crate::event::EventSource::User, |e| e.event_source.into());
-    let scope = EntryScope {
-        database_id,
-        event_source,
-    };
+    let commit_hlc = watch.commit_hlc(
+        group_id,
+        log_index,
+        decoded.as_ref().map_or(0, |e| e.write_hlc),
+    );
+    let scope = entry_scope(&mut decoded);
 
     // A second committed copy of a proposal this node already applied (a
     // re-proposal after a leader change whose first copy also committed)
@@ -112,42 +88,94 @@ pub(super) fn prepare_entry<'a>(
     let Some(replicated) = decoded else {
         return prepare_generic_entry(ctx, pos, entry, scope, false);
     };
+    prepare_replicated(ctx, watch, pos, log_term, entry, scope, replicated)
+}
+
+/// A leader-change no-op committed where a proposer can wait. The
+/// proposer's data is gone; firing an empty success tells it the
+/// write applied. `RetryableLeaderChange` makes the gateway re-propose.
+fn conclude_leader_change_noop<'a>(
+    ctx: ApplyContext<'a>,
+    group_id: u64,
+    log_index: u64,
+) -> Prepared<'a> {
+    tracing::error!(
+        group_id,
+        log_index,
+        "leader-change no-op committed at index where a proposer was waiting; \
+         surfacing RetryableLeaderChange so the gateway re-proposes"
+    );
+    ctx.tracker.complete(
+        group_id,
+        log_index,
+        0,
+        Err(crate::Error::RetryableLeaderChange {
+            group_id,
+            log_index,
+        }),
+    );
+    Prepared::Concluded(EntryOutcome::Skipped)
+}
+
+/// The scope a decoded entry applies under. The entry's incarnations move
+/// into the scope, so the entry no longer holds them.
+fn entry_scope(decoded: &mut Option<ReplicatedEntry>) -> EntryScope {
+    // Database scope for the entry, read from the wire. The generic decode
+    // path returns no scope, so it is taken from the entry itself: a redo
+    // appended under the wrong scope replays into the wrong namespace.
+    let database_id = decoded
+        .as_ref()
+        .map_or(DatabaseId::DEFAULT, |e| DatabaseId::new(e.database_id));
+    // The source the proposer stamped. An entry that does not decode applies
+    // nothing, so its source is never read.
+    let event_source = decoded
+        .as_ref()
+        .map_or(crate::event::EventSource::User, |e| e.event_source.into());
+    EntryScope {
+        database_id,
+        event_source,
+        incarnations: decoded
+            .as_mut()
+            .map(|e| std::mem::take(&mut e.incarnations))
+            .unwrap_or_default(),
+    }
+}
+
+/// Route a decoded entry to the apply path of its write.
+fn prepare_replicated<'a>(
+    ctx: ApplyContext<'a>,
+    watch: &mut GroupWatch,
+    pos: AppliedPosition,
+    log_term: u64,
+    entry: LogEntry,
+    scope: EntryScope,
+    replicated: ReplicatedEntry,
+) -> Prepared<'a> {
     let tenant_id = TenantId::new(replicated.tenant_id);
     let entry_database = DatabaseId::new(replicated.database_id);
     match replicated.write {
         ReplicatedWrite::ArrayOp {
             array,
             op_bytes,
+            cell_surrogate,
             provenance,
+            incarnation,
             ..
-        } => {
-            // The op path submits through the write funnel, so its redo is
-            // durable before it reports success. A failure breaks the
-            // prefix: the entry must stay replayable.
-            Prepared::Exclusive(Box::pin(async move {
-                let applied_ok = apply_array_op(
-                    ctx.state,
-                    ctx.tracker,
-                    pos,
-                    ArrayOpTarget {
-                        tenant_id,
-                        database_id: entry_database,
-                        array: &array,
-                    },
-                    &op_bytes,
-                    provenance.as_deref(),
-                )
-                .await;
-                FinishedApply {
-                    group_id,
-                    log_index,
-                    outcome: EntryOutcome::Applied {
-                        durable: applied_ok,
-                        result: None,
-                    },
-                }
-            }))
-        }
+        } => prepare_array_op(
+            ctx,
+            pos,
+            entry_database,
+            ArrayOpWrite {
+                cell: super::array_cell_route::CellWrite {
+                    tenant_id,
+                    array,
+                    incarnation,
+                },
+                op_bytes,
+                cell_surrogate,
+                provenance,
+            },
+        ),
         ReplicatedWrite::ArraySchema {
             ref array,
             ref snapshot_payload,
@@ -174,16 +202,69 @@ pub(super) fn prepare_entry<'a>(
                 result: None,
             })
         }
-        ReplicatedWrite::ArrayCellPut { .. } | ReplicatedWrite::ArrayCellDelete { .. } => {
-            prepare_generic_entry(ctx, pos, entry, scope, true)
+        ReplicatedWrite::ArrayCellPut {
+            array, incarnation, ..
         }
+        | ReplicatedWrite::ArrayCellDelete {
+            array, incarnation, ..
+        } => super::array_cell_route::prepare_array_cell_entry(
+            ctx,
+            pos,
+            entry,
+            scope,
+            super::array_cell_route::CellWrite {
+                tenant_id,
+                array,
+                incarnation,
+            },
+        ),
         ReplicatedWrite::TransactionRedo { .. } => {
-            prepare_transaction_redo_entry(ctx, pos, &replicated)
+            prepare_transaction_redo_entry(ctx, pos, &replicated, scope.incarnations)
         }
-        ReplicatedWrite::CutBarrier { hlc } => {
-            // Every entry after the barrier records above the cut.
-            watch.raise_cut(group_id, hlc);
-            Prepared::Barrier
+        ReplicatedWrite::SurrogateBind { ref identities } => {
+            Prepared::Concluded(super::surrogate_bind::apply_surrogate_bind(
+                ctx,
+                pos,
+                tenant_id,
+                entry_database,
+                identities,
+            ))
+        }
+        ReplicatedWrite::TopicPublish {
+            topic,
+            payload,
+            event_time,
+            origin,
+        } => prepare_topic_publish_entry(
+            ctx,
+            pos,
+            TopicPublishEntry {
+                database_id: entry_database,
+                tenant_id,
+                vshard_id: replicated.vshard_id,
+                topic,
+                payload,
+                event_time,
+                origin,
+            },
+        ),
+        ReplicatedWrite::CutBarrier {
+            hlc,
+            restore_point,
+            capture,
+        } => {
+            // Every entry after the barrier records above the cut, on this
+            // life and on every later one.
+            watch.raise_cut(pos.group_id, pos.log_index, hlc);
+            let barrier = CutBarrierPoint {
+                hlc,
+                restore_point,
+                log_term,
+            };
+            match capture {
+                Some(request) => prepare_capture_barrier(ctx, pos, barrier, request),
+                None => prepare_plain_barrier(ctx, pos, barrier),
+            }
         }
         ReplicatedWrite::CalvinReadResult {
             epoch,
@@ -208,9 +289,204 @@ pub(super) fn prepare_entry<'a>(
             // A read result is forwarded to an in-memory Calvin scheduler and
             // writes nothing durable, so it neither advances the prefix nor
             // breaks it. The epoch it belongs to does not survive a restart,
-            // so a re-delivery could not usefully replay it.
+            // so a re-delivery cannot usefully replay it.
             Prepared::Concluded(EntryOutcome::Skipped)
         }
         _ => prepare_generic_entry(ctx, pos, entry, scope, false),
+    }
+}
+
+/// The parts of a `ReplicatedWrite::ArrayOp` its apply takes.
+struct ArrayOpWrite {
+    cell: super::array_cell_route::CellWrite,
+    op_bytes: Vec<u8>,
+    cell_surrogate: Option<u32>,
+    provenance: Option<Vec<u8>>,
+}
+
+/// Prepare an array op. The op path submits through the write funnel, so
+/// its redo is durable before it reports success. A failure breaks the
+/// prefix: the entry must stay replayable.
+fn prepare_array_op<'a>(
+    ctx: ApplyContext<'a>,
+    pos: AppliedPosition,
+    entry_database: DatabaseId,
+    write: ArrayOpWrite,
+) -> Prepared<'a> {
+    Prepared::Exclusive(Box::pin(async move {
+        let ArrayOpWrite {
+            cell,
+            op_bytes,
+            cell_surrogate,
+            provenance,
+        } = write;
+        let (_gate, database_id) = match super::array_cell_route::route_cell_write(
+            ctx,
+            pos,
+            entry_database,
+            &cell,
+        )
+        .await
+        {
+            Ok(routed) => routed,
+            Err(finished) => return *finished,
+        };
+        let applied_ok = apply_array_op(
+            ctx.state,
+            ctx.tracker,
+            pos,
+            ArrayOpTarget {
+                tenant_id: cell.tenant_id,
+                database_id,
+                array: &cell.array,
+            },
+            &op_bytes,
+            cell_surrogate,
+            provenance.as_deref(),
+        )
+        .await;
+        FinishedApply {
+            group_id: pos.group_id,
+            log_index: pos.log_index,
+            outcome: EntryOutcome::Applied {
+                durable: applied_ok,
+                result: None,
+            },
+        }
+    }))
+}
+
+/// Where a cut barrier cuts its group.
+#[derive(Clone, Copy)]
+struct CutBarrierPoint {
+    hlc: u64,
+    restore_point: u64,
+    log_term: u64,
+}
+
+/// Prepare a backup capture's cut barrier. The lane starts a barrier with
+/// nothing else of its group in flight, and starts no later entry until it
+/// finishes: the floor is durable, and the capture holds every entry at or
+/// below it and none above.
+fn prepare_capture_barrier<'a>(
+    ctx: ApplyContext<'a>,
+    pos: AppliedPosition,
+    barrier: CutBarrierPoint,
+    request: nodedb_physical::physical_plan::CutCaptureRequest,
+) -> Prepared<'a> {
+    let AppliedPosition {
+        group_id,
+        log_index,
+        applied_key,
+        ..
+    } = pos;
+    let CutBarrierPoint {
+        hlc,
+        restore_point,
+        log_term,
+    } = barrier;
+    Prepared::Exclusive(Box::pin(async move {
+        persist_floor_durably(ctx, group_id, log_index, hlc).await;
+        record_restore_point(ctx, group_id, restore_point, hlc, log_index, log_term);
+        crate::control::backup::cut_capture::apply::capture_at_barrier(
+            ctx.state, group_id, &request,
+        )
+        .await;
+        finish_barrier(ctx, group_id, log_index, applied_key)
+    }))
+}
+
+/// Prepare a cut barrier with no capture. A failed floor write holds the
+/// group until the floor is durable.
+fn prepare_plain_barrier<'a>(
+    ctx: ApplyContext<'a>,
+    pos: AppliedPosition,
+    barrier: CutBarrierPoint,
+) -> Prepared<'a> {
+    let AppliedPosition {
+        group_id,
+        log_index,
+        applied_key,
+        ..
+    } = pos;
+    let CutBarrierPoint {
+        hlc,
+        restore_point,
+        log_term,
+    } = barrier;
+    let persisted =
+        crate::control::pitr::restore_point::persist_cut_floor(ctx.state, group_id, log_index, hlc);
+    if persisted.is_ok() {
+        record_restore_point(ctx, group_id, restore_point, hlc, log_index, log_term);
+        return Prepared::Barrier;
+    }
+    Prepared::Exclusive(Box::pin(async move {
+        persist_floor_durably(ctx, group_id, log_index, hlc).await;
+        record_restore_point(ctx, group_id, restore_point, hlc, log_index, log_term);
+        finish_barrier(ctx, group_id, log_index, applied_key)
+    }))
+}
+
+/// Record the group's place at the cluster restore point `restore_point` a
+/// cut barrier takes. `0` takes none.
+fn record_restore_point(
+    ctx: ApplyContext<'_>,
+    group_id: u64,
+    restore_point: u64,
+    hlc: u64,
+    log_index: u64,
+    log_term: u64,
+) {
+    if restore_point == 0 {
+        return;
+    }
+    crate::control::pitr::restore_point::record_group_point(
+        ctx.state,
+        nodedb_wal::record::RestorePointPayload {
+            id: restore_point,
+            hlc,
+            group_id,
+            applied_index: log_index,
+            term: log_term,
+            next_epoch: 0,
+            epoch_system_ms: 0,
+            vshards: Vec::new(),
+        },
+    );
+}
+
+/// Persist the floor of the barrier at `log_index`, retrying until it holds.
+/// A floor write that keeps failing wedges the node until it succeeds.
+async fn persist_floor_durably(ctx: ApplyContext<'_>, group_id: u64, log_index: u64, hlc: u64) {
+    crate::control::pitr::restore_point::persist_until_durable(
+        &ctx.state.metadata_apply_wedge,
+        group_id,
+        log_index,
+        || {
+            crate::control::pitr::restore_point::persist_cut_floor(
+                ctx.state, group_id, log_index, hlc,
+            )
+        },
+    )
+    .await;
+}
+
+/// Resolve a barrier's waiter once every step of the barrier is durable.
+fn finish_barrier(
+    ctx: ApplyContext<'_>,
+    group_id: u64,
+    log_index: u64,
+    applied_key: u64,
+) -> FinishedApply {
+    ctx.tracker.complete(
+        group_id,
+        log_index,
+        applied_key,
+        Ok(crate::control::distributed_applier::AppliedWrite::unversioned(Vec::new())),
+    );
+    FinishedApply {
+        group_id,
+        log_index,
+        outcome: EntryOutcome::Skipped,
     }
 }

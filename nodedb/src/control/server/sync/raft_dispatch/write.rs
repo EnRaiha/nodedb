@@ -5,20 +5,18 @@
 use std::time::Duration;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::server::dispatch_utils::{MintedRecords, RecordOwner};
+use crate::control::server::dispatch_utils::RecordOwner;
 use crate::control::server::shared::authorization::AuthorizedTask;
-use crate::control::server::shared::response_payload::payload_or_typed_error;
 use crate::control::state::SharedState;
-use crate::control::wal_replication::{ReplicableWrite, to_replicated_entry};
 use crate::event::EventSource;
 
 use super::admission_guard::reject_unadmitted_crdt_apply;
 use super::outcome::SyncDispatchOutcome;
-use super::propose::propose_sync_write;
+use super::propose::propose_sync_plan;
 
 /// Dispatch a sync write and return the apply payload plus what CRDT admission
-/// measured about the delta. Cluster path proposes through Raft; single-node
-/// falls through to `sync_dispatch::dispatch_system_with_source`.
+/// measured about the delta. A CRDT apply runs its admission. Every other
+/// plan is proposed through Raft.
 pub async fn dispatch_sync_bytes(
     state: &SharedState,
     collection: &str,
@@ -52,30 +50,21 @@ pub async fn dispatch_sync_bytes(
             trimmed_ops: outcome.trimmed_ops,
         });
     }
-    // Mints no redo of its own — the admitted-apply path and Raft entry own durability.
-    dispatch_write_replicated(state, collection, authorized, timeout, event_source, None)
+    // The Raft entry's apply owns durability.
+    dispatch_write_replicated(state, collection, authorized, event_source)
         .await
         .map(SyncDispatchOutcome::untrimmed)
 }
 
-/// Dispatch a write so it is quorum-durable when the node is clustered.
-///
-/// `minted` holds the redo records the caller already appended, under their
-/// outcome-floor window. Cluster path proposes through Raft and blocks until
-/// applied locally; the Raft entry's apply appends its own records, so the
-/// caller's records are cancelled. Single-node path installs the write,
-/// closes the records from its outcome, and waits until they are durable.
+/// Dispatch a write so it is quorum-durable: propose it through Raft and
+/// block until it applied locally. The entry's apply appends the write's redo
+/// record on every replica.
 pub(crate) async fn dispatch_write_replicated(
     state: &SharedState,
     collection: &str,
     authorized: AuthorizedTask,
-    timeout: Duration,
     event_source: EventSource,
-    minted: Option<MintedRecords>,
 ) -> crate::Result<Vec<u8>> {
-    // The caller appended this write's records before the call, so this
-    // instant bounds its commit from above and precedes the ack.
-    let committed_at = state.hlc_clock.now().wall_ns;
     let task = authorized.into_physical_task();
     let tenant_id = task.tenant_id;
     let database_id = task.database_id;
@@ -86,366 +75,65 @@ pub(crate) async fn dispatch_write_replicated(
         database_id,
         vshard_id,
     };
-    let refused = reject_unadmitted_crdt_apply(&plan).and_then(|()| {
-        if vshard_id == nodedb_types::CollectionKey::from_bare(database_id, collection).vshard() {
-            Ok(())
-        } else {
-            Err(crate::Error::Internal {
-                detail: "authorized sync task vShard does not match collection".into(),
-            })
-        }
-    });
-    if let Err(error) = refused {
-        // Nothing was dispatched.
-        if let Some(minted) = minted {
-            minted.cancel(&state.wal, owner, 0).await?;
-        }
-        return Err(error);
-    }
-    let local_frontier_mutation = matches!(
-        &plan,
-        PhysicalPlan::Crdt(op) if crate::control::crdt_admission::changes_crdt_frontier(op)
-    );
-
-    if let Some(proposer) = state.async_raft_proposer() {
-        let entry = ReplicableWrite::decide_for_replication(&plan).and_then(|replicable| {
-            to_replicated_entry(tenant_id, database_id, vshard_id, &replicable)
-                .map(|entry| entry.map(|entry| entry.with_event_source(event_source)))
+    reject_unadmitted_crdt_apply(&plan)?;
+    if vshard_id != nodedb_types::CollectionKey::from_bare(database_id, collection).vshard() {
+        return Err(crate::Error::Internal {
+            detail: "authorized sync task vShard does not match collection".into(),
         });
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                if let Some(minted) = minted {
-                    minted.cancel(&state.wal, owner, 0).await?;
-                }
-                return Err(error);
-            }
-        };
-        if let Some(entry) = entry {
-            // The Raft entry's apply appends its own records.
-            let superseded = minted.map(|minted| {
-                minted.supersede(std::sync::Arc::clone(&state.wal), owner, "raft_proposal")
-            });
-            let proposed = propose_sync_write(state, entry, proposer).await;
-            if let Some(superseded) = superseded {
-                superseded.finish().await;
-            }
-            return proposed;
-        }
     }
-
-    let wal_lsn = minted.as_ref().and_then(MintedRecords::highest);
-    let task = crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
-        crate::control::server::shared::ddl::sync_dispatch::SystemReason::AdmittedContinuation,
+    // The lease gates a sync write on a drained collection like any other
+    // write, and lives until the write's outcome.
+    let _lease = crate::control::server::shared::clone_write::write_lease(
+        state,
         tenant_id,
-        nodedb_types::CollectionKey::from_bare(database_id, collection),
-        plan,
-    );
-    let resp = if local_frontier_mutation {
-        // The sequencer can refuse before it runs the dispatch. The records
-        // stay here until the dispatch takes them, so such a refusal cancels
-        // them: nothing reached a core.
-        let unsent = std::sync::Mutex::new(minted);
-        let run = state
-            .vshard_admission_sequencer
-            .run(vshard_id, || async {
-                let minted = unsent.lock().unwrap_or_else(|p| p.into_inner()).take();
-                let task = match minted {
-                    Some(minted) => task.with_minted(minted),
-                    None => task,
-                };
-                crate::control::server::shared::ddl::sync_dispatch::dispatch_system_response_with_source(
-                    state,
-                    task,
-                    timeout,
-                    event_source,
-                )
-                .await
-            })
-            .await;
-        match run {
-            Ok(resp) => resp,
-            Err(error) => {
-                let never_sent = unsent.into_inner().unwrap_or_else(|p| p.into_inner());
-                if let Some(minted) = never_sent {
-                    minted.cancel(&state.wal, owner, 0).await?;
-                }
-                return Err(error);
-            }
-        }
-    } else {
-        let task = match minted {
-            Some(minted) => task.with_minted(minted),
-            None => task,
-        };
-        crate::control::server::shared::ddl::sync_dispatch::dispatch_system_response_with_source(
-            state,
-            task,
-            timeout,
-            event_source,
-        )
-        .await?
-    };
-
-    // Rejection short-circuits here with its typed error code preserved, so the
-    // CRDT delta path builds a precise compensation hint instead of
-    // substring-matching a message.
-    let payload = payload_or_typed_error(resp)?;
-
-    // On a node with no Raft groups the write's mark lives in the catalog, and
-    // it is durable before the ack.
-    if state.async_raft_proposer().is_none() {
-        state.tenant_marks.record_local_write(
-            state.credentials.catalog(),
-            tenant_id.as_u64(),
-            committed_at,
-            Some(collection),
-        )?;
-    }
-
-    // System-task dispatch bypasses the write funnel's own durable-at-ack barrier —
-    // without this fsync, `kill -9` erases an acked write.
-    if let Some(lsn) = wal_lsn {
-        state.wal.wait_durable(lsn).await?;
-    }
-
-    // A device's sync write is user data: RESTORE's staleness gate counts it.
-    state.advance_tenant_write_hlc(
-        tenant_id.as_u64(),
-        committed_at,
-        "sync write",
-        Some(collection),
-    );
-    Ok(payload)
+        database_id,
+        &plan,
+    )
+    .await?;
+    // The apply's write funnel records the write's mark on every replica.
+    propose_sync_plan(state, owner, &plan, event_source).await
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
-
     use super::super::durability_test_support::{
-        COLLECTION, append_buffered_record, authorized_write, fixture, minted_buffered_record,
-        respond_once,
+        COLLECTION, applying_proposer, authorized_write, fixture,
     };
     use super::dispatch_write_replicated;
     use crate::event::EventSource;
 
-    /// Guards the single-node branch's durable-at-ack barrier: without the wait
-    /// below, the record is still only buffered when the peer hears "applied".
+    /// A proposed write answers with the applied entry's payload.
     #[tokio::test]
-    async fn a_supplied_lsn_is_fsync_durable_before_the_payload_returns() {
-        let (state, side, _directory) = fixture();
-        let (minted, lsn) = minted_buffered_record(&state);
-        assert!(
-            state.wal.durable_through() < lsn.as_u64(),
-            "the append must only buffer, or this test proves nothing"
-        );
+    async fn a_proposed_write_answers_with_the_applied_payload() {
+        let (state, _side, _directory) = fixture();
+        crate::control::vshard_admission::install_async_raft_proposer(
+            &state,
+            crate::control::vshard_admission::applying_submit(applying_proposer()),
+        )
+        .expect("install proposer");
         let authorized = authorized_write(&state);
 
-        let responder = tokio::spawn(respond_once(Arc::clone(&state), side));
-        dispatch_write_replicated(
-            &state,
-            COLLECTION,
-            authorized,
-            Duration::from_secs(5),
-            EventSource::CrdtSync,
-            Some(minted),
-        )
-        .await
-        .expect("replicated sync dispatch succeeds");
-        responder.await.expect("responder completes");
-
-        assert!(
-            state.wal.durable_through() >= lsn.as_u64(),
-            "the supplied redo must be fsync-durable before the peer is acked"
-        );
-    }
-
-    /// A caller that appended nothing has nothing to wait on, which is what
-    /// makes the assertion above a statement about the threaded LSN.
-    #[tokio::test]
-    async fn no_supplied_lsn_leaves_an_unrelated_buffered_record_alone() {
-        let (state, side, _directory) = fixture();
-        let lsn = append_buffered_record(&state);
-        let authorized = authorized_write(&state);
-
-        let responder = tokio::spawn(respond_once(Arc::clone(&state), side));
-        dispatch_write_replicated(
-            &state,
-            COLLECTION,
-            authorized,
-            Duration::from_secs(5),
-            EventSource::CrdtSync,
-            None,
-        )
-        .await
-        .expect("replicated sync dispatch succeeds");
-        responder.await.expect("responder completes");
-
-        assert!(
-            state.wal.durable_through() < lsn.as_u64(),
-            "nothing appended by this dispatch means nothing to fsync"
-        );
-    }
-
-    /// The admission sequencer refuses a frontier write before it runs the
-    /// dispatch. Nothing reached a core, so the caller's records are
-    /// cancelled and their window settles.
-    #[tokio::test]
-    async fn a_sequencer_refusal_cancels_the_unsent_records() {
-        use super::super::durability_test_support::{authorized_plan, vshard};
-
-        let (state, _side, _directory) = fixture();
-        let (minted, lsn) = minted_buffered_record(&state);
-        let sequencer = Arc::clone(&state.vshard_admission_sequencer);
-        let holders: Vec<_> = (0..crate::control::vshard_admission::VSHARD_ADMISSION_CAPACITY)
-            .map(|_| {
-                let sequencer = Arc::clone(&sequencer);
-                tokio::spawn(async move {
-                    sequencer
-                        .run(vshard(), std::future::pending::<crate::Result<()>>)
-                        .await
-                })
-            })
-            .collect();
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        let authorized = authorized_plan(
-            &state,
-            crate::bridge::envelope::PhysicalPlan::Crdt(
-                nodedb_physical::physical_plan::CrdtOp::DocDelete {
-                    collection: nodedb_types::QualifiedCollection::new(
-                        crate::types::DatabaseId::DEFAULT,
-                        COLLECTION,
-                    ),
-                    document_id: "d1".into(),
-                    surrogate: nodedb_types::Surrogate::ZERO,
-                    returning: None,
-                    rls_filters: Vec::new(),
-                },
-            ),
-        );
-
-        let result = dispatch_write_replicated(
-            &state,
-            COLLECTION,
-            authorized,
-            Duration::from_secs(5),
-            EventSource::CrdtSync,
-            Some(minted),
-        )
-        .await;
-
-        assert!(
-            matches!(
-                result,
-                Err(crate::Error::VShardAdmissionCapacityExceeded { .. })
-            ),
-            "got {result:?}"
-        );
-        assert!(state.outcome_floor.floor() >= lsn);
-        assert_eq!(state.outcome_floor.leaked_windows(), 0);
-        for holder in holders {
-            holder.abort();
-        }
-    }
-
-    /// A caller dropped while its frontier write waits for the sequencer
-    /// sent nothing to a core, so the drop cancels its records and their
-    /// window settles.
-    #[tokio::test]
-    async fn a_caller_dropped_in_the_sequencer_wait_cancels_its_records() {
-        use super::super::durability_test_support::{authorized_plan, vshard};
-
-        let (state, _side, _directory) = fixture();
-        let (minted, lsn) = minted_buffered_record(&state);
-        let sequencer = Arc::clone(&state.vshard_admission_sequencer);
-        let holder = tokio::spawn(async move {
-            sequencer
-                .run(vshard(), std::future::pending::<crate::Result<()>>)
+        let payload =
+            dispatch_write_replicated(&state, COLLECTION, authorized, EventSource::CrdtSync)
                 .await
-        });
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        let authorized = authorized_plan(
-            &state,
-            crate::bridge::envelope::PhysicalPlan::Crdt(
-                nodedb_physical::physical_plan::CrdtOp::DocDelete {
-                    collection: nodedb_types::QualifiedCollection::new(
-                        crate::types::DatabaseId::DEFAULT,
-                        COLLECTION,
-                    ),
-                    document_id: "d1".into(),
-                    surrogate: nodedb_types::Surrogate::ZERO,
-                    returning: None,
-                    rls_filters: Vec::new(),
-                },
-            ),
-        );
-
-        let waited = tokio::time::timeout(
-            Duration::from_millis(50),
-            dispatch_write_replicated(
-                &state,
-                COLLECTION,
-                authorized,
-                Duration::from_secs(5),
-                EventSource::CrdtSync,
-                Some(minted),
-            ),
-        )
-        .await;
-
-        assert!(waited.is_err(), "the write waits behind the running holder");
-        state.wal.sync().expect("sync");
-        let replayed: Vec<u64> = state
-            .wal
-            .replay()
-            .expect("replay")
-            .iter()
-            .map(|record| record.header.lsn)
-            .collect();
-        assert!(!replayed.contains(&lsn.as_u64()), "a marker names it");
-        assert!(state.outcome_floor.floor() >= lsn);
-        assert_eq!(state.outcome_floor.leaked_windows(), 0);
-        assert_eq!(state.outcome_floor.held_windows(), 0);
-        holder.abort();
-    }
-
-    /// The Raft entry carried the write, so its result stands although the
-    /// caller's records could not be cancelled. Their window is held, which
-    /// keeps the floor below them and reports it.
-    #[cfg(feature = "failpoints")]
-    #[tokio::test]
-    async fn a_failed_cancel_keeps_the_proposed_result_and_holds_the_window() {
-        let (state, _side, _directory) = fixture();
-        let raw: Arc<crate::control::wal_replication::AsyncRaftProposer> =
-            Arc::new(|_vshard, _key, _data, _deadline| {
-                Box::pin(async { Ok((b"applied".to_vec(), crate::types::Lsn::ZERO)) })
-            });
-        crate::control::vshard_admission::install_async_raft_proposer(&state, raw)
-            .expect("install proposer");
-        let (minted, lsn) = minted_buffered_record(&state);
-        let _fail = crate::fail_point::FailGuard::fail("wal::append_write_aborted", "disk full");
-        let authorized = authorized_write(&state);
-
-        let payload = dispatch_write_replicated(
-            &state,
-            COLLECTION,
-            authorized,
-            Duration::from_secs(5),
-            EventSource::CrdtSync,
-            Some(minted),
-        )
-        .await
-        .expect("the proposal's result stands");
+                .expect("the proposal applies");
 
         assert_eq!(payload, b"applied".to_vec());
-        assert!(state.outcome_floor.floor() < lsn, "the window is held");
-        assert_eq!(state.outcome_floor.held_windows(), 1);
-        assert_eq!(state.outcome_floor.leaked_windows(), 0);
+    }
+
+    /// A state `start_raft` never ran on has no proposer, so the write is
+    /// refused.
+    #[tokio::test]
+    async fn a_state_without_a_proposer_refuses_the_write() {
+        let (state, _side, _directory) = fixture();
+        let authorized = authorized_write(&state);
+
+        let result =
+            dispatch_write_replicated(&state, COLLECTION, authorized, EventSource::CrdtSync).await;
+
+        assert!(
+            matches!(result, Err(crate::Error::Internal { .. })),
+            "got {result:?}"
+        );
     }
 }

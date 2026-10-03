@@ -54,7 +54,7 @@ pub async fn spawn_protocol_listeners(
     config: &ServerConfig,
     infra: ListenerInfra,
     base_acceptor: Option<tokio_rustls::TlsAcceptor>,
-    cluster_handle: &Option<Arc<ClusterHandle>>,
+    cluster_handle: &ClusterHandle,
 ) {
     let ProtocolListeners {
         pg_listener,
@@ -165,10 +165,12 @@ pub async fn spawn_protocol_listeners(
     );
 
     // Signal readiness to systemd and cluster lifecycle.
-    if let Some(handle) = cluster_handle {
-        let nodes = handle.topology.read().map(|t| t.node_count()).unwrap_or(1);
-        handle.lifecycle.to_ready(nodes);
-    }
+    let nodes = cluster_handle
+        .topology
+        .read()
+        .map(|t| t.node_count())
+        .unwrap_or(1);
+    cluster_handle.lifecycle.to_ready(nodes);
     nodedb_cluster::readiness::notify_ready();
 }
 

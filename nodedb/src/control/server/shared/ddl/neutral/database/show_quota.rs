@@ -2,12 +2,10 @@
 
 //! Handler for `SHOW DATABASE QUOTA FOR <name>`.
 //!
-//! Ported from the pgwire `ddl::database::show_quota` handler. The tenant-admin
-//! gate, catalog lookup, quota-record fallback to `QuotaRecord::DEFAULT`, and
-//! per-dimension row rendering (including the `unlimited` special-case) are
-//! preserved verbatim; only the result construction changed from pgwire
-//! `QueryResponse` to the protocol-neutral [`DdlResult`] over `ShapedRows`.
-//! Every column is a `text_field` in the original, so all columns stay `Text`.
+//! The tenant-admin gate, catalog lookup, quota-record fallback to
+//! `QuotaRecord::DEFAULT`, and per-dimension row rendering (including the
+//! `unlimited` special-case) run here. The result is the protocol-neutral
+//! [`DdlResult`] over `ShapedRows`. Every column is `Text`.
 
 use serde_json::{Map, Value as JsonValue};
 

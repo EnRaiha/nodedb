@@ -4,18 +4,15 @@
 //! `UPDATE ... FROM`, `INSERT ... SELECT`): the resolved plan the orchestrator
 //! built lands on its target vShard's owner and on every replica.
 //!
-//! On a cluster the plan proposes through Raft exactly as a plain replicated
-//! write does; the proposer forwards to the group leader, so the coordinator
-//! never has to own the vShard. Standalone, the plan dispatches to the local
-//! Data Plane and mints the redo record the write funnel would have minted.
+//! The plan proposes through Raft exactly as a plain replicated write does,
+//! on a one-node cluster too; the proposer forwards to the group leader, so
+//! the coordinator never has to own the vShard.
 
 use std::sync::atomic::Ordering;
 
 use nodedb_types::{DatabaseId, TenantId};
 
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
-use crate::control::maintenance::clone_materializer::dispatch_local;
-use crate::control::server::dispatch_utils::publish_origin_change_events;
 use crate::control::state::SharedState;
 use crate::control::wal_replication::{
     ReplicableWrite, propose_replicated_entry, to_replicated_entry,
@@ -36,25 +33,7 @@ pub(crate) async fn apply_orchestrated_write(
     collection: &str,
     plan: PhysicalPlan,
 ) -> crate::Result<Response> {
-    let Some(proposer) = state.async_raft_proposer() else {
-        let resp = dispatch_local(state, tenant_id, database_id, collection, plan, None).await?;
-        // `dispatch_local` bypasses the funnel's post-apply redo minting, so a
-        // vector-indexed target's write-set arrives unconsumed. Without it a
-        // WAL-only restart rebuilds the index from pre-write records. No-op
-        // on a target with no write-set.
-        crate::control::server::wal_dispatch::mint_dispatch_local_redo(
-            state
-                .wal
-                .appender(crate::wal::manager::NO_APPLY_KEY)
-                // `dispatch_local` runs the write as a client write.
-                .with_event_source(crate::event::EventSource::User),
-            tenant_id,
-            database_id,
-            collection,
-            &resp,
-        )?;
-        return Ok(resp);
-    };
+    let proposer = state.async_raft_proposer()?;
 
     // `collection` is the plan's database-qualified name.
     let vshard_id =
@@ -84,9 +63,6 @@ pub(crate) async fn apply_orchestrated_write(
                 read_version_lsn: write_version,
                 write_set: Vec::new(),
             };
-            // The proposing node handled this write exactly once, so it is
-            // the one node that publishes the CDC change event.
-            publish_origin_change_events(state, tenant_id, database_id, &plan, &response);
             Ok(response)
         }
         Err(crate::Error::DataPlane(code)) => Ok(data_plane_verdict(request_id, code)),

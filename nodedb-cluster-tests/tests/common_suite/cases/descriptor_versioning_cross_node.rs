@@ -19,7 +19,7 @@ use crate::common;
 
 use std::time::Duration;
 
-use common::cluster_harness::{TestCluster, TestClusterNode, wait_for};
+use common::cluster_harness::{TestCluster, wait_for};
 
 const TENANT: u64 = 1;
 
@@ -221,114 +221,4 @@ async fn distinct_collections_get_independent_versions() {
     }
 
     cluster.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn historical_descriptor_entries_replay_without_regressing_the_latest_version() {
-    let data_dir = tempfile::tempdir().expect("tempdir");
-    let data_path = data_dir.path().to_path_buf();
-    let node = TestClusterNode::spawn_single_node_calvin_on_path(4, data_path.clone())
-        .await
-        .expect("spawn single-node metadata group");
-    wait_for(
-        "single-node sequencer leader elected",
-        Duration::from_secs(10),
-        Duration::from_millis(50),
-        || node.sequencer_leader() == node.node_id,
-    )
-    .await;
-    wait_for(
-        "single-node metadata leader elected",
-        Duration::from_secs(10),
-        Duration::from_millis(50),
-        || node.shared.is_metadata_leader(),
-    )
-    .await;
-
-    node.client
-        .simple_query(
-            "CREATE COLLECTION replay_graph (id TEXT PRIMARY KEY, name TEXT) \
-             WITH (engine='document_strict')",
-        )
-        .await
-        .expect("create graph-bearing collection");
-    wait_for(
-        "collection descriptor reaches version 1",
-        Duration::from_secs(10),
-        Duration::from_millis(50),
-        || {
-            node.collection_descriptor(TENANT, "replay_graph")
-                .map(|v| v.0)
-                == Some(1)
-        },
-    )
-    .await;
-
-    node.client
-        .simple_query(
-            "GRAPH INSERT EDGE IN replay_graph FROM 'a' TO 'b' \
-             TYPE 'knows' PROPERTIES '{}'",
-        )
-        .await
-        .expect("insert edge and mark collection edge-bearing");
-    wait_for(
-        "edge-bearing descriptor reaches version 2",
-        Duration::from_secs(10),
-        Duration::from_millis(50),
-        || {
-            node.collection_descriptor(TENANT, "replay_graph")
-                .map(|v| v.0)
-                == Some(2)
-        },
-    )
-    .await;
-
-    node.graceful_shutdown_wal_only().await;
-    let node = TestClusterNode::spawn_single_node_calvin_on_path(4, data_path)
-        .await
-        .expect("restart against the persisted catalog and full metadata log");
-    wait_for(
-        "single-node sequencer leader re-elected after restart",
-        Duration::from_secs(10),
-        Duration::from_millis(50),
-        || node.sequencer_leader() == node.node_id,
-    )
-    .await;
-    wait_for(
-        "single-node metadata leader re-elected after restart",
-        Duration::from_secs(10),
-        Duration::from_millis(50),
-        || node.shared.is_metadata_leader(),
-    )
-    .await;
-
-    wait_for(
-        "latest collection descriptor remains visible after replay",
-        Duration::from_secs(10),
-        Duration::from_millis(50),
-        || {
-            node.collection_descriptor(TENANT, "replay_graph")
-                .map(|v| v.0)
-                == Some(2)
-        },
-    )
-    .await;
-
-    node.client
-        .simple_query(
-            "CREATE COLLECTION ddl_after_descriptor_replay \
-             (id TEXT PRIMARY KEY) WITH (engine='document_strict')",
-        )
-        .await
-        .expect(
-            "historical metadata replay must advance its watermark so later DDL remains usable",
-        );
-    assert_eq!(
-        node.collection_descriptor(TENANT, "replay_graph")
-            .map(|version| version.0),
-        Some(2),
-        "replaying historical version 1 must not overwrite the persisted latest version 2"
-    );
-
-    node.shutdown().await;
 }

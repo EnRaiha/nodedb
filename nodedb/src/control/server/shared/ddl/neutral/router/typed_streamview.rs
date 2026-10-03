@@ -28,26 +28,28 @@ pub(super) async fn try_typed(
             name,
             collection,
             with_clause_raw,
-        }) => Some(change_stream::create_change_stream(
-            state,
-            identity,
-            database_id,
-            name,
-            collection,
-            with_clause_raw,
-        )),
+        }) => Some(
+            change_stream::create_change_stream(
+                state,
+                identity,
+                database_id,
+                name,
+                collection,
+                with_clause_raw,
+            )
+            .await,
+        ),
 
         NodedbStatement::StreamView(StreamViewStmt::AlterChangeStream { name, action }) => Some(
             change_stream::alter_change_stream(state, identity, name, action),
         ),
 
         NodedbStatement::StreamView(StreamViewStmt::DropChangeStream { name, if_exists }) => {
-            // IF EXISTS short-circuit folded from the pgwire guard: a DROP of a
+            // IF EXISTS short-circuit: a DROP of a
             // non-existing change stream returns the tag before the token
             // handler runs. The `if_exists: false` case and the existing-stream
             // case fall through to `drop_change_stream`, which re-derives the
-            // name / IF EXISTS from `parts` exactly as the pgwire streaming
-            // string dispatch did.
+            // name / IF EXISTS from `parts`.
             if *if_exists
                 && !change_stream::change_stream_exists(state, identity, database_id, name)
             {
@@ -57,12 +59,7 @@ pub(super) async fn try_typed(
                 }]));
             }
             let parts: Vec<&str> = sql.split_whitespace().collect();
-            Some(change_stream::drop_change_stream(
-                state,
-                identity,
-                database_id,
-                &parts,
-            ))
+            Some(change_stream::drop_change_stream(state, identity, database_id, &parts).await)
         }
 
         NodedbStatement::StreamView(StreamViewStmt::CreateConsumerGroup {
@@ -84,12 +81,11 @@ pub(super) async fn try_typed(
             stream,
             if_exists,
         }) => {
-            // IF EXISTS short-circuit folded from the pgwire guard: a DROP of a
+            // IF EXISTS short-circuit: a DROP of a
             // non-existing consumer group returns the tag before the token
             // handler runs. The `if_exists: false` case and the existing-group
             // case fall through to `drop_consumer_group`, which re-derives the
-            // name / stream from `parts` exactly as the pgwire streaming string
-            // dispatch did. The guard checks the in-memory group registry for the
+            // name / stream from `parts`. The guard checks the in-memory group registry for the
             // identity tenant using the parsed name / stream verbatim.
             let tid = identity.tenant_id.as_u64();
             let requested_stream = match parse_stream_ident_token(stream) {
@@ -140,14 +136,13 @@ pub(super) async fn try_typed(
         ),
 
         NodedbStatement::StreamView(StreamViewStmt::DropMaterializedView { name, if_exists }) => {
-            // IF EXISTS short-circuit folded from the pgwire guard: a DROP of a
+            // IF EXISTS short-circuit: a DROP of a
             // non-existing materialized view returns the tag before the token
             // handler runs. The existence check reads the in-memory registry
-            // (`mv_registry`) for the identity tenant exactly as the pgwire guard
-            // did. The `if_exists: false` case and the existing-view case fall
-            // through to `drop_materialized_view`, which re-derives the name / IF
-            // EXISTS from `parts` (and runs its own catalog-based existence check)
-            // exactly as the pgwire admin string dispatch did.
+            // (`mv_registry`) for the identity tenant. The `if_exists: false`
+            // case and the existing-view case fall through to
+            // `drop_materialized_view`, which re-derives the name / IF EXISTS
+            // from `parts` (and runs its own catalog-based existence check).
             if *if_exists
                 && !materialized_view::materialized_view_exists(state, identity, database_id, name)
             {
@@ -157,12 +152,10 @@ pub(super) async fn try_typed(
                 }]));
             }
             let parts: Vec<&str> = sql.split_whitespace().collect();
-            Some(materialized_view::drop_materialized_view(
-                state,
-                identity,
-                database_id,
-                &parts,
-            ))
+            Some(
+                materialized_view::drop_materialized_view(state, identity, database_id, &parts)
+                    .await,
+            )
         }
 
         NodedbStatement::StreamView(StreamViewStmt::CreateContinuousAggregate {
@@ -193,14 +186,13 @@ pub(super) async fn try_typed(
             name,
             if_exists,
         }) => {
-            // IF EXISTS short-circuit folded from the pgwire guard: a DROP of a
+            // IF EXISTS short-circuit: a DROP of a
             // non-existing continuous aggregate returns the tag before the token
             // handler runs. The existence check reads the in-memory registry
-            // (`mv_registry`) for the identity tenant exactly as the pgwire guard
-            // did. The `if_exists: false` case and the existing-aggregate case
-            // fall through to `drop_continuous_aggregate`, which re-derives the
-            // name from `parts[3]` exactly as the pgwire admin string dispatch
-            // did.
+            // (`mv_registry`) for the identity tenant. The `if_exists: false`
+            // case and the existing-aggregate case fall through to
+            // `drop_continuous_aggregate`, which re-derives the name from
+            // `parts[3]`.
             if *if_exists
                 && !continuous_agg::continuous_aggregate_exists(state, identity, database_id, name)
             {

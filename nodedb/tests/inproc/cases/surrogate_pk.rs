@@ -30,8 +30,8 @@ fn make_assigner(
     SurrogateAssigner::new(fresh_registry(), creds, wal)
 }
 
-#[test]
-fn assign_is_idempotent_for_same_pk() {
+#[tokio::test]
+async fn assign_is_idempotent_for_same_pk() {
     let (_dir, creds) = open_credentials();
     let wal: Arc<dyn SurrogateWalAppender> = Arc::new(NoopWalAppender);
     let a = make_assigner(creds.clone(), wal);
@@ -41,6 +41,7 @@ fn assign_is_idempotent_for_same_pk() {
             nodedb_types::TenantId::new(0),
             b"alice",
         )
+        .await
         .unwrap();
     let s2 = a
         .assign(
@@ -48,6 +49,7 @@ fn assign_is_idempotent_for_same_pk() {
             nodedb_types::TenantId::new(0),
             b"alice",
         )
+        .await
         .unwrap();
     let s3 = a
         .assign(
@@ -55,6 +57,7 @@ fn assign_is_idempotent_for_same_pk() {
             nodedb_types::TenantId::new(0),
             b"alice",
         )
+        .await
         .unwrap();
     assert_eq!(s1, s2);
     assert_eq!(s2, s3);
@@ -79,8 +82,8 @@ fn assign_is_idempotent_for_same_pk() {
     );
 }
 
-#[test]
-fn assign_distinct_pks_returns_distinct_surrogates() {
+#[tokio::test]
+async fn assign_distinct_pks_returns_distinct_surrogates() {
     let (_dir, creds) = open_credentials();
     let wal: Arc<dyn SurrogateWalAppender> = Arc::new(NoopWalAppender);
     let a = make_assigner(creds, wal);
@@ -90,6 +93,7 @@ fn assign_distinct_pks_returns_distinct_surrogates() {
             nodedb_types::TenantId::new(0),
             b"alice",
         )
+        .await
         .unwrap();
     let s2 = a
         .assign(
@@ -97,6 +101,7 @@ fn assign_distinct_pks_returns_distinct_surrogates() {
             nodedb_types::TenantId::new(0),
             b"bob",
         )
+        .await
         .unwrap();
     let s3 = a
         .assign(
@@ -104,6 +109,7 @@ fn assign_distinct_pks_returns_distinct_surrogates() {
             nodedb_types::TenantId::new(0),
             b"carol",
         )
+        .await
         .unwrap();
     assert_ne!(s1, s2);
     assert_ne!(s2, s3);
@@ -112,8 +118,8 @@ fn assign_distinct_pks_returns_distinct_surrogates() {
     assert!(s2.as_u32() < s3.as_u32());
 }
 
-#[test]
-fn drop_collection_wipes_surrogate_map() {
+#[tokio::test]
+async fn drop_collection_wipes_surrogate_map() {
     let (_dir, creds) = open_credentials();
     let wal: Arc<dyn SurrogateWalAppender> = Arc::new(NoopWalAppender);
     let a = make_assigner(creds.clone(), wal);
@@ -123,6 +129,7 @@ fn drop_collection_wipes_surrogate_map() {
             nodedb_types::TenantId::new(0),
             b"alice",
         )
+        .await
         .unwrap();
     let _ = a
         .assign(
@@ -130,6 +137,7 @@ fn drop_collection_wipes_surrogate_map() {
             nodedb_types::TenantId::new(0),
             b"bob",
         )
+        .await
         .unwrap();
     let s_other = a
         .assign(
@@ -137,6 +145,7 @@ fn drop_collection_wipes_surrogate_map() {
             nodedb_types::TenantId::new(0),
             b"o1",
         )
+        .await
         .unwrap();
     let cat = creds.catalog();
     assert_eq!(
@@ -209,8 +218,8 @@ impl SurrogateWalAppender for CountingAppender {
     }
 }
 
-#[test]
-fn flush_emits_wal_record_at_threshold() {
+#[tokio::test]
+async fn flush_emits_wal_record_at_threshold() {
     let (_dir, creds) = open_credentials();
     let wal_concrete = Arc::new(CountingAppender::new());
     let wal_dyn: Arc<dyn SurrogateWalAppender> = wal_concrete.clone();
@@ -225,6 +234,7 @@ fn flush_emits_wal_record_at_threshold() {
                 nodedb_types::TenantId::new(0),
                 pk.as_bytes(),
             )
+            .await
             .unwrap();
     }
 
@@ -250,8 +260,8 @@ fn flush_emits_wal_record_at_threshold() {
     );
 }
 
-#[test]
-fn assigns_persist_across_reopen() {
+#[tokio::test]
+async fn assigns_persist_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("system.redb");
     let s_persisted: Surrogate;
@@ -265,6 +275,7 @@ fn assigns_persist_across_reopen() {
                 nodedb_types::TenantId::new(0),
                 b"alice",
             )
+            .await
             .unwrap();
     }
     // Reopen — the binding row must survive.

@@ -28,10 +28,10 @@ pub struct OriginCatalog {
     pub(super) database_id: DatabaseId,
     pub(super) retention_policy_registry:
         Option<Arc<crate::engine::timeseries::retention_policy::RetentionPolicyRegistry>>,
-    /// Array catalog handle. When `None`, `lookup_array` returns
-    /// `None` for every name — used by sub-planners that don't own
-    /// array state.
-    pub(super) array_catalog: Option<crate::control::array_catalog::ArrayCatalogHandle>,
+    /// The node's array catalog. Every adapter resolves array names against
+    /// it, so a sub-planner plans array DML exactly as a client statement
+    /// does.
+    pub(super) array_catalog: crate::control::array_catalog::ArrayCatalogHandle,
     /// Optional reference to the host's drain tracker. When
     /// present, `get_collection` checks for an active drain
     /// on each descriptor it reads and returns
@@ -77,6 +77,7 @@ impl OriginCatalog {
     /// `QueryLeaseScope`.
     pub fn new(
         credentials: Arc<CredentialStore>,
+        array_catalog: crate::control::array_catalog::ArrayCatalogHandle,
         tenant_id: u64,
         database_id: DatabaseId,
         retention_policy_registry: Option<
@@ -90,7 +91,7 @@ impl OriginCatalog {
             retention_policy_registry,
             drain_tracker: None,
             recorded_versions: Mutex::new(DescriptorVersionSet::new()),
-            array_catalog: None,
+            array_catalog,
             sequence_registry: None,
             session_sequences: None,
         }
@@ -116,7 +117,7 @@ impl OriginCatalog {
             retention_policy_registry,
             drain_tracker: Some(Arc::clone(&shared.lease_drain)),
             recorded_versions: Mutex::new(DescriptorVersionSet::new()),
-            array_catalog: Some(shared.array_catalog.clone()),
+            array_catalog: shared.array_catalog.clone(),
             sequence_registry: Some(Arc::clone(&shared.sequence_registry)),
             session_sequences: None,
         }

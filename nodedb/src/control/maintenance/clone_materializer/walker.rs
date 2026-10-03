@@ -14,19 +14,25 @@
 //! - **Columnar / Timeseries / Spatial** — implemented (all three share the
 //!   same columnar materializer path via `ColumnarOp::MaterializeScan`).
 //!
-//! ## Sync wrapper
+//! ## Cluster
 //!
-//! The public API is sync because it is invoked from `spawn_blocking` on
-//! both the DDL hot path and the maintenance scheduler. Internally we call
-//! [`tokio::runtime::Handle::block_on`] so the per-engine async helpers can
-//! use the SPSC bridge.
+//! Source scans run on the source shard's owner, and target writes go
+//! through the target shard's replicated write path, so every replica holds
+//! the copied rows. Status flips are replicated `PutCollection` entries. The
+//! scheduled sweep runs on one node cluster-wide.
+//!
+//! ## Async end to end
+//!
+//! Every entry point is async and awaits the per-engine copies, which
+//! dispatch through the SPSC bridge. Nothing blocks a runtime thread on a
+//! future, so the DDL handlers that await it and the maintenance sweep run
+//! on any runtime flavor.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nodedb_types::{CloneStatus, CollectionType, DatabaseId};
 
-use crate::control::maintenance::wrapper::{MaintenanceOutcome, with_budget};
+use crate::control::maintenance::wrapper::{MaintenanceOutcome, with_budget_async};
 use crate::control::security::catalog::{StoredCollection, SystemCatalog};
 use crate::control::state::SharedState;
 
@@ -35,15 +41,16 @@ use super::document::materialize_document_collection;
 use super::kv::materialize_kv_collection;
 use super::progress::CloneMaterializerHandle;
 use super::rls_gate::refuse_if_rls_policy_applies;
+use super::source_drain::with_source_drain;
 
 /// Result of a single `materialize_database` call.
 #[derive(Debug)]
 pub enum MaterializeOutcome {
     /// Every clone collection in the database is `Materialized`.
     AllComplete,
-    /// `n` collections still need work and the caller should reschedule.
+    /// `n` collections still need work and the caller reschedules.
     Incomplete { collections_remaining: usize },
-    /// The maintenance budget was exhausted before any work could be done.
+    /// The maintenance budget was exhausted before any work was done.
     BudgetDeferred,
     /// Cooperative shutdown signal received.
     Cancelled,
@@ -66,17 +73,20 @@ pub struct MaterializeParams<'a> {
 }
 
 /// Drive one materialization sweep for `db_id`.
-pub fn materialize_database(params: MaterializeParams<'_>) -> crate::Result<MaterializeOutcome> {
+pub async fn materialize_database(
+    params: MaterializeParams<'_>,
+) -> crate::Result<MaterializeOutcome> {
     if params.cancel.load(Ordering::Relaxed) {
         return Ok(MaterializeOutcome::Cancelled);
     }
 
-    let outcome = with_budget(
+    let outcome = with_budget_async(
         &params.state.maintenance_budget,
         params.db_id,
         params.estimated_secs,
-        || do_materialize_database(&params),
-    );
+        do_materialize_database(&params),
+    )
+    .await;
 
     match outcome {
         MaintenanceOutcome::Deferred => Ok(MaterializeOutcome::BudgetDeferred),
@@ -85,7 +95,13 @@ pub fn materialize_database(params: MaterializeParams<'_>) -> crate::Result<Mate
 }
 
 /// Inner sweep, runs inside the budget window.
-fn do_materialize_database(params: &MaterializeParams<'_>) -> crate::Result<MaterializeOutcome> {
+///
+/// Document and columnar sources are read as of the clone point through
+/// `system_as_of_ms`, and a KV source is drained cluster-wide in
+/// `materialize_one`.
+async fn do_materialize_database(
+    params: &MaterializeParams<'_>,
+) -> crate::Result<MaterializeOutcome> {
     if params.cancel.load(Ordering::Relaxed) {
         return Ok(MaterializeOutcome::Cancelled);
     }
@@ -100,35 +116,12 @@ fn do_materialize_database(params: &MaterializeParams<'_>) -> crate::Result<Mate
         return Ok(MaterializeOutcome::AllComplete);
     }
 
-    // Freeze every distinct source database referenced by the pending
-    // collections for the duration of this sweep.  This prevents concurrent
-    // user writes from leaking into the KV materializer copy path (KV has no
-    // MVCC).  Guards are held until `_freeze_guards` drops at end of scope.
-    let source_db_ids: HashSet<DatabaseId> = pending
-        .iter()
-        .filter_map(|c| c.cloned_from.as_ref().map(|o| o.source_database))
-        .collect();
-    let _freeze_guards: Vec<crate::control::clone::FreezeGuard> = source_db_ids
-        .iter()
-        .map(|db_id| params.state.materialize_freeze.freeze(*db_id))
-        .collect();
-
-    let runtime_handle = tokio::runtime::Handle::try_current().map_err(|_| {
-        // Materializer must run inside a Tokio runtime so SPSC dispatch
-        // futures can drive. The DDL hot path runs sync handlers on runtime
-        // worker threads; the background sweep runs sync handlers on
-        // `spawn_blocking` threads. Both share the runtime.
-        crate::Error::Dispatch {
-            detail: "clone materializer requires a Tokio runtime context".into(),
-        }
-    })?;
-
     let mut remaining = 0usize;
     for coll in &pending {
         if params.cancel.load(Ordering::Relaxed) {
             return Ok(MaterializeOutcome::Cancelled);
         }
-        match materialize_one(&runtime_handle, params, coll) {
+        match materialize_one(params, coll).await {
             Ok(()) => {
                 if let Some(h) = params.handle {
                     h.notify_collection_done();
@@ -181,62 +174,45 @@ fn pending_clone_collections(
         .collect())
 }
 
-/// Route one collection to its per-engine materializer.
-///
-/// The per-engine implementations are async (they dispatch through the SPSC
-/// bridge). We bridge sync↔async with [`tokio::task::block_in_place`] so the
-/// runtime worker stays usable while we drive the future on this thread. This
-/// requires a multi-threaded runtime — the production server uses
-/// `#[tokio::main]` (multi-thread by default) and tests must annotate with
-/// `#[tokio::test(flavor = "multi_thread")]`.
+/// Route one collection to its per-engine materializer and await it.
 ///
 /// Every engine's materialization flows through this function, so the RLS
 /// policy-existence gate is checked once here, before any scan or write plan
 /// is built for any of the four write sites (KV `Put`, Document
 /// `PointInsert`, Columnar `Insert`, Timeseries `Ingest`) or their matching
 /// source-side `MaterializeScan`s.
-fn materialize_one(
-    runtime: &tokio::runtime::Handle,
+async fn materialize_one(
     params: &MaterializeParams<'_>,
     coll: &StoredCollection,
 ) -> crate::Result<()> {
     refuse_if_rls_policy_applies(params.state, params.db_id, coll)?;
 
     match &coll.collection_type {
-        CollectionType::KeyValue(_) => tokio::task::block_in_place(|| {
-            runtime.block_on(materialize_kv_collection(
+        // KV keeps no row versions, so its source takes no write for the copy.
+        CollectionType::KeyValue(_) => {
+            with_source_drain(
                 params.state,
-                params.catalog,
-                params.db_id,
                 coll,
-            ))
-        }),
-        CollectionType::Document(_) => tokio::task::block_in_place(|| {
-            runtime.block_on(materialize_document_collection(
-                params.state,
-                params.catalog,
-                params.db_id,
-                coll,
-            ))
-        }),
-        CollectionType::Columnar(_) => tokio::task::block_in_place(|| {
-            runtime.block_on(materialize_columnar_collection(
-                params.state,
-                params.catalog,
-                params.db_id,
-                coll,
-            ))
-        }),
+                materialize_kv_collection(params.state, params.catalog, params.db_id, coll),
+            )
+            .await
+        }
+        CollectionType::Document(_) => {
+            materialize_document_collection(params.state, params.catalog, params.db_id, coll).await
+        }
+        CollectionType::Columnar(_) => {
+            materialize_columnar_collection(params.state, params.catalog, params.db_id, coll).await
+        }
     }
 }
 
-/// Drive materialization to completion synchronously.
+/// Drive materialization of `db_id` to completion.
 ///
 /// Used by `ALTER DATABASE … MATERIALIZE` and `DROP DATABASE … FORCE`. Returns
 /// `Err(Error::BadRequest)` for unsupported engines (mapped to SQLSTATE
 /// `0A000` by the DDL handlers); returns `Ok(())` on success or after the
 /// budget defers.
-pub fn force_materialize_blocking(
+pub async fn force_materialize(
     db_id: DatabaseId,
     state: &SharedState,
     catalog: &SystemCatalog,
@@ -252,7 +228,7 @@ pub fn force_materialize_blocking(
         estimated_secs: 0.0,
     };
 
-    match do_materialize_database(&params)? {
+    match do_materialize_database(&params).await? {
         MaterializeOutcome::AllComplete => Ok(()),
         MaterializeOutcome::Incomplete {
             collections_remaining,
@@ -270,11 +246,19 @@ pub fn force_materialize_blocking(
 }
 
 /// Entry point called by the maintenance scheduler on each tick.
-pub fn run_scheduled_sweep(
+pub async fn run_scheduled_sweep(
     state: &SharedState,
     catalog: &SystemCatalog,
     cancel: &AtomicBool,
 ) -> crate::Result<()> {
+    // Materializer writes route to each shard's owner and replicate, so one
+    // node sweeps for the whole cluster.
+    if !state.is_singleton_worker() {
+        return Ok(());
+    }
+    // A copy that crashed on any node, or whose clone went away, leaves its
+    // source drain to this node. Settled before the sweep re-drives copies.
+    super::source_drain::recover_orphaned_source_drains(state).await?;
     let database_ids: Vec<DatabaseId> = catalog
         .list_databases()?
         .into_iter()
@@ -295,7 +279,7 @@ pub fn run_scheduled_sweep(
             estimated_secs: 5.0,
         };
 
-        match materialize_database(params) {
+        match materialize_database(params).await {
             Ok(MaterializeOutcome::AllComplete) => {}
             Ok(MaterializeOutcome::Incomplete {
                 collections_remaining,

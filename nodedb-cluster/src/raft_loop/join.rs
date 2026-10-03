@@ -28,14 +28,12 @@
 //!    step 1 is intentionally *not* reused for the final response; a
 //!    fresh clone is taken after step 6 so the response reflects the
 //!    post-AddLearner routing state.
-//! 6. **Propose AddLearner on each missing group.** For each Raft group
-//!    that does not already contain the node, take
-//!    the `MultiRaft` lock, propose
-//!    `ConfChange::AddLearner(new_node_id)`, and record the resulting
-//!    log index. Drop the lock between groups. Metadata-group admission
-//!    remains mandatory. Once that group already has three voters,
-//!    `NotLeader` on an independently led non-metadata group is deferred;
-//!    a later same-address join can reconcile the missing membership.
+//! 6. **Propose AddLearner on the metadata and sequencer groups** where
+//!    they do not contain the node yet. Metadata-group admission is
+//!    mandatory. The sequencer group defers only once the metadata group
+//!    has three voters. Data groups follow placement: reconcile, kicked in
+//!    step 9, names the joiner in the placements that take it, and each
+//!    group's leader adds it there.
 //! 7. **Wait for each conf-change to apply.** Poll actual group membership
 //!    every 20 ms with a 5-second deadline. A
 //!    single-voter group (the bootstrap seed before any voters have
@@ -46,8 +44,8 @@
 //!    attached). Order matters: Raft log → catalog → response.
 //! 9. **Broadcast TopologyUpdate** to every currently-active peer so
 //!    followers learn the new node's address. Fire-and-forget.
-//! 10. **Build and return JoinResponse** with the updated routing
-//!     (which now includes the new node as a learner on every group).
+//! 10. **Build and return JoinResponse** with every group of the routing
+//!     view. A group this node hosts carries its Raft membership.
 //!
 //! The Raft-level promotion from learner to voter happens asynchronously
 //! in the tick loop (`super::tick::promote_ready_learners`) once the
@@ -56,6 +54,7 @@
 //! two-phase single-server add.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
@@ -80,14 +79,25 @@ const CONF_CHANGE_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Polling interval for the commit-wait loop.
 const CONF_CHANGE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// The groups the join admits `node_id` to: the metadata group and the
+/// sequencer group, where they do not contain it yet.
+///
+/// A data group's members follow its placement alone. Reconcile authors the
+/// placement with the joiner, each group's leader adds the joiner where the
+/// placement names it, and the joiner mounts those groups. A join-time
+/// learner in every data group would outrun that placement: the leader drops
+/// each learner the placement it holds does not name, then adds it back
+/// once the new placement applies.
 fn groups_requiring_admission(multi_raft: &MultiRaft, node_id: u64) -> Vec<u64> {
     multi_raft
         .group_ids()
         .into_iter()
         .filter(|group_id| {
-            !multi_raft
-                .group_contains_node(*group_id, node_id)
-                .unwrap_or(false)
+            (*group_id == TOPOLOGY_GROUP_ID
+                || *group_id == crate::calvin::sequencer::SEQUENCER_GROUP_ID)
+                && !multi_raft
+                    .group_contains_node(*group_id, node_id)
+                    .unwrap_or(false)
         })
         .collect()
 }
@@ -174,24 +184,13 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         // 4. Register transport peer so the leader can reach it.
         self.transport.register_peer(req.node_id, new_addr);
 
-        // Read the local cluster id from the catalog and echo it
-        // on every successful `JoinResponse`. The joining node
-        // persists this value so its next boot takes the
-        // `restart()` path instead of re-bootstrapping.
-        //
-        // Strict contract:
-        //
-        // - If a catalog is attached and is missing a cluster_id,
-        //   the server is lying about being bootstrapped — this
-        //   is an invariant violation, so we reject the join
-        //   loudly instead of papering over it with a sentinel
-        //   zero that would silently collapse two different
-        //   clusters into one "cluster 0".
-        // - If a catalog is not attached (unit-test path), we
-        //   fall back to `self.node_id`. This is a test-only
-        //   affordance: it keeps the response well-formed without
-        //   inventing a cross-cluster identity, because in tests
-        //   every node id is locally unique by construction.
+        // Every successful `JoinResponse` echoes the catalog's cluster id.
+        // The joiner persists it, so its next boot takes `restart()`.
+        // - An attached catalog with no cluster id is an invariant
+        //   violation: the join is rejected, never answered with a
+        //   sentinel id.
+        // - With no catalog attached (unit tests), `self.node_id` stands
+        //   in: test node ids are unique by construction.
         let cluster_id = match self.catalog.as_ref() {
             Some(catalog) => match catalog.load_cluster_id() {
                 Ok(Some(id)) => id,
@@ -221,20 +220,24 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             }
         }
 
-        // 6. Propose AddLearner on every group that does not already contain
-        //    this node. This makes retries resume a partial join instead of
-        //    treating topology insertion as proof that Raft admission finished.
-        let (group_ids, can_defer_non_metadata) = {
+        // 6. Propose AddLearner on the metadata group and the sequencer
+        //    group where they do not contain this node yet, so a retry
+        //    resumes a partial join. Data groups are left to placement (see
+        //    `groups_requiring_admission`). Metadata-group admission is
+        //    mandatory. The sequencer group defers only once the metadata
+        //    group has three voters.
+        let (group_ids, metadata_voters) = {
             let mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
             let metadata_voters = mr
                 .group_membership(TOPOLOGY_GROUP_ID)
-                .map(|membership| membership.voters.len())
-                .unwrap_or(0);
+                .map_or(0, |membership| membership.voters.len());
             (
                 groups_requiring_admission(&mr, req.node_id),
-                metadata_voters >= 3,
+                metadata_voters,
             )
         };
+        let deferrable =
+            |gid: u64| gid == crate::calvin::sequencer::SEQUENCER_GROUP_ID && metadata_voters >= 3;
 
         let mut pending: Vec<(u64, u64)> = Vec::with_capacity(group_ids.len()); // (group_id, log_index)
         for gid in &group_ids {
@@ -248,9 +251,9 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             };
             match propose_result {
                 Ok((_, log_index)) => pending.push((*gid, log_index)),
-                Err(ClusterError::Raft(nodedb_raft::RaftError::NotLeader { leader_hint }))
-                    if can_defer_non_metadata && *gid != TOPOLOGY_GROUP_ID =>
-                {
+                Err(ClusterError::Raft(nodedb_raft::RaftError::NotLeader {
+                    leader_hint, ..
+                })) if deferrable(*gid) => {
                     debug!(
                         group_id = *gid,
                         joining_node = req.node_id,
@@ -259,16 +262,8 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                     );
                 }
                 Err(ClusterError::Transport { detail })
-                    if can_defer_non_metadata
-                        && *gid != TOPOLOGY_GROUP_ID
-                        && detail.contains("not leader") =>
+                    if deferrable(*gid) && detail.contains("not leader") =>
                 {
-                    // Join routing is anchored on the metadata leader, but
-                    // independent Raft groups can elect different leaders.
-                    // Do not make topology admission unavailable merely
-                    // because this node cannot propose a non-metadata group
-                    // change. A later same-address join retries only the
-                    // still-missing groups.
                     debug!(
                         group_id = *gid,
                         joining_node = req.node_id,
@@ -287,12 +282,8 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             }
         }
 
-        // 7. Wait for every conf change to actually *apply* to
-        //    routing. Earlier versions of this flow polled
-        //    `commit_index_for` and relied on an unconditional inline apply.
-        //    The semantic signal is actual Raft membership: the node appears
-        //    as either learner or voter. This works for non-routing groups and
-        //    also tolerates promotion racing the polling interval.
+        // 7. Wait for every conf change to apply: the node appears in the
+        //    group's Raft membership as a learner or a voter.
         let deadline = Instant::now() + CONF_CHANGE_COMMIT_TIMEOUT;
         for (gid, log_index) in &pending {
             if let Err(err) = self
@@ -303,28 +294,35 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             }
         }
 
-        // 8. Persist catalog (topology + post-AddLearner routing).
+        // 8. Persist catalog (topology + post-AddLearner routing), off the
+        // async threads. The routing table goes through the one routing
+        // writer, so this save never lands after a newer one.
         if let Some(catalog) = self.catalog.as_ref() {
             let topo_snapshot = self
                 .topology
                 .read()
                 .unwrap_or_else(|p| p.into_inner())
                 .clone();
-            let routing_snapshot = {
-                let mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-                mr.routing()
-                    .read()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .clone()
+            let catalog = Arc::clone(catalog);
+            let saved =
+                tokio::task::spawn_blocking(move || catalog.save_topology(&topo_snapshot)).await;
+            let error = match saved {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(e) => Some(format!("save task: {e}")),
             };
-            if let Err(e) = catalog.save_topology(&topo_snapshot) {
+            if let Some(e) = error {
                 warn!(error = %e, "failed to persist topology after join");
                 return reject(format!("catalog save_topology failed: {e}"));
             }
-            if let Err(e) = catalog.save_routing(&routing_snapshot) {
-                warn!(error = %e, "failed to persist routing after join");
-                return reject(format!("catalog save_routing failed: {e}"));
-            }
+        }
+        if let Some(persister) = self.routing_persister.as_ref()
+            && !persister.wait(persister.request()).await
+        {
+            warn!("failed to persist routing after join");
+            return reject(
+                "catalog save_routing failed; see the routing persister's warning".into(),
+            );
         }
 
         // 9. Broadcast topology to everyone so peers learn the new addr.
@@ -418,7 +416,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             .clone();
         let (routing_clone, raft_groups) = {
             let mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
-            let groups = mr
+            let groups: Vec<JoinGroupInfo> = mr
                 .group_ids()
                 .into_iter()
                 .filter_map(|group_id| mr.group_membership(group_id))
@@ -443,8 +441,28 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         // wire response.
         let mut topo = topology_clone;
         let mut response = handle_join_request(req, &mut topo, &routing_clone, cluster_id);
-        response.groups = raft_groups;
+        overlay_hosted_groups(&mut response.groups, raft_groups);
         response
+    }
+}
+
+/// Replace each routing-view group in `groups` with the Raft membership this
+/// node hosts for it, and add the hosted groups routing does not list.
+///
+/// `groups` starts as every group of this node's routing view. The joiner
+/// builds its whole routing table from the response. A group missing from it
+/// has no routing entry on the joiner, and nothing adds one later: the leader
+/// probe and the placement apply only move entries that exist. A replication
+/// factor below the node count leaves groups this node hosts no replica of,
+/// so the response cannot list only the hosted groups. A hosted group's Raft
+/// membership holds every conf change this node applied, so it replaces the
+/// routing entry.
+fn overlay_hosted_groups(groups: &mut Vec<JoinGroupInfo>, hosted: Vec<JoinGroupInfo>) {
+    for group in hosted {
+        match groups.iter_mut().find(|g| g.group_id == group.group_id) {
+            Some(slot) => *slot = group,
+            None => groups.push(group),
+        }
     }
 }
 
@@ -490,6 +508,47 @@ mod tests {
         assert_eq!(
             groups_requiring_admission(&multi_raft, 2),
             vec![SEQUENCER_GROUP_ID]
+        );
+        // A new node is admitted to the metadata and sequencer groups only.
+        // Data group 1 takes it as its placement names it.
+        let mut fresh = groups_requiring_admission(&multi_raft, 3);
+        fresh.sort_unstable();
+        assert_eq!(fresh, vec![0, SEQUENCER_GROUP_ID]);
+    }
+
+    fn info(group_id: u64, leader: u64, members: &[u64], learners: &[u64]) -> JoinGroupInfo {
+        JoinGroupInfo {
+            group_id,
+            leader,
+            members: members.to_vec(),
+            learners: learners.to_vec(),
+        }
+    }
+
+    #[test]
+    fn the_response_keeps_the_groups_this_node_hosts_no_replica_of() {
+        // Routing lists groups 0, 1 and 2. This node hosts 0, 1 and the
+        // sequencer; group 2 lives on node 2 only.
+        let mut groups = vec![
+            info(0, 1, &[1, 2], &[]),
+            info(1, 1, &[1], &[]),
+            info(2, 2, &[2], &[]),
+        ];
+        let hosted = vec![
+            info(0, 1, &[1, 2], &[3]),
+            info(1, 1, &[1], &[3]),
+            info(SEQUENCER_GROUP_ID, 1, &[1, 2], &[3]),
+        ];
+        overlay_hosted_groups(&mut groups, hosted);
+        groups.sort_by_key(|g| g.group_id);
+        assert_eq!(
+            groups,
+            vec![
+                info(0, 1, &[1, 2], &[3]),
+                info(1, 1, &[1], &[3]),
+                info(2, 2, &[2], &[]),
+                info(SEQUENCER_GROUP_ID, 1, &[1, 2], &[3]),
+            ]
         );
     }
 }

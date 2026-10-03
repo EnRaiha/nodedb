@@ -38,6 +38,8 @@ fn make_req(
         done,
         group_id,
         total_size: 0,
+        voters: Vec::new(),
+        learners: Vec::new(),
     }
 }
 
@@ -106,16 +108,18 @@ async fn chunked_happy_path() {
         }
     }
 
-    // After commit the `.partial` file must be gone and `.snap` must exist.
+    // A committed install keeps no file: no partial, no staged file, no copy.
     let recv_dir = data_dir.join("recv_snapshots");
-    assert!(
-        !recv_dir.join("42.partial").exists(),
-        "partial file must be removed after commit"
-    );
-    assert!(
-        recv_dir.join("42.snap").exists(),
-        "snap file must exist after commit"
-    );
+    let left: Vec<String> = std::fs::read_dir(&recv_dir)
+        .expect("read recv_snapshots")
+        .map(|e| {
+            e.expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert!(left.is_empty(), "files left after commit: {left:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -234,11 +238,17 @@ async fn corrupt_chunk_crc() {
         "unexpected error: {err}"
     );
 
-    // The partial file must still exist after CRC failure (not renamed to .snap).
+    // The partial file stays for inspection, and nothing is staged.
     let recv_dir = data_dir.join("recv_snapshots");
     assert!(
-        !recv_dir.join("7.snap").exists(),
-        "snap must NOT exist after CRC failure"
+        recv_dir.join("7.partial").exists(),
+        "partial must remain after CRC failure"
+    );
+    assert!(
+        nodedb_cluster::install_snapshot::staged::list_staged(&recv_dir)
+            .expect("list staged")
+            .is_empty(),
+        "nothing may be staged after CRC failure"
     );
 }
 

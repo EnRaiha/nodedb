@@ -29,6 +29,14 @@ pub struct WccSuperstepPlan {
     /// (cross-shard) edge target and the edge is recorded as a boundary edge
     /// rather than unioned locally.
     pub owned_vshards: Vec<u32>,
+    /// The watermark of the Calvin cut marker the read cut comes from, `0`
+    /// when `system_as_of` already holds it. Every node resolves the same
+    /// cut from it (see `BspSuperstepPlan::read_cut_marker`), so every node
+    /// reads the same graph.
+    pub read_cut_marker: u64,
+    /// The system-time ordinal every core reads the graph at. The handler
+    /// refuses a plan without one.
+    pub system_as_of: Option<i64>,
 }
 
 /// Result of one [`super::op::GraphOp::WccSuperstep`] on a single shard.
@@ -59,4 +67,6 @@ pub struct WccSuperstepResult {
     pub boundary_edges: Vec<(String, String)>,
     /// Number of owned nodes on this shard (== `node_labels.len()`).
     pub vertex_count: usize,
+    /// The system-time ordinal the node read the graph at.
+    pub system_as_of: Option<i64>,
 }

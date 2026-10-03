@@ -13,7 +13,7 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 use super::extract::weight_properties;
 use crate::control::server::surrogate_exchange::assign_surrogate_routed;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, RecordHomes, TenantId, TraceId};
 
 /// Shared routing context for a single implicit-edge task (delete or put):
 /// the endpoint tenancy/collection identity plus the two endpoint keys.
@@ -51,15 +51,17 @@ pub(super) async fn push_edge_delete(
         src,
         dst,
     } = ctx;
-    let vsrc = VShardId::from_key(src.as_bytes());
-    let vdst = VShardId::from_key(dst.as_bytes());
+    // The write routes to the source endpoint's home. Both endpoints'
+    // surrogates come from the collection home, where every key of the
+    // collection is minted.
+    let vsrc = RecordHomes::edge(src, dst).owner();
 
     // `collection` is the plan's database-qualified name.
     let key = nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?;
     let src_surrogate =
-        assign_surrogate_routed(state, vsrc, key, tenant_id, src.as_bytes(), trace_id).await?;
+        assign_surrogate_routed(state, key, tenant_id, src.as_bytes(), trace_id).await?;
     let dst_surrogate =
-        assign_surrogate_routed(state, vdst, key, tenant_id, dst.as_bytes(), trace_id).await?;
+        assign_surrogate_routed(state, key, tenant_id, dst.as_bytes(), trace_id).await?;
 
     out.push(PhysicalTask {
         tenant_id,
@@ -74,7 +76,7 @@ pub(super) async fn push_edge_delete(
             dst_surrogate,
             // A mirrored edge is reconciliation of the document write that owns
             // it, and the policy on that same collection decided that write
-            // before this task was derived. Gating the mirror as well would
+            // before this task was derived. Gating the mirror as well will
             // refuse a document write the policy already admitted. The
             // identity that decided it is live and known here, which is what
             // separates this from a follower or replay path.
@@ -92,7 +94,7 @@ pub(super) async fn push_edge_delete(
 /// from `weight` via the SAME [`weight_properties`] helper the INSERT path uses,
 /// so INSERT and UPDATE produce byte-identical properties for equal weight
 /// (`None` → empty properties → CSR unit weight). Endpoint surrogates are
-/// resolved get-or-create (a new endpoint may not exist yet), homed on
+/// resolved get-or-create (a new endpoint can be absent yet), homed on
 /// `from_key(src)`.
 pub(super) async fn push_edge_put(
     ctx: EdgeRouteCtx<'_>,
@@ -114,15 +116,17 @@ pub(super) async fn push_edge_put(
         None => Vec::new(),
     };
 
-    let vsrc = VShardId::from_key(src.as_bytes());
-    let vdst = VShardId::from_key(dst.as_bytes());
+    // The write routes to the source endpoint's home. Both endpoints'
+    // surrogates come from the collection home, where every key of the
+    // collection is minted.
+    let vsrc = RecordHomes::edge(src, dst).owner();
 
     // `collection` is the plan's database-qualified name.
     let key = nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?;
     let src_surrogate =
-        assign_surrogate_routed(state, vsrc, key, tenant_id, src.as_bytes(), trace_id).await?;
+        assign_surrogate_routed(state, key, tenant_id, src.as_bytes(), trace_id).await?;
     let dst_surrogate =
-        assign_surrogate_routed(state, vdst, key, tenant_id, dst.as_bytes(), trace_id).await?;
+        assign_surrogate_routed(state, key, tenant_id, dst.as_bytes(), trace_id).await?;
 
     out.push(PhysicalTask {
         tenant_id,

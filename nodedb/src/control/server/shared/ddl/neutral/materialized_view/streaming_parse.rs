@@ -2,13 +2,11 @@
 
 //! Parser for the streaming variant of `CREATE MATERIALIZED VIEW ... STREAMING`.
 //!
-//! Ported from the deleted pgwire `ddl::streaming_mv::create` parser. The
-//! extraction logic (source stream from the `FROM` clause, `GROUP BY` columns,
-//! `WHERE` filter, and the `COUNT/SUM/MIN/MAX/AVG` aggregate list) is preserved
-//! verbatim; the only behavioural change is that it operates on the already-split
-//! query body (`query_sql`, the text after ` AS `) plus the view `name` that the
-//! DDL parser extracted, rather than re-parsing the full statement string. Parse
-//! failures surface as protocol-neutral [`DdlError`] with SQLSTATE `42601`.
+//! The extraction logic (source stream from the `FROM` clause, `GROUP BY`
+//! columns, `WHERE` filter, and the `COUNT/SUM/MIN/MAX/AVG` aggregate list)
+//! operates on the already-split query body (`query_sql`, the text after
+//! ` AS `) plus the view `name` that the DDL parser extracted. Parse failures
+//! surface as protocol-neutral [`DdlError`] with SQLSTATE `42601`.
 
 use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::event::streaming_mv::types::{AggDef, AggFunction};

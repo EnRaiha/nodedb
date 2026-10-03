@@ -55,7 +55,7 @@ pub async fn select_diff(
 
     // The delta is stored document content in oplog form, so it carries the
     // collection's read grant, and a read policy refuses it: the bytes come
-    // back as one payload with no row a filter could be evaluated against. The
+    // back as one payload with no row a filter can be evaluated against. The
     // checkpoint lookup below already discloses that a named version exists for
     // this document, so the gate runs before it.
     RefusingReadGate::open(state, identity, database_id, collection, DIFF_WHAT)?;
@@ -96,7 +96,7 @@ pub async fn select_diff(
     ];
 
     // Encode delta as hex for SQL-safe transport.
-    let hex: String = delta_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let delta_hex = hex::encode(&delta_bytes);
 
     let mut row = Map::new();
     row.insert(
@@ -111,7 +111,7 @@ pub async fn select_diff(
         "delta_size_bytes".to_string(),
         JsonValue::String((delta_bytes.len() as i64).to_string()),
     );
-    row.insert("delta_hex".to_string(), JsonValue::String(hex));
+    row.insert("delta_hex".to_string(), JsonValue::String(delta_hex));
 
     Ok(vec![DdlResult::Rows(ShapedRows::from_json_rows(
         columns,

@@ -40,12 +40,14 @@ impl SessionStore {
             let buffer_len = session.tx_buffer.len();
             let pending_offset_len = session.pending_offset_commits.len();
             let pending_inference_len = session.pending_field_inference.len();
+            let pending_publish_len = session.pending_publishes.len();
             session.savepoints.push(SavepointEntry {
                 name,
                 buffer_len,
                 pending_offset_len,
                 pending_inference_len,
                 ddl_buffer_len,
+                pending_publish_len,
                 markers,
             });
         });
@@ -94,6 +96,7 @@ impl SessionStore {
             let pending_offset_len = session.savepoints[pos].pending_offset_len;
             let pending_inference_len = session.savepoints[pos].pending_inference_len;
             let ddl_buffer_len = session.savepoints[pos].ddl_buffer_len;
+            let pending_publish_len = session.savepoints[pos].pending_publish_len;
             let markers = session.savepoints[pos].markers.clone();
             if session.tx_buffer.len() != session.tx_lease_scopes.len() {
                 return Err(crate::Error::Internal {
@@ -102,10 +105,15 @@ impl SessionStore {
             }
             session.tx_buffer.truncate(buffer_len);
             session.tx_lease_scopes.truncate(buffer_len);
+            session.tx_body_tasks.retain(|index| *index < buffer_len);
+            session
+                .tx_ts_preview_rejected
+                .retain(|index, _| *index < buffer_len);
             session.pending_offset_commits.truncate(pending_offset_len);
             session
                 .pending_field_inference
                 .truncate(pending_inference_len);
+            session.pending_publishes.truncate(pending_publish_len);
             debug_assert_eq!(session.tx_buffer.len(), session.tx_lease_scopes.len());
             session.savepoints.truncate(pos + 1);
             Ok(SavepointRewind {

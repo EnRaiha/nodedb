@@ -72,7 +72,7 @@ impl CoreLoop {
             return self.response_error(task, e);
         }
 
-        self.kv_engine.put(crate::engine::kv::KvPutParams {
+        if let Err(e) = self.kv_engine.put(crate::engine::kv::KvPutParams {
             database_id: did,
             tenant_id: tid,
             collection,
@@ -81,7 +81,9 @@ impl CoreLoop {
             ttl_ms,
             now_ms,
             surrogate,
-        });
+        }) {
+            return self.response_error(task, e);
+        }
         if let Some(ref m) = self.metrics {
             m.record_kv_put();
         }

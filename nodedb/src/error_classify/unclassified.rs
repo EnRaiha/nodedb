@@ -22,10 +22,13 @@ pub(crate) fn is_unclassified_failure(e: &Error) -> bool {
         | Error::Encryption { .. }
         | Error::Bridge { .. }
         | Error::VersionCompat { .. }
+        | Error::RestoreTargetNotEmpty { .. }
+        | Error::RestoreVerificationFailed { .. }
         | Error::Internal { .. }
         | Error::DescriptorVersionAnomaly { .. }
         | Error::CatalogIntegrityViolation { .. }
         | Error::CollectionPurgeRowMissing { .. }
+        | Error::CollectionUnstamped { .. }
         | Error::MaterializedSumResolutionMissing { .. }
         | Error::CascadeCycle { .. } => true,
         // A client-matchable class or a retry contract a caller matches by
@@ -66,9 +69,7 @@ pub(crate) fn is_unclassified_failure(e: &Error) -> bool {
         | Error::CrdtAdmissionTimeout { .. }
         | Error::NoLeader { .. }
         | Error::NotLeader { .. }
-        | Error::FanOutExceeded { .. }
         | Error::CrossCollectionNotColocated { .. }
-        | Error::SourceFrozen { .. }
         | Error::CloneWriteRequiresMaterialize { .. }
         | Error::BadRequest { .. }
         | Error::BackupTenantMismatch { .. }
@@ -87,10 +88,14 @@ pub(crate) fn is_unclassified_failure(e: &Error) -> bool {
         | Error::InvalidLimitValue { .. }
         | Error::RetryableSchemaChanged { .. }
         | Error::RetryableLeaderChange { .. }
+        | Error::CommittedResultUnavailable { .. }
+        | Error::ProposalOutcomeUnknown { .. }
         | Error::GroupQuorumUnavailable { .. }
         | Error::GroupMarksUnavailable { .. }
+        | Error::BackupCaptureMoved { .. }
         | Error::MetadataLeaderUnavailable
         | Error::AuthorizationStateBehind { .. }
+        | Error::LinearizableReadRefused { .. }
         | Error::ExecutionLimitExceeded { .. }
         | Error::LimitExceeded { .. }
         | Error::DispatchCapacity { .. }

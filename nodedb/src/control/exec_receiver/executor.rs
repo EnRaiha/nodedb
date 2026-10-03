@@ -3,8 +3,9 @@
 //! Local execution of incoming `ExecuteRequest` / `ExecuteStreamRequest` RPCs.
 //!
 //! When this node leads the target vShard, [`LocalPlanExecutor`] validates
-//! descriptor versions, decodes the `PhysicalPlan`, and fans it across all
-//! local Data-Plane cores before returning the merged result.
+//! descriptor versions, decodes the `PhysicalPlan`, and runs it through
+//! `execute_received_plan`: a vShard-scoped plan on its one owning core, every
+//! other plan across all local cores.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -16,13 +17,14 @@ use nodedb_cluster::forward::{ChunkSink, PlanExecutor};
 use nodedb_cluster::rpc_codec::{ExecuteRequest, ExecuteResponse, TypedClusterError};
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::server::exchange::execute_plan_all_local_cores;
+use crate::control::server::exchange::execute_received_plan;
 use crate::control::state::SharedState;
 use crate::control::trace_export::EmitSpanParams;
 use crate::types::DatabaseId;
 
 use super::backup_cut::take_backup_cut;
 use super::plan_decode::decode_plan;
+use super::read_leg::confirm_read_leg;
 use super::request_validation::validate_request;
 use super::support::{PLAN_DECODE_FAILED, SinkOutcome, execution_error_to_typed};
 
@@ -138,146 +140,43 @@ impl LocalPlanExecutor {
         let tenant_id = crate::types::TenantId::new(req.tenant_id);
         let trace_id = nodedb_types::TraceId(req.trace_id);
 
-        if let PhysicalPlan::ClusterEvent(
-            nodedb_physical::physical_plan::ClusterEventOp::TenantWriteMarks {
-                tenant_id: marks_tenant,
-                group_ids,
-            },
-        ) = &plan
+        if let Some(response) = super::backup_cut::answer_capture_plan(&self.state, &plan).await {
+            return response;
+        }
+        if let Some(response) =
+            super::tenant_marks::answer_marks_plan(&self.state, &plan, deadline).await
         {
-            return super::tenant_marks::answer_tenant_marks(
-                &self.state,
-                *marks_tenant,
-                group_ids,
-                deadline,
-            )
-            .await;
+            return response;
+        }
+        if let Some(response) = super::surrogate_binds::answer_binds_plan(&self.state, &plan) {
+            return response;
+        }
+        if let Some(response) = super::surrogate_binds::answer_holders_plan(&self.state, &plan) {
+            return response;
+        }
+        if let Some(response) =
+            super::metadata_applied::answer_applied_plan(&self.state, &plan, deadline).await
+        {
+            return response;
         }
 
-        if let PhysicalPlan::ClusterEvent(
-            nodedb_physical::physical_plan::ClusterEventOp::PublishTopic {
-                database_id: topic_database_id,
-                topic_name,
-                payload,
-            },
-        ) = &plan
-        {
-            if *topic_database_id != database_id {
-                return ExecuteResponse::err(TypedClusterError::Internal {
-                    code: PLAN_DECODE_FAILED,
-                    message: "topic publish database does not match RPC database".into(),
-                });
-            }
-            return match crate::event::topic::publish::publish_to_topic(
-                &self.state,
-                database_id,
-                req.tenant_id,
-                topic_name,
-                payload,
-            )
-            .await
-            {
-                Ok(sequence) => match zerompk::to_msgpack_vec(&sequence) {
-                    Ok(payload) => ExecuteResponse::ok(vec![payload], 0, 0),
-                    Err(error) => ExecuteResponse::err(TypedClusterError::Internal {
-                        code: PLAN_DECODE_FAILED,
-                        message: format!("topic response encoding failed: {error}"),
-                    }),
-                },
-                Err(error) => ExecuteResponse::err(TypedClusterError::Internal {
-                    code: PLAN_DECODE_FAILED,
-                    message: error.to_string(),
-                }),
-            };
-        }
-
-        if let PhysicalPlan::ClusterEvent(
-            nodedb_physical::physical_plan::ClusterEventOp::ConsumeStream {
-                database_id: stream_database_id,
-                stream_name,
-                group_name,
-                partition,
-                limit,
-                committed_offsets,
-            },
-        ) = &plan
-        {
-            if let Err(error) = reject_consume_database_mismatch(*stream_database_id, database_id) {
-                return ExecuteResponse::err(error);
-            }
-            let limit = match usize::try_from(*limit) {
-                Ok(limit) => limit,
-                Err(_) => {
-                    return ExecuteResponse::err(TypedClusterError::Internal {
-                        code: PLAN_DECODE_FAILED,
-                        message: "CDC consume limit exceeds platform range".into(),
-                    });
-                }
-            };
-            let params = crate::event::cdc::consume::ConsumeParams {
-                database_id: *stream_database_id,
-                tenant_id: req.tenant_id,
-                stream_name,
-                group_name,
-                partition: *partition,
-                limit,
-            };
-            if let Err(error) =
-                crate::event::cdc::consume::validate_consume_identity(&self.state, &params)
-            {
-                return ExecuteResponse::err(TypedClusterError::Internal {
-                    code: PLAN_DECODE_FAILED,
-                    message: error.to_string(),
-                });
-            }
-            let committed_offsets =
-                match crate::event::cdc::consume::decode_remote_committed_offsets(committed_offsets)
-                {
-                    Ok(offsets) => offsets,
-                    Err(error) => {
-                        return ExecuteResponse::err(TypedClusterError::Internal {
-                            code: PLAN_DECODE_FAILED,
-                            message: error.to_string(),
-                        });
-                    }
-                };
-            // Events go to an authenticated peer node, not a subscriber; the
-            // requesting node applies its caller's redaction at the delivery
-            // surface (SELECT / HTTP poll / SSE), using the same replicated
-            // catalog policies on both sides.
-            return match crate::event::cdc::consume::consume_local_with_offsets(
-                &self.state,
-                &params,
-                Some(&committed_offsets),
-            ) {
-                Ok(result) => {
-                    let events = result
-                        .events
-                        .iter()
-                        .map(|event| event.as_ref().clone())
-                        .collect::<Vec<_>>();
-                    match zerompk::to_msgpack_vec(&events) {
-                        Ok(payload) => ExecuteResponse::ok(vec![payload], 0, 0),
-                        Err(error) => ExecuteResponse::err(TypedClusterError::Internal {
-                            code: PLAN_DECODE_FAILED,
-                            message: format!("CDC response encoding failed: {error}"),
-                        }),
-                    }
-                }
-                Err(error) => ExecuteResponse::err(TypedClusterError::Internal {
-                    code: PLAN_DECODE_FAILED,
-                    message: error.to_string(),
-                }),
-            };
+        if let Some(response) = super::stream_events::answer_stream_event_plan(
+            &self.state,
+            &plan,
+            database_id,
+            req.tenant_id,
+        ) {
+            return response;
         }
 
         // Replicable write: drive through Raft, not local cores. Fanning it
-        // across local cores only would commit here without proposing to the
+        // across local cores only commits here without proposing to the
         // Raft group — silent write loss. Propose through the same proposer
         // the local pgwire write path uses. Reads / non-replicable plans fall
-        // through to `execute_plan_all_local_cores` unchanged.
+        // through to `execute_received_plan` unchanged.
         //
-        // The vshard is not carried on the wire; re-derive it as a pure
+        // Only a vShard-scoped plan carries its vShard on the wire. For a
+        // replicable write, re-derive the vShard as a pure
         // function of the plan's primary collection, matching the gateway
         // router's `CollectionHomed` arm (`vshard_for_collection`). The plan
         // carries the database-qualified name, de-qualified into the
@@ -300,10 +199,30 @@ impl LocalPlanExecutor {
             return ExecuteResponse::err(error);
         }
 
-        if let Some(proposer) = self.state.async_raft_proposer() {
+        {
+            let proposer = match self.state.async_raft_proposer() {
+                Ok(proposer) => proposer,
+                Err(e) => return ExecuteResponse::err(execution_error_to_typed(e)),
+            };
+            // The entry carries resolved rows: a timeseries ingest resolves
+            // here, on the proposer, before the entry exists.
+            let resolved = match crate::control::write_resolve::resolve_for_log(
+                &self.state,
+                crate::control::write_resolve::WriteResolveContext {
+                    tenant_id,
+                    database_id,
+                },
+                vshard_id,
+                &plan,
+            )
+            .await
+            {
+                Ok(resolved) => resolved,
+                Err(e) => return ExecuteResponse::err(execution_error_to_typed(e)),
+            };
             let replicable =
                 match crate::control::wal_replication::ReplicableWrite::decide_for_replication(
-                    &plan,
+                    resolved.as_ref().unwrap_or(&plan),
                 ) {
                     Ok(replicable) => replicable,
                     Err(e) => {
@@ -335,21 +254,7 @@ impl LocalPlanExecutor {
                     {
                         // Replicated writes carry no read watermark → 0: it floors a
                         // session's later reads, and this RPC seam has no session.
-                        Ok((payload, write_version)) => {
-                            // Replicas apply with `ChangeFeedOwner::Unowned`. This
-                            // node proposed the write once, so it publishes the
-                            // change event.
-                            crate::control::server::dispatch_utils::publish_change_set_with_lsn(
-                                &self.state,
-                                tenant_id,
-                                database_id,
-                                crate::control::server::dispatch_utils::extract_write_change_set(
-                                    &plan, tenant_id,
-                                ),
-                                write_version,
-                            );
-                            ExecuteResponse::ok(vec![payload], 0, 0)
-                        }
+                        Ok((payload, _write_version)) => ExecuteResponse::ok(vec![payload], 0, 0),
                         // A replicated write's apply verdict is a Data-Plane
                         // verdict: carry its code, never flatten to internal.
                         Err(e) => ExecuteResponse::err(execution_error_to_typed(e)),
@@ -359,15 +264,23 @@ impl LocalPlanExecutor {
             }
         }
 
+        if let Err(error) =
+            confirm_read_leg(&self.state, database_id, &plan, &req.read_groups, deadline).await
+        {
+            return ExecuteResponse::err(error);
+        }
+        // A vShard-scoped plan runs on its one owning core. Every other plan
+        // fans across all local cores.
         match tokio::time::timeout(
             deadline,
-            execute_plan_all_local_cores(
+            execute_received_plan(
                 &self.state,
                 tenant_id,
                 database_id,
                 plan,
                 trace_id,
                 req.txn_id,
+                req.vshard_id,
             ),
         )
         .await
@@ -407,7 +320,29 @@ impl LocalPlanExecutor {
                 message: "ClusterEvent operations do not support streaming RPC".into(),
             });
         }
+        // A capture request is answered from parked captures, never from a
+        // live read of the cores.
+        if super::backup_cut::is_capture_plan(&plan) {
+            return Some(TypedClusterError::Internal {
+                code: PLAN_DECODE_FAILED,
+                message: "a cut capture request does not support streaming RPC".into(),
+            });
+        }
+        // The stream fans across every core, so it cannot serve a plan that
+        // must run on one owning core.
+        if req.vshard_id.is_some() || crate::control::gateway::router::is_task_vshard_scoped(&plan)
+        {
+            return Some(TypedClusterError::Internal {
+                code: PLAN_DECODE_FAILED,
+                message: "vShard-scoped plans do not support streaming RPC".into(),
+            });
+        }
 
+        if let Err(error) =
+            confirm_read_leg(&self.state, database_id, &plan, &req.read_groups, deadline).await
+        {
+            return Some(error);
+        }
         let tenant_id = crate::types::TenantId::new(req.tenant_id);
         let trace_id = nodedb_types::TraceId(req.trace_id);
 
@@ -461,52 +396,10 @@ impl LocalPlanExecutor {
     }
 }
 
-fn reject_consume_database_mismatch(
-    stream_database_id: crate::types::DatabaseId,
-    envelope_database_id: crate::types::DatabaseId,
-) -> Result<(), TypedClusterError> {
-    if stream_database_id == envelope_database_id {
-        Ok(())
-    } else {
-        Err(TypedClusterError::Internal {
-            code: PLAN_DECODE_FAILED,
-            message: "CDC consume database does not match RPC database".into(),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use nodedb_physical::physical_plan::CrdtOp;
-
-    #[test]
-    fn consume_stream_rejects_database_mismatch() {
-        let op = nodedb_physical::physical_plan::ClusterEventOp::ConsumeStream {
-            database_id: crate::types::DatabaseId::new(7),
-            stream_name: "topic:orders".into(),
-            group_name: "analytics".into(),
-            partition: Some(0),
-            limit: 1,
-            committed_offsets: vec![(0, 0, 0)],
-        };
-        let nodedb_physical::physical_plan::ClusterEventOp::ConsumeStream { database_id, .. } = op
-        else {
-            panic!("expected typed consume operation");
-        };
-        assert!(matches!(
-            reject_consume_database_mismatch(database_id, crate::types::DatabaseId::new(8)),
-            Err(TypedClusterError::Internal { .. })
-        ));
-    }
-
-    #[test]
-    fn consume_stream_rejects_duplicate_caller_offsets() {
-        assert!(matches!(
-            crate::event::cdc::consume::decode_remote_committed_offsets(&[(3, 7, 1), (3, 8, 1)]),
-            Err(crate::event::cdc::consume::ConsumeError::InvalidRemoteOffsets(_))
-        ));
-    }
 
     #[test]
     fn every_remote_execution_mode_rejects_unadmitted_crdt_apply() {
@@ -516,7 +409,7 @@ mod tests {
             delta: Vec::new(),
             peer_id: 1,
             mutation_id: 1,
-            surrogate: nodedb_types::Surrogate::ZERO,
+            surrogate: nodedb_types::Surrogate::new(1),
             provenance: None,
             constraint_version_required: 0,
             expected_frontier_digest: None,

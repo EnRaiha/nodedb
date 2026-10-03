@@ -63,9 +63,36 @@ where
     }
 }
 
+/// [`with_budget`] for async work: awaits `work` only if `db` has CPU budget
+/// remaining. The lease covers the whole await.
+pub async fn with_budget_async<R, Fut>(
+    tracker: &Arc<MaintenanceBudgetTracker>,
+    db: DatabaseId,
+    estimated_secs: f64,
+    work: Fut,
+) -> MaintenanceOutcome<R>
+where
+    Fut: std::future::Future<Output = R>,
+{
+    match tracker.try_acquire(db, estimated_secs) {
+        None => MaintenanceOutcome::Deferred,
+        Some(_lease) => MaintenanceOutcome::Ran(work.await),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn with_budget_async_awaits_within_cap() {
+        let tracker = Arc::new(MaintenanceBudgetTracker::new());
+        let db = DatabaseId::new(3);
+        tracker.set_cap(db, 25);
+
+        let outcome = with_budget_async(&tracker, db, 1.0, async { 7u32 }).await;
+        assert!(matches!(outcome, MaintenanceOutcome::Ran(7)));
+    }
 
     #[test]
     fn with_budget_runs_within_cap() {
@@ -101,8 +128,8 @@ mod tests {
             }
         }
 
-        // At this point the budget may be near exhaustion. The exact behavior
-        // depends on timing; we just verify the API compiles and returns a
+        // At this point the budget can be near exhaustion. The exact behavior
+        // depends on timing; we only verify the API compiles and returns a
         // valid variant.
         let outcome = with_budget(&tracker, db, 0.0, || 99u32);
         let _ = outcome.ran() || outcome.deferred();

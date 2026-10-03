@@ -6,7 +6,7 @@
 ///
 /// Takes `(vshard_id, serialized_entry)` and returns `(group_id, log_index)`.
 /// Works only when the current node is the group leader. Use
-/// [`AsyncRaftProposer`] when proposals may originate from non-leader nodes.
+/// [`AsyncRaftProposer`] when proposals can originate from non-leader nodes.
 pub type RaftProposer =
     dyn Fn(u32, Vec<u8>) -> std::result::Result<(u64, u64), crate::Error> + Send + Sync;
 
@@ -45,13 +45,59 @@ pub type AsyncRaftProposer = dyn Fn(
     > + Send
     + Sync;
 
+/// Where a proposed entry landed in its data group's Raft log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProposedAt {
+    pub group_id: u64,
+    pub log_index: u64,
+}
+
+/// The wait for this node's apply of a proposed entry: the result an
+/// [`AsyncRaftProposer`] returns.
+pub type AppliedWait = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = std::result::Result<(Vec<u8>, crate::types::Lsn), crate::Error>,
+            > + Send,
+    >,
+>;
+
+/// A proposal the group's leader accepted into its log.
+pub struct ProposedWrite {
+    /// Where the entry landed. `None` when the proposer applied the write
+    /// before it returned, so no apply is outstanding.
+    pub at: Option<ProposedAt>,
+    /// This node's apply of the entry.
+    pub applied: AppliedWait,
+}
+
+/// Type alias for the first phase of an [`AsyncRaftProposer`]: propose the
+/// entry, and return once the leader holds it in its log, with the wait for
+/// this node's apply of it.
+///
+/// Same arguments and deadline rule as [`AsyncRaftProposer`]. The admission
+/// sequencer holds a vShard's slot across this phase only, so a later write
+/// of the vShard proposes while an earlier one waits for its apply.
+pub type AsyncRaftSubmit = dyn Fn(
+        u32,
+        u64,
+        Vec<u8>,
+        tokio::time::Instant,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::result::Result<ProposedWrite, crate::Error>>
+                + Send,
+        >,
+    > + Send
+    + Sync;
+
 /// Type alias for the Raft log-compaction callback.
 ///
 /// Takes `(group_id, applied_index)` where `applied_index` is the index the
 /// DATA-PLANE state machine has durably applied to (NOT raft's commit
 /// index). Invoked from the apply-completion path so a log can only be
 /// compacted up to an index the engines have actually persisted — never
-/// past it, which would corrupt a rebuilt snapshot. Returns `true` when a
+/// past it, which corrupts a rebuilt snapshot. Returns `true` when a
 /// compaction was performed. A no-op when the group's
 /// `log_compaction_threshold` is `None`.
 pub type RaftCompactor = dyn Fn(u64, u64) -> std::result::Result<bool, crate::Error> + Send + Sync;
@@ -74,8 +120,7 @@ pub(crate) fn default_pq_m() -> usize {
     crate::engine::vector::index_config::DEFAULT_PQ_M
 }
 /// Default `ColumnarIngest::intent` for a record written before that field
-/// existed: a plain `INSERT`, matching the value `decode_sync_engines` used to
-/// hardcode.
+/// existed: a plain `INSERT`.
 pub(crate) fn default_columnar_insert_intent()
 -> nodedb_physical::physical_plan::ColumnarInsertIntent {
     nodedb_physical::physical_plan::ColumnarInsertIntent::Insert

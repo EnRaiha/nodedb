@@ -10,10 +10,11 @@ use tracing::{info, warn};
 
 use crate::control::planner::procedural::executor::bindings::RowBindings;
 use crate::control::planner::procedural::executor::core::{
-    CrossShardOrigin, MAX_CASCADE_DEPTH, StatementExecutor,
+    AtomicBody, CrossShardOrigin, MAX_CASCADE_DEPTH, StatementExecutor,
 };
 use crate::control::security::catalog::trigger_types::{StoredTrigger, TriggerSecurity};
 use crate::control::security::identity::{AuthenticatedIdentity, Role};
+use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
@@ -52,6 +53,9 @@ pub struct FireTriggersParams<'a> {
     pub cross_shard_origin: Option<CrossShardOrigin>,
     /// What a failing trigger does to the triggers queued behind it.
     pub on_error: FireErrorPolicy,
+    /// The triggering statement's transaction, which a synchronous body
+    /// joins. `None` on the Event Plane: each body runs its own transaction.
+    pub joined: Option<&'a DmlTxnCtx<'a>>,
 }
 
 /// What happens to the remaining triggers when one of them fails.
@@ -64,7 +68,7 @@ pub enum FireErrorPolicy {
     Abort,
     /// Run every trigger and report each outcome. The Event Plane uses this:
     /// its triggers share no transaction, so one failing must not silently
-    /// cancel its siblings — they would never run at all, since a retry
+    /// cancel its siblings — they never run at all, since a retry
     /// re-fires only the trigger that failed.
     Continue,
 }
@@ -73,7 +77,8 @@ pub enum FireErrorPolicy {
 pub struct TriggerOutcome {
     /// The trigger that ran, named so a failure can be retried on its own.
     pub trigger_name: String,
-    /// The failure, when the body did not execute to completion.
+    /// The failure, when the body did not execute to completion. A body that
+    /// committed owes nothing more: its cross-node writes committed with it.
     pub error: Option<crate::Error>,
 }
 
@@ -92,12 +97,21 @@ impl FireReport {
     /// depth stop.
     ///
     /// The failure belongs to the pass rather than to any one trigger, and
-    /// re-running it would hit the same depth again, so a refusal is terminal:
+    /// re-running it hits the same depth again, so a refusal is terminal:
     /// it is reported, never retried.
     pub fn from_precondition(error: crate::Error) -> Self {
         Self {
             refusal: Some(error),
             outcomes: Vec::new(),
+        }
+    }
+
+    /// A pass with the given per-trigger outcomes.
+    #[cfg(test)]
+    pub(crate) fn from_outcomes(outcomes: Vec<TriggerOutcome>) -> Self {
+        Self {
+            refusal: None,
+            outcomes,
         }
     }
 
@@ -146,6 +160,7 @@ pub async fn fire_triggers(params: FireTriggersParams<'_>) -> FireReport {
         cascade_depth,
         cross_shard_origin,
         on_error,
+        joined,
     } = params;
 
     let mut report = FireReport::default();
@@ -191,9 +206,23 @@ pub async fn fire_triggers(params: FireTriggersParams<'_>) -> FireReport {
             trigger.database_id,
             cascade_depth + 1,
             crate::event::EventSource::Trigger,
-        );
+        )
+        .with_atomic_body(AtomicBody::trigger(&trigger.name));
         if let Some(ref origin) = cross_shard_origin {
             executor = executor.with_cross_shard_origin(origin.clone());
+        }
+        if let Some(ctx) = joined {
+            executor = executor.joined_into(ctx);
+        }
+
+        // A body an earlier firing of this event committed does not run again.
+        if let Some(skipped) = super::fire_skip::skipped(&executor, trigger, collection) {
+            let failed = skipped.error.is_some();
+            report.outcomes.push(skipped);
+            if failed && on_error == FireErrorPolicy::Abort {
+                break;
+            }
+            continue;
         }
 
         let error = executor
@@ -247,7 +276,7 @@ pub(crate) fn resolve_trigger_identity(
     }
 }
 
-/// Execute BEFORE triggers that may mutate the NEW row.
+/// Execute BEFORE triggers that can mutate the NEW row.
 ///
 /// Returns the (possibly modified) NEW fields after all BEFORE triggers have run.
 /// If a trigger executes `RAISE EXCEPTION`, the error propagates and the DML is aborted.
@@ -270,6 +299,8 @@ pub struct BeforeTriggersMutationParams<'a> {
     pub cascade_depth: u32,
     /// NEW row fields, mutated in place by ASSIGN statements across triggers.
     pub new_fields: Option<HashMap<String, nodedb_types::Value>>,
+    /// The triggering statement's transaction, which every body joins.
+    pub joined: &'a DmlTxnCtx<'a>,
 }
 
 /// BEFORE triggers can modify NEW by executing `SET NEW.field = value` statements.
@@ -288,6 +319,7 @@ pub async fn fire_before_triggers_with_mutation(
         bindings,
         cascade_depth,
         mut new_fields,
+        joined,
     } = params;
 
     for trigger in triggers {
@@ -343,9 +375,12 @@ pub async fn fire_before_triggers_with_mutation(
             trigger.database_id,
             cascade_depth + 1,
             crate::event::EventSource::Trigger,
-        );
+        )
+        .with_atomic_body(AtomicBody::trigger(&trigger.name))
+        .joined_into(joined);
 
-        // RAISE EXCEPTION in the body will propagate as an error, aborting the DML.
+        // RAISE EXCEPTION in the body will propagate as an error, aborting the
+        // DML. A joined body's publishes wait for the statement's COMMIT.
         if let Err(e) = executor.execute_block(&block, &current_bindings).await {
             return Err(crate::Error::BadRequest {
                 detail: format!(

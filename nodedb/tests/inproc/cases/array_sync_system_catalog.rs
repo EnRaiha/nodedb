@@ -1,43 +1,25 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Regression test: single-node, non-cluster.
+//! A synced Array schema is visible in the system catalog.
 //!
-//! When an Array (`CREATE ARRAY`) collection's schema is synced onto a node
-//! that has no Raft group configured, `OriginArrayInbound::handle_schema`
-//! takes the direct-import branch (no `raft_proposer` installed). Before
-//! this fix, that branch called `OriginSchemaRegistry::import_snapshot` and
-//! returned — it never registered an `ArrayCatalogEntry`, so the array was
-//! invisible to `array_catalog` and, transitively, to `SHOW COLLECTIONS`
-//! (which — also before this fix — never consulted `array_catalog` at all).
+//! When an Array (`CREATE ARRAY`) collection's schema is synced onto a node,
+//! `OriginArrayInbound::handle_schema` proposes it through the metadata
+//! group. Its apply registers an `ArrayCatalogEntry`, so the array is visible
+//! to `array_catalog` and, through it, to `SHOW COLLECTIONS`.
 //!
 //! This test drives `handle_schema` exactly as the WebSocket listener would
-//! on a single-node deployment, then asserts the array is visible via
-//! `SHOW COLLECTIONS`. It fails on the pre-fix tree because (a) the
-//! single-node branch never called the catalog-registration helper and
-//! (b) `show_collections` never merged in `array_catalog` entries.
+//! on a one-node cluster, then asserts the array is visible via
+//! `SHOW COLLECTIONS`.
 
 use std::sync::Arc;
 
-use nodedb::bridge::dispatch::Dispatcher;
 use nodedb::control::array_sync::{OriginApplyEngine, OriginArrayInbound};
 use nodedb::control::security::identity::AuthenticatedIdentity;
 use nodedb::control::server::shared::ddl::neutral::collection::show_collections;
 use nodedb::control::server::shared::ddl::result::DdlResult;
-use nodedb::control::state::SharedState;
-use nodedb::wal::WalManager;
 use nodedb_test_support::array_sync::build_schema_snapshot;
+use nodedb_test_support::pgwire_harness::TestServer;
 use nodedb_types::DatabaseId;
-
-/// Returns the shared state plus the backing `TempDir` guard — the caller
-/// must keep the guard alive for as long as the state is in use.
-fn build_test_state() -> (Arc<SharedState>, tempfile::TempDir) {
-    let dir = tempfile::tempdir().expect("tmpdir");
-    let wal_path = dir.path().join("test.wal");
-
-    let wal = Arc::new(WalManager::open_for_testing(&wal_path).expect("wal"));
-    let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-    (SharedState::new(dispatcher, wal).unwrap(), dir)
-}
 
 fn superuser_identity() -> AuthenticatedIdentity {
     nodedb_test_support::pgwire_auth_helpers::superuser()
@@ -57,14 +39,12 @@ fn row_names(results: &[DdlResult]) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn synced_array_schema_is_visible_in_system_catalog_single_node() {
-    let (shared, _dir) = build_test_state();
-    // No `raft_proposer` installed => `handle_schema` takes the single-node
-    // direct-import branch (mirrors an embedded / single-node deployment).
-    assert!(
-        shared.raft_proposer.get().is_none(),
-        "test assumes single-node (no raft_proposer installed)"
-    );
+async fn synced_array_schema_is_visible_in_system_catalog() {
+    // A full one-node cluster: `handle_schema` proposes the array through its
+    // metadata group, and the catalog entry opens the array on its
+    // Data-Plane cores.
+    let server = TestServer::start().await;
+    let shared = Arc::clone(&server.shared);
 
     let engine = Arc::new(OriginApplyEngine::new(
         Arc::clone(&shared.array_sync_schemas),
@@ -92,17 +72,27 @@ async fn synced_array_schema_is_visible_in_system_catalog_single_node() {
     inbound
         .handle_schema(&msg)
         .await
-        .expect("single-node direct-import schema handling must succeed");
+        .expect("schema handling on a one-node cluster must succeed");
 
-    // Sanity: the array_catalog itself must now carry the entry (this is the
-    // Data-Plane-openability half of the bug).
+    // The array_catalog mirror and the durable catalog carry the entry, so the
+    // Data Plane can open the array.
     {
         let cat = shared.array_catalog.read().expect("array_catalog lock");
         assert!(
-            cat.lookup_by_name(array_name).is_some(),
-            "array_catalog must be registered by the single-node direct-import path"
+            cat.all_entries().iter().any(|e| e.name == array_name),
+            "array_catalog must be registered once the schema entry applies"
         );
     }
+    assert!(
+        shared
+            .credentials
+            .catalog()
+            .load_all_arrays()
+            .expect("catalog read")
+            .iter()
+            .any(|e| e.name == array_name),
+        "the synced array's catalog row must be durable"
+    );
 
     // The actual reported gap: SHOW COLLECTIONS must list the array.
     let identity = superuser_identity();

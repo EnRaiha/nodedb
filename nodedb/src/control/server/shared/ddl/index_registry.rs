@@ -4,11 +4,10 @@
 //!
 //! Every `CREATE [<kind>] INDEX` registers its index here and every drop
 //! removes it, through the metadata raft group so all nodes list and resolve
-//! the same set. The single-node fallback writes the catalog row directly,
-//! mirroring [`super::owner`].
+//! the same set.
 
 use crate::control::catalog_entry::CatalogEntry;
-use crate::control::metadata_proposer::propose_catalog_entry;
+use crate::control::metadata_proposer::propose_catalog_entry_async;
 use crate::control::security::catalog::{IndexKind, StoredIndexRecord};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
@@ -26,7 +25,7 @@ pub struct IndexRegistration<'a> {
 }
 
 /// Register an index so it is listable and droppable by name.
-pub fn propose_index_record(
+pub async fn propose_index_record(
     state: &SharedState,
     registration: &IndexRegistration<'_>,
 ) -> Result<(), DdlError> {
@@ -39,21 +38,15 @@ pub fn propose_index_record(
         fields: registration.fields.clone(),
         is_active: true,
     };
-    let entry = CatalogEntry::PutIndexRecord(Box::new(record.clone()));
-    let outcome = propose_catalog_entry(state, &entry)
+    let entry = CatalogEntry::PutIndexRecord(Box::new(record));
+    propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        state
-            .credentials
-            .catalog()
-            .put_index_record(&record)
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-    }
     Ok(())
 }
 
 /// Remove an index's identity record.
-pub fn propose_delete_index_record(
+pub async fn propose_delete_index_record(
     state: &SharedState,
     database_id: DatabaseId,
     tenant_id: TenantId,
@@ -66,14 +59,8 @@ pub fn propose_delete_index_record(
         name: name.to_string(),
         collection: collection.to_string(),
     };
-    let outcome = propose_catalog_entry(state, &entry)
+    propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        state
-            .credentials
-            .catalog()
-            .delete_index_record(database_id.as_u64(), tenant_id.as_u64(), name)
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))?;
-    }
     Ok(())
 }

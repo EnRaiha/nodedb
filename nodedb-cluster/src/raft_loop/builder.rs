@@ -38,6 +38,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             tick_interval: self.tick_interval,
             vshard_handler: self.vshard_handler,
             catalog: self.catalog,
+            routing_persister: self.routing_persister,
             shutdown_watch: self.shutdown_watch,
             ready_watch: self.ready_watch,
             loop_metrics: self.loop_metrics,
@@ -65,10 +66,12 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             // `with_plan_executor` is a construction-time builder, called before
             // `run()` ever ticks — `tick_count` is still 0, so reset is exact.
             tick_count: std::sync::atomic::AtomicU64::new(0),
+            tick_state: self.tick_state,
             // Construction-time builder, before `run()` and any join kick — a
             // fresh `Notify` has no pending permit, so this loses nothing.
             reconcile_notify: tokio::sync::Notify::new(),
             metadata_cache: self.metadata_cache,
+            lease_holder_liveness: self.lease_holder_liveness,
         }
     }
 
@@ -78,7 +81,16 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// `SharedState` so proposers and consistent-read paths share
     /// one registry with the tick loop's bump points. Defaults to a
     /// fresh empty registry when not set.
+    ///
+    /// Every group mounted on this node, now or later, starts its watcher at
+    /// the applied index it restored: its durable applied floor. Every entry
+    /// at or below it applied before the restart and is never delivered
+    /// again, so no apply moves the watcher there.
     pub fn with_group_watchers(mut self, watchers: Arc<GroupAppliedWatchers>) -> Self {
+        self.multi_raft
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_applied_watchers(Arc::clone(&watchers));
         self.group_watchers = watchers;
         self
     }
@@ -231,8 +243,8 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     ///
     /// The supplied implementation (backed by `nodedb`'s Data Plane restore
     /// dispatch) is called by the install-snapshot finalize path to apply a
-    /// received per-group snapshot to the local state machine after the atomic
-    /// `.partial`→`.snap` rename and before advancing Raft. When not set, the
+    /// received per-group snapshot to the local state machine after staging
+    /// it and before advancing Raft. When not set, the
     /// follower advances Raft without restoring engine state.
     pub fn with_snapshot_applier(mut self, applier: Arc<dyn SnapshotApplier>) -> Self {
         self.snapshot_applier = Some(applier);
@@ -282,8 +294,31 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
 
     /// Wire the metadata cache used by the periodic lease-GC sweep. The
     /// host passes the same `Arc` the production metadata applier holds.
+    ///
+    /// The cache's applied index starts at the restored applied floor, so
+    /// replay resumes above it and the cache agrees with the group watcher.
     pub fn with_metadata_cache(mut self, cache: Arc<RwLock<MetadataCache>>) -> Self {
+        let floor = self
+            .multi_raft
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .last_applied(crate::metadata_group::METADATA_GROUP_ID)
+            .unwrap_or(0);
+        cache
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .advance_applied_index(floor);
         self.metadata_cache = Some(cache);
+        self
+    }
+
+    /// Share the SWIM Dead records the lease-GC sweep reads. The host passes
+    /// the same `Arc` it registers as a SWIM subscriber.
+    pub fn with_lease_holder_liveness(
+        mut self,
+        liveness: Arc<crate::lease_liveness::LeaseHolderLiveness>,
+    ) -> Self {
+        self.lease_holder_liveness = liveness;
         self
     }
 
@@ -317,6 +352,15 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                 tracing::warn!(error = %e, "could not load the persisted cluster epoch; starting at 0")
             }
         }
+        let routing = self
+            .multi_raft
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .routing();
+        self.routing_persister = Some(Arc::new(super::routing_persist::RoutingPersister::new(
+            Arc::clone(&catalog),
+            routing,
+        )));
         self.catalog = Some(catalog);
         self
     }

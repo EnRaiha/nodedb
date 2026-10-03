@@ -146,7 +146,7 @@ mod tests {
         let op = SpatialOp::Delete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
             field: "loc".to_string(),
-            surrogate: Surrogate::new(7),
+            surrogate: Some(Surrogate::new(7)),
             provenance: Some(prov(2)),
         };
         let mut ops = Vec::new();
@@ -206,7 +206,7 @@ mod tests {
         let op = SpatialOp::Delete {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
             field: "loc".to_string(),
-            surrogate: Surrogate::new(1),
+            surrogate: Some(Surrogate::new(1)),
             provenance: None,
         };
         let mut ops = Vec::new();

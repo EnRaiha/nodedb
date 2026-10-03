@@ -11,7 +11,7 @@ fn group_specs_key(group_by: &[GroupKeySpec]) -> String {
     group_by
         .iter()
         .map(|spec| match zerompk::to_msgpack_vec(spec) {
-            Ok(bytes) => bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+            Ok(bytes) => hex::encode(bytes),
             Err(_) => format!("{spec:?}"),
         })
         .collect::<Vec<_>>()
@@ -20,7 +20,7 @@ fn group_specs_key(group_by: &[GroupKeySpec]) -> String {
 
 fn expression_key(expr: &nodedb_query::expr::SqlExpr) -> String {
     match zerompk::to_msgpack_vec(expr) {
-        Ok(bytes) => bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+        Ok(bytes) => hex::encode(bytes),
         Err(_) => format!("{expr:?}"),
     }
 }

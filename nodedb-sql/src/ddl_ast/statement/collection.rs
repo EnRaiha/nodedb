@@ -12,7 +12,7 @@ pub enum CloneAsOf {
     /// explicit `… AS OF SYSTEM TIME LATEST` form.
     Latest,
     /// Use the LSN corresponding to the given milliseconds-since-epoch
-    /// timestamp, resolved via the `LsnMsAnchor` mechanism.
+    /// timestamp, resolved from the WAL time anchors.
     ///
     /// Corresponds to `… AS OF SYSTEM TIME <ms>`.
     SystemTimeMs(i64),

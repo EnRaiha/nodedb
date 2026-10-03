@@ -13,7 +13,7 @@ use super::super::super::result::{DdlError, DdlResult};
 use super::helpers::{ddl_err, parse_with_clause};
 
 /// ALTER TIMESERIES <name> SET (key = 'value', ...)
-pub fn alter_timeseries(
+pub async fn alter_timeseries(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     parts: &[&str],
@@ -62,7 +62,8 @@ pub fn alter_timeseries(
             }
         }
 
-        persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
+        persist_collection_replicated(state, &coll)
+            .await
             .map_err(|e| DdlError::from_error(&e))?;
     }
 

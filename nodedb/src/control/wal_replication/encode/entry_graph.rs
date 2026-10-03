@@ -54,6 +54,11 @@ pub(super) fn graph_write(op: &GraphOp) -> Option<ReplicatedWrite> {
         GraphOp::RemoveNodeLabels { node_id, labels } => graph::remove_node_labels(node_id, labels),
         GraphOp::EdgePutBatch { edges } => graph::edge_put_batch(edges),
         GraphOp::EdgeDeleteBatch { edges } => graph::edge_delete_batch(edges),
+        // A node delete's guard and a TRUNCATE's edge share run only inside
+        // a transaction, which replicates its resolved redo record.
+        GraphOp::NodeEdgeGuard { .. }
+        | GraphOp::NodePresenceGuard { .. }
+        | GraphOp::TruncateEdges { .. } => return None,
 
         // Not a write — traversals, pattern matching, algorithms, and stats.
         GraphOp::ResolveEdgeDelete(_)
@@ -71,6 +76,7 @@ pub(super) fn graph_write(op: &GraphOp) -> Option<ReplicatedWrite> {
         | GraphOp::WccSuperstep(_)
         | GraphOp::TemporalNeighbors { .. }
         | GraphOp::TemporalAlgorithm { .. }
-        | GraphOp::Stats { .. } => return None,
+        | GraphOp::Stats { .. }
+        | GraphOp::NodePresenceRead { .. } => return None,
     })
 }

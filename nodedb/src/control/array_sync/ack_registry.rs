@@ -64,6 +64,12 @@ pub struct ArrayAckRegistry {
     cache: std::sync::RwLock<HashMap<ArrayScope, AckVector>>,
 }
 
+impl crate::storage::RedbBacked for ArrayAckRegistry {
+    fn redb_database(&self) -> &redb::Database {
+        &self.db
+    }
+}
+
 impl ArrayAckRegistry {
     /// Open or create the ack registry database at `{data_dir}/array_sync/acks.redb`.
     pub fn open(data_dir: &Path) -> crate::Result<Arc<Self>> {

@@ -292,7 +292,8 @@ fn build_segment_bytes(
 struct MergedRow {
     coord: Vec<CoordValue>,
     attrs: Vec<CellValue>,
-    surrogate: nodedb_types::Surrogate,
+    /// `Some` for a live row, `None` for a tombstone or erasure row.
+    surrogate: Option<nodedb_types::Surrogate>,
     valid_from_ms: i64,
     valid_until_ms: i64,
     kind: RowKind,
@@ -321,6 +322,9 @@ impl MergedTile {
 
     fn absorb_sparse(&mut self, _schema: &ArraySchema, tile: &SparseTile) -> ArrayResult<()> {
         let n = tile.row_count();
+        // Attribute columns hold live rows only, so they are read at the
+        // live-row index, not the physical row index.
+        let mut live_row = 0usize;
         for row in 0..n {
             let coord: Vec<CoordValue> = tile
                 .dim_dicts
@@ -330,27 +334,34 @@ impl MergedTile {
             let kind = tile.row_kind(row)?;
             let (attrs, surrogate, valid_from_ms, valid_until_ms) = match kind {
                 RowKind::Live => {
-                    let attrs: Vec<CellValue> =
-                        tile.attr_cols.iter().map(|col| col[row].clone()).collect();
-                    let surrogate = tile
-                        .surrogates
-                        .get(row)
-                        .copied()
-                        .unwrap_or(nodedb_types::Surrogate::ZERO);
+                    let attrs = tile
+                        .attr_cols
+                        .iter()
+                        .map(|col| {
+                            col.get(live_row).cloned().ok_or_else(|| {
+                                nodedb_array::ArrayError::SegmentCorruption {
+                                    detail: format!(
+                                        "array compaction: attr column has no live row \
+                                         {live_row} for tile row {row}"
+                                    ),
+                                }
+                            })
+                        })
+                        .collect::<ArrayResult<Vec<CellValue>>>()?;
+                    live_row += 1;
+                    // A stored live row always holds its bound surrogate.
+                    let surrogate = tile.live_surrogate(row)?;
                     let vf = tile.valid_from_ms.get(row).copied().unwrap_or(0);
                     let vu = tile
                         .valid_until_ms
                         .get(row)
                         .copied()
                         .unwrap_or(nodedb_types::OPEN_UPPER);
-                    (attrs, surrogate, vf, vu)
+                    (attrs, Some(surrogate), vf, vu)
                 }
-                RowKind::Tombstone | RowKind::GdprErased => (
-                    Vec::new(),
-                    nodedb_types::Surrogate::ZERO,
-                    0,
-                    nodedb_types::OPEN_UPPER,
-                ),
+                RowKind::Tombstone | RowKind::GdprErased => {
+                    (Vec::new(), None, 0, nodedb_types::OPEN_UPPER)
+                }
             };
             self.upsert(MergedRow {
                 coord,
@@ -411,7 +422,7 @@ mod tests {
             vec![ArrayPutCell {
                 coord: vec![CoordValue::Int64(x), CoordValue::Int64(y)],
                 attrs: vec![CellValue::Int64(v)],
-                surrogate: nodedb_types::Surrogate::ZERO,
+                surrogate: nodedb_types::Surrogate::new((x * 100 + y + 1) as u32),
                 system_from_ms: sys_ms,
                 valid_from_ms: 0,
                 valid_until_ms: i64::MAX,
@@ -576,6 +587,39 @@ mod tests {
         assert!(
             found_erased,
             "merged segment must preserve GDPR-erased rows"
+        );
+    }
+
+    /// A live row after a tombstone row reads its own attributes and keeps
+    /// its own surrogate: attribute columns hold live rows only, and the
+    /// tombstone carries no identity.
+    #[test]
+    fn a_live_row_after_a_tombstone_keeps_its_attrs_and_identity() {
+        use super::MergedTile;
+        use nodedb_array::tile::sparse_tile::{RowKind, SparseRow, SparseTileBuilder};
+
+        let s = schema();
+        let mut b = SparseTileBuilder::new(&s);
+        let dead = [CoordValue::Int64(1), CoordValue::Int64(1)];
+        let live = [CoordValue::Int64(2), CoordValue::Int64(2)];
+        b.push_row(SparseRow::sentinel(&dead, RowKind::Tombstone))
+            .unwrap();
+        b.push_row(SparseRow::live(
+            &live,
+            &[CellValue::Int64(7)],
+            nodedb_types::Surrogate::new(9),
+            0,
+            i64::MAX,
+        ))
+        .unwrap();
+        let mut merged = MergedTile::empty(&s);
+        merged.absorb_sparse(&s, &b.build()).unwrap();
+        let tile = merged.into_sparse(&s).unwrap();
+        tile.check_stored_identities().unwrap();
+        assert_eq!(tile.attr_cols[0], vec![CellValue::Int64(7)]);
+        assert_eq!(
+            tile.surrogates,
+            vec![None, Some(nodedb_types::Surrogate::new(9))]
         );
     }
 }

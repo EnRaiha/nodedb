@@ -13,21 +13,21 @@
 //! node's own apply position. The scans dispatch through the read-only local
 //! path, never the write funnel.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use nodedb_types::{QualifiedCollection, TenantId};
+use nodedb_types::TenantId;
 
 use crate::control::local_dispatch::{LocalRead, dispatch_local_read, reject_data_plane_error};
 use crate::control::state::SharedState;
-use crate::types::DatabaseId;
 
 use super::cache::{PermissionCache, TreeSource, TreeSourceKind};
 use super::event_handler::{extract_edge, extract_grant};
+use super::scope::TreeScope;
 use super::types::PermissionGrant;
 
-/// Edges and grants a reload read for one tenant.
+/// Edges and grants a reload read for one scope.
 #[derive(Default)]
-struct TenantRows {
+struct ScopeRows {
     edges: Vec<(String, String)>,
     grants: Vec<PermissionGrant>,
 }
@@ -74,19 +74,20 @@ async fn reload_locked(state: &SharedState, cache: &mut PermissionCache) -> crat
     // counted, and none it applies later can be.
     let emitted = fence.emitted_snapshot().unwrap_or_default();
 
-    let mut rows: HashMap<u64, TenantRows> = HashMap::new();
+    let mut rows: HashMap<TreeScope, ScopeRows> = HashMap::new();
     for source in cache.tree_sources() {
         let docs = scan_source(state, &source).await?;
-        let tenant = rows.entry(source.tenant_id).or_default();
+        let scope = rows.entry(source.key.scope).or_default();
         match source.kind {
-            TreeSourceKind::Hierarchy => tenant.edges.extend(docs.iter().filter_map(|doc| {
+            TreeSourceKind::Hierarchy => scope.edges.extend(docs.iter().filter_map(|doc| {
                 extract_edge(doc).map(|(child, parent)| (child.to_owned(), parent.to_owned()))
             })),
-            TreeSourceKind::Grants => tenant.grants.extend(docs.iter().filter_map(extract_grant)),
+            TreeSourceKind::Grants => scope.grants.extend(docs.iter().filter_map(extract_grant)),
         }
     }
-    for (tenant_id, tenant) in rows {
-        cache.replace_tenant_state(tenant_id, &tenant.edges, &tenant.grants);
+    cache.retain_scopes(&rows.keys().copied().collect::<HashSet<_>>());
+    for (scope, loaded) in rows {
+        cache.replace_scope_state(scope, &loaded.edges, &loaded.grants);
     }
     cache.progress_mut().install_reload(&emitted);
     fence.permission_applied().notify_waiters();
@@ -97,14 +98,15 @@ async fn reload_locked(state: &SharedState, cache: &mut PermissionCache) -> crat
 ///
 /// A source that no longer exists holds no rows. A source that is not a
 /// document collection cannot carry edges or grants, and refuses the reload:
-/// planning with it would silently grant or deny nothing.
+/// planning with it silently grants or denies nothing.
 async fn scan_source(
     state: &SharedState,
     source: &TreeSource,
 ) -> crate::Result<Vec<serde_json::Value>> {
-    let database_id = DatabaseId::DEFAULT;
+    let key = &source.key;
+    let database_id = key.scope.database_id;
     let catalog = state.credentials.catalog();
-    let stored = catalog.get_collection(database_id, source.tenant_id, &source.collection)?;
+    let stored = catalog.get_collection(database_id, key.scope.tenant_id, &key.collection)?;
     let Some(stored) = stored.filter(|collection| collection.is_active) else {
         return Ok(Vec::new());
     };
@@ -113,7 +115,7 @@ async fn scan_source(
             detail: format!(
                 "permission tree source '{}' is a {} collection; the hierarchy and the \
                  permission table must be document collections",
-                source.collection, stored.collection_type
+                key.collection, stored.collection_type
             ),
         });
     }
@@ -123,11 +125,11 @@ async fn scan_source(
     // path.
     let response = dispatch_local_read(
         state,
-        TenantId::new(source.tenant_id),
+        TenantId::new(key.scope.tenant_id),
         database_id,
-        nodedb_types::CollectionKey::from_bare(database_id, &source.collection).vshard(),
+        key.vshard(),
         LocalRead::DocumentScan {
-            collection: QualifiedCollection::new(database_id, &source.collection),
+            collection: key.qualified(),
         },
     )
     .await?;

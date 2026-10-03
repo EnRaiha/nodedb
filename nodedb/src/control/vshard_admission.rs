@@ -1,22 +1,43 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Bounded, cancellation-safe serialization for Control-Plane vShard admission.
+//!
+//! Each vShard has one slot. A write holds it while it proposes: until the
+//! group's leader holds the entry in its log. The slot records where the
+//! entry landed, and the write waits for this node's apply after it lets the
+//! slot go. So the writes of one vShard enter the log in admission order,
+//! and several of them wait for their applies at once. A queue place, held
+//! from admission through the apply, bounds the vShard's writes in flight.
+//!
+//! A CRDT admission holds the slot across its preview and its fenced apply.
+//! Before it previews, it waits for this node's apply through the last entry
+//! the slot recorded and through the group's commit index, so the preview
+//! reads every earlier admitted write.
 
 use std::future::Future;
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::control::state::SharedState;
-use crate::control::wal_replication::AsyncRaftProposer;
+use crate::control::wal_replication::{
+    AsyncRaftProposer, AsyncRaftSubmit, ProposedAt, ProposedWrite,
+};
 use crate::types::VShardId;
 
 /// Maximum active plus waiting admissions for one vShard.
 pub const VSHARD_ADMISSION_CAPACITY: usize = 64;
 
 struct VShardAdmissionSlot {
-    active: Mutex<()>,
+    active: Mutex<SlotState>,
     capacity: Arc<Semaphore>,
+}
+
+/// What a vShard's slot remembers across admissions.
+#[derive(Debug, Default)]
+struct SlotState {
+    /// Where the last write proposed through the slot landed.
+    last_proposed: Option<ProposedAt>,
 }
 
 /// Serializes admission work independently for every valid vShard.
@@ -38,7 +59,7 @@ impl VShardAdmissionSequencer {
     fn with_capacity(capacity: usize) -> Self {
         let slots = (0..VShardId::COUNT)
             .map(|_| VShardAdmissionSlot {
-                active: Mutex::new(()),
+                active: Mutex::new(SlotState::default()),
                 capacity: Arc::new(Semaphore::new(capacity)),
             })
             .collect();
@@ -64,41 +85,63 @@ impl VShardAdmissionSequencer {
         F: FnOnce() -> Fut,
         Fut: Future<Output = crate::Result<T>>,
     {
-        let slot = self.slot(vshard_id)?;
-        let _queued = self.reserve(slot, vshard_id)?;
-        let _active = slot.active.lock().await;
-        operation().await
+        self.run_after_proposed(vshard_id, |_| operation()).await
     }
 
-    /// Run one admission operation like [`Self::run`], but wait in the queue
-    /// only until `deadline`.
-    ///
-    /// A queued operation still waiting at `deadline` leaves the queue and
-    /// returns [`crate::Error::DeadlineExceeded`]. Its factory is never
-    /// called. Waiters behind it keep their order.
-    ///
-    /// `timeout_at` polls the lock before the timer. A lock granted in the
-    /// same poll the deadline fires wins, and the operation runs. A lock future
-    /// dropped on timeout hands any turn it was granted to the next waiter. So
-    /// each operation either runs once or leaves without running.
-    pub async fn run_until<T, F, Fut>(
+    /// Run one admission operation like [`Self::run`], handing it where the
+    /// last write proposed through the slot landed. An operation that reads
+    /// local state waits for this node's apply through it first.
+    pub async fn run_after_proposed<T, F, Fut>(
         &self,
         vshard_id: VShardId,
-        deadline: tokio::time::Instant,
         operation: F,
     ) -> crate::Result<T>
     where
-        F: FnOnce() -> Fut,
+        F: FnOnce(Option<ProposedAt>) -> Fut,
         Fut: Future<Output = crate::Result<T>>,
     {
         let slot = self.slot(vshard_id)?;
         let _queued = self.reserve(slot, vshard_id)?;
-        let _active = tokio::time::timeout_at(deadline, slot.active.lock())
+        let active = slot.active.lock().await;
+        operation(active.last_proposed).await
+    }
+
+    /// Propose one write through the vShard's slot, waiting in the queue
+    /// only until `deadline`.
+    ///
+    /// The slot is held across `submit` only: until the leader holds the
+    /// entry. The slot records where it landed. The returned queue place
+    /// stays taken until the caller drops it after the apply, so the
+    /// vShard's writes in flight stay bounded.
+    ///
+    /// A queued write still waiting at `deadline` leaves the queue and
+    /// returns [`crate::Error::DeadlineExceeded`]. Its `submit` is never
+    /// called. Waiters behind it keep their order. `timeout_at` polls the
+    /// lock before the timer, so a lock granted in the same poll the deadline
+    /// fires wins, and a lock future dropped on timeout hands its turn to the
+    /// next waiter. So each write either proposes once or leaves unproposed.
+    pub async fn propose_until<F, Fut>(
+        &self,
+        vshard_id: VShardId,
+        deadline: tokio::time::Instant,
+        submit: F,
+    ) -> crate::Result<(ProposedWrite, OwnedSemaphorePermit)>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = crate::Result<ProposedWrite>>,
+    {
+        let slot = self.slot(vshard_id)?;
+        let queued = self.reserve(slot, vshard_id)?;
+        let mut active = tokio::time::timeout_at(deadline, slot.active.lock())
             .await
             .map_err(|_| crate::Error::DeadlineExceeded {
                 request_id: crate::types::RequestId::new(0),
             })?;
-        operation().await
+        let proposed = submit().await?;
+        if proposed.at.is_some() {
+            active.last_proposed = proposed.at;
+        }
+        Ok((proposed, queued))
     }
 
     /// Take one of the vShard's queue places, or fail at once when all are
@@ -123,22 +166,20 @@ impl Default for VShardAdmissionSequencer {
     }
 }
 
-/// Install raw and admission-sequenced proposal handles in one atomic set.
+/// Install raw and admission-sequenced proposal handles, both built from
+/// `submit`, in one atomic set.
 pub(crate) fn install_async_raft_proposer(
     shared: &SharedState,
-    raw: Arc<AsyncRaftProposer>,
+    submit: Arc<AsyncRaftSubmit>,
 ) -> crate::Result<()> {
     let sequenced = wrap_async_raft_proposer(
         Arc::clone(&shared.vshard_admission_sequencer),
-        Arc::clone(&raw),
+        Arc::clone(&submit),
     );
+    let raw = raw_async_raft_proposer(submit);
     let expected_raw = Arc::clone(&raw);
     shared.install_async_raft_proposer_pair(sequenced, raw)?;
-    let installed_raw = shared
-        .raw_async_raft_proposer()
-        .ok_or_else(|| crate::Error::Internal {
-            detail: "async raft proposer pair missing immediately after installation".into(),
-        })?;
+    let installed_raw = shared.raw_async_raft_proposer()?;
     if !Arc::ptr_eq(installed_raw, &expected_raw) {
         return Err(crate::Error::Internal {
             detail: "async raft raw proposer identity changed during installation".into(),
@@ -147,13 +188,41 @@ pub(crate) fn install_async_raft_proposer(
     Ok(())
 }
 
+/// A submit whose proposal is applied before it returns: `proposer` answers
+/// only at apply, as a test double does. The whole call is the propose phase.
+#[cfg(test)]
+pub(crate) fn applying_submit(proposer: Arc<AsyncRaftProposer>) -> Arc<AsyncRaftSubmit> {
+    Arc::new(move |vshard_id, idempotency_key, data, deadline| {
+        let proposer = Arc::clone(&proposer);
+        Box::pin(async move {
+            let applied = proposer(vshard_id, idempotency_key, data, deadline).await;
+            Ok(ProposedWrite {
+                at: None,
+                applied: Box::pin(async move { applied }),
+            })
+        })
+    })
+}
+
+/// The proposer a CRDT admission uses while it holds the vShard's slot:
+/// propose, then wait for the apply, with no slot of its own.
+fn raw_async_raft_proposer(submit: Arc<AsyncRaftSubmit>) -> Arc<AsyncRaftProposer> {
+    Arc::new(move |vshard_id, idempotency_key, data, deadline| {
+        let submit = Arc::clone(&submit);
+        Box::pin(async move {
+            let proposed = submit(vshard_id, idempotency_key, data, deadline).await?;
+            proposed.applied.await
+        })
+    })
+}
+
 fn wrap_async_raft_proposer(
     sequencer: Arc<VShardAdmissionSequencer>,
-    raw: Arc<AsyncRaftProposer>,
+    submit: Arc<AsyncRaftSubmit>,
 ) -> Arc<AsyncRaftProposer> {
     Arc::new(move |vshard_id, idempotency_key, data, deadline| {
         let sequencer = Arc::clone(&sequencer);
-        let raw = Arc::clone(&raw);
+        let submit = Arc::clone(&submit);
         Box::pin(async move {
             if vshard_id >= VShardId::COUNT {
                 return Err(crate::Error::Internal {
@@ -162,14 +231,70 @@ fn wrap_async_raft_proposer(
             }
             let vshard_id = VShardId::new(vshard_id);
             // The queue wait ends at the caller's deadline. A proposal that
-            // leaves the queue then never reaches `raw`.
-            sequencer
-                .run_until(vshard_id, deadline, move || async move {
-                    raw(vshard_id.as_u32(), idempotency_key, data, deadline).await
+            // leaves the queue then never reaches `submit`.
+            let (proposed, _queued) = sequencer
+                .propose_until(vshard_id, deadline, move || {
+                    submit(vshard_id.as_u32(), idempotency_key, data, deadline)
                 })
-                .await
+                .await?;
+            // The slot is free again: the next write of the vShard proposes
+            // while this one waits for its apply.
+            proposed.applied.await
         })
     })
+}
+
+/// Wait until this node applied every write admitted to `vshard_id` before
+/// the caller took its slot: through `last_proposed`, and through the commit
+/// index this node holds for the vShard's group. A node with no routing
+/// table runs no data group, and only `last_proposed` binds it.
+pub(crate) async fn await_admitted_applies(
+    state: &SharedState,
+    vshard_id: VShardId,
+    last_proposed: Option<ProposedAt>,
+    deadline: std::time::Instant,
+) -> crate::Result<()> {
+    let group = if state.cluster_routing.is_some() {
+        Some(
+            crate::control::security::auth_fence::cluster::group_of_vshard(
+                state,
+                vshard_id.as_u32(),
+            )?,
+        )
+    } else {
+        None
+    };
+    let committed = group.and_then(|group_id| {
+        state.raft_status_fn.get().and_then(|status| {
+            status()
+                .into_iter()
+                .find(|g| g.group_id == group_id)
+                .map(|g| ProposedAt {
+                    group_id,
+                    log_index: g.commit_index,
+                })
+        })
+    });
+    // A group this node no longer hosts applies nothing here to wait for:
+    // the admission's fenced apply refuses a preview that missed a write.
+    let hosted = |at: &ProposedAt| {
+        group.is_none()
+            || crate::control::security::auth_fence::cluster::hosts_group(state, at.group_id)
+    };
+    for at in [last_proposed, committed]
+        .into_iter()
+        .flatten()
+        .filter(hosted)
+    {
+        crate::control::cluster::linearizable_read::wait_applied_through(
+            state,
+            at.group_id,
+            at.log_index,
+            deadline,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -415,7 +540,7 @@ mod tests {
                 })
             })
         };
-        let wrapped = wrap_async_raft_proposer(Arc::clone(&sequencer), raw);
+        let wrapped = wrap_async_raft_proposer(Arc::clone(&sequencer), applying_submit(raw));
         let first = {
             let wrapped = Arc::clone(&wrapped);
             tokio::spawn(async move { wrapped(5, 11, vec![1], test_deadline()).await })
@@ -470,7 +595,7 @@ mod tests {
     async fn a_queued_proposal_past_its_deadline_leaves_the_queue_and_never_proposes() {
         let sequencer = Arc::new(VShardAdmissionSequencer::with_capacity(8));
         let (raw, proposed) = recording_proposer();
-        let wrapped = wrap_async_raft_proposer(Arc::clone(&sequencer), raw);
+        let wrapped = wrap_async_raft_proposer(Arc::clone(&sequencer), applying_submit(raw));
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let holder = {
@@ -544,5 +669,123 @@ mod tests {
             vec![22, 23],
             "the waiters behind the expired proposal propose in their queue order"
         );
+    }
+
+    /// A two-phase submit: records each proposal as it lands at
+    /// `(group 1, index = key)`, and applies it only once `release` grants it
+    /// a permit.
+    fn two_phase_submit(
+        proposed: Arc<std::sync::Mutex<Vec<u64>>>,
+        release: Arc<Semaphore>,
+    ) -> Arc<AsyncRaftSubmit> {
+        Arc::new(move |_vshard, key, data, _deadline| {
+            let proposed = Arc::clone(&proposed);
+            let release = Arc::clone(&release);
+            Box::pin(async move {
+                proposed.lock().expect("proposed log").push(key);
+                Ok(ProposedWrite {
+                    at: Some(ProposedAt {
+                        group_id: 1,
+                        log_index: key,
+                    }),
+                    applied: Box::pin(async move {
+                        release
+                            .acquire()
+                            .await
+                            .map_err(|e| crate::Error::Internal {
+                                detail: format!("test apply gate closed: {e}"),
+                            })?
+                            .forget();
+                        Ok((data, Lsn::new(key)))
+                    }),
+                })
+            })
+        })
+    }
+
+    /// Two writes of one vShard are in flight at once: the second proposes
+    /// while the first waits for its apply. The slot records where the last
+    /// one landed.
+    #[tokio::test]
+    async fn two_writes_of_one_vshard_wait_for_their_applies_at_once() {
+        let sequencer = Arc::new(VShardAdmissionSequencer::with_capacity(4));
+        let proposed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let release = Arc::new(Semaphore::new(0));
+        let wrapped = wrap_async_raft_proposer(
+            Arc::clone(&sequencer),
+            two_phase_submit(Arc::clone(&proposed), Arc::clone(&release)),
+        );
+        let first = tokio::spawn(wrapped(5, 11, vec![1], test_deadline()));
+        let second = tokio::spawn(wrapped(5, 12, vec![2], test_deadline()));
+        while proposed.lock().expect("proposed log").len() != 2 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!first.is_finished() && !second.is_finished());
+        assert_eq!(
+            sequencer.slots[5].capacity.available_permits(),
+            2,
+            "each write in flight keeps its queue place until its apply"
+        );
+        let last = sequencer
+            .run_after_proposed(shard(5), |last| async move { Ok(last) })
+            .await
+            .expect("the slot is free while both writes wait for their applies");
+        let order = proposed.lock().expect("proposed log").clone();
+        assert_eq!(
+            last,
+            order.last().map(|&key| ProposedAt {
+                group_id: 1,
+                log_index: key,
+            })
+        );
+
+        release.add_permits(2);
+        let mut results = vec![
+            first.await.expect("first joins").expect("first applies"),
+            second.await.expect("second joins").expect("second applies"),
+        ];
+        results.sort_by_key(|(_, lsn)| lsn.as_u64());
+        assert_eq!(
+            results,
+            vec![(vec![1], Lsn::new(11)), (vec![2], Lsn::new(12))]
+        );
+        assert_eq!(sequencer.slots[5].capacity.available_permits(), 4);
+    }
+
+    /// An admission that reads local state waits for this node's apply
+    /// through the last write the slot recorded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_admission_waits_for_the_last_admitted_apply() {
+        let directory = tempfile::tempdir().expect("temporary WAL directory");
+        let wal = Arc::new(
+            crate::wal::WalManager::open_for_testing(&directory.path().join("admission.wal"))
+                .expect("test WAL"),
+        );
+        let (dispatcher, _sides) = crate::bridge::dispatch::Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).expect("shared state");
+
+        let at = ProposedAt {
+            group_id: 9,
+            log_index: 3,
+        };
+        let waiter = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                await_admitted_applies(
+                    &state,
+                    shard(2),
+                    Some(at),
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "the entry is not applied here yet");
+        state.applied_index_watcher(9).bump(3);
+        waiter
+            .await
+            .expect("waiter joins")
+            .expect("the admission proceeds once the entry applied");
     }
 }

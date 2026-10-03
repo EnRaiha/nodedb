@@ -40,15 +40,23 @@ fn bootstrap_listener_addr(
 /// dispatcher for the `SpscCommitApplier`). Moves the `MultiRaft` out of
 /// `handle.multi_raft` into the `RaftLoop`; must be called **exactly
 /// once** per handle.
-pub fn start_raft(
+pub async fn start_raft(
     handle: &ClusterHandle,
     shared: Arc<SharedState>,
     data_dir: &std::path::Path,
     transport_tuning: &ClusterTransportTuning,
 ) -> crate::Result<tokio::sync::watch::Receiver<bool>> {
-    let (multi_raft, setup) = build_group_setup(handle, &shared, data_dir, transport_tuning)?;
-    let hooks = build_hooks(handle, &shared, data_dir)?;
-    let loop_build = build_raft_loop(handle, &shared, data_dir, multi_raft, setup, hooks)?;
+    let (mut multi_raft, setup) = build_group_setup(handle, &shared, data_dir, transport_tuning)?;
+    let hooks = build_hooks(
+        handle,
+        &shared,
+        data_dir,
+        &mut multi_raft,
+        &setup.token_state,
+        &setup.sequencer_state_machine,
+    )
+    .await?;
+    let loop_build = build_raft_loop(handle, &shared, data_dir, multi_raft, setup, hooks).await?;
 
     let bootstrap_raft_loop = Arc::clone(&loop_build.raft_loop);
     let bootstrap_token_state = Arc::clone(&loop_build.token_state);
@@ -76,6 +84,12 @@ pub fn start_raft(
             sequencer_service: loop_build.sequencer_service,
         },
     );
+    // `finish_observability` installed the metadata raft handle: releases
+    // handed off by synchronous code can be proposed from here on.
+    crate::control::lease::releaser::spawn_lease_releaser(&shared);
+    // The metadata leader reclaims a DDL preparation lease whose owner died,
+    // left, or got stuck. It proposes through the same handle.
+    crate::control::metadata_proposer::ddl_reclaim::spawn_ddl_lease_reclaimer(&shared);
 
     if let Some(material) = crate::control::cluster::tls::load_bootstrap_issuer_material(data_dir)?
     {

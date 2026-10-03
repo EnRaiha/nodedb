@@ -9,6 +9,15 @@
 //! **Exactly-once:** When `transactional = true`, uses Kafka's idempotent
 //! producer (`enable.idempotence = true`) with a `transactional.id` per stream.
 //! Each batch is wrapped in `begin_transaction` / `commit_transaction`.
+//!
+//! In a cluster only the node that holds the leader lease of the stream's
+//! owning group publishes. It reads every partition, from its own buffer and
+//! from the members of groups it does not replicate. It checks the lease
+//! right before each send and right before each offset commit. Each record's
+//! key is the event's `<partition>:<epoch>:<index>:<sequence>`, the same for
+//! every owner and retry. Its `fencing-token` header is the owner's lease
+//! term, which rises with each new owner (see
+//! [`crate::event::cdc::sink_owner`]).
 
 use sonic_rs;
 
@@ -22,7 +31,8 @@ use tracing::{debug, info, trace, warn};
 use super::config::KafkaDeliveryConfig;
 use crate::control::state::SharedState;
 use crate::event::cdc::CdcSubscriberScope;
-use crate::event::cdc::consume::{ConsumeParams, consume_local};
+use crate::event::cdc::consume::{ConsumeParams, consume_for_sink};
+use crate::event::cdc::sink_owner::{SinkFence, kafka_group, register_sink_groups, sink_lease};
 
 /// Spawn a background Kafka producer task for a change stream.
 ///
@@ -38,6 +48,15 @@ pub fn spawn_kafka_task(
     shared_state: Arc<SharedState>,
     mut shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
+    // The replicated offset commit names a registered group. Installing the
+    // stream registered it on every node; this covers a stream registered
+    // before its sink task started.
+    if let Some(def) = shared_state
+        .stream_registry
+        .get(database_id, tenant_id, &stream_name)
+    {
+        register_sink_groups(&shared_state.group_registry, &def);
+    }
     tokio::spawn(async move {
         info!(
             stream = %stream_name,
@@ -70,12 +89,24 @@ pub fn spawn_kafka_task(
             );
         }
 
-        let group_name = format!("_kafka_{stream_name}");
+        let group_name = kafka_group(&stream_name);
         let poll_interval = Duration::from_millis(100);
 
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(poll_interval) => {
+                    // Only the lease holder of the stream's owning group
+                    // publishes.
+                    let Some(lease) = sink_lease(&shared_state, database_id, &stream_name) else {
+                        continue;
+                    };
+                    let fence = SinkFence {
+                        state: &shared_state,
+                        database_id,
+                        stream_name: &stream_name,
+                        lease,
+                    };
+                    let fencing_token = lease.term.to_string();
                     let consume_params = ConsumeParams {
                         database_id,
                         tenant_id,
@@ -85,7 +116,7 @@ pub fn spawn_kafka_task(
                         limit: 100,
                     };
 
-                    let result = consume_local(&shared_state, &consume_params);
+                    let result = consume_for_sink(&shared_state, &consume_params).await;
                     let events = match result {
                         Ok(r) if !r.events.is_empty() => r,
                         _ => continue,
@@ -141,10 +172,22 @@ pub fn spawn_kafka_task(
                             }
                         };
 
+                        // The lease is checked right before each send: a
+                        // node whose lease lapsed or moved on stops here.
+                        if !fence.holds() {
+                            break;
+                        }
                         let key = format!("{}:{}", event.partition, event.offset_token());
+                        let headers = rdkafka::message::OwnedHeaders::new().insert(
+                            rdkafka::message::Header {
+                                key: "fencing-token",
+                                value: Some(fencing_token.as_str()),
+                            },
+                        );
                         let record = rdkafka::producer::FutureRecord::to(&config.topic)
                             .key(&key)
-                            .payload(&payload);
+                            .payload(&payload)
+                            .headers(headers);
 
                         match producer.send(record, Duration::from_secs(5)).await {
                             Ok(_) => {
@@ -173,25 +216,36 @@ pub fn spawn_kafka_task(
                     }
 
                     // Commit consumer offsets over the events this cycle
-                    // finished with, taken from the batch as consumed.
-                    if finished > 0 {
-                        let mut tails = std::collections::HashMap::new();
-                        for event in events.events.iter().take(finished as usize) {
-                            let entry = tails
-                                .entry(event.partition)
-                                .or_insert(crate::event::cdc::CdcOffset::ZERO);
-                            if event.position() > *entry {
-                                *entry = event.position();
-                            }
-                        }
-                        for (partition_id, offset) in tails {
-                            let _ = shared_state.offset_store.commit_offset(
-                                database_id,
-                                tenant_id,
-                                &stream_name,
-                                &group_name,
-                                partition_id,
-                                offset,
+                    // finished with, taken from the batch as consumed, only
+                    // while this node still holds the batch's lease.
+                    if finished > 0 && fence.holds() {
+                        // One replicated commit per tick carries every
+                        // partition, so a producer on any node resumes here.
+                        let finished_events =
+                            &events.events[..(finished as usize).min(events.events.len())];
+                        let offsets = crate::event::cdc::consume::batch_tails(finished_events)
+                            .into_iter()
+                            .map(|(partition_id, offset)| {
+                                crate::event::cdc::consumer_group::PartitionOffset::new(
+                                    partition_id,
+                                    offset,
+                                )
+                            })
+                            .collect();
+                        if let Err(e) = crate::control::server::shared::ddl::neutral::consumer_group::commit::commit_group_offsets(
+                            &shared_state,
+                            database_id,
+                            tenant_id,
+                            &stream_name,
+                            &group_name,
+                            offsets,
+                        )
+                        .await
+                        {
+                            warn!(
+                                stream = %stream_name,
+                                error = %e.message,
+                                "failed to commit Kafka offset"
                             );
                         }
                         trace!(

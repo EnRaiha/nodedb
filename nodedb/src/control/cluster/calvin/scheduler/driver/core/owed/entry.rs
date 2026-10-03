@@ -21,8 +21,10 @@ use crate::control::cluster::calvin::scheduler::metrics::sequencer_propose_kind;
 pub enum SchedulerProposal {
     /// This vShard's commit vote. `Some(reason)` is an abort vote.
     Vote { abort: Option<AbortReason> },
-    /// This vShard applied or dropped the txn.
-    CompletionAck,
+    /// This vShard applied or dropped the txn. `result` is the apply result
+    /// the coordinator reads: the timeseries install counts of the apply.
+    /// Empty when there are none.
+    CompletionAck { result: Vec<u8> },
     /// The active executor saw its OLLP prediction drift.
     OllpMismatch,
     /// The txn's local plan routing failed for good.
@@ -34,21 +36,21 @@ impl SchedulerProposal {
     pub fn kind(&self) -> OwedKind {
         match self {
             Self::Vote { .. } => OwedKind::Vote,
-            Self::CompletionAck => OwedKind::CompletionAck,
+            Self::CompletionAck { .. } => OwedKind::CompletionAck,
             Self::OllpMismatch => OwedKind::OllpMismatch,
             Self::RoutingFailed { .. } => OwedKind::RoutingFailed,
         }
     }
 
-    /// The sequencer entry for `txn_id` proposed by `vshard`.
-    pub fn entry(&self, txn_id: TxnId, vshard: u32) -> SequencerEntry {
+    /// The sequencer entry for `txn_id` proposed by `vshard`'s scheduler on
+    /// node `node_id`.
+    pub fn entry(&self, txn_id: TxnId, vshard: u32, node_id: u64) -> SequencerEntry {
         let (epoch, position) = (txn_id.epoch, txn_id.position);
         match self {
             Self::Vote { abort: None } => SequencerEntry::Vote {
                 epoch,
                 position,
                 vshard,
-                commit: true,
             },
             Self::Vote {
                 abort: Some(reason),
@@ -58,10 +60,12 @@ impl SchedulerProposal {
                 vshard,
                 reason: *reason,
             },
-            Self::CompletionAck => SequencerEntry::CompletionAck {
+            Self::CompletionAck { result } => SequencerEntry::CompletionAck {
                 epoch,
                 position,
                 vshard_id: vshard,
+                result: result.clone(),
+                from_node: node_id,
             },
             Self::OllpMismatch => SequencerEntry::OllpMismatch { epoch, position },
             Self::RoutingFailed { detail } => SequencerEntry::TxnRoutingFailed {
@@ -96,6 +100,11 @@ impl OwedKind {
             Self::OllpMismatch => sequencer_propose_kind::OLLP_MISMATCH,
             Self::RoutingFailed => sequencer_propose_kind::ROUTING_FAILED,
         }
+    }
+
+    /// Whether only the vShard's data-group leader proposes this kind.
+    pub fn leader_only(self) -> bool {
+        matches!(self, Self::Vote | Self::CompletionAck)
     }
 
     /// Whether this node applied the entry of this kind.
@@ -219,19 +228,18 @@ mod tests {
     fn a_vote_proposal_carries_its_abort_reason() {
         let txn = TxnId::new(3, 4);
         assert!(matches!(
-            SchedulerProposal::Vote { abort: None }.entry(txn, 9),
+            SchedulerProposal::Vote { abort: None }.entry(txn, 9, 1),
             SequencerEntry::Vote {
                 epoch: 3,
                 position: 4,
-                vshard: 9,
-                commit: true
+                vshard: 9
             }
         ));
         assert!(matches!(
             SchedulerProposal::Vote {
                 abort: Some(AbortReason::SerializationConflict)
             }
-            .entry(txn, 9),
+            .entry(txn, 9, 1),
             SequencerEntry::AbortVote {
                 epoch: 3,
                 position: 4,

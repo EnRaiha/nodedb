@@ -19,37 +19,41 @@ use super::result_shaping::ResultShaping;
 use super::super::super::types::error_to_sqlstate;
 use super::super::core::NodeDbPgHandler;
 
-/// How long a linearizable read waits for a quorum to confirm this node still
-/// leads the group. Several election timeouts (150-300ms), so an ordinary
-/// round trip always fits and a partition is reported rather than hung on.
-const LEADERSHIP_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
-
 /// This node has missed a topology transition and must not coordinate work
 /// until it catches up.
 fn superseded_topology_view(behind: u64) -> PgWireError {
+    stale_read(format!(
+        "this node is {behind} cluster generation(s) behind and is not \
+         coordinating queries until it catches up; retry"
+    ))
+}
+
+/// A retryable refusal of a read that needs a leader.
+fn stale_read(message: String) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "ERROR".to_owned(),
         nodedb_types::error::sqlstate::STALE_READ_NOT_LEADER.to_owned(),
-        format!(
-            "this node is {behind} cluster generation(s) behind and is not \
-             coordinating queries until it catches up; retry"
-        ),
+        message,
     )))
 }
 
 /// No leader is known for a group whose read requires one.
 fn no_serving_leader() -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".to_owned(),
-        nodedb_types::error::sqlstate::STALE_READ_NOT_LEADER.to_owned(),
-        "no leader is currently serving this range; retry".to_owned(),
-    )))
+    stale_read("no leader is currently serving this range; retry".to_owned())
+}
+
+/// A linearizable read that no node can serve with proof.
+fn unconfirmable_read() -> PgWireError {
+    stale_read(
+        "this read spans ranges led by different nodes, and this node holds no \
+         replica of some of them; retry on a node that replicates every range"
+            .to_owned(),
+    )
 }
 
 impl NodeDbPgHandler {
-    /// Prove against a quorum that this node still leads `group_id`.
-    /// The routing table is a cached view — a partitioned leader keeps its
-    /// entry long after a successor is elected.
+    /// Refuse to coordinate while this node's cluster epoch is behind. Its
+    /// routing table is then a stale view of who leads what.
     fn refuse_if_topology_view_superseded(&self) -> PgWireResult<()> {
         let Some(epoch) = self.state.cluster_epoch.get() else {
             return Ok(());
@@ -58,28 +62,6 @@ impl NodeDbPgHandler {
             return Err(superseded_topology_view(epoch.generations_behind()));
         }
         Ok(())
-    }
-
-    async fn confirm_local_leadership(&self, group_id: u64) -> PgWireResult<()> {
-        let Some(gate) = self.state.raft_read_gate.get() else {
-            // Reached only if routed here before `start_raft` published the gate.
-            return Err(no_serving_leader());
-        };
-        use crate::control::cluster::read_index::ReadIndexRefusal;
-        match gate
-            .confirm_leader(group_id, LEADERSHIP_CONFIRM_TIMEOUT)
-            .await
-        {
-            Ok(_read_index) => Ok(()),
-            Err(ReadIndexRefusal::NotLeader) => Err(no_serving_leader()),
-            Err(ReadIndexRefusal::Timeout { waited_ms }) => {
-                Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    nodedb_types::error::sqlstate::STALE_READ_NOT_LEADER.to_owned(),
-                    format!("no quorum confirmed leadership within {waited_ms}ms; retry"),
-                ))))
-            }
-        }
     }
 
     /// Route an implicit-edge dependent predicate through OLLP/Calvin when its
@@ -98,9 +80,7 @@ impl NodeDbPgHandler {
             formats: result_formats,
         } = shaping;
         let tx_state = self.sessions.transaction_state(session_id);
-        if tx_state == TransactionState::InBlock
-            || self.state.calvin_completion_registry.get().is_none()
-        {
+        if tx_state == TransactionState::InBlock {
             return Ok(None);
         }
 
@@ -137,7 +117,10 @@ impl NodeDbPgHandler {
     /// Forward an ordinary remote-leader task set through the gateway.
     ///
     /// Unresolved multi-step DML stays local so its orchestrator can resolve
-    /// final plans before authorization.
+    /// final plans before authorization. A `ClusterArray` plan stays local
+    /// because this node's array coordinator routes it to the owning shards.
+    /// Array DDL stays local because the dispatch loop proposes it as a
+    /// replicated catalog entry. Its task's vShard names no owner.
     ///
     /// The caller skips this for an in-block statement. A write forwarded
     /// here applies durably at once, outside the transaction; the dispatch
@@ -159,19 +142,19 @@ impl NodeDbPgHandler {
             projection,
             formats: result_formats,
         } = shaping;
-        if has_orchestrated_dml(tasks) {
+        if has_orchestrated_dml(tasks) || has_cluster_array_op(tasks) || has_array_ddl(tasks) {
             return Ok(None);
         }
         self.refuse_if_topology_view_superseded()?;
         let consistency = consistency_for_tasks(&self.sessions, tasks, session_id);
         let needs_confirmed_leader = consistency.requires_leader() && !has_replicated_writes(tasks);
         match self.placement_for_tasks(tasks, consistency, needs_confirmed_leader) {
-            TaskPlacement::Local => return Ok(None),
-            TaskPlacement::LocalLeader { group_id } => {
-                self.confirm_local_leadership(group_id).await?;
-                return Ok(None);
-            }
+            // Each read in the set confirms its group where it is served: the
+            // local dispatch for a replica read here, the serving node for a
+            // leg the gateway sends elsewhere.
+            TaskPlacement::Local | TaskPlacement::LocalConfirmed => return Ok(None),
             TaskPlacement::NoLeader => return Err(no_serving_leader()),
+            TaskPlacement::Unconfirmable => return Err(unconfirmable_read()),
             TaskPlacement::Gateway => {}
         }
 
@@ -196,6 +179,32 @@ impl NodeDbPgHandler {
         .await
         .map(Some)
     }
+}
+
+/// Whether any task is a `ClusterArray` plan.
+///
+/// The `ArrayCoordinator` on this node fans such a plan out to the shards
+/// that own its cells. The plan's own vShard names no owner, so forwarding
+/// it to that vShard's leader is wrong, and the plan has no wire encoding.
+/// The dispatch loop runs it here.
+fn has_cluster_array_op(tasks: &[PhysicalTask]) -> bool {
+    tasks.iter().any(|task| {
+        matches!(
+            &task.plan,
+            crate::bridge::envelope::PhysicalPlan::ClusterArray(_)
+        )
+    })
+}
+
+/// Whether any task is array DDL.
+///
+/// The dispatch loop proposes it as a `PutArray` or `DeleteArray` catalog
+/// entry, which every node applies. Forwarded to its vShard's leader, it
+/// opens the array on that one node and writes no catalog entry.
+fn has_array_ddl(tasks: &[PhysicalTask]) -> bool {
+    tasks
+        .iter()
+        .any(|task| crate::control::array_catalog::ddl::is_array_ddl(&task.plan))
 }
 
 fn has_orchestrated_dml(tasks: &[PhysicalTask]) -> bool {

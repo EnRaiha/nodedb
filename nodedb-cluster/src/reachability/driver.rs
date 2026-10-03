@@ -7,9 +7,9 @@
 //! injected [`ReachabilityProber`]. Probes run in parallel via
 //! `tokio::spawn` so a slow peer never blocks the next one. Probe
 //! results are intentionally ignored: the production `TransportProber`
-//! routes through `NexarTransport::send_rpc`, which already walks the
-//! circuit breaker's `check → record_success|record_failure` path, so
-//! the driver does not need to bookkeep anything itself.
+//! routes through `NexarTransport::send_probe_rpc`, which admits the
+//! probe past the open circuit and records its outcome on the breaker,
+//! so the driver does not need to bookkeep anything itself.
 //!
 //! Shutdown is cooperative via `tokio::sync::watch`. On `true` the
 //! run loop breaks at the next tick or immediately if it is waiting.
@@ -121,7 +121,7 @@ impl ReachabilityDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::circuit_breaker::CircuitBreakerConfig;
+    use crate::circuit_breaker::{Admission, CircuitBreakerConfig};
     use async_trait::async_trait;
     use std::sync::Mutex;
 
@@ -161,9 +161,9 @@ mod tests {
     #[tokio::test]
     async fn sweep_probes_every_open_peer() {
         let breaker = open_breaker();
-        breaker.record_failure(1);
-        breaker.record_failure(2);
-        breaker.record_failure(3);
+        breaker.record_failure(1, Admission::Normal);
+        breaker.record_failure(2, Admission::Normal);
+        breaker.record_failure(3, Admission::Normal);
 
         let prober = RecordingProber::new();
         let driver = Arc::new(ReachabilityDriver::new(
@@ -186,8 +186,8 @@ mod tests {
     #[tokio::test]
     async fn sweep_skips_closed_peers() {
         let breaker = open_breaker();
-        breaker.record_success(1); // Registers 1 as Closed.
-        breaker.record_failure(2); // Opens 2.
+        breaker.record_success(1, Admission::Normal); // Registers 1 as Closed.
+        breaker.record_failure(2, Admission::Normal); // Opens 2.
         let prober = RecordingProber::new();
         let driver = Arc::new(ReachabilityDriver::new(
             Arc::clone(&breaker),
@@ -204,7 +204,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn run_loop_fires_sweeps_on_interval_and_shuts_down() {
         let breaker = open_breaker();
-        breaker.record_failure(7);
+        breaker.record_failure(7, Admission::Normal);
         let prober = RecordingProber::new();
         let driver = Arc::new(ReachabilityDriver::new(
             Arc::clone(&breaker),

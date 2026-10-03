@@ -4,15 +4,15 @@
 //! read at the effective source LSN.
 
 use nodedb_types::DatabaseId;
+use nodedb_types::QualifiedCollection;
 use nodedb_types::TenantId;
 
 use crate::control::state::SharedState;
-use nodedb_physical::physical_plan::{
-    ColumnarOp, DocumentOp, ExchangeOp, KvOp, PhysicalPlan, QueryOp, SetOpKind, TimeseriesOp,
-};
+use nodedb_physical::physical_plan::{ExchangeOp, PhysicalPlan, QueryOp, SetOpKind};
 use nodedb_types::SystemTimeScope;
 
 use super::refusal::{SourceRewrite, plan_reads_cloned_collection, refuse_clone_read_shape};
+use super::rewrite_engine::{rewrite_columnar, rewrite_document, rewrite_kv, rewrite_timeseries};
 
 /// Compute the source-side system-time selection for a clone scan rewrite.
 ///
@@ -70,7 +70,9 @@ pub struct RewriteForSourceParams<'a> {
 ///
 /// A read that names the cloned collection but has no rewrite is refused with a
 /// typed error; see [`SourceRewrite`].
-pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> crate::Result<SourceRewrite> {
+pub async fn rewrite_plan_for_source(
+    params: RewriteForSourceParams<'_>,
+) -> crate::Result<SourceRewrite> {
     let RewriteForSourceParams {
         plan,
         target_db_id,
@@ -82,38 +84,116 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> crate::Res
         kv_surrogate_ceiling,
         state,
     } = params;
-    let target_qualified = nodedb_types::QualifiedCollection::new(target_db_id, target_coll);
-    let source_qualified = nodedb_types::QualifiedCollection::new(source_db_id, source_coll);
+    let ctx = RewriteCtx {
+        source_db_id,
+        tenant_id,
+        target_coll,
+        source_coll,
+        target_qualified: QualifiedCollection::new(target_db_id, target_coll),
+        source_qualified: QualifiedCollection::new(source_db_id, source_coll),
+        effective_source_ms,
+        kv_surrogate_ceiling,
+        state,
+    };
+    rewrite(plan, &ctx).await
+}
 
+/// The inputs every rewrite stage shares.
+pub(super) struct RewriteCtx<'a> {
+    pub source_db_id: DatabaseId,
+    pub tenant_id: TenantId,
+    pub target_coll: &'a str,
+    pub source_coll: &'a str,
+    pub target_qualified: QualifiedCollection,
+    pub source_qualified: QualifiedCollection,
+    pub effective_source_ms: Option<i64>,
+    pub kv_surrogate_ceiling: Option<u32>,
+    pub state: &'a SharedState,
+}
+
+impl RewriteCtx<'_> {
+    /// Whether `collection` is the cloned collection.
+    pub(super) fn is_target(&self, collection: &QualifiedCollection) -> bool {
+        collection == &self.target_qualified
+    }
+
+    /// The source-side system-time selection for a plan's own selection.
+    pub(super) fn system_time(
+        &self,
+        plan_scope: SystemTimeScope,
+    ) -> crate::Result<SystemTimeScope> {
+        rewrite_system_time(self.effective_source_ms, plan_scope)
+    }
+}
+
+/// Rewrite one plan node through the stage for its plan family.
+async fn rewrite(plan: &PhysicalPlan, ctx: &RewriteCtx<'_>) -> crate::Result<SourceRewrite> {
     match plan {
-        // Structural wrappers, matched before the engine arms: the converter
-        // wraps every sharded read in `Exchange{Gather}` / `PostProcess`.
-        // Recursing and re-wrapping with the same mode makes the source-side
-        // task fan and gather exactly like the target-side one.
-        PhysicalPlan::Query(QueryOp::Exchange(op)) => {
-            let rewritten = rewrite_plan_for_source(RewriteForSourceParams {
-                plan: &op.child,
-                target_db_id,
-                source_db_id,
-                tenant_id,
-                target_coll,
-                source_coll,
-                effective_source_ms,
-                kv_surrogate_ceiling,
-                state,
-            })?;
-            Ok(match rewritten {
-                SourceRewrite::Task(child) => {
-                    SourceRewrite::task(PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
-                        child,
-                        mode: op.mode.clone(),
-                    })))
-                }
-                SourceRewrite::NoSourceTask => SourceRewrite::NoSourceTask,
-            })
-        }
+        PhysicalPlan::Query(op) => rewrite_query(plan, op, ctx).await,
+        PhysicalPlan::Document(op) => rewrite_document(plan, op, ctx).await,
+        PhysicalPlan::Kv(op) => rewrite_kv(plan, op, ctx),
+        PhysicalPlan::Columnar(op) => rewrite_columnar(plan, op, ctx),
+        PhysicalPlan::Timeseries(op) => rewrite_timeseries(plan, op, ctx),
+        // No proven rewrite for these families. Every top-level variant is
+        // enumerated so a new engine forces a decision here.
+        PhysicalPlan::Vector(_)
+        | PhysicalPlan::Graph(_)
+        | PhysicalPlan::Text(_)
+        | PhysicalPlan::Spatial(_)
+        | PhysicalPlan::Crdt(_)
+        | PhysicalPlan::Meta(_)
+        | PhysicalPlan::Array(_)
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => refuse_or_skip(plan, ctx),
+    }
+}
 
-        PhysicalPlan::Query(QueryOp::PostProcess {
+/// The default for a plan with no rewrite. A read that names the cloned
+/// collection (aggregates, joins, vector/text/graph/spatial searches) is
+/// refused. Everything else passes through untouched.
+pub(super) fn refuse_or_skip(
+    plan: &PhysicalPlan,
+    ctx: &RewriteCtx<'_>,
+) -> crate::Result<SourceRewrite> {
+    if plan_reads_cloned_collection(plan, ctx.target_qualified.as_str()) {
+        return Err(refuse_clone_read_shape(plan, ctx.target_coll));
+    }
+    Ok(SourceRewrite::NoSourceTask)
+}
+
+/// Put a rewritten child back under the wrapper node it came from.
+fn rewrap(
+    rewritten: SourceRewrite,
+    wrap: impl FnOnce(Box<PhysicalPlan>) -> PhysicalPlan,
+) -> SourceRewrite {
+    match rewritten {
+        SourceRewrite::Task(child) => SourceRewrite::task(wrap(child)),
+        SourceRewrite::NoSourceTask => SourceRewrite::NoSourceTask,
+    }
+}
+
+/// Query plans. The structural wrappers recurse into their inputs. Every
+/// other query op takes the default.
+async fn rewrite_query(
+    plan: &PhysicalPlan,
+    op: &QueryOp,
+    ctx: &RewriteCtx<'_>,
+) -> crate::Result<SourceRewrite> {
+    match op {
+        // The converter wraps every sharded read in `Exchange{Gather}` /
+        // `PostProcess`. Recursing and re-wrapping with the same mode makes
+        // the source-side task fan and gather exactly like the target-side
+        // one.
+        QueryOp::Exchange(exchange) => {
+            let rewritten = Box::pin(rewrite(&exchange.child, ctx)).await?;
+            Ok(rewrap(rewritten, |child| {
+                PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
+                    child,
+                    mode: exchange.mode.clone(),
+                }))
+            }))
+        }
+        QueryOp::PostProcess {
             input,
             filters,
             projection,
@@ -123,324 +203,65 @@ pub fn rewrite_plan_for_source(params: RewriteForSourceParams<'_>) -> crate::Res
             limit,
             offset,
             distinct,
-        }) => {
-            let rewritten = rewrite_plan_for_source(RewriteForSourceParams {
-                plan: input,
-                target_db_id,
-                source_db_id,
-                tenant_id,
-                target_coll,
-                source_coll,
-                effective_source_ms,
-                kv_surrogate_ceiling,
-                state,
-            })?;
-            Ok(match rewritten {
-                SourceRewrite::Task(child) => {
-                    SourceRewrite::task(PhysicalPlan::Query(QueryOp::PostProcess {
-                        input: child,
-                        filters: filters.clone(),
-                        projection: projection.clone(),
-                        computed_columns: computed_columns.clone(),
-                        window_functions: window_functions.clone(),
-                        sort_keys: sort_keys.clone(),
-                        limit: *limit,
-                        offset: *offset,
-                        distinct: *distinct,
-                    }))
-                }
-                SourceRewrite::NoSourceTask => SourceRewrite::NoSourceTask,
-            })
-        }
-
-        // SetOp: rewrite every branch. Branches that do not read the cloned
-        // collection yield no source task and are dropped, so the source-side
-        // node carries only the rows the target side is missing. That is
-        // sound for `UNION ALL` (the merge appends). Any other kind dedups or
-        // subtracts by exact row match against the target rows, which is
-        // unsound across an unmaterialized clone; refuse it the same way the
-        // task-level `post_set_op` refusal does.
-        PhysicalPlan::Query(QueryOp::SetOp { inputs, op }) => {
-            let mut rewritten_inputs = Vec::with_capacity(inputs.len());
-            for input in inputs {
-                let rewritten = rewrite_plan_for_source(RewriteForSourceParams {
-                    plan: input,
-                    target_db_id,
-                    source_db_id,
-                    tenant_id,
-                    target_coll,
-                    source_coll,
-                    effective_source_ms,
-                    kv_surrogate_ceiling,
-                    state,
-                })?;
-                if let SourceRewrite::Task(child) = rewritten {
-                    rewritten_inputs.push(*child);
-                }
-            }
-            if rewritten_inputs.is_empty() {
-                return Ok(SourceRewrite::NoSourceTask);
-            }
-            match op {
-                SetOpKind::UnionAll => {
-                    Ok(SourceRewrite::task(PhysicalPlan::Query(QueryOp::SetOp {
-                        inputs: rewritten_inputs,
-                        op: SetOpKind::UnionAll,
-                    })))
-                }
-                SetOpKind::UnionDistinct
-                | SetOpKind::Intersect
-                | SetOpKind::IntersectAll
-                | SetOpKind::Except
-                | SetOpKind::ExceptAll => Err(crate::Error::PlanError {
-                    detail: format!(
-                        "a set operation over '{target_coll}' cannot be read through an \
-                         unmaterialized clone; run ALTER DATABASE <clone> MATERIALIZE first"
-                    ),
-                }),
-            }
-        }
-
-        PhysicalPlan::Document(DocumentOp::Scan {
-            collection,
-            limit,
-            offset,
-            sort_keys,
-            filters,
-            distinct,
-            projection,
-            computed_columns,
-            window_functions,
-            system_time,
-            valid_at_ms,
-            prefilter,
-        }) if collection == &target_qualified => {
-            let system_time = rewrite_system_time(effective_source_ms, *system_time)?;
-            Ok(SourceRewrite::task(PhysicalPlan::Document(
-                DocumentOp::Scan {
-                    collection: source_qualified,
-                    limit: *limit,
-                    offset: *offset,
-                    sort_keys: sort_keys.clone(),
+        } => {
+            let rewritten = Box::pin(rewrite(input, ctx)).await?;
+            Ok(rewrap(rewritten, |child| {
+                PhysicalPlan::Query(QueryOp::PostProcess {
+                    input: child,
                     filters: filters.clone(),
-                    distinct: *distinct,
                     projection: projection.clone(),
                     computed_columns: computed_columns.clone(),
                     window_functions: window_functions.clone(),
-                    system_time,
-                    valid_at_ms: *valid_at_ms,
-                    prefilter: prefilter.clone(),
-                },
-            )))
-        }
-
-        PhysicalPlan::Document(DocumentOp::PointGet {
-            collection,
-            document_id,
-            surrogate: _,
-            pk_bytes,
-            rls_filters,
-            system_time,
-            valid_at_ms,
-        }) if collection == &target_qualified => {
-            // The target surrogate is invalid in the source database — each
-            // maintains its own pk→surrogate mapping. No binding means the
-            // row never existed there; skip rather than use a sentinel.
-            // Lookup errors are also treated as "skip" (visible in the
-            // assigner's own metrics/logs instead).
-            let system_time = rewrite_system_time(effective_source_ms, *system_time)?;
-            let Some(source_surrogate) = state
-                .surrogate_assigner
-                .lookup(
-                    nodedb_types::CollectionKey::from_bare(source_db_id, source_coll),
-                    tenant_id,
-                    pk_bytes,
-                )
-                .ok()
-                .flatten()
-            else {
-                return Ok(SourceRewrite::NoSourceTask);
-            };
-            Ok(SourceRewrite::task(PhysicalPlan::Document(
-                DocumentOp::PointGet {
-                    collection: source_qualified,
-                    document_id: document_id.clone(),
-                    surrogate: source_surrogate,
-                    pk_bytes: pk_bytes.clone(),
-                    rls_filters: rls_filters.clone(),
-                    system_time,
-                    valid_at_ms: *valid_at_ms,
-                },
-            )))
-        }
-
-        PhysicalPlan::Document(DocumentOp::IndexedFetch {
-            collection,
-            path,
-            value,
-            filters,
-            projection,
-            limit,
-            offset,
-        }) if collection == &target_qualified => Ok(SourceRewrite::task(PhysicalPlan::Document(
-            DocumentOp::IndexedFetch {
-                collection: source_qualified,
-                path: path.clone(),
-                value: value.clone(),
-                filters: filters.clone(),
-                projection: projection.clone(),
-                limit: *limit,
-                offset: *offset,
-            },
-        ))),
-
-        PhysicalPlan::Kv(KvOp::Scan {
-            collection,
-            cursor,
-            count,
-            filters,
-            projection,
-            computed_columns,
-            match_pattern,
-            sort_keys,
-            // The original target-side scan never carries a ceiling
-            // (clones-of-clones still funnel through here per-level);
-            // the resolver overrides it for source delegation below.
-            surrogate_ceiling: _,
-        }) if collection == &target_qualified => {
-            Ok(SourceRewrite::task(PhysicalPlan::Kv(KvOp::Scan {
-                collection: source_qualified,
-                cursor: cursor.clone(),
-                count: *count,
-                filters: filters.clone(),
-                projection: projection.clone(),
-                computed_columns: computed_columns.clone(),
-                match_pattern: match_pattern.clone(),
-                sort_keys: sort_keys.clone(),
-                surrogate_ceiling: kv_surrogate_ceiling,
-            })))
-        }
-
-        PhysicalPlan::Kv(KvOp::Get {
-            collection,
-            key,
-            rls_filters,
-            surrogate_ceiling: _,
-        }) if collection == &target_qualified => {
-            Ok(SourceRewrite::task(PhysicalPlan::Kv(KvOp::Get {
-                collection: source_qualified,
-                key: key.clone(),
-                rls_filters: rls_filters.clone(),
-                surrogate_ceiling: kv_surrogate_ceiling,
-            })))
-        }
-
-        PhysicalPlan::Columnar(ColumnarOp::Scan {
-            collection,
-            projection,
-            limit,
-            filters,
-            rls_filters,
-            sort_keys,
-            system_time,
-            valid_at_ms,
-            prefilter,
-            computed_columns,
-        }) if collection == &target_qualified => {
-            let system_time = rewrite_system_time(effective_source_ms, *system_time)?;
-            Ok(SourceRewrite::task(PhysicalPlan::Columnar(
-                ColumnarOp::Scan {
-                    collection: source_qualified,
-                    projection: projection.clone(),
-                    limit: *limit,
-                    filters: filters.clone(),
-                    rls_filters: rls_filters.clone(),
                     sort_keys: sort_keys.clone(),
-                    system_time,
-                    valid_at_ms: *valid_at_ms,
-                    prefilter: prefilter.clone(),
-                    computed_columns: computed_columns.clone(),
-                },
-            )))
-        }
-
-        // A bucketing or aggregating timeseries scan is the same unsound
-        // concatenation as `Query::Aggregate`: target and source payloads are
-        // appended, so a bucket present on both sides comes back twice and
-        // every sum/avg over the union is wrong. Only a plain scan reads
-        // through; the aggregating form is refused.
-        PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-            collection,
-            bucket_interval_ms,
-            group_by,
-            aggregates,
-            ..
-        }) if collection == &target_qualified
-            && (!group_by.is_empty() || !aggregates.is_empty() || *bucket_interval_ms != 0) =>
-        {
-            Err(refuse_clone_read_shape(plan, target_coll))
-        }
-
-        PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-            collection,
-            time_range,
-            projection,
-            limit,
-            filters,
-            sort_keys,
-            bucket_interval_ms,
-            group_by,
-            aggregates,
-            gap_fill,
-            computed_columns,
-            rls_filters,
-            system_time,
-            valid_at_ms,
-        }) if collection == &target_qualified => {
-            let system_time = rewrite_system_time(effective_source_ms, *system_time)?;
-            Ok(SourceRewrite::task(PhysicalPlan::Timeseries(
-                TimeseriesOp::Scan {
-                    collection: source_qualified,
-                    time_range: *time_range,
-                    projection: projection.clone(),
                     limit: *limit,
-                    filters: filters.clone(),
-                    sort_keys: sort_keys.clone(),
-                    bucket_interval_ms: *bucket_interval_ms,
-                    group_by: group_by.clone(),
-                    aggregates: aggregates.clone(),
-                    gap_fill: gap_fill.clone(),
-                    computed_columns: computed_columns.clone(),
-                    rls_filters: rls_filters.clone(),
-                    system_time,
-                    valid_at_ms: *valid_at_ms,
-                },
-            )))
+                    offset: *offset,
+                    distinct: *distinct,
+                })
+            }))
         }
+        QueryOp::SetOp { inputs, op } => rewrite_set_op(inputs, op, ctx).await,
+        _ => refuse_or_skip(plan, ctx),
+    }
+}
 
-        // DEFAULT: refuse any READ naming the cloned collection (aggregates,
-        // joins, vector/text/graph/spatial searches — no proven rewrite);
-        // allow everything else through untouched. Every top-level variant
-        // is enumerated so a new engine forces a decision here.
-        PhysicalPlan::Document(_)
-        | PhysicalPlan::Kv(_)
-        | PhysicalPlan::Vector(_)
-        | PhysicalPlan::Graph(_)
-        | PhysicalPlan::Text(_)
-        | PhysicalPlan::Columnar(_)
-        | PhysicalPlan::Timeseries(_)
-        | PhysicalPlan::Spatial(_)
-        | PhysicalPlan::Crdt(_)
-        | PhysicalPlan::Query(_)
-        | PhysicalPlan::Meta(_)
-        | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_)
-        | PhysicalPlan::ClusterEvent(_) => {
-            if plan_reads_cloned_collection(plan, target_qualified.as_str()) {
-                return Err(refuse_clone_read_shape(plan, target_coll));
-            }
-            Ok(SourceRewrite::NoSourceTask)
+/// Rewrite every branch of a set operation.
+///
+/// Branches that do not read the cloned collection yield no source task and
+/// are dropped, so the source-side node carries only the rows the target side
+/// is missing. That is sound for `UNION ALL` (the merge appends). Any other
+/// kind dedups or subtracts by exact row match against the target rows, which
+/// is unsound across an unmaterialized clone. It is refused the same way the
+/// task-level `post_set_op` refusal does.
+async fn rewrite_set_op(
+    inputs: &[PhysicalPlan],
+    op: &SetOpKind,
+    ctx: &RewriteCtx<'_>,
+) -> crate::Result<SourceRewrite> {
+    let mut rewritten_inputs = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        if let SourceRewrite::Task(child) = Box::pin(rewrite(input, ctx)).await? {
+            rewritten_inputs.push(*child);
         }
+    }
+    if rewritten_inputs.is_empty() {
+        return Ok(SourceRewrite::NoSourceTask);
+    }
+    match op {
+        SetOpKind::UnionAll => Ok(SourceRewrite::task(PhysicalPlan::Query(QueryOp::SetOp {
+            inputs: rewritten_inputs,
+            op: SetOpKind::UnionAll,
+        }))),
+        SetOpKind::UnionDistinct
+        | SetOpKind::Intersect
+        | SetOpKind::IntersectAll
+        | SetOpKind::Except
+        | SetOpKind::ExceptAll => Err(crate::Error::PlanError {
+            detail: format!(
+                "a set operation over '{}' cannot be read through an \
+                 unmaterialized clone; run ALTER DATABASE <clone> MATERIALIZE first",
+                ctx.target_coll
+            ),
+        }),
     }
 }
 
@@ -627,6 +448,7 @@ mod tests {
                     options: GraphTraversalOptions::default(),
                     bm25_query: None,
                     bm25_field: None,
+                    stage: nodedb_physical::physical_plan::RagStage::Local,
                 }),
             ),
         ]
@@ -659,8 +481,8 @@ mod tests {
 
     /// The default arm refuses a plan when it is classified `Read` AND its
     /// collection is extractable. Both inputs must hold for every sharded
-    /// source, or an unrewritable read would fall through to `NoSourceTask` and
-    /// answer from the target alone.
+    /// source, or an unrewritable read falls through to `NoSourceTask` and
+    /// answers from the target alone.
     #[test]
     fn every_sharded_source_is_a_classified_read() {
         for (name, plan) in sharded_source_plans() {

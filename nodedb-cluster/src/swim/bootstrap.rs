@@ -7,10 +7,11 @@
 //!
 //! 1. Constructs a [`MembershipList`] containing the local node at
 //!    incarnation 0.
-//! 2. Seeds the list with an `Alive` entry for every address in
-//!    `seeds`, using a synthetic `NodeId` of the form `"seed:<addr>"`.
-//!    The first successful probe replaces the placeholder with the
-//!    peer's real node id via the normal merge path.
+//! 2. Seeds the list with an `Alive` entry per peer. [`spawn_with_members`]
+//!    takes real node ids (cluster startup reads them from topology).
+//!    [`spawn`] and [`spawn_with_subscribers`] take bare addresses and use
+//!    a synthetic `NodeId` of the form `"seed:<addr>"`, which the first
+//!    successful probe replaces with the peer's real id.
 //! 3. Validates [`SwimConfig`] and constructs a [`FailureDetector`].
 //! 4. Spawns the detector's run loop on a fresh tokio task.
 //! 5. Returns a [`SwimHandle`] the caller can use to read membership,
@@ -120,6 +121,37 @@ pub async fn spawn_with_subscribers(
     subscribers: Vec<Arc<dyn MembershipSubscriber>>,
     incarnation_store: Option<Arc<dyn IncarnationStore>>,
 ) -> Result<SwimHandle, SwimError> {
+    // Address-only seeds get placeholder ids, replaced on the first ack.
+    // Callers without a topology to read real ids from seed this way.
+    let peers = seeds
+        .into_iter()
+        // SocketAddr display always produces a valid ID: non-empty, well under cap, no NUL.
+        .map(|addr| (NodeId::from_validated(format!("seed:{addr}")), addr))
+        .collect();
+    spawn_with_members(
+        cfg,
+        local_id,
+        local_addr,
+        peers,
+        transport,
+        subscribers,
+        incarnation_store,
+    )
+    .await
+}
+
+/// Same as [`spawn_with_subscribers`], seeded with peers whose real ids are
+/// already known, such as every node in the cluster topology. Entries at
+/// `local_addr` are skipped.
+pub async fn spawn_with_members(
+    cfg: SwimConfig,
+    local_id: NodeId,
+    local_addr: SocketAddr,
+    peers: Vec<(NodeId, SocketAddr)>,
+    transport: Arc<dyn Transport>,
+    subscribers: Vec<Arc<dyn MembershipSubscriber>>,
+    incarnation_store: Option<Arc<dyn IncarnationStore>>,
+) -> Result<SwimHandle, SwimError> {
     cfg.validate()?;
 
     let membership = Arc::new(MembershipList::new_local(
@@ -128,16 +160,14 @@ pub async fn spawn_with_subscribers(
         cfg.initial_incarnation,
     ));
 
-    // Seed the membership table so the first probe round has somewhere
-    // to go. Placeholder ids are replaced on the first ack.
-    for seed_addr in &seeds {
-        if *seed_addr == local_addr {
+    // Seed the membership table so the first probe round has somewhere to go.
+    for (node_id, addr) in peers {
+        if addr == local_addr || node_id == local_id {
             continue;
         }
         membership.apply(&MemberUpdate {
-            // SocketAddr display always produces a valid ID: non-empty, well under cap, no NUL.
-            node_id: NodeId::from_validated(format!("seed:{seed_addr}")),
-            addr: seed_addr.to_string(),
+            node_id,
+            addr: addr.to_string(),
             state: MemberState::Alive,
             incarnation: Incarnation::ZERO,
         });

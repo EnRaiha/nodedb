@@ -6,20 +6,27 @@ use std::time::Instant;
 
 use tokio::sync::OwnedMutexGuard;
 
+use crate::bridge::dispatch::JournalGroup;
 use crate::bridge::envelope::{Admission, PhysicalPlan, Priority, Request};
-use crate::control::array_catalog::ddl::AuthorizedDdlTransition;
-use crate::control::server::shared::write_admission::WriteAdmissionGuard;
+use crate::control::server::shared::write_admission::{WriteAdmissionGuard, WriteOrder};
 use crate::control::state::SharedState;
 use crate::types::{
     DatabaseId, Lsn, ReadConsistency, RequestId, TenantId, TraceId, TxnId, VShardId,
 };
 
-use super::wal_append::rollback_on_err;
+/// The guards a dispatched write holds before its enqueue, held for their
+/// `Drop`, which releases them.
+pub(super) struct HeldGuards {
+    pub _admission: Option<WriteAdmissionGuard>,
+    pub _order: Option<OwnedMutexGuard<()>>,
+    /// The document write order (see `write_order_fence`).
+    pub _write_order: WriteOrder,
+}
 
-/// The write-admission guards a dispatched write must hold across the
-/// response await — deferred (rather than dropped at enqueue) only when the
-/// write's redo is minted post-apply.
-pub(super) type DeferredGuards = Option<(Option<WriteAdmissionGuard>, Option<OwnedMutexGuard<()>>)>;
+/// The guards a dispatched write must hold across the response await —
+/// deferred (rather than dropped at enqueue) only when the write's redo is
+/// minted post-apply.
+pub(super) type DeferredGuards = Option<HeldGuards>;
 
 /// Everything [`dispatch_to_data_plane`] needs to build the wire `Request`.
 pub(super) struct DispatchTarget {
@@ -34,7 +41,11 @@ pub(super) struct DispatchTarget {
     pub txn_id: Option<TxnId>,
     pub wal_lsn: Option<Lsn>,
     pub resolved_now_ms: Option<u64>,
+    /// The write's commit HLC, which dates every event it emits.
+    pub commit_hlc: u64,
     pub admission: Admission,
+    /// The record group the write journals its write set into.
+    pub journal: Option<JournalGroup>,
 }
 
 /// What the dispatch phase produced: the id the response is tracked under,
@@ -61,10 +72,8 @@ pub(super) struct DispatchOutcome {
 /// retry, up to the request's deadline. Every other refusal returns at once.
 pub(super) async fn dispatch_to_data_plane(
     shared: &SharedState,
-    ddl_transition: &AuthorizedDdlTransition,
     target: DispatchTarget,
-    admission_guard: Option<WriteAdmissionGuard>,
-    order_guard: Option<OwnedMutexGuard<()>>,
+    guards: HeldGuards,
     post_apply_pending: bool,
     waits_for_capacity: bool,
 ) -> crate::Result<DispatchOutcome> {
@@ -89,44 +98,46 @@ pub(super) async fn dispatch_to_data_plane(
         txn_id: target.txn_id,
         wal_lsn: target.wal_lsn,
         resolved_now_ms: target.resolved_now_ms,
+        commit_hlc: Some(target.commit_hlc),
         admission: target.admission,
     };
 
+    // A refusal, or a caller dropped mid-wait, drops `rx`, which removes the
+    // tracker entry of the request no core holds.
     let rx = shared.tracker.register(request_id);
 
+    let journal = target.journal;
     let dispatched = if waits_for_capacity {
-        dispatch_when_capacity_frees(shared, request).await
+        dispatch_when_capacity_frees(shared, request, journal).await
     } else {
-        match shared.dispatcher.lock() {
-            Ok(mut d) => d.dispatch(request),
-            Err(poisoned) => poisoned.into_inner().dispatch(request),
-        }
+        let attempt = match shared.dispatcher.lock() {
+            Ok(mut d) => d.try_dispatch_journalled(request, journal),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .try_dispatch_journalled(request, journal),
+        };
+        attempt.map_err(|refusal| refusal.error)
     };
-    if dispatched.is_err() {
-        // No response will ever arrive for a refused request.
-        shared.tracker.cancel(&request_id);
-    }
-    rollback_on_err(shared, ddl_transition, dispatched)?;
+    dispatched?;
 
     // Release the write-admission guards immediately after the enqueue, before
     // the Data-Plane round-trip. The per-database WFQ is strict FIFO, so once LSN
     // order equals enqueue order the apply order follows from the queue alone;
-    // holding the guards across the response await would only serialize same-key
+    // holding the guards across the response await will only serialize same-key
     // throughput needlessly.
     //
     // EXCEPTION — a post-apply-redo write mints its durable redo AFTER apply,
-    // from the write-set on the response; the guards MUST stay held across the
-    // response collect + that append so two concurrent same-surrogate writes
-    // cannot reorder their redo appends. Both guard types are `Send`, so
-    // holding them across the `.await` is sound. Moved into an `Option` so the
-    // release is a single, unconditional `drop` below regardless of which path
-    // took it. (`None` guard slots when no lock manager was registered / for
-    // the exempt-read / Calvin / already-ordered cases.)
+    // from the write-set on the response; the guards and the document write
+    // order MUST stay held across the response collect + that append so no
+    // other write touching its rows mints a record in between. Every guard is
+    // `Send`, so holding them across the `.await` is sound. Moved into an
+    // `Option` so the release is a single, unconditional `drop` in the
+    // response phase. (`None` guard slots when no lock manager was registered /
+    // for the exempt-read / Calvin / already-ordered cases.)
     let deferred_guards = if post_apply_pending {
-        Some((admission_guard, order_guard))
+        Some(guards)
     } else {
-        drop(admission_guard);
-        drop(order_guard);
+        drop(guards);
         None
     };
 
@@ -141,7 +152,15 @@ pub(super) async fn dispatch_to_data_plane(
 /// Dispatch `request`, waiting for freed capacity after each capacity
 /// refusal, until the request's deadline. Returns the last refusal once the
 /// deadline passes.
-async fn dispatch_when_capacity_frees(shared: &SharedState, request: Request) -> crate::Result<()> {
+///
+/// A caller that fans one statement out into more requests than the tenant's
+/// in-flight cap dispatches each through here: the fan-out then advances as
+/// earlier requests answer, instead of refusing the statement.
+pub(crate) async fn dispatch_when_capacity_frees(
+    shared: &SharedState,
+    request: Request,
+    journal: Option<JournalGroup>,
+) -> crate::Result<()> {
     let deadline = tokio::time::Instant::from_std(request.deadline);
     let capacity_freed = match shared.dispatcher.lock() {
         Ok(d) => d.capacity_freed(),
@@ -155,8 +174,10 @@ async fn dispatch_when_capacity_frees(shared: &SharedState, request: Request) ->
         tokio::pin!(freed);
         freed.as_mut().enable();
         let attempt = match shared.dispatcher.lock() {
-            Ok(mut d) => d.try_dispatch(request),
-            Err(poisoned) => poisoned.into_inner().try_dispatch(request),
+            Ok(mut d) => d.try_dispatch_journalled(request, journal.clone()),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .try_dispatch_journalled(request, journal.clone()),
         };
         let refusal = match attempt {
             Ok(()) => return Ok(()),

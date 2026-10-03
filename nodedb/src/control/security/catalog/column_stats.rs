@@ -133,6 +133,50 @@ impl SystemCatalog {
     }
 }
 
+impl SystemCatalog {
+    /// Remove every statistics row of one collection. Returns how many went.
+    pub fn delete_column_stats_for_collection(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+    ) -> crate::Result<usize> {
+        let prefix = format!("{database_id}:{tenant_id}:{collection}:");
+        let upper = prefix_upper_bound(database_id, tenant_id, collection);
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| catalog_err("write txn", e))?;
+        let removed = {
+            let mut table = write_txn
+                .open_table(COLUMN_STATS)
+                .map_err(|e| catalog_err("open column_stats", e))?;
+            // A collection name can hold ':', so the range only yields
+            // candidates: the stored collection must match exactly.
+            let mut keys = Vec::new();
+            for row in table
+                .range(prefix.as_str()..upper.as_str())
+                .map_err(|e| catalog_err("range column_stats", e))?
+            {
+                let (key, value) = row.map_err(|e| catalog_err("scan column_stats", e))?;
+                let decoded: StoredColumnStats = zerompk::from_msgpack(value.value())
+                    .map_err(|e| catalog_err("deser column_stats", e))?;
+                if decoded.collection == collection {
+                    keys.push(key.value().to_string());
+                }
+            }
+            for key in &keys {
+                table
+                    .remove(key.as_str())
+                    .map_err(|e| catalog_err("remove column_stats", e))?;
+            }
+            keys.len()
+        };
+        write_txn.commit().map_err(|e| catalog_err("commit", e))?;
+        Ok(removed)
+    }
+}
+
 fn stats_key(database_id: u64, tenant_id: u64, collection: &str, column: &str) -> String {
     format!("{database_id}:{tenant_id}:{collection}:{column}")
 }
@@ -206,6 +250,28 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(first[0].row_count, 10000);
         assert_eq!(second[0].row_count, 42);
+    }
+
+    #[test]
+    fn delete_for_collection_removes_only_that_collection() {
+        let (_dir, cat) = make_catalog();
+        let mut sibling = sample(2, "email");
+        sibling.collection = "users_archive".into();
+        cat.put_column_stats_batch(&[sample(2, "email"), sample(2, "name"), sibling])
+            .unwrap();
+        cat.put_column_stats(&sample(3, "email")).unwrap();
+
+        assert_eq!(
+            cat.delete_column_stats_for_collection(2, 1, "users")
+                .unwrap(),
+            2
+        );
+        assert!(cat.load_column_stats(2, 1, "users").unwrap().is_empty());
+        assert_eq!(
+            cat.load_column_stats(2, 1, "users_archive").unwrap().len(),
+            1
+        );
+        assert_eq!(cat.load_column_stats(3, 1, "users").unwrap().len(), 1);
     }
 
     #[test]

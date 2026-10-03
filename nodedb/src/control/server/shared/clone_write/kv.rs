@@ -4,201 +4,86 @@
 
 use std::sync::Arc;
 
-use nodedb_types::{CloneStatus, Lsn, TenantId};
+use nodedb_types::{CloneStatus, TenantId};
 
+use crate::bridge::envelope::Response;
 use crate::control::clone::copyup::{KvCopyUpParams, perform_kv_clone_copyup};
 use crate::control::clone::tombstone::{KvTombstoneParams, perform_kv_clone_tombstone};
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::shared::authorization::authorize_collection;
+use crate::control::server::shared::session::ddl_buffer::buffered_clone_suppressions;
 use crate::control::server::shared::sql::staging_predicates::require_affected_count;
 use crate::control::state::SharedState;
+use crate::types::TxnId;
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
 use nodedb_physical::physical_task::PhysicalTask;
 
-use super::entry::CloneWriteOutcome;
-use super::probes::{dispatch_data_plane_raw, fetch_kv_source_value, probe_kv_key_in_target};
+use super::probes::{
+    ProbeTarget, RawTarget, dispatch_data_plane_raw, fetch_kv_source_value, probe_kv_key_in_target,
+};
 use super::util::{strip_db_prefix, synthetic_affected_response, write_err};
 
-/// Handle KV CoW write interception (FieldSet / Delete).
+/// What the copy-on-write decided for a KV delete on a shadowed clone. Every
+/// key's tombstone is already recorded.
+pub(super) struct KvCloneDelete {
+    /// The delete narrowed to the keys the clone's target holds, which it
+    /// still removes. `None` when the target holds none of them. Boxed: a
+    /// plan dwarfs every other step the enums carrying this hold.
+    pub narrowed: Option<Box<PhysicalPlan>>,
+    /// Source-only keys the tombstones hid. The delete removed these rows
+    /// from the clone's view, and the tombstones report no count of their own.
+    pub source_only_hidden: u64,
+}
+
+/// One KV copy-on-write step.
+pub(super) enum KvCloneStep {
+    /// Dispatch the write as planned.
+    Passthrough,
+    /// A delete on a shadowed clone. The caller's mode removes the target's
+    /// rows.
+    Delete(KvCloneDelete),
+}
+
+/// Handle KV CoW write interception (FieldSet / Delete). Inside transaction
+/// `txn_id` the presence probes read its overlay, and a key the transaction
+/// already tombstoned counts as absent from the source.
 pub(super) async fn intercept_kv_clone_write(
     state: &SharedState,
     task: &PhysicalTask,
     identity: &AuthenticatedIdentity,
     tenant_id: TenantId,
-) -> crate::Result<CloneWriteOutcome> {
-    let (collection_qualified, kv_key, is_delete) = match &task.plan {
+    txn_id: Option<TxnId>,
+) -> crate::Result<KvCloneStep> {
+    let (collection_qualified, kv_key) = match &task.plan {
         PhysicalPlan::Kv(KvOp::FieldSet {
             collection, key, ..
-        }) => (collection.as_str(), key.clone(), false),
+        }) => (collection.as_str(), key.clone()),
         PhysicalPlan::Kv(KvOp::Delete {
             collection,
             keys,
-            rls_write_check,
             returning,
+            rls_write_check,
             rls_filters,
-            // The tombstone path answers a count, not a sync ack. A Lite KV
-            // push that lands here moves its stream mark on its own, after
-            // this returns `Handled`.
-            provenance: _,
+            ..
         }) => {
-            // Delete may have multiple keys; handle each. We serialize here
-            // (one tombstone per key) and return Handled with synthetic OK.
-            let collection_qualified = collection.as_str();
-            let db_id = task.database_id;
-            let coll_name = strip_db_prefix(db_id, collection_qualified);
-
-            let catalog = state.credentials.catalog();
-
-            let desc = catalog
-                .get_collection(db_id, tenant_id.as_u64(), coll_name)
-                .map_err(|e| write_err(format!("clone kv delete: get_collection: {e}")))?;
-            let Some(desc) = desc else {
-                return Ok(CloneWriteOutcome::Passthrough);
-            };
-            let Some(ref origin) = desc.cloned_from else {
-                return Ok(CloneWriteOutcome::Passthrough);
-            };
-            match desc.clone_status {
-                CloneStatus::Materialized => return Ok(CloneWriteOutcome::Passthrough),
-                CloneStatus::Shadowed | CloneStatus::Materializing { .. } => {}
-            }
-            // A row this delete hides only by tombstone lives in the source,
-            // so the clone has no stored pre-image to project for it. The
-            // reply below is a synthesized count, which the RETURNING renderer
-            // cannot decode as rows; refusing beats answering the wrong shape.
-            if returning.is_some() {
-                return Err(crate::Error::BadRequest {
-                    detail: "RETURNING is not supported on a DELETE against a shadowed clone: \
-                             rows hidden by tombstone have no stored pre-image to project. \
-                             Materialize the clone first, or SELECT the rows before deleting."
-                        .to_string(),
-                });
-            }
-
-            let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
-            authorize_collection(
+            return intercept_kv_clone_delete(
+                state,
+                task,
                 identity,
-                origin.source_database,
-                &origin.source_collection,
-                Permission::Read,
-                &state.permissions,
-                &state.roles,
-                &emitter,
-            )?;
-
-            // Split each key into one of two paths:
-            //   • key absent in target (source-only) → record a tombstone
-            //     so future scans hide the source row.
-            //   • key present in target (already copied up or written
-            //     in this clone) → dispatch a real KV Delete to remove
-            //     the target row, then ALSO record a tombstone so any
-            //     surviving source row remains hidden after deletion.
-            //
-            // Tombstoning unconditionally for target-resident keys is
-            // safe: the source row (if any) must always be hidden in
-            // this clone after the user has issued a DELETE.
-            // `source_only_hidden` counts keys the tombstone alone removed
-            // from this clone's view: absent from the target but present in
-            // the source. Those are rows this DELETE removed just as much as
-            // the target-resident ones, and the tombstone write reports no
-            // count of its own, so the source read is what makes the total
-            // honest. A key in neither target nor source removed nothing.
-            let mut keys_to_dispatch: Vec<Vec<u8>> = Vec::new();
-            let mut source_only_hidden = 0u64;
-            let source_db_id = origin.source_database;
-            let source_coll_qualified =
-                crate::control::planner::sql_plan_convert::convert::db_qualified(
-                    source_db_id,
-                    origin.source_collection.as_str(),
-                );
-            for key in keys {
-                let key_str = String::from_utf8_lossy(key).into_owned();
-                let key_in_target = probe_kv_key_in_target(
-                    state,
-                    identity,
+                KvDeleteTarget {
                     tenant_id,
-                    db_id,
-                    collection_qualified,
-                    key,
-                )
-                .await
-                .map_err(|e| write_err(format!("clone kv delete probe: {e}")))?;
-
-                if !key_in_target {
-                    let source_value = fetch_kv_source_value(
-                        state,
-                        identity,
-                        tenant_id,
-                        source_db_id,
-                        &source_coll_qualified,
-                        key,
-                    )
-                    .await
-                    .map_err(|e| write_err(format!("clone kv delete source probe: {e}")))?;
-                    if source_value.is_some() {
-                        source_only_hidden += 1;
-                    }
-                }
-
-                perform_kv_clone_tombstone(KvTombstoneParams {
-                    state,
-                    target_db_id: db_id,
-                    target_collection: coll_name,
-                    kv_key: key_str,
-                })
-                .map_err(|e| write_err(format!("clone kv tombstone: {e}")))?;
-
-                if key_in_target {
-                    keys_to_dispatch.push(key.clone());
-                }
-            }
-
-            if !keys_to_dispatch.is_empty() {
-                // Dispatch a real Delete for keys that exist in target.
-                let delete_plan = PhysicalPlan::Kv(KvOp::Delete {
-                    collection: nodedb_types::QualifiedCollection::from_stored(
-                        collection_qualified.to_string(),
-                    ),
-                    keys: keys_to_dispatch,
-                    // The narrowed delete is the same statement's write, so
-                    // it carries the same compiled predicate: dropping it
-                    // here would launder a governed delete into an
-                    // ungoverned one for exactly the keys that resolve to
-                    // real target rows.
-                    rls_write_check: rls_write_check.clone(),
-                    // Same statement, same projection and read gate.
-                    returning: returning.clone(),
-                    rls_filters: rls_filters.clone(),
-                    provenance: None,
-                });
-                let vshard_id =
-                    nodedb_types::CollectionKey::from_qualified_str(db_id, collection_qualified)?
-                        .vshard();
-                let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, db_id, delete_plan)
-                    .await
-                    .map_err(|e| write_err(format!("clone kv delete dispatch: {e}")))?;
-
-                // Total = keys removed from the target + keys the tombstones
-                // hid in the source. Re-wrap so the client sees one count for
-                // the one statement it issued.
-                let dispatched = require_affected_count(resp.payload.as_ref())
-                    .map_err(|e| write_err(format!("clone kv delete count: {e}")))?;
-                return Ok(CloneWriteOutcome::Handled(synthetic_affected_response(
-                    state.next_request_id(),
-                    resp.watermark_lsn,
-                    dispatched + source_only_hidden,
-                )));
-            }
-
-            let synthetic_resp = synthetic_affected_response(
-                state.next_request_id(),
-                Lsn::new(0),
-                source_only_hidden,
-            );
-            return Ok(CloneWriteOutcome::Handled(synthetic_resp));
+                    collection,
+                    keys,
+                    has_returning: returning.is_some(),
+                    rls_write_check,
+                    rls_filters,
+                    txn_id,
+                },
+            )
+            .await;
         }
-        _ => return Ok(CloneWriteOutcome::Passthrough),
+        _ => return Ok(KvCloneStep::Passthrough),
     };
 
     // FieldSet path: check clone status, copy-up if needed.
@@ -211,14 +96,14 @@ pub(super) async fn intercept_kv_clone_write(
         .get_collection(db_id, tenant_id.as_u64(), coll_name)
         .map_err(|e| write_err(format!("clone kv write: get_collection: {e}")))?;
     let Some(desc) = desc else {
-        return Ok(CloneWriteOutcome::Passthrough);
+        return Ok(KvCloneStep::Passthrough);
     };
 
     let Some(ref origin) = desc.cloned_from else {
-        return Ok(CloneWriteOutcome::Passthrough);
+        return Ok(KvCloneStep::Passthrough);
     };
     match desc.clone_status {
-        CloneStatus::Materialized => return Ok(CloneWriteOutcome::Passthrough),
+        CloneStatus::Materialized => return Ok(KvCloneStep::Passthrough),
         CloneStatus::Shadowed | CloneStatus::Materializing { .. } => {}
     }
 
@@ -233,15 +118,15 @@ pub(super) async fn intercept_kv_clone_write(
         &emitter,
     )?;
 
-    // FieldSet is not a delete.
-    let _ = is_delete;
-
     let key_in_target = probe_kv_key_in_target(
         state,
         identity,
-        tenant_id,
-        db_id,
-        collection_qualified,
+        ProbeTarget {
+            tenant_id,
+            db_id,
+            collection_qualified,
+            txn_id,
+        },
         &kv_key,
     )
     .await
@@ -249,7 +134,19 @@ pub(super) async fn intercept_kv_clone_write(
 
     if key_in_target {
         // Row exists in target — let the normal FieldSet proceed.
-        return Ok(CloneWriteOutcome::Passthrough);
+        return Ok(KvCloneStep::Passthrough);
+    }
+
+    let kv_key_str = String::from_utf8_lossy(&kv_key).into_owned();
+    // A key this transaction already tombstoned is gone from the clone: the
+    // FieldSet finds no row, as the committed tombstone will make it find.
+    let qualified =
+        crate::control::planner::sql_plan_convert::convert::db_qualified(db_id, coll_name);
+    if buffered_clone_suppressions(&qualified)
+        .kv_keys
+        .contains(&kv_key_str)
+    {
+        return Ok(KvCloneStep::Passthrough);
     }
 
     // Fetch source KV row and copy it up to target.
@@ -271,10 +168,8 @@ pub(super) async fn intercept_kv_clone_write(
 
     let Some(source_value) = source_value else {
         // Row absent in source — let normal FieldSet run (no-op or error from DP).
-        return Ok(CloneWriteOutcome::Passthrough);
+        return Ok(KvCloneStep::Passthrough);
     };
-
-    let kv_key_str = String::from_utf8_lossy(&kv_key).into_owned();
 
     perform_kv_clone_copyup(KvCopyUpParams {
         state,
@@ -291,13 +186,221 @@ pub(super) async fn intercept_kv_clone_write(
     // now-superseded source row.  The copy-up wrote the row to the target
     // and the FieldSet will overwrite it; the source copy must be hidden.
     perform_kv_clone_tombstone(KvTombstoneParams {
+        tenant_id,
         state,
         target_db_id: db_id,
         target_collection: coll_name,
         kv_key: kv_key_str,
     })
+    .await
     .map_err(|e| write_err(format!("clone kv tombstone after copyup: {e}")))?;
 
     // Fall through: let the original FieldSet dispatch to the target.
-    Ok(CloneWriteOutcome::Passthrough)
+    Ok(KvCloneStep::Passthrough)
+}
+
+/// The clone collection, keys and write gate a KV delete names.
+struct KvDeleteTarget<'a> {
+    tenant_id: TenantId,
+    collection: &'a nodedb_types::QualifiedCollection,
+    keys: &'a [Vec<u8>],
+    has_returning: bool,
+    rls_write_check: &'a nodedb_types::RlsWriteCheck,
+    rls_filters: &'a [u8],
+    txn_id: Option<TxnId>,
+}
+
+/// Record a tombstone for every key a KV delete on a shadowed clone names,
+/// and sort the keys by where they live.
+async fn intercept_kv_clone_delete(
+    state: &SharedState,
+    task: &PhysicalTask,
+    identity: &AuthenticatedIdentity,
+    target: KvDeleteTarget<'_>,
+) -> crate::Result<KvCloneStep> {
+    let KvDeleteTarget {
+        tenant_id,
+        collection,
+        keys,
+        has_returning,
+        rls_write_check,
+        rls_filters,
+        txn_id,
+    } = target;
+    let collection_qualified = collection.as_str();
+    let db_id = task.database_id;
+    let coll_name = strip_db_prefix(db_id, collection_qualified);
+
+    let catalog = state.credentials.catalog();
+
+    let desc = catalog
+        .get_collection(db_id, tenant_id.as_u64(), coll_name)
+        .map_err(|e| write_err(format!("clone kv delete: get_collection: {e}")))?;
+    let Some(desc) = desc else {
+        return Ok(KvCloneStep::Passthrough);
+    };
+    let Some(ref origin) = desc.cloned_from else {
+        return Ok(KvCloneStep::Passthrough);
+    };
+    match desc.clone_status {
+        CloneStatus::Materialized => return Ok(KvCloneStep::Passthrough),
+        CloneStatus::Shadowed | CloneStatus::Materializing { .. } => {}
+    }
+    // A row this delete hides only by tombstone lives in the source, so the
+    // clone has no stored pre-image to project for it. The reply is a
+    // synthesized count, which the RETURNING renderer cannot decode as rows;
+    // refusing beats answering the wrong shape.
+    if has_returning {
+        return Err(crate::Error::BadRequest {
+            detail: "RETURNING is not supported on a DELETE against a shadowed clone: \
+                     rows hidden by tombstone have no stored pre-image to project. \
+                     Materialize the clone first, or SELECT the rows before deleting."
+                .to_string(),
+        });
+    }
+
+    let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
+    authorize_collection(
+        identity,
+        origin.source_database,
+        &origin.source_collection,
+        Permission::Read,
+        &state.permissions,
+        &state.roles,
+        &emitter,
+    )?;
+
+    // Split each key into one of two paths:
+    //   • key absent in target (source-only) → record a tombstone so future
+    //     scans hide the source row.
+    //   • key present in target (already copied up or written in this clone)
+    //     → the target row is removed, and a tombstone is ALSO recorded so any
+    //     surviving source row remains hidden after deletion.
+    //
+    // Tombstoning unconditionally for target-resident keys is safe: the
+    // source row (if any) must always be hidden in this clone after the user
+    // has issued a DELETE. `source_only_hidden` counts keys the tombstone
+    // alone removed from this clone's view: absent from the target but present
+    // in the source, and not already tombstoned by this transaction. A key in
+    // neither target nor source removed nothing.
+    let mut keys_in_target: Vec<Vec<u8>> = Vec::new();
+    let mut source_only_hidden = 0u64;
+    let source_db_id = origin.source_database;
+    let source_coll_qualified = crate::control::planner::sql_plan_convert::convert::db_qualified(
+        source_db_id,
+        origin.source_collection.as_str(),
+    );
+    let qualified =
+        crate::control::planner::sql_plan_convert::convert::db_qualified(db_id, coll_name);
+    let already_hidden = buffered_clone_suppressions(&qualified).kv_keys;
+    for key in keys {
+        let key_str = String::from_utf8_lossy(key).into_owned();
+        let key_in_target = probe_kv_key_in_target(
+            state,
+            identity,
+            ProbeTarget {
+                tenant_id,
+                db_id,
+                collection_qualified,
+                txn_id,
+            },
+            key,
+        )
+        .await
+        .map_err(|e| write_err(format!("clone kv delete probe: {e}")))?;
+
+        if !key_in_target && !already_hidden.contains(&key_str) {
+            let source_value = fetch_kv_source_value(
+                state,
+                identity,
+                tenant_id,
+                source_db_id,
+                &source_coll_qualified,
+                key,
+            )
+            .await
+            .map_err(|e| write_err(format!("clone kv delete source probe: {e}")))?;
+            if source_value.is_some() {
+                source_only_hidden += 1;
+            }
+        }
+
+        perform_kv_clone_tombstone(KvTombstoneParams {
+            tenant_id,
+            state,
+            target_db_id: db_id,
+            target_collection: coll_name,
+            kv_key: key_str,
+        })
+        .await
+        .map_err(|e| write_err(format!("clone kv tombstone: {e}")))?;
+
+        if key_in_target {
+            keys_in_target.push(key.clone());
+        }
+    }
+
+    let narrowed = (!keys_in_target.is_empty()).then(|| {
+        Box::new(PhysicalPlan::Kv(KvOp::Delete {
+            collection: collection.clone(),
+            keys: keys_in_target,
+            // The narrowed delete is the same statement's write, so it carries
+            // the same compiled predicate: dropping it here will launder a
+            // governed delete into an ungoverned one for exactly the keys that
+            // resolve to real target rows.
+            rls_write_check: rls_write_check.clone(),
+            // `has_returning` refused a projection above.
+            returning: None,
+            rls_filters: rls_filters.to_vec(),
+            // The narrowed delete answers a count, not a sync ack.
+            provenance: None,
+        }))
+    });
+    Ok(KvCloneStep::Delete(KvCloneDelete {
+        narrowed,
+        source_only_hidden,
+    }))
+}
+
+/// Outside a transaction: remove the target's rows of `delete` at once and
+/// answer the statement's whole count.
+pub(super) async fn apply_kv_clone_delete(
+    state: &SharedState,
+    task: &PhysicalTask,
+    delete: KvCloneDelete,
+) -> crate::Result<Response> {
+    let KvCloneDelete {
+        narrowed,
+        source_only_hidden,
+    } = delete;
+    let Some(narrowed) = narrowed else {
+        return Ok(synthetic_affected_response(
+            state.next_request_id(),
+            crate::types::Lsn::new(0),
+            source_only_hidden,
+        ));
+    };
+    let resp = dispatch_data_plane_raw(
+        state,
+        RawTarget {
+            tenant_id: task.tenant_id,
+            vshard_id: task.vshard_id,
+            database_id: task.database_id,
+            txn_id: None,
+        },
+        *narrowed,
+    )
+    .await
+    .map_err(|e| write_err(format!("clone kv delete dispatch: {e}")))?;
+
+    // Total = keys removed from the target + keys the tombstones hid in the
+    // source. Re-wrap so the client sees one count for the one statement it
+    // issued.
+    let dispatched = require_affected_count(resp.payload.as_ref())
+        .map_err(|e| write_err(format!("clone kv delete count: {e}")))?;
+    Ok(synthetic_affected_response(
+        state.next_request_id(),
+        resp.watermark_lsn,
+        dispatched + source_only_hidden,
+    ))
 }

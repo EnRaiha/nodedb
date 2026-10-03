@@ -60,6 +60,30 @@ impl EdgeStore {
         Ok(out)
     }
 
+    /// The surrogate `node` is durably bound to, `None` when it has no
+    /// binding.
+    pub fn node_surrogate(
+        &self,
+        db: DatabaseId,
+        tid: TenantId,
+        node: &str,
+    ) -> crate::Result<Option<u32>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| redb_err("begin_read", e))?;
+        let table = match read_txn.open_table(NODE_SURROGATES) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(redb_err("open node_surrogates", e)),
+        };
+        Ok(table
+            .get((db.as_u64(), tid.as_u64(), node))
+            .map_err(|e| redb_err("read node surrogate", e))?
+            .map(|value| value.value())
+            .filter(|raw| *raw != 0))
+    }
+
     /// Drop a node's identity binding.
     ///
     /// Called when the node itself goes away. Leaving the row behind would

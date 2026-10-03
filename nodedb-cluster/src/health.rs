@@ -16,11 +16,10 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::catalog::ClusterCatalog;
+use crate::error::ClusterError;
 use crate::loop_metrics::LoopMetrics;
-use crate::rpc_codec::{
-    JoinNodeInfo, PingRequest, PongResponse, RaftRpc, TopologyAck, TopologyUpdate,
-};
-use crate::topology::{ClusterTopology, NodeState};
+use crate::rpc_codec::{PingRequest, PongResponse, RaftRpc, TopologyAck, TopologyUpdate};
+use crate::topology::{ClusterTopology, NodeInfo, NodeState};
 use crate::transport::NexarTransport;
 
 /// Default ping interval.
@@ -143,8 +142,10 @@ impl HealthMonitor {
                 sender_id: self.node_id,
                 topology_version: topo_version,
             });
+            // The ping is the peer's recovery probe. An open circuit still
+            // lets it through, and its answer closes the circuit.
             handles.push(tokio::spawn(async move {
-                let result = transport.send_rpc(peer_id, ping).await;
+                let result = transport.send_probe_rpc(peer_id, ping).await;
                 (peer_id, addr, result)
             }));
         }
@@ -156,17 +157,14 @@ impl HealthMonitor {
                 Err(_) => continue, // JoinError — task panicked, skip.
             };
 
-            match result {
-                Ok(RaftRpc::Pong(pong)) => {
+            match classify_ping(result) {
+                PingOutcome::Pong(pong) => {
                     topology_changed |= self.handle_pong(peer_id, &pong);
                 }
-                Ok(_) => {
-                    // Unexpected response type — count as failure.
+                PingOutcome::Failed => {
                     topology_changed |= self.record_ping_failure(peer_id);
                 }
-                Err(_) => {
-                    topology_changed |= self.record_ping_failure(peer_id);
-                }
+                PingOutcome::NotSent => {}
             }
         }
 
@@ -267,6 +265,26 @@ impl HealthMonitor {
     }
 }
 
+/// What one ping says about the peer.
+#[derive(Debug)]
+enum PingOutcome {
+    /// The peer answered.
+    Pong(PongResponse),
+    /// The ping failed, or the peer answered with something else.
+    Failed,
+    /// This node's circuit breaker refused the ping before it left. That
+    /// says nothing about the peer, so it is not a ping failure.
+    NotSent,
+}
+
+fn classify_ping(result: crate::error::Result<RaftRpc>) -> PingOutcome {
+    match result {
+        Ok(RaftRpc::Pong(pong)) => PingOutcome::Pong(pong),
+        Err(ClusterError::CircuitOpen { .. }) => PingOutcome::NotSent,
+        Ok(_) | Err(_) => PingOutcome::Failed,
+    }
+}
+
 /// Broadcast the current topology to every active peer (fire-and-forget).
 ///
 /// Shared by [`HealthMonitor`] and the cluster-join path
@@ -282,18 +300,7 @@ pub fn broadcast_topology(
         let topo = topology.read().unwrap_or_else(|p| p.into_inner());
         let update = RaftRpc::TopologyUpdate(TopologyUpdate {
             version: topo.version(),
-            nodes: topo
-                .all_nodes()
-                .map(|n| JoinNodeInfo {
-                    node_id: n.node_id,
-                    addr: n.addr.clone(),
-                    state: n.state.as_u8(),
-                    raft_groups: n.raft_groups.clone(),
-                    wire_version: n.wire_version,
-                    spiffe_id: n.spiffe_id.clone(),
-                    spki_pin: n.spki_pin.map(|arr| arr.to_vec()),
-                })
-                .collect(),
+            nodes: topo.all_nodes().map(NodeInfo::to_wire).collect(),
         });
         let peers: Vec<u64> = topo
             .active_nodes()
@@ -326,18 +333,7 @@ async fn broadcast_topology_to_peer(
         let topo = topology.read().unwrap_or_else(|p| p.into_inner());
         RaftRpc::TopologyUpdate(TopologyUpdate {
             version: topo.version(),
-            nodes: topo
-                .all_nodes()
-                .map(|n| JoinNodeInfo {
-                    node_id: n.node_id,
-                    addr: n.addr.clone(),
-                    state: n.state.as_u8(),
-                    raft_groups: n.raft_groups.clone(),
-                    wire_version: n.wire_version,
-                    spiffe_id: n.spiffe_id.clone(),
-                    spki_pin: n.spki_pin.map(|arr| arr.to_vec()),
-                })
-                .collect(),
+            nodes: topo.all_nodes().map(NodeInfo::to_wire).collect(),
         })
     };
     if let Err(e) = transport.send_rpc(peer_id, update).await {
@@ -364,34 +360,22 @@ pub fn handle_topology_update(
     let mut topo = topology.write().unwrap_or_else(|p| p.into_inner());
 
     let updated = if update.version > topo.version() {
-        // Adopt the newer topology.
+        // This node is the authority on its own SWIM address. A pushed
+        // topology that carries a stale one for this node is corrected below.
+        let own_swim = topo.get_node(node_id).and_then(|n| n.swim_addr.clone());
         let mut new_topo = ClusterTopology::new();
         for node in &update.nodes {
-            let state = crate::topology::NodeState::from_u8(node.state)
-                .unwrap_or(crate::topology::NodeState::Active);
-            let spki_pin: Option<[u8; 32]> = node.spki_pin.as_deref().and_then(|b| {
-                if b.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(b);
-                    Some(arr)
-                } else {
-                    None
-                }
-            });
-            let mut info = crate::topology::NodeInfo::new(
-                node.node_id,
-                node.addr.parse().unwrap_or_else(|_| {
-                    "0.0.0.0:0"
-                        .parse()
-                        .expect("invariant: \"0.0.0.0:0\" is a valid SocketAddr literal")
-                }),
-                state,
-            )
-            .with_wire_version(node.wire_version)
-            .with_spiffe_id(node.spiffe_id.clone())
-            .with_spki_pin(spki_pin);
-            info.raft_groups = node.raft_groups.clone();
-            new_topo.add_node(info);
+            new_topo.add_node(NodeInfo::from_wire(node));
+        }
+        new_topo.adopt_version(update.version);
+        if own_swim.is_some()
+            && let Some(mut own) = new_topo.get_node(node_id).cloned()
+            && own.swim_addr != own_swim
+        {
+            own.swim_addr = own_swim;
+            // Bumps the version past the sender's, so the correction spreads
+            // through the next health round.
+            new_topo.add_node(own);
         }
         *topo = new_topo;
         true
@@ -410,7 +394,7 @@ pub fn handle_topology_update(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::topology::NodeInfo;
+    use crate::rpc_codec::JoinNodeInfo;
 
     #[test]
     fn handle_ping_returns_pong() {
@@ -443,6 +427,7 @@ mod tests {
                     wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
                     spiffe_id: None,
                     spki_pin: None,
+                    swim_addr: None,
                 },
                 JoinNodeInfo {
                     node_id: 2,
@@ -452,6 +437,7 @@ mod tests {
                     wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
                     spiffe_id: None,
                     spki_pin: None,
+                    swim_addr: None,
                 },
             ],
         };
@@ -461,6 +447,11 @@ mod tests {
 
         let t = topo.read().unwrap();
         assert_eq!(t.node_count(), 2);
+        assert_eq!(
+            t.version(),
+            3,
+            "the adopted topology keeps the sender's version"
+        );
 
         match ack {
             RaftRpc::TopologyAck(a) => assert_eq!(a.accepted_version, t.version()),
@@ -582,5 +573,58 @@ mod tests {
 
         let t = topo.read().unwrap();
         assert_eq!(t.get_node(2).unwrap().state, NodeState::Active);
+    }
+
+    #[test]
+    fn an_open_circuit_is_not_a_ping_failure() {
+        let refused = Err(ClusterError::CircuitOpen {
+            node_id: 2,
+            failures: 5,
+        });
+        assert!(matches!(classify_ping(refused), PingOutcome::NotSent));
+    }
+
+    #[test]
+    fn a_link_failure_or_a_wrong_reply_is_a_ping_failure() {
+        let lost = Err(ClusterError::Transport {
+            detail: "connection lost".into(),
+        });
+        assert!(matches!(classify_ping(lost), PingOutcome::Failed));
+        let wrong = Ok(RaftRpc::TopologyAck(TopologyAck {
+            responder_id: 2,
+            accepted_version: 1,
+        }));
+        assert!(matches!(classify_ping(wrong), PingOutcome::Failed));
+        let pong = Ok(RaftRpc::Pong(PongResponse {
+            responder_id: 2,
+            topology_version: 1,
+        }));
+        assert!(matches!(classify_ping(pong), PingOutcome::Pong(_)));
+    }
+
+    /// A pushed topology carrying a stale SWIM address for this node keeps
+    /// this node's own address and ends up newer than the push.
+    #[test]
+    fn topology_update_keeps_this_nodes_swim_address() {
+        let topo = RwLock::new(ClusterTopology::new());
+        topo.write().unwrap().add_node(
+            NodeInfo::new(1, "10.0.0.1:9400".parse().unwrap(), NodeState::Active)
+                .with_swim_addr("10.0.0.1:9501".parse().ok()),
+        );
+        let stale = NodeInfo::new(1, "10.0.0.1:9400".parse().unwrap(), NodeState::Active)
+            .with_swim_addr("10.0.0.1:9401".parse().ok());
+        let update = TopologyUpdate {
+            version: 5,
+            nodes: vec![stale.to_wire()],
+        };
+
+        let (updated, _) = handle_topology_update(1, &topo, &update);
+        assert!(updated);
+        let t = topo.read().unwrap();
+        assert_eq!(
+            t.get_node(1).and_then(NodeInfo::swim_socket_addr),
+            "10.0.0.1:9501".parse().ok()
+        );
+        assert!(t.version() > 5);
     }
 }

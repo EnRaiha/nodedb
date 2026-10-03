@@ -175,10 +175,14 @@ mod tests {
             ],
             leader_commit: 98,
             group_id: 7,
+            round: 11,
+            replicated_floor: 7,
         };
         match roundtrip(RaftRpc::AppendEntriesRequest(req)) {
             RaftRpc::AppendEntriesRequest(d) => {
                 assert_eq!(d.term, 5);
+                assert_eq!(d.round, 11);
+                assert_eq!(d.replicated_floor, 7);
                 assert_eq!(d.entries.len(), 2);
                 assert_eq!(d.entries[0].data, b"put x=1");
             }
@@ -196,6 +200,8 @@ mod tests {
             entries: vec![],
             leader_commit: 8,
             group_id: 0,
+            round: 2,
+            replicated_floor: 0,
         };
         match roundtrip(RaftRpc::AppendEntriesRequest(req)) {
             RaftRpc::AppendEntriesRequest(d) => {
@@ -212,11 +218,15 @@ mod tests {
             term: 5,
             success: true,
             last_log_index: 100,
+            round: 11,
+            needs_snapshot: true,
         };
         match roundtrip(RaftRpc::AppendEntriesResponse(resp)) {
             RaftRpc::AppendEntriesResponse(d) => {
                 assert_eq!(d.term, 5);
+                assert_eq!(d.round, 11);
                 assert!(d.success);
+                assert!(d.needs_snapshot);
             }
             other => panic!("expected AppendEntriesResponse, got {other:?}"),
         }
@@ -230,10 +240,12 @@ mod tests {
             last_log_index: 200,
             last_log_term: 9,
             group_id: 42,
+            transfer: true,
         };
         match roundtrip(RaftRpc::RequestVoteRequest(req)) {
             RaftRpc::RequestVoteRequest(d) => {
                 assert_eq!(d.term, 10);
+                assert!(d.transfer);
                 assert_eq!(d.group_id, 42);
             }
             other => panic!("expected RequestVoteRequest, got {other:?}"),
@@ -306,6 +318,8 @@ mod tests {
             done: false,
             group_id: 3,
             total_size: 0,
+            voters: Vec::new(),
+            learners: Vec::new(),
         };
         match roundtrip(RaftRpc::InstallSnapshotRequest(req)) {
             RaftRpc::InstallSnapshotRequest(d) => {
@@ -329,10 +343,14 @@ mod tests {
             done: true,
             group_id: 3,
             total_size: 0,
+            voters: vec![1, 2],
+            learners: vec![4],
         };
         match roundtrip(RaftRpc::InstallSnapshotRequest(req)) {
             RaftRpc::InstallSnapshotRequest(d) => {
                 assert!(d.done);
+                assert_eq!(d.voters, vec![1, 2]);
+                assert_eq!(d.learners, vec![4]);
                 assert_eq!(d.offset, 4096);
             }
             other => panic!("expected InstallSnapshotRequest, got {other:?}"),
@@ -378,6 +396,8 @@ mod tests {
             done: false,
             group_id: 0,
             total_size: 0,
+            voters: Vec::new(),
+            learners: Vec::new(),
         };
         match roundtrip(RaftRpc::InstallSnapshotRequest(req)) {
             RaftRpc::InstallSnapshotRequest(d) => {

@@ -46,6 +46,7 @@ pub(in crate::data::executor) fn atomic_error_code(
         // Nothing was written: the engine consults the gate before it
         // installs the computed value.
         AtomicError::Rejected(error) => (*error).into(),
+        AtomicError::Unbound(error) => error.into(),
     }
 }
 
@@ -470,16 +471,18 @@ mod tests {
     }
 
     fn seed(core: &mut CoreLoop, key: &[u8], value: &[u8]) {
-        core.kv_engine.put(crate::engine::kv::KvPutParams {
-            database_id: did(),
-            tenant_id: TID,
-            collection: COLLECTION,
-            key,
-            value,
-            ttl_ms: 0,
-            now_ms: crate::engine::kv::current_ms(),
-            surrogate: Surrogate::new(1),
-        });
+        core.kv_engine
+            .put(crate::engine::kv::KvPutParams {
+                database_id: did(),
+                tenant_id: TID,
+                collection: COLLECTION,
+                key,
+                value,
+                ttl_ms: 0,
+                now_ms: crate::engine::kv::current_ms(),
+                surrogate: Surrogate::new(1),
+            })
+            .expect("a bound row writes");
     }
 
     fn stored(core: &CoreLoop, key: &[u8]) -> Vec<u8> {

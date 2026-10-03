@@ -18,13 +18,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::control::state::SharedState;
 use crate::event::action::ActionRetryQueue;
 use crate::event::consumer_helpers::{flush_watermark, maybe_flush_watermark, record_event};
 use crate::event::metrics::CoreMetrics;
 use crate::event::trigger::dlq::TriggerDlq;
+use crate::event::trigger::lane::DeliveredEvents;
 use crate::types::Lsn;
 use crate::wal::WalManager;
 
@@ -58,6 +59,15 @@ fn last_wal_lsn(wal: &WalManager) -> Lsn {
     Lsn::new(wal.next_lsn().as_u64().saturating_sub(1))
 }
 
+/// How far this consumer delivered its core's events, for a Raft group
+/// snapshot that waits for the events its cut covers.
+fn delivered_events(shared_state: &SharedState) -> Option<&DeliveredEvents> {
+    shared_state
+        .sink_ledgers
+        .get()
+        .map(|ledgers| &ledgers.actions.delivered)
+}
+
 /// Every record at or below this LSN has its final outcome. Records the cores
 /// replayed at boot are final, whatever the live outcome floor says.
 fn final_outcome_bound(shared_state: &SharedState, boot_end: Lsn) -> Lsn {
@@ -83,6 +93,17 @@ pub(super) async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetri
     let emit_progress = rx.progress();
     let mut retry_queue = ActionRetryQueue::for_core(&shared_state.data_dir, core_id);
     let mut last_retry_poll = tokio::time::Instant::now();
+
+    // A crash between a by-name timeseries install and its outcome write
+    // leaves no landed row, and boot replay installs the record again and
+    // writes the outcome. WAL catch-up rebuilds that record's events from the
+    // outcome, so it runs once every core replayed and every data group
+    // recovered. Only catch-up waits: the consumer drains its ring and runs
+    // the permission step from the start, so no boot step that waits on
+    // either can stall behind it.
+    let mut boot_replayed = false;
+    let outcome_dir =
+        crate::engine::timeseries::install_outcome::outcome_dir(&shared_state.data_dir, core_id);
 
     let persisted = match watermark_store.load(core_id) {
         Ok(lsn) => {
@@ -117,12 +138,23 @@ pub(super) async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetri
             debug!(core_id, "event plane consumer shutting down");
             break;
         }
+        serve_retry_store_captures(&shared_state, core_id, &retry_queue);
 
         let mut replayed = 0u64;
-        if let Some(active) = recovery.as_mut() {
+        boot_replayed = boot_replayed
+            || shared_state.startup.current_phase()
+                >= crate::control::startup::StartupPhase::DataGroupsReplay;
+        if boot_replayed && let Some(active) = recovery.as_mut() {
             let final_bound = final_outcome_bound(&shared_state, boot_end);
             if let Some((from, upto)) = active.next_range(final_bound) {
-                match super::replay::replay_range(&wal, from, upto, core_id, num_cores) {
+                match super::replay::replay_range(
+                    &wal,
+                    from,
+                    upto,
+                    core_id,
+                    num_cores,
+                    &outcome_dir,
+                ) {
                     Ok(events) => {
                         wal_retry_count = 0;
                         for event in &events {
@@ -133,7 +165,6 @@ pub(super) async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetri
                             &events,
                             &mut guard,
                             &shared_state,
-                            &mut retry_queue,
                             &cdc_router,
                         )
                         .await;
@@ -191,6 +222,9 @@ pub(super) async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetri
             }
             if active.is_done() {
                 recovery = None;
+                if let Some(delivered) = delivered_events(&shared_state) {
+                    delivered.note_caught_up(core_id);
+                }
                 debug!(core_id, "WAL catchup complete");
             }
         }
@@ -200,8 +234,15 @@ pub(super) async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetri
         let final_bound = final_outcome_bound(&shared_state, boot_end);
         cursor.take_snapshot(final_bound, emit_progress.emitted());
         let emitted_before = emit_progress.emitted();
+        let taken_before = cursor.last_sequence();
         let drained = cursor.drain(&mut rx, &metrics, core_id, emitted_before);
         let batch_count = drained.events.len();
+        // A dropped event is owed before any later number counts as taken.
+        if drained.dropped
+            && let Some(delivered) = delivered_events(&shared_state)
+        {
+            delivered.note_dropped(core_id, taken_before.saturating_add(1));
+        }
 
         crate::control::security::permission_tree::event_handler::apply_ring_events(
             core_id,
@@ -227,12 +268,15 @@ pub(super) async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetri
                 &drained.events,
                 &mut guard,
                 &shared_state,
-                &mut retry_queue,
                 &cdc_router,
             )
             .await;
             slab_account.release_pinned(batch_payload_bytes);
             trace!(core_id, batch_count, "event batch processed");
+        }
+        // Every event taken is held now, and a tail drop's numbers are owed.
+        if let Some(delivered) = delivered_events(&shared_state) {
+            delivered.note_taken(core_id, cursor.last_sequence());
         }
 
         if drained.dropped {
@@ -325,6 +369,23 @@ pub(super) async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetri
     );
 }
 
+/// Answer every retry store capture parked for this core. The image is read
+/// between two passes of this task, the store's only writer, so no enqueue or
+/// completion is half-applied in it.
+fn serve_retry_store_captures(
+    shared_state: &SharedState,
+    core_id: usize,
+    retry_queue: &ActionRetryQueue,
+) {
+    let Some(inbox) = shared_state.action_requeue.get() else {
+        return;
+    };
+    for reply in inbox.retry_captures().take_for_core(core_id) {
+        // A requester that timed out has gone; nothing waits on this answer.
+        let _ = reply.send(retry_queue.store_image());
+    }
+}
+
 /// Process the retry queue: DLQ exhausted entries and retry ready ones.
 async fn process_retry_queue(
     retry_queue: &mut ActionRetryQueue,
@@ -344,7 +405,21 @@ async fn process_retry_queue(
     if !exhausted.is_empty() {
         let mut dlq = trigger_dlq.lock().unwrap_or_else(|p| p.into_inner());
         for action in exhausted {
-            let _ = dlq.enqueue(action);
+            match dlq.enqueue(action.clone()) {
+                Ok(_) => retry_queue.complete(&action.key),
+                Err(e) => {
+                    // The action stays in the retry queue and its durable
+                    // set, and the next due drain offers it to the DLQ again.
+                    error!(
+                        core_id,
+                        owner = %action.owner(),
+                        collection = %action.context.collection,
+                        error = %e,
+                        "trigger DLQ refused an exhausted action; keeping it in the retry queue"
+                    );
+                    retry_queue.hold_exhausted(action);
+                }
+            }
         }
         // dlq MutexGuard dropped before any await.
     }
@@ -412,6 +487,7 @@ mod tests {
             owner: "admin".into(),
             created_at: 0,
             subscriber_roles: Vec::new(),
+            modification_hlc: nodedb_types::Hlc::ZERO,
         });
         shared.mv_registry.register(StreamingMvDef {
             database_id: DatabaseId::DEFAULT,
@@ -486,6 +562,7 @@ mod tests {
             valid_time_ms: None,
             user_id: None,
             statement_digest: None,
+            commit_hlc: Some(crate::event::test_utils::test_commit_hlc()),
         }
     }
 
@@ -664,9 +741,12 @@ mod tests {
         }
     }
 
-    /// Log and emit writes `range`, as the write path does.
+    /// Log and emit writes `range`, as the write path does: the WAL record and
+    /// the ring event carry the write's one commit HLC, so an event WAL replay
+    /// or catch-up rebuilds dates and routes as the live event does.
     fn write(node: &mut Node, range: std::ops::RangeInclusive<u64>) {
         for i in range {
+            let commit_hlc = crate::event::test_utils::test_commit_hlc();
             let window = node.shared.outcome_floor.open_write();
             let provenance: Option<SyncProvenance> = None;
             let payload = zerompk::to_msgpack_vec(&(
@@ -681,6 +761,7 @@ mod tests {
                 .wal
                 .appender(NO_APPLY_KEY)
                 .with_event_source(crate::event::EventSource::User)
+                .with_commit_hlc(commit_hlc)
                 .append_put(
                     TenantId::new(TENANT),
                     VShardId::new(0),
@@ -691,7 +772,9 @@ mod tests {
             node.wal.sync().expect("wal sync");
             window.note_minted(lsn);
             window.settle();
-            node.producers[0].emit(ring_event(i, i, lsn));
+            let mut event = ring_event(i, i, lsn);
+            event.commit_hlc = Some(commit_hlc);
+            node.producers[0].emit(event);
         }
     }
 

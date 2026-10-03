@@ -2,10 +2,8 @@
 
 //! SQL parsing helpers for `CREATE CONTINUOUS AGGREGATE`.
 //!
-//! Ported from the pgwire `ddl::continuous_agg::parse` helpers. The parsing
-//! logic, keyword tables, auto-alias derivation, and SQLSTATE codes are
-//! preserved verbatim; only the error type changed from pgwire
-//! `PgWireError` (via `sqlstate_error`) to the protocol-neutral [`DdlError`].
+//! The parsing logic, keyword tables, auto-alias derivation, and SQLSTATE
+//! codes live here. Errors are the protocol-neutral [`DdlError`].
 
 use nodedb_sql::parser::preprocess::lex::{
     find_ascii_case_insensitive, find_ascii_case_insensitive_from, rfind_ascii_case_insensitive,

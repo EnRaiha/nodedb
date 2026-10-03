@@ -140,50 +140,36 @@ impl CoreLoop {
             return self.response_error(task, e);
         }
 
+        // Both rows are bound before either is written, so a transfer cannot
+        // half-apply.
+        for surrogate in [debit_surrogate, credit_surrogate] {
+            if let Err(e) = crate::engine::kv::UnboundKvWrite::check(collection, surrogate) {
+                return self.response_error(task, e);
+            }
+        }
+
         // Step 4: Write both atomically (deterministic order for consistency).
         // Write lower key first to match the documented lock ordering.
-        if source_key <= dest_key {
-            self.kv_engine.put(crate::engine::kv::KvPutParams {
-                database_id: did,
-                tenant_id: tid,
-                collection,
-                key: source_key,
-                value: &new_source,
-                ttl_ms: 0,
-                now_ms,
-                surrogate: debit_surrogate,
-            });
-            self.kv_engine.put(crate::engine::kv::KvPutParams {
-                database_id: did,
-                tenant_id: tid,
-                collection,
-                key: dest_key,
-                value: &new_dest,
-                ttl_ms: 0,
-                now_ms,
-                surrogate: credit_surrogate,
-            });
+        let debit = (source_key, new_source.as_slice(), debit_surrogate);
+        let credit = (dest_key, new_dest.as_slice(), credit_surrogate);
+        let ordered = if source_key <= dest_key {
+            [debit, credit]
         } else {
-            self.kv_engine.put(crate::engine::kv::KvPutParams {
+            [credit, debit]
+        };
+        for (key, value, surrogate) in ordered {
+            if let Err(e) = self.kv_engine.put(crate::engine::kv::KvPutParams {
                 database_id: did,
                 tenant_id: tid,
                 collection,
-                key: dest_key,
-                value: &new_dest,
+                key,
+                value,
                 ttl_ms: 0,
                 now_ms,
-                surrogate: credit_surrogate,
-            });
-            self.kv_engine.put(crate::engine::kv::KvPutParams {
-                database_id: did,
-                tenant_id: tid,
-                collection,
-                key: source_key,
-                value: &new_source,
-                ttl_ms: 0,
-                now_ms,
-                surrogate: debit_surrogate,
-            });
+                surrogate,
+            }) {
+                return self.response_error(task, e);
+            }
         }
 
         if let Some(ref m) = self.metrics {
@@ -289,10 +275,16 @@ impl CoreLoop {
             return self.response_error(task, e);
         }
 
+        // The moved row is bound before the source row is deleted, so a move
+        // cannot delete and then fail to insert.
+        if let Err(e) = crate::engine::kv::UnboundKvWrite::check(dest_collection, surrogate) {
+            return self.response_error(task, e);
+        }
+
         // Step 2: Delete from source, insert at dest — atomic (single core).
         self.kv_engine
             .delete(did, tid, source_collection, &[item_key.to_vec()], now_ms);
-        self.kv_engine.put(crate::engine::kv::KvPutParams {
+        if let Err(e) = self.kv_engine.put(crate::engine::kv::KvPutParams {
             database_id: did,
             tenant_id: tid,
             collection: dest_collection,
@@ -301,7 +293,9 @@ impl CoreLoop {
             ttl_ms: 0,
             now_ms,
             surrogate,
-        });
+        }) {
+            return self.response_error(task, e);
+        }
 
         if let Some(ref m) = self.metrics {
             m.record_kv_delete();

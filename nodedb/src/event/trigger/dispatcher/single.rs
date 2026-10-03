@@ -46,7 +46,7 @@ pub async fn dispatch_triggers(
     queue: &mut ActionRetryQueue,
 ) {
     let mode_filter = match event.source {
-        EventSource::User => Some(TriggerExecutionMode::Async),
+        EventSource::User | EventSource::ImplicitClient => Some(TriggerExecutionMode::Async),
         EventSource::Deferred => Some(TriggerExecutionMode::Deferred),
         EventSource::Trigger
         | EventSource::RaftFollower
@@ -152,8 +152,15 @@ pub async fn dispatch_triggers(
         event: dml_event,
         cascade_depth: 0,
         mode_filter,
+        cross_shard_origin: Some(CrossShardOrigin {
+            source_lsn: event.lsn.as_u64(),
+            source_sequence: event.sequence,
+            source_vshard: event.vshard_id.as_u32(),
+            source_collection: event.collection.to_string(),
+        }),
         on_error: FireErrorPolicy::Continue,
         only_trigger: None,
+        joined: None,
     })
     .await;
     record_statement_failures(&source, report, queue);
@@ -271,6 +278,7 @@ pub(super) async fn fire_for_operation(params: FireForOperationParams<'_>) -> Fi
                     cross_shard_origin,
                     on_error,
                     only_trigger,
+                    joined: None,
                 })
                 .await
             }
@@ -291,6 +299,7 @@ pub(super) async fn fire_for_operation(params: FireForOperationParams<'_>) -> Fi
                     cross_shard_origin,
                     on_error,
                     only_trigger,
+                    joined: None,
                 })
                 .await
             }
@@ -310,6 +319,7 @@ pub(super) async fn fire_for_operation(params: FireForOperationParams<'_>) -> Fi
                     cross_shard_origin,
                     on_error,
                     only_trigger,
+                    joined: None,
                 })
                 .await
             }

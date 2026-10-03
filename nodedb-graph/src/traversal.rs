@@ -44,8 +44,13 @@ impl CsrIndex {
         }
     }
 
-    /// Durable-only BFS over the dense u32 CSR ids. Behavior and performance
-    /// are identical to the pre-overlay traversal.
+    /// Durable-only BFS over the dense u32 CSR ids.
+    ///
+    /// The walk runs level by level. Each level's new nodes are admitted in
+    /// node-name order until `max_visited` nodes are visited, so a capped walk
+    /// admits the same nodes however the edges are stored. A cluster
+    /// coordinator walking the same edges across partitions admits the same
+    /// nodes.
     fn traverse_bfs_dense(&self, params: BfsParams<'_>) -> Vec<String> {
         let BfsParams {
             start_nodes,
@@ -55,60 +60,75 @@ impl CsrIndex {
             max_visited,
             frontier_bitmap,
         } = params;
-        let label_id = label_filter.and_then(|l| self.label_id(l));
+        let labels = self.label_filter(label_filter);
+        let in_bitmap = |id: u32| {
+            frontier_bitmap.is_none_or(|bm| {
+                bm.contains(nodedb_types::Surrogate::new(self.node_surrogate_raw(id)))
+            })
+        };
         let mut visited: HashSet<u32> = HashSet::new();
-        let mut queue: VecDeque<(u32, usize)> = VecDeque::new();
-
+        let mut frontier: Vec<u32> = Vec::new();
         for &node in start_nodes {
             if let Some(&id) = self.node_to_id.get(node)
                 && visited.insert(id)
             {
-                queue.push_back((id, 0));
+                frontier.push(id);
             }
         }
 
-        while let Some((node_id, depth)) = queue.pop_front() {
-            if depth >= max_depth || visited.len() >= max_visited {
-                continue;
+        for _depth in 0..max_depth {
+            if frontier.is_empty() || visited.len() >= max_visited {
+                break;
             }
-
-            // Track access for hot/cold partition decisions.
-            self.record_access(node_id);
-
-            if matches!(direction, Direction::Out | Direction::Both) {
-                for (lid, dst) in self.dense_iter_out(node_id) {
-                    if label_id.is_none_or(|f| f == lid)
-                        && visited.len() < max_visited
-                        && frontier_bitmap.is_none_or(|bm| {
-                            bm.contains(nodedb_types::Surrogate::new(self.node_surrogate_raw(dst)))
-                        })
-                        && visited.insert(dst)
-                    {
-                        self.prefetch_node(dst);
-                        queue.push_back((dst, depth + 1));
+            let mut candidates: Vec<u32> = Vec::new();
+            for &node_id in &frontier {
+                // Track access for hot/cold partition decisions.
+                self.record_access(node_id);
+                if matches!(direction, Direction::Out | Direction::Both) {
+                    for (lid, dst) in self.dense_iter_out(node_id) {
+                        if labels.keeps(lid) && !visited.contains(&dst) && in_bitmap(dst) {
+                            candidates.push(dst);
+                        }
+                    }
+                }
+                if matches!(direction, Direction::In | Direction::Both) {
+                    for (lid, src) in self.dense_iter_in(node_id) {
+                        if labels.keeps(lid) && !visited.contains(&src) && in_bitmap(src) {
+                            candidates.push(src);
+                        }
                     }
                 }
             }
-            if matches!(direction, Direction::In | Direction::Both) {
-                for (lid, src) in self.dense_iter_in(node_id) {
-                    if label_id.is_none_or(|f| f == lid)
-                        && visited.len() < max_visited
-                        && frontier_bitmap.is_none_or(|bm| {
-                            bm.contains(nodedb_types::Surrogate::new(self.node_surrogate_raw(src)))
-                        })
-                        && visited.insert(src)
-                    {
-                        self.prefetch_node(src);
-                        queue.push_back((src, depth + 1));
-                    }
-                }
-            }
+            frontier = self.admit_by_name(candidates, &mut visited, max_visited);
         }
 
         visited
             .into_iter()
             .map(|id| self.id_to_node[id as usize].clone())
             .collect()
+    }
+
+    /// Admit `candidates` into `visited` in node-name order, until `visited`
+    /// holds `max_visited` nodes. Returns the nodes admitted, in name order.
+    pub(crate) fn admit_by_name(
+        &self,
+        mut candidates: Vec<u32>,
+        visited: &mut HashSet<u32>,
+        max_visited: usize,
+    ) -> Vec<u32> {
+        self.sort_by_name(&mut candidates);
+        candidates.dedup();
+        let mut admitted = Vec::with_capacity(candidates.len());
+        for id in candidates {
+            if visited.len() >= max_visited {
+                break;
+            }
+            if visited.insert(id) {
+                self.prefetch_node(id);
+                admitted.push(id);
+            }
+        }
+        admitted
     }
 
     /// BFS traversal returning nodes with depth information.
@@ -143,7 +163,9 @@ impl CsrIndex {
             .iter()
             .filter_map(|l| self.label_id(l))
             .collect();
-        let match_label = |lid: u32| label_ids.is_empty() || label_ids.contains(&lid);
+        // Filters this partition has never seen match no edge here; they must
+        // not widen the filter to every edge.
+        let match_label = |lid: u32| label_filters.is_empty() || label_ids.contains(&lid);
         let mut visited: HashMap<u32, u8> = HashMap::new();
         let mut queue: VecDeque<(u32, u8)> = VecDeque::new();
 
@@ -215,8 +237,12 @@ impl CsrIndex {
         }
     }
 
-    /// Durable-only bidirectional BFS over the dense u32 CSR ids. Behavior and
-    /// performance are identical to the pre-overlay shortest path.
+    /// Durable-only bidirectional BFS over the dense u32 CSR ids.
+    ///
+    /// Each step expands one forward level, then one backward level. A level
+    /// relaxes its edges in `(neighbour, frontier node)` name order, and the
+    /// search stops at the first node both sides reached. The cap is checked
+    /// before each step.
     fn shortest_path_dense(&self, params: ShortestPathParams<'_>) -> Option<Vec<String>> {
         let ShortestPathParams {
             src,
@@ -232,7 +258,12 @@ impl CsrIndex {
             return Some(vec![src.to_string()]);
         }
 
-        let label_id = label_filter.and_then(|l| self.label_id(l));
+        let labels = self.label_filter(label_filter);
+        let in_bitmap = |id: u32| {
+            frontier_bitmap.is_none_or(|bm| {
+                bm.contains(nodedb_types::Surrogate::new(self.node_surrogate_raw(id)))
+            })
+        };
         let mut fwd_parent: HashMap<u32, u32> = HashMap::new();
         let mut bwd_parent: HashMap<u32, u32> = HashMap::new();
         fwd_parent.insert(src_id, src_id);
@@ -246,48 +277,50 @@ impl CsrIndex {
                 break;
             }
 
-            let mut next_fwd = Vec::new();
+            // Each level's edges are relaxed in (neighbour, frontier node)
+            // name order, so the parent a node gets, and the meeting point,
+            // do not depend on how the edges are stored. A cluster coordinator
+            // relaxes cross-shard hops in the same order.
+            let mut candidates: Vec<(u32, u32)> = Vec::new();
             for &node in &fwd_frontier {
                 self.record_access(node);
                 for (lid, neighbor) in self.dense_iter_out(node) {
-                    if label_id.is_none_or(|f| f == lid)
-                        && frontier_bitmap.is_none_or(|bm| {
-                            bm.contains(nodedb_types::Surrogate::new(
-                                self.node_surrogate_raw(neighbor),
-                            ))
-                        })
-                    {
-                        if let Entry::Vacant(e) = fwd_parent.entry(neighbor) {
-                            e.insert(node);
-                            next_fwd.push(neighbor);
-                        }
-                        if bwd_parent.contains_key(&neighbor) {
-                            return Some(self.reconstruct_path(neighbor, &fwd_parent, &bwd_parent));
-                        }
+                    if labels.keeps(lid) && in_bitmap(neighbor) {
+                        candidates.push((neighbor, node));
                     }
+                }
+            }
+            self.sort_edges_by_name(&mut candidates);
+            let mut next_fwd = Vec::new();
+            for (neighbor, node) in candidates {
+                if let Entry::Vacant(e) = fwd_parent.entry(neighbor) {
+                    e.insert(node);
+                    next_fwd.push(neighbor);
+                }
+                if bwd_parent.contains_key(&neighbor) {
+                    return Some(self.reconstruct_path(neighbor, &fwd_parent, &bwd_parent));
                 }
             }
             fwd_frontier = next_fwd;
 
-            let mut next_bwd = Vec::new();
+            let mut candidates: Vec<(u32, u32)> = Vec::new();
             for &node in &bwd_frontier {
                 self.record_access(node);
                 for (lid, neighbor) in self.dense_iter_in(node) {
-                    if label_id.is_none_or(|f| f == lid)
-                        && frontier_bitmap.is_none_or(|bm| {
-                            bm.contains(nodedb_types::Surrogate::new(
-                                self.node_surrogate_raw(neighbor),
-                            ))
-                        })
-                    {
-                        if let Entry::Vacant(e) = bwd_parent.entry(neighbor) {
-                            e.insert(node);
-                            next_bwd.push(neighbor);
-                        }
-                        if fwd_parent.contains_key(&neighbor) {
-                            return Some(self.reconstruct_path(neighbor, &fwd_parent, &bwd_parent));
-                        }
+                    if labels.keeps(lid) && in_bitmap(neighbor) {
+                        candidates.push((neighbor, node));
                     }
+                }
+            }
+            self.sort_edges_by_name(&mut candidates);
+            let mut next_bwd = Vec::new();
+            for (neighbor, node) in candidates {
+                if let Entry::Vacant(e) = bwd_parent.entry(neighbor) {
+                    e.insert(node);
+                    next_bwd.push(neighbor);
+                }
+                if fwd_parent.contains_key(&neighbor) {
+                    return Some(self.reconstruct_path(neighbor, &fwd_parent, &bwd_parent));
                 }
             }
             bwd_frontier = next_bwd;
@@ -297,6 +330,14 @@ impl CsrIndex {
             }
         }
         None
+    }
+
+    /// Order `(neighbour, frontier node)` edges by the two node names.
+    fn sort_edges_by_name(&self, edges: &mut [(u32, u32)]) {
+        edges.sort_by(|a, b| {
+            let name = |id: u32| self.node_name_checked(id);
+            (name(a.0), name(a.1)).cmp(&(name(b.0), name(b.1)))
+        });
     }
 
     fn reconstruct_path(
@@ -376,52 +417,58 @@ impl CsrIndex {
         max_depth: usize,
         max_visited: usize,
     ) -> Vec<(String, String, String)> {
-        let label_id = label_filter.and_then(|l| self.label_id(l));
+        let labels = self.label_filter(label_filter);
         let mut visited: HashSet<u32> = HashSet::new();
-        let mut queue: VecDeque<(u32, usize)> = VecDeque::new();
+        let mut frontier: Vec<u32> = Vec::new();
         let mut edges = Vec::new();
 
         for &node in start_nodes {
             if let Some(&id) = self.node_to_id.get(node)
                 && visited.insert(id)
             {
-                queue.push_back((id, 0));
+                frontier.push(id);
             }
         }
 
-        while let Some((node_id, depth)) = queue.pop_front() {
-            if depth >= max_depth || visited.len() >= max_visited {
-                continue;
+        // Level by level, as `traverse_bfs_dense`: every frontier node's edges
+        // are recorded, then the level's new nodes are admitted in name order.
+        for _depth in 0..max_depth {
+            if frontier.is_empty() || visited.len() >= max_visited {
+                break;
             }
-            self.record_access(node_id);
-            if matches!(direction, Direction::Out | Direction::Both) {
-                for (lid, dst) in self.dense_iter_out(node_id) {
-                    if label_id.is_none_or(|f| f == lid) {
-                        edges.push((
-                            self.id_to_node[node_id as usize].clone(),
-                            self.label_name(lid).to_string(),
-                            self.id_to_node[dst as usize].clone(),
-                        ));
-                        if visited.len() < max_visited && visited.insert(dst) {
-                            queue.push_back((dst, depth + 1));
+            let mut candidates: Vec<u32> = Vec::new();
+            for &node_id in &frontier {
+                self.record_access(node_id);
+                if matches!(direction, Direction::Out | Direction::Both) {
+                    for (lid, dst) in self.dense_iter_out(node_id) {
+                        if labels.keeps(lid) {
+                            edges.push((
+                                self.id_to_node[node_id as usize].clone(),
+                                self.label_name(lid).to_string(),
+                                self.id_to_node[dst as usize].clone(),
+                            ));
+                            if !visited.contains(&dst) {
+                                candidates.push(dst);
+                            }
+                        }
+                    }
+                }
+                if matches!(direction, Direction::In | Direction::Both) {
+                    for (lid, src) in self.dense_iter_in(node_id) {
+                        if labels.keeps(lid) {
+                            edges.push((
+                                self.id_to_node[src as usize].clone(),
+                                self.label_name(lid).to_string(),
+                                self.id_to_node[node_id as usize].clone(),
+                            ));
+                            if !visited.contains(&src) {
+                                candidates.push(src);
+                            }
                         }
                     }
                 }
             }
-            if matches!(direction, Direction::In | Direction::Both) {
-                for (lid, src) in self.dense_iter_in(node_id) {
-                    if label_id.is_none_or(|f| f == lid) {
-                        edges.push((
-                            self.id_to_node[src as usize].clone(),
-                            self.label_name(lid).to_string(),
-                            self.id_to_node[node_id as usize].clone(),
-                        ));
-                        if visited.len() < max_visited && visited.insert(src) {
-                            queue.push_back((src, depth + 1));
-                        }
-                    }
-                }
-            }
+            frontier = self.admit_by_name(candidates, &mut visited, max_visited);
         }
 
         edges
@@ -476,6 +523,49 @@ mod tests {
         );
         result.sort();
         assert_eq!(result, vec!["a", "b", "e"]);
+    }
+
+    /// `a` points at `z`, `m` and `b`, stored in that order. A cap of 3 leaves
+    /// room for two of them, and name order picks `b` and `m`.
+    fn fan_out_csr() -> CsrIndex {
+        let mut csr = CsrIndex::new(test_memory());
+        csr.add_edge("a", "L", "z").unwrap();
+        csr.add_edge("a", "L", "m").unwrap();
+        csr.add_edge("a", "L", "b").unwrap();
+        csr
+    }
+
+    #[test]
+    fn a_capped_bfs_admits_each_level_in_name_order() {
+        let csr = fan_out_csr();
+        let mut result = csr.traverse_bfs(
+            BfsParams {
+                start_nodes: &["a"],
+                label_filter: None,
+                direction: Direction::Out,
+                max_depth: 2,
+                max_visited: 3,
+                frontier_bitmap: None,
+            },
+            None,
+        );
+        result.sort();
+        assert_eq!(result, vec!["a", "b", "m"]);
+    }
+
+    #[test]
+    fn a_capped_subgraph_expands_only_admitted_levels() {
+        let mut csr = fan_out_csr();
+        csr.add_edge("z", "L", "y").unwrap();
+        csr.add_edge("b", "L", "c").unwrap();
+        let mut edges = csr.subgraph(&["a"], None, Direction::Out, 3, 3, None);
+        edges.sort();
+        // Level 1 fills the cap, so no level-1 node expands.
+        let expected: Vec<(String, String, String)> = ["b", "m", "z"]
+            .iter()
+            .map(|dst| ("a".to_string(), "L".to_string(), dst.to_string()))
+            .collect();
+        assert_eq!(edges, expected);
     }
 
     #[test]
@@ -540,6 +630,20 @@ mod tests {
             .shortest_path(path_params("a", "c", Some("KNOWS"), 5, None), None)
             .unwrap();
         assert_eq!(path, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn shortest_path_takes_the_smallest_named_tie() {
+        // Two paths of equal length, the `z` one stored first.
+        let mut csr = CsrIndex::new(test_memory());
+        csr.add_edge("a", "L", "z").unwrap();
+        csr.add_edge("z", "L", "d").unwrap();
+        csr.add_edge("a", "L", "b").unwrap();
+        csr.add_edge("b", "L", "d").unwrap();
+        let path = csr
+            .shortest_path(path_params("a", "d", None, 5, None), None)
+            .unwrap();
+        assert_eq!(path, vec!["a", "b", "d"]);
     }
 
     #[test]

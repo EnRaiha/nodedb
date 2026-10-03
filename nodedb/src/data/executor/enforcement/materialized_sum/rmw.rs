@@ -154,6 +154,8 @@ impl CoreLoop {
         // out of the store are in the collection's own encoding.
         let body = doc_format::encode_to_msgpack(&target_doc);
 
+        // No chain guard: DDL refuses a HASH_CHAIN collection as a
+        // materialized-sum target, so this write never reaches a chained row.
         let put = self.apply_point_put(
             txn,
             PointPutParams {
@@ -172,6 +174,7 @@ impl CoreLoop {
                 // one the engine maintains.
                 user_roles: &[],
                 enforce: false,
+                unique: crate::data::executor::enforcement::unique::UniqueJudge::Row,
                 wal_lsn: params.wal_lsn,
                 resolved_targets: &[],
             },

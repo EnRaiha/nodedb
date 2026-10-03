@@ -2,12 +2,16 @@
 
 //! Graph engine operations dispatched to the Data Plane.
 
+pub mod algo_stage;
 pub mod batch_edge;
 pub mod bsp;
 pub mod op;
+pub mod rag_stage;
 pub mod wcc;
 
+pub use algo_stage::{AlgoEdge, AlgoStage};
 pub use batch_edge::BatchEdge;
 pub use bsp::{BspSuperstepPlan, BspSuperstepResult};
 pub use op::GraphOp;
+pub use rag_stage::{RagBindingRow, RagLegs, RagStage, RagTextHit, RagVectorHit};
 pub use wcc::{WccSuperstepPlan, WccSuperstepResult};

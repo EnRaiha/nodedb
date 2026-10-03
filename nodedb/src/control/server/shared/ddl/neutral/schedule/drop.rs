@@ -2,12 +2,9 @@
 
 //! Protocol-neutral `DROP SCHEDULE` DDL handler.
 //!
-//! Ported from the pgwire `ddl::schedule::drop` handler. The original
-//! `propose_catalog_entry` + `LocalOnly` local-delete fallback (direct
-//! `catalog.delete_schedule` + in-memory registry unregister), the `_schedules`
-//! CRDT-sync tombstone delta, and the `audit_record` call are preserved
-//! verbatim; only the result construction changed from pgwire `Response` /
-//! `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
+//! The `propose_catalog_entry`, the `_schedules` CRDT-sync tombstone delta,
+//! and the `audit_record` call run here. The result is the protocol-neutral
+//! [`DdlResult`] / [`DdlError`].
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
@@ -17,7 +14,7 @@ use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::{require_tenant_admin, status};
 
 /// Existence check used by the `DROP SCHEDULE IF EXISTS` short-circuit in the
-/// neutral router. Mirrors the pgwire `exists::schedule_exists` helper.
+/// neutral router.
 pub fn schedule_exists(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -31,7 +28,7 @@ pub fn schedule_exists(
 }
 
 /// Handle `DROP SCHEDULE [IF EXISTS] <name>`
-pub fn drop_schedule(
+pub async fn drop_schedule(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: crate::types::DatabaseId,
@@ -56,8 +53,6 @@ pub fn drop_schedule(
 
     let tenant_id = identity.tenant_id.as_u64();
 
-    let catalog = state.credentials.catalog();
-
     // Pre-check existence: `IF EXISTS` + missing is a no-op that
     // doesn't touch raft. Check via the in-memory registry since
     // `schedules.rs` has no `get_schedule` method today.
@@ -80,25 +75,9 @@ pub fn drop_schedule(
         tenant_id,
         name: name.clone(),
     };
-    let outcome = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+    crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
+        .await
         .map_err(|e| DdlError::from_error_in_context("metadata propose", &e))?;
-    if outcome.needs_local_apply() {
-        let _ = catalog
-            .delete_schedule_in_database(database_id, tenant_id, &name)
-            .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))?;
-        catalog
-            .delete_owner("schedule", database_id.as_u64(), tenant_id, &name)
-            .map_err(|e| DdlError::from_error_in_context("catalog owner delete", &e))?;
-        state
-            .schedule_registry
-            .unregister(database_id, tenant_id, &name);
-        state.permissions.install_replicated_remove_owner(
-            "schedule",
-            database_id.as_u64(),
-            tenant_id,
-            &name,
-        );
-    }
 
     // Emit tombstone delta for Lite visibility (removes schedule from Lite catalog).
     {

@@ -17,7 +17,7 @@
 //!                                    → Query via DataFusion predicate pushdown
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
@@ -43,6 +43,9 @@ pub enum SseMode {
     /// bucket's default KMS key.
     Kms { key_id: Option<String> },
 }
+
+/// Local cold store directory when neither an endpoint nor `local_dir` is set.
+pub const DEFAULT_COLD_LOCAL_DIR: &str = "/tmp/nodedb/cold";
 
 /// Configuration for the cold storage layer.
 #[derive(Debug, Clone)]
@@ -119,7 +122,7 @@ impl ColdStorage {
             let dir = config
                 .local_dir
                 .clone()
-                .unwrap_or_else(|| PathBuf::from("/tmp/nodedb/cold"));
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_COLD_LOCAL_DIR));
             std::fs::create_dir_all(&dir)?;
             Arc::new(LocalFileSystem::new_with_prefix(&dir).map_err(|e| {
                 crate::Error::ColdStorage {
@@ -189,140 +192,14 @@ impl ColdStorage {
         min_lsn: u64,
         max_lsn: u64,
     ) -> crate::Result<String> {
-        if rows.is_empty() {
-            return Err(crate::Error::BadRequest {
-                detail: "no rows to encode".into(),
-            });
-        }
-
-        // Build Arrow schema from first row.
-        let first_obj = rows[0]
-            .1
-            .as_object()
-            .ok_or_else(|| crate::Error::ColdStorage {
-                detail: "first row is not an object".into(),
-            })?;
-
-        let mut fields = vec![Field::new("_id", DataType::Utf8, false)];
-        for (key, value) in first_obj {
-            let dt = match value {
-                serde_json::Value::Number(n) if n.is_i64() => DataType::Int64,
-                serde_json::Value::Number(_) => DataType::Float64,
-                _ => DataType::Utf8,
-            };
-            fields.push(Field::new(key, dt, true));
-        }
-        let schema = Arc::new(Schema::new(fields));
-
-        // Build column arrays.
-        let field_names: Vec<String> = first_obj.keys().cloned().collect();
-        let mut ids: Vec<String> = Vec::with_capacity(rows.len());
-        let mut columns: Vec<Vec<serde_json::Value>> =
-            vec![Vec::with_capacity(rows.len()); field_names.len()];
-
-        for (doc_id, data) in rows {
-            ids.push(doc_id.clone());
-            let obj = data.as_object();
-            for (i, name) in field_names.iter().enumerate() {
-                let val = obj
-                    .and_then(|o| o.get(name))
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                columns[i].push(val);
-            }
-        }
-
-        let mut arrays: Vec<ArrayRef> = vec![Arc::new(StringArray::from(ids))];
-        for (i, field) in schema.fields().iter().skip(1).enumerate() {
-            let arr: ArrayRef = match field.data_type() {
-                DataType::Int64 => {
-                    let vals: Vec<Option<i64>> = columns[i].iter().map(|v| v.as_i64()).collect();
-                    Arc::new(Int64Array::from(vals))
-                }
-                DataType::Float64 => {
-                    let vals: Vec<Option<f64>> = columns[i].iter().map(|v| v.as_f64()).collect();
-                    Arc::new(Float64Array::from(vals))
-                }
-                _ => {
-                    let vals: Vec<Option<String>> = columns[i]
-                        .iter()
-                        .map(|v| match v {
-                            serde_json::Value::String(s) => Some(s.clone()),
-                            serde_json::Value::Null => None,
-                            other => Some(other.to_string()),
-                        })
-                        .collect();
-                    Arc::new(StringArray::from(vals))
-                }
-            };
-            arrays.push(arr);
-        }
-
-        let batch = RecordBatch::try_new(schema.clone(), arrays).map_err(|e| {
-            crate::Error::ColdStorage {
-                detail: format!("build RecordBatch: {e}"),
-            }
-        })?;
-
-        // Write Parquet — CPU-intensive compression runs off the async executor.
-        let compression = match self.config.compression {
-            ParquetCompression::None => Compression::UNCOMPRESSED,
-            ParquetCompression::Snappy => Compression::SNAPPY,
-            ParquetCompression::Zstd => Compression::ZSTD(Default::default()),
-            ParquetCompression::Lz4 => Compression::LZ4,
-        };
-        let row_group_size = self.config.row_group_size;
-
-        let buf = tokio::task::spawn_blocking(move || {
-            let props = WriterProperties::builder()
-                .set_compression(compression)
-                .set_max_row_group_row_count(Some(row_group_size))
-                .build();
-            let mut buf: Vec<u8> = Vec::new();
-            let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).map_err(|e| {
-                crate::Error::ColdStorage {
-                    detail: format!("parquet writer init: {e}"),
-                }
-            })?;
-            writer
-                .write(&batch)
-                .map_err(|e| crate::Error::ColdStorage {
-                    detail: format!("parquet write: {e}"),
-                })?;
-            writer.close().map_err(|e| crate::Error::ColdStorage {
-                detail: format!("parquet close: {e}"),
-            })?;
-            Ok::<_, crate::Error>(buf)
-        })
-        .await
-        .map_err(|e| crate::Error::ColdStorage {
-            detail: format!("parquet encoding task: {e}"),
-        })??;
-
+        let batch = rows_to_batch(rows)?;
+        let buf = self.encode_parquet(batch).await?;
         let file_size = buf.len();
-
-        // Upload to object store.
         let object_path = format!(
             "{}{}/{}/{}/lsn-{}-{}.parquet",
             self.config.prefix, database_id, tenant_id, collection, min_lsn, max_lsn
         );
-        let path = object_store::path::Path::from(object_path.clone());
-
-        self.store
-            .put_opts(
-                &path,
-                PutPayload::from(buf),
-                object_store::PutOptions::default(),
-            )
-            .await
-            .map_err(|e| crate::Error::ColdStorage {
-                detail: format!("upload to {object_path}: {e}"),
-            })?;
-
-        self.bytes_uploaded
-            .fetch_add(file_size as u64, std::sync::atomic::Ordering::Relaxed);
-        self.files_uploaded
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.upload(&object_path, buf).await?;
 
         info!(
             collection,
@@ -337,41 +214,64 @@ impl ColdStorage {
         Ok(object_path)
     }
 
-    /// Upload a raw WAL segment file to cold storage.
-    ///
-    /// Used for continuous WAL archiving (RPO guarantee).
-    pub async fn upload_wal_segment(
-        &self,
-        segment_path: &Path,
-        segment_name: &str,
-    ) -> crate::Result<String> {
-        let path_buf = segment_path.to_path_buf();
-        let segment_display = segment_path.display().to_string();
-        let data = tokio::task::spawn_blocking(move || std::fs::read(&path_buf))
-            .await
-            .map_err(|e| crate::Error::ColdStorage {
-                detail: format!("spawn_blocking join: {e}"),
-            })?
-            .map_err(|e| crate::Error::ColdStorage {
-                detail: format!("read WAL segment {segment_display}: {e}"),
+    /// Write `batch` as one Parquet file. The CPU-intensive compression runs
+    /// off the async executor.
+    async fn encode_parquet(&self, batch: RecordBatch) -> crate::Result<Vec<u8>> {
+        let compression = match self.config.compression {
+            ParquetCompression::None => Compression::UNCOMPRESSED,
+            ParquetCompression::Snappy => Compression::SNAPPY,
+            ParquetCompression::Zstd => Compression::ZSTD(Default::default()),
+            ParquetCompression::Lz4 => Compression::LZ4,
+        };
+        let row_group_size = self.config.row_group_size;
+
+        tokio::task::spawn_blocking(move || {
+            let props = WriterProperties::builder()
+                .set_compression(compression)
+                .set_max_row_group_row_count(Some(row_group_size))
+                .build();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut writer =
+                ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).map_err(|e| {
+                    crate::Error::ColdStorage {
+                        detail: format!("parquet writer init: {e}"),
+                    }
+                })?;
+            writer
+                .write(&batch)
+                .map_err(|e| crate::Error::ColdStorage {
+                    detail: format!("parquet write: {e}"),
+                })?;
+            writer.close().map_err(|e| crate::Error::ColdStorage {
+                detail: format!("parquet close: {e}"),
             })?;
+            Ok::<_, crate::Error>(buf)
+        })
+        .await
+        .map_err(|e| crate::Error::ColdStorage {
+            detail: format!("parquet encoding task: {e}"),
+        })?
+    }
 
-        let object_path = format!("{}wal/{}", self.config.prefix, segment_name);
-        let path = object_store::path::Path::from(object_path.clone());
-
+    /// Put `buf` at `object_path` in the object store and count the upload.
+    async fn upload(&self, object_path: &str, buf: Vec<u8>) -> crate::Result<()> {
+        let file_size = buf.len();
+        let path = object_store::path::Path::from(object_path);
         self.store
             .put_opts(
                 &path,
-                PutPayload::from(data),
+                PutPayload::from(buf),
                 object_store::PutOptions::default(),
             )
             .await
             .map_err(|e| crate::Error::ColdStorage {
-                detail: format!("upload WAL segment: {e}"),
+                detail: format!("upload to {object_path}: {e}"),
             })?;
-
-        info!(segment_name, path = %object_path, "WAL segment archived to cold storage");
-        Ok(object_path)
+        self.bytes_uploaded
+            .fetch_add(file_size as u64, std::sync::atomic::Ordering::Relaxed);
+        self.files_uploaded
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     /// Total bytes uploaded to cold storage.
@@ -396,9 +296,89 @@ impl ColdStorage {
         Arc::clone(&self.store)
     }
 
-    /// Access the configured prefix (used by cold_query module).
-    pub(super) fn prefix(&self) -> &str {
+    /// The configured key prefix every cold object sits under.
+    pub fn prefix(&self) -> &str {
         &self.config.prefix
+    }
+}
+
+/// One record batch of `rows`, typed by the schema of the first row. A field
+/// a later row lacks is null.
+fn rows_to_batch(rows: &[(String, serde_json::Value)]) -> crate::Result<RecordBatch> {
+    let Some((_, first)) = rows.first() else {
+        return Err(crate::Error::BadRequest {
+            detail: "no rows to encode".into(),
+        });
+    };
+    let first_obj = first.as_object().ok_or_else(|| crate::Error::ColdStorage {
+        detail: "first row is not an object".into(),
+    })?;
+    let schema = Arc::new(infer_schema(first_obj));
+
+    let field_names: Vec<String> = first_obj.keys().cloned().collect();
+    let mut ids: Vec<String> = Vec::with_capacity(rows.len());
+    let mut columns: Vec<Vec<serde_json::Value>> =
+        vec![Vec::with_capacity(rows.len()); field_names.len()];
+    for (doc_id, data) in rows {
+        ids.push(doc_id.clone());
+        let obj = data.as_object();
+        for (column, name) in columns.iter_mut().zip(&field_names) {
+            let val = obj
+                .and_then(|o| o.get(name))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            column.push(val);
+        }
+    }
+
+    let mut arrays: Vec<ArrayRef> = vec![Arc::new(StringArray::from(ids))];
+    for (field, values) in schema.fields().iter().skip(1).zip(&columns) {
+        arrays.push(column_array(field.data_type(), values));
+    }
+    RecordBatch::try_new(schema, arrays).map_err(|e| crate::Error::ColdStorage {
+        detail: format!("build RecordBatch: {e}"),
+    })
+}
+
+/// The Arrow schema of a row: `_id` first, then one nullable column per field
+/// of `first_obj`. An integer is `Int64`, any other number `Float64`, and
+/// every other value `Utf8`.
+fn infer_schema(first_obj: &serde_json::Map<String, serde_json::Value>) -> Schema {
+    let mut fields = vec![Field::new("_id", DataType::Utf8, false)];
+    for (key, value) in first_obj {
+        let dt = match value {
+            serde_json::Value::Number(n) if n.is_i64() => DataType::Int64,
+            serde_json::Value::Number(_) => DataType::Float64,
+            _ => DataType::Utf8,
+        };
+        fields.push(Field::new(key, dt, true));
+    }
+    Schema::new(fields)
+}
+
+/// One Arrow column of `values` as `data_type`. A value that does not fit the
+/// type is null, and a non-string value in a `Utf8` column is its JSON text.
+fn column_array(data_type: &DataType, values: &[serde_json::Value]) -> ArrayRef {
+    match data_type {
+        DataType::Int64 => {
+            let vals: Vec<Option<i64>> = values.iter().map(|v| v.as_i64()).collect();
+            Arc::new(Int64Array::from(vals))
+        }
+        DataType::Float64 => {
+            let vals: Vec<Option<f64>> = values.iter().map(|v| v.as_f64()).collect();
+            Arc::new(Float64Array::from(vals))
+        }
+        _ => {
+            let vals: Vec<Option<String>> = values
+                .iter()
+                .map(|v| match v {
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Null => None,
+                    other => Some(other.to_string()),
+                })
+                .collect();
+            Arc::new(StringArray::from(vals))
+        }
     }
 }
 

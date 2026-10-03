@@ -14,16 +14,14 @@ impl MetadataCommitApplier {
     /// node. `restore_hwm` is idempotent and monotonic: calling
     /// it with a value at or below the current HWM is a no-op,
     /// so duplicate or reordered delivery cannot push the
-    /// counter backwards. Also persist the hwm to the catalog so
-    /// the local node survives a restart without re-reading the
-    /// full log.
+    /// counter backwards. The hwm is persisted before the entry counts as
+    /// applied, so boot never depends on re-reading the log.
     pub(super) fn apply_surrogate_alloc(
         &self,
         hwm: u32,
         raft_index: u64,
     ) -> Result<(), crate::Error> {
-        if let Some(weak) = self.shared.get()
-            && let Some(shared) = weak.upgrade()
+        let shared = self.shared_state()?;
         {
             let reg = shared
                 .surrogate_assigner
@@ -31,9 +29,13 @@ impl MetadataCommitApplier {
                 .read()
                 .unwrap_or_else(|p| p.into_inner());
             let restored = reg.restore_hwm(hwm);
+            // The raised watermark, never below what this node already
+            // issued: persisting the entry's `hwm` can lower the catalog
+            // copy and reissue surrogates after a restart.
+            let current = reg.current_hwm();
             drop(reg);
             // The in-memory HWM advance is correctness-critical: if it
-            // fails this replica could re-issue a surrogate the cluster
+            // fails this replica can re-issue a surrogate the cluster
             // already allocated. Do not advance past this entry — retry.
             if let Err(e) = restored {
                 warn!(hwm, error = %e, "surrogate_alloc apply: restore_hwm failed — halting watermark for retry");
@@ -41,18 +43,9 @@ impl MetadataCommitApplier {
                     detail: format!("surrogate_alloc apply: restore_hwm failed: {e}"),
                 });
             }
-            // Best-effort catalog persist: a failure means the
-            // next restart will re-derive the HWM from the log
-            // (the log is the source of truth), which is correct —
-            // just slightly slower. Tolerate and continue.
-            let catalog = self.credentials.catalog();
-            if let Err(e) = catalog.put_surrogate_hwm(hwm) {
-                warn!(
-                    hwm,
-                    error = %e,
-                    "surrogate_alloc apply: failed to persist hwm to catalog (tolerable; log is authoritative)"
-                );
-            }
+            // A failed persist returns `Err`: the entry is re-delivered, and
+            // `restore_hwm` is a no-op on the retry, which persists again.
+            self.credentials.catalog().put_surrogate_hwm(current)?;
             debug!(hwm, raft_index, "surrogate hwm advanced via raft");
         }
         Ok(())
@@ -86,7 +79,7 @@ impl MetadataCommitApplier {
     ///   2. The reserved batch must NOT be installed during replay.
     ///      A node that crashed mid-batch already consumed part of
     ///      its pre-crash `[start, end)`; re-installing it on replay
-    ///      would hand those surrogates out AGAIN. So `G` advances
+    ///      will hand those surrogates out AGAIN. So `G` advances
     ///      (deterministic, every node) but the batch install is
     ///      gated on a LIVE pending waiter, which only exists during
     ///      a genuine in-process reservation (`pending_reservations`
@@ -105,12 +98,11 @@ impl MetadataCommitApplier {
         batch_size: u32,
         raft_index: u64,
     ) -> Result<(), crate::Error> {
-        if let Some(weak) = self.shared.get()
-            && let Some(shared) = weak.upgrade()
+        let shared = self.shared_state()?;
         {
             // Read guard is sufficient: `reserve_at_index` mutates via
             // interior atomics (counter + last_reserve_index). Taking a
-            // write guard here would risk deadlocking the allocation
+            // write guard here will risk deadlocking the allocation
             // path, which holds no registry lock across the propose+wait
             // but does re-take it to retry.
             let reg = shared
@@ -121,7 +113,7 @@ impl MetadataCommitApplier {
             // Advancing the global watermark is correctness-critical and
             // must be deterministic across nodes incl. replay: an
             // exhaustion error must NOT advance the apply watermark past
-            // this entry, or replicas would diverge on `G`. Surface it
+            // this entry, or replicas will diverge on `G`. Surface it
             // so Raft re-delivers. This apply path only runs when
             // `start_raft` is active, which only happens when
             // `config.cluster.is_some()` — the same condition that puts
@@ -166,14 +158,35 @@ impl MetadataCommitApplier {
                     });
                 }
             };
+            let current_hwm = reg.current_hwm();
             drop(reg);
 
+            let catalog = self.credentials.catalog();
             let Some((start, end)) = reserved else {
-                // Already applied (full-log replay / duplicate
-                // delivery): do NOT advance `G`, do NOT persist, do NOT
-                // install a batch. Advancing the apply watermark past a
-                // replayed entry is correct — its effect is already in
-                // the seeded state.
+                // Already applied in memory (replay, duplicate delivery, or
+                // a re-delivery after a failed persist): do NOT advance `G`.
+                // When the persisted cursor is behind this entry, the earlier
+                // persist failed, so this delivery writes it. The applier
+                // stops at a failed entry, so the in-memory `G` is exactly
+                // this entry's carve.
+                if catalog.get_surrogate_reserve_index()? < raft_index {
+                    catalog.put_surrogate_reserve_state(current_hwm, raft_index)?;
+                }
+                // The carve kept from the failed first application goes to
+                // the allocator still waiting on it. After a restart no carve
+                // is kept and no allocator waits.
+                let kept = self
+                    .unpersisted_carve
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take_if(|(index, _, _)| *index == raft_index);
+                if let Some((_, start, end)) = kept
+                    && node_id == shared.node_id
+                {
+                    shared
+                        .surrogate_assigner
+                        .complete_reservation(request_id, start, end);
+                }
                 debug!(
                     node_id,
                     request_id,
@@ -185,25 +198,25 @@ impl MetadataCommitApplier {
 
             // First application: persist `(hwm = end - 1, cursor =
             // raft_index)` ATOMICALLY so a restart can skip this
-            // reservation on replay (no double-count) and seed an
-            // already-equal `G` on every node. Best-effort (warn on
-            // fail) like the `SurrogateAlloc` arm: if the persist fails,
-            // the log is still authoritative and the next restart
-            // re-derives `G` by replaying from the last durable cursor —
-            // correct, just slightly slower. The hwm and cursor are
-            // written together in one redb txn, so a crash can never
-            // leave them inconsistent.
-            let catalog = self.credentials.catalog();
+            // reservation (no double-count) and seed an already-equal `G`
+            // on every node. A failed persist returns `Err`: the entry is
+            // re-delivered, and the branch above persists it and hands the
+            // kept carve to the waiting allocator.
             if let Err(e) = catalog.put_surrogate_reserve_state(end - 1, raft_index) {
+                *self
+                    .unpersisted_carve
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some((raft_index, start, end));
                 warn!(
                     node_id,
                     request_id,
                     hwm = end - 1,
                     raft_index,
                     error = %e,
-                    "surrogate_reserve apply: failed to persist reserve state to catalog \
-                     (tolerable; log is authoritative)"
+                    "surrogate_reserve apply: failed to persist reserve state; the entry is \
+                     re-delivered"
                 );
+                return Err(e);
             }
 
             if node_id == shared.node_id {
@@ -225,5 +238,59 @@ impl MetadataCommitApplier {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_cluster::{MetadataApplier, MetadataEntry, encode_entry};
+
+    use super::super::test_fixture::{applier_with_shared_at, cluster_applier_with_shared_at};
+
+    /// A failed hwm persist stops the entry. The re-delivered entry persists
+    /// and applies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn surrogate_hwm_persist_error_stops_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (applier, state) = applier_with_shared_at(dir.path(), "test.wal");
+        let entry = encode_entry(&MetadataEntry::SurrogateAlloc { hwm: 500 }).unwrap();
+        let catalog = state.credentials.catalog();
+
+        catalog.fail_next_surrogate_write_for_test();
+        assert_eq!(applier.apply(&[(3, entry.clone())]).await, 0);
+
+        assert_eq!(applier.apply(&[(3, entry)]).await, 3);
+        assert!(catalog.get_surrogate_hwm().unwrap() >= 500);
+    }
+
+    /// A reserve whose persist failed keeps its carve. The re-delivered entry
+    /// persists it and hands that exact batch to the allocator waiting on it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reserve_redelivery_hands_the_kept_carve_to_the_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (applier, state) = cluster_applier_with_shared_at(dir.path(), "test.wal");
+        let catalog = state.credentials.catalog();
+        let mut waiter = state.surrogate_assigner.await_reservation_for_test(77);
+        let entry = encode_entry(&MetadataEntry::SurrogateReserve {
+            node_id: state.node_id,
+            request_id: 77,
+            batch_size: 16,
+        })
+        .unwrap();
+
+        catalog.fail_next_surrogate_write_for_test();
+        assert_eq!(applier.apply(&[(5, entry.clone())]).await, 0);
+        assert!(
+            waiter.try_recv().is_err(),
+            "no batch before the carve is durable"
+        );
+
+        assert_eq!(applier.apply(&[(5, entry)]).await, 5);
+        let (start, end) = waiter
+            .try_recv()
+            .expect("the kept carve reaches the waiter");
+        assert_eq!(end - start, 16);
+        assert_eq!(catalog.get_surrogate_reserve_index().unwrap(), 5);
+        assert_eq!(catalog.get_surrogate_hwm().unwrap(), end - 1);
     }
 }

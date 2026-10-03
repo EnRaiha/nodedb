@@ -13,24 +13,19 @@
 
 use nodedb_types::{StoredVectorIndexParams, VectorModelEntry};
 
-use crate::control::catalog_entry::apply::vector as apply;
 use crate::control::catalog_entry::entry::CatalogEntry;
-use crate::control::propose_outcome::ProposeOutcome;
 use crate::control::state::SharedState;
 
 use super::super::result::DdlError;
-use super::replicate::{propose_and_apply, propose_and_apply_outcome};
+use super::replicate::propose_and_apply_async;
 
 /// Propose the embedding-model row for one collection column.
-pub(crate) fn propose_put_model(
+pub(crate) async fn propose_put_model(
     state: &SharedState,
     entry: &VectorModelEntry,
 ) -> Result<(), DdlError> {
     let catalog_entry = CatalogEntry::PutVectorModel(Box::new(entry.clone()));
-    propose_and_apply(state, &catalog_entry, || {
-        apply::put_model(entry, state.credentials.catalog())
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))
-    })
+    propose_and_apply_async(state, &catalog_entry).await
 }
 
 /// Propose removal of one column's embedding-model row on every node.
@@ -38,7 +33,7 @@ pub(crate) fn propose_put_model(
 /// The caller skips the proposal when the row is already absent, but apply
 /// still treats a missing row as a no-op, so replay on every node stays
 /// idempotent.
-pub(crate) fn propose_delete_model(
+pub(crate) async fn propose_delete_model(
     state: &SharedState,
     database_id: u64,
     tenant_id: u64,
@@ -51,60 +46,41 @@ pub(crate) fn propose_delete_model(
         collection: collection.to_string(),
         column: column.to_string(),
     };
-    propose_and_apply(state, &entry, || {
-        apply::delete_model(
-            database_id,
-            tenant_id,
-            collection,
-            column,
-            state.credentials.catalog(),
-        )
-        .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))
-    })
+    propose_and_apply_async(state, &entry).await
 }
 
 /// Propose the build-parameter row for one vector index.
 ///
 /// The handler reports the duplicate index before proposing, so apply is a
-/// plain write that never rejects. The returned outcome tells the handler
-/// whether a post-apply lane will run this node's WAL append and dispatch.
-pub(crate) fn propose_put_params(
+/// plain write that never rejects. The post-apply lane runs this node's WAL
+/// append and dispatch, which this call awaits.
+pub(crate) async fn propose_put_params(
     state: &SharedState,
     entry: &StoredVectorIndexParams,
-) -> Result<ProposeOutcome, DdlError> {
+) -> Result<(), DdlError> {
     let catalog_entry = CatalogEntry::PutVectorIndexParams(Box::new(entry.clone()));
-    propose_and_apply_outcome(state, &catalog_entry, || {
-        apply::put_params(entry, state.credentials.catalog())
-            .map_err(|e| DdlError::from_error_in_context("catalog write", &e))
-    })
+    propose_and_apply_async(state, &catalog_entry).await
 }
 
 /// Propose removal of one vector index's build parameters on every node.
 ///
 /// Apply stays idempotent under replay: a missing row is not an error. The
-/// returned outcome tells the handler whether a post-apply lane will run this
-/// node's WAL append and dispatch.
-pub(crate) fn propose_delete_params(
+/// post-apply lane runs this node's WAL append and dispatch, which this call
+/// awaits.
+pub(crate) async fn propose_delete_params(
     state: &SharedState,
     database_id: u64,
     tenant_id: u64,
     collection: &str,
     field_name: &str,
-) -> Result<ProposeOutcome, DdlError> {
+) -> Result<(), DdlError> {
     let entry = CatalogEntry::DeleteVectorIndexParams {
         database_id,
         tenant_id,
         collection: collection.to_string(),
         field_name: field_name.to_string(),
+        // Frozen by the proposer's stamp.
+        target_hlc: nodedb_types::Hlc::ZERO,
     };
-    propose_and_apply_outcome(state, &entry, || {
-        apply::delete_params(
-            database_id,
-            tenant_id,
-            collection,
-            field_name,
-            state.credentials.catalog(),
-        )
-        .map_err(|e| DdlError::from_error_in_context("catalog delete", &e))
-    })
+    propose_and_apply_async(state, &entry).await
 }

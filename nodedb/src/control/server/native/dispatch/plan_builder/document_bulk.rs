@@ -12,7 +12,7 @@ use nodedb_physical::physical_plan::DocumentOp;
 use super::super::DispatchCtx;
 use super::declared_primary_key;
 
-pub(crate) fn build_bulk_update(
+pub(crate) async fn build_bulk_update(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -54,7 +54,7 @@ pub(crate) fn build_bulk_update(
     }))
 }
 
-pub(crate) fn build_bulk_delete(
+pub(crate) async fn build_bulk_delete(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -81,7 +81,7 @@ pub(crate) fn build_bulk_delete(
     }))
 }
 
-pub(crate) fn build_truncate(
+pub(crate) async fn build_truncate(
     ctx: &DispatchCtx<'_>,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
@@ -95,7 +95,7 @@ pub(crate) fn build_truncate(
     }))
 }
 
-pub(crate) fn build_estimate_count(
+pub(crate) async fn build_estimate_count(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,
@@ -108,7 +108,7 @@ pub(crate) fn build_estimate_count(
     }))
 }
 
-pub(crate) fn build_insert_select(
+pub(crate) async fn build_insert_select(
     ctx: &DispatchCtx<'_>,
     fields: &TextFields,
     collection: &str,

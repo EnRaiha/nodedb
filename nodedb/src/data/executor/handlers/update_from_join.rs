@@ -125,6 +125,13 @@ impl CoreLoop {
             }
         };
 
+        // A bitemporal target reads each row's current version and lands a new
+        // version at one system time for the whole statement, as a point
+        // update does for its row.
+        let bitemporal_sys_from_ms = self
+            .is_bitemporal(task.request.database_id.as_u64(), tid, target_collection)
+            .then(|| self.bitemporal_now_ms());
+
         // Scan the target, join, evaluate assignments, encode the post-image —
         // without writing. Shared by both the resolve pass and write path.
         let rows = match self.collect_update_from_join_rows(
@@ -140,6 +147,7 @@ impl CoreLoop {
                 strict_schema: strict_schema.as_ref(),
                 config_key: &config_key,
                 declared_primary_key,
+                bitemporal_sys_from_ms,
             },
         ) {
             Ok(r) => r,
@@ -237,6 +245,7 @@ impl CoreLoop {
                 strict_schema: strict_schema.as_ref(),
                 declared_primary_key,
                 want_returning: returning.is_some(),
+                bitemporal_sys_from_ms,
             },
             rows,
         ) {

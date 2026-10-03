@@ -31,12 +31,30 @@ use crate::wire::WIRE_VERSION;
 /// length prefixes before we allocate a receive buffer).
 const MAX_HANDSHAKE_BYTES: u32 = 4 * 1024; // 4 KiB — far more than needed
 
-/// The local version range derived from the compile-time constants in
-/// `rpc_codec::header`. Single source of truth for both sides.
+/// The local version range derived from the compile-time constant in
+/// `crate::wire::WIRE_VERSION`. Single source of truth for both sides.
+///
+/// Floor == ceiling: this build advertises only its own exact frame
+/// version, never a range of supported older versions — there is no
+/// rolling-upgrade window pre-1.0 (see `nodedb_types::wire_version`).
 pub fn local_version_range() -> VersionRange {
-    // Supported range: [1, WIRE_VERSION]. Min is 1 (oldest supported);
-    // max is the current build's wire version.
-    VersionRange::new(WireVersion(1), WireVersion(WIRE_VERSION))
+    VersionRange::new(WireVersion(WIRE_VERSION), WireVersion(WIRE_VERSION))
+}
+
+/// This build's exact identity, compared for equality in every handshake.
+pub fn local_build_id() -> &'static str {
+    nodedb_types::wire_version::WIRE_BUILD_ID
+}
+
+/// Compare two build identities for exact equality.
+fn check_build_id(local: &str, remote: &str) -> std::result::Result<(), WireVersionError> {
+    if local != remote {
+        return Err(WireVersionError::BuildIdMismatch {
+            local_build_id: local.to_owned(),
+            peer_build_id: remote.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Write a length-prefixed zerompk message to `send`.
@@ -119,7 +137,19 @@ pub async fn perform_version_handshake_server(
         }
     })?;
 
-    let ack = VersionHandshakeAck::new(agreed);
+    if let Err(e) = check_build_id(local_build_id(), &client_hs.build_id) {
+        let reason = e.to_string();
+        let reason_bytes = reason.as_bytes();
+        conn.close(
+            quinn::VarInt::from_u32(0x01),
+            &reason_bytes[..reason_bytes.len().min(100)],
+        );
+        return Err(ClusterError::Transport {
+            detail: format!("wire version handshake failed (server): {e}"),
+        });
+    }
+
+    let ack = VersionHandshakeAck::new(agreed, local_build_id().to_owned());
     write_framed(send, &ack).await?;
 
     Ok(agreed)
@@ -135,7 +165,7 @@ pub async fn perform_version_handshake_client(
     recv: &mut quinn::RecvStream,
 ) -> Result<WireVersion> {
     let local = local_version_range();
-    let hs = VersionHandshake::from_range(local);
+    let hs = VersionHandshake::from_range(local, local_build_id().to_owned());
     write_framed(send, &hs).await?;
 
     let ack: VersionHandshakeAck = read_framed(recv).await?;
@@ -152,6 +182,13 @@ pub async fn perform_version_handshake_client(
             ),
         });
     }
+
+    // Belt-and-suspenders: the server already refuses a build mismatch
+    // before sending an ack, but a misbehaving server must not be trusted
+    // silently either.
+    check_build_id(local_build_id(), &ack.build_id).map_err(|e| ClusterError::Transport {
+        detail: format!("wire version handshake failed (client): {e}"),
+    })?;
 
     Ok(agreed)
 }
@@ -196,7 +233,7 @@ mod tests {
             r.min,
             r.max
         );
-        assert_eq!(r.min, v(1));
+        assert_eq!(r.min, v(WIRE_VERSION));
         assert_eq!(r.max, v(WIRE_VERSION));
     }
 
@@ -235,6 +272,7 @@ mod tests {
         let hs = VersionHandshake {
             range: (1, 3),
             capabilities: caps,
+            build_id: "test-build".to_owned(),
         };
         let bytes = zerompk::to_msgpack_vec(&hs).unwrap();
         let decoded: VersionHandshake = zerompk::from_msgpack(&bytes).unwrap();
@@ -249,10 +287,28 @@ mod tests {
         let ack = VersionHandshakeAck {
             agreed: 2,
             capabilities: caps,
+            build_id: "test-build".to_owned(),
         };
         let bytes = zerompk::to_msgpack_vec(&ack).unwrap();
         let decoded: VersionHandshakeAck = zerompk::from_msgpack(&bytes).unwrap();
         assert_eq!(decoded.agreed_version(), v(2));
         assert_eq!(decoded.capabilities, caps);
+    }
+
+    /// A build-id mismatch is refused with the operator-facing message.
+    #[test]
+    fn build_id_mismatch_is_refused_with_message() {
+        let err = check_build_id("build-a", "build-b").unwrap_err();
+        assert!(matches!(err, WireVersionError::BuildIdMismatch { .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("all nodes must run one build before 1.0"));
+        assert!(msg.contains("build-a"));
+        assert!(msg.contains("build-b"));
+    }
+
+    /// Matching build identities are accepted.
+    #[test]
+    fn matching_build_id_is_accepted() {
+        assert!(check_build_id("same-build", "same-build").is_ok());
     }
 }
