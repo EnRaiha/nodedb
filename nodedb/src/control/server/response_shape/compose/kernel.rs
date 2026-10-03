@@ -445,8 +445,7 @@ mod tests {
             .expect("shape rows");
         assert!(
             shaped.columns.contains(&"email".to_string()),
-            "redacted column must stay in the derived SELECT * schema: {:?}",
-            shaped.columns
+            "redacted column must stay in the derived SELECT * schema"
         );
         assert_eq!(shaped.rows[0]["email"], Value::Null);
     }
