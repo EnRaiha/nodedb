@@ -102,14 +102,14 @@ pub fn classify(path: &Path, corruption_offset: u64, last_lsn: u64) -> Result<Ta
         return Ok(TailVerdict::TornTail);
     }
 
-    let mut window = vec![0u8; SCAN_CHUNK];
+    let mut window = Vec::with_capacity(SCAN_CHUNK);
     let magic = WAL_MAGIC.to_le_bytes();
     let mut base = start;
 
     while base < file_len {
         let want = SCAN_CHUNK.min(usize::try_from(file_len - base).unwrap_or(SCAN_CHUNK));
         file.seek(SeekFrom::Start(base))?;
-        let filled = read_up_to(&mut file, &mut window[..want])?;
+        let filled = read_up_to(&mut file, want, &mut window)?;
         if filled < magic.len() {
             break;
         }
@@ -146,12 +146,13 @@ fn intact_record_lsn(file: &mut File, offset: u64, file_len: u64) -> Result<Opti
     };
 
     file.seek(SeekFrom::Start(offset))?;
-    let mut header_buf = [0u8; HEADER_SIZE];
-    if read_up_to(file, &mut header_buf)? != HEADER_SIZE {
+    let mut header_buf = Vec::with_capacity(HEADER_SIZE);
+    read_up_to(file, HEADER_SIZE, &mut header_buf)?;
+    let Ok(header_bytes) = <&[u8; HEADER_SIZE]>::try_from(header_buf.as_slice()) else {
         return Ok(None);
-    }
+    };
 
-    let header = RecordHeader::from_bytes(&header_buf);
+    let header = RecordHeader::from_bytes(header_bytes);
     if header.validate(offset).is_err() {
         return Ok(None);
     }
@@ -164,8 +165,8 @@ fn intact_record_lsn(file: &mut File, offset: u64, file_len: u64) -> Result<Opti
         _ => return Ok(None),
     }
 
-    let mut payload = vec![0u8; payload_len];
-    if read_up_to(file, &mut payload)? != payload_len {
+    let mut payload = Vec::with_capacity(payload_len);
+    if read_up_to(file, payload_len, &mut payload)? != payload_len {
         return Ok(None);
     }
 
@@ -177,18 +178,16 @@ fn intact_record_lsn(file: &mut File, offset: u64, file_len: u64) -> Result<Opti
     Ok(Some(header.lsn))
 }
 
-/// Fill `buf` as far as the file allows, returning the number of bytes read.
-fn read_up_to(file: &mut File, buf: &mut [u8]) -> Result<usize> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        match file.read(&mut buf[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(WalError::Io(e)),
-        }
-    }
-    Ok(filled)
+/// Replace `buf` with up to `len` bytes from the file's current position,
+/// returning the number of bytes read. Fewer than `len` means EOF.
+///
+/// `buf` holds only bytes read from the file, never a placeholder fill.
+fn read_up_to(file: &mut File, len: usize, buf: &mut Vec<u8>) -> Result<usize> {
+    buf.clear();
+    file.by_ref()
+        .take(len as u64)
+        .read_to_end(buf)
+        .map_err(WalError::Io)
 }
 
 #[cfg(test)]
