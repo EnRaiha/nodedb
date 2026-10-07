@@ -1,0 +1,14 @@
+diff --git a/nodedb/src/wal/manager/replay.rs b/nodedb/src/wal/manager/replay.rs
+index aaf3acc88..404c279c7 100644
+--- a/nodedb/src/wal/manager/replay.rs
++++ b/nodedb/src/wal/manager/replay.rs
+@@ -262,7 +262,8 @@ fn carried_format_version(path: &std::path::Path, offset: u64) -> Option<(u16, u
+     let version = u16::from_le_bytes([head[4], head[5]]);
+     let required = nodedb_wal::record::WAL_FORMAT_VERSION;
+ 
+-    (magic == nodedb_wal::record::WAL_MAGIC && version != required).then_some((version, required))
++    let _ = (magic, version, required);
++    None // MUTATION: the version read removed
+ }
+ 
+ #[cfg(test)]
