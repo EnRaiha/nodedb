@@ -12,11 +12,12 @@ Exit codes are the process exit code: 0 passes, 100 is a test failure, 101 is a 
 | Arm | Command | Exit | Commit | Log | sha256 |
 | --- | --- | --- | --- | --- | --- |
 | red | `cargo nextest run -p nodedb --lib -E 'test(a_store_written_in_an_older_format_says_which_version)'` | 100 | `e01612439` | [`logs/red-base.log`](logs/red-base.log) | `458af8cbab467489` |
-| green | `cargo nextest run -p nodedb --lib -E 'test(/wal::manager::replay/) or test(/class_parity/)'` | 0 | `b3f9950ed` | [`logs/green-b3f9950ed.log`](logs/green-b3f9950ed.log) | `95752ba7a092e08b` |
+| green | `cargo nextest run -p nodedb --lib -E 'test(/wal::manager::replay/) or test(/class_parity/)'` and `cargo nextest run -p nodedb-wal -E 'test(/segmented/)'` | 0 | `7ed16c1f0` | [`logs/green-7ed16c1f0.log`](logs/green-7ed16c1f0.log) | `b2fb3a7c8663a493` |
 | mutation A | the same filter, reader's version error removed | 100 | `afe1c835e` | [`logs/mutation-A-reader-surfacing.log`](logs/mutation-A-reader-surfacing.log) | `c0f9bbcfbbba6d2b` |
 | mutation B | the same filter, version-zero guard removed | 100 | `afe1c835e` | [`logs/mutation-B-zeroed-guard.log`](logs/mutation-B-zeroed-guard.log) | `ff1cfeb1452404ab` |
-| mutation C | the same filter, the reader's version-zero arm removed | 100 | `b3f9950ed` | [`logs/mutation-reader-zeroed-guard.log`](logs/mutation-reader-zeroed-guard.log) | `645f8ef7836efeac` |
-| end to end | `scripts/e2e-version-message.sh`, a real production copy and a real version-3 store | 0 | `435fb0b42` | [`logs/e2e-version-message.log`](logs/e2e-version-message.log) | `d0053996e876bb98` |
+| mutation C | the same filter, the reader's version-zero arm removed | 100 | `7ed16c1f0` | [`logs/mutation-zeroed-guard.log`](logs/mutation-zeroed-guard.log) | `6413fe585cd2a87e` |
+| end to end, message reaches the operator | `scripts/e2e-version-message.sh`, a real production copy and a real version-3 store | 0 | `3ec504dfb` | [`logs/e2e-message-reaches-operator.log`](logs/e2e-message-reaches-operator.log) | `60c3394d3cbf4cc9` |
+| end to end, first version | the same script, before the boot-order fix | 0 | `435fb0b42` | [`logs/e2e-version-message.log`](logs/e2e-version-message.log) | `d0053996e876bb98` |
 | full suite | `cargo nextest run -p nodedb --lib` | 0 | `d23e47984` | [`logs/full-suite.log`](logs/full-suite.log) | `bb60f23ed6599889` |
 
 ## Documents
