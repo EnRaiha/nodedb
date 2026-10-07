@@ -12,9 +12,10 @@ Exit codes are the process exit code: 0 passes, 100 is a test failure, 101 is a 
 | Arm | Command | Exit | Commit | Log | sha256 |
 | --- | --- | --- | --- | --- | --- |
 | red | `cargo nextest run -p nodedb --lib -E 'test(a_store_written_in_an_older_format_says_which_version)'` | 100 | `e01612439` | [`logs/red-base.log`](logs/red-base.log) | `458af8cbab467489` |
-| green | `cargo nextest run -p nodedb --lib -E 'test(/wal::manager::replay/) or test(/class_parity/)'` | 0 | `afe1c835e` | [`logs/green-afe1c835e.log`](logs/green-afe1c835e.log) | `ff7b0bc1ed9a61e7` |
+| green | `cargo nextest run -p nodedb --lib -E 'test(/wal::manager::replay/) or test(/class_parity/)'` | 0 | `b3f9950ed` | [`logs/green-b3f9950ed.log`](logs/green-b3f9950ed.log) | `95752ba7a092e08b` |
 | mutation A | the same filter, reader's version error removed | 100 | `afe1c835e` | [`logs/mutation-A-reader-surfacing.log`](logs/mutation-A-reader-surfacing.log) | `c0f9bbcfbbba6d2b` |
 | mutation B | the same filter, version-zero guard removed | 100 | `afe1c835e` | [`logs/mutation-B-zeroed-guard.log`](logs/mutation-B-zeroed-guard.log) | `ff1cfeb1452404ab` |
+| mutation C | the same filter, the reader's version-zero arm removed | 100 | `b3f9950ed` | [`logs/mutation-reader-zeroed-guard.log`](logs/mutation-reader-zeroed-guard.log) | `645f8ef7836efeac` |
 | end to end | `scripts/e2e-version-message.sh`, a real production copy and a real version-3 store | 0 | `435fb0b42` | [`logs/e2e-version-message.log`](logs/e2e-version-message.log) | `d0053996e876bb98` |
 | full suite | `cargo nextest run -p nodedb --lib` | 0 | `d23e47984` | [`logs/full-suite.log`](logs/full-suite.log) | `bb60f23ed6599889` |
 
