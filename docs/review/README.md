@@ -12,13 +12,14 @@ Exit codes are the process exit code: 0 passes, 100 is a test failure, 101 is a 
 | Arm | Command | Exit | Commit | Log | sha256 |
 | --- | --- | --- | --- | --- | --- |
 | red | `cargo nextest run -p nodedb --lib -E 'test(a_store_written_in_an_older_format_says_which_version)'` | 100 | `e01612439` | [`logs/red-base.log`](logs/red-base.log) | `458af8cbab467489` |
-| green | `cargo nextest run -p nodedb --lib -E 'test(/wal::manager::replay/) or test(/class_parity/)'` and `cargo nextest run -p nodedb-wal -E 'test(/segmented/)'` | 0 | `7ed16c1f0` | [`logs/green-7ed16c1f0.log`](logs/green-7ed16c1f0.log) | `b2fb3a7c8663a493` |
+| green | `cargo nextest run -p nodedb --lib -E 'test(/wal::manager::replay/) or test(/class_parity/)'` and `cargo nextest run -p nodedb-wal -E 'test(/segmented/)'` | 0 | `b0f1c8f33` | [`logs/green-b0f1c8f33.log`](logs/green-b0f1c8f33.log) | `b78d814bfaa053d0` |
 | mutation A | the same filter, reader's version error removed | 100 | `afe1c835e` | [`logs/mutation-A-reader-surfacing.log`](logs/mutation-A-reader-surfacing.log) | `c0f9bbcfbbba6d2b` |
 | mutation B | the same filter, version-zero guard removed | 100 | `afe1c835e` | [`logs/mutation-B-zeroed-guard.log`](logs/mutation-B-zeroed-guard.log) | `ff1cfeb1452404ab` |
-| mutation C | the same filter, the reader's version-zero arm removed | 100 | `7ed16c1f0` | [`logs/mutation-zeroed-guard.log`](logs/mutation-zeroed-guard.log) | `6413fe585cd2a87e` |
+| mutation | the same filter, the reader's version-zero arm removed | 100 | `b0f1c8f33` | [`logs/mutation-zeroed-guard-both-crates.log`](logs/mutation-zeroed-guard-both-crates.log) | `c98f08f6529e2c2d` |
 | end to end, message reaches the operator | `scripts/e2e-version-message.sh`, a real production copy and a real version-3 store | 0 | `3ec504dfb` | [`logs/e2e-message-reaches-operator.log`](logs/e2e-message-reaches-operator.log) | `60c3394d3cbf4cc9` |
 | end to end, first version | the same script, before the boot-order fix | 0 | `435fb0b42` | [`logs/e2e-version-message.log`](logs/e2e-version-message.log) | `d0053996e876bb98` |
-| full suite | `cargo nextest run -p nodedb --lib` | 0 | `d23e47984` | [`logs/full-suite.log`](logs/full-suite.log) | `bb60f23ed6599889` |
+| full suite | `cargo nextest run -p nodedb --lib` | 0 | `b0f1c8f33` | [`logs/full-suite.log`](logs/full-suite.log) | `cac084756dd2bb69` |
+| preflight, clippy included | the repository preflight, full mode against the base | 0 | `b0f1c8f33` | [`logs/preflight.log`](logs/preflight.log) | `6b6f194931ffcaf6` |
 
 ## Documents
 
@@ -42,3 +43,11 @@ Exit codes are the process exit code: 0 passes, 100 is a test failure, 101 is a 
 ## Tags
 
 Each tested head is tagged, so a log and the code it came from can be checked out together.
+
+## Verdict
+
+Review 2: **PASS, 0 blockers**, bound to head `b0f1c8f339b713acb9ddedfeda445e75b41e2dab`.
+
+The mutation that proves the version-zero guard now fails two tests, one per crate: `a_zeroed_version_is_not_a_format_gap` and `open_accepts_a_newest_segment_with_a_zeroed_version`. The full library suite is **8,785 tests, 0 failures** on this head.
+
+The branch is three commits, one per unit, rewritten from the twenty-four it took to get here. The tree is byte-identical to the tree before the rewrite, confirmed by comparing the tree hashes rather than the commit hashes.
