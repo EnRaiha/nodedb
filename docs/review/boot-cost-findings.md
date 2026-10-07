@@ -470,8 +470,8 @@ stick's autorun identified each machine, measured the scan, ran a real boot, and
 | Machine | CPU | Threads | The 1,024-vshard loop | Whole boot | Probe µs per record |
 | --- | --- | --- | --- | --- | --- |
 | Lenovo Yoga 7 2-in-1 14AHP9 (83DK) | AMD Ryzen 7 8840HS | 16 | **43.51 s**, **44.00 s** | 44.19 s, 45.19 s | 1.781, 1.816 |
-| lotus, native | Intel i5-8400 | 6 | 51.73 s | 53.16 s | 1.921 |
-| lotus under QEMU, 2 vCPU | Intel i5-8400 | 2 | 54.76 s | 56.18 s | 2.030 |
+| the reference host, native | Intel i5-8400 | 6 | 51.73 s | 53.16 s | 1.921 |
+| the reference host under QEMU, 2 vCPU | Intel i5-8400 | 2 | 54.76 s | 56.18 s | 2.030 |
 
 Per record per pass, from the loop itself: **2.80 µs on the Ryzen 7 8840HS** and **3.32 µs on the
 i5-8400**.

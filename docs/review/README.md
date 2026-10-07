@@ -1,33 +1,42 @@
-# Review material for pull request #412
+# Evidence for pull request #412
 
-This directory is the reading material for
-[pull request #412](https://github.com/NodeDB-Lab/nodedb/pull/412), which makes the startup bounds
-configurable and makes NodeDB say which WAL format version it found when it refuses a store. It lives on
-its own branch so the pull request's diff stays code only.
+Reading material and raw logs for [NodeDB-Lab/nodedb#412](https://github.com/NodeDB-Lab/nodedb/pull/412),
+which makes the startup bounds configurable and makes startup name the WAL format version it found when
+it refuses a store. It lives on its own branch so the pull request's diff stays code only.
 
-| File | What it is |
+## The evidence, arm by arm
+
+Every log below is the unedited output of the command beside it, with paths and hostnames replaced.
+Exit codes are the process exit code: 0 passes, 100 is a test failure, 101 is a build failure.
+
+| Arm | Command | Exit | Commit | Log | sha256 |
+| --- | --- | --- | --- | --- | --- |
+| red | `cargo nextest run -p nodedb --lib -E 'test(a_store_written_in_an_older_format_says_which_version)'` | 100 | `e01612439` | [`logs/red-base.log`](logs/red-base.log) | `458af8cbab467489` |
+| green | `cargo nextest run -p nodedb --lib -E 'test(/wal::manager::replay/) or test(/class_parity/)'` | 0 | `afe1c835e` | [`logs/green-afe1c835e.log`](logs/green-afe1c835e.log) | `ff7b0bc1ed9a61e7` |
+| mutation A | the same filter, reader's version error removed | 100 | `afe1c835e` | [`logs/mutation-A-reader-surfacing.log`](logs/mutation-A-reader-surfacing.log) | `c0f9bbcfbbba6d2b` |
+| mutation B | the same filter, version-zero guard removed | 100 | `afe1c835e` | [`logs/mutation-B-zeroed-guard.log`](logs/mutation-B-zeroed-guard.log) | `ff1cfeb1452404ab` |
+| end to end | `scripts/e2e-version-message.sh`, a real production copy and a real version-3 store | 0 | `435fb0b42` | [`logs/e2e-version-message.log`](logs/e2e-version-message.log) | `d0053996e876bb98` |
+| full suite | `cargo nextest run -p nodedb --lib` | 0 | `d23e47984` | [`logs/full-suite.log`](logs/full-suite.log) | `bb60f23ed6599889` |
+
+## Documents
+
+| File | What it answers |
 | --- | --- |
-| [`issue354-review-packet.md`](issue354-review-packet.md) | The review packet. The five commits, the evidence with exit codes, the design decisions to check, and the questions to answer. Start here |
-| [`boot-cost-findings.md`](boot-cost-findings.md) | What the boot spends and why, measured: the per-vshard WAL replay, the fat-increment experiments, the two-machine hardware comparison |
-| [`boot-cost-flexibility-design.md`](boot-cost-flexibility-design.md) | Where flexibility pays and where it does not, each row tied to a measurement, plus the rule that where the system's own numbers move, a fixed value will be wrong sometimes |
-| [`plan-next-work.md`](plan-next-work.md) | The plan for the work after this pull request, one branch and one pull request, each step with the code-graph survey that would contradict it |
-| [`mutation-version-read-removed.diff`](mutation-version-read-removed.diff) | The exact code removed in the mutation run, so the assertion strength is auditable rather than asserted |
+| [`issue354-review-packet.md`](issue354-review-packet.md) | The problem, the root cause, the design decisions, the evidence, and the questions for a reviewer. Start here |
+| [`boot-cost-findings.md`](boot-cost-findings.md) | What a boot spends and why, measured on real stores: the per-vshard WAL replay, the fat-increment experiments, and the same store on a 2023 laptop and a 2018 desktop |
+| [`boot-cost-flexibility-design.md`](boot-cost-flexibility-design.md) | Where a knob changes an outcome and where it would buy nothing, each row tied to a measurement |
+| [`plan-next-work.md`](plan-next-work.md) | The plan for the work after this pull request, each step with the code-graph survey that would contradict it |
+| [`scripts/e2e-version-message.sh`](scripts/e2e-version-message.sh) | The end-to-end script: boots a real store and asserts what the refusal says |
+| [`mutation/mutation-version-read-removed.diff`](mutation/mutation-version-read-removed.diff) | The first attempt's mutation diff, kept as the record of what that arm removed |
 
-## The change in one paragraph
+## What is not here, on purpose
 
-A node with a long WAL tail spends nearly all of its boot replaying the same WAL once per hosted
-vshard, which on the store that motivated this work is 83 s of a 90 s boot. The bounds meant to catch a
-stuck boot were hard-coded and do not cover the phase that dominates. Separately, a store written in an
-older WAL format failed every boot with "the segment appears to be corrupted", which sent its reader
-looking for damage that was not there. It now says which format version it found and which this build
-requires.
+| Item | Why |
+| --- | --- |
+| The production store itself | It holds real data. Its size and digest are recorded in the packet instead. A segment near 60 MB also sits close to a hosting limit |
+| Customer, tenant and host names | Replaced with `<user>`, `<host>`, `<ip>`, `<store>` in every log and document |
+| Anything from a private wiki or a local ledger | Those paths were rewritten, so every reference here resolves inside this branch |
 
-## Evidence at a glance
+## Tags
 
-| Arm | Exit | What it shows |
-| --- | --- | --- |
-| red | 100 | The version test fails against the old wording |
-| green | 0 | The replay module and the error-class parity module pass |
-| mutation | 100 | With the version read removed, exactly the two version-message tests fail |
-| end to end | 0 | A real version-1 production copy is refused naming both versions, and a real version-3 store boots to serving |
-| full suite | 0 | 8,784 tests passed on the head |
+Each tested head is tagged, so a log and the code it came from can be checked out together.

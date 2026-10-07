@@ -1,12 +1,11 @@
-# Review packet: a store from another build now says which version
+# Review packet: startup names the WAL format version it found
 
-Self-contained. A reviewer with no session context can read this file, the five commits it names, and
-judge the work.
+Self-contained. A reviewer with no context can read this file, the commits it names, and the logs in
+`logs/`, and judge the work.
 
-## What the change is
+## The problem
 
-NodeDB refuses to start when a WAL segment holds records in a format version it cannot read. It used
-to say this:
+A store written by another build failed every boot with this:
 
 ```
 StartupError: WAL validation failed — cannot start with corrupted WAL segments
@@ -14,78 +13,96 @@ StartupError: WAL validation failed — cannot start with corrupted WAL segments
         valid WAL records — the segment appears to be corrupted
 ```
 
-The store was not corrupted. It was written by an older build, in WAL format version 1, and this build
-reads version 3. Nothing in the message said so, and the reader went looking for damage. There is no
-migration path either, so the operator's real problem, "this store needs an upgrade", was invisible.
+The store was not corrupted. It was written in WAL format version 1 and this build reads version 3.
+Nothing in the message said so, and its reader went looking for damage. There is no migration path
+either, so the operator's real problem, "this store needs an upgrade", was invisible.
 
 It says this now:
 
 ```
 StartupError: WAL validation failed — cannot start with these WAL segments
-  error=WAL segment '…/wal-00000000000000710217.seg' holds records in WAL format version 1;
-        this build requires 3. The store needs a migration, not a repair.
+  error=version compatibility: WAL segment '…/wal-00000000000000710217.seg' holds records in WAL
+        format version 1; this build requires 3. The store needs a migration, not a repair.
 ```
 
-The behaviour is unchanged: the node still refuses to start. Only the diagnosis changed. The store
-remains unreadable by this build, which is the separate question of a migration path, and it is not in
-this change.
+The node still refuses to start. Only the diagnosis changed. The store stays unreadable by this build,
+which is the separate question of a migration path, and that question is not in this change.
 
-## The five commits
+## The root cause, and why the first attempt was wrong
 
-| Commit | What it does |
+`WalError::UnsupportedVersion { version, supported }` already existed and the record header already
+returned it. `nodedb-wal/src/reader.rs` then flattened it, along with every other header validation
+failure, into `StopReason::Corruption`. The reader knew the version and threw it away, which is why the
+gate saw an empty tail and reported corruption.
+
+The first attempt at this change added a new error variant, `WalFormatUnsupported`, and read the version
+from the segment in the gate. That worked, and it cost fifteen classification edits across the error
+machinery, growth in a file already over the repository's size limit, and a preflight bypass. A review
+found the root cause above, and the change was rebuilt on it.
+
+The final change is three files:
+
+| File | Change |
 | --- | --- |
-| `e01612439` | Drops a tolerance that had been added earlier, and adds the tests for what the message should say. This is the red commit: one of its tests fails on it |
-| `e531f319d` | Adds `Error::WalFormatUnsupported` and the version read, in sixteen files because the variant has to be classified everywhere `SegmentCorrupted` is |
-| `d92244beb` | Restores the tolerance **behind** the version check, and reads the version behind the preamble. Both answers to the first review |
-| `faa465fa5` | Moves the version read to the offset where the reader stopped, which is zero in a plaintext segment and sixteen behind an encrypted store's preamble |
-| `435fb0b42` | Makes the log line above the error neutral. Found by the end-to-end run, not by a unit test |
-
-## Evidence, with exit codes
-
-| Arm | Command | Exit | What it shows |
-| --- | --- | --- | --- |
-| base | `cargo nextest run -p nodedb --lib -E 'test(a_store_written_in_an_older_format_says_which_version) or test(a_segment_that_is_not_a_wal_still_says_corrupted)'` | **100** | The version test fails against the old wording, which is the bug |
-| fix | `cargo nextest run -p nodedb --lib -E 'test(/wal::manager::replay/) or test(/class_parity/)'` | **0** | All six replay tests and the error-class parity tests pass on `faa465fa5` |
-| mutation | the same filter, with the version comparison replaced by `None` | **100** | Exactly two tests fail, both the version-message ones; the four guards keep passing |
-| end to end | `e2e-version-message.sh` on a real production copy and a real version-3 store | **0** | The version-1 store is refused with the message above, and the version-3 store boots to serving |
-
-The mutation is recorded with its exact diff:
-`evidence-mutations/mutation-version-read-removed.diff`, sha256 `e74a7e6936bda4e4`.
-
-Logs: `/home/maya/.drill/issue354/logs/` — one file per arm, with the exit code in the name.
+| `nodedb-wal/src/reader.rs` | Return `UnsupportedVersion` instead of flattening it into `StopReason::Corruption` |
+| `nodedb/src/wal/manager/replay.rs` | Catch it at the gate and report `Error::VersionCompat` with the segment, the version found, the version required, and the right advice for the direction of the gap |
+| `nodedb/src/bootstrap/wal_init.rs` | The wrapper log line above the error is neutral, because it wraps every validation failure |
 
 ## Design decisions a reviewer should check
 
 | Decision | Why |
 | --- | --- |
-| A new error variant rather than a better string in the old one | A format gap is an upgrade and corruption is a repair. The variant carries `found` and `required`, so the message cannot drift from the values |
-| The version is read at `info.end_offset` | That is where the reader stopped. A plaintext store stops at 0, an encrypted one behind its 16-byte `WALP` preamble, and a torn tail stops with this build's own version, so a torn tail is not mistaken for a format gap |
-| The preallocated-tail tolerance is kept, behind the check | Every boot recreates the newest segment. Refusing a record-less newest segment made a store permanently unbootable, which an earlier review caught. The version check runs first, so the store that motivated this work is still refused |
-| `WalFormatUnsupported` is a permanent apply failure | Retrying cannot help until an upgrade, and the arm `SegmentCorrupted` happens to sit in returns `Transient` |
-| The wrapper log line is neutral | It wraps every validation failure, and it was the first line an operator read |
+| The reader returns the error rather than a stop reason | The reason travels with its values instead of being re-derived from the file afterwards. It also removes the six-byte re-read the first attempt needed, and with it the preamble case that re-read got wrong |
+| `Error::VersionCompat` rather than a new variant | It already exists and carries a detail string, so the message keeps the segment path and the direction of the gap without touching the classification machinery |
+| Version zero takes the empty-tail path | Zero is uninitialised bytes, not a format any build wrote. A torn write that persists the four magic bytes over a zeroed tail leaves exactly that, and refusing it would refuse a store that used to boot |
+| The preallocated-tail tolerance is kept, and the version check no longer sits in front of it | The reader reports the version before the gate looks at `end_offset`, so the tolerance only ever sees a segment whose records this build can read |
+| The advice depends on the direction | An older store needs a migration. A newer store needs a newer binary, and telling that operator to migrate would be wrong |
+
+## Evidence
+
+| Arm | Command | Exit | Commit | Log |
+| --- | --- | --- | --- | --- |
+| red | `cargo nextest run -p nodedb --lib -E 'test(a_store_written_in_an_older_format_says_which_version)'` | **100** | `e01612439` | `logs/red-base.log` |
+| green | `cargo nextest run -p nodedb --lib -E 'test(/wal::manager::replay/) or test(/class_parity/)'` | **0** | `afe1c835e` | `logs/green-afe1c835e.log` |
+| mutation A | the same filter, with the reader's version error removed | **100** | `afe1c835e` | `logs/mutation-A-reader-surfacing.log` |
+| mutation B | the same filter, with the version-zero guard removed | **100** | `afe1c835e` | `logs/mutation-B-zeroed-guard.log` |
+| end to end | a real production copy and a real version-3 store, release binary | **0** | `435fb0b42` | `logs/e2e-version-message.log` |
+| full suite | `cargo nextest run -p nodedb --lib` | **0** | `d23e47984` | `logs/full-suite.log` |
+
+What each arm proves:
+
+- **Red** fails against the old wording, so the test is about the bug and not about the change.
+- **Green** passes the replay module and the error-class parity module.
+- **Mutation A** removes the reader's version error, and exactly the version-message tests fail. The four guards keep passing, so they are guards and not proofs, which is what they are for.
+- **Mutation B** removes the version-zero guard, and exactly `a_zeroed_version_is_not_a_format_gap` fails.
+- **End to end** refuses a real version-1 production copy with the message above, the word "corrupted" appears zero times in its log, and a real version-3 store reaches `ready=1`. This run is what found the wrapper line above the error still saying "cannot start with corrupted WAL segments", which no unit test could see.
+- **Full suite** is 8,784 tests, three more than before this work, which is the three tests this change adds.
+
+Mutation A and B were each run with only that mutation installed. An earlier B run still had A applied,
+which masked B's effect; it was discarded and re-run.
+
+## The tests
+
+| Test | What it pins |
+| --- | --- |
+| `a_store_written_in_an_older_format_says_which_version` | A plaintext store in version 1 is refused, naming the version found, the version required, the segment, and not the word "corrupted" |
+| `a_store_with_a_preamble_says_which_version` | The same behind an encrypted store's preamble, which is where the first attempt's offset assumption broke |
+| `a_zeroed_version_is_not_a_format_gap` | A torn write that persists the magic and leaves the version zeroed is not a format gap, and does not refuse a store that used to boot |
+| `a_preallocated_newest_segment_does_not_block_startup` | A record-less newest segment stays allowed, which is the tolerance this repository already had |
+| `a_segment_with_no_records_behind_the_newest_still_blocks_startup` | A record-less segment that is not the tail stays fatal |
+| `a_segment_that_is_not_a_wal_still_says_corrupted` | Bytes with no WAL framing are still corruption |
 
 ## Questions for the reviewer
 
-1. Is the ordering right: version check, then the tail tolerance, then corruption? A store that is both
-   the tail and in the wrong format must be refused, and one that is the tail and merely empty must not.
-2. `carried_format_version` reads six bytes at the stop offset. A file shorter than six bytes, a file
-   that vanishes between discovery and the read, and a file whose bytes at that offset are not a header
-   all yield `None`, which falls through to corruption. Is that the right default?
-3. The new variant was added to every exhaustive match that mentions `SegmentCorrupted` — sixteen files.
-   Check the class each match assigns, especially the retryability ones.
-4. Do the five tests pin behaviour or wording? The mutation says only the two version tests fail without
-   the code, which is the intended split.
-5. Anything in the change that makes the *store* worse rather than the message better.
+1. Is surfacing `UnsupportedVersion` from the reader the right layer, given the writer paths that also call recovery?
+2. Version zero is treated as uninitialised bytes. Is that the right line, or should a zeroed version be reported as damage?
+3. The advice in the message depends on whether the found version is below or above the required one. Is the wording right for a store from a **newer** build?
+4. Do the six tests pin behaviour, or the current wording?
 
 ## What is not in this change
 
 | Item | Status |
 | --- | --- |
 | A migration or dump path for an older store | Not attempted. The store stays unreadable, and the message now says so |
-| The redundant per-vshard WAL replay, the measured five-fold win | Separate unit, planned next |
-| The withdrawn tolerance itself | Reverted. It was measured harmful: on the version-1 store it let the gate pass, replayed zero records, and the node died later in the write-group settle |
-
-## Where the wider evidence lives
-
-`Bumi-Hijau/wiki/nodedb/NODEDB-BOOT-BENCH-20261006/` — the boot study, the two-machine hardware
-measurement, the flexibility design, and the plan for the work after this.
+| A total boot deadline | Designed, not implemented. `StartupTuning` carries the two bounds this branch makes configurable |
+| The redundant per-vshard WAL replay, the measured five-fold win | Separate work, planned in `plan-next-work.md` |
