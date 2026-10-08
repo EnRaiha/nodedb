@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 use nodedb_types::strip_prefix_ascii_case_insensitive;
+use pgwire::api::portal::Format;
 use pgwire::api::results::{DataRowEncoder, QueryResponse, Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
@@ -22,6 +23,7 @@ use super::connection_admin;
 use super::core::NodeDbPgHandler;
 use super::sql_split::split_sql_statements;
 use crate::control::server::shared::session::{SessionId, TransactionState};
+use crate::control::server::shared::txn_control::{TxnControl, classify as classify_txn_control};
 
 impl NodeDbPgHandler {
     /// Execute a SQL query: session state → identity → DDL check → quota → plan → perms → dispatch.
@@ -29,23 +31,30 @@ impl NodeDbPgHandler {
     /// Handles multi-statement queries (e.g. psql heredoc sends all statements in one message).
     /// Splits at top-level semicolons before dispatching so that `parts[2]` is never polluted
     /// with trailing `;` characters.
+    ///
+    /// `requested` is the client's result-format request: `TEXT_RESULTS`
+    /// for the simple-query protocol, the portal's formats for an
+    /// extended-query Execute. Typed DDL and planned results honour it.
     pub(super) async fn execute_sql(
         &self,
         identity: &AuthenticatedIdentity,
         session_id: SessionId,
         sql: &str,
+        requested: &Format,
     ) -> PgWireResult<Vec<Response>> {
         let statements = split_sql_statements(sql);
         match statements.len() {
             0 => Ok(vec![Response::EmptyQuery]),
             1 => {
-                self.execute_single_sql(identity, session_id, &statements[0])
+                self.execute_single_sql(identity, session_id, &statements[0], requested)
                     .await
             }
             _ => {
                 let mut all = Vec::new();
                 for stmt in statements {
-                    let mut resp = self.execute_single_sql(identity, session_id, &stmt).await?;
+                    let mut resp = self
+                        .execute_single_sql(identity, session_id, &stmt, requested)
+                        .await?;
                     all.append(&mut resp);
                 }
                 Ok(all)
@@ -59,6 +68,7 @@ impl NodeDbPgHandler {
         identity: &AuthenticatedIdentity,
         session_id: SessionId,
         sql: &str,
+        requested: &Format,
     ) -> PgWireResult<Vec<Response>> {
         use super::super::types::error_to_sqlstate;
 
@@ -70,17 +80,35 @@ impl NodeDbPgHandler {
         }
 
         // ── Transaction commands ──────────────────────────────────────
+        // Their session handlers own the aborted-block state, so they run
+        // before the failed-transaction guard.
 
-        if upper == "BEGIN" || upper == "BEGIN TRANSACTION" || upper == "START TRANSACTION" {
-            return self.handle_begin(session_id);
+        if let Some(control) = classify_txn_control(sql_trimmed) {
+            return match control {
+                TxnControl::Begin(modes) => self.handle_begin(session_id, &modes),
+                TxnControl::Commit => self.handle_commit(identity, session_id).await,
+                TxnControl::Rollback => self.handle_rollback(identity, session_id).await,
+                TxnControl::Savepoint(name) => {
+                    self.handle_savepoint(identity, session_id, &name).await
+                }
+                TxnControl::Release(name) => self.handle_release_savepoint(session_id, &name),
+                TxnControl::RollbackTo(name) => {
+                    self.handle_rollback_to_savepoint(identity, session_id, &name)
+                        .await
+                }
+            };
         }
 
-        if upper == "COMMIT" || upper == "END" || upper == "END TRANSACTION" {
-            return self.handle_commit(identity, session_id).await;
-        }
+        // ── Failed transaction guard ──────────────────────────────────
+        // An aborted block refuses every other statement until it ends.
 
-        if upper == "ROLLBACK" || upper == "ABORT" {
-            return self.handle_rollback(identity, session_id).await;
+        if self.sessions.transaction_state(session_id) == TransactionState::Failed {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "25P02".to_owned(),
+                "current transaction is aborted, commands ignored until end of transaction block"
+                    .to_owned(),
+            ))));
         }
 
         if let Some(result) =
@@ -95,22 +123,6 @@ impl NodeDbPgHandler {
                 .intent_to_response(identity, session_id, intent)
                 .await
                 .map(|r| vec![r]);
-        }
-
-        if upper.starts_with("SAVEPOINT ") {
-            return self
-                .handle_savepoint(identity, session_id, sql_trimmed)
-                .await;
-        }
-
-        if upper.starts_with("RELEASE SAVEPOINT ") || upper.starts_with("RELEASE ") {
-            return self.handle_release_savepoint(session_id, sql_trimmed);
-        }
-
-        if upper.starts_with("ROLLBACK TO ") {
-            return self
-                .handle_rollback_to_savepoint(identity, session_id, sql_trimmed)
-                .await;
         }
 
         // ── Cursor commands ───────────────────────────────────────────
@@ -173,17 +185,6 @@ impl NodeDbPgHandler {
                 .to_string();
             self.sessions.close_cursor(session_id, &cursor_name);
             return Ok(vec![Response::Execution(Tag::new("CLOSE CURSOR"))]);
-        }
-
-        // ── Failed transaction guard ──────────────────────────────────
-
-        if self.sessions.transaction_state(session_id) == TransactionState::Failed {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "25P02".to_owned(),
-                "current transaction is aborted, commands ignored until end of transaction block"
-                    .to_owned(),
-            ))));
         }
 
         // ── Session commands ──────────────────────────────────────────
@@ -321,7 +322,9 @@ impl NodeDbPgHandler {
             return self.handle_prepare(session_id, sql_trimmed);
         }
         if upper.starts_with("EXECUTE ") {
-            return self.handle_execute(identity, session_id, sql_trimmed).await;
+            return self
+                .handle_execute(identity, session_id, sql_trimmed, requested)
+                .await;
         }
         if upper.starts_with("DEALLOCATE ") {
             return self.handle_deallocate(session_id, sql_trimmed);
@@ -440,7 +443,9 @@ impl NodeDbPgHandler {
             )
             .await
         {
-            return crate::control::server::pgwire::ddl_encode::ddl_results_to_pgwire(result);
+            return crate::control::server::pgwire::ddl_encode::ddl_results_to_pgwire(
+                result, requested,
+            );
         }
 
         if let Some(result) = crate::control::server::shared::ddl::dispatch(
@@ -452,7 +457,9 @@ impl NodeDbPgHandler {
         )
         .await
         {
-            return crate::control::server::pgwire::ddl_encode::ddl_results_to_pgwire(result);
+            return crate::control::server::pgwire::ddl_encode::ddl_results_to_pgwire(
+                result, requested,
+            );
         }
 
         // SHOW commands the DDL / AST router did not claim are PG
@@ -478,7 +485,7 @@ impl NodeDbPgHandler {
 
         let _request = self.state.tenant_request_guard(tenant_id);
         let result = self
-            .execute_planned_sql(identity, sql_trimmed, tenant_id, session_id)
+            .execute_planned_sql(identity, sql_trimmed, tenant_id, session_id, requested)
             .await;
 
         if result.is_err() {

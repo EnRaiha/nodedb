@@ -17,6 +17,11 @@
 /// included here because `execute_planned_sql_with_params` uses the standard
 /// SQL planner (sqlparser) which does not recognise NodeDB extensions.
 pub(super) fn is_dsl_statement(sql: &str) -> bool {
+    // Transaction control has no plan: the session handlers in `execute_sql`
+    // own it, including in an aborted block.
+    if is_transaction_control_sql(sql) {
+        return true;
+    }
     let upper = sql.trim().to_uppercase();
     // `SEARCH ... USING VECTOR(...)` is preprocessor-rewritten into canonical
     // SELECT and goes through plan_sql like any other SELECT. Only the FUSION
@@ -89,6 +94,14 @@ pub(super) fn is_dsl_statement(sql: &str) -> bool {
         || upper.starts_with("DROP SPARSE INDEX ")
 }
 
+/// Return true if `sql` is transaction control. An aborted block admits a
+/// Parse only for these: their session handlers own the aborted state.
+/// The transaction-command arms of `execute_sql` classify with the same
+/// function, so Parse and execution agree on every spelling.
+pub(super) fn is_transaction_control_sql(sql: &str) -> bool {
+    crate::control::server::shared::txn_control::classify(sql).is_some()
+}
+
 /// Replace each `$N` placeholder in `sql` with the literal `NULL`.
 /// Used only for Parse-time schema inference — the real bound values
 /// are substituted at Execute time.
@@ -128,6 +141,42 @@ mod tests {
         assert_eq!(count_placeholders("SELECT $1, $2, $3"), 3);
         assert_eq!(count_placeholders("SELECT 1"), 0);
         assert_eq!(count_placeholders("WHERE id = $1 AND name = $1"), 1);
+    }
+
+    #[test]
+    fn transaction_control_routes_through_execute_sql() {
+        for sql in [
+            "BEGIN",
+            "begin;",
+            "START TRANSACTION",
+            "COMMIT",
+            "END",
+            "ROLLBACK",
+            "abort",
+            "SAVEPOINT s1",
+            "RELEASE SAVEPOINT s1",
+            "ROLLBACK TO SAVEPOINT s1",
+            "rollback to s1",
+            "ROLLBACK TRANSACTION",
+            "ROLLBACK WORK TO SAVEPOINT s1",
+            "ABORT WORK",
+            "COMMIT WORK",
+            "END TRANSACTION;",
+            "BEGIN WORK",
+            "START TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY",
+            "RELEASE s1",
+        ] {
+            assert!(
+                is_dsl_statement(sql),
+                "{sql} must route through execute_sql"
+            );
+            assert!(
+                is_transaction_control_sql(sql),
+                "{sql} must pass the aborted-block Parse gate"
+            );
+        }
+        assert!(!is_dsl_statement("SELECT 1"));
+        assert!(!is_dsl_statement("BEGINNING"));
     }
 
     #[test]

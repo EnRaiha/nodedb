@@ -10,6 +10,7 @@ use crate::control::server::shared::session::SessionId;
 
 use super::super::types::sqlstate_error;
 use super::core::NodeDbPgHandler;
+use crate::control::server::shared::txn_control::{IsolationLevel, unsupported_isolation_message};
 
 /// Outcome of classifying a `SET TRANSACTION` / `SET SESSION CHARACTERISTICS` command.
 enum TransactionCmd {
@@ -37,20 +38,17 @@ fn classify_transaction_cmd(upper: &str, sql: &str) -> TransactionCmd {
         }
 
         let level = if upper.contains("SERIALIZABLE") {
-            Some("SERIALIZABLE")
+            Some(IsolationLevel::Serializable)
         } else if upper.contains("REPEATABLE READ") {
-            Some("REPEATABLE READ")
+            Some(IsolationLevel::RepeatableRead)
         } else if upper.contains("READ UNCOMMITTED") {
-            Some("READ UNCOMMITTED")
+            Some(IsolationLevel::ReadUncommitted)
         } else {
             None
         };
 
         let message = match level {
-            Some(lvl) => format!(
-                "SET TRANSACTION ISOLATION LEVEL {lvl} is not supported; \
-                 NodeDB enforces Snapshot Isolation"
-            ),
+            Some(level) => unsupported_isolation_message("SET TRANSACTION", level),
             None => format!(
                 "unsupported SET TRANSACTION option: {}",
                 sql.split_whitespace().skip(2).collect::<Vec<_>>().join(" ")

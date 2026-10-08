@@ -3,12 +3,15 @@
 //! Request routing: maps a decoded [`NativeRequest`](nodedb_types::protocol::NativeRequest)
 //! to the appropriate handler by opcode.
 
+use nodedb_types::protocol::opcodes::ResponseStatus;
 use nodedb_types::protocol::{AuthMethod, NativeResponse, OpCode, RequestFields, TextFields};
 
 use super::NativeSession;
 use super::dispatch::{self, DispatchCtx};
 use crate::config::auth::AuthMode;
 use crate::control::server::native::sqlstate_code::sqlstate_error;
+use crate::control::server::shared::session::TransactionState;
+use crate::control::server::shared::txn_control::TxnModes;
 
 impl NativeSession {
     /// Route a decoded request to the appropriate handler.
@@ -248,188 +251,216 @@ impl NativeSession {
                 .await;
         }
 
-        let response = match op {
-            // SQL handled above (streaming-capable).
-            OpCode::Sql | OpCode::Ddl => unreachable!("SQL/DDL handled before this match"),
+        // An aborted block admits only transaction control, as on pgwire.
+        // Any other opcode that errors inside a block aborts the block, the
+        // rule pgwire applies to every extended-query message.
+        let is_txn_control = matches!(op, OpCode::Begin | OpCode::Commit | OpCode::Rollback);
+        if !is_txn_control
+            && self.sessions.transaction_state(self.peer_addr) == TransactionState::Failed
+        {
+            return SqlOutcome::Response(Box::new(dispatch::aborted_block_error(seq)));
+        }
 
-            // Session parameters.
-            OpCode::Set => {
-                let key = match &fields.key {
-                    Some(k) => k.as_str(),
-                    None => {
-                        // Also support SET via sql field: "SET key = value"
-                        if let Some(sql) = &fields.sql {
-                            return SqlOutcome::Response(Box::new(
-                                dispatch::handle_sql(&ctx, seq, sql, None).await,
-                            ));
-                        }
-                        return SqlOutcome::Response(Box::new(sqlstate_error(
-                            seq,
-                            "42601",
-                            "missing 'key' field",
-                        )));
-                    }
-                };
-                let value = fields.value.as_deref().unwrap_or("");
-                dispatch::handle_set(&ctx, seq, key, value)
-            }
-            OpCode::Show => {
-                let key = match &fields.key {
-                    Some(k) => k.as_str(),
-                    None => {
-                        if let Some(sql) = &fields.sql {
-                            return SqlOutcome::Response(Box::new(
-                                dispatch::handle_sql(&ctx, seq, sql, None).await,
-                            ));
-                        }
-                        return SqlOutcome::Response(Box::new(sqlstate_error(
-                            seq,
-                            "42601",
-                            "missing 'key' field",
-                        )));
-                    }
-                };
-                dispatch::handle_show(&ctx, seq, key)
-            }
-            OpCode::Reset => {
-                let key = match &fields.key {
-                    Some(k) => k.as_str(),
-                    None => {
-                        return SqlOutcome::Response(Box::new(sqlstate_error(
-                            seq,
-                            "42601",
-                            "missing 'key' field",
-                        )));
-                    }
-                };
-                dispatch::handle_reset(&ctx, seq, key)
-            }
-
-            // Transaction control.
-            OpCode::Begin => dispatch::handle_begin(&ctx, seq),
-            OpCode::Commit => dispatch::handle_commit(&ctx, seq).await,
-            OpCode::Rollback => dispatch::handle_rollback(&ctx, seq).await,
-
-            // Explain.
-            OpCode::Explain => {
-                let sql = match &fields.sql {
-                    Some(s) => s.as_str(),
-                    None => {
-                        return SqlOutcome::Response(Box::new(sqlstate_error(
-                            seq,
-                            "42601",
-                            "missing 'sql' field",
-                        )));
-                    }
-                };
-                dispatch::handle_sql(&ctx, seq, &format!("EXPLAIN {sql}"), None).await
-            }
-
-            // Sorted-index reads name only an index: gated on its owning
-            // collection and run in the caller's transaction, like the SQL
-            // sorted-index functions.
-            OpCode::KvSortedIndexRank
-            | OpCode::KvSortedIndexTopK
-            | OpCode::KvSortedIndexRange
-            | OpCode::KvSortedIndexCount
-            | OpCode::KvSortedIndexScore => {
-                dispatch::handle_sorted_read_op(&ctx, seq, op, fields).await
-            }
-
-            // Index DDL runs as the SQL statement it names, so it reaches the
-            // catalog and the transaction's DDL buffer.
-            OpCode::KvRegisterSortedIndex
-            | OpCode::KvDropSortedIndex
-            | OpCode::VectorSetParams
-            | OpCode::DocumentDropIndex
-            | OpCode::DocumentRegister
-            | OpCode::KvRegisterIndex
-            | OpCode::KvDropIndex => dispatch::handle_index_ddl_op(&ctx, seq, op, fields).await,
-
-            // Direct Data Plane operations.
-            OpCode::PointGet
-            | OpCode::PointPut
-            | OpCode::PointDelete
-            | OpCode::VectorSearch
-            | OpCode::RangeScan
-            | OpCode::CrdtRead
-            | OpCode::CrdtApply
-            | OpCode::GraphRagFusion
-            | OpCode::AlterCollectionPolicy
-            | OpCode::GraphHop
-            | OpCode::GraphNeighbors
-            | OpCode::GraphPath
-            | OpCode::GraphSubgraph
-            | OpCode::EdgePut
-            | OpCode::EdgeDelete
-            | OpCode::TextSearch
-            | OpCode::HybridSearch
-            | OpCode::SpatialScan
-            | OpCode::TimeseriesScan
-            | OpCode::TimeseriesIngest
-            | OpCode::KvScan
-            | OpCode::KvExpire
-            | OpCode::KvPersist
-            | OpCode::KvGetTtl
-            | OpCode::KvBatchGet
-            | OpCode::KvBatchPut
-            | OpCode::KvFieldGet
-            | OpCode::KvFieldSet
-            | OpCode::DocumentUpdate
-            | OpCode::DocumentScan
-            | OpCode::DocumentUpsert
-            | OpCode::DocumentBulkUpdate
-            | OpCode::DocumentBulkDelete
-            | OpCode::VectorInsert
-            | OpCode::VectorMultiSearch
-            | OpCode::VectorDelete
-            | OpCode::GraphAlgo
-            | OpCode::ColumnarScan
-            | OpCode::ColumnarInsert
-            | OpCode::RecursiveScan
-            | OpCode::DocumentTruncate
-            | OpCode::DocumentEstimateCount
-            | OpCode::DocumentInsertSelect
-            | OpCode::KvTruncate
-            | OpCode::KvIncr
-            | OpCode::KvIncrFloat
-            | OpCode::KvCas
-            | OpCode::KvGetSet
-            | OpCode::CrdtListInsert
-            | OpCode::CrdtListDelete
-            | OpCode::CrdtListMove => dispatch::handle_direct_op(&ctx, seq, op, fields).await,
-
-            // MATCH: dedicated path that unwraps the DP `{rows, frontier}`
-            // envelope into the bare rows array the native row decoder expects.
-            OpCode::GraphMatch => dispatch::handle_graph_match(&ctx, seq, fields).await,
-
-            // Batch ops: direct Data Plane dispatch.
-            OpCode::VectorBatchInsert | OpCode::DocumentBatchInsert => {
-                dispatch::handle_direct_op(&ctx, seq, op, fields).await
-            }
-
-            // Copy from file.
-            OpCode::CopyFrom => {
-                let sql = match &fields.sql {
-                    Some(s) => s.as_str(),
-                    None => {
-                        return SqlOutcome::Response(Box::new(sqlstate_error(
-                            seq,
-                            "42601",
-                            "missing 'sql' field",
-                        )));
-                    }
-                };
-                dispatch::handle_sql(&ctx, seq, sql, None).await
-            }
-
-            // Auth/Ping/Status handled above.
-            OpCode::Auth | OpCode::Ping | OpCode::Status => unreachable!(),
-            // OpCode is #[non_exhaustive]; future opcodes that reach this
-            // handler before session.rs is updated return a typed error.
-            _ => sqlstate_error(seq, "0A000", "opcode not supported by this server version"),
-        };
-
-        SqlOutcome::Response(Box::new(response))
+        let outcome = route_opcode(ctx, seq, op, fields).await;
+        if !is_txn_control
+            && let SqlOutcome::Response(response) = &outcome
+            && response.status == ResponseStatus::Error
+        {
+            self.sessions.fail_transaction(self.peer_addr);
+        }
+        outcome
     }
+}
+
+/// Run one opcode other than Auth, Ping, Status, Sql and Ddl.
+async fn route_opcode(
+    ctx: DispatchCtx<'_>,
+    seq: u64,
+    op: OpCode,
+    fields: &TextFields,
+) -> dispatch::SqlOutcome {
+    use dispatch::SqlOutcome;
+    let response = match op {
+        // SQL handled above (streaming-capable).
+        OpCode::Sql | OpCode::Ddl => unreachable!("SQL/DDL handled before this match"),
+
+        // Session parameters.
+        OpCode::Set => {
+            let key = match &fields.key {
+                Some(k) => k.as_str(),
+                None => {
+                    // Also support SET via sql field: "SET key = value"
+                    if let Some(sql) = &fields.sql {
+                        return SqlOutcome::Response(Box::new(
+                            dispatch::handle_sql(&ctx, seq, sql, None).await,
+                        ));
+                    }
+                    return SqlOutcome::Response(Box::new(sqlstate_error(
+                        seq,
+                        "42601",
+                        "missing 'key' field",
+                    )));
+                }
+            };
+            let value = fields.value.as_deref().unwrap_or("");
+            dispatch::handle_set(&ctx, seq, key, value)
+        }
+        OpCode::Show => {
+            let key = match &fields.key {
+                Some(k) => k.as_str(),
+                None => {
+                    if let Some(sql) = &fields.sql {
+                        return SqlOutcome::Response(Box::new(
+                            dispatch::handle_sql(&ctx, seq, sql, None).await,
+                        ));
+                    }
+                    return SqlOutcome::Response(Box::new(sqlstate_error(
+                        seq,
+                        "42601",
+                        "missing 'key' field",
+                    )));
+                }
+            };
+            dispatch::handle_show(&ctx, seq, key)
+        }
+        OpCode::Reset => {
+            let key = match &fields.key {
+                Some(k) => k.as_str(),
+                None => {
+                    return SqlOutcome::Response(Box::new(sqlstate_error(
+                        seq,
+                        "42601",
+                        "missing 'key' field",
+                    )));
+                }
+            };
+            dispatch::handle_reset(&ctx, seq, key)
+        }
+
+        // Transaction control.
+        OpCode::Begin => dispatch::handle_begin(&ctx, seq, &TxnModes::default()),
+        OpCode::Commit => dispatch::handle_commit(&ctx, seq).await,
+        OpCode::Rollback => dispatch::handle_rollback(&ctx, seq).await,
+
+        // Explain.
+        OpCode::Explain => {
+            let sql = match &fields.sql {
+                Some(s) => s.as_str(),
+                None => {
+                    return SqlOutcome::Response(Box::new(sqlstate_error(
+                        seq,
+                        "42601",
+                        "missing 'sql' field",
+                    )));
+                }
+            };
+            dispatch::handle_sql(&ctx, seq, &format!("EXPLAIN {sql}"), None).await
+        }
+
+        // Sorted-index reads name only an index: gated on its owning
+        // collection and run in the caller's transaction, like the SQL
+        // sorted-index functions.
+        OpCode::KvSortedIndexRank
+        | OpCode::KvSortedIndexTopK
+        | OpCode::KvSortedIndexRange
+        | OpCode::KvSortedIndexCount
+        | OpCode::KvSortedIndexScore => {
+            dispatch::handle_sorted_read_op(&ctx, seq, op, fields).await
+        }
+
+        // Index DDL runs as the SQL statement it names, so it reaches the
+        // catalog and the transaction's DDL buffer.
+        OpCode::KvRegisterSortedIndex
+        | OpCode::KvDropSortedIndex
+        | OpCode::VectorSetParams
+        | OpCode::DocumentDropIndex
+        | OpCode::DocumentRegister
+        | OpCode::KvRegisterIndex
+        | OpCode::KvDropIndex => dispatch::handle_index_ddl_op(&ctx, seq, op, fields).await,
+
+        // Direct Data Plane operations.
+        OpCode::PointGet
+        | OpCode::PointPut
+        | OpCode::PointDelete
+        | OpCode::VectorSearch
+        | OpCode::RangeScan
+        | OpCode::CrdtRead
+        | OpCode::CrdtApply
+        | OpCode::GraphRagFusion
+        | OpCode::AlterCollectionPolicy
+        | OpCode::GraphHop
+        | OpCode::GraphNeighbors
+        | OpCode::GraphPath
+        | OpCode::GraphSubgraph
+        | OpCode::EdgePut
+        | OpCode::EdgeDelete
+        | OpCode::TextSearch
+        | OpCode::HybridSearch
+        | OpCode::SpatialScan
+        | OpCode::TimeseriesScan
+        | OpCode::TimeseriesIngest
+        | OpCode::KvScan
+        | OpCode::KvExpire
+        | OpCode::KvPersist
+        | OpCode::KvGetTtl
+        | OpCode::KvBatchGet
+        | OpCode::KvBatchPut
+        | OpCode::KvFieldGet
+        | OpCode::KvFieldSet
+        | OpCode::DocumentUpdate
+        | OpCode::DocumentScan
+        | OpCode::DocumentUpsert
+        | OpCode::DocumentBulkUpdate
+        | OpCode::DocumentBulkDelete
+        | OpCode::VectorInsert
+        | OpCode::VectorMultiSearch
+        | OpCode::VectorDelete
+        | OpCode::GraphAlgo
+        | OpCode::ColumnarScan
+        | OpCode::ColumnarInsert
+        | OpCode::RecursiveScan
+        | OpCode::DocumentTruncate
+        | OpCode::DocumentEstimateCount
+        | OpCode::DocumentInsertSelect
+        | OpCode::KvTruncate
+        | OpCode::KvIncr
+        | OpCode::KvIncrFloat
+        | OpCode::KvCas
+        | OpCode::KvGetSet
+        | OpCode::CrdtListInsert
+        | OpCode::CrdtListDelete
+        | OpCode::CrdtListMove => dispatch::handle_direct_op(&ctx, seq, op, fields).await,
+
+        // MATCH: dedicated path that unwraps the DP `{rows, frontier}`
+        // envelope into the bare rows array the native row decoder expects.
+        OpCode::GraphMatch => dispatch::handle_graph_match(&ctx, seq, fields).await,
+
+        // Batch ops: direct Data Plane dispatch.
+        OpCode::VectorBatchInsert | OpCode::DocumentBatchInsert => {
+            dispatch::handle_direct_op(&ctx, seq, op, fields).await
+        }
+
+        // Copy from file.
+        OpCode::CopyFrom => {
+            let sql = match &fields.sql {
+                Some(s) => s.as_str(),
+                None => {
+                    return SqlOutcome::Response(Box::new(sqlstate_error(
+                        seq,
+                        "42601",
+                        "missing 'sql' field",
+                    )));
+                }
+            };
+            dispatch::handle_sql(&ctx, seq, sql, None).await
+        }
+
+        // Auth/Ping/Status handled above.
+        OpCode::Auth | OpCode::Ping | OpCode::Status => unreachable!(),
+        // OpCode is #[non_exhaustive]; future opcodes that reach this
+        // handler before session.rs is updated return a typed error.
+        _ => sqlstate_error(seq, "0A000", "opcode not supported by this server version"),
+    };
+
+    SqlOutcome::Response(Box::new(response))
 }
