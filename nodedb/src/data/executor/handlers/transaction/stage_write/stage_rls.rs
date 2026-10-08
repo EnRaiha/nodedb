@@ -106,9 +106,10 @@ impl CoreLoop {
                         .map_err(|e| ErrorCode::Internal {
                             detail: format!("columnar insert: pk encode failed: {e}"),
                         })?;
-                engine
-                    .lookup_memtable_row_by_pk(&pk_bytes)
-                    .or_else(|| self.read_flushed_row_by_pk(engine_key, &pk_bytes))
+                // A prior row that does not read refuses the statement: the
+                // policy would otherwise decide against no prior row.
+                self.read_columnar_row_by_pk(engine_key, &pk_bytes)
+                    .map_err(ErrorCode::from)?
             }
         };
         let Some(prior) = prior else {
@@ -127,10 +128,8 @@ impl CoreLoop {
         schema
             .columns
             .iter()
-            .map(|col| ndb_field_to_value(merged.get(&col.name), &col.column_type))
+            .map(|col| ndb_field_to_value(merged.get(&col.name), col))
             .collect::<Result<Vec<Value>, crate::Error>>()
-            .map_err(|e| ErrorCode::Internal {
-                detail: format!("columnar ON CONFLICT coercion: {e}"),
-            })
+            .map_err(ErrorCode::from)
     }
 }

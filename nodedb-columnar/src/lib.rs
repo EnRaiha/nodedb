@@ -14,6 +14,7 @@
 //! [SegmentFooter: schema_hash, column metadata, block stats, CRC32C]
 //! ```
 
+pub(crate) mod diag;
 pub(crate) mod encrypt;
 
 pub mod compaction;
@@ -41,12 +42,15 @@ pub use filter::{
     dict_eval_ne, words_for,
 };
 pub use format::{
-    BLOCK_SIZE, BlockStats, BloomFilter, ColumnMeta, MAGIC, SegmentFooter, SegmentHeader,
-    VERSION_MAJOR, VERSION_MINOR,
+    BLOCK_SIZE, BlockLayout, BlockStats, BloomFilter, ColumnMeta, MAGIC, SegmentFooter,
+    SegmentHeader, VERSION_MAJOR, VERSION_MINOR,
 };
 pub use materialize_rows::materialize_segment_live_rows;
 pub use memtable::{ColumnarMemtable, IngestValue, MemtableRowIter};
-pub use mutation::{ColumnDataSnapshot, ColumnarEngineSnapshot, MutationEngine, TruncatedRows};
+pub use mutation::{
+    BatchConflict, BatchRow, ColumnDataSnapshot, ColumnarEngineSnapshot, MutationEngine,
+    TruncatedRows,
+};
 pub use pk_index::PkIndex;
 pub use predicate::{
     BLOOM_BITS_DEFAULT, BLOOM_BYTES, BLOOM_K_DEFAULT, PredicateOp, PredicateValue, ScanPredicate,

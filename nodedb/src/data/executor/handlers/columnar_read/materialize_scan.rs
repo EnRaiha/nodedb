@@ -26,7 +26,6 @@ use nodedb_types::value::Value;
 
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::scan_normalize::decoded_col_to_value;
 use crate::data::executor::task::ExecutionTask;
 
 impl CoreLoop {
@@ -101,44 +100,19 @@ impl CoreLoop {
                 continue;
             }
 
-            let reader = match nodedb_columnar::SegmentReader::open(seg_bytes) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(
-                        collection,
-                        seg_id,
-                        error = %e,
-                        "materialize_scan: failed to open flushed segment; skipping"
-                    );
-                    continue;
-                }
+            // A segment that does not read refuses the scan. Skipping it
+            // would hand the materializer a clone without its rows.
+            let segment = match self.decode_flushed_segment(
+                collection,
+                u64::from(seg_id),
+                seg_bytes,
+                schema.columns.len(),
+                "columnar_materialize_scan",
+            ) {
+                Ok(segment) => segment,
+                Err(e) => return self.response_error(task, e),
             };
-
-            let row_count = reader.row_count() as usize;
-            let col_count = schema.columns.len();
-
-            // Decode all columns once per segment for efficiency.
-            let mut decoded_cols = Vec::with_capacity(col_count);
-            let mut decode_ok = true;
-            for col_idx in 0..col_count {
-                match reader.read_column(col_idx) {
-                    Ok(dc) => decoded_cols.push(dc),
-                    Err(e) => {
-                        tracing::warn!(
-                            collection,
-                            seg_id,
-                            col_idx,
-                            error = %e,
-                            "materialize_scan: column decode failed; skipping segment"
-                        );
-                        decode_ok = false;
-                        break;
-                    }
-                }
-            }
-            if !decode_ok {
-                continue;
-            }
+            let row_count = segment.row_count();
 
             // Starting row within this segment.
             let first_row_in_seg = if seg_id == start_segment {
@@ -166,11 +140,11 @@ impl CoreLoop {
 
                 // Bitemporal system-time filter.
                 if let (Some(ts_idx), Some(cutoff)) = (ts_system_idx, system_as_of_ms) {
-                    let ts_val = decoded_col_to_value(
-                        &decoded_cols[ts_idx],
-                        row_idx,
-                        &schema.columns[ts_idx].column_type,
-                    );
+                    let ts_val =
+                        match segment.cell(ts_idx, row_idx, &schema.columns[ts_idx].column_type) {
+                            Ok(v) => v,
+                            Err(e) => return self.response_error(task, e),
+                        };
                     if let Value::Integer(ts) = ts_val
                         && ts > cutoff
                     {
@@ -179,27 +153,23 @@ impl CoreLoop {
                 }
 
                 // Build a Value::Object for this row.
-                let mut map = std::collections::HashMap::new();
-                for (col_idx, col_def) in schema.columns.iter().enumerate() {
-                    let val =
-                        decoded_col_to_value(&decoded_cols[col_idx], row_idx, &col_def.column_type);
-                    map.insert(col_def.name.clone(), val);
-                }
+                let row = match segment.row(&schema, row_idx) {
+                    Ok(row) => row,
+                    Err(e) => return self.response_error(task, e),
+                };
+                let map: std::collections::HashMap<String, Value> = schema
+                    .columns
+                    .iter()
+                    .map(|col_def| col_def.name.clone())
+                    .zip(row)
+                    .collect();
 
-                // Encode as msgpack value bytes (the Insert handler reads this format).
-                let ndb_val = Value::Object(map);
-                let value_bytes = match nodedb_types::value_to_msgpack(&ndb_val) {
+                // Encode as msgpack value bytes (the Insert handler reads this
+                // format). A row that does not encode refuses the scan rather
+                // than leaving it out of the clone.
+                let value_bytes = match encode_row(&Value::Object(map)) {
                     Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!(
-                            collection,
-                            seg_id,
-                            row_idx,
-                            error = %e,
-                            "materialize_scan: row msgpack encode failed; skipping"
-                        );
-                        continue;
-                    }
+                    Err(e) => return self.response_error(task, e),
                 };
 
                 // Emit the real per-row surrogate when available so the
@@ -255,10 +225,14 @@ impl CoreLoop {
                 let ts_system_idx = schema.columns.iter().position(|c| c.name == TS_SYSTEM);
 
                 let rows_with_surrogates: Vec<(Option<nodedb_types::Surrogate>, Vec<Value>)> =
-                    engine
+                    match engine
                         .scan_memtable_rows_with_surrogates()
                         .skip(memtable_start_row)
-                        .collect();
+                        .collect::<Result<_, _>>()
+                    {
+                        Ok(rows) => rows,
+                        Err(e) => return self.response_error(task, crate::Error::from(e)),
+                    };
 
                 for (mt_idx, (row_surrogate, row)) in rows_with_surrogates.iter().enumerate() {
                     // Bitemporal system-time filter.
@@ -276,18 +250,9 @@ impl CoreLoop {
                             map.insert(col_def.name.clone(), row[col_idx].clone());
                         }
                     }
-                    let ndb_val = Value::Object(map);
-                    let value_bytes = match nodedb_types::value_to_msgpack(&ndb_val) {
+                    let value_bytes = match encode_row(&Value::Object(map)) {
                         Ok(b) => b,
-                        Err(e) => {
-                            tracing::warn!(
-                                collection,
-                                mt_idx,
-                                error = %e,
-                                "materialize_scan: memtable row encode failed; skipping"
-                            );
-                            continue;
-                        }
+                        Err(e) => return self.response_error(task, e),
                     };
 
                     let abs_row = memtable_start_row + mt_idx;
@@ -318,6 +283,15 @@ impl CoreLoop {
 
         build_response(self, task, entries, next_cursor)
     }
+}
+
+/// Encode one materialized row as MessagePack value bytes, the format the
+/// Insert handler reads.
+fn encode_row(row: &Value) -> crate::Result<Vec<u8>> {
+    nodedb_types::value_to_msgpack(row).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("encode materialized columnar row: {e}"),
+    })
 }
 
 /// Encode `(seg_id, row_idx)` as a compact 32-bit tag.

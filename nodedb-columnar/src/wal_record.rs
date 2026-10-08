@@ -134,21 +134,20 @@ pub fn encode_row_for_wal(
                 buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                 buf.extend_from_slice(bytes);
             }
-            Value::Array(arr) => {
-                // Vectors stored as: tag(9) + count(u32) + f32 values.
+            Value::Array(arr) if arr.iter().all(|v| matches!(v, Value::Float(_))) => {
+                // An all-float array: tag(9) + count(u32) + f64 values, so
+                // every element decodes to the value it was.
                 buf.push(9);
                 buf.extend_from_slice(&(arr.len() as u32).to_le_bytes());
                 for v in arr {
-                    let f = match v {
-                        Value::Float(f) => *f as f32,
-                        Value::Integer(n) => *n as f32,
-                        _ => 0.0,
-                    };
-                    buf.extend_from_slice(&f.to_le_bytes());
+                    if let Value::Float(f) = v {
+                        buf.extend_from_slice(&f.to_le_bytes());
+                    }
                 }
             }
             _ => {
-                // Geometry and other complex types: serialize as JSON bytes.
+                // Any other array, geometry and other complex types: JSON
+                // bytes.
                 buf.push(10);
                 let json = sonic_rs::to_vec(value).map_err(|e| {
                     crate::error::ColumnarError::Serialization(format!(
@@ -168,6 +167,28 @@ pub fn encode_row_for_wal(
 /// Prevents OOM from crafted/corrupt records with bogus length prefixes.
 const MAX_FIELD_LEN: usize = 256 * 1024 * 1024;
 
+/// The error for a WAL row that stops decoding at byte `offset`.
+fn corrupt(offset: usize, reason: impl Into<String>) -> crate::error::ColumnarError {
+    crate::error::ColumnarError::WalRowCorrupt {
+        offset,
+        reason: reason.into(),
+    }
+}
+
+/// Read exactly `N` bytes from `data` at `cursor` as an array, advancing
+/// cursor. Returns `Err` if not enough bytes remain.
+fn read_array<const N: usize>(
+    data: &[u8],
+    cursor: &mut usize,
+    context: &str,
+) -> Result<[u8; N], crate::error::ColumnarError> {
+    let at = *cursor;
+    let slice = read_slice(data, cursor, N, context)?;
+    slice
+        .try_into()
+        .map_err(|_| corrupt(at, format!("truncated {context}")))
+}
+
 /// Read exactly `n` bytes from `data` at `cursor`, advancing cursor.
 /// Returns `Err` if not enough bytes remain.
 fn read_slice<'a>(
@@ -176,14 +197,17 @@ fn read_slice<'a>(
     n: usize,
     context: &str,
 ) -> Result<&'a [u8], crate::error::ColumnarError> {
-    let end = cursor.checked_add(n).ok_or_else(|| {
-        crate::error::ColumnarError::Serialization(format!("overflow in {context}"))
-    })?;
+    let end = cursor
+        .checked_add(n)
+        .ok_or_else(|| corrupt(*cursor, format!("overflow in {context}")))?;
     if end > data.len() {
-        return Err(crate::error::ColumnarError::Serialization(format!(
-            "truncated {context}: need {n} bytes at offset {cursor}, have {}",
-            data.len().saturating_sub(*cursor)
-        )));
+        return Err(corrupt(
+            *cursor,
+            format!(
+                "truncated {context}: need {n} bytes, have {}",
+                data.len().saturating_sub(*cursor)
+            ),
+        ));
     }
     let slice = &data[*cursor..end];
     *cursor = end;
@@ -197,126 +221,108 @@ fn read_length_prefixed<'a>(
     cursor: &mut usize,
     context: &str,
 ) -> Result<&'a [u8], crate::error::ColumnarError> {
-    let len_bytes = read_slice(data, cursor, 4, context)?;
-    let len = u32::from_le_bytes(len_bytes.try_into().map_err(|_| {
-        crate::error::ColumnarError::Serialization(format!("truncated {context} len"))
-    })?) as usize;
+    let at = *cursor;
+    let len = u32::from_le_bytes(read_array::<4>(data, cursor, context)?) as usize;
     if len > MAX_FIELD_LEN {
-        return Err(crate::error::ColumnarError::Serialization(format!(
-            "{context} length {len} exceeds maximum {MAX_FIELD_LEN}"
-        )));
+        return Err(corrupt(
+            at,
+            format!("{context} length {len} exceeds maximum {MAX_FIELD_LEN}"),
+        ));
     }
     read_slice(data, cursor, len, context)
 }
 
+/// Read a length-prefixed UTF-8 string. Bytes that are not UTF-8 are an
+/// error, never replacement characters.
+fn read_utf8(
+    data: &[u8],
+    cursor: &mut usize,
+    context: &str,
+) -> Result<String, crate::error::ColumnarError> {
+    let at = *cursor;
+    let bytes = read_length_prefixed(data, cursor, context)?;
+    String::from_utf8(bytes.to_vec())
+        .map_err(|e| corrupt(at, format!("{context} is not UTF-8: {e}")))
+}
+
 /// Decode a row from the columnar wire format back into Values.
+///
+/// `Err(WalRowCorrupt)` when the bytes do not decode. The corruption is
+/// reported here, where it is detected.
 pub fn decode_row_from_wal(
     data: &[u8],
 ) -> Result<Vec<nodedb_types::value::Value>, crate::error::ColumnarError> {
+    decode_row(data).inspect_err(crate::diag::wal_row_corrupt)
+}
+
+/// The body of [`decode_row_from_wal`].
+fn decode_row(data: &[u8]) -> Result<Vec<nodedb_types::value::Value>, crate::error::ColumnarError> {
     use nodedb_types::value::Value;
 
     let mut values = Vec::new();
     let mut cursor = 0;
 
     while cursor < data.len() {
-        let tag_slice = read_slice(data, &mut cursor, 1, "tag")?;
-        let tag = tag_slice[0];
+        let tag_at = cursor;
+        let [tag] = read_array::<1>(data, &mut cursor, "tag")?;
 
         let value = match tag {
             0 => Value::Null,
-            1 => {
-                let bytes = read_slice(data, &mut cursor, 8, "i64")?;
-                let v = i64::from_le_bytes(bytes.try_into().map_err(|_| {
-                    crate::error::ColumnarError::Serialization("truncated i64".into())
-                })?);
-                Value::Integer(v)
-            }
-            2 => {
-                let bytes = read_slice(data, &mut cursor, 8, "f64")?;
-                let v = f64::from_le_bytes(bytes.try_into().map_err(|_| {
-                    crate::error::ColumnarError::Serialization("truncated f64".into())
-                })?);
-                Value::Float(v)
-            }
+            1 => Value::Integer(i64::from_le_bytes(read_array(data, &mut cursor, "i64")?)),
+            2 => Value::Float(f64::from_le_bytes(read_array(data, &mut cursor, "f64")?)),
             3 => {
-                let bytes = read_slice(data, &mut cursor, 1, "bool")?;
-                Value::Bool(bytes[0] != 0)
+                let [b] = read_array::<1>(data, &mut cursor, "bool")?;
+                Value::Bool(b != 0)
             }
-            4 | 5 | 8 => {
-                let bytes = read_length_prefixed(
-                    data,
-                    &mut cursor,
-                    match tag {
-                        4 => "string",
-                        5 => "bytes",
-                        8 => "uuid",
-                        _ => unreachable!(),
-                    },
-                )?;
-                match tag {
-                    4 => Value::String(String::from_utf8_lossy(bytes).into_owned()),
-                    5 => Value::Bytes(bytes.to_vec()),
-                    8 => Value::Uuid(String::from_utf8_lossy(bytes).into_owned()),
-                    _ => unreachable!(),
-                }
-            }
+            4 => Value::String(read_utf8(data, &mut cursor, "string")?),
+            5 => Value::Bytes(read_length_prefixed(data, &mut cursor, "bytes")?.to_vec()),
+            8 => Value::Uuid(read_utf8(data, &mut cursor, "uuid")?),
             6 => {
-                let bytes = read_slice(data, &mut cursor, 8, "timestamp")?;
-                let micros = i64::from_le_bytes(bytes.try_into().map_err(|_| {
-                    crate::error::ColumnarError::Serialization("truncated timestamp".into())
-                })?);
+                let micros = i64::from_le_bytes(read_array(data, &mut cursor, "timestamp")?);
                 Value::DateTime(nodedb_types::datetime::NdbDateTime::from_micros(micros))
             }
-            7 => {
-                let bytes = read_slice(data, &mut cursor, 16, "decimal")?;
-                let mut arr = [0u8; 16];
-                arr.copy_from_slice(bytes);
-                Value::Decimal(rust_decimal::Decimal::deserialize(arr))
-            }
+            7 => Value::Decimal(rust_decimal::Decimal::deserialize(read_array(
+                data,
+                &mut cursor,
+                "decimal",
+            )?)),
             9 => {
-                let count_bytes = read_slice(data, &mut cursor, 4, "vector count")?;
-                let count = u32::from_le_bytes(count_bytes.try_into().map_err(|_| {
-                    crate::error::ColumnarError::Serialization("truncated vector count".into())
-                })?) as usize;
-                let remaining_values = data.len().saturating_sub(cursor) / 4;
-                let max_count = (MAX_FIELD_LEN / 4).min(remaining_values);
+                let count_at = cursor;
+                let count =
+                    u32::from_le_bytes(read_array(data, &mut cursor, "vector count")?) as usize;
+                let remaining_values = data.len().saturating_sub(cursor) / 8;
+                let max_count = (MAX_FIELD_LEN / 8).min(remaining_values);
                 if count > max_count {
-                    return Err(crate::error::ColumnarError::Serialization(format!(
-                        "vector count {count} exceeds maximum {max_count}"
-                    )));
+                    return Err(corrupt(
+                        count_at,
+                        format!("vector count {count} exceeds maximum {max_count}"),
+                    ));
                 }
                 let capacity = checked_decode_capacity(
                     count,
                     size_of::<nodedb_types::value::Value>(),
                     data.len().saturating_sub(cursor),
-                    4,
+                    8,
                     max_count,
                     usize::MAX,
                 )
                 .ok_or_else(|| {
-                    crate::error::ColumnarError::Serialization(
-                        "vector count exceeds decode allocation bounds".into(),
-                    )
+                    corrupt(count_at, "vector count exceeds decode allocation bounds")
                 })?;
                 let mut arr = Vec::with_capacity(capacity);
                 for _ in 0..count {
-                    let fb = read_slice(data, &mut cursor, 4, "vector f32")?;
-                    let f = f32::from_le_bytes(fb.try_into().map_err(|_| {
-                        crate::error::ColumnarError::Serialization("truncated f32".into())
-                    })?);
-                    arr.push(Value::Float(f as f64));
+                    let f = f64::from_le_bytes(read_array(data, &mut cursor, "vector f64")?);
+                    arr.push(Value::Float(f));
                 }
                 Value::Array(arr)
             }
             10 => {
+                let json_at = cursor;
                 let json_bytes = read_length_prefixed(data, &mut cursor, "json")?;
-                sonic_rs::from_slice(json_bytes).unwrap_or(Value::Null)
+                sonic_rs::from_slice(json_bytes)
+                    .map_err(|e| corrupt(json_at, format!("json value does not decode: {e}")))?
             }
-            _ => {
-                return Err(crate::error::ColumnarError::Serialization(format!(
-                    "unknown WAL value tag: {tag}"
-                )));
-            }
+            _ => return Err(corrupt(tag_at, format!("unknown WAL value tag: {tag}"))),
         };
 
         values.push(value);
@@ -339,8 +345,52 @@ mod tests {
         bytes.extend_from_slice(&u32::MAX.to_le_bytes());
         assert!(matches!(
             decode_row_from_wal(&bytes),
-            Err(crate::error::ColumnarError::Serialization(_))
+            Err(crate::error::ColumnarError::WalRowCorrupt { .. })
         ));
+    }
+
+    #[test]
+    fn a_string_that_is_not_utf8_is_refused() {
+        let mut bytes = vec![4];
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&[0xC3, 0x28]);
+        assert!(matches!(
+            decode_row_from_wal(&bytes),
+            Err(crate::error::ColumnarError::WalRowCorrupt { offset: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn a_uuid_that_is_not_utf8_is_refused() {
+        let mut bytes = vec![8];
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.push(0xFF);
+        assert!(matches!(
+            decode_row_from_wal(&bytes),
+            Err(crate::error::ColumnarError::WalRowCorrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn a_json_value_that_does_not_decode_is_refused() {
+        let json = b"{not json";
+        let mut bytes = vec![10];
+        bytes.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(json);
+        assert!(matches!(
+            decode_row_from_wal(&bytes),
+            Err(crate::error::ColumnarError::WalRowCorrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn arrays_decode_to_the_values_they_were() {
+        let values = vec![
+            Value::Array(vec![Value::Float(0.1), Value::Float(-2.5)]),
+            Value::Array(vec![Value::String("a".into()), Value::String("b".into())]),
+        ];
+        let encoded = encode_row_for_wal(&values).expect("encode");
+        assert_eq!(decode_row_from_wal(&encoded).expect("decode"), values);
     }
 
     #[test]

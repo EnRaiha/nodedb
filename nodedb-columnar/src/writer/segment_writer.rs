@@ -10,7 +10,7 @@ use crate::error::ColumnarError;
 use crate::format::{ColumnMeta, HEADER_SIZE, SegmentFooter, SegmentHeader};
 use crate::memtable::ColumnData;
 
-use super::block::encode_column_blocks;
+use super::block::{block_layout, encode_column_blocks};
 use super::encode::compute_schema_hash;
 
 /// Profile tag values for the segment footer.
@@ -83,8 +83,8 @@ impl SegmentWriter {
             // Encode blocks.
             let block_stats = encode_column_blocks(
                 &mut buf,
+                &col_def.name,
                 col_data,
-                &col_def.column_type,
                 codec,
                 row_count,
                 &self.memory,
@@ -107,6 +107,7 @@ impl SegmentWriter {
                 offset: col_start - HEADER_SIZE as u64,
                 length: col_end - col_start,
                 codec: effective_codec,
+                layout: block_layout(col_data),
                 block_count: block_stats.len() as u32,
                 block_stats,
                 dictionary,

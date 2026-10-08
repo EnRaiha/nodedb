@@ -4,23 +4,41 @@
 
 use nodedb_codec::{ColumnCodec, ResolvedColumnCodec};
 use nodedb_mem::ScopedMemory;
-use nodedb_types::columnar::ColumnType;
 
 use crate::error::ColumnarError;
-use crate::format::{BLOCK_SIZE, BlockStats};
+use crate::format::{BLOCK_SIZE, BlockLayout, BlockStats};
 use crate::memtable::ColumnData;
 
 use super::encode::{
     encode_f64_with_validity, encode_i64_with_validity, encode_validity_bitmap, prepend_validity,
 };
-use super::stats::{compute_string_block_stats, numeric_min_max_f64, numeric_min_max_i64};
+use super::stats::{
+    StringBlock, compute_string_block_stats, numeric_min_max_f64, numeric_min_max_i64,
+};
+
+/// The block layout `encode_single_block` writes for `col_data`.
+pub(super) fn block_layout(col_data: &ColumnData) -> BlockLayout {
+    match col_data {
+        ColumnData::Int64 { .. } | ColumnData::Timestamp { .. } => BlockLayout::Int64,
+        ColumnData::Float64 { .. } => BlockLayout::Float64,
+        ColumnData::Bool { .. } => BlockLayout::PackedBool,
+        ColumnData::String { .. }
+        | ColumnData::Bytes { .. }
+        | ColumnData::Json { .. }
+        | ColumnData::Geometry { .. } => BlockLayout::VarLen,
+        ColumnData::Decimal { .. } | ColumnData::Uuid { .. } | ColumnData::Vector { .. } => {
+            BlockLayout::FixedWidth
+        }
+        ColumnData::DictEncoded { .. } => BlockLayout::DictIds,
+    }
+}
 
 /// Encode all blocks for a single column, appending to `buf`.
 /// Returns per-block statistics.
 pub(super) fn encode_column_blocks(
     buf: &mut Vec<u8>,
+    col_name: &str,
     col_data: &ColumnData,
-    col_type: &ColumnType,
     codec: ResolvedColumnCodec,
     row_count: usize,
     memory: &ScopedMemory,
@@ -35,8 +53,8 @@ pub(super) fn encode_column_blocks(
         let block_row_count = end - start;
 
         let (compressed, stats) = encode_single_block(
+            col_name,
             col_data,
-            col_type,
             codec,
             start,
             end,
@@ -56,9 +74,12 @@ pub(super) fn encode_column_blocks(
 }
 
 /// Encode a single block of rows for a column.
+///
+/// Only string columns carry min/max bounds. A bytes column carries none,
+/// so no predicate prunes its blocks by a byte compare.
 fn encode_single_block(
+    col_name: &str,
     col_data: &ColumnData,
-    _col_type: &ColumnType,
     codec: ResolvedColumnCodec,
     start: usize,
     end: usize,
@@ -138,7 +159,8 @@ fn encode_single_block(
             let compressed =
                 nodedb_codec::encode_bytes_pipeline(string_bytes, codec.into_column_codec())?;
 
-            let stats = compute_string_block_stats(
+            let stats = compute_string_block_stats(StringBlock {
+                column: col_name,
                 data,
                 offsets,
                 valid_slice,
@@ -146,7 +168,7 @@ fn encode_single_block(
                 end,
                 null_count,
                 block_row_count,
-            );
+            })?;
 
             let block_offsets: Vec<i64> = offsets[start..=end]
                 .iter()

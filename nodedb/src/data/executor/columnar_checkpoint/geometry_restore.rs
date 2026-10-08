@@ -46,10 +46,7 @@
 //! the identity was already lost at write time, and this rebuild neither creates
 //! nor widens that gap.
 
-use tracing::warn;
-
 use super::super::core_loop::CoreLoop;
-use super::super::scan_normalize::decoded_col_to_value;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::{ColumnarInsertIntent, ColumnarOp};
@@ -63,12 +60,17 @@ impl CoreLoop {
     ///
     /// A no-op — without decoding anything — for the overwhelmingly common case
     /// of a collection with no geometry column.
+    ///
+    /// `Err` when a restored row does not read: a segment that does not open
+    /// or decode, a corrupt cell, or a corrupt memtable cell. The rebuilt
+    /// R-tree would miss that row, so the restore is refused and the core
+    /// does not come up.
     pub(super) fn restore_columnar_geometry_indexes(
         &mut self,
         key: &(DatabaseId, TenantId, String),
         engine: &nodedb_columnar::MutationEngine,
         segments: &[Vec<u8>],
-    ) -> usize {
+    ) -> crate::Result<usize> {
         let (db_id, tenant_id, collection) = key;
         let schema = engine.schema().clone();
         if !schema
@@ -76,8 +78,17 @@ impl CoreLoop {
             .iter()
             .any(|c| c.column_type == ColumnType::Geometry)
         {
-            return 0;
+            return Ok(0);
         }
+
+        // Every fallible read runs before the spatial maps change, so a
+        // refused restore leaves them as the spatial checkpoint loaded them.
+        let mut rows = self.restored_flushed_rows(engine, segments, &schema, collection)?;
+        for row in engine.scan_memtable_rows() {
+            rows.push(row?);
+        }
+        // The checkpoint key carries the stored, database-qualified name.
+        let vshard = nodedb_types::CollectionKey::from_qualified_str(*db_id, collection)?.vshard();
 
         // The R-tree is derived from the restored rows and nothing else. An
         // entry a restored spatial checkpoint holds for a row this generation
@@ -87,12 +98,6 @@ impl CoreLoop {
             .retain(|(d, t, c, _), _| !(d == db_id && t == tenant_id && c == collection));
         self.spatial_doc_map
             .retain(|(d, t, c, _, _), _| !(d == db_id && t == tenant_id && c == collection));
-
-        let mut rows: Vec<Vec<nodedb_types::value::Value>> = Vec::new();
-        rows.extend(Self::restored_flushed_rows(
-            engine, segments, &schema, collection,
-        ));
-        rows.extend(engine.scan_memtable_rows());
 
         // The indexer takes documents, not positional rows: rebuild each row as
         // the `Value::Object` shape the live insert path hands it, so the two
@@ -115,19 +120,6 @@ impl CoreLoop {
         // rows that are already durable, and is not itself a write. Noting an
         // LSN here would raise the core watermark during boot from a path that
         // applied no record.
-        // The checkpoint key carries the stored, database-qualified name.
-        let vshard = match nodedb_types::CollectionKey::from_qualified_str(*db_id, collection) {
-            Ok(key) => key.vshard(),
-            Err(e) => {
-                warn!(
-                    %collection,
-                    error = %e,
-                    "columnar checkpoint restore: collection name does not de-qualify; its \
-                     geometry rows are absent from the rebuilt R-tree"
-                );
-                return 0;
-            }
-        };
         let task = Self::replay_task(
             *tenant_id,
             *db_id,
@@ -155,7 +147,7 @@ impl CoreLoop {
         let indexed = docs.len();
         // Boot-time rebuild: nothing to roll back, so the delta is dropped.
         let _ = self.index_columnar_geometry_columns(&task, &schema, collection, &docs);
-        indexed
+        Ok(indexed)
     }
 
     /// Decode the live (non-tombstoned) rows of every restored flushed segment.
@@ -164,72 +156,150 @@ impl CoreLoop {
     /// memtable's virtual segment, so `segments[i]` is `segment_id i + 1`, and a
     /// row whose delete-bitmap bit is set is not a row any more.
     ///
-    /// A segment that fails to open or decode is warned about and skipped rather
-    /// than aborting the restore: this rebuilds a derived index, and skipping
-    /// costs the same geometry entries a `scan_flushed` over the identical
-    /// unreadable bytes would also fail to produce.
+    /// `Err` on the first segment that does not open or decode, or the first
+    /// corrupt cell of a live row. The shared segment reader files the
+    /// corruption report.
     fn restored_flushed_rows(
+        &self,
         engine: &nodedb_columnar::MutationEngine,
         segments: &[Vec<u8>],
         schema: &nodedb_types::columnar::ColumnarSchema,
         collection: &str,
-    ) -> Vec<Vec<nodedb_types::value::Value>> {
+    ) -> crate::Result<Vec<Vec<nodedb_types::value::Value>>> {
         let mut out = Vec::new();
         for (seg_idx, seg_bytes) in segments.iter().enumerate() {
             let seg_id = seg_idx as u64 + 1;
-            let reader = match nodedb_columnar::SegmentReader::open(seg_bytes) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(
-                        %collection,
-                        seg_id,
-                        error = %e,
-                        "columnar checkpoint restore: flushed segment unreadable; its \
-                         geometry rows are absent from the rebuilt R-tree"
-                    );
-                    continue;
-                }
-            };
-
-            let mut decoded_cols = Vec::with_capacity(schema.columns.len());
-            let mut decode_ok = true;
-            for col_idx in 0..schema.columns.len() {
-                match reader.read_column(col_idx) {
-                    Ok(dc) => decoded_cols.push(dc),
-                    Err(e) => {
-                        warn!(
-                            %collection,
-                            seg_id,
-                            col_idx,
-                            error = %e,
-                            "columnar checkpoint restore: column decode failed; the \
-                             segment's geometry rows are absent from the rebuilt R-tree"
-                        );
-                        decode_ok = false;
-                        break;
-                    }
-                }
-            }
-            if !decode_ok {
-                continue;
-            }
-
+            let segment = self.decode_flushed_segment(
+                collection,
+                seg_id,
+                seg_bytes,
+                schema.columns.len(),
+                "columnar_checkpoint_geometry_restore",
+            )?;
             let delete_bm = engine.delete_bitmap(seg_id);
-            for row_idx in 0..reader.row_count() as usize {
+            for row_idx in 0..segment.row_count() {
                 if delete_bm.is_some_and(|bm| bm.is_deleted(row_idx as u32)) {
                     continue;
                 }
-                out.push(
-                    decoded_cols
-                        .iter()
-                        .zip(&schema.columns)
-                        .map(|(dc, col_def)| {
-                            decoded_col_to_value(dc, row_idx, &col_def.column_type)
-                        })
-                        .collect(),
-                );
+                out.push(segment.row(schema, row_idx)?);
             }
         }
-        out
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_columnar::MutationEngine;
+    use nodedb_types::columnar::{ColumnDef, ColumnType, ColumnarSchema};
+    use nodedb_types::value::Value;
+
+    use crate::data::executor::core_loop::CoreLoop;
+    use crate::data::executor::core_loop::tests::make_core_with_dir;
+    use crate::types::{DatabaseId, TenantId};
+
+    type EngineKey = (DatabaseId, TenantId, String);
+
+    fn key() -> EngineKey {
+        (DatabaseId::DEFAULT, TenantId::new(1), "geo".to_string())
+    }
+
+    fn schema() -> ColumnarSchema {
+        ColumnarSchema::new(vec![
+            ColumnDef::required("id", ColumnType::String).with_primary_key(),
+            ColumnDef::nullable("loc", ColumnType::Geometry),
+        ])
+        .expect("valid")
+    }
+
+    /// An engine whose one row lives only in a flushed segment, encoded as
+    /// the flush path encodes it. Returns the engine and the segment bytes.
+    fn flushed_engine(core: &CoreLoop) -> (MutationEngine, Vec<u8>) {
+        let key = key();
+        let mut engine = MutationEngine::new(key.2.clone(), schema());
+        engine
+            .insert(&[
+                Value::String("a".into()),
+                Value::String(r#"{"type":"Point","coordinates":[1.0,2.0]}"#.into()),
+            ])
+            .expect("insert");
+        let segment_id = engine.next_segment_id();
+        let (seg_schema, columns, row_count) = engine.memtable_mut().drain_optimized();
+        let memory = nodedb_mem::ScopedMemory::new(
+            core.governor.clone(),
+            key.0,
+            key.1,
+            nodedb_mem::EngineId::Columnar,
+        );
+        let blob =
+            nodedb_columnar::SegmentWriter::new(nodedb_columnar::writer::PROFILE_PLAIN, memory)
+                .write_segment(&seg_schema, &columns, row_count, None)
+                .expect("write_segment");
+        engine
+            .on_memtable_flushed(segment_id)
+            .expect("on_memtable_flushed");
+        (engine, blob)
+    }
+
+    #[test]
+    fn a_readable_segment_rebuilds_its_geometry_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let (engine, blob) = flushed_engine(&core);
+        let indexed = core
+            .restore_columnar_geometry_indexes(&key(), &engine, &[blob])
+            .expect("restore");
+        assert_eq!(indexed, 1);
+    }
+
+    #[test]
+    fn an_unopenable_segment_refuses_the_restore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let (engine, _blob) = flushed_engine(&core);
+        let result = core.restore_columnar_geometry_indexes(&key(), &engine, &[Vec::new()]);
+        assert!(
+            matches!(result, Err(crate::Error::SegmentCorrupted { ref detail }) if detail.contains("segment 1 of 'geo'")),
+            "{result:?}"
+        );
+    }
+
+    /// A segment that opens and decodes, but whose geometry cell is not
+    /// UTF-8 text. Skipping it would leave the row out of the R-tree while
+    /// a full scan still sees the segment, so the restore is refused.
+    #[test]
+    fn a_corrupt_segment_cell_refuses_the_restore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let key = key();
+        let columns = vec![
+            nodedb_columnar::memtable::ColumnData::String {
+                data: b"a".to_vec(),
+                offsets: vec![0, 1],
+                valid: None,
+            },
+            nodedb_columnar::memtable::ColumnData::Geometry {
+                data: vec![0xFF, 0xFE],
+                offsets: vec![0, 2],
+                valid: Some(vec![true]),
+            },
+        ];
+        let memory = nodedb_mem::ScopedMemory::new(
+            core.governor.clone(),
+            key.0,
+            key.1,
+            nodedb_mem::EngineId::Columnar,
+        );
+        let blob =
+            nodedb_columnar::SegmentWriter::new(nodedb_columnar::writer::PROFILE_PLAIN, memory)
+                .write_segment(&schema(), &columns, 1, None)
+                .expect("write_segment");
+        let engine = MutationEngine::new(key.2.clone(), schema());
+
+        let result = core.restore_columnar_geometry_indexes(&key, &engine, &[blob]);
+        assert!(
+            matches!(result, Err(crate::Error::SegmentCorrupted { ref detail }) if detail.contains("segment 1 of 'geo'")),
+            "{result:?}"
+        );
     }
 }

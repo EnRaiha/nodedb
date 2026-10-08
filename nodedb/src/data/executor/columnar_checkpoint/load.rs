@@ -90,8 +90,9 @@ impl CoreLoop {
             // rebuilt from the restored rows, not carried in the checkpoint —
             // see `geometry_restore.rs`. Done BEFORE the maps are populated so
             // it reads the restored engine and blobs directly and cannot see a
-            // half-installed state.
-            geometry_rows += self.restore_columnar_geometry_indexes(&key, &engine, &blobs);
+            // half-installed state. A restored row that does not read refuses
+            // the load: the rebuilt R-tree would silently miss it.
+            geometry_rows += self.restore_columnar_geometry_indexes(&key, &engine, &blobs)?;
 
             segments += blobs.len();
             // Both halves are installed from one destructured value, in the same

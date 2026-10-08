@@ -17,7 +17,13 @@ use super::strategies::dispatch_grouping;
 use super::types::{GroupedAggResult, resolve_schema};
 use crate::bridge::envelope::Priority;
 use crate::bridge::scan_filter::ScanFilter;
+use crate::data::executor::handlers::timeseries::partition_read::{
+    partition_corrupt, require_partition_dir,
+};
 use crate::data::io::IoMetrics;
+
+/// The read path the corruption report names.
+const SITE: &str = "timeseries_grouped_scan";
 
 /// Aggregate from a columnar memtable with GROUP BY + optional time_bucket.
 ///
@@ -119,22 +125,21 @@ pub struct PartitionAggParams<'a> {
 /// When `uring_reader` is `Some`, column files are batch-read via io_uring
 /// (parallel kernel I/O). When `None`, falls back to fadvise + std::fs::read.
 ///
-/// `Ok(None)` when the partition's schema or metadata cannot be read or does
-/// not carry a GROUP BY / aggregate column. `Err` when a predicate in
-/// `filters` cannot be lowered onto the partition's typed columns: the
-/// caller fails the statement rather than aggregating rows the predicate
-/// never excluded.
-pub fn aggregate_partition(
-    p: PartitionAggParams<'_>,
-) -> Result<Option<GroupedAggResult>, UnsupportedPredicate> {
+/// `Ok(None)` when the partition's schema does not carry a GROUP BY or
+/// aggregate column. `Err` when a predicate in `filters` cannot be lowered
+/// onto the partition's typed columns: the caller fails the statement
+/// rather than aggregating rows the predicate never excluded. `Err` when the
+/// partition does not read: its directory, schema, metadata, sparse index,
+/// a needed column, or a symbol dictionary. The partition is never skipped.
+pub fn aggregate_partition(p: PartitionAggParams<'_>) -> crate::Result<Option<GroupedAggResult>> {
     let num_aggs = p.aggregates.len();
+    let dir = p.partition_dir;
 
-    let Ok(schema) = ColumnarSegmentReader::read_schema(p.partition_dir, None) else {
-        return Ok(None);
-    };
-    let Ok(meta) = ColumnarSegmentReader::read_meta(p.partition_dir, None) else {
-        return Ok(None);
-    };
+    require_partition_dir(dir, SITE)?;
+    let schema = ColumnarSegmentReader::read_schema(dir, None)
+        .map_err(|e| partition_corrupt(dir, "schema", SITE, e))?;
+    let meta = ColumnarSegmentReader::read_meta(dir, None)
+        .map_err(|e| partition_corrupt(dir, "meta", SITE, e))?;
     let row_count = meta.row_count as usize;
     if row_count == 0 {
         return Ok(Some(GroupedAggResult::new(num_aggs)));
@@ -149,10 +154,10 @@ pub fn aggregate_partition(
         return Ok(None);
     };
 
-    // Load sparse index for block-level skip.
-    let sparse_idx = ColumnarSegmentReader::read_sparse_index(p.partition_dir, None)
-        .ok()
-        .flatten();
+    // Load sparse index for block-level skip. A partition written without
+    // one has no index file.
+    let sparse_idx = ColumnarSegmentReader::read_sparse_index(dir, None)
+        .map_err(|e| partition_corrupt(dir, "sparse_index", SITE, e))?;
 
     // Determine surviving blocks (if sparse index available).
     let surviving_blocks: Option<Vec<usize>> = sparse_idx
@@ -169,17 +174,23 @@ pub fn aggregate_partition(
         .as_ref()
         .is_some_and(|sb| !sb.is_empty() && sb.len() < total_blocks);
 
+    let has_time_range = p.time_range.0 > 0 || p.time_range.1 < i64::MAX;
+    // The time column is read whenever a time range or a bucket needs it,
+    // named in `needed_columns` or not.
+    let time_column = (has_time_range || p.bucket_interval_ms > 0).then_some(resolved.ts_idx);
+
     let col_data: Vec<Option<ColumnData>> = read_partition_columns(ReadPartitionColumnsParams {
-        partition_dir: p.partition_dir,
+        partition_dir: dir,
         schema_columns: &schema.columns,
         needed_columns: p.needed_columns,
+        time_column,
         meta: &meta,
         use_block_read,
         surviving_blocks: surviving_blocks.as_deref(),
         uring_reader: p.uring_reader,
         io_priority: p.io_priority,
         io_metrics: p.io_metrics,
-    });
+    })?;
 
     // When block-level read was used, row_count is the number of
     // decoded rows (only surviving blocks), not the partition total.
@@ -200,36 +211,29 @@ pub fn aggregate_partition(
         row_count
     };
 
-    let sym_dicts: HashMap<usize, nodedb_types::timeseries::SymbolDictionary> = schema
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, ty))| *ty == ColumnType::Symbol)
-        .filter_map(|(i, (name, _))| {
-            if p.needed_columns.is_empty() || p.needed_columns.iter().any(|n| n == name) {
-                ColumnarSegmentReader::read_symbol_dict(p.partition_dir, name, None)
-                    .ok()
-                    .map(|dict| (i, dict))
-            } else {
-                None
-            }
-        })
-        .collect();
+    // A `.sym` file is written only for a symbol column that has a
+    // dictionary, so an absent one is no dictionary. A present one that does
+    // not read is corruption.
+    let mut sym_dicts: HashMap<usize, nodedb_types::timeseries::SymbolDictionary> = HashMap::new();
+    for (i, (name, ty)) in schema.columns.iter().enumerate() {
+        let needed = p.needed_columns.is_empty() || p.needed_columns.iter().any(|n| n == name);
+        if *ty != ColumnType::Symbol || !needed || !dir.join(format!("{name}.sym")).exists() {
+            continue;
+        }
+        let dict = ColumnarSegmentReader::read_symbol_dict(dir, name, None)
+            .map_err(|e| partition_corrupt(dir, "symbol_dict", SITE, e))?;
+        sym_dicts.insert(i, dict);
+    }
 
     // Build bitmask over the decoded data.
     // When block-level read was used, data is already filtered to surviving
     // blocks — just need predicate + time range filters on the decoded rows.
     // When full read was used, need time range + sparse skip + predicate.
-    let has_time_range = p.time_range.0 > 0 || p.time_range.1 < i64::MAX;
-
     let mut mask = if use_block_read {
         // Block-level read already filtered by sparse index.
         // Only need time range filter within surviving blocks.
         if has_time_range {
-            let Some(ts_col) = col_data.get(resolved.ts_idx).and_then(|d| d.as_ref()) else {
-                return Ok(None);
-            };
-            let timestamps = ts_col.as_timestamps();
+            let timestamps = time_cells(dir, &col_data, resolved.ts_idx)?;
             let rt = simd_filter::filter_runtime();
             (rt.range_i64)(timestamps, p.time_range.0, p.time_range.1)
         } else {
@@ -241,10 +245,7 @@ pub fn aggregate_partition(
         let m = if partition_fully_in_range {
             simd_filter::bitmask_all(effective_row_count)
         } else {
-            let Some(ts_col) = col_data.get(resolved.ts_idx).and_then(|d| d.as_ref()) else {
-                return Ok(None);
-            };
-            let timestamps = ts_col.as_timestamps();
+            let timestamps = time_cells(dir, &col_data, resolved.ts_idx)?;
             let rt = simd_filter::filter_runtime();
             (rt.range_i64)(timestamps, p.time_range.0, p.time_range.1)
         };
@@ -286,10 +287,7 @@ pub fn aggregate_partition(
     };
 
     let timestamps = if p.bucket_interval_ms > 0 {
-        col_data
-            .get(resolved.ts_idx)
-            .and_then(|d| d.as_ref())
-            .map(|d| d.as_timestamps())
+        Some(time_cells(dir, &col_data, resolved.ts_idx)?)
     } else {
         None
     };
@@ -315,10 +313,38 @@ pub fn aggregate_partition(
     Ok(Some(result))
 }
 
+/// The time column of a partition read, as millisecond cells.
+///
+/// `Err` when the column was not decoded or does not hold time cells: the
+/// partition is unreadable, and skipping it would drop its rows.
+fn time_cells<'a>(
+    dir: &Path,
+    col_data: &'a [Option<ColumnData>],
+    ts_idx: usize,
+) -> crate::Result<&'a [i64]> {
+    match col_data.get(ts_idx).and_then(Option::as_ref) {
+        Some(ColumnData::Timestamp(v)) => Ok(v),
+        Some(_) => Err(partition_corrupt(
+            dir,
+            "column",
+            SITE,
+            format!("time column {ts_idx} does not hold time cells"),
+        )),
+        None => Err(partition_corrupt(
+            dir,
+            "column",
+            SITE,
+            format!("time column {ts_idx} was not decoded"),
+        )),
+    }
+}
+
 struct ReadPartitionColumnsParams<'a> {
     partition_dir: &'a Path,
     schema_columns: &'a [(String, super::super::columnar_memtable::ColumnType)],
     needed_columns: &'a [String],
+    /// A column read whether `needed_columns` names it or not.
+    time_column: Option<usize>,
     meta: &'a nodedb_types::timeseries::PartitionMeta,
     use_block_read: bool,
     surviving_blocks: Option<&'a [usize]>,
@@ -331,11 +357,17 @@ struct ReadPartitionColumnsParams<'a> {
 ///
 /// With `uring_reader`: batch-reads all needed `.col` files in parallel
 /// via io_uring, then decodes each. Without: fadvise + sequential std::fs::read.
-fn read_partition_columns(p: ReadPartitionColumnsParams<'_>) -> Vec<Option<ColumnData>> {
+///
+/// A column that is not needed is `None`. A needed column that does not read
+/// is an error: the partition is corrupt.
+fn read_partition_columns(
+    p: ReadPartitionColumnsParams<'_>,
+) -> crate::Result<Vec<Option<ColumnData>>> {
     let ReadPartitionColumnsParams {
         partition_dir,
         schema_columns,
         needed_columns,
+        time_column,
         meta,
         use_block_read,
         surviving_blocks,
@@ -347,56 +379,50 @@ fn read_partition_columns(p: ReadPartitionColumnsParams<'_>) -> Vec<Option<Colum
     let needed_indices: Vec<usize> = schema_columns
         .iter()
         .enumerate()
-        .filter(|(_, (name, _))| {
-            needed_columns.is_empty() || needed_columns.iter().any(|n| n == name)
+        .filter(|(i, (name, _))| {
+            needed_columns.is_empty()
+                || needed_columns.iter().any(|n| n == name)
+                || time_column == Some(*i)
         })
         .map(|(i, _)| i)
         .collect();
 
+    // One column read on its own: whole, or its surviving blocks.
+    let read_one = |i: usize, blocks: bool| -> crate::Result<ColumnData> {
+        let (name, ty) = &schema_columns[i];
+        let codec = meta.column_stats.get(name).map(|s| s.codec);
+        let read = if blocks {
+            ColumnarSegmentReader::read_column_blocks(
+                partition_dir,
+                name,
+                *ty,
+                codec,
+                surviving_blocks.unwrap_or(&[]),
+                None,
+            )
+            .map(|(data, _)| data)
+        } else {
+            ColumnarSegmentReader::read_column_with_codec(partition_dir, name, *ty, codec, None)
+        };
+        read.map_err(|e| partition_corrupt(partition_dir, "column", SITE, e))
+    };
+    let mut columns: Vec<Option<ColumnData>> = (0..schema_columns.len()).map(|_| None).collect();
+
     // Block-level reads can't use io_uring batching (need per-block decode).
     // io_uring batching only benefits full-column reads.
-    if use_block_read || uring_reader.is_none() {
-        // Fallback: fadvise + sequential read.
-        crate::data::io::fadvise::prefetch_partition_columns(partition_dir, needed_columns);
-
-        return schema_columns
-            .iter()
-            .enumerate()
-            .map(|(i, (name, ty))| {
-                if !needed_indices.contains(&i) {
-                    return None;
-                }
-                let codec = meta.column_stats.get(name).map(|s| s.codec);
-                if use_block_read {
-                    ColumnarSegmentReader::read_column_blocks(
-                        partition_dir,
-                        name,
-                        *ty,
-                        codec,
-                        surviving_blocks.unwrap_or(&[]),
-                        None,
-                    )
-                    .ok()
-                    .map(|(data, _)| data)
-                } else {
-                    ColumnarSegmentReader::read_column_with_codec(
-                        partition_dir,
-                        name,
-                        *ty,
-                        codec,
-                        None,
-                    )
-                    .ok()
-                }
-            })
-            .collect();
-    }
-
-    // io_uring path: batch-read all needed .col files in parallel.
-    let Some(reader) = uring_reader else {
-        unreachable!("guarded by is_none() check above");
+    let reader = match uring_reader {
+        Some(reader) if !use_block_read => reader,
+        _ => {
+            // Fallback: fadvise + sequential read.
+            crate::data::io::fadvise::prefetch_partition_columns(partition_dir, needed_columns);
+            for &i in &needed_indices {
+                columns[i] = Some(read_one(i, use_block_read)?);
+            }
+            return Ok(columns);
+        }
     };
 
+    // io_uring path: batch-read all needed .col files in parallel.
     let col_paths: Vec<std::path::PathBuf> = needed_indices
         .iter()
         .map(|&i| partition_dir.join(format!("{}.col", schema_columns[i].0)))
@@ -410,30 +436,69 @@ fn read_partition_columns(p: ReadPartitionColumnsParams<'_>) -> Vec<Option<Colum
         _ => reader.read_files(&path_refs),
     };
 
-    // Decode each raw buffer into ColumnData.
-    let mut decoded: HashMap<usize, ColumnData> = HashMap::new();
+    // Decode each raw buffer into ColumnData. The batch returns an empty
+    // buffer for a file it could not read. That file reads again on its own,
+    // so the error names why it does not read.
     for (buf_idx, &schema_idx) in needed_indices.iter().enumerate() {
-        let raw = &raw_buffers[buf_idx];
-        if raw.is_empty() {
-            continue;
-        }
-        let (name, ty) = &schema_columns[schema_idx];
-        let codec = meta.column_stats.get(name).map(|s| s.codec);
-        if let Ok(data) = ColumnarSegmentReader::decode_column_from_bytes(
-            partition_dir,
-            name,
-            *ty,
-            codec,
-            raw,
-            None,
-        ) {
-            decoded.insert(schema_idx, data);
-        }
+        let raw = raw_buffers
+            .get(buf_idx)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let data = if raw.is_empty() {
+            read_one(schema_idx, false)?
+        } else {
+            let (name, ty) = &schema_columns[schema_idx];
+            let codec = meta.column_stats.get(name).map(|s| s.codec);
+            ColumnarSegmentReader::decode_column_from_bytes(
+                partition_dir,
+                name,
+                *ty,
+                codec,
+                raw,
+                None,
+            )
+            .map_err(|e| partition_corrupt(partition_dir, "column", SITE, e))?
+        };
+        columns[schema_idx] = Some(data);
+    }
+    Ok(columns)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn aggregate(dir: &Path) -> crate::Result<Option<GroupedAggResult>> {
+        aggregate_partition(PartitionAggParams {
+            partition_dir: dir,
+            group_by: &[],
+            aggregates: &[("count".to_string(), "*".to_string())],
+            filters: &[],
+            time_range: (0, i64::MAX),
+            needed_columns: &[],
+            bucket_interval_ms: 0,
+            uring_reader: None,
+            io_priority: None,
+            io_metrics: None,
+        })
     }
 
-    schema_columns
-        .iter()
-        .enumerate()
-        .map(|(i, _)| decoded.remove(&i))
-        .collect()
+    #[test]
+    fn a_listed_partition_without_a_directory_refuses_the_aggregate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = aggregate(&dir.path().join("ts-0001"));
+        assert!(matches!(
+            result,
+            Err(crate::Error::SegmentCorrupted { ref detail }) if detail.contains("directory is missing")
+        ));
+    }
+
+    #[test]
+    fn a_partition_whose_schema_does_not_read_refuses_the_aggregate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(matches!(
+            aggregate(dir.path()),
+            Err(crate::Error::SegmentCorrupted { .. })
+        ));
+    }
 }

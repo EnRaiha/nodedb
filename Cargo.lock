@@ -4343,6 +4343,7 @@ version = "0.5.0"
 dependencies = [
  "async-trait",
  "nodedb-types",
+ "rust_decimal",
  "rustls-pemfile",
  "serde",
  "serde_json",
@@ -4363,6 +4364,8 @@ dependencies = [
  "nodedb-client",
  "nodedb-test-support",
  "nodedb-types",
+ "serde_json",
+ "sonic-rs",
  "tempfile",
  "tokio",
  "tokio-postgres",
@@ -4464,6 +4467,7 @@ name = "nodedb-columnar"
 version = "0.5.0"
 dependencies = [
  "crc32c",
+ "faultbox",
  "nodedb-codec",
  "nodedb-mem",
  "nodedb-types",
@@ -4474,6 +4478,7 @@ dependencies = [
  "serde_json",
  "sonic-rs",
  "thiserror 2.0.20",
+ "ulid",
  "uuid",
  "zerompk",
 ]

@@ -87,6 +87,33 @@ pub enum ColumnarError {
         offset: Option<u64>,
     },
 
+    /// A memtable cell whose bytes do not hold a value of its declared type.
+    ///
+    /// The memtable writer encodes every cell it stores, so this is in-memory
+    /// corruption. The read is refused rather than answered with `NULL`.
+    #[error("memtable cell corrupt: column '{column}' row {row}: {reason}")]
+    MemtableCellCorrupt {
+        column: String,
+        row: usize,
+        reason: String,
+    },
+
+    /// A columnar WAL row whose bytes do not decode.
+    ///
+    /// `offset` is the byte position in the row where decoding stopped. The
+    /// decode is refused rather than answered with `NULL` or replacement
+    /// characters.
+    #[error("columnar WAL row corrupt at byte {offset}: {reason}")]
+    WalRowCorrupt { offset: usize, reason: String },
+
+    /// A string column cell whose bytes are not UTF-8 at segment write time.
+    ///
+    /// The memtable push stores only valid UTF-8, so these bytes were
+    /// damaged in memory. The segment write is refused rather than written
+    /// with wrong block statistics.
+    #[error("string column '{column}' row {row} holds bytes that are not UTF-8")]
+    StringCellNotUtf8 { column: String, row: usize },
+
     /// Segment is encrypted (starts with `SEGV`) but no KEK was supplied.
     #[error(
         "columnar segment is encrypted but no encryption key was provided; \

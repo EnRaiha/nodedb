@@ -12,6 +12,13 @@ documentation = "https://docs.rs/nodedb-columnar"
 keywords = ["columnar", "segment", "compression", "olap", "analytics"]
 categories = ["database-implementations", "compression"]
 
+[features]
+default = []
+# Corrupt memtable cells report through the `faultbox` black-box recorder.
+# Inert until the host application calls `faultbox::init`. A no-op on wasm32.
+# Off by default so Lite and WASM embedders do not pull the recorder.
+diagnostics = ["dep:faultbox"]
+
 [dependencies]
 nodedb-types = { workspace = true }
 nodedb-codec = { workspace = true }
@@ -23,6 +30,8 @@ sonic-rs = { workspace = true }
 zerompk = { workspace = true }
 crc32c = { workspace = true }
 uuid = { workspace = true }
+ulid = { workspace = true }
 roaring = { workspace = true }
 rust_decimal = { workspace = true }
 nodedb-wal = { workspace = true }
+faultbox = { workspace = true, optional = true }

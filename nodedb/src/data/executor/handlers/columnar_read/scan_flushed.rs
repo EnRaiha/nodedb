@@ -6,7 +6,6 @@ use crate::bridge::expr_eval::ComputedColumn;
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::transaction::overlay::ColumnarMatchedRow;
-use crate::data::executor::scan_normalize::decoded_col_to_value;
 
 use super::bitemporal::bitemporal_row_visible;
 use super::convert::row_to_projected_value;
@@ -43,6 +42,9 @@ impl CoreLoop {
     /// type, and each row is projected by `row_to_projected_value` — the same
     /// two steps the live-memtable phase applies — so a row reads identically
     /// from a segment and from the memtable.
+    ///
+    /// `Err` when a segment does not open or decode, or a live row holds a
+    /// corrupt cell. No segment is skipped.
     pub(in crate::data::executor) fn scan_flushed_columnar_segments(
         &self,
         ctx: FlushedScanCtx<'_>,
@@ -76,64 +78,16 @@ impl CoreLoop {
                 // active memtable virtual segment). Mirror: materialize_scan.rs.
                 let seg_id = seg_idx as u64 + 1;
 
-                let reader = if let Some(ref reg) = self.quarantine_registry {
-                    match crate::storage::quarantine::engines::open_segment_with_quarantine(
-                        reg,
-                        seg_bytes,
-                        collection,
-                        &seg_id.to_string(),
-                    ) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!(
-                                collection,
-                                seg_id,
-                                error = %e,
-                                "execute_columnar_scan: failed to open flushed segment (quarantine); skipping"
-                            );
-                            continue;
-                        }
-                    }
-                } else {
-                    match nodedb_columnar::SegmentReader::open(seg_bytes) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!(
-                                collection,
-                                seg_id,
-                                error = %e,
-                                "execute_columnar_scan: failed to open flushed segment; skipping"
-                            );
-                            continue;
-                        }
-                    }
-                };
-
-                let row_count = reader.row_count() as usize;
-                let col_count = schema.columns.len();
-
-                // Decode all columns for this segment up front.
-                let mut decoded_cols = Vec::with_capacity(col_count);
-                let mut decode_ok = true;
-                for col_idx in 0..col_count {
-                    match reader.read_column(col_idx) {
-                        Ok(dc) => decoded_cols.push(dc),
-                        Err(e) => {
-                            tracing::warn!(
-                                collection,
-                                seg_id,
-                                col_idx,
-                                error = %e,
-                                "execute_columnar_scan: column decode failed; skipping segment"
-                            );
-                            decode_ok = false;
-                            break;
-                        }
-                    }
-                }
-                if !decode_ok {
-                    continue;
-                }
+                // A segment that does not read refuses the scan. Skipping it
+                // would answer the query without the segment's rows.
+                let segment = self.decode_flushed_segment(
+                    collection,
+                    seg_id,
+                    seg_bytes,
+                    schema.columns.len(),
+                    "columnar_scan",
+                )?;
+                let row_count = segment.row_count();
 
                 // Fetch the delete bitmap for this segment once per segment.
                 let delete_bm = self
@@ -177,13 +131,7 @@ impl CoreLoop {
 
                     // Build the row as Vec<Value> using the shared decoder,
                     // typing each cell by its declared column type.
-                    let row: Vec<nodedb_types::value::Value> = decoded_cols
-                        .iter()
-                        .zip(&schema.columns)
-                        .map(|(dc, col_def)| {
-                            decoded_col_to_value(dc, row_idx, &col_def.column_type)
-                        })
-                        .collect();
+                    let row = segment.row(schema, row_idx)?;
 
                     if !bitemporal_row_visible(
                         &row,

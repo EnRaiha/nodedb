@@ -328,6 +328,7 @@ mod tests {
             .get(&key)
             .expect("engine")
             .scan_memtable_rows()
+            .map(|row| row.expect("read"))
             .filter_map(|row| match row.first() {
                 Some(Value::Integer(id)) => Some(*id),
                 _ => None,

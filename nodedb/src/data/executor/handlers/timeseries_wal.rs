@@ -533,7 +533,8 @@ mod tests {
             .get(&(DatabaseId::new(0), TenantId::new(7), "m".to_string()))
             .expect("engine")
             .scan_memtable_rows()
-            .collect();
+            .collect::<Result<_, _>>()
+            .expect("read");
         assert_eq!(rows, vec![vec![Value::Integer(1), Value::Integer(10)]]);
     }
 

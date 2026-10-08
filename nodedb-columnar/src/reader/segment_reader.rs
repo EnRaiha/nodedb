@@ -18,8 +18,7 @@ use crate::format::{HEADER_SIZE, SegmentFooter, SegmentHeader};
 use crate::predicate::ScanPredicate;
 
 use super::block_decode::{
-    append_null_fill, decode_block, empty_decoded, infer_column_type, result_valid_len,
-    result_valid_slice_mut,
+    append_null_fill, decode_block, empty_decoded, result_valid_len, result_valid_slice_mut,
 };
 use super::types::DecodedColumn;
 
@@ -241,8 +240,7 @@ impl<'a> SegmentReader<'a> {
             });
         }
         let mut cursor = col_start;
-        let col_type = infer_column_type(col_meta);
-        let mut result = empty_decoded(&col_type);
+        let mut result = empty_decoded(col_meta.layout);
         let mut global_row: u32 = 0;
 
         for block_stat in &col_meta.block_stats {
@@ -298,7 +296,7 @@ impl<'a> SegmentReader<'a> {
             decode_block(
                 &mut result,
                 block_data,
-                &col_type,
+                col_meta.layout,
                 col_meta.codec,
                 block_row_count as usize,
                 col_meta.dictionary.as_deref(),

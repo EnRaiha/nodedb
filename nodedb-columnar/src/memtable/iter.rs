@@ -7,6 +7,7 @@ use nodedb_types::value::Value;
 
 use super::column_data::ColumnData;
 use super::core::ColumnarMemtable;
+use crate::error::ColumnarError;
 
 impl ColumnarMemtable {
     /// Iterate rows as `Vec<Value>`. For scan/read operations.
@@ -23,16 +24,28 @@ impl ColumnarMemtable {
     }
 
     /// Get a single row by index as `Vec<Value>`.
-    pub fn get_row(&self, row_idx: usize) -> Option<Vec<Value>> {
+    ///
+    /// `Ok(None)` when `row_idx` is past the last row. `Err` when a cell of
+    /// the row is corrupt.
+    pub fn get_row(&self, row_idx: usize) -> Result<Option<Vec<Value>>, ColumnarError> {
         if row_idx >= self.row_count {
-            return None;
+            return Ok(None);
         }
-        let mut row = Vec::with_capacity(self.columns.len());
-        for (col, def) in self.columns.iter().zip(&self.schema.columns) {
-            row.push(col.get_value(row_idx, &def.column_type));
-        }
-        Some(row)
+        read_row(&self.columns, &self.schema.columns, row_idx).map(Some)
     }
+}
+
+/// Read row `row_idx` of `columns`, typing each cell by its column def.
+fn read_row(
+    columns: &[ColumnData],
+    column_defs: &[ColumnDef],
+    row_idx: usize,
+) -> Result<Vec<Value>, ColumnarError> {
+    columns
+        .iter()
+        .zip(column_defs)
+        .map(|(col, def)| col.get_value(row_idx, &def.column_type, &def.name))
+        .collect()
 }
 
 /// Row iterator over a columnar memtable.
@@ -43,17 +56,16 @@ pub struct MemtableRowIter<'a> {
     current: usize,
 }
 
+/// Yields `Err` for a row with a corrupt cell. The iterator still advances
+/// past that row.
 impl Iterator for MemtableRowIter<'_> {
-    type Item = Vec<Value>;
+    type Item = Result<Vec<Value>, ColumnarError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.current >= self.row_count {
             return None;
         }
-        let mut row = Vec::with_capacity(self.columns.len());
-        for (col, def) in self.columns.iter().zip(self.column_defs) {
-            row.push(col.get_value(self.current, &def.column_type));
-        }
+        let row = read_row(self.columns, self.column_defs, self.current);
         self.current += 1;
         Some(row)
     }
@@ -104,8 +116,9 @@ mod tests {
             Value::DateTime(dt),
             Value::Integer(7),
         ];
-        assert_eq!(mt.get_row(0), Some(expected.clone()));
-        assert_eq!(mt.iter_rows().collect::<Vec<_>>(), vec![expected]);
-        assert_eq!(mt.get_row(1), None);
+        assert_eq!(mt.get_row(0).expect("read"), Some(expected.clone()));
+        let rows: Vec<Vec<Value>> = mt.iter_rows().collect::<Result<_, _>>().expect("read");
+        assert_eq!(rows, vec![expected]);
+        assert_eq!(mt.get_row(1).expect("read"), None);
     }
 }

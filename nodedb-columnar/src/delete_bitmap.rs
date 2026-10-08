@@ -131,6 +131,14 @@ impl DeleteBitmap {
         self.inner.remove(row_idx)
     }
 
+    /// Remove every row index at or above `start` from the deleted set.
+    ///
+    /// Used when the rows from `start` on are cut from a memtable: an index
+    /// that later holds a new row must not inherit a tombstone.
+    pub fn unmark_from(&mut self, start: u32) {
+        self.inner.remove_range(start..);
+    }
+
     /// Merge another bitmap into this one (union).
     ///
     /// Used when two views of the same segment's tombstones must be combined
@@ -157,6 +165,18 @@ mod tests {
         assert!(bm.mark_deleted(5));
         assert!(bm.is_deleted(5));
         assert!(!bm.mark_deleted(5)); // Already deleted.
+        assert_eq!(bm.deleted_count(), 1);
+    }
+
+    #[test]
+    fn unmark_from_clears_the_tail_only() {
+        let mut bm = DeleteBitmap::new();
+        bm.mark_deleted_batch(&[1, 4, 5, 9]);
+        bm.unmark_from(4);
+        assert!(bm.is_deleted(1));
+        assert!(!bm.is_deleted(4));
+        assert!(!bm.is_deleted(5));
+        assert!(!bm.is_deleted(9));
         assert_eq!(bm.deleted_count(), 1);
     }
 
