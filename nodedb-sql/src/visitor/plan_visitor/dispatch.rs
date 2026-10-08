@@ -8,12 +8,17 @@
 use super::args::{
     AggregateVisitArgs, DocumentIndexLookupVisitArgs, HybridSearchTripleVisitArgs,
     HybridSearchVisitArgs, InsertVisitArgs, JoinVisitArgs, RecursiveScanVisitArgs,
-    RecursiveValueVisitArgs, ScanVisitArgs, SpatialScanVisitArgs, TimeseriesScanVisitArgs,
-    UpdateFromVisitArgs, UpsertVisitArgs, VectorSearchVisitArgs,
+    RecursiveValueVisitArgs, ScanVisitArgs, SpatialScanVisitArgs, TextSearchVisitArgs,
+    TimeseriesScanVisitArgs, UpdateFromVisitArgs, UpsertVisitArgs, VectorSearchVisitArgs,
 };
 use super::dispatch_rest::dispatch_rest;
 use super::trait_def::PlanVisitor;
 use crate::types::SqlPlan;
+use crate::types::{
+    DocumentIndexLookupPlan, HybridSearchPlan, HybridSearchTriplePlan, InsertPlan, KvInsertPlan,
+    RangeScanPlan, RecursiveScanPlan, RecursiveValuePlan, TextSearchPlan, TimeseriesIngestPlan,
+    TimeseriesScanPlan, UpsertPlan,
+};
 
 pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Output, V::Error> {
     match plan {
@@ -53,7 +58,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             key_value,
             projection: _,
         } => visitor.point_get(collection, alias.as_deref(), *engine, key_column, key_value),
-        SqlPlan::DocumentIndexLookup {
+        SqlPlan::DocumentIndexLookup(DocumentIndexLookupPlan {
             collection,
             alias,
             engine,
@@ -68,7 +73,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             window_functions,
             case_insensitive,
             temporal,
-        } => visitor.document_index_lookup(DocumentIndexLookupVisitArgs {
+        }) => visitor.document_index_lookup(DocumentIndexLookupVisitArgs {
             collection,
             alias: alias.as_deref(),
             engine: *engine,
@@ -84,15 +89,15 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             case_insensitive: *case_insensitive,
             temporal,
         }),
-        SqlPlan::RangeScan {
+        SqlPlan::RangeScan(RangeScanPlan {
             collection,
             field,
             lower,
             upper,
             limit,
             projection: _,
-        } => visitor.range_scan(collection, field, lower.as_ref(), upper.as_ref(), *limit),
-        SqlPlan::Insert {
+        }) => visitor.range_scan(collection, field, lower.as_ref(), upper.as_ref(), *limit),
+        SqlPlan::Insert(InsertPlan {
             collection,
             engine,
             route,
@@ -101,7 +106,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             if_absent,
             column_schema,
             primary_key,
-        } => visitor.insert(InsertVisitArgs {
+        }) => visitor.insert(InsertVisitArgs {
             collection,
             engine: *engine,
             route: *route,
@@ -110,15 +115,15 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             column_schema,
             primary_key: primary_key.as_deref(),
         }),
-        SqlPlan::KvInsert {
+        SqlPlan::KvInsert(KvInsertPlan {
             collection,
             entries,
             ttl_secs,
             intent,
             on_conflict_updates,
             ..
-        } => visitor.kv_insert(collection, entries, *ttl_secs, *intent, on_conflict_updates),
-        SqlPlan::Upsert {
+        }) => visitor.kv_insert(collection, entries, *ttl_secs, *intent, on_conflict_updates),
+        SqlPlan::Upsert(UpsertPlan {
             collection,
             engine,
             route,
@@ -127,7 +132,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             on_conflict_updates,
             column_schema,
             primary_key,
-        } => visitor.upsert(UpsertVisitArgs {
+        }) => visitor.upsert(UpsertVisitArgs {
             collection,
             engine: *engine,
             route: *route,
@@ -225,7 +230,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             grouping_sets: grouping_sets.as_deref(),
             sort_keys,
         }),
-        SqlPlan::TimeseriesScan {
+        SqlPlan::TimeseriesScan(TimeseriesScanPlan {
             collection,
             time_range,
             bucket_interval_ms,
@@ -238,7 +243,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             sort_keys,
             tiered,
             temporal,
-        } => visitor.timeseries_scan(TimeseriesScanVisitArgs {
+        }) => visitor.timeseries_scan(TimeseriesScanVisitArgs {
             collection,
             time_range: *time_range,
             bucket_interval_ms: *bucket_interval_ms,
@@ -252,11 +257,11 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             tiered: *tiered,
             temporal,
         }),
-        SqlPlan::TimeseriesIngest {
+        SqlPlan::TimeseriesIngest(TimeseriesIngestPlan {
             collection,
             rows,
             volatile_defaults: _,
-        } => visitor.timeseries_ingest(collection, rows),
+        }) => visitor.timeseries_ingest(collection, rows),
         SqlPlan::VectorSearch {
             collection,
             field,
@@ -269,6 +274,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             ann_options,
             skip_payload_fetch,
             payload_filters,
+            pk_prefilter,
             projection: _,
         } => visitor.vector_search(VectorSearchVisitArgs {
             collection,
@@ -282,6 +288,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             ann_options,
             skip_payload_fetch: *skip_payload_fetch,
             payload_filters,
+            pk_prefilter: pk_prefilter.as_deref(),
         }),
         SqlPlan::MultiVectorSearch {
             collection,
@@ -297,56 +304,76 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             top_k,
             projection: _,
         } => visitor.sparse_search(collection, field, query_entries, *top_k),
-        SqlPlan::TextSearch {
+        SqlPlan::TextSearch(TextSearchPlan {
             collection,
-            query,
-            top_k,
+            shape,
             filters,
-            score_alias,
+            scores,
             projection: _,
-        } => visitor.text_search(collection, query, *top_k, filters, score_alias.as_deref()),
-        SqlPlan::HybridSearch {
+        }) => visitor.text_search(TextSearchVisitArgs {
             collection,
+            shape,
+            filters,
+            scores,
+        }),
+        SqlPlan::HybridSearch(HybridSearchPlan {
+            collection,
+            vector_field,
             query_vector,
+            text_field,
             query_text,
+            filters,
             top_k,
             ef_search,
             vector_weight,
+            mode,
             fuzzy,
             score_alias,
             projection: _,
-        } => visitor.hybrid_search(HybridSearchVisitArgs {
+        }) => visitor.hybrid_search(HybridSearchVisitArgs {
             collection,
+            vector_field,
             query_vector,
+            text_field: text_field.as_deref(),
             query_text,
+            filters,
             top_k: *top_k,
             ef_search: *ef_search,
             vector_weight: *vector_weight,
+            mode: *mode,
             fuzzy: *fuzzy,
             score_alias: score_alias.as_deref(),
         }),
-        SqlPlan::HybridSearchTriple {
+        SqlPlan::HybridSearchTriple(HybridSearchTriplePlan {
             collection,
+            vector_field,
             query_vector,
+            text_field,
             query_text,
+            filters,
             graph_seed_id,
             graph_depth,
             graph_edge_label,
             top_k,
             ef_search,
+            mode,
             fuzzy,
             rrf_k,
             score_alias,
             projection: _,
-        } => visitor.hybrid_search_triple(HybridSearchTripleVisitArgs {
+        }) => visitor.hybrid_search_triple(HybridSearchTripleVisitArgs {
             collection,
+            vector_field,
             query_vector,
+            text_field: text_field.as_deref(),
             query_text,
+            filters,
             graph_seed_id,
             graph_depth: *graph_depth,
             graph_edge_label: graph_edge_label.as_deref(),
             top_k: *top_k,
             ef_search: *ef_search,
+            mode: *mode,
             fuzzy: *fuzzy,
             rrf_k: *rrf_k,
             score_alias: score_alias.as_deref(),
@@ -370,7 +397,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             limit: *limit,
             projection,
         }),
-        SqlPlan::RecursiveScan {
+        SqlPlan::RecursiveScan(RecursiveScanPlan {
             collection,
             base_filters,
             recursive_filters,
@@ -379,7 +406,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             distinct,
             limit,
             projection: _,
-        } => visitor.recursive_scan(RecursiveScanVisitArgs {
+        }) => visitor.recursive_scan(RecursiveScanVisitArgs {
             collection,
             base_filters,
             recursive_filters,
@@ -388,7 +415,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             distinct: *distinct,
             limit: *limit,
         }),
-        SqlPlan::RecursiveValue {
+        SqlPlan::RecursiveValue(RecursiveValuePlan {
             cte_name,
             columns,
             init_exprs,
@@ -396,7 +423,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             condition,
             max_depth,
             distinct,
-        } => visitor.recursive_value(RecursiveValueVisitArgs {
+        }) => visitor.recursive_value(RecursiveValueVisitArgs {
             cte_name,
             columns,
             init_exprs,

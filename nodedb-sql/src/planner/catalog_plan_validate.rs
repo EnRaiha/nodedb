@@ -2,6 +2,11 @@
 
 //! Catalog-dependent expression validation across nested SQL plan shapes.
 
+use crate::types::{
+    CtePlan, DocumentIndexLookupPlan, HybridSearchPlan, HybridSearchTriplePlan, LateralLoopPlan,
+    LateralTopKPlan, MergePlan, RangeScanPlan, RecursiveScanPlan, TextSearchPlan,
+    VectorPrimaryDeletePlan, VectorPrimaryUpdatePlan,
+};
 use nodedb_types::DatabaseId;
 
 use crate::catalog::SqlCatalog;
@@ -26,19 +31,20 @@ pub(super) fn validate_catalog_exprs(
             window_functions,
             ..
         }
-        | SqlPlan::DocumentIndexLookup {
+        | SqlPlan::DocumentIndexLookup(DocumentIndexLookupPlan {
             filters,
             projection,
             sort_keys,
             window_functions,
             ..
-        } => {
+        }) => {
             validate_filters(filters, catalog, database_id, tenant_id)?;
             validate_projection(projection, catalog, database_id, tenant_id)?;
             validate_sort_keys(sort_keys, catalog, database_id, tenant_id)?;
             validate_windows(window_functions, catalog, database_id, tenant_id)?;
         }
-        SqlPlan::PointGet { projection, .. } | SqlPlan::RangeScan { projection, .. } => {
+        SqlPlan::PointGet { projection, .. }
+        | SqlPlan::RangeScan(RangeScanPlan { projection, .. }) => {
             validate_projection(projection, catalog, database_id, tenant_id)?;
         }
         SqlPlan::Update {
@@ -46,17 +52,18 @@ pub(super) fn validate_catalog_exprs(
             filters,
             ..
         }
-        | SqlPlan::VectorPrimaryUpdate {
+        | SqlPlan::VectorPrimaryUpdate(VectorPrimaryUpdatePlan {
             assignments,
             filters,
             ..
-        } => {
+        }) => {
             for (_, expr) in assignments {
                 validate_expr(expr, catalog, database_id, tenant_id)?;
             }
             validate_filters(filters, catalog, database_id, tenant_id)?;
         }
-        SqlPlan::Delete { filters, .. } | SqlPlan::VectorPrimaryDelete { filters, .. } => {
+        SqlPlan::Delete { filters, .. }
+        | SqlPlan::VectorPrimaryDelete(VectorPrimaryDeletePlan { filters, .. }) => {
             validate_filters(filters, catalog, database_id, tenant_id)?
         }
         SqlPlan::UpdateFrom {
@@ -99,7 +106,7 @@ pub(super) fn validate_catalog_exprs(
             validate_catalog_exprs(left, catalog, database_id, tenant_id)?;
             validate_catalog_exprs(right, catalog, database_id, tenant_id)?;
         }
-        SqlPlan::Cte { definitions, outer } => {
+        SqlPlan::Cte(CtePlan { definitions, outer }) => {
             for (_, definition) in definitions {
                 validate_catalog_exprs(definition, catalog, database_id, tenant_id)?;
             }
@@ -137,31 +144,31 @@ pub(super) fn validate_catalog_exprs(
             validate_projection(projection, catalog, database_id, tenant_id)?;
             validate_filters(filters, catalog, database_id, tenant_id)?;
         }
-        SqlPlan::LateralTopK {
+        SqlPlan::LateralTopK(LateralTopKPlan {
             outer,
             inner_filters,
             inner_order_by,
             projection,
             ..
-        } => {
+        }) => {
             validate_catalog_exprs(outer, catalog, database_id, tenant_id)?;
             validate_filters(inner_filters, catalog, database_id, tenant_id)?;
             validate_sort_keys(inner_order_by, catalog, database_id, tenant_id)?;
             validate_projection(projection, catalog, database_id, tenant_id)?;
         }
-        SqlPlan::LateralLoop {
+        SqlPlan::LateralLoop(LateralLoopPlan {
             outer,
             inner,
             projection,
             ..
-        } => {
+        }) => {
             validate_catalog_exprs(outer, catalog, database_id, tenant_id)?;
             validate_catalog_exprs(inner, catalog, database_id, tenant_id)?;
             validate_projection(projection, catalog, database_id, tenant_id)?;
         }
-        SqlPlan::Merge {
+        SqlPlan::Merge(MergePlan {
             source, clauses, ..
-        } => {
+        }) => {
             validate_catalog_exprs(source, catalog, database_id, tenant_id)?;
             for clause in clauses {
                 validate_filters(&clause.extra_predicate, catalog, database_id, tenant_id)?;
@@ -189,16 +196,27 @@ pub(super) fn validate_catalog_exprs(
             validate_projection(projection, catalog, database_id, tenant_id)?;
         }
         SqlPlan::MultiVectorSearch { projection, .. }
-        | SqlPlan::SparseSearch { projection, .. }
-        | SqlPlan::HybridSearch { projection, .. }
-        | SqlPlan::HybridSearchTriple { projection, .. } => {
+        | SqlPlan::SparseSearch { projection, .. } => {
             validate_projection(projection, catalog, database_id, tenant_id)?;
         }
-        SqlPlan::TextSearch {
+        SqlPlan::HybridSearch(HybridSearchPlan {
             filters,
             projection,
             ..
-        } => {
+        })
+        | SqlPlan::HybridSearchTriple(HybridSearchTriplePlan {
+            filters,
+            projection,
+            ..
+        }) => {
+            validate_filters(filters, catalog, database_id, tenant_id)?;
+            validate_projection(projection, catalog, database_id, tenant_id)?;
+        }
+        SqlPlan::TextSearch(TextSearchPlan {
+            filters,
+            projection,
+            ..
+        }) => {
             validate_filters(filters, catalog, database_id, tenant_id)?;
             validate_projection(projection, catalog, database_id, tenant_id)?;
         }
@@ -210,17 +228,39 @@ pub(super) fn validate_catalog_exprs(
             validate_filters(attribute_filters, catalog, database_id, tenant_id)?;
             validate_projection(projection, catalog, database_id, tenant_id)?;
         }
-        SqlPlan::RecursiveScan {
+        SqlPlan::RecursiveScan(RecursiveScanPlan {
             base_filters,
             recursive_filters,
             projection,
             ..
-        } => {
+        }) => {
             validate_filters(base_filters, catalog, database_id, tenant_id)?;
             validate_filters(recursive_filters, catalog, database_id, tenant_id)?;
             validate_projection(projection, catalog, database_id, tenant_id)?;
         }
-        _ => {}
+        SqlPlan::ConstantResult { .. }
+        | SqlPlan::Insert(_)
+        | SqlPlan::KvInsert(_)
+        | SqlPlan::Upsert(_)
+        | SqlPlan::Truncate { .. }
+        | SqlPlan::TimeseriesScan(_)
+        | SqlPlan::TimeseriesIngest(_)
+        | SqlPlan::RecursiveValue(_)
+        | SqlPlan::CreateArray(_)
+        | SqlPlan::DropArray { .. }
+        | SqlPlan::AlterArray(_)
+        | SqlPlan::InsertArray(_)
+        | SqlPlan::DeleteArray(_)
+        | SqlPlan::ArraySlice(_)
+        | SqlPlan::ArrayProject(_)
+        | SqlPlan::ArrayAgg(_)
+        | SqlPlan::ArrayElementwise(_)
+        | SqlPlan::ArrayFlush { .. }
+        | SqlPlan::ArrayCompact { .. }
+        | SqlPlan::VectorPrimaryInsert(_)
+        | SqlPlan::VectorPrimaryTruncate(_)
+        | SqlPlan::CreateIndex(_)
+        | SqlPlan::DropIndex(_) => {}
     }
     Ok(())
 }
