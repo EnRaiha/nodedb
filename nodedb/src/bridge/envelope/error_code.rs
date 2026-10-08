@@ -221,4 +221,13 @@ pub enum ErrorCode {
     /// An instant outside the range a `TIMESTAMP` or `TIMESTAMPTZ` holds.
     /// SQLSTATE `22008` (datetime_field_overflow).
     DatetimeFieldOverflow { detail: String },
+    /// The request names an object that does not exist, such as a document
+    /// at a version where it had no state. `object` describes it, and the
+    /// message reads "`object` does not exist". SQLSTATE `42704`
+    /// (undefined_object).
+    UndefinedObject { object: String },
+    /// The object exists but is not in the state the request needs, such as
+    /// a version whose history compaction discarded. SQLSTATE `55000`
+    /// (object_not_in_prerequisite_state).
+    ObjectNotInPrerequisiteState { object: String, detail: String },
 }

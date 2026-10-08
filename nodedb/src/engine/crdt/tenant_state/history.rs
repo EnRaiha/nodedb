@@ -89,9 +89,10 @@ impl TenantCrdtEngine {
     ) -> crate::Result<Vec<u8>> {
         let vv = json_to_vv(target_version_json)?;
         let state = self.collections.get(collection).ok_or_else(|| {
-            crate::Error::Crdt(nodedb_crdt::CrdtError::Loro(
-                "document did not exist at target version".into(),
-            ))
+            crate::Error::Crdt(nodedb_crdt::CrdtError::RowAbsentAtVersion {
+                collection: collection.to_string(),
+                row_id: document_id.to_string(),
+            })
         })?;
         state
             .preview_restore_to_version(collection, document_id, &vv)
@@ -107,9 +108,10 @@ impl TenantCrdtEngine {
     ) -> crate::Result<Vec<u8>> {
         let vv = json_to_vv(target_version_json)?;
         let state = self.collections.get(collection).ok_or_else(|| {
-            crate::Error::Crdt(nodedb_crdt::CrdtError::Loro(
-                "document did not exist at target version".into(),
-            ))
+            crate::Error::Crdt(nodedb_crdt::CrdtError::RowAbsentAtVersion {
+                collection: collection.to_string(),
+                row_id: document_id.to_string(),
+            })
         })?;
         state
             .restore_to_version(collection, document_id, &vv)

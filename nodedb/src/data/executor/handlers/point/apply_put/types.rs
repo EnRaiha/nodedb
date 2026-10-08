@@ -181,6 +181,8 @@ pub(in crate::data::executor) fn map_enforcement_error(e: ErrorCode) -> crate::E
         | ErrorCode::DatatypeMismatch { .. }
         | ErrorCode::InvalidDatetimeFormat { .. }
         | ErrorCode::DatetimeFieldOverflow { .. }
+        | ErrorCode::UndefinedObject { .. }
+        | ErrorCode::ObjectNotInPrerequisiteState { .. }
         | ErrorCode::DispatchCapacity { .. }
         | ErrorCode::ExpiredBeforeExecution
         | ErrorCode::BadRequest { .. }

@@ -247,16 +247,23 @@ impl From<crate::Error> for ErrorCode {
                     resource: e.to_string(),
                 }
             }
-            // Client errors of class `42`, and client errors whose class
-            // (`25006`, `55`) no Data-Plane code has. `BadRequest` is the
-            // class their public code has.
+            // `42704` and `55000`, as the Control Plane gives them.
+            crate::Error::UndefinedObject { kind, name } => Self::UndefinedObject {
+                object: format!("{kind} \"{name}\""),
+            },
+            crate::Error::ObjectNotInPrerequisiteState { object, detail } => {
+                Self::ObjectNotInPrerequisiteState { object, detail }
+            }
+            // Each CRDT error keeps the class of what caused it.
+            crate::Error::Crdt(crdt) => Self::from(&crdt),
+            // Client errors of class `42`, and client errors whose dedicated
+            // SQLSTATE (`25006`, a `55` code of their own) no Data-Plane code
+            // has. `BadRequest` is the class their public code has.
             e @ (crate::Error::CrdtAdmissionInvalidPlan { .. }
             | crate::Error::CrdtAdmissionCallerFence
             | crate::Error::CrdtApplyRequiresAdmission
             | crate::Error::CloneWriteRequiresMaterialize { .. }
-            | crate::Error::ObjectNotInPrerequisiteState { .. }
             | crate::Error::MirrorReadOnly { .. }
-            | crate::Error::UndefinedObject { .. }
             | crate::Error::AmbiguousColumn { .. }
             | crate::Error::ExecutionLimitExceeded { .. }
             | crate::Error::LimitExceeded { .. }
@@ -298,7 +305,6 @@ impl From<crate::Error> for ErrorCode {
             | crate::Error::Serialization { .. }
             | crate::Error::Codec { .. }
             | crate::Error::SegmentCorrupted { .. }
-            | crate::Error::Crdt(_)
             | crate::Error::Io(_)
             | crate::Error::Config { .. }
             | crate::Error::Encryption { .. }

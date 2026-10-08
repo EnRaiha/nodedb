@@ -16,7 +16,6 @@ pub(crate) fn is_unclassified_failure(e: &Error) -> bool {
         | Error::Serialization { .. }
         | Error::Codec { .. }
         | Error::SegmentCorrupted { .. }
-        | Error::Crdt(_)
         | Error::Io(_)
         | Error::Config { .. }
         | Error::Encryption { .. }
@@ -31,6 +30,12 @@ pub(crate) fn is_unclassified_failure(e: &Error) -> bool {
         | Error::CollectionUnstamped { .. }
         | Error::MaterializedSumResolutionMissing { .. }
         | Error::CascadeCycle { .. } => true,
+        // A CRDT error is classified unless its Data-Plane verdict is a
+        // server fault.
+        Error::Crdt(crdt) => matches!(
+            crate::bridge::envelope::ErrorCode::from(crdt),
+            crate::bridge::envelope::ErrorCode::Internal { .. }
+        ),
         // A client-matchable class or a retry contract a caller matches by
         // variant.
         Error::RejectedConstraint { .. }
@@ -156,5 +161,19 @@ mod tests {
         assert!(is_unclassified_failure(&Error::Internal {
             detail: "apply error".to_owned(),
         }));
+    }
+
+    /// A client-caused CRDT error is a verdict. A Loro fault is machinery.
+    #[test]
+    fn a_crdt_error_is_unclassified_only_when_it_is_a_server_fault() {
+        assert!(!is_unclassified_failure(&Error::Crdt(
+            nodedb_crdt::CrdtError::RowAbsentAtVersion {
+                collection: "notes".to_owned(),
+                row_id: "doc".to_owned(),
+            }
+        )));
+        assert!(is_unclassified_failure(&Error::Crdt(
+            nodedb_crdt::CrdtError::Loro("encode".to_owned())
+        )));
     }
 }

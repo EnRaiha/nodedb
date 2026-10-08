@@ -228,6 +228,8 @@ fn compensation_hint_for_code(code: &ErrorCode) -> CompensationHint {
         | ErrorCode::DatatypeMismatch { .. }
         | ErrorCode::InvalidDatetimeFormat { .. }
         | ErrorCode::DatetimeFieldOverflow { .. }
+        | ErrorCode::UndefinedObject { .. }
+        | ErrorCode::ObjectNotInPrerequisiteState { .. }
         | ErrorCode::BadRequest { .. }
         | ErrorCode::ActiveSqlTransaction { .. }
         | ErrorCode::DependentObjectsExist { .. }

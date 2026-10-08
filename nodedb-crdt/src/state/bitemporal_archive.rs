@@ -56,24 +56,30 @@ impl CrdtState {
     /// [`CrdtState::upsert`] — the archive has a non-trivial doc-size
     /// cost and is only meaningful when the collection participates in
     /// `AS OF` / audit queries.
+    ///
+    /// The archive entry and the new row commit together on return, on
+    /// success and on error.
     pub fn upsert_versioned(
         &self,
         collection: &str,
         row_id: &str,
         fields: &[(&str, LoroValue)],
     ) -> Result<()> {
-        if let Some((prior_sys_ms, prior_fields)) = self.prior_system_snapshot(collection, row_id) {
-            let archive = self.doc.get_map(HISTORY_ROOT);
-            let key = archive_key(collection, row_id, prior_sys_ms);
-            let slot = archive
-                .insert_container(&key, LoroMap::new())
-                .map_err(|e| CrdtError::Loro(format!("archive insert: {e}")))?;
-            for (k, v) in &prior_fields {
-                slot.insert(k.as_str(), v.clone())
-                    .map_err(|e| CrdtError::Loro(format!("archive field: {e}")))?;
+        let prior = self.prior_system_snapshot(collection, row_id);
+        self.doc.mutate(|doc| {
+            if let Some((prior_sys_ms, prior_fields)) = prior {
+                let archive = doc.get_map(HISTORY_ROOT);
+                let key = archive_key(collection, row_id, prior_sys_ms);
+                let slot = archive
+                    .insert_container(&key, LoroMap::new())
+                    .map_err(|e| CrdtError::Loro(format!("archive insert: {e}")))?;
+                for (k, v) in &prior_fields {
+                    slot.insert(k.as_str(), v.clone())
+                        .map_err(|e| CrdtError::Loro(format!("archive field: {e}")))?;
+                }
             }
-        }
-        self.upsert(collection, row_id, fields)
+            Self::replace_row_fields(doc, collection, row_id, fields)
+        })
     }
 
     /// Read the row as it was at `asof_ms` (system-time). Scans the
@@ -133,25 +139,26 @@ impl CrdtState {
     /// collection. Returns the number of archive entries deleted. The
     /// live row is never touched — retention only reclaims history, so
     /// the current state of every logical row remains readable even
-    /// when the entire archive is pruned.
+    /// when the entire archive is pruned. The deletes commit on return.
     pub fn purge_history_before(&self, collection: &str, cutoff_ms: i64) -> Result<usize> {
-        let archive = self.doc.get_map(HISTORY_ROOT);
-        let victims: Vec<String> = archive
-            .keys()
-            .filter_map(|k| {
-                let ks = k.to_string();
-                let matches = parse_archive_key(&ks)
-                    .is_some_and(|(c, _, ts)| c == collection && ts < cutoff_ms);
-                matches.then_some(ks)
-            })
-            .collect();
-        let count = victims.len();
-        for key in victims {
-            archive
-                .delete(&key)
-                .map_err(|e| CrdtError::Loro(format!("archive delete: {e}")))?;
-        }
-        Ok(count)
+        self.doc.mutate(|doc| {
+            let archive = doc.get_map(HISTORY_ROOT);
+            let victims: Vec<String> = archive
+                .keys()
+                .filter_map(|k| {
+                    let ks = k.to_string();
+                    let matches = parse_archive_key(&ks)
+                        .is_some_and(|(c, _, ts)| c == collection && ts < cutoff_ms);
+                    matches.then_some(ks)
+                })
+                .collect();
+            for key in &victims {
+                archive
+                    .delete(key)
+                    .map_err(|e| CrdtError::Loro(format!("archive delete: {e}")))?;
+            }
+            Ok(victims.len())
+        })
     }
 
     /// Read the live row's (`_ts_system`, field-map) pair when both the

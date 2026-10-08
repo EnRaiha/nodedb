@@ -2,6 +2,7 @@
 
 //! Request/response envelopes exchanged over the SPSC bridge.
 
+pub mod crdt_error_code;
 pub mod error_code;
 pub mod error_code_from;
 pub mod payload;

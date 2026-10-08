@@ -244,6 +244,16 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
         ErrorCode::DatetimeFieldOverflow { detail } => {
             ("ERROR", sqlstate::DATETIME_FIELD_OVERFLOW, detail.clone())
         }
+        ErrorCode::UndefinedObject { object } => (
+            "ERROR",
+            sqlstate::UNDEFINED_OBJECT,
+            format!("{object} does not exist"),
+        ),
+        ErrorCode::ObjectNotInPrerequisiteState { detail, .. } => (
+            "ERROR",
+            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+            detail.clone(),
+        ),
         // The same SQLSTATE the Control Plane gives `crate::Error::BadRequest`.
         ErrorCode::BadRequest { detail } => ("ERROR", sqlstate::SYNTAX_ERROR, detail.clone()),
         ErrorCode::TransactionRollback { detail } => {

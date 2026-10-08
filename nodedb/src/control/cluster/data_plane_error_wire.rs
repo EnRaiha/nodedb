@@ -158,6 +158,10 @@ impl From<ErrorCode> for DataPlaneErrorCode {
             ErrorCode::DatatypeMismatch { detail } => Self::DatatypeMismatch { detail },
             ErrorCode::InvalidDatetimeFormat { detail } => Self::InvalidDatetimeFormat { detail },
             ErrorCode::DatetimeFieldOverflow { detail } => Self::DatetimeFieldOverflow { detail },
+            ErrorCode::UndefinedObject { object } => Self::UndefinedObject { object },
+            ErrorCode::ObjectNotInPrerequisiteState { object, detail } => {
+                Self::ObjectNotInPrerequisiteState { object, detail }
+            }
             ErrorCode::TextColumn {
                 collection,
                 column,
@@ -325,6 +329,10 @@ impl From<DataPlaneErrorCode> for ErrorCode {
             DataPlaneErrorCode::DatetimeFieldOverflow { detail } => {
                 Self::DatetimeFieldOverflow { detail }
             }
+            DataPlaneErrorCode::UndefinedObject { object } => Self::UndefinedObject { object },
+            DataPlaneErrorCode::ObjectNotInPrerequisiteState { object, detail } => {
+                Self::ObjectNotInPrerequisiteState { object, detail }
+            }
             DataPlaneErrorCode::TextColumn {
                 collection,
                 column,
@@ -369,6 +377,22 @@ mod tests {
     fn division_by_zero_survives_the_wire_hop() {
         let wire = DataPlaneErrorCode::from(ErrorCode::DivisionByZero);
         assert_eq!(ErrorCode::from(wire), ErrorCode::DivisionByZero);
+    }
+
+    #[test]
+    fn object_state_codes_roundtrip_verbatim() {
+        for original in [
+            ErrorCode::UndefinedObject {
+                object: "document \"doc\" in collection \"notes\"".into(),
+            },
+            ErrorCode::ObjectNotInPrerequisiteState {
+                object: "CRDT version".into(),
+                detail: "version predates the compaction boundary".into(),
+            },
+        ] {
+            let wire = DataPlaneErrorCode::from(original.clone());
+            assert_eq!(ErrorCode::from(wire), original);
+        }
     }
 
     #[test]

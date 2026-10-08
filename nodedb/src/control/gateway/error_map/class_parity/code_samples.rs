@@ -8,7 +8,7 @@ use nodedb_types::sync::wire::SyncProvenance;
 use crate::bridge::envelope::{CounterFault, ErrorCode, SyncHold};
 
 /// The number of `ErrorCode` variants [`variant_index`] numbers.
-pub(super) const VARIANT_COUNT: usize = 50;
+pub(super) const VARIANT_COUNT: usize = 52;
 
 /// A dense index per variant. Exhaustive, so a new variant fails to compile
 /// here until it gets an index, and [`every_variant_has_a_sample`] then fails
@@ -65,6 +65,8 @@ pub(super) fn variant_index(code: &ErrorCode) -> usize {
         ErrorCode::DatatypeMismatch { .. } => 47,
         ErrorCode::InvalidDatetimeFormat { .. } => 48,
         ErrorCode::DatetimeFieldOverflow { .. } => 49,
+        ErrorCode::UndefinedObject { .. } => 50,
+        ErrorCode::ObjectNotInPrerequisiteState { .. } => 51,
     }
 }
 
@@ -193,6 +195,13 @@ pub(super) fn samples() -> Vec<ErrorCode> {
         ErrorCode::DatatypeMismatch { detail: text() },
         ErrorCode::InvalidDatetimeFormat { detail: text() },
         ErrorCode::DatetimeFieldOverflow { detail: text() },
+        ErrorCode::UndefinedObject {
+            object: "document \"d\"".into(),
+        },
+        ErrorCode::ObjectNotInPrerequisiteState {
+            object: "CRDT version".into(),
+            detail: text(),
+        },
         ErrorCode::DispatchCapacity { reason: text() },
         ErrorCode::ExpiredBeforeExecution,
         ErrorCode::BadRequest { detail: text() },

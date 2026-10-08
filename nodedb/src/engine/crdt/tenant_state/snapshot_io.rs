@@ -71,8 +71,11 @@ impl TenantCrdtEngine {
             super::ValidatedApplyOutcome::DeadLetterRefused { error, .. } => {
                 Err(crate::Error::Crdt(error))
             }
+            // The caller's bytes do not decode as a snapshot.
             super::ValidatedApplyOutcome::Malformed => Err(crate::Error::Crdt(
-                nodedb_crdt::CrdtError::DeltaApplyFailed("malformed snapshot".into()),
+                nodedb_crdt::CrdtError::ImportMalformed {
+                    detail: "the bytes do not decode as a snapshot".into(),
+                },
             )),
             super::ValidatedApplyOutcome::PendingDependencies => Err(crate::Error::Crdt(
                 nodedb_crdt::CrdtError::DeltaApplyFailed(

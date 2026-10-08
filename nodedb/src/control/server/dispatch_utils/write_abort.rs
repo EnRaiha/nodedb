@@ -96,6 +96,8 @@ fn is_transient_verdict(code: &ErrorCode) -> bool {
         | ErrorCode::DatatypeMismatch { .. }
         | ErrorCode::InvalidDatetimeFormat { .. }
         | ErrorCode::DatetimeFieldOverflow { .. }
+        | ErrorCode::UndefinedObject { .. }
+        | ErrorCode::ObjectNotInPrerequisiteState { .. }
         | ErrorCode::BadRequest { .. } => false,
     }
 }
@@ -174,7 +176,11 @@ pub(crate) fn write_definitely_not_applied(code: &ErrorCode) -> bool {
         | ErrorCode::DatetimeFieldOverflow { .. }
         | ErrorCode::UndefinedColumn { .. }
         // A full-text read refused the field before ranking.
-        | ErrorCode::TextColumn { .. } => true,
+        | ErrorCode::TextColumn { .. }
+        // The named object is absent, or not in the state the request needs.
+        // Both are checked before any mutation.
+        | ErrorCode::UndefinedObject { .. }
+        | ErrorCode::ObjectNotInPrerequisiteState { .. } => true,
 
         // NOT established — every one of these can be reported by a request
         // whose write reached, or can have reached, engine state. Emitting an

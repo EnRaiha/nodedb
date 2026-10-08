@@ -290,7 +290,10 @@ mod tests {
             nodedb_graph::GraphError::RebuildInProgress,
         );
 
-        assert!(matches!(code, ErrorCode::BadRequest { .. }), "{code:?}");
+        assert!(
+            matches!(code, ErrorCode::ObjectNotInPrerequisiteState { .. }),
+            "{code:?}"
+        );
         let stored = h
             .core
             .edge_store

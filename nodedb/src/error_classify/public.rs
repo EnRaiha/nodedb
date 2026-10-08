@@ -260,7 +260,11 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         Error::SegmentCorrupted { detail } => NodeDbError::segment_corrupted(detail),
         Error::MemoryExhausted { engine } => NodeDbError::memory_exhausted(engine.clone()),
         Error::Backpressure { engine } => NodeDbError::memory_exhausted(engine.to_string()),
-        Error::Crdt(crdt_err) => NodeDbError::internal(crdt_err),
+        // A CRDT error takes the public code of its Data-Plane verdict. Only
+        // a server fault is `internal`.
+        Error::Crdt(crdt_err) => crate::error_from_data_plane::data_plane_code_to_public(
+            crate::bridge::envelope::ErrorCode::from(crdt_err),
+        ),
         Error::Io(io_err) => NodeDbError::storage(io_err),
         Error::Config { detail } => NodeDbError::config(detail),
         Error::Encryption { detail } => NodeDbError::encryption(detail),

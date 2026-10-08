@@ -7,6 +7,8 @@ use std::ops::Deref;
 
 use loro::LoroDoc;
 
+use crate::error::Result;
+
 /// A measured point relating the document's operation count to its encoded
 /// size, taken from one real snapshot export.
 struct Calibration {
@@ -80,6 +82,28 @@ impl DocumentCell {
     /// previous one. The only way to reassign the document.
     pub(in crate::state) fn replace(&mut self, doc: LoroDoc) {
         *self = Self::new(doc);
+    }
+
+    /// Run one local mutation, then commit its Loro transaction.
+    ///
+    /// Every `CrdtState` method that writes the document goes through here.
+    /// The authoritative document is then quiescent between calls. A version
+    /// vector read after the call covers the write, and a fork or preview
+    /// never meets a pending transaction.
+    ///
+    /// The commit runs on success and on error. Loro cannot roll back an
+    /// operation it has applied. A failed mutation therefore commits the
+    /// operations it authored before the error. A caller that needs the write
+    /// to be all-or-nothing captures a `RowImage` first. On error it calls
+    /// `restore_row_image`, which authors and commits the compensating
+    /// operations.
+    pub(in crate::state) fn mutate<T>(
+        &self,
+        write: impl FnOnce(&LoroDoc) -> Result<T>,
+    ) -> Result<T> {
+        let outcome = write(&self.doc);
+        self.doc.commit();
+        outcome
     }
 
     /// Estimated encoded size in bytes, as a proxy for memory footprint.

@@ -155,6 +155,9 @@ impl CrdtState {
     /// restoring would not change the live row (e.g. restoring to the
     /// version the document is already at).
     ///
+    /// The restore operations commit before the export, on success and on
+    /// error.
+    ///
     /// Historical fields are inspected on the *live* forked container (via
     /// `LoroMap::get` → `ValueOrContainer`), not the flattened
     /// `read_at_version` projection: scalar entries are replaced the same
@@ -174,7 +177,8 @@ impl CrdtState {
             return Ok(Vec::new());
         }
         let vv_before = self.doc.oplog_vv();
-        apply_restore_to_document(&self.doc, collection, row_id, &historical)?;
+        self.doc
+            .mutate(|doc| apply_restore_to_document(doc, collection, row_id, &historical))?;
         self.doc
             .export(loro::ExportMode::updates(&vv_before))
             .map_err(|e| CrdtError::Loro(format!("restore delta export: {e}")))
@@ -238,10 +242,20 @@ fn historical_row(
     let forked = fork_at_version(doc, version)?;
     match forked.get_map(collection).get(row_id) {
         Some(ValueOrContainer::Container(loro::Container::Map(row))) => Ok(row),
-        Some(_) => Err(CrdtError::Loro("historical state is not a map".into())),
-        None => Err(CrdtError::Loro(
-            "document did not exist at target version".into(),
-        )),
+        Some(other) => Err(CrdtError::NonMapRowValue {
+            collection: collection.to_string(),
+            row_id: row_id.to_string(),
+            value: match other {
+                ValueOrContainer::Value(value) => format!("the scalar {value:?}"),
+                ValueOrContainer::Container(container) => {
+                    format!("a {:?} container", container.get_type())
+                }
+            },
+        }),
+        None => Err(CrdtError::RowAbsentAtVersion {
+            collection: collection.to_string(),
+            row_id: row_id.to_string(),
+        }),
     }
 }
 
@@ -306,7 +320,6 @@ mod tests {
                     &[("title", LoroValue::String(title.into()))],
                 )
                 .expect("write");
-            state.doc.commit();
             versions.push(state.oplog_version_vector());
         }
         History {
@@ -541,7 +554,6 @@ mod tests {
         state
             .upsert("docs", "doc-1", &[("body", LoroValue::String("v1".into()))])
             .expect("write");
-        state.doc.commit();
         let current = state.oplog_version_vector();
         assert!(
             state
@@ -559,14 +571,12 @@ mod tests {
         state
             .upsert("docs", "a", &[("v", LoroValue::I64(1))])
             .expect("write a");
-        state.doc.commit();
         let after_a = state.local_op_counter();
         assert!(after_a > 0);
 
         state
             .upsert("docs", "b", &[("v", LoroValue::I64(2))])
             .expect("write b");
-        state.doc.commit();
         let after_b = state.local_op_counter();
         assert!(after_b > after_a);
     }
@@ -579,13 +589,11 @@ mod tests {
         state
             .upsert("docs", "a", &[("v", LoroValue::I64(1))])
             .expect("write a");
-        state.doc.commit();
         let end_a = state.local_op_counter();
 
         state
             .upsert("docs", "b", &[("v", LoroValue::I64(2))])
             .expect("write b");
-        state.doc.commit();
 
         let row_a_delta = state
             .export_local_range(start_a, end_a)
@@ -604,7 +612,6 @@ mod tests {
         state
             .upsert("docs", "a", &[("v", LoroValue::I64(1))])
             .expect("write a");
-        state.doc.commit();
 
         let delta = state.export_local_range(5, 5).expect("empty range export");
         assert!(delta.is_empty());
@@ -618,5 +625,30 @@ mod tests {
             "an empty export is not a valid delta; callers must skip it"
         );
         assert!(!target.row_exists("docs", "a"));
+    }
+
+    #[test]
+    fn restoring_a_row_absent_at_the_version_is_a_typed_refusal() {
+        let state = CrdtState::new(1).expect("state");
+        let before = state.oplog_version_vector();
+        state
+            .upsert("docs", "late", &[("v", LoroValue::I64(1))])
+            .expect("write");
+
+        for result in [
+            state.preview_restore_to_version("docs", "late", &before),
+            state.restore_to_version("docs", "late", &before),
+        ] {
+            match result {
+                Err(CrdtError::RowAbsentAtVersion { collection, row_id }) => {
+                    assert_eq!((collection.as_str(), row_id.as_str()), ("docs", "late"));
+                }
+                other => panic!("expected RowAbsentAtVersion, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            state.read_field("docs", "late", "v"),
+            Some(LoroValue::I64(1))
+        );
     }
 }

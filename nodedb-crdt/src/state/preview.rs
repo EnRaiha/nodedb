@@ -361,9 +361,6 @@ mod tests {
         let state = CrdtState::new(1).expect("state");
         let delta = delta_for("docs", "one", "new");
 
-        // Make the authoritative baseline explicitly committed before any
-        // snapshot/frontier observation used by this non-mutation regression.
-        state.doc.commit();
         let snapshot_before = state.export_snapshot().expect("before snapshot");
         let frontier_before = state.oplog_version_vector();
         let preview = state
@@ -389,10 +386,17 @@ mod tests {
     #[test]
     fn rejects_preview_when_source_has_pending_transaction_without_mutating_it() {
         let state = CrdtState::new(1).expect("state");
+        // Every `CrdtState` mutator commits on return. A pending transaction
+        // is only reachable through the raw document handle.
         state
-            .upsert("local", "pending", &[("value", LoroValue::I64(7))])
+            .doc
+            .get_map("local")
+            .insert_container("pending", loro::LoroMap::new())
+            .expect("pending row")
+            .insert("value", LoroValue::I64(7))
             .expect("local pending write");
         let pending_before = state.doc.get_pending_txn_len();
+        assert_ne!(pending_before, 0);
         let row_before = state.read_row("local", "pending");
         let delta = delta_for("docs", "one", "remote");
 
@@ -432,11 +436,6 @@ mod tests {
                 &[("value", LoroValue::String("base".into()))],
             )
             .expect("base");
-        // Loro's auto-commit transaction is finalized only at an explicit
-        // commit or an import/export boundary. Commit the prerequisite so
-        // the incremental delta below depends on an operation absent from
-        // the preview target, rather than exporting both writes together.
-        source.doc.commit();
         let version = source.oplog_version_vector();
         source
             .set_fields(
@@ -464,7 +463,6 @@ mod tests {
                 &[("value", LoroValue::String("base".into()))],
             )
             .expect("base");
-        source.doc.commit();
         let version = source.oplog_version_vector();
         source
             .set_fields(
@@ -675,7 +673,6 @@ mod tests {
         source
             .upsert("docs", "new", &[("value", LoroValue::I64(2))])
             .expect("new row");
-        source.doc.commit();
         let expected_new_ops =
             positive_oplog_advance(&receiver_oplog, &source.oplog_version_vector())
                 .expect("monotonic source oplog");

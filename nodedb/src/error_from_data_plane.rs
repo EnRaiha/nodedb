@@ -174,6 +174,10 @@ pub(crate) fn data_plane_code_to_public(code: ErrorCode) -> NodeDbError {
         ErrorCode::DependentObjectsExist { object, detail } => {
             NodeDbError::dependent_objects_exist(object, detail)
         }
+        ErrorCode::UndefinedObject { object } => NodeDbError::undefined_object(object),
+        ErrorCode::ObjectNotInPrerequisiteState { object, detail } => {
+            NodeDbError::object_not_ready(object, detail)
+        }
         // Nothing was enqueued, and the same request succeeds once capacity
         // frees: the retryable overload class.
         ErrorCode::DispatchCapacity { reason } => NodeDbError::server_overload(reason),
