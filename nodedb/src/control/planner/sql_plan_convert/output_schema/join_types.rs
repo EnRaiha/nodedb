@@ -11,8 +11,12 @@
 
 use std::collections::HashMap;
 
+use nodedb_sql::SqlError;
 use nodedb_sql::catalog::SqlCatalog;
-use nodedb_sql::types::SqlPlan;
+use nodedb_sql::types::{
+    DocumentIndexLookupPlan, HybridSearchPlan, HybridSearchTriplePlan, RangeScanPlan,
+    RecursiveScanPlan, SqlPlan, TextSearchPlan, TimeseriesScanPlan,
+};
 
 use crate::control::server::response_shape::types::DdlColType;
 
@@ -30,13 +34,14 @@ struct JoinSide {
 ///
 /// Each side contributes `<alias>.<column>` and `<collection>.<column>` — a
 /// projection can spell either — plus the bare `<column>` when no other side
-/// declares that name with a different type.
+/// declares that name with a different type. A catalog lookup error is
+/// returned.
 pub(super) fn join_column_types<C: SqlCatalog + ?Sized>(
     left: &SqlPlan,
     right: &SqlPlan,
     catalog: &C,
     database_id: nodedb_types::DatabaseId,
-) -> HashMap<String, DdlColType> {
+) -> Result<HashMap<String, DdlColType>, SqlError> {
     let mut sides = Vec::new();
     collect_sides(left, &mut sides);
     collect_sides(right, &mut sides);
@@ -49,7 +54,7 @@ pub(super) fn join_column_types<C: SqlCatalog + ?Sized>(
     let mut ambiguous: Vec<String> = Vec::new();
 
     for side in &sides {
-        let types = column_types_for(catalog, database_id, &side.collection);
+        let types = column_types_for(catalog, database_id, &side.collection)?;
         for (column, ty) in &types {
             qualified.insert(format!("{}.{column}", side.collection), *ty);
             if let Some(alias) = &side.alias {
@@ -76,7 +81,7 @@ pub(super) fn join_column_types<C: SqlCatalog + ?Sized>(
     for (column, ty) in bare {
         qualified.entry(column).or_insert(ty);
     }
-    qualified
+    Ok(qualified)
 }
 
 /// Collect the scan-like leaves of one join side.
@@ -97,24 +102,24 @@ fn collect_sides(plan: &SqlPlan, out: &mut Vec<JoinSide>) {
         | SqlPlan::PointGet {
             collection, alias, ..
         }
-        | SqlPlan::DocumentIndexLookup {
+        | SqlPlan::DocumentIndexLookup(DocumentIndexLookupPlan {
             collection, alias, ..
-        } => out.push(JoinSide {
+        }) => out.push(JoinSide {
             collection: collection.clone(),
             alias: alias.clone(),
         }),
         // Reads over one collection that carry no alias slot: the merged row
         // qualifies their columns by the collection name.
-        SqlPlan::RangeScan { collection, .. }
-        | SqlPlan::TimeseriesScan { collection, .. }
+        SqlPlan::RangeScan(RangeScanPlan { collection, .. })
+        | SqlPlan::TimeseriesScan(TimeseriesScanPlan { collection, .. })
         | SqlPlan::SpatialScan { collection, .. }
         | SqlPlan::VectorSearch { collection, .. }
         | SqlPlan::MultiVectorSearch { collection, .. }
         | SqlPlan::SparseSearch { collection, .. }
-        | SqlPlan::TextSearch { collection, .. }
-        | SqlPlan::HybridSearch { collection, .. }
-        | SqlPlan::HybridSearchTriple { collection, .. }
-        | SqlPlan::RecursiveScan { collection, .. } => out.push(JoinSide {
+        | SqlPlan::TextSearch(TextSearchPlan { collection, .. })
+        | SqlPlan::HybridSearch(HybridSearchPlan { collection, .. })
+        | SqlPlan::HybridSearchTriple(HybridSearchTriplePlan { collection, .. })
+        | SqlPlan::RecursiveScan(RecursiveScanPlan { collection, .. }) => out.push(JoinSide {
             collection: collection.clone(),
             alias: None,
         }),
@@ -244,7 +249,8 @@ mod tests {
             &scan("hosts", None),
             &TwoSideCatalog,
             nodedb_types::DatabaseId::DEFAULT,
-        );
+        )
+        .expect("types derive");
         assert_eq!(types.get("events.ts"), Some(&DdlColType::Timestamp));
         assert_eq!(types.get("ts"), Some(&DdlColType::Timestamp));
     }
@@ -257,7 +263,8 @@ mod tests {
             &scan("hosts", None),
             &TwoSideCatalog,
             nodedb_types::DatabaseId::DEFAULT,
-        );
+        )
+        .expect("types derive");
         assert_eq!(types.get("e.ts"), Some(&DdlColType::Timestamp));
         assert_eq!(types.get("events.ts"), Some(&DdlColType::Timestamp));
     }
@@ -271,7 +278,8 @@ mod tests {
             &scan("hosts", None),
             &TwoSideCatalog,
             nodedb_types::DatabaseId::DEFAULT,
-        );
+        )
+        .expect("types derive");
         assert_eq!(types.get("id"), Some(&DdlColType::Text));
         assert_eq!(types.get("events.id"), Some(&DdlColType::Int8));
         assert_eq!(types.get("hosts.id"), Some(&DdlColType::Text));

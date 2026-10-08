@@ -59,7 +59,7 @@ fn meter_calvin_task(
 pub(super) struct CalvinDispatchSession<'a> {
     pub identity: &'a AuthenticatedIdentity,
     pub session_id: SessionId,
-    pub result_formats: &'a [pgwire::api::results::FieldFormat],
+    pub result_formats: &'a pgwire::api::portal::Format,
     pub auth: &'a crate::control::security::auth_context::AuthContext,
     /// The statement's announced output columns, when it announced any.
     pub projection: Option<&'a crate::control::server::response_shape::schema::OutputSchema>,
@@ -277,7 +277,7 @@ impl NodeDbPgHandler {
 /// How a completed Calvin batch is shaped back to the client.
 struct CalvinBatchShaping<'a> {
     identity: &'a AuthenticatedIdentity,
-    result_formats: &'a [pgwire::api::results::FieldFormat],
+    result_formats: &'a pgwire::api::portal::Format,
     auth: &'a crate::control::security::auth_context::AuthContext,
     projection: Option<&'a crate::control::server::response_shape::schema::OutputSchema>,
     tenant_id: TenantId,

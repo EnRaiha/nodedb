@@ -20,14 +20,20 @@ use pgwire::types::ToSqlText;
 use pgwire::types::format::FormatOptions;
 use postgres_types::{IsNull, ToSql, accepts, to_sql_checked};
 
-use nodedb_types::columnar::IntWidth;
+use nodedb_types::columnar::{FloatWidth, IntWidth};
 use nodedb_types::error::NodeDbError;
+use nodedb_types::value::non_finite_float_text;
 use nodedb_types::{NdbDateTime, Value};
 
 use crate::control::server::pgwire::numeric_narrow::{checked_narrow, checked_narrow_f32};
 use crate::control::server::pgwire::types::error_map::shape_error_to_pg;
-use crate::control::server::response_shape::cell::{cell_text, instant_of, shape_mismatch};
+use crate::control::server::pgwire::types::wire_type::effective_format;
+use crate::control::server::response_shape::cell::{
+    bytea_hex, cell_text, instant_of, shape_mismatch, value_to_wire_json,
+};
 use crate::control::server::response_shape::types::DdlColType;
+
+use super::array_text::{PgArrayLiteral, float_array_text};
 
 /// Microseconds from the Unix epoch to the PostgreSQL epoch
 /// (2000-01-01 00:00:00 UTC), which binary `timestamp`/`timestamptz` count
@@ -39,12 +45,23 @@ const PG_EPOCH_OFFSET_MICROS: i64 = 946_684_800_000_000;
 ///
 /// `Value::Null` is SQL NULL for every type and format. Under the text
 /// format, `Float8`/`Float4` numbers go through pgwire's native float
-/// encoder (ryu + `extra_float_digits`) so their bytes match PostgreSQL,
+/// encoder (ryu + `extra_float_digits`) so their bytes match PostgreSQL. A
+/// non-finite float renders `NaN`, `Infinity` or `-Infinity`, the
+/// PostgreSQL text, where pgwire's encoder would emit `inf`. Binary floats
+/// carry the IEEE bits, non-finite ones included.
 /// `Timestamp`/`Timestamptz` cells render the instant [`instant_of`] reads
-/// as ISO-8601, and every other type renders [`cell_text`]. Under the binary
-/// format each scalar type takes only its own shape; a mismatch is an error,
-/// because the client reads the advertised type's bytes and a text value
-/// under it would be misread.
+/// as ISO-8601. A `bytea` cell renders `\x` hex of its bytes, a `json` or
+/// `jsonb` cell its JSON text, and a float array cell its `{...}` literal.
+/// Every other type renders [`cell_text`]. Under the binary format each
+/// scalar type takes only its own shape; a mismatch is an error, because
+/// the client reads the advertised type's bytes and a text value under it
+/// would be misread.
+///
+/// `format` is the requested format. A type with no binary form renders
+/// text under either, as [`effective_format`] decides, and the encoder's
+/// schema field carries the same format by [`result_field`].
+///
+/// [`result_field`]: crate::control::server::pgwire::types::wire_type::result_field
 pub(in crate::control::server::pgwire) fn encode_cell(
     encoder: &mut DataRowEncoder,
     column: &str,
@@ -55,6 +72,7 @@ pub(in crate::control::server::pgwire) fn encode_cell(
     if matches!(v, Value::Null) {
         return encoder.encode_field(&None::<&str>);
     }
+    let format = effective_format(ct, format);
 
     // A timestamp column renders the one instant its cell denotes; the
     // encoder picks text (ISO-8601) or binary (PostgreSQL-epoch micros) from
@@ -65,10 +83,9 @@ pub(in crate::control::server::pgwire) fn encode_cell(
     }
 
     // Binary result format: the column's `FieldInfo` is Binary, so
-    // `encode_field` emits the value's binary wire form. Only the
-    // binary-supported types reach a Binary format (the resolver downgrades
-    // the rest to Text upstream); any other `ct` under Binary falls through
-    // to the text arms below.
+    // `encode_field` emits the value's binary wire form. `effective_format`
+    // leaves Binary only for the binary-capable types; the others take the
+    // text arms below.
     if format == FieldFormat::Binary {
         match ct {
             DdlColType::Int8 => return encoder.encode_field(&integer_of(column, v)?),
@@ -112,6 +129,8 @@ pub(in crate::control::server::pgwire) fn encode_cell(
             | DdlColType::Jsonb
             | DdlColType::Float4Array
             | DdlColType::Float8Array
+            | DdlColType::Numeric
+            | DdlColType::Uuid
             | DdlColType::Timestamp
             | DdlColType::Timestamptz => {}
         }
@@ -119,7 +138,10 @@ pub(in crate::control::server::pgwire) fn encode_cell(
 
     match ct {
         DdlColType::Float8 => match v {
-            Value::Float(f) => encoder.encode_field(f),
+            Value::Float(f) => match non_finite_float_text(*f) {
+                Some(text) => encoder.encode_field(&text),
+                None => encoder.encode_field(f),
+            },
             Value::Integer(i) => encoder.encode_field(&(*i as f64)),
             other => encoder.encode_field(&cell_text(other)),
         },
@@ -127,23 +149,58 @@ pub(in crate::control::server::pgwire) fn encode_cell(
         // `real` column must not silently read `Infinity` for a finite stored
         // value either.
         DdlColType::Float4 => match v {
-            Value::Float(f) => encoder.encode_field(&checked_narrow_f32(*f)?),
+            Value::Float(f) => {
+                let narrowed = checked_narrow_f32(*f)?;
+                match non_finite_float_text(f64::from(narrowed)) {
+                    Some(text) => encoder.encode_field(&text),
+                    None => encoder.encode_field(&narrowed),
+                }
+            }
             Value::Integer(i) => encoder.encode_field(&checked_narrow_f32(*i as f64)?),
             other => encoder.encode_field(&cell_text(other)),
         },
+        DdlColType::Bytea => encoder.encode_field(&bytea_text(v)),
+        DdlColType::Json | DdlColType::Jsonb => encoder.encode_field(&json_text(v)),
+        DdlColType::Float4Array => encoder.encode_field(&PgArrayLiteral(float_array_text(
+            column,
+            v,
+            FloatWidth::F32,
+        )?)),
+        DdlColType::Float8Array => encoder.encode_field(&PgArrayLiteral(float_array_text(
+            column,
+            v,
+            FloatWidth::F64,
+        )?)),
+        // `numeric` text is the decimal digits and `uuid` text is the
+        // hyphenated hex, which is the cell's own text.
         DdlColType::Text
         | DdlColType::Varchar
         | DdlColType::Int8
         | DdlColType::Int4
         | DdlColType::Int2
         | DdlColType::Bool
-        | DdlColType::Bytea
-        | DdlColType::Json
-        | DdlColType::Jsonb
-        | DdlColType::Float4Array
-        | DdlColType::Float8Array
+        | DdlColType::Numeric
+        | DdlColType::Uuid
         | DdlColType::Timestamp
         | DdlColType::Timestamptz => encoder.encode_field(&cell_text(v)),
+    }
+}
+
+/// The text of a `bytea` cell: `\x` hex of its bytes. A cell that is not
+/// bytes stands for the UTF-8 bytes of its text form.
+fn bytea_text(v: &Value) -> Option<String> {
+    match v {
+        Value::Bytes(bytes) => Some(bytea_hex(bytes)),
+        other => cell_text(other).map(|text| bytea_hex(text.as_bytes())),
+    }
+}
+
+/// The text of a `json` or `jsonb` cell: the cell's wire JSON. A string
+/// cell is a JSON string, quoted.
+fn json_text(v: &Value) -> Option<String> {
+    match value_to_wire_json(v) {
+        serde_json::Value::Null => None,
+        json => Some(json.to_string()),
     }
 }
 
@@ -222,7 +279,7 @@ mod tests {
     use pgwire::api::results::FieldInfo;
 
     use super::*;
-    use crate::control::server::pgwire::ddl_encode::col_type_to_field_with_format;
+    use crate::control::server::pgwire::types::wire_type::result_field;
 
     /// The one instant these tests use: 2020-03-05T10:00:00Z.
     const EARLY_MICROS: i64 = 1_583_402_400_000_000;
@@ -230,8 +287,7 @@ mod tests {
     /// Encode one cell under a one-column schema and return its raw field
     /// bytes, or `None` for SQL NULL.
     fn encode_one(ct: DdlColType, format: FieldFormat, v: &Value) -> PgWireResult<Option<Vec<u8>>> {
-        let schema: Arc<Vec<FieldInfo>> =
-            Arc::new(vec![col_type_to_field_with_format("c", ct, format)]);
+        let schema: Arc<Vec<FieldInfo>> = Arc::new(vec![result_field("c", ct, format)]);
         let mut encoder = DataRowEncoder::new(schema);
         encode_cell(&mut encoder, "c", ct, format, v)?;
         let row = encoder.take_row();
@@ -405,7 +461,96 @@ mod tests {
             encode_text(DdlColType::Text, &Value::Bytes(vec![0, 255, 7]))
                 .expect("encodes")
                 .as_deref(),
-            Some("AP8H")
+            Some("\\x00ff07")
+        );
+    }
+
+    /// A `bytea` cell is `\x` lowercase hex under either requested format,
+    /// and a cell that is not bytes is the hex of its text bytes.
+    #[test]
+    fn bytea_renders_hex_text_under_either_format() {
+        for format in [FieldFormat::Text, FieldFormat::Binary] {
+            let bytes = encode_one(DdlColType::Bytea, format, &Value::Bytes(vec![0, 0xAB, 7]))
+                .expect("encodes")
+                .expect("not null");
+            assert_eq!(bytes, b"\\x00ab07".to_vec(), "{format:?}");
+        }
+        assert_eq!(
+            encode_text(DdlColType::Bytea, &Value::Bytes(Vec::new()))
+                .expect("encodes")
+                .as_deref(),
+            Some("\\x")
+        );
+        assert_eq!(
+            encode_text(DdlColType::Bytea, &Value::String("hi".into()))
+                .expect("encodes")
+                .as_deref(),
+            Some("\\x6869")
+        );
+    }
+
+    /// `numeric` and `uuid` cells render their PostgreSQL text under either
+    /// requested format.
+    #[test]
+    fn numeric_and_uuid_render_text_under_either_format() {
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        for format in [FieldFormat::Text, FieldFormat::Binary] {
+            assert_eq!(
+                encode_one(
+                    DdlColType::Numeric,
+                    format,
+                    &Value::Decimal(rust_decimal::Decimal::new(1250, 2))
+                )
+                .expect("encodes"),
+                Some(b"12.50".to_vec()),
+                "{format:?}"
+            );
+            assert_eq!(
+                encode_one(DdlColType::Uuid, format, &Value::Uuid(uuid.into())).expect("encodes"),
+                Some(uuid.as_bytes().to_vec()),
+                "{format:?}"
+            );
+        }
+    }
+
+    /// A float array cell renders its `{...}` literal under either requested
+    /// format, NULL and non-finite elements included.
+    #[test]
+    fn float_arrays_render_array_literals() {
+        let v = Value::Array(vec![
+            Value::Float(1.0),
+            Value::Float(2.5),
+            Value::Float(f64::NAN),
+            Value::Null,
+        ]);
+        for format in [FieldFormat::Text, FieldFormat::Binary] {
+            for ct in [DdlColType::Float4Array, DdlColType::Float8Array] {
+                assert_eq!(
+                    encode_one(ct, format, &v).expect("encodes"),
+                    Some(b"{1,2.5,NaN,NULL}".to_vec()),
+                    "{ct:?}/{format:?}"
+                );
+            }
+        }
+    }
+
+    /// A `json` cell is its JSON text: a string cell is a quoted JSON string.
+    #[test]
+    fn json_renders_json_text() {
+        assert_eq!(
+            encode_text(DdlColType::Jsonb, &Value::String("x".into()))
+                .expect("encodes")
+                .as_deref(),
+            Some("\"x\"")
+        );
+        assert_eq!(
+            encode_text(
+                DdlColType::Json,
+                &Value::Array(vec![Value::Integer(1), Value::Bool(true)])
+            )
+            .expect("encodes")
+            .as_deref(),
+            Some("[1,true]")
         );
     }
 
@@ -418,6 +563,43 @@ mod tests {
                 .expect_err("overflow must be refused");
             assert_eq!(error_of(err).0, "22003");
         }
+    }
+
+    /// A non-finite float renders the PostgreSQL text under the text
+    /// format, and its IEEE bits under the binary format.
+    #[test]
+    fn non_finite_floats_render_postgres_text_and_ieee_bits() {
+        for ct in [DdlColType::Float8, DdlColType::Float4, DdlColType::Text] {
+            for (f, text) in [
+                (f64::NAN, "NaN"),
+                (f64::INFINITY, "Infinity"),
+                (f64::NEG_INFINITY, "-Infinity"),
+            ] {
+                assert_eq!(
+                    encode_text(ct, &Value::Float(f))
+                        .expect("encodes")
+                        .as_deref(),
+                    Some(text),
+                    "{ct:?}"
+                );
+            }
+        }
+        for f in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                encode_one(DdlColType::Float8, FieldFormat::Binary, &Value::Float(f))
+                    .expect("encodes"),
+                Some(f.to_bits().to_be_bytes().to_vec())
+            );
+        }
+        assert_eq!(
+            encode_one(
+                DdlColType::Float4,
+                FieldFormat::Binary,
+                &Value::Float(f64::INFINITY)
+            )
+            .expect("encodes"),
+            Some(f32::INFINITY.to_bits().to_be_bytes().to_vec())
+        );
     }
 
     /// A binary scalar column takes only its own shape.

@@ -26,6 +26,8 @@ pub enum DdlColType {
     Varchar,
     Float4Array,
     Float8Array,
+    Numeric,
+    Uuid,
 }
 
 /// One shaped row: typed cells keyed by [`ShapedRows::cell_keys`].

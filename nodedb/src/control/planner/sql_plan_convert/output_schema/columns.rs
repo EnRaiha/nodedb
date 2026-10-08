@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 
+use nodedb_sql::SqlError;
 use nodedb_sql::catalog::SqlCatalog;
 use nodedb_sql::types::query::Projection;
 use nodedb_sql::types_expr::SqlExpr;
@@ -115,32 +116,46 @@ pub(super) fn projection_to_column(
     }
 }
 
+/// The key column `collection` declares, or `None` when its rows key by the
+/// implicit `id` or the auto-generated `_rowid`, or the catalog holds no such
+/// collection.
+///
+/// A scan row's identity renders under this column when the row lacks it.
+/// The lookup is the one [`column_types_for`] makes, against the catalog the
+/// statement was just planned with. A catalog error is returned, never read as
+/// "no declared key": that reading renders the identity under the wrong column.
+pub(super) fn declared_key_for<C: SqlCatalog + ?Sized>(
+    catalog: &C,
+    database_id: nodedb_types::DatabaseId,
+    collection: &str,
+) -> Result<Option<String>, SqlError> {
+    let primary_key = catalog
+        .get_collection(database_id, collection)?
+        .and_then(|info| info.primary_key);
+    Ok(nodedb_types::declared_key(primary_key.as_deref()).map(str::to_string))
+}
+
 /// Builds a `HashMap` of bare column name -> resolved wire type for
-/// `collection`, via a best-effort catalog lookup. Returns an empty map
-/// (never an error) when the lookup fails or the collection is unknown —
-/// callers fall back to `DdlColType::Text` for every column in that case.
+/// `collection`. An unknown collection yields an empty map, and callers then
+/// type every column `DdlColType::Text`. A catalog error is returned.
 pub(super) fn column_types_for<C: SqlCatalog + ?Sized>(
     catalog: &C,
     database_id: nodedb_types::DatabaseId,
     collection: &str,
-) -> HashMap<String, DdlColType> {
-    match catalog.get_collection(database_id, collection) {
-        Ok(Some(info)) => info
-            .columns
-            .iter()
-            .map(|c| {
-                (
-                    c.name.clone(),
-                    sql_data_type_to_ddl_col_type_with_width(
-                        &c.data_type,
-                        c.int_width,
-                        c.float_width,
-                    ),
-                )
-            })
-            .collect(),
-        _ => HashMap::new(),
-    }
+) -> Result<HashMap<String, DdlColType>, SqlError> {
+    let Some(info) = catalog.get_collection(database_id, collection)? else {
+        return Ok(HashMap::new());
+    };
+    Ok(info
+        .columns
+        .iter()
+        .map(|c| {
+            (
+                c.name.clone(),
+                sql_data_type_to_ddl_col_type_with_width(&c.data_type, c.int_width, c.float_width),
+            )
+        })
+        .collect())
 }
 
 /// Derives an `OutputColumn` for one GROUP BY key expression.
@@ -200,31 +215,27 @@ pub(super) fn group_by_key_column(
 }
 
 /// Returns the collection's columns in declared catalog order, mapped to
-/// `OutputColumn`s (`display_name` = `lookup_key` = column name). Returns an
-/// empty `Vec` when the catalog/collection lookup fails or the collection has
-/// no declared columns (e.g. a schemaless collection) — so a schemaless
-/// `SELECT *` still yields empty columns, deriving its shape from the rows.
+/// `OutputColumn`s (`display_name` = `lookup_key` = column name). An unknown
+/// collection, or one with no declared columns (a schemaless collection),
+/// yields an empty `Vec`, so a schemaless `SELECT *` derives its shape from
+/// the rows. A catalog error is returned.
 pub(super) fn ordered_columns_for<C: SqlCatalog + ?Sized>(
     catalog: &C,
     database_id: nodedb_types::DatabaseId,
     collection: &str,
-) -> Vec<OutputColumn> {
-    match catalog.get_collection(database_id, collection) {
-        Ok(Some(info)) => info
-            .columns
-            .iter()
-            .map(|c| OutputColumn {
-                display_name: c.name.clone(),
-                lookup_key: c.name.clone(),
-                ty: sql_data_type_to_ddl_col_type_with_width(
-                    &c.data_type,
-                    c.int_width,
-                    c.float_width,
-                ),
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
+) -> Result<Vec<OutputColumn>, SqlError> {
+    let Some(info) = catalog.get_collection(database_id, collection)? else {
+        return Ok(Vec::new());
+    };
+    Ok(info
+        .columns
+        .iter()
+        .map(|c| OutputColumn {
+            display_name: c.name.clone(),
+            lookup_key: c.name.clone(),
+            ty: sql_data_type_to_ddl_col_type_with_width(&c.data_type, c.int_width, c.float_width),
+        })
+        .collect())
 }
 
 /// Maps a projection list to an `OutputSchema` fragment using `types`.
@@ -269,6 +280,7 @@ pub(super) fn schema_from_projection(
         columns,
         is_star,
         cp_computed,
+        declared_key: None,
     }
 }
 

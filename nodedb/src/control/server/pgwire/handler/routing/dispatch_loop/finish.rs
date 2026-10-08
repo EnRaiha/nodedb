@@ -6,7 +6,8 @@
 
 use std::sync::Arc;
 
-use pgwire::api::results::{FieldFormat, Response};
+use pgwire::api::portal::Format;
+use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
 
 use nodedb_physical::physical_task::PostSetOp;
@@ -33,7 +34,7 @@ pub(super) struct StatementTail<'a> {
     pub(super) dedup_payloads: Vec<Vec<u8>>,
     pub(super) dedup_set_op: PostSetOp,
     pub(super) projection: Option<&'a OutputSchema>,
-    pub(super) result_formats: &'a [FieldFormat],
+    pub(super) result_formats: &'a Format,
     /// Redaction over the union of the branches' sources, present only when
     /// the statement carries a set operation.
     pub(super) set_op_redaction: Option<QueryRedaction>,

@@ -9,7 +9,8 @@
 
 use std::sync::Arc;
 
-use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response};
+use pgwire::api::portal::Format;
+use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::server::response_shape::compose::shape_decoded_rows;
@@ -21,7 +22,7 @@ use crate::control::server::shared::metering::DetachedMeterGuard;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec::{decode_payload_to_json, decode_payload_value};
 
-use super::super::ddl_encode::col_type_to_field_with_format;
+use super::super::types::wire_type::{TEXT_RESULTS, result_fields};
 use super::super::types::{error_to_pg_in_context, error_to_sqlstate, text_field};
 use super::shape_encode::{encode_shaped_row, shaped_query_response};
 
@@ -151,7 +152,7 @@ pub(crate) fn streaming_shaped_response(
     stream: ResultStream,
     limit: usize,
     schema_out: OutputSchema,
-    formats: &[FieldFormat],
+    requested: &Format,
     context: StreamResponseContext,
 ) -> Response {
     use futures::StreamExt;
@@ -175,23 +176,17 @@ pub(crate) fn streaming_shaped_response(
     // Advertise each projected column's real catalog type so the streaming
     // path's RowDescription OIDs match the non-streaming `shaped_query_response`
     // (and the extended-query Describe path); `column_types` also drives the
-    // per-cell text rendering in `encode_shaped_row`. Per-column `formats`
-    // carry the client's (feature-downgraded) result-format request so binary
+    // per-cell rendering in `encode_shaped_row`. Each column's format is
+    // resolved from the client's `requested` formats and its type, so binary
     // columns advertise and encode in binary.
     let column_types: Vec<DdlColType> = schema_out.columns.iter().map(|c| c.ty).collect();
-    let row_formats: Vec<FieldFormat> = schema_out
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(i, _)| formats.get(i).copied().unwrap_or(FieldFormat::Text))
-        .collect();
-    let fields: Vec<FieldInfo> = schema_out
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(i, c)| col_type_to_field_with_format(&c.display_name, c.ty, row_formats[i]))
-        .collect();
-    let schema = Arc::new(fields);
+    let schema = Arc::new(result_fields(
+        schema_out
+            .columns
+            .iter()
+            .map(|c| (c.display_name.as_str(), c.ty)),
+        requested,
+    ));
     let row_schema = schema.clone();
 
     let row_stream = async_stream::try_stream! {
@@ -244,8 +239,7 @@ pub(crate) fn streaming_shaped_response(
                 if emitted >= limit {
                     break;
                 }
-                let encoded =
-                    encode_shaped_row(&row_schema, &cell_keys, &column_types, &row_formats, row)?;
+                let encoded = encode_shaped_row(&row_schema, &cell_keys, &column_types, row)?;
                 emitted += 1;
                 if let Some(guard) = meter_guard.as_mut() {
                     guard.add_rows(1);
@@ -274,9 +268,14 @@ fn single_pgwire_error(err: PgWireError) -> Response {
 /// can only be known once every row is seen, so all batches are drained first,
 /// then the neutral shaping core derives the column union. Zero rows yield a
 /// single-column `result` empty response.
+///
+/// `schema` is the statement's star schema. A row's identity renders under
+/// its declared key, as on the materialized path, never under a synthesized
+/// `id`.
 pub(crate) async fn streaming_star_response(
     stream: ResultStream,
     limit: usize,
+    schema: &OutputSchema,
     redaction: Option<QueryRedaction>,
     state: &SharedState,
     meter_guard: Option<DetachedMeterGuard>,
@@ -343,7 +342,7 @@ pub(crate) async fn streaming_star_response(
 
     let shaped = match shape_decoded_rows(
         nodedb_types::Value::Array(values),
-        None,
+        Some(schema),
         redaction.as_ref().map(|r| r.ctx(&state.redaction)),
         None,
     ) {
@@ -357,6 +356,6 @@ pub(crate) async fn streaming_star_response(
     };
     // `SELECT *` derives its columns from the rows and has no client-requested
     // per-column formats, so it always renders text.
-    let (response, _notice) = shaped_query_response(shaped, &[]);
+    let (response, _notice) = shaped_query_response(shaped, &TEXT_RESULTS);
     response
 }

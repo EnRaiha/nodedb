@@ -241,6 +241,7 @@ impl NodeDbPgHandler {
                 stream_response::streaming_star_response(
                     stream,
                     limit,
+                    s,
                     redaction,
                     &state,
                     meter_guard,

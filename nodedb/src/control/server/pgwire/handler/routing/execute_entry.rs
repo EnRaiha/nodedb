@@ -2,6 +2,7 @@
 
 //! Simple-query and prepared-statement entry points for planned SQL execution.
 
+use pgwire::api::portal::Format;
 use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
 
@@ -16,13 +17,15 @@ impl NodeDbPgHandler {
     /// Plan and dispatch SQL after quota and DDL checks have passed.
     ///
     /// When in a transaction block, writes are buffered until COMMIT while
-    /// reads execute immediately. This simple-query path renders text results.
+    /// reads execute immediately. Results honour `requested`, the client's
+    /// result formats: text for the simple-query protocol.
     pub(in crate::control::server::pgwire::handler) async fn execute_planned_sql(
         &self,
         identity: &AuthenticatedIdentity,
         sql: &str,
         tenant_id: TenantId,
         session_id: SessionId,
+        requested: &Format,
     ) -> PgWireResult<Vec<Response>> {
         self.execute_planned_sql_inner(
             identity,
@@ -32,7 +35,7 @@ impl NodeDbPgHandler {
             &[],
             ResultShaping {
                 projection: None,
-                formats: &[],
+                formats: requested,
             },
         )
         .await

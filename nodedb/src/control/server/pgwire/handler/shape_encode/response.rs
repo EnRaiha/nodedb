@@ -12,11 +12,12 @@
 
 use std::sync::Arc;
 
+use pgwire::api::portal::Format;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response};
 use pgwire::error::PgWireResult;
 use pgwire::messages::data::DataRow;
 
-use crate::control::server::pgwire::ddl_encode::col_type_to_field_with_format;
+use crate::control::server::pgwire::types::wire_type::result_fields;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRow, ShapedRows};
 
 use super::cell::encode_cell;
@@ -31,19 +32,18 @@ use super::cell::encode_cell;
 /// case later duplicates carry a `_n` suffix so both cells survive the map.
 ///
 /// A missing key encodes as SQL NULL. Every present cell renders per its
-/// column type via [`encode_cell`]; a missing/short `column_types` entry
-/// defaults to `Text`.
+/// column type via [`encode_cell`], in the format its `schema` field
+/// carries; a missing/short `column_types` entry defaults to `Text`.
 pub(in crate::control::server::pgwire) fn encode_shaped_row(
     schema: &Arc<Vec<FieldInfo>>,
     cell_keys: &[String],
     column_types: &[DdlColType],
-    formats: &[FieldFormat],
     row: &ShapedRow,
 ) -> PgWireResult<DataRow> {
     let mut encoder = DataRowEncoder::new(schema.clone());
     for (idx, name) in cell_keys.iter().enumerate() {
         let ct = column_types.get(idx).copied().unwrap_or(DdlColType::Text);
-        let format = formats.get(idx).copied().unwrap_or(FieldFormat::Text);
+        let format = schema.get(idx).map_or(FieldFormat::Text, FieldInfo::format);
         match row.get(name) {
             None => encoder.encode_field(&None::<&str>)?,
             Some(v) => encode_cell(&mut encoder, name, ct, format, v)?,
@@ -59,9 +59,12 @@ pub(in crate::control::server::pgwire) fn encode_shaped_row(
 /// notice — the pgwire DDL router never attached one to a `Response::Query`),
 /// this path preserves `notice`: the caller is expected to surface it via
 /// `sessions.push_notice`.
+///
+/// `requested` is the client's result-format request. Each column travels
+/// in the format [`result_fields`] resolves for its type.
 pub(in crate::control::server::pgwire) fn shaped_query_response(
     shaped: ShapedRows,
-    formats: &[FieldFormat],
+    requested: &Format,
 ) -> (Response, Option<String>) {
     // Cells live in the row maps under per-column keys that differ from the
     // display names only when two columns share a name; derived here before
@@ -74,20 +77,17 @@ pub(in crate::control::server::pgwire) fn shaped_query_response(
         notice,
     } = shaped;
 
-    let fields: Vec<FieldInfo> = columns
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
+    let schema = Arc::new(result_fields(
+        columns.iter().enumerate().map(|(i, name)| {
             let ct = column_types.get(i).copied().unwrap_or(DdlColType::Text);
-            let format = formats.get(i).copied().unwrap_or(FieldFormat::Text);
-            col_type_to_field_with_format(name, ct, format)
-        })
-        .collect();
-    let schema = Arc::new(fields);
+            (name.as_str(), ct)
+        }),
+        requested,
+    ));
 
     let encoded_rows: Vec<PgWireResult<DataRow>> = rows
         .iter()
-        .map(|row| encode_shaped_row(&schema, &keys, &column_types, formats, row))
+        .map(|row| encode_shaped_row(&schema, &keys, &column_types, row))
         .collect();
 
     let response = Response::Query(QueryResponse::new(
@@ -101,6 +101,7 @@ pub(in crate::control::server::pgwire) fn shaped_query_response(
 mod tests {
     use futures::StreamExt;
     use nodedb_types::Value;
+    use pgwire::api::portal::Format;
     use pgwire::api::results::{FieldFormat, QueryResponse, Response};
     use pgwire::error::PgWireError;
 
@@ -210,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn string_cell_renders_verbatim() {
         let shaped = make_shaped(&["a"], vec![obj(&[("a", text("hello"))])]);
-        let (response, notice) = shaped_query_response(shaped, &[]);
+        let (response, notice) = shaped_query_response(shaped, &Format::UnifiedText);
         assert!(notice.is_none());
         let rows = drain(query_of(response)).await;
         assert_eq!(field_text(&rows[0], 0).as_deref(), Some("hello"));
@@ -225,7 +226,7 @@ mod tests {
                 obj(&[("a", Value::Bool(false))]),
             ],
         );
-        let (response, _notice) = shaped_query_response(shaped, &[]);
+        let (response, _notice) = shaped_query_response(shaped, &Format::UnifiedText);
         let rows = drain(query_of(response)).await;
         assert_eq!(field_text(&rows[0], 0).as_deref(), Some("t"));
         assert_eq!(field_text(&rows[1], 0).as_deref(), Some("f"));
@@ -240,7 +241,7 @@ mod tests {
                 obj(&[("a", Value::Float(0.0))]),
             ],
         );
-        let (response, _notice) = shaped_query_response(shaped, &[]);
+        let (response, _notice) = shaped_query_response(shaped, &Format::UnifiedText);
         let rows = drain(query_of(response)).await;
         assert_eq!(field_text(&rows[0], 0).as_deref(), Some("42"));
         assert_eq!(field_text(&rows[1], 0).as_deref(), Some("0.0"));
@@ -249,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn null_and_missing_column_both_encode_as_sql_null() {
         let shaped = make_shaped(&["a", "b"], vec![obj(&[("a", Value::Null)])]);
-        let (response, _notice) = shaped_query_response(shaped, &[]);
+        let (response, _notice) = shaped_query_response(shaped, &Format::UnifiedText);
         let rows = drain(query_of(response)).await;
         // "a" was an explicit NULL cell.
         assert_eq!(field_text(&rows[0], 0), None);
@@ -263,7 +264,7 @@ mod tests {
             &["b", "a"],
             vec![obj(&[("a", text("first")), ("b", text("second"))])],
         );
-        let (response, _notice) = shaped_query_response(shaped, &[]);
+        let (response, _notice) = shaped_query_response(shaped, &Format::UnifiedText);
         let rows = drain(query_of(response)).await;
         assert_eq!(field_text(&rows[0], 0).as_deref(), Some("second"));
         assert_eq!(field_text(&rows[0], 1).as_deref(), Some("first"));
@@ -296,7 +297,7 @@ mod tests {
             ]),
         );
 
-        let (response, _notice) = shaped_query_response(shaped, &[]);
+        let (response, _notice) = shaped_query_response(shaped, &Format::UnifiedText);
         let qr = query_of(response);
         // RowDescription OIDs are the typed ones, not TEXT.
         let schema = qr.row_schema.clone();
@@ -316,7 +317,7 @@ mod tests {
     }
 
     /// An instant cell renders as its ISO-8601 text under a TEXT column and
-    /// under a TIMESTAMP column alike, and a byte cell as unpadded base64.
+    /// under a TIMESTAMP column alike, and a byte cell as `\x` hex.
     #[tokio::test]
     async fn instant_and_byte_cells_render_through_the_edge_conversion() {
         let at = nodedb_types::NdbDateTime::from_micros(1_583_402_400_000_000);
@@ -329,7 +330,7 @@ mod tests {
                 ("blob", Value::Bytes(vec![0, 255, 7])),
             ]),
         );
-        let (response, _notice) = shaped_query_response(shaped, &[]);
+        let (response, _notice) = shaped_query_response(shaped, &Format::UnifiedText);
         let rows = drain(query_of(response)).await;
         assert_eq!(
             field_text(&rows[0], 0).as_deref(),
@@ -339,7 +340,7 @@ mod tests {
             field_text(&rows[0], 1).as_deref(),
             Some("2020-03-05T10:00:00.000000Z")
         );
-        assert_eq!(field_text(&rows[0], 2).as_deref(), Some("AP8H"));
+        assert_eq!(field_text(&rows[0], 2).as_deref(), Some("\\x00ff07"));
     }
 
     /// An ISO string under a TIMESTAMP column re-parses, so the row renders
@@ -351,7 +352,7 @@ mod tests {
             vec![DdlColType::Timestamp],
             obj(&[("ts", text("2020-03-05 10:00:00"))]),
         );
-        let (response, _notice) = shaped_query_response(shaped, &[]);
+        let (response, _notice) = shaped_query_response(shaped, &Format::UnifiedText);
         let rows = drain(query_of(response)).await;
         assert_eq!(
             field_text(&rows[0], 0).as_deref(),
@@ -368,7 +369,7 @@ mod tests {
             vec![DdlColType::Timestamp],
             obj(&[("created_at", Value::Integer(1_583_402_400_000_000))]),
         );
-        let (response, _notice) = shaped_query_response(shaped, &[]);
+        let (response, _notice) = shaped_query_response(shaped, &Format::UnifiedText);
         let results = drain_results(query_of(response)).await;
         let err = results
             .into_iter()
@@ -401,8 +402,7 @@ mod tests {
                 ("tstz", Value::DateTime(at)),
             ]),
         );
-        let formats = vec![FieldFormat::Binary; 2];
-        let (response, _notice) = shaped_query_response(shaped, &formats);
+        let (response, _notice) = shaped_query_response(shaped, &Format::UnifiedBinary);
         let qr = query_of(response);
         for f in qr.row_schema.iter() {
             assert_eq!(f.format(), FieldFormat::Binary);
@@ -417,7 +417,7 @@ mod tests {
     async fn notice_is_preserved_not_dropped() {
         let mut shaped = make_shaped(&["a"], vec![obj(&[("a", text("x"))])]);
         shaped.notice = Some("heads up".to_owned());
-        let (_response, notice) = shaped_query_response(shaped, &[]);
+        let (_response, notice) = shaped_query_response(shaped, &Format::UnifiedText);
         assert_eq!(notice.as_deref(), Some("heads up"));
     }
 
@@ -441,8 +441,7 @@ mod tests {
                 ("t", text("hello")),
             ]),
         );
-        let formats = vec![FieldFormat::Binary; 4];
-        let (response, _notice) = shaped_query_response(shaped, &formats);
+        let (response, _notice) = shaped_query_response(shaped, &Format::UnifiedBinary);
         let qr = query_of(response);
         // RowDescription advertises Binary for every column.
         for f in qr.row_schema.iter() {
@@ -471,12 +470,64 @@ mod tests {
             vec![DdlColType::Int8, DdlColType::Int8],
             obj(&[("i", Value::Integer(7)), ("j", Value::Integer(9))]),
         );
-        let formats = vec![FieldFormat::Binary, FieldFormat::Text];
-        let (response, _notice) = shaped_query_response(shaped, &formats);
+        let (response, _notice) = shaped_query_response(shaped, &Format::Individual(vec![1, 0]));
         let rows = drain(query_of(response)).await;
         // Column 0 binary: 8 raw bytes.
         assert_eq!(field_bytes(&rows[0], 0), Some(7i64.to_be_bytes().to_vec()));
         // Column 1 text: ASCII "9".
         assert_eq!(field_text(&rows[0], 1).as_deref(), Some("9"));
+    }
+
+    /// Under a binary request the text-form types advertise text format and
+    /// send text bytes: `bytea` as `\x` hex, `numeric`, `uuid`, and a float
+    /// array as its `{...}` literal. The binary-capable column next to them
+    /// stays binary.
+    #[tokio::test]
+    async fn binary_request_keeps_text_form_types_in_text() {
+        let shaped = shaped_typed(
+            &["n", "raw", "price", "uid", "emb"],
+            vec![
+                DdlColType::Int8,
+                DdlColType::Bytea,
+                DdlColType::Numeric,
+                DdlColType::Uuid,
+                DdlColType::Float4Array,
+            ],
+            obj(&[
+                ("n", Value::Integer(5)),
+                ("raw", Value::Bytes(vec![1, 2, 0xff])),
+                ("price", Value::Decimal(rust_decimal::Decimal::new(1250, 2))),
+                (
+                    "uid",
+                    Value::Uuid("550e8400-e29b-41d4-a716-446655440000".into()),
+                ),
+                (
+                    "emb",
+                    Value::Array(vec![Value::Float(0.5), Value::Float(1.25)]),
+                ),
+            ]),
+        );
+        let (response, _notice) = shaped_query_response(shaped, &Format::UnifiedBinary);
+        let qr = query_of(response);
+        let formats: Vec<FieldFormat> = qr.row_schema.iter().map(|f| f.format()).collect();
+        assert_eq!(
+            formats,
+            vec![
+                FieldFormat::Binary,
+                FieldFormat::Text,
+                FieldFormat::Text,
+                FieldFormat::Text,
+                FieldFormat::Text
+            ]
+        );
+        let rows = drain(qr).await;
+        assert_eq!(field_bytes(&rows[0], 0), Some(5i64.to_be_bytes().to_vec()));
+        assert_eq!(field_text(&rows[0], 1).as_deref(), Some("\\x0102ff"));
+        assert_eq!(field_text(&rows[0], 2).as_deref(), Some("12.50"));
+        assert_eq!(
+            field_text(&rows[0], 3).as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(field_text(&rows[0], 4).as_deref(), Some("{0.5,1.25}"));
     }
 }

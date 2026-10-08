@@ -224,13 +224,18 @@ fn retype_cell(ct: DdlColType, cell: &mut Value) {
             "f" | "false" | "FALSE" | "F" => Some(Value::Bool(false)),
             _ => None,
         },
+        // A vector stored as text is its JSON list of numbers.
+        DdlColType::Float4Array | DdlColType::Float8Array => sonic_rs::from_str::<Vec<f64>>(text)
+            .ok()
+            .map(|floats| Value::Array(floats.into_iter().map(Value::Float).collect())),
+        // These render from text: `numeric` and `uuid` as the text itself.
         DdlColType::Text
         | DdlColType::Varchar
         | DdlColType::Bytea
         | DdlColType::Json
         | DdlColType::Jsonb
-        | DdlColType::Float4Array
-        | DdlColType::Float8Array => None,
+        | DdlColType::Numeric
+        | DdlColType::Uuid => None,
     };
     if let Some(value) = retyped {
         *cell = value;
@@ -347,6 +352,7 @@ mod tests {
                 .collect(),
             is_star: false,
             cp_computed: Vec::new(),
+            declared_key: None,
         }
     }
 
@@ -444,6 +450,27 @@ mod tests {
         assert_eq!(shaped.rows[0]["ts"], Value::NaiveDateTime(at));
         assert_eq!(shaped.rows[0]["tstz"], Value::DateTime(at));
         assert_eq!(shaped.rows[0]["digits"], text("1583402400000000"));
+    }
+
+    /// A JSON number list under a float array column becomes an array of
+    /// floats. Other text stays text.
+    #[test]
+    fn vector_text_is_retyped_to_a_float_array() {
+        let bytes = payload(&["v", "bad"], &[&[Some("[0.5, 1, -2.25]"), Some("{0.5}")]]);
+        let schema = announced(&[
+            ("v", DdlColType::Float4Array),
+            ("bad", DdlColType::Float8Array),
+        ]);
+        let shaped = shape_returning_rows(&bytes, Some(&schema), None, None).expect("shape");
+        assert_eq!(
+            shaped.rows[0]["v"],
+            Value::Array(vec![
+                Value::Float(0.5),
+                Value::Float(1.0),
+                Value::Float(-2.25)
+            ])
+        );
+        assert_eq!(shaped.rows[0]["bad"], text("{0.5}"));
     }
 
     /// A typed cell passes through as itself: an integer stays a number under

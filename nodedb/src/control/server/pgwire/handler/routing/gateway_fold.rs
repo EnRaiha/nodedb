@@ -5,7 +5,8 @@
 //! through [`StatementTag`] into one command tag — the same tail
 //! `dispatch_loop/finish.rs` emits for a locally dispatched statement.
 
-use pgwire::api::results::{FieldFormat, Response};
+use pgwire::api::portal::Format;
+use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -29,7 +30,7 @@ pub(super) struct GatewayShaping<'a> {
     pub(super) tenant_id: crate::types::TenantId,
     pub(super) database_id: crate::types::DatabaseId,
     pub(super) projection: Option<&'a OutputSchema>,
-    pub(super) result_formats: &'a [FieldFormat],
+    pub(super) result_formats: &'a Format,
     /// Resolved once over the whole forwarded task set.
     pub(super) redaction: &'a QueryRedaction,
     /// Receives a shaped row set's NOTICE.
@@ -111,9 +112,9 @@ impl NodeDbPgHandler {
     ) -> PgWireResult<Option<u64>> {
         let outcome = match (plan_produces_rows(plan_kind), shape_plan) {
             (false, _) => ShapeOutcome::Passthrough,
-            // Gateway forwarding carries no sequence access: a projection
-            // with Control-Plane computed columns is refused by the shaper
-            // rather than NULL-filled.
+            // Gateway forwarding carries no sequence access: a Control-Plane
+            // computed column that calls a sequence accessor is refused by
+            // the shaper rather than NULL-filled. Any other one evaluates.
             (true, Some(plan)) => compose::shape_response_materialized(MaterializedShapeRequest {
                 payload,
                 plan,
