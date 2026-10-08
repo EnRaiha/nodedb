@@ -3,8 +3,9 @@
 //! Savepoint and deferred-offset adapters for `NodeDbPgHandler`.
 //!
 //! Thin pgwire shims over the protocol-neutral savepoint orchestrator
-//! (`control/server/shared/session/savepoint_ops.rs`): they parse the wire
-//! statement, drive the neutral op, and shape the tag / SQLSTATE. The overlay
+//! (`control/server/shared/session/savepoint_ops.rs`): they take the savepoint
+//! name the transaction-control classifier extracted, drive the neutral op,
+//! and shape the tag / SQLSTATE. The overlay
 //! marker capture/decode and the COMMIT OFFSET parsing live in the neutral
 //! core.
 
@@ -20,15 +21,22 @@ use crate::control::server::shared::session::{PendingOffsetCommit, SessionId, Tr
 use super::core::NodeDbPgHandler;
 use super::transaction_cmds::PgwireTxnDp;
 
-/// Map a neutral savepoint error to the pgwire error the pre-extraction path
-/// emitted (`25P01` outside a transaction, `3B001` for an unknown savepoint).
+/// Map a neutral savepoint error to its pgwire error: `25P01` outside a
+/// transaction, `25P02` in an aborted block, `3B001` for an unknown
+/// savepoint, `XX000` for a failed overlay mark or rewind.
 fn savepoint_error_to_pgerror(e: &SavepointError) -> PgWireError {
     let (code, message) = match e {
         SavepointError::NoActiveTransaction => (
             "25P01",
             "SAVEPOINT can only be used in transaction blocks".to_owned(),
         ),
+        SavepointError::TransactionAborted => (
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block"
+                .to_owned(),
+        ),
         SavepointError::NotFound { message } => ("3B001", message.clone()),
+        SavepointError::OverlayDispatch { message } => ("XX000", message.clone()),
     };
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "ERROR".to_owned(),
@@ -125,14 +133,13 @@ impl NodeDbPgHandler {
         }
     }
 
-    /// Handle SAVEPOINT <name>.
+    /// Handle SAVEPOINT <name>. `sp_name` is the classified savepoint name.
     pub(super) async fn handle_savepoint(
         &self,
         identity: &AuthenticatedIdentity,
         session_id: SessionId,
-        sql_trimmed: &str,
+        sp_name: &str,
     ) -> PgWireResult<Vec<Response>> {
-        let sp_name = sql_trimmed.split_whitespace().nth(1).unwrap_or("sp");
         let dp = PgwireTxnDp { handler: self };
         match savepoint_ops::run_savepoint(
             &self.sessions,
@@ -148,27 +155,26 @@ impl NodeDbPgHandler {
         }
     }
 
-    /// Handle RELEASE SAVEPOINT <name>.
+    /// Handle RELEASE SAVEPOINT <name>. `sp_name` is the classified savepoint name.
     pub(super) fn handle_release_savepoint(
         &self,
         session_id: SessionId,
-        sql_trimmed: &str,
+        sp_name: &str,
     ) -> PgWireResult<Vec<Response>> {
-        let sp_name = sql_trimmed.split_whitespace().last().unwrap_or("sp");
         match savepoint_ops::run_release_savepoint(&self.sessions, session_id, sp_name) {
             Ok(()) => Ok(vec![Response::Execution(Tag::new("RELEASE"))]),
             Err(e) => Err(savepoint_error_to_pgerror(&e)),
         }
     }
 
-    /// Handle ROLLBACK TO SAVEPOINT <name>.
+    /// Handle ROLLBACK TO SAVEPOINT <name>. `sp_name` is the classified
+    /// savepoint name.
     pub(super) async fn handle_rollback_to_savepoint(
         &self,
         identity: &AuthenticatedIdentity,
         session_id: SessionId,
-        sql_trimmed: &str,
+        sp_name: &str,
     ) -> PgWireResult<Vec<Response>> {
-        let sp_name = sql_trimmed.split_whitespace().last().unwrap_or("sp");
         let dp = PgwireTxnDp { handler: self };
         match savepoint_ops::run_rollback_to_savepoint(
             &self.sessions,

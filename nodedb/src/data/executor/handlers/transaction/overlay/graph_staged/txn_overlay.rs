@@ -10,8 +10,8 @@
 //! (which is keyed by `u32` surrogate), so this is a parallel, independent
 //! overlay type held alongside it on `CoreLoop` (`graph_txn_overlays`).
 //!
-//! Scope: this overlay serves read-your-own-writes for Neighbors / Hop
-//! (single-hop reads), and COMMIT resolves the staged edges and labels into
+//! Scope: this overlay serves read-your-own-writes for Neighbors, Hop and
+//! the `NeighborsMulti` hops of the walk coordinators, and COMMIT resolves the staged edges and labels into
 //! the transaction's redo record, which the redo install applies.
 //! This overlay is in-memory only and is dropped at commit or rollback, same
 //! lifecycle as `super::TxnOverlay`.
@@ -145,8 +145,8 @@ impl GraphTxnOverlay {
     }
 
     /// Current length of the graph overlay undo journal — the savepoint marker
-    /// a later `rollback_to` rewinds toward. Returned to the Control Plane by
-    /// `MetaOp::MarkSavepoint` alongside the value overlay's marker.
+    /// a later `rollback_to` rewinds toward. `MetaOp::MarkSavepoint` records it
+    /// on the core beside the value overlay's marker.
     pub fn journal_len(&self) -> usize {
         self.journal.len()
     }

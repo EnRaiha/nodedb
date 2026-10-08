@@ -73,7 +73,8 @@ impl CoreLoop {
     }
 
     /// Release all staging state for `txn_id`: the value/TTL overlay, the
-    /// parallel GRAPH and ARRAY overlays, its timeseries resolve holds, and any
+    /// parallel GRAPH and ARRAY overlays, its savepoint records, its
+    /// timeseries resolve holds, and any
     /// still-empty columnar engines this transaction auto-created during
     /// staging. Decrements the
     /// `active_txn_overlays` gauge by the number of overlays removed and
@@ -89,6 +90,7 @@ impl CoreLoop {
         let removed = u64::from(self.txn_overlays.remove(&txn_id).is_some())
             + u64::from(self.graph_txn_overlays.remove(&txn_id).is_some())
             + u64::from(self.array_txn_overlays.remove(&txn_id).is_some());
+        self.txn_savepoints.remove(&txn_id);
         if removed > 0
             && let Some(m) = &self.metrics
         {
@@ -122,6 +124,19 @@ impl CoreLoop {
     /// core, so it never interleaves with a COMMIT resolve.
     pub(in crate::data::executor) fn reap_expired_overlays(&mut self) {
         let threshold = self.hlc.peek().saturating_sub(OVERLAY_LEASE_NS);
+
+        // A transaction with no overlay on this core has no staged write to
+        // rewind. Every write it stages later comes after all its savepoints,
+        // so its correct rewind target is an empty journal. A missing record
+        // gives exactly that, so its records go.
+        let (value, graph, array) = (
+            &self.txn_overlays,
+            &self.graph_txn_overlays,
+            &self.array_txn_overlays,
+        );
+        self.txn_savepoints.retain(|txn_id, _| {
+            value.contains_key(txn_id) || graph.contains_key(txn_id) || array.contains_key(txn_id)
+        });
 
         // Union of txn ids across every overlay — a txn may hold only one of
         // them (value-only, graph-only, or array-only), so no map alone is
