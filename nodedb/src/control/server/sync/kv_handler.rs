@@ -133,6 +133,7 @@ impl KvPushDispatcher for SharedStateKvDispatcher<'_> {
             database_id,
             &mut plan,
             &self.shared.rls,
+            self.shared.credentials.catalog(),
             request.scope().auth(),
         )?;
 

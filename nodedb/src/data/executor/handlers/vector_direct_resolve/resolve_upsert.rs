@@ -122,8 +122,14 @@ impl CoreLoop {
         let response_payload = match returning {
             Some(spec) => {
                 let key = StorageKey::for_surrogate(surrogate);
-                vector_stored_rows_payload(spec, rls_filters, &[(&key, sidecar.as_slice())])
-                    .map_err(ErrorCode::from)?
+                let identity_column = self.identity_column(database_id, tid, collection);
+                vector_stored_rows_payload(
+                    spec,
+                    rls_filters,
+                    &identity_column,
+                    &[(&key, sidecar.as_slice())],
+                )
+                .map_err(ErrorCode::from)?
             }
             None if !on_conflict_updates.is_empty() => {
                 let op = if existing { "update" } else { "insert" };

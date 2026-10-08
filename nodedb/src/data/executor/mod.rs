@@ -17,6 +17,7 @@ pub mod enforcement;
 pub(crate) mod fts_text;
 mod graph_label_checkpoint;
 pub mod handlers;
+mod identity_column;
 pub(crate) mod kv_checkpoint;
 pub(super) mod msgpack_utils;
 pub(crate) mod replay_abort;

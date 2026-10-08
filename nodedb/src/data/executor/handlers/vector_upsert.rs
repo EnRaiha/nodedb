@@ -196,6 +196,7 @@ impl CoreLoop {
             "vector direct write"
         );
         let database_id = task.request.database_id.as_u64();
+        let identity_column = self.identity_column(database_id, tid, collection);
 
         let index_key = match self.vector_direct_index(
             task,
@@ -251,7 +252,13 @@ impl CoreLoop {
                 // `ON CONFLICT DO NOTHING`: nothing is written, so the count is
                 // 0 and a `RETURNING` clause has no post-image to project.
                 if let Some(spec) = returning {
-                    return self.vector_stored_returning_response(task, spec, rls_filters, &[]);
+                    return self.vector_stored_returning_response(
+                        task,
+                        spec,
+                        rls_filters,
+                        &identity_column,
+                        &[],
+                    );
                 }
                 return self.response_affected(task, 0);
             }
@@ -311,6 +318,7 @@ impl CoreLoop {
                 task,
                 spec,
                 rls_filters,
+                &identity_column,
                 &[(&storage_key, sidecar.as_slice())],
             );
         }

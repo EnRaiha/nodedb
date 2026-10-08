@@ -41,7 +41,8 @@ fn resolve_returning_and_output_schema<C: nodedb_sql::catalog::SqlCatalog>(
             returning
                 .as_ref()
                 .map(|clause| clause.projection.as_slice()),
-        );
+        )
+        .map_err(|error| map_plan_error(error, tenant_id))?;
     Ok((output_schema, returning))
 }
 
@@ -287,7 +288,12 @@ impl QueryContext {
         let rls_version = sec.rls_store.tenant_version(tenant_id.as_u64());
 
         // Inject RLS predicates.
-        crate::control::planner::rls_injection::inject_rls(&mut tasks, sec.rls_store, sec.auth)?;
+        crate::control::planner::rls_injection::inject_rls(
+            &mut tasks,
+            sec.rls_store,
+            self.catalog_inputs.credentials.catalog(),
+            sec.auth,
+        )?;
 
         // Refuse what column redaction cannot cover (aggregates over a
         // redacted column, graph traversals), before anything is dispatched.
@@ -406,7 +412,12 @@ impl QueryContext {
         let rls_version = sec.rls_store.tenant_version(tenant_id.as_u64());
 
         // Inject RLS predicates.
-        crate::control::planner::rls_injection::inject_rls(&mut tasks, sec.rls_store, sec.auth)?;
+        crate::control::planner::rls_injection::inject_rls(
+            &mut tasks,
+            sec.rls_store,
+            self.catalog_inputs.credentials.catalog(),
+            sec.auth,
+        )?;
 
         // Refuse what column redaction cannot cover (aggregates over a
         // redacted column, graph traversals), before anything is dispatched.

@@ -39,31 +39,32 @@ use super::CoreLoop;
 /// the behavior-flip rule applies: the query fails instead of the row being
 /// silently excluded.
 ///
-/// `row_key` is the row's storage key. A schemaless collection with no
-/// declared `id` field carries its identity only in that key, never in the
-/// body, so the body is matched with `id` injected — the same injection
+/// `row_key` is the row's storage key. A row that lacks its identity column
+/// carries its identity only in that key, so the image is matched with the
+/// identity injected under `identity_column` — the same injection
 /// [`super::super::row_shape::sparse_row_to_doc`] applies to a materialized
-/// row, so `WHERE id ...` sees the identity a reader of the same row sees. A
-/// strict row already surfaces `id` as a real tuple column, so no injection
-/// runs on that arm.
+/// row, so a predicate on the identity column sees the identity a reader of
+/// the same row sees. A declared-key row holds its key and gains no `id`.
 pub(in crate::data::executor) fn matches_with_resolved_schema(
     strict_schema: Option<&StrictSchema>,
     filters: &[ScanFilter],
     row_key: &StorageKey,
     body: &[u8],
+    identity_column: &str,
 ) -> Result<bool, EvalError> {
-    match strict_schema {
+    let decoded;
+    let stored: &[u8] = match strict_schema {
         Some(schema) => match strict_format::binary_tuple_to_msgpack(body, schema) {
-            Some(msgpack) => ScanFilter::all_match_binary(filters, &msgpack),
-            None => Ok(false),
+            Some(msgpack) => {
+                decoded = msgpack;
+                &decoded
+            }
+            None => return Ok(false),
         },
-        None => {
-            let identity = row_key.to_identity();
-            let with_id =
-                nodedb_query::msgpack_scan::inject_str_field(body, "id", identity.as_str());
-            ScanFilter::all_match_binary(filters, &with_id)
-        }
-    }
+        None => body,
+    };
+    let image = super::super::row_shape::inject_row_identity(stored, row_key, identity_column);
+    ScanFilter::all_match_binary(filters, &image)
 }
 
 impl CoreLoop {
@@ -114,8 +115,15 @@ impl CoreLoop {
         filters: &'a [ScanFilter],
     ) -> impl Fn(&StorageKey, &[u8]) -> Result<bool, EvalError> + 'a {
         let strict_schema = self.resolve_strict_schema(database_id, tid, collection);
+        let identity_column = self.identity_column(database_id, tid, collection);
         move |row_key: &StorageKey, body: &[u8]| {
-            matches_with_resolved_schema(strict_schema.as_ref(), filters, row_key, body)
+            matches_with_resolved_schema(
+                strict_schema.as_ref(),
+                filters,
+                row_key,
+                body,
+                &identity_column,
+            )
         }
     }
 }

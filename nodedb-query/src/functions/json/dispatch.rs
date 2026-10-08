@@ -26,6 +26,13 @@ pub(in crate::functions) fn try_eval(
 }
 
 fn try_eval_value(name: &str, args: &[Value]) -> Option<Value> {
+    // `to_jsonb(v)`: `v` as a JSON value. A `Value` already holds the JSON
+    // data model, so the value passes through with every type intact.
+    // `to_jsonb(*)` is the whole row as one JSON object.
+    if name == "to_jsonb" {
+        return Some(args.first().cloned().unwrap_or(Value::Null));
+    }
+
     // PostgreSQL JSON operator functions (lowered from AST BinaryOp).
     let pg_result = match name {
         "pg_json_get" => {

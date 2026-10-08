@@ -60,118 +60,81 @@ pub(in crate::data::executor) fn sparse_body_to_msgpack<'a>(
     }
 }
 
-/// Convert a single sparse/document row to a `(id, msgpack)` document.
+/// Convert a single sparse/document row to a `(storage key, msgpack)` pair.
 ///
-/// Normalizes the body per [`sparse_body_to_msgpack`], then injects the `id`
-/// field. Injection is a no-op when the body already carries an `id` — a
-/// vector-primary sidecar stores the user's declared primary key, and its
-/// sparse key is the internal surrogate-hex, which must not displace it.
-///
-/// `key` is the row's storage key. The client-visible identity is the row's
-/// `_rowid` when its body carries one, else its surrogate's decimal string,
-/// per [`StorageKey::to_identity`]. A first write sets `_rowid` to the
-/// surrogate, and a copy under a new surrogate keeps it. Shared by the
-/// materializing scan and the streaming scan so both paths produce
-/// byte-identical output.
+/// Normalizes the body per [`sparse_body_to_msgpack`], then gives it its
+/// identity per [`inject_row_identity`] under `identity_column`, the column
+/// `CoreLoop::identity_column` resolves for the collection. Shared by the
+/// materializing scan, the streaming scan, and every per-engine read, so all
+/// of them produce byte-identical rows.
 pub(in crate::data::executor) fn sparse_row_to_doc(
     key: &nodedb_types::StorageKey,
     raw: &[u8],
     format: SparseBodyFormatRef<'_>,
+    identity_column: &str,
 ) -> (String, Vec<u8>) {
     let mp = sparse_body_to_msgpack(raw, format);
-    let identity = msgpack_scan::extract_field(&mp, 0, nodedb_types::ROWID_COLUMN)
-        .and_then(|(start, _)| msgpack_scan::read_i64(&mp, start))
+    (
+        key.to_string(),
+        inject_row_identity(&mp, key, identity_column).into_owned(),
+    )
+}
+
+/// Give a msgpack row body its identity under `identity_column`.
+///
+/// `identity_column` is the collection's declared key, else `id`. A body that
+/// holds that column keeps it unchanged: a declared key is authoritative, and
+/// a vector-primary sidecar stores the user's key, so no `id` appears beside
+/// it. A body that lacks it gains the identity there: the body's `_rowid`
+/// when it carries one, else the storage key's identity per
+/// [`StorageKey::to_identity`](nodedb_types::StorageKey::to_identity). A first
+/// write sets `_rowid` to the surrogate, and a copy under a new surrogate
+/// keeps it. The Control Plane's envelope shaping applies the same rule.
+/// The result borrows `body` when it already holds the column.
+pub(in crate::data::executor) fn inject_row_identity<'a>(
+    body: &'a [u8],
+    key: &nodedb_types::StorageKey,
+    identity_column: &str,
+) -> std::borrow::Cow<'a, [u8]> {
+    if msgpack_scan::extract_field(body, 0, identity_column).is_some() {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let identity = msgpack_scan::extract_field(body, 0, nodedb_types::ROWID_COLUMN)
+        .and_then(|(start, _)| msgpack_scan::read_integer(body, start))
         .map(|rowid| rowid.to_string())
         .unwrap_or_else(|| key.to_identity().into_string());
-    let mp = msgpack_scan::inject_str_field(&mp, "id", &identity);
-    (key.to_string(), mp)
+    std::borrow::Cow::Owned(msgpack_scan::inject_str_field(
+        body,
+        identity_column,
+        &identity,
+    ))
 }
 
 /// Convert a single row from a `DecodedColumn` to a `nodedb_types::value::Value`.
 ///
-/// `declared` is the column's declared type from the collection schema. It
-/// decides how an eight-byte integer cell is typed, because the segment
-/// reader infers a column's physical kind from its codec and decodes every
-/// time column as `DecodedColumn::Int64`: a `Timestamp` column yields
-/// `Value::NaiveDateTime`, a `Timestamptz` column `Value::DateTime`, both from
-/// the epoch microseconds the segment stores. Every other declared type
-/// yields the integer stored: a `SystemTimestamp` column is an engine-assigned
-/// system-time count, and the bitemporal `_ts_system`, `_ts_valid_from`,
-/// `_ts_valid_until` columns are declared `Int64` and hold epoch milliseconds
-/// with `i64::MIN` / `i64::MAX` as the unbounded sentinels, which no instant
-/// can carry. The live memtable applies the same rule, so a row reads
-/// identically before and after a flush.
+/// `declared` is the column's declared type from the collection schema. A
+/// segment block records only its physical layout, so the declared type
+/// decides the variant, by the live memtable's read rule: a row reads
+/// identically before and after a flush. A `UUID` cell is UUID text, a `ULID`
+/// cell ULID text, a `VECTOR` cell an array of floats, a `GEOMETRY` cell its
+/// stored text, and a `JSON` cell its decoded value. A `Timestamp` column
+/// yields `Value::NaiveDateTime` and a `Timestamptz` column `Value::DateTime`,
+/// both from the epoch microseconds the segment stores. Every other declared
+/// type backed by integer storage yields the integer stored: a
+/// `SystemTimestamp` column is an engine-assigned system-time count, and the
+/// bitemporal `_ts_system`, `_ts_valid_from`, `_ts_valid_until` columns are
+/// declared `Int64` and hold epoch milliseconds with `i64::MIN` / `i64::MAX`
+/// as the unbounded sentinels, which no instant can carry.
 ///
-/// Returns `Value::Null` if the row index is out of range or the validity bit is false.
+/// Returns `Value::Null` if the row index is out of range or the validity bit
+/// is false. Returns `Err` when the cell's bytes do not hold a value of the
+/// declared type: the segment is corrupt.
 pub(in crate::data::executor) fn decoded_col_to_value(
     col: &nodedb_columnar::reader::DecodedColumn,
     row_idx: usize,
     declared: &nodedb_types::columnar::ColumnType,
-) -> nodedb_types::value::Value {
-    use nodedb_columnar::reader::DecodedColumn;
-    use nodedb_types::value::Value;
-
-    match col {
-        DecodedColumn::Int64 { values, valid } | DecodedColumn::Timestamp { values, valid } => {
-            if row_idx < valid.len() && valid[row_idx] {
-                declared.time_cell(values[row_idx])
-            } else {
-                Value::Null
-            }
-        }
-        DecodedColumn::Float64 { values, valid } => {
-            if row_idx < valid.len() && valid[row_idx] {
-                Value::Float(values[row_idx])
-            } else {
-                Value::Null
-            }
-        }
-        DecodedColumn::Bool { values, valid } => {
-            if row_idx < valid.len() && valid[row_idx] {
-                Value::Bool(values[row_idx])
-            } else {
-                Value::Null
-            }
-        }
-        DecodedColumn::Binary {
-            data,
-            offsets,
-            valid,
-        } => {
-            if row_idx < valid.len() && valid[row_idx] && row_idx + 1 < offsets.len() {
-                let start = offsets[row_idx] as usize;
-                let end = offsets[row_idx + 1] as usize;
-                if start <= end && end <= data.len() {
-                    let bytes = &data[start..end];
-                    // Best-effort UTF-8 interpretation; fall back to bytes.
-                    match std::str::from_utf8(bytes) {
-                        Ok(s) => Value::String(s.to_string()),
-                        Err(_) => Value::Bytes(bytes.to_vec()),
-                    }
-                } else {
-                    Value::Null
-                }
-            } else {
-                Value::Null
-            }
-        }
-        DecodedColumn::DictEncoded {
-            ids,
-            dictionary,
-            valid,
-        } => {
-            if row_idx < valid.len() && valid[row_idx] {
-                let id = ids[row_idx] as usize;
-                if id < dictionary.len() {
-                    Value::String(dictionary[id].clone())
-                } else {
-                    Value::Null
-                }
-            } else {
-                Value::Null
-            }
-        }
-    }
+) -> crate::Result<nodedb_types::value::Value> {
+    nodedb_columnar::reader::decoded_cell_value(col, row_idx, declared).map_err(crate::Error::from)
 }
 
 #[cfg(test)]
@@ -181,9 +144,13 @@ mod tests {
     use nodedb_types::value::Value;
     use nodedb_types::{InstantKind, NdbDateTime};
 
-    use super::{decoded_col_to_value, kv_row_to_doc, msgpack_scan};
+    use super::{SparseBodyFormatRef, kv_row_to_doc, msgpack_scan, sparse_row_to_doc};
 
     const MICROS: i64 = 1_583_402_400_000_000;
+
+    fn decoded_col_to_value(col: &DecodedColumn, row: usize, ty: &ColumnType) -> Value {
+        super::decoded_col_to_value(col, row, ty).expect("decodable cell")
+    }
 
     /// A time column as the segment reader decodes it: the reader infers the
     /// physical kind from the codec, so a time column arrives as `Int64`.
@@ -260,6 +227,28 @@ mod tests {
         );
     }
 
+    /// A 16-byte identifier cell reads as the text its declared type names,
+    /// as on the live memtable, never as raw bytes.
+    #[test]
+    fn an_identifier_cell_reads_back_as_its_declared_text() {
+        let uuid = uuid::Uuid::from_u128(0x67e5_5044_10b1_426f_9247_bb68_0e5f_e0c8);
+        let col = DecodedColumn::Binary {
+            data: uuid.as_bytes().to_vec(),
+            offsets: vec![0, 16],
+            valid: vec![true],
+        };
+        assert_eq!(
+            decoded_col_to_value(&col, 0, &ColumnType::Uuid),
+            Value::Uuid(uuid.to_string())
+        );
+        // A ULID is 26 Crockford base32 characters.
+        assert!(matches!(
+            decoded_col_to_value(&col, 0, &ColumnType::Ulid),
+            Value::Ulid(ref text) if text.len() == 26
+        ));
+        assert!(super::decoded_col_to_value(&col, 0, &ColumnType::Vector(2)).is_err());
+    }
+
     /// A raw (non-msgpack) KV value must be wrapped as a msgpack STRING, not
     /// appended verbatim.
     ///
@@ -282,6 +271,64 @@ mod tests {
             "the raw value must survive as its text, not as its first byte: {doc:?}"
         );
         assert_eq!(doc.get("key").and_then(|v| v.as_str()), Some("k1"));
+    }
+
+    /// A schemaless body of `fields`, as msgpack.
+    fn body(fields: &[(&str, &str)]) -> Vec<u8> {
+        let mut mp = Vec::new();
+        msgpack_scan::write_map_header(&mut mp, fields.len());
+        for (name, value) in fields {
+            msgpack_scan::write_str(&mut mp, name);
+            msgpack_scan::write_str(&mut mp, value);
+        }
+        mp
+    }
+
+    /// Shape one schemaless row stored under surrogate 7.
+    fn shaped(
+        fields: &[(&str, &str)],
+        identity_column: &str,
+    ) -> std::collections::HashMap<String, Value> {
+        let key = nodedb_types::StorageKey::for_surrogate(nodedb_types::Surrogate::new(7));
+        let (_, mp) = sparse_row_to_doc(
+            &key,
+            &body(fields),
+            SparseBodyFormatRef::Document,
+            identity_column,
+        );
+        let Ok(Value::Object(row)) = nodedb_types::value_from_msgpack(&mp) else {
+            panic!("a shaped row decodes as a map");
+        };
+        row
+    }
+
+    /// A row holding its declared key keeps it and gains no `id`.
+    #[test]
+    fn a_row_holding_its_declared_key_gains_no_id() {
+        let row = shaped(&[("sku", "p1"), ("name", "pen")], "sku");
+        assert_eq!(row.get("sku"), Some(&Value::String("p1".into())));
+        assert!(!row.contains_key("id"), "{row:?}");
+        assert_eq!(row.len(), 2, "{row:?}");
+    }
+
+    /// A row lacking its identity column gains the identity there, and only
+    /// there.
+    #[test]
+    fn a_row_lacking_its_identity_column_gains_it_there() {
+        let row = shaped(&[("name", "pen")], "sku");
+        assert_eq!(row.get("sku"), Some(&Value::String("7".into())));
+        assert!(!row.contains_key("id"), "{row:?}");
+
+        let row = shaped(&[("name", "pen")], "id");
+        assert_eq!(row.get("id"), Some(&Value::String("7".into())));
+    }
+
+    /// A stored `id` stays authoritative under a collection with no declared
+    /// key.
+    #[test]
+    fn a_stored_id_stays_authoritative() {
+        let row = shaped(&[("id", "dup"), ("n", "1")], "id");
+        assert_eq!(row.get("id"), Some(&Value::String("dup".into())));
     }
 
     /// A msgpack-map value keeps its fields and gains `key`.

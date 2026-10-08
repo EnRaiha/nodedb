@@ -50,11 +50,18 @@ impl CoreLoop {
         debug!(core = self.core_id, %collection, %field, "vector direct delete");
         let database_id = task.request.database_id.as_u64();
         let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field);
+        let identity_column = self.identity_column(database_id, tid, collection);
 
         // No index means no row was ever written: nothing to remove.
         if !self.vector_collections.contains_key(&index_key) {
             if let Some(spec) = returning {
-                return self.vector_stored_returning_response(task, spec, rls_filters, &[]);
+                return self.vector_stored_returning_response(
+                    task,
+                    spec,
+                    rls_filters,
+                    &identity_column,
+                    &[],
+                );
             }
             return self.response_affected(task, 0);
         }
@@ -105,7 +112,13 @@ impl CoreLoop {
         if let Some(spec) = returning {
             let rows: Vec<(&StorageKey, &[u8])> =
                 removed.iter().map(|(k, b)| (k, b.as_slice())).collect();
-            return self.vector_stored_returning_response(task, spec, rls_filters, &rows);
+            return self.vector_stored_returning_response(
+                task,
+                spec,
+                rls_filters,
+                &identity_column,
+                &rows,
+            );
         }
         self.response_affected(task, removed.len() as u64)
     }

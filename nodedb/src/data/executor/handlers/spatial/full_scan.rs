@@ -7,7 +7,7 @@ use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use crate::data::executor::handlers::spatial_refine::{
-    apply_predicate, extract_geometry, project_doc,
+    SpatialHit, apply_predicate, extract_geometry, hit_rows, project_doc,
 };
 use crate::data::executor::handlers::transaction::overlay::SpatialOverlayMergeParams;
 use crate::data::executor::response_codec;
@@ -61,15 +61,12 @@ impl CoreLoop {
         ) {
             Ok(e) => e,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
 
+        let identity_column =
+            self.identity_column(task.request.database_id.as_u64(), tid, collection);
         let mut results = Vec::new();
         for (doc_id, doc_bytes) in &entries {
             if results.len() >= limit {
@@ -115,7 +112,10 @@ impl CoreLoop {
                 }
             }
 
-            results.push(project_doc(&doc, doc_id, projection));
+            results.push(SpatialHit::new(
+                doc_id,
+                project_doc(&doc, doc_id, projection, &identity_column),
+            ));
         }
 
         if let Some(txn_id) = task.request.txn_id {
@@ -142,14 +142,9 @@ impl CoreLoop {
             }
         }
 
-        match response_codec::encode_value_vec(&results) {
+        match response_codec::encode_value_vec(&hit_rows(results)) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }

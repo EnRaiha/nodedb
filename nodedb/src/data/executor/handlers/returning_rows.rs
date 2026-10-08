@@ -28,15 +28,18 @@ impl CoreLoop {
     /// Build this task's `RETURNING` response from the rows it just stored.
     /// The single exit every insert-family handler uses, so the read gate and
     /// decode can never be applied on one path and skipped on another.
+    /// `identity_column` is the column each row renders its identity under,
+    /// per `CoreLoop::identity_column`.
     pub(in crate::data::executor) fn stored_returning_response(
         &self,
         task: &ExecutionTask,
         spec: &ReturningSpec,
         rls_filters: &[u8],
         strict_schema: Option<&StrictSchema>,
+        identity_column: &str,
         rows: &[StoredRow<'_>],
     ) -> Response {
-        match build_stored_rows_payload(spec, rls_filters, strict_schema, rows) {
+        match build_stored_rows_payload(spec, rls_filters, strict_schema, identity_column, rows) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(
                 task,
@@ -160,15 +163,17 @@ impl CoreLoop {
     /// [`SparseBodyFormatRef::VectorSidecar`] — the same converter `SELECT`
     /// uses. The sidecar is `zerompk` TAGGED bytes an ordinary document
     /// decode misreads (`"alice"` comes back as `[4,"alice"]`), so the
-    /// format must be this literal, not re-decided.
+    /// format must be this literal, not re-decided. `identity_column` is the
+    /// column each row renders its identity under.
     pub(in crate::data::executor) fn vector_stored_returning_response(
         &self,
         task: &ExecutionTask,
         spec: &ReturningSpec,
         rls_filters: &[u8],
+        identity_column: &str,
         rows: &[VectorStoredRow<'_>],
     ) -> Response {
-        match vector_stored_rows_payload(spec, rls_filters, rows) {
+        match vector_stored_rows_payload(spec, rls_filters, identity_column, rows) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(task, e),
         }
@@ -182,6 +187,7 @@ impl CoreLoop {
 pub(in crate::data::executor) fn vector_stored_rows_payload(
     spec: &ReturningSpec,
     rls_filters: &[u8],
+    identity_column: &str,
     rows: &[VectorStoredRow<'_>],
 ) -> crate::Result<Vec<u8>> {
     // An unreadable sidecar fails the statement: an empty row set here
@@ -189,7 +195,12 @@ pub(in crate::data::executor) fn vector_stored_rows_payload(
     let docs: Vec<Value> = rows
         .iter()
         .map(|(row_key, sidecar)| {
-            let (_id, mp) = sparse_row_to_doc(row_key, sidecar, SparseBodyFormatRef::VectorSidecar);
+            let (_id, mp) = sparse_row_to_doc(
+                row_key,
+                sidecar,
+                SparseBodyFormatRef::VectorSidecar,
+                identity_column,
+            );
             doc_format::decode_document_value(&mp)
         })
         .collect::<crate::Result<Vec<_>>>()?;
@@ -207,11 +218,14 @@ pub(in crate::data::executor) fn build_stored_rows_payload(
     spec: &ReturningSpec,
     rls_filters: &[u8],
     strict_schema: Option<&StrictSchema>,
+    identity_column: &str,
     rows: &[StoredRow<'_>],
 ) -> crate::Result<Vec<u8>> {
     let docs: Vec<Value> = rows
         .iter()
-        .map(|(doc_id, body)| returning_doc::from_stored(body, doc_id, strict_schema))
+        .map(|(doc_id, body)| {
+            returning_doc::from_stored(body, doc_id, strict_schema, identity_column)
+        })
         .collect::<crate::Result<Vec<_>>>()?;
     build_rows_payload(spec, rls_filters, &docs)
 }

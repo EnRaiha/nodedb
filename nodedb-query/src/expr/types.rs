@@ -4,10 +4,17 @@
 
 use nodedb_types::Value;
 
+/// The column name that references the whole row.
+///
+/// SQL `*` as a function argument (`to_jsonb(*)`) lowers to
+/// `Column(WHOLE_ROW_COLUMN)`, which evaluates to the row document itself.
+pub const WHOLE_ROW_COLUMN: &str = "*";
+
 /// A serializable SQL expression that can be evaluated against a document.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SqlExpr {
     /// Column reference: extract field value from the document.
+    /// [`WHOLE_ROW_COLUMN`] is the whole document.
     Column(String),
     /// Literal value.
     Literal(Value),

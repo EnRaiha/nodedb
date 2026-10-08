@@ -218,11 +218,13 @@ impl CoreLoop {
                 // Placed after the generated columns are recomputed — a policy
                 // may reference one — and before any store or index is touched,
                 // so a rejected row leaves nothing behind.
+                let identity_column = self.identity_column(database_id, tid, collection);
                 if let Err(e) = rls_write_gate::admit_stored_row(
                     rls_write_check,
                     &updated_bytes,
                     &document_identity,
                     strict_schema.as_ref(),
+                    &identity_column,
                     tid,
                     collection,
                 ) {
@@ -288,12 +290,13 @@ impl CoreLoop {
                         // no pre-dispatch record for a PointUpdate.
                         let mut response = if let Some(spec) = returning {
                             // Post-update image, decoded in the collection's
-                            // storage mode; the user-visible key only fills in
-                            // as `id` when the row declares none of its own.
+                            // storage mode; the user-visible key fills in under
+                            // the identity column only when the row lacks it.
                             let doc = match returning_doc::from_stored(
                                 &updated_bytes,
                                 &document_identity,
                                 strict_schema.as_ref(),
+                                &identity_column,
                             ) {
                                 Ok(doc) => doc,
                                 Err(e) => return self.response_error(task, e),
@@ -317,7 +320,7 @@ impl CoreLoop {
                         };
                         // A versioned row landed at the system time the
                         // update encoded it with, valid for all time.
-                        response.write_set = vec![self.stored_row_image(
+                        response.write_set = match self.stored_row_image(
                             StoredRow {
                                 database_id,
                                 tid,
@@ -327,7 +330,10 @@ impl CoreLoop {
                             },
                             &updated_bytes,
                             bitemporal.then_some(sys_from_for_encode),
-                        )];
+                        ) {
+                            Ok(image) => vec![image],
+                            Err(e) => return self.response_error(task, e),
+                        };
                         // Derived target rows live in a DIFFERENT collection
                         // than this statement's, so each carries its own
                         // `Some(collection)` and homes to that collection's

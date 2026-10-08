@@ -112,9 +112,10 @@ pub fn shape_response_materialized(
 /// plan-dependent `apply_kv_wrap` / `translate_search_response` transforms those
 /// callers never ran.
 ///
-/// `sequences` resolves the projection's Control-Plane computed columns; a
-/// caller with no session in scope passes `None`, and a projection that
-/// carries computed columns then fails rather than shipping NULL.
+/// `sequences` resolves the sequence accessors of the projection's
+/// Control-Plane computed columns. A caller with no session in scope passes
+/// `None`. A column that calls an accessor then fails rather than shipping
+/// NULL. A column that calls none evaluates.
 pub fn shape_payload_no_plan(
     payload: &[u8],
     plan_kind: PlanKind,

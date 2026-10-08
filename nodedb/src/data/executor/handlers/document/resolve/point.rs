@@ -152,6 +152,7 @@ impl CoreLoop {
             &stored_image,
             &row_identity,
             ctx.strict_schema.as_ref(),
+            &ctx.identity_column,
             tid,
             collection,
         )
@@ -160,7 +161,7 @@ impl CoreLoop {
         let response_payload = resolved_response_payload(
             returning,
             rls_filters,
-            ctx.strict_schema.as_ref(),
+            &ctx,
             &[(&document_identity, stored_image.as_slice())],
         )?;
         Ok(DocumentResolveOutcome {
@@ -209,12 +210,7 @@ impl CoreLoop {
         let Some((surrogate, prior)) = prior else {
             return Ok(DocumentResolveOutcome {
                 mutations: Vec::new(),
-                response_payload: resolved_response_payload(
-                    returning,
-                    rls_filters,
-                    ctx.strict_schema.as_ref(),
-                    &[],
-                )?,
+                response_payload: resolved_response_payload(returning, rls_filters, &ctx, &[])?,
             });
         };
         let row_identity = StorageKey::for_surrogate(surrogate).to_identity();
@@ -224,6 +220,7 @@ impl CoreLoop {
             &prior,
             &row_identity,
             ctx.strict_schema.as_ref(),
+            &ctx.identity_column,
             tid,
             collection,
         )
@@ -232,7 +229,7 @@ impl CoreLoop {
         let response_payload = resolved_response_payload(
             returning,
             rls_filters,
-            ctx.strict_schema.as_ref(),
+            &ctx,
             &[(&document_identity, prior.as_slice())],
         )?;
         Ok(DocumentResolveOutcome {

@@ -117,6 +117,8 @@ impl CoreLoop {
                 // Staged puts whose sidecar matches; a staged tombstone is a
                 // row that is gone.
                 if let Some(overlay) = overlay {
+                    let identity_column =
+                        self.identity_column(scope.database_id, scope.tid, scope.collection);
                     for (surrogate, staged) in overlay.iter_for_collection(&scope.coll_key) {
                         let Staged::Put(_) = staged else {
                             continue;
@@ -128,7 +130,12 @@ impl CoreLoop {
                             continue;
                         };
                         let key = StorageKey::for_surrogate(surrogate);
-                        if vector_sidecar_matches(&key, &row.sidecar.bytes, &filters)? {
+                        if vector_sidecar_matches(
+                            &key,
+                            &row.sidecar.bytes,
+                            &filters,
+                            &identity_column,
+                        )? {
                             out.push((surrogate, row));
                         }
                     }

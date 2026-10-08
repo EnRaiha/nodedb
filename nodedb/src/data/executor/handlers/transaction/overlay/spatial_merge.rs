@@ -5,9 +5,9 @@
 //! ST_Within/ST_DWithin(...)` scan observes the transaction's own
 //! uncommitted spatial-row writes (read-your-own-writes).
 //!
-//! Row identity is the hex-encoded surrogate carried in each result row's
-//! `"id"` field (`project_doc`'s shape) — the same identity
-//! [`super::columnar_merge`] uses, since a mainstream SQL `INSERT INTO
+//! Row identity is the surrogate each [`SpatialHit`] carries beside its row —
+//! the same identity [`super::columnar_merge`] uses, since a mainstream SQL
+//! `INSERT INTO
 //! <spatial_collection> VALUES(...)` stages through `ColumnarOp::Insert`
 //! (`stage_columnar_insert`), not `SpatialOp::Insert`.
 //!
@@ -39,7 +39,7 @@ use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::columnar_read::convert::row_to_projected_value;
 use crate::data::executor::handlers::spatial_refine::{
-    apply_predicate, extract_geometry, project_doc,
+    SpatialHit, apply_predicate, extract_geometry, project_doc,
 };
 use crate::data::executor::handlers::transaction::overlay::Staged;
 use crate::engine::document::store::StorageKey;
@@ -84,26 +84,14 @@ fn decode_staged_spatial_row(
     })
 }
 
-/// Extract the hex-surrogate identity from a projected spatial result row
-/// (`project_doc`'s `{"id": "<hex>", ...}` shape).
-fn row_surrogate(row: &Value) -> Option<u32> {
-    match row {
-        Value::Object(map) => match map.get("id") {
-            Some(Value::String(s)) => u32::from_str_radix(s, 16).ok(),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 impl CoreLoop {
     /// Merge the overlay for `params.txn_id` into `results` (base spatial
-    /// scan rows, already projected via `project_doc`). No-op when the
+    /// scan hits, already projected via `project_doc`). No-op when the
     /// transaction has no overlay entries for this collection.
     pub(in crate::data::executor) fn merge_overlay_into_spatial_scan(
         &self,
         params: SpatialOverlayMergeParams<'_>,
-        results: &mut Vec<Value>,
+        results: &mut Vec<SpatialHit>,
     ) -> crate::Result<()> {
         let SpatialOverlayMergeParams {
             txn_id,
@@ -144,7 +132,9 @@ impl CoreLoop {
         };
 
         // Surrogates already represented in the base result.
-        let mut seen: HashSet<u32> = results.iter().filter_map(row_surrogate).collect();
+        let mut seen: HashSet<u32> = results.iter().filter_map(|hit| hit.surrogate).collect();
+        let identity_column =
+            self.identity_column(coll_key.0.as_u64(), coll_key.1.as_u64(), &coll_key.2);
 
         // Base-minus-superseded: a tombstoned row is dropped; a staged put
         // replaces the row with the re-projected staged geometry and is
@@ -158,11 +148,11 @@ impl CoreLoop {
         // finishes, aborting the merge before the overlay-addition pass runs.
         let mut first_err: Option<crate::Error> = None;
         let base_visible = overlay.base_visible(coll_key);
-        results.retain_mut(|row| {
+        results.retain_mut(|hit| {
             if first_err.is_some() {
                 return true;
             }
-            let Some(raw) = row_surrogate(row) else {
+            let Some(raw) = hit.surrogate else {
                 return base_visible;
             };
             match overlay.get(coll_key, raw) {
@@ -186,8 +176,10 @@ impl CoreLoop {
                             return true;
                         }
                     }
-                    let doc_id = StorageKey::for_surrogate(Surrogate(raw)).to_string();
-                    *row = project_doc(&doc, &doc_id, projection);
+                    // A staged row that lacks its identity column renders the
+                    // client-visible identity there, never the storage key.
+                    let identity = StorageKey::for_surrogate(Surrogate(raw)).to_identity();
+                    hit.row = project_doc(&doc, identity.as_str(), projection, &identity_column);
                     true
                 }
                 None => base_visible,
@@ -214,8 +206,11 @@ impl CoreLoop {
             if !row_matches(&doc)? {
                 continue;
             }
-            let doc_id = StorageKey::for_surrogate(Surrogate(surrogate)).to_string();
-            results.push(project_doc(&doc, &doc_id, projection));
+            let identity = StorageKey::for_surrogate(Surrogate(surrogate)).to_identity();
+            results.push(SpatialHit {
+                surrogate: Some(surrogate),
+                row: project_doc(&doc, identity.as_str(), projection, &identity_column),
+            });
             seen.insert(surrogate);
         }
         Ok(())

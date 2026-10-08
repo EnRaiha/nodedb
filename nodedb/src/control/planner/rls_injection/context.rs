@@ -9,6 +9,7 @@
 //! silent no-op, indistinguishable from no policy at all.
 
 use crate::control::security::auth_context::AuthContext;
+use crate::control::security::catalog::SystemCatalog;
 use crate::control::security::rls::{PolicyType, RlsPolicyStore};
 
 use super::filters::{get_rls, get_rls_write, merge_filters};
@@ -23,6 +24,8 @@ pub(super) struct RlsCtx<'a> {
     /// Database bare op-carried collection names (e.g.
     /// `AlgoParams.collection`) must be qualified against before a lookup.
     pub(super) database_id: nodedb_types::DatabaseId,
+    /// The catalog a write image's identity column resolves against.
+    pub(super) catalog: &'a SystemCatalog,
 }
 
 impl RlsCtx<'_> {
@@ -48,15 +51,17 @@ impl RlsCtx<'_> {
         Ok(())
     }
 
-    /// Store the collection's read policy in a dedicated post-fetch slot.
+    /// AND the collection's read policy into a post-fetch slot. The slot can
+    /// already hold the statement's own WHERE predicates (a vector search
+    /// carries them there), so the policy joins them and never replaces them.
     pub(super) fn set_post_filters(
         &self,
         collection: &nodedb_types::QualifiedCollection,
         rls_filters: &mut Vec<u8>,
     ) -> crate::Result<()> {
-        let rls = self.read_filters(collection)?;
-        if !rls.is_empty() {
-            *rls_filters = rls;
+        let policy = self.read_filters(collection)?;
+        if !policy.is_empty() {
+            merge_filters(rls_filters, &policy)?;
         }
         Ok(())
     }
@@ -111,29 +116,63 @@ impl RlsCtx<'_> {
     }
 
     /// Admit a document write, injecting the row's client-visible identity
-    /// as `id`.
+    /// under the collection's identity column.
     ///
-    /// A schemaless row with no declared `id` column carries its identity
-    /// only in its storage key, never in `image`. The caller decides the
-    /// encoding: a minted key renders as the surrogate's decimal string,
-    /// never the hex storage key, matching what the read paths inject via
-    /// `sparse_row_to_doc` — a policy naming `id` judges the write against
-    /// the value a later read returns. `inject_str_field` is a no-op when
-    /// `image` already carries `id`.
+    /// A row that lacks its identity column carries its identity only in its
+    /// storage key, never in `image`. The caller decides the encoding: a
+    /// minted key renders as the surrogate's decimal string, never the hex
+    /// storage key, matching what the read paths inject via
+    /// `sparse_row_to_doc` — a policy judges the write against the row a
+    /// later read returns. A declared-key image holds its key and gains no
+    /// `id`. `inject_str_field` is a no-op when `image` already carries the
+    /// column.
     pub(super) fn admit_document_write_image(
         &self,
         collection: &nodedb_types::QualifiedCollection,
         identity: &crate::engine::document::store::RowIdentity,
         image: &[u8],
     ) -> crate::Result<()> {
-        let with_id = nodedb_query::msgpack_scan::inject_str_field(image, "id", identity.as_str());
-        self.admit_write_image(collection, &with_id)
+        let check = get_rls_write(self.store, self.tenant_id, collection.as_str(), self.auth)?;
+        if check.is_empty() {
+            return Ok(());
+        }
+        let identity_column = self.identity_column(collection)?;
+        let with_id = nodedb_query::msgpack_scan::inject_str_field(
+            image,
+            &identity_column,
+            identity.as_str(),
+        );
+        crate::control::security::rls::admit_compiled_write_image(
+            &check,
+            &with_id,
+            self.tenant_id,
+            collection.as_str(),
+        )
     }
 
-    /// Admit a write whose post-image is a JSON object (a graph edge's
-    /// `PROPERTIES`). Non-object bytes, including an empty `PROPERTIES`,
-    /// deny rather than admit by omission.
-    pub(super) fn admit_write_json_image(
+    /// The column `collection`'s rows render their identity under: its
+    /// declared key, per `document_declared_key`, else `id`. The register
+    /// config the Data Plane reads comes from the same function, so a write
+    /// image and a read row name the identity alike. An unknown collection
+    /// has no declared key.
+    fn identity_column(
+        &self,
+        collection: &nodedb_types::QualifiedCollection,
+    ) -> crate::Result<String> {
+        let name = collection.collection_name(self.database_id);
+        let declared_key = self
+            .catalog
+            .get_collection(self.database_id, self.tenant_id, name)?
+            .and_then(|stored| {
+                crate::control::planner::catalog_adapter::document_declared_key(&stored)
+            });
+        Ok(declared_key.unwrap_or_else(|| nodedb_types::DEFAULT_IDENTITY_COLUMN.to_string()))
+    }
+
+    /// Admit a write whose post-image is a plain-MessagePack property map (a
+    /// graph edge's `PROPERTIES`). Non-map bytes, including an empty
+    /// `PROPERTIES`, deny rather than admit by omission.
+    pub(super) fn admit_write_property_image(
         &self,
         collection: &nodedb_types::QualifiedCollection,
         image: &[u8],
@@ -142,8 +181,8 @@ impl RlsCtx<'_> {
         if check.is_empty() {
             return Ok(());
         }
-        let decoded = sonic_rs::from_slice::<serde_json::Value>(image).ok();
-        let Some(object @ serde_json::Value::Object(_)) = decoded else {
+        let decoded = nodedb_types::json_msgpack::value_from_msgpack(image).ok();
+        let Some(nodedb_types::Value::Object(_)) = decoded else {
             return Err(crate::Error::RejectedAuthz {
                 tenant_id: crate::types::TenantId::new(self.tenant_id),
                 resource: format!(
@@ -154,7 +193,7 @@ impl RlsCtx<'_> {
         };
         crate::control::security::rls::admit_compiled_write_image(
             &check,
-            &nodedb_types::json_to_msgpack_or_empty(&object),
+            image,
             self.tenant_id,
             collection.as_str(),
         )

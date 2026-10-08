@@ -145,15 +145,21 @@ impl CoreLoop {
         rows: &[StoredRow<'_>],
     ) -> Response {
         let schema = self.resolve_strict_schema(of.database_id, of.tid, of.collection);
-        let reply =
-            build_stored_rows_payload(returning.spec, returning.rls_filters, schema.as_ref(), rows)
-                .and_then(|rows| {
-                    zerompk::to_msgpack_vec(&StagedReturningReply { affected, rows }).map_err(
-                        |error| crate::Error::Codec {
-                            detail: format!("staged RETURNING reply: {error}"),
-                        },
-                    )
-                });
+        let identity_column = self.identity_column(of.database_id, of.tid, of.collection);
+        let reply = build_stored_rows_payload(
+            returning.spec,
+            returning.rls_filters,
+            schema.as_ref(),
+            &identity_column,
+            rows,
+        )
+        .and_then(|rows| {
+            zerompk::to_msgpack_vec(&StagedReturningReply { affected, rows }).map_err(|error| {
+                crate::Error::Codec {
+                    detail: format!("staged RETURNING reply: {error}"),
+                }
+            })
+        });
         match reply {
             Ok(payload) => self.response_with_payload(of.task, payload),
             Err(e) => self.response_error(

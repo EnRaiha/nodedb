@@ -83,6 +83,7 @@ impl CoreLoop {
             &body,
             &row_identity,
             None,
+            &ctx.identity_column,
             tid,
             collection,
         )
@@ -110,7 +111,7 @@ impl CoreLoop {
         let response_payload = resolved_response_payload(
             returning,
             rls_filters,
-            ctx.strict_schema.as_ref(),
+            &ctx,
             &[(&document_identity, stored_image.as_slice())],
         )?;
 

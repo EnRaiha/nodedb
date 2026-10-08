@@ -457,6 +457,7 @@ impl CoreLoop {
             body,
             identity,
             schema.as_ref(),
+            &self.identity_column(database_id, tid, collection),
             tid,
             collection,
         )

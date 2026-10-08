@@ -17,7 +17,7 @@ use crate::control::sequence::SequenceAccess;
 use super::super::project::push_flat_rows;
 use super::super::redaction::RedactionCtx;
 use super::super::schema::OutputSchema;
-use super::super::stamp::stamp_rows;
+use super::super::stamp::{NoSequenceAccess, stamp_rows};
 use super::super::types::{DdlColType, ShapedRow, ShapedRows};
 
 /// Pure shaping core: given an already-decoded Data-Plane value, unwrap the
@@ -31,8 +31,8 @@ use super::super::types::{DdlColType, ShapedRow, ShapedRows};
 /// or vector-translate but still needs the same envelope-unwrap + projection
 /// logic applied per batch, so streaming callers call this directly.
 ///
-/// `sequences` resolves the projection's Control-Plane computed columns
-/// (`cp_computed`). A projection that carries any and a caller that passes
+/// `sequences` resolves the sequence accessors of the projection's
+/// Control-Plane computed columns (`cp_computed`). An accessor call with
 /// `None` is an error: the alias would otherwise project as NULL.
 pub fn shape_decoded_rows(
     decoded: Value,
@@ -41,7 +41,11 @@ pub fn shape_decoded_rows(
     sequences: Option<&dyn SequenceAccess>,
 ) -> crate::Result<ShapedRows> {
     let mut rows = Vec::new();
-    push_flat_rows(decoded, &mut rows)?;
+    push_flat_rows(
+        decoded,
+        OutputSchema::identity_column(projection),
+        &mut rows,
+    )?;
 
     // Column-level redaction runs on the flat row maps, AFTER the scan
     // envelope is unwrapped and BEFORE any projection or column derivation.
@@ -100,9 +104,10 @@ pub fn shape_decoded_rows(
 /// Stamp the projection's Control-Plane computed columns onto the flat rows.
 ///
 /// A projection with no computed column is a no-op whatever `sequences` is.
-/// One that carries any needs session sequence access: a caller with none
-/// (a per-batch stream, gateway forwarding, a clone merge) cannot answer
-/// the statement, and says so rather than shipping NULL under the alias.
+/// A caller with no session sequence state (a per-batch stream, gateway
+/// forwarding, a clone merge) passes `None`. A column that calls no sequence
+/// accessor evaluates there all the same. A sequence accessor call is
+/// refused, never shipped as NULL under the alias.
 pub(in crate::control::server::response_shape) fn stamp_computed_columns(
     projection: Option<&OutputSchema>,
     rows: &mut [ShapedRow],
@@ -111,11 +116,9 @@ pub(in crate::control::server::response_shape) fn stamp_computed_columns(
     let Some(schema) = projection.filter(|s| !s.cp_computed.is_empty()) else {
         return Ok(());
     };
-    let Some(access) = sequences else {
-        return Err(crate::Error::FeatureNotSupported {
-            detail: "Control-Plane computed columns need session sequence access on this path"
-                .to_string(),
-        });
+    let access: &dyn SequenceAccess = match sequences {
+        Some(access) => access,
+        None => &NoSequenceAccess,
     };
     stamp_rows(rows, &schema.cp_computed, access)
 }
@@ -319,6 +322,7 @@ mod tests {
                 .collect(),
             is_star: false,
             cp_computed: Vec::new(),
+            declared_key: None,
         }
     }
 
@@ -583,5 +587,34 @@ mod tests {
         let err =
             shape_decoded_rows(decoded, Some(&projection), None, None).expect_err("must refuse");
         assert!(matches!(err, crate::Error::FeatureNotSupported { .. }));
+    }
+
+    /// `SELECT to_jsonb(*) AS document FROM t WHERE id = 'r1'`: the whole row
+    /// is one typed object, and no sequence access is needed to build it.
+    #[test]
+    fn a_whole_row_column_needs_no_sequence_access() {
+        use crate::bridge::expr_eval::SqlExpr;
+        let decoded = one_row(&[("id", text("r1")), ("n", Value::Integer(5))]);
+        let mut projection = named_projection(&[("document", "document")]);
+        projection.cp_computed = vec![
+            crate::control::server::response_shape::schema::CpComputedColumn {
+                alias: "document".to_string(),
+                expr: SqlExpr::Function {
+                    name: "to_jsonb".to_string(),
+                    args: vec![SqlExpr::Column(
+                        nodedb_query::expr::WHOLE_ROW_COLUMN.to_string(),
+                    )],
+                },
+            },
+        ];
+
+        let shaped = shape_decoded_rows(decoded, Some(&projection), None, None)
+            .expect("an accessor-free column evaluates without sequence access");
+        assert_eq!(shaped.columns, vec!["document".to_string()]);
+        let Value::Object(document) = &shaped.rows[0]["document"] else {
+            panic!("the whole row is an object: {:?}", shaped.rows[0]);
+        };
+        assert_eq!(document.get("id"), Some(&text("r1")));
+        assert_eq!(document.get("n"), Some(&Value::Integer(5)));
     }
 }

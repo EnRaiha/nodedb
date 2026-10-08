@@ -111,7 +111,8 @@ fn convert_expr_inner(expr: &SqlExpr, qualify: bool) -> crate::bridge::expr_eval
                 to_type: cast_type,
             }
         }
-        SqlExpr::Wildcard => BExpr::Column("*".into()),
+        // `*` is the whole row: `to_jsonb(*)` reads the row document.
+        SqlExpr::Wildcard => BExpr::Column(nodedb_query::expr::WHOLE_ROW_COLUMN.into()),
 
         // NOT e / -e → evaluator's Negate (handles both bool and numeric).
         SqlExpr::UnaryOp { expr, .. } => BExpr::Negate(Box::new(convert_expr_inner(expr, qualify))),

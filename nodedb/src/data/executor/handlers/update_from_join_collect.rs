@@ -159,6 +159,12 @@ impl CoreLoop {
                 }
             }
             let merged_ndb: nodedb_types::Value = merged.clone().into();
+            let identity = super::identity_guard::IdentitySnapshot::capture(
+                strict_schema,
+                declared_primary_key,
+                updates,
+                &target_doc,
+            );
 
             // Apply SET assignments evaluated against the merged document.
             if let Some(target_obj) = target_doc.as_object_mut() {
@@ -191,6 +197,7 @@ impl CoreLoop {
                     declared_primary_key,
                 )?;
             }
+            identity.check_unchanged(target_collection, &target_doc)?;
 
             // Recompute generated columns if any dependency changed. A column
             // the engine cannot recompute fails the statement.
@@ -207,6 +214,13 @@ impl CoreLoop {
                 )
                 .map_err(crate::Error::DataPlane)?;
             }
+
+            // A declared numeric column holds the value its type stores,
+            // whether the assignment was a literal or computed.
+            super::super::strict_format::coerce_declared_doc(
+                &mut target_doc,
+                self.declared_columns(config_key),
+            )?;
 
             // Re-encode the post-image (strict Binary Tuple or MessagePack).
             // An encode error carries its own typed cause, such as a field the
@@ -275,13 +289,26 @@ impl CoreLoop {
             target_coll_key,
             bitemporal,
         } = args;
+        let identity_column = self.identity_column(database_id, tid, target_collection);
         let mut rows = if bitemporal {
             self.scan_current_versions(database_id, tid, target_collection, |key, body| {
-                matches_with_resolved_schema(strict_schema, target_filters, key, body)
+                matches_with_resolved_schema(
+                    strict_schema,
+                    target_filters,
+                    key,
+                    body,
+                    &identity_column,
+                )
             })?
         } else {
             self.scan_plain_rows(database_id, tid, target_collection, |key, body| {
-                matches_with_resolved_schema(strict_schema, target_filters, key, body)
+                matches_with_resolved_schema(
+                    strict_schema,
+                    target_filters,
+                    key,
+                    body,
+                    &identity_column,
+                )
             })?
         };
 

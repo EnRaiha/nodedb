@@ -8,7 +8,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use crate::data::executor::handlers::columnar_read::filter::decode_rls_filters;
 use crate::data::executor::handlers::spatial_refine::{
-    apply_predicate, expand_bbox, extract_geometry, project_doc,
+    SpatialHit, apply_predicate, expand_bbox, extract_geometry, hit_rows, project_doc,
 };
 use crate::data::executor::handlers::transaction::overlay::SpatialOverlayMergeParams;
 use crate::data::executor::response_codec;
@@ -139,12 +139,7 @@ impl CoreLoop {
             None => {
                 return match response_codec::encode_value_vec(&[]) {
                     Ok(payload) => self.response_with_payload(task, payload),
-                    Err(e) => self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    ),
+                    Err(e) => self.response_error(task, ErrorCode::from(e)),
                 };
             }
         };
@@ -172,6 +167,7 @@ impl CoreLoop {
         // routing and is correct regardless of which engine backs the row.
         let database_id = db_id.as_u64();
         let body_format = self.sparse_body_format(db_id, tid_id, collection);
+        let identity_column = self.identity_column(database_id, tid, collection);
 
         // Lazily-built columnar id → document map, populated on the first
         // candidate that is absent from the sparse store (i.e. a columnar-family
@@ -238,6 +234,7 @@ impl CoreLoop {
                         &key,
                         &raw,
                         body_format.as_format_ref(),
+                        &identity_column,
                     );
                     // A candidate skipped here silently drops out of the
                     // spatial result set, which reads as "no row matched the
@@ -258,12 +255,7 @@ impl CoreLoop {
                                 columnar_docs = Some(rows.into_iter().collect());
                             }
                             Err(e) => {
-                                return self.response_error(
-                                    task,
-                                    ErrorCode::Internal {
-                                        detail: e.to_string(),
-                                    },
-                                );
+                                return self.response_error(task, ErrorCode::from(e));
                             }
                         }
                     }
@@ -310,7 +302,10 @@ impl CoreLoop {
                 }
             }
 
-            results.push(project_doc(&doc, &doc_id, projection));
+            results.push(SpatialHit::new(
+                &doc_id,
+                project_doc(&doc, &doc_id, projection, &identity_column),
+            ));
         }
 
         if let Some(txn_id) = task.request.txn_id
@@ -332,14 +327,9 @@ impl CoreLoop {
             return self.response_error(task, e);
         }
 
-        match response_codec::encode_value_vec(&results) {
+        match response_codec::encode_value_vec(&hit_rows(results)) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }

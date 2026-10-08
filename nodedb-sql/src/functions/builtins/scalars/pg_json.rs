@@ -119,5 +119,15 @@ pub(super) fn pg_json_functions() -> Vec<FunctionMeta> {
             Some(ColumnType::Bool),
             arg_types::JSON_EXISTS_ARGS,
         ),
+        // `to_jsonb(v)` is `v` as JSON. `to_jsonb(*)` is the whole row.
+        m(
+            "to_jsonb",
+            Scalar,
+            1,
+            1,
+            no_trigger(),
+            Some(ColumnType::Json),
+            arg_types::TO_JSONB_ARGS,
+        ),
     ]
 }

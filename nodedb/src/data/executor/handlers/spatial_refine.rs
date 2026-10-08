@@ -56,24 +56,57 @@ pub(in crate::data::executor) fn apply_predicate(
     }
 }
 
+/// One spatial scan result: the projected row and the surrogate it was read
+/// under. The overlay merge keys rows by `surrogate`, never by a row field,
+/// so the row names its identity by the collection's identity column alone.
+pub(in crate::data::executor) struct SpatialHit {
+    /// The row's surrogate, `None` when its `doc_id` is no hex surrogate.
+    pub surrogate: Option<u32>,
+    pub row: Value,
+}
+
+impl SpatialHit {
+    /// A hit read under `doc_id`: a document row's hex storage key, or a
+    /// columnar-family row's `id` value.
+    pub(in crate::data::executor) fn new(doc_id: &str, row: Value) -> Self {
+        Self {
+            surrogate: u32::from_str_radix(doc_id, 16).ok(),
+            row,
+        }
+    }
+}
+
+/// The rows of `hits`, in order, for the response encoder.
+pub(in crate::data::executor) fn hit_rows(hits: Vec<SpatialHit>) -> Vec<Value> {
+    hits.into_iter().map(|hit| hit.row).collect()
+}
+
 /// Apply projection to a document, returning `nodedb_types::Value`.
+///
+/// The row names its identity under `identity_column`: the collection's
+/// declared key, else `id`. A document that holds that column keeps its own
+/// value. One that lacks it gains `doc_id` there. A declared-key row never
+/// gains an `id` beside its key.
 pub(in crate::data::executor) fn project_doc(
     doc: &Value,
     doc_id: &str,
     projection: &[String],
+    identity_column: &str,
 ) -> Value {
+    let identity = doc
+        .get(identity_column)
+        .cloned()
+        .unwrap_or_else(|| Value::String(doc_id.to_string()));
     if projection.is_empty() {
-        // Add id if not present.
         if let Value::Object(mut map) = doc.clone() {
-            map.entry("id".to_string())
-                .or_insert(Value::String(doc_id.to_string()));
+            map.entry(identity_column.to_string()).or_insert(identity);
             Value::Object(map)
         } else {
             doc.clone()
         }
     } else {
         let mut map = std::collections::HashMap::new();
-        map.insert("id".to_string(), Value::String(doc_id.to_string()));
+        map.insert(identity_column.to_string(), identity);
         for col in projection {
             if let Some(v) = doc.get(col) {
                 map.insert(col.clone(), v.clone());

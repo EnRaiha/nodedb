@@ -13,6 +13,7 @@ use nodedb_types::columnar::StrictSchema;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
+use crate::data::executor::handlers::identity_guard::IdentitySnapshot;
 use crate::engine::document::store::StorageKey;
 use crate::types::{DatabaseId, TenantId};
 
@@ -136,9 +137,9 @@ impl CoreLoop {
         let doc_id = doc_id_owned.as_str();
 
         // Decode current value — format depends on storage mode, with the
-        // storage key attached as `id` for a schemaless row whose body
-        // carries none, so this image matches the one DELETE's
-        // write-gate judges. A row the statement matched but cannot
+        // row identity attached under the collection's identity column for a
+        // schemaless row whose body lacks it, so this image matches the one
+        // DELETE's write-gate judges. A row the statement matched but cannot
         // decode fails the statement rather than under-reporting the
         // affected count.
         let mut doc = match strict_schema {
@@ -155,17 +156,20 @@ impl CoreLoop {
             }
             None => {
                 // `key` is the storage key from the apply set. The
-                // decoded document's `id` is the row's client-visible
-                // identity, not the storage key.
+                // decoded document's identity column holds the row's
+                // client-visible identity, not the storage key.
                 let identity = key.to_identity();
                 crate::data::executor::handlers::returning_doc::from_stored_json(
                     &current_bytes,
                     &identity,
                     None,
+                    &self.identity_column(database_id, tid, collection),
                 )?
             }
         };
 
+        let identity =
+            IdentitySnapshot::capture(strict_schema, declared_primary_key, updates, &doc);
         // Feeds the secondary-index SET diff for values the UPDATE drops.
         let old_doc = doc.clone();
         // All assignments see this pre-update snapshot — they don't
@@ -203,6 +207,7 @@ impl CoreLoop {
                 declared_primary_key,
             )?;
         }
+        identity.check_unchanged(collection, &doc)?;
 
         // Recompute generated columns if any dependency changed. A column
         // the engine cannot recompute fails the statement.
@@ -219,6 +224,13 @@ impl CoreLoop {
             )
             .map_err(crate::Error::DataPlane)?;
         }
+
+        // A declared numeric column holds the value its type stores, whether
+        // the assignment was a literal or computed.
+        crate::data::executor::strict_format::coerce_declared_doc(
+            &mut doc,
+            self.declared_columns(&config_key),
+        )?;
 
         // Re-encode — format depends on storage mode. An encode error
         // carries its own typed cause, such as a field the strict schema

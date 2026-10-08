@@ -45,5 +45,15 @@ pub(in crate::data::executor) fn admit_kv_row(
     // own identity, taken verbatim.
     let key_display = String::from_utf8_lossy(key);
     let identity = crate::engine::document::store::RowIdentity::from_user_key(key_display.as_ref());
-    rls_write_gate::admit_stored_row(rls_write_check, body, &identity, None, tid, collection)
+    // A KV image names its key `id`, as the KV write policy has always
+    // read it. KV rows never take the document identity column.
+    rls_write_gate::admit_stored_row(
+        rls_write_check,
+        body,
+        &identity,
+        None,
+        nodedb_types::DEFAULT_IDENTITY_COLUMN,
+        tid,
+        collection,
+    )
 }

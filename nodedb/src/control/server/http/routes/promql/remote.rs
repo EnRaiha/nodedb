@@ -135,6 +135,7 @@ pub async fn remote_write(
         if let Err(error) = crate::control::planner::rls_injection::inject_rls(
             std::slice::from_mut(&mut task),
             &state.shared.rls,
+            state.shared.credentials.catalog(),
             scope.auth(),
         ) {
             tracing::warn!(error = ?error, collection = %collection, "remote write denied by row policy");

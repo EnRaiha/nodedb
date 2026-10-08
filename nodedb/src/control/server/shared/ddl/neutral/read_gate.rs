@@ -160,6 +160,7 @@ impl<'a> CollectionReadGate<'a> {
             self.scope.database_id(),
             plan,
             &self.state.rls,
+            self.state.credentials.catalog(),
             self.scope.auth(),
         )
         .map_err(|error| match &error {

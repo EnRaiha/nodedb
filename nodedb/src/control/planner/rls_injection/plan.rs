@@ -16,6 +16,7 @@
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::auth_context::AuthContext;
+use crate::control::security::catalog::SystemCatalog;
 use crate::control::security::rls::RlsPolicyStore;
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -23,10 +24,13 @@ use super::context::RlsCtx;
 
 /// Inject RLS predicates into physical tasks after plan conversion: reads
 /// get filters injected, a write's policy admits its image or refuses.
-/// `Err` on a missing `$auth` field or an uncoverable read/write shape.
+/// `catalog` resolves the identity column a write image names its row by.
+/// `Err` on a missing `$auth` field, an uncoverable read/write shape, or a
+/// catalog lookup error.
 pub fn inject_rls(
     tasks: &mut [PhysicalTask],
     rls_store: &RlsPolicyStore,
+    catalog: &SystemCatalog,
     auth: &AuthContext,
 ) -> crate::Result<()> {
     for task in tasks.iter_mut() {
@@ -35,6 +39,7 @@ pub fn inject_rls(
             tenant_id: task.tenant_id.as_u64(),
             auth,
             database_id: task.database_id,
+            catalog,
         };
         walk(&ctx, &mut task.plan)?;
         refuse_undecided_write_check(&task.plan)?;
@@ -48,6 +53,7 @@ pub fn inject_rls_for_single_plan(
     database_id: nodedb_types::DatabaseId,
     plan: &mut PhysicalPlan,
     rls_store: &RlsPolicyStore,
+    catalog: &SystemCatalog,
     auth: &AuthContext,
 ) -> crate::Result<()> {
     let ctx = RlsCtx {
@@ -55,6 +61,7 @@ pub fn inject_rls_for_single_plan(
         tenant_id,
         auth,
         database_id,
+        catalog,
     };
     walk(&ctx, plan)?;
     refuse_undecided_write_check(plan)
@@ -105,6 +112,7 @@ pub(super) fn walk(ctx: &RlsCtx<'_>, plan: &mut PhysicalPlan) -> crate::Result<(
 #[cfg(test)]
 pub(super) mod test_support {
     use crate::control::security::auth_context::AuthContext;
+    use crate::control::security::catalog::SystemCatalog;
     use crate::control::security::predicate::{CompareOp, PredicateValue, RlsPredicate};
     use crate::control::security::rls::{PolicyType, RlsPolicy, RlsPolicyStore};
     use crate::types::TenantId;
@@ -265,6 +273,7 @@ pub(super) mod test_support {
             nodedb_types::DatabaseId::DEFAULT,
             plan,
             store,
+            &SystemCatalog::open_in_memory().expect("in-memory catalog"),
             &regular_auth(),
         )
     }
@@ -278,6 +287,7 @@ pub(super) mod test_support {
             nodedb_types::DatabaseId::DEFAULT,
             plan,
             &RlsPolicyStore::new(),
+            &SystemCatalog::open_in_memory().expect("in-memory catalog"),
             &regular_auth(),
         )
     }

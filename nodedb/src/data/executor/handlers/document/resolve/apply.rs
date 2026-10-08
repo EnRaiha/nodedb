@@ -60,6 +60,11 @@ impl CoreLoop {
                         document_id.as_str(),
                     ),
                     None,
+                    &self.identity_column(
+                        task.request.database_id.as_u64(),
+                        tid,
+                        collection.as_str(),
+                    ),
                     tid,
                     collection.as_str(),
                 )

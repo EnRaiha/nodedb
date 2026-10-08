@@ -102,6 +102,8 @@ impl CoreLoop {
                 None
             }
         });
+        let identity_column =
+            self.identity_column(task.request.database_id.as_u64(), tid, collection);
 
         // Predicate: decode each current body, extract `field`, keep in-range
         // rows. `extract_index_values(_, field, false)` yields the scalar
@@ -135,22 +137,17 @@ impl CoreLoop {
                     // The filters evaluate against the normalized msgpack form,
                     // the same encoding every other RLS site filters on — a
                     // strict body is a Binary Tuple until it is decoded here.
-                    // A schemaless row's identity lives only in its storage
-                    // key when its body carries no `id` field, so the
-                    // client-visible identity is injected before the RLS
-                    // check, matching what a reader of the same row sees.
+                    // A row that lacks its identity column carries its
+                    // identity only in its storage key, so the identity is
+                    // injected under that column before the RLS check, the
+                    // image a reader of the same row sees.
                     Some(filters) => match nodedb_types::json_msgpack::json_to_msgpack(&doc) {
                         Ok(mp) => {
-                            let mp = if strict_schema.is_none() {
-                                let identity = doc_id.to_identity();
-                                nodedb_query::msgpack_scan::inject_str_field(
-                                    &mp,
-                                    "id",
-                                    identity.as_str(),
-                                )
-                            } else {
-                                mp
-                            };
+                            let mp = crate::data::executor::row_shape::inject_row_identity(
+                                &mp,
+                                doc_id,
+                                &identity_column,
+                            );
                             crate::bridge::scan_filter::ScanFilter::all_match_binary(filters, &mp)
                                 .unwrap_or(false)
                         }
@@ -185,12 +182,7 @@ impl CoreLoop {
             Ok(rows) => rows,
             Err(e) => {
                 warn!(core = self.core_id, error = %e, "versioned range scan failed");
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
 
@@ -242,29 +234,18 @@ impl CoreLoop {
         // Sort ascending by `field` and cap at `limit` — the same ordering the
         // secondary-index range path yields (index-key order) and the same
         // truncation the non-bitemporal fallback applies.
-        if let Err(e) = sort::sort_rows(
-            &mut rows,
-            &[nodedb_physical::physical_plan::SortKeySpec::column(
-                field, true,
-            )],
-        ) {
-            return self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: format!("in-memory sort failed: {e}"),
-                },
-            );
+        let sort_keys = [nodedb_physical::physical_plan::SortKeySpec::column(
+            field, true,
+        )];
+        let decimal_keys = sort::decimal_sort_keys(&sort_keys, strict_schema.as_ref());
+        if let Err(e) = sort::sort_rows(&mut rows, &sort_keys, &decimal_keys) {
+            return self.response_error(task, ErrorCode::from(e));
         }
         rows.truncate(limit);
 
         match response_codec::encode_raw_document_rows(&rows) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }

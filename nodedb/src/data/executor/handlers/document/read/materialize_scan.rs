@@ -5,10 +5,11 @@
 //! `doc_id` is the hex-encoded surrogate; `value_bytes` is always standard
 //! MessagePack — Binary Tuple and vector-primary sidecar sources are
 //! transcoded here so consumers never re-decide the source format. `value_bytes`
-//! also carries an `id` field via `sparse_row_to_doc`, so a Control-Plane
-//! filter naming `id` sees the same identity the read paths produce. A
-//! `raw_bodies` scan adds no `id`: the clone materializer copies the stored
-//! contents, which a `HASH_CHAIN` link covers and a strict schema accepts.
+//! also carries the row identity under the collection's identity column via
+//! `sparse_row_to_doc`, so a Control-Plane filter sees the same identity the
+//! read paths produce. A `raw_bodies` scan adds no identity: the clone
+//! materializer copies the stored contents, which a `HASH_CHAIN` link covers
+//! and a strict schema accepts.
 //! Payload: `[next_cursor: bin, entries: [[doc_id, surrogate, value], ...]]`.
 
 use nodedb_types::StorageKey;
@@ -136,20 +137,22 @@ impl CoreLoop {
                 .unwrap_or_default()
         };
 
-        // Normalize every body to standard msgpack and inject its `id` here —
-        // the one place that owns the source format — so no consumer repeats
-        // the decision or filters a row missing the identity its storage key
-        // already carries.
+        // Normalize every body to standard msgpack and inject its identity
+        // here — the one place that owns the source format — so no consumer
+        // repeats the decision or filters a row missing the identity its
+        // storage key already carries.
         let body_format =
             self.sparse_body_format(task.request.database_id, TenantId::new(tid), collection);
         let format_ref = body_format.as_format_ref();
+        let identity_column =
+            self.identity_column(task.request.database_id.as_u64(), tid, collection);
         // A raw body goes out as stored, with no `id` added: the clone
         // materializer copies the exact stored contents.
         for (key, value) in &mut entries {
             *value = if raw_bodies {
                 sparse_body_to_msgpack(value, format_ref).into_owned()
             } else {
-                sparse_row_to_doc(key, value, format_ref).1
+                sparse_row_to_doc(key, value, format_ref, &identity_column).1
             };
         }
 

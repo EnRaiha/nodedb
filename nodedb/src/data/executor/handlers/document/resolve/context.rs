@@ -29,6 +29,9 @@ pub(super) struct DocResolveCtx {
     /// `Some` exactly when the collection stores Binary Tuples.
     pub strict_schema: Option<StrictSchema>,
     pub bitemporal: bool,
+    /// The column a row renders its identity under, per
+    /// `CoreLoop::identity_column`.
+    pub identity_column: String,
 }
 
 impl CoreLoop {
@@ -57,6 +60,7 @@ impl CoreLoop {
             tid,
             strict_schema,
             bitemporal: self.is_bitemporal(database_id, tid, collection),
+            identity_column: self.identity_column(database_id, tid, collection),
         }
     }
 
@@ -154,16 +158,20 @@ pub(super) fn affected_payload(affected: usize) -> Vec<u8> {
 pub(super) fn resolved_response_payload(
     returning: Option<&ReturningSpec>,
     rls_filters: &[u8],
-    strict_schema: Option<&StrictSchema>,
+    ctx: &DocResolveCtx,
     rows: &[(&RowIdentity, &[u8])],
 ) -> Result<Vec<u8>, ErrorCode> {
     match returning {
-        Some(spec) => {
-            returning_rows::build_stored_rows_payload(spec, rls_filters, strict_schema, rows)
-                .map_err(|e| ErrorCode::Internal {
-                    detail: format!("RETURNING encode: {e}"),
-                })
-        }
+        Some(spec) => returning_rows::build_stored_rows_payload(
+            spec,
+            rls_filters,
+            ctx.strict_schema.as_ref(),
+            &ctx.identity_column,
+            rows,
+        )
+        .map_err(|e| ErrorCode::Internal {
+            detail: format!("RETURNING encode: {e}"),
+        }),
         None => Ok(affected_payload(rows.len())),
     }
 }

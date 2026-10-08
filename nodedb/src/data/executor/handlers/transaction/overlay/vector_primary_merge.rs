@@ -45,17 +45,23 @@ pub(in crate::data::executor) enum SidecarRowShape {
 }
 
 /// The scan-row body of a staged vector-primary put in `shape`.
+/// `identity_column` is the column a normalized row's identity renders under.
 fn staged_vector_scan_body(
     shape: SidecarRowShape,
     key: &StorageKey,
     body: &[u8],
+    identity_column: &str,
 ) -> crate::Result<Vec<u8>> {
     let sidecar = staged_vector_sidecar(body)?;
     match shape {
         SidecarRowShape::Stored => Ok(sidecar),
         SidecarRowShape::Normalized => {
-            let (_, normalized) =
-                sparse_row_to_doc(key, &sidecar, SparseBodyFormatRef::VectorSidecar);
+            let (_, normalized) = sparse_row_to_doc(
+                key,
+                &sidecar,
+                SparseBodyFormatRef::VectorSidecar,
+                identity_column,
+            );
             Ok(normalized)
         }
     }
@@ -78,8 +84,10 @@ impl CoreLoop {
         let Some(overlay) = self.txn_overlays.get(&txn_id) else {
             return Ok(());
         };
+        let identity_column =
+            self.identity_column(coll_key.0.as_u64(), coll_key.1.as_u64(), &coll_key.2);
         merge_staged_rows(overlay, coll_key, rows, matches, &|key, body| {
-            staged_vector_scan_body(shape, key, body)
+            staged_vector_scan_body(shape, key, body, &identity_column)
         })
     }
 
@@ -258,16 +266,16 @@ mod tests {
         .to_bytes()
         .expect("encode");
         let key = StorageKey::for_surrogate(Surrogate::new(9));
-        let body =
-            staged_vector_scan_body(SidecarRowShape::Normalized, &key, &staged).expect("decode");
+        let body = staged_vector_scan_body(SidecarRowShape::Normalized, &key, &staged, "id")
+            .expect("decode");
         let doc: serde_json::Value = nodedb_types::json_from_msgpack(&body).expect("json");
         assert_eq!(doc.get("owner").and_then(|v| v.as_str()), Some("carol"));
         assert_eq!(doc.get("id").and_then(|v| v.as_str()), Some("r1"));
         assert_eq!(
-            staged_vector_scan_body(SidecarRowShape::Stored, &key, &staged).expect("decode"),
+            staged_vector_scan_body(SidecarRowShape::Stored, &key, &staged, "id").expect("decode"),
             stored_sidecar,
             "the stored shape is the sidecar byte-for-byte"
         );
-        assert!(staged_vector_scan_body(SidecarRowShape::Normalized, &key, &[0xc1]).is_err());
+        assert!(staged_vector_scan_body(SidecarRowShape::Normalized, &key, &[0xc1], "id").is_err());
     }
 }
