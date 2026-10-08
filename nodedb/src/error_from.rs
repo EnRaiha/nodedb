@@ -318,6 +318,11 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
             // Keep the verdict typed across a further hop instead of
             // degrading it to a numeric class on the second forward.
             Error::DataPlane(code) => TypedClusterError::DataPlane { code: code.into() },
+            // A CRDT error crosses as its Data-Plane verdict, so its class
+            // survives the hop instead of reading as a server fault.
+            Error::Crdt(crdt) => TypedClusterError::DataPlane {
+                code: crate::bridge::envelope::ErrorCode::from(&crdt).into(),
+            },
             // Keep the constraint kind typed across a further hop, same as
             // a Data-Plane verdict, instead of flattening it to one code.
             Error::RejectedConstraint {
@@ -438,7 +443,6 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
             | Error::SegmentCorrupted { .. }
             | Error::MemoryExhausted { .. }
             | Error::Backpressure { .. }
-            | Error::Crdt(_)
             | Error::Io(_)
             | Error::Config { .. }
             | Error::Encryption { .. }

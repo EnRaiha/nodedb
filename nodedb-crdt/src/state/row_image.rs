@@ -66,56 +66,61 @@ impl CrdtState {
     /// Container-valued fields keep their state. A `Fields` image needs the
     /// row to still be a map: a scalar write keeps the row's map, so any
     /// other row shape is refused with `NonMapRowValue`.
+    ///
+    /// The compensating operations commit on return, on success and on
+    /// error. This is the undo path for a failed `upsert` or `set_fields`.
     pub fn restore_row_image(
         &self,
         collection: &str,
         row_id: &str,
         image: &RowImage,
     ) -> Result<()> {
-        let coll = self.doc.get_map(collection);
-        match image {
-            RowImage::Absent => {
-                if coll.get(row_id).is_some() {
-                    coll.delete(row_id).map_err(loro_error)?;
-                }
-                Ok(())
-            }
-            RowImage::Value(value) => coll.insert(row_id, value.clone()).map_err(loro_error),
-            RowImage::Fields(fields) => {
-                let row = match coll.get(row_id) {
-                    Some(ValueOrContainer::Container(loro::Container::Map(row))) => row,
-                    other => {
-                        return Err(CrdtError::NonMapRowValue {
-                            collection: collection.to_string(),
-                            row_id: row_id.to_string(),
-                            value: match other {
-                                None => "nothing".to_string(),
-                                Some(ValueOrContainer::Value(value)) => {
-                                    format!("the scalar {value:?}")
-                                }
-                                Some(ValueOrContainer::Container(container)) => {
-                                    format!("a {:?} container", container.get_type())
-                                }
-                            },
-                        });
+        self.doc.mutate(|doc| {
+            let coll = doc.get_map(collection);
+            match image {
+                RowImage::Absent => {
+                    if coll.get(row_id).is_some() {
+                        coll.delete(row_id).map_err(loro_error)?;
                     }
-                };
-                for (key, _) in scalar_fields(&row) {
-                    if !fields.iter().any(|(field, _)| *field == key) {
-                        row.delete(&key).map_err(loro_error)?;
-                    }
+                    Ok(())
                 }
-                for (field, value) in fields {
-                    match row.get(field) {
-                        Some(ValueOrContainer::Value(current)) if current == *value => {}
-                        _ => {
-                            row.insert(field, value.clone()).map_err(loro_error)?;
+                RowImage::Value(value) => coll.insert(row_id, value.clone()).map_err(loro_error),
+                RowImage::Fields(fields) => {
+                    let row = match coll.get(row_id) {
+                        Some(ValueOrContainer::Container(loro::Container::Map(row))) => row,
+                        other => {
+                            return Err(CrdtError::NonMapRowValue {
+                                collection: collection.to_string(),
+                                row_id: row_id.to_string(),
+                                value: match other {
+                                    None => "nothing".to_string(),
+                                    Some(ValueOrContainer::Value(value)) => {
+                                        format!("the scalar {value:?}")
+                                    }
+                                    Some(ValueOrContainer::Container(container)) => {
+                                        format!("a {:?} container", container.get_type())
+                                    }
+                                },
+                            });
+                        }
+                    };
+                    for (key, _) in scalar_fields(&row) {
+                        if !fields.iter().any(|(field, _)| *field == key) {
+                            row.delete(&key).map_err(loro_error)?;
                         }
                     }
+                    for (field, value) in fields {
+                        match row.get(field) {
+                            Some(ValueOrContainer::Value(current)) if current == *value => {}
+                            _ => {
+                                row.insert(field, value.clone()).map_err(loro_error)?;
+                            }
+                        }
+                    }
+                    Ok(())
                 }
-                Ok(())
             }
-        }
+        })
     }
 }
 

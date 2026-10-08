@@ -323,6 +323,13 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::DataPlane(code) => {
             crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(code)
         }
+        // A CRDT error renders the SQLSTATE of its Data-Plane verdict. Only
+        // a server fault renders `XX000`.
+        crate::Error::Crdt(crdt) => {
+            crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate(
+                &crate::bridge::envelope::ErrorCode::from(crdt),
+            )
+        }
         crate::Error::Shaping(e) => (
             "ERROR",
             numeric_code_to_sqlstate(e.code()),
@@ -419,7 +426,6 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         | crate::Error::Serialization { .. }
         | crate::Error::Codec { .. }
         | crate::Error::SegmentCorrupted { .. }
-        | crate::Error::Crdt(_)
         | crate::Error::Io(_)
         | crate::Error::Config { .. }
         | crate::Error::Encryption { .. }

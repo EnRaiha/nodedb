@@ -90,6 +90,8 @@ pub struct ColumnInfo {
     /// `None` for columns synthesized by the planner (e.g. auto-injected `id`).
     /// Columnar INSERT converters use this to reconstruct the exact `ColumnType`
     /// so JSON / Geometry / UUID columns are not incorrectly inferred as String.
+    /// Write coercion reads a `VECTOR(dim)` declaration from it on a column
+    /// whose `data_type` advertises text.
     pub raw_type: Option<String>,
     /// Declared width of an integer column, resolved once from the catalog at
     /// adapter-construction time. `None` for non-integer columns and for

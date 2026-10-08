@@ -36,6 +36,7 @@ pub mod read_result;
 mod redo_window;
 pub mod request;
 pub mod routing;
+pub mod run_loop;
 pub mod scheduler;
 pub mod sequencer_proposer;
 pub mod staged_vote;

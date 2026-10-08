@@ -67,6 +67,8 @@ pub(super) fn retryable_refusal_reason(error: &crate::Error) -> Option<&str> {
             | ErrorCode::DatatypeMismatch { .. }
             | ErrorCode::InvalidDatetimeFormat { .. }
             | ErrorCode::DatetimeFieldOverflow { .. }
+            | ErrorCode::UndefinedObject { .. }
+            | ErrorCode::ObjectNotInPrerequisiteState { .. }
             | ErrorCode::DispatchCapacity { .. }
             | ErrorCode::ExpiredBeforeExecution
             | ErrorCode::BadRequest { .. }
@@ -393,6 +395,8 @@ fn is_indeterminate_code(code: &ErrorCode) -> bool {
         | ErrorCode::DatatypeMismatch { .. }
         | ErrorCode::InvalidDatetimeFormat { .. }
         | ErrorCode::DatetimeFieldOverflow { .. }
+        | ErrorCode::UndefinedObject { .. }
+        | ErrorCode::ObjectNotInPrerequisiteState { .. }
         | ErrorCode::BadRequest { .. }
         | ErrorCode::ActiveSqlTransaction { .. }
         | ErrorCode::DependentObjectsExist { .. }

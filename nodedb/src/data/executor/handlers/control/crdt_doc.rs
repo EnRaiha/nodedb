@@ -116,7 +116,9 @@ impl CoreLoop {
                 }
                 Ok(Self::encode_crdt_row(engine, collection, document_id))
             });
-        // A Loro write that fails part-way leaves some fields written.
+        // A Loro write that fails part-way commits the fields it wrote before
+        // the error. Loro cannot roll them back, so the undo writes the
+        // captured row image over them.
         let bytes = match mutated {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {

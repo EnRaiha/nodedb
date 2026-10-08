@@ -57,10 +57,11 @@ pub fn list_delete(
 ) -> Result<()> {
     let list = get_movable_list(doc, collection, row_id, list_path)?;
     if index >= list.len() {
-        return Err(CrdtError::Loro(format!(
-            "list delete index {index} out of bounds (len={})",
-            list.len()
-        )));
+        return Err(CrdtError::BlockListIndexOutOfBounds {
+            list_path: list_path.to_string(),
+            index,
+            len: list.len(),
+        });
     }
     list.delete(index, 1)
         .map_err(|e| CrdtError::Loro(format!("list delete at {index}: {e}")))?;
@@ -84,15 +85,14 @@ pub fn list_move(
     }
     let list = get_movable_list(doc, collection, row_id, list_path)?;
     let len = list.len();
-    if from_index >= len {
-        return Err(CrdtError::Loro(format!(
-            "list move from_index {from_index} out of bounds (len={len})"
-        )));
-    }
-    if to_index >= len {
-        return Err(CrdtError::Loro(format!(
-            "list move to_index {to_index} out of bounds (len={len})"
-        )));
+    for index in [from_index, to_index] {
+        if index >= len {
+            return Err(CrdtError::BlockListIndexOutOfBounds {
+                list_path: list_path.to_string(),
+                index,
+                len,
+            });
+        }
     }
     list.mov(from_index, to_index)
         .map_err(|e| CrdtError::Loro(format!("list move {from_index}→{to_index}: {e}")))?;
@@ -129,6 +129,51 @@ pub fn list_get(
     })
 }
 
+/// The row map `list_path` is resolved in. A block list lives inside an
+/// existing row map, so an absent or non-map row is refused.
+fn block_list_row(doc: &LoroDoc, collection: &str, row_id: &str) -> Result<LoroMap> {
+    match doc.get_map(collection).get(row_id) {
+        Some(ValueOrContainer::Container(loro::Container::Map(m))) => Ok(m),
+        _ => Err(CrdtError::BlockListRowAbsent {
+            collection: collection.to_string(),
+            row_id: row_id.to_string(),
+        }),
+    }
+}
+
+/// Split `list_path` into its parent map segments and the list segment.
+fn split_list_path(list_path: &str) -> (Vec<&str>, &str) {
+    match list_path.rsplit_once('.') {
+        Some((parents, last)) => (parents.split('.').collect(), last),
+        None => (Vec::new(), list_path),
+    }
+}
+
+/// The movable list held by `value` at the last segment of `list_path`.
+fn movable_list_at(
+    value: Option<ValueOrContainer>,
+    list_path: &str,
+    segment: &str,
+) -> Result<Option<LoroMovableList>> {
+    match value {
+        Some(ValueOrContainer::Container(loro::Container::MovableList(l))) => Ok(Some(l)),
+        Some(ValueOrContainer::Container(loro::Container::List(_))) => {
+            Err(CrdtError::BlockListNotMovable {
+                list_path: list_path.to_string(),
+            })
+        }
+        None => Ok(None),
+        Some(_) => Err(path_unresolved(list_path, segment)),
+    }
+}
+
+fn path_unresolved(list_path: &str, segment: &str) -> CrdtError {
+    CrdtError::BlockListPathUnresolved {
+        list_path: list_path.to_string(),
+        segment: segment.to_string(),
+    }
+}
+
 /// Navigate to a LoroMovableList at `collection/row_id/list_path`.
 ///
 /// `list_path` is a dot-separated field path within the row LoroMap.
@@ -140,46 +185,16 @@ fn get_movable_list(
     row_id: &str,
     list_path: &str,
 ) -> Result<LoroMovableList> {
-    let coll = doc.get_map(collection);
-    let row = match coll.get(row_id) {
-        Some(ValueOrContainer::Container(loro::Container::Map(m))) => m,
-        _ => {
-            return Err(CrdtError::Loro(format!(
-                "row '{row_id}' not found or not a map in '{collection}'"
-            )));
-        }
-    };
-
-    let segments: Vec<&str> = list_path.split('.').collect();
-    let mut current_map = row;
-
-    for (i, segment) in segments.iter().enumerate() {
-        let is_last = i == segments.len() - 1;
-        match current_map.get(segment) {
-            Some(ValueOrContainer::Container(loro::Container::MovableList(l))) if is_last => {
-                return Ok(l);
-            }
-            // Also accept LoroList for backward compatibility (read-only navigation).
-            Some(ValueOrContainer::Container(loro::Container::List(_))) if is_last => {
-                return Err(CrdtError::Loro(format!(
-                    "path '{list_path}' resolved to LoroList, not LoroMovableList. \
-                     Use LoroMovableList for block containers that support reordering."
-                )));
-            }
-            Some(ValueOrContainer::Container(loro::Container::Map(m))) if !is_last => {
-                current_map = m;
-            }
-            _ => {
-                return Err(CrdtError::Loro(format!(
-                    "path '{list_path}' segment '{segment}' not found or wrong type"
-                )));
-            }
-        }
+    let (parents, last) = split_list_path(list_path);
+    let mut current_map = block_list_row(doc, collection, row_id)?;
+    for segment in parents {
+        current_map = match current_map.get(segment) {
+            Some(ValueOrContainer::Container(loro::Container::Map(m))) => m,
+            _ => return Err(path_unresolved(list_path, segment)),
+        };
     }
-
-    Err(CrdtError::Loro(format!(
-        "path '{list_path}' did not resolve to a movable list"
-    )))
+    movable_list_at(current_map.get(last), list_path, last)?
+        .ok_or_else(|| path_unresolved(list_path, last))
 }
 
 /// Navigate to a LoroMovableList at `collection/row_id/list_path`, creating
@@ -204,42 +219,9 @@ fn get_or_create_movable_list(
     row_id: &str,
     list_path: &str,
 ) -> Result<LoroMovableList> {
-    let coll = doc.get_map(collection);
-    let row = match coll.get(row_id) {
-        Some(ValueOrContainer::Container(loro::Container::Map(m))) => m,
-        _ => {
-            return Err(CrdtError::Loro(format!(
-                "row '{row_id}' not found or not a map in '{collection}'"
-            )));
-        }
-    };
-
-    let segments: Vec<&str> = list_path.split('.').collect();
-    let mut current_map = row;
-
-    for (i, segment) in segments.iter().enumerate() {
-        let is_last = i == segments.len() - 1;
-
-        if is_last {
-            return match current_map.get(segment) {
-                Some(ValueOrContainer::Container(loro::Container::MovableList(l))) => Ok(l),
-                Some(ValueOrContainer::Container(loro::Container::List(_))) => {
-                    Err(CrdtError::Loro(format!(
-                        "path '{list_path}' resolved to LoroList, not LoroMovableList. \
-                         Use LoroMovableList for block containers that support reordering."
-                    )))
-                }
-                None => current_map
-                    .insert_container(segment, LoroMovableList::new())
-                    .map_err(|e| {
-                        CrdtError::Loro(format!("create movable list at '{list_path}': {e}"))
-                    }),
-                Some(_) => Err(CrdtError::Loro(format!(
-                    "path '{list_path}' segment '{segment}' not found or wrong type"
-                ))),
-            };
-        }
-
+    let (parents, last) = split_list_path(list_path);
+    let mut current_map = block_list_row(doc, collection, row_id)?;
+    for segment in parents {
         current_map = match current_map.get(segment) {
             Some(ValueOrContainer::Container(loro::Container::Map(m))) => m,
             None => current_map
@@ -249,17 +231,15 @@ fn get_or_create_movable_list(
                         "create intermediate map at '{list_path}' segment '{segment}': {e}"
                     ))
                 })?,
-            Some(_) => {
-                return Err(CrdtError::Loro(format!(
-                    "path '{list_path}' segment '{segment}' not found or wrong type"
-                )));
-            }
+            Some(_) => return Err(path_unresolved(list_path, segment)),
         };
     }
-
-    Err(CrdtError::Loro(format!(
-        "path '{list_path}' did not resolve to a movable list"
-    )))
+    match movable_list_at(current_map.get(last), list_path, last)? {
+        Some(list) => Ok(list),
+        None => current_map
+            .insert_container(last, LoroMovableList::new())
+            .map_err(|e| CrdtError::Loro(format!("create movable list at '{list_path}': {e}"))),
+    }
 }
 
 #[cfg(test)]
@@ -412,14 +392,22 @@ mod tests {
     fn list_delete_out_of_bounds() {
         let state = setup_doc_with_blocks();
         let err = list_delete(state.doc(), "pages", "doc-1", "blocks", 99);
-        assert!(err.is_err());
+        assert!(matches!(
+            err,
+            Err(CrdtError::BlockListIndexOutOfBounds { index: 99, .. })
+        ));
     }
 
     #[test]
     fn get_list_wrong_path_errors() {
         let state = setup_doc_with_blocks();
         let err = list_length(state.doc(), "pages", "doc-1", "nonexistent");
-        assert!(err.is_err());
+        assert!(matches!(
+            err,
+            Err(CrdtError::BlockListPathUnresolved { ref segment, .. }) if segment == "nonexistent"
+        ));
+        let err = list_length(state.doc(), "pages", "missing-row", "blocks");
+        assert!(matches!(err, Err(CrdtError::BlockListRowAbsent { .. })));
     }
 
     /// A row with no list at `list_path` yet — the setup previous agents
@@ -502,7 +490,10 @@ mod tests {
             0,
             LoroValue::String("x".into()),
         );
-        assert!(err.is_err());
+        assert!(matches!(
+            err,
+            Err(CrdtError::BlockListPathUnresolved { ref segment, .. }) if segment == "blocks"
+        ));
         // The scalar must survive untouched — no silent replacement.
         match row.get("blocks") {
             Some(ValueOrContainer::Value(v)) => {
@@ -516,13 +507,19 @@ mod tests {
     fn list_delete_on_missing_list_still_errors() {
         let state = setup_bare_row("doc-2");
         let err = list_delete(state.doc(), "pages", "doc-2", "blocks", 0);
-        assert!(err.is_err());
+        assert!(matches!(
+            err,
+            Err(CrdtError::BlockListPathUnresolved { .. })
+        ));
     }
 
     #[test]
     fn list_move_on_missing_list_still_errors() {
         let state = setup_bare_row("doc-2");
         let err = list_move(state.doc(), "pages", "doc-2", "blocks", 0, 1);
-        assert!(err.is_err());
+        assert!(matches!(
+            err,
+            Err(CrdtError::BlockListPathUnresolved { .. })
+        ));
     }
 }

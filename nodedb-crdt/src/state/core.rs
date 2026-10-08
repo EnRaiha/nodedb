@@ -89,8 +89,8 @@ impl CrdtState {
     /// Fetch a row's existing `LoroMap` container, or create one if absent.
     /// Shared by `upsert` and `set_fields` — both need the same row handle
     /// before diverging on prune-vs-preserve semantics.
-    fn row_container(&self, collection: &str, row_id: &str) -> Result<LoroMap> {
-        let coll = self.doc.get_map(collection);
+    fn row_container(doc: &LoroDoc, collection: &str, row_id: &str) -> Result<LoroMap> {
+        let coll = doc.get_map(collection);
         match coll.get(row_id) {
             Some(ValueOrContainer::Container(loro::Container::Map(m))) => Ok(m),
             _ => coll
@@ -128,23 +128,17 @@ impl CrdtState {
         Ok(())
     }
 
-    /// Insert or update a row in a collection.
+    /// The body of [`CrdtState::upsert`], run inside an open mutation.
     ///
-    /// This is a REPLACE for scalar fields — every caller passes the
-    /// complete scalar projection, and any current scalar key absent from
-    /// `fields` is deleted. It reuses the row's existing `LoroMap` rather
-    /// than destroying and recreating it, because container-valued keys
-    /// (e.g. the Notion-style block list in `list_ops.rs`, stored as a
-    /// container-valued key inside this same row map) cannot be expressed in
-    /// `fields: &[(&str, LoroValue)]` at all — they are structurally out of
-    /// scope for this replace and must survive across every call.
-    pub fn upsert(
-        &self,
+    /// `upsert_versioned` calls it in the same mutation as its archive
+    /// write, so the archive entry and the new row commit together.
+    pub(in crate::state) fn replace_row_fields(
+        doc: &LoroDoc,
         collection: &str,
         row_id: &str,
         fields: &[(&str, LoroValue)],
     ) -> Result<()> {
-        let row_container = self.row_container(collection, row_id)?;
+        let row_container = Self::row_container(doc, collection, row_id)?;
 
         let incoming_keys: HashSet<&str> = fields.iter().map(|(field, _)| *field).collect();
 
@@ -169,30 +163,58 @@ impl CrdtState {
         Self::write_scalar_fields(&row_container, collection, row_id, fields)
     }
 
+    /// Insert or update a row in a collection.
+    ///
+    /// This is a REPLACE for scalar fields — every caller passes the
+    /// complete scalar projection, and any current scalar key absent from
+    /// `fields` is deleted. It reuses the row's existing `LoroMap` rather
+    /// than destroying and recreating it, because container-valued keys
+    /// (e.g. the Notion-style block list in `list_ops.rs`, stored as a
+    /// container-valued key inside this same row map) cannot be expressed in
+    /// `fields: &[(&str, LoroValue)]` at all — they are structurally out of
+    /// scope for this replace and must survive across every call.
+    ///
+    /// The write commits on return, on success and on error.
+    pub fn upsert(
+        &self,
+        collection: &str,
+        row_id: &str,
+        fields: &[(&str, LoroValue)],
+    ) -> Result<()> {
+        self.doc
+            .mutate(|doc| Self::replace_row_fields(doc, collection, row_id, fields))
+    }
+
     /// Partial-merge write: set exactly the provided scalar `fields` on a row
     /// (LWW-per-field), creating the row if absent, leaving every untouched
     /// key intact. This is `upsert` WITHOUT the full-projection prune step —
     /// the UPDATE-SET semantic for `CrdtOp::DocUpsert { partial: true }`.
+    ///
+    /// The write commits on return, on success and on error.
     pub fn set_fields(
         &self,
         collection: &str,
         row_id: &str,
         fields: &[(&str, LoroValue)],
     ) -> Result<()> {
-        let row_container = self.row_container(collection, row_id)?;
-        Self::write_scalar_fields(&row_container, collection, row_id, fields)
+        self.doc.mutate(|doc| {
+            let row_container = Self::row_container(doc, collection, row_id)?;
+            Self::write_scalar_fields(&row_container, collection, row_id, fields)
+        })
     }
 
-    /// Delete a row from a collection.
+    /// Delete a row from a collection. The delete commits on return.
     pub fn delete(&self, collection: &str, row_id: &str) -> Result<()> {
-        let coll = self.doc.get_map(collection);
-        coll.delete(row_id)
-            .map_err(|e| CrdtError::Loro(e.to_string()))?;
-        Ok(())
+        self.doc.mutate(|doc| {
+            doc.get_map(collection)
+                .delete(row_id)
+                .map_err(|e| CrdtError::Loro(e.to_string()))
+        })
     }
 
     /// Insert a block-map into one row's movable list and populate scalar fields.
-    /// The raw document handle never leaves this state object.
+    /// The raw document handle never leaves this state object. The insert
+    /// commits on return, on success and on error.
     pub fn list_insert_fields(
         &self,
         collection: &str,
@@ -201,18 +223,20 @@ impl CrdtState {
         index: usize,
         fields: &[(String, LoroValue)],
     ) -> Result<()> {
-        let block = crate::list_ops::list_insert_container(
-            &self.doc, collection, row_id, list_path, index,
-        )?;
-        for (key, value) in fields {
-            block
-                .insert(key.as_str(), value.clone())
-                .map_err(|error| CrdtError::Loro(error.to_string()))?;
-        }
-        Ok(())
+        self.doc.mutate(|doc| {
+            let block =
+                crate::list_ops::list_insert_container(doc, collection, row_id, list_path, index)?;
+            for (key, value) in fields {
+                block
+                    .insert(key.as_str(), value.clone())
+                    .map_err(|error| CrdtError::Loro(error.to_string()))?;
+            }
+            Ok(())
+        })
     }
 
-    /// Delete one block from a row-owned movable list.
+    /// Delete one block from a row-owned movable list. The delete commits on
+    /// return.
     pub fn list_delete(
         &self,
         collection: &str,
@@ -220,10 +244,12 @@ impl CrdtState {
         list_path: &str,
         index: usize,
     ) -> Result<()> {
-        crate::list_ops::list_delete(&self.doc, collection, row_id, list_path, index)
+        self.doc
+            .mutate(|doc| crate::list_ops::list_delete(doc, collection, row_id, list_path, index))
     }
 
-    /// Move one block within a row-owned movable list.
+    /// Move one block within a row-owned movable list. The move commits on
+    /// return.
     pub fn list_move(
         &self,
         collection: &str,
@@ -232,9 +258,9 @@ impl CrdtState {
         from_index: usize,
         to_index: usize,
     ) -> Result<()> {
-        crate::list_ops::list_move(
-            &self.doc, collection, row_id, list_path, from_index, to_index,
-        )
+        self.doc.mutate(|doc| {
+            crate::list_ops::list_move(doc, collection, row_id, list_path, from_index, to_index)
+        })
     }
 
     /// Return one row-owned movable list's length.
@@ -254,15 +280,17 @@ impl CrdtState {
     }
 
     /// Delete all rows in a collection. Returns the number of rows deleted.
+    /// The deletes commit on return, on success and on error.
     pub fn clear_collection(&self, collection: &str) -> Result<usize> {
-        let coll = self.doc.get_map(collection);
-        let keys: Vec<String> = coll.keys().map(|k| k.to_string()).collect();
-        let count = keys.len();
-        for key in &keys {
-            coll.delete(key)
-                .map_err(|e| CrdtError::Loro(e.to_string()))?;
-        }
-        Ok(count)
+        self.doc.mutate(|doc| {
+            let coll = doc.get_map(collection);
+            let keys: Vec<String> = coll.keys().map(|k| k.to_string()).collect();
+            for key in &keys {
+                coll.delete(key)
+                    .map_err(|e| CrdtError::Loro(e.to_string()))?;
+            }
+            Ok(keys.len())
+        })
     }
 
     /// Read a single row's fields as a `LoroValue::Map`.
@@ -770,9 +798,14 @@ mod tests {
     #[test]
     fn oplog_version_counts_uncommitted_operations() {
         let state = CrdtState::new(1).unwrap();
+        // Every mutator commits on return, so the raw handle is the only way
+        // to hold an operation in an open transaction.
         state
-            .upsert("items", "a", &[("value", LoroValue::I64(1))])
+            .doc
+            .get_map("items")
+            .insert("a", LoroValue::I64(1))
             .unwrap();
+        assert_ne!(state.doc.get_pending_txn_len(), 0);
 
         // The memory estimate is cached against this version vector. That is only
         // sound because Loro advances it when the operation is written rather than
@@ -1015,5 +1048,160 @@ mod tests {
             "the collections are the top-level keys; row ids and fields belong to \
              the collections, not to this list"
         );
+    }
+
+    /// The operation count this state has authored, after checking that the
+    /// write named `what` left no open Loro transaction and authored at
+    /// least one operation past `before`.
+    fn committed(state: &CrdtState, before: i32, what: &str) -> i32 {
+        assert_eq!(
+            state.doc.get_pending_txn_len(),
+            0,
+            "{what} left its operations in an open Loro transaction"
+        );
+        let after = state.local_op_counter();
+        assert!(after > before, "{what} authored no operation");
+        after
+    }
+
+    #[test]
+    fn every_mutator_commits_before_it_returns() {
+        let state = CrdtState::new(1).unwrap();
+        let mut ops = state.local_op_counter();
+
+        state
+            .upsert(
+                "docs",
+                "r",
+                &[("a", LoroValue::I64(1)), ("b", LoroValue::I64(2))],
+            )
+            .unwrap();
+        ops = committed(&state, ops, "upsert");
+        state
+            .set_fields("docs", "r", &[("b", LoroValue::I64(3))])
+            .unwrap();
+        ops = committed(&state, ops, "set_fields");
+        for (index, id) in ["b0", "b1"].into_iter().enumerate() {
+            state
+                .list_insert_fields(
+                    "docs",
+                    "r",
+                    "blocks",
+                    index,
+                    &[("id".into(), LoroValue::String(id.into()))],
+                )
+                .unwrap();
+            ops = committed(&state, ops, "list_insert_fields");
+        }
+        state.list_move("docs", "r", "blocks", 0, 1).unwrap();
+        ops = committed(&state, ops, "list_move");
+        state.list_delete("docs", "r", "blocks", 0).unwrap();
+        ops = committed(&state, ops, "list_delete");
+        assert_eq!(state.remove_fields("docs", "r", &["a"]).unwrap(), 1);
+        ops = committed(&state, ops, "remove_fields");
+        state
+            .restore_row_image("docs", "r", &crate::state::RowImage::Absent)
+            .unwrap();
+        ops = committed(&state, ops, "restore_row_image");
+
+        for sys_ms in [10, 20] {
+            state
+                .upsert_versioned(
+                    "hist",
+                    "h",
+                    &[
+                        ("_ts_system", LoroValue::I64(sys_ms)),
+                        ("v", LoroValue::I64(sys_ms)),
+                    ],
+                )
+                .unwrap();
+            ops = committed(&state, ops, "upsert_versioned");
+        }
+        assert_eq!(state.archive_version_count("hist", "h"), 1);
+        assert_eq!(state.purge_history_before("hist", 15).unwrap(), 1);
+        ops = committed(&state, ops, "purge_history_before");
+
+        state
+            .upsert("docs", "r2", &[("v", LoroValue::I64(1))])
+            .unwrap();
+        ops = committed(&state, ops, "upsert");
+        let version = state.oplog_version_vector();
+        state
+            .upsert("docs", "r2", &[("v", LoroValue::I64(2))])
+            .unwrap();
+        ops = committed(&state, ops, "upsert");
+        let delta = state.restore_to_version("docs", "r2", &version).unwrap();
+        assert!(!delta.is_empty());
+        ops = committed(&state, ops, "restore_to_version");
+        state.delete("docs", "r2").unwrap();
+        ops = committed(&state, ops, "delete");
+        assert_eq!(state.clear_collection("hist").unwrap(), 1);
+        committed(&state, ops, "clear_collection");
+    }
+
+    #[test]
+    fn a_version_taken_after_a_write_restores_through_preview() {
+        let state = CrdtState::new(1).unwrap();
+        state
+            .upsert("docs", "doc", &[("title", LoroValue::String("v1".into()))])
+            .unwrap();
+        // A checkpoint reads the version right after the acknowledged write.
+        let checkpoint = state.oplog_version_vector();
+        assert!(
+            state
+                .preview_restore_to_version("docs", "doc", &checkpoint)
+                .expect("a restore preview right after a write must not be refused")
+                .is_empty(),
+            "the document is already at the checkpoint"
+        );
+
+        state
+            .set_fields("docs", "doc", &[("title", LoroValue::String("v2".into()))])
+            .unwrap();
+        let delta = state
+            .preview_restore_to_version("docs", "doc", &checkpoint)
+            .expect("preview after a later write");
+        assert!(!delta.is_empty());
+        state.import(&delta).unwrap();
+        assert_eq!(
+            state.read_field("docs", "doc", "title"),
+            Some(LoroValue::String("v1".into())),
+            "the checkpoint must hold the write acknowledged before it"
+        );
+    }
+
+    #[test]
+    fn a_scalar_write_refused_part_way_commits_and_its_row_image_undoes_it() {
+        let state = CrdtState::new(1).unwrap();
+        state
+            .upsert("docs", "r", &[("a", LoroValue::I64(1))])
+            .unwrap();
+        attach_nested_block_list(&state, "docs", "r");
+        let image = state.row_image("docs", "r").unwrap();
+
+        // `a` is written before `blocks` is refused, for both scalar writes.
+        let partial = [("a", LoroValue::I64(2)), ("blocks", LoroValue::I64(3))];
+        for partial_merge in [true, false] {
+            let refusal = if partial_merge {
+                state.set_fields("docs", "r", &partial)
+            } else {
+                state.upsert("docs", "r", &partial)
+            };
+            assert!(matches!(
+                refusal,
+                Err(CrdtError::ScalarFieldShadowsContainer { ref field, .. }) if field == "blocks"
+            ));
+            assert_eq!(
+                state.doc.get_pending_txn_len(),
+                0,
+                "a refused write must not leave its partial operations open"
+            );
+            assert_eq!(state.read_field("docs", "r", "a"), Some(LoroValue::I64(2)));
+
+            state.restore_row_image("docs", "r", &image).unwrap();
+            assert_eq!(state.doc.get_pending_txn_len(), 0);
+            assert_eq!(state.read_field("docs", "r", "a"), Some(LoroValue::I64(1)));
+            assert_eq!(state.list_length("docs", "r", "blocks").unwrap(), 1);
+        }
     }
 }

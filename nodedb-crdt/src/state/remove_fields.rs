@@ -18,7 +18,8 @@ impl CrdtState {
     /// A container-valued key is refused with `ScalarFieldShadowsContainer`,
     /// as `set_fields` refuses it: deleting it discards its nested CRDT state
     /// (e.g. a row's block list). Every field is checked before any is
-    /// deleted, so a refused call deletes nothing.
+    /// deleted, so a refused call deletes nothing. The deletes commit on
+    /// return.
     pub fn remove_fields(&self, collection: &str, row_id: &str, fields: &[&str]) -> Result<usize> {
         let coll = self.doc.get_map(collection);
         let row: LoroMap = match coll.get(row_id) {
@@ -35,15 +36,17 @@ impl CrdtState {
                 field: (*field).to_string(),
             });
         }
-        let mut removed = 0;
-        for field in fields {
-            if row.get(field).is_some() {
-                row.delete(field)
-                    .map_err(|e| CrdtError::Loro(e.to_string()))?;
-                removed += 1;
+        self.doc.mutate(|_| {
+            let mut removed = 0;
+            for field in fields {
+                if row.get(field).is_some() {
+                    row.delete(field)
+                        .map_err(|e| CrdtError::Loro(e.to_string()))?;
+                    removed += 1;
+                }
             }
-        }
-        Ok(removed)
+            Ok(removed)
+        })
     }
 }
 

@@ -19,6 +19,11 @@ use nodedb_cluster::rpc_codec::{DataPlaneErrorCode, TypedClusterError};
 pub(crate) fn execution_error_to_typed(err: crate::Error) -> TypedClusterError {
     match err {
         crate::Error::DataPlane(code) => TypedClusterError::DataPlane { code: code.into() },
+        // A CRDT error crosses as its Data-Plane verdict, so the coordinator
+        // answers the SQLSTATE a local execution answers.
+        crate::Error::Crdt(crdt) => TypedClusterError::DataPlane {
+            code: crate::bridge::envelope::ErrorCode::from(&crdt).into(),
+        },
         // A statement that ran out of time keeps the wire's own deadline
         // variant, which the coordinator rebuilds as `Error::DeadlineExceeded`.
         // Folding it into `Internal` will report a client's own timeout as an
@@ -141,7 +146,6 @@ pub(crate) fn execution_error_to_typed(err: crate::Error) -> TypedClusterError {
         | crate::Error::SegmentCorrupted { .. }
         | crate::Error::MemoryExhausted { .. }
         | crate::Error::Backpressure { .. }
-        | crate::Error::Crdt(_)
         | crate::Error::Io(_)
         | crate::Error::Config { .. }
         | crate::Error::Encryption { .. }

@@ -154,9 +154,7 @@ pub(crate) fn convert_collection_type(
                 if !profile.is_timeseries() && name.eq_ignore_ascii_case(pk_name) {
                     continue;
                 }
-                let mut column = declared_column_info(name, type_str);
-                column.raw_type = Some(type_str.clone());
-                columns.push(column);
+                columns.push(declared_column_info(name, type_str));
             }
             let pk = if profile.is_timeseries() {
                 None
@@ -169,7 +167,8 @@ pub(crate) fn convert_collection_type(
 }
 
 /// The planner-facing column a raw DDL declaration (`name`, `type_str`)
-/// resolves to: its SQL type, declared numeric width, and DEFAULT text.
+/// resolves to: its SQL type, declared numeric width, DEFAULT text, and the
+/// declared text itself.
 ///
 /// `type_str` is the text that followed the column name in the DDL, modifiers
 /// included (`SMALLINT DEFAULT 5`, `TIMESTAMP TIME_KEY`). The schemaless and
@@ -184,7 +183,7 @@ pub(crate) fn declared_column_info(name: &str, type_str: &str) -> ColumnInfo {
         nullable: true,
         is_primary_key: false,
         default: declared_default(type_str),
-        raw_type: None,
+        raw_type: Some(type_str.to_string()),
         int_width: IntWidth::from_declared_type(type_str),
         float_width: FloatWidth::from_declared_type(type_str),
     }

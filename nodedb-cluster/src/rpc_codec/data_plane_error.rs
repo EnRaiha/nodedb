@@ -228,6 +228,15 @@ pub enum DataPlaneErrorCode {
     DatetimeFieldOverflow {
         detail: String,
     },
+    /// The request names an object that does not exist (SQLSTATE `42704`).
+    UndefinedObject {
+        object: String,
+    },
+    /// The object is not in the state the request needs (SQLSTATE `55000`).
+    ObjectNotInPrerequisiteState {
+        object: String,
+        detail: String,
+    },
 }
 
 /// Wire mirror of `nodedb_types::text_search::TextColumnFault`.

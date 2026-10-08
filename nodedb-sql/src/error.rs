@@ -82,6 +82,16 @@ pub enum SqlError {
     #[error("type mismatch: {detail}")]
     TypeMismatch { detail: String },
 
+    /// An element of an array bound for a declared `VECTOR(dim)` column is
+    /// not a number. Rendered as SQLSTATE `42804` (datatype_mismatch).
+    /// `element` names the refused element's kind, and its text for a string.
+    #[error("column '{column}': expected a number for VECTOR({dim}), got {element}")]
+    VectorElementNotNumeric {
+        column: String,
+        dim: usize,
+        element: String,
+    },
+
     /// A statement lists a different number of targets than expressions, such
     /// as an `INSERT` whose target column list does not match its `SELECT`
     /// list.

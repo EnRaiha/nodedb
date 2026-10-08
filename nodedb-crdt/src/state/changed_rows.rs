@@ -76,6 +76,20 @@ mod tests {
             .expect("upsert");
     }
 
+    /// A local write left in Loro's open transaction. Every `CrdtState`
+    /// mutator commits on return, so only the raw document handle can leave
+    /// one open.
+    fn put_uncommitted(state: &CrdtState, row: &str, text: &str) {
+        state
+            .doc
+            .get_map("docs")
+            .insert_container(row, loro::LoroMap::new())
+            .expect("row")
+            .insert("body", LoroValue::from(text))
+            .expect("field");
+        assert_ne!(state.doc.get_pending_txn_len(), 0);
+    }
+
     fn rows(tracked: &super::TrackedImport) -> Vec<&str> {
         tracked.changed_rows.iter().map(String::as_str).collect()
     }
@@ -226,8 +240,7 @@ mod tests {
     #[test]
     fn an_uncommitted_local_write_is_not_reported_as_imported() {
         let (source, target) = synced_pair();
-        put(&target, "local", "mine");
-        assert_ne!(target.doc.get_pending_txn_len(), 0);
+        put_uncommitted(&target, "local", "mine");
         let before = source.oplog_version_vector();
         put(&source, "c", "changed");
         let delta = source.export_updates_since(&before).expect("delta");
@@ -239,11 +252,25 @@ mod tests {
     }
 
     #[test]
-    fn an_uncommitted_local_write_on_an_empty_doc_is_not_reported() {
+    fn a_committed_local_write_is_not_reported_as_imported() {
         let source = CrdtState::new(1).expect("source");
         put(&source, "a", "one");
         let target = CrdtState::new(2).expect("target");
         put(&target, "local", "mine");
+        assert_eq!(target.doc.get_pending_txn_len(), 0);
+
+        let tracked = target.import_tracked("docs", &source.export_snapshot().expect("snapshot"));
+        tracked.outcome.as_ref().expect("import");
+        assert_eq!(rows(&tracked), vec!["a"]);
+        assert!(target.row_exists("docs", "local"));
+    }
+
+    #[test]
+    fn an_uncommitted_local_write_on_an_empty_doc_is_not_reported() {
+        let source = CrdtState::new(1).expect("source");
+        put(&source, "a", "one");
+        let target = CrdtState::new(2).expect("target");
+        put_uncommitted(&target, "local", "mine");
 
         let tracked = target.import_tracked("docs", &source.export_snapshot().expect("snapshot"));
         tracked.outcome.as_ref().expect("import");
@@ -345,7 +372,6 @@ mod tests {
             .expect("hub imports peer 1");
         hub.import(&withheld).expect("hub imports peer 3");
         put(&hub, "z", "dependent");
-        hub.doc.commit();
         let vv = hub.oplog_version_vector();
         let end = |peer: u64| vv.get(&peer).copied().unwrap_or(0);
         let blob = hub

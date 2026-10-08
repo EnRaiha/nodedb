@@ -53,6 +53,9 @@ pub enum CrdtError {
 
     /// Preview requires a quiescent authoritative state and refuses to commit
     /// a caller's pending auto-commit transaction as a side effect of forking.
+    ///
+    /// Every `CrdtState` mutator commits before it returns. This error
+    /// therefore means that invariant broke, never that a client erred.
     #[error("delta preview source has {operations} pending operations")]
     PreviewSourceTransactionPending { operations: usize },
 
@@ -109,6 +112,33 @@ pub enum CrdtError {
         /// Operations of this peer the compaction discarded. A readable
         /// version asks for more than this count.
         discarded: i32,
+    },
+
+    /// The row did not exist at the requested version, so there is no state
+    /// to read or restore there.
+    #[error("document `{row_id}` in collection `{collection}` did not exist at the target version")]
+    RowAbsentAtVersion { collection: String, row_id: String },
+
+    /// A block-list operation named a row that does not exist, or a row that
+    /// is not a map of fields.
+    #[error("row `{row_id}` in collection `{collection}` is absent or is not a map")]
+    BlockListRowAbsent { collection: String, row_id: String },
+
+    /// A block-list path segment is absent, or holds a value of the wrong kind.
+    #[error("block-list path `{list_path}`: segment `{segment}` is absent or has the wrong type")]
+    BlockListPathUnresolved { list_path: String, segment: String },
+
+    /// A block-list path resolves to a plain list. Block lists must be movable
+    /// lists, so concurrent reorders converge without duplicates.
+    #[error("block-list path `{list_path}` is a plain list, not a movable list")]
+    BlockListNotMovable { list_path: String },
+
+    /// A block-list index is past the end of the list.
+    #[error("block-list `{list_path}` index {index} is out of bounds (len {len})")]
+    BlockListIndexOutOfBounds {
+        list_path: String,
+        index: usize,
+        len: usize,
     },
 
     /// Loro internal error.
