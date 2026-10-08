@@ -54,6 +54,11 @@ pub(crate) fn map_plan_error(
         // row-scope evaluator raises, so it carries the same code.
         nodedb_sql::SqlError::DivisionByZero => crate::Error::DivisionByZero,
         nodedb_sql::SqlError::DataException { detail } => crate::Error::DataException { detail },
+        // A vector element that is not a number is the wrong kind for the
+        // column: `42804`, the code the strict encoder gives the same element.
+        nodedb_sql::SqlError::VectorElementNotNumeric { .. } => crate::Error::DatatypeMismatch {
+            detail: error.to_string(),
+        },
         nodedb_sql::SqlError::InvalidLimitValue { clause, value } => {
             crate::Error::InvalidLimitValue { clause, value }
         }

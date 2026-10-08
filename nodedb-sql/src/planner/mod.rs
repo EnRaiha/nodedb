@@ -19,6 +19,7 @@ pub mod const_fold;
 pub mod cp_projection;
 pub mod cte;
 pub mod declared_type_coerce;
+pub mod declared_vector_coerce;
 pub mod defaults;
 pub mod dml;
 pub mod dml_helpers;

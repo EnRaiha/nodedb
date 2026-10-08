@@ -56,6 +56,9 @@
 //! one with more than `p - s` integer digits is refused. A plain `DECIMAL`
 //! keeps every digit it is given.
 //!
+//! A column declared `VECTOR(dim)` turns an array literal into an array of
+//! floats, for every engine. See `declared_vector_coerce` for the element rule.
+//!
 //! Every other declared type has one unambiguous literal form already and
 //! passes through untouched.
 //!
@@ -79,6 +82,7 @@ use nodedb_types::datetime::NdbDateTime;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
+use super::declared_vector_coerce::{coerce_to_vector, declared_vector_dim};
 use super::dml_helpers::{check_declared_float_ranges, check_declared_int_ranges};
 use crate::error::{Result, SqlError};
 use crate::types::{ColumnInfo, SqlDataType, SqlExpr, SqlValue};
@@ -98,7 +102,7 @@ pub fn coerce_write_literal(column: &ColumnInfo, value: SqlValue) -> Result<SqlV
     if column.is_primary_key {
         return Ok(value);
     }
-    let coerced = coerce_value(&column.name, value, &column.data_type)?;
+    let coerced = coerce_for_column(&column.name, column, value)?;
     let row = [vec![(column.name.clone(), coerced)]];
     check_declared_int_ranges(std::slice::from_ref(column), &row)?;
     check_declared_float_ranges(std::slice::from_ref(column), &row)?;
@@ -129,7 +133,7 @@ pub(super) fn coerce_row_to_declared_types(
             continue;
         };
         let taken = std::mem::replace(value, SqlValue::Null);
-        *value = coerce_value(name.as_str(), taken, &column.data_type)?;
+        *value = coerce_for_column(name.as_str(), column, taken)?;
     }
     Ok(())
 }
@@ -184,7 +188,7 @@ pub(super) fn coerce_assignments_to_declared_types(
             continue;
         };
         let taken = std::mem::replace(value, SqlValue::Null);
-        *value = coerce_value(name.as_str(), taken, &column.data_type)?;
+        *value = coerce_for_column(name.as_str(), column, taken)?;
     }
     Ok(())
 }
@@ -193,6 +197,18 @@ pub(super) fn coerce_assignments_to_declared_types(
 /// case-insensitive way as every other column-name lookup here.
 fn is_exempt(exempt_column: Option<&str>, column: &str) -> bool {
     exempt_column.is_some_and(|exempt| exempt.eq_ignore_ascii_case(column))
+}
+
+/// Coerce one literal written to `column`, reported under the name `name`.
+///
+/// A column declared `VECTOR(dim)` takes the vector rule even when its
+/// advertised [`SqlDataType`] is text, as on a schemaless or columnar-family
+/// collection. Every other column takes [`coerce_value`] for its type.
+fn coerce_for_column(name: &str, column: &ColumnInfo, value: SqlValue) -> Result<SqlValue> {
+    match declared_vector_dim(column) {
+        Some(dim) => coerce_to_vector(name, value, dim),
+        None => coerce_value(name, value, &column.data_type),
+    }
 }
 
 /// Coerce one literal to `declared`, returning it unchanged when the declared
@@ -214,12 +230,12 @@ pub(crate) fn coerce_value(
             coerce_to_instant(column, value, declared)
         }
         SqlDataType::Decimal(Some(typmod)) => coerce_to_decimal(column, value, *typmod),
+        SqlDataType::Vector(dim) => coerce_to_vector(column, value, *dim),
         SqlDataType::String
         | SqlDataType::Bool
         | SqlDataType::Bytes
         | SqlDataType::Decimal(None)
         | SqlDataType::Uuid
-        | SqlDataType::Vector(_)
         | SqlDataType::Geometry
         | SqlDataType::Json
         | SqlDataType::Unknown => Ok(value),
@@ -861,6 +877,78 @@ mod tests {
         assert_eq!(
             coerced(&columns, "ttl", decimal("1.5")).expect("undeclared columns are untouched"),
             decimal("1.5")
+        );
+    }
+
+    fn fractional_vector() -> SqlValue {
+        SqlValue::Array(vec![decimal("0.1"), SqlValue::Int(2), decimal("0.3")])
+    }
+
+    fn float_vector() -> SqlValue {
+        SqlValue::Array(vec![
+            SqlValue::Float(0.1),
+            SqlValue::Float(2.0),
+            SqlValue::Float(0.3),
+        ])
+    }
+
+    /// A strict or KV `VECTOR(3)` column turns every element into a float on
+    /// the `VALUES`, `SET`, and DEFAULT paths alike.
+    #[test]
+    fn a_typed_vector_column_coerces_its_elements_to_floats() {
+        let columns = [column("embedding", SqlDataType::Vector(3))];
+        assert_eq!(
+            coerced(&columns, "embedding", fractional_vector()).expect("VALUES coerces"),
+            float_vector()
+        );
+
+        let mut assignments = vec![(
+            "embedding".to_string(),
+            SqlExpr::Literal(fractional_vector()),
+        )];
+        coerce_assignments_to_declared_types(&columns, &mut assignments, None)
+            .expect("SET coerces");
+        assert!(matches!(
+            &assignments[0].1,
+            SqlExpr::Literal(value) if *value == float_vector()
+        ));
+
+        assert_eq!(
+            coerce_write_literal(&columns[0], fractional_vector()).expect("DEFAULT coerces"),
+            float_vector()
+        );
+    }
+
+    /// A schemaless or columnar-family `VECTOR(3)` column advertises text,
+    /// and still takes the vector rule from its declared type text.
+    #[test]
+    fn a_text_advertised_vector_column_coerces_from_its_declared_text() {
+        let mut embedding = column("embedding", SqlDataType::String);
+        embedding.raw_type = Some("VECTOR(3)".to_string());
+        assert_eq!(
+            coerced(
+                std::slice::from_ref(&embedding),
+                "embedding",
+                fractional_vector()
+            )
+            .expect("VALUES coerces"),
+            float_vector()
+        );
+    }
+
+    /// A text element is refused with the typed vector error naming the
+    /// column, on every engine's write path.
+    #[test]
+    fn a_vector_column_refuses_a_text_element() {
+        let columns = [column("embedding", SqlDataType::Vector(2))];
+        let value = SqlValue::Array(vec![decimal("0.1"), SqlValue::String("abc".into())]);
+        let err = coerced(&columns, "embedding", value).expect_err("text is not a number");
+        assert!(
+            matches!(
+                err,
+                SqlError::VectorElementNotNumeric { ref column, dim: 2, .. } if column == "embedding"
+            ),
+            "{err}"
         );
     }
 }
