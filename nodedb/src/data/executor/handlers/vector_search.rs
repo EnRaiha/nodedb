@@ -124,12 +124,7 @@ pub(super) fn encode_hits_response(
         Ok(payload) => core.response_with_payload(task, payload),
         Err(e) => {
             warn!(core = core.core_id, error = %e, "vector search serialization failed");
-            core.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            )
+            core.response_error(task, ErrorCode::from(e))
         }
     }
 }
@@ -153,7 +148,10 @@ pub(in crate::data::executor) struct VectorSearchParams<'a> {
     pub metric: DistanceMetric,
     pub filter_bitmap: Option<&'a nodedb_types::SurrogateBitmap>,
     pub field_name: &'a str,
-    /// RLS post-candidate filters. Applied after HNSW/IVF returns candidates.
+    /// Residual row filters: the statement's `WHERE` conjuncts and any read
+    /// policy, as `ScanFilter` msgpack. The Control Plane applies them to
+    /// the ranked candidates. The candidate window widens until `top_k`
+    /// candidates pass them.
     pub rls_filters: &'a [u8],
     /// Cross-engine prefilter sub-plan: when `Some`, executed locally and
     /// its output rows materialized into a `SurrogateBitmap` that is

@@ -191,6 +191,75 @@ impl CoreLoop {
         )
     }
 
+    /// The key of the vector index a search of `field_name` reads: the
+    /// field's own index, or the collection-level index when the field has
+    /// none of its own and the collection-level one exists. Data synced from
+    /// NodeDB-Lite lives in the collection-level index, while SQL names the
+    /// field.
+    ///
+    /// A search that names no field reads the collection-level index. When
+    /// the collection has none and exactly one field index, it reads that
+    /// one: a client API with no field argument searches the collection's
+    /// only vector column. With several field indexes the search is
+    /// ambiguous and fails, naming them.
+    pub(in crate::data::executor) fn resolve_vector_index_key(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+        field_name: &str,
+    ) -> Result<(DatabaseId, TenantId, String), ErrorCode> {
+        let index_key = Self::vector_index_key(database_id, tenant_id, collection, field_name);
+        if self.vector_collections.contains_key(&index_key) {
+            return Ok(index_key);
+        }
+        if field_name.is_empty() {
+            let mut field_keys = self.field_index_keys(&index_key, collection);
+            return match field_keys.len() {
+                0 => Ok(index_key),
+                1 => Ok(field_keys.remove(0)),
+                _ => {
+                    let prefix_len = collection.len() + 1;
+                    let mut fields: Vec<&str> = field_keys
+                        .iter()
+                        .filter_map(|(_, _, key)| key.get(prefix_len..))
+                        .collect();
+                    fields.sort_unstable();
+                    Err(ErrorCode::BadRequest {
+                        detail: format!(
+                            "vector search of '{collection}' names no field and the \
+                             collection has several vector indexes ({}); name one",
+                            fields.join(", ")
+                        ),
+                    })
+                }
+            };
+        }
+        let fallback_key = Self::vector_index_key(database_id, tenant_id, collection, "");
+        if self.vector_collections.contains_key(&fallback_key) {
+            Ok(fallback_key)
+        } else {
+            Ok(index_key)
+        }
+    }
+
+    /// The keys of `collection`'s field indexes. `collection_key` is the
+    /// collection-level key of the same database and tenant.
+    fn field_index_keys(
+        &self,
+        collection_key: &(DatabaseId, TenantId, String),
+        collection: &str,
+    ) -> Vec<(DatabaseId, TenantId, String)> {
+        let prefix = format!("{collection}:");
+        self.vector_collections
+            .keys()
+            .filter(|(db, tid, key)| {
+                *db == collection_key.0 && *tid == collection_key.1 && key.starts_with(&prefix)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// In-memory build key for a vector collection: `"{db}:{tid}:{coll}"`.
     /// `coll` may itself contain `:` — parsing uses `splitn(3, ':')`.
     ///
@@ -219,11 +288,13 @@ impl CoreLoop {
                 let mut engine =
                     TenantCrdtEngine::new(tenant_id, self.core_id as u64, ConstraintSet::new())?;
                 // Rejected deltas leave no replayable record, so their
-                // dead-letter entries come back from storage.
+                // dead-letter entries come back from storage. An entry that
+                // does not decode or does not fit the queue fails the open:
+                // the engine is not installed without it.
                 engine.restore_dead_letters(
                     self.sparse
                         .load_crdt_dead_letters(database_id.as_u64(), tenant_id.as_u64())?,
-                );
+                )?;
                 Ok(slot.insert(engine))
             }
         }
