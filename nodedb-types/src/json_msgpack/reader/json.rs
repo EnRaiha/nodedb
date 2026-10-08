@@ -9,6 +9,7 @@ use super::super::error::MsgpackResult;
 use super::super::instant_ext::instant_from_ext;
 use super::cursor::Cursor;
 use crate::datetime::NdbDateTime;
+use crate::value::float_text::float_to_json;
 
 /// Deserialize a `serde_json::Value` from MessagePack bytes.
 ///
@@ -64,16 +65,18 @@ fn read_json_value(c: &mut Cursor<'_>) -> zerompk::Result<serde_json::Value> {
             ))
         }
 
+        // A non-finite float is its PostgreSQL text in a JSON string, never
+        // `null`.
         0xCA => {
             let b = c.take_n(4)?;
-            Ok(serde_json::json!(
-                f32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64
-            ))
+            Ok(float_to_json(f64::from(f32::from_be_bytes([
+                b[0], b[1], b[2], b[3],
+            ]))))
         }
         0xCB => {
             let b = c.take_n(8)?;
-            Ok(serde_json::json!(f64::from_be_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]
+            Ok(float_to_json(f64::from_be_bytes([
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
             ])))
         }
 
@@ -280,6 +283,22 @@ mod tests {
         let bytes = json_to_msgpack(&val).unwrap();
         let restored = json_from_msgpack(&bytes).unwrap();
         assert_eq!(val, restored);
+    }
+
+    /// A non-finite msgpack float reads as its PostgreSQL text in a JSON
+    /// string, never `null`.
+    #[test]
+    fn non_finite_float_reads_as_postgres_text() {
+        let mut bytes = vec![0x93, 0xCB];
+        bytes.extend_from_slice(&f64::NAN.to_be_bytes());
+        bytes.push(0xCB);
+        bytes.extend_from_slice(&f64::INFINITY.to_be_bytes());
+        bytes.push(0xCA);
+        bytes.extend_from_slice(&f32::NEG_INFINITY.to_be_bytes());
+        assert_eq!(
+            json_from_msgpack(&bytes).unwrap(),
+            json!(["NaN", "Infinity", "-Infinity"])
+        );
     }
 
     #[test]

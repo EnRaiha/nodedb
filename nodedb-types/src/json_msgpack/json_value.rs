@@ -4,6 +4,8 @@
 
 use zerompk::{ToMessagePack, Write};
 
+use crate::value::float_text::float_to_json;
+
 /// Newtype wrapper around `serde_json::Value` implementing zerompk traits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JsonValue(pub serde_json::Value);
@@ -109,13 +111,14 @@ fn read_json_from_reader<'a, R: zerompk::Read<'a>>(reader: &mut R) -> zerompk::R
     if let Ok(u) = reader.read_u64() {
         return Ok(JsonValue(serde_json::Value::Number(u.into())));
     }
-    // Try f64 (0xCB)
+    // Try f64 (0xCB). A non-finite float is its PostgreSQL text in a JSON
+    // string, never `null`.
     if let Ok(f) = reader.read_f64() {
-        return Ok(JsonValue(serde_json::json!(f)));
+        return Ok(JsonValue(float_to_json(f)));
     }
     // Try f32 (0xCA)
     if let Ok(f) = reader.read_f32() {
-        return Ok(JsonValue(serde_json::json!(f as f64)));
+        return Ok(JsonValue(float_to_json(f64::from(f))));
     }
     // Try string (fixstr 0xA0-0xBF, str8 0xD9, str16 0xDA, str32 0xDB)
     if let Ok(s) = reader.read_string() {

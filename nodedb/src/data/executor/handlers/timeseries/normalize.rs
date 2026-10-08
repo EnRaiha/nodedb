@@ -10,6 +10,7 @@ use nodedb_types::datetime::NdbDateTime;
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 
 use super::msgpack_decode::MsgpackValue;
+use crate::data::executor::strict_format::float_to_i64;
 use crate::engine::timeseries::ilp::{self, IlpError};
 
 /// Nanoseconds per millisecond — line protocol timestamps are nanoseconds, the
@@ -104,6 +105,9 @@ pub(in crate::data::executor) fn msgpack_rows_to_ilp(
             match val {
                 MsgpackValue::Float(f) => fields.push(format!("{key}={f}")),
                 MsgpackValue::Int(n) => fields.push(format!("{key}={n}i")),
+                // An unsigned field keeps its exact number. A column whose
+                // type cannot hold it refuses the line at ingest.
+                MsgpackValue::UInt(u) => fields.push(format!("{key}={u}u")),
                 MsgpackValue::Str(s) => {
                     // Recover the numeric type `SqlValue::Decimal` encoded as a
                     // string, so schema inference picks Float64/Int64, not Symbol.
@@ -157,8 +161,9 @@ fn time_column_nanos(
             .checked_mul(NANOS_PER_MILLI)
             .map(Some)
             .ok_or_else(|| invalid(&n.to_string())),
-        MsgpackValue::Float(f) => (*f as i64)
-            .checked_mul(NANOS_PER_MILLI)
+        // Past `i64::MAX` milliseconds: no timestamp holds it.
+        MsgpackValue::UInt(u) => Err(invalid(&u.to_string())),
+        MsgpackValue::Float(f) => float_millis_to_nanos(*f)
             .map(Some)
             .ok_or_else(|| invalid(&f.to_string())),
         // A typed instant of either kind: the stored time column is the
@@ -171,15 +176,69 @@ fn time_column_nanos(
     }
 }
 
+/// A float count of epoch milliseconds as epoch nanoseconds. A fractional
+/// millisecond is kept to the nanosecond, the line timestamp unit. A part
+/// below one nanosecond rounds half to even, as PostgreSQL's
+/// `to_timestamp(double precision)` rounds below its own unit. `None` for
+/// NaN, an infinity, or a value past the nanosecond range.
+fn float_millis_to_nanos(ms: f64) -> Option<i64> {
+    float_to_i64((ms * NANOS_PER_MILLI as f64).round_ties_even())
+}
+
+/// The nanosecond timestamp a JSON time-column cell denotes, under the same
+/// rules as [`time_column_nanos`]: `None` for JSON null, an error for a value
+/// no timestamp can carry.
+fn json_time_column_nanos(
+    val: &sonic_rs::Value,
+    column: &str,
+    line_number: usize,
+) -> Result<Option<i64>, IlpError> {
+    let invalid = |detail: &str| {
+        IlpError::new(
+            line_number,
+            &format!("{column}={detail}"),
+            0..0,
+            ilp::IlpErrorKind::InvalidTimestamp,
+        )
+    };
+    if val.is_null() {
+        return Ok(None);
+    }
+    if let Some(s) = val.as_str() {
+        return parse_ts_string_to_nanos(s)
+            .map(Some)
+            .ok_or_else(|| invalid(&format!("\"{s}\"")));
+    }
+    if let Some(n) = val.as_i64() {
+        return n
+            .checked_mul(NANOS_PER_MILLI)
+            .map(Some)
+            .ok_or_else(|| invalid(&n.to_string()));
+    }
+    if let Some(f) = val.as_f64() {
+        return float_millis_to_nanos(f)
+            .map(Some)
+            .ok_or_else(|| invalid(&f.to_string()));
+    }
+    let detail = match val.as_bool() {
+        Some(b) => b.to_string(),
+        None if val.is_array() => "<array>".to_string(),
+        None => "<object>".to_string(),
+    };
+    Err(invalid(&detail))
+}
+
 /// Normalize decoded JSON rows into line protocol. The JSON value model
 /// carries no decimal-as-string case, so no string is re-parsed as a number.
+/// A time column that holds a value the line cannot carry is an error, as it
+/// is for [`msgpack_rows_to_ilp`].
 pub(in crate::data::executor) fn json_rows_to_ilp(
     rows: &sonic_rs::Array,
     measurement: &str,
     time_key: Option<&str>,
-) -> String {
+) -> Result<String, IlpError> {
     let mut ilp_buf = String::new();
-    for row_val in rows.iter() {
+    for (line_number, row_val) in rows.iter().enumerate() {
         let Some(obj) = row_val.as_object() else {
             continue;
         };
@@ -189,13 +248,7 @@ pub(in crate::data::executor) fn json_rows_to_ilp(
 
         for (key, val) in obj.iter() {
             if is_time_column(key, time_key) {
-                if let Some(s) = val.as_str() {
-                    timestamp_ns = parse_ts_string_to_nanos(s);
-                } else if let Some(n) = val.as_i64() {
-                    timestamp_ns = Some(n * NANOS_PER_MILLI);
-                } else if let Some(f) = val.as_f64() {
-                    timestamp_ns = Some(f as i64 * NANOS_PER_MILLI);
-                }
+                timestamp_ns = json_time_column_nanos(val, key, line_number + 1)?;
                 continue;
             }
 
@@ -212,7 +265,7 @@ pub(in crate::data::executor) fn json_rows_to_ilp(
 
         push_line(&mut ilp_buf, measurement, &fields, timestamp_ns);
     }
-    ilp_buf
+    Ok(ilp_buf)
 }
 
 /// Split `batch` into lines, giving every timestamp-less line the batch's
@@ -304,6 +357,53 @@ mod tests {
                 ("v".to_string(), MsgpackValue::Int(1)),
             ]];
             let err = msgpack_rows_to_ilp(&rows, "m", Some("ts")).expect_err("refused");
+            assert_eq!(err.kind, ilp::IlpErrorKind::InvalidTimestamp);
+            assert!(err.raw.starts_with("ts="), "{err:?}");
+        }
+    }
+
+    /// A float time column keeps its fractional millisecond to the
+    /// nanosecond; NaN, an infinity, and a value past the nanosecond range
+    /// are refused instead of being stored as the epoch or a wrapped time.
+    #[test]
+    fn a_float_time_key_converts_exactly_or_is_refused() {
+        let rows = vec![vec![
+            ("ts".to_string(), MsgpackValue::Float(1.5)),
+            ("v".to_string(), MsgpackValue::Int(1)),
+        ]];
+        assert_eq!(
+            msgpack_rows_to_ilp(&rows, "m", Some("ts")).expect("ilp"),
+            "m v=1i 1500000\n"
+        );
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e300] {
+            let rows = vec![vec![
+                ("ts".to_string(), MsgpackValue::Float(bad)),
+                ("v".to_string(), MsgpackValue::Int(1)),
+            ]];
+            let err = msgpack_rows_to_ilp(&rows, "m", Some("ts")).expect_err("refused");
+            assert_eq!(err.kind, ilp::IlpErrorKind::InvalidTimestamp);
+        }
+    }
+
+    /// The JSON path applies the msgpack time-column rules: a fractional
+    /// millisecond is kept, and an overflowing or unparseable value is an
+    /// error rather than a clock stamp or a wrapped time.
+    #[test]
+    fn a_json_time_key_follows_the_msgpack_rules() {
+        let rows: sonic_rs::Array =
+            sonic_rs::from_str(r#"[{"ts": 2.25, "v": "x"}]"#).expect("json");
+        assert_eq!(
+            json_rows_to_ilp(&rows, "m", Some("ts")).expect("ilp"),
+            "m v=\"x\" 2250000\n"
+        );
+        for bad in [
+            r#"[{"ts": 9223372036854775807, "v": "x"}]"#,
+            r#"[{"ts": 1e300, "v": "x"}]"#,
+            r#"[{"ts": "not a date", "v": "x"}]"#,
+            r#"[{"ts": true, "v": "x"}]"#,
+        ] {
+            let rows: sonic_rs::Array = sonic_rs::from_str(bad).expect("json");
+            let err = json_rows_to_ilp(&rows, "m", Some("ts")).expect_err(bad);
             assert_eq!(err.kind, ilp::IlpErrorKind::InvalidTimestamp);
             assert!(err.raw.starts_with("ts="), "{err:?}");
         }

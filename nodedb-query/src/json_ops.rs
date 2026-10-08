@@ -7,6 +7,8 @@
 
 use std::cmp::Ordering;
 
+use crate::numeric_cmp::{Numeric, cmp_numeric, numeric_eq, parse_numeric_str};
+
 /// Coerce a JSON value to f64.
 ///
 /// - Numbers: `as_f64()` directly
@@ -22,14 +24,52 @@ pub fn json_to_f64(v: &serde_json::Value, coerce_bool: bool) -> Option<f64> {
     }
 }
 
+/// A JSON number read without rounding an integer through `f64`.
+fn number_reading(n: &serde_json::Number) -> Option<Numeric> {
+    if let Some(i) = n.as_i64() {
+        return Some(Numeric::Int(i128::from(i)));
+    }
+    if let Some(u) = n.as_u64() {
+        return Some(Numeric::Int(i128::from(u)));
+    }
+    n.as_f64().map(Numeric::Float)
+}
+
+/// `v` read as a number: numbers, numeric strings, and bools (`true` = 1).
+/// Integer text stays exact, and fractional decimal text reads as an exact
+/// `Decimal`.
+fn numeric_reading(v: &serde_json::Value) -> Option<Numeric> {
+    match v {
+        serde_json::Value::Number(n) => number_reading(n),
+        serde_json::Value::Bool(b) => Some(Numeric::Int(i128::from(*b))),
+        serde_json::Value::String(s) => parse_numeric_str(s),
+        _ => None,
+    }
+}
+
+/// Exact order of two JSON numbers. `i64` and `u64` pairs compare exactly,
+/// and an integer against a float compares without rounding. `None` when a
+/// side has no numeric reading.
+pub fn compare_json_numbers(a: &serde_json::Number, b: &serde_json::Number) -> Option<Ordering> {
+    Some(cmp_numeric(number_reading(a)?, number_reading(b)?))
+}
+
+/// Numeric order of `a` and `b` when both have a numeric reading (number,
+/// numeric string, bool). `None` when a side is not numeric. The order is
+/// total: NaN sorts above every number and equals NaN.
+pub fn numeric_order(a: &serde_json::Value, b: &serde_json::Value) -> Option<Ordering> {
+    let (na, nb) = (numeric_reading(a)?, numeric_reading(b)?);
+    Some(cmp_numeric(na, nb))
+}
+
 /// Compare two JSON values with type coercion.
 ///
-/// Tries numeric comparison first (with bool coercion), then falls
-/// back to string comparison.
+/// Numeric comparison first (with bool coercion, exact for integers and
+/// decimal text, NaN above every number), then string comparison of the
+/// display forms.
 pub fn compare_json(a: &serde_json::Value, b: &serde_json::Value) -> Ordering {
-    // Try numeric comparison with bool coercion.
-    if let (Some(na), Some(nb)) = (json_to_f64(a, true), json_to_f64(b, true)) {
-        return na.partial_cmp(&nb).unwrap_or(Ordering::Equal);
+    if let Some(order) = numeric_order(a, b) {
+        return order;
     }
     // Fallback: string comparison.
     let sa = json_to_display_string(a);
@@ -52,16 +92,17 @@ pub fn compare_json_optional(
 
 /// Check equality with type coercion.
 ///
-/// Handles `"5" == 5` by coercing both sides to f64 when one is a
-/// number and the other is a numeric string.
+/// Handles `"5" == 5` by reading both sides as numbers when each has a
+/// numeric reading. A pair with an integer or decimal side compares
+/// exactly. A float pair is equal within `f64::EPSILON`.
 pub fn coerced_eq(a: &serde_json::Value, b: &serde_json::Value) -> bool {
     if a == b {
         return true;
     }
-    if let (Some(af), Some(bf)) = (json_to_f64(a, true), json_to_f64(b, true)) {
-        return (af - bf).abs() < f64::EPSILON;
+    match (numeric_reading(a), numeric_reading(b)) {
+        (Some(na), Some(nb)) => numeric_eq(na, nb),
+        _ => false,
     }
-    false
 }
 
 /// Check if a JSON value is truthy (for boolean contexts).
@@ -139,6 +180,144 @@ mod tests {
             compare_json(&json!("10"), &json!(9)),
             std::cmp::Ordering::Greater
         );
+    }
+
+    /// `2^53 + 1` and `2^53` collapse to one `f64`. Integers compare exactly.
+    #[test]
+    fn integers_past_two_pow_53_compare_exactly() {
+        let above = json!(9_007_199_254_740_993_i64);
+        let at = json!(9_007_199_254_740_992_i64);
+        assert!(!coerced_eq(&above, &at));
+        assert_eq!(compare_json(&above, &at), Ordering::Greater);
+        assert_eq!(compare_json(&at, &above), Ordering::Less);
+        assert!(coerced_eq(&above, &json!(9_007_199_254_740_993_u64)));
+    }
+
+    #[test]
+    fn nanosecond_timestamps_one_tick_apart() {
+        let t0 = json!(1_700_000_000_000_000_001_i64);
+        let t1 = json!(1_700_000_000_000_000_002_i64);
+        assert!(!coerced_eq(&t0, &t1));
+        assert_eq!(compare_json(&t0, &t1), Ordering::Less);
+        assert_eq!(compare_json(&t1, &t0), Ordering::Greater);
+    }
+
+    #[test]
+    fn u64_against_i64_compares_exactly() {
+        let u_max = json!(u64::MAX);
+        let i_max = json!(i64::MAX);
+        assert!(!coerced_eq(&u_max, &i_max));
+        assert_eq!(compare_json(&u_max, &i_max), Ordering::Greater);
+        assert_eq!(compare_json(&i_max, &u_max), Ordering::Less);
+        assert_eq!(compare_json(&json!(u64::MAX - 1), &u_max), Ordering::Less);
+        assert_eq!(compare_json(&json!(i64::MIN), &u_max), Ordering::Less);
+        // `i64::MAX + 1` as `u64` against `i64::MAX`.
+        assert_eq!(
+            compare_json(&json!(9_223_372_036_854_775_808_u64), &i_max),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_json_numbers(
+                &serde_json::Number::from(u64::MAX),
+                &serde_json::Number::from(i64::MAX)
+            ),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn integer_against_float_compares_without_rounding() {
+        let above = json!(9_007_199_254_740_993_i64);
+        let float = json!(9_007_199_254_740_992.0_f64);
+        assert!(!coerced_eq(&above, &float));
+        assert_eq!(compare_json(&above, &float), Ordering::Greater);
+        assert_eq!(compare_json(&float, &above), Ordering::Less);
+        assert!(coerced_eq(&json!(9_007_199_254_740_992_i64), &float));
+        assert_eq!(compare_json(&json!(2), &json!(2.5)), Ordering::Less);
+        assert_eq!(compare_json(&json!(-2), &json!(-2.5)), Ordering::Greater);
+        assert!(coerced_eq(&json!(3), &json!(3.0)));
+        // `u64::MAX` rounds up to `2^64` as an `f64`, so it is below that float.
+        assert_eq!(
+            compare_json(&json!(u64::MAX), &json!(18_446_744_073_709_551_616.0_f64)),
+            Ordering::Less
+        );
+        assert!(!coerced_eq(
+            &json!(u64::MAX),
+            &json!(18_446_744_073_709_551_616.0_f64)
+        ));
+        assert_eq!(
+            compare_json(&json!(i64::MIN), &json!(-9_223_372_036_854_775_808.0_f64)),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn integer_strings_compare_exactly_against_integers() {
+        let text = json!("9007199254740993");
+        assert!(!coerced_eq(&text, &json!(9_007_199_254_740_992_i64)));
+        assert!(coerced_eq(&text, &json!(9_007_199_254_740_993_i64)));
+        assert_eq!(
+            compare_json(&text, &json!(9_007_199_254_740_992_i64)),
+            Ordering::Greater
+        );
+        assert!(coerced_eq(&json!("18446744073709551615"), &json!(u64::MAX)));
+        assert!(coerced_eq(&json!("5.0"), &json!(5)));
+    }
+
+    #[test]
+    fn small_numbers_keep_their_order() {
+        assert_eq!(compare_json(&json!(1), &json!(2)), Ordering::Less);
+        assert_eq!(compare_json(&json!(1.5), &json!(1.25)), Ordering::Greater);
+        assert_eq!(compare_json(&json!(-3), &json!(-3)), Ordering::Equal);
+        assert_eq!(compare_json(&json!(true), &json!(0)), Ordering::Greater);
+        assert_eq!(compare_json(&json!("abc"), &json!("abd")), Ordering::Less);
+        // Float equality is exact, as PostgreSQL's float8 `=` is.
+        assert!(!coerced_eq(&json!(0.1 + 0.2), &json!(0.3)));
+        assert!(coerced_eq(&json!(0.5), &json!(0.5)));
+        assert!(!coerced_eq(&json!("abc"), &json!(1)));
+    }
+
+    /// NaN text sorts above every number and equals NaN, so a sort over it
+    /// is total.
+    #[test]
+    fn nan_text_sorts_above_every_number() {
+        assert_eq!(compare_json(&json!("NaN"), &json!(1)), Ordering::Greater);
+        assert_eq!(compare_json(&json!(1e308), &json!("NaN")), Ordering::Less);
+        assert_eq!(compare_json(&json!("NaN"), &json!("NaN")), Ordering::Equal);
+        assert_eq!(
+            compare_json(&json!("NaN"), &json!("inf")),
+            Ordering::Greater
+        );
+        assert!(coerced_eq(&json!("NaN"), &json!("nan")));
+        let mut values = [
+            json!("NaN"),
+            json!(2),
+            json!("-inf"),
+            json!("NaN"),
+            json!(1.5),
+        ];
+        values.sort_by(compare_json);
+        assert_eq!(values[0], json!("-inf"));
+        assert_eq!(values[1], json!(1.5));
+        assert_eq!(values[2], json!(2));
+    }
+
+    /// Two decimal strings one hundredth apart past `2^53` compare exactly.
+    #[test]
+    fn fractional_decimal_text_compares_exactly() {
+        let low = json!("12345678901234567.01");
+        let high = json!("12345678901234567.02");
+        assert_eq!(compare_json(&low, &high), Ordering::Less);
+        assert_eq!(compare_json(&high, &low), Ordering::Greater);
+        assert!(!coerced_eq(&low, &high));
+        assert_eq!(
+            compare_json(
+                &json!("9007199254740993.5"),
+                &json!(9_007_199_254_740_993_i64)
+            ),
+            Ordering::Greater
+        );
+        assert!(coerced_eq(&json!("2.50"), &json!("2.5")));
     }
 
     #[test]

@@ -61,9 +61,7 @@ fn finish_fusion<K: Clone + Eq + Hash + Ord>(
         .collect();
 
     fused.sort_unstable_by(|a, b| {
-        b.rrf_score
-            .partial_cmp(&a.rrf_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        crate::numeric_cmp::cmp_f64(b.rrf_score, a.rrf_score)
             .then_with(|| a.document_id.cmp(&b.document_id))
     });
     fused.truncate(top_k);

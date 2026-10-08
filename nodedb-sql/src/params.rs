@@ -84,7 +84,7 @@ fn placeholder_to_value(placeholder: &str, params: &[ParamValue]) -> Option<Valu
         ParamValue::Bool(true) => Value::Boolean(true),
         ParamValue::Bool(false) => Value::Boolean(false),
         ParamValue::Int64(n) => Value::Number(n.to_string(), false),
-        ParamValue::Float64(f) => Value::Number(f.to_string(), false),
+        ParamValue::Float64(f) => Value::Number(float_literal_text(*f), false),
         ParamValue::Decimal(d) => Value::Number(d.to_string(), false),
         ParamValue::Text(s) => Value::SingleQuotedString(s.clone()),
         // Timestamp/Timestamptz: emit as a typed SQL literal so the resolver
@@ -92,6 +92,17 @@ fn placeholder_to_value(placeholder: &str, params: &[ParamValue]) -> Option<Valu
         ParamValue::Timestamp(dt) => Value::SingleQuotedString(dt.to_iso8601()),
         ParamValue::Timestamptz(dt) => Value::SingleQuotedString(dt.to_iso8601()),
     })
+}
+
+/// The number-literal text of a float parameter.
+///
+/// The text always carries an exponent: `1.5e0`, `2e0`. The literal
+/// resolver reads an exponent as a float, so the value stays a float. The
+/// plain form reads `1.5` as a decimal and `2` as an integer. The mantissa
+/// is the shortest text that round-trips the `f64`. A non-finite float is
+/// `NaN`, `inf` or `-inf`, which the resolver also reads as a float.
+pub(crate) fn float_literal_text(f: f64) -> String {
+    format!("{f:e}")
 }
 
 #[cfg(test)]
@@ -303,6 +314,29 @@ mod tests {
             &[ParamValue::Text("user_id".into())],
         );
         assert!(!result.contains("$1"), "got: {result}");
+    }
+
+    /// A float parameter resolves to a float, whole or fractional, never to
+    /// the decimal or integer its plain text reads as.
+    #[test]
+    fn a_float_param_resolves_to_a_float() {
+        use crate::resolver::expr::convert_value;
+        use crate::types::SqlValue;
+        for f in [1.5, 2.0, 0.1, -3.25, 1e300, 1e-300, f64::INFINITY] {
+            let literal = placeholder_to_value("$1", &[ParamValue::Float64(f)])
+                .expect("the placeholder names the one parameter");
+            assert_eq!(
+                convert_value(&literal).expect("a float literal resolves"),
+                SqlValue::Float(f),
+                "{f}"
+            );
+        }
+        let literal = placeholder_to_value("$1", &[ParamValue::Float64(f64::NAN)])
+            .expect("the placeholder names the one parameter");
+        assert!(
+            matches!(convert_value(&literal), Ok(SqlValue::Float(f)) if f.is_nan()),
+            "{literal}"
+        );
     }
 
     #[test]

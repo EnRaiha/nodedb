@@ -250,7 +250,11 @@ impl CoreLoop {
                         reason: format!("timeseries resolve: JSON parse error: {error}"),
                     }
                 })?;
-                Ok(normalize::json_rows_to_ilp(&rows, measurement, time_key))
+                normalize::json_rows_to_ilp(&rows, measurement, time_key).map_err(|error| {
+                    ErrorCode::RejectedPrevalidation {
+                        reason: format!("timeseries resolve: {error}"),
+                    }
+                })
             }
             other => Err(ErrorCode::Internal {
                 detail: format!("timeseries resolve: unknown ingest format: {other}"),
