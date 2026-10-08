@@ -11,7 +11,9 @@ impl WalManager {
     ///
     /// Returns `Err` if any non-empty segment contains no valid WAL records —
     /// a reliable signal that the segment was corrupted (wrong magic, truncated
-    /// header, etc.) rather than simply rolled over empty.
+    /// header, etc.) rather than simply rolled over empty. The newest segment is
+    /// the exception: a crash can leave it with no parseable record, and the
+    /// next boot resumes that same file, so it passes.
     ///
     /// This check is intentionally strict: a segment file with content that
     /// does not parse as WAL records is treated as fatal corruption, not as an
@@ -64,6 +66,23 @@ impl WalManager {
             })?;
 
             if info.end_offset == 0 {
+                // This check covers only segments without a preamble. A
+                // segment that opens with one reports its end at the end of the
+                // preamble, never at 0, even when no record follows it.
+                //
+                // The newest segment is the one exception. A crash can leave
+                // zero-filled pages in it, and the next boot resumes that same
+                // file. Refusing it here makes the store permanently
+                // unbootable, because every later boot reads the same bytes and
+                // refuses them again. The version check runs before this one,
+                // so a segment written by another build is still refused above.
+                //
+                // Any other segment without a preamble and without a record is
+                // refused: nothing resumes it, and replay would silently skip
+                // whatever it held.
+                if idx + 1 == segments.len() {
+                    continue;
+                }
                 return Err(crate::Error::SegmentCorrupted {
                     detail: format!(
                         "WAL segment '{}' is non-empty ({file_len} bytes) but contains no valid \
@@ -359,6 +378,20 @@ mod tests {
     }
 
     #[test]
+    fn a_recordless_newest_segment_does_not_block_startup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wal");
+        let wal = wal_with_a_recordless_newest_segment(&path);
+
+        assert!(
+            wal.validate_for_startup().is_ok(),
+            "the newest segment holds no committed record, which torn_tail already warns \
+             about, and the next boot resumes it. Refusing it here makes the store \
+             permanently unbootable"
+        );
+    }
+
+    #[test]
     fn a_segment_with_no_records_behind_the_newest_still_blocks_startup() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wal");
@@ -435,6 +468,39 @@ mod tests {
         assert!(
             text.contains(&format!("reads version {WAL_FORMAT_VERSION}")),
             "the message must name the version this build reads: {text}"
+        );
+    }
+
+    /// A torn write that persists the magic and leaves the version zeroed is
+    /// not a format gap, and must not turn a bootable store into a refused one.
+    #[test]
+    fn a_zeroed_version_is_not_a_format_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wal");
+        {
+            let wal = WalManager::open_for_testing(&path).expect("open wal");
+            put(&wal, b"a");
+            wal.sync().expect("sync");
+        }
+        let wal = WalManager::open_for_testing(&path).expect("reopen wal");
+        let newest = nodedb_wal::segment::discover_segments(&path)
+            .expect("discover segments")
+            .last()
+            .expect("the boot's own segment")
+            .first_lsn;
+
+        // The magic of a real record, the version bytes never written.
+        let mut bytes = vec![0u8; 64 * 1024];
+        bytes[0..4].copy_from_slice(&WAL_MAGIC.to_le_bytes());
+        std::fs::write(
+            nodedb_wal::segment::segment_path(&path, newest + 1_000),
+            &bytes,
+        )
+        .expect("write a torn newest segment");
+
+        assert!(
+            wal.validate_for_startup().is_ok(),
+            "a zeroed version is uninitialised bytes, not a format this build cannot read"
         );
     }
 
