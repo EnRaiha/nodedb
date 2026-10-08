@@ -86,12 +86,7 @@ impl CoreLoop {
 
         // Lazy-load partition registry from disk if not yet loaded.
         if let Err(e) = self.ensure_ts_registry(tid, task.request.database_id, collection) {
-            return self.response_error(
-                task,
-                crate::bridge::envelope::ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            );
+            return self.response_error(task, crate::bridge::envelope::ErrorCode::from(e));
         }
 
         // Both predicate sets are decoded before any row is read. A payload

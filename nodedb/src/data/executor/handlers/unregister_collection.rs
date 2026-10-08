@@ -99,12 +99,7 @@ impl CoreLoop {
             // the DROP does not finalize the catalog-row removal over storage
             // rows that survive — the resurrection hole on re-CREATE.
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
 

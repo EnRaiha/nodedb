@@ -130,12 +130,7 @@ impl CoreLoop {
                 // Empty result for missing collection.
                 return match response_codec::encode_value_vec(&[]) {
                     Ok(payload) => self.response_with_payload(task, payload),
-                    Err(e) => self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    ),
+                    Err(e) => self.response_error(task, ErrorCode::from(e)),
                 };
             }
         };
@@ -235,7 +230,11 @@ impl CoreLoop {
         // the flushed pass already filled an unsorted limit; otherwise the
         // loop stops at the limit or the deadline, like the flushed pass.
         if !block_skipped && (!sort_keys.is_empty() || matched.len() < limit) {
-            for (row_surrogate, row) in engine.scan_memtable_rows_with_surrogates() {
+            for scanned in engine.scan_memtable_rows_with_surrogates() {
+                let (row_surrogate, row) = match scanned {
+                    Ok(scanned) => scanned,
+                    Err(e) => return self.response_error(task, crate::Error::from(e)),
+                };
                 // Row-boundary prefilter: skip this row when its surrogate is
                 // absent from the bitmap. Rows without a recorded surrogate
                 // are always included when no prefilter is active; when a
@@ -369,12 +368,7 @@ impl CoreLoop {
         let payload = match response_codec::encode_value_vec(&results) {
             Ok(payload) => payload,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
 

@@ -49,12 +49,7 @@ impl CoreLoop {
             Ok(e) => e,
             Err(e) => {
                 warn!(core = self.core_id, error = %e, "failed to create CRDT engine");
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         // A `false` return means the incoming version is older than the one
@@ -82,12 +77,7 @@ impl CoreLoop {
             Ok(e) => e,
             Err(e) => {
                 warn!(core = self.core_id, error = %e, "failed to create CRDT engine");
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         // `false` means a stale (older-version) drop was correctly ignored by
@@ -117,12 +107,7 @@ impl CoreLoop {
             Ok(e) => e,
             Err(e) => {
                 warn!(core = self.core_id, error = %e, "failed to create CRDT engine");
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         let constraints = engine.constraints_for_collection(collection);

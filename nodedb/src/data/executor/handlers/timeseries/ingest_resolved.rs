@@ -53,6 +53,7 @@ use nodedb_types::timeseries::SeriesKey;
 use super::admission;
 use super::ingest_dispatch::{TimeseriesApplyMode, TimeseriesIngestParams};
 use super::ingest_resolved_fit::{CollKey, SchemaFit, landing_values};
+use super::ingest_resolved_returning::decode_returning_images;
 use crate::data::executor::response_codec::IngestRejection;
 use crate::engine::timeseries::install_counts::TsInstallCount;
 
@@ -111,12 +112,7 @@ impl CoreLoop {
                 self.flush_ts_collection(tid, task.request.database_id, collection, now_ms)
         {
             if refusable {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("pre-ingest ts flush failed: {e}"),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
             // A committed entry every other replica applies cannot make room
             // on this node.
@@ -311,12 +307,11 @@ impl CoreLoop {
             );
         }
 
-        let returned_rows: Vec<rmpv::Value> = match returning {
-            Some(_) => images
-                .iter()
-                .filter_map(|image| crate::util::bounded_msgpack::read_value(image).ok())
-                .collect(),
-            None => Vec::new(),
+        // An image that does not decode refuses the statement below, once the
+        // landed rows' bookkeeping has run.
+        let returned_rows = match returning {
+            Some(_) => decode_returning_images(collection, &images),
+            None => Ok(Vec::new()),
         };
 
         if mode != TimeseriesApplyMode::RedoInstall {
@@ -329,12 +324,7 @@ impl CoreLoop {
                 && let Err(e) =
                     self.flush_ts_collection(tid, task.request.database_id, collection, now_ms)
             {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("post-ingest ts flush failed: {e}"),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
             if accepted > 0 {
                 // no-determinism: Instant::now runs only for the operational idle/checkpoint timer, outside a committed-redo install.
@@ -346,6 +336,10 @@ impl CoreLoop {
         }
 
         if let Some(spec) = returning {
+            let returned_rows = match returned_rows {
+                Ok(rows) => rows,
+                Err(e) => return self.response_error(task, e),
+            };
             // A row set has no place for a rejected row, so the rows the
             // install rejected travel beside it as the rejected-lines notice.
             let rejection = (rejected > 0).then(|| IngestRejection {
@@ -392,12 +386,7 @@ impl CoreLoop {
                 read_version_lsn: crate::types::Lsn::ZERO,
                 write_set: Vec::new(),
             },
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -472,6 +461,7 @@ impl CoreLoop {
                     row_id: RowId::Batch,
                     new_value: Some(*image),
                     old_value: None,
+                    image_fault: None,
                 },
             );
         }

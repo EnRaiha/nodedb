@@ -29,6 +29,9 @@ impl From<nodedb_query::EvalError> for Error {
             | nodedb_query::EvalError::InvalidJsonPath { .. }) => Self::DataException {
                 detail: e.to_string(),
             },
+            e @ nodedb_query::EvalError::NumericOverflow { .. } => Self::NumericValueOutOfRange {
+                detail: e.to_string(),
+            },
         }
     }
 }
@@ -341,6 +344,26 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
                 expected_version: 0,
                 actual_version: 0,
             },
+            // A value refusal crosses as the Data-Plane verdict of the same
+            // name, so the coordinator answers its exact SQLSTATE.
+            Error::InvalidTextRepresentation { detail } => TypedClusterError::DataPlane {
+                code: nodedb_cluster::rpc_codec::DataPlaneErrorCode::InvalidTextRepresentation {
+                    detail,
+                },
+            },
+            Error::DatatypeMismatch { detail } => TypedClusterError::DataPlane {
+                code: nodedb_cluster::rpc_codec::DataPlaneErrorCode::DatatypeMismatch { detail },
+            },
+            Error::InvalidDatetimeFormat { detail } => TypedClusterError::DataPlane {
+                code: nodedb_cluster::rpc_codec::DataPlaneErrorCode::InvalidDatetimeFormat {
+                    detail,
+                },
+            },
+            Error::DatetimeFieldOverflow { detail } => TypedClusterError::DataPlane {
+                code: nodedb_cluster::rpc_codec::DataPlaneErrorCode::DatetimeFieldOverflow {
+                    detail,
+                },
+            },
             // Every other error crosses as its public numeric code, so a
             // multi-hop forward keeps its class.
             other @ (Error::TxnOverlayMemoryExceeded { .. }
@@ -387,10 +410,12 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
             | Error::UndefinedObject { .. }
             | Error::ObjectNotInPrerequisiteState { .. }
             | Error::UndefinedColumn { .. }
+            | Error::TextColumn { .. }
             | Error::AmbiguousColumn { .. }
             | Error::UnknownStrictField { .. }
             | Error::DivisionByZero
             | Error::DataException { .. }
+            | Error::NumericValueOutOfRange { .. }
             | Error::InvalidLimitValue { .. }
             | Error::RetryableLeaderChange { .. }
             | Error::CommittedResultUnavailable { .. }

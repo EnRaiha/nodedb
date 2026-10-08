@@ -162,12 +162,7 @@ impl CoreLoop {
             let json = match response_codec::encode_json_as_msgpack(&result) {
                 Ok(b) => b,
                 Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
+                    return self.response_error(task, ErrorCode::from(e));
                 }
             };
             return Response {

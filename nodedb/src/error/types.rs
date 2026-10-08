@@ -332,6 +332,16 @@ pub enum Error {
     #[error("column \"{column}\" does not exist")]
     UndefinedColumn { column: String },
 
+    /// The column argument of a full-text search cannot serve it. Propagated
+    /// from `SqlError::TextColumn` or the Data-Plane `ErrorCode::TextColumn`.
+    /// The pgwire layer renders `fault.sqlstate()`.
+    #[error("column \"{column}\" of collection \"{collection}\" {fault}")]
+    TextColumn {
+        collection: String,
+        column: String,
+        fault: nodedb_types::text_search::TextColumnFault,
+    },
+
     /// A bare column name resolved against more than one relation in scope.
     /// Propagated from `SqlError::AmbiguousColumn`; the pgwire layer renders
     /// it as SQLSTATE `42702` (ambiguous_column).
@@ -356,6 +366,38 @@ pub enum Error {
     /// SQLSTATE `22000` (data_exception) at the pgwire layer.
     #[error("{detail}")]
     DataException { detail: String },
+
+    /// A value does not fit its numeric type: an integer past a column's
+    /// declared width, a float that overflows `REAL`, a literal past the exact
+    /// numeric range, or arithmetic that overflows. Rendered as SQLSTATE
+    /// `22003` (numeric_value_out_of_range) at the pgwire layer.
+    #[error("{detail}")]
+    NumericValueOutOfRange { detail: String },
+
+    /// Text does not parse as the type of the column it is written to.
+    /// `detail` names the column, the text and the type. Rendered as
+    /// SQLSTATE `22P02` (invalid_text_representation) at the pgwire layer.
+    #[error("{detail}")]
+    InvalidTextRepresentation { detail: String },
+
+    /// A value of the wrong kind for the column it is written to: an array
+    /// for a `BOOL`, a fractional number for an `INT`. `detail` names the
+    /// column, the value and the type. Rendered as SQLSTATE `42804`
+    /// (datatype_mismatch) at the pgwire layer.
+    #[error("{detail}")]
+    DatatypeMismatch { detail: String },
+
+    /// Text does not parse as the `TIMESTAMP` or `TIMESTAMPTZ` it is written
+    /// to. `detail` names the column, the text and the type. Rendered as
+    /// SQLSTATE `22007` (invalid_datetime_format) at the pgwire layer.
+    #[error("{detail}")]
+    InvalidDatetimeFormat { detail: String },
+
+    /// An instant outside the range a `TIMESTAMP` or `TIMESTAMPTZ` holds.
+    /// `detail` names the column, the value and the type. Rendered as
+    /// SQLSTATE `22008` (datetime_field_overflow) at the pgwire layer.
+    #[error("{detail}")]
+    DatetimeFieldOverflow { detail: String },
 
     /// A LIMIT/OFFSET/FETCH bound did not resolve to `[0, usize::MAX]`.
     /// The pgwire layer renders it as SQLSTATE `2201W`.

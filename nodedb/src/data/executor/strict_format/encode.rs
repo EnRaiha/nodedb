@@ -66,16 +66,50 @@ pub fn value_to_binary_tuple(
                 }
                 Value::Null
             }
-            Some(v) => coerce_value(v, &col.column_type, &col.name)?,
+            Some(v) => coerce_value(v, col)?,
         };
         values.push(typed);
     }
 
     encoder
         .encode(&values)
-        .map_err(|e| crate::Error::BadRequest {
-            detail: format!("Binary Tuple encode: {e}"),
-        })
+        .map_err(|e| tuple_encode_error(e, map))
+}
+
+/// The error for a row the tuple encoder refuses.
+///
+/// A value of a kind the column does not hold is `DatatypeMismatch`
+/// (SQLSTATE `42804`). A value of an accepted kind that does not convert,
+/// such as text that is no UUID, is `InvalidTextRepresentation` (SQLSTATE
+/// `22P02`). Both name the column, the value from `row`, and the type. Any
+/// other encoder error is a malformed request.
+fn tuple_encode_error(
+    error: nodedb_strict::StrictError,
+    row: &std::collections::HashMap<String, Value>,
+) -> crate::Error {
+    match error {
+        nodedb_strict::StrictError::TypeMismatch { column, expected } => {
+            crate::Error::DatatypeMismatch {
+                detail: format!(
+                    "column '{column}': expected {expected}, got {:?}",
+                    row.get(&column).unwrap_or(&Value::Null)
+                ),
+            }
+        }
+        nodedb_strict::StrictError::InvalidValue {
+            column,
+            expected,
+            detail,
+        } => crate::Error::InvalidTextRepresentation {
+            detail: format!(
+                "column '{column}': {:?} is not a valid {expected} value: {detail}",
+                row.get(&column).unwrap_or(&Value::Null)
+            ),
+        },
+        other => crate::Error::BadRequest {
+            detail: format!("Binary Tuple encode: {other}"),
+        },
+    }
 }
 
 /// Bitemporal variant: decode msgpack to `Value`, then encode as a Binary
@@ -170,7 +204,7 @@ pub fn value_to_binary_tuple_bitemporal(
                 }
                 Value::Null
             }
-            Some(v) => coerce_value(v, &col.column_type, &col.name)?,
+            Some(v) => coerce_value(v, col)?,
         };
         user_values.push(typed);
     }
@@ -178,7 +212,5 @@ pub fn value_to_binary_tuple_bitemporal(
     let encoder = nodedb_strict::TupleEncoder::new(schema);
     encoder
         .encode_bitemporal(system_from_ms, valid_from_ms, valid_until_ms, &user_values)
-        .map_err(|e| crate::Error::BadRequest {
-            detail: format!("Binary Tuple encode: {e}"),
-        })
+        .map_err(|e| tuple_encode_error(e, map))
 }

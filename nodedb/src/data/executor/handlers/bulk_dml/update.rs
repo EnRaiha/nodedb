@@ -119,12 +119,7 @@ impl CoreLoop {
         ) {
             Ok(ids) => ids,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
 
@@ -306,7 +301,7 @@ impl CoreLoop {
             );
             // The row's post-image, then one durable redo entry per derived
             // target row, naming the TARGET collection.
-            write_set.push(self.stored_row_image(
+            let image = self.stored_row_image(
                 StoredRow {
                     database_id,
                     tid,
@@ -316,7 +311,15 @@ impl CoreLoop {
                 },
                 &updated_bytes,
                 None,
-            ));
+            );
+            match image {
+                Ok(image) => write_set.push(image),
+                // This row's transaction committed, so a row landed.
+                Err(e) => {
+                    let code = refusal_after_partial_apply(ErrorCode::from(e));
+                    return self.refusal_with_landed_rows(task, code, write_set);
+                }
+            }
             write_set.extend(write_hook::target_write_set(&target_writes));
             // Published only after the commit succeeded — the same
             // ordering the reindex helper used when it owned the
@@ -372,8 +375,9 @@ impl CoreLoop {
             // metadata reconstructed only when the live per-row events
             // were lost — the live path always emits per row.
             //
-            // `row_identity` is read again below for `RETURNING`'s `id` field,
-            // so the event-emit boundary gets a clone rather than the move.
+            // `row_identity` is read again below for `RETURNING`'s identity
+            // column, so the event-emit boundary gets a clone rather than the
+            // move.
             self.emit_put_event(
                 task,
                 tid,
@@ -384,11 +388,15 @@ impl CoreLoop {
             );
             affected += 1;
             if returning.is_some() {
-                // `row_identity` only stands in as `id` for a row that
-                // declares no primary key of its own — overwriting a
-                // declared key would return a value the client never wrote.
+                // `row_identity` fills the identity column only for a row
+                // that lacks it. A declared key keeps the value the client
+                // wrote.
                 let mut row = nodedb_types::Value::from(doc);
-                returning_doc::attach_row_id(&mut row, &row_identity);
+                returning_doc::attach_row_id(
+                    &mut row,
+                    &row_identity,
+                    &self.identity_column(database_id, tid, collection),
+                );
                 returned_docs.push(row);
             }
         }
@@ -400,23 +408,13 @@ impl CoreLoop {
         let mut response = if let Some(spec) = returning {
             match returning_rows::build_rows_payload(spec, rls_filters, &returned_docs) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("RETURNING encode: {e}"),
-                    },
-                ),
+                Err(e) => self.response_error(task, ErrorCode::from(e)),
             }
         } else {
             let result = serde_json::json!({ "affected": affected });
             match response_codec::encode_json_as_msgpack(&result) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                ),
+                Err(e) => self.response_error(task, ErrorCode::from(e)),
             }
         };
         response.write_set = write_set;

@@ -62,12 +62,14 @@ impl CoreLoop {
             Err(e) => return self.response_error(task, e),
         };
 
+        let declared = self.declared_columns_of(did, tid, collection);
         let mut writes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::with_capacity(matched.len());
         for (key, body) in matched {
-            let computed = match merge_field_updates(collection, Some(body.as_slice()), updates) {
-                Ok(c) => c,
-                Err(e) => return self.response_error(task, e),
-            };
+            let computed =
+                match merge_field_updates(collection, Some(body.as_slice()), updates, declared) {
+                    Ok(c) => c,
+                    Err(e) => return self.response_error(task, e),
+                };
             if let Err(e) =
                 admit_kv_row(rls_write_check, &computed.new_value, &key, tid, collection)
             {
@@ -119,12 +121,7 @@ impl CoreLoop {
 
         match response_codec::encode_count("affected", writes.len()) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 

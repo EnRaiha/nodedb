@@ -203,6 +203,15 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
             sqlstate::UNDEFINED_COLUMN,
             format!("column \"{column}\" does not exist"),
         ),
+        ErrorCode::TextColumn {
+            collection,
+            column,
+            fault,
+        } => (
+            "ERROR",
+            fault.sqlstate(),
+            format!("column \"{column}\" of collection \"{collection}\" {fault}"),
+        ),
         ErrorCode::Internal { detail } => ("ERROR", sqlstate::INTERNAL_ERROR, detail.clone()),
         // Division/modulo by zero.
         ErrorCode::DivisionByZero => (
@@ -216,6 +225,25 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
             format!("function {name}() does not exist"),
         ),
         ErrorCode::DataException { detail } => ("ERROR", sqlstate::DATA_EXCEPTION, detail.clone()),
+        ErrorCode::NumericValueOutOfRange { detail } => (
+            "ERROR",
+            sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+            detail.clone(),
+        ),
+        ErrorCode::InvalidTextRepresentation { detail } => (
+            "ERROR",
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            detail.clone(),
+        ),
+        ErrorCode::DatatypeMismatch { detail } => {
+            ("ERROR", sqlstate::DATATYPE_MISMATCH, detail.clone())
+        }
+        ErrorCode::InvalidDatetimeFormat { detail } => {
+            ("ERROR", sqlstate::INVALID_DATETIME_FORMAT, detail.clone())
+        }
+        ErrorCode::DatetimeFieldOverflow { detail } => {
+            ("ERROR", sqlstate::DATETIME_FIELD_OVERFLOW, detail.clone())
+        }
         // The same SQLSTATE the Control Plane gives `crate::Error::BadRequest`.
         ErrorCode::BadRequest { detail } => ("ERROR", sqlstate::SYNTAX_ERROR, detail.clone()),
         ErrorCode::TransactionRollback { detail } => {
@@ -239,14 +267,22 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
         ErrorCode::RollbackFailed {
             entry_index,
             detail,
-        } => (
-            "ERROR",
-            sqlstate::INTERNAL_ERROR,
-            format!(
-                "transaction rollback failed at undo entry {entry_index}: {detail}; \
-                 shard state is unknown — restart required"
-            ),
-        ),
+            cause,
+        } => {
+            // The message of the typed cause, as its own code renders it.
+            let because = cause
+                .as_deref()
+                .map(|cause| format!(" ({})", error_code_to_sqlstate(cause).2))
+                .unwrap_or_default();
+            (
+                "ERROR",
+                sqlstate::INTERNAL_ERROR,
+                format!(
+                    "transaction rollback failed at undo entry {entry_index}: \
+                     {detail}{because}; shard state is unknown — restart required"
+                ),
+            )
+        }
         // OllpRetryRequired is an internal scheduler signal and must not
         // reach the pgwire layer as a user-visible error. If it does, surface
         // it as a serialization failure so clients retry automatically.
@@ -267,6 +303,11 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
                 "transaction staging overlay exceeded its {limit}-byte per-core budget; \
                  split the transaction into smaller batches"
             ),
+        ),
+        ErrorCode::NodeLabelLimit { node, label, limit } => (
+            "ERROR",
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            crate::error_from_data_plane::node_label_limit_message(node, label, *limit),
         ),
     }
 }

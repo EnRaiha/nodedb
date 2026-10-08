@@ -66,12 +66,7 @@ impl CoreLoop {
             Ok(e) => e,
             Err(e) => {
                 warn!(core = self.core_id, error = %e, "failed to create CRDT engine for get policy");
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         let policy = engine.get_collection_policy(collection);
@@ -98,24 +93,14 @@ impl CoreLoop {
             Ok(e) => e,
             Err(e) => {
                 warn!(core = self.core_id, error = %e, "failed to create CRDT engine");
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         match engine.set_collection_policy(collection, policy_json) {
             Ok(()) => self.response_ok(task),
             Err(e) => {
                 warn!(core = self.core_id, error = %e, "set collection policy failed");
-                self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                )
+                self.response_error(task, ErrorCode::from(e))
             }
         }
     }
@@ -165,12 +150,7 @@ impl CoreLoop {
                             Ok(true) => kept.push((id, bytes)),
                             Ok(false) => {}
                             Err(e) => {
-                                return self.response_error(
-                                    task,
-                                    ErrorCode::Internal {
-                                        detail: e.to_string(),
-                                    },
-                                );
+                                return self.response_error(task, ErrorCode::from(e));
                             }
                         }
                     }
@@ -178,12 +158,7 @@ impl CoreLoop {
                 }
                 Err(e) => {
                     warn!(core = self.core_id, error = %e, "sparse range scan failed");
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
+                    return self.response_error(task, ErrorCode::from(e));
                 }
             };
 
@@ -199,18 +174,24 @@ impl CoreLoop {
             );
             match scan_result {
                 Ok(mut docs) => {
+                    let sort_keys = [nodedb_physical::physical_plan::SortKeySpec::column(
+                        field, true,
+                    )];
+                    let strict_schema = self.strict_schema_for(
+                        task.request.database_id,
+                        crate::types::TenantId::new(tid),
+                        collection,
+                    );
+                    let decimal_keys = super::super::document::sort::decimal_sort_keys(
+                        &sort_keys,
+                        strict_schema.as_ref(),
+                    );
                     if let Err(e) = super::super::document::sort::sort_rows(
                         &mut docs,
-                        &[nodedb_physical::physical_plan::SortKeySpec::column(
-                            field, true,
-                        )],
+                        &sort_keys,
+                        &decimal_keys,
                     ) {
-                        return self.response_error(
-                            task,
-                            ErrorCode::Internal {
-                                detail: format!("in-memory sort failed: {e}"),
-                            },
-                        );
+                        return self.response_error(task, ErrorCode::from(e));
                     }
                     docs.truncate(limit);
                     // Raw msgpack passthrough — no decode/re-encode.
@@ -224,22 +205,12 @@ impl CoreLoop {
                     match super::super::super::response_codec::encode_raw_document_rows(&rows) {
                         Ok(payload) => return self.response_with_payload(task, payload),
                         Err(e) => {
-                            return self.response_error(
-                                task,
-                                ErrorCode::Internal {
-                                    detail: e.to_string(),
-                                },
-                            );
+                            return self.response_error(task, ErrorCode::from(e));
                         }
                     }
                 }
                 Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
+                    return self.response_error(task, ErrorCode::from(e));
                 }
             }
         }
@@ -248,12 +219,7 @@ impl CoreLoop {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => {
                 warn!(core = self.core_id, error = %e, "range scan serialization failed");
-                self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                )
+                self.response_error(task, ErrorCode::from(e))
             }
         }
     }

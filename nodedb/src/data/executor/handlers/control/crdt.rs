@@ -24,12 +24,7 @@ impl CoreLoop {
             Ok(e) => e,
             Err(e) => {
                 warn!(core = self.core_id, error = %e, "failed to create CRDT engine");
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         match engine.read_snapshot(collection, document_id) {
@@ -37,12 +32,7 @@ impl CoreLoop {
             Ok(None) => self.response_error(task, ErrorCode::NotFound),
             Err(e) => {
                 warn!(core = self.core_id, error = %e, "crdt read snapshot failed");
-                self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                )
+                self.response_error(task, ErrorCode::from(e))
             }
         }
     }
@@ -60,23 +50,13 @@ impl CoreLoop {
         let engine = match self.get_crdt_engine(task.request.database_id, tenant_id) {
             Ok(e) => e,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         match engine.read_at_version_json(collection, document_id, version_vector_json) {
             Ok(Some(json_bytes)) => self.response_with_payload(task, json_bytes),
             Ok(None) => self.response_error(task, ErrorCode::NotFound),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -90,22 +70,12 @@ impl CoreLoop {
         let engine = match self.get_crdt_engine(task.request.database_id, tenant_id) {
             Ok(e) => e,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         match engine.version_vector_json(collection) {
             Ok(json) => self.response_with_payload(task, json.into_bytes()),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -120,22 +90,12 @@ impl CoreLoop {
         let engine = match self.get_crdt_engine(task.request.database_id, tenant_id) {
             Ok(e) => e,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         match engine.export_delta(collection, from_version_json) {
             Ok(delta) => self.response_with_payload(task, delta),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -152,22 +112,12 @@ impl CoreLoop {
         let engine = match self.get_crdt_engine(task.request.database_id, tenant_id) {
             Ok(e) => e,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         match engine.preview_restore_to_version(collection, document_id, target_version_json) {
             Ok(delta) => self.response_with_payload(task, delta),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -183,21 +133,11 @@ impl CoreLoop {
         let engine = match self.get_crdt_engine(task.request.database_id, tenant_id) {
             Ok(e) => e,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         if let Err(e) = engine.compact_at_version(collection, target_version_json) {
-            return self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            );
+            return self.response_error(task, ErrorCode::from(e));
         }
         // The Loro docs are in-memory, and boot restores them from the last
         // checkpoint plus WAL deltas. Without a publish here, a crash restores
@@ -208,12 +148,7 @@ impl CoreLoop {
                     .record_flush("crdt", outcome.files_written);
                 self.response_ok(task)
             }
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: format!("history compaction applied but not checkpointed: {e}"),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -237,12 +172,7 @@ impl CoreLoop {
             Ok(e) => e,
             Err(e) => {
                 warn!(core = self.core_id, error = %e, "failed to create CRDT engine");
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         match engine.apply_committed_delta_validated(
@@ -260,6 +190,9 @@ impl CoreLoop {
                 warn!(core = self.core_id, %reason, "crdt snapshot rejected by constraints");
                 // Nothing applied, so the record is cancelled and replay never
                 // reaches this rejection. Its dead-letter entry is stored first.
+                // An entry the store refused is removed from the queue, so
+                // nothing records the snapshot, as for a queue refusal. The
+                // store recorded the refusal in the black box.
                 let code = match self.store_crdt_dead_letter(
                     task.request.database_id,
                     tid,
@@ -268,21 +201,41 @@ impl CoreLoop {
                     Ok(()) => crate::data::executor::core_loop::crdt_rejection(
                         collection, "snapshot", &reason,
                     ),
-                    Err(error) => ErrorCode::Internal {
-                        detail: format!(
+                    Err(error) => ErrorCode::RetryableRefusal {
+                        reason: format!(
                             "CRDT snapshot for {collection} violates {reason}, and its \
-                             dead-letter entry could not be stored: {error}"
+                             dead-letter entry could not be stored: {error}; nothing was \
+                             applied"
                         ),
                     },
                 };
                 self.response_error(task, code)
             }
+            // Nothing applied and nothing records the snapshot. The apply
+            // recorded the refusal in the black box.
+            crate::engine::crdt::tenant_state::ValidatedApplyOutcome::DeadLetterRefused {
+                violation,
+                error,
+            } => self.response_error(
+                task,
+                ErrorCode::RetryableRefusal {
+                    reason: format!(
+                        "CRDT snapshot for {collection} violates {violation}, and the \
+                         dead-letter queue refused it: {error}; nothing was applied"
+                    ),
+                },
+            ),
+            // The caller sent bytes that do not decode as a snapshot. The
+            // import ran on a detached candidate, so nothing was applied.
             crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Malformed => {
                 warn!(core = self.core_id, "crdt snapshot import was malformed");
                 self.response_error(
                     task,
-                    ErrorCode::Internal {
-                        detail: "malformed CRDT snapshot".into(),
+                    ErrorCode::DataException {
+                        detail: format!(
+                            "CRDT snapshot for {collection} is malformed: its bytes do not \
+                             decode as a snapshot; nothing was applied"
+                        ),
                     },
                 )
             }
@@ -298,6 +251,27 @@ impl CoreLoop {
                     task,
                     ErrorCode::Internal {
                         detail: "CRDT snapshot import left operations causally pending".into(),
+                    },
+                )
+            }
+            // This node failed to build the candidate; the snapshot itself
+            // is not at fault, so the refusal is retryable.
+            crate::engine::crdt::tenant_state::ValidatedApplyOutcome::CandidateUnavailable {
+                error,
+            } => {
+                warn!(
+                    core = self.core_id,
+                    %collection,
+                    %error,
+                    "crdt snapshot import refused: no apply candidate"
+                );
+                self.response_error(
+                    task,
+                    ErrorCode::RetryableRefusal {
+                        reason: format!(
+                            "no apply candidate for CRDT collection {collection}: {error}; \
+                             nothing was imported"
+                        ),
                     },
                 )
             }

@@ -144,6 +144,11 @@ pub(crate) fn data_plane_code_to_public(code: ErrorCode) -> NodeDbError {
              add a stricter termination condition or raise max_recursion_depth"
         )),
         ErrorCode::UndefinedColumn { column } => NodeDbError::undefined_column(column),
+        ErrorCode::TextColumn {
+            collection,
+            column,
+            fault,
+        } => text_column_to_public(&collection, &column, &fault),
         // `0A000` (feature_not_supported). `SQL_NOT_ENABLED` is the class
         // every bare `0A000` refusal carries.
         ErrorCode::Unsupported { detail } => {
@@ -152,7 +157,18 @@ pub(crate) fn data_plane_code_to_public(code: ErrorCode) -> NodeDbError {
         ErrorCode::DivisionByZero => NodeDbError::division_by_zero(),
         ErrorCode::UndefinedFunction { name } => NodeDbError::undefined_function(name),
         ErrorCode::DataException { detail } => NodeDbError::data_exception(detail),
+        ErrorCode::NumericValueOutOfRange { detail } => {
+            NodeDbError::numeric_value_out_of_range(detail)
+        }
         ErrorCode::BadRequest { detail } => NodeDbError::bad_request(detail),
+        // The public class `code_for_sqlstate` gives `22P02`, `22007`,
+        // `22008` and `42804`.
+        ErrorCode::InvalidTextRepresentation { detail }
+        | ErrorCode::InvalidDatetimeFormat { detail }
+        | ErrorCode::DatetimeFieldOverflow { detail } => NodeDbError::data_exception(detail),
+        ErrorCode::DatatypeMismatch { detail } => {
+            NodeDbError::from_wire(PublicCode::BAD_REQUEST, detail)
+        }
         ErrorCode::TransactionRollback { detail } => NodeDbError::transaction_rollback(detail),
         ErrorCode::ActiveSqlTransaction { detail } => NodeDbError::active_sql_transaction(detail),
         ErrorCode::DependentObjectsExist { object, detail } => {
@@ -167,16 +183,33 @@ pub(crate) fn data_plane_code_to_public(code: ErrorCode) -> NodeDbError {
                  split the transaction into smaller batches"
             ))
         }
+        ErrorCode::NodeLabelLimit { node, label, limit } => {
+            NodeDbError::program_limit_exceeded(node_label_limit_message(&node, &label, limit))
+        }
         // Genuinely internal: the shard is in an unknown or faulted state.
         // These are the only codes for which NDB-9000 is the truth.
         ErrorCode::Internal { detail } => NodeDbError::internal(detail),
+        // The typed cause of the failed reverse write chains onto the error
+        // and names itself in the message.
         ErrorCode::RollbackFailed {
             entry_index,
             detail,
-        } => NodeDbError::internal(format!(
-            "transaction rollback failed at undo entry {entry_index}: {detail}; \
-             shard state is unknown — restart required"
-        )),
+            cause,
+        } => {
+            let cause = cause.map(|cause| data_plane_code_to_public(*cause));
+            let because = cause
+                .as_ref()
+                .map(|cause| format!(" ({cause})"))
+                .unwrap_or_default();
+            let error = NodeDbError::internal(format!(
+                "transaction rollback failed at undo entry {entry_index}: {detail}{because}; \
+                 shard state is unknown — restart required"
+            ));
+            match cause {
+                Some(cause) => error.with_cause(cause),
+                None => error,
+            }
+        }
         // A scheduler signal that reached a client: nothing was written, and
         // the retry that the signal asks for succeeds, so it takes the
         // retriable class the SQL surfaces send (`40001`).
@@ -205,6 +238,35 @@ pub(crate) fn rejected_constraint_to_public(
         sqlstate::GENERATED_ALWAYS => NodeDbError::bad_request(detail),
         _ => NodeDbError::constraint_violation(collection, constraint, detail),
     }
+}
+
+/// The public error of a full-text column fault. A field that does not exist
+/// as text is an undefined column (`42703`). An argument that is not a text
+/// column is a type mismatch (class `42`). Shared by the Data-Plane code and
+/// the Control-Plane variant, so both render one message.
+pub(crate) fn text_column_to_public(
+    collection: &str,
+    column: &str,
+    fault: &nodedb_types::text_search::TextColumnFault,
+) -> NodeDbError {
+    use nodedb_types::text_search::TextColumnFault;
+    let code = match fault {
+        TextColumnFault::Undeclared | TextColumnFault::NotIndexed => PublicCode::UNDEFINED_COLUMN,
+        TextColumnFault::NotText { .. } | TextColumnFault::NotAColumn => PublicCode::TYPE_MISMATCH,
+    };
+    NodeDbError::from_wire(
+        code,
+        format!("column \"{column}\" of collection \"{collection}\" {fault}"),
+    )
+}
+
+/// The message of a refused node-label write. Shared by the public error and
+/// the SQLSTATE table, so every protocol renders one text.
+pub(crate) fn node_label_limit_message(node: &str, label: &str, limit: usize) -> String {
+    format!(
+        "label \"{label}\" on node \"{node}\" exceeds the {limit} distinct node-label \
+         limit of the graph partition; no label of the statement was applied"
+    )
 }
 
 #[cfg(test)]

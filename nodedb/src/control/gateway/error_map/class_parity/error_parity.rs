@@ -109,6 +109,11 @@ fn classified_sqlstates() -> Vec<(usize, &'static str)> {
         (107, sqlstate::STALE_READ_NOT_LEADER),
         (108, sqlstate::DEPENDENT_OBJECTS_STILL_EXIST),
         (109, sqlstate::DEPENDENT_OBJECTS_STILL_EXIST),
+        (116, sqlstate::NUMERIC_VALUE_OUT_OF_RANGE),
+        (117, sqlstate::INVALID_TEXT_REPRESENTATION),
+        (118, sqlstate::DATATYPE_MISMATCH),
+        (119, sqlstate::INVALID_DATETIME_FORMAT),
+        (120, sqlstate::DATETIME_FIELD_OVERFLOW),
     ]
 }
 

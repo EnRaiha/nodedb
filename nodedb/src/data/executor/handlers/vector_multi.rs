@@ -126,12 +126,7 @@ impl CoreLoop {
 
         match super::super::response_codec::encode_count("inserted_vectors", ids.len()) {
             Ok(bytes) => self.response_with_payload(task, bytes),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -274,12 +269,7 @@ impl CoreLoop {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => {
                 warn!(core = self.core_id, error = %e, "multi-vector search encode failed");
-                self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                )
+                self.response_error(task, ErrorCode::from(e))
             }
         }
     }

@@ -87,3 +87,14 @@ impl From<nodedb_types::LsnTimeError> for Error {
         }
     }
 }
+
+/// An array-engine error. The array store is engine storage, so it renders
+/// as a storage error of the `array` engine.
+impl From<crate::engine::array::engine::ArrayEngineError> for Error {
+    fn from(e: crate::engine::array::engine::ArrayEngineError) -> Self {
+        Error::Storage {
+            engine: "array".to_string(),
+            detail: e.to_string(),
+        }
+    }
+}

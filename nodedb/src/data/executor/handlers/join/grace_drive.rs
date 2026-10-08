@@ -266,12 +266,7 @@ impl CoreLoop {
                 return self.response_error(join.task, ErrorCode::ResourcesExhausted);
             }
             Err(e) => {
-                return self.response_error(
-                    join.task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(join.task, ErrorCode::from(e));
             }
         };
 
@@ -283,12 +278,7 @@ impl CoreLoop {
         }
 
         if let Err(e) = join.filter_and_project(&mut results) {
-            return self.response_error(
-                join.task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            );
+            return self.response_error(join.task, ErrorCode::from(e));
         }
 
         let payload = crate::data::executor::response_codec::encode_binary_rows(&results);

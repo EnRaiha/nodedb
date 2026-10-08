@@ -110,12 +110,7 @@ impl CoreLoop {
             .unwrap_or_default();
         match response_codec::encode_serde(&wm) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -138,12 +133,7 @@ impl CoreLoop {
             };
         match response_codec::encode(&entries) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -166,12 +156,7 @@ impl CoreLoop {
             .map(|e| (e.ts, e.value));
         match response_codec::encode(&entry) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -204,12 +189,7 @@ impl CoreLoop {
                 let payload = (n as u64).to_le_bytes().to_vec();
                 self.response_with_payload(task, payload)
             }
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: format!("edge_store temporal purge: {e}"),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -243,12 +223,7 @@ impl CoreLoop {
                 payload.extend_from_slice(&(idx as u64).to_le_bytes());
                 self.response_with_payload(task, payload)
             }
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: format!("document_strict temporal purge: {e}"),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -270,12 +245,7 @@ impl CoreLoop {
             Some(engine) => match engine.purge_history_before(collection, cutoff_system_ms) {
                 Ok(n) => n as u64,
                 Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("crdt temporal purge: {e}"),
-                        },
-                    );
+                    return self.response_error(task, ErrorCode::from(e));
                 }
             },
             None => 0,
@@ -385,12 +355,7 @@ impl CoreLoop {
                 let payload = (n as u64).to_le_bytes().to_vec();
                 self.response_with_payload(task, payload)
             }
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: format!("columnar temporal purge: {e}"),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }

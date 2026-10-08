@@ -136,13 +136,16 @@ impl CoreLoop {
         // in-transaction staging path so a staged insert into a brand-new
         // collection registers the same schema (see
         // `ensure_columnar_engine_schema` doc comment).
-        let schema = self.ensure_columnar_engine_schema(
+        let schema = match self.ensure_columnar_engine_schema(
             &engine_key,
             collection,
             bitemporal,
             &ndb_rows[0],
             schema_bytes,
-        );
+        ) {
+            Ok(schema) => schema,
+            Err(e) => return self.response_error(task, ErrorCode::from(e)),
+        };
 
         let outcome = match self.insert_columnar_rows(
             task,
@@ -229,12 +232,7 @@ impl CoreLoop {
         let json = match response_codec::encode_json_as_msgpack(&result) {
             Ok(b) => b,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         Response {

@@ -79,7 +79,7 @@ impl CoreLoop {
                     self.graph_txn_overlays.get(&txn_id),
                     &(task.request.database_id, tenant, collection.to_string()),
                     node_id,
-                    edge_label.as_deref(),
+                    edge_label.as_deref().as_slice(),
                     direction,
                     edges,
                 )
@@ -103,12 +103,7 @@ impl CoreLoop {
             .collect();
         match super::super::response_codec::encode(&entries) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 

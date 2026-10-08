@@ -30,40 +30,6 @@ use crate::data::executor::core_loop::CoreLoop;
 /// it the rebuild is discarded at cutover and the live partition stays.
 pub const CSR_REBUILD_JOURNAL_MAX_BYTES: usize = 64 << 20;
 
-/// Map a graph-engine error into the crate error.
-pub(super) fn graph_err(e: nodedb_graph::GraphError) -> crate::Error {
-    use nodedb_graph::GraphError;
-    match e {
-        // The engine's memory budget, the same class a vector or FTS budget
-        // refusal has.
-        GraphError::MemoryBudget(_) => crate::Error::MemoryExhausted {
-            engine: "graph".to_string(),
-        },
-        // A rebuild already holds the partition's journal: the index is busy.
-        GraphError::RebuildInProgress => crate::Error::ObjectNotInPrerequisiteState {
-            object: "graph CSR index".to_string(),
-            detail: e.to_string(),
-        },
-        other @ (GraphError::LabelOverflow { .. }
-        | GraphError::NodeOverflow { .. }
-        | GraphError::WithdrawRefused { .. }
-        | GraphError::RebuildSuperseded
-        | GraphError::RebuildJournalOverflow { .. }
-        | GraphError::RebuildReplayDiverged { .. }
-        | GraphError::RebuildSnapshotInvalid { .. }) => crate::Error::Storage {
-            engine: "graph".to_string(),
-            detail: other.to_string(),
-        },
-        // `GraphError` is `#[non_exhaustive]` and lives in another crate, so
-        // the compiler requires this arm. A variant this build cannot name is
-        // a storage fault.
-        other => crate::Error::Storage {
-            engine: "graph".to_string(),
-            detail: other.to_string(),
-        },
-    }
-}
-
 impl CoreLoop {
     /// Start a CSR rebuild for `target` on its own thread.
     pub(super) fn start_csr_rebuild(&mut self, target: &RebuildTarget) -> crate::Result<()> {
@@ -115,9 +81,7 @@ impl CoreLoop {
             );
             return Ok(None);
         }
-        let seed = partition
-            .begin_rebuild(CSR_REBUILD_JOURNAL_MAX_BYTES)
-            .map_err(graph_err)?;
+        let seed = partition.begin_rebuild(CSR_REBUILD_JOURNAL_MAX_BYTES)?;
         info!(
             target: "nodedb::reindex",
             core = core_id,
@@ -136,9 +100,9 @@ impl CoreLoop {
     ) -> crate::Result<()> {
         let memory = self.graph_memory(target);
         let Some(live) = self.csr.partition_mut(target.database_id, target.tenant_id) else {
-            return Err(graph_err(nodedb_graph::GraphError::RebuildSuperseded));
+            return Err(nodedb_graph::GraphError::RebuildSuperseded.into());
         };
-        let copy = live.finish_rebuild(rebuilt, memory).map_err(graph_err)?;
+        let copy = live.finish_rebuild(rebuilt, memory)?;
         let nodes = copy.node_count();
         let edges = copy.edge_count();
         self.csr
@@ -169,20 +133,5 @@ impl CoreLoop {
             target.tenant_id,
             EngineId::Graph,
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A REINDEX refused because a rebuild is running reports a busy index,
-    /// not a storage fault.
-    #[test]
-    fn a_running_rebuild_is_a_busy_index() {
-        assert!(matches!(
-            graph_err(nodedb_graph::GraphError::RebuildInProgress),
-            crate::Error::ObjectNotInPrerequisiteState { .. }
-        ));
     }
 }

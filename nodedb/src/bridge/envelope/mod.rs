@@ -3,6 +3,7 @@
 //! Request/response envelopes exchanged over the SPSC bridge.
 
 pub mod error_code;
+pub mod error_code_from;
 pub mod payload;
 pub mod request;
 pub mod response;

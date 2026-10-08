@@ -199,12 +199,7 @@ impl CoreLoop {
     fn kv_get_ttl_response(&self, task: &ExecutionTask, ttl_ms: i64) -> Response {
         match response_codec::encode_json_as_msgpack(&serde_json::json!({ "ttl_ms": ttl_ms })) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }

@@ -160,12 +160,7 @@ impl CoreLoop {
                     strict_schema: strict_schema.as_ref(),
                 },
             ),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }
