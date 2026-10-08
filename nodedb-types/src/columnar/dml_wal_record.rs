@@ -42,8 +42,9 @@ pub struct ColumnarDmlWalRecord {
     pub is_update: bool,
     /// Serialized `Vec<nodedb_query::scan_filter::ScanFilter>` (MessagePack).
     pub filters: Vec<u8>,
-    /// Field assignments for `Update`: `(column_name, msgpack_value_bytes)`.
-    /// Always empty for `Delete`.
+    /// Field assignments for `Update`: `(column_name, value_bytes)`. Each
+    /// value is a MessagePack-encoded `UpdateValue`, a literal or an
+    /// expression over the row. Always empty for `Delete`.
     pub updates: Vec<(String, Vec<u8>)>,
 }
 

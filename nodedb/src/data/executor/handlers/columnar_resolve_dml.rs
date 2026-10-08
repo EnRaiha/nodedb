@@ -17,13 +17,14 @@
 //! statement, exactly as `execute_columnar_update` / `execute_columnar_delete`
 //! do — the caller never sees a partial resolved set.
 
+use nodedb_physical::physical_plan::UpdateValue;
 use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
-use crate::bridge::scan_filter::ScanFilter;
+use crate::bridge::scan_filter::decode_scan_filters;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::columnar_resolve::{
-    ResolveUpdateRowsParams, require_pk_column_index, resolve_delete_rows, resolve_update_rows,
+    ResolveDeleteRowsParams, ResolveUpdateRowsParams, require_pk_column_index,
 };
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
@@ -37,7 +38,7 @@ impl CoreLoop {
         task: &ExecutionTask,
         collection: &str,
         filters: &[u8],
-        updates: &[(String, Vec<u8>)],
+        updates: &[(String, UpdateValue)],
         is_update: bool,
         rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
@@ -67,16 +68,17 @@ impl CoreLoop {
             Err(e) => return self.response_error(task, e),
         };
 
-        let filter_predicates: Vec<ScanFilter> = if !filters.is_empty() {
-            zerompk::from_msgpack(filters).unwrap_or_default()
-        } else {
-            Vec::new()
+        // A filter that does not decode refuses the statement. Read as no
+        // filter, it would resolve every row.
+        let filter_predicates = match decode_scan_filters(filters, "columnar DML filter") {
+            Ok(filters) => filters,
+            Err(e) => return self.response_error(task, e),
         };
 
         let tid = task.request.tenant_id.as_u64();
         let payload = if is_update {
-            let rows = match resolve_update_rows(ResolveUpdateRowsParams {
-                engine,
+            let rows = match self.resolve_columnar_update_rows(ResolveUpdateRowsParams {
+                key: &key,
                 schema: &schema,
                 pk_col_idx,
                 filter_predicates: &filter_predicates,
@@ -90,15 +92,15 @@ impl CoreLoop {
             };
             response_codec::encode(&rows)
         } else {
-            let pks = match resolve_delete_rows(
-                engine,
-                &schema,
+            let pks = match self.resolve_columnar_delete_rows(ResolveDeleteRowsParams {
+                key: &key,
+                schema: &schema,
                 pk_col_idx,
-                &filter_predicates,
+                filter_predicates: &filter_predicates,
                 rls_write_check,
                 tid,
                 collection,
-            ) {
+            }) {
                 Ok(pks) => pks,
                 Err(e) => return self.response_error(task, e),
             };

@@ -3,6 +3,7 @@
 pub mod archiver;
 pub mod audit_archive;
 pub mod audit_segment;
+pub mod columnar_dml_updates;
 pub mod crdt_doc_payload;
 pub mod crdt_list_payload;
 pub mod crdt_payload;
@@ -12,6 +13,7 @@ pub mod replay;
 pub mod timeseries_batch_payload;
 
 pub use audit_segment::AuditWalSegment;
+pub(crate) use columnar_dml_updates::{decode_columnar_dml_updates, encode_columnar_dml_updates};
 pub(crate) use crdt_doc_payload::CrdtDocOpWalRecord;
 pub(crate) use crdt_list_payload::CrdtListOpWalRecord;
 pub(crate) use crdt_payload::{
