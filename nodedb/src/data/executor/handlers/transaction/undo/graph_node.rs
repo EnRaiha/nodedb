@@ -16,19 +16,19 @@
 //! The node-label undo puts each label back, then withdraws the label names
 //! and the node the op interned, so the CSR holds what it held before.
 //!
-//! Returns `Err((entry_index, detail))` on fatal failure so the caller can
-//! escalate to a typed `RollbackFailed` response.
+//! Returns an [`UndoError`] on fatal failure, and the caller escalates it to
+//! a typed `RollbackFailed` response.
 
 use crate::data::executor::core_loop::CoreLoop;
 
-use super::UndoEntry;
+use super::{UndoEntry, UndoError};
 
 impl CoreLoop {
     pub(super) fn apply_undo_mark_node(
         &mut self,
         _entry_index: usize,
         entry: UndoEntry,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         match entry {
             UndoEntry::MarkNodeDeleted {
                 database_id,
@@ -87,7 +87,7 @@ impl CoreLoop {
         &mut self,
         entry_index: usize,
         undo: NodeLabelsUndo,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         let NodeLabelsUndo {
             database_id,
             tid,
@@ -100,9 +100,10 @@ impl CoreLoop {
         for (label, carried) in prior {
             if carried {
                 partition.add_node_label(&node_id, &label).map_err(|e| {
-                    (
+                    UndoError::failed(
                         entry_index,
-                        format!("restoring label '{label}' on node '{node_id}': {e}"),
+                        format!("restoring label '{label}' on node '{node_id}'"),
+                        e,
                     )
                 })?;
             } else {
@@ -110,14 +111,14 @@ impl CoreLoop {
             }
         }
         for label in interned_labels.iter().rev() {
-            partition
-                .withdraw_newest_node_label(label)
-                .map_err(|e| (entry_index, format!("withdrawing label '{label}': {e}")))?;
+            partition.withdraw_newest_node_label(label).map_err(|e| {
+                UndoError::failed(entry_index, format!("withdrawing label '{label}'"), e)
+            })?;
         }
         if created_node {
-            partition
-                .withdraw_newest_node(&node_id)
-                .map_err(|e| (entry_index, format!("withdrawing node '{node_id}': {e}")))?;
+            partition.withdraw_newest_node(&node_id).map_err(|e| {
+                UndoError::failed(entry_index, format!("withdrawing node '{node_id}'"), e)
+            })?;
         }
         Ok(())
     }

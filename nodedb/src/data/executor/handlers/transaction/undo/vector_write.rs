@@ -19,7 +19,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::vector_direct_row::VectorIndexKey;
 use crate::engine::vector::collection::VectorWriteMark;
 
-use super::UndoEntry;
+use super::{UndoEntry, UndoError};
 
 /// The pre-image of one vector write.
 pub(in crate::data::executor) struct VectorWriteUndo {
@@ -115,7 +115,7 @@ impl CoreLoop {
         &mut self,
         entry_index: usize,
         undo: VectorWriteUndo,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         let VectorWriteUndo {
             index_key,
             tid,
@@ -126,7 +126,6 @@ impl CoreLoop {
             payload_rows,
         } = undo;
         let database_id = index_key.0.as_u64();
-        let fail = |detail: String| (entry_index, detail);
 
         // The bitmap entries of the rows the write left behind go first: their
         // fields sit in the sidecars the write stored.
@@ -141,7 +140,9 @@ impl CoreLoop {
             let current = self
                 .sparse
                 .get(database_id, tid, &collection, &key)
-                .map_err(|e| fail(format!("reading the sidecar of {key}: {e}")))?;
+                .map_err(|e| {
+                    UndoError::failed(entry_index, format!("reading the sidecar of {key}"), e)
+                })?;
             if let Some(bytes) = current
                 && let Ok(fields) =
                     crate::data::executor::handlers::vector_upsert::decode_payload_lowercased(
@@ -156,17 +157,21 @@ impl CoreLoop {
         match mark {
             Some(mark) => {
                 let Some(coll) = self.vector_collections.get_mut(&index_key) else {
-                    return Err(fail(format!(
-                        "vector index {:?} vanished before its write was rolled back",
-                        index_key
-                    )));
+                    return Err(UndoError::mismatch(
+                        entry_index,
+                        format!(
+                            "vector index {index_key:?} vanished before its write was rolled back"
+                        ),
+                    ));
                 };
                 if !coll.roll_back_to(mark) {
-                    return Err(fail(format!(
-                        "vector index {:?} sealed or trained away the nodes a rolled-back \
-                         write inserted",
-                        index_key
-                    )));
+                    return Err(UndoError::mismatch(
+                        entry_index,
+                        format!(
+                            "vector index {index_key:?} sealed or trained away the nodes a \
+                             rolled-back write inserted"
+                        ),
+                    ));
                 }
                 for (id, fields) in &payload_rows {
                     coll.payload.insert_row(*id, fields);
@@ -192,7 +197,9 @@ impl CoreLoop {
                     .delete(database_id, tid, &collection, &key)
                     .map(drop),
             };
-            restored.map_err(|e| fail(format!("restoring the sidecar of {key}: {e}")))?;
+            restored.map_err(|e| {
+                UndoError::failed(entry_index, format!("restoring the sidecar of {key}"), e)
+            })?;
             self.doc_cache
                 .invalidate(database_id, tid, &collection, &key);
         }

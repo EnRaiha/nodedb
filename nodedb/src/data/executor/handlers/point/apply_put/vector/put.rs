@@ -3,9 +3,12 @@
 //! Index a document's vectors into their HNSW collections on a point put.
 
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::transaction::undo::UndoEntry;
+use crate::data::executor::handlers::vector_direct_row::VectorIndexKey;
 use crate::data::executor::vector_string::floats_from_value;
 
-use super::types::{VectorFieldInsert, VectorIndexDelta, VectorIndexPutParams};
+use super::fields::DEFAULT_VECTOR_FIELD;
+use super::types::{VectorFieldInsert, VectorIndexPutParams};
 
 /// A document vector field whose width differs from its index: the
 /// caller's data error, SQLSTATE `22000`, naming the field.
@@ -21,10 +24,14 @@ fn field_dimension_mismatch(field_name: &str, expected: usize, got: usize) -> cr
 impl CoreLoop {
     /// HNSW vector indexing side-effect: index declared strict-schema
     /// `Vector(dim)` columns, or (schemaless) fields matched by registered
-    /// `vector_params`, into the corresponding `VectorCollection`.
+    /// `vector_params` and declared `VECTOR(n)` columns, into the
+    /// corresponding `VectorCollection`.
     ///
-    /// Returns the `(index_key, vector_id)` pairs inserted so a transactional
-    /// caller can push `UndoEntry::InsertVector` reversals. Each inserted
+    /// Pushes an undo entry onto `undo` for each in-memory mutation as it
+    /// makes it: a vector index it creates, the prior node it soft-deletes,
+    /// and the node it inserts. The entries cover every mutation that ran,
+    /// also when a later field fails. Returns how many nodes it inserted.
+    /// Each inserted
     /// vector is also recorded in `vector_doc_map` keyed by the hex surrogate
     /// row key, so `apply_point_delete` can soft-delete it when the owning
     /// document is removed (closing the vector-orphan leak).
@@ -36,15 +43,17 @@ impl CoreLoop {
     /// this LSN is skipped rather than re-appended as a duplicate HNSW node.
     ///
     /// Fails when a vector's width disagrees with the index it would land in —
-    /// either the width declared by `CREATE VECTOR INDEX ... DIM <n>` or the
-    /// width an already-materialized index carries. The write is refused
-    /// rather than the field skipped: a document that silently loses its
+    /// the width declared by `CREATE VECTOR INDEX ... DIM <n>`, the width of a
+    /// declared `VECTOR(n)` column, or the width an already-materialized index
+    /// carries. The write is refused rather than the field skipped: a
+    /// document that silently loses its
     /// embedding is indistinguishable, at query time, from one that was never
     /// similar to anything.
     pub(in crate::data::executor) fn apply_point_put_vector_indexes(
         &mut self,
         params: VectorIndexPutParams<'_>,
-    ) -> crate::Result<Vec<VectorIndexDelta>> {
+        undo: &mut Vec<UndoEntry>,
+    ) -> crate::Result<usize> {
         let VectorIndexPutParams {
             database_id,
             tid,
@@ -53,7 +62,7 @@ impl CoreLoop {
             value,
             wal_lsn,
         } = params;
-        let mut inserts: Vec<VectorIndexDelta> = Vec::new();
+        let mut inserted: Vec<VectorIndexKey> = Vec::new();
 
         // Vector index: if the strict schema declares Vector(dim) columns,
         // extract float arrays and insert into HNSW so KNN search works.
@@ -87,22 +96,28 @@ impl CoreLoop {
                     // all of them replayed before the core serves a request,
                     // so a live write is never named.
                     let skip = wal_lsn != 0 && self.vector_replay_skips(wal_lsn);
-                    self.ensure_vector_collection(&index_key, &index_key, *dim as usize)?;
+                    self.ensure_vector_collection_with_undo(
+                        &index_key,
+                        &index_key,
+                        *dim as usize,
+                        undo,
+                    )?;
                     if skip {
                         continue;
                     }
-                    if let Some(delta) =
-                        self.remove_then_insert_vector_field(VectorFieldInsert {
+                    if self.remove_then_insert_vector_field(
+                        VectorFieldInsert {
                             database_id,
                             tid,
-                            index_key,
+                            index_key: index_key.clone(),
                             collection,
                             field_name,
                             storage_key,
                             floats,
-                        })?
-                    {
-                        inserts.push(delta);
+                        },
+                        undo,
+                    )? {
+                        inserted.push(index_key);
                     }
                 }
             }
@@ -119,9 +134,10 @@ impl CoreLoop {
             let bare_key = (db_key, tid_key, collection.to_string());
             let field_names = self.schemaless_vector_field_names(database_id, tid, collection);
 
-            // Each field name maps back to its `vector_params` map key: either
-            // the field-qualified key (if one was registered) or the bare key
-            // (single default-"embedding" field, no per-field registration).
+            // Each field name maps back to its `vector_params` map key: the
+            // field-qualified key (if one was registered), the bare key for
+            // the default "embedding" field, or the field-qualified key of a
+            // declared column with no registration (default parameters).
             let schemaless_keys: Vec<(
                 (nodedb_types::DatabaseId, crate::types::TenantId, String),
                 String,
@@ -129,7 +145,9 @@ impl CoreLoop {
                 .into_iter()
                 .map(|field| {
                     let qualified = (db_key, tid_key, format!("{field_prefix}{field}"));
-                    let params_key = if self.vector_params.contains_key(&qualified) {
+                    let params_key = if self.vector_params.contains_key(&qualified)
+                        || field != DEFAULT_VECTOR_FIELD
+                    {
                         qualified
                     } else {
                         bare_key.clone()
@@ -154,25 +172,37 @@ impl CoreLoop {
                     let store_key =
                         Self::vector_index_key(database_id, tid, collection, field_name);
                     self.check_vector_width(&store_key, field_name, floats.len())?;
+                    // A declared `VECTOR(n)` column refuses another width, as
+                    // a strict schema's vector column does.
+                    if let Some(declared) = self.declared_schemaless_vector_dim(
+                        database_id,
+                        tid,
+                        collection,
+                        field_name,
+                    ) && declared != floats.len()
+                    {
+                        return Err(field_dimension_mismatch(field_name, declared, floats.len()));
+                    }
                     let dim = floats.len();
                     // Same stamp gate as the strict arm above.
                     let skip = wal_lsn != 0 && self.vector_replay_skips(wal_lsn);
-                    self.ensure_vector_collection(&store_key, params_key, dim)?;
+                    self.ensure_vector_collection_with_undo(&store_key, params_key, dim, undo)?;
                     if skip {
                         continue;
                     }
-                    if let Some(delta) =
-                        self.remove_then_insert_vector_field(VectorFieldInsert {
+                    if self.remove_then_insert_vector_field(
+                        VectorFieldInsert {
                             database_id,
                             tid,
-                            index_key: store_key,
+                            index_key: store_key.clone(),
                             collection,
                             field_name,
                             storage_key,
                             floats,
-                        })?
-                    {
-                        inserts.push(delta);
+                        },
+                        undo,
+                    )? {
+                        inserted.push(store_key);
                     }
                 }
             }
@@ -183,11 +213,30 @@ impl CoreLoop {
         // once the whole record landed, so a rollback finds its inserts in the
         // growing segment.
         if !self.recording_redo_undo() {
-            for delta in &inserts {
-                self.settle_vector_collection(&delta.index_key);
+            for index_key in &inserted {
+                self.settle_vector_collection(index_key);
             }
         }
-        Ok(inserts)
+        Ok(inserted.len())
+    }
+
+    /// `ensure_vector_collection`, plus an undo entry when the call creates
+    /// the index.
+    fn ensure_vector_collection_with_undo(
+        &mut self,
+        index_key: &VectorIndexKey,
+        config_key: &VectorIndexKey,
+        dim: usize,
+        undo: &mut Vec<UndoEntry>,
+    ) -> crate::Result<()> {
+        let created = !self.vector_collections.contains_key(index_key);
+        self.ensure_vector_collection(index_key, config_key, dim)?;
+        if created {
+            undo.push(UndoEntry::VectorCollectionCreated {
+                index_key: index_key.clone(),
+            });
+        }
+        Ok(())
     }
 
     /// Reject a vector whose width disagrees with the index it targets.
@@ -230,14 +279,19 @@ impl CoreLoop {
     /// Binds the vector node to the document's global surrogate so
     /// cross-engine identity holds: a search hit resolves back to this row's
     /// surrogate (and thus its user PK at the response boundary) instead of
-    /// leaking a headless local node id. Returns `Ok(None)` if `index_key`'s
+    /// leaking a headless local node id. Returns `Ok(false)` if `index_key`'s
     /// `VectorCollection` was somehow absent (defensive — it was just
     /// populated via `entry().or_insert_with()` by the caller), and the
     /// collection's typed error when the vector does not fit it.
+    ///
+    /// Pushes a `DeleteVector` undo entry for the prior node it removes, a
+    /// `DisplacedVector` entry for an unrecorded node bound to the surrogate,
+    /// and an `InsertVector` entry for the node it inserts.
     fn remove_then_insert_vector_field(
         &mut self,
         params: VectorFieldInsert<'_>,
-    ) -> crate::Result<Option<VectorIndexDelta>> {
+        undo: &mut Vec<UndoEntry>,
+    ) -> crate::Result<bool> {
         let VectorFieldInsert {
             database_id,
             tid,
@@ -247,17 +301,32 @@ impl CoreLoop {
             storage_key,
             floats,
         } = params;
-        let _ = self.remove_document_vector_index_field(
+        if let Some(prior) = self.remove_document_vector_index_field(
             database_id,
             tid,
             collection,
             field_name,
             storage_key,
-        );
+        ) {
+            undo.push(prior.into_delete_undo());
+        }
         let Some(coll) = self.vector_collections.get_mut(&index_key) else {
-            return Ok(None);
+            return Ok(false);
         };
-        let vector_id = coll.insert_with_surrogate(floats, storage_key.surrogate())?;
+        // A node still bound to the surrogate has no `vector_doc_map` entry:
+        // a direct vector write bound it. `insert_with_surrogate` displaces
+        // such a node, so it is deleted here first, where undo can see it.
+        let surrogate = storage_key.surrogate();
+        if let Some(displaced) = coll.local_for_surrogate(surrogate)
+            && coll.delete(displaced)
+        {
+            undo.push(UndoEntry::DisplacedVector {
+                index_key: index_key.clone(),
+                vector_id: displaced,
+                surrogate,
+            });
+        }
+        let vector_id = coll.insert_with_surrogate(floats, surrogate)?;
         self.vector_doc_map.insert(
             (
                 index_key.0,
@@ -268,13 +337,14 @@ impl CoreLoop {
             ),
             vector_id,
         );
-        Ok(Some(VectorIndexDelta {
+        undo.push(UndoEntry::InsertVector {
             index_key,
             vector_id,
             collection: collection.to_string(),
             field: field_name.to_string(),
-            doc_id: storage_key,
-        }))
+            doc_id: Some(storage_key),
+        });
+        Ok(true)
     }
 }
 
@@ -395,25 +465,31 @@ mod tests {
         register_bare_field(core, db_id, tid, collection);
 
         let first = doc_with_vectors(&[("embedding", &[1.0, 0.0, 0.0])]);
-        core.apply_point_put_vector_indexes(VectorIndexPutParams {
-            database_id: db_id,
-            tid,
-            collection,
-            storage_key,
-            value: &first,
-            wal_lsn: 0,
-        })
+        core.apply_point_put_vector_indexes(
+            VectorIndexPutParams {
+                database_id: db_id,
+                tid,
+                collection,
+                storage_key,
+                value: &first,
+                wal_lsn: 0,
+            },
+            &mut Vec::new(),
+        )
         .expect("vector indexing must accept this fixture");
 
         let second = doc_with_vectors(&[("embedding", &[0.0, 1.0, 0.0])]);
-        core.apply_point_put_vector_indexes(VectorIndexPutParams {
-            database_id: db_id,
-            tid,
-            collection,
-            storage_key,
-            value: &second,
-            wal_lsn: 0,
-        })
+        core.apply_point_put_vector_indexes(
+            VectorIndexPutParams {
+                database_id: db_id,
+                tid,
+                collection,
+                storage_key,
+                value: &second,
+                wal_lsn: 0,
+            },
+            &mut Vec::new(),
+        )
         .expect("vector indexing must accept this fixture");
 
         assert_eq!(
@@ -452,14 +528,17 @@ mod tests {
             ("embedding", &[1.0, 0.0, 0.0]),
             ("title_vec", &[0.0, 1.0, 0.0, 0.0]),
         ]);
-        core.apply_point_put_vector_indexes(VectorIndexPutParams {
-            database_id: db_id,
-            tid,
-            collection,
-            storage_key,
-            value: &doc,
-            wal_lsn: 0,
-        })
+        core.apply_point_put_vector_indexes(
+            VectorIndexPutParams {
+                database_id: db_id,
+                tid,
+                collection,
+                storage_key,
+                value: &doc,
+                wal_lsn: 0,
+            },
+            &mut Vec::new(),
+        )
         .expect("vector indexing must accept this fixture");
 
         assert_eq!(
@@ -487,14 +566,17 @@ mod tests {
         register_bare_field(core, db_id, tid, collection);
 
         let doc = doc_with_vectors(&[("embedding", &[1.0, 0.0, 0.0])]);
-        core.apply_point_put_vector_indexes(VectorIndexPutParams {
-            database_id: db_id,
-            tid,
-            collection,
-            storage_key,
-            value: &doc,
-            wal_lsn: 0,
-        })
+        core.apply_point_put_vector_indexes(
+            VectorIndexPutParams {
+                database_id: db_id,
+                tid,
+                collection,
+                storage_key,
+                value: &doc,
+                wal_lsn: 0,
+            },
+            &mut Vec::new(),
+        )
         .expect("vector indexing must accept this fixture");
         let key = CoreLoop::vector_index_key(db_id, tid, collection, "embedding");
         core.vector_collections
@@ -510,6 +592,69 @@ mod tests {
             live_count(core, db_id, tid, collection, "embedding"),
             0,
             "the node bound to the deleted row must be gone"
+        );
+    }
+
+    /// A put over a row whose surrogate binds a node no `vector_doc_map`
+    /// entry records displaces that node. Reversing the put's undo entries
+    /// brings the node and its binding back.
+    #[test]
+    fn undoing_a_put_restores_a_displaced_unrecorded_node() {
+        let mut harness = make_core();
+        let core = &mut harness.core;
+        let (db_id, tid, collection) = (0u64, 1u64, "docs");
+        let surrogate = Surrogate::new(1);
+        let storage_key = crate::engine::document::store::StorageKey::for_surrogate(surrogate);
+        register_bare_field(core, db_id, tid, collection);
+
+        // A direct vector write binds a node to the surrogate. It records no
+        // `vector_doc_map` entry.
+        let key = CoreLoop::vector_index_key(db_id, tid, collection, "embedding");
+        core.ensure_vector_collection(&key, &key, 3)
+            .expect("vector index");
+        let direct = core
+            .vector_collections
+            .get_mut(&key)
+            .expect("collection")
+            .insert_with_surrogate(vec![0.0, 1.0, 0.0], surrogate)
+            .expect("vector write");
+
+        let doc = doc_with_vectors(&[("embedding", &[1.0, 0.0, 0.0])]);
+        let mut undo = Vec::new();
+        core.apply_point_put_vector_indexes(
+            VectorIndexPutParams {
+                database_id: db_id,
+                tid,
+                collection,
+                storage_key,
+                value: &doc,
+                wal_lsn: 0,
+            },
+            &mut undo,
+        )
+        .expect("vector indexing must accept this fixture");
+        assert_eq!(live_count(core, db_id, tid, collection, "embedding"), 1);
+        assert_ne!(
+            core.vector_collections
+                .get(&key)
+                .and_then(|c| c.local_for_surrogate(surrogate)),
+            Some(direct),
+            "the put must bind its own node"
+        );
+
+        core.undo_memory_effects(db_id, tid, undo)
+            .expect("the put's entries reverse");
+
+        let coll = core.vector_collections.get(&key).expect("collection stays");
+        assert_eq!(coll.live_count(), 1, "only the displaced node is live");
+        assert_eq!(
+            coll.local_for_surrogate(surrogate),
+            Some(direct),
+            "the displaced node is bound to the surrogate again"
+        );
+        assert!(
+            core.vector_doc_map.is_empty(),
+            "the put's `vector_doc_map` entry is gone, and none existed before"
         );
     }
 
@@ -543,14 +688,17 @@ mod tests {
             )])))
             .expect("encode doc");
 
-        core.apply_point_put_vector_indexes(VectorIndexPutParams {
-            database_id: db_id,
-            tid,
-            collection,
-            storage_key,
-            value: &body,
-            wal_lsn: 0,
-        })
+        core.apply_point_put_vector_indexes(
+            VectorIndexPutParams {
+                database_id: db_id,
+                tid,
+                collection,
+                storage_key,
+                value: &body,
+                wal_lsn: 0,
+            },
+            &mut Vec::new(),
+        )
         .expect("vector indexing must accept a JSON-string embedding");
 
         assert_eq!(
@@ -583,14 +731,17 @@ mod tests {
                 ])))
                 .expect("encode doc");
 
-            let res = core.apply_point_put_vector_indexes(VectorIndexPutParams {
-                database_id: db_id,
-                tid,
-                collection,
-                storage_key,
-                value: &body,
-                wal_lsn: 0,
-            });
+            let res = core.apply_point_put_vector_indexes(
+                VectorIndexPutParams {
+                    database_id: db_id,
+                    tid,
+                    collection,
+                    storage_key,
+                    value: &body,
+                    wal_lsn: 0,
+                },
+                &mut Vec::new(),
+            );
 
             assert!(
                 matches!(res, Err(crate::Error::DataException { .. })),
@@ -625,14 +776,17 @@ mod tests {
                 Surrogate::new(surrogate),
             );
             let doc = doc_with_vectors(&[("embedding", &[1.0, 0.0, 0.0])]);
-            core.apply_point_put_vector_indexes(VectorIndexPutParams {
-                database_id: db_id,
-                tid,
-                collection,
-                storage_key,
-                value: &doc,
-                wal_lsn,
-            })
+            core.apply_point_put_vector_indexes(
+                VectorIndexPutParams {
+                    database_id: db_id,
+                    tid,
+                    collection,
+                    storage_key,
+                    value: &doc,
+                    wal_lsn,
+                },
+                &mut Vec::new(),
+            )
             .expect("vector indexing must accept this fixture");
         }
         assert_eq!(

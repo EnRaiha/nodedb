@@ -119,12 +119,13 @@ impl CoreLoop {
     ) -> PassRefusal {
         match self.rollback_undo_log(target.database_id, target.tid, undo) {
             Ok(()) => PassRefusal::RolledBack(cause),
-            Err((entry_index, detail)) => PassRefusal::RollbackFailed(ErrorCode::RollbackFailed {
-                entry_index,
-                detail: format!(
-                    "rolling back a committed redo install that failed with {cause:?}: {detail}"
-                ),
-            }),
+            Err(mut undo_error) => {
+                undo_error.action = format!(
+                    "rolling back a committed redo install that failed with {cause:?}: {}",
+                    undo_error.action
+                );
+                PassRefusal::RollbackFailed(ErrorCode::from(undo_error))
+            }
         }
     }
 
@@ -168,6 +169,7 @@ impl CoreLoop {
             (_, None) => Err(PassRefusal::RollbackFailed(ErrorCode::RollbackFailed {
                 entry_index: 0,
                 detail: "committed transaction redo lost its apply scope and its undo log".into(),
+                cause: None,
             })),
         }
     }

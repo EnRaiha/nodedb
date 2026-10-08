@@ -101,15 +101,19 @@ impl CoreLoop {
 
         // Live in-memory maintenance only: `wal_lsn = 0` disables the
         // checkpoint-straddle guard (the WAL record for this update is appended
-        // in the Control Plane, not here).
-        self.apply_point_put_vector_indexes(VectorIndexPutParams {
-            database_id: p.database_id,
-            tid: p.tid,
-            collection: p.collection,
-            storage_key: p.storage_key,
-            value: mp,
-            wal_lsn: 0,
-        })?;
+        // in the Control Plane, not here). The row this re-indexes is already
+        // committed, so the undo entries go unused.
+        self.apply_point_put_vector_indexes(
+            VectorIndexPutParams {
+                database_id: p.database_id,
+                tid: p.tid,
+                collection: p.collection,
+                storage_key: p.storage_key,
+                value: mp,
+                wal_lsn: 0,
+            },
+            &mut Vec::new(),
+        )?;
         Ok(())
     }
 }

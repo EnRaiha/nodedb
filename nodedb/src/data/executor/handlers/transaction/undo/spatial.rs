@@ -7,19 +7,19 @@
 //! write transaction does NOT reverse them — they require explicit undo. This
 //! mirrors the vector-index undo path (`apply_undo_vector`).
 //!
-//! Returns `Err((entry_index, detail))` on fatal failure so the caller can
-//! escalate to a typed `RollbackFailed` response.
+//! Returns an [`UndoError`] on fatal failure, and the caller escalates it to
+//! a typed `RollbackFailed` response.
 
 use crate::data::executor::core_loop::CoreLoop;
 
-use super::UndoEntry;
+use super::{UndoEntry, UndoError};
 
 impl CoreLoop {
     pub(super) fn apply_undo_spatial(
         &mut self,
         _entry_index: usize,
         entry: UndoEntry,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         match entry {
             UndoEntry::SpatialInsert { key, entry_id } => {
                 // Reverse a forward spatial insert: drop the R-tree entry and

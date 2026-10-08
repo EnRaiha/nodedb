@@ -5,7 +5,7 @@
 use crate::data::executor::core_loop::CoreLoop;
 use crate::engine::kv::current_ms;
 
-use super::UndoEntry;
+use super::{UndoEntry, UndoError};
 
 fn kv_key<'a>(
     did: u64,
@@ -28,7 +28,7 @@ impl CoreLoop {
         tid: u64,
         entry_index: usize,
         entry: UndoEntry,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         match entry {
             UndoEntry::KvPut {
                 collection,
@@ -41,7 +41,7 @@ impl CoreLoop {
                     prior.as_ref(),
                     current_ms(),
                 )
-                .map_err(|e| (entry_index, e.to_string())),
+                .map_err(|e| UndoError::failed(entry_index, "reinstating a KV entry", e)),
             UndoEntry::KvDelete {
                 collection,
                 key,
@@ -49,7 +49,7 @@ impl CoreLoop {
             } => self
                 .kv_engine
                 .restore_entry_image(kv_key(did, tid, &collection, &key), &prior, current_ms())
-                .map_err(|e| (entry_index, e.to_string())),
+                .map_err(|e| UndoError::failed(entry_index, "restoring a deleted KV entry", e)),
             UndoEntry::KvTtl {
                 collection,
                 key,
@@ -85,13 +85,19 @@ impl CoreLoop {
                             },
                             now_ms,
                         )
-                        .map_err(|e| (entry_index, e.to_string()))?;
+                        .map_err(|e| {
+                            UndoError::failed(
+                                entry_index,
+                                format!("restoring a truncated KV row of '{collection}'"),
+                                e,
+                            )
+                        })?;
                 }
                 Ok(())
             }
-            _ => Err((
+            _ => Err(UndoError::mismatch(
                 entry_index,
-                "apply_undo_kv called with non-kv entry".to_string(),
+                "apply_undo_kv called with non-kv entry",
             )),
         }
     }

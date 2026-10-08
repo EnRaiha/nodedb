@@ -14,7 +14,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::engine::sparse::inverted::FtsDocImage;
 use crate::types::{DatabaseId, TenantId};
 
-use super::UndoEntry;
+use super::{UndoEntry, UndoError};
 
 /// The pre-image of one document's index footprint.
 pub(in crate::data::executor) struct FtsDocUndo {
@@ -59,7 +59,7 @@ impl CoreLoop {
         &mut self,
         entry_index: usize,
         undo: FtsDocUndo,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         self.inverted
             .restore_document_image(
                 undo.database_id,
@@ -69,13 +69,14 @@ impl CoreLoop {
                 undo.prior.as_ref(),
             )
             .map_err(|e| {
-                (
+                UndoError::failed(
                     entry_index,
                     format!(
-                        "restoring the full-text footprint of {} in '{}': {e}",
+                        "restoring the full-text footprint of {} in '{}'",
                         undo.surrogate.as_u32(),
                         undo.collection
                     ),
+                    e,
                 )
             })
     }

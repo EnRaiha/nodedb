@@ -5,10 +5,10 @@
 
 use tracing::debug;
 
-use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
+use crate::bridge::envelope::{Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::redo_image::versioned_point_images;
-use crate::data::executor::enforcement::chain_guard::{self, ChainGuard};
+use crate::data::executor::enforcement::chain_guard::{self, AbandonedWrite, ChainGuard};
 use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
@@ -114,13 +114,11 @@ impl CoreLoop {
         ) {
             Ok(p) => p,
             Err(e) => {
-                chain_guard::abort_after_apply(
+                let e = chain_guard::abort_after_apply(
                     self,
                     &mut chain,
-                    database_id,
-                    tid,
-                    collection,
-                    &storage_key,
+                    AbandonedWrite::row(database_id, tid, collection, &storage_key),
+                    e,
                 );
                 return self.response_error(task, e);
             }
@@ -130,13 +128,12 @@ impl CoreLoop {
             .settle(self, surrogate, &prior.stored_value)
             .and_then(|()| chain.persist_head(self, &txn))
         {
-            chain_guard::abort_after_apply(
+            let e = chain_guard::abort_after_apply(
                 self,
                 &mut chain,
-                database_id,
-                tid,
-                collection,
-                &storage_key,
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(std::mem::take(&mut prior.memory_undo)),
+                e,
             );
             return self.response_error(task, e);
         }
@@ -157,18 +154,18 @@ impl CoreLoop {
         let enforcement = match write_hook::run(self, &txn, &hook_ctx, images) {
             Ok(outcome) => outcome,
             Err(e) => {
-                chain_guard::abort_after_apply(
+                let e = chain_guard::abort_after_apply(
                     self,
                     &mut chain,
-                    database_id,
-                    tid,
-                    collection,
-                    &storage_key,
+                    AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                        .undo(std::mem::take(&mut prior.memory_undo)),
+                    e,
                 );
                 return self.response_error(task, e);
             }
         };
         let target_write_set = write_hook::target_write_set(&enforcement.target_writes);
+        let target_writes = enforcement.target_writes;
 
         // Settled before the commit: an autocommit statement is its own
         // transaction boundary, so a put that leaves a journal group unbalanced
@@ -176,32 +173,30 @@ impl CoreLoop {
         if let Err(e) =
             self.settle_balanced_entries(database_id, tid, collection, enforcement.balanced_entries)
         {
-            chain_guard::abort_after_apply(
+            let e = chain_guard::abort_after_apply(
                 self,
                 &mut chain,
-                database_id,
-                tid,
-                collection,
-                &storage_key,
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(std::mem::take(&mut prior.memory_undo))
+                    .targets(target_writes),
+                e,
             );
             return self.response_error(task, e);
         }
 
         if let Err(e) = txn.commit() {
-            chain_guard::abort_after_apply(
+            let e = chain_guard::abort_after_apply(
                 self,
                 &mut chain,
-                database_id,
-                tid,
-                collection,
-                &storage_key,
-            );
-            return self.response_error(
-                task,
-                ErrorCode::Internal {
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(std::mem::take(&mut prior.memory_undo))
+                    .targets(target_writes),
+                crate::Error::Storage {
+                    engine: "sparse".into(),
                     detail: format!("commit: {e}"),
                 },
             );
+            return self.response_error(task, e);
         }
 
         // Record the committed write's version against its surrogate + collection.
@@ -249,6 +244,7 @@ impl CoreLoop {
                 spec,
                 rls_filters,
                 strict_schema.as_ref(),
+                &self.identity_column(database_id, tid, collection),
                 &[(&document_identity, prior.stored_value.as_slice())],
             )
         } else {
@@ -271,7 +267,7 @@ impl CoreLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::envelope::Status;
+    use crate::bridge::envelope::{ErrorCode, Status};
     use crate::data::executor::core_loop::tests::{make_core_with_dir, make_default_task};
     use crate::data::executor::doc_format;
     use crate::engine::document::store::CollectionConfig;
@@ -404,6 +400,75 @@ mod tests {
             "an overwrite must delta the total, not add the new amount on top of \
              the old one"
         );
+    }
+
+    /// A put refused after `apply_point_put` ran puts the row's in-memory
+    /// index back. The second put replaces the row's vector node, then its
+    /// materialized-sum fold is refused: the plan resolves no target row.
+    /// The prior node must be live and bound to the row again, the new node
+    /// gone, and the target balance unmoved.
+    #[test]
+    fn a_put_refused_after_apply_restores_the_prior_vector_node() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut core = seeded_core(dir.path());
+        core.vector_params.insert(
+            config_key(SOURCE),
+            crate::engine::vector::hnsw::HnswParams::default(),
+        );
+        let task = make_default_task();
+        let body = |amount: i64, embedding: &[f64]| {
+            doc_format::encode_to_msgpack(&serde_json::json!({
+                "account_id": A1,
+                "amount": amount,
+                "embedding": embedding,
+            }))
+        };
+        let row = Surrogate(21);
+
+        assert_eq!(
+            put(&mut core, &task, &body(10, &[1.0, 0.0, 0.0])),
+            Status::Ok
+        );
+        let key = CoreLoop::vector_index_key(DB, TID, SOURCE, "embedding");
+        let prior = core.vector_collections[&key]
+            .local_for_surrogate(row)
+            .expect("the first put binds a node");
+
+        let refused = core.execute_point_put(
+            &task,
+            PointPutExec {
+                tid: TID,
+                collection: SOURCE,
+                document_id: "e1",
+                surrogate: row,
+                value: &body(30, &[0.0, 1.0, 0.0]),
+                returning: None,
+                rls_filters: &[],
+                resolved_sum_targets: &[],
+            },
+        );
+        assert_eq!(
+            refused.status,
+            Status::Error,
+            "the unresolved fold must refuse"
+        );
+
+        let coll = &core.vector_collections[&key];
+        assert_eq!(coll.live_count(), 1, "the new node must be gone");
+        assert_eq!(
+            coll.local_for_surrogate(row),
+            Some(prior),
+            "the prior node must be live and bound to the row again"
+        );
+        let doc_key = (
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            SOURCE.to_string(),
+            "embedding".to_string(),
+            StorageKey::for_surrogate(row),
+        );
+        assert_eq!(core.vector_doc_map.get(&doc_key).copied(), Some(prior));
+        assert_eq!(balance(&core, T1), "10", "the refused put moves no total");
     }
 
     /// A put that carries `Surrogate::ZERO` is refused before any write: no

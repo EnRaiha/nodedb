@@ -103,16 +103,21 @@ impl CoreLoop {
                     crate::engine::document::store::StorageKey::for_surrogate(surrogate);
                 // Same as WAL replay: the document is already durable, so a
                 // width mismatch from before the forward-path check existed is
-                // reported and skipped rather than aborting the rebuild.
-                let deltas = match self.apply_point_put_vector_indexes(VectorIndexPutParams {
-                    database_id: db,
-                    tid: tenant_id,
-                    collection: &collection,
-                    storage_key,
-                    value: &value,
-                    wal_lsn: 0,
-                }) {
-                    Ok(deltas) => deltas,
+                // reported and skipped rather than aborting the rebuild. The
+                // rebuild re-derives durable rows and has no write to abandon,
+                // so the undo entries go unused.
+                let inserted = match self.apply_point_put_vector_indexes(
+                    VectorIndexPutParams {
+                        database_id: db,
+                        tid: tenant_id,
+                        collection: &collection,
+                        storage_key,
+                        value: &value,
+                        wal_lsn: 0,
+                    },
+                    &mut Vec::new(),
+                ) {
+                    Ok(inserted) => inserted,
                     Err(e) => {
                         tracing::warn!(
                             core = self.core_id,
@@ -124,7 +129,7 @@ impl CoreLoop {
                         continue;
                     }
                 };
-                if !deltas.is_empty() {
+                if inserted > 0 {
                     rebuilt += 1;
                 }
             }

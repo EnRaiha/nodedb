@@ -36,6 +36,7 @@ use crate::data::executor::handlers::transaction::undo::document_outcome::{
 use nodedb_types::{RowIdentity, Surrogate};
 
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::enforcement::chain_guard::{AbandonedWrite, abandon_write};
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::crdt::tenant_state::TenantCrdtEngine;
@@ -152,8 +153,11 @@ impl CoreLoop {
 
         // No chain guard: DDL refuses HASH_CHAIN on a CRDT collection, so this
         // write never reaches a chained row.
+        // An abort drops the txn uncommitted, which reverses the durable
+        // writes. `abandon_write` reverses the cache and in-memory index
+        // entries.
         let txn = self.sparse.begin_write()?;
-        let outcome = self.apply_point_put(
+        let outcome = match self.apply_point_put(
             &txn,
             PointPutParams {
                 database_id,
@@ -169,11 +173,27 @@ impl CoreLoop {
                 wal_lsn: task.wal_lsn(),
                 resolved_targets: &[],
             },
-        )?;
-        txn.commit().map_err(|e| crate::Error::Storage {
-            engine: "sparse".into(),
-            detail: format!("crdt materialize commit: {e}"),
-        })?;
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                return Err(abandon_write(
+                    self,
+                    AbandonedWrite::row(database_id, tid, collection, &storage_key),
+                    e,
+                ));
+            }
+        };
+        if let Err(e) = txn.commit() {
+            return Err(abandon_write(
+                self,
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(outcome.memory_undo),
+                crate::Error::Storage {
+                    engine: "sparse".into(),
+                    detail: format!("crdt materialize commit: {e}"),
+                },
+            ));
+        }
 
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
@@ -193,8 +213,6 @@ impl CoreLoop {
             push_put_undo(
                 &mut undo,
                 DocumentRow {
-                    database_id,
-                    tid,
                     collection,
                     storage_key,
                 },

@@ -79,7 +79,7 @@ fn image_values(schema: &ColumnarSchema, image: &Value) -> Result<Vec<Value>, Er
     schema
         .columns
         .iter()
-        .map(|col| ndb_field_to_value(fields.get(&col.name), &col.column_type))
+        .map(|col| ndb_field_to_value(fields.get(&col.name), col))
         .collect::<crate::Result<Vec<Value>>>()
         .map_err(ErrorCode::from)
 }
@@ -231,6 +231,7 @@ impl CoreLoop {
                     first,
                     schema_bytes,
                 )
+                .map_err(ErrorCode::from)?
             }
         };
 
@@ -255,8 +256,9 @@ impl CoreLoop {
         }
 
         let mut undo = Vec::new();
-        let removed =
-            self.apply_columnar_delete_pks(&key, &schema, &priors, recording.then_some(&mut undo));
+        let removed = self
+            .apply_columnar_delete_pks(&key, &schema, &priors, recording.then_some(&mut undo))
+            .map_err(ErrorCode::from)?;
         self.record_redo_undo(undo);
         if removed.affected != priors.len() as u64 {
             return Err(ErrorCode::Internal {

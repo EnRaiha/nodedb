@@ -73,10 +73,7 @@ impl CoreLoop {
         } = p;
         let final_err = match self.rollback_undo_log(database_id, tid, undo_log) {
             Ok(()) => err,
-            Err((entry_index, detail)) => ErrorCode::RollbackFailed {
-                entry_index,
-                detail,
-            },
+            Err(undo_error) => ErrorCode::from(undo_error),
         };
         self.rollback_merge_cache(database_id, tid, collection, applied_keys);
         self.response_error(task, final_err)

@@ -11,7 +11,7 @@
 use crate::data::executor::core_loop::CoreLoop;
 use crate::types::{DatabaseId, TenantId};
 
-use super::UndoEntry;
+use super::{UndoEntry, UndoError};
 
 /// The Loro state of one CRDT collection before a write.
 pub(in crate::data::executor) struct CrdtCollectionUndo {
@@ -51,14 +51,14 @@ impl CoreLoop {
         &mut self,
         entry_index: usize,
         undo: CrdtCollectionUndo,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         let key = (undo.database_id, undo.tenant_id);
         if !undo.engine_existed {
             self.crdt_engines.remove(&key);
             return Ok(());
         }
         let Some(engine) = self.crdt_engines.get_mut(&key) else {
-            return Err((
+            return Err(UndoError::mismatch(
                 entry_index,
                 format!(
                     "the CRDT engine of '{}' vanished before its write was rolled back",
@@ -69,9 +69,10 @@ impl CoreLoop {
         engine
             .restore_collection_snapshot(&undo.collection, undo.snapshot.as_deref())
             .map_err(|e| {
-                (
+                UndoError::failed(
                     entry_index,
-                    format!("restoring the CRDT collection '{}': {e}", undo.collection),
+                    format!("restoring the CRDT collection '{}'", undo.collection),
+                    e,
                 )
             })
     }

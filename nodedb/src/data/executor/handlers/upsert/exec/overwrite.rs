@@ -7,9 +7,11 @@
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::redo_image::submitted_row_image;
+use crate::data::executor::enforcement::chain_guard::{AbandonedWrite, abandon_write};
 use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
-use crate::data::executor::handlers::point::apply_put::PointPutParams;
+use crate::data::executor::handlers::point::apply_put::{PointPutParams, VectorIndexDelta};
 use crate::data::executor::handlers::rls_write_gate;
+use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use crate::data::executor::handlers::upsert::merge::{apply_on_conflict_updates, merge_values};
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::{RowIdentity, StorageKey};
@@ -155,24 +157,17 @@ impl CoreLoop {
         // post-image the policy never saw, which is why this branch
         // cannot be admitted at plan time. Decided on the MessagePack
         // form, exactly as the insert arm below decides its own body.
+        let identity_column = self.identity_column(database_id, tid, collection);
         if let Err(e) = rls_write_gate::admit_stored_row(
             rls_write_check,
             &merged_body,
             &document_identity,
             None,
+            &identity_column,
             tid,
             collection,
         ) {
             return self.response_error(task, e);
-        }
-
-        // The surrogate is stable across an overwrite and
-        // `insert_with_surrogate` APPENDS an HNSW node rather than
-        // replacing one, so the prior embedding has to come out before
-        // the write below puts the new one in — otherwise KNN keeps
-        // scoring both. No-op when `has_vectors` is false.
-        if has_vectors {
-            self.remove_document_vector_indexes(database_id, tid, collection, storage_key);
         }
 
         // One transaction for the body, every index that describes it,
@@ -185,15 +180,25 @@ impl CoreLoop {
         let txn = match self.sparse.begin_write() {
             Ok(t) => t,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
-        let outcome = match self.apply_point_put(
+
+        // The surrogate is stable across an overwrite and
+        // `insert_with_surrogate` APPENDS an HNSW node rather than
+        // replacing one, so the prior embedding has to come out before
+        // the write below puts the new one in — otherwise KNN keeps
+        // scoring both. No-op when `has_vectors` is false. The removal is
+        // in memory, so an abort below puts the prior nodes back.
+        let mut memory_undo: Vec<UndoEntry> = Vec::new();
+        if has_vectors {
+            memory_undo.extend(
+                self.remove_document_vector_indexes(database_id, tid, collection, storage_key)
+                    .into_iter()
+                    .map(VectorIndexDelta::into_delete_undo),
+            );
+        }
+        let mut outcome = match self.apply_point_put(
             &txn,
             PointPutParams {
                 database_id,
@@ -216,11 +221,16 @@ impl CoreLoop {
                 // dropping `txn` reverses the durable write but not
                 // that entry, which would then serve a body that never
                 // committed.
-                self.doc_cache
-                    .invalidate(database_id, tid, collection, &storage_key);
+                let e = abandon_write(
+                    self,
+                    AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                        .undo(memory_undo),
+                    e,
+                );
                 return self.response_error(task, e);
             }
         };
+        memory_undo.append(&mut outcome.memory_undo);
 
         // An overwrite is an UPDATE, and the pre-image is what tells the
         // fold to take the row's old contribution off a total before
@@ -237,12 +247,17 @@ impl CoreLoop {
         ) {
             Ok(o) => o,
             Err(e) => {
-                self.doc_cache
-                    .invalidate(database_id, tid, collection, &storage_key);
+                let e = abandon_write(
+                    self,
+                    AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                        .undo(memory_undo),
+                    e,
+                );
                 return self.response_error(task, e);
             }
         };
         let target_write_set = write_hook::target_write_set(&enforcement.target_writes);
+        let target_writes = enforcement.target_writes;
 
         // Settled before the commit: the merged row's old amount comes
         // off the group and its new one goes on, so an overwrite that
@@ -250,18 +265,28 @@ impl CoreLoop {
         if let Err(e) =
             self.settle_balanced_entries(database_id, tid, collection, enforcement.balanced_entries)
         {
-            self.doc_cache
-                .invalidate(database_id, tid, collection, &storage_key);
+            let e = abandon_write(
+                self,
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(memory_undo)
+                    .targets(target_writes),
+                e,
+            );
             return self.response_error(task, e);
         }
 
         if let Err(e) = txn.commit() {
-            return self.response_error(
-                task,
-                ErrorCode::Internal {
+            let e = abandon_write(
+                self,
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(memory_undo)
+                    .targets(target_writes),
+                crate::Error::Storage {
+                    engine: "sparse".into(),
                     detail: format!("commit: {e}"),
                 },
             );
+            return self.response_error(task, e);
         }
 
         // `current_bytes` is the pre-merge stored row, already read
@@ -287,6 +312,7 @@ impl CoreLoop {
                 spec,
                 rls_filters,
                 strict_schema,
+                &identity_column,
                 &[(&document_identity, stored_bytes.as_slice())],
             ),
             None => self.response_affected(task, 1),

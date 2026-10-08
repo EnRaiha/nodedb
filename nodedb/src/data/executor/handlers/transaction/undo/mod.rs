@@ -5,15 +5,18 @@
 pub(super) mod apply;
 pub(super) mod columnar_insert;
 pub(in crate::data::executor) mod crdt_collection;
+pub(in crate::data::executor) mod crdt_row;
 pub(super) mod document;
 pub(super) mod document_fts;
 pub(in crate::data::executor::handlers) mod document_outcome;
 pub(in crate::data::executor) mod edge_cut;
 pub(in crate::data::executor) mod edge_write;
 pub(super) mod entry;
+pub(in crate::data::executor) mod error;
 pub(in crate::data::executor) mod fts_doc;
 pub(super) mod graph_node;
 pub(super) mod kv;
+pub(in crate::data::executor) mod memory;
 pub(super) mod rollback;
 pub(super) mod spatial;
 pub(in crate::data::executor) mod spatial_row;
@@ -27,3 +30,4 @@ pub(in crate::data::executor) mod vector_write;
 pub(in crate::data::executor) use entry::{
     ColumnarTruncateUndo, TimeseriesIngestUndo, TimeseriesTruncateUndo, UndoEntry,
 };
+pub(in crate::data::executor) use error::UndoError;

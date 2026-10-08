@@ -68,8 +68,9 @@ impl CoreLoop {
     /// Reverse a [`CoreLoop::mark_node_deleted`] by removing `node_id` of
     /// `collection` from the caller's `(database, tenant)` deleted-nodes
     /// set. Called only on transaction rollback, and only for a node THIS
-    /// transaction newly marked (see the `was_newly_marked` capture in
-    /// `apply_point_delete`), so it never removes a pre-existing tombstone.
+    /// transaction newly marked (see the `MarkNodeDeleted` undo entry
+    /// `apply_point_delete` pushes), so it never removes a pre-existing
+    /// tombstone.
     #[inline]
     pub(in crate::data::executor) fn unmark_node_deleted(
         &mut self,

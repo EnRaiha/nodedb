@@ -65,7 +65,15 @@ impl CoreLoop {
         // clears the `SparseVector` field must not leave the stale literal
         // searchable, and the re-insert below only re-adds fields present in
         // the new body.
-        self.remove_document_sparse_indexes(p.database_id, p.tid, p.collection, p.storage_key);
+        // The row this re-indexes is already committed, so the undo entries
+        // go unused.
+        self.remove_document_sparse_indexes(
+            p.database_id,
+            p.tid,
+            p.collection,
+            p.storage_key,
+            &mut Vec::new(),
+        );
 
         // Re-extract from the new body via the exact put-time path. Sparse
         // extraction reads MessagePack; strict bodies are stored as Binary
@@ -94,7 +102,16 @@ impl CoreLoop {
             p.new_body
         };
 
-        self.apply_point_put_sparse_indexes(p.database_id, p.tid, p.collection, p.storage_key, mp);
+        // The row this re-indexes is already committed, so the undo entries
+        // go unused.
+        self.apply_point_put_sparse_indexes(
+            p.database_id,
+            p.tid,
+            p.collection,
+            p.storage_key,
+            mp,
+            &mut Vec::new(),
+        );
         Ok(())
     }
 }

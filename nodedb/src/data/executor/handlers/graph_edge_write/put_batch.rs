@@ -6,7 +6,8 @@ use tracing::debug;
 
 use crate::bridge::envelope::{EdgeImage, ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::partial_refusal::refusal_after_partial_apply;
+use crate::data::executor::handlers::partial_refusal::refusal_after_rows;
+use crate::data::executor::handlers::transaction::undo::edge_write::EdgeTarget;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
 
@@ -60,10 +61,22 @@ impl CoreLoop {
         // apply. An edge that failed after earlier ones landed refuses the
         // batch with the landed versions, which stay.
         let mut write_set: Vec<WriteSetEntry> = Vec::with_capacity(edges.len());
-        for (idx, edge) in edges.iter().enumerate() {
+        for edge in edges {
+            let target = EdgeTarget {
+                database_id,
+                tid,
+                collection: edge.collection.as_str(),
+                src_id: &edge.src_id,
+                label: &edge.label,
+                dst_id: &edge.dst_id,
+            };
+            let csr_prior = self.capture_edge_csr(&target);
             let stamp = match self.graph_write_stamp() {
                 Ok(stamp) => stamp,
-                Err(e) => return self.refusal_with_landed_rows(task, e.into(), write_set),
+                Err(e) => {
+                    let code = refusal_after_rows(write_set.len() as u64, e);
+                    return self.refusal_with_landed_rows(task, code, write_set);
+                }
             };
             let ord = stamp.system_from;
             let valid_from_ms = nodedb_types::ordinal_to_ms(ord);
@@ -85,7 +98,22 @@ impl CoreLoop {
                 owns_logical_edge_stats(task, &edge.src_id),
             ) {
                 Ok(version) => {
-                    // The version is in the edge store from here on.
+                    let current = version.current.clone();
+                    // The CSR follows what the edge resolves to: a version a
+                    // TRUNCATE hides leaves the edge as it was. A CSR refusal
+                    // takes this version back out; the edges before it stand
+                    // and are journalled.
+                    if let Err(e) = self.mirror_edge_csr(
+                        database_id,
+                        tid,
+                        (&edge.src_id, &edge.label, &edge.dst_id),
+                        edge.collection.as_str(),
+                        current.as_deref(),
+                    ) {
+                        let reversed = self.reverse_edge_write(target.undo(version, csr_prior), e);
+                        let code = refusal_after_rows(write_set.len() as u64, reversed);
+                        return self.refusal_with_landed_rows(task, code, write_set);
+                    }
                     write_set.push(WriteSetEntry::edge(EdgeImage::Put(
                         crate::wal::EdgePutRedo {
                             collection: edge.collection.to_string(),
@@ -99,28 +127,12 @@ impl CoreLoop {
                             applied: (stamp.applied != ord).then_some(stamp.applied),
                         },
                     )));
-                    // The CSR follows what the edge resolves to: a version a
-                    // TRUNCATE hides leaves the edge as it was.
-                    if let Err(e) = self.mirror_edge_csr(
-                        database_id,
-                        tid,
-                        (&edge.src_id, &edge.label, &edge.dst_id),
-                        edge.collection.as_str(),
-                        version.current.as_deref(),
-                    ) {
-                        let code = refusal_after_partial_apply(ErrorCode::Internal {
-                            detail: format!("edge {idx} (label interning): {e}"),
-                        });
-                        return self.refusal_with_landed_rows(task, code, write_set);
-                    }
                     let partition = self.csr_partition_mut(database_id, tid);
                     partition.set_node_surrogate(&edge.src_id, edge.src_surrogate);
                     partition.set_node_surrogate(&edge.dst_id, edge.dst_surrogate);
                 }
                 Err(e) => {
-                    let code = ErrorCode::Internal {
-                        detail: format!("edge {idx}: {e}"),
-                    };
+                    let code = refusal_after_rows(write_set.len() as u64, e);
                     return self.refusal_with_landed_rows(task, code, write_set);
                 }
             }

@@ -8,6 +8,7 @@
 
 use tracing::error;
 
+use super::UndoError;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::engine::graph::edge_store::EdgeCutInstall;
 use crate::types::{DatabaseId, TenantId};
@@ -25,29 +26,33 @@ impl CoreLoop {
         &mut self,
         entry_index: usize,
         undo: EdgeCutUndo,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         let EdgeCutUndo {
             database_id,
             tid,
             install,
         } = undo;
         let core = self.core_id;
-        let fail = |detail: String| {
+        let fail = |action: String, cause: crate::Error| {
+            let err = UndoError::failed(entry_index, action, cause);
             error!(
                 core,
                 entry_index,
-                error = %detail,
+                error = %err,
                 "transaction undo: edge cut rollback failed; shard state unknown"
             );
-            (entry_index, detail)
+            err
         };
         self.edge_store
             .remove_edge_cut(DatabaseId::new(database_id), TenantId::new(tid), &install)
             .map_err(|e| {
-                fail(format!(
-                    "removing the cut of '{}' at {}: {e}",
-                    install.collection, install.cut
-                ))
+                fail(
+                    format!(
+                        "removing the cut of '{}' at {}",
+                        install.collection, install.cut
+                    ),
+                    e,
+                )
             })?;
         for flip in &install.flips {
             self.mirror_edge_csr(
@@ -58,10 +63,13 @@ impl CoreLoop {
                 flip.before.as_deref(),
             )
             .map_err(|e| {
-                fail(format!(
-                    "restoring the CSR edge {} {}-[{}]->{}: {e}",
-                    install.collection, flip.src, flip.label, flip.dst
-                ))
+                fail(
+                    format!(
+                        "restoring the CSR edge {} {}-[{}]->{}",
+                        install.collection, flip.src, flip.label, flip.dst
+                    ),
+                    e.into(),
+                )
             })?;
         }
         Ok(())

@@ -40,11 +40,12 @@ impl CoreLoop {
         // replaces the recorded node, so the recorded id can name a node that
         // is already soft-deleted while the live one keeps scoring.
         let mut vector_id = recorded;
+        let mut node_deleted = false;
         if let Some(coll) = self.vector_collections.get_mut(&index_key) {
             if let Some(bound) = coll.local_for_surrogate(storage_key.surrogate()) {
                 vector_id = bound;
             }
-            coll.delete(vector_id);
+            node_deleted = coll.delete(vector_id);
         }
         Some(VectorIndexDelta {
             index_key,
@@ -52,6 +53,7 @@ impl CoreLoop {
             collection: collection.to_string(),
             field: field.to_string(),
             doc_id: storage_key,
+            node_deleted,
         })
     }
 
@@ -62,8 +64,8 @@ impl CoreLoop {
     /// the surrogate's old embedding before inserting the new one, since
     /// `insert_with_surrogate` appends rather than replaces).
     ///
-    /// Candidate fields come from the same strict-schema / `vector_params`
-    /// enumeration the put path uses, so each `vector_doc_map` entry is looked
+    /// Candidate fields come from the same strict-schema / `vector_params` /
+    /// declared-column enumeration the put path uses, so each `vector_doc_map` entry is looked
     /// up by its exact key (via `remove_document_vector_index_field`) instead
     /// of scanning the whole map. Returns the removed `(index_key, vector_id)`
     /// deltas so a transactional caller can push `UndoEntry::DeleteVector`

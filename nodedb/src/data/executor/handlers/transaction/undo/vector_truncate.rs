@@ -16,7 +16,7 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::vector_direct_row::VectorIndexKey;
 use crate::engine::vector::collection::VectorCollection;
 
-use super::UndoEntry;
+use super::{UndoEntry, UndoError};
 
 /// The collection and sidecar rows a truncate would remove.
 pub(in crate::data::executor) struct VectorTruncateUndo {
@@ -70,7 +70,7 @@ impl CoreLoop {
         &mut self,
         entry_index: usize,
         undo: VectorTruncateUndo,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         let VectorTruncateUndo {
             index_key,
             tid,
@@ -92,9 +92,10 @@ impl CoreLoop {
             self.sparse
                 .put(database_id, tid, &collection, &key, &bytes)
                 .map_err(|e| {
-                    (
+                    UndoError::failed(
                         entry_index,
-                        format!("restoring the sidecar of {key} in '{collection}': {e}"),
+                        format!("restoring the sidecar of {key} in '{collection}'"),
+                        e,
                     )
                 })?;
             self.doc_cache

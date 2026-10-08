@@ -21,6 +21,10 @@ use redb::WriteTransaction;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use crate::data::executor::enforcement::hash_chain::{self, ChainHead};
+use crate::data::executor::enforcement::materialized_sum::apply::TargetWrite;
+use crate::data::executor::handlers::transaction::undo::UndoEntry;
+use crate::data::executor::handlers::transaction::undo::memory::abort_error;
+use crate::engine::document::store::StorageKey;
 use crate::types::{DatabaseId, TenantId};
 
 /// The chain link a pending write asks `build_stored_body` to write.
@@ -285,27 +289,114 @@ impl ChainGuard {
     }
 }
 
+/// A document write abandoned after `apply_point_put` ran, before its
+/// transaction commits. One write can store several rows of one collection.
+pub(in crate::data::executor) struct AbandonedWrite<'a> {
+    pub database_id: u64,
+    pub tid: u64,
+    pub collection: &'a str,
+    /// Every row `apply_point_put` was called for, including a row whose
+    /// call failed: it cached the row before it failed.
+    pub row_keys: &'a [StorageKey],
+    /// The rows' in-memory index entries to reverse, from
+    /// `PointPutOutcome::memory_undo` or `PointDeleteOutcome::memory_undo`,
+    /// in the order the rows were written.
+    /// A row whose `apply_point_put` failed has none: the call reverses its
+    /// own entries before it returns.
+    pub memory_undo: Vec<UndoEntry>,
+    /// The target rows the write's enforcement updated. Empty before
+    /// enforcement ran.
+    pub target_writes: Vec<TargetWrite>,
+}
+
+impl<'a> AbandonedWrite<'a> {
+    /// A write of one row, with no in-memory entries to reverse yet.
+    pub(in crate::data::executor) fn row(
+        database_id: u64,
+        tid: u64,
+        collection: &'a str,
+        row_key: &'a StorageKey,
+    ) -> Self {
+        Self::rows(database_id, tid, collection, std::slice::from_ref(row_key))
+    }
+
+    /// A write of several rows, with no in-memory entries to reverse yet.
+    pub(in crate::data::executor) fn rows(
+        database_id: u64,
+        tid: u64,
+        collection: &'a str,
+        row_keys: &'a [StorageKey],
+    ) -> Self {
+        Self {
+            database_id,
+            tid,
+            collection,
+            row_keys,
+            memory_undo: Vec::new(),
+            target_writes: Vec::new(),
+        }
+    }
+
+    /// The rows' `PointPutOutcome::memory_undo` or
+    /// `PointDeleteOutcome::memory_undo`.
+    pub(in crate::data::executor) fn undo(mut self, memory_undo: Vec<UndoEntry>) -> Self {
+        self.memory_undo = memory_undo;
+        self
+    }
+
+    /// The target rows the write's enforcement updated.
+    pub(in crate::data::executor) fn targets(mut self, target_writes: Vec<TargetWrite>) -> Self {
+        self.target_writes = target_writes;
+        self
+    }
+}
+
 /// Undo the in-memory side effects an abort AFTER `apply_point_put` leaves
-/// behind, before the caller drops its transaction uncommitted.
+/// behind, before the caller drops its transaction uncommitted. Returns the
+/// error the caller reports: `error`, or `RollbackFailed` when an in-memory
+/// entry did not reverse.
 ///
-/// `apply_point_put` populates the read-through document cache with the body it
-/// wrote. Dropping the redb transaction reverses the durable write but not that
-/// cache entry, so every subsequent read of the row would be served the
-/// post-image of a write that never landed — a row visible to readers and
-/// absent from storage. Restoring the hash-chain head is the same class of
-/// in-memory reversal, so both happen here rather than one being remembered at
-/// each abort site and the other forgotten.
+/// Dropping the redb transaction reverses the durable writes and nothing in
+/// memory. Four things stay behind, and all four are reversed here, so no
+/// abort site remembers one and forgets another:
+/// - the document-cache entries `apply_point_put` wrote: reads would serve
+///   rows absent from storage
+/// - the R-tree, vector and sparse entries of the rows: spatial predicates
+///   and vector search would answer with them
+/// - the same cache and index entries of every materialized-sum target row
+/// - the advanced hash-chain head
 pub(in crate::data::executor) fn abort_after_apply(
     core: &mut CoreLoop,
     guard: &mut ChainGuard,
-    database_id: u64,
-    tid: u64,
-    collection: &str,
-    row_key: &crate::engine::document::store::StorageKey,
-) {
+    write: AbandonedWrite<'_>,
+    error: crate::Error,
+) -> crate::Error {
     guard.restore(core);
-    core.doc_cache
-        .invalidate(database_id, tid, collection, row_key);
+    abandon_write(core, write, error)
+}
+
+/// [`abort_after_apply`] for a write that set no hash-chain intent.
+pub(in crate::data::executor) fn abandon_write(
+    core: &mut CoreLoop,
+    write: AbandonedWrite<'_>,
+    error: crate::Error,
+) -> crate::Error {
+    let AbandonedWrite {
+        database_id,
+        tid,
+        collection,
+        row_keys,
+        memory_undo,
+        target_writes,
+    } = write;
+    for row_key in row_keys {
+        core.doc_cache
+            .invalidate(database_id, tid, collection, row_key);
+    }
+    // A target is written after its row, so targets are reversed first.
+    let targets = core.abandon_target_writes(database_id, tid, target_writes);
+    let row = core.undo_memory_effects(database_id, tid, memory_undo);
+    abort_error(error, targets.and(row))
 }
 
 impl CoreLoop {

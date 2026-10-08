@@ -112,12 +112,24 @@ impl CoreLoop {
 
     /// Fail-stop the core when `response` reports a failed rollback.
     pub(in crate::data::executor) fn fail_stop_on_rollback_failure(&mut self, response: &Response) {
-        if let Some(ErrorCode::RollbackFailed {
+        if let Some(code) = response.error_code.as_deref() {
+            self.fail_stop_on_rollback_code(code);
+        }
+    }
+
+    /// Fail-stop the core when `code` is `RollbackFailed`. The logged detail
+    /// names the undo entry, the reverse write, and its typed cause.
+    pub(in crate::data::executor) fn fail_stop_on_rollback_code(&mut self, code: &ErrorCode) {
+        if let ErrorCode::RollbackFailed {
             entry_index,
             detail,
-        }) = response.error_code.as_deref()
+            cause,
+        } = code
         {
-            let detail = format!("undo entry {entry_index}: {detail}");
+            let detail = match cause {
+                Some(cause) => format!("undo entry {entry_index}: {detail}; cause: {cause:?}"),
+                None => format!("undo entry {entry_index}: {detail}"),
+            };
             self.fail_stop_core(FailStopCause::RollbackFailed, &detail);
         }
     }
@@ -186,12 +198,18 @@ mod tests {
             ErrorCode::RollbackFailed {
                 entry_index: 2,
                 detail: "restore failed".into(),
+                cause: Some(Box::new(ErrorCode::Internal {
+                    detail: "storage error (sparse): commit".into(),
+                })),
             },
         );
 
         core.fail_stop_on_rollback_failure(&response);
 
         assert!(core.fail_stop.is_stopped());
+        let (cause, detail) = core.fail_stop.cause().expect("stopped");
+        assert_eq!(cause, FailStopCause::RollbackFailed);
+        assert!(detail.starts_with("undo entry 2: restore failed; cause: Internal"));
         assert_eq!(metrics.core_fail_stops.stopped_cores(), 1);
         assert_eq!(
             metrics.core_fail_stops.report().map(|r| r.cause),

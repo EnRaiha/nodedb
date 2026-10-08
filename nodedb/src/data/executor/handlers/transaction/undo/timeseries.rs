@@ -14,7 +14,7 @@
 use crate::data::executor::core_loop::CoreLoop;
 use crate::types::{DatabaseId, TenantId};
 
-use super::{TimeseriesIngestUndo, TimeseriesTruncateUndo};
+use super::{TimeseriesIngestUndo, TimeseriesTruncateUndo, UndoError};
 
 impl CoreLoop {
     /// The complete in-memory pre-image of a timeseries collection before an
@@ -45,7 +45,7 @@ impl CoreLoop {
         &mut self,
         entry_index: usize,
         undo: TimeseriesTruncateUndo,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         let TimeseriesTruncateUndo {
             collection_key,
             original_dir: original,
@@ -64,24 +64,23 @@ impl CoreLoop {
         if original.exists()
             && let Err(e) = std::fs::remove_dir_all(&original)
         {
-            return Err((
+            return Err(UndoError::failed(
                 entry_index,
-                format!(
-                    "timeseries truncate undo: remove {}: {e}",
-                    original.display()
-                ),
+                format!("timeseries truncate undo: remove {}", original.display()),
+                e,
             ));
         }
         if let Some(moved) = moved_dir
             && let Err(e) = std::fs::rename(&moved, &original)
         {
-            return Err((
+            return Err(UndoError::failed(
                 entry_index,
                 format!(
-                    "timeseries truncate undo: rename {} back to {}: {e}",
+                    "timeseries truncate undo: rename {} back to {}",
                     moved.display(),
                     original.display()
                 ),
+                e,
             ));
         }
 

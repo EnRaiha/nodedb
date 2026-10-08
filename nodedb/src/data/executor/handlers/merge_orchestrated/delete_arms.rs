@@ -15,6 +15,7 @@
 use crate::bridge::envelope::{Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::redo_image::removed_row_image;
+use crate::data::executor::enforcement::chain_guard::{AbandonedWrite, abandon_write};
 use crate::data::executor::enforcement::write_hook;
 use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
 use crate::data::executor::task::ExecutionTask;
@@ -71,6 +72,7 @@ impl CoreLoop {
             write_set,
             returned_docs,
         } = tally;
+        let identity_column = self.identity_column(database_id, tid, collection);
 
         for del in deletes {
             let surrogate = del.key.surrogate();
@@ -98,7 +100,11 @@ impl CoreLoop {
                     resolved_targets,
                 },
             ) {
-                Ok(outcome) => {
+                Ok(mut outcome) => {
+                    // An abort below drops `txn` uncommitted, which reverses
+                    // the durable writes only. `abandon_write` reverses the
+                    // arm's in-memory cascades.
+                    let memory_undo = std::mem::take(&mut outcome.memory_undo);
                     // A DELETE arm takes the removed row's contribution
                     // back off its target, folded inside THIS arm's
                     // transaction so the debit and the removal commit
@@ -129,16 +135,28 @@ impl CoreLoop {
                         Ok(enforcement) => enforcement.target_writes,
                         // Dropping `txn` un-committed reverses the
                         // removal and every target it had debited.
-                        Err(e) => return Err(self.response_error(task, e)),
+                        Err(e) => {
+                            let e = abandon_write(
+                                self,
+                                AbandonedWrite::row(database_id, tid, collection, &del.key)
+                                    .undo(memory_undo),
+                                e,
+                            );
+                            return Err(self.response_error(task, e));
+                        }
                     };
                     if let Err(e) = txn.commit() {
-                        return Err(self.response_error(
-                            task,
+                        let e = abandon_write(
+                            self,
+                            AbandonedWrite::row(database_id, tid, collection, &del.key)
+                                .undo(memory_undo)
+                                .targets(target_writes),
                             crate::Error::Storage {
                                 engine: "sparse".into(),
                                 detail: format!("merge delete commit: {e}"),
                             },
-                        ));
+                        );
+                        return Err(self.response_error(task, e));
                     }
                     // Journalled only once the arm committed: the removal
                     // and the target rows its debit rewrote.
@@ -159,7 +177,7 @@ impl CoreLoop {
                         // is the raw stored form (Binary Tuple on a
                         // strict target) and would need re-decoding.
                         if returning {
-                            match returning_doc(&del.body, &del.key) {
+                            match returning_doc(&del.body, &del.key, &identity_column) {
                                 Ok(doc) => returned_docs.push(doc),
                                 Err(e) => return Err(self.response_error(task, e)),
                             }
@@ -167,6 +185,7 @@ impl CoreLoop {
                     }
                     self.emit_document_delete_event(
                         task,
+                        tid,
                         collection,
                         row_identity,
                         outcome.prior_value.as_deref(),
