@@ -349,7 +349,7 @@ pub(super) fn transfer(
     source_key: &[u8],
     dest_key: &[u8],
     field: &str,
-    amount: f64,
+    amount: nodedb_physical::physical_plan::TransferAmount,
     debit_surrogate: u32,
     credit_surrogate: u32,
 ) -> ReplicatedWrite {

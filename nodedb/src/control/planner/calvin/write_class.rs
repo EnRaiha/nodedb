@@ -544,7 +544,7 @@ mod tests {
             source_key: b"a".to_vec(),
             dest_key: b"b".to_vec(),
             field: "balance".to_owned(),
-            amount: 10.0,
+            amount: nodedb_physical::physical_plan::TransferAmount::Float(10.0),
             debit_surrogate: Surrogate::new(1),
             credit_surrogate: Surrogate::new(2),
             rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),

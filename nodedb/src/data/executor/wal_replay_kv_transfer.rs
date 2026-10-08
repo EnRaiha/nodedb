@@ -9,9 +9,11 @@
 //! `handlers/kv/transfer.rs` perform, against whatever state this core's KV
 //! engine holds at this point in LSN-ordered replay.
 
+use nodedb_physical::physical_plan::TransferAmount;
 use tracing::warn;
 
 use super::core_loop::CoreLoop;
+use super::handlers::kv::declared_body::fit_kv_image;
 use super::handlers::kv::transfer_compute::{TransferError, compute_transfer};
 use crate::data::executor::core_loop::write_index::KeyRepr;
 
@@ -25,7 +27,7 @@ pub(super) struct ReplayKvTransferParams<'a> {
     pub source_key: &'a [u8],
     pub dest_key: &'a [u8],
     pub field: &'a str,
-    pub amount: f64,
+    pub amount: TransferAmount,
     pub debit_surrogate: u32,
     pub credit_surrogate: u32,
 }
@@ -91,8 +93,24 @@ impl CoreLoop {
             Some(dest_bytes.as_slice())
         };
 
-        let computed = match compute_transfer(&source_bytes, dest_ref, p.field, p.amount) {
+        let declared = self.declared_columns_of(p.database_id, p.tenant_id, p.collection);
+        let computed = match compute_transfer(&source_bytes, dest_ref, p.field, p.amount, declared)
+        {
             Ok(c) => c,
+            // The live write refused the same balance against the same
+            // pre-state, so the record converges to the same no-op.
+            Err(TransferError::Declared(error)) => {
+                warn!(
+                    core = self.core_id,
+                    collection = p.collection,
+                    source_key = %String::from_utf8_lossy(p.source_key),
+                    dest_key = %String::from_utf8_lossy(p.dest_key),
+                    %error,
+                    "WAL kv_transfer replay: declared column rule refused a balance, \
+                     skipping record"
+                );
+                return 0;
+            }
             Err(TransferError::TypeMismatch(detail)) => {
                 warn!(
                     core = self.core_id,
@@ -110,8 +128,8 @@ impl CoreLoop {
                     collection = p.collection,
                     source_key = %String::from_utf8_lossy(p.source_key),
                     dest_key = %String::from_utf8_lossy(p.dest_key),
-                    have,
-                    need,
+                    %have,
+                    %need,
                     "WAL kv_transfer replay: insufficient balance, skipping record"
                 );
                 return 0;
@@ -207,6 +225,25 @@ impl CoreLoop {
             );
             return (0, 0);
         };
+        // The row arriving at the destination meets the destination's
+        // declared numeric columns. The live move refused a row they refuse,
+        // so the record converges to the same no-op.
+        let declared = self.declared_columns_of(p.database_id, p.tenant_id, p.dest_collection);
+        let dest_data = match fit_kv_image(&item_data, declared) {
+            Ok(fitted) => fitted.unwrap_or(item_data),
+            Err(error) => {
+                warn!(
+                    core = self.core_id,
+                    source_collection = p.source_collection,
+                    dest_collection = p.dest_collection,
+                    item_key = %String::from_utf8_lossy(p.item_key),
+                    %error,
+                    "WAL kv_transfer_item replay: declared column rule refused the row, \
+                     skipping record"
+                );
+                return (0, 0);
+            }
+        };
 
         // The moved row is bound before the source row is deleted.
         let surrogate = nodedb_types::Surrogate::new(p.surrogate);
@@ -231,7 +268,7 @@ impl CoreLoop {
             tenant_id: p.tenant_id,
             collection: p.dest_collection,
             key: p.dest_key,
-            value: &item_data,
+            value: &dest_data,
             ttl_ms: 0,
             now_ms: p.now_ms,
             surrogate,
@@ -286,9 +323,16 @@ impl CoreLoop {
             amount,
             debit_surrogate,
             credit_surrogate,
-        ) = zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, String, f64, u32, u32)>(
-            payload,
-        )
+        ) = zerompk::from_msgpack::<(
+            &str,
+            String,
+            Vec<u8>,
+            Vec<u8>,
+            String,
+            TransferAmount,
+            u32,
+            u32,
+        )>(payload)
         .ok()?;
         if disc != "kv_transfer" {
             return None;
@@ -372,7 +416,7 @@ mod tests {
     use crate::control::server::wal_dispatch::wal_append_if_write;
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::WalManager;
-    use nodedb_physical::physical_plan::KvOp;
+    use nodedb_physical::physical_plan::{KvOp, TransferAmount};
     use nodedb_types::{QualifiedCollection, RlsWriteCheck, Surrogate};
     use nodedb_wal::TombstoneSet;
 
@@ -471,7 +515,7 @@ mod tests {
             source_key: b"alice".to_vec(),
             dest_key: b"bob".to_vec(),
             field: "balance".into(),
-            amount: 30.0,
+            amount: TransferAmount::Float(30.0),
             debit_surrogate: Surrogate::new(1),
             credit_surrogate: Surrogate::new(2),
             rls_write_check: RlsWriteCheck::already_decided_elsewhere(),

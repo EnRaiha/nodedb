@@ -3,6 +3,7 @@
 //! Pure payload encoders for KV WAL records.
 
 use nodedb_physical::physical_plan::KvCounterShape;
+use nodedb_physical::physical_plan::TransferAmount;
 use nodedb_physical::physical_plan::UpdateValue;
 
 /// Serialize `value` to a MessagePack WAL payload, wrapping any encode error
@@ -75,7 +76,7 @@ pub(crate) struct KvTransferFields<'a> {
     pub source_key: &'a [u8],
     pub dest_key: &'a [u8],
     pub field: &'a str,
-    pub amount: f64,
+    pub amount: TransferAmount,
     pub debit_surrogate: u32,
     pub credit_surrogate: u32,
 }
@@ -403,7 +404,7 @@ pub(crate) fn encode_kv_truncate(collection: &str) -> crate::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use nodedb_physical::physical_plan::{KvCounterShape, UpdateValue};
+    use nodedb_physical::physical_plan::{KvCounterShape, TransferAmount, UpdateValue};
 
     use super::{
         KvIncrRecord, KvTransferFields, encode_kv_batch_put, encode_kv_cas, encode_kv_expire,
@@ -532,7 +533,7 @@ mod tests {
             source_key: b"alice",
             dest_key: b"bob",
             field: "balance",
-            amount: 30.0,
+            amount: TransferAmount::Float(30.0),
             debit_surrogate: 7,
             credit_surrogate: 8,
         })
@@ -547,16 +548,23 @@ mod tests {
             amount,
             debit_surrogate,
             credit_surrogate,
-        ) = zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, String, f64, u32, u32)>(
-            &entry,
-        )
+        ) = zerompk::from_msgpack::<(
+            &str,
+            String,
+            Vec<u8>,
+            Vec<u8>,
+            String,
+            TransferAmount,
+            u32,
+            u32,
+        )>(&entry)
         .unwrap();
         assert_eq!(disc, "kv_transfer");
         assert_eq!(collection, "accounts");
         assert_eq!(source_key, b"alice");
         assert_eq!(dest_key, b"bob");
         assert_eq!(field, "balance");
-        assert_eq!(amount, 30.0);
+        assert_eq!(amount, TransferAmount::Float(30.0));
         assert_eq!(debit_surrogate, 7);
         assert_eq!(credit_surrogate, 8);
     }
