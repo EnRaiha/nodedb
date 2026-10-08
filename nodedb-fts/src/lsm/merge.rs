@@ -10,12 +10,18 @@ use std::collections::{BTreeSet, HashMap};
 use nodedb_types::Surrogate;
 
 use crate::block::{CompactPosting, PostingBlock, into_blocks};
+use crate::index::FtsIndexError;
 
-use super::segment::reader::SegmentReader;
+use super::query::{LiveSegment, live_segment_postings};
 
 use nodedb_mem::ScopedMemory;
 
 /// Merge multiple segments into a single set of per-term PostingBlocks.
+///
+/// Each segment's postings of its deleted documents are dropped, so the
+/// merged segment holds live postings only. A term left with no live
+/// posting is not written. Posting data that does not decode is a
+/// [`FtsIndexError::CorruptSegment`].
 ///
 /// The result is a sorted list of `(term, blocks)` suitable for
 /// `segment::writer::build_from_blocks`.
@@ -25,14 +31,14 @@ use nodedb_mem::ScopedMemory;
 /// exceeded the allocation still proceeds — the scope serves as an
 /// accounting and backpressure signal; callers that need hard rejection
 /// check pressure before dispatching the operation.
-pub fn merge_segments(
-    segments: &[SegmentReader],
+pub fn merge_segments<E: std::fmt::Display>(
+    segments: &[LiveSegment],
     memory: &ScopedMemory,
-) -> Vec<(String, Vec<PostingBlock>)> {
+) -> Result<Vec<(String, Vec<PostingBlock>)>, FtsIndexError<E>> {
     // Collect all unique terms across all segments.
     let mut all_terms = BTreeSet::new();
     for seg in segments {
-        for entry in seg.term_dict() {
+        for entry in seg.reader.term_dict() {
             all_terms.insert(entry.term.clone());
         }
     }
@@ -44,21 +50,10 @@ pub fn merge_segments(
     let mut result = Vec::with_capacity(all_terms.len());
 
     for term in &all_terms {
-        // Gather all postings for this term across segments.
+        // Gather the live postings for this term across segments.
         let mut merged_postings: Vec<CompactPosting> = Vec::new();
-
         for seg in segments {
-            let blocks = seg.read_postings(term);
-            for block in blocks {
-                for i in 0..block.doc_ids.len() {
-                    merged_postings.push(CompactPosting {
-                        doc_id: block.doc_ids[i],
-                        term_freq: block.term_freqs[i],
-                        fieldnorm: block.fieldnorms[i],
-                        positions: block.positions[i].clone(),
-                    });
-                }
-            }
+            merged_postings.extend(live_segment_postings::<E>(seg, term)?);
         }
 
         if merged_postings.is_empty() {
@@ -73,7 +68,7 @@ pub fn merge_segments(
         result.push((term.clone(), blocks));
     }
 
-    result
+    Ok(result)
 }
 
 /// Merge posting lists from a memtable and multiple segments for a single term.
@@ -117,8 +112,11 @@ pub fn dedup_postings(postings: &mut Vec<CompactPosting>) {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+
     use super::*;
     use crate::codec::smallfloat;
+    use crate::lsm::segment::reader::SegmentReader;
     use crate::lsm::segment::writer;
     use crate::test_support::test_memory;
 
@@ -146,10 +144,11 @@ mod tests {
             writer::flush_to_segment(m).unwrap()
         };
 
-        let r1 = SegmentReader::open(seg1).expect("seg1 must be valid");
-        let r2 = SegmentReader::open(seg2).expect("seg2 must be valid");
-
-        let merged = merge_segments(&[r1, r2], &test_memory());
+        let merged = merge_segments::<Infallible>(
+            &[live("s1", seg1, None), live("s2", seg2, None)],
+            &test_memory(),
+        )
+        .unwrap();
         let terms: Vec<&str> = merged.iter().map(|(t, _)| t.as_str()).collect();
         assert!(terms.contains(&"hello"));
         assert!(terms.contains(&"world"));
@@ -159,6 +158,44 @@ mod tests {
         let hello_blocks = &merged.iter().find(|(t, _)| t == "hello").unwrap().1;
         let total_docs: usize = hello_blocks.iter().map(|b| b.len()).sum();
         assert_eq!(total_docs, 4);
+    }
+
+    fn live(id: &str, data: Vec<u8>, deleted: Option<&[u32]>) -> LiveSegment {
+        LiveSegment {
+            segment_id: id.to_string(),
+            reader: SegmentReader::open(data).expect("segment must be valid"),
+            deleted: deleted.map(|ids| ids.iter().map(|d| Surrogate(*d)).collect()),
+        }
+    }
+
+    /// A segment's deleted documents leave the merge, and a term holding
+    /// only deleted documents is not written.
+    #[test]
+    fn merge_drops_deleted_postings() {
+        let seg1 = {
+            let mut m = std::collections::HashMap::new();
+            m.insert("hello".to_string(), vec![cp(1, 1), cp(2, 1)]);
+            m.insert("gone".to_string(), vec![cp(2, 1)]);
+            writer::flush_to_segment(m).unwrap()
+        };
+        let seg2 = {
+            let mut m = std::collections::HashMap::new();
+            m.insert("hello".to_string(), vec![cp(3, 1)]);
+            writer::flush_to_segment(m).unwrap()
+        };
+        let merged = merge_segments::<Infallible>(
+            &[live("s1", seg1, Some(&[2])), live("s2", seg2, None)],
+            &test_memory(),
+        )
+        .unwrap();
+        let terms: Vec<&str> = merged.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(terms, vec!["hello"]);
+        let docs: Vec<Surrogate> = merged[0]
+            .1
+            .iter()
+            .flat_map(|b| b.doc_ids.iter().copied())
+            .collect();
+        assert_eq!(docs, vec![Surrogate(1), Surrogate(3)]);
     }
 
     #[test]

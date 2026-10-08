@@ -6,3 +6,4 @@ pub mod merge;
 pub mod parallel_build;
 pub mod query;
 pub mod segment;
+pub mod segment_deletes;

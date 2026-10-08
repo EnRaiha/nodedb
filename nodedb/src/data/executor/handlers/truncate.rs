@@ -3,10 +3,11 @@
 //! TRUNCATE and ESTIMATE_COUNT handlers.
 
 use nodedb_physical::physical_plan::{ResolvedSumTarget, StorageMode};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::fail_stop::FailStopCause;
 use crate::data::executor::enforcement::materialized_sum::divergence::SumTargetCheck;
 use crate::data::executor::enforcement::write_hook;
 use crate::data::executor::handlers::partial_refusal::refusal_after_rows;
@@ -61,12 +62,7 @@ impl CoreLoop {
         ) {
             Ok(ids) => ids,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("scan for truncate: {e}"),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
 
@@ -139,9 +135,10 @@ impl CoreLoop {
         // `DocumentOp::Truncate`, so these entries are the only record of the
         // removals WAL replay and a point-in-time restore apply.
         let mut write_set: Vec<WriteSetEntry> = Vec::new();
+        // Surrogates removed so far. A refusal part-way removes their text
+        // from the inverted index. A full TRUNCATE empties it in one purge.
+        let mut removed: Vec<nodedb_types::Surrogate> = Vec::new();
         for storage_key in &all_ids {
-            let doc_id = storage_key.to_string();
-
             // One transaction per removed row, shared with the materialized-sum
             // delta that row owes — identical to `execute_bulk_delete`, so a
             // TRUNCATE and a `DELETE` with no predicate leave the same totals.
@@ -151,14 +148,37 @@ impl CoreLoop {
                 Ok(txn) => txn,
                 Err(e) => {
                     let code = refusal_after_rows(truncated, e);
-                    return self.refusal_with_landed_rows(task, code, write_set);
+                    return self.truncate_refusal(task, tid, collection, code, &removed, write_set);
                 }
             };
-            let deleted_bytes = self
-                .sparse
-                .delete_in_txn(&row_txn, database_id, tid, collection, storage_key)
-                .ok()
-                .flatten();
+            // A delete error refuses the TRUNCATE: read as an absent row, it
+            // would leave the row stored under a success.
+            let deleted_bytes =
+                match self
+                    .sparse
+                    .delete_in_txn(&row_txn, database_id, tid, collection, storage_key)
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        let code = refusal_after_rows(truncated, e);
+                        return self
+                            .truncate_refusal(task, tid, collection, code, &removed, write_set);
+                    }
+                };
+            // The row's secondary-index entries leave in the row's own
+            // transaction, so the row and its entries go together or not at all.
+            if deleted_bytes.is_some()
+                && let Err(e) = self.sparse.delete_indexes_for_document_in_txn(
+                    &row_txn,
+                    database_id,
+                    tid,
+                    collection,
+                    storage_key,
+                )
+            {
+                let code = refusal_after_rows(truncated, e);
+                return self.truncate_refusal(task, tid, collection, code, &removed, write_set);
+            }
             let mut target_writes = Vec::new();
             if let Some(bytes) = deleted_bytes.as_deref() {
                 match write_hook::run(
@@ -182,18 +202,20 @@ impl CoreLoop {
                     Ok(outcome) => target_writes = outcome.target_writes,
                     Err(e) => {
                         let code = refusal_after_rows(truncated, e);
-                        return self.refusal_with_landed_rows(task, code, write_set);
+                        return self
+                            .truncate_refusal(task, tid, collection, code, &removed, write_set);
                     }
                 }
             }
             if let Err(e) = row_txn.commit() {
                 let code = refusal_after_rows(
                     truncated,
-                    ErrorCode::Internal {
+                    crate::Error::Storage {
+                        engine: "sparse".into(),
                         detail: format!("truncate commit: {e}"),
                     },
                 );
-                return self.refusal_with_landed_rows(task, code, write_set);
+                return self.truncate_refusal(task, tid, collection, code, &removed, write_set);
             }
             if let Some(deleted_bytes) = deleted_bytes.as_deref() {
                 let surrogate = storage_key.surrogate();
@@ -207,22 +229,9 @@ impl CoreLoop {
                     declared_primary_key,
                     *storage_key,
                 );
-                if let Err(e) = self.inverted.remove_document(
-                    database_id,
-                    crate::types::TenantId::new(tid),
-                    collection,
-                    surrogate,
-                ) {
-                    warn!(core = self.core_id, %collection, %doc_id, error = %e, "truncate: inverted removal failed");
-                }
-                if let Err(e) = self.sparse.delete_indexes_for_document(
-                    database_id,
-                    tid,
-                    collection,
-                    storage_key,
-                ) {
-                    warn!(core = self.core_id, %collection, %doc_id, error = %e, "truncate: index cascade failed");
-                }
+                // The row's text leaves the inverted index with every other
+                // row's, in one purge once the loop ends.
+                removed.push(surrogate);
                 // Cascade: secondary HNSW vector index. The put path indexed
                 // this row's vectors under its surrogate; truncate must
                 // soft-delete those nodes and drop the reverse-map entry, or
@@ -255,21 +264,27 @@ impl CoreLoop {
                 // events were lost, and per-row events are what ROW-level
                 // AFTER-DELETE triggers match on (see
                 // `event::trigger::dispatcher::single`).
-                let old_converted = self.resolve_event_payload(
-                    task.request.database_id.as_u64(),
-                    tid,
-                    collection,
-                    deleted_bytes,
-                );
                 self.emit_document_delete_event(
                     task,
+                    tid,
                     collection,
                     row_identity,
-                    Some(old_converted.as_deref().unwrap_or(deleted_bytes)),
+                    Some(deleted_bytes),
                 );
                 truncated += 1;
             }
             write_set.extend(write_hook::target_write_set(&target_writes));
+        }
+
+        // Every row is removed: empty the collection's inverted index in one
+        // purge. Its analyzer, language, and fuzzy configuration stay.
+        if let Err(e) = self.inverted.clear_collection(
+            database_id,
+            crate::types::TenantId::new(tid),
+            collection,
+        ) {
+            let code = refusal_after_rows(truncated, ErrorCode::from(e));
+            return self.refusal_with_landed_rows(task, code, write_set);
         }
 
         // Clear aggregate cache for this collection.
@@ -285,15 +300,45 @@ impl CoreLoop {
         // removals' entries as well.
         let mut response = match response_codec::encode_json_as_msgpack(&result) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         };
         response.write_set = write_set;
         response
+    }
+
+    /// The refusal of a TRUNCATE that stopped part-way. The rows removed so
+    /// far stay removed, so their text leaves the inverted index in one batch
+    /// before the refusal answers. The refusal keeps `code`, so the client
+    /// sees the SQLSTATE of what stopped the TRUNCATE.
+    ///
+    /// A failure of the text removal leaves the inverted index holding text
+    /// of removed rows. That cannot be undone here, so the core fail-stops.
+    /// Restart replay applies the journalled removals and rebuilds the index.
+    fn truncate_refusal(
+        &mut self,
+        task: &ExecutionTask,
+        tid: u64,
+        collection: &str,
+        code: ErrorCode,
+        removed: &[nodedb_types::Surrogate],
+        write_set: Vec<WriteSetEntry>,
+    ) -> Response {
+        if let Err(e) = self.inverted.remove_documents(
+            task.request.database_id.as_u64(),
+            crate::types::TenantId::new(tid),
+            collection,
+            removed,
+        ) {
+            self.fail_stop_core(
+                FailStopCause::PostInstallFailed,
+                &format!(
+                    "TRUNCATE of '{collection}' stopped after {} rows with {code:?}, then \
+                     removing those rows' text from the inverted index failed: {e}",
+                    removed.len()
+                ),
+            );
+        }
+        self.refusal_with_landed_rows(task, code, write_set)
     }
 
     /// ESTIMATE_COUNT: return approximate row count from HLL cardinality stats.
@@ -318,12 +363,7 @@ impl CoreLoop {
                 });
                 match response_codec::encode_json_as_msgpack(&result) {
                     Ok(payload) => self.response_with_payload(task, payload),
-                    Err(e) => self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    ),
+                    Err(e) => self.response_error(task, ErrorCode::from(e)),
                 }
             }
             Ok(None) => {
@@ -336,20 +376,10 @@ impl CoreLoop {
                 });
                 match response_codec::encode_json_as_msgpack(&result) {
                     Ok(payload) => self.response_with_payload(task, payload),
-                    Err(e) => self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    ),
+                    Err(e) => self.response_error(task, ErrorCode::from(e)),
                 }
             }
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }

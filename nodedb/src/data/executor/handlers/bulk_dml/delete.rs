@@ -16,7 +16,7 @@ use nodedb_physical::physical_plan::{
     OllpPredictedEdge, ResolvedSumTarget, ReturningSpec, StorageMode,
 };
 
-use super::delete_cascade::BulkDeleteRowCascade;
+use super::delete_cascade::{BulkDeleteRowCascade, TextFlush};
 
 /// OLLP prediction inputs threaded to `execute_bulk_delete`: the predicted
 /// matched-doc surrogate set and the predicted implicit-edge set. Both are
@@ -103,12 +103,7 @@ impl CoreLoop {
         ) {
             Ok(ids) => ids,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
 
@@ -179,6 +174,7 @@ impl CoreLoop {
         // The period lock is judged here too, on the same image: each row
         // below commits in its own transaction, so a lock judged there
         // refuses after the rows ahead of it were removed.
+        let identity_column = self.identity_column(database_id, tid, collection);
         let gate_policy = !matches!(
             rls_write_check.decision(),
             nodedb_types::WriteGateDecision::AdmitAll
@@ -200,6 +196,7 @@ impl CoreLoop {
                         &stored,
                         &key.to_identity(),
                         strict_schema.as_ref(),
+                        &identity_column,
                         tid,
                         collection,
                     )
@@ -251,9 +248,10 @@ impl CoreLoop {
         } else {
             Vec::new()
         };
+        // Removed rows whose text has not left the inverted index yet. It
+        // leaves in batches, one write transaction each.
+        let mut pending_text: Vec<nodedb_types::Surrogate> = Vec::new();
         for storage_key in &apply_ids {
-            let doc_id = storage_key.to_string();
-
             // Capture pre-deletion snapshot if RETURNING was requested, or if
             // the collection is indexed (needed to recompute the removed
             // secondary-index tuples below — the delete cascade's prefix scan
@@ -281,11 +279,19 @@ impl CoreLoop {
                                 &bytes,
                                 &identity,
                                 strict_schema.as_ref(),
+                                &identity_column,
                             ) {
                                 Ok(doc) => Some(doc),
                                 Err(e) => {
                                     let code = refusal_after_rows(affected, e);
-                                    return self.refusal_with_landed_rows(task, code, write_set);
+                                    return self.bulk_delete_refusal(
+                                        task,
+                                        tid,
+                                        collection,
+                                        code,
+                                        &mut pending_text,
+                                        write_set,
+                                    );
                                 }
                             }
                         }
@@ -305,7 +311,14 @@ impl CoreLoop {
                 Ok(txn) => txn,
                 Err(e) => {
                     let code = refusal_after_rows(affected, e);
-                    return self.refusal_with_landed_rows(task, code, write_set);
+                    return self.bulk_delete_refusal(
+                        task,
+                        tid,
+                        collection,
+                        code,
+                        &mut pending_text,
+                        write_set,
+                    );
                 }
             };
             let deleted_bytes = self
@@ -344,7 +357,14 @@ impl CoreLoop {
                     // and every target it had already debited.
                     Err(e) => {
                         let code = refusal_after_rows(affected, e);
-                        return self.refusal_with_landed_rows(task, code, write_set);
+                        return self.bulk_delete_refusal(
+                            task,
+                            tid,
+                            collection,
+                            code,
+                            &mut pending_text,
+                            write_set,
+                        );
                     }
                 }
             }
@@ -355,7 +375,14 @@ impl CoreLoop {
                         detail: format!("bulk delete commit: {e}"),
                     },
                 );
-                return self.refusal_with_landed_rows(task, code, write_set);
+                return self.bulk_delete_refusal(
+                    task,
+                    tid,
+                    collection,
+                    code,
+                    &mut pending_text,
+                    write_set,
+                );
             }
             // One durable redo entry per debited target row, naming the TARGET
             // collection: this statement's own redo describes the removed source
@@ -363,13 +390,12 @@ impl CoreLoop {
             // as it stood before the delete.
             write_set.extend(write_hook::target_write_set(&target_writes));
             if let Some(bytes) = deleted_bytes.as_deref() {
-                self.bulk_delete_row_cascade(
+                let cascaded = self.bulk_delete_row_cascade(
                     BulkDeleteRowCascade {
                         task,
                         database_id,
                         tid,
                         collection,
-                        doc_id: doc_id.as_str(),
                         storage_key: *storage_key,
                         deleted_bytes: bytes,
                         strict_schema: strict_schema.as_ref(),
@@ -383,7 +409,30 @@ impl CoreLoop {
                     &mut returned_docs,
                 );
                 affected += 1;
+                pending_text.push(storage_key.surrogate());
+                // The row is removed and journalled: its index cleanup error
+                // fails the statement after its pending text leaves the
+                // inverted index.
+                if let Err(e) = cascaded {
+                    let code = refusal_after_rows(affected, ErrorCode::from(e));
+                    return self.bulk_delete_refusal(
+                        task,
+                        tid,
+                        collection,
+                        code,
+                        &mut pending_text,
+                        write_set,
+                    );
+                }
+                let flush = TextFlush::full_batch(tid, collection, affected);
+                if let Err(code) = self.flush_deleted_text_at(task, flush, &mut pending_text) {
+                    return self.refusal_with_landed_rows(task, code, write_set);
+                }
             }
+        }
+        let flush = TextFlush::remainder(tid, collection, affected);
+        if let Err(code) = self.flush_deleted_text_at(task, flush, &mut pending_text) {
+            return self.refusal_with_landed_rows(task, code, write_set);
         }
 
         // Invalidate aggregate cache — a delete changes count(*) for this
@@ -403,23 +452,13 @@ impl CoreLoop {
         let mut response = if let Some(spec) = returning {
             match returning_rows::build_rows_payload(spec, rls_filters, &returned_docs) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("RETURNING encode: {e}"),
-                    },
-                ),
+                Err(e) => self.response_error(task, ErrorCode::from(e)),
             }
         } else {
             let result = serde_json::json!({ "affected": affected });
             match response_codec::encode_json_as_msgpack(&result) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                ),
+                Err(e) => self.response_error(task, ErrorCode::from(e)),
             }
         };
         response.write_set = write_set;

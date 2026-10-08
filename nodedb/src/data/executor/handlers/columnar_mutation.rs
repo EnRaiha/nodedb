@@ -7,21 +7,21 @@
 //! the R-tree cascade for spatial collections, is shared with the
 //! resolved-row-set handlers through `columnar_mutation_apply.rs`.
 
+use nodedb_physical::physical_plan::UpdateValue;
 use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
-use crate::bridge::scan_filter::ScanFilter;
+use crate::bridge::scan_filter::decode_scan_filters;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::columnar_resolve::{
-    ResolveUpdateRowsParams, require_pk_column_index, resolve_delete_rows, resolve_update_rows,
+    ResolveDeleteRowsParams, ResolveUpdateRowsParams, require_pk_column_index,
 };
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use crate::data::executor::task::ExecutionTask;
 
 impl CoreLoop {
-    /// Handle columnar UPDATE: scan memtable for matching rows, apply field updates.
-    ///
-    /// Currently operates on in-memory memtable rows only.
+    /// Handle columnar UPDATE: match the current rows, flushed and in the
+    /// memtable, and apply the field updates to each match.
     /// Returns `{"affected": N}` as JSON payload.
     ///
     /// When `undo_log` is `Some` (the durable COMMIT-replay path inside a
@@ -34,7 +34,7 @@ impl CoreLoop {
         task: &ExecutionTask,
         collection: &str,
         filter_bytes: &[u8],
-        updates: &[(String, Vec<u8>)],
+        updates: &[(String, UpdateValue)],
         rls_write_check: &nodedb_types::RlsWriteCheck,
         undo_log: Option<&mut Vec<UndoEntry>>,
     ) -> Response {
@@ -57,18 +57,20 @@ impl CoreLoop {
             }
         };
 
-        // Columnar UPDATE: scan memtable rows matching filter predicates,
-        // then apply updates via PK-based MutationEngine (delete + re-insert).
+        // Match the current rows against the filter predicates, then apply
+        // the updates through the PK-based MutationEngine (delete + re-insert).
         let schema = engine.schema().clone();
+        let row_count_before = engine.memtable().row_count();
         let pk_col_idx = match require_pk_column_index(&schema, "UPDATE") {
             Ok(idx) => idx,
             Err(e) => return self.response_error(task, e),
         };
 
-        let filter_predicates: Vec<ScanFilter> = if !filter_bytes.is_empty() {
-            zerompk::from_msgpack(filter_bytes).unwrap_or_default()
-        } else {
-            Vec::new()
+        // A filter that does not decode refuses the statement. Read as no
+        // filter, it would update every row.
+        let filter_predicates = match decode_scan_filters(filter_bytes, "columnar UPDATE filter") {
+            Ok(filters) => filters,
+            Err(e) => return self.response_error(task, e),
         };
 
         // Resolve every matching row's post-image, and let the write policy
@@ -80,8 +82,13 @@ impl CoreLoop {
         // no way for the caller to see or undo that. Shared with
         // `execute_columnar_resolve_dml`, which reports this same selection
         // instead of applying it.
-        let pending = match resolve_update_rows(ResolveUpdateRowsParams {
-            engine,
+        //
+        // An expression assignment evaluates against each row's pre-image, and
+        // each post-image meets the declared column rule inside the resolve. A
+        // failed evaluation or a value past a declared width refuses the
+        // statement whole.
+        let pending = match self.resolve_columnar_update_rows(ResolveUpdateRowsParams {
+            key: &key,
             schema: &schema,
             pk_col_idx,
             filter_predicates: &filter_predicates,
@@ -93,15 +100,21 @@ impl CoreLoop {
             Ok(rows) => rows,
             Err(e) => return self.response_error(task, e),
         };
-
         // Undo capture (only on the durable COMMIT-replay path). `row_count_before`
         // is the memtable size before any replacement row is appended, so the
         // undo can truncate back to it; `inserted_pks`/`displaced` reverse the
         // insert half, `restored` re-materializes each tombstoned original.
-        let row_count_before = engine.memtable().row_count();
         let mut undo_log = undo_log;
-        let outcome =
-            self.apply_columnar_update_rows(task, &key, &schema, &pending, undo_log.as_deref_mut());
+        let outcome = match self.apply_columnar_update_rows(
+            task,
+            &key,
+            &schema,
+            &pending,
+            undo_log.as_deref_mut(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => return self.response_error(task, e),
+        };
         let affected = outcome.affected;
 
         if let Some(log) = undo_log {
@@ -137,18 +150,12 @@ impl CoreLoop {
         let result = serde_json::json!({ "affected": affected });
         match super::super::response_codec::encode_json_as_msgpack(&result) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
-    /// Handle columnar DELETE: scan memtable for matching rows, delete them.
-    ///
-    /// Currently operates on in-memory memtable rows only.
+    /// Handle columnar DELETE: match the current rows, flushed and in the
+    /// memtable, and delete each match.
     /// Returns `{"affected": N}` as JSON payload.
     ///
     /// When `undo_log` is `Some` (the durable COMMIT-replay path inside a
@@ -189,10 +196,11 @@ impl CoreLoop {
             Err(e) => return self.response_error(task, e),
         };
 
-        let filter_predicates: Vec<ScanFilter> = if !filter_bytes.is_empty() {
-            zerompk::from_msgpack(filter_bytes).unwrap_or_default()
-        } else {
-            Vec::new()
+        // A filter that does not decode refuses the statement. Read as no
+        // filter, it would delete every row.
+        let filter_predicates = match decode_scan_filters(filter_bytes, "columnar DELETE filter") {
+            Ok(filters) => filters,
+            Err(e) => return self.response_error(task, e),
         };
 
         // The image a delete is governed by is the row it removes. Every
@@ -200,15 +208,15 @@ impl CoreLoop {
         // rejection removes nothing at all rather than leaving the rows ahead
         // of it already tombstoned. Shared with `execute_columnar_resolve_dml`,
         // which reports this same selection instead of applying it.
-        let pk_values = match resolve_delete_rows(
-            engine,
-            &schema,
+        let pk_values = match self.resolve_columnar_delete_rows(ResolveDeleteRowsParams {
+            key: &key,
+            schema: &schema,
             pk_col_idx,
-            &filter_predicates,
+            filter_predicates: &filter_predicates,
             rls_write_check,
-            task.request.tenant_id.as_u64(),
+            tid: task.request.tenant_id.as_u64(),
             collection,
-        ) {
+        }) {
             Ok(pks) => pks,
             Err(e) => return self.response_error(task, e),
         };
@@ -217,8 +225,15 @@ impl CoreLoop {
         // and PK bytes of each tombstoned row, so the undo can clear its
         // delete-bitmap bit and re-bind the PK index.
         let mut undo_log = undo_log;
-        let outcome =
-            self.apply_columnar_delete_pks(&key, &schema, &pk_values, undo_log.as_deref_mut());
+        let outcome = match self.apply_columnar_delete_pks(
+            &key,
+            &schema,
+            &pk_values,
+            undo_log.as_deref_mut(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => return self.response_error(task, e),
+        };
         let affected = outcome.affected;
 
         if let Some(log) = undo_log {
@@ -242,12 +257,7 @@ impl CoreLoop {
         let result = serde_json::json!({ "affected": affected });
         match super::super::response_codec::encode_json_as_msgpack(&result) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }

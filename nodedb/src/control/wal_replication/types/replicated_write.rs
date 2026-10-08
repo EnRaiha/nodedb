@@ -323,7 +323,8 @@ pub enum ReplicatedWrite {
         collection: String,
         /// Leader-assigned global surrogate for the document.
         surrogate: u32,
-        text: String,
+        /// `(field, text)` per top-level string field.
+        fields: Vec<(String, String)>,
         /// Sync provenance encoded as zerompk bytes.
         #[serde(default)]
         provenance: Option<Vec<u8>>,
@@ -579,7 +580,8 @@ pub enum ReplicatedWrite {
         source_key: Vec<u8>,
         dest_key: Vec<u8>,
         field: String,
-        amount: f64,
+        /// The amount, typed by the field it moves.
+        amount: nodedb_physical::physical_plan::TransferAmount,
         debit_surrogate: u32,
         credit_surrogate: u32,
     },
@@ -637,7 +639,7 @@ pub enum ReplicatedWrite {
         collection: String,
         filters: Vec<u8>,
         is_update: bool,
-        updates: Vec<(String, Vec<u8>)>,
+        updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
     },
     InsertSelect {
         target_collection: String,

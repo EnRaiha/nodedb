@@ -24,6 +24,11 @@ pub enum SegmentError {
     #[error("segment data is truncated")]
     Truncated,
 
+    /// A term's posting data lies outside the segment body or does not
+    /// decode, although the segment checksum matched.
+    #[error("posting data of term '{term}' is corrupt")]
+    CorruptPostings { term: String },
+
     /// A term exceeds the maximum encodable length (u16::MAX bytes).
     #[error("term length {term_len} exceeds maximum {max}")]
     TermTooLong { term_len: usize, max: usize },

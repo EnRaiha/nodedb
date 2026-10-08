@@ -79,6 +79,34 @@ pub enum FtsIndexError<E: std::fmt::Display> {
     #[error("FTS segment error: {0}")]
     Segment(crate::lsm::segment::error::SegmentError),
 
+    /// A stored segment of the index fails validation when it is opened.
+    ///
+    /// The segment's postings cannot be read, so a read that skipped it
+    /// would answer from part of the index.
+    #[error("FTS segment {segment_id} is corrupt: {source}")]
+    CorruptSegment {
+        segment_id: String,
+        source: crate::lsm::segment::error::SegmentError,
+    },
+
+    /// The backend lists a segment of the index that it does not hold.
+    #[error("FTS segment {segment_id} is listed but missing")]
+    MissingSegment { segment_id: String },
+
+    /// A stored index-state blob (backend metadata `subkey`) fails to decode.
+    #[error("FTS index state '{subkey}' is corrupt: {detail}")]
+    CorruptState {
+        subkey: &'static str,
+        detail: String,
+    },
+
+    /// An index-state blob (backend metadata `subkey`) fails to encode.
+    #[error("FTS index state '{subkey}' failed to encode: {detail}")]
+    StateEncode {
+        subkey: &'static str,
+        detail: String,
+    },
+
     /// Memory budget exhausted for the FTS engine.
     ///
     /// The operation requires more memory than the engine's remaining budget
