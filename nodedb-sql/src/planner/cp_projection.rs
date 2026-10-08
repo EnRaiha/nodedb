@@ -18,8 +18,8 @@ use crate::functions::sequence_accessor::is_sequence_accessor;
 use crate::resolver::ColumnScope;
 use crate::resolver::columns::TableScope;
 use crate::resolver::expr::convert_expr;
-use crate::types::Projection;
 use crate::types::plan::contains_sequence_accessor;
+use crate::types::{Projection, SqlExpr};
 
 /// A copy of `scope` that resolves sequence accessors, when `scope` iterates
 /// rows and backs the statement's output SELECT. A FROM-less SELECT gets
@@ -93,11 +93,40 @@ pub fn convert_cp_item(
     }))
 }
 
+/// A computed item as a Control-Plane computed item.
+///
+/// A computed item that is a bare column under an alias stays `Computed`: the
+/// value is the stored column, looked up under the source name and displayed
+/// under the alias, so nothing is evaluated. Every other item passes through.
+pub fn to_cp_computed(projection: Projection) -> Projection {
+    match projection {
+        Projection::Computed { expr, alias } => match expr {
+            SqlExpr::Column { .. } => Projection::Computed { expr, alias },
+            SqlExpr::Function { .. }
+            | SqlExpr::Literal(_)
+            | SqlExpr::BinaryOp { .. }
+            | SqlExpr::UnaryOp { .. }
+            | SqlExpr::Case { .. }
+            | SqlExpr::Cast { .. }
+            | SqlExpr::Subquery(_)
+            | SqlExpr::Wildcard
+            | SqlExpr::IsNull { .. }
+            | SqlExpr::InList { .. }
+            | SqlExpr::Between { .. }
+            | SqlExpr::Like { .. }
+            | SqlExpr::ArrayLiteral(_) => Projection::CpComputed { expr, alias },
+        },
+        Projection::Column(_)
+        | Projection::Star
+        | Projection::QualifiedStar(_)
+        | Projection::CpComputed { .. } => projection,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::resolver::columns::test_support::open_scope;
-    use crate::types::SqlExpr;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 

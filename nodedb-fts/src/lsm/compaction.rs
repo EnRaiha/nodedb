@@ -7,9 +7,13 @@
 //! that level are merged into a single segment at the next level.
 
 use crate::backend::FtsBackend;
+use crate::index::FtsIndexError;
+use crate::scope::IndexScope;
 
 use super::merge;
+use super::query::LiveSegment;
 use super::segment::{reader::SegmentReader, writer};
+use super::segment_deletes::SegmentDeletes;
 
 use std::sync::Arc;
 
@@ -67,13 +71,17 @@ pub fn needs_compaction(segments: &[SegmentMeta], config: &CompactionConfig) -> 
 /// Result of a compaction: new segment bytes and ids of merged (to-remove) segments.
 pub type CompactionResult = (Vec<u8>, Vec<String>);
 
-/// Errors from `compact_level` — wraps the backend error and budget exhaustion.
+/// Errors from `compact_level` — wraps the backend error, budget exhaustion,
+/// and index state that cannot be read or written.
 #[derive(Debug)]
-pub enum CompactError<E> {
+pub enum CompactError<E: std::fmt::Display> {
     /// Underlying backend storage error.
     Backend(E),
     /// Memory budget exhausted.
     Budget(nodedb_mem::MemError),
+    /// A source segment or the index's delete sets are corrupt or missing,
+    /// or the merged segment cannot be encoded. No segment is replaced.
+    Index(FtsIndexError<E>),
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for CompactError<E> {
@@ -81,20 +89,24 @@ impl<E: std::fmt::Display> std::fmt::Display for CompactError<E> {
         match self {
             CompactError::Backend(e) => write!(f, "compaction backend error: {e}"),
             CompactError::Budget(e) => write!(f, "compaction budget exhausted: {e}"),
+            CompactError::Index(e) => write!(f, "compaction index error: {e}"),
         }
     }
 }
 
-/// Helper for converting a `CompactError` to `Backend` variant.
-impl<E> CompactError<E> {
-    pub(crate) fn backend(e: E) -> Self {
-        CompactError::Backend(e)
+impl<E: std::fmt::Display> From<FtsIndexError<E>> for CompactError<E> {
+    fn from(e: FtsIndexError<E>) -> Self {
+        match e {
+            FtsIndexError::Backend(inner) => CompactError::Backend(inner),
+            FtsIndexError::BudgetExhausted(inner) => CompactError::Budget(inner),
+            other => CompactError::Index(other),
+        }
     }
 }
 
 /// Inputs to [`compact_level`].
 ///
-/// Groups the backend handle, the `(database_id, tid, collection)` scope, the
+/// Groups the backend handle, the `(database_id, tid, index)` scope, the
 /// candidate segment list, the target level, and the optional memory governor.
 pub struct CompactLevelParams<'a, B: FtsBackend> {
     /// Backend the source segments are read from.
@@ -103,9 +115,9 @@ pub struct CompactLevelParams<'a, B: FtsBackend> {
     pub database_id: u64,
     /// Owning tenant id.
     pub tid: u64,
-    /// Collection whose segments are being compacted.
-    pub collection: &'a str,
-    /// All known segments for the collection (filtered to `level` internally).
+    /// Index whose segments are being compacted.
+    pub index: IndexScope<'a>,
+    /// All known segments of the index (filtered to `level` internally).
     pub segments: &'a [SegmentMeta],
     /// Level whose segments are merged into `level + 1`.
     pub level: u32,
@@ -117,6 +129,13 @@ pub struct CompactLevelParams<'a, B: FtsBackend> {
 ///
 /// Returns the merged segment bytes and the ids of segments that were merged
 /// (which should be removed from storage after the new segment is written).
+/// The merge drops each source segment's postings of its deleted documents,
+/// so the merged segment carries no delete set. Once a source segment is
+/// removed, reads ignore its delete set and the next delete drops it.
+///
+/// A source segment that is missing or fails validation fails the
+/// compaction: merging without it and then removing it would lose its
+/// postings.
 ///
 /// Each `Vec::with_capacity` allocation is budgeted via
 /// [`nodedb_mem::ScopedMemory::reserve`]. If the budget is exhausted the
@@ -128,7 +147,7 @@ pub fn compact_level<B: FtsBackend>(
         backend,
         database_id,
         tid,
-        collection,
+        index,
         segments,
         level,
         governor,
@@ -141,33 +160,44 @@ pub fn compact_level<B: FtsBackend>(
     let memory = fts_scope(governor, database_id, tid);
 
     let _readers_guard = memory
-        .reserve(to_merge.len() * size_of::<SegmentReader>())
+        .reserve(to_merge.len() * size_of::<LiveSegment>())
         .map_err(CompactError::Budget)?;
-    let mut readers = Vec::with_capacity(to_merge.len());
+    let mut sources = Vec::with_capacity(to_merge.len());
 
     let _ids_guard = memory
         .reserve(to_merge.len() * size_of::<String>())
         .map_err(CompactError::Budget)?;
     let mut merged_ids = Vec::with_capacity(to_merge.len());
 
-    for meta in &to_merge {
-        if let Some(data) = backend
-            .read_segment(database_id, tid, collection, &meta.segment_id)
-            .map_err(CompactError::backend)?
-            && let Ok(reader) = SegmentReader::open(data)
-        {
-            readers.push(reader);
-            merged_ids.push(meta.segment_id.clone());
-        }
+    let merge_ids: Vec<String> = to_merge.iter().map(|m| m.segment_id.clone()).collect();
+    let mut deletes = SegmentDeletes::load(backend, database_id, tid, index, &merge_ids)?;
+    for segment_id in merge_ids {
+        let Some(data) = backend
+            .read_segment(database_id, tid, index, &segment_id)
+            .map_err(CompactError::Backend)?
+        else {
+            return Err(CompactError::Index(FtsIndexError::MissingSegment {
+                segment_id,
+            }));
+        };
+        let reader = SegmentReader::open(data).map_err(|source| {
+            CompactError::Index(FtsIndexError::CorruptSegment {
+                segment_id: segment_id.clone(),
+                source,
+            })
+        })?;
+        let deleted = deletes.take(&segment_id);
+        merged_ids.push(segment_id.clone());
+        sources.push(LiveSegment {
+            segment_id,
+            reader,
+            deleted,
+        });
     }
 
-    if readers.len() < 2 {
-        return Ok(None);
-    }
-
-    let merged_term_blocks = merge::merge_segments(&readers, &memory);
+    let merged_term_blocks = merge::merge_segments::<B::Error>(&sources, &memory)?;
     let new_segment = writer::build_from_blocks(&merged_term_blocks)
-        .expect("compaction produced a term longer than u16::MAX — data invariant violated");
+        .map_err(|e| CompactError::Index(FtsIndexError::from(e)))?;
 
     Ok(Some((new_segment, merged_ids)))
 }

@@ -58,6 +58,16 @@ impl QualifiedCollection {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The collection name [`Self::new`] qualified for `database_id`: the
+    /// catalog key a collection lookup in that database takes.
+    pub fn collection_name(&self, database_id: DatabaseId) -> &str {
+        if database_id == DatabaseId::DEFAULT {
+            return &self.0;
+        }
+        let prefix = format!("{}/", database_id.as_u64());
+        self.0.strip_prefix(prefix.as_str()).unwrap_or(&self.0)
+    }
 }
 
 impl fmt::Display for QualifiedCollection {
@@ -81,6 +91,14 @@ mod tests {
     fn non_default_database_yields_prefixed_name() {
         let q = QualifiedCollection::new(DatabaseId::new(7), "users");
         assert_eq!(q.as_str(), "7/users");
+    }
+
+    #[test]
+    fn collection_name_inverts_new() {
+        let q = QualifiedCollection::new(DatabaseId::new(7), "users");
+        assert_eq!(q.collection_name(DatabaseId::new(7)), "users");
+        let bare = QualifiedCollection::new(DatabaseId::DEFAULT, "users");
+        assert_eq!(bare.collection_name(DatabaseId::DEFAULT), "users");
     }
 
     #[test]

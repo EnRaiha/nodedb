@@ -38,10 +38,7 @@ fn schema_from_descriptor(descriptor: &[u8]) -> StrictSchema {
                 4 => ColumnType::Bytes,
                 5 => ColumnType::Timestamp,
                 6 => ColumnType::Timestamptz,
-                7 => ColumnType::Decimal {
-                    precision: 38,
-                    scale: 10,
-                },
+                7 => ColumnType::Decimal(None),
                 8 => ColumnType::Uuid,
                 9 => ColumnType::Vector(
                     descriptor
@@ -147,10 +144,7 @@ fn all_supported_schema() -> StrictSchema {
         ColumnType::Timestamp,
         ColumnType::Timestamptz,
         ColumnType::SystemTimestamp,
-        ColumnType::Decimal {
-            precision: 38,
-            scale: 10,
-        },
+        ColumnType::Decimal(None),
         ColumnType::Uuid,
         ColumnType::Vector(1),
         ColumnType::SparseVector,

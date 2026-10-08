@@ -89,10 +89,19 @@ pub fn single_result(value: &str) -> Vec<DdlResult> {
 /// typed value for the unwrap and its rows rendered back to JSON for the
 /// callers, which read fields as JSON. Rows that are not `{id, data}`
 /// wrapped (already-flat producers) pass through unchanged.
+///
+/// The callers read a row's identity under `id`, so a row that lacks `id`
+/// gains it here. These rows feed the query functions only and never reach
+/// a client as a result set.
 pub fn unwrap_scan_docs(docs: Vec<JsonValue>) -> Result<Vec<Map<String, JsonValue>>, DdlError> {
     let mut rows = Vec::with_capacity(docs.len());
     for doc in docs {
-        push_flat_rows(Value::from(doc), &mut rows).map_err(|e| DdlError::from_error(&e))?;
+        push_flat_rows(
+            Value::from(doc),
+            nodedb_types::DEFAULT_IDENTITY_COLUMN,
+            &mut rows,
+        )
+        .map_err(|e| DdlError::from_error(&e))?;
     }
     Ok(rows.iter().map(row_to_wire_json).collect())
 }

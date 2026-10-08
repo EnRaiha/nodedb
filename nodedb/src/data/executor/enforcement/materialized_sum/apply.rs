@@ -78,6 +78,7 @@ use super::rmw::BalanceRmw;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::enforcement::images::{EnforcementCtx, RowImages};
 use crate::data::executor::handlers::point::apply_put::PointPutOutcome;
+use crate::data::executor::handlers::transaction::undo::memory::abort_error;
 use crate::types::DatabaseId;
 
 /// A target row this write updated, captured so a transactional caller can
@@ -188,20 +189,11 @@ impl CoreLoop {
                     Err(e) => {
                         // The caller drops `txn`, which reverses every target
                         // row this pass already wrote — but not the read-through
-                        // cache entries those writes populated. Left behind, they
-                        // serve balances that no longer exist in storage.
-                        for write in &writes {
-                            let key = crate::engine::document::store::StorageKey::for_surrogate(
-                                write.surrogate,
-                            );
-                            self.doc_cache.invalidate(
-                                ctx.database_id,
-                                ctx.tid,
-                                &write.collection,
-                                &key,
-                            );
-                        }
-                        return Err(e);
+                        // cache entries or the in-memory index entries those
+                        // writes made. Left behind, they serve balances that no
+                        // longer exist in storage.
+                        let undone = self.abandon_target_writes(ctx.database_id, ctx.tid, writes);
+                        return Err(abort_error(e, undone));
                     }
                 }
             }

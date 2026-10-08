@@ -16,6 +16,7 @@ use crate::control::server::shared::ddl::neutral::collection::helpers::parse_ori
 use crate::control::server::shared::ddl::neutral::column_default::{
     DeclaredColumn, validate_column_default,
 };
+use crate::control::server::shared::ddl::neutral::declared_typmod::validate_declared_typmod;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
@@ -31,16 +32,26 @@ pub(super) async fn alter_table_add_column(
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
 
+    // The declared type as written, with its modifiers: `SMALLINT NOT NULL`
+    // from `age SMALLINT NOT NULL`, the same text `CREATE` records for a
+    // column. `ColumnDef::column_type` cannot supply this: it has one `Int64`
+    // variant for every integer width. A spaced parameter list such as
+    // `DECIMAL(10, 2)` stays whole.
+    let written_type = col_def_str
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .map(|(name, declared)| (name, declared.trim()));
+    // An invalid `DECIMAL(p,s)` typmod is refused with the SQLSTATE `CREATE`
+    // gives it.
+    if let Some((name, declared)) = written_type {
+        validate_declared_typmod(name, declared)?;
+    }
     let column = parse_origin_column_def(col_def_str).map_err(|e| err("42601", e.to_string()))?;
     let column_name = column.name.clone();
-    // The declared type as written, e.g. `SMALLINT` from `age SMALLINT NOT
-    // NULL`. `ColumnDef::column_type` cannot supply this: it has one `Int64`
-    // variant for every integer width. Falls back to the resolved type's own
-    // name when the definition has no separate type token to quote.
-    let declared_type = col_def_str
-        .split_whitespace()
-        .nth(1)
-        .map(str::to_string)
+    // Falls back to the resolved type's own name when the definition has no
+    // separate type text to quote.
+    let declared_type = written_type
+        .map(|(_, declared)| declared.to_string())
         .unwrap_or_else(|| column.column_type.to_string());
 
     // Validate: new column must be nullable or have a default.
@@ -90,11 +101,9 @@ pub(super) async fn alter_table_add_column(
                     let mut updated = coll;
                     updated.collection_type = nodedb_types::CollectionType::strict(schema.clone());
                     updated.timeseries_config = sonic_rs::to_string(&schema).ok();
-                    // Record the column's *declared* type alongside the
-                    // resolved one — see `strict_schema::retype_field`. Without
-                    // this the added column has no declared width and falls
-                    // back to `BIGINT` on the wire, unlike an identical column
-                    // declared at CREATE time.
+                    // Record the column's *declared* type alongside the schema
+                    // column — see `strict_schema::retype_field`. Catalog
+                    // introspection reads the width from this spelling.
                     super::strict_schema::add_field(
                         &mut updated,
                         &column_name,

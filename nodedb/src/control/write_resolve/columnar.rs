@@ -23,7 +23,7 @@ pub struct ColumnarWriteResolver {
     /// Serialized `Vec<ScanFilter>` — the statement's `WHERE` clause.
     filters: Vec<u8>,
     /// Field assignments for an `UPDATE`. Empty for a `DELETE`.
-    updates: Vec<(String, Vec<u8>)>,
+    updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
     is_update: bool,
     rls_write_check: RlsWriteCheck,
 }

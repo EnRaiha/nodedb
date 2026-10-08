@@ -15,7 +15,6 @@
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
-use crate::engine::timeseries::grouped_filter::UnsupportedPredicate;
 use crate::engine::timeseries::grouped_scan::{
     GroupedAggResult, PartitionAggParams, aggregate_memtable, aggregate_partition,
 };
@@ -95,13 +94,14 @@ impl CoreLoop {
                 let data_dir = &self.data_dir;
                 let db_id = task.request.database_id.as_u64();
                 let tenant = tid.as_u64();
+                // Every listed partition is read. A missing directory refuses
+                // the aggregate in `aggregate_partition`.
                 let partition_dirs: Vec<std::path::PathBuf> = entries
                     .iter()
                     .map(|e| {
                         super::paths::ts_collection_dir(data_dir, db_id, tenant, collection)
                             .join(&e.dir_name)
                     })
-                    .filter(|p| p.exists())
                     .collect();
 
                 if partition_dirs.len() <= 1 {
@@ -123,7 +123,7 @@ impl CoreLoop {
                         }) {
                             Ok(Some(part_result)) => merged.merge(&part_result),
                             Ok(None) => {}
-                            Err(e) => return self.response_error(task, crate::Error::from(e)),
+                            Err(e) => return self.response_error(task, e),
                         }
                     }
                 } else {
@@ -140,7 +140,7 @@ impl CoreLoop {
                     let thread_count = available.min(partition_dirs.len()).min(8);
                     let chunk_size = partition_dirs.len().div_ceil(thread_count);
 
-                    let partition_results: Result<Vec<GroupedAggResult>, UnsupportedPredicate> =
+                    let partition_results: crate::Result<Vec<GroupedAggResult>> =
                         std::thread::scope(|s| {
                             let handles: Vec<_> = partition_dirs
                                 .chunks(chunk_size)
@@ -149,7 +149,7 @@ impl CoreLoop {
                                     let ag = &agg_owned;
                                     let fl = &filters_owned;
                                     let nc = &needed_owned;
-                                    s.spawn(move || -> Result<_, UnsupportedPredicate> {
+                                    s.spawn(move || -> crate::Result<_> {
                                         let mut local = GroupedAggResult::new(ag.len());
                                         for dir in chunk {
                                             // Parallel threads: no io_uring (fadvise fallback).
@@ -175,12 +175,25 @@ impl CoreLoop {
                                 })
                                 .collect();
 
-                            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+                            // A worker that panicked aggregated none of its
+                            // partitions: the aggregate is refused, never
+                            // answered without them.
+                            handles
+                                .into_iter()
+                                .map(|h| {
+                                    h.join().map_err(|_| crate::Error::Internal {
+                                        detail: format!(
+                                            "timeseries aggregate on '{collection}': a partition \
+                                             worker panicked"
+                                        ),
+                                    })?
+                                })
+                                .collect()
                         });
 
                     let partition_results = match partition_results {
                         Ok(results) => results,
-                        Err(e) => return self.response_error(task, crate::Error::from(e)),
+                        Err(e) => return self.response_error(task, e),
                     };
                     for r in &partition_results {
                         merged.merge(r);

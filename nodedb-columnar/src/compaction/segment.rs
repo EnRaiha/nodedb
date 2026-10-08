@@ -3,13 +3,13 @@
 //! Single-segment compaction: drop deleted rows from one segment, write a new one.
 
 use nodedb_mem::ScopedMemory;
-use nodedb_types::columnar::ColumnarSchema;
+use nodedb_types::columnar::{ColumnType, ColumnarSchema};
+use nodedb_types::value::Value;
 
 use crate::delete_bitmap::DeleteBitmap;
 use crate::error::ColumnarError;
-use crate::materialize_rows::extract::extract_row_value;
 use crate::memtable::ColumnarMemtable;
-use crate::reader::SegmentReader;
+use crate::reader::{DecodedColumn, SegmentReader, decoded_cell_value};
 use crate::writer::SegmentWriter;
 
 /// Default compaction threshold: compact when >20% of rows are deleted.
@@ -81,8 +81,7 @@ pub fn compact_segment(
         row_values.clear();
         for (col_idx, decoded) in decoded_cols.iter().enumerate() {
             let col = &schema.columns[col_idx];
-            let value = extract_row_value(decoded, row_idx, &col.column_type, &col.name)?;
-            row_values.push(value);
+            row_values.push(carried_cell(decoded, row_idx, &col.column_type)?);
         }
 
         memtable.append_row(&row_values)?;
@@ -97,6 +96,30 @@ pub fn compact_segment(
         live_rows: row_count,
         removed_rows: deleted,
     })
+}
+
+/// One cell as the value that re-appends it to a memtable unchanged.
+///
+/// A JSON cell carries its stored MessagePack bytes, which a JSON column
+/// appends as is. Its decoded value does not always re-append: a JSON string
+/// scalar reads as `Value::String`, which a JSON column parses as JSON text.
+/// Every other cell carries its read value.
+fn carried_cell(
+    decoded: &DecodedColumn,
+    row_idx: usize,
+    declared: &ColumnType,
+) -> Result<Value, ColumnarError> {
+    let value = decoded_cell_value(decoded, row_idx, declared)?;
+    if !matches!(declared, ColumnType::Json) || value == Value::Null {
+        return Ok(value);
+    }
+    let DecodedColumn::Binary { data, offsets, .. } = decoded else {
+        return Ok(value);
+    };
+    // `decoded_cell_value` read this cell, so its byte range is in bounds.
+    let start = offsets[row_idx] as usize;
+    let end = offsets[row_idx + 1] as usize;
+    Ok(Value::Bytes(data[start..end].to_vec()))
 }
 
 #[cfg(test)]
@@ -234,6 +257,65 @@ mod tests {
                 assert!(valid[0]);
             }
             _ => panic!("expected Binary"),
+        }
+    }
+
+    /// Compaction carries every surviving cell unchanged: identifiers,
+    /// decimals, booleans, geometry text and JSON, a JSON string scalar
+    /// included.
+    #[test]
+    fn compact_preserves_typed_cells() {
+        let schema = ColumnarSchema::new(vec![
+            ColumnDef::required("id", ColumnType::Int64).with_primary_key(),
+            ColumnDef::nullable("u", ColumnType::Uuid),
+            ColumnDef::nullable("ul", ColumnType::Ulid),
+            ColumnDef::nullable("dec", ColumnType::Decimal(None)),
+            ColumnDef::nullable("b", ColumnType::Bool),
+            ColumnDef::nullable("geo", ColumnType::Geometry),
+            ColumnDef::nullable("j", ColumnType::Json),
+        ])
+        .expect("valid");
+        let mut mt = ColumnarMemtable::new(&schema);
+        for i in 0..6u128 {
+            let json = if i % 2 == 0 {
+                Value::String("\"scalar\"".into())
+            } else {
+                Value::Array(vec![Value::Integer(i as i64)])
+            };
+            mt.append_row(&[
+                Value::Integer(i as i64),
+                Value::Uuid(uuid::Uuid::from_u128(i + 1).to_string()),
+                Value::Ulid(ulid::Ulid(i + 1).to_string()),
+                Value::Decimal(rust_decimal::Decimal::new(i as i64 * 5, 1)),
+                Value::Bool(i % 3 == 0),
+                Value::String(format!("POINT({i} 2)")),
+                json,
+            ])
+            .expect("append");
+        }
+        let expected: Vec<Vec<Value>> = (1..6)
+            .map(|i| mt.get_row(i).expect("read").expect("row"))
+            .collect();
+        let (schema, columns, row_count) = mt.drain();
+        let segment = SegmentWriter::new(0, test_memory())
+            .write_segment(&schema, &columns, row_count, None)
+            .expect("write");
+
+        let mut deletes = DeleteBitmap::new();
+        deletes.mark_deleted(0);
+        let result =
+            compact_segment(&segment, &deletes, &schema, 0, &test_memory(), None).expect("compact");
+        let new_seg = result.segment.as_ref().expect("segment");
+        let reader = SegmentReader::open(new_seg).expect("open");
+        let indices: Vec<usize> = (0..schema.columns.len()).collect();
+        let decoded = reader.read_columns(&indices, &[]).expect("read");
+
+        for (row, want_row) in expected.iter().enumerate() {
+            for ((col, def), want) in decoded.iter().zip(&schema.columns).zip(want_row) {
+                let got = crate::reader::decoded_cell_value(col, row, &def.column_type)
+                    .expect("decodable cell");
+                assert_eq!(&got, want, "row {row} column '{}'", def.name);
+            }
         }
     }
 }

@@ -12,7 +12,20 @@
 /// One variant per `nodedb::bridge::envelope::ErrorCode` variant; the `nodedb`
 /// side converts both ways with exhaustive matches, so a new code fails to
 /// compile there until it is mirrored here.
+///
+/// The enum is recursive: `RollbackFailed` carries the code of its cause.
+/// The recursive field omits its derived bounds, and the bounds below are
+/// the ones its `Box` needs.
 #[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(serialize_bounds(
+    __S: rkyv::ser::Writer + rkyv::ser::Allocator,
+    __S::Error: rkyv::rancor::Source,
+))]
+#[rkyv(deserialize_bounds(__D::Error: rkyv::rancor::Source))]
+#[rkyv(bytecheck(bounds(
+    __C: rkyv::validation::ArchiveContext,
+    __C::Error: rkyv::rancor::Source,
+)))]
 pub enum DataPlaneErrorCode {
     DeadlineExceeded,
     RejectedConstraint {
@@ -102,9 +115,13 @@ pub enum DataPlaneErrorCode {
         detail: String,
     },
     /// `entry_index` is `u64` on the wire, for the same reason as `max_depth`.
+    /// `cause` is the code of the failed reverse write, `None` when no
+    /// reverse write ran.
     RollbackFailed {
         entry_index: u64,
         detail: String,
+        #[rkyv(omit_bounds)]
+        cause: Option<Box<DataPlaneErrorCode>>,
     },
     OllpRetryRequired,
     /// `limit` is `u64` on the wire, for the same reason as `max_depth`.
@@ -175,6 +192,51 @@ pub enum DataPlaneErrorCode {
         object: String,
         detail: String,
     },
+    /// A full-text search named a field that cannot serve it (SQLSTATE
+    /// `42703` or `42804`, by fault).
+    TextColumn {
+        collection: String,
+        column: String,
+        fault: DataPlaneTextColumnFault,
+    },
+    /// A computed value lies outside the range of its result type (SQLSTATE
+    /// `22003`).
+    NumericValueOutOfRange {
+        detail: String,
+    },
+    /// A label write needs a node label past the partition's node-label cap
+    /// (SQLSTATE `54000`). `limit` is `u64` on the wire, for the same reason
+    /// as `max_depth`.
+    NodeLabelLimit {
+        node: String,
+        label: String,
+        limit: u64,
+    },
+    /// Text does not parse as the column's type (SQLSTATE `22P02`).
+    InvalidTextRepresentation {
+        detail: String,
+    },
+    /// A value of the wrong kind for the column's type (SQLSTATE `42804`).
+    DatatypeMismatch {
+        detail: String,
+    },
+    /// Text does not parse as a timestamp (SQLSTATE `22007`).
+    InvalidDatetimeFormat {
+        detail: String,
+    },
+    /// An instant outside the timestamp range (SQLSTATE `22008`).
+    DatetimeFieldOverflow {
+        detail: String,
+    },
+}
+
+/// Wire mirror of `nodedb_types::text_search::TextColumnFault`.
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum DataPlaneTextColumnFault {
+    Undeclared,
+    NotText { data_type: String },
+    NotAColumn,
+    NotIndexed,
 }
 
 /// Wire mirror of `nodedb::bridge::envelope::SyncHold`.
@@ -192,4 +254,31 @@ pub enum DataPlaneCounterFault {
     NotAFloat,
     IntegerOverflow,
     NonFinite,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A nested rollback cause survives an rkyv encode and a checked decode.
+    #[test]
+    fn nested_rollback_cause_roundtrips_through_rkyv() {
+        let code = DataPlaneErrorCode::RollbackFailed {
+            entry_index: 2,
+            detail: "outer".into(),
+            cause: Some(Box::new(DataPlaneErrorCode::RollbackFailed {
+                entry_index: 1,
+                detail: "inner".into(),
+                cause: Some(Box::new(DataPlaneErrorCode::Internal {
+                    detail: "commit".into(),
+                })),
+            })),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&code).expect("encode");
+        let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+        aligned.extend_from_slice(&bytes);
+        let decoded =
+            rkyv::from_bytes::<DataPlaneErrorCode, rkyv::rancor::Error>(&aligned).expect("decode");
+        assert_eq!(decoded, code);
+    }
 }

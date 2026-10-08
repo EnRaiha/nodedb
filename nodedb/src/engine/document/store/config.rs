@@ -41,6 +41,20 @@ pub struct CollectionConfig {
     /// MessagePack maps with the same header byte, so byte sniffing silently
     /// returns tag arrays to the client.
     pub vector_primary: Option<Box<nodedb_types::VectorPrimaryConfig>>,
+    /// Declared `VECTOR(n)` columns of a schemaless collection, as
+    /// `(column, n)`. A document write indexes each one into its field's
+    /// vector index. Empty for every other collection: a strict schema
+    /// carries its vector columns in `storage_mode`.
+    pub vector_fields: Vec<(String, usize)>,
+    /// Declared numeric columns of a schemaless or KV collection. Every
+    /// value a write stores under one of them is re-typed to it. Empty for
+    /// every other collection: strict and columnar re-type through their own
+    /// typed schema.
+    pub declared_columns: Vec<nodedb_physical::physical_plan::DeclaredColumn>,
+    /// The declared key column, per `nodedb_types::declared_key`. `None` when
+    /// rows key by the implicit `id` or `_rowid`. A sparse row's identity
+    /// renders under this column, else under `id`.
+    pub declared_key: Option<String>,
 }
 
 impl CollectionConfig {
@@ -55,6 +69,9 @@ impl CollectionConfig {
             conflict_policy: None,
             timeseries: None,
             vector_primary: None,
+            vector_fields: Vec::new(),
+            declared_columns: Vec::new(),
+            declared_key: None,
         }
     }
 

@@ -3,6 +3,7 @@
 //! Encode a protocol-neutral [`ShapedRows`](crate::control::server::response_shape::types::ShapedRows)
 //! into pgwire `DataRow`s and a `Response::Query`.
 
+pub mod array_text;
 pub mod cell;
 pub mod response;
 

@@ -7,6 +7,8 @@ use std::fmt;
 use std::str::FromStr;
 
 use super::column_type::ColumnType;
+use super::decimal_typmod::{DecimalTypmod, DecimalTypmodError};
+use crate::error::sqlstate;
 
 /// Every declared spelling that resolves to [`ColumnType::Int64`].
 ///
@@ -51,9 +53,29 @@ pub enum ColumnTypeParseError {
     #[error("invalid VARCHAR length: '{0}' (must be a positive integer)")]
     InvalidCharLength(String),
     #[error(
-        "invalid DECIMAL/NUMERIC params: '{0}' (expected DECIMAL(precision, scale) with precision 1-38 and scale <= precision)"
+        "invalid DECIMAL/NUMERIC params: '{0}' (expected DECIMAL(precision) or DECIMAL(precision, scale))"
     )]
     InvalidDecimalParams(String),
+    /// A well-formed `DECIMAL(p,s)` whose precision or scale is out of range.
+    #[error("{0}")]
+    InvalidDecimalTypmod(#[from] DecimalTypmodError),
+}
+
+impl ColumnTypeParseError {
+    /// The SQLSTATE a DDL statement refuses this declared type with.
+    ///
+    /// An out-of-range typmod is `22023` (invalid_parameter_value), as
+    /// PostgreSQL reports it. Every other refusal is `42601` (syntax_error).
+    pub fn sqlstate(&self) -> &'static str {
+        match self {
+            Self::InvalidDecimalTypmod(_) => sqlstate::INVALID_PARAMETER_VALUE,
+            Self::Unknown(_)
+            | Self::UseTimestamp
+            | Self::InvalidVectorDim(_)
+            | Self::InvalidCharLength(_)
+            | Self::InvalidDecimalParams(_) => sqlstate::SYNTAX_ERROR,
+        }
+    }
 }
 
 impl fmt::Display for ColumnType {
@@ -67,7 +89,10 @@ impl fmt::Display for ColumnType {
             Self::Timestamp => f.write_str("TIMESTAMP"),
             Self::Timestamptz => f.write_str("TIMESTAMPTZ"),
             Self::SystemTimestamp => f.write_str("SYSTEM_TIMESTAMP"),
-            Self::Decimal { precision, scale } => write!(f, "DECIMAL({precision},{scale})"),
+            Self::Decimal(Some(typmod)) => {
+                write!(f, "DECIMAL({},{})", typmod.precision(), typmod.scale())
+            }
+            Self::Decimal(None) => f.write_str("DECIMAL"),
             Self::Geometry => f.write_str("GEOMETRY"),
             Self::Vector(dim) => write!(f, "VECTOR({dim})"),
             Self::SparseVector => f.write_str("SPARSEVECTOR"),
@@ -90,46 +115,20 @@ impl FromStr for ColumnType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let upper = s.trim().to_uppercase();
 
-        // NUMERIC(p,s) / DECIMAL(p,s) special case.
-        if upper.starts_with("NUMERIC") || upper.starts_with("DECIMAL") {
-            let base = if upper.starts_with("NUMERIC") {
-                "NUMERIC"
-            } else {
-                "DECIMAL"
-            };
-            let rest = upper[base.len()..].trim();
+        // NUMERIC / DECIMAL, bare or with a `(p)` / `(p,s)` typmod. A longer
+        // word such as `NUMERIC_MONEY` is not this keyword and falls through
+        // to the unknown-type arm.
+        if let Some(rest) = upper
+            .strip_prefix("NUMERIC")
+            .or_else(|| upper.strip_prefix("DECIMAL"))
+        {
+            let rest = rest.trim();
             if rest.is_empty() {
-                return Ok(Self::Decimal {
-                    precision: 38,
-                    scale: 10,
-                });
+                return Ok(Self::Decimal(None));
             }
-            if rest.starts_with('(') && rest.ends_with(')') {
-                let inner = &rest[1..rest.len() - 1];
-                let parts: Vec<&str> = inner.splitn(2, ',').collect();
-                let precision: u8 = parts[0]
-                    .trim()
-                    .parse()
-                    .map_err(|_| ColumnTypeParseError::InvalidDecimalParams(rest.to_string()))?;
-                let scale: u8 = parts
-                    .get(1)
-                    .map(|p| p.trim())
-                    .unwrap_or("0")
-                    .parse()
-                    .map_err(|_| ColumnTypeParseError::InvalidDecimalParams(rest.to_string()))?;
-                if precision == 0 || precision > 38 {
-                    return Err(ColumnTypeParseError::InvalidDecimalParams(format!(
-                        "precision {precision} out of range 1-38"
-                    )));
-                }
-                if scale > precision {
-                    return Err(ColumnTypeParseError::InvalidDecimalParams(format!(
-                        "scale {scale} must be <= precision {precision}"
-                    )));
-                }
-                return Ok(Self::Decimal { precision, scale });
+            if rest.starts_with('(') {
+                return parse_decimal_typmod(rest).map(|typmod| Self::Decimal(Some(typmod)));
             }
-            return Err(ColumnTypeParseError::InvalidDecimalParams(rest.to_string()));
         }
 
         // VECTOR(N) special case.
@@ -221,8 +220,36 @@ impl ColumnType {
     /// here as catalog text resolves to [`ColumnType::Timestamp`]. Pass such a
     /// spelling to [`str::parse`] instead to resolve it whole.
     pub fn from_declared_type(declared: &str) -> Option<Self> {
-        bare_declared_token(declared).parse().ok()
+        Self::parse_declared_type(declared).ok()
     }
+
+    /// [`ColumnType::from_declared_type`] with the parse error kept.
+    ///
+    /// A DDL gate uses this to refuse a declared type it cannot hold, such as
+    /// `DECIMAL(1001,0)`, instead of reading it as an unknown type.
+    pub fn parse_declared_type(declared: &str) -> Result<Self, ColumnTypeParseError> {
+        bare_declared_token(declared).parse()
+    }
+}
+
+/// The typmod of `DECIMAL(p)` or `DECIMAL(p,s)`, from the `(p)` or `(p,s)`
+/// text after the keyword. A bare `(p)` has scale 0.
+///
+/// Text that is not one or two integers in parentheses is malformed. Integers
+/// out of range are an [`ColumnTypeParseError::InvalidDecimalTypmod`].
+fn parse_decimal_typmod(params: &str) -> Result<DecimalTypmod, ColumnTypeParseError> {
+    let malformed = || ColumnTypeParseError::InvalidDecimalParams(params.to_string());
+    let inner = params
+        .strip_prefix('(')
+        .and_then(|p| p.strip_suffix(')'))
+        .ok_or_else(malformed)?;
+    let (precision_text, scale_text) = match inner.split_once(',') {
+        Some((precision, scale)) => (precision, scale),
+        None => (inner, "0"),
+    };
+    let precision: i64 = precision_text.trim().parse().map_err(|_| malformed())?;
+    let scale: i64 = scale_text.trim().parse().map_err(|_| malformed())?;
+    Ok(DecimalTypmod::new(precision, scale)?)
 }
 
 /// The leading type token of a declared DDL type string.
@@ -317,14 +344,36 @@ mod tests {
     fn declared_type_keeps_a_spaced_parameter_list() {
         assert_eq!(
             ColumnType::from_declared_type("DECIMAL(10, 2) NOT NULL"),
-            Some(ColumnType::Decimal {
-                precision: 10,
-                scale: 2
-            })
+            Some(ColumnType::Decimal(Some(
+                DecimalTypmod::new(10, 2).expect("valid typmod")
+            )))
         );
         assert_eq!(
             ColumnType::from_declared_type("VECTOR(768)"),
             Some(ColumnType::Vector(768))
+        );
+    }
+
+    /// An out-of-range typmod keeps its typed error through the declared-type
+    /// parse, and refuses as `22023`. A malformed one refuses as `42601`.
+    #[test]
+    fn declared_decimal_typmod_errors_are_typed() {
+        let err = ColumnType::parse_declared_type("DECIMAL(1001,0) NOT NULL")
+            .expect_err("precision 1001 is refused");
+        assert_eq!(
+            err,
+            ColumnTypeParseError::InvalidDecimalTypmod(DecimalTypmodError::PrecisionOutOfRange {
+                precision: 1001
+            })
+        );
+        assert_eq!(err.sqlstate(), "22023");
+        assert_eq!(ColumnType::from_declared_type("DECIMAL(1001,0)"), None);
+
+        let err = ColumnType::parse_declared_type("NUMERIC(x)").expect_err("malformed");
+        assert_eq!(err.sqlstate(), "42601");
+        assert_eq!(
+            ColumnType::parse_declared_type("NUMERIC DEFAULT 1"),
+            Ok(ColumnType::Decimal(None))
         );
     }
 

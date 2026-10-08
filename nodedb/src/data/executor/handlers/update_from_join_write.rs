@@ -254,7 +254,7 @@ impl CoreLoop {
                 // The row's post-image, journalled after apply: this plan
                 // carries no pre-dispatch record of it. Then one entry per
                 // moved target row, naming the TARGET collection.
-                write_set.push(self.stored_row_image(
+                let image = self.stored_row_image(
                     StoredRow {
                         database_id,
                         tid,
@@ -265,7 +265,15 @@ impl CoreLoop {
                     &updated_bytes,
                     // A versioned row landed at the statement's system time.
                     bitemporal_sys_from_ms,
-                ));
+                );
+                match image {
+                    Ok(image) => write_set.push(image),
+                    // This row committed above, so it counts as landed.
+                    Err(e) => {
+                        let code = refusal_after_rows(affected + 1, e);
+                        return Err(self.refusal_with_landed_rows(task, code, write_set));
+                    }
+                }
                 write_set.extend(write_hook::target_write_set(&target_writes));
                 self.doc_cache.put(
                     database_id,
@@ -314,11 +322,15 @@ impl CoreLoop {
                 }
                 affected += 1;
                 if want_returning {
-                    // `row_identity` only stands in as `id` for a row that
-                    // declares no primary key of its own — overwriting a
-                    // declared key would return a value the client never wrote.
+                    // `row_identity` fills the identity column only for a row
+                    // that lacks it. A declared key keeps the value the
+                    // client wrote.
                     let mut row = nodedb_types::Value::from(doc);
-                    returning_doc::attach_row_id(&mut row, &row_identity);
+                    returning_doc::attach_row_id(
+                        &mut row,
+                        &row_identity,
+                        &self.identity_column(database_id, tid, target_collection),
+                    );
                     returned_docs.push(row);
                 }
             }

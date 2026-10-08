@@ -316,7 +316,17 @@ pub(super) fn convert_subquery(
     } = args;
 
     // The body is ONE relation, already gathered when sharded.
-    let child = convert_body_to_single_plan(input, tenant_id, ctx)?;
+    let mut child = convert_body_to_single_plan(input, tenant_id, ctx)?;
+    // A text body takes the LIMIT when the tail only cuts rows.
+    super::scan::bound_text_body(
+        &mut child,
+        &super::scan::TextBodyTail {
+            sort_keys,
+            limit,
+            offset,
+            reads_past_cut: !filters.is_empty() || distinct || !window_functions.is_empty(),
+        },
+    );
 
     // A join / lateral body emits ONE merged document per output row whose
     // columns keep their table prefix (`a.attnum`), which is why the response
@@ -698,5 +708,75 @@ mod tests {
         .expect("convert insert-select with star");
 
         assert_eq!(tasks.len(), 1);
+    }
+
+    /// The text search under the tail, looked up through a gather.
+    fn search_top_k(plan: &PhysicalPlan) -> usize {
+        match plan {
+            PhysicalPlan::Query(QueryOp::Exchange(exchange)) => search_top_k(&exchange.child),
+            PhysicalPlan::Text(TextOp::Search { top_k, .. }) => *top_k,
+            other => panic!("expected a text search body, got {other:?}"),
+        }
+    }
+
+    /// `WHERE text_match(body, q) ORDER BY bm25_score(body, q) DESC LIMIT 3
+    /// OFFSET 2`: the search under the tail ranks only the 5 rows the tail
+    /// can return.
+    #[test]
+    fn a_text_match_sorted_by_its_own_score_takes_the_tail_limit() {
+        use nodedb_sql::fts_types::FtsQuery;
+        use nodedb_sql::types::{TextScoreColumn, TextSearchPlan, TextSearchShape};
+        use nodedb_types::text_search::QueryMode;
+
+        let score = |query: &str| TextScoreColumn {
+            field: Some("body".into()),
+            query: query.into(),
+            mode: QueryMode::And,
+            fuzzy: false,
+            alias: "score".into(),
+        };
+        let wrapped = |score_query: &str, ascending: bool| SqlPlan::Subquery {
+            input: Box::new(SqlPlan::TextSearch(TextSearchPlan {
+                collection: "docs".into(),
+                shape: TextSearchShape::Match {
+                    field: Some("body".into()),
+                    query: FtsQuery::Plain {
+                        text: "rust db".into(),
+                        fuzzy: false,
+                    },
+                    mode: QueryMode::And,
+                    top_k: None,
+                },
+                filters: Vec::new(),
+                scores: vec![score(score_query)],
+                projection: Vec::new(),
+            })),
+            filters: Vec::new(),
+            projection: Vec::new(),
+            window_functions: Vec::new(),
+            sort_keys: vec![SortKey {
+                expr: SqlExpr::Column {
+                    table: None,
+                    name: "score".into(),
+                },
+                ascending,
+                nulls_first: ascending,
+            }],
+            offset: 2,
+            distinct: false,
+            limit: Some(3),
+        };
+        let body_top_k = |plan: &SqlPlan| {
+            let tasks = convert_one(plan, TenantId::new(1), &bare_ctx()).expect("converts");
+            match &tasks[0].plan {
+                PhysicalPlan::Query(QueryOp::PostProcess { input, .. }) => search_top_k(input),
+                other => panic!("expected a post-processing tail, got {other:?}"),
+            }
+        };
+
+        assert_eq!(body_top_k(&wrapped("rust db", false)), 5);
+        // An ascending sort, or a score of another query, keeps every match.
+        assert_eq!(body_top_k(&wrapped("rust db", true)), usize::MAX);
+        assert_eq!(body_top_k(&wrapped("rust", false)), usize::MAX);
     }
 }

@@ -8,6 +8,7 @@
 
 use tracing::debug;
 
+use super::declared_body::fit_kv_image;
 use super::transfer_compute::{TransferError, compute_transfer};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
@@ -23,7 +24,8 @@ pub(in crate::data::executor) struct TransferParams<'a> {
     pub source_key: &'a [u8],
     pub dest_key: &'a [u8],
     pub field: &'a str,
-    pub amount: f64,
+    /// The amount, typed by the field it moves.
+    pub amount: nodedb_physical::physical_plan::TransferAmount,
     /// Cross-engine surrogate of the debit (source) row.
     pub debit_surrogate: nodedb_types::Surrogate,
     /// Cross-engine surrogate of the credit (dest) row.
@@ -74,7 +76,7 @@ impl CoreLoop {
             credit_surrogate,
             rls_write_check,
         } = params;
-        debug!(core = self.core_id, %collection, %field, amount, "kv transfer");
+        debug!(core = self.core_id, %collection, %field, %amount, "kv transfer");
 
         if self.kv_engine.is_over_budget() {
             return self.response_error(task, ErrorCode::ResourcesExhausted);
@@ -100,8 +102,10 @@ impl CoreLoop {
         } else {
             Some(dest_bytes.as_slice())
         };
-        let computed = match compute_transfer(&source_bytes, dest_ref, field, amount) {
+        let declared = self.declared_columns_of(did, tid, collection);
+        let computed = match compute_transfer(&source_bytes, dest_ref, field, amount, declared) {
             Ok(c) => c,
+            Err(TransferError::Declared(e)) => return self.response_error(task, e),
             Err(TransferError::TypeMismatch(detail)) => {
                 return self.response_error(
                     task,
@@ -123,6 +127,7 @@ impl CoreLoop {
         };
         let new_source = computed.new_source;
         let new_dest = computed.new_dest;
+        let moved = computed.amount;
         let source_balance_after = computed.source_balance_after;
         let dest_balance_after = computed.dest_balance_after;
 
@@ -205,17 +210,12 @@ impl CoreLoop {
             "source_key": src_str,
             "dest_key": dst_str,
             "field": field,
-            "amount": amount,
-            "source_balance": source_balance_after,
-            "dest_balance": dest_balance_after,
+            "amount": moved.to_json(),
+            "source_balance": source_balance_after.to_json(),
+            "dest_balance": dest_balance_after.to_json(),
         })) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -252,10 +252,21 @@ impl CoreLoop {
             return self.response_error(task, ErrorCode::NotFound);
         };
 
-        // The same bytes are two different images to two different policies:
-        // the row leaving the source, and the row arriving at the destination.
-        // Both are decided before either half runs, so a move a policy rejects
-        // cannot delete from the source and then fail to insert at the dest.
+        // The row arriving at the destination meets the destination's
+        // declared numeric columns, decided before either half runs.
+        let fitted = match fit_kv_image(
+            &item_data,
+            self.declared_columns_of(did, tid, dest_collection),
+        ) {
+            Ok(fitted) => fitted,
+            Err(e) => return self.response_error(task, e),
+        };
+        let dest_data: &[u8] = fitted.as_deref().unwrap_or(&item_data);
+
+        // The row leaving the source and the row arriving at the destination
+        // are two images to two different policies. Both are decided before
+        // either half runs, so a move a policy rejects cannot delete from the
+        // source and then fail to insert at the dest.
         if let Err(e) = super::rls::admit_kv_row(
             source_rls_write_check,
             &item_data,
@@ -267,7 +278,7 @@ impl CoreLoop {
         }
         if let Err(e) = super::rls::admit_kv_row(
             dest_rls_write_check,
-            &item_data,
+            dest_data,
             dest_key,
             tid,
             dest_collection,
@@ -289,7 +300,7 @@ impl CoreLoop {
             tenant_id: tid,
             collection: dest_collection,
             key: dest_key,
-            value: &item_data,
+            value: dest_data,
             ttl_ms: 0,
             now_ms,
             surrogate,
@@ -318,7 +329,7 @@ impl CoreLoop {
             dest_collection,
             crate::event::WriteOp::Insert,
             dest_key,
-            Some(&item_data),
+            Some(dest_data),
             None,
         );
 
@@ -329,12 +340,7 @@ impl CoreLoop {
             "dest_collection": dest_collection,
         })) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }

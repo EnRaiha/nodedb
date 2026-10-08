@@ -7,10 +7,14 @@ use tracing::{debug, warn};
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::redo_image::submitted_row_image;
-use crate::data::executor::enforcement::chain_guard::ChainGuard;
+use crate::data::executor::enforcement::chain_guard::{
+    AbandonedWrite, ChainGuard, abort_after_apply,
+};
+use crate::data::executor::enforcement::materialized_sum::apply::TargetWrite;
 use crate::data::executor::enforcement::unique::SubmittedWrite;
 use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
+use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::{ResolvedSumTarget, ReturningSpec};
 
@@ -190,11 +194,16 @@ impl CoreLoop {
         // judged together and a journal written as several rows of one
         // statement balances.
         let mut balanced_entries = Vec::new();
+        // The page's in-memory side effects, in write order: every applied
+        // row's R-tree, vector and sparse entries, and the target rows its
+        // enforcement wrote. Dropping `txn` reverses the durable writes and
+        // none of these.
+        let mut page_undo: Vec<UndoEntry> = Vec::new();
+        let mut page_targets: Vec<TargetWrite> = Vec::new();
         // The row that failed, plus why. Collected rather than returned inline
-        // so the page's in-memory side effects — the advanced chain head and the
-        // document-cache entries `apply_point_put` populated — are reversed in
-        // one place. Dropping `txn` reverses the durable writes; it does not
-        // reverse either of those.
+        // so the page's in-memory side effects — these, the advanced chain
+        // head and the document-cache entries `apply_point_put` populated —
+        // are reversed in one place.
         let mut failure: Option<(nodedb_types::StorageKey, crate::Error)> = None;
         for (i, (document_id, value)) in documents.iter().enumerate() {
             let surrogate = surrogates[i];
@@ -212,7 +221,7 @@ impl CoreLoop {
                 failure = Some((key, e));
                 break;
             }
-            let outcome = match self.apply_point_put(
+            let mut outcome = match self.apply_point_put(
                 &txn,
                 PointPutParams {
                     database_id,
@@ -238,6 +247,7 @@ impl CoreLoop {
                     break;
                 }
             };
+            page_undo.append(&mut outcome.memory_undo);
             if let Err(e) = chain.settle(self, surrogate, &outcome.stored_value) {
                 failure = Some((key, e));
                 break;
@@ -262,6 +272,7 @@ impl CoreLoop {
                 }
             };
             target_write_set.extend(write_hook::target_write_set(&enforcement.target_writes));
+            page_targets.extend(enforcement.target_writes);
             balanced_entries.extend(enforcement.balanced_entries);
             if returning.is_some() {
                 stored_bodies.push(outcome.stored_value);
@@ -281,19 +292,24 @@ impl CoreLoop {
             applied.push((row_identity, key));
         }
 
+        // Every row the page called `apply_point_put` for. An abort below
+        // drops their cache entries: a cached body for a row that never
+        // committed is served to readers as though it had.
+        let mut written_keys: Vec<nodedb_types::StorageKey> =
+            applied.iter().map(|(_, key)| *key).collect();
+
         if let Some((failed_key, error)) = failure {
-            // The whole page rolls back, so put the chain head back where it
-            // started and drop every cache entry the abandoned rows populated —
-            // a cached body for a row that never committed is served to readers
-            // as though it had.
-            chain.restore(self);
-            for key in applied
-                .iter()
-                .map(|(_, key)| key)
-                .chain(std::iter::once(&failed_key))
-            {
-                self.doc_cache.invalidate(database_id, tid, collection, key);
-            }
+            // The whole page rolls back: the chain head, the cache entries
+            // and every in-memory index entry of the page go back.
+            written_keys.push(failed_key);
+            let error = abort_after_apply(
+                self,
+                &mut chain,
+                AbandonedWrite::rows(database_id, tid, collection, &written_keys)
+                    .undo(page_undo)
+                    .targets(page_targets),
+                error,
+            );
             return self.response_error(task, error);
         }
 
@@ -302,34 +318,44 @@ impl CoreLoop {
         // no rows at all.
         if let Err(e) = self.settle_balanced_entries(database_id, tid, collection, balanced_entries)
         {
-            chain.restore(self);
-            for (_, key) in &applied {
-                self.doc_cache.invalidate(database_id, tid, collection, key);
-            }
+            let e = abort_after_apply(
+                self,
+                &mut chain,
+                AbandonedWrite::rows(database_id, tid, collection, &written_keys)
+                    .undo(page_undo)
+                    .targets(page_targets),
+                e,
+            );
             return self.response_error(task, e);
         }
 
         // The advanced head lands in the SAME transaction as the rows whose
         // hashes it covers.
         if let Err(e) = chain.persist_head(self, &txn) {
-            chain.restore(self);
-            for (_, key) in &applied {
-                self.doc_cache.invalidate(database_id, tid, collection, key);
-            }
+            let e = abort_after_apply(
+                self,
+                &mut chain,
+                AbandonedWrite::rows(database_id, tid, collection, &written_keys)
+                    .undo(page_undo)
+                    .targets(page_targets),
+                e,
+            );
             return self.response_error(task, e);
         }
 
         if let Err(e) = txn.commit() {
-            chain.restore(self);
-            for (_, key) in &applied {
-                self.doc_cache.invalidate(database_id, tid, collection, key);
-            }
-            return self.response_error(
-                task,
-                ErrorCode::Internal {
+            let e = abort_after_apply(
+                self,
+                &mut chain,
+                AbandonedWrite::rows(database_id, tid, collection, &written_keys)
+                    .undo(page_undo)
+                    .targets(page_targets),
+                crate::Error::Storage {
+                    engine: "sparse".into(),
                     detail: format!("batch insert commit: {e}"),
                 },
             );
+            return self.response_error(task, e);
         }
 
         // Record each committed row's touched secondary-index values into the
@@ -377,17 +403,20 @@ impl CoreLoop {
                 .zip(stored_bodies.iter())
                 .map(|(identity, stored)| (identity, stored.as_slice()))
                 .collect();
-            self.stored_returning_response(task, spec, rls_filters, strict_schema.as_ref(), &rows)
+            let identity_column = self.identity_column(database_id, tid, collection);
+            self.stored_returning_response(
+                task,
+                spec,
+                rls_filters,
+                strict_schema.as_ref(),
+                &identity_column,
+                &rows,
+            )
         } else {
             match crate::data::executor::response_codec::encode_count("inserted", documents.len()) {
                 Ok(bytes) => self.response_with_payload(task, bytes),
                 Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
+                    return self.response_error(task, ErrorCode::from(e));
                 }
             }
         };
@@ -567,6 +596,77 @@ mod tests {
             stored(&core, Surrogate(21)).is_none() && stored(&core, Surrogate(22)).is_none(),
             "an indexing failure on any row must roll the whole batch back — a stored \
              row whose index update failed is invisible to search forever"
+        );
+    }
+
+    /// A geometry + vector row body, in the MessagePack every handler gets.
+    fn geo_vector_body(x: f64, embedding: &[f64]) -> Vec<u8> {
+        doc_format::encode_to_msgpack(&serde_json::json!({
+            "loc": format!(r#"{{"type":"Point","coordinates":[{x},1.0]}}"#),
+            "embedding": embedding,
+        }))
+    }
+
+    /// A batch whose last row is refused leaves no in-memory trace of the
+    /// rows before it. Dropping the transaction reverses the stored rows
+    /// only, so without the undo rows 1-2 keep answering spatial predicates
+    /// and vector search. Row 3 is refused in its vector step, after its own
+    /// R-tree entry landed, so it also checks the refused row's own undo.
+    #[test]
+    fn a_refused_last_row_leaves_no_spatial_or_vector_trace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let db = DatabaseId::DEFAULT;
+        core.vector_params.insert(
+            (db, TenantId::new(TID), COLL.to_string()),
+            crate::engine::vector::hnsw::HnswParams::default(),
+        );
+        let documents = vec![
+            ("g1".to_string(), geo_vector_body(1.0, &[1.0, 0.0, 0.0])),
+            ("g2".to_string(), geo_vector_body(2.0, &[0.0, 1.0, 0.0])),
+            // The index is three wide, so this row is refused.
+            ("g3".to_string(), geo_vector_body(3.0, &[1.0, 1.0])),
+        ];
+        let surrogates = vec![Surrogate(31), Surrogate(32), Surrogate(33)];
+
+        let task = batch_task(&documents, &surrogates);
+        let resp = core.execute_document_batch_insert(
+            &task,
+            DocumentBatchInsertParams {
+                tid: TID,
+                collection: COLL,
+                documents: &documents,
+                surrogates: &surrogates,
+                returning: None,
+                rls_filters: &[],
+                resolved_sum_targets: &[],
+                deferred_sum_targets: &[],
+            },
+        );
+
+        assert_eq!(resp.status, Status::Error, "row 3 must refuse the batch");
+        for surrogate in &surrogates {
+            assert!(stored(&core, *surrogate).is_none(), "no row may be stored");
+        }
+        let spatial_key = (db, TenantId::new(TID), COLL.to_string(), "loc".to_string());
+        assert!(
+            core.spatial_indexes
+                .get(&spatial_key)
+                .is_none_or(|rtree| rtree.entries().is_empty()),
+            "the R-tree must hold no entry of the abandoned rows"
+        );
+        assert!(
+            core.spatial_doc_map.is_empty(),
+            "the reverse spatial map must hold no entry of the abandoned rows"
+        );
+        let vector_key = CoreLoop::vector_index_key(db.as_u64(), TID, COLL, "embedding");
+        assert!(
+            !core.vector_collections.contains_key(&vector_key),
+            "row 1 created the vector index, so the abandoned page must remove it"
+        );
+        assert!(
+            core.vector_doc_map.is_empty(),
+            "the vector reverse map must hold no entry of the abandoned rows"
         );
     }
 

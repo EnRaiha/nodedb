@@ -14,6 +14,8 @@ use crate::data::executor::doc_format;
 use crate::data::executor::enforcement::unique::{
     PostImage, UniqueJudge, UniqueScope, check_unique_post_state,
 };
+use crate::data::executor::handlers::transaction::undo::UndoEntry;
+use crate::data::executor::handlers::transaction::undo::memory::abort_error;
 
 use super::enforce::PutEnforcement;
 use super::types::{PointPutOutcome, PointPutParams};
@@ -23,6 +25,12 @@ impl CoreLoop {
     /// the document, auto-indexes text, updates stats, populates the doc
     /// cache. Does NOT commit — on `Err` the caller MUST drop `txn`
     /// uncommitted, or a row publishes with indexes nothing re-derives.
+    ///
+    /// The R-tree, vector and sparse writes are in memory, so dropping `txn`
+    /// does not reverse them. On `Err` this function has
+    /// already reversed its own. On `Ok` they come back as
+    /// `PointPutOutcome::memory_undo`: a caller that abandons the write after
+    /// this returns reverses them with `undo_memory_effects`.
     ///
     /// `value` always arrives WITH the write (never a row read back to
     /// reconcile), so a `decode_document(value)` guard below that fails
@@ -172,7 +180,7 @@ impl CoreLoop {
         // inverted-index write failure is real and rejects the write.
         if let Ok(doc) = doc_format::decode_document(value) {
             // Shared with the DELETE-rollback re-index path.
-            let text_content = crate::data::executor::fts_text::extract_fts_text(&doc);
+            let text_content = crate::data::executor::fts_text::extract_fts_fields(&doc);
             // Empty text is NOT skipped — stripping every indexable word
             // must still remove the document from the index.
             if index_text {
@@ -311,10 +319,12 @@ impl CoreLoop {
             }
         }
 
-        let spatial_inserts =
-            self.apply_point_put_spatial(database_id, tid, collection, storage_key, value);
-        let vector_inserts = self.apply_point_put_vector_indexes(
-            crate::data::executor::handlers::point::apply_put::VectorIndexPutParams {
+        // Every write below is in memory, where the caller's transaction
+        // cannot reach it. A failure part-way reverses what already ran, so
+        // an `Err` from this function leaves no in-memory index entry behind.
+        let mut memory_undo: Vec<UndoEntry> = Vec::new();
+        if let Err(e) = self.apply_point_put_memory_indexes(
+            MemoryIndexPut {
                 database_id,
                 tid,
                 collection,
@@ -322,9 +332,11 @@ impl CoreLoop {
                 value,
                 wal_lsn: wal_lsn.map(|l| l.as_u64()).unwrap_or(0),
             },
-        )?;
-        // No-op unless the strict schema declares a `SparseVector` column.
-        self.apply_point_put_sparse_indexes(database_id, tid, collection, storage_key, value);
+            &mut memory_undo,
+        ) {
+            let undone = self.undo_memory_effects(database_id, tid, memory_undo);
+            return Err(abort_error(e, undone));
+        }
 
         Ok(PointPutOutcome {
             prior_value: prior,
@@ -333,11 +345,54 @@ impl CoreLoop {
             bitemporal_index_tuples,
             secondary_index_added,
             secondary_index_removed,
-            vector_inserts,
-            spatial_inserts,
+            memory_undo,
             stats_prior,
         })
     }
+
+    /// The in-memory index writes of one put: the R-tree, the vector
+    /// indexes, and the sparse-vector indexes. Each step pushes an undo entry
+    /// onto `undo` for every mutation it makes, also when it fails part-way.
+    fn apply_point_put_memory_indexes(
+        &mut self,
+        put: MemoryIndexPut<'_>,
+        undo: &mut Vec<UndoEntry>,
+    ) -> crate::Result<()> {
+        let MemoryIndexPut {
+            database_id,
+            tid,
+            collection,
+            storage_key,
+            value,
+            wal_lsn,
+        } = put;
+        self.apply_point_put_spatial(database_id, tid, collection, storage_key, value, undo);
+        self.apply_point_put_vector_indexes(
+            crate::data::executor::handlers::point::apply_put::VectorIndexPutParams {
+                database_id,
+                tid,
+                collection,
+                storage_key,
+                value,
+                wal_lsn,
+            },
+            undo,
+        )?;
+        // No-op unless the strict schema declares a `SparseVector` column.
+        self.apply_point_put_sparse_indexes(database_id, tid, collection, storage_key, value, undo);
+        Ok(())
+    }
+}
+
+/// Inputs to `apply_point_put_memory_indexes`. `wal_lsn` is `0` when the
+/// write carries no LSN.
+struct MemoryIndexPut<'a> {
+    database_id: u64,
+    tid: u64,
+    collection: &'a str,
+    storage_key: crate::engine::document::store::StorageKey,
+    value: &'a [u8],
+    wal_lsn: u64,
 }
 
 #[cfg(test)]
@@ -362,7 +417,7 @@ mod tests {
     const COLL: &str = "articles";
     const SURROGATE: Surrogate = Surrogate(7);
     /// Raw JSON body — `doc_format::decode_document`'s JSON fallback accepts
-    /// it, and its single string field is what `extract_fts_text` feeds the
+    /// it, and its single string field is what `extract_fts_fields` feeds the
     /// inverted index, so this document has real text to index.
     const BODY: &[u8] = br#"{"title":"alpha bravo charlie"}"#;
 

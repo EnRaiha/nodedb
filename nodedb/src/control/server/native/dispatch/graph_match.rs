@@ -51,6 +51,7 @@ pub(crate) async fn handle_graph_match(
         ctx.database_id(),
         &mut plan,
         &ctx.state.rls,
+        ctx.state.credentials.catalog(),
         ctx.auth_context(),
     ) {
         return error_to_native_with_sqlstate(seq, "42501", &error);

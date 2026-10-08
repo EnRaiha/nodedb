@@ -6,7 +6,7 @@
 use nodedb_types::Surrogate;
 
 use crate::bridge::envelope::ErrorCode;
-use crate::data::executor::spatial_key::SpatialIndexKey;
+use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use crate::engine::document::store::StorageKey;
 use nodedb_physical::physical_plan::ResolvedSumTarget;
 
@@ -87,16 +87,13 @@ pub(in crate::data::executor) struct PointPutOutcome {
     /// bitemporal path. A transactional caller re-inserts these on rollback.
     /// Autocommit callers ignore it.
     pub secondary_index_removed: Vec<(String, String)>,
-    /// Vector index mutations this put performed, so a transactional caller
-    /// can push `UndoEntry::InsertVector` reversals (which also undo the
-    /// paired `vector_doc_map` entry). Empty when the document had no vector
-    /// fields. Autocommit callers ignore it.
-    pub vector_inserts: Vec<super::vector::VectorIndexDelta>,
-    /// `(spatial_index_key, entry_id)` pairs this put inserted into per-field
-    /// spatial R-trees, so a transactional caller can push
-    /// `UndoEntry::SpatialInsert` reversals. Empty when the document had no
-    /// spatial fields. Autocommit callers ignore it.
-    pub spatial_inserts: Vec<(SpatialIndexKey, u64)>,
+    /// Undo entries for every in-memory mutation this put made, in the order
+    /// it made them: R-tree and `spatial_doc_map` entries, vector nodes and
+    /// indexes, and sparse-vector postings. A dropped redb transaction does not reverse
+    /// them. A transactional caller pushes them onto its undo log. An
+    /// autocommit caller that abandons the write reverses them with
+    /// `undo_memory_effects`.
+    pub memory_undo: Vec<UndoEntry>,
     /// Pre-images of the column-stats read-modify-write this put performed, so a
     /// transactional caller can push `UndoEntry::StatsRestore` reversals. Each
     /// element is `(stats_key, prior_bytes)`: `prior_bytes = Some(b)` restores
@@ -170,6 +167,7 @@ pub(in crate::data::executor) fn map_enforcement_error(e: ErrorCode) -> crate::E
         | ErrorCode::CollectionDraining { .. }
         | ErrorCode::RecursionDepthExceeded { .. }
         | ErrorCode::UndefinedColumn { .. }
+        | ErrorCode::TextColumn { .. }
         | ErrorCode::Internal { .. }
         | ErrorCode::Unsupported { .. }
         | ErrorCode::RollbackFailed { .. }
@@ -178,12 +176,18 @@ pub(in crate::data::executor) fn map_enforcement_error(e: ErrorCode) -> crate::E
         | ErrorCode::DivisionByZero
         | ErrorCode::UndefinedFunction { .. }
         | ErrorCode::DataException { .. }
+        | ErrorCode::NumericValueOutOfRange { .. }
+        | ErrorCode::InvalidTextRepresentation { .. }
+        | ErrorCode::DatatypeMismatch { .. }
+        | ErrorCode::InvalidDatetimeFormat { .. }
+        | ErrorCode::DatetimeFieldOverflow { .. }
         | ErrorCode::DispatchCapacity { .. }
         | ErrorCode::ExpiredBeforeExecution
         | ErrorCode::BadRequest { .. }
         | ErrorCode::TransactionRollback { .. }
         | ErrorCode::ActiveSqlTransaction { .. }
-        | ErrorCode::DependentObjectsExist { .. }) => crate::Error::DataPlane(other),
+        | ErrorCode::DependentObjectsExist { .. }
+        | ErrorCode::NodeLabelLimit { .. }) => crate::Error::DataPlane(other),
     }
 }
 

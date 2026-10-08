@@ -3,9 +3,10 @@
 //! Window-function and computed-column evaluation for `QueryOp::ProviderScan`.
 //!
 //! Runs after filter and before sort/distinct/offset/project/limit in the
-//! `ProviderScan` pipeline. Each msgpack row decodes to a `serde_json::Value`,
+//! `ProviderScan` pipeline. Each msgpack row decodes to a `nodedb_types::Value`,
 //! windows evaluate over the full row set, computed columns evaluate
-//! per-row, and the result re-encodes to msgpack. Skipped entirely when both
+//! per-row, and the result re-encodes to msgpack. `Value` keeps NaN and
+//! ±Infinity results, which a JSON number cannot. Skipped entirely when both
 //! byte slices are empty, so the zero-decode msgpack path stays untouched for
 //! a plain relational scan.
 
@@ -50,43 +51,43 @@ pub(in crate::data::executor) fn apply_windows_and_computed(
         decode_bytes(computed_bytes, "computed")?
     };
 
-    let mut json_rows: Vec<(String, serde_json::Value)> = Vec::with_capacity(rows.len());
+    let mut value_rows: Vec<(String, nodedb_types::Value)> = Vec::with_capacity(rows.len());
     for (idx, row) in rows.iter().enumerate() {
         let value = nodedb_types::value_from_msgpack(row).map_err(|e| {
             crate::Error::DataPlane(ErrorCode::Internal {
                 detail: format!("ProviderScan: malformed row for window/computed evaluation: {e}"),
             })
         })?;
-        json_rows.push((idx.to_string(), serde_json::Value::from(value)));
+        value_rows.push((idx.to_string(), value));
     }
 
     if !window_specs.is_empty() {
-        evaluate_window_functions(&mut json_rows, &window_specs).map_err(crate::Error::from)?;
+        evaluate_window_functions(&mut value_rows, &window_specs).map_err(crate::Error::from)?;
     }
 
-    for (_, row_json) in &mut json_rows {
+    for (_, row) in &mut value_rows {
         if computed_cols.is_empty() {
             continue;
         }
         // Every computed column evaluates against the row as it stood before
-        // this loop, matching `apply_projection`'s semantics: later computed
+        // this loop, matching `apply_projection_msgpack`'s semantics: later computed
         // columns never observe earlier ones' results.
-        let doc_val = nodedb_types::Value::from(row_json.clone());
+        let before = row.clone();
         for cc in &computed_cols {
-            let already_present = matches!(row_json.get(&cc.alias), Some(v) if !v.is_null());
+            let already_present = matches!(row.get(&cc.alias), Some(v) if !v.is_null());
             if already_present {
                 continue;
             }
-            let v = cc.expr.eval(&doc_val)?;
-            if let serde_json::Value::Object(obj) = row_json {
-                obj.insert(cc.alias.clone(), serde_json::Value::from(v));
+            let v = cc.expr.eval(&before)?;
+            if let nodedb_types::Value::Object(obj) = row {
+                obj.insert(cc.alias.clone(), v);
             }
         }
     }
 
-    let mut out = Vec::with_capacity(json_rows.len());
-    for (_, row_json) in json_rows {
-        let bytes = nodedb_types::json_to_msgpack(&row_json).map_err(|e| {
+    let mut out = Vec::with_capacity(value_rows.len());
+    for (_, row) in value_rows {
+        let bytes = nodedb_types::value_to_msgpack(&row).map_err(|e| {
             crate::Error::DataPlane(ErrorCode::Internal {
                 detail: format!(
                     "ProviderScan: failed to re-encode row after window/computed evaluation: {e}"

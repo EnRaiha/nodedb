@@ -63,7 +63,10 @@ pub fn decode_snapshot_live_rows(
     let mut surrogates: Vec<Surrogate> = Vec::new();
 
     // Memtable: non-deleted rows in schema column order → keyed object.
-    for (surrogate, values) in engine.scan_memtable_rows_with_surrogates() {
+    // A memtable row that does not read refuses the restore: dropping it
+    // would lose the row from the restored collection.
+    for scanned in engine.scan_memtable_rows_with_surrogates() {
+        let (surrogate, values) = scanned?;
         let surrogate = surrogate.ok_or_else(|| Error::Storage {
             engine: "columnar".into(),
             detail: format!(

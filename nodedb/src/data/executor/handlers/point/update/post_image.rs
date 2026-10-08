@@ -9,6 +9,7 @@
 use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
+use crate::data::executor::handlers::identity_guard::{IdentitySnapshot, assigns_identity};
 use crate::data::executor::strict_format;
 use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::UpdateValue;
@@ -140,8 +141,13 @@ impl CoreLoop {
             }
         }
 
-        // Fast path: non-strict, no generated columns, all literal — merge at binary level.
-        if !is_strict && !has_generated && !has_expr {
+        // Fast path: non-strict, no generated columns, all literal, identity
+        // untouched — merge at binary level.
+        if !is_strict
+            && !has_generated
+            && !has_expr
+            && !assigns_identity(None, declared_primary_key, updates)
+        {
             let base_mp = doc_format::json_to_msgpack(current_bytes);
             let update_pairs: Vec<(&str, &[u8])> = updates
                 .iter()
@@ -150,29 +156,37 @@ impl CoreLoop {
                     UpdateValue::Expr(_) => None,
                 })
                 .collect();
-            return Ok(PointUpdateBody::Msgpack(
-                nodedb_query::msgpack_scan::merge_fields(&base_mp, &update_pairs),
-            ));
+            let merged = nodedb_query::msgpack_scan::merge_fields(&base_mp, &update_pairs);
+            let merged =
+                strict_format::coerce_declared_body(merged, self.declared_columns(config_key))
+                    .map_err(ErrorCode::from)?;
+            return Ok(PointUpdateBody::Msgpack(merged));
         }
 
-        // Strict, generated, or expression RHS: decode → mutate → re-encode.
-        let mut doc = if is_strict {
-            if let Some(config) = self.doc_configs.get(config_key)
-                && let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
-                    config.storage_mode
-            {
-                match strict_format::binary_tuple_to_json(current_bytes, schema) {
-                    Some(v) => v,
-                    None => {
-                        return Err(ErrorCode::Internal {
-                            detail: "failed to decode Binary Tuple for update".into(),
-                        });
-                    }
+        // Strict, generated, expression RHS, or identity assignment:
+        // decode → mutate → re-encode.
+        let strict_schema = if is_strict {
+            match self.doc_configs.get(config_key).map(|c| &c.storage_mode) {
+                Some(nodedb_physical::physical_plan::StorageMode::Strict { schema }) => {
+                    Some(schema)
                 }
-            } else {
-                return Err(ErrorCode::Internal {
-                    detail: "strict config missing during update".into(),
-                });
+                _ => {
+                    return Err(ErrorCode::Internal {
+                        detail: "strict config missing during update".into(),
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        let mut doc = if let Some(schema) = strict_schema {
+            match strict_format::binary_tuple_to_json(current_bytes, schema) {
+                Some(v) => v,
+                None => {
+                    return Err(ErrorCode::Internal {
+                        detail: "failed to decode Binary Tuple for update".into(),
+                    });
+                }
             }
         } else {
             match doc_format::decode_document(current_bytes) {
@@ -184,6 +198,9 @@ impl CoreLoop {
                 }
             }
         };
+
+        let identity =
+            IdentitySnapshot::capture(strict_schema, declared_primary_key, updates, &doc);
 
         // Expressions evaluate against the pre-update snapshot, so later
         // assignments don't observe earlier ones — matches PostgreSQL.
@@ -223,6 +240,9 @@ impl CoreLoop {
                 detail: format!("primary key '{pk}' cannot be NULL or omitted"),
             });
         }
+        identity
+            .check_unchanged(&config_key.2, &doc)
+            .map_err(ErrorCode::from)?;
 
         // Recompute generated columns.
         if has_generated
@@ -234,6 +254,11 @@ impl CoreLoop {
         {
             return Err(e);
         }
+
+        // A declared numeric column holds the value its type stores, whether
+        // the assignment was a literal or computed.
+        strict_format::coerce_declared_doc(&mut doc, self.declared_columns(config_key))
+            .map_err(ErrorCode::from)?;
 
         Ok(PointUpdateBody::Document(doc))
     }

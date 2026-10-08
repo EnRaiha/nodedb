@@ -5,13 +5,15 @@
 //!
 //! This is the pgwire entrypoint's consumer of the shared, protocol-neutral
 //! DDL dispatch result — the mirror of the native and http encoders. Each
-//! column's `RowDescription` OID comes from the [`DdlColType`] the neutral
-//! result captured, and each typed cell renders through the one pgwire cell
-//! encoder (`handler::shape_encode::encode_cell`) in that type's text form.
+//! column's `RowDescription` type and format come from the [`DdlColType`]
+//! the neutral result captured and the client's requested result formats,
+//! and each typed cell renders through the one pgwire cell encoder
+//! (`handler::shape_encode::encode_cell`) in that format.
 
 use std::sync::Arc;
 
-use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
+use pgwire::api::portal::Format;
+use pgwire::api::results::{DataRowEncoder, QueryResponse, Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
@@ -19,16 +21,15 @@ use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 
 use super::command_tag::dml_tag;
 use super::handler::shape_encode::encode_cell;
-use super::types::{
-    bool_field, bytea_field, float4_array_field, float4_field, float8_array_field, float8_field,
-    int2_field, int4_field, int8_field, json_field, jsonb_field, text_field, timestamp_field,
-    timestamptz_field, varchar_field,
-};
+use super::types::wire_type::result_fields;
 
 /// Encode a protocol-neutral DDL dispatch result into pgwire responses.
 ///
 /// An `Err(DdlError)` maps to a pgwire `UserError` carrying the SQLSTATE +
-/// message; each `DdlResult` maps to exactly one `Response`.
+/// message; each `DdlResult` maps to exactly one `Response`. Row results
+/// honour `requested`, the client's result formats: the simple-query
+/// protocol passes `wire_type::TEXT_RESULTS`, an extended-query Execute
+/// passes its portal's formats.
 ///
 /// The PostgreSQL wire `ErrorResponse` has no field for a NodeDB numeric
 /// code, so it travels in `routine` as `ErrorCode`'s `NDB-XXXX` display
@@ -36,6 +37,7 @@ use super::types::{
 /// which entrypoint produced the error.
 pub fn ddl_results_to_pgwire(
     result: Result<Vec<DdlResult>, DdlError>,
+    requested: &Format,
 ) -> PgWireResult<Vec<Response>> {
     let results = match result {
         Ok(results) => results,
@@ -66,13 +68,13 @@ pub fn ddl_results_to_pgwire(
 
     let mut responses = Vec::with_capacity(results.len());
     for ddl in results {
-        responses.push(ddl_result_to_response(ddl)?);
+        responses.push(ddl_result_to_response(ddl, requested)?);
     }
     Ok(responses)
 }
 
 /// Map a single [`DdlResult`] to a pgwire [`Response`].
-fn ddl_result_to_response(ddl: DdlResult) -> PgWireResult<Response> {
+fn ddl_result_to_response(ddl: DdlResult, requested: &Format) -> PgWireResult<Response> {
     match ddl {
         DdlResult::Status {
             command,
@@ -85,16 +87,17 @@ fn ddl_result_to_response(ddl: DdlResult) -> PgWireResult<Response> {
             Ok(Response::Execution(tag))
         }
         DdlResult::Empty => Ok(Response::EmptyQuery),
-        DdlResult::Rows(shaped) => rows_to_response(shaped),
+        DdlResult::Rows(shaped) => rows_to_response(shaped, requested),
     }
 }
 
-/// Build a `Response::Query` from a protocol-neutral shaped row set.
+/// Build a `Response::Query` from a protocol-neutral shaped row set, in the
+/// client's `requested` result formats.
 ///
 /// The `notice` field is intentionally ignored: the pgwire DDL router never
 /// attached a NOTICE to a `Response::Query` (notices are a separate protocol
 /// message), so honouring it here would diverge from the captured wire shape.
-fn rows_to_response(shaped: ShapedRows) -> PgWireResult<Response> {
+fn rows_to_response(shaped: ShapedRows, requested: &Format) -> PgWireResult<Response> {
     let ShapedRows {
         columns,
         column_types,
@@ -102,28 +105,26 @@ fn rows_to_response(shaped: ShapedRows) -> PgWireResult<Response> {
         ..
     } = shaped;
 
-    // Build the RowDescription. Each column's OID is reproduced from its
-    // captured `DdlColType`; a missing/short `column_types` defaults to text.
-    let fields: Vec<FieldInfo> = columns
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            let ct = column_types.get(i).copied().unwrap_or(DdlColType::Text);
-            col_type_to_field(name, ct)
-        })
-        .collect();
-    let schema = Arc::new(fields);
+    // Each column's type and format come from its captured `DdlColType` and
+    // the requested formats; a missing/short `column_types` defaults to text.
+    let column_type = |i: usize| column_types.get(i).copied().unwrap_or(DdlColType::Text);
+    let schema = Arc::new(result_fields(
+        columns
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.as_str(), column_type(i))),
+        requested,
+    ));
 
     let mut encoded_rows: Vec<PgWireResult<pgwire::messages::data::DataRow>> =
         Vec::with_capacity(rows.len());
+    let mut encoder = DataRowEncoder::new(schema.clone());
     for row in &rows {
-        let mut encoder = DataRowEncoder::new(schema.clone());
-        for (idx, name) in columns.iter().enumerate() {
-            let ct = column_types.get(idx).copied().unwrap_or(DdlColType::Text);
+        for (idx, (name, field)) in columns.iter().zip(schema.iter()).enumerate() {
             match row.get(name) {
                 // Absent key → -1 length field.
                 None => encoder.encode_field(&None::<&str>)?,
-                Some(v) => encode_cell(&mut encoder, name, ct, FieldFormat::Text, v)?,
+                Some(v) => encode_cell(&mut encoder, name, column_type(idx), field.format(), v)?,
             }
         }
         encoded_rows.push(Ok(encoder.take_row()));
@@ -133,52 +134,6 @@ fn rows_to_response(shaped: ShapedRows) -> PgWireResult<Response> {
         schema,
         futures::stream::iter(encoded_rows),
     )))
-}
-
-/// Map a protocol-neutral [`DdlColType`] to the pgwire `FieldInfo` builder
-/// that produces the matching type OID (all with `FieldFormat::Text`). This
-/// is the inverse of the OID→`DdlColType` mapping the neutral dispatch used
-/// when capturing the schema, so the RowDescription round-trips losslessly.
-///
-/// Visible across the pgwire module so `handler::shape_encode` can reuse the
-/// same OID mapping when encoding the canonical `ShapedRows` response shape.
-pub(in crate::control::server::pgwire) fn col_type_to_field(
-    name: &str,
-    ct: DdlColType,
-) -> FieldInfo {
-    match ct {
-        DdlColType::Text => text_field(name),
-        DdlColType::Int8 => int8_field(name),
-        DdlColType::Int4 => int4_field(name),
-        DdlColType::Int2 => int2_field(name),
-        DdlColType::Float8 => float8_field(name),
-        DdlColType::Float4 => float4_field(name),
-        DdlColType::Bool => bool_field(name),
-        DdlColType::Bytea => bytea_field(name),
-        DdlColType::Json => json_field(name),
-        DdlColType::Jsonb => jsonb_field(name),
-        DdlColType::Timestamp => timestamp_field(name),
-        DdlColType::Timestamptz => timestamptz_field(name),
-        DdlColType::Varchar => varchar_field(name),
-        DdlColType::Float4Array => float4_array_field(name),
-        DdlColType::Float8Array => float8_array_field(name),
-    }
-}
-
-/// Like [`col_type_to_field`] but with an explicit wire `format`.
-///
-/// Reuses the `DdlColType` -> type-OID mapping and swaps the format, so a
-/// column can advertise (and be encoded in) binary when the client requested
-/// it. The `DataRowEncoder` reads this format from the schema to pick binary
-/// vs text encoding, so both the RowDescription and the `DataRow` bytes stay
-/// in agreement.
-pub(in crate::control::server::pgwire) fn col_type_to_field_with_format(
-    name: &str,
-    ct: DdlColType,
-    format: pgwire::api::results::FieldFormat,
-) -> FieldInfo {
-    let base = col_type_to_field(name, ct);
-    FieldInfo::new(name.to_owned(), None, None, base.datatype().clone(), format)
 }
 
 #[cfg(test)]
@@ -198,7 +153,8 @@ mod tests {
         let result: Result<Vec<DdlResult>, DdlError> =
             Err(DdlError::move_tenant_snapshot_failed(phase.message()).with_cause_of(&phase));
 
-        let err = ddl_results_to_pgwire(result).expect_err("must map to a pgwire error");
+        let err = ddl_results_to_pgwire(result, &Format::UnifiedText)
+            .expect_err("must map to a pgwire error");
         let PgWireError::UserError(info) = err else {
             panic!("expected a UserError carrying ErrorInfo");
         };
@@ -217,7 +173,8 @@ mod tests {
         let result: Result<Vec<DdlResult>, DdlError> =
             Err(DdlError::new("42501", "write permission denied"));
 
-        let err = ddl_results_to_pgwire(result).expect_err("must map to a pgwire error");
+        let err = ddl_results_to_pgwire(result, &Format::UnifiedText)
+            .expect_err("must map to a pgwire error");
         let PgWireError::UserError(info) = err else {
             panic!("expected a UserError carrying ErrorInfo");
         };
@@ -239,5 +196,66 @@ mod tests {
             decoded_info.routine,
             Some(nodedb_types::error::ErrorCode::AUTHORIZATION_DENIED.to_string())
         );
+    }
+
+    /// The first field's raw bytes of the first row of a query response,
+    /// with the response's per-column formats.
+    async fn first_cell(response: Response) -> (Vec<pgwire::api::results::FieldFormat>, Vec<u8>) {
+        use futures::StreamExt;
+
+        let Response::Query(mut qr) = response else {
+            panic!("expected a Query response");
+        };
+        let formats = qr.row_schema.iter().map(|f| f.format()).collect();
+        let row = qr
+            .data_rows
+            .next()
+            .await
+            .expect("one row")
+            .expect("row encodes");
+        let data = &row.data;
+        let len = i32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        (formats, data[4..4 + len].to_vec())
+    }
+
+    fn show_rows() -> Result<Vec<DdlResult>, DdlError> {
+        let row = [
+            ("n".to_string(), nodedb_types::Value::Integer(42)),
+            ("name".to_string(), nodedb_types::Value::String("x".into())),
+        ]
+        .into_iter()
+        .collect();
+        Ok(vec![DdlResult::Rows(ShapedRows::from_rows(
+            vec!["n".into(), "name".into()],
+            vec![DdlColType::Int8, DdlColType::Text],
+            vec![row],
+        ))])
+    }
+
+    /// A DDL row result honours a binary request: an `int8` column is
+    /// advertised binary and its cell is the 8-byte big-endian integer.
+    #[tokio::test]
+    async fn ddl_rows_honour_a_binary_request() {
+        let mut responses =
+            ddl_results_to_pgwire(show_rows(), &Format::UnifiedBinary).expect("encodes");
+        let (formats, bytes) = first_cell(responses.remove(0)).await;
+        assert_eq!(
+            formats,
+            vec![
+                pgwire::api::results::FieldFormat::Binary,
+                pgwire::api::results::FieldFormat::Binary
+            ]
+        );
+        assert_eq!(bytes, 42i64.to_be_bytes().to_vec());
+    }
+
+    /// The simple-query protocol's text request renders the digits.
+    #[tokio::test]
+    async fn ddl_rows_render_text_under_a_text_request() {
+        let mut responses =
+            ddl_results_to_pgwire(show_rows(), &Format::UnifiedText).expect("encodes");
+        let (formats, bytes) = first_cell(responses.remove(0)).await;
+        assert_eq!(formats[0], pgwire::api::results::FieldFormat::Text);
+        assert_eq!(bytes, b"42".to_vec());
     }
 }

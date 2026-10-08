@@ -141,12 +141,19 @@ impl CoreLoop {
             "vector direct update"
         );
         let database_id = task.request.database_id.as_u64();
+        let identity_column = self.identity_column(database_id, tid, collection);
 
         // No index means no row was ever written: nothing to rewrite.
         let probe_key = CoreLoop::vector_index_key(database_id, tid, collection, field);
         if !self.vector_collections.contains_key(&probe_key) {
             if let Some(spec) = returning {
-                return self.vector_stored_returning_response(task, spec, rls_filters, &[]);
+                return self.vector_stored_returning_response(
+                    task,
+                    spec,
+                    rls_filters,
+                    &identity_column,
+                    &[],
+                );
             }
             return self.response_affected(task, 0);
         }
@@ -215,7 +222,13 @@ impl CoreLoop {
         if let Some(spec) = returning {
             let rows: Vec<(&StorageKey, &[u8])> =
                 written.iter().map(|(k, b)| (k, b.as_slice())).collect();
-            return self.vector_stored_returning_response(task, spec, rls_filters, &rows);
+            return self.vector_stored_returning_response(
+                task,
+                spec,
+                rls_filters,
+                &identity_column,
+                &rows,
+            );
         }
         self.response_affected(task, written.len() as u64)
     }

@@ -11,15 +11,15 @@
 //! in `sql_transactions_graph_overlay.rs`). So the savepoint mechanism for the
 //! GRAPH overlay is exercised here at the bridge level instead: build
 //! `MetaOp::StageWrite { plan: GraphOp::EdgePut / EdgeDelete }` tasks stamped
-//! with a `txn_id`, `MetaOp::MarkSavepoint` to capture the composite marker,
-//! stage more, then `MetaOp::RollbackToSavepoint` and read back through
+//! with a `txn_id`, `MetaOp::MarkSavepoint` to record the savepoint on the
+//! core, stage more, then `MetaOp::RollbackToSavepoint` and read back through
 //! `GraphOp::Neighbors` (which merges the overlay for the same `txn_id`).
 //!
 //! The pure journal mechanics (cross-set clearing, node-label deltas) are also
-//! covered as unit tests on `GraphTxnOverlay` in `graph_staged.rs`; these tests
-//! additionally verify the full composite-marker meta-op path through
-//! `dispatch_meta` and that ONE savepoint reverts the value AND graph overlays
-//! together (U7-1 is not regressed).
+//! covered as unit tests on `GraphTxnOverlay` in `graph_staged.rs`. These tests
+//! cover the meta-op path through `dispatch_meta`: one savepoint reverts the
+//! value and graph overlays together, and a core that hosts several staged
+//! vShards rewinds to its own record however many vShards send the meta-ops.
 
 use nodedb::bridge::envelope::{Request, Status};
 use nodedb::engine::graph::edge_store::Direction;
@@ -28,7 +28,8 @@ use nodedb_physical::physical_plan::{GraphOp, KvOp, MetaOp, PhysicalPlan};
 
 use super::helpers::*;
 
-fn send_txn(
+/// Send `plan` stamped with `txn_id` and return its response.
+pub(super) fn send_txn(
     core: &mut nodedb::data::executor::core_loop::CoreLoop,
     req_tx: &mut nodedb_bridge::buffer::Producer<nodedb::bridge::dispatch::BridgeRequest>,
     resp_rx: &mut nodedb_bridge::buffer::Consumer<nodedb::bridge::dispatch::BridgeResponse>,
@@ -46,7 +47,18 @@ fn send_txn(
     resp_rx.try_pop().unwrap().inner
 }
 
-fn stage_edge_put(collection: &str, src: &str, label: &str, dst: &str) -> PhysicalPlan {
+pub(super) fn stage_edge_put(collection: &str, src: &str, label: &str, dst: &str) -> PhysicalPlan {
+    stage_edge_put_with(collection, src, label, dst, Vec::new())
+}
+
+/// A staged put of `src -label-> dst` carrying the plain-msgpack `properties`.
+pub(super) fn stage_edge_put_with(
+    collection: &str,
+    src: &str,
+    label: &str,
+    dst: &str,
+    properties: Vec<u8>,
+) -> PhysicalPlan {
     PhysicalPlan::Meta(MetaOp::StageWrite {
         plan: Box::new(PhysicalPlan::Graph(GraphOp::EdgePut {
             collection: nodedb_types::QualifiedCollection::new(
@@ -56,14 +68,19 @@ fn stage_edge_put(collection: &str, src: &str, label: &str, dst: &str) -> Physic
             src_id: src.into(),
             label: label.into(),
             dst_id: dst.into(),
-            properties: Vec::new(),
+            properties,
             src_surrogate: doc_surrogate(src),
             dst_surrogate: doc_surrogate(dst),
         })),
     })
 }
 
-fn stage_edge_delete(collection: &str, src: &str, label: &str, dst: &str) -> PhysicalPlan {
+pub(super) fn stage_edge_delete(
+    collection: &str,
+    src: &str,
+    label: &str,
+    dst: &str,
+) -> PhysicalPlan {
     PhysicalPlan::Meta(MetaOp::StageWrite {
         plan: Box::new(PhysicalPlan::Graph(GraphOp::EdgeDelete {
             collection: nodedb_types::QualifiedCollection::new(
@@ -83,31 +100,22 @@ fn stage_edge_delete(collection: &str, src: &str, label: &str, dst: &str) -> Phy
 fn neighbors(node: &str, label: &str) -> PhysicalPlan {
     PhysicalPlan::Graph(GraphOp::Neighbors {
         node_id: node.into(),
-        edge_label: Some(label.into()),
+        edge_labels: vec![label.into()],
         direction: Direction::Out,
         rls_filters: Vec::new(),
         collection: None,
     })
 }
 
-/// Parse the 24-byte `MarkSavepoint` payload into `(value_marker,
-/// graph_marker, array_marker)`.
-fn parse_markers(payload: &[u8]) -> (u64, u64, u64) {
-    assert_eq!(payload.len(), 24, "MarkSavepoint must return 24 bytes");
-    let mut v = [0u8; 8];
-    v.copy_from_slice(&payload[..8]);
-    let mut g = [0u8; 8];
-    g.copy_from_slice(&payload[8..16]);
-    let mut a = [0u8; 8];
-    a.copy_from_slice(&payload[16..24]);
-    (
-        u64::from_le_bytes(v),
-        u64::from_le_bytes(g),
-        u64::from_le_bytes(a),
-    )
+fn mark(txn_id: TxnId, savepoint: u64) -> PhysicalPlan {
+    PhysicalPlan::Meta(MetaOp::MarkSavepoint { txn_id, savepoint })
 }
 
-fn neighbor_nodes(payload: &[u8]) -> Vec<String> {
+fn rewind(txn_id: TxnId, savepoint: u64) -> PhysicalPlan {
+    PhysicalPlan::Meta(MetaOp::RollbackToSavepoint { txn_id, savepoint })
+}
+
+pub(super) fn neighbor_nodes(payload: &[u8]) -> Vec<String> {
     let json = payload_json(payload);
     let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap_or_default();
     parsed
@@ -132,15 +140,8 @@ fn rollback_to_savepoint_discards_graph_edge_staged_after_marker() {
     assert_eq!(resp.status, Status::Ok, "{:?}", resp.error_code);
 
     // Mark the savepoint.
-    let resp = send_txn(
-        &mut core,
-        &mut tx,
-        &mut rx,
-        txn_id,
-        PhysicalPlan::Meta(MetaOp::MarkSavepoint { txn_id }),
-    );
+    let resp = send_txn(&mut core, &mut tx, &mut rx, txn_id, mark(txn_id, 1));
     assert_eq!(resp.status, Status::Ok);
-    let (value_marker, graph_marker, array_marker) = parse_markers(resp.payload.as_ref());
 
     // Stage A→C after the savepoint.
     let resp = send_txn(
@@ -161,18 +162,7 @@ fn rollback_to_savepoint_discards_graph_edge_staged_after_marker() {
     );
 
     // Roll back to the savepoint.
-    let resp = send_txn(
-        &mut core,
-        &mut tx,
-        &mut rx,
-        txn_id,
-        PhysicalPlan::Meta(MetaOp::RollbackToSavepoint {
-            txn_id,
-            value_marker,
-            graph_marker,
-            array_marker,
-        }),
-    );
+    let resp = send_txn(&mut core, &mut tx, &mut rx, txn_id, rewind(txn_id, 1));
     assert_eq!(resp.status, Status::Ok);
 
     // A→B (pre-marker) survives; A→C (post-marker) is gone.
@@ -228,14 +218,8 @@ fn rollback_to_savepoint_restores_cross_set_cleared_tombstone() {
     );
 
     // Mark savepoint AFTER the tombstone.
-    let resp = send_txn(
-        &mut core,
-        &mut tx,
-        &mut rx,
-        txn_id,
-        PhysicalPlan::Meta(MetaOp::MarkSavepoint { txn_id }),
-    );
-    let (value_marker, graph_marker, array_marker) = parse_markers(resp.payload.as_ref());
+    let resp = send_txn(&mut core, &mut tx, &mut rx, txn_id, mark(txn_id, 1));
+    assert_eq!(resp.status, Status::Ok);
 
     // Re-put X→Y: this CLEARS the tombstone (cross-set), so Y is visible again.
     let resp = send_txn(
@@ -254,18 +238,7 @@ fn rollback_to_savepoint_restores_cross_set_cleared_tombstone() {
 
     // Roll back: the re-put is undone AND the tombstone it cleared is restored,
     // so Y is hidden once more.
-    let resp = send_txn(
-        &mut core,
-        &mut tx,
-        &mut rx,
-        txn_id,
-        PhysicalPlan::Meta(MetaOp::RollbackToSavepoint {
-            txn_id,
-            value_marker,
-            graph_marker,
-            array_marker,
-        }),
-    );
+    let resp = send_txn(&mut core, &mut tx, &mut rx, txn_id, rewind(txn_id, 1));
     assert_eq!(resp.status, Status::Ok);
     let resp = send_txn(&mut core, &mut tx, &mut rx, txn_id, neighbors("x", "knows"));
     assert!(
@@ -329,25 +302,9 @@ fn one_savepoint_reverts_value_and_graph_overlays_together() {
     );
     assert_eq!(resp.status, Status::Ok, "{:?}", resp.error_code);
 
-    // Composite savepoint marker.
-    let resp = send_txn(
-        &mut core,
-        &mut tx,
-        &mut rx,
-        txn_id,
-        PhysicalPlan::Meta(MetaOp::MarkSavepoint { txn_id }),
-    );
-    let (value_marker, graph_marker, array_marker) = parse_markers(resp.payload.as_ref());
-    // The value marker is the value journal's length. The journal also holds
-    // the row-source tags a savepoint rollback reverts: the edge put's
-    // staging tag and its row tag, then the EXPIRE's staging tag for `c`,
-    // then the EXPIRE's TTL delta.
-    assert_eq!(
-        (value_marker, graph_marker, array_marker),
-        (4, 1, 0),
-        "three tag entries + one value mutation journalled, one graph mutation staged, \
-         no array mutation"
-    );
+    // One savepoint spans every overlay.
+    let resp = send_txn(&mut core, &mut tx, &mut rx, txn_id, mark(txn_id, 1));
+    assert_eq!(resp.status, Status::Ok);
 
     // Stage more of BOTH after the savepoint: another edge and a PERSIST that
     // overwrites the staged EXPIRE.
@@ -375,19 +332,8 @@ fn one_savepoint_reverts_value_and_graph_overlays_together() {
         }),
     );
 
-    // One rollback reverts both overlays to the marker.
-    let resp = send_txn(
-        &mut core,
-        &mut tx,
-        &mut rx,
-        txn_id,
-        PhysicalPlan::Meta(MetaOp::RollbackToSavepoint {
-            txn_id,
-            value_marker,
-            graph_marker,
-            array_marker,
-        }),
-    );
+    // One rollback reverts both overlays to the savepoint.
+    let resp = send_txn(&mut core, &mut tx, &mut rx, txn_id, rewind(txn_id, 1));
     assert_eq!(resp.status, Status::Ok);
 
     // Graph: A→B survives, A→C discarded.
@@ -420,4 +366,69 @@ fn one_savepoint_reverts_value_and_graph_overlays_together() {
         (0..=60_000).contains(&ttl_ms),
         "value overlay must revert the post-marker PERSIST, leaving the staged EXPIRE; got {ttl_ms}"
     );
+}
+
+/// The Control Plane sends a mark and a rewind through each staged vShard. A
+/// core hosting several of them gets each meta-op more than once. Writes
+/// staged before the savepoint survive every repeat.
+#[test]
+fn repeated_marks_and_rewinds_on_one_core_keep_the_writes_before_the_savepoint() {
+    let (mut core, mut tx, mut rx, _dir) = make_core();
+    let txn_id = TxnId::new(4);
+
+    let resp = send_txn(
+        &mut core,
+        &mut tx,
+        &mut rx,
+        txn_id,
+        stage_edge_put("g", "a", "knows", "b"),
+    );
+    assert_eq!(resp.status, Status::Ok, "{:?}", resp.error_code);
+    for _ in 0..2 {
+        let resp = send_txn(&mut core, &mut tx, &mut rx, txn_id, mark(txn_id, 7));
+        assert_eq!(resp.status, Status::Ok);
+    }
+    let resp = send_txn(
+        &mut core,
+        &mut tx,
+        &mut rx,
+        txn_id,
+        stage_edge_put("g", "a", "knows", "c"),
+    );
+    assert_eq!(resp.status, Status::Ok, "{:?}", resp.error_code);
+    for _ in 0..2 {
+        let resp = send_txn(&mut core, &mut tx, &mut rx, txn_id, rewind(txn_id, 7));
+        assert_eq!(resp.status, Status::Ok);
+    }
+
+    let resp = send_txn(&mut core, &mut tx, &mut rx, txn_id, neighbors("a", "knows"));
+    let after = neighbor_nodes(resp.payload.as_ref());
+    assert_eq!(
+        after,
+        vec!["b".to_string()],
+        "only the write before the savepoint stays"
+    );
+}
+
+/// A core that holds no record of the savepoint hosted no staged vShard at
+/// the mark. Every write it holds came after the savepoint, so the rewind
+/// empties its overlays.
+#[test]
+fn a_rewind_on_a_core_without_the_record_drops_every_staged_write() {
+    let (mut core, mut tx, mut rx, _dir) = make_core();
+    let txn_id = TxnId::new(5);
+
+    let resp = send_txn(
+        &mut core,
+        &mut tx,
+        &mut rx,
+        txn_id,
+        stage_edge_put("g", "a", "knows", "b"),
+    );
+    assert_eq!(resp.status, Status::Ok, "{:?}", resp.error_code);
+    let resp = send_txn(&mut core, &mut tx, &mut rx, txn_id, rewind(txn_id, 3));
+    assert_eq!(resp.status, Status::Ok);
+
+    let resp = send_txn(&mut core, &mut tx, &mut rx, txn_id, neighbors("a", "knows"));
+    assert!(neighbor_nodes(resp.payload.as_ref()).is_empty());
 }

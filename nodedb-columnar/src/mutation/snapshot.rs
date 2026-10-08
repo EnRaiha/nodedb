@@ -502,7 +502,10 @@ mod tests {
         assert_eq!(restored.pk_index().len(), 3);
 
         // Scan rows — all 3 should be present.
-        let rows: Vec<Vec<Value>> = restored.scan_memtable_rows().collect();
+        let rows: Vec<Vec<Value>> = restored
+            .scan_memtable_rows()
+            .collect::<Result<_, _>>()
+            .expect("read");
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0][0], Value::Integer(1));
         assert_eq!(rows[1][1], Value::String("Bob".into()));
@@ -533,7 +536,10 @@ mod tests {
         let (restored, _, _) = MutationEngine::from_snapshot(snap2).expect("from_snapshot");
 
         // scan_memtable_rows skips deleted row 1 (id=20).
-        let rows: Vec<Vec<Value>> = restored.scan_memtable_rows().collect();
+        let rows: Vec<Vec<Value>> = restored
+            .scan_memtable_rows()
+            .collect::<Result<_, _>>()
+            .expect("read");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Integer(10));
 
@@ -690,5 +696,46 @@ mod tests {
             MutationEngine::from_snapshot(snap2).expect("from_snapshot");
         assert_eq!(flushed.len(), 1);
         assert!(flushed_surrogates.is_empty());
+    }
+
+    /// A memtable JSON cell restored with bytes that are not MessagePack is
+    /// refused on every read path, never read as NULL or as an absent row.
+    #[test]
+    fn a_corrupt_json_cell_is_refused_not_read_as_null() {
+        let schema = ColumnarSchema {
+            columns: vec![
+                ColumnDef::required("id", ColumnType::Int64).with_primary_key(),
+                ColumnDef::nullable("doc", ColumnType::Json),
+            ],
+            version: 1,
+        };
+        let mut engine = MutationEngine::new("json_col".to_string(), schema);
+        engine
+            .insert(&[Value::Integer(1), Value::Integer(5)])
+            .expect("insert");
+        let mut snap = engine.export_snapshot(&[], &[]).expect("export");
+        let Some(ColumnDataSnapshot::Json { data, offsets, .. }) = snap.memtable_columns.get_mut(1)
+        else {
+            panic!("doc column snapshots as JSON");
+        };
+        // 0xC1 is the one MessagePack marker that is never valid.
+        *data = vec![0xC1];
+        *offsets = vec![0, 1];
+        let (restored, _, _) = MutationEngine::from_snapshot(snap).expect("from_snapshot");
+
+        let is_corrupt = |e: &ColumnarError| matches!(e, ColumnarError::MemtableCellCorrupt { column, row: 0, .. } if column == "doc");
+        let scanned: Vec<_> = restored.scan_memtable_rows().collect();
+        assert_eq!(scanned.len(), 1);
+        assert!(scanned[0].as_ref().is_err_and(is_corrupt));
+        let with_surrogates: Vec<_> = restored.scan_memtable_rows_with_surrogates().collect();
+        assert!(with_surrogates[0].as_ref().is_err_and(is_corrupt));
+        assert!(restored.get_memtable_row(0).as_ref().is_err_and(is_corrupt));
+        let pk = crate::pk_index::encode_pk(&Value::Integer(1));
+        assert!(
+            restored
+                .lookup_memtable_row_by_pk(&pk)
+                .as_ref()
+                .is_err_and(is_corrupt)
+        );
     }
 }

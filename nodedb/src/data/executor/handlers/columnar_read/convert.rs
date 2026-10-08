@@ -76,7 +76,8 @@ pub(in crate::data::executor) fn row_to_projected_value(
 /// A time cell is written as its column's kind says: an instant column
 /// yields a typed instant ext, a `Millis` column the integer stored. `Err`
 /// when a stored millisecond count overflows the microsecond range an
-/// instant carries; the cell is never written wrapped.
+/// instant carries; the cell is never written wrapped. `Err` when the cell
+/// does not read as its declared type, never a written NULL.
 pub(in crate::data::executor) fn emit_column_value(
     buf: &mut Vec<u8>,
     mt: &crate::engine::timeseries::columnar_memtable::ColumnarMemtable,
@@ -85,41 +86,24 @@ pub(in crate::data::executor) fn emit_column_value(
     col_data: &crate::engine::timeseries::columnar_memtable::ColumnData,
     row_idx: usize,
 ) -> crate::Result<()> {
-    use crate::engine::timeseries::columnar_memtable::{
-        ColumnData as TsColumnData, ColumnType as TsColumnType,
-    };
-    match col_type {
-        TsColumnType::Timestamp(kind) => {
-            let millis = col_data.as_timestamps()[row_idx];
-            write_time_cell(buf, *kind, millis)?;
-        }
-        TsColumnType::Float64 => {
-            let v = col_data.as_f64()[row_idx];
-            if v.is_finite() {
-                nodedb_query::msgpack_scan::write_f64(buf, v);
-            } else {
-                nodedb_query::msgpack_scan::write_null(buf);
-            }
-        }
-        TsColumnType::Symbol => {
-            if let TsColumnData::Symbol(ids) = col_data {
-                let sym_id = ids[row_idx];
-                if let Some(s) = mt.symbol_dict(col_idx).and_then(|dict| dict.get(sym_id)) {
-                    nodedb_query::msgpack_scan::write_str(buf, s);
-                } else {
-                    nodedb_query::msgpack_scan::write_null(buf);
-                }
-            } else {
-                nodedb_query::msgpack_scan::write_null(buf);
-            }
-        }
-        TsColumnType::Int64 => {
-            if let TsColumnData::Int64(vals) = col_data {
-                nodedb_query::msgpack_scan::write_i64(buf, vals[row_idx]);
-            } else {
-                nodedb_query::msgpack_scan::write_null(buf);
-            }
-        }
+    use crate::data::executor::handlers::timeseries::cell_read::{TsCell, read_ts_cell};
+    let column = mt
+        .schema()
+        .columns
+        .get(col_idx)
+        .map_or("", |(name, _)| name.as_str());
+    match read_ts_cell(
+        col_data,
+        *col_type,
+        column,
+        mt.symbol_dict(col_idx),
+        row_idx,
+    )? {
+        TsCell::Time(kind, millis) => write_time_cell(buf, kind, millis)?,
+        TsCell::Float(v) if v.is_finite() => nodedb_query::msgpack_scan::write_f64(buf, v),
+        TsCell::Float(_) | TsCell::Null => nodedb_query::msgpack_scan::write_null(buf),
+        TsCell::Symbol(s) => nodedb_query::msgpack_scan::write_str(buf, s),
+        TsCell::Int(n) => nodedb_query::msgpack_scan::write_i64(buf, n),
     }
     Ok(())
 }

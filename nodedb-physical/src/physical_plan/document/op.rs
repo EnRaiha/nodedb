@@ -268,6 +268,21 @@ pub enum DocumentOp {
         /// `WITH (primary='vector')`. Both plain and vector-primary rows are
         /// legal MessagePack maps — this is the only way to tell them apart.
         vector_primary: Option<Box<nodedb_types::VectorPrimaryConfig>>,
+        /// Declared `VECTOR(n)` columns of a schemaless collection, as
+        /// `(column, n)`. A document write indexes each one into its
+        /// field's vector index, as a strict schema's vector columns are.
+        /// Empty for every other collection.
+        vector_fields: Vec<(String, usize)>,
+        /// Declared numeric columns of a schemaless or KV collection. Every
+        /// value a write stores under one of them is re-typed to it. Empty
+        /// for every other collection.
+        declared_columns: Vec<super::declared_column::DeclaredColumn>,
+        /// The collection's declared key column, per
+        /// `nodedb_types::declared_key`. `None` when rows key by the implicit
+        /// `id` or `_rowid`. A row read from the sparse store renders its
+        /// identity under this column, else under `id`, and only when the
+        /// row lacks that column.
+        declared_key: Option<String>,
     },
 
     /// Lookup documents by secondary index value.

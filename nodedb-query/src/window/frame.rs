@@ -7,8 +7,11 @@
 //! concrete `[start_idx, end_idx]` inclusive range into the partition's index
 //! array.
 
+use nodedb_types::Value;
+
 use super::helpers::as_f64;
 use super::spec::{FrameBound, WindowFrame};
+use crate::value_ops::sort_peers;
 
 /// Resolve the frame for row at position `pos` in a partition of `len` rows.
 ///
@@ -30,7 +33,7 @@ pub(super) fn evaluate_frame_bounds(
     frame: &WindowFrame,
     pos: usize,
     len: usize,
-    order_values: &[serde_json::Value],
+    order_values: &[Value],
     peer_groups: &[usize],
 ) -> (usize, usize) {
     match frame.mode.as_str() {
@@ -45,14 +48,14 @@ pub(super) fn evaluate_frame_bounds(
 
 /// Build a per-row peer-group index array for a partition.
 ///
-/// Two rows are in the same peer group when they share the same order-by
-/// value. The returned vec has the same length as the partition; each element
-/// is the zero-based group index of that row.
-pub(super) fn build_peer_groups(order_values: &[serde_json::Value]) -> Vec<usize> {
+/// Two rows are in the same peer group when their order-by values are peers
+/// (see [`sort_peers`]). The returned vec has the same length as the
+/// partition; each element is the zero-based group index of that row.
+pub(super) fn build_peer_groups(order_values: &[Value]) -> Vec<usize> {
     let mut groups = Vec::with_capacity(order_values.len());
     let mut current_group = 0usize;
     for (i, val) in order_values.iter().enumerate() {
-        if i > 0 && val != &order_values[i - 1] {
+        if i > 0 && !sort_peers(val, &order_values[i - 1]) {
             current_group += 1;
         }
         groups.push(current_group);
@@ -85,7 +88,7 @@ fn range_bounds(
     end: &FrameBound,
     pos: usize,
     len: usize,
-    order_values: &[serde_json::Value],
+    order_values: &[Value],
 ) -> (usize, usize) {
     let current_val = order_values.get(pos).and_then(as_f64);
 
@@ -98,7 +101,7 @@ fn range_bound_to_idx(
     bound: &FrameBound,
     pos: usize,
     len: usize,
-    order_values: &[serde_json::Value],
+    order_values: &[Value],
     current_val: Option<f64>,
     is_start: bool,
 ) -> usize {
@@ -108,17 +111,22 @@ fn range_bound_to_idx(
         FrameBound::CurrentRow => {
             // Peer-aware: for start bound, go back to first peer;
             // for end bound, advance to last peer.
+            let peers = |other: usize| match (order_values.get(other), order_values.get(pos)) {
+                (Some(a), Some(b)) => sort_peers(a, b),
+                (None, None) => true,
+                _ => false,
+            };
             if is_start {
-                // Scan backward to find the first row with the same value.
+                // Scan backward to find the first peer of the current row.
                 let mut idx = pos;
-                while idx > 0 && order_values.get(idx - 1) == order_values.get(pos) {
+                while idx > 0 && peers(idx - 1) {
                     idx -= 1;
                 }
                 idx
             } else {
-                // Scan forward to find the last row with the same value.
+                // Scan forward to find the last peer of the current row.
                 let mut idx = pos;
-                while idx + 1 < len && order_values.get(idx + 1) == order_values.get(pos) {
+                while idx + 1 < len && peers(idx + 1) {
                     idx += 1;
                 }
                 idx
@@ -208,7 +216,6 @@ fn groups_bound_to_group(
 mod tests {
     use super::*;
     use crate::window::spec::{FrameBound, WindowFrame};
-    use serde_json::json;
 
     fn range_frame(start: FrameBound, end: FrameBound) -> WindowFrame {
         WindowFrame {
@@ -234,8 +241,8 @@ mod tests {
         }
     }
 
-    fn num_vals(ns: &[i64]) -> Vec<serde_json::Value> {
-        ns.iter().map(|&n| json!(n)).collect()
+    fn num_vals(ns: &[i64]) -> Vec<Value> {
+        ns.iter().map(|&n| Value::Integer(n)).collect()
     }
 
     // ROWS ───────────────────────────────────────────────────────────────────

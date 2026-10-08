@@ -50,9 +50,15 @@ use nodedb_types::value::Value;
 
 use super::materialize_scan::{build_response, encode_cursor};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::timeseries::cell_read::{TsCell, read_ts_cell};
+use crate::data::executor::handlers::timeseries::partition_read::{
+    TsPartitionColumns, partition_corrupt, read_ts_partition,
+};
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::timeseries::columnar_memtable::{ColumnData, ColumnType};
-use crate::engine::timeseries::columnar_segment::ColumnarSegmentReader;
+
+/// The read path the corruption report names.
+const SITE: &str = "timeseries_materialize_scan";
 
 impl CoreLoop {
     /// Execute a cursor-paginated materialize scan for a timeseries collection.
@@ -92,7 +98,10 @@ impl CoreLoop {
             for row_idx in first_row..row_count {
                 // `system_as_of_ms` filter: skip rows newer than the cutoff.
                 if let (Some(sys_idx), Some(cutoff)) = (ts_system_idx, system_as_of_ms) {
-                    let ts_val = ts_memtable_value(mt.column(sys_idx), row_idx);
+                    let ts_val = match memtable_system_time(mt, sys_idx, row_idx) {
+                        Ok(ts) => ts,
+                        Err(e) => return self.response_error(task, e),
+                    };
                     if ts_val > cutoff {
                         continue;
                     }
@@ -155,52 +164,38 @@ impl CoreLoop {
                 if *part_id < first_part_id {
                     continue;
                 }
-                if !part_dir.exists() {
-                    continue;
-                }
 
-                let schema = match ColumnarSegmentReader::read_schema(part_dir, None) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!(
-                            collection,
-                            part_id,
-                            error = %e,
-                            "ts_materialize_scan: failed to read schema; skipping partition"
-                        );
-                        continue;
-                    }
+                // A partition that does not read refuses the scan, a missing
+                // directory included. Skipping it would hand the materializer
+                // a clone without its rows.
+                let TsPartitionColumns {
+                    schema,
+                    columns: col_data,
+                    sym_dicts,
+                } = match read_ts_partition(part_dir, SITE) {
+                    Ok(partition) => partition,
+                    Err(e) => return self.response_error(task, e),
                 };
 
                 let ts_system_idx = schema.ts_system_idx();
 
-                // Read all columns.
-                let col_data: Vec<Option<ColumnData>> = schema
-                    .columns
-                    .iter()
-                    .map(|(name, ty)| {
-                        ColumnarSegmentReader::read_column(part_dir, name, *ty, None).ok()
-                    })
-                    .collect();
-
-                // Read symbol dictionaries.
-                let sym_dicts: HashMap<usize, nodedb_types::timeseries::SymbolDictionary> = schema
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (_, ty))| *ty == ColumnType::Symbol)
-                    .filter_map(|(i, (name, _))| {
-                        ColumnarSegmentReader::read_symbol_dict(part_dir, name, None)
-                            .ok()
-                            .map(|dict| (i, dict))
-                    })
-                    .collect();
-
                 // Determine row count from the timestamp column.
-                let ts_col = col_data.get(schema.timestamp_idx).and_then(|d| d.as_ref());
-                let row_count = match ts_col {
+                let row_count = match col_data.get(schema.timestamp_idx).and_then(|d| d.as_ref()) {
                     Some(col) => col.len(),
-                    None => continue,
+                    None => {
+                        return self.response_error(
+                            task,
+                            partition_corrupt(
+                                part_dir,
+                                "schema",
+                                SITE,
+                                format!(
+                                    "time column index {} is outside its schema",
+                                    schema.timestamp_idx
+                                ),
+                            ),
+                        );
+                    }
                 };
 
                 let first_row_in_part = if *part_id == start_segment as usize {
@@ -209,21 +204,25 @@ impl CoreLoop {
                     0
                 };
 
+                let partition = PartitionCells {
+                    part_dir,
+                    schema_columns: &schema.columns,
+                    col_data: &col_data,
+                    sym_dicts: &sym_dicts,
+                };
                 for row_idx in first_row_in_part..row_count {
                     // `system_as_of_ms` filter.
-                    if let (Some(sys_idx), Some(cutoff)) = (ts_system_idx, system_as_of_ms)
-                        && let Some(sys_col) = &col_data[sys_idx]
-                        && ts_partition_value(sys_col, row_idx) > cutoff
-                    {
-                        continue;
+                    if let (Some(sys_idx), Some(cutoff)) = (ts_system_idx, system_as_of_ms) {
+                        let ts_val = match partition.system_time(sys_idx, row_idx) {
+                            Ok(ts) => ts,
+                            Err(e) => return self.response_error(task, e),
+                        };
+                        if ts_val > cutoff {
+                            continue;
+                        }
                     }
 
-                    let value_bytes = match encode_ts_partition_row(
-                        &schema.columns,
-                        &col_data,
-                        &sym_dicts,
-                        row_idx,
-                    ) {
+                    let value_bytes = match partition.encode_row(row_idx) {
                         Ok(b) => b,
                         Err(e) => return self.response_error(task, e),
                     };
@@ -302,35 +301,104 @@ fn encode_ts_memtable_row(
     let mut map: HashMap<String, Value> = HashMap::with_capacity(col_count);
     let schema = mt.schema();
 
-    for (col_idx, (col_name, col_type)) in schema.columns.iter().enumerate() {
-        let col_data = mt.column(col_idx);
-        let val = memtable_col_to_value(col_data, col_type, col_idx, mt, row_idx)
-            .map_err(|e| instant_read_error(col_name, e))?;
-        map.insert(col_name.clone(), val);
+    for (col_idx, (col_name, _)) in schema.columns.iter().enumerate() {
+        let cell = memtable_cell(mt, col_idx, row_idx)?;
+        map.insert(col_name.clone(), cell_to_value(cell, col_name)?);
     }
 
     encode_row_map(map, row_idx)
 }
 
-/// Encode a partition row as msgpack `Value::Object` bytes.
-fn encode_ts_partition_row(
-    schema_columns: &[(String, ColumnType)],
-    col_data: &[Option<ColumnData>],
-    sym_dicts: &HashMap<usize, nodedb_types::timeseries::SymbolDictionary>,
+/// Cell `row_idx` of memtable column `col_idx`. A cell that does not read
+/// as its declared type is an error.
+fn memtable_cell(
+    mt: &crate::engine::timeseries::columnar_memtable::ColumnarMemtable,
+    col_idx: usize,
     row_idx: usize,
-) -> crate::Result<Vec<u8>> {
-    let mut map: HashMap<String, Value> = HashMap::with_capacity(schema_columns.len());
+) -> crate::Result<TsCell<'_>> {
+    let (col_name, col_type) = &mt.schema().columns[col_idx];
+    read_ts_cell(
+        mt.column(col_idx),
+        *col_type,
+        col_name,
+        mt.symbol_dict(col_idx),
+        row_idx,
+    )
+    .map_err(crate::Error::from)
+}
 
-    for (col_i, (col_name, col_type)) in schema_columns.iter().enumerate() {
-        let Some(data) = &col_data[col_i] else {
-            continue;
+/// The system time of memtable row `row_idx`, read from column `sys_idx`.
+fn memtable_system_time(
+    mt: &crate::engine::timeseries::columnar_memtable::ColumnarMemtable,
+    sys_idx: usize,
+    row_idx: usize,
+) -> crate::Result<i64> {
+    let cell = memtable_cell(mt, sys_idx, row_idx)?;
+    system_time(cell).ok_or_else(|| crate::Error::SegmentCorrupted {
+        detail: format!(
+            "timeseries memtable column {} row {row_idx} holds {cell:?}, not a system time",
+            mt.schema().columns[sys_idx].0
+        ),
+    })
+}
+
+/// The decoded columns of one partition, read cell by cell.
+struct PartitionCells<'a> {
+    part_dir: &'a std::path::Path,
+    schema_columns: &'a [(String, ColumnType)],
+    col_data: &'a [Option<ColumnData>],
+    sym_dicts: &'a HashMap<usize, nodedb_types::timeseries::SymbolDictionary>,
+}
+
+impl PartitionCells<'_> {
+    /// Cell `row_idx` of column `col_i`. A column the partition read did not
+    /// decode, and a cell that does not read as its declared type, are
+    /// corruption: each files one report.
+    fn cell(&self, col_i: usize, row_idx: usize) -> crate::Result<TsCell<'_>> {
+        let (col_name, col_type) = &self.schema_columns[col_i];
+        let Some(data) = self.col_data.get(col_i).and_then(Option::as_ref) else {
+            return Err(partition_corrupt(
+                self.part_dir,
+                "column",
+                SITE,
+                format!("column '{col_name}' was not decoded"),
+            ));
         };
-        let val = partition_col_to_value(data, col_type, col_i, sym_dicts, row_idx)
-            .map_err(|e| instant_read_error(col_name, e))?;
-        map.insert(col_name.clone(), val);
+        read_ts_cell(
+            data,
+            *col_type,
+            col_name,
+            self.sym_dicts.get(&col_i),
+            row_idx,
+        )
+        .map_err(|e| partition_corrupt(self.part_dir, "cell", SITE, e))
     }
 
-    encode_row_map(map, row_idx)
+    /// The system time of row `row_idx`, read from column `sys_idx`.
+    fn system_time(&self, sys_idx: usize, row_idx: usize) -> crate::Result<i64> {
+        let cell = self.cell(sys_idx, row_idx)?;
+        system_time(cell).ok_or_else(|| {
+            partition_corrupt(
+                self.part_dir,
+                "cell",
+                SITE,
+                format!(
+                    "column {} row {row_idx} holds {cell:?}, not a system time",
+                    self.schema_columns[sys_idx].0
+                ),
+            )
+        })
+    }
+
+    /// Encode row `row_idx` as msgpack `Value::Object` bytes.
+    fn encode_row(&self, row_idx: usize) -> crate::Result<Vec<u8>> {
+        let mut map: HashMap<String, Value> = HashMap::with_capacity(self.schema_columns.len());
+        for (col_i, (col_name, _)) in self.schema_columns.iter().enumerate() {
+            let cell = self.cell(col_i, row_idx)?;
+            map.insert(col_name.clone(), cell_to_value(cell, col_name)?);
+        }
+        encode_row_map(map, row_idx)
+    }
 }
 
 /// Serialize one row map to msgpack bytes.
@@ -352,91 +420,24 @@ fn instant_read_error(column: &str, e: nodedb_types::NdbDateTimeError) -> crate:
 // Column-to-Value converters
 // ---------------------------------------------------------------------------
 
-/// Convert a memtable column entry to `nodedb_types::Value`.
-fn memtable_col_to_value(
-    col_data: &ColumnData,
-    col_type: &ColumnType,
-    col_idx: usize,
-    mt: &crate::engine::timeseries::columnar_memtable::ColumnarMemtable,
-    row_idx: usize,
-) -> Result<Value, nodedb_types::NdbDateTimeError> {
-    let value = match col_type {
-        ColumnType::Timestamp(kind) => {
-            return kind.cell_value(col_data.as_timestamps()[row_idx]);
-        }
-        ColumnType::Float64 => {
-            let v = col_data.as_f64()[row_idx];
-            if v.is_nan() {
-                Value::Null
-            } else {
-                Value::Float(v)
-            }
-        }
-        ColumnType::Int64 => Value::Integer(col_data.as_i64()[row_idx]),
-        ColumnType::Symbol => {
-            let sym_id = col_data.as_symbols()[row_idx];
-            mt.symbol_dict(col_idx)
-                .and_then(|d| d.get(sym_id))
-                .map(|s| Value::String(s.to_string()))
-                .unwrap_or(Value::Null)
-        }
-    };
-    Ok(value)
+/// The `Value` a timeseries cell of column `column` emits.
+fn cell_to_value(cell: TsCell<'_>, column: &str) -> crate::Result<Value> {
+    Ok(match cell {
+        TsCell::Null => Value::Null,
+        TsCell::Time(kind, millis) => kind
+            .cell_value(millis)
+            .map_err(|e| instant_read_error(column, e))?,
+        TsCell::Float(f) => Value::Float(f),
+        TsCell::Int(n) => Value::Integer(n),
+        TsCell::Symbol(s) => Value::String(s.to_string()),
+    })
 }
 
-/// Convert a partition column entry to `nodedb_types::Value`.
-fn partition_col_to_value(
-    data: &ColumnData,
-    col_type: &ColumnType,
-    col_i: usize,
-    sym_dicts: &HashMap<usize, nodedb_types::timeseries::SymbolDictionary>,
-    row_idx: usize,
-) -> Result<Value, nodedb_types::NdbDateTimeError> {
-    let value = match col_type {
-        ColumnType::Timestamp(kind) => {
-            return kind.cell_value(data.as_timestamps()[row_idx]);
-        }
-        ColumnType::Float64 => {
-            let v = data.as_f64()[row_idx];
-            if v.is_nan() {
-                Value::Null
-            } else {
-                Value::Float(v)
-            }
-        }
-        ColumnType::Int64 => {
-            if let ColumnData::Int64(vals) = data {
-                Value::Integer(vals[row_idx])
-            } else {
-                Value::Null
-            }
-        }
-        ColumnType::Symbol => {
-            if let ColumnData::Symbol(ids) = data {
-                sym_dicts
-                    .get(&col_i)
-                    .and_then(|dict| dict.get(ids[row_idx]))
-                    .map(|s| Value::String(s.to_string()))
-                    .unwrap_or(Value::Null)
-            } else {
-                Value::Null
-            }
-        }
-    };
-    Ok(value)
-}
-
-/// Extract a timestamp value from a column (for `_ts_system` filtering).
-fn ts_memtable_value(col_data: &ColumnData, row_idx: usize) -> i64 {
-    match col_data {
-        ColumnData::Timestamp(v) | ColumnData::Int64(v) => v.get(row_idx).copied().unwrap_or(0),
-        _ => 0,
-    }
-}
-
-fn ts_partition_value(col_data: &ColumnData, row_idx: usize) -> i64 {
-    match col_data {
-        ColumnData::Timestamp(v) | ColumnData::Int64(v) => v.get(row_idx).copied().unwrap_or(0),
-        _ => 0,
+/// The millisecond system time a `_ts_system` cell holds. `None` for any
+/// cell other than a time or an integer.
+fn system_time(cell: TsCell<'_>) -> Option<i64> {
+    match cell {
+        TsCell::Time(_, millis) | TsCell::Int(millis) => Some(millis),
+        TsCell::Null | TsCell::Float(_) | TsCell::Symbol(_) => None,
     }
 }

@@ -10,6 +10,7 @@
 
 use tracing::error;
 
+use super::UndoError;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::engine::graph::edge_store::{EdgeRef, EdgeVersionWrite};
 use crate::types::{DatabaseId, TenantId};
@@ -105,11 +106,11 @@ impl CoreLoop {
     }
 
     /// Reverse one edge write.
-    pub(super) fn apply_undo_edge_write(
+    pub(in crate::data::executor) fn apply_undo_edge_write(
         &mut self,
         entry_index: usize,
         undo: EdgeWriteUndo,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         let EdgeWriteUndo {
             database_id,
             tid,
@@ -121,14 +122,15 @@ impl CoreLoop {
             csr,
         } = undo;
         let core = self.core_id;
-        let fail = |detail: String| {
+        let fail = |action: String, cause: crate::Error| {
+            let err = UndoError::failed(entry_index, action, cause);
             error!(
                 core,
                 entry_index,
-                error = %detail,
+                error = %err,
                 "transaction undo: edge rollback failed; shard state unknown"
             );
-            (entry_index, detail)
+            err
         };
         let edge_name = format!("{collection} {src_id}-[{label}]->{dst_id}");
         let database = DatabaseId::new(database_id);
@@ -139,19 +141,19 @@ impl CoreLoop {
                 EdgeRef::new(database, tenant, &collection, &src_id, &label, &dst_id),
                 &version,
             )
-            .map_err(|e| fail(format!("removing the version of {edge_name}: {e}")))?;
+            .map_err(|e| fail(format!("removing the version of {edge_name}"), e))?;
 
         let partition = self.csr_partition_mut(database_id, tid);
         partition
             .restore_edge_in_collection(&src_id, &label, &dst_id, &collection, csr.weight)
-            .map_err(|e| fail(format!("restoring the CSR edge {edge_name}: {e}")))?;
+            .map_err(|e| fail(format!("restoring the CSR edge {edge_name}"), e.into()))?;
         for (node, prior) in &csr.surrogates {
             partition.restore_node_surrogate(node, *prior);
         }
         for node in csr.created_nodes.iter().rev() {
             partition
                 .withdraw_newest_node(node)
-                .map_err(|e| fail(format!("withdrawing node '{node}': {e}")))?;
+                .map_err(|e| fail(format!("withdrawing node '{node}'"), e.into()))?;
         }
         Ok(())
     }
@@ -303,7 +305,7 @@ mod tests {
         assert_eq!(resolve(&core, "alice", "bob", 250), Some(weighted(2.5)));
         assert_eq!(
             core.csr_partition(DB, TID)
-                .map(|p| p.neighbors("alice", None, Direction::Out)),
+                .map(|p| p.neighbors("alice", &[], Direction::Out)),
             Some(vec![("KNOWS".to_string(), "bob".to_string())])
         );
     }

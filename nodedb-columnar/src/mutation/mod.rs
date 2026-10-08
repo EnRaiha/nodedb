@@ -7,12 +7,14 @@
 //! columnar write operations. It produces WAL records that must be
 //! persisted before the mutation is considered durable.
 
+pub mod batch;
 pub mod engine;
 pub mod flush;
 pub mod snapshot;
 pub mod truncate;
 pub mod write;
 
+pub use batch::{BatchConflict, BatchRow};
 pub use engine::{MutationEngine, MutationResult};
 pub use snapshot::{ColumnDataSnapshot, ColumnarEngineSnapshot};
 pub use truncate::TruncatedRows;

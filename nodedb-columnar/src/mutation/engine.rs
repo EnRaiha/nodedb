@@ -168,7 +168,10 @@ impl MutationEngine {
     ///
     /// Skips rows marked as deleted in the memtable's virtual segment
     /// delete bitmap. For rows in flushed segments, use `SegmentReader`.
-    pub fn scan_memtable_rows(&self) -> impl Iterator<Item = Vec<Value>> + '_ {
+    /// Yields `Err` for a live row with a corrupt cell.
+    pub fn scan_memtable_rows(
+        &self,
+    ) -> impl Iterator<Item = Result<Vec<Value>, ColumnarError>> + '_ {
         let deletes = self.delete_bitmaps.get(&self.memtable_segment_id);
         self.memtable
             .iter_rows()
@@ -177,7 +180,7 @@ impl MutationEngine {
                 if deletes.is_some_and(|bm| bm.is_deleted(row_idx as u32)) {
                     None
                 } else {
-                    Some(row)
+                    Some(row.map_err(|e| self.memtable_read_fault(e)))
                 }
             })
     }
@@ -187,9 +190,10 @@ impl MutationEngine {
     /// Yields `(Option<Surrogate>, Vec<Value>)`. The surrogate is `None`
     /// for rows inserted without one (test fixtures, legacy paths). Deleted
     /// rows are filtered out exactly as in [`Self::scan_memtable_rows`].
+    /// Yields `Err` for a live row with a corrupt cell.
     pub fn scan_memtable_rows_with_surrogates(
         &self,
-    ) -> impl Iterator<Item = (Option<Surrogate>, Vec<Value>)> + '_ {
+    ) -> impl Iterator<Item = Result<(Option<Surrogate>, Vec<Value>), ColumnarError>> + '_ {
         let deletes = self.delete_bitmaps.get(&self.memtable_segment_id);
         let surrogates = &self.memtable_surrogates;
         self.memtable
@@ -200,20 +204,37 @@ impl MutationEngine {
                     return None;
                 }
                 let surrogate = surrogates.get(row_idx).copied().flatten();
-                Some((surrogate, row))
+                Some(
+                    row.map(|row| (surrogate, row))
+                        .map_err(|e| self.memtable_read_fault(e)),
+                )
             })
     }
 
-    /// Get a single row from the memtable by index (None if deleted).
-    pub fn get_memtable_row(&self, row_idx: usize) -> Option<Vec<Value>> {
+    /// Get a single row from the memtable by index.
+    ///
+    /// `Ok(None)` if the row is deleted or past the end. `Err` if a cell of
+    /// the row is corrupt.
+    pub fn get_memtable_row(&self, row_idx: usize) -> Result<Option<Vec<Value>>, ColumnarError> {
         if self
             .delete_bitmaps
             .get(&self.memtable_segment_id)
             .is_some_and(|bm| bm.is_deleted(row_idx as u32))
         {
-            return None;
+            return Ok(None);
         }
-        self.memtable.get_row(row_idx)
+        self.memtable
+            .get_row(row_idx)
+            .map_err(|e| self.memtable_read_fault(e))
+    }
+
+    /// Record a corrupt memtable cell and hand the error back.
+    ///
+    /// Every memtable row read of this engine routes its error through here,
+    /// so the corruption is reported once, where it is detected.
+    pub(super) fn memtable_read_fault(&self, err: ColumnarError) -> ColumnarError {
+        crate::diag::memtable_cell_corrupt(&err, &self.collection);
+        err
     }
 
     /// Roll back in-memory inserts to `row_count_before`.
@@ -245,9 +266,22 @@ impl MutationEngine {
             }
         }
         // 3. Truncate memtable and surrogate list.
-        self.memtable.truncate_to(row_count_before);
-        self.memtable_surrogates.truncate(row_count_before);
-        self.memtable_row_counter = row_count_before as u32;
+        self.cut_memtable_to(row_count_before);
+    }
+
+    /// Cut the memtable, its surrogate table and its row counter back to
+    /// `row_count` rows.
+    ///
+    /// A cut row can carry a tombstone: a later row of the same write
+    /// replaced it. Those tombstones are cleared too, so a row appended
+    /// later at that index starts live.
+    pub(super) fn cut_memtable_to(&mut self, row_count: usize) {
+        if let Some(bm) = self.delete_bitmaps.get_mut(&self.memtable_segment_id) {
+            bm.unmark_from(row_count as u32);
+        }
+        self.memtable.truncate_to(row_count);
+        self.memtable_surrogates.truncate(row_count);
+        self.memtable_row_counter = row_count as u32;
     }
 
     /// Reverse one or more positional deletes: for each `(pk_bytes, location)`
@@ -562,6 +596,7 @@ mod tests {
         // Row-boundary: count rows that pass the bitmap membership check.
         let passing: Vec<_> = engine
             .scan_memtable_rows_with_surrogates()
+            .map(|r| r.expect("read"))
             .filter(|(sur, _)| sur.is_some_and(|s| bitmap.contains(s)))
             .collect();
         assert_eq!(passing.len(), 2);
@@ -635,7 +670,7 @@ mod tests {
             .expect("update");
         let live: Vec<Option<Surrogate>> = engine
             .scan_memtable_rows_with_surrogates()
-            .map(|(surrogate, _)| surrogate)
+            .map(|r| r.expect("read").0)
             .collect();
         assert_eq!(
             live,
@@ -665,7 +700,7 @@ mod tests {
             .expect("update");
         let live: Vec<Option<Surrogate>> = engine
             .scan_memtable_rows_with_surrogates()
-            .map(|(surrogate, _)| surrogate)
+            .map(|r| r.expect("read").0)
             .collect();
         assert_eq!(
             live,

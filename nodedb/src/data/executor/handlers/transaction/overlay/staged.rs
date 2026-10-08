@@ -343,8 +343,8 @@ impl TxnOverlay {
     }
 
     /// Current length of the overlay undo journal — the savepoint marker a
-    /// later `rollback_to` rewinds toward. Returned to the Control Plane by
-    /// `MetaOp::MarkSavepoint`.
+    /// later `rollback_to` rewinds toward. `MetaOp::MarkSavepoint` records it
+    /// on the core.
     pub fn journal_len(&self) -> usize {
         self.journal.len()
     }

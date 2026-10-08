@@ -33,6 +33,8 @@ fn push_describe_row(
 }
 
 /// DESCRIBE <collection> — show fields, types, and schema info.
+///
+/// Columns: `field`, `type`, `nullable` (text) and `primary_key` (bool).
 pub fn describe_collection(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -63,6 +65,7 @@ pub fn describe_collection(
         "field".to_string(),
         "type".to_string(),
         "nullable".to_string(),
+        "primary_key".to_string(),
     ];
     let mut rows = Vec::new();
 
@@ -125,7 +128,7 @@ pub fn describe_collection(
             push_describe_row(
                 &mut rows,
                 "__kv_key",
-                &format!("{} ({})", pk.name, pk.column_type),
+                &format!("{} ({})", pk.name, pk.declared_type_name()),
                 "false",
             );
         }
@@ -143,7 +146,38 @@ pub fn describe_collection(
         }
     }
 
-    Ok(vec![DdlResult::Rows(ShapedRows::text_rows(columns, rows))])
+    mark_primary_key(&mut rows, &coll);
+    Ok(vec![DdlResult::Rows(ShapedRows::from_json_rows(
+        columns,
+        vec![
+            DdlColType::Text,
+            DdlColType::Text,
+            DdlColType::Text,
+            DdlColType::Bool,
+        ],
+        rows,
+    ))])
+}
+
+/// Set each row's `primary_key` cell: whether the row's field is the
+/// collection's key column.
+///
+/// The key column is the one the SQL planner keys the collection by. A
+/// schemaless collection's key is its declared primary key, else `id`. A
+/// client reads it here to name the key in the SQL it generates.
+fn mark_primary_key(
+    rows: &mut [Map<String, JsonValue>],
+    coll: &crate::control::security::catalog::StoredCollection,
+) {
+    let (_, _, primary_key) =
+        crate::control::planner::catalog_adapter::convert_collection_type(coll);
+    for row in rows.iter_mut() {
+        let is_key = match (row.get("field"), primary_key.as_deref()) {
+            (Some(JsonValue::String(field)), Some(key)) => field.eq_ignore_ascii_case(key),
+            _ => false,
+        };
+        row.insert("primary_key".to_string(), JsonValue::Bool(is_key));
+    }
 }
 
 /// SHOW COLLECTIONS

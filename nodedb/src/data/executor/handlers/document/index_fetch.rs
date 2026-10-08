@@ -122,12 +122,7 @@ impl CoreLoop {
                     ),
                 }
             }
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -181,12 +176,7 @@ impl CoreLoop {
             match doc_engine.index_lookup(collection, path, value, bitemporal) {
                 Ok(ids) => ids,
                 Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("indexed fetch: {e}"),
-                        },
-                    );
+                    return self.response_error(task, ErrorCode::from(e));
                 }
             };
 
@@ -264,6 +254,7 @@ impl CoreLoop {
             }
         }
 
+        let identity_column = self.identity_column(database_id, tid, collection);
         let mut rows: Vec<(String, Vec<u8>)> = Vec::new();
         for doc_id in doc_ids.iter().skip(offset).take(limit) {
             // Bitemporal collections keep the current body on the versioned
@@ -295,6 +286,7 @@ impl CoreLoop {
                             &residual,
                             doc_id,
                             &bytes,
+                            &identity_column,
                         )
                     } {
                         Ok(true) => {}
@@ -320,24 +312,14 @@ impl CoreLoop {
                     // fail. A future compaction will purge the orphan.
                 }
                 Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("fetch doc {doc_id}: {e}"),
-                        },
-                    );
+                    return self.response_error(task, ErrorCode::from(e));
                 }
             }
         }
 
         match super::super::super::response_codec::encode_raw_document_rows(&rows) {
             Ok(bytes) => self.response_with_payload(task, bytes),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: format!("indexed fetch encode: {e}"),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }

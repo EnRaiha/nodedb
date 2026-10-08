@@ -9,6 +9,7 @@
 pub mod bitemporal;
 pub mod convert;
 pub mod filter;
+pub mod flushed_segment;
 pub mod materialize_scan;
 pub mod materialize_scan_ts;
 pub mod scan;

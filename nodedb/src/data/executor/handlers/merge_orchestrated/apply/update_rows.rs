@@ -79,6 +79,7 @@ impl CoreLoop {
             balanced_entries,
             returned_docs,
         } = tally;
+        let identity_column = self.identity_column(database_id, tid, collection);
 
         for upd in updates {
             let surrogate = upd.key.surrogate();
@@ -95,13 +96,7 @@ impl CoreLoop {
             if has_vectors {
                 for d in self.remove_document_vector_indexes(database_id, tid, collection, upd.key)
                 {
-                    undo_log.push(UndoEntry::DeleteVector {
-                        index_key: d.index_key,
-                        vector_id: d.vector_id,
-                        collection: d.collection,
-                        field: d.field,
-                        doc_id: Some(d.doc_id),
-                    });
+                    undo_log.push(d.into_delete_undo());
                 }
             }
             match self.apply_point_put(
@@ -170,7 +165,7 @@ impl CoreLoop {
                         outcome.bitemporal_sys_from_ms,
                     ));
                     if returning {
-                        match returning_doc(&upd.body, &upd.key) {
+                        match returning_doc(&upd.body, &upd.key, &identity_column) {
                             Ok(doc) => returned_docs.push(doc),
                             Err(e) => {
                                 return Err(self.abort_merge_apply(MergeAbort {

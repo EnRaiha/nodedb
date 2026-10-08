@@ -198,7 +198,12 @@ async fn flush_ilp_batch_inner(
     let scope =
         ClientRequestScope::for_database(identity, state.auth_stores(), database_id, peer_addr)
             .into_resolved_scope();
-    crate::control::planner::rls_injection::inject_rls(&mut tasks, &state.rls, scope.auth())?;
+    crate::control::planner::rls_injection::inject_rls(
+        &mut tasks,
+        &state.rls,
+        state.credentials.catalog(),
+        scope.auth(),
+    )?;
 
     // A spent hard quota refuses the batch before any of it is staged. The
     // charge below runs once the atomic Calvin write has committed, so it can

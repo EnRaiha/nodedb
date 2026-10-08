@@ -94,12 +94,7 @@ impl CoreLoop {
 
         match response_codec::encode_count("deleted", count) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -114,12 +109,7 @@ impl CoreLoop {
         let count = self.kv_engine.truncate(did, tid, collection);
         match response_codec::encode_count("deleted", count) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }

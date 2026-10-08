@@ -86,10 +86,11 @@ impl CoreLoop {
     /// Convert to strict mode: re-encode each document as a Binary Tuple.
     ///
     /// The sparse engine keys a minted row by its storage key, not its
-    /// client-visible `id`. A `SELECT` synthesizes `id` at read time; this
-    /// re-encode must do the same before validating and encoding, or a row
-    /// with no declared primary key loses its identity and the target
-    /// schema's NOT NULL `id` column rejects it.
+    /// client-visible identity. A `SELECT` synthesizes the identity under the
+    /// identity column at read time; this re-encode does the same under the
+    /// target schema's key column before validating and encoding, or a row
+    /// that lacks its key loses its identity and the target schema's NOT NULL
+    /// key column rejects it. A row that holds its key gains no `id`.
     fn convert_to_strict(
         &mut self,
         task: &ExecutionTask,
@@ -131,6 +132,8 @@ impl CoreLoop {
             .iter()
             .find(|c| c.primary_key)
             .map(|c| c.name.as_str());
+        let identity_column = nodedb_types::declared_key(declared_primary_key)
+            .unwrap_or(nodedb_types::DEFAULT_IDENTITY_COLUMN);
 
         // Scan all existing documents.
         let database_id = task.request.database_id.as_u64();
@@ -140,12 +143,7 @@ impl CoreLoop {
         {
             Ok(d) => d,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("scan failed: {e}"),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
 
@@ -153,11 +151,12 @@ impl CoreLoop {
 
         for (doc_id, doc_bytes) in &docs {
             let normalized = sparse_body_to_msgpack(doc_bytes, source_format.as_format_ref());
-            // A row with no declared primary key has no client-visible identity
-            // yet: inject the surrogate's decimal string as `id` so the target
-            // schema's NOT NULL primary key column has something to validate.
+            // A row that lacks the target's key column has no client-visible
+            // identity yet: inject the surrogate's decimal string there so the
+            // target schema's NOT NULL key column has something to validate.
             let synth_id = doc_id.to_identity();
-            let with_id = msgpack_scan::inject_str_field(&normalized, "id", synth_id.as_str());
+            let with_id =
+                msgpack_scan::inject_str_field(&normalized, identity_column, synth_id.as_str());
             // The identity a user recognizes: the declared primary key's value,
             // or `id`, read from the row itself — never the internal surrogate.
             let identity = RowIdentity::of_stored_row(&normalized, declared_primary_key, *doc_id);
@@ -199,15 +198,7 @@ impl CoreLoop {
                     collection,
                     identity.as_str(),
                 );
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!(
-                            "collection '{collection}': row '{identity}' converted to a tuple \
-                             that does not decode: {e}"
-                        ),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             };
             if let Err(e) = self.put_converted_row(
                 ConvertedRow {
@@ -219,14 +210,7 @@ impl CoreLoop {
                 &tuple_bytes,
                 &stored_msgpack,
             ) {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!(
-                            "collection '{collection}': row '{identity}' failed to write converted document_strict body: {e}"
-                        ),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
             // Write-through: a point-get after this statement must see the
             // re-encoded bytes, not a stale cache entry from before the
@@ -245,12 +229,7 @@ impl CoreLoop {
         });
         match response_codec::encode_json_as_msgpack(&result) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -275,22 +254,12 @@ impl CoreLoop {
         {
             Ok(d) => d,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("scan failed: {e}"),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
 
         let converted = match source_format {
             SparseBodyFormat::Strict(schema) => {
-                let declared_primary_key = schema
-                    .columns
-                    .iter()
-                    .find(|c| c.primary_key)
-                    .map(|c| c.name.as_str());
                 let mut converted = 0u64;
                 for (doc_id, doc_bytes) in &docs {
                     // Before decode, the row's own identity is unreadable —
@@ -304,19 +273,8 @@ impl CoreLoop {
                             collection,
                             undecoded_identity.as_str(),
                         );
-                        return self.response_error(
-                            task,
-                            ErrorCode::Internal {
-                                detail: format!(
-                                    "collection '{collection}': row '{undecoded_identity}' failed to convert to {target_type}: {e}"
-                                ),
-                            },
-                        );
+                        return self.response_error(task, ErrorCode::from(e));
                     };
-                    // The identity a user recognizes: the declared primary
-                    // key's value, or `id`, read from the decoded row.
-                    let identity = RowIdentity::of_stored_row(&mp, declared_primary_key, *doc_id);
-
                     if let Err(e) = self.put_converted_row(
                         ConvertedRow {
                             database_id,
@@ -327,14 +285,7 @@ impl CoreLoop {
                         &mp,
                         &mp,
                     ) {
-                        return self.response_error(
-                            task,
-                            ErrorCode::Internal {
-                                detail: format!(
-                                    "collection '{collection}': row '{identity}' failed to write converted {target_type} body: {e}"
-                                ),
-                            },
-                        );
+                        return self.response_error(task, ErrorCode::from(e));
                     }
                     // Write-through: a point-get after this statement must see
                     // the re-encoded bytes, not a stale cache entry from before
@@ -355,12 +306,7 @@ impl CoreLoop {
         });
         match response_codec::encode_json_as_msgpack(&result) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }

@@ -22,7 +22,7 @@ pub(super) fn source_projection(plan: &SqlPlan) -> Vec<Projection> {
     match plan {
         SqlPlan::Scan { projection, .. }
         | SqlPlan::Join { projection, .. }
-        | SqlPlan::TextSearch { projection, .. } => projection.clone(),
+        | SqlPlan::TextSearch(TextSearchPlan { projection, .. }) => projection.clone(),
         _ => Vec::new(),
     }
 }

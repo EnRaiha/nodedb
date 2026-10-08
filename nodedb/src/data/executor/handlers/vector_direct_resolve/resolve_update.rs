@@ -91,7 +91,9 @@ impl CoreLoop {
                     .zip(planned.iter())
                     .map(|(key, row)| (key, row.sidecar.as_slice()))
                     .collect();
-                vector_stored_rows_payload(spec, rls_filters, &stored).map_err(ErrorCode::from)?
+                let identity_column = self.identity_column(database_id, tid, collection);
+                vector_stored_rows_payload(spec, rls_filters, &identity_column, &stored)
+                    .map_err(ErrorCode::from)?
             }
             None => response_codec::encode_affected(planned.len() as u64),
         };

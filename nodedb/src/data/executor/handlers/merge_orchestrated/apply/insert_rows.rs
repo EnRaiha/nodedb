@@ -83,6 +83,7 @@ impl CoreLoop {
             balanced_entries,
             returned_docs,
         } = tally;
+        let identity_column = self.identity_column(database_id, tid, collection);
 
         // Every NOT-MATCHED INSERT row of a HASH_CHAIN target is a chain link.
         // The head advances in the shared transaction, and the pre-image goes
@@ -205,7 +206,7 @@ impl CoreLoop {
                         outcome.bitemporal_sys_from_ms,
                     ));
                     if returning {
-                        match returning_doc(&ins.body, &storage_key) {
+                        match returning_doc(&ins.body, &storage_key, &identity_column) {
                             Ok(doc) => returned_docs.push(doc),
                             Err(e) => {
                                 return Err(self.abort_merge_apply(MergeAbort {

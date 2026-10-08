@@ -47,6 +47,7 @@ pub mod lsn;
 pub mod mirror;
 pub mod multi_vector;
 pub mod namespace;
+pub mod numeric_cmp;
 pub mod path_component;
 pub mod pg_compat;
 pub mod protocol;
@@ -122,7 +123,7 @@ pub use result::{QueryResult, SearchResult, SubGraph};
 pub use rls_write_check::{RlsWriteCheck, WriteGateDecision};
 pub use row_identity::{
     DEFAULT_IDENTITY_COLUMN, HEADLESS_SENTINEL_PREFIX, ROWID_COLUMN, RowIdentity, StorageKey,
-    extract_pk_value, value_to_pk_string,
+    declared_key, extract_pk_value, value_to_pk_string,
 };
 pub use sparse_vector::{SparseVector, SparseVectorError};
 pub use sql_quote::{quote_ident, quote_literal};
@@ -137,7 +138,7 @@ pub use temporal::{
     MAX_POSITIONS_PER_EPOCH, NANOS_PER_MS, OPEN_UPPER, OrdinalClock, SystemTimeScope,
     ValidTimePredicate, calvin_txn_ordinal, ms_to_ordinal_upper, ordinal_to_ms,
 };
-pub use text_search::{Bm25Params, QueryMode, TextSearchParams};
+pub use text_search::{Bm25Params, QueryMode, TextColumnFault, TextSearchParams};
 pub use trace::{SpanId, TraceId};
 pub use typeguard::TypeGuardFieldDef;
 pub use value::{NotScalar, Value, scalar_to_raw_bytes};

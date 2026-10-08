@@ -6,6 +6,8 @@
 //! `SELECT TRANSFER(collection, source_key, dest_key, field, amount)`
 //!   — Atomically: source.field -= amount, dest.field += amount.
 //!   — Fails with INSUFFICIENT_BALANCE if source.field < amount.
+//!   — A `DECIMAL` field takes an exact INT or DECIMAL amount and moves by
+//!     exact decimal arithmetic. Every other field moves by float arithmetic.
 //!   — Returns: `{ source_key, dest_key, field, amount, source_balance, dest_balance }`.
 //!
 //! `SELECT TRANSFER_ITEM(source_collection, dest_collection, item_id, source_owner, dest_owner)`
@@ -20,7 +22,8 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
-use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
+use nodedb_physical::physical_plan::{KvOp, PhysicalPlan, TransferAmount};
+use rust_decimal::Decimal;
 
 use super::super::result::{DdlError, DdlResult};
 use super::kv_atomic::{dispatch_and_respond, parse_function_args, unquote};
@@ -46,15 +49,9 @@ pub async fn transfer(
     let source_key = unquote(&args[1]);
     let dest_key = unquote(&args[2]);
     let field = unquote(&args[3]);
-    let amount_str = args[4].trim().to_string();
-    let amount: f64 = amount_str.parse().map_err(|_| {
-        ddl_err(
-            "42601",
-            format!("TRANSFER: amount must be a number, got '{amount_str}'"),
-        )
-    })?;
-
-    if amount <= 0.0 {
+    let decimal_field = transfer_field_is_decimal(state, identity, &collection, &field)?;
+    let amount = parse_amount(args[4].trim(), &field, decimal_field)?;
+    if !amount.is_positive() {
         return Err(ddl_err("42601", "TRANSFER: amount must be positive"));
     }
 
@@ -204,6 +201,113 @@ pub async fn transfer_item(
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
+/// Whether the catalog declares `field` of `collection` as `DECIMAL`.
+///
+/// The caller's grants are checked first, the pair `dispatch_and_respond`
+/// checks: a caller refused the collection learns nothing of its columns.
+fn transfer_field_is_decimal(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    collection: &str,
+    field: &str,
+) -> Result<bool, DdlError> {
+    let gate =
+        super::read_gate::CollectionReadGate::for_request(state, identity, DatabaseId::DEFAULT);
+    gate.authorize(collection)?;
+    gate.authorize_permission(
+        collection,
+        crate::control::security::identity::Permission::Write,
+    )?;
+    crate::control::planner::sql_plan_convert::kv_transfer_field::kv_transfer_field_is_decimal(
+        state,
+        identity.tenant_id,
+        DatabaseId::DEFAULT,
+        collection,
+        field,
+    )
+    .map_err(|error| DdlError::from_error(&error))
+}
+
+/// The `TRANSFER` amount literal, typed by the field it moves.
+///
+/// A `DECIMAL` field takes an exact INT or DECIMAL literal. A number no
+/// `Decimal` holds is out of range for it (`22003`). Every other field takes
+/// a finite float. Text that is no number is refused with `42601`.
+fn parse_amount(text: &str, field: &str, decimal_field: bool) -> Result<TransferAmount, DdlError> {
+    let not_a_number = || {
+        ddl_err(
+            "42601",
+            format!("TRANSFER: amount must be a number, got '{text}'"),
+        )
+    };
+    let float = text
+        .parse::<f64>()
+        .ok()
+        .filter(|f| f.is_finite())
+        .ok_or_else(not_a_number)?;
+    if !decimal_field {
+        return Ok(TransferAmount::Float(float));
+    }
+    let exact = Decimal::from_str_exact(text)
+        .or_else(|_| Decimal::from_scientific(text))
+        .map_err(|_| {
+            ddl_err(
+                "22003",
+                format!("TRANSFER: amount {text} is out of range for DECIMAL field '{field}'"),
+            )
+        })?;
+    Ok(TransferAmount::Decimal(exact))
+}
+
 fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dec(text: &str) -> Decimal {
+        text.parse().expect("test decimal parses")
+    }
+
+    #[test]
+    fn a_decimal_field_takes_an_exact_amount() {
+        for (text, expected) in [
+            ("30", "30"),
+            ("0.1", "0.1"),
+            ("12.345", "12.345"),
+            ("1.5e2", "150"),
+        ] {
+            assert_eq!(
+                parse_amount(text, "balance", true).expect(text),
+                TransferAmount::Decimal(dec(expected)),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_decimal_field_refuses_an_amount_no_decimal_holds() {
+        let err = parse_amount("1e40", "balance", true).expect_err("past the Decimal range");
+        assert_eq!(err.sqlstate, "22003");
+    }
+
+    #[test]
+    fn other_fields_take_a_float_amount() {
+        assert_eq!(
+            parse_amount("2.5", "balance", false).expect("float"),
+            TransferAmount::Float(2.5)
+        );
+    }
+
+    #[test]
+    fn text_that_is_no_finite_number_is_refused() {
+        for text in ["abc", "NaN", "inf", ""] {
+            for decimal_field in [true, false] {
+                let err = parse_amount(text, "balance", decimal_field).expect_err(text);
+                assert_eq!(err.sqlstate, "42601", "{text}");
+            }
+        }
+    }
 }

@@ -214,4 +214,22 @@ impl ColumnData {
             Self::DictEncoded { ids, .. } => ids.len(),
         }
     }
+
+    /// Name of the storage kind, for type-mismatch errors.
+    pub(crate) fn type_name(&self) -> &'static str {
+        match self {
+            Self::Int64 { .. } => "Int64",
+            Self::Float64 { .. } => "Float64",
+            Self::Bool { .. } => "Bool",
+            Self::Timestamp { .. } => "Timestamp",
+            Self::Decimal { .. } => "Decimal",
+            Self::Uuid { .. } => "Uuid",
+            Self::String { .. } => "String",
+            Self::Bytes { .. } => "Bytes",
+            Self::Json { .. } => "Json",
+            Self::Geometry { .. } => "Geometry",
+            Self::Vector { .. } => "Vector",
+            Self::DictEncoded { .. } => "DictEncoded",
+        }
+    }
 }

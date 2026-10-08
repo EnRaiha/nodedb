@@ -173,13 +173,13 @@ pub enum ColumnarOp {
     /// Update rows matching filter predicates.
     ///
     /// Uses `MutationEngine` for plain/spatial profiles.
-    /// `updates` is a list of (field_name, json_value_bytes) pairs.
     Update {
         collection: QualifiedCollection,
         /// Serialized `Vec<ScanFilter>` (MessagePack).
         filters: Vec<u8>,
-        /// Field assignments: `(column_name, json_value_bytes)`.
-        updates: Vec<(String, Vec<u8>)>,
+        /// Field assignments: `(column_name, value)`. An `Expr` value
+        /// evaluates against each matched row's pre-image.
+        updates: Vec<(String, super::document::UpdateValue)>,
         /// Compiled row-level-security WRITE predicate, evaluated against each
         /// row's post-image once the assignments have been applied, or the
         /// reason no predicate is attached.
@@ -240,7 +240,7 @@ pub enum ColumnarOp {
         /// Serialized `Vec<ScanFilter>` — the statement's WHERE clause.
         filters: Vec<u8>,
         /// Field assignments for an UPDATE. Empty for a DELETE.
-        updates: Vec<(String, Vec<u8>)>,
+        updates: Vec<(String, super::document::UpdateValue)>,
         /// True for UPDATE, false for DELETE.
         is_update: bool,
         rls_write_check: RlsWriteCheck,

@@ -36,9 +36,11 @@ impl CoreLoop {
         let now_ms = current_ms();
         let matched = self.kv_predicate_matches(did, tid, collection, filters, now_ms)?;
 
+        let declared = self.declared_columns_of(did, tid, collection);
         let mut writes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::with_capacity(matched.len());
         for (key, body) in matched {
-            let computed = merge_field_updates(collection, Some(body.as_slice()), updates)?;
+            let computed =
+                merge_field_updates(collection, Some(body.as_slice()), updates, declared)?;
             admit_kv_row(rls_write_check, &computed.new_value, &key, tid, collection)?;
             writes.push((key, body, computed.new_value));
         }

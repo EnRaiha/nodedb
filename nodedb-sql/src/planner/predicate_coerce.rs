@@ -167,10 +167,11 @@ fn is_instant(declared: &SqlDataType) -> bool {
         | SqlDataType::String
         | SqlDataType::Bool
         | SqlDataType::Bytes
-        | SqlDataType::Decimal
+        | SqlDataType::Decimal(_)
         | SqlDataType::Uuid
         | SqlDataType::Vector(_)
         | SqlDataType::Geometry
+        | SqlDataType::Json
         | SqlDataType::Unknown => false,
     }
 }

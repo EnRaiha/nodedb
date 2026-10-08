@@ -3,32 +3,48 @@
 //! Protocol-neutral savepoint orchestration: SAVEPOINT, RELEASE SAVEPOINT,
 //! ROLLBACK TO SAVEPOINT, plus the neutral COMMIT OFFSET parse helper.
 //!
-//! Captures/rewinds the composite overlay undo-journal marker on the
-//! transaction's home vShard (via the injected [`TxnDataPlane`]) and drives the
-//! neutral `SessionStore` savepoint stack. Transports translate the returned
-//! [`SavepointError`] into their own SQLSTATE (`25P01` / `3B001`).
+//! A Data-Plane core holds one set of staging overlays per transaction,
+//! shared by every vShard it hosts. Each savepoint gets a fresh id. The
+//! mark and the rewind go through every staged vShard (via the injected
+//! [`TxnDataPlane`]), and each core records and rewinds its own overlay
+//! positions under that id. The orchestrator also drives the neutral
+//! `SessionStore` savepoint stack. Transports translate the returned
+//! [`SavepointError`] into their own SQLSTATE (`25P01` / `25P02` / `3B001` /
+//! `XX000`).
 
-use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::event::cdc::CdcOffset;
 use crate::types::{TenantId, VShardId};
-use nodedb_physical::physical_plan::{MetaOp, SAVEPOINT_MARKER_BYTES};
+use nodedb_physical::physical_plan::MetaOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::connection::SessionId;
 use super::outcome::TxnDataPlane;
-use super::state::{OverlayMarkers, TransactionState};
+use super::state::TransactionState;
 use super::store::SessionStore;
+
+/// Mints savepoint ids. One counter for the process keeps every id unique
+/// and larger than every id minted before it, so a transaction's later
+/// savepoint always has the larger id.
+static NEXT_OVERLAY_SAVEPOINT: AtomicU64 = AtomicU64::new(1);
 
 /// Typed savepoint failure. Adapters map each variant to its SQLSTATE.
 #[derive(Debug)]
 pub enum SavepointError {
     /// A savepoint command was issued outside a transaction block. → `25P01`.
     NoActiveTransaction,
+    /// SAVEPOINT or RELEASE ran in an aborted transaction block. Only
+    /// ROLLBACK or ROLLBACK TO SAVEPOINT leave that state. → `25P02`.
+    TransactionAborted,
     /// The named savepoint does not exist (or there is no active session).
     /// `message` is the exact human message. → `3B001`.
     NotFound { message: String },
+    /// The overlay mark or rewind on a staged vShard failed. The block is
+    /// aborted: its staged state no longer matches the savepoint stack.
+    /// → `XX000`.
+    OverlayDispatch { message: String },
 }
 
 /// Reject a savepoint command issued outside a transaction block.
@@ -42,14 +58,27 @@ fn require_active_txn(
     Ok(())
 }
 
-/// Dispatch a savepoint overlay meta-op to a specific vShard's core and return
-/// the raw response payload bytes, or `None` on dispatch failure.
+/// Reject SAVEPOINT / RELEASE outside a usable transaction block.
+///
+/// An aborted block refuses both, as PostgreSQL does.
+fn require_usable_txn(
+    sessions: &SessionStore,
+    session_id: SessionId,
+) -> Result<(), SavepointError> {
+    match sessions.transaction_state(session_id) {
+        TransactionState::Idle => Err(SavepointError::NoActiveTransaction),
+        TransactionState::Failed => Err(SavepointError::TransactionAborted),
+        TransactionState::InBlock => Ok(()),
+    }
+}
+
+/// Dispatch a savepoint overlay meta-op to a specific vShard's core.
 async fn dispatch_overlay_savepoint(
     tenant_id: TenantId,
     vshard_id: VShardId,
     dp: &impl TxnDataPlane,
     op: MetaOp,
-) -> Option<Vec<u8>> {
+) -> Result<(), SavepointError> {
     let task = PhysicalTask {
         tenant_id,
         vshard_id,
@@ -59,45 +88,22 @@ async fn dispatch_overlay_savepoint(
         txn_id: None,
     };
     // Savepoint overlay meta-ops are not writes — no WAL record, no version.
-    match dp.dispatch_no_wal(task).await {
-        Ok(resp) => Some(resp.payload.to_vec()),
-        Err(e) => {
-            tracing::warn!(error = %e, "savepoint overlay meta-op dispatch failed");
-            None
-        }
-    }
-}
-
-/// Decode the 24-byte composite savepoint marker payload: three LE u64s
-/// carrying the value/TTL overlay journal marker, then the graph overlay
-/// marker, then the array overlay marker. A missing or short payload means
-/// empty journals → all-zero markers.
-fn decode_markers(payload: Option<Vec<u8>>) -> OverlayMarkers {
-    payload
-        .filter(|bytes| bytes.len() == SAVEPOINT_MARKER_BYTES)
-        .map(|bytes| {
-            let mut value = [0u8; 8];
-            value.copy_from_slice(&bytes[..8]);
-            let mut graph = [0u8; 8];
-            graph.copy_from_slice(&bytes[8..16]);
-            let mut array = [0u8; 8];
-            array.copy_from_slice(&bytes[16..24]);
-            OverlayMarkers {
-                value: u64::from_le_bytes(value) as usize,
-                graph: u64::from_le_bytes(graph) as usize,
-                array: u64::from_le_bytes(array) as usize,
-            }
+    dp.dispatch_no_wal(task)
+        .await
+        .map(|_| ())
+        .map_err(|e| SavepointError::OverlayDispatch {
+            message: format!("savepoint overlay meta-op on vShard {vshard_id:?} failed: {e}"),
         })
-        .unwrap_or_default()
 }
 
 /// Handle SAVEPOINT `<name>`.
 ///
-/// Captures the composite overlay undo-journal marker on EVERY vShard the
-/// transaction has staged writes to, so a later ROLLBACK TO reverts staged
-/// value/TTL, graph, AND array state on all of them to exactly here. A
-/// missing/short payload means empty journals → all-zero markers. With no
-/// vShard staged yet the marker map is empty.
+/// Mints the savepoint's id and sends the mark through EVERY vShard the
+/// transaction has staged writes to. Each core records its value/TTL,
+/// graph, and array overlay positions under the id, so a later ROLLBACK TO
+/// rewinds every staged overlay to exactly here. With no vShard staged yet
+/// no core records anything. A failed mark aborts the block: a savepoint
+/// that a core did not record cannot rewind correctly.
 pub async fn run_savepoint(
     sessions: &SessionStore,
     session_id: SessionId,
@@ -105,25 +111,25 @@ pub async fn run_savepoint(
     dp: &impl TxnDataPlane,
     name: &str,
 ) -> Result<(), SavepointError> {
-    require_active_txn(sessions, session_id)?;
+    require_usable_txn(sessions, session_id)?;
+    let savepoint = NEXT_OVERLAY_SAVEPOINT.fetch_add(1, Ordering::Relaxed);
     let (txn_id, vshards) = sessions.txn_identity(session_id);
-    let mut markers: BTreeMap<VShardId, OverlayMarkers> = BTreeMap::new();
     if let Some(txn_id) = txn_id {
         for vshard_id in vshards {
-            let payload = dispatch_overlay_savepoint(
+            dispatch_overlay_savepoint(
                 tenant_id,
                 vshard_id,
                 dp,
-                MetaOp::MarkSavepoint { txn_id },
+                MetaOp::MarkSavepoint { txn_id, savepoint },
             )
-            .await;
-            markers.insert(vshard_id, decode_markers(payload));
+            .await
+            .inspect_err(|_| sessions.fail_transaction(session_id))?;
         }
     }
     sessions.create_savepoint(
         session_id,
         name.to_string(),
-        markers,
+        savepoint,
         super::ddl_buffer::buffer_len(),
     );
     Ok(())
@@ -139,7 +145,7 @@ pub fn run_release_savepoint(
     session_id: SessionId,
     name: &str,
 ) -> Result<(), SavepointError> {
-    require_active_txn(sessions, session_id)?;
+    require_usable_txn(sessions, session_id)?;
     sessions
         .release_savepoint(session_id, name)
         .map_err(|e| SavepointError::NotFound {
@@ -149,13 +155,15 @@ pub fn run_release_savepoint(
 
 /// Handle ROLLBACK TO SAVEPOINT `<name>`.
 ///
-/// Truncates the write buffer to the saved position and rewinds the
-/// value/TTL, graph, and array overlays on every vShard the transaction has
-/// staged to. Iterates the CURRENT staged set (a superset of the savepoint's,
-/// since writes can have staged to NEW vShards after the savepoint): a vShard
-/// with a saved marker rewinds to it; a vShard first staged AFTER the savepoint
-/// has no saved marker and rewinds to all-zero markers, dropping ALL of its
-/// staged writes.
+/// Truncates the write buffer to the saved position and sends the rewind
+/// through every vShard the transaction has staged to. The current staged
+/// set is a superset of the savepoint's: writes can stage to new vShards
+/// after it. Each core rewinds its overlays to the positions it recorded
+/// under the savepoint's id. A core with no record hosted no staged vShard
+/// at the savepoint, so it drops all its staged writes. Several vShards on
+/// one core rewind that core to the same record. A failed rewind aborts
+/// the block: its staged state no longer matches the truncated write
+/// buffer, so only ROLLBACK can end it.
 pub async fn run_rollback_to_savepoint(
     sessions: &SessionStore,
     session_id: SessionId,
@@ -170,23 +178,18 @@ pub async fn run_rollback_to_savepoint(
             message: e.to_string(),
         })?;
     super::ddl_buffer::truncate(rewind.ddl_buffer_len);
-    let markers = rewind.markers;
+    let savepoint = rewind.overlay_savepoint;
     let (txn_id, vshards) = sessions.txn_identity(session_id);
     if let Some(txn_id) = txn_id {
         for vshard_id in vshards {
-            let saved = markers.get(&vshard_id).copied().unwrap_or_default();
             dispatch_overlay_savepoint(
                 tenant_id,
                 vshard_id,
                 dp,
-                MetaOp::RollbackToSavepoint {
-                    txn_id,
-                    value_marker: saved.value as u64,
-                    graph_marker: saved.graph as u64,
-                    array_marker: saved.array as u64,
-                },
+                MetaOp::RollbackToSavepoint { txn_id, savepoint },
             )
-            .await;
+            .await
+            .inspect_err(|_| sessions.fail_transaction(session_id))?;
         }
     }
     Ok(())
@@ -281,9 +284,7 @@ mod tests {
     use crate::types::{DatabaseId, Lsn, RequestId};
 
     /// A `TxnDataPlane` that records every dispatched overlay meta-op (per vShard)
-    /// instead of touching a real core. `MarkSavepoint` replies with a 24-byte
-    /// composite marker whose value component is `vshard + 1`, so a later
-    /// ROLLBACK TO can be asserted to thread each vShard's own saved marker.
+    /// instead of touching a real core.
     #[derive(Default)]
     struct RecordingDp {
         ops: Mutex<Vec<(VShardId, MetaOp)>>,
@@ -294,32 +295,16 @@ mod tests {
             &'a self,
             task: PhysicalTask,
         ) -> Pin<Box<dyn Future<Output = crate::Result<Response>> + Send + 'a>> {
-            let vshard = task.vshard_id;
-            let payload = if let PhysicalPlan::Meta(op) = &task.plan {
-                self.ops.lock().unwrap().push((vshard, op.clone()));
-                match op {
-                    MetaOp::MarkSavepoint { .. } => {
-                        let value = (vshard.as_u32() as u64) + 1;
-                        let graph = 0u64;
-                        let array = 0u64;
-                        let mut bytes = Vec::with_capacity(SAVEPOINT_MARKER_BYTES);
-                        bytes.extend_from_slice(&value.to_le_bytes());
-                        bytes.extend_from_slice(&graph.to_le_bytes());
-                        bytes.extend_from_slice(&array.to_le_bytes());
-                        Payload::from_vec(bytes)
-                    }
-                    _ => Payload::empty(),
-                }
-            } else {
-                Payload::empty()
-            };
+            if let PhysicalPlan::Meta(op) = &task.plan {
+                self.ops.lock().unwrap().push((task.vshard_id, op.clone()));
+            }
             Box::pin(async move {
                 Ok(Response {
                     request_id: RequestId::new(1),
                     status: Status::Ok,
                     attempt: 1,
                     partial: false,
-                    payload,
+                    payload: Payload::empty(),
                     watermark_lsn: Lsn::ZERO,
                     error_code: None,
                     read_set_valid: None,
@@ -332,6 +317,49 @@ mod tests {
         fn event_source(&self) -> crate::event::EventSource {
             crate::event::EventSource::User
         }
+    }
+
+    /// A `TxnDataPlane` whose every dispatch fails.
+    struct FailingDp;
+
+    impl TxnDataPlane for FailingDp {
+        fn dispatch_no_wal<'a>(
+            &'a self,
+            _task: PhysicalTask,
+        ) -> Pin<Box<dyn Future<Output = crate::Result<Response>> + Send + 'a>> {
+            Box::pin(async {
+                Err(crate::Error::Internal {
+                    detail: "core unreachable".into(),
+                })
+            })
+        }
+
+        fn event_source(&self) -> crate::event::EventSource {
+            crate::event::EventSource::User
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_overlay_mark_aborts_the_block() {
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:5203".parse().unwrap();
+        store.ensure_session(addr);
+        store.begin(addr, Lsn::new(1), 0).unwrap();
+        assert!(store.buffer_write(addr, staged_task(3)));
+
+        let result = run_savepoint(
+            &store,
+            SessionId::from(&addr),
+            TenantId::new(1),
+            &FailingDp,
+            "s1",
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(SavepointError::OverlayDispatch { .. })
+        ));
+        assert_eq!(store.transaction_state(addr), TransactionState::Failed);
     }
 
     /// A benign staged write task homed on `vshard`. The plan content is irrelevant
@@ -349,11 +377,12 @@ mod tests {
         }
     }
 
-    /// A vShard first staged AFTER a savepoint must have ALL its staged writes
-    /// rewound on ROLLBACK TO — its overlay is rewound to marker `(0, 0)`, while a
-    /// vShard present at savepoint time rewinds to its own saved marker.
+    /// The mark goes through each vShard staged at the savepoint. The rewind
+    /// goes through each vShard staged at the rollback, all under the one
+    /// savepoint id, so each core rewinds to its own record. A core that
+    /// hosts vShard 3 and vShard 9 rewinds to the same record through both.
     #[tokio::test]
-    async fn multi_vshard_rollback_to_savepoint_rewinds_each_vshard() {
+    async fn rollback_to_savepoint_rewinds_every_staged_vshard_to_the_savepoint_id() {
         let store = SessionStore::new();
         let addr: std::net::SocketAddr = "127.0.0.1:5201".parse().unwrap();
         store.ensure_session(addr);
@@ -361,52 +390,107 @@ mod tests {
         let tenant = TenantId::new(1);
         let dp = RecordingDp::default();
 
-        // Stage on core A (3), then SAVEPOINT — only A is marked.
+        // Stage on vShard 3, then SAVEPOINT: only vShard 3 is marked.
         assert!(store.buffer_write(addr, staged_task(3)));
         run_savepoint(&store, SessionId::from(&addr), tenant, &dp, "s1")
             .await
             .expect("savepoint");
 
-        // Stage on core B (9) AFTER the savepoint.
+        // Stage on vShard 9 AFTER the savepoint.
         assert!(store.buffer_write(addr, staged_task(9)));
 
-        // ROLLBACK TO s1 — A rewinds to its saved marker, B rewinds to zero.
         run_rollback_to_savepoint(&store, SessionId::from(&addr), tenant, &dp, "s1")
             .await
             .expect("rollback to savepoint");
 
         let ops = dp.ops.lock().unwrap();
-
-        // Only core A was marked at savepoint time (B was not yet staged).
-        let marks: Vec<u32> = ops
-            .iter()
-            .filter_map(|(v, op)| matches!(op, MetaOp::MarkSavepoint { .. }).then_some(v.as_u32()))
-            .collect();
-        assert_eq!(marks, vec![3], "only the pre-savepoint vShard is marked");
-
-        // Both staged vShards are rewound; A to its saved marker (3+1), B to zero.
-        let rewinds: std::collections::BTreeMap<u32, (u64, u64, u64)> = ops
+        let marks: Vec<(u32, u64)> = ops
             .iter()
             .filter_map(|(v, op)| match op {
-                MetaOp::RollbackToSavepoint {
-                    value_marker,
-                    graph_marker,
-                    array_marker,
-                    ..
-                } => Some((v.as_u32(), (*value_marker, *graph_marker, *array_marker))),
+                MetaOp::MarkSavepoint { savepoint, .. } => Some((v.as_u32(), *savepoint)),
+                _ => None,
+            })
+            .collect();
+        let [(3, savepoint)] = marks.as_slice() else {
+            panic!("only the vShard staged at the savepoint is marked: {marks:?}");
+        };
+        let rewinds: Vec<(u32, u64)> = ops
+            .iter()
+            .filter_map(|(v, op)| match op {
+                MetaOp::RollbackToSavepoint { savepoint, .. } => Some((v.as_u32(), *savepoint)),
                 _ => None,
             })
             .collect();
         assert_eq!(
-            rewinds.get(&3),
-            Some(&(4, 0, 0)),
-            "core A rewinds to its saved marker"
+            rewinds,
+            vec![(3, *savepoint), (9, *savepoint)],
+            "every staged vShard rewinds under the savepoint's id"
         );
-        assert_eq!(
-            rewinds.get(&9),
-            Some(&(0, 0, 0)),
-            "core B (staged after savepoint) rewinds to empty"
+    }
+
+    /// A later savepoint gets a larger id, so a core can drop the records of
+    /// the savepoints a rewind destroys.
+    #[tokio::test]
+    async fn a_later_savepoint_gets_a_larger_id() {
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:5204".parse().unwrap();
+        store.ensure_session(addr);
+        store.begin(addr, Lsn::new(1), 0).unwrap();
+        let tenant = TenantId::new(1);
+        let dp = RecordingDp::default();
+        assert!(store.buffer_write(addr, staged_task(2)));
+
+        for name in ["s1", "s2"] {
+            run_savepoint(&store, SessionId::from(&addr), tenant, &dp, name)
+                .await
+                .expect("savepoint");
+        }
+
+        let ids: Vec<u64> = dp
+            .ops
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, op)| match op {
+                MetaOp::MarkSavepoint { savepoint, .. } => Some(*savepoint),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(ids.as_slice(), [first, second] if first < second),
+            "{ids:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_aborted_block_refuses_savepoint_and_release_until_rollback_to() {
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:5202".parse().unwrap();
+        store.ensure_session(addr);
+        store.begin(addr, Lsn::new(1), 0).unwrap();
+        let session = SessionId::from(&addr);
+        let tenant = TenantId::new(1);
+        let dp = RecordingDp::default();
+
+        run_savepoint(&store, session, tenant, &dp, "s1")
+            .await
+            .expect("savepoint in a usable block");
+        store.fail_transaction(addr);
+
+        assert!(matches!(
+            run_savepoint(&store, session, tenant, &dp, "s2").await,
+            Err(SavepointError::TransactionAborted)
+        ));
+        assert!(matches!(
+            run_release_savepoint(&store, session, "s1"),
+            Err(SavepointError::TransactionAborted)
+        ));
+
+        run_rollback_to_savepoint(&store, session, tenant, &dp, "s1")
+            .await
+            .expect("rollback to savepoint in an aborted block");
+        assert_eq!(store.transaction_state(addr), TransactionState::InBlock);
+        run_release_savepoint(&store, session, "s1").expect("release after rollback to");
     }
 
     #[test]

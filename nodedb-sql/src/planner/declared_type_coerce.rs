@@ -13,9 +13,9 @@
 //! storing it — the strict document encoder parses that string back into a
 //! float — so the stored cell always matches what the column declared.
 //!
-//! Two engines have no typed write path — key-value and document-schemaless.
-//! Both store the value bytes they are handed, and the declared schema lives
-//! only in the catalog, in the Control Plane. Left uncoerced, a column declared
+//! Two engines have no typed schema — key-value and document-schemaless. The
+//! Data Plane re-types only their declared integer, float, and `DECIMAL(p,s)`
+//! columns, and stores every other value as handed. Left uncoerced, a column declared
 //! `REAL` / `DOUBLE` holds the string `"1.5"` while `RowDescription` advertises
 //! float4 / float8, and the pgwire encoder — which correctly refuses to encode
 //! a non-number under a numeric OID — transmits SQL NULL. The client asked for
@@ -51,15 +51,32 @@
 //! parsed here for the same reason, so an unparseable spelling is refused at
 //! the statement instead of being stored as text that no read can render.
 //!
-//! Every other declared type either has one unambiguous literal form already
-//! or (like `DECIMAL`) is deliberately carried as text for exactness, and
+//! A [`SqlDataType::Decimal`] column with a declared `DECIMAL(p,s)` typmod
+//! is fitted to it here, for every engine. The value rounds to `s` digits and
+//! one with more than `p - s` integer digits is refused. A plain `DECIMAL`
+//! keeps every digit it is given.
+//!
+//! Every other declared type has one unambiguous literal form already and
 //! passes through untouched.
 //!
 //! The numeric conversions mirror the strict document encoder's
 //! `coerce_value`, so the two engines accept and reject exactly the same
 //! literals for a given declared type.
+//!
+//! # Relation to the Data Plane rule
+//!
+//! The key-value and document-schemaless write paths re-type every value
+//! stored under a declared integer, float, or `DECIMAL(p,s)` column on the
+//! Data Plane, through the strict encoder's `coerce_value` and the declared
+//! width. That rule covers computed values, which this pass never sees. This
+//! pass still runs for literals: it refuses a bad literal at plan time with
+//! the column named, and the DDL `DEFAULT` gate and the predicate coercion
+//! share it. Fitting is idempotent, so a literal fitted here is unchanged by
+//! the Data Plane pass and is never rounded twice.
 
+use nodedb_types::columnar::DecimalTypmod;
 use nodedb_types::datetime::NdbDateTime;
+use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
 use super::dml_helpers::{check_declared_float_ranges, check_declared_int_ranges};
@@ -144,8 +161,8 @@ pub(super) fn coerce_rows_to_declared_types(
 /// [`coerce_row_to_declared_types`] for `SET col = <literal>` assignments.
 ///
 /// Only literal assignments carry a value at plan time; a computed assignment
-/// (`SET n = n + 1`) is evaluated by the engine and is not this pass's to
-/// re-type. `exempt_column` carries the same primary-key exemption, for the
+/// (`SET n = n + 1`) is evaluated by the engine, which re-types the result by
+/// the same numeric rule before it stores the row. `exempt_column` carries the same primary-key exemption, for the
 /// same reason: `SET pk = <literal>` rewrites the row's identity, which the
 /// engines derive from the literal's own rendering.
 pub(super) fn coerce_assignments_to_declared_types(
@@ -196,13 +213,15 @@ pub(crate) fn coerce_value(
         SqlDataType::Timestamp | SqlDataType::Timestamptz => {
             coerce_to_instant(column, value, declared)
         }
+        SqlDataType::Decimal(Some(typmod)) => coerce_to_decimal(column, value, *typmod),
         SqlDataType::String
         | SqlDataType::Bool
         | SqlDataType::Bytes
-        | SqlDataType::Decimal
+        | SqlDataType::Decimal(None)
         | SqlDataType::Uuid
         | SqlDataType::Vector(_)
         | SqlDataType::Geometry
+        | SqlDataType::Json
         | SqlDataType::Unknown => Ok(value),
     }
 }
@@ -253,6 +272,33 @@ fn coerce_to_float(column: &str, value: SqlValue) -> Result<SqlValue> {
     }
 }
 
+/// `DECIMAL(p,s)` column: a numeric literal or numeric text becomes the exact
+/// decimal the column stores, fitted by [`DecimalTypmod::fit`].
+///
+/// `fit` is the rule the strict and columnar encoders apply, so every engine
+/// rounds and refuses the same values. A value that does not fit is refused
+/// as [`SqlError::DecimalOutOfRange`]. `NULL` and non-numeric kinds are left
+/// alone, as for the other numeric columns.
+fn coerce_to_decimal(column: &str, value: SqlValue, typmod: DecimalTypmod) -> Result<SqlValue> {
+    let exact = match value {
+        SqlValue::Decimal(d) => d,
+        SqlValue::Int(i) => Decimal::from(i),
+        SqlValue::Float(f) => Decimal::try_from(f)
+            .map_err(|_| not_representable(column, &f.to_string(), "DECIMAL"))?,
+        SqlValue::String(s) => s
+            .parse::<Decimal>()
+            .map_err(|_| not_representable(column, &s, "DECIMAL"))?,
+        other => return Ok(other),
+    };
+    typmod
+        .fit(exact)
+        .map(SqlValue::Decimal)
+        .map_err(|source| SqlError::DecimalOutOfRange {
+            column: column.to_string(),
+            source,
+        })
+}
+
 /// Timestamp column: every accepted literal becomes the one typed instant
 /// the column stores, tagged as the declared kind.
 ///
@@ -275,10 +321,11 @@ fn coerce_to_instant(column: &str, value: SqlValue, declared: &SqlDataType) -> R
         | SqlDataType::Bool
         | SqlDataType::Bytes
         | SqlDataType::Timestamp
-        | SqlDataType::Decimal
+        | SqlDataType::Decimal(_)
         | SqlDataType::Uuid
         | SqlDataType::Vector(_)
         | SqlDataType::Geometry
+        | SqlDataType::Json
         | SqlDataType::Unknown => SqlValue::Timestamp(at),
     };
     match value {
@@ -321,10 +368,11 @@ fn instant_declared_name(declared: &SqlDataType) -> &'static str {
         | SqlDataType::Bool
         | SqlDataType::Bytes
         | SqlDataType::Timestamp
-        | SqlDataType::Decimal
+        | SqlDataType::Decimal(_)
         | SqlDataType::Uuid
         | SqlDataType::Vector(_)
         | SqlDataType::Geometry
+        | SqlDataType::Json
         | SqlDataType::Unknown => "TIMESTAMP",
     }
 }
@@ -482,13 +530,12 @@ mod tests {
         );
     }
 
-    /// Non-numeric declared types impose no representation of their own: a
-    /// `DECIMAL` column keeps its exact decimal, and a `TEXT` column keeps
-    /// whatever literal it was given.
+    /// A plain `DECIMAL` column keeps its exact decimal with every digit, and
+    /// a `TEXT` column keeps whatever literal it was given.
     #[test]
     fn non_numeric_declared_types_pass_through_untouched() {
         let columns = [
-            column("d", SqlDataType::Decimal),
+            column("d", SqlDataType::Decimal(None)),
             column("t", SqlDataType::String),
         ];
         assert_eq!(
@@ -496,9 +543,80 @@ mod tests {
             decimal("1.5")
         );
         assert_eq!(
+            coerced(&columns, "d", decimal("12345678901234567890.123456789"))
+                .expect("a plain DECIMAL has no digit limit"),
+            decimal("12345678901234567890.123456789")
+        );
+        assert_eq!(
             coerced(&columns, "t", SqlValue::Int(9)).expect("text columns are untouched"),
             SqlValue::Int(9)
         );
+    }
+
+    fn decimal_5_2() -> SqlDataType {
+        SqlDataType::Decimal(Some(DecimalTypmod::new(5, 2).expect("valid typmod")))
+    }
+
+    /// A `DECIMAL(5,2)` column rounds every numeric literal to two digits,
+    /// half away from zero, as the strict and columnar encoders do.
+    #[test]
+    fn constrained_decimal_rounds_to_its_scale() {
+        let columns = [column("d", decimal_5_2())];
+        for (input, expected) in [
+            (decimal("1.005"), "1.01"),
+            (decimal("-1.005"), "-1.01"),
+            (SqlValue::Int(7), "7.00"),
+            (SqlValue::Float(2.5), "2.50"),
+            (SqlValue::String("999.994".into()), "999.99"),
+        ] {
+            let label = format!("{input:?}");
+            let got = coerced(&columns, "d", input).expect(&label);
+            assert_eq!(got, decimal(expected), "{label}");
+            let SqlValue::Decimal(d) = got else {
+                panic!("{label}: expected a decimal");
+            };
+            assert_eq!(d.to_string(), expected, "{label} keeps scale 2");
+        }
+        assert_eq!(
+            coerced(&columns, "d", SqlValue::Null).expect("null passes"),
+            SqlValue::Null
+        );
+    }
+
+    /// A value whose rounded integer part exceeds `p - s` digits is refused
+    /// as `DecimalOutOfRange`, on `VALUES`, `SET` and a `DEFAULT` literal.
+    #[test]
+    fn constrained_decimal_past_precision_is_out_of_range() {
+        let columns = [column("d", decimal_5_2())];
+        for input in [
+            decimal("123456.789"),
+            decimal("999.995"),
+            SqlValue::Int(1000),
+        ] {
+            let label = format!("{input:?}");
+            let err = coerced(&columns, "d", input).expect_err(&label);
+            assert!(
+                matches!(err, SqlError::DecimalOutOfRange { ref column, .. } if column == "d"),
+                "{label}: {err:?}"
+            );
+        }
+
+        let mut assignments = vec![("d".to_string(), SqlExpr::Literal(decimal("123456.789")))];
+        let err = coerce_assignments_to_declared_types(&columns, &mut assignments, None)
+            .expect_err("SET past precision is refused");
+        assert!(matches!(err, SqlError::DecimalOutOfRange { .. }), "{err:?}");
+
+        let err = coerce_write_literal(&columns[0], decimal("123456.789"))
+            .expect_err("a DEFAULT past precision is refused");
+        assert!(matches!(err, SqlError::DecimalOutOfRange { .. }), "{err:?}");
+    }
+
+    /// Text that names no decimal is a type mismatch naming the column.
+    #[test]
+    fn constrained_decimal_refuses_non_numeric_text() {
+        let columns = [column("d", decimal_5_2())];
+        let err = coerced(&columns, "d", SqlValue::String("abc".into())).expect_err("abc");
+        assert!(matches!(err, SqlError::TypeMismatch { .. }), "{err:?}");
     }
 
     /// `2020-03-05T10:00:00Z` as microseconds since the Unix epoch.

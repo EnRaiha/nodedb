@@ -36,7 +36,7 @@ pub(super) async fn alter_collection_alter_column_type(
     let tenant_id = identity.tenant_id;
 
     let new_type = nodedb_types::columnar::ColumnType::from_str(new_type_str)
-        .map_err(|e| err("42601", format!("invalid type '{new_type_str}': {e}")))?;
+        .map_err(|e| err(e.sqlstate(), format!("invalid type '{new_type_str}': {e}")))?;
 
     let (coll, mut schema) = load_strict_collection(
         state,
@@ -48,7 +48,7 @@ pub(super) async fn alter_collection_alter_column_type(
 
     let col = schema
         .columns
-        .iter()
+        .iter_mut()
         .find(|c| c.name.eq_ignore_ascii_case(column_name))
         .ok_or_else(|| {
             err(
@@ -62,7 +62,7 @@ pub(super) async fn alter_collection_alter_column_type(
     // An alias change resolves to the identical `ColumnType`: every integer
     // width parses to `Int64`, and only the declared spelling differs. A
     // parameter change — `VECTOR(384)` to `VECTOR(768)`, `DECIMAL(10,2)` to
-    // `DECIMAL(38,10)` — shares the discriminant but rewrites every stored
+    // `DECIMAL(28,10)` — shares the discriminant but rewrites every stored
     // value, so full equality is the gate.
     if col.column_type != new_type {
         return Err(err(
@@ -74,14 +74,27 @@ pub(super) async fn alter_collection_alter_column_type(
             ),
         ));
     }
-    // The resolved type already matches; the alias change lands in
-    // `retype_field`, which records the declared spelling.
+    // An alias change moves the declared numeric width. A narrower width
+    // bounds values that existing rows can already exceed, so it needs every
+    // stored row checked. Only an equal or wider width is accepted.
+    let retyped = col.clone().with_declared_width(new_type_str);
+    if narrows_declared_width(col, &retyped) {
+        return Err(err(
+            "0A000",
+            format!(
+                "type change from {} to {} narrows the column and requires every \
+                 stored row checked; only a change to an equal or wider type is supported",
+                col.declared_type_name(),
+                retyped.declared_type_name()
+            ),
+        ));
+    }
+    *col = retyped;
     schema.version = schema.version.saturating_add(1);
 
     let mut updated = coll;
     write_schema_back(&mut updated, schema);
-    // The declared spelling, not the resolved `ColumnType`, is what carries
-    // the integer width — see `retype_field`.
+    // The catalog keeps the declared spelling the schema width came from.
     retype_field(&mut updated, column_name, new_type_str);
     persist_schema_change(state, &updated).await?;
 
@@ -93,4 +106,41 @@ pub(super) async fn alter_collection_alter_column_type(
     );
 
     Ok(status("ALTER COLLECTION"))
+}
+
+/// Whether `to` declares a narrower integer or float width than `from`. An
+/// absent width is the widest of its family.
+fn narrows_declared_width(
+    from: &nodedb_types::columnar::ColumnDef,
+    to: &nodedb_types::columnar::ColumnDef,
+) -> bool {
+    use nodedb_types::columnar::{FloatWidth, IntWidth};
+    let int = |c: &nodedb_types::columnar::ColumnDef| c.int_width.unwrap_or(IntWidth::I64);
+    let float = |c: &nodedb_types::columnar::ColumnDef| c.float_width.unwrap_or(FloatWidth::F64);
+    int(to) < int(from) || float(to) < float(from)
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::columnar::{ColumnDef, ColumnType};
+
+    use super::narrows_declared_width;
+
+    fn int(declared: &str) -> ColumnDef {
+        ColumnDef::nullable("n", ColumnType::Int64).with_declared_width(declared)
+    }
+
+    fn float(declared: &str) -> ColumnDef {
+        ColumnDef::nullable("f", ColumnType::Float64).with_declared_width(declared)
+    }
+
+    #[test]
+    fn only_a_narrower_width_is_a_narrowing() {
+        assert!(narrows_declared_width(&int("BIGINT"), &int("SMALLINT")));
+        assert!(narrows_declared_width(&int("INT"), &int("INT2")));
+        assert!(narrows_declared_width(&float("DOUBLE"), &float("REAL")));
+        assert!(!narrows_declared_width(&int("SMALLINT"), &int("BIGINT")));
+        assert!(!narrows_declared_width(&int("INT"), &int("INTEGER")));
+        assert!(!narrows_declared_width(&float("REAL"), &float("FLOAT8")));
+    }
 }

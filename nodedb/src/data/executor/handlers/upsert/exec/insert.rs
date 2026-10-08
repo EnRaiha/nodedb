@@ -3,10 +3,10 @@
 //! The upsert insert branch: no existing row was found, so insert fresh
 //! (identical in shape to a `PointPut`, plus chain + enforcement).
 
-use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::redo_image::submitted_row_image;
-use crate::data::executor::enforcement::chain_guard::{self, ChainGuard};
+use crate::data::executor::enforcement::chain_guard::{self, AbandonedWrite, ChainGuard};
 use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::handlers::rls_write_gate;
@@ -58,6 +58,7 @@ impl CoreLoop {
         // The plan's `document_id` is the row's client identity: the write
         // gate, the event, the redo entry, and `RETURNING` all name it.
         let document_identity = RowIdentity::from_user_key(document_id);
+        let identity_column = self.identity_column(database_id, tid, collection);
 
         // Insert: document doesn't exist, create new (same as PointPut).
         // The incoming body IS the post-image here, and the planner
@@ -69,6 +70,7 @@ impl CoreLoop {
             value,
             &document_identity,
             None,
+            &identity_column,
             tid,
             collection,
         ) {
@@ -96,7 +98,7 @@ impl CoreLoop {
         // existence probe just above found none, and apply_point_put
         // is the only writer on this core — prior must be None. We
         // pass it straight through so the emit resolves to Insert.
-        let prior = match self.apply_point_put(
+        let mut prior = match self.apply_point_put(
             &txn,
             PointPutParams {
                 database_id,
@@ -115,13 +117,11 @@ impl CoreLoop {
         ) {
             Ok(p) => p,
             Err(e) => {
-                chain_guard::abort_after_apply(
+                let e = chain_guard::abort_after_apply(
                     self,
                     &mut chain,
-                    database_id,
-                    tid,
-                    collection,
-                    &storage_key,
+                    AbandonedWrite::row(database_id, tid, collection, &storage_key),
+                    e,
                 );
                 return self.response_error(task, e);
             }
@@ -133,13 +133,12 @@ impl CoreLoop {
             .settle(self, surrogate, &prior.stored_value)
             .and_then(|()| chain.persist_head(self, &txn))
         {
-            chain_guard::abort_after_apply(
+            let e = chain_guard::abort_after_apply(
                 self,
                 &mut chain,
-                database_id,
-                tid,
-                collection,
-                &storage_key,
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(std::mem::take(&mut prior.memory_undo)),
+                e,
             );
             return self.response_error(task, e);
         }
@@ -157,50 +156,48 @@ impl CoreLoop {
         ) {
             Ok(o) => o,
             Err(e) => {
-                chain_guard::abort_after_apply(
+                let e = chain_guard::abort_after_apply(
                     self,
                     &mut chain,
-                    database_id,
-                    tid,
-                    collection,
-                    &storage_key,
+                    AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                        .undo(std::mem::take(&mut prior.memory_undo)),
+                    e,
                 );
                 return self.response_error(task, e);
             }
         };
         let target_write_set = write_hook::target_write_set(&enforcement.target_writes);
+        let target_writes = enforcement.target_writes;
 
         // Settled before the commit, so an insert of one journal leg on
         // its own leaves nothing behind.
         if let Err(e) =
             self.settle_balanced_entries(database_id, tid, collection, enforcement.balanced_entries)
         {
-            chain_guard::abort_after_apply(
+            let e = chain_guard::abort_after_apply(
                 self,
                 &mut chain,
-                database_id,
-                tid,
-                collection,
-                &storage_key,
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(std::mem::take(&mut prior.memory_undo))
+                    .targets(target_writes),
+                e,
             );
             return self.response_error(task, e);
         }
 
         if let Err(e) = txn.commit() {
-            chain_guard::abort_after_apply(
+            let e = chain_guard::abort_after_apply(
                 self,
                 &mut chain,
-                database_id,
-                tid,
-                collection,
-                &storage_key,
-            );
-            return self.response_error(
-                task,
-                ErrorCode::Internal {
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(std::mem::take(&mut prior.memory_undo))
+                    .targets(target_writes),
+                crate::Error::Storage {
+                    engine: "sparse".into(),
                     detail: format!("commit: {e}"),
                 },
             );
+            return self.response_error(task, e);
         }
 
         self.emit_put_event(
@@ -219,6 +216,7 @@ impl CoreLoop {
                 spec,
                 rls_filters,
                 strict_schema,
+                &identity_column,
                 &[(&document_identity, prior.stored_value.as_slice())],
             ),
             None => self.response_affected(task, 1),

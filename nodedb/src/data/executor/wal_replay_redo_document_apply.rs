@@ -20,7 +20,9 @@
 use nodedb_types::Surrogate;
 
 use super::core_loop::CoreLoop;
-use super::enforcement::chain_guard::{ChainGuard, abort_after_apply};
+use super::enforcement::chain_guard::{
+    AbandonedWrite, ChainGuard, abandon_write, abort_after_apply,
+};
 use super::handlers::point::apply_delete::PointDeleteParams;
 use super::handlers::point::apply_put::PointPutParams;
 use crate::engine::document::store::StorageKey;
@@ -78,6 +80,9 @@ impl CoreLoop {
                 return false;
             }
         };
+        // The row's in-memory index entries, kept so a failed settle or
+        // commit can reverse them.
+        let mut memory_undo = Vec::new();
         let applied = self
             .apply_point_put(
                 &txn,
@@ -98,7 +103,10 @@ impl CoreLoop {
                     wal_lsn: (row.record_lsn != 0).then(|| crate::types::Lsn::new(row.record_lsn)),
                 },
             )
-            .and_then(|outcome| chain.settle(self, surrogate, &outcome.stored_value))
+            .and_then(|mut outcome| {
+                memory_undo = std::mem::take(&mut outcome.memory_undo);
+                chain.settle(self, surrogate, &outcome.stored_value)
+            })
             .and_then(|()| chain.persist_head(self, &txn));
         // An error drops the write txn un-committed, which rolls it back.
         let committed = applied.and_then(|()| {
@@ -113,14 +121,14 @@ impl CoreLoop {
                 true
             }
             Err(e) => {
-                abort_after_apply(
+                let e = abort_after_apply(
                     self,
                     &mut chain,
-                    row.database_id,
-                    row.tenant_id,
-                    collection,
-                    &storage_key,
+                    AbandonedWrite::row(row.database_id, row.tenant_id, collection, &storage_key)
+                        .undo(memory_undo),
+                    e,
                 );
+                self.fail_stop_on_failed_undo(&e);
                 tracing::warn!(
                     core = self.core_id,
                     %collection,
@@ -155,6 +163,15 @@ impl CoreLoop {
             prior.as_deref(),
             true,
         )
+    }
+
+    /// Fail-stop the core when `error` reports a failed undo. An in-memory
+    /// entry that did not reverse leaves the core's state unknown, so the
+    /// core stops serving.
+    fn fail_stop_on_failed_undo(&mut self, error: &crate::Error) {
+        if let crate::Error::DataPlane(code) = error {
+            self.fail_stop_on_rollback_code(code);
+        }
     }
 
     /// Apply one document DELETE through `apply_point_delete` in its own redb
@@ -201,6 +218,19 @@ impl CoreLoop {
                     outcome.prior_value.is_some()
                 }
                 Err(e) => {
+                    // The dropped txn reverses the durable writes only. The
+                    // in-memory cascades are reversed here.
+                    let storage_key = StorageKey::for_surrogate(surrogate);
+                    let e = abandon_write(
+                        self,
+                        AbandonedWrite::row(database_id, tenant_id, collection, &storage_key)
+                            .undo(outcome.memory_undo),
+                        crate::Error::Storage {
+                            engine: "sparse".into(),
+                            detail: format!("WAL document redo commit: {e}"),
+                        },
+                    );
+                    self.fail_stop_on_failed_undo(&e);
                     tracing::warn!(
                         core = self.core_id,
                         %collection,

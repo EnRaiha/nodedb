@@ -3,7 +3,7 @@
 //! Dispatch for MetaOp variants (WAL, snapshots, retention, continuous aggregates).
 
 use crate::bridge::envelope::{ErrorCode, Response};
-use nodedb_physical::physical_plan::{MetaOp, SAVEPOINT_MARKER_BYTES};
+use nodedb_physical::physical_plan::MetaOp;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::control::calvin::CalvinExecCtx;
@@ -59,12 +59,9 @@ impl CoreLoop {
                 let infos = self.continuous_agg_mgr.list_aggregates();
                 match response_codec::encode_serde(&infos) {
                     Ok(payload) => self.response_with_payload(task, payload),
-                    Err(e) => self.response_error(
-                        task,
-                        crate::bridge::envelope::ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    ),
+                    Err(e) => {
+                        self.response_error(task, crate::bridge::envelope::ErrorCode::from(e))
+                    }
                 }
             }
 
@@ -337,56 +334,15 @@ impl CoreLoop {
                 self.response_ok(task)
             }
 
-            // Return a composite savepoint marker spanning every overlay: the
-            // value/TTL overlay's undo-journal length, then the parallel GRAPH
-            // overlay's, then the ARRAY overlay's, each an 8-byte LE u64 (24
-            // bytes total). An absent overlay (no staged write of that kind
-            // yet) reports 0.
-            MetaOp::MarkSavepoint { txn_id } => {
-                // A savepoint marks an active transaction — refresh its lease.
-                self.touch_overlay(*txn_id);
-                let value_marker = self
-                    .txn_overlays
-                    .get(txn_id)
-                    .map(|overlay| overlay.journal_len())
-                    .unwrap_or(0) as u64;
-                let graph_marker = self
-                    .graph_txn_overlays
-                    .get(txn_id)
-                    .map(|overlay| overlay.journal_len())
-                    .unwrap_or(0) as u64;
-                let array_marker = self
-                    .array_txn_overlays
-                    .get(txn_id)
-                    .map(|overlay| overlay.journal_len())
-                    .unwrap_or(0) as u64;
-                let mut payload = Vec::with_capacity(SAVEPOINT_MARKER_BYTES);
-                payload.extend_from_slice(&value_marker.to_le_bytes());
-                payload.extend_from_slice(&graph_marker.to_le_bytes());
-                payload.extend_from_slice(&array_marker.to_le_bytes());
-                self.response_with_payload(task, payload)
+            // A savepoint mark and its rewind are transaction activity: both
+            // refresh the overlay lease.
+            MetaOp::MarkSavepoint { txn_id, savepoint } => {
+                self.mark_savepoint(*txn_id, *savepoint);
+                self.response_ok(task)
             }
 
-            // Rewind the value/TTL overlay and the GRAPH and ARRAY overlays to
-            // their marked journal lengths. An absent overlay is a no-op
-            // (nothing of that kind was staged).
-            MetaOp::RollbackToSavepoint {
-                txn_id,
-                value_marker,
-                graph_marker,
-                array_marker,
-            } => {
-                // Rewinding a savepoint is transaction activity — refresh lease.
-                self.touch_overlay(*txn_id);
-                if let Some(overlay) = self.txn_overlays.get_mut(txn_id) {
-                    overlay.rollback_to(*value_marker as usize);
-                }
-                if let Some(overlay) = self.graph_txn_overlays.get_mut(txn_id) {
-                    overlay.rollback_to(*graph_marker as usize);
-                }
-                if let Some(overlay) = self.array_txn_overlays.get_mut(txn_id) {
-                    overlay.rollback_to(*array_marker as usize);
-                }
+            MetaOp::RollbackToSavepoint { txn_id, savepoint } => {
+                self.rollback_to_savepoint(*txn_id, *savepoint);
                 self.response_ok(task)
             }
         }

@@ -13,7 +13,7 @@ use tracing::debug;
 use crate::bridge::envelope::{Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::redo_image::versioned_point_images;
-use crate::data::executor::enforcement::chain_guard::{self, ChainGuard};
+use crate::data::executor::enforcement::chain_guard::{self, AbandonedWrite, ChainGuard};
 use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
@@ -143,7 +143,16 @@ impl CoreLoop {
                     // shape by the RETURNING renderer.
                     let mut response = match returning {
                         Some(spec) => {
-                            self.stored_returning_response(task, spec, rls_filters, None, &[])
+                            let identity_column =
+                                self.identity_column(database_id, tid, collection);
+                            self.stored_returning_response(
+                                task,
+                                spec,
+                                rls_filters,
+                                None,
+                                &identity_column,
+                                &[],
+                            )
                         }
                         None => self.response_affected(task, 0),
                     };
@@ -197,13 +206,11 @@ impl CoreLoop {
         ) {
             Ok(o) => o,
             Err(e) => {
-                chain_guard::abort_after_apply(
+                let e = chain_guard::abort_after_apply(
                     self,
                     &mut chain,
-                    database_id,
-                    tid,
-                    collection,
-                    &storage_key,
+                    AbandonedWrite::row(database_id, tid, collection, &storage_key),
+                    e,
                 );
                 return self.response_error(task, e);
             }
@@ -215,13 +222,12 @@ impl CoreLoop {
             .settle(self, surrogate, &outcome.stored_value)
             .and_then(|()| chain.persist_head(self, &txn))
         {
-            chain_guard::abort_after_apply(
+            let e = chain_guard::abort_after_apply(
                 self,
                 &mut chain,
-                database_id,
-                tid,
-                collection,
-                &storage_key,
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(std::mem::take(&mut outcome.memory_undo)),
+                e,
             );
             return self.response_error(task, e);
         }
@@ -239,15 +245,14 @@ impl CoreLoop {
                 new: ImageBody::Submitted(value),
             },
         ) {
-            Ok(outcome) => outcome,
+            Ok(enforcement) => enforcement,
             Err(e) => {
-                chain_guard::abort_after_apply(
+                let e = chain_guard::abort_after_apply(
                     self,
                     &mut chain,
-                    database_id,
-                    tid,
-                    collection,
-                    &storage_key,
+                    AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                        .undo(std::mem::take(&mut outcome.memory_undo)),
+                    e,
                 );
                 return self.response_error(task, e);
             }
@@ -257,6 +262,7 @@ impl CoreLoop {
         // against its OWN collection — the statement's own redo names only the
         // source row.
         let target_write_set = write_hook::target_write_set(&enforcement.target_writes);
+        let target_writes = enforcement.target_writes;
 
         // BALANCED is settled before the commit, so a single-row insert of one
         // journal leg — unbalanced by the constraint's own definition when the
@@ -264,33 +270,30 @@ impl CoreLoop {
         if let Err(e) =
             self.settle_balanced_entries(database_id, tid, collection, enforcement.balanced_entries)
         {
-            chain_guard::abort_after_apply(
+            let e = chain_guard::abort_after_apply(
                 self,
                 &mut chain,
-                database_id,
-                tid,
-                collection,
-                &storage_key,
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(std::mem::take(&mut outcome.memory_undo))
+                    .targets(target_writes),
+                e,
             );
             return self.response_error(task, e);
         }
 
         if let Err(e) = txn.commit() {
-            chain_guard::abort_after_apply(
+            let e = chain_guard::abort_after_apply(
                 self,
                 &mut chain,
-                database_id,
-                tid,
-                collection,
-                &storage_key,
-            );
-            return self.response_error(
-                task,
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(std::mem::take(&mut outcome.memory_undo))
+                    .targets(target_writes),
                 crate::Error::Storage {
                     engine: "sparse".into(),
                     detail: format!("commit: {e}"),
                 },
             );
+            return self.response_error(task, e);
         }
 
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
@@ -348,6 +351,7 @@ impl CoreLoop {
                 spec,
                 rls_filters,
                 strict_schema.as_ref(),
+                &self.identity_column(database_id, tid, collection),
                 &[(&document_identity, stored_value.as_slice())],
             )
         } else {

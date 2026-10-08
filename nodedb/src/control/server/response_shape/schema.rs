@@ -39,20 +39,35 @@ pub struct CpComputedColumn {
 /// (id-first union derivation still applies for that case). `cp_computed`
 /// lists the columns the response shaper evaluates on the Control Plane
 /// before the projection runs; each one also appears in `columns` under its
-/// alias.
+/// alias. `declared_key` decides the column a scan row's identity renders
+/// under (see [`OutputSchema::identity_column`]).
 #[derive(Clone, Debug, Default)]
 pub struct OutputSchema {
     pub columns: Vec<OutputColumn>,
     pub is_star: bool,
     pub cp_computed: Vec<CpComputedColumn>,
+    /// The scanned collection's declared key column. `None` when the plan
+    /// reads no collection with a declared key: the identity then renders
+    /// under the implicit `id`.
+    pub declared_key: Option<String>,
+}
+
+impl OutputSchema {
+    /// The column a scan row's identity renders under: the declared key,
+    /// else the implicit `id`.
+    pub fn identity_column(schema: Option<&OutputSchema>) -> &str {
+        schema
+            .and_then(|s| s.declared_key.as_deref())
+            .unwrap_or(nodedb_types::DEFAULT_IDENTITY_COLUMN)
+    }
 }
 
 /// Maps the planner's resolved SQL column type to the response shaper's
 /// protocol-neutral wire type.
 ///
-/// Variants with no dedicated wire type yet (`Decimal`, `Uuid`, `Vector`,
-/// `Geometry`) fall back to `DdlColType::Text`, preserving today's
-/// all-TEXT behavior for those types until a dedicated wire type exists.
+/// `Decimal` is `Numeric`, `Uuid` is `Uuid`, and a `Vector` is a `float4`
+/// array, because a vector stores `f32` elements. `Json` is `Json`: its
+/// cells render as JSON text. `Geometry` and an undeclared type are `Text`.
 pub fn sql_data_type_to_ddl_col_type(
     ty: &nodedb_sql::types_expr::SqlDataType,
 ) -> super::types::DdlColType {
@@ -67,13 +82,11 @@ pub fn sql_data_type_to_ddl_col_type(
         SqlDataType::Bytes => DdlColType::Bytea,
         SqlDataType::Timestamp => DdlColType::Timestamp,
         SqlDataType::Timestamptz => DdlColType::Timestamptz,
-        // No dedicated wire type yet; falls back to Text (no regression).
-        SqlDataType::Decimal => DdlColType::Text,
-        // No dedicated wire type yet; falls back to Text (no regression).
-        SqlDataType::Uuid => DdlColType::Text,
-        // No dedicated wire type yet; falls back to Text (no regression).
-        SqlDataType::Vector(_) => DdlColType::Text,
-        // No dedicated wire type yet; falls back to Text (no regression).
+        SqlDataType::Decimal(_) => DdlColType::Numeric,
+        SqlDataType::Uuid => DdlColType::Uuid,
+        SqlDataType::Vector(_) => DdlColType::Float4Array,
+        SqlDataType::Json => DdlColType::Json,
+        // Geometry renders as its GeoJSON text.
         SqlDataType::Geometry => DdlColType::Text,
         // No declared type at all; the column resolves by name only.
         SqlDataType::Unknown => DdlColType::Text,
@@ -308,18 +321,21 @@ mod tests {
             sql_data_type_to_ddl_col_type(&SqlDataType::Timestamptz),
             DdlColType::Timestamptz
         );
-        // Fallback variants: no dedicated wire type, all map to Text.
         assert_eq!(
-            sql_data_type_to_ddl_col_type(&SqlDataType::Decimal),
-            DdlColType::Text
+            sql_data_type_to_ddl_col_type(&SqlDataType::Decimal(None)),
+            DdlColType::Numeric
         );
         assert_eq!(
             sql_data_type_to_ddl_col_type(&SqlDataType::Uuid),
-            DdlColType::Text
+            DdlColType::Uuid
         );
         assert_eq!(
             sql_data_type_to_ddl_col_type(&SqlDataType::Vector(3)),
-            DdlColType::Text
+            DdlColType::Float4Array
+        );
+        assert_eq!(
+            sql_data_type_to_ddl_col_type(&SqlDataType::Json),
+            DdlColType::Json
         );
         assert_eq!(
             sql_data_type_to_ddl_col_type(&SqlDataType::Geometry),

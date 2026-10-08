@@ -6,6 +6,7 @@ use nodedb_physical::physical_plan::KvCounterShape;
 use nodedb_query::msgpack_scan::{KvBodyShape, kv_body_shape};
 use tracing::debug;
 
+use super::declared_body::fit_and_admit_kv_image;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::response_codec;
@@ -45,7 +46,7 @@ pub(in crate::data::executor) fn atomic_error_code(
         AtomicError::Encode { detail } => ErrorCode::Internal { detail },
         // Nothing was written: the engine consults the gate before it
         // installs the computed value.
-        AtomicError::Rejected(error) => (*error).into(),
+        AtomicError::Declared(error) | AtomicError::Rejected(error) => (*error).into(),
         AtomicError::Unbound(error) => error.into(),
     }
 }
@@ -91,10 +92,13 @@ impl CoreLoop {
         // see `CoreLoop::kv_ttl_now_ms` for the precedence this resolves.
         let now_ms: u64 = self.kv_ttl_now_ms(task);
         // The engine computes the post-image and installs it in one pass, so
-        // the write policy is handed in and decided on the computed bytes
-        // rather than on a duplicate of the increment arithmetic out here.
-        let admit =
-            |image: &[u8]| super::rls::admit_kv_row(rls_write_check, image, key, tid, collection);
+        // the declared column rule and the write policy are handed in and
+        // applied to the computed bytes rather than to a duplicate of the
+        // increment arithmetic out here.
+        let declared = self.declared_columns_of(did, tid, collection).to_vec();
+        let admit = |image: &[u8]| {
+            fit_and_admit_kv_image(image, &declared, rls_write_check, key, tid, collection)
+        };
         match self.kv_engine.incr(
             crate::engine::kv::AtomicKeyCtx {
                 database_id: did,
@@ -127,12 +131,7 @@ impl CoreLoop {
                 match response_codec::encode_json_as_msgpack(&serde_json::json!({ "value": value }))
                 {
                     Ok(payload) => self.response_with_payload(task, payload),
-                    Err(e) => self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    ),
+                    Err(e) => self.response_error(task, ErrorCode::from(e)),
                 }
             }
             Err(error) => self.response_atomic_error(task, collection, error),
@@ -165,8 +164,10 @@ impl CoreLoop {
             .map(|ms| ms as u64)
             .unwrap_or_else(current_ms);
         // Same engine-internal compute-and-persist as `Incr` — see there.
-        let admit =
-            |image: &[u8]| super::rls::admit_kv_row(rls_write_check, image, key, tid, collection);
+        let declared = self.declared_columns_of(did, tid, collection).to_vec();
+        let admit = |image: &[u8]| {
+            fit_and_admit_kv_image(image, &declared, rls_write_check, key, tid, collection)
+        };
         match self.kv_engine.incr_float(
             crate::engine::kv::AtomicKeyCtx {
                 database_id: did,
@@ -197,12 +198,7 @@ impl CoreLoop {
                 self.note_kv_write_lsn(task, did, tid, collection, key);
                 match response_codec::encode_json_as_msgpack(&incr_float_reply(value, &written)) {
                     Ok(payload) => self.response_with_payload(task, payload),
-                    Err(e) => self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    ),
+                    Err(e) => self.response_error(task, ErrorCode::from(e)),
                 }
             }
             Err(error) => self.response_atomic_error(task, collection, error),
@@ -235,10 +231,12 @@ impl CoreLoop {
             .map(|ms| ms as u64)
             .unwrap_or_else(current_ms);
         // A swap into a typed row stores the row with one column replaced, not
-        // `new_value` itself, so the policy decides the image the engine
-        // computes — see `Incr`.
-        let admit =
-            |image: &[u8]| super::rls::admit_kv_row(rls_write_check, image, key, tid, collection);
+        // `new_value` itself, so the declared rule and the policy apply to the
+        // image the engine computes — see `Incr`.
+        let declared = self.declared_columns_of(did, tid, collection).to_vec();
+        let admit = |image: &[u8]| {
+            fit_and_admit_kv_image(image, &declared, rls_write_check, key, tid, collection)
+        };
         let result = match self.kv_engine.cas(
             crate::engine::kv::AtomicKeyCtx {
                 database_id: did,
@@ -280,12 +278,7 @@ impl CoreLoop {
             "current_value": current_b64,
         })) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -319,9 +312,12 @@ impl CoreLoop {
             .map(|ms| ms as u64)
             .unwrap_or_else(current_ms);
         // A write into a typed row stores the row with one column replaced, so
-        // the policy decides the image the engine computes — see `Incr`.
-        let admit =
-            |image: &[u8]| super::rls::admit_kv_row(rls_write_check, image, key, tid, collection);
+        // the declared rule and the policy apply to the image the engine
+        // computes — see `Incr`.
+        let declared = self.declared_columns_of(did, tid, collection).to_vec();
+        let admit = |image: &[u8]| {
+            fit_and_admit_kv_image(image, &declared, rls_write_check, key, tid, collection)
+        };
         let crate::engine::kv::GetSetResult { old, written } = match self.kv_engine.getset(
             crate::engine::kv::AtomicKeyCtx {
                 database_id: did,
@@ -361,12 +357,7 @@ impl CoreLoop {
                 Ok(true) => old.as_deref(),
                 Ok(false) => None,
                 Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
+                    return self.response_error(task, ErrorCode::from(e));
                 }
             },
             None => None,
@@ -376,12 +367,7 @@ impl CoreLoop {
             .map(|v| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, v));
         match response_codec::encode_json_as_msgpack(&serde_json::json!({ "old_value": old_b64 })) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -610,6 +596,126 @@ mod tests {
         let row = columns(event.new_value.as_deref().expect("the new row"));
         assert_eq!(row.get("value"), Some(&Value::String("42".into())));
         assert_eq!(stored(&h.core, b"hits"), b"42".to_vec());
+    }
+
+    /// Register `declared` as the declared numeric columns of the collection.
+    fn declare(core: &mut CoreLoop, declared: &[(&str, &str)]) {
+        let mut config = crate::engine::document::store::CollectionConfig::new(COLLECTION);
+        config.declared_columns = declared
+            .iter()
+            .map(|(name, declared)| {
+                nodedb_physical::physical_plan::DeclaredColumn::from_declared(name, declared)
+                    .expect("numeric declaration")
+            })
+            .collect();
+        core.doc_configs.insert(
+            (
+                DatabaseId::DEFAULT,
+                TenantId::new(TID),
+                COLLECTION.to_string(),
+            ),
+            config,
+        );
+    }
+
+    fn is_out_of_range(resp: &crate::bridge::envelope::Response) -> bool {
+        matches!(
+            resp.error_code.as_deref(),
+            Some(crate::bridge::envelope::ErrorCode::NumericValueOutOfRange { .. })
+        )
+    }
+
+    #[test]
+    fn incr_past_a_declared_smallint_is_refused_and_writes_nothing() {
+        let mut h = make_core();
+        let row = typed_row(&[
+            ("label", Value::String("gold".into())),
+            ("n", Value::Integer(32767)),
+        ]);
+        seed(&mut h.core, b"player", &row);
+        declare(&mut h.core, &[("n", "SMALLINT")]);
+
+        let t = task();
+        let check = RlsWriteCheck::already_decided_elsewhere();
+        let resp = h
+            .core
+            .execute_kv_incr(ctx(&t, b"player", &check), 1, 0, &KvCounterShape::Raw);
+        assert!(is_out_of_range(&resp), "{:?}", resp.error_code);
+        assert!(
+            h.events.try_recv().is_none(),
+            "a refused INCR emits no event"
+        );
+        assert_eq!(stored(&h.core, b"player"), row);
+
+        let resp = h
+            .core
+            .execute_kv_incr(ctx(&t, b"player", &check), -1, 0, &KvCounterShape::Raw);
+        assert_eq!(resp.status, Status::Ok, "{:?}", resp.error_code);
+        assert_eq!(
+            columns(&stored(&h.core, b"player")).get("n"),
+            Some(&Value::Integer(32766))
+        );
+    }
+
+    #[test]
+    fn incr_float_meets_a_declared_decimal() {
+        let mut h = make_core();
+        declare(&mut h.core, &[("value", "DECIMAL(5,2)")]);
+        let t = task();
+        let check = RlsWriteCheck::already_decided_elsewhere();
+
+        seed(&mut h.core, b"price", b"999.99");
+        let resp =
+            h.core
+                .execute_kv_incr_float(ctx(&t, b"price", &check), "1", &KvCounterShape::Raw);
+        assert!(is_out_of_range(&resp), "{:?}", resp.error_code);
+        assert_eq!(stored(&h.core, b"price"), b"999.99".to_vec());
+
+        seed(&mut h.core, b"fee", b"1.50");
+        let resp =
+            h.core
+                .execute_kv_incr_float(ctx(&t, b"fee", &check), "0.005", &KvCounterShape::Raw);
+        assert_eq!(resp.status, Status::Ok, "{:?}", resp.error_code);
+        assert_eq!(
+            stored(&h.core, b"fee"),
+            b"1.51".to_vec(),
+            "the stored value is rounded to the declared scale"
+        );
+        let reply: serde_json::Value =
+            nodedb_types::json_from_msgpack(resp.payload.as_bytes()).expect("decode reply");
+        assert_eq!(reply["value"], serde_json::json!(1.51));
+        assert_eq!(reply["text"], serde_json::json!("1.51"));
+    }
+
+    #[test]
+    fn cas_and_getset_past_a_declared_smallint_are_refused() {
+        let mut h = make_core();
+        declare(&mut h.core, &[("value", "SMALLINT")]);
+        seed(&mut h.core, b"slot", b"5");
+        let t = task();
+        let check = RlsWriteCheck::already_decided_elsewhere();
+
+        let resp = h
+            .core
+            .execute_kv_cas(ctx(&t, b"slot", &check), b"5", b"40000");
+        assert!(is_out_of_range(&resp), "{:?}", resp.error_code);
+        assert_eq!(stored(&h.core, b"slot"), b"5".to_vec());
+
+        let resp = h
+            .core
+            .execute_kv_getset(ctx(&t, b"slot", &check), b"40000", &[]);
+        assert!(is_out_of_range(&resp), "{:?}", resp.error_code);
+        assert_eq!(stored(&h.core, b"slot"), b"5".to_vec());
+        assert!(
+            h.events.try_recv().is_none(),
+            "a refused write emits no event"
+        );
+
+        let resp = h
+            .core
+            .execute_kv_getset(ctx(&t, b"slot", &check), b"7", &[]);
+        assert_eq!(resp.status, Status::Ok, "{:?}", resp.error_code);
+        assert_eq!(stored(&h.core, b"slot"), b"7".to_vec());
     }
 
     #[test]

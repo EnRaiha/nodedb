@@ -2,12 +2,12 @@
 
 //! Parallel and sequential disk-partition scanning for raw mode.
 
-use std::collections::HashMap;
-
 use crate::bridge::scan_filter::ScanFilter;
+use crate::data::executor::handlers::timeseries::partition_read::{
+    TsPartitionColumns, read_ts_partition,
+};
 use crate::engine::timeseries::columnar_agg::timestamp_range_filter;
-use crate::engine::timeseries::columnar_memtable::{ColumnData, ColumnType};
-use crate::engine::timeseries::columnar_segment::ColumnarSegmentReader;
+use crate::engine::timeseries::columnar_memtable::ColumnType;
 
 use super::row_emit::{emit_partition_row, extract_timestamp, row_admitted};
 
@@ -78,9 +78,15 @@ pub(super) fn scan_partitions_parallel(
                 })
                 .collect();
 
+            // A scan thread that panicked refuses the scan: dropping its
+            // result would answer without its partitions' rows.
             handles
                 .into_iter()
-                .filter_map(|h| h.join().ok())
+                .map(|h| {
+                    h.join().map_err(|_| crate::Error::Internal {
+                        detail: "timeseries partition scan thread panicked".into(),
+                    })?
+                })
                 .collect::<crate::Result<Vec<_>>>()
         })?;
 
@@ -153,36 +159,23 @@ pub(super) fn scan_one_partition(
     has_filters: bool,
     rls_predicates: &[ScanFilter],
 ) -> crate::Result<Vec<rmpv::Value>> {
-    let schema = match ColumnarSegmentReader::read_schema(part_dir, None) {
-        Ok(s) => s,
-        Err(_) => return Ok(Vec::new()),
-    };
-
-    // Prefetch all column files into page cache before reading.
+    // A partition that does not read refuses the scan. Skipping it would
+    // answer without the partition's rows.
+    let TsPartitionColumns {
+        schema,
+        columns: col_data,
+        sym_dicts,
+    } = read_ts_partition(part_dir, "timeseries_raw_scan")?;
     let all_col_names: Vec<String> = schema.columns.iter().map(|(n, _)| n.clone()).collect();
-    crate::data::io::fadvise::prefetch_partition_columns(part_dir, &all_col_names);
 
-    let col_data: Vec<Option<ColumnData>> = schema
-        .columns
-        .iter()
-        .map(|(name, ty)| ColumnarSegmentReader::read_column(part_dir, name, *ty, None).ok())
-        .collect();
-
-    let sym_dicts: HashMap<usize, nodedb_types::timeseries::SymbolDictionary> = schema
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, ty))| *ty == ColumnType::Symbol)
-        .filter_map(|(i, (name, _))| {
-            ColumnarSegmentReader::read_symbol_dict(part_dir, name, None)
-                .ok()
-                .map(|dict| (i, dict))
-        })
-        .collect();
-
-    let ts_col = col_data.get(schema.timestamp_idx).and_then(|d| d.as_ref());
-    let Some(ts_col) = ts_col else {
-        return Ok(Vec::new());
+    let Some(ts_col) = col_data.get(schema.timestamp_idx).and_then(|d| d.as_ref()) else {
+        return Err(crate::Error::SegmentCorrupted {
+            detail: format!(
+                "timeseries partition {}: time column index {} is outside its schema",
+                part_dir.display(),
+                schema.timestamp_idx
+            ),
+        });
     };
     let timestamps = ts_col.as_timestamps();
     let indices = timestamp_range_filter(timestamps, time_range.0, time_range.1);
@@ -229,7 +222,7 @@ pub(super) fn scan_one_partition(
         if rows.len() >= limit {
             break;
         }
-        let row = emit_partition_row(&schema_vec, &col_data, &sym_dicts, idx as usize)?;
+        let row = emit_partition_row(part_dir, &schema_vec, &col_data, &sym_dicts, idx as usize)?;
         if !row_admitted(&row, row_filters, rls_predicates)? {
             continue;
         }

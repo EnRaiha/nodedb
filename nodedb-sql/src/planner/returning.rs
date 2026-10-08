@@ -16,9 +16,10 @@ use nodedb_types::DatabaseId;
 
 use crate::error::{Result, SqlError};
 use crate::parser::statement::parse_sql;
+use crate::planner::cp_projection::to_cp_computed;
 use crate::planner::select::helpers::convert_projection;
 use crate::resolver::columns::{ResolvedTable, TableScope};
-use crate::types::{Projection, SqlCatalog, SqlExpr};
+use crate::types::{Projection, SqlCatalog};
 
 /// Resolve a RETURNING item list against the DML target collection.
 ///
@@ -84,40 +85,11 @@ fn parse_items(items_sql: &str) -> Result<Vec<ast::SelectItem>> {
     Ok(select.projection)
 }
 
-/// A computed item becomes Control-Plane computed. A computed item that is a
-/// bare column under an alias stays `Computed`: the value is the stored
-/// column, looked up under the source name and displayed under the alias, so
-/// nothing is evaluated.
-fn to_cp_computed(projection: Projection) -> Projection {
-    match projection {
-        Projection::Computed { expr, alias } => match expr {
-            SqlExpr::Column { .. } => Projection::Computed { expr, alias },
-            SqlExpr::Function { .. }
-            | SqlExpr::Literal(_)
-            | SqlExpr::BinaryOp { .. }
-            | SqlExpr::UnaryOp { .. }
-            | SqlExpr::Case { .. }
-            | SqlExpr::Cast { .. }
-            | SqlExpr::Subquery(_)
-            | SqlExpr::Wildcard
-            | SqlExpr::IsNull { .. }
-            | SqlExpr::InList { .. }
-            | SqlExpr::Between { .. }
-            | SqlExpr::Like { .. }
-            | SqlExpr::ArrayLiteral(_) => Projection::CpComputed { expr, alias },
-        },
-        Projection::Column(_)
-        | Projection::Star
-        | Projection::QualifiedStar(_)
-        | Projection::CpComputed { .. } => projection,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::catalog::SqlCatalogError;
-    use crate::types::{CollectionInfo, ColumnInfo, EngineType, SqlDataType};
+    use crate::types::{CollectionInfo, ColumnInfo, EngineType, SqlDataType, SqlExpr};
 
     /// One strict `items` collection: `id TEXT`, `score BIGINT`.
     struct ItemsCatalog;

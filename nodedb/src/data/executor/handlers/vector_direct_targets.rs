@@ -37,15 +37,22 @@ pub(in crate::data::executor) fn decode_vector_write_filters(
 /// through the vector sidecar format, the same converter `SELECT` uses. A
 /// predicate that divides by zero fails the statement, the same as it fails
 /// the equivalent `SELECT`. Empty `filters` match every row.
+/// `identity_column` is the column the row's identity renders under.
 pub(in crate::data::executor) fn vector_sidecar_matches(
     key: &StorageKey,
     sidecar: &[u8],
     filters: &[ScanFilter],
+    identity_column: &str,
 ) -> Result<bool, ErrorCode> {
     if filters.is_empty() {
         return Ok(true);
     }
-    let (_id, mp) = sparse_row_to_doc(key, sidecar, SparseBodyFormatRef::VectorSidecar);
+    let (_id, mp) = sparse_row_to_doc(
+        key,
+        sidecar,
+        SparseBodyFormatRef::VectorSidecar,
+        identity_column,
+    );
     ScanFilter::all_match_binary(filters, &mp).map_err(ErrorCode::from)
 }
 
@@ -113,6 +120,7 @@ impl CoreLoop {
         let range = table
             .range(prefix.as_str()..end.as_str())
             .map_err(|e| storage_err("range", &e))?;
+        let identity_column = self.identity_column(database_id, tid, collection);
 
         let mut out = Vec::new();
         for entry in range {
@@ -128,7 +136,7 @@ impl CoreLoop {
                     rest,
                 ))
             })?;
-            if !vector_sidecar_matches(&key, value_guard.value(), filters)? {
+            if !vector_sidecar_matches(&key, value_guard.value(), filters, &identity_column)? {
                 continue;
             }
             out.push(key.surrogate());

@@ -19,6 +19,15 @@ pub enum StrictError {
         expected: ColumnType,
     },
 
+    /// A value of an accepted variant does not convert to the column type.
+    /// A text that does not parse as a UUID is one example.
+    #[error("column '{column}': invalid {expected} value: {detail}")]
+    InvalidValue {
+        column: String,
+        expected: ColumnType,
+        detail: String,
+    },
+
     /// A non-nullable column received a null value with no default.
     #[error("column '{0}' is NOT NULL and has no default")]
     NullViolation(String),

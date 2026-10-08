@@ -175,9 +175,7 @@ mod tests {
     }
 
     /// A `TxnDataPlane` that records every dispatched overlay meta-op (per vShard)
-    /// instead of touching a real core. `MarkSavepoint` replies with a `SAVEPOINT_MARKER_BYTES`-byte
-    /// composite marker whose value component is `vshard + 1`, so a later
-    /// ROLLBACK TO can be asserted to thread each vShard's own saved marker.
+    /// instead of touching a real core.
     #[derive(Default)]
     struct RecordingDp {
         ops: Mutex<Vec<(VShardId, MetaOp)>>,
@@ -188,34 +186,16 @@ mod tests {
             &'a self,
             task: PhysicalTask,
         ) -> Pin<Box<dyn Future<Output = crate::Result<Response>> + Send + 'a>> {
-            let vshard = task.vshard_id;
-            let payload = if let PhysicalPlan::Meta(op) = &task.plan {
-                self.ops.lock().unwrap().push((vshard, op.clone()));
-                match op {
-                    MetaOp::MarkSavepoint { .. } => {
-                        let value = (vshard.as_u32() as u64) + 1;
-                        let graph = 0u64;
-                        let array = 0u64;
-                        let mut bytes = Vec::with_capacity(
-                            nodedb_physical::physical_plan::SAVEPOINT_MARKER_BYTES,
-                        );
-                        bytes.extend_from_slice(&value.to_le_bytes());
-                        bytes.extend_from_slice(&graph.to_le_bytes());
-                        bytes.extend_from_slice(&array.to_le_bytes());
-                        Payload::from_vec(bytes)
-                    }
-                    _ => Payload::empty(),
-                }
-            } else {
-                Payload::empty()
-            };
+            if let PhysicalPlan::Meta(op) = &task.plan {
+                self.ops.lock().unwrap().push((task.vshard_id, op.clone()));
+            }
             Box::pin(async move {
                 Ok(Response {
                     request_id: RequestId::new(1),
                     status: Status::Ok,
                     attempt: 1,
                     partial: false,
-                    payload,
+                    payload: Payload::empty(),
                     watermark_lsn: Lsn::ZERO,
                     error_code: None,
                     read_set_valid: None,

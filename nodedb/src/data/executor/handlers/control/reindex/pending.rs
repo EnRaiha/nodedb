@@ -67,7 +67,7 @@ impl PendingBuild {
             Self::Csr { token, rx } => match rx.try_recv() {
                 Ok(result) => BuildPoll::Csr {
                     token,
-                    result: result.map_err(super::csr::graph_err),
+                    result: result.map_err(crate::Error::from),
                 },
                 Err(TryRecvError::Empty) => BuildPoll::Running(Self::Csr { token, rx }),
                 Err(TryRecvError::Disconnected) => BuildPoll::Csr {

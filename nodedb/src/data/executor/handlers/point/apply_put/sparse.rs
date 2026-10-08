@@ -10,6 +10,7 @@
 //! the dense-vector path needs.
 
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use crate::engine::document::store::StorageKey;
 
 impl CoreLoop {
@@ -91,6 +92,10 @@ impl CoreLoop {
     ///
     /// No-op (byte-identical to a collection without sparse columns) when
     /// `strict_sparse_fields` is empty.
+    ///
+    /// Pushes a `SparseDoc` undo entry onto `undo` before each upsert. The
+    /// entry holds the document's prior postings in that index and the
+    /// index's id counter, or marks the index as created by this write.
     pub(in crate::data::executor) fn apply_point_put_sparse_indexes(
         &mut self,
         database_id: u64,
@@ -98,6 +103,7 @@ impl CoreLoop {
         collection: &str,
         storage_key: StorageKey,
         value: &[u8],
+        undo: &mut Vec<UndoEntry>,
     ) {
         let sparse_fields = self.strict_sparse_fields(database_id, tid, collection);
         if sparse_fields.is_empty() {
@@ -119,6 +125,20 @@ impl CoreLoop {
             let Ok(sv) = nodedb_types::SparseVector::parse_literal(literal) else {
                 continue;
             };
+            let key = Self::sparse_index_key(database_id, tid, collection, field);
+            let (prior, next_id) = match self.sparse_vector_indexes.get(&key) {
+                Some(index) => (
+                    index.doc_image(&document_id),
+                    Some(index.next_internal_id()),
+                ),
+                None => (None, None),
+            };
+            undo.push(UndoEntry::SparseDoc {
+                key,
+                doc_id: document_id.clone(),
+                prior,
+                next_id,
+            });
             self.get_or_create_sparse_index(database_id, tid, collection, field)
                 .insert(&document_id, &sv);
             // Sparse indexes are in-memory with no redb store behind them; the
@@ -133,12 +153,16 @@ impl CoreLoop {
     /// and the PointUpdate re-index (which clears the old literal before
     /// inserting the new one). Mirrors `remove_document_vector_indexes`.
     /// No-op when the collection declares no sparse columns.
+    ///
+    /// Pushes a `SparseDoc` undo entry onto `undo` for each document entry it
+    /// removes, carrying the entry's internal id and postings.
     pub(in crate::data::executor) fn remove_document_sparse_indexes(
         &mut self,
         database_id: u64,
         tid: u64,
         collection: &str,
         storage_key: StorageKey,
+        undo: &mut Vec<UndoEntry>,
     ) {
         let sparse_fields = self.strict_sparse_fields(database_id, tid, collection);
         if sparse_fields.is_empty() {
@@ -147,12 +171,23 @@ impl CoreLoop {
         // The sparse index keys postings by the rendered storage key.
         let row_key = storage_key.to_string();
         for field in &sparse_fields {
-            if self
-                .get_or_create_sparse_index(database_id, tid, collection, field)
-                .delete(&row_key)
-            {
-                self.checkpoint_coordinator.mark_dirty("vector", 1);
-            }
+            let key = Self::sparse_index_key(database_id, tid, collection, field);
+            // A field with no index holds no entry to remove.
+            let Some(index) = self.sparse_vector_indexes.get_mut(&key) else {
+                continue;
+            };
+            let Some(prior) = index.doc_image(&row_key) else {
+                continue;
+            };
+            let next_id = index.next_internal_id();
+            index.delete(&row_key);
+            undo.push(UndoEntry::SparseDoc {
+                key,
+                doc_id: row_key.clone(),
+                prior: Some(prior),
+                next_id: Some(next_id),
+            });
+            self.checkpoint_coordinator.mark_dirty("vector", 1);
         }
     }
 }
@@ -255,6 +290,7 @@ mod tests {
             collection,
             StorageKey::for_surrogate(Surrogate::new(1)),
             &doc,
+            &mut Vec::new(),
         );
 
         assert_eq!(
@@ -284,6 +320,7 @@ mod tests {
             collection,
             StorageKey::for_surrogate(Surrogate::new(1)),
             &doc_with_sparse(field, "{3:0.5, 7:1.5}"),
+            &mut Vec::new(),
         );
         core.apply_point_put_sparse_indexes(
             db,
@@ -291,6 +328,7 @@ mod tests {
             collection,
             StorageKey::for_surrogate(Surrogate::new(1)),
             &doc_with_sparse(field, "{1:0.9}"),
+            &mut Vec::new(),
         );
 
         assert_eq!(
@@ -320,20 +358,63 @@ mod tests {
             collection,
             StorageKey::for_surrogate(Surrogate::new(1)),
             &doc_with_sparse(field, "{3:0.5, 7:1.5}"),
+            &mut Vec::new(),
         );
         assert_eq!(doc_count(core, db, tid, collection, field), 1);
 
+        let mut undo = Vec::new();
         core.remove_document_sparse_indexes(
             db,
             tid,
             collection,
             StorageKey::for_surrogate(Surrogate::new(1)),
+            &mut undo,
         );
         assert_eq!(
             doc_count(core, db, tid, collection, field),
             0,
             "remove must drop the document from the sparse field's index"
         );
+        assert_eq!(undo.len(), 1, "the removal pushes one undo entry");
+    }
+
+    /// Reversing a removal's undo entries puts the document's postings back
+    /// under the same internal id.
+    #[test]
+    fn undoing_a_remove_restores_the_sparse_entry() {
+        let mut harness = make_core();
+        let core = &mut harness.core;
+        let (db, tid, collection, field) = (0u64, 1u64, "docs", "terms");
+        register_strict_sparse(core, tid, collection, field);
+        let row = StorageKey::for_surrogate(Surrogate::new(1));
+
+        core.apply_point_put_sparse_indexes(
+            db,
+            tid,
+            collection,
+            row,
+            &doc_with_sparse(field, "{3:0.5, 7:1.5}"),
+            &mut Vec::new(),
+        );
+        let key = CoreLoop::sparse_index_key(db, tid, collection, field);
+        let before = core
+            .sparse_vector_indexes
+            .get(&key)
+            .and_then(|index| index.doc_image(&row.to_string()))
+            .expect("the put indexed the row");
+
+        let mut undo = Vec::new();
+        core.remove_document_sparse_indexes(db, tid, collection, row, &mut undo);
+        assert_eq!(doc_count(core, db, tid, collection, field), 0);
+
+        core.undo_memory_effects(db, tid, undo)
+            .expect("the removal reverses");
+        let after = core
+            .sparse_vector_indexes
+            .get(&key)
+            .and_then(|index| index.doc_image(&row.to_string()))
+            .expect("the row is indexed again");
+        assert_eq!(after, before, "same internal id and postings");
     }
 
     /// A collection with no `SparseVector` column is untouched: no index is
@@ -360,6 +441,7 @@ mod tests {
             collection,
             StorageKey::for_surrogate(Surrogate::new(1)),
             &doc_with_sparse("terms", "{3:0.5}"),
+            &mut Vec::new(),
         );
 
         assert!(

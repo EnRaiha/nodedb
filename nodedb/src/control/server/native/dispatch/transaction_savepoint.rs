@@ -5,9 +5,10 @@
 //! savepoint orchestrator in `control/server/shared/session/savepoint_ops.rs`.
 //!
 //! The overlay marker capture/decode and the `SessionStore` savepoint stack
-//! live in the neutral core; native only parses the statement, shares the same
+//! live in the neutral core; native receives the name the shared classifier
+//! parsed, shares the same
 //! Data-Plane dispatch seam as COMMIT/ROLLBACK, and maps the neutral error to a
-//! native SQLSTATE frame (`25P01` / `3B001`).
+//! native SQLSTATE frame (`25P01` / `25P02` / `3B001` / `XX000`).
 
 use nodedb_types::protocol::NativeResponse;
 
@@ -25,17 +26,25 @@ fn savepoint_error_to_native(seq: u64, e: &SavepointError) -> NativeResponse {
             "25P01",
             "SAVEPOINT can only be used in transaction blocks",
         ),
+        SavepointError::TransactionAborted => sqlstate_error(
+            seq,
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
+        ),
         SavepointError::NotFound { message } => sqlstate_error(seq, "3B001", message.clone()),
+        SavepointError::OverlayDispatch { message } => {
+            sqlstate_error(seq, "XX000", message.clone())
+        }
     }
 }
 
-/// Handle SAVEPOINT <name>.
+/// Handle `SAVEPOINT name`. `sp_name` is the name the shared classifier
+/// parsed: folded to lower case unless quoted.
 pub(crate) async fn handle_savepoint(
     ctx: &DispatchCtx<'_>,
     seq: u64,
-    sql_trimmed: &str,
+    sp_name: &str,
 ) -> NativeResponse {
-    let sp_name = sql_trimmed.split_whitespace().nth(1).unwrap_or("sp");
     let dp = NativeTxnDp { state: ctx.state };
     match savepoint_ops::run_savepoint(
         ctx.sessions,
@@ -51,26 +60,24 @@ pub(crate) async fn handle_savepoint(
     }
 }
 
-/// Handle RELEASE SAVEPOINT <name>.
+/// Handle `RELEASE [SAVEPOINT] name`.
 pub(crate) fn handle_release_savepoint(
     ctx: &DispatchCtx<'_>,
     seq: u64,
-    sql_trimmed: &str,
+    sp_name: &str,
 ) -> NativeResponse {
-    let sp_name = sql_trimmed.split_whitespace().last().unwrap_or("sp");
     match savepoint_ops::run_release_savepoint(ctx.sessions, ctx.peer_addr.into(), sp_name) {
         Ok(()) => NativeResponse::status_row(seq, "RELEASE"),
         Err(e) => savepoint_error_to_native(seq, &e),
     }
 }
 
-/// Handle ROLLBACK TO SAVEPOINT <name>.
+/// Handle `ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] name`.
 pub(crate) async fn handle_rollback_to_savepoint(
     ctx: &DispatchCtx<'_>,
     seq: u64,
-    sql_trimmed: &str,
+    sp_name: &str,
 ) -> NativeResponse {
-    let sp_name = sql_trimmed.split_whitespace().last().unwrap_or("sp");
     let dp = NativeTxnDp { state: ctx.state };
     match savepoint_ops::run_rollback_to_savepoint(
         ctx.sessions,

@@ -19,11 +19,18 @@ use super::types::ShapedRow;
 /// The envelope `id` is a rendered [`StorageKey`](crate::engine::document::store::StorageKey)
 /// by construction.
 /// A value that fails `StorageKey::parse` is surfaced as `Err`, never accommodated.
-pub fn push_flat_rows(value: Value, out: &mut Vec<ShapedRow>) -> crate::Result<()> {
+///
+/// `identity_column` is the column a scan row's identity renders under: the
+/// scanned collection's declared key, else the implicit `id`.
+pub fn push_flat_rows(
+    value: Value,
+    identity_column: &str,
+    out: &mut Vec<ShapedRow>,
+) -> crate::Result<()> {
     match value {
         Value::Array(items) => {
             for item in items {
-                push_flat_rows(item, out)?;
+                push_flat_rows(item, identity_column, out)?;
             }
         }
         Value::Object(mut map) => {
@@ -32,24 +39,25 @@ pub fn push_flat_rows(value: Value, out: &mut Vec<ShapedRow>) -> crate::Result<(
             {
                 let mut inner: ShapedRow = inner.into_iter().collect();
                 // The envelope carries the row's storage key, which is
-                // internal. A body with no `id` field renders its identity at
-                // this boundary, by the rule the Data Plane's row shaping
+                // internal. A body that lacks its identity column renders the
+                // identity there, by the rule the Data Plane's row shaping
                 // applies: the body's `_rowid`, else the storage key. A copy
                 // under a new surrogate keeps its `_rowid`, so it keeps its
-                // identity. `or_insert` leaves a declared primary key as the
-                // authority.
+                // identity. A body that holds its identity column keeps the
+                // stored value and gains no column: a declared key stays the
+                // authority, and no `id` appears beside it.
                 if let Some(Value::String(key)) = map.remove("id") {
                     let storage_key = crate::engine::document::store::StorageKey::parse(&key)
                         .ok_or_else(|| crate::Error::Internal {
                             detail: format!("scan envelope id is not a storage key: '{key}'"),
                         })?;
-                    let identity = match inner.get(nodedb_types::ROWID_COLUMN) {
-                        Some(Value::Integer(rowid)) => rowid.to_string(),
-                        _ => storage_key.to_identity().into_string(),
-                    };
-                    inner
-                        .entry("id".to_string())
-                        .or_insert(Value::String(identity));
+                    if !inner.contains_key(identity_column) {
+                        let identity = match inner.get(nodedb_types::ROWID_COLUMN) {
+                            Some(Value::Integer(rowid)) => rowid.to_string(),
+                            _ => storage_key.to_identity().into_string(),
+                        };
+                        inner.insert(identity_column.to_string(), Value::String(identity));
+                    }
                 }
                 out.push(inner);
                 return Ok(());
@@ -138,7 +146,53 @@ pub fn cell_keys(columns: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::cell_keys;
+    use super::{Value, cell_keys, push_flat_rows};
+
+    /// A scan envelope around `fields`, keyed by surrogate 7.
+    fn envelope(fields: &[(&str, &str)]) -> Value {
+        let key = nodedb_types::StorageKey::for_surrogate(nodedb_types::Surrogate::new(7));
+        let data = fields
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), Value::String((*v).to_string())))
+            .collect();
+        Value::Object(
+            [
+                ("id".to_string(), Value::String(key.to_string())),
+                ("data".to_string(), Value::Object(data)),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    }
+
+    fn flat(value: Value, identity_column: &str) -> Vec<(String, Value)> {
+        let mut rows = Vec::new();
+        push_flat_rows(value, identity_column, &mut rows).expect("a well-formed envelope");
+        assert_eq!(rows.len(), 1);
+        rows.remove(0).into_iter().collect()
+    }
+
+    #[test]
+    fn a_row_holding_its_declared_key_gains_no_column() {
+        let row = flat(envelope(&[("sku", "p1"), ("name", "pen")]), "sku");
+        assert_eq!(
+            row,
+            vec![
+                ("name".to_string(), Value::String("pen".into())),
+                ("sku".to_string(), Value::String("p1".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_row_lacking_its_identity_column_renders_the_identity_there() {
+        let row = flat(envelope(&[("name", "pen")]), "sku");
+        assert!(row.contains(&("sku".to_string(), Value::String("7".into()))));
+        assert!(!row.iter().any(|(k, _)| k == "id"), "{row:?}");
+
+        let row = flat(envelope(&[("name", "pen")]), "id");
+        assert!(row.contains(&("id".to_string(), Value::String("7".into()))));
+    }
 
     fn keys(cols: &[&str]) -> Vec<String> {
         cell_keys(&cols.iter().map(|s| s.to_string()).collect::<Vec<_>>())

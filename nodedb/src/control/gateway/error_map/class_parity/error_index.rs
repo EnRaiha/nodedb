@@ -3,7 +3,7 @@
 //! A dense index per `crate::Error` variant.
 
 /// The number of `crate::Error` variants [`error_variant_index`] numbers.
-pub(super) const ERROR_VARIANT_COUNT: usize = 115;
+pub(super) const ERROR_VARIANT_COUNT: usize = 121;
 
 /// A dense index per `crate::Error` variant. Exhaustive, so a new variant
 /// fails to compile here until it gets an index, and
@@ -61,6 +61,7 @@ pub(crate) fn error_variant_index(err: &crate::Error) -> usize {
         E::UndefinedObject { .. } => 48,
         E::ObjectNotInPrerequisiteState { .. } => 49,
         E::UndefinedColumn { .. } => 50,
+        E::TextColumn { .. } => 115,
         E::AmbiguousColumn { .. } => 51,
         E::UnknownStrictField { .. } => 52,
         E::DivisionByZero => 53,
@@ -127,5 +128,10 @@ pub(crate) fn error_variant_index(err: &crate::Error) -> usize {
         E::RestoreVerificationFailed { .. } => 113,
         E::BackupCaptureMoved { .. } => 114,
         E::CollectionUnstamped { .. } => 37,
+        E::NumericValueOutOfRange { .. } => 116,
+        E::InvalidTextRepresentation { .. } => 117,
+        E::DatatypeMismatch { .. } => 118,
+        E::InvalidDatetimeFormat { .. } => 119,
+        E::DatetimeFieldOverflow { .. } => 120,
     }
 }

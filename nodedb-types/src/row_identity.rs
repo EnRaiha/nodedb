@@ -178,6 +178,19 @@ impl std::fmt::Display for RowIdentity {
     }
 }
 
+/// The declared key among a collection's resolved primary key, or `None`.
+///
+/// `id` and `_rowid` name no declared key: a row keyed by either renders its
+/// identity under [`DEFAULT_IDENTITY_COLUMN`]. Every other key is declared,
+/// and a row's identity renders under it. Both planes apply this rule, so a
+/// scan row, a filter image, and a write image name the identity alike.
+pub fn declared_key(primary_key: Option<&str>) -> Option<&str> {
+    primary_key.filter(|key| {
+        !key.eq_ignore_ascii_case(DEFAULT_IDENTITY_COLUMN)
+            && !key.eq_ignore_ascii_case(ROWID_COLUMN)
+    })
+}
+
 /// Extract the stringified value of `field` from a MessagePack row body.
 ///
 /// Returns `None` when the body is not an object, lacks `field`, or the

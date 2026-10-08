@@ -2,88 +2,70 @@
 
 //! Value conversion and SQL formatting helpers for the remote client.
 //!
-//! Extracts pgwire row/column conversion, JSON-to-Value mapping, and
-//! SQL identifier quoting into a focused module. Shared row decoders
+//! Holds the pgwire row-cell entry point (the decoders live in
+//! [`crate::pg_cell`]), JSON-to-Value mapping, and SQL array formatting. Shared row decoders
 //! (column-level `value_as_*`, `_system.dropped_collections` parsing)
 //! live in [`crate::row_decode`] instead so the trait default impls can
 //! reuse them without dragging in pgwire types.
 
 use nodedb_types::Value;
+use nodedb_types::error::{NodeDbError, NodeDbResult};
 
-/// Convert a `tokio_postgres` column value to `nodedb_types::Value`.
+use crate::pg_cell::{RawCell, decode_cell};
+
+/// Convert cell `idx` of a `tokio_postgres` row, whose column is `column`,
+/// to `nodedb_types::Value` by the column type. A cell that does not decode
+/// is an error naming the column, the PG type and the cell text, never a
+/// NULL.
 pub(crate) fn pg_value_to_value(
     row: &tokio_postgres::Row,
     idx: usize,
-    ty: &tokio_postgres::types::Type,
-) -> Value {
-    use tokio_postgres::types::Type;
-
-    match *ty {
-        Type::BOOL => row
-            .try_get::<_, bool>(idx)
-            .map(Value::Bool)
-            .unwrap_or(Value::Null),
-        Type::INT2 => row
-            .try_get::<_, i16>(idx)
-            .map(|v| Value::Integer(v as i64))
-            .unwrap_or(Value::Null),
-        Type::INT4 => row
-            .try_get::<_, i32>(idx)
-            .map(|v| Value::Integer(v as i64))
-            .unwrap_or(Value::Null),
-        Type::INT8 => row
-            .try_get::<_, i64>(idx)
-            .map(Value::Integer)
-            .unwrap_or(Value::Null),
-        Type::FLOAT4 => row
-            .try_get::<_, f32>(idx)
-            .map(|v| Value::Float(v as f64))
-            .unwrap_or(Value::Null),
-        Type::FLOAT8 => row
-            .try_get::<_, f64>(idx)
-            .map(Value::Float)
-            .unwrap_or(Value::Null),
-        Type::TEXT | Type::VARCHAR | Type::NAME => row
-            .try_get::<_, String>(idx)
-            .map(Value::String)
-            .unwrap_or(Value::Null),
-        Type::BYTEA => row
-            .try_get::<_, Vec<u8>>(idx)
-            .map(Value::Bytes)
-            .unwrap_or(Value::Null),
-        Type::JSON | Type::JSONB => row
-            .try_get::<_, serde_json::Value>(idx)
-            .map(|v| json_to_value(&v))
-            .unwrap_or(Value::Null),
-        _ => {
-            // Fallback: try as string.
-            row.try_get::<_, String>(idx)
-                .map(Value::String)
-                .unwrap_or(Value::Null)
-        }
-    }
+    column: &tokio_postgres::Column,
+) -> NodeDbResult<Value> {
+    let raw = row.try_get::<_, Option<RawCell<'_>>>(idx).map_err(|e| {
+        NodeDbError::serialization(
+            "pgwire",
+            format!(
+                "column \"{}\" of type {}: cannot read the cell: {e}",
+                column.name(),
+                column.type_().name()
+            ),
+        )
+    })?;
+    decode_cell(column.name(), column.type_(), raw.map(|cell| cell.0))
 }
 
 /// Convert `serde_json::Value` to `nodedb_types::Value`.
-pub(crate) fn json_to_value(v: &serde_json::Value) -> Value {
-    match v {
+///
+/// A JSON number keeps the kind the native client decodes it to: an integer
+/// in `i64` range is an `Integer`, a larger unsigned integer is the `Decimal`
+/// of [`Value::from_u64`], and every other number is a `Float`. A number
+/// with no `f64` form is an error naming it, never a guessed value.
+pub(crate) fn json_to_value(v: &serde_json::Value) -> NodeDbResult<Value> {
+    Ok(match v {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => Value::Bool(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Integer(i)
-            } else {
-                Value::Float(n.as_f64().unwrap_or(0.0))
+        serde_json::Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+            (Some(i), _, _) => Value::Integer(i),
+            (None, Some(u), _) => Value::from_u64(u),
+            (None, None, Some(f)) => Value::Float(f),
+            (None, None, None) => {
+                return Err(NodeDbError::serialization(
+                    "json",
+                    format!("number {n} has no integer or f64 form"),
+                ));
             }
-        }
+        },
         serde_json::Value::String(s) => Value::String(s.clone()),
-        serde_json::Value::Array(a) => Value::Array(a.iter().map(json_to_value).collect()),
+        serde_json::Value::Array(a) => {
+            Value::Array(a.iter().map(json_to_value).collect::<NodeDbResult<_>>()?)
+        }
         serde_json::Value::Object(m) => Value::Object(
             m.iter()
-                .map(|(k, v)| (k.clone(), json_to_value(v)))
-                .collect(),
+                .map(|(k, v)| Ok((k.clone(), json_to_value(v)?)))
+                .collect::<NodeDbResult<_>>()?,
         ),
-    }
+    })
 }
 
 /// Format an f32 slice as a SQL ARRAY literal: `ARRAY[0.1,0.2,0.3]`.
@@ -108,21 +90,33 @@ mod tests {
         assert_eq!(arr, "ARRAY[]");
     }
 
+    fn decoded(v: serde_json::Value) -> Value {
+        json_to_value(&v).expect("every serde_json number has an f64 form")
+    }
+
     #[test]
     fn json_to_value_primitives() {
-        assert_eq!(json_to_value(&serde_json::json!(null)), Value::Null);
-        assert_eq!(json_to_value(&serde_json::json!(true)), Value::Bool(true));
-        assert_eq!(json_to_value(&serde_json::json!(42)), Value::Integer(42));
-        assert_eq!(json_to_value(&serde_json::json!(2.5)), Value::Float(2.5));
+        assert_eq!(decoded(serde_json::json!(null)), Value::Null);
+        assert_eq!(decoded(serde_json::json!(true)), Value::Bool(true));
+        assert_eq!(decoded(serde_json::json!(42)), Value::Integer(42));
+        assert_eq!(decoded(serde_json::json!(2.5)), Value::Float(2.5));
         assert_eq!(
-            json_to_value(&serde_json::json!("hello")),
+            decoded(serde_json::json!("hello")),
             Value::String("hello".into())
         );
     }
 
     #[test]
+    fn json_to_value_keeps_a_u64_above_i64_max_exact() {
+        assert_eq!(
+            decoded(serde_json::json!(u64::MAX)),
+            Value::from_u64(u64::MAX)
+        );
+    }
+
+    #[test]
     fn json_to_value_nested() {
-        let v = json_to_value(&serde_json::json!({"a": [1, 2]}));
+        let v = decoded(serde_json::json!({"a": [1, 2]}));
         assert!(matches!(v, Value::Object(_)));
     }
 }

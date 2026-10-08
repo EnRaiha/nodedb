@@ -12,7 +12,7 @@ pub fn ts_percentile_exact(values: &[f64], p: f64) -> Option<f64> {
     if sorted.is_empty() {
         return None;
     }
-    sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_unstable_by(|a, b| crate::numeric_cmp::cmp_f64(*a, *b));
 
     let n = sorted.len();
     if n == 1 {

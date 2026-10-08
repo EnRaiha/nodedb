@@ -3,7 +3,8 @@
 //! BEGIN and ROLLBACK adapters — thin pgwire shims over the protocol-neutral
 //! lifecycle orchestrator (`control/server/shared/session/lifecycle.rs`). The
 //! staging-overlay release, DDL-buffer, and GAP_FREE rollback logic all live in
-//! the neutral core now; these functions only shape the tag / error.
+//! the neutral core. These functions check BEGIN's transaction modes and
+//! shape the tag / error.
 
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
@@ -11,17 +12,37 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::session::{SessionId, TransactionState, lifecycle};
 
+use super::super::super::types::sqlstate_error;
 use super::super::core::NodeDbPgHandler;
 use super::commit::PgwireTxnDp;
+use crate::control::server::shared::txn_control::TxnModes;
 
 impl NodeDbPgHandler {
-    /// Handle BEGIN / START TRANSACTION.
+    /// Handle BEGIN / START TRANSACTION. A refused isolation level or
+    /// `DEFERRABLE` fails with SQLSTATE 0A000 before the block opens. An
+    /// access mode is stored the way `SET TRANSACTION` stores it.
     pub(in crate::control::server::pgwire::handler) fn handle_begin(
         &self,
         session_id: SessionId,
+        modes: &TxnModes,
     ) -> PgWireResult<Vec<Response>> {
+        if let Some(message) = modes.refusal("BEGIN") {
+            return Err(sqlstate_error(
+                nodedb_types::error::sqlstate::FEATURE_NOT_SUPPORTED,
+                &message,
+            ));
+        }
         match lifecycle::run_begin(&self.sessions, session_id, &self.state) {
-            Ok(()) => Ok(vec![Response::Execution(Tag::new("BEGIN"))]),
+            Ok(()) => {
+                if let Some(access) = modes.access {
+                    self.sessions.set_parameter(
+                        session_id,
+                        "transaction_access_mode".into(),
+                        access.parameter_value().into(),
+                    );
+                }
+                Ok(vec![Response::Execution(Tag::new("BEGIN"))])
+            }
             Err(e) => {
                 let message = match &e {
                     crate::Error::BadRequest { detail } => detail.clone(),

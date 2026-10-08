@@ -84,9 +84,8 @@ impl NodeDbRemote {
         let mut result_rows = Vec::with_capacity(rows.len());
         for row in &rows {
             let mut vals = Vec::with_capacity(columns.len());
-            for (i, col) in row.columns().iter().enumerate() {
-                let val = pg_value_to_value(row, i, col.type_());
-                vals.push(val);
+            for (idx, column) in row.columns().iter().enumerate() {
+                vals.push(pg_value_to_value(row, idx, column)?);
             }
             result_rows.push(vals);
         }

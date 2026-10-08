@@ -3,7 +3,7 @@
 //! TDigest — approximate percentile estimation (mergeable centroids).
 
 /// Centroid in the t-digest: represents a cluster of values.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 struct Centroid {
     mean: f64,
     count: u64,
@@ -14,7 +14,7 @@ struct Centroid {
 /// Maintains a sorted set of centroids that approximate the data distribution.
 /// Accurate at the extremes (p1, p99) and reasonable in the middle.
 /// Mergeable across partitions and shards.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub struct TDigest {
     centroids: Vec<Centroid>,
     max_centroids: usize,
@@ -223,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn tdigest_serde_roundtrip_merge_semantics() {
+    fn tdigest_msgpack_roundtrip_merge_semantics() {
         let mut a = TDigest::new();
         let mut b = TDigest::new();
         for i in 0..500 {
@@ -233,8 +233,8 @@ mod tests {
             b.add(i as f64);
         }
 
-        let bytes = serde_json::to_vec(&a).expect("serialize TDigest");
-        let mut a_prime: TDigest = serde_json::from_slice(&bytes).expect("deserialize TDigest");
+        let bytes = zerompk::to_msgpack_vec(&a).expect("serialize TDigest");
+        let mut a_prime: TDigest = zerompk::from_msgpack(&bytes).expect("deserialize TDigest");
 
         a_prime.merge(&b);
         a.merge(&b);

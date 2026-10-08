@@ -13,7 +13,9 @@ use pgwire::messages::PgWireBackendMessage;
 
 use super::NodeDbPgHandler;
 use crate::control::server::pgwire::handler::in_flight::InFlightGuard;
+use crate::control::server::pgwire::types::wire_type::TEXT_RESULTS;
 use crate::control::server::shared::session::TransactionState;
+use crate::control::server::shared::txn_control::{TxnControl, classify as classify_txn_control};
 
 // ── SimpleQueryHandler ──────────────────────────────────────────────
 
@@ -66,9 +68,10 @@ impl SimpleQueryHandler for NodeDbPgHandler {
             "session query dispatch",
         );
 
-        // Send notice if BEGIN is called (advisory transactions).
-        let upper = query.trim().to_uppercase();
-        if (upper == "BEGIN" || upper == "BEGIN TRANSACTION" || upper == "START TRANSACTION")
+        // Warn on BEGIN inside a block and on COMMIT outside one, as
+        // PostgreSQL does.
+        let control = classify_txn_control(query);
+        if matches!(control, Some(TxnControl::Begin(_)))
             && self.sessions.transaction_state(session_id) == TransactionState::InBlock
         {
             let notice = super::super::super::types::notice_warning(
@@ -79,7 +82,7 @@ impl SimpleQueryHandler for NodeDbPgHandler {
                 .await;
         }
 
-        if (upper == "COMMIT" || upper == "END")
+        if control == Some(TxnControl::Commit)
             && self.sessions.transaction_state(session_id) == TransactionState::Idle
         {
             let notice =
@@ -102,7 +105,9 @@ impl SimpleQueryHandler for NodeDbPgHandler {
             },
         );
 
-        let result = self.execute_sql(&identity, session_id, query).await;
+        let result = self
+            .execute_sql(&identity, session_id, query, &TEXT_RESULTS)
+            .await;
 
         // Drain queued NOTICE messages emitted by response shapers (e.g.
         // `truncated_before_horizon` on array slices) and raised below them

@@ -7,6 +7,7 @@ use nodedb_types::{QualifiedCollection, RlsWriteCheck, Surrogate};
 use super::counter_shape::KvCounterShape;
 use super::resolved_mutation::KvResolvedMutation;
 use super::sorted_read::{SortedIndexRead, SortedIndexSpec};
+use super::transfer_amount::TransferAmount;
 use crate::physical_plan::document::ReturningSpec;
 
 /// KV engine physical operations.
@@ -402,8 +403,9 @@ pub enum KvOp {
         source_key: Vec<u8>,
         dest_key: Vec<u8>,
         field: String,
-        /// Amount to transfer (encoded as f64 bytes).
-        amount: f64,
+        /// Amount to transfer, typed by the field it moves: exact for a
+        /// `DECIMAL` field, a float otherwise.
+        amount: TransferAmount,
         /// Debit (source) row's identity, content-addressed on `(collection,
         /// source_key)`, threaded to the write-back.
         debit_surrogate: Surrogate,

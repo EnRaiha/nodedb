@@ -89,12 +89,7 @@ impl CoreLoop {
         ) {
             Ok(d) => d,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    crate::bridge::envelope::ErrorCode::Internal {
-                        detail: format!("backfill scan: {e}"),
-                    },
-                );
+                return self.response_error(task, crate::bridge::envelope::ErrorCode::from(e));
             }
         };
 
@@ -121,12 +116,7 @@ impl CoreLoop {
         let txn = match self.sparse.begin_write() {
             Ok(t) => t,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    crate::bridge::envelope::ErrorCode::Internal {
-                        detail: format!("backfill txn: {e}"),
-                    },
-                );
+                return self.response_error(task, crate::bridge::envelope::ErrorCode::from(e));
             }
         };
 
@@ -194,12 +184,7 @@ impl CoreLoop {
         // it writes. Buffering the keys and writing them in order turns the
         // whole backfill into a single forward walk.
         if let Err(e) = self.sparse.index_put_sorted_in_txn(&txn, &mut pending_keys) {
-            return self.response_error(
-                task,
-                crate::bridge::envelope::ErrorCode::Internal {
-                    detail: format!("backfill index_put: {e}"),
-                },
-            );
+            return self.response_error(task, crate::bridge::envelope::ErrorCode::from(e));
         }
 
         if let Err(e) = txn.commit() {
@@ -241,20 +226,12 @@ impl CoreLoop {
             Ok(removed) => {
                 match super::super::super::response_codec::encode_count("removed", removed) {
                     Ok(bytes) => self.response_with_payload(task, bytes),
-                    Err(e) => self.response_error(
-                        task,
-                        crate::bridge::envelope::ErrorCode::Internal {
-                            detail: format!("drop index encode: {e}"),
-                        },
-                    ),
+                    Err(e) => {
+                        self.response_error(task, crate::bridge::envelope::ErrorCode::from(e))
+                    }
                 }
             }
-            Err(e) => self.response_error(
-                task,
-                crate::bridge::envelope::ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, crate::bridge::envelope::ErrorCode::from(e)),
         }
     }
 }

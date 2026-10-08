@@ -73,37 +73,39 @@ impl SegmentReader {
 
     /// Read and decode posting blocks for a term.
     ///
-    /// Returns empty vec if the term is not in this segment.
-    pub fn read_postings(&self, term: &str) -> Vec<PostingBlock> {
+    /// Returns an empty vec if the term is not in this segment. Posting data
+    /// that lies outside the segment body or does not decode is
+    /// [`SegmentError::CorruptPostings`].
+    pub fn read_postings(&self, term: &str) -> Result<Vec<PostingBlock>, SegmentError> {
         let Some(entry) = self.find_term(term) else {
-            return Vec::new();
+            return Ok(Vec::new());
+        };
+        let corrupt = || SegmentError::CorruptPostings {
+            term: term.to_string(),
         };
 
-        let Some(start) = usize::try_from(self.header.posting_data_offset)
+        let start = usize::try_from(self.header.posting_data_offset)
             .ok()
             .and_then(|base| {
                 usize::try_from(entry.posting_offset)
                     .ok()
                     .and_then(|offset| base.checked_add(offset))
             })
-        else {
-            return Vec::new();
-        };
-        let Some(end) = usize::try_from(entry.posting_len)
+            .ok_or_else(corrupt)?;
+        let end = usize::try_from(entry.posting_len)
             .ok()
             .and_then(|len| start.checked_add(len))
-        else {
-            return Vec::new();
-        };
-        let Some(body_end) = self.data.len().checked_sub(format::FOOTER_SIZE) else {
-            return Vec::new();
-        };
+            .ok_or_else(corrupt)?;
+        let body_end = self
+            .data
+            .len()
+            .checked_sub(format::FOOTER_SIZE)
+            .ok_or_else(corrupt)?;
         if end > body_end {
-            return Vec::new();
+            return Err(corrupt());
         }
 
-        let buf = &self.data[start..end];
-        decode_term_blocks(buf)
+        decode_term_blocks(&self.data[start..end]).ok_or_else(corrupt)
     }
 
     /// Get all unique terms in this segment.
@@ -120,50 +122,47 @@ impl SegmentReader {
 /// Decode posting blocks from the term's posting data bytes.
 ///
 /// Format: [num_blocks: u32 LE][for each: block_len: u32 LE, block_bytes]
-fn decode_term_blocks(buf: &[u8]) -> Vec<PostingBlock> {
+///
+/// `None` when the bytes do not hold every block the count names, or a
+/// block does not decode.
+fn decode_term_blocks(buf: &[u8]) -> Option<Vec<PostingBlock>> {
     if buf.len() < 4 {
-        return Vec::new();
+        return None;
     }
-    let num_blocks = match usize::try_from(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])) {
-        Ok(count) => count,
-        Err(_) => return Vec::new(),
-    };
+    let num_blocks = usize::try_from(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])).ok()?;
     // Each block has at least its four-byte length prefix, so the remaining
     // bytes prove a safe upper bound before reserving the result vector.
     if num_blocks > (buf.len() - 4) / 4 {
-        return Vec::new();
+        return None;
     }
     const MAX_POSTING_BLOCK_ALLOCATION_BYTES: usize = 64 * 1024 * 1024;
-    let Some(blocks_capacity) = checked_decode_capacity(
+    let blocks_capacity = checked_decode_capacity(
         num_blocks,
         size_of::<PostingBlock>(),
         buf.len() - 4,
         4,
         (buf.len() - 4) / 4,
         MAX_POSTING_BLOCK_ALLOCATION_BYTES,
-    ) else {
-        return Vec::new();
-    };
-    let mut pos = 4;
+    )?;
+    let mut pos: usize = 4;
     let mut blocks = Vec::with_capacity(blocks_capacity);
 
     for _ in 0..num_blocks {
-        if pos + 4 > buf.len() {
-            break;
-        }
-        let block_len =
-            u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
-        pos += 4;
-        if pos + block_len > buf.len() {
-            break;
-        }
-        if let Some(block) = PostingBlock::from_bytes(&buf[pos..pos + block_len]) {
-            blocks.push(block);
-        }
-        pos += block_len;
+        let len_end = pos.checked_add(4).filter(|end| *end <= buf.len())?;
+        let block_len = usize::try_from(u32::from_le_bytes([
+            buf[pos],
+            buf[pos + 1],
+            buf[pos + 2],
+            buf[pos + 3],
+        ]))
+        .ok()?;
+        pos = len_end;
+        let block_end = pos.checked_add(block_len).filter(|end| *end <= buf.len())?;
+        blocks.push(PostingBlock::from_bytes(&buf[pos..block_end])?);
+        pos = block_end;
     }
 
-    blocks
+    Some(blocks)
 }
 
 #[cfg(test)]
@@ -207,7 +206,16 @@ mod tests {
 
     #[test]
     fn rejects_huge_block_count_with_tiny_payload_before_allocation() {
-        assert!(decode_term_blocks(&u32::MAX.to_le_bytes()).is_empty());
+        assert!(decode_term_blocks(&u32::MAX.to_le_bytes()).is_none());
+    }
+
+    #[test]
+    fn a_truncated_block_list_does_not_decode() {
+        // Two blocks named, one empty block present.
+        let mut buf = 2u32.to_le_bytes().to_vec();
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        assert!(decode_term_blocks(&buf).is_none());
     }
 
     #[test]
@@ -216,7 +224,7 @@ mod tests {
         let reader = SegmentReader::open(seg_data).unwrap();
         assert_eq!(reader.num_terms(), 2);
 
-        let blocks = reader.read_postings("alpha");
+        let blocks = reader.read_postings("alpha").unwrap();
         assert_eq!(blocks.len(), 1); // 2 docs fit in 1 block.
         assert_eq!(
             blocks[0].doc_ids,
@@ -226,11 +234,14 @@ mod tests {
     }
 
     #[test]
-    fn overflowing_posting_offset_returns_empty() {
+    fn overflowing_posting_offset_is_corrupt() {
         let seg_data = make_segment();
         let mut reader = SegmentReader::open(seg_data).unwrap();
         reader.term_dict[0].posting_offset = u64::MAX;
-        assert!(reader.read_postings("alpha").is_empty());
+        assert!(matches!(
+            reader.read_postings("alpha"),
+            Err(SegmentError::CorruptPostings { ref term }) if term == "alpha"
+        ));
     }
 
     #[test]
@@ -249,7 +260,7 @@ mod tests {
     fn missing_term_returns_empty() {
         let seg_data = make_segment();
         let reader = SegmentReader::open(seg_data).unwrap();
-        assert!(reader.read_postings("nonexistent").is_empty());
+        assert!(reader.read_postings("nonexistent").unwrap().is_empty());
     }
 
     #[test]

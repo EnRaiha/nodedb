@@ -233,14 +233,14 @@ pub(crate) fn encode_columnar_dml_payload(
     collection: &str,
     is_update: bool,
     filters: &[u8],
-    updates: &[(String, Vec<u8>)],
+    updates: &[(String, nodedb_physical::physical_plan::UpdateValue)],
 ) -> crate::Result<Vec<u8>> {
     let record = nodedb_types::columnar::ColumnarDmlWalRecord {
         kind: "columnar_dml".to_string(),
         collection: collection.to_string(),
         is_update,
         filters: filters.to_vec(),
-        updates: updates.to_vec(),
+        updates: crate::wal::encode_columnar_dml_updates(updates)?,
     };
     zerompk::to_msgpack_vec(&record).map_err(|e| crate::Error::Serialization {
         format: "msgpack".into(),

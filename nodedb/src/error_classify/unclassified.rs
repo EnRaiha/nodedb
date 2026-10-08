@@ -81,10 +81,16 @@ pub(crate) fn is_unclassified_failure(e: &Error) -> bool {
         | Error::UndefinedObject { .. }
         | Error::ObjectNotInPrerequisiteState { .. }
         | Error::UndefinedColumn { .. }
+        | Error::TextColumn { .. }
         | Error::AmbiguousColumn { .. }
         | Error::UnknownStrictField { .. }
         | Error::DivisionByZero
         | Error::DataException { .. }
+        | Error::NumericValueOutOfRange { .. }
+        | Error::InvalidTextRepresentation { .. }
+        | Error::DatatypeMismatch { .. }
+        | Error::InvalidDatetimeFormat { .. }
+        | Error::DatetimeFieldOverflow { .. }
         | Error::InvalidLimitValue { .. }
         | Error::RetryableSchemaChanged { .. }
         | Error::RetryableLeaderChange { .. }

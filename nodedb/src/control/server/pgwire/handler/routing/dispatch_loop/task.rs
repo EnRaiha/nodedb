@@ -4,7 +4,8 @@
 
 use std::sync::Arc;
 
-use pgwire::api::results::{FieldFormat, Response};
+use pgwire::api::portal::Format;
+use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -33,7 +34,7 @@ pub(super) struct ShapeTaskParams<'a> {
     /// implicit-edge write beside the user's own, which folds as opaque.
     pub(super) counts_toward_tag: bool,
     pub(super) projection: Option<&'a OutputSchema>,
-    pub(super) result_formats: &'a [FieldFormat],
+    pub(super) result_formats: &'a Format,
     pub(super) session_id: SessionId,
     pub(super) tenant_id: TenantId,
     pub(super) database_id: DatabaseId,

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `FieldInfo` builders and NodeDB-type-name to pgwire `Type` mapping used
-//! when constructing query result row descriptors.
+//! The text `FieldInfo` builder for fixed text result columns, and the
+//! NodeDB-type-name to pgwire `Type` mapping. Typed result columns build
+//! their fields through `wire_type::result_field`.
 
 use nodedb_types::columnar::ColumnType;
 use pgwire::api::Type;
@@ -11,106 +12,6 @@ use pgwire::api::results::FieldInfo;
 /// Build a FieldInfo for a text column in query results.
 pub fn text_field(name: &str) -> FieldInfo {
     FieldInfo::new(name.to_owned(), None, None, Type::TEXT, FieldFormat::Text)
-}
-
-/// Build a FieldInfo for an int8 column.
-pub fn int8_field(name: &str) -> FieldInfo {
-    FieldInfo::new(name.to_owned(), None, None, Type::INT8, FieldFormat::Text)
-}
-
-/// Build a FieldInfo for a float8 column.
-pub fn float8_field(name: &str) -> FieldInfo {
-    FieldInfo::new(name.to_owned(), None, None, Type::FLOAT8, FieldFormat::Text)
-}
-
-/// Build a FieldInfo for a float4 column.
-pub fn float4_field(name: &str) -> FieldInfo {
-    FieldInfo::new(name.to_owned(), None, None, Type::FLOAT4, FieldFormat::Text)
-}
-
-/// Build a FieldInfo for an int4 column.
-pub fn int4_field(name: &str) -> FieldInfo {
-    FieldInfo::new(name.to_owned(), None, None, Type::INT4, FieldFormat::Text)
-}
-
-/// Build a FieldInfo for an int2 column.
-pub fn int2_field(name: &str) -> FieldInfo {
-    FieldInfo::new(name.to_owned(), None, None, Type::INT2, FieldFormat::Text)
-}
-
-/// Build a FieldInfo for a bool column.
-pub fn bool_field(name: &str) -> FieldInfo {
-    FieldInfo::new(name.to_owned(), None, None, Type::BOOL, FieldFormat::Text)
-}
-
-/// Build a FieldInfo for a bytea column.
-pub fn bytea_field(name: &str) -> FieldInfo {
-    FieldInfo::new(name.to_owned(), None, None, Type::BYTEA, FieldFormat::Text)
-}
-
-/// Build a FieldInfo for a JSON column.
-pub fn json_field(name: &str) -> FieldInfo {
-    FieldInfo::new(name.to_owned(), None, None, Type::JSON, FieldFormat::Text)
-}
-
-/// Build a FieldInfo for a JSONB column.
-pub fn jsonb_field(name: &str) -> FieldInfo {
-    FieldInfo::new(name.to_owned(), None, None, Type::JSONB, FieldFormat::Text)
-}
-
-/// Build a FieldInfo for a timestamptz column.
-pub fn timestamptz_field(name: &str) -> FieldInfo {
-    FieldInfo::new(
-        name.to_owned(),
-        None,
-        None,
-        Type::TIMESTAMPTZ,
-        FieldFormat::Text,
-    )
-}
-
-/// Build a FieldInfo for a timestamp column.
-pub fn timestamp_field(name: &str) -> FieldInfo {
-    FieldInfo::new(
-        name.to_owned(),
-        None,
-        None,
-        Type::TIMESTAMP,
-        FieldFormat::Text,
-    )
-}
-
-/// Build a FieldInfo for a varchar column.
-pub fn varchar_field(name: &str) -> FieldInfo {
-    FieldInfo::new(
-        name.to_owned(),
-        None,
-        None,
-        Type::VARCHAR,
-        FieldFormat::Text,
-    )
-}
-
-/// Build a FieldInfo for a float4 array column (vector embeddings).
-pub fn float4_array_field(name: &str) -> FieldInfo {
-    FieldInfo::new(
-        name.to_owned(),
-        None,
-        None,
-        Type::FLOAT4_ARRAY,
-        FieldFormat::Text,
-    )
-}
-
-/// Build a FieldInfo for a float8 array column.
-pub fn float8_array_field(name: &str) -> FieldInfo {
-    FieldInfo::new(
-        name.to_owned(),
-        None,
-        None,
-        Type::FLOAT8_ARRAY,
-        FieldFormat::Text,
-    )
 }
 
 /// Map a NodeDB field type name to a pgwire `Type`.

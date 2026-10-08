@@ -124,7 +124,10 @@ mod tests {
     #[test]
     fn restore_truncated_brings_back_rows_and_tombstones_exactly() {
         let mut engine = seeded();
-        let before: Vec<Vec<Value>> = engine.scan_memtable_rows().collect();
+        let before: Vec<Vec<Value>> = engine
+            .scan_memtable_rows()
+            .collect::<Result<_, _>>()
+            .expect("read");
 
         let pre = engine.truncate();
         engine
@@ -132,7 +135,10 @@ mod tests {
             .expect("insert after truncate");
         engine.restore_truncated(pre);
 
-        let after: Vec<Vec<Value>> = engine.scan_memtable_rows().collect();
+        let after: Vec<Vec<Value>> = engine
+            .scan_memtable_rows()
+            .collect::<Result<_, _>>()
+            .expect("read");
         assert_eq!(
             after, before,
             "restore must reproduce the pre-truncate rows"

@@ -53,12 +53,7 @@ impl CoreLoop {
             "write_amp_estimate": format!("{:.0}%", 15.0 + 10.0 * self.kv_engine.index_count(did, tid, collection) as f64),
         })) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -77,12 +72,7 @@ impl CoreLoop {
             "entries_removed": removed,
         })) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }

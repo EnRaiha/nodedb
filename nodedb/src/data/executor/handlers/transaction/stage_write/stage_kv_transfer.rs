@@ -27,6 +27,7 @@ use nodedb_physical::physical_plan::KvOp;
 use super::context::StageCtx;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::kv::declared_body::fit_kv_image;
 use crate::data::executor::handlers::kv::field_compute::merge_field_updates;
 use crate::data::executor::handlers::kv::transfer_compute::{TransferError, compute_transfer};
 use crate::data::executor::response_codec;
@@ -50,7 +51,8 @@ struct StageTransfer<'a> {
     source_key: &'a [u8],
     dest_key: &'a [u8],
     field: &'a str,
-    amount: f64,
+    /// The amount, typed by the field it moves.
+    amount: nodedb_physical::physical_plan::TransferAmount,
     /// Compiled RLS write predicate for the collection both rows live in.
     rls_write_check: &'a nodedb_types::RlsWriteCheck,
 }
@@ -168,7 +170,12 @@ impl CoreLoop {
                 Err(e) => self.response_error(ctx.task, e),
             };
         }
-        let computed = match merge_field_updates(ctx.collection, current.as_deref(), updates) {
+        let computed = match merge_field_updates(
+            ctx.collection,
+            current.as_deref(),
+            updates,
+            self.declared_columns_of(ctx.database_id, ctx.tid, ctx.collection),
+        ) {
             Ok(c) => c,
             Err(e) => return self.response_error(ctx.task, e),
         };
@@ -206,8 +213,16 @@ impl CoreLoop {
         let dest_ctx = self.kv_atomic_stage_ctx(task, cx.tid, cx.txn_id, collection, dest_key);
         let dest_bytes = self.resolve_kv_current(&dest_ctx, dest_key);
 
-        let computed = match compute_transfer(&source_bytes, dest_bytes.as_deref(), field, amount) {
+        let declared = self.declared_columns(&source_ctx.coll_key);
+        let computed = match compute_transfer(
+            &source_bytes,
+            dest_bytes.as_deref(),
+            field,
+            amount,
+            declared,
+        ) {
             Ok(c) => c,
+            Err(TransferError::Declared(e)) => return self.response_error(task, e),
             Err(TransferError::TypeMismatch(detail)) => {
                 return self.response_error(
                     task,
@@ -253,9 +268,9 @@ impl CoreLoop {
             "source_key": src_str,
             "dest_key": dst_str,
             "field": field,
-            "amount": amount,
-            "source_balance": computed.source_balance_after,
-            "dest_balance": computed.dest_balance_after,
+            "amount": computed.amount.to_json(),
+            "source_balance": computed.source_balance_after.to_json(),
+            "dest_balance": computed.dest_balance_after.to_json(),
         })) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(task, e),
@@ -284,16 +299,23 @@ impl CoreLoop {
             return self.response_error(task, ErrorCode::NotFound);
         };
         let dest_ctx = self.kv_atomic_stage_ctx(task, cx.tid, cx.txn_id, dest_collection, dest_key);
+        // The row arriving at the destination meets the destination's
+        // declared numeric columns.
+        let fitted = match fit_kv_image(&item_bytes, self.declared_columns(&dest_ctx.coll_key)) {
+            Ok(fitted) => fitted,
+            Err(e) => return self.response_error(task, e),
+        };
 
-        // The same bytes are two different images to two independent policies:
-        // the row leaving the source and the row arriving at the destination.
-        // Both are decided before the source is tombstoned, so a rejected move
-        // never removes the row it could not deliver.
+        // The row leaving the source and the row arriving at the destination
+        // are two images to two independent policies. Both are decided before
+        // the source is tombstoned, so a rejected move never removes the row
+        // it could not deliver.
         if let Err(e) = self.stage_admit_kv_image(&source_ctx, &item_bytes, source_rls_write_check)
         {
             return self.response_error(task, e);
         }
-        if let Err(e) = self.stage_admit_kv_image(&dest_ctx, &item_bytes, dest_rls_write_check) {
+        let dest_bytes = fitted.unwrap_or(item_bytes);
+        if let Err(e) = self.stage_admit_kv_image(&dest_ctx, &dest_bytes, dest_rls_write_check) {
             return self.response_error(task, e);
         }
 
@@ -303,7 +325,7 @@ impl CoreLoop {
             &source_ctx.document_id,
         );
 
-        if let Err(e) = self.stage_put_capped(&dest_ctx, item_bytes) {
+        if let Err(e) = self.stage_put_capped(&dest_ctx, dest_bytes) {
             return self.response_error(task, e);
         }
 

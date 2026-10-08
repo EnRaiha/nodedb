@@ -6,6 +6,7 @@
 //! queue for a single tenant. Lives on the Data Plane (one per tenant per core).
 
 pub mod apply;
+pub mod apply_target;
 pub mod apply_validated;
 pub mod constraints;
 pub mod core;
@@ -20,5 +21,6 @@ mod snapshot_io;
 mod snapshot_restore;
 pub mod validate;
 
-pub use apply_validated::{ApplyTarget, DeltaSigningAdmission, ValidatedApplyOutcome};
+pub use apply_target::ApplyTarget;
+pub use apply_validated::{DeltaSigningAdmission, ValidatedApplyOutcome};
 pub use core::TenantCrdtEngine;

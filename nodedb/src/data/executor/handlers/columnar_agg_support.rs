@@ -2,6 +2,8 @@
 
 //! Supporting types and low-level routines for columnar aggregation.
 
+use nodedb_query::window::extremum::value_replaces;
+
 use crate::engine::timeseries::columnar_memtable::{ColumnData, ColumnType, ColumnarMemtable};
 
 /// Iterate over every set bit in a packed `u64` bitmask, calling `f(row_idx)`.
@@ -32,43 +34,83 @@ pub(in crate::data::executor::handlers) fn for_each_set_bit(
 }
 
 /// Accumulator for running aggregate computation per group.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+///
+/// SUM / AVG total exactly per `ExactSum`: an `Int64` or `Timestamp` cell
+/// never rounds through `f64`. MIN / MAX keep the original cell, compared
+/// exactly, so an integer column returns an integer. Spill runs encode it
+/// as MessagePack, which keeps NaN and ±Infinity exact.
+#[derive(Debug, Clone, Default, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub(in crate::data::executor::handlers) struct AggAccum {
     pub count: u64,
-    pub sum: f64,
-    pub min: f64,
-    pub max: f64,
+    pub sum: nodedb_query::ExactSum,
+    pub min: Option<nodedb_types::Value>,
+    pub max: Option<nodedb_types::Value>,
 }
 
 impl AggAccum {
     pub(in crate::data::executor::handlers) fn new() -> Self {
-        Self {
-            count: 0,
-            sum: 0.0,
-            min: f64::INFINITY,
-            max: f64::NEG_INFINITY,
-        }
+        Self::default()
     }
 
-    pub(in crate::data::executor::handlers) fn feed(&mut self, val: f64) {
-        self.count += 1;
-        self.sum += val;
-        if val < self.min {
-            self.min = val;
+    /// Feed aggregate `op` the cell at `row_idx` of a numeric column:
+    /// `count` counts it, any other op folds its value. Returns `false` for
+    /// a non-numeric column, which feeds nothing; the caller stops feeding
+    /// the row.
+    pub(in crate::data::executor::handlers) fn feed_op(
+        &mut self,
+        op: &str,
+        col_data: &ColumnData,
+        row_idx: usize,
+    ) -> bool {
+        let cell = match col_data {
+            ColumnData::Float64(vals) => nodedb_types::Value::Float(vals[row_idx]),
+            ColumnData::Int64(vals) => nodedb_types::Value::Integer(vals[row_idx]),
+            ColumnData::Timestamp(vals) => nodedb_types::Value::Integer(vals[row_idx]),
+            _ => return false,
+        };
+        if op == "count" {
+            self.feed_count_only();
+        } else {
+            self.feed(cell);
         }
-        if val > self.max {
-            self.max = val;
+        true
+    }
+
+    fn feed(&mut self, cell: nodedb_types::Value) {
+        self.count += 1;
+        self.sum.add_value(&cell);
+        if value_replaces(&cell, self.min.as_ref(), false) {
+            self.min = Some(cell.clone());
+        }
+        if value_replaces(&cell, self.max.as_ref(), true) {
+            self.max = Some(cell);
         }
     }
 
     pub(in crate::data::executor::handlers) fn feed_count_only(&mut self) {
         self.count += 1;
     }
+
+    /// Fold a partial accumulator (a spilled run) into this one without loss.
+    pub(in crate::data::executor::handlers) fn merge(&mut self, other: AggAccum) {
+        self.count += other.count;
+        self.sum.merge(&other.sum);
+        if let Some(min) = other.min
+            && value_replaces(&min, self.min.as_ref(), false)
+        {
+            self.min = Some(min);
+        }
+        if let Some(max) = other.max
+            && value_replaces(&max, self.max.as_ref(), true)
+        {
+            self.max = Some(max);
+        }
+    }
 }
 
 /// A group key composed of symbol IDs (for Symbol columns) or raw i64/f64
 /// values (for numeric group-by columns). Avoids string allocation entirely.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub(in crate::data::executor::handlers) enum GroupKeyPart {
     SymbolId(u32),
     Int64(i64),
@@ -118,26 +160,23 @@ pub(in crate::data::executor::handlers) fn extract_group_key_part(
     }
 }
 
-/// Resolve a group key part to a serde_json::Value for output.
+/// Resolve a group key part to its output value. A float key keeps NaN and
+/// ±Infinity.
 pub(in crate::data::executor::handlers) fn resolve_key_part(
     mt: &ColumnarMemtable,
     col_idx: usize,
     part: &GroupKeyPart,
-) -> serde_json::Value {
+) -> nodedb_types::Value {
     match part {
         GroupKeyPart::SymbolId(id) => mt
             .symbol_dict(col_idx)
             .and_then(|dict| dict.get(*id))
-            .map(|s| serde_json::Value::String(s.to_string()))
-            .unwrap_or(serde_json::Value::Null),
-        GroupKeyPart::Int64(v) => serde_json::Value::Number(serde_json::Number::from(*v)),
-        GroupKeyPart::Float64Bits(bits) => {
-            let v = f64::from_bits(*bits);
-            serde_json::Number::from_f64(v)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
-        }
-        GroupKeyPart::Null => serde_json::Value::Null,
+            .map_or(nodedb_types::Value::Null, |s| {
+                nodedb_types::Value::String(s.to_string())
+            }),
+        GroupKeyPart::Int64(v) => nodedb_types::Value::Integer(*v),
+        GroupKeyPart::Float64Bits(bits) => nodedb_types::Value::Float(f64::from_bits(*bits)),
+        GroupKeyPart::Null => nodedb_types::Value::Null,
     }
 }
 
@@ -181,16 +220,8 @@ pub(in crate::data::executor::handlers) fn aggregate_dense_symbol(
             match &p.agg_col_data[agg_idx] {
                 None => accums[agg_idx].feed_count_only(),
                 Some((_, col_data)) => {
-                    let val = match col_data {
-                        ColumnData::Float64(vals) => vals[row_idx],
-                        ColumnData::Int64(vals) => vals[row_idx] as f64,
-                        ColumnData::Timestamp(vals) => vals[row_idx] as f64,
-                        _ => return,
-                    };
-                    if op == "count" {
-                        accums[agg_idx].feed_count_only();
-                    } else {
-                        accums[agg_idx].feed(val);
+                    if !accums[agg_idx].feed_op(op, col_data, row_idx) {
+                        return;
                     }
                 }
             }

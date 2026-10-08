@@ -84,12 +84,7 @@ impl CoreLoop {
                 Ok(Some(data)) => data,
                 Ok(None) => return self.response_with_payload(task, Vec::new()),
                 Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
+                    return self.response_error(task, ErrorCode::from(e));
                 }
             }
         } else if let Some(overlay_data) = self.overlay_point_lookup(
@@ -126,12 +121,7 @@ impl CoreLoop {
                     Ok(None) => return self.response_with_payload(task, Vec::new()),
                     Err(e) => {
                         tracing::warn!(core = self.core_id, error = %e, "sparse get failed");
-                        return self.response_error(
-                            task,
-                            ErrorCode::Internal {
-                                detail: e.to_string(),
-                            },
-                        );
+                        return self.response_error(task, ErrorCode::from(e));
                     }
                 }
             }
@@ -149,15 +139,22 @@ impl CoreLoop {
         // actually rewritten yields an owned buffer, and only then is `data`
         // superseded.
         //
-        // RLS reads a second image with `id` injected: a schemaless row with
-        // no declared `id` field carries its identity only in `row_key`, so a
-        // policy naming `id` reads it as absent otherwise. The client still
-        // gets the stored body, which never gains a field it did not have.
+        // RLS reads a second image with the identity under the collection's
+        // identity column, the image a scan of the same row returns: a row
+        // that lacks the column carries its identity only in the storage key,
+        // so a policy naming the column reads it as absent otherwise. A
+        // declared-key row gains no `id`. The client still gets the stored
+        // body, which never gains a field it did not have.
         let transcoded = {
             let normalized = sparse_body_to_msgpack(&data, body_format.as_format_ref());
             if !rls_filters.is_empty() {
-                let (_, gated) =
-                    sparse_row_to_doc(&storage_key, &data, body_format.as_format_ref());
+                let identity_column = self.identity_column(database_id, tid, collection);
+                let (_, gated) = sparse_row_to_doc(
+                    &storage_key,
+                    &data,
+                    body_format.as_format_ref(),
+                    &identity_column,
+                );
                 if !super::super::rls_eval::rls_check_msgpack_bytes(rls_filters, &gated) {
                     return self.response_with_payload(task, Vec::new());
                 }

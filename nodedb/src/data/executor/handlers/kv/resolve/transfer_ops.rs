@@ -10,6 +10,7 @@ use nodedb_physical::physical_plan::KvResolveOutcome;
 use super::context::{ResolveResult, ResolvedPut, delete_mutation, put_mutation};
 use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::kv::declared_body::fit_kv_image;
 use crate::data::executor::handlers::kv::rls::admit_kv_row;
 use crate::data::executor::handlers::kv::transfer::{TransferItemParams, TransferParams};
 use crate::data::executor::handlers::kv::transfer_compute::{TransferError, compute_transfer};
@@ -50,8 +51,10 @@ impl CoreLoop {
             dest_bytes.as_deref().filter(|b| !b.is_empty()),
             field,
             amount,
+            self.declared_columns_of(did, tid, collection),
         )
         .map_err(|e| match e {
+            TransferError::Declared(error) => ErrorCode::from(error),
             TransferError::TypeMismatch(detail) => ErrorCode::TypeMismatch {
                 collection: collection.to_string(),
                 detail,
@@ -107,9 +110,9 @@ impl CoreLoop {
             "source_key": String::from_utf8_lossy(source_key),
             "dest_key": String::from_utf8_lossy(dest_key),
             "field": field,
-            "amount": amount,
-            "source_balance": computed.source_balance_after,
-            "dest_balance": computed.dest_balance_after,
+            "amount": computed.amount.to_json(),
+            "source_balance": computed.source_balance_after.to_json(),
+            "dest_balance": computed.dest_balance_after.to_json(),
         }))?;
         Ok(KvResolveOutcome {
             mutations,
@@ -141,6 +144,13 @@ impl CoreLoop {
         else {
             return Err(ErrorCode::NotFound);
         };
+        // The row arriving at the destination meets the destination's
+        // declared numeric columns.
+        let dest_data = fit_kv_image(
+            &item_data,
+            self.declared_columns_of(did, tid, dest_collection),
+        )?
+        .unwrap_or_else(|| item_data.clone());
         admit_kv_row(
             source_rls_write_check,
             &item_data,
@@ -150,7 +160,7 @@ impl CoreLoop {
         )?;
         admit_kv_row(
             dest_rls_write_check,
-            &item_data,
+            &dest_data,
             dest_key,
             tid,
             dest_collection,
@@ -169,11 +179,11 @@ impl CoreLoop {
 
         Ok(KvResolveOutcome {
             mutations: vec![
-                delete_mutation(source_collection, item_key, Some(item_data.clone())),
+                delete_mutation(source_collection, item_key, Some(item_data)),
                 put_mutation(ResolvedPut {
                     collection: dest_collection,
                     key: dest_key,
-                    value: item_data,
+                    value: dest_data,
                     ttl_ms: 0,
                     expire_at_ms: 0,
                     surrogate,

@@ -3,22 +3,27 @@
 //! Type-coerced equality and ordering for `Value`.
 //!
 //! Single source of truth for type coercion in filter/sort evaluation.
+//! Numbers compare through the shared order in [`crate::numeric_cmp`].
+
+use std::cmp::Ordering;
 
 use super::core::Value;
+use crate::numeric_cmp::{Numeric, cmp_numeric, decimal_reading, parse_numeric_str};
 
 impl Value {
     /// Coerced equality: `Value` vs `Value` with numeric/string coercion.
     ///
     /// Single source of truth for type coercion in filter evaluation.
     /// Used by `matches_binary` (msgpack path) and `matches_value` (Value path).
+    ///
+    /// Two strings are equal by their text or by the instant they denote.
+    /// Any other pair where both sides read as numbers is equal when
+    /// [`cmp_numeric`] orders it `Equal`: exact for integers and decimals,
+    /// and NaN equals NaN.
     pub fn eq_coerced(&self, other: &Value) -> bool {
         match (self, other) {
             (Value::Null, Value::Null) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Integer(a), Value::Integer(b)) => a == b,
-            (Value::Integer(a), Value::Float(b)) => *a as f64 == *b,
-            (Value::Float(a), Value::Integer(b)) => *a == *b as f64,
-            (Value::Float(a), Value::Float(b)) => a == b,
             (Value::String(a), Value::String(b)) => {
                 a == b
                     || matches!(
@@ -26,46 +31,32 @@ impl Value {
                         (Some(x), Some(y)) if x.micros == y.micros
                     )
             }
-            // Coercion: number vs string
-            (Value::Integer(a), Value::String(s)) => {
-                s.parse::<i64>().is_ok_and(|n| *a == n)
-                    || s.parse::<f64>().is_ok_and(|n| *a as f64 == n)
-            }
-            (Value::String(s), Value::Integer(b)) => {
-                s.parse::<i64>().is_ok_and(|n| n == *b)
-                    || s.parse::<f64>().is_ok_and(|n| n == *b as f64)
-            }
-            (Value::Float(a), Value::String(s)) => s.parse::<f64>().is_ok_and(|n| *a == n),
-            (Value::String(s), Value::Float(b)) => s.parse::<f64>().is_ok_and(|n| n == *b),
             // Structural equality on ND cells: same coords and same attrs.
             (Value::ArrayCell(a), Value::ArrayCell(b)) => a == b,
-            // Two exact decimals compare exactly; a decimal against any other
-            // number compares through f64 like the arms above.
-            (Value::Decimal(a), Value::Decimal(b)) => a == b,
-            (Value::Decimal(_), _) | (_, Value::Decimal(_)) => {
-                match (numeric_f64(self), numeric_f64(other)) {
+            (a, b) => {
+                if let (Some(x), Some(y)) = (numeric_reading(a), numeric_reading(b)) {
+                    return cmp_numeric(x, y) == Ordering::Equal;
+                }
+                match (datetime_micros(a), datetime_micros(b)) {
                     (Some(x), Some(y)) => x == y,
                     _ => false,
                 }
             }
-            (a, b) => match (datetime_micros(a), datetime_micros(b)) {
-                (Some(x), Some(y)) => x == y,
-                _ => false,
-            },
         }
     }
 
     /// Coerced partial ordering for predicate evaluation.
     ///
-    /// Two numbers (or numeric strings) order numerically, two instants (or
-    /// ISO-8601 strings) by epoch microseconds, two other strings
-    /// lexicographically, and two ND cells coordinate-major. A pair with no
-    /// defined order — an integer against an instant, text against a number,
-    /// a NaN — is `None`, so a range predicate over it matches nothing rather
-    /// than every row: the row-level counterpart of PostgreSQL refusing to
+    /// Two numbers (or numeric strings) order by [`cmp_numeric`]: exact for
+    /// integers and decimals, NaN above every number and equal to NaN, as
+    /// in PostgreSQL. Two instants (or ISO-8601 strings) order by epoch
+    /// microseconds, two other strings lexicographically, and two ND cells
+    /// coordinate-major. A pair with no defined order — an integer against
+    /// an instant, text against a number, a bool against a number — is
+    /// `None`, so a range predicate over it matches nothing rather than
+    /// every row: the row-level counterpart of PostgreSQL refusing to
     /// compare the two types.
-    pub fn partial_cmp_coerced(&self, other: &Value) -> Option<std::cmp::Ordering> {
-        use std::cmp::Ordering;
+    pub fn partial_cmp_coerced(&self, other: &Value) -> Option<Ordering> {
         if let (Value::ArrayCell(a), Value::ArrayCell(b)) = (self, other) {
             for (x, y) in a.coords.iter().zip(b.coords.iter()) {
                 match x.partial_cmp_coerced(y)? {
@@ -85,8 +76,8 @@ impl Value {
             }
             return Some(a.attrs.len().cmp(&b.attrs.len()));
         }
-        if let (Some(a), Some(b)) = (numeric_f64(self), numeric_f64(other)) {
-            return a.partial_cmp(&b);
+        if let (Some(a), Some(b)) = (numeric_reading(self), numeric_reading(other)) {
+            return Some(cmp_numeric(a, b));
         }
         if let (Some(a), Some(b)) = (datetime_micros(self), datetime_micros(other)) {
             return Some(a.cmp(&b));
@@ -104,21 +95,20 @@ impl Value {
     /// for ORDER BY / MIN / MAX style paths that need an `Ordering` for every
     /// pair; a predicate uses `partial_cmp_coerced` so an unordered pair
     /// matches nothing.
-    pub fn cmp_coerced(&self, other: &Value) -> std::cmp::Ordering {
-        self.partial_cmp_coerced(other)
-            .unwrap_or(std::cmp::Ordering::Equal)
+    pub fn cmp_coerced(&self, other: &Value) -> Ordering {
+        self.partial_cmp_coerced(other).unwrap_or(Ordering::Equal)
     }
 }
 
-/// The number a value denotes for coerced ordering: an integer, a float, or
-/// a string that parses as one. `None` for anything else.
-fn numeric_f64(v: &Value) -> Option<f64> {
-    use rust_decimal::prelude::ToPrimitive;
+/// The number a value denotes for coerced comparison: an integer, a float,
+/// a decimal, or a string that parses as a number. A bool has no numeric
+/// reading here. `None` for anything else.
+fn numeric_reading(v: &Value) -> Option<Numeric> {
     match v {
-        Value::Integer(i) => Some(*i as f64),
-        Value::Float(f) => Some(*f),
-        Value::Decimal(d) => d.to_f64(),
-        Value::String(s) => s.parse::<f64>().ok(),
+        Value::Integer(i) => Some(Numeric::Int(i128::from(*i))),
+        Value::Float(f) => Some(Numeric::Float(*f)),
+        Value::Decimal(d) => Some(decimal_reading(d)),
+        Value::String(s) => parse_numeric_str(s),
         _ => None,
     }
 }
@@ -270,7 +260,7 @@ mod tests {
 
     /// An integer carries no unit, so it has no order against an instant:
     /// `WHERE at >= 5` over an instant column matches nothing, in both
-    /// orientations. The same holds for text against a number and for NaN.
+    /// orientations. The same holds for text against a number.
     #[test]
     fn partial_cmp_coerced_is_none_for_an_unordered_pair() {
         let instant = Value::NaiveDateTime(crate::NdbDateTime::from_micros(1_583_402_400_000_000));
@@ -285,9 +275,110 @@ mod tests {
             None
         );
         assert_eq!(Value::Null.partial_cmp_coerced(&Value::Integer(0)), None);
+    }
+
+    /// NaN sorts above every number and equals NaN, as in PostgreSQL, so
+    /// `WHERE f > 1` matches a NaN row and `WHERE f = 'NaN'` matches it.
+    #[test]
+    fn nan_orders_above_every_number_and_equals_nan() {
+        let nan = Value::Float(f64::NAN);
         assert_eq!(
-            Value::Float(f64::NAN).partial_cmp_coerced(&Value::Float(1.0)),
-            None
+            nan.partial_cmp_coerced(&Value::Float(1.0)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            nan.partial_cmp_coerced(&Value::Float(f64::INFINITY)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            Value::Integer(i64::MAX).partial_cmp_coerced(&nan),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            Value::Decimal(rust_decimal::Decimal::MAX).partial_cmp_coerced(&nan),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            nan.partial_cmp_coerced(&Value::Float(f64::NAN)),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            nan.partial_cmp_coerced(&Value::String("NaN".into())),
+            Some(Ordering::Equal)
+        );
+        assert!(nan.eq_coerced(&Value::Float(f64::NAN)));
+        assert!(!nan.eq_coerced(&Value::Float(1.0)));
+        let mut values = [
+            nan.clone(),
+            Value::Integer(3),
+            Value::Float(f64::NEG_INFINITY),
+            Value::Float(0.5),
+        ];
+        values.sort_by(Value::cmp_coerced);
+        assert_eq!(values[0], Value::Float(f64::NEG_INFINITY));
+        assert_eq!(values[1], Value::Float(0.5));
+        assert_eq!(values[2], Value::Integer(3));
+        assert!(matches!(values[3], Value::Float(f) if f.is_nan()));
+    }
+
+    /// Two decimals one hundredth apart past `2^53` collapse to one `f64`.
+    /// They compare exactly, as decimals and as decimal text.
+    #[test]
+    fn decimal_pairs_compare_exactly() {
+        let dec = |s: &str| rust_decimal::Decimal::from_str_exact(s).expect("decimal");
+        let low = Value::Decimal(dec("12345678901234567.01"));
+        let high = Value::Decimal(dec("12345678901234567.02"));
+        assert_eq!(low.partial_cmp_coerced(&high), Some(Ordering::Less));
+        assert_eq!(high.cmp_coerced(&low), Ordering::Greater);
+        assert!(!low.eq_coerced(&high));
+        let high_text = Value::String("12345678901234567.02".into());
+        assert_eq!(low.partial_cmp_coerced(&high_text), Some(Ordering::Less));
+        assert!(high.eq_coerced(&high_text));
+        assert!(!low.eq_coerced(&high_text));
+        let half = Value::Decimal(dec("9007199254740993.5"));
+        assert_eq!(
+            half.partial_cmp_coerced(&Value::Integer(9_007_199_254_740_993)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            Value::Integer(9_007_199_254_740_994).partial_cmp_coerced(&half),
+            Some(Ordering::Greater)
+        );
+    }
+
+    /// An `i64` near the limit compares exactly against a float, with no
+    /// rounding of the integer to `f64`.
+    #[test]
+    fn large_integers_compare_exactly_against_floats() {
+        const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+        let max = Value::Integer(i64::MAX);
+        assert_eq!(
+            max.partial_cmp_coerced(&Value::Float(TWO_POW_63)),
+            Some(Ordering::Less)
+        );
+        assert!(!max.eq_coerced(&Value::Float(TWO_POW_63)));
+        assert_eq!(
+            Value::Integer(i64::MIN).partial_cmp_coerced(&Value::Float(-TWO_POW_63)),
+            Some(Ordering::Equal)
+        );
+        assert!(Value::Integer(i64::MIN).eq_coerced(&Value::Float(-TWO_POW_63)));
+        let above = Value::Integer(9_007_199_254_740_993);
+        let float = Value::Float(9_007_199_254_740_992.0);
+        assert_eq!(above.partial_cmp_coerced(&float), Some(Ordering::Greater));
+        assert_eq!(float.partial_cmp_coerced(&above), Some(Ordering::Less));
+        assert!(!above.eq_coerced(&float));
+        assert!(!float.eq_coerced(&above));
+        assert_eq!(
+            Value::Integer(i64::MAX - 1).partial_cmp_coerced(&Value::Integer(i64::MAX)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            Value::Integer(i64::MIN).partial_cmp_coerced(&Value::Float(f64::NEG_INFINITY)),
+            Some(Ordering::Greater)
+        );
+        assert!(
+            !Value::String("9007199254740993".into())
+                .eq_coerced(&Value::Integer(9_007_199_254_740_992))
         );
     }
 

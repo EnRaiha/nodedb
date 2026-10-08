@@ -440,6 +440,7 @@ mod tests {
                 "json_contains",
                 "json_merge",
                 "json_patch",
+                "to_jsonb",
             ],
         );
 

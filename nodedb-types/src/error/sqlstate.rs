@@ -57,6 +57,14 @@ pub const DATA_EXCEPTION: &str = "22000";
 /// `22003` — `numeric_value_out_of_range`
 pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 
+/// `22007` — `invalid_datetime_format` (text that does not parse as a
+/// `timestamp` or `timestamptz`)
+pub const INVALID_DATETIME_FORMAT: &str = "22007";
+
+/// `22008` — `datetime_field_overflow` (an instant outside the range a
+/// `timestamp` or `timestamptz` holds)
+pub const DATETIME_FIELD_OVERFLOW: &str = "22008";
+
 /// `22012` — `division_by_zero` (`/` or `%` with a zero divisor —
 /// raised at runtime instead of evaluating to `NULL`)
 pub const DIVISION_BY_ZERO: &str = "22012";
@@ -397,6 +405,8 @@ mod tests {
             FEATURE_NOT_SUPPORTED,
             DATA_EXCEPTION,
             NUMERIC_VALUE_OUT_OF_RANGE,
+            INVALID_DATETIME_FORMAT,
+            DATETIME_FIELD_OVERFLOW,
             DIVISION_BY_ZERO,
             INVALID_LIMIT_VALUE,
             INVALID_TEXT_REPRESENTATION,

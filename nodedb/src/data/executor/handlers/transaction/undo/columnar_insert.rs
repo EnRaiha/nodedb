@@ -43,9 +43,10 @@ impl CoreLoop {
                     }
                 }
                 ColumnarInsertIntent::Insert | ColumnarInsertIntent::Put => {
-                    if let Some(prior_loc) = engine.pk_index().get(&pk_bytes).copied()
-                        && prior_loc.segment_id == engine.memtable_segment_id()
-                    {
+                    // The insert tombstones the prior row wherever it lives,
+                    // in the memtable or a flushed segment, so the undo puts
+                    // back either one.
+                    if let Some(prior_loc) = engine.pk_index().get(&pk_bytes).copied() {
                         displaced.push((pk_bytes.clone(), prior_loc));
                     }
                     inserted_pks.push(pk_bytes);

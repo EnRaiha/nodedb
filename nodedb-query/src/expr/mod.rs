@@ -13,4 +13,4 @@ pub mod eval;
 pub mod types;
 
 pub use eval::EvalError;
-pub use types::{BinaryOp, CastType, ComputedColumn, GroupKeySpec, SqlExpr};
+pub use types::{BinaryOp, CastType, ComputedColumn, GroupKeySpec, SqlExpr, WHOLE_ROW_COLUMN};

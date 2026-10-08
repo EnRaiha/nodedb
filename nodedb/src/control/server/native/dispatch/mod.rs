@@ -46,6 +46,6 @@ pub(crate) use graph_match::handle_graph_match;
 pub(crate) use index_ddl_op::handle_index_ddl_op;
 pub(crate) use session_ops::{handle_reset, handle_set, handle_show, show_all};
 pub(crate) use sorted_read_op::handle_sorted_read_op;
-pub(crate) use sql::{handle_sql, handle_sql_streaming};
+pub(crate) use sql::{aborted_block_error, handle_sql, handle_sql_streaming};
 pub(crate) use streaming::{SqlOutcome, SqlStream};
 pub(crate) use transaction::{NativeTxnDp, handle_begin, handle_commit, handle_rollback};

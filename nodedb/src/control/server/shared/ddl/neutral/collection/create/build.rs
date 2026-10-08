@@ -41,6 +41,7 @@ use super::build_flags::{
 use super::build_post_create::{create_serial_sequences, log_vector_fields};
 use super::build_primary_engine::resolve_primary_engine;
 use crate::control::server::shared::ddl::neutral::column_default::validate_column_defaults;
+use crate::control::server::shared::ddl::neutral::declared_typmod::validate_declared_typmods;
 
 /// Per-surface configuration. The fields are the entire surface-level
 /// difference between `CREATE COLLECTION` and `CREATE TABLE`.
@@ -102,6 +103,10 @@ pub async fn build_and_persist(
         ));
     }
 
+    // Refuse an invalid `DECIMAL(p,s)` typmod on every engine. It runs
+    // before the DEFAULT gate, which reads the declared type to check a
+    // literal against it.
+    validate_declared_typmods(columns)?;
     // Refuse a DEFAULT the server cannot evaluate, or that the declared
     // column type cannot hold, here, not at the first INSERT. It runs before
     // any lifecycle guard or predecessor purge, so a rejected declaration

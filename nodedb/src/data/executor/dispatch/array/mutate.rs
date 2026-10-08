@@ -159,12 +159,7 @@ impl CoreLoop {
                 .note_applied(crate::types::Lsn::new(wal_lsn));
         }
         if let Err(e) = self.flush_array(array_id) {
-            return self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: format!("array flush: {e}"),
-                },
-            );
+            return self.response_error(task, ErrorCode::from(e));
         }
         encode_count_response(self, task, "flushed", 1)
     }
@@ -230,12 +225,7 @@ impl CoreLoop {
         if self.array_engine.is_open(array_id)
             && let Err(e) = self.flush_array(array_id)
         {
-            return self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: format!("array rekey flush: {e}"),
-                },
-            );
+            return self.response_error(task, ErrorCode::from(e));
         }
         if let Err(e) = self.array_engine.rekey_array(array_id, target) {
             return self.response_error(
@@ -295,12 +285,7 @@ impl CoreLoop {
 fn encode_count_response(core: &CoreLoop, task: &ExecutionTask, key: &str, n: usize) -> Response {
     match super::super::super::response_codec::encode_count(key, n) {
         Ok(bytes) => core.response_with_payload(task, bytes),
-        Err(e) => core.response_error(
-            task,
-            ErrorCode::Internal {
-                detail: e.to_string(),
-            },
-        ),
+        Err(e) => core.response_error(task, ErrorCode::from(e)),
     }
 }
 

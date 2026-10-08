@@ -2,30 +2,25 @@
 
 //! SAVEPOINT / RELEASE / ROLLBACK TO on an open transaction.
 
-use std::collections::BTreeMap;
-
-use crate::types::VShardId;
-
 use super::super::connection::SessionId;
-use super::super::state::{OverlayMarkers, SavepointEntry};
+use super::super::state::{SavepointEntry, TransactionState};
 use super::super::store::SessionStore;
 
-/// What a ROLLBACK TO must rewind: per-vShard Data-Plane overlay journal
-/// markers, and the task-local DDL buffer length.
+/// What a ROLLBACK TO must rewind: the Data-Plane overlays to the positions
+/// the cores recorded under `overlay_savepoint`, and the task-local DDL
+/// buffer to its length.
 pub struct SavepointRewind {
-    /// A vShard first staged AFTER the savepoint is absent; rewind it to
-    /// all-zero markers.
-    pub markers: BTreeMap<VShardId, OverlayMarkers>,
+    pub overlay_savepoint: u64,
     pub ddl_buffer_len: usize,
 }
 
 impl SessionStore {
     /// Create a savepoint at the current tx_buffer position.
     ///
-    /// `markers` maps each vShard that had staged writes at savepoint time to its
-    /// Data-Plane value/TTL, GRAPH, and ARRAY overlay undo-journal lengths (captured via
-    /// `MetaOp::MarkSavepoint`), so a later ROLLBACK TO can rewind every staging
-    /// overlay to exactly this point. `ddl_buffer_len` is the task-local DDL
+    /// `overlay_savepoint` is the id each core hosting a staged vShard records
+    /// its overlay undo-journal lengths under (`MetaOp::MarkSavepoint`), so a
+    /// later ROLLBACK TO rewinds every staging overlay to exactly this point.
+    /// `ddl_buffer_len` is the task-local DDL
     /// buffer's length at savepoint time — `SessionStore` cannot read the
     /// task-local itself, so the caller (which runs inside the connection's
     /// task) supplies it.
@@ -33,7 +28,7 @@ impl SessionStore {
         &self,
         addr: impl Into<SessionId>,
         name: String,
-        markers: BTreeMap<VShardId, OverlayMarkers>,
+        overlay_savepoint: u64,
         ddl_buffer_len: usize,
     ) {
         self.write_session(addr, |session| {
@@ -48,7 +43,7 @@ impl SessionStore {
                 pending_inference_len,
                 ddl_buffer_len,
                 pending_publish_len,
-                markers,
+                overlay_savepoint,
             });
         });
     }
@@ -97,7 +92,7 @@ impl SessionStore {
             let pending_inference_len = session.savepoints[pos].pending_inference_len;
             let ddl_buffer_len = session.savepoints[pos].ddl_buffer_len;
             let pending_publish_len = session.savepoints[pos].pending_publish_len;
-            let markers = session.savepoints[pos].markers.clone();
+            let overlay_savepoint = session.savepoints[pos].overlay_savepoint;
             if session.tx_buffer.len() != session.tx_lease_scopes.len() {
                 return Err(crate::Error::Internal {
                     detail: "transaction lease scope holders are misaligned".into(),
@@ -116,8 +111,14 @@ impl SessionStore {
             session.pending_publishes.truncate(pending_publish_len);
             debug_assert_eq!(session.tx_buffer.len(), session.tx_lease_scopes.len());
             session.savepoints.truncate(pos + 1);
+            // ROLLBACK TO leaves an aborted block usable again, as in
+            // PostgreSQL: the failed statement's work is discarded with the
+            // rest of the rewound buffer.
+            if session.tx_state == TransactionState::Failed {
+                session.tx_state = TransactionState::InBlock;
+            }
             Ok(SavepointRewind {
-                markers,
+                overlay_savepoint,
                 ddl_buffer_len,
             })
         })
@@ -139,7 +140,7 @@ mod tests {
 
     use crate::control::lease::QueryLeaseScope;
     use crate::control::server::shared::session::state::PendingOffsetCommit;
-    use crate::types::{DatabaseId, Lsn, TenantId};
+    use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 
     fn task() -> PhysicalTask {
         PhysicalTask {
@@ -164,7 +165,7 @@ mod tests {
         let scope = Arc::new(QueryLeaseScope::empty());
         assert!(store.buffer_write(addr, task()));
         assert!(store.attach_tx_lease_scope_since(addr, 0, Arc::clone(&scope)));
-        store.create_savepoint(addr, "sp".into(), BTreeMap::new(), 0);
+        store.create_savepoint(addr, "sp".into(), 1, 0);
         assert!(store.buffer_write(addr, task()));
         assert!(store.attach_tx_lease_scope_since(addr, 1, Arc::clone(&scope)));
 
@@ -194,7 +195,7 @@ mod tests {
             offset: crate::event::cdc::CdcOffset::new(10, 1),
         };
         assert!(store.defer_offset_commit(addr, before));
-        store.create_savepoint(addr, "sp".into(), BTreeMap::new(), 0);
+        store.create_savepoint(addr, "sp".into(), 1, 0);
         assert!(store.defer_offset_commit(
             addr,
             PendingOffsetCommit {
@@ -213,5 +214,21 @@ mod tests {
         let pending = store.take_pending_offsets(addr);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].offset, crate::event::cdc::CdcOffset::new(10, 1));
+    }
+
+    #[test]
+    fn rollback_to_savepoint_leaves_an_aborted_block_usable() {
+        let store = SessionStore::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:6014".parse().expect("address");
+        store.ensure_session(addr);
+        store.begin(addr, Lsn::new(1), 0).expect("begin");
+        store.create_savepoint(addr, "sp".into(), 1, 0);
+        store.fail_transaction(addr);
+        assert_eq!(store.transaction_state(addr), TransactionState::Failed);
+
+        store
+            .rollback_to_savepoint(addr, "sp")
+            .expect("rollback to savepoint");
+        assert_eq!(store.transaction_state(addr), TransactionState::InBlock);
     }
 }

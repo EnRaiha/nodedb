@@ -62,12 +62,7 @@ impl CoreLoop {
             }
             Err(e) => {
                 warn!(core = self.core_id, error = %e, "core snapshot capture failed");
-                self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                )
+                self.response_error(task, ErrorCode::from(e))
             }
         }
     }
@@ -197,7 +192,7 @@ mod tests {
                 tid(),
                 "docs",
                 Surrogate::new(7),
-                "quick brown fox",
+                &crate::engine::sparse::inverted::test_support::body("quick brown fox"),
             )
             .unwrap();
 

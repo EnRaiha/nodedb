@@ -13,13 +13,16 @@ use std::future::Future;
 use std::pin::Pin;
 
 use nodedb_types::TraceId;
+use nodedb_types::error::sqlstate;
 use nodedb_types::protocol::NativeResponse;
 
 use crate::bridge::envelope::{ErrorCode, Response};
+use crate::control::server::native::sqlstate_code::sqlstate_error;
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::session::{
     AbortReason, CommitOutcome, TxnDataPlane, commit, lifecycle,
 };
+use crate::control::server::shared::txn_control::TxnModes;
 use crate::control::state::SharedState;
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -71,14 +74,29 @@ impl TxnDataPlane for NativeTxnDp<'_> {
     }
 }
 
-pub(crate) fn handle_begin(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResponse {
+/// Handle `BEGIN` / `START TRANSACTION` and `OpCode::Begin`. A refused
+/// isolation level or `DEFERRABLE` fails with SQLSTATE 0A000 before the
+/// block opens, with the message pgwire sends. An access mode is stored the
+/// way `SET TRANSACTION` stores it.
+pub(crate) fn handle_begin(ctx: &DispatchCtx<'_>, seq: u64, modes: &TxnModes) -> NativeResponse {
+    if let Some(message) = modes.refusal("BEGIN") {
+        return sqlstate_error(seq, sqlstate::FEATURE_NOT_SUPPORTED, message);
+    }
     // OpCode::Begin can arrive before any SQL statement has created the
     // session. `SessionStore::begin` no-ops when the peer has no entry, so
-    // ensure the session exists first (SQL "BEGIN" already does this in
-    // `sql.rs` before calling here).
+    // the session must exist first.
     ctx.sessions.ensure_session(*ctx.peer_addr);
     match lifecycle::run_begin(ctx.sessions, ctx.peer_addr.into(), ctx.state) {
-        Ok(()) => NativeResponse::status_row(seq, "BEGIN"),
+        Ok(()) => {
+            if let Some(access) = modes.access {
+                ctx.sessions.set_parameter(
+                    *ctx.peer_addr,
+                    "transaction_access_mode".into(),
+                    access.parameter_value().into(),
+                );
+            }
+            NativeResponse::status_row(seq, "BEGIN")
+        }
         Err(e) => {
             let message = match &e {
                 crate::Error::BadRequest { detail } => detail.clone(),

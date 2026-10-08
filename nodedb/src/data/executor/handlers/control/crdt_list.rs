@@ -26,12 +26,7 @@ impl CoreLoop {
         let engine = match self.get_crdt_engine(task.request.database_id, tenant_id) {
             Ok(e) => e,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         let fields =
@@ -47,12 +42,7 @@ impl CoreLoop {
             };
         match engine.list_insert_fields(collection, document_id, list_path, index, &fields) {
             Ok(()) => self.response_ok(task),
-            Err(error) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: error.to_string(),
-                },
-            ),
+            Err(error) => self.response_error(task, ErrorCode::from(error)),
         }
     }
 
@@ -70,22 +60,12 @@ impl CoreLoop {
         let engine = match self.get_crdt_engine(task.request.database_id, tenant_id) {
             Ok(e) => e,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         match engine.list_delete(collection, document_id, list_path, index) {
             Ok(()) => self.response_ok(task),
-            Err(error) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: error.to_string(),
-                },
-            ),
+            Err(error) => self.response_error(task, ErrorCode::from(error)),
         }
     }
 
@@ -104,22 +84,12 @@ impl CoreLoop {
         let engine = match self.get_crdt_engine(task.request.database_id, tenant_id) {
             Ok(e) => e,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         match engine.list_move(collection, document_id, list_path, from_index, to_index) {
             Ok(()) => self.response_ok(task),
-            Err(error) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: error.to_string(),
-                },
-            ),
+            Err(error) => self.response_error(task, ErrorCode::from(error)),
         }
     }
 }

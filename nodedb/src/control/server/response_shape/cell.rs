@@ -11,7 +11,6 @@
 //! ([`cell_text`]) and, for a timestamp column, the instant it denotes
 //! ([`instant_of`]).
 
-use base64::Engine;
 use nodedb_types::error::NodeDbError;
 use nodedb_types::{NdbDateTime, Value};
 
@@ -28,11 +27,13 @@ pub fn row_to_wire_json(row: &ShapedRow) -> serde_json::Map<String, serde_json::
 
 /// The PostgreSQL text form of one cell, or `None` for SQL NULL.
 ///
-/// `None` covers `Value::Null` and every shape with no JSON form: a
-/// non-finite float, a range, a record. Scalars render directly — a string
-/// verbatim, a bool as `t`/`f`, an integer as its decimal digits, a finite
-/// float as its shortest round-trip JSON text (`0.0` stays `0.0`), an
-/// instant as ISO-8601, bytes as unpadded standard base64. Every other shape
+/// `None` covers `Value::Null` and every shape with no JSON form: a range,
+/// a record. Scalars render directly — a string verbatim, a bool as
+/// `t`/`f`, an integer as its decimal digits, a finite float as its
+/// shortest round-trip JSON text (`0.0` stays `0.0`), a non-finite float as
+/// `NaN`, `Infinity` or `-Infinity` as PostgreSQL renders it, an instant as
+/// ISO-8601, bytes as [`bytea_hex`], a decimal as its digits with its
+/// scale (`1.10` stays `1.10`). Every other shape
 /// renders through [`value_to_wire_json`], so its text is the JSON a text
 /// protocol emits for it.
 pub fn cell_text(v: &Value) -> Option<String> {
@@ -40,16 +41,18 @@ pub fn cell_text(v: &Value) -> Option<String> {
         Value::Null => None,
         Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_owned()),
         Value::Integer(i) => Some(i.to_string()),
-        Value::Float(f) => serde_json::Number::from_f64(*f).map(|n| n.to_string()),
+        Value::Float(f) => wire_json_text(&nodedb_types::value::float_to_json(*f)),
         Value::String(s) => Some(s.clone()),
-        Value::Bytes(bytes) => Some(base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)),
+        Value::Bytes(bytes) => Some(bytea_hex(bytes)),
+        // Every digit and the scale, as PostgreSQL renders `numeric`. The
+        // wire JSON number is an `f64` and drops both.
+        Value::Decimal(d) => Some(d.to_string()),
         Value::DateTime(at) | Value::NaiveDateTime(at) => Some(at.to_iso8601()),
         Value::Array(_)
         | Value::Object(_)
         | Value::Uuid(_)
         | Value::Ulid(_)
         | Value::Duration(_)
-        | Value::Decimal(_)
         | Value::Geometry(_)
         | Value::Set(_)
         | Value::Regex(_)
@@ -74,6 +77,15 @@ fn wire_json_text(v: &serde_json::Value) -> Option<String> {
         serde_json::Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_owned()),
         other => Some(other.to_string()),
     }
+}
+
+/// The PostgreSQL text output of a `bytea`: `\x` followed by two lowercase
+/// hex digits per byte.
+pub fn bytea_hex(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(2 + bytes.len() * 2);
+    text.push_str("\\x");
+    text.push_str(&hex::encode(bytes));
+    text
 }
 
 /// The instant a cell under a timestamp column denotes.
@@ -142,8 +154,10 @@ mod tests {
     /// The one instant these tests use: 2020-03-05T10:00:00Z.
     const EARLY_MICROS: i64 = 1_583_402_400_000_000;
 
-    /// Every scalar renders the same text its wire JSON renders to, so the
-    /// direct arms and the JSON edge cannot drift apart.
+    /// Every scalar except bytes and decimals renders the same text its wire
+    /// JSON renders to, so the direct arms and the JSON edge cannot drift
+    /// apart. Bytes are base64 in JSON and `\x` hex in PostgreSQL text. A
+    /// decimal is an `f64` JSON number and exact digits in PostgreSQL text.
     #[test]
     fn scalar_text_matches_the_wire_json_text() {
         let at = NdbDateTime::from_micros(EARLY_MICROS);
@@ -159,11 +173,9 @@ mod tests {
             Value::Float(f64::NAN),
             Value::Float(f64::INFINITY),
             Value::String("hello".into()),
-            Value::Bytes(vec![0, 255, 7]),
             Value::DateTime(at),
             Value::NaiveDateTime(at),
             Value::Uuid("550e8400-e29b-41d4-a716-446655440000".into()),
-            Value::Decimal(rust_decimal::Decimal::new(110, 2)),
             Value::Duration(nodedb_types::NdbDuration::from_micros(1_500_000)),
             Value::Array(vec![Value::Integer(1), Value::Bool(true)]),
             Value::Range {
@@ -190,11 +202,31 @@ mod tests {
         assert_eq!(cell_text(&Value::Bool(false)).as_deref(), Some("f"));
         assert_eq!(cell_text(&Value::Integer(42)).as_deref(), Some("42"));
         assert_eq!(cell_text(&Value::Float(0.0)).as_deref(), Some("0.0"));
-        assert_eq!(cell_text(&Value::Float(f64::NAN)), None);
+        assert_eq!(cell_text(&Value::Float(f64::NAN)).as_deref(), Some("NaN"));
+        assert_eq!(
+            cell_text(&Value::Float(f64::INFINITY)).as_deref(),
+            Some("Infinity")
+        );
+        assert_eq!(
+            cell_text(&Value::Float(f64::NEG_INFINITY)).as_deref(),
+            Some("-Infinity")
+        );
         assert_eq!(cell_text(&Value::String("x".into())).as_deref(), Some("x"));
         assert_eq!(
             cell_text(&Value::Bytes(vec![0, 255, 7])).as_deref(),
-            Some("AP8H")
+            Some("\\x00ff07")
+        );
+        assert_eq!(cell_text(&Value::Bytes(Vec::new())).as_deref(), Some("\\x"));
+        assert_eq!(
+            cell_text(&Value::Decimal(rust_decimal::Decimal::new(110, 2))).as_deref(),
+            Some("1.10")
+        );
+        assert_eq!(
+            cell_text(&Value::Decimal(
+                "0.1234567890123456789012345678".parse().expect("decimal")
+            ))
+            .as_deref(),
+            Some("0.1234567890123456789012345678")
         );
         assert_eq!(
             cell_text(&Value::NaiveDateTime(at)).as_deref(),

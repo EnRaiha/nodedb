@@ -8,15 +8,18 @@
 //! is responsible for partitioning documents and spawning workers.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 
 use nodedb_mem::ScopedMemory;
 use nodedb_types::Surrogate;
 
 use crate::block::CompactPosting;
 use crate::codec::smallfloat;
+use crate::index::FtsIndexError;
 
 use super::merge;
-use super::segment::{reader::SegmentReader, writer};
+use super::query::LiveSegment;
+use super::segment::{error::SegmentError, reader::SegmentReader, writer};
 
 /// A worker's accumulated result: per-term postings ready to flush.
 pub struct WorkerResult {
@@ -39,14 +42,10 @@ impl WorkerResult {
             .push(posting);
     }
 
-    /// Flush this worker's result to a temporary segment.
-    ///
-    /// Panics if any term exceeds `MAX_TERM_LEN` — callers must validate
-    /// term lengths before insertion.
-    pub fn flush_to_segment(self) -> Vec<u8> {
-        writer::flush_to_segment(self.term_postings).expect(
-            "worker result contained a term exceeding u16::MAX bytes — caller invariant violated",
-        )
+    /// Flush this worker's result to a temporary segment. A term longer
+    /// than `MAX_TERM_LEN` is [`SegmentError::TermTooLong`].
+    pub fn flush_to_segment(self) -> Result<Vec<u8>, SegmentError> {
+        writer::flush_to_segment(self.term_postings)
     }
 }
 
@@ -59,21 +58,29 @@ impl Default for WorkerResult {
 /// Merge multiple worker segments into a single compacted segment.
 ///
 /// This is the "leader" step: takes the flushed segments from all workers
-/// and performs N-way merge into one final segment.
-pub fn merge_worker_segments(worker_segments: Vec<Vec<u8>>, memory: &ScopedMemory) -> Vec<u8> {
-    let readers: Vec<SegmentReader> = worker_segments
-        .into_iter()
-        .filter_map(|data| SegmentReader::open(data).ok())
-        .collect();
-
-    if readers.is_empty() {
-        return writer::build_from_blocks(&[])
-            .expect("build_from_blocks on empty input must not fail");
+/// and performs N-way merge into one final segment. A worker segment that
+/// fails validation fails the merge: merging without it would lose that
+/// worker's postings.
+pub fn merge_worker_segments(
+    worker_segments: Vec<Vec<u8>>,
+    memory: &ScopedMemory,
+) -> Result<Vec<u8>, FtsIndexError<Infallible>> {
+    let mut sources = Vec::with_capacity(worker_segments.len());
+    for (worker, data) in worker_segments.into_iter().enumerate() {
+        let segment_id = format!("worker:{worker}");
+        let reader = SegmentReader::open(data).map_err(|source| FtsIndexError::CorruptSegment {
+            segment_id: segment_id.clone(),
+            source,
+        })?;
+        sources.push(LiveSegment {
+            segment_id,
+            reader,
+            deleted: None,
+        });
     }
 
-    let merged_term_blocks = merge::merge_segments(&readers, memory);
-    writer::build_from_blocks(&merged_term_blocks)
-        .expect("merge produced a term exceeding u16::MAX bytes — data invariant violated")
+    let merged_term_blocks = merge::merge_segments::<Infallible>(&sources, memory)?;
+    Ok(writer::build_from_blocks(&merged_term_blocks)?)
 }
 
 /// Partition a document range into `num_workers` disjoint sub-ranges.
@@ -155,11 +162,11 @@ mod tests {
             make_compact_posting(Surrogate(3), 3, 120, vec![0, 2, 7]),
         );
 
-        let seg1 = w1.flush_to_segment();
-        let seg2 = w2.flush_to_segment();
+        let seg1 = w1.flush_to_segment().unwrap();
+        let seg2 = w2.flush_to_segment().unwrap();
 
         // Leader merge.
-        let merged = merge_worker_segments(vec![seg1, seg2], &test_memory());
+        let merged = merge_worker_segments(vec![seg1, seg2], &test_memory()).unwrap();
 
         // Verify merged segment.
         let reader = SegmentReader::open(merged).expect("merged segment must be valid");
@@ -171,8 +178,22 @@ mod tests {
 
     #[test]
     fn merge_empty_workers() {
-        let merged = merge_worker_segments(Vec::new(), &test_memory());
+        let merged = merge_worker_segments(Vec::new(), &test_memory()).unwrap();
         let reader = SegmentReader::open(merged).expect("merged segment must be valid");
         assert_eq!(reader.num_terms(), 0);
+    }
+
+    #[test]
+    fn a_corrupt_worker_segment_fails_the_merge() {
+        let mut w1 = WorkerResult::new();
+        w1.insert("hello", make_compact_posting(Surrogate(1), 1, 50, vec![0]));
+        let mut seg = w1.flush_to_segment().unwrap();
+        let last = seg.len() - 1;
+        seg[last] ^= 0xFF;
+        let err = merge_worker_segments(vec![seg], &test_memory()).unwrap_err();
+        assert!(
+            matches!(err, FtsIndexError::CorruptSegment { ref segment_id, .. } if segment_id == "worker:0"),
+            "{err}"
+        );
     }
 }

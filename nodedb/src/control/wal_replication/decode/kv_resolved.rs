@@ -18,7 +18,7 @@ pub(super) struct TransferFields<'a> {
     pub(super) source_key: &'a [u8],
     pub(super) dest_key: &'a [u8],
     pub(super) field: &'a str,
-    pub(super) amount: f64,
+    pub(super) amount: nodedb_physical::physical_plan::TransferAmount,
     pub(super) debit_surrogate: u32,
     pub(super) credit_surrogate: u32,
 }

@@ -183,10 +183,26 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
             NodeDbError::object_not_ready(object.clone(), detail.clone())
         }
         Error::UndefinedColumn { column } => NodeDbError::undefined_column(column.clone()),
+        Error::TextColumn {
+            collection,
+            column,
+            fault,
+        } => crate::error_from_data_plane::text_column_to_public(collection, column, fault),
         Error::AmbiguousColumn { column } => NodeDbError::ambiguous_column(column.clone()),
         Error::UnknownStrictField { column, .. } => NodeDbError::undefined_column(column.clone()),
         Error::DivisionByZero => NodeDbError::division_by_zero(),
         Error::DataException { detail } => NodeDbError::data_exception(detail.clone()),
+        Error::NumericValueOutOfRange { detail } => {
+            NodeDbError::numeric_value_out_of_range(detail.clone())
+        }
+        // The public class `code_for_sqlstate` gives `22P02`, `22007`,
+        // `22008` and `42804`.
+        Error::InvalidTextRepresentation { detail }
+        | Error::InvalidDatetimeFormat { detail }
+        | Error::DatetimeFieldOverflow { detail } => NodeDbError::data_exception(detail.clone()),
+        Error::DatatypeMismatch { detail } => {
+            NodeDbError::from_wire(nodedb_types::error::ErrorCode::BAD_REQUEST, detail.clone())
+        }
         Error::InvalidLimitValue { clause, value } => {
             NodeDbError::invalid_limit_value(*clause, value.clone())
         }

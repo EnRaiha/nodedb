@@ -12,9 +12,11 @@
 
 use std::collections::HashMap;
 
+use nodedb_types::Value;
 use sonic_rs;
 
 use super::accum::GroupState;
+use super::aggregate::rows::{apply_user_aliases_to_rows, retain_having};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
@@ -99,12 +101,7 @@ pub(super) fn execute_grouping_sets(
     let owned_docs: Vec<Vec<u8>> = match docs_result {
         Ok(docs) => docs.into_iter().map(|(_, v)| v.to_vec()).collect(),
         Err(e) => {
-            return core.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            );
+            return core.response_error(task, ErrorCode::from(e));
         }
     };
 
@@ -121,7 +118,7 @@ pub(super) fn execute_grouping_sets(
         .filter(|a| a.function == "grouping")
         .collect();
 
-    let mut all_rows: Vec<serde_json::Value> = Vec::new();
+    let mut all_rows: Vec<Value> = Vec::new();
 
     for set in grouping_sets {
         // Build the active key list for this set.
@@ -201,7 +198,7 @@ pub(super) fn execute_grouping_sets(
         }
 
         for (group_key, state) in groups {
-            let mut row = serde_json::Map::new();
+            let mut row: HashMap<String, Value> = HashMap::new();
 
             // Parse the group key (JSON array of active key values).
             let active_values: Vec<serde_json::Value> =
@@ -223,16 +220,20 @@ pub(super) fn execute_grouping_sets(
                     let val = active_values
                         .get(pos)
                         .cloned()
-                        .unwrap_or(serde_json::Value::Null);
+                        .map_or(Value::Null, Value::from);
                     row.insert(key.clone(), val);
                 } else {
-                    row.insert(key.clone(), serde_json::Value::Null);
+                    row.insert(key.clone(), Value::Null);
                 }
             }
 
             // Real aggregate results.
-            for (alias, val) in state.finalize(&real_agg_slice) {
-                row.insert(alias, val.into());
+            let finalized = match state.finalize(&real_agg_slice) {
+                Ok(finalized) => finalized,
+                Err(e) => return core.response_error(task, ErrorCode::from(e)),
+            };
+            for (alias, val) in finalized {
+                row.insert(alias, val);
             }
 
             // GROUPING(col) pseudo-aggregates: compute from the bitmask.
@@ -243,85 +244,28 @@ pub(super) fn execute_grouping_sets(
                 let bit_present = (grouping_id >> col_idx) & 1;
                 let grouping_val = 1u64 ^ bit_present;
                 let output_alias = agg.user_alias.as_deref().unwrap_or(&agg.alias);
-                row.insert(
-                    output_alias.to_string(),
-                    serde_json::Value::Number(serde_json::Number::from(grouping_val)),
-                );
+                row.insert(output_alias.to_string(), Value::from_u64(grouping_val));
             }
 
             // Hidden grouping bitmask column — available for downstream use.
-            row.insert(
-                GROUPING_ID_COL.to_string(),
-                serde_json::Value::Number(serde_json::Number::from(grouping_id)),
-            );
+            row.insert(GROUPING_ID_COL.to_string(), Value::from_u64(grouping_id));
 
-            all_rows.push(serde_json::Value::Object(row));
+            all_rows.push(Value::Object(row));
         }
     }
 
-    // Apply HAVING.
-    if !having_predicates.is_empty() {
-        // `Vec::retain`'s closure must return `bool`, so an evaluation error
-        // in a HAVING predicate is captured via this side-channel and checked
-        // once the retain finishes.
-        let predicate_err: std::cell::RefCell<Option<nodedb_query::EvalError>> =
-            std::cell::RefCell::new(None);
-        all_rows.retain(|row| {
-            if predicate_err.borrow().is_some() {
-                return true;
-            }
-            let mp = nodedb_types::json_to_msgpack_or_empty(row);
-            match ScanFilter::all_match_binary(&having_predicates, &mp) {
-                Ok(keep) => keep,
-                Err(e) => {
-                    predicate_err.replace(Some(e));
-                    true
-                }
-            }
-        });
-        if let Some(e) = predicate_err.take() {
-            return core.response_error(task, ErrorCode::from(e));
-        }
+    // Apply HAVING. An evaluation error in a predicate fails the statement.
+    if let Err(e) = retain_having(&mut all_rows, &having_predicates) {
+        return core.response_error(task, ErrorCode::from(e));
     }
 
     // Apply user aliases for real aggregates (grouping aliases were applied above).
-    apply_user_aliases(&mut all_rows, &real_agg_slice);
+    apply_user_aliases_to_rows(&mut all_rows, &real_agg_slice);
 
     all_rows.truncate(limit);
 
-    match super::super::response_codec::encode_json_vec_as_msgpack(&all_rows) {
+    match super::super::response_codec::encode_value_vec(&all_rows) {
         Ok(payload) => core.response_with_payload(task, payload),
-        Err(e) => core.response_error(
-            task,
-            ErrorCode::Internal {
-                detail: e.to_string(),
-            },
-        ),
-    }
-}
-
-fn apply_user_aliases(rows: &mut [serde_json::Value], aggregates: &[AggregateSpec]) {
-    let renames: Vec<(&str, &str)> = aggregates
-        .iter()
-        .filter_map(|agg| {
-            agg.user_alias
-                .as_deref()
-                .filter(|alias| *alias != agg.alias)
-                .map(|alias| (agg.alias.as_str(), alias))
-        })
-        .collect();
-
-    if renames.is_empty() {
-        return;
-    }
-
-    for row in rows {
-        if let Some(obj) = row.as_object_mut() {
-            for (from, to) in &renames {
-                if let Some(value) = obj.remove(*from) {
-                    obj.insert((*to).to_string(), value);
-                }
-            }
-        }
+        Err(e) => core.response_error(task, ErrorCode::from(e)),
     }
 }

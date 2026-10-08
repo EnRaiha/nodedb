@@ -109,6 +109,7 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
             sqlstate::UNDEFINED_COLUMN,
             format!("column \"{column}\" does not exist"),
         ),
+        crate::Error::TextColumn { fault, .. } => ("ERROR", fault.sqlstate(), err.to_string()),
         crate::Error::AmbiguousColumn { column } => (
             "ERROR",
             sqlstate::AMBIGUOUS_COLUMN,
@@ -120,6 +121,25 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::DivisionByZero => ("ERROR", sqlstate::DIVISION_BY_ZERO, err.to_string()),
         crate::Error::DataException { detail } => {
             ("ERROR", sqlstate::DATA_EXCEPTION, detail.clone())
+        }
+        crate::Error::NumericValueOutOfRange { detail } => (
+            "ERROR",
+            sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+            detail.clone(),
+        ),
+        crate::Error::InvalidTextRepresentation { detail } => (
+            "ERROR",
+            sqlstate::INVALID_TEXT_REPRESENTATION,
+            detail.clone(),
+        ),
+        crate::Error::DatatypeMismatch { detail } => {
+            ("ERROR", sqlstate::DATATYPE_MISMATCH, detail.clone())
+        }
+        crate::Error::InvalidDatetimeFormat { detail } => {
+            ("ERROR", sqlstate::INVALID_DATETIME_FORMAT, detail.clone())
+        }
+        crate::Error::DatetimeFieldOverflow { detail } => {
+            ("ERROR", sqlstate::DATETIME_FIELD_OVERFLOW, detail.clone())
         }
         crate::Error::InvalidLimitValue { .. } => {
             ("ERROR", sqlstate::INVALID_LIMIT_VALUE, err.to_string())

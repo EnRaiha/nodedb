@@ -459,6 +459,12 @@ pub struct CoreLoop {
         crate::types::TxnId,
         crate::data::executor::handlers::transaction::overlay::ArrayTxnOverlay,
     >,
+    /// Savepoint records of each transaction's overlays on this core. Same
+    /// lifecycle as the overlays.
+    pub(in crate::data::executor) txn_savepoints: HashMap<
+        crate::types::TxnId,
+        crate::data::executor::handlers::transaction::savepoint_marks::TxnSavepoints,
+    >,
     /// Columnar engines THIS txn newly created while staging; `DropTxnOverlay`
     /// drops still-empty entries (rollback) and leaves filled ones (commit).
     pub(in crate::data::executor) txn_created_columnar_engines:

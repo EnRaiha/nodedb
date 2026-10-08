@@ -235,6 +235,66 @@ fn build_timeseries_schema(
     }))
 }
 
+/// The declared `VECTOR(n)` columns of a schemaless collection, as
+/// `(column, n)`.
+///
+/// Empty for every other collection. A strict schema carries its vector
+/// columns in its storage mode. A vector-primary collection keeps its vector
+/// in the index and never in the stored row.
+fn declared_vector_fields(coll: &StoredCollection) -> Vec<(String, usize)> {
+    if !coll.collection_type.is_schemaless() || coll.vector_primary.is_some() {
+        return Vec::new();
+    }
+    crate::control::server::shared::ddl::schema_validation::extract_vector_fields(&coll.fields)
+        .into_iter()
+        .map(|(name, dim, _metric)| (name, dim))
+        .collect()
+}
+
+/// The declared numeric columns of a schemaless or KV collection, which the
+/// Data Plane re-types on every write.
+///
+/// A schemaless collection reads them from its declared text. A KV
+/// collection reads them from its typed schema, the source its wire types
+/// come from. Empty for every other collection. Strict and columnar re-type
+/// through their typed schema. A vector-primary collection stores tagged
+/// metadata sidecars, not field maps. A CRDT collection stores the state its
+/// replicas converged on, and a refusal there would split them.
+///
+/// The primary key is left out. The engines key a row on the literal as
+/// written, and a lookup renders its own literal the same way, so a re-typed
+/// key would no longer match its row.
+fn declared_columns(
+    coll: &StoredCollection,
+) -> Vec<nodedb_physical::physical_plan::DeclaredColumn> {
+    use nodedb_physical::physical_plan::DeclaredColumn;
+    match &coll.collection_type {
+        nodedb_types::CollectionType::Document(nodedb_types::DocumentMode::Schemaless) => {
+            if coll.vector_primary.is_some() || coll.crdt {
+                return Vec::new();
+            }
+            let primary_key = coll
+                .declared_primary_key
+                .as_deref()
+                .unwrap_or(nodedb_types::DEFAULT_IDENTITY_COLUMN);
+            coll.fields
+                .iter()
+                .filter(|(name, _)| !primary_key.eq_ignore_ascii_case(name))
+                .filter_map(|(name, declared)| DeclaredColumn::from_declared(name, declared))
+                .collect()
+        }
+        nodedb_types::CollectionType::KeyValue(config) => config
+            .schema
+            .columns
+            .iter()
+            .filter(|column| !column.primary_key)
+            .filter_map(DeclaredColumn::from_column_def)
+            .collect(),
+        nodedb_types::CollectionType::Document(nodedb_types::DocumentMode::Strict(_))
+        | nodedb_types::CollectionType::Columnar(_) => Vec::new(),
+    }
+}
+
 /// Build the `CollectionConfig` a `DocumentOp::Register` will install in
 /// `doc_configs`, straight from the durable catalog — storage mode,
 /// enforcement options, generated columns, and secondary indexes.
@@ -334,6 +394,9 @@ pub(crate) fn build_doc_config_from_stored<S: CollectionSource + ?Sized>(
         conflict_policy: coll.conflict_policy.clone(),
         timeseries: build_timeseries_schema(coll),
         vector_primary: coll.vector_primary.clone().map(Box::new),
+        vector_fields: declared_vector_fields(coll),
+        declared_columns: declared_columns(coll),
+        declared_key: crate::control::planner::catalog_adapter::document_declared_key(coll),
     }
 }
 
@@ -357,6 +420,9 @@ async fn dispatch_register_from_stored_inner(
             conflict_policy: config.conflict_policy.clone(),
             timeseries: config.timeseries.clone(),
             vector_primary: config.vector_primary.clone(),
+            vector_fields: config.vector_fields.clone(),
+            declared_columns: config.declared_columns.clone(),
+            declared_key: config.declared_key.clone(),
         },
     );
 
@@ -442,5 +508,29 @@ mod tests {
             &[],
         );
         assert!(config.vector_primary.is_none());
+    }
+
+    /// A declared key reaches the Data Plane config. The implicit `id` key
+    /// names no declared key.
+    #[test]
+    fn a_declared_key_reaches_the_doc_config() {
+        let mut coll = StoredCollection::new(1, "items", "owner");
+        coll.declared_primary_key = Some("sku".to_string());
+        let config = build_doc_config_from_stored(
+            &EmptyCatalog,
+            crate::types::TenantId::new(coll.tenant_id),
+            &coll,
+            &[],
+        );
+        assert_eq!(config.declared_key.as_deref(), Some("sku"));
+
+        let plain = StoredCollection::new(1, "docs", "owner");
+        let config = build_doc_config_from_stored(
+            &EmptyCatalog,
+            crate::types::TenantId::new(plain.tenant_id),
+            &plain,
+            &[],
+        );
+        assert_eq!(config.declared_key, None);
     }
 }

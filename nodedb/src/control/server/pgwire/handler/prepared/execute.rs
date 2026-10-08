@@ -16,12 +16,13 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 
 use crate::control::server::response_shape::schema::{OutputColumn, OutputSchema};
+use crate::control::server::shared::session::TransactionState;
 
 use super::super::core::NodeDbPgHandler;
 use super::super::routing::result_shaping::ResultShaping;
 use super::param_bind::convert_portal_params;
-use super::result_format::{pg_type_to_ddl_col_type, resolve_result_formats};
 use super::statement::ParsedStatement;
+use crate::control::server::shared::txn_control::classify as classify_txn_control;
 
 impl NodeDbPgHandler {
     /// Execute a prepared statement from a portal.
@@ -42,8 +43,25 @@ impl NodeDbPgHandler {
     {
         let session_id = self.session_id;
         let identity = self.resolve_identity(client, &session_id)?;
-        self.authorize_session_database(&identity, session_id)?;
         let stmt = &portal.statement.statement;
+
+        // An aborted transaction block refuses every statement until it ends,
+        // the same gate Parse and the simple-query path apply. Transaction
+        // control passes: its session handlers in `execute_sql` end the block.
+        // The gate runs before backup COPY detection, admission and parameter
+        // conversion, so none of them runs in an aborted block.
+        if self.sessions.transaction_state(session_id) == TransactionState::Failed
+            && classify_txn_control(&stmt.sql).is_none()
+        {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "25P02".to_owned(),
+                "current transaction is aborted, commands ignored until end of transaction block"
+                    .to_owned(),
+            ))));
+        }
+
+        self.authorize_session_database(&identity, session_id)?;
         let tenant_id = identity.tenant_id;
 
         // J.4: mirror `do_query`'s audit scope. The extended-query
@@ -91,7 +109,12 @@ impl NodeDbPgHandler {
                 )))
             })?;
             let mut results = self
-                .execute_sql(&identity, session_id, bound.as_str())
+                .execute_sql(
+                    &identity,
+                    session_id,
+                    bound.as_str(),
+                    &portal.result_column_format,
+                )
                 .await?;
             return Ok(results.pop().unwrap_or(Response::EmptyQuery));
         }
@@ -124,37 +147,35 @@ impl NodeDbPgHandler {
         // announced. The same projection therefore governs them: the shaper
         // holds those rows to exactly the announced columns, so the DataRow
         // field count equals the RowDescription column count by construction.
-        // Resolve the client's requested per-column result formats (from the
-        // Bind message), downgrading any column the cell encoder has no
-        // binary arm for back to text. Parallel to `stmt.result_fields`.
-        let result_formats =
-            resolve_result_formats(&stmt.result_fields, &portal.result_column_format);
-
-        let projection: Option<OutputSchema> = if stmt.result_fields.is_empty() {
+        // The client's requested result formats (from the Bind message) travel
+        // to the encoder, which resolves each column's format from its type.
+        let projection: Option<OutputSchema> = if stmt.result_columns.is_empty() {
             None
         } else {
             Some(OutputSchema {
                 columns: stmt
-                    .result_fields
+                    .result_columns
                     .iter()
-                    .map(|f| OutputColumn {
-                        display_name: f.name().into(),
-                        lookup_key: f.name().into(),
-                        // Carry each column's real catalog type (from the
-                        // Describe-phase field) so the encoder can render the
-                        // matching PostgreSQL text form and, for binary
-                        // columns, extract the correctly-typed scalar.
-                        ty: pg_type_to_ddl_col_type(f.datatype()),
+                    .map(|column| OutputColumn {
+                        display_name: column.name.clone(),
+                        lookup_key: column.name.clone(),
+                        // The column's type from Parse, so the encoder
+                        // renders the matching PostgreSQL form.
+                        ty: column.ty,
                     })
                     .collect(),
                 is_star: false,
                 // The Describe-phase fields carry no expressions; the
                 // execute path merges the statement's own computed list in.
                 cp_computed: Vec::new(),
+                // The execute path takes the key from the statement's own plan.
+                declared_key: None,
             })
         };
 
         // Execute through the planned SQL path with AST-level parameter binding.
+        // An error here aborts an open transaction block: the connection loop
+        // applies that rule to every failed extended-query message.
         let mut results = self
             .execute_planned_sql_with_params(
                 &identity,
@@ -164,7 +185,7 @@ impl NodeDbPgHandler {
                 &params,
                 ResultShaping {
                     projection: projection.as_ref(),
-                    formats: &result_formats,
+                    formats: &portal.result_column_format,
                 },
             )
             .await?;

@@ -118,12 +118,7 @@ impl CoreLoop {
             >::new())
             {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                ),
+                Err(e) => self.response_error(task, ErrorCode::from(e)),
             };
         };
 
@@ -170,12 +165,7 @@ impl CoreLoop {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => {
                 warn!(core = self.core_id, error = %e, "sparse search encode failed");
-                self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                )
+                self.response_error(task, ErrorCode::from(e))
             }
         }
     }

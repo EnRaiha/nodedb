@@ -192,6 +192,18 @@ pub(crate) fn error_samples() -> Vec<crate::Error> {
             detail: text(),
         },
         E::UndefinedColumn { column: "x".into() },
+        E::TextColumn {
+            collection: collection(),
+            column: "x".into(),
+            fault: nodedb_types::text_search::TextColumnFault::NotIndexed,
+        },
+        E::TextColumn {
+            collection: collection(),
+            column: "n".into(),
+            fault: nodedb_types::text_search::TextColumnFault::NotText {
+                data_type: "INT".into(),
+            },
+        },
         E::AmbiguousColumn {
             column: "id".into(),
         },
@@ -201,6 +213,11 @@ pub(crate) fn error_samples() -> Vec<crate::Error> {
         },
         E::DivisionByZero,
         E::DataException { detail: text() },
+        E::NumericValueOutOfRange { detail: text() },
+        E::InvalidTextRepresentation { detail: text() },
+        E::DatatypeMismatch { detail: text() },
+        E::InvalidDatetimeFormat { detail: text() },
+        E::DatetimeFieldOverflow { detail: text() },
         E::InvalidLimitValue {
             clause: "LIMIT",
             value: "-1".into(),

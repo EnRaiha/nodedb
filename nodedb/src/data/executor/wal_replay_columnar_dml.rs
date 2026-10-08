@@ -109,6 +109,23 @@ impl CoreLoop {
         else {
             return Some(0);
         };
+        // An assignment that does not decode rejects the record, the same way
+        // a malformed resolved row does below.
+        let updates = match crate::wal::decode_columnar_dml_updates(&record.updates) {
+            Ok(updates) => updates,
+            Err(e) => {
+                self.replay_record_rejected(
+                    "columnar",
+                    record_lsn,
+                    Some(Box::new(crate::bridge::envelope::ErrorCode::from(e))),
+                    &format!(
+                        "columnar predicate DML on '{}': malformed assignment",
+                        record.collection
+                    ),
+                );
+                return Some(0);
+            }
+        };
 
         // The task carries the real predicate even though today's handlers read
         // only `task.request.{database_id, tenant_id}`. A placeholder plan would
@@ -126,7 +143,7 @@ impl CoreLoop {
                     record.collection.clone(),
                 ),
                 filters: record.filters.clone(),
-                updates: record.updates.clone(),
+                updates: updates.clone(),
                 rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
             })
         } else {
@@ -164,7 +181,7 @@ impl CoreLoop {
                 &task,
                 &record.collection,
                 &record.filters,
-                &record.updates,
+                &updates,
                 &replay_check,
                 recording.then_some(&mut undo),
             )
@@ -398,7 +415,7 @@ mod tests {
     use crate::control::server::wal_dispatch::wal_append_if_write;
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::WalManager;
-    use nodedb_physical::physical_plan::{ColumnarInsertIntent, ColumnarOp};
+    use nodedb_physical::physical_plan::{ColumnarInsertIntent, ColumnarOp, UpdateValue};
     use nodedb_query::scan_filter::{FilterOp, ScanFilter};
     use nodedb_types::{QualifiedCollection, RlsWriteCheck, Value};
     use nodedb_wal::TombstoneSet;
@@ -528,6 +545,7 @@ mod tests {
         engine
             .scan_memtable_rows()
             .map(|row| {
+                let row = row.expect("read");
                 let id = match &row[id_idx] {
                     Value::Integer(n) => *n,
                     other => panic!("expected integer id, got {other:?}"),
@@ -574,11 +592,13 @@ mod tests {
             filters: eq_filter_bytes("id", Value::Integer(1)),
             updates: vec![(
                 "v".to_string(),
-                // `execute_columnar_update` decodes each update value with the
+                // `execute_columnar_update` decodes each literal with the
                 // plain reader (`value_from_msgpack`), matching the planner's
                 // `sql_value_to_msgpack` output — not the tagged `Value` enum
                 // encoding `zerompk::to_msgpack_vec(&Value)` would emit.
-                nodedb_types::value_to_msgpack(&Value::Integer(999)).expect("encode"),
+                UpdateValue::Literal(
+                    nodedb_types::value_to_msgpack(&Value::Integer(999)).expect("encode"),
+                ),
             )],
             rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
@@ -633,7 +653,9 @@ mod tests {
             // (`sql_value_to_msgpack`), not the tagged `Value` enum encoding.
             updates: vec![(
                 "v".to_string(),
-                nodedb_types::value_to_msgpack(&Value::Integer(999)).expect("encode"),
+                UpdateValue::Literal(
+                    nodedb_types::value_to_msgpack(&Value::Integer(999)).expect("encode"),
+                ),
             )],
             rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
         });
@@ -653,5 +675,37 @@ mod tests {
              (pre-fix: the Update was never WAL-logged, so the value reverted; \
              a non-idempotent double-apply would instead duplicate the row)"
         );
+    }
+
+    #[test]
+    fn computed_update_replays_the_expression_against_each_row() {
+        use nodedb_query::expr::{BinaryOp, SqlExpr};
+
+        let insert = insert_plan(vec![row(1, 10), row(2, 20)]);
+        // `UPDATE t SET v = v + 5`: the record carries the expression, and
+        // replay evaluates it against each matched row's pre-image.
+        let update = PhysicalPlan::Columnar(ColumnarOp::Update {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, COLLECTION),
+            filters: Vec::new(),
+            updates: vec![(
+                "v".to_string(),
+                UpdateValue::Expr(SqlExpr::BinaryOp {
+                    left: Box::new(SqlExpr::Column("v".to_string())),
+                    op: BinaryOp::Add,
+                    right: Box::new(SqlExpr::Literal(Value::Integer(5))),
+                }),
+            )],
+            rls_write_check: RlsWriteCheck::already_decided_elsewhere(),
+        });
+
+        let records = append_via_autocommit(&[insert, update]);
+
+        let mut h = make_core();
+        h.core
+            .replay_timeseries_wal(&records, 1, &TombstoneSet::new());
+
+        let mut rows = scan_ids(&mut h.core);
+        rows.sort();
+        assert_eq!(rows, vec![(1, 15), (2, 25)]);
     }
 }

@@ -65,12 +65,7 @@ impl CoreLoop {
         ) {
             Ok(m) => m,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
 
@@ -99,12 +94,7 @@ impl CoreLoop {
             let result = serde_json::json!({ "affected": 0u64 });
             return match encode_json_as_msgpack(&result) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                ),
+                Err(e) => self.response_error(task, ErrorCode::from(e)),
             };
         }
 
@@ -152,12 +142,7 @@ impl CoreLoop {
         ) {
             Ok(r) => r,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
 
@@ -260,23 +245,13 @@ impl CoreLoop {
                 &outcome.returned_docs,
             ) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("RETURNING encode: {e}"),
-                    },
-                ),
+                Err(e) => self.response_error(task, ErrorCode::from(e)),
             }
         } else {
             let result = serde_json::json!({ "affected": outcome.affected });
             match encode_json_as_msgpack(&result) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                ),
+                Err(e) => self.response_error(task, ErrorCode::from(e)),
             }
         };
         if !outcome.write_set.is_empty() {

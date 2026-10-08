@@ -8,16 +8,28 @@ use crate::types::*;
 /// Convert a sqlparser `Value` to our `SqlValue`.
 ///
 /// Number literal routing:
-/// - Pure integers → `SqlValue::Int`.
-/// - Numbers with `.`, `e`, or `E` → `SqlValue::Decimal` (exact arithmetic).
+/// - Integers in `i64` range → `SqlValue::Int`.
+/// - Larger integers → `SqlValue::Decimal`, exact. A `u64` above `i64::MAX`
+///   is the `Decimal` `Value::from_u64` gives it, so it is written as a
+///   msgpack `uint64`. An integer past the `Decimal` range is
+///   [`SqlError::NumericLiteralOutOfRange`]: rounding it to a float would
+///   store another number than the one written.
+/// - Numbers with an exponent (`e` or `E`) → `SqlValue::Float`. A bound
+///   float parameter renders in this form, so it stays a float.
+/// - Other numbers with `.` → `SqlValue::Decimal` (exact arithmetic).
 /// - If decimal parse fails → fallback to `SqlValue::Float`, then `SqlValue::String`.
 pub fn convert_value(val: &Value) -> Result<SqlValue> {
     match val {
         Value::Number(n, _) => {
             if let Ok(i) = n.parse::<i64>() {
                 Ok(SqlValue::Int(i))
-            } else if n.contains('.') || n.contains('e') || n.contains('E') {
-                // Fractional or scientific notation: prefer exact Decimal.
+            } else if n.contains('e') || n.contains('E') {
+                match n.parse::<f64>() {
+                    Ok(f) => Ok(SqlValue::Float(f)),
+                    Err(_) => Ok(SqlValue::String(n.clone())),
+                }
+            } else if n.contains('.') {
+                // A fractional literal: prefer exact Decimal.
                 if let Ok(d) = rust_decimal::Decimal::from_str_exact(n) {
                     Ok(SqlValue::Decimal(d))
                 } else if let Ok(f) = n.parse::<f64>() {
@@ -25,6 +37,8 @@ pub fn convert_value(val: &Value) -> Result<SqlValue> {
                 } else {
                     Ok(SqlValue::String(n.clone()))
                 }
+            } else if n.bytes().all(|b| b.is_ascii_digit()) {
+                integer_literal(n)
             } else if let Ok(f) = n.parse::<f64>() {
                 Ok(SqlValue::Float(f))
             } else {
@@ -41,6 +55,18 @@ pub fn convert_value(val: &Value) -> Result<SqlValue> {
             detail: format!("value literal: {val}"),
         }),
     }
+}
+
+/// An all-digit literal past `i64::MAX` as an exact `Decimal`.
+fn integer_literal(digits: &str) -> Result<SqlValue> {
+    if let Ok(u) = digits.parse::<u64>() {
+        return Ok(SqlValue::Decimal(rust_decimal::Decimal::from(u)));
+    }
+    rust_decimal::Decimal::from_str_exact(digits)
+        .map(SqlValue::Decimal)
+        .map_err(|_| SqlError::NumericLiteralOutOfRange {
+            literal: digits.to_string(),
+        })
 }
 
 /// Decode an even-length ASCII hex string (the inner text of an `X'...'`
@@ -91,7 +117,55 @@ pub(super) fn parse_interval_to_micros(s: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_interval_to_micros;
+    use super::*;
+
+    fn number(n: &str) -> Value {
+        Value::Number(n.to_string(), false)
+    }
+
+    #[test]
+    fn integer_literal_past_i64_stays_exact() {
+        assert_eq!(
+            convert_value(&number("9223372036854775807")).unwrap(),
+            SqlValue::Int(i64::MAX)
+        );
+        assert_eq!(
+            convert_value(&number("18446744073709551615")).unwrap(),
+            SqlValue::Decimal(rust_decimal::Decimal::from(u64::MAX))
+        );
+        // Past `u64`, inside the 96-bit `Decimal` mantissa.
+        assert_eq!(
+            convert_value(&number("79228162514264337593543950335")).unwrap(),
+            SqlValue::Decimal(rust_decimal::Decimal::MAX)
+        );
+    }
+
+    #[test]
+    fn an_exponent_literal_is_a_float_and_a_fraction_is_a_decimal() {
+        assert_eq!(
+            convert_value(&number("1.5e0")).unwrap(),
+            SqlValue::Float(1.5)
+        );
+        assert_eq!(convert_value(&number("2E0")).unwrap(), SqlValue::Float(2.0));
+        assert_eq!(
+            convert_value(&number("1e300")).unwrap(),
+            SqlValue::Float(1e300)
+        );
+        assert_eq!(
+            convert_value(&number("1.5")).unwrap(),
+            SqlValue::Decimal(rust_decimal::Decimal::new(15, 1))
+        );
+    }
+
+    #[test]
+    fn integer_literal_past_decimal_range_is_an_error() {
+        let err = convert_value(&number("79228162514264337593543950336")).unwrap_err();
+        assert!(
+            matches!(err, SqlError::NumericLiteralOutOfRange { ref literal }
+                if literal == "79228162514264337593543950336"),
+            "{err:?}"
+        );
+    }
 
     #[test]
     fn parse_interval_sql_word_forms() {

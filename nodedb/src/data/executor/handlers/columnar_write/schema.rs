@@ -29,6 +29,9 @@ impl CoreLoop {
     /// from "not yet created" for every read path, and the durable insert
     /// path already treats engine creation as idempotent
     /// (`if !self.columnar_engines.contains_key(...)`).
+    ///
+    /// Fails when `schema_bytes` is present but does not decode. A sampled
+    /// row never stands in for a declared schema.
     pub(in crate::data::executor) fn ensure_columnar_engine_schema(
         &mut self,
         engine_key: &(DatabaseId, TenantId, String),
@@ -36,33 +39,32 @@ impl CoreLoop {
         bitemporal: bool,
         first_row: &Value,
         schema_bytes: &[u8],
-    ) -> ColumnarSchema {
+    ) -> crate::Result<ColumnarSchema> {
         if let Some(engine) = self.columnar_engines.get(engine_key) {
-            return engine.schema().clone();
+            return Ok(engine.schema().clone());
         }
-        let flush_threshold = self.query_tuning.columnar_flush_threshold;
-        let engine = self
-            .columnar_engines
-            .entry(engine_key.clone())
-            .or_insert_with(|| {
-                let base_schema = if !schema_bytes.is_empty() {
-                    zerompk::from_msgpack::<ColumnarSchema>(schema_bytes)
-                        .unwrap_or_else(|_| infer_schema_from_value(first_row))
-                } else {
-                    infer_schema_from_value(first_row)
-                };
-                let schema = if bitemporal {
-                    prepend_bitemporal_columns(base_schema)
-                } else {
-                    base_schema
-                };
-                nodedb_columnar::MutationEngine::with_flush_threshold(
-                    collection.to_string(),
-                    schema,
-                    flush_threshold,
-                )
-            });
-        engine.schema().clone()
+        let base_schema = if schema_bytes.is_empty() {
+            infer_schema_from_value(first_row)
+        } else {
+            zerompk::from_msgpack::<ColumnarSchema>(schema_bytes).map_err(|e| {
+                crate::Error::Serialization {
+                    format: "msgpack".to_string(),
+                    detail: format!("columnar schema of '{collection}' does not decode: {e}"),
+                }
+            })?
+        };
+        let schema = if bitemporal {
+            prepend_bitemporal_columns(base_schema)
+        } else {
+            base_schema
+        };
+        let engine = nodedb_columnar::MutationEngine::with_flush_threshold(
+            collection.to_string(),
+            schema.clone(),
+            self.query_tuning.columnar_flush_threshold,
+        );
+        self.columnar_engines.insert(engine_key.clone(), engine);
+        Ok(schema)
     }
 }
 
@@ -82,73 +84,44 @@ pub(in crate::data::executor) fn row_values_to_object(
     nodedb_types::Value::Object(map)
 }
 
-/// Coerce a `nodedb_types::Value` field to match the column type.
+/// Coerce a `nodedb_types::Value` field to the value `column` stores.
 ///
-/// Returns `Err` if a millisecond timestamp value overflows `i64` microseconds.
+/// Every column converts by the strict document coercion rule, declared
+/// numeric width included, so columnar and strict collections accept and
+/// refuse the same values. A refusal names the column. Text the type cannot
+/// read is `InvalidTextRepresentation`, a value of the wrong kind is
+/// `DatatypeMismatch`, and a value past the type's range or the declared
+/// width is `NumericValueOutOfRange`. The memtable stores every shape the
+/// coercion yields.
+///
+/// A `SYSTEM_TIMESTAMP` column is the one exception. The columnar write path
+/// assigns no value to it, so it stores the instant the row carries, in the
+/// two forms the planner's type guard admits: `DateTime` and `Integer`.
 pub(in crate::data::executor) fn ndb_field_to_value(
     val: Option<&Value>,
-    col_type: &ColumnType,
+    column: &ColumnDef,
 ) -> crate::Result<Value> {
-    let Some(val) = val else {
-        return Ok(Value::Null);
-    };
-    let v = match (col_type, val) {
-        (_, Value::Null) => Value::Null,
-        (ColumnType::Int64, Value::Integer(_)) => val.clone(),
-        (ColumnType::Int64, Value::Float(f)) => Value::Integer(*f as i64),
-        (ColumnType::Int64, Value::String(s)) => {
-            s.parse::<i64>().map(Value::Integer).unwrap_or(Value::Null)
+    match (&column.column_type, val) {
+        (_, None | Some(Value::Null)) => Ok(Value::Null),
+        (ColumnType::SystemTimestamp, Some(v @ (Value::DateTime(_) | Value::Integer(_)))) => {
+            Ok(v.clone())
         }
-        (ColumnType::Float64, Value::Float(_)) => val.clone(),
-        (ColumnType::Float64, Value::Integer(n)) => Value::Float(*n as f64),
-        (ColumnType::Float64, Value::String(s)) => {
-            s.parse::<f64>().map(Value::Float).unwrap_or(Value::Null)
-        }
-        (ColumnType::Bool, Value::Bool(_)) => val.clone(),
-        (ColumnType::String, Value::String(_)) => val.clone(),
-        (ColumnType::Timestamp, Value::Integer(n)) => {
-            Value::NaiveDateTime(nodedb_types::NdbDateTime::from_millis(*n).map_err(|e| {
-                crate::Error::BadRequest {
-                    detail: format!("timestamp coercion: {e}"),
-                }
-            })?)
-        }
-        (ColumnType::Timestamp, Value::Float(f)) => {
-            Value::NaiveDateTime(nodedb_types::NdbDateTime::from_millis(*f as i64).map_err(
-                |e| crate::Error::BadRequest {
-                    detail: format!("timestamp coercion: {e}"),
-                },
-            )?)
-        }
-        (ColumnType::Timestamp, Value::String(s)) => nodedb_types::datetime::NdbDateTime::parse(s)
-            .map(Value::NaiveDateTime)
-            .unwrap_or_else(|| Value::String(s.clone())),
-        (ColumnType::Timestamptz, Value::Integer(n)) => {
-            Value::DateTime(nodedb_types::NdbDateTime::from_millis(*n).map_err(|e| {
-                crate::Error::BadRequest {
-                    detail: format!("timestamptz coercion: {e}"),
-                }
-            })?)
-        }
-        (ColumnType::Timestamptz, Value::Float(f)) => Value::DateTime(
-            nodedb_types::NdbDateTime::from_millis(*f as i64).map_err(|e| {
-                crate::Error::BadRequest {
-                    detail: format!("timestamptz coercion: {e}"),
-                }
-            })?,
-        ),
-        (ColumnType::Timestamptz, Value::String(s)) => {
-            nodedb_types::datetime::NdbDateTime::parse(s)
-                .map(Value::DateTime)
-                .unwrap_or_else(|| Value::String(s.clone()))
-        }
-        (ColumnType::Uuid, Value::String(_)) => val.clone(),
-        // Fallback: integers as floats, strings as strings.
-        (ColumnType::Float64, _) => Value::Null,
-        (ColumnType::Int64, _) => Value::Null,
-        _ => val.clone(),
-    };
-    Ok(v)
+        (_, Some(val)) => crate::data::executor::strict_format::coerce_value(val, column),
+    }
+}
+
+/// Coerce every cell of the schema-ordered `row` to the value its column
+/// stores, in place. An UPDATE runs this on each post-image before the
+/// engine stores it, the rule an INSERT applies to each new row.
+pub(in crate::data::executor) fn coerce_columnar_row(
+    schema: &ColumnarSchema,
+    row: &mut [Value],
+) -> crate::Result<()> {
+    for (column, cell) in schema.columns.iter().zip(row.iter_mut()) {
+        let coerced = ndb_field_to_value(Some(&*cell), column)?;
+        *cell = coerced;
+    }
+    Ok(())
 }
 
 /// Infer a columnar schema from a `nodedb_types::Value::Object` (first row).
@@ -175,6 +148,9 @@ pub(in crate::data::executor) fn infer_schema_from_value(row: &Value) -> Columna
             Value::Bool(_) => ColumnType::Bool,
             Value::DateTime(_) => ColumnType::Timestamptz,
             Value::NaiveDateTime(_) => ColumnType::Timestamp,
+            Value::Geometry(_) => ColumnType::Geometry,
+            Value::Bytes(_) => ColumnType::Bytes,
+            Value::Object(_) | Value::Array(_) => ColumnType::Json,
             _ => ColumnType::String,
         };
         let lower = key.to_lowercase();
@@ -208,8 +184,164 @@ pub(in crate::data::executor) fn prepend_bitemporal_columns(
     ColumnarSchema::new(cols).expect("bitemporal columnar schema must be valid")
 }
 
-/// Infer a columnar schema from a JSON object — used by the spatial insert path.
-pub(super) fn infer_schema_from_json(row: &serde_json::Value) -> ColumnarSchema {
-    let ndb: Value = row.clone().into();
-    infer_schema_from_value(&ndb)
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn column_type(schema: &ColumnarSchema, name: &str) -> ColumnType {
+        schema
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.column_type)
+            .expect("column inferred")
+    }
+
+    #[test]
+    fn field_coercion_matches_strict_for_every_column_type() {
+        let coerce =
+            |v: Value, t: ColumnType| ndb_field_to_value(Some(&v), &ColumnDef::nullable("c", t));
+
+        assert_eq!(
+            coerce(Value::Integer(5), ColumnType::String).expect("string"),
+            Value::String("5".into())
+        );
+        assert_eq!(
+            coerce(Value::String("7".into()), ColumnType::Int64).expect("int"),
+            Value::Integer(7)
+        );
+        assert!(matches!(
+            coerce(Value::Float(1.5), ColumnType::Int64),
+            Err(crate::Error::DatatypeMismatch { ref detail }) if detail.contains("'c'")
+        ));
+        assert!(matches!(
+            coerce(Value::Integer(1), ColumnType::Geometry),
+            Err(crate::Error::DatatypeMismatch { .. })
+        ));
+        assert_eq!(
+            coerce(
+                Value::Array(vec![Value::Float(0.5), Value::Float(1.25)]),
+                ColumnType::Vector(2)
+            )
+            .expect("vector"),
+            Value::Bytes(
+                [0.5f32, 1.25f32]
+                    .iter()
+                    .flat_map(|f| f.to_le_bytes())
+                    .collect()
+            )
+        );
+        assert!(matches!(
+            coerce(Value::Array(vec![Value::Float(0.5)]), ColumnType::Vector(2)),
+            Err(crate::Error::DataException { .. })
+        ));
+        assert_eq!(
+            coerce(Value::Integer(9), ColumnType::SystemTimestamp).expect("system ts"),
+            Value::Integer(9)
+        );
+        assert_eq!(
+            ndb_field_to_value(None, &ColumnDef::nullable("c", ColumnType::Int64)).expect("absent"),
+            Value::Null
+        );
+    }
+
+    /// A columnar `SMALLINT` or `REAL` column refuses a value past its
+    /// declared width, on a new row and on an UPDATE post-image alike.
+    #[test]
+    fn declared_width_is_enforced_on_insert_and_update_post_images() {
+        let small = ColumnDef::nullable("v", ColumnType::Int64).with_declared_width("SMALLINT");
+        let real = ColumnDef::nullable("r", ColumnType::Float64).with_declared_width("REAL");
+        for (value, column) in [(Value::Integer(40000), &small), (Value::Float(1e39), &real)] {
+            let err = ndb_field_to_value(Some(&value), column).expect_err("past the width");
+            assert!(
+                matches!(err, crate::Error::NumericValueOutOfRange { .. }),
+                "{value:?}: {err:?}"
+            );
+        }
+
+        let schema = ColumnarSchema::new(vec![
+            ColumnDef::required("id", ColumnType::Int64).with_primary_key(),
+            small.clone(),
+            real.clone(),
+        ])
+        .expect("valid schema");
+        // A computed `SET v = v + 39999` over a stored `1`.
+        let mut post_image = vec![Value::Integer(1), Value::Integer(40000), Value::Float(1.5)];
+        let err = coerce_columnar_row(&schema, &mut post_image).expect_err("past smallint");
+        assert!(
+            matches!(err, crate::Error::NumericValueOutOfRange { .. }),
+            "{err:?}"
+        );
+
+        let mut fits = vec![Value::Integer(1), Value::Integer(32767), Value::Integer(2)];
+        coerce_columnar_row(&schema, &mut fits).expect("fits");
+        assert_eq!(
+            fits,
+            vec![Value::Integer(1), Value::Integer(32767), Value::Float(2.0)]
+        );
+    }
+
+    /// Every value `ndb_field_to_value` yields is a value the memtable holds.
+    #[test]
+    fn coerced_fields_append_to_the_memtable() {
+        let schema = ColumnarSchema::new(vec![
+            ColumnDef::required("s", ColumnType::String),
+            ColumnDef::required("u", ColumnType::Uuid),
+            ColumnDef::required("v", ColumnType::Vector(2)),
+            ColumnDef::required("d", ColumnType::Duration),
+            ColumnDef::required("b", ColumnType::Bytes),
+        ])
+        .expect("valid schema");
+        let input = [
+            Value::Integer(5),
+            Value::String("67e55044-10b1-426f-9247-bb680e5fe0c8".into()),
+            Value::Array(vec![Value::Float(0.5), Value::Float(1.25)]),
+            Value::Duration(nodedb_types::NdbDuration::from_micros(10)),
+            Value::String("AQI=".into()),
+        ];
+        let row: Vec<Value> = schema
+            .columns
+            .iter()
+            .zip(input.iter())
+            .map(|(col, v)| ndb_field_to_value(Some(v), col))
+            .collect::<crate::Result<_>>()
+            .expect("coerce");
+        let mut mt = nodedb_columnar::ColumnarMemtable::new(&schema);
+        mt.append_row(&row).expect("append");
+        assert_eq!(
+            mt.get_row(0).expect("read"),
+            Some(vec![
+                Value::String("5".into()),
+                Value::Uuid("67e55044-10b1-426f-9247-bb680e5fe0c8".into()),
+                Value::Array(vec![Value::Float(0.5), Value::Float(1.25)]),
+                Value::Integer(10),
+                Value::Bytes(vec![1, 2]),
+            ])
+        );
+    }
+
+    #[test]
+    fn nested_and_geometry_fields_infer_columns_that_hold_them() {
+        let row = Value::Object(HashMap::from([
+            ("id".to_string(), Value::String("a".into())),
+            (
+                "geom".to_string(),
+                Value::Geometry(nodedb_types::geometry::Geometry::point(1.0, 2.0)),
+            ),
+            (
+                "emb".to_string(),
+                Value::Array(vec![Value::Float(0.5), Value::Float(1.5)]),
+            ),
+            ("meta".to_string(), Value::Object(HashMap::new())),
+            ("raw".to_string(), Value::Bytes(vec![1, 2])),
+        ]));
+        let schema = infer_schema_from_value(&row);
+        assert_eq!(column_type(&schema, "id"), ColumnType::String);
+        assert_eq!(column_type(&schema, "geom"), ColumnType::Geometry);
+        assert_eq!(column_type(&schema, "emb"), ColumnType::Json);
+        assert_eq!(column_type(&schema, "meta"), ColumnType::Json);
+        assert_eq!(column_type(&schema, "raw"), ColumnType::Bytes);
+    }
 }

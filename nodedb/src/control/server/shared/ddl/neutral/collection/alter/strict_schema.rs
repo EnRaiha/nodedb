@@ -64,14 +64,9 @@ pub(super) fn write_schema_back(
 /// Retype a column's entry in `coll.fields`, the catalog's record of the
 /// *declared* type string each column was created with.
 ///
-/// `fields` is not redundant with the strict schema: `ColumnType` collapses
-/// every integer width onto one `Int64` variant, so the declared spelling is
-/// the only surviving record of how wide the author said the column was. That
-/// spelling drives the column's advertised wire OID and the range accepted on
-/// write, which is exactly why `ALTER COLUMN TYPE` — whose only supported use
-/// *is* an alias change such as `INT` → `BIGINT` — has to update it. Leaving
-/// it stale will make the alter a silent no-op for the case it exists to
-/// serve, and will keep rejecting writes the new type allows.
+/// The strict schema column carries the declared numeric width, and catalog
+/// introspection reads the width from this spelling. `ALTER COLUMN TYPE`
+/// updates both, so the two report the same width.
 pub(super) fn retype_field(coll: &mut StoredCollection, column: &str, new_type: &str) {
     for (name, type_str) in coll.fields.iter_mut() {
         if name.eq_ignore_ascii_case(column) {

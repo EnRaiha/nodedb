@@ -5,12 +5,11 @@
 //! search responses.
 //!
 //! `TextOp::Search` hits carry the standard `{id, data}` document-scan
-//! envelope, keyed by `StorageKey::for_surrogate(surrogate)` hex — the document
-//! body itself already carries the user's PK as an ordinary field (it was
-//! written verbatim from the user's INSERT), so the resolved value only
-//! needs injecting when the body has no `id` field of its own (a headless
-//! FTS-indexed row with no document ever written, in which case there is no
-//! PK to resolve either).
+//! envelope, keyed by `StorageKey::for_surrogate(surrogate)` hex — the Data
+//! Plane already gives every body its identity under the collection's
+//! identity column (the declared key, else `id`), so the resolved value only
+//! needs injecting, under that same column, when the row has no body (a
+//! headless FTS-indexed row with no document ever written).
 //!
 //! `TextOp::HybridSearch` / `HybridSearchTriple` hits never fetch a document
 //! body at all — the row is just `{doc_id, <score alias>, vector_rank?,
@@ -31,12 +30,15 @@ use super::hit_key::parse_surrogate_hex;
 use super::vector::resolve_surrogate_pk;
 
 /// Decode the DP-side JSON/msgpack array of `TextOp::Search` /
-/// `PhraseSearch`-shaped hits (`{id: <surrogate hex>, data: {...}}`), and for
-/// any row whose `data` object has no `id` field of its own, resolve the
-/// surrogate to the user PK via the catalog and inject it into `data`. Rows
-/// whose body already carries an `id` (the common case) are left untouched;
-/// an unresolved or headless surrogate is left untouched (no fabricated PK).
-/// On any decode failure the payload is returned unchanged.
+/// `PhraseSearch` / `BM25ScoreScan` rows (`{id: <surrogate hex>, data: {...}}`), and for
+/// any row whose `data` object lacks the collection's identity column, resolve
+/// the surrogate to the user PK via the catalog and inject it into `data`
+/// under that column. A declared-key row never gains an `id` beside its key.
+/// Rows that hold the column (the common case) are left untouched. An
+/// unresolved or headless surrogate is left untouched (no fabricated PK).
+/// On any decode failure, or a catalog error resolving the identity column,
+/// the payload is returned unchanged: a row never gains a wrongly named
+/// column.
 pub fn translate_text_search_payload(
     payload: &[u8],
     state: &SharedState,
@@ -52,6 +54,9 @@ pub fn translate_text_search_payload(
     let Ok(JsonValue::Array(mut rows)) = sonic_rs::from_str::<JsonValue>(&text) else {
         return payload.to_vec();
     };
+    let Ok(identity_column) = identity_column(state, database_id, tenant_id, collection) else {
+        return payload.to_vec();
+    };
 
     for row in &mut rows {
         let JsonValue::Object(map) = row else {
@@ -60,11 +65,11 @@ pub fn translate_text_search_payload(
         let Some(JsonValue::String(hex_id)) = map.get("id").cloned() else {
             continue;
         };
-        let data_has_id = matches!(
+        let data_has_identity = matches!(
             map.get("data"),
-            Some(JsonValue::Object(inner)) if inner.contains_key("id")
+            Some(JsonValue::Object(inner)) if inner.contains_key(&identity_column)
         );
-        if data_has_id {
+        if data_has_identity {
             continue;
         }
         let Some(surrogate) = parse_surrogate_hex(&hex_id) else {
@@ -73,7 +78,7 @@ pub fn translate_text_search_payload(
         if let Some(pk) = resolve_surrogate_pk(state, database_id, tenant_id, collection, surrogate)
             && let Some(JsonValue::Object(inner)) = map.get_mut("data")
         {
-            inner.insert("id".to_string(), JsonValue::String(pk));
+            inner.insert(identity_column.clone(), JsonValue::String(pk));
         }
     }
 
@@ -81,6 +86,30 @@ pub fn translate_text_search_payload(
         Ok(s) => s.into_bytes(),
         Err(_) => payload.to_vec(),
     }
+}
+
+/// The column `collection`'s rows render their identity under: its declared
+/// key, per `document_declared_key`, else `id`. The Data Plane's register
+/// config comes from the same function.
+fn identity_column(
+    state: &SharedState,
+    database_id: DatabaseId,
+    tenant_id: TenantId,
+    collection: &str,
+) -> crate::Result<String> {
+    let qualified = nodedb_types::QualifiedCollection::from_stored(collection.to_string());
+    let declared_key = state
+        .credentials
+        .catalog()
+        .get_collection(
+            database_id,
+            tenant_id.as_u64(),
+            qualified.collection_name(database_id),
+        )?
+        .and_then(|stored| {
+            crate::control::planner::catalog_adapter::document_declared_key(&stored)
+        });
+    Ok(declared_key.unwrap_or_else(|| nodedb_types::DEFAULT_IDENTITY_COLUMN.to_string()))
 }
 
 /// Decode the DP-side JSON/msgpack array of `HybridSearchHit`-shaped rows

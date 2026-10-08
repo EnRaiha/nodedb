@@ -189,14 +189,14 @@ impl CoreLoop {
         //    `scan_documents_for_each`. The body encoding is resolved once up
         //    front through the same helper `scan_sparse` uses, so the streaming
         //    and materializing scans cannot disagree about a row's shape.
-        let format = self.sparse_body_format(
-            crate::types::DatabaseId::new(did),
-            crate::types::TenantId::new(tid),
-            collection,
-        );
+        let database_id = crate::types::DatabaseId::new(did);
+        let tenant_id = crate::types::TenantId::new(tid);
+        let format = self.sparse_body_format(database_id, tenant_id, collection);
+        let identity_column = self.identity_column(did, tid, collection);
         self.sparse
             .scan_documents_for_each(did, tid, collection, usize::MAX, |id, raw| {
-                let (id_s, mp) = sparse_row_to_doc(id, raw, format.as_format_ref());
+                let (id_s, mp) =
+                    sparse_row_to_doc(id, raw, format.as_format_ref(), &identity_column);
                 f(&id_s, &mp)
             })?;
         Ok(())
@@ -299,67 +299,26 @@ impl CoreLoop {
                 if results.len() >= limit {
                     break;
                 }
-                let seg_id = format!("{}", seg_idx as u64 + 1);
-                let reader = if let Some(ref reg) = self.quarantine_registry {
-                    match crate::storage::quarantine::engines::open_segment_with_quarantine(
-                        reg, seg_bytes, collection, &seg_id,
-                    ) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!(error = %e, segment_id = %seg_id, collection, "failed to open flushed columnar segment for scan");
-                            continue;
-                        }
+                let seg_id = seg_idx as u64 + 1;
+                // A segment that does not read refuses the scan. Skipping it
+                // would answer without the segment's rows.
+                let segment = self.decode_flushed_segment(
+                    collection,
+                    seg_id,
+                    seg_bytes,
+                    schema.columns.len(),
+                    "columnar_normalized_scan",
+                )?;
+                let delete_bm = engine.delete_bitmap(seg_id);
+                for row_idx in 0..segment.row_count() {
+                    if results.len() >= limit {
+                        break;
                     }
-                } else {
-                    match nodedb_columnar::SegmentReader::open(seg_bytes) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to open flushed columnar segment for scan");
-                            continue;
-                        }
+                    // A tombstoned row is not a row any more.
+                    if delete_bm.is_some_and(|bm| bm.is_deleted(row_idx as u32)) {
+                        continue;
                     }
-                };
-                let seg_row_count = reader.row_count() as usize;
-                let remaining = limit - results.len();
-                let take = seg_row_count.min(remaining);
-
-                // Decode all columns for this segment.
-                let col_count = schema.columns.len();
-                let mut decoded_cols = Vec::with_capacity(col_count);
-                let mut decode_ok = true;
-                for col_idx in 0..col_count {
-                    match reader.read_column(col_idx) {
-                        Ok(dc) => decoded_cols.push(dc),
-                        Err(e) => {
-                            tracing::warn!(error = %e, col_idx, "failed to decode columnar segment column");
-                            decode_ok = false;
-                            break;
-                        }
-                    }
-                }
-                if !decode_ok {
-                    continue;
-                }
-
-                for row_idx in 0..take {
-                    let mut map = std::collections::HashMap::new();
-                    let mut id = String::new();
-                    for (col_idx, col_def) in schema.columns.iter().enumerate() {
-                        let val = decoded_col_to_value(
-                            &decoded_cols[col_idx],
-                            row_idx,
-                            &col_def.column_type,
-                        );
-                        if col_def.name == "id"
-                            && let nodedb_types::value::Value::String(s) = &val
-                        {
-                            id.clone_from(s);
-                        }
-                        map.insert(col_def.name.clone(), val);
-                    }
-                    let ndb_val = nodedb_types::value::Value::Object(map);
-                    let mp = nodedb_types::value_to_msgpack(&ndb_val).unwrap_or_default();
-                    results.push((id, mp));
+                    results.push(columnar_row_to_doc(schema, segment.row(schema, row_idx)?)?);
                 }
             }
         }
@@ -367,23 +326,8 @@ impl CoreLoop {
         // 2. Read from the live memtable (most-recent rows not yet flushed).
         if results.len() < limit {
             let remaining = limit - results.len();
-            let rows: Vec<_> = engine.scan_memtable_rows().take(remaining).collect();
-            for row in rows {
-                let mut map = std::collections::HashMap::new();
-                let mut id = String::new();
-                for (i, col_def) in schema.columns.iter().enumerate() {
-                    if i < row.len() {
-                        if col_def.name == "id"
-                            && let nodedb_types::value::Value::String(s) = &row[i]
-                        {
-                            id.clone_from(s);
-                        }
-                        map.insert(col_def.name.clone(), row[i].clone());
-                    }
-                }
-                let ndb_val = nodedb_types::value::Value::Object(map);
-                let mp = nodedb_types::value_to_msgpack(&ndb_val).unwrap_or_default();
-                results.push((id, mp));
+            for row in engine.scan_memtable_rows().take(remaining) {
+                results.push(columnar_row_to_doc(schema, row?)?);
             }
         }
 
@@ -400,18 +344,48 @@ impl CoreLoop {
         limit: usize,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
         let docs = self.sparse.scan_documents(did, tid, collection, limit)?;
-        let format = self.sparse_body_format(
-            crate::types::DatabaseId::new(did),
-            crate::types::TenantId::new(tid),
-            collection,
-        );
+        let database_id = crate::types::DatabaseId::new(did);
+        let tenant_id = crate::types::TenantId::new(tid);
+        let format = self.sparse_body_format(database_id, tenant_id, collection);
+        let identity_column = self.identity_column(did, tid, collection);
 
         let mut normalized = Vec::with_capacity(docs.len());
         for (id, raw) in docs {
-            normalized.push(sparse_row_to_doc(&id, &raw, format.as_format_ref()));
+            normalized.push(sparse_row_to_doc(
+                &id,
+                &raw,
+                format.as_format_ref(),
+                &identity_column,
+            ));
         }
         Ok(normalized)
     }
+}
+
+/// A positional columnar row as `(id, msgpack object)`: the `id` column's
+/// text, or empty when the row has none, and the row keyed by column name.
+fn columnar_row_to_doc(
+    schema: &nodedb_types::columnar::ColumnarSchema,
+    row: Vec<nodedb_types::value::Value>,
+) -> crate::Result<(String, Vec<u8>)> {
+    let mut id = String::new();
+    let mut map = std::collections::HashMap::with_capacity(schema.columns.len());
+    for (col_def, val) in schema.columns.iter().zip(row) {
+        if col_def.name == "id"
+            && let nodedb_types::value::Value::String(s) = &val
+        {
+            id.clone_from(s);
+        }
+        map.insert(col_def.name.clone(), val);
+    }
+    let mp =
+        nodedb_types::value_to_msgpack(&nodedb_types::value::Value::Object(map)).map_err(|e| {
+            crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("encode normalized columnar row: {e}"),
+            }
+        })?;
+    Ok((id, mp))
 }
 
 // The per-row shape converters live in `row_shape`, beside each other and

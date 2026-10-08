@@ -12,7 +12,7 @@ use nodedb_types::Value;
 use crate::value_ops::{coerced_eq, is_truthy, to_value_number, value_to_f64};
 
 use super::binary::eval_binary_op;
-use super::types::SqlExpr;
+use super::types::{SqlExpr, WHOLE_ROW_COLUMN};
 
 /// Error type for row-scope `SqlExpr` evaluation.
 ///
@@ -25,7 +25,8 @@ use super::types::SqlExpr;
 ///   silent `NULL`;
 /// - a function argument it cannot compute on: vectors of different
 ///   dimensions, an argument of the wrong type, a malformed JSONPath.
-///   SQLSTATE `22000`. A `NULL` argument stays `NULL` instead.
+///   SQLSTATE `22000`. A `NULL` argument stays `NULL` instead;
+/// - an exact integer SUM past the `Decimal` range, SQLSTATE `22000`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EvalError {
     #[error("division by zero")]
@@ -62,6 +63,9 @@ pub enum EvalError {
         path: String,
         reason: String,
     },
+    /// An exact integer aggregate total lies outside the `Decimal` range.
+    #[error("{function}(): integer total out of range")]
+    NumericOverflow { function: &'static str },
 }
 
 /// Row scope for `SqlExpr::eval_scope`: how `Column(..)` and `OldColumn(..)`
@@ -81,22 +85,31 @@ struct RowScope<'a> {
 
 impl<'a> RowScope<'a> {
     fn column(&self, name: &str) -> Value {
-        self.new_doc.get(name).cloned().unwrap_or(Value::Null)
+        row_field(self.new_doc, name)
     }
 
     fn old_column(&self, name: &str) -> Value {
         match self.old_doc {
-            Some(old) => old.get(name).cloned().unwrap_or(Value::Null),
+            Some(old) => row_field(old, name),
             None => Value::Null,
         }
     }
 
     fn excluded_column(&self, name: &str) -> Value {
         match self.excluded_doc {
-            Some(excluded) => excluded.get(name).cloned().unwrap_or(Value::Null),
+            Some(excluded) => row_field(excluded, name),
             None => Value::Null,
         }
     }
+}
+
+/// The value `name` references in `doc`: the whole document for
+/// [`WHOLE_ROW_COLUMN`], else the field, else `Null`.
+fn row_field(doc: &Value, name: &str) -> Value {
+    if name == WHOLE_ROW_COLUMN {
+        return doc.clone();
+    }
+    doc.get(name).cloned().unwrap_or(Value::Null)
 }
 
 impl SqlExpr {
@@ -273,6 +286,24 @@ mod tests {
     fn missing_column() {
         let expr = SqlExpr::Column("missing".into());
         assert_eq!(expr.eval(&doc()).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn whole_row_column_is_the_document() {
+        let expr = SqlExpr::Column(WHOLE_ROW_COLUMN.into());
+        assert_eq!(expr.eval(&doc()).unwrap(), doc());
+        let old = SqlExpr::OldColumn(WHOLE_ROW_COLUMN.into());
+        let before = Value::Object(Default::default());
+        assert_eq!(old.eval_with_old(&doc(), &before).unwrap(), before);
+    }
+
+    #[test]
+    fn to_jsonb_of_the_whole_row_keeps_every_field_type() {
+        let expr = SqlExpr::Function {
+            name: "to_jsonb".into(),
+            args: vec![SqlExpr::Column(WHOLE_ROW_COLUMN.into())],
+        };
+        assert_eq!(expr.eval(&doc()).unwrap(), doc());
     }
 
     #[test]

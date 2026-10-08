@@ -18,6 +18,7 @@
 //! keeps the row-derived list and renders those cells as text, the same answer
 //! `SELECT *` gives for the same row.
 
+use nodedb_sql::SqlError;
 use nodedb_sql::catalog::SqlCatalog;
 use nodedb_sql::types::query::Projection;
 
@@ -28,19 +29,20 @@ use super::columns::{column_types_for, ordered_columns_for, schema_from_projecti
 /// The output schema a write announces for `returning` against `collection`.
 ///
 /// `None` — the statement carries no `RETURNING` clause — announces nothing,
-/// which is what a write with no result set must say.
+/// which is what a write with no result set must say. A catalog lookup error
+/// is returned.
 pub fn build_returning_schema<C: SqlCatalog + ?Sized>(
     returning: Option<&[Projection]>,
     collection: &str,
     catalog: &C,
     database_id: nodedb_types::DatabaseId,
-) -> OutputSchema {
+) -> Result<OutputSchema, SqlError> {
     let Some(projection) = returning else {
-        return OutputSchema::default();
+        return Ok(OutputSchema::default());
     };
-    let types = column_types_for(catalog, database_id, collection);
-    let ordered_cols = ordered_columns_for(catalog, database_id, collection);
-    schema_from_projection(projection, &types, &ordered_cols)
+    let types = column_types_for(catalog, database_id, collection)?;
+    let ordered_cols = ordered_columns_for(catalog, database_id, collection)?;
+    Ok(schema_from_projection(projection, &types, &ordered_cols))
 }
 
 #[cfg(test)]
@@ -110,6 +112,7 @@ mod tests {
     fn schema(projection: Option<&[Projection]>) -> OutputSchema {
         let database_id = nodedb_types::DatabaseId::DEFAULT;
         build_returning_schema(projection, "points", &PointsCatalog, database_id)
+            .expect("schema derives")
     }
 
     /// Named columns carry the declared catalog type, in clause order — the

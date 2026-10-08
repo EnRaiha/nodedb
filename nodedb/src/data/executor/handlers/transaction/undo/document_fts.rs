@@ -7,28 +7,29 @@
 //! rollback restores the document body into the primary store, so it must also
 //! recompute and re-insert the FTS postings — otherwise the row comes back
 //! restored-but-unsearchable. `nodedb_fts::analyze` is deterministic, so the
-//! recomputed text (extracted via the same [`extract_fts_text`] helper the
-//! forward PUT path uses) reproduces byte-identical postings.
+//! recomputed text (extracted via the same [`extract_fts_fields`] helper the
+//! forward PUT path uses) reproduces byte-identical postings in every index.
 
 use tracing::error;
 
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::fts_text::extract_fts_text;
+use crate::data::executor::fts_text::extract_fts_fields;
 
+use super::UndoError;
 use super::document::UndoDocumentContext;
 
 impl CoreLoop {
     /// Re-index a restored document's text into the inverted index during
     /// DELETE rollback. Decodes the restored body through the storage-mode-aware
     /// helper (strict → Binary Tuple, schemaless → MessagePack) so both modes
-    /// recompute their real text. Returns `Err((entry_index, detail))` on
-    /// failure so a partial FTS restore escalates to `RollbackFailed`.
+    /// recompute their real text. Returns an [`UndoError`] on failure, so a
+    /// partial FTS restore escalates to `RollbackFailed`.
     pub(super) fn reindex_restored_document_fts(
         &self,
         ctx: UndoDocumentContext<'_>,
         surrogate: nodedb_types::Surrogate,
         old_value: &[u8],
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         let UndoDocumentContext {
             database_id,
             tid,
@@ -52,8 +53,14 @@ impl CoreLoop {
         // unsearchable. That is a failed rollback, not a no-op.
         let doc = self
             .decode_stored_document(config, old_value)
-            .map_err(|e| (entry_index, e.to_string()))?;
-        let text = extract_fts_text(&doc);
+            .map_err(|e| {
+                UndoError::failed(
+                    entry_index,
+                    format!("decoding the restored body of {collection}/{document_id}"),
+                    e,
+                )
+            })?;
+        let text = extract_fts_fields(&doc);
         if text.is_empty() {
             return Ok(());
         }
@@ -66,18 +73,20 @@ impl CoreLoop {
                 &text,
             )
             .map_err(|e| {
+                let err = UndoError::failed(
+                    entry_index,
+                    format!("fts re-index on {collection}/{document_id}"),
+                    e,
+                );
                 error!(
                     core = self.core_id,
                     entry_index,
                     collection = %collection,
                     document_id = %document_id,
-                    error = %e,
+                    error = %err,
                     "transaction undo: FTS re-index failed; shard state unknown"
                 );
-                (
-                    entry_index,
-                    format!("fts re-index on {collection}/{document_id}: {e}"),
-                )
+                err
             })
     }
 }

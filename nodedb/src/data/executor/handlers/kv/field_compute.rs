@@ -7,10 +7,12 @@
 //! mirrors the `nodedb_physical::kv_atomic::compute` / `stage_kv_atomic` split for
 //! `Incr`/`Cas`/etc.
 
+use nodedb_physical::physical_plan::DeclaredColumn;
 use nodedb_query::msgpack_scan::{KvBodyError, KvBodyShape, kv_body_to_row, row_to_kv_body};
 use nodedb_types::Value;
 
 use crate::bridge::envelope::ErrorCode;
+use crate::data::executor::strict_format::coerce_declared_row;
 
 /// Result of merging field updates into a KV document body.
 #[derive(Debug)]
@@ -27,10 +29,14 @@ pub(in crate::data::executor) struct FieldSetComputation {
 /// A raw scalar body (the single-`value` SQL form, RESP `SET`) is not a
 /// hash: a field set against it is a type mismatch, the verdict Redis gives
 /// `HSET` on a string key. It is never silently replaced by a map.
+///
+/// Every `declared` column of the merged row holds the value its type
+/// stores, so a value out of the declared range fails the write.
 pub(in crate::data::executor) fn merge_field_updates(
     collection: &str,
     current: Option<&[u8]>,
     updates: &[(String, Vec<u8>)],
+    declared: &[DeclaredColumn],
 ) -> Result<FieldSetComputation, ErrorCode> {
     let mut doc = match current {
         None => std::collections::HashMap::new(),
@@ -69,6 +75,7 @@ pub(in crate::data::executor) fn merge_field_updates(
         }
         doc.insert(field.clone(), new_value);
     }
+    coerce_declared_row(&mut doc, declared).map_err(ErrorCode::from)?;
 
     let new_value = row_to_kv_body(&Value::Object(doc), KvBodyShape::Map)
         .map_err(|e| ErrorCode::from(crate::Error::from(e)))?;
@@ -93,7 +100,8 @@ mod tests {
 
     #[test]
     fn merges_into_empty_document() {
-        let result = merge_field_updates("c", None, &[("score".to_string(), int(42))]).unwrap();
+        let result =
+            merge_field_updates("c", None, &[("score".to_string(), int(42))], &[]).unwrap();
         assert_eq!(result.fields_added, 1);
         assert_eq!(
             decode(&result.new_value).get("score"),
@@ -109,7 +117,8 @@ mod tests {
             nodedb_types::value_to_msgpack(&Value::Object(m)).unwrap()
         };
         let result =
-            merge_field_updates("c", Some(&existing), &[("score".to_string(), int(2))]).unwrap();
+            merge_field_updates("c", Some(&existing), &[("score".to_string(), int(2))], &[])
+                .unwrap();
         assert_eq!(result.fields_added, 0);
         assert_eq!(
             decode(&result.new_value).get("score"),
@@ -119,14 +128,29 @@ mod tests {
 
     #[test]
     fn empty_value_bytes_set_null() {
-        let result = merge_field_updates("c", None, &[("f".to_string(), Vec::new())]).unwrap();
+        let result = merge_field_updates("c", None, &[("f".to_string(), Vec::new())], &[]).unwrap();
         assert_eq!(decode(&result.new_value).get("f"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn declared_column_is_retyped_and_range_checked() {
+        let declared = [DeclaredColumn::from_declared("n", "SMALLINT").expect("smallint")];
+        let result = merge_field_updates("c", None, &[("n".to_string(), int(7))], &declared)
+            .expect("fits smallint");
+        assert_eq!(decode(&result.new_value).get("n"), Some(&Value::Integer(7)));
+
+        let err = merge_field_updates("c", None, &[("n".to_string(), int(40000))], &declared)
+            .expect_err("past smallint");
+        assert!(
+            matches!(err, ErrorCode::NumericValueOutOfRange { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
     fn raw_body_is_a_type_mismatch_not_replaced_by_a_map() {
         for body in [b"first".as_slice(), b"1".as_slice()] {
-            let err = merge_field_updates("c", Some(body), &[("f".to_string(), int(1))])
+            let err = merge_field_updates("c", Some(body), &[("f".to_string(), int(1))], &[])
                 .expect_err("HSET on a bare-value key must be refused");
             match err {
                 ErrorCode::TypeMismatch { collection, .. } => assert_eq!(collection, "c"),
@@ -138,7 +162,7 @@ mod tests {
     #[test]
     fn corrupt_map_body_is_an_error_not_an_empty_document() {
         // fixmap header claiming one entry, then nothing.
-        let err = merge_field_updates("c", Some(&[0x81]), &[("f".to_string(), int(1))])
+        let err = merge_field_updates("c", Some(&[0x81]), &[("f".to_string(), int(1))], &[])
             .expect_err("a truncated body must not merge onto an empty map");
         assert!(!matches!(err, ErrorCode::TypeMismatch { .. }), "{err:?}");
     }

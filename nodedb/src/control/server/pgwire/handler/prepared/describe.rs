@@ -11,6 +11,8 @@ use pgwire::api::stmt::StoredStatement;
 use pgwire::api::{ClientInfo, Type};
 use pgwire::error::PgWireResult;
 
+use crate::control::server::pgwire::types::wire_type::TEXT_RESULTS;
+
 use super::super::core::NodeDbPgHandler;
 use super::statement::ParsedStatement;
 
@@ -43,15 +45,13 @@ impl NodeDbPgHandler {
             })
             .collect();
 
-        if stmt.result_fields.is_empty() {
-            // DML statement (INSERT/UPDATE/DELETE) — no result columns.
-            Ok(DescribeStatementResponse::new(param_types, vec![]))
-        } else {
-            Ok(DescribeStatementResponse::new(
-                param_types,
-                stmt.result_fields.clone(),
-            ))
-        }
+        // A DML statement (INSERT/UPDATE/DELETE) has no result columns. The
+        // result formats are not known before Bind, so the fields say text,
+        // as PostgreSQL's statement Describe does.
+        Ok(DescribeStatementResponse::new(
+            param_types,
+            stmt.result_fields(&TEXT_RESULTS),
+        ))
     }
 
     /// Describe a portal: return result columns.
@@ -68,18 +68,14 @@ impl NodeDbPgHandler {
     {
         let stmt = &target.statement.statement;
 
-        if stmt.result_fields.is_empty() {
+        if stmt.result_columns.is_empty() {
             return Ok(DescribePortalResponse::no_data());
         }
 
         // The portal is bound, so the client's requested result-column formats
-        // are known. Stamp the resolved (feature-downgraded) formats onto the
-        // RowDescription so Describe advertises exactly what Execute encodes.
-        let formats = super::result_format::resolve_result_formats(
-            &stmt.result_fields,
-            &target.result_column_format,
-        );
-        let fields = super::result_format::stamp_formats(&stmt.result_fields, &formats);
-        Ok(DescribePortalResponse::new(fields))
+        // are known. Each field carries the format Execute encodes it in.
+        Ok(DescribePortalResponse::new(
+            stmt.result_fields(&target.result_column_format),
+        ))
     }
 }

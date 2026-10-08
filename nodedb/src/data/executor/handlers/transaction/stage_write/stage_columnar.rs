@@ -147,13 +147,16 @@ impl CoreLoop {
         // hitting the scan's "missing engine -> empty result" branch. See
         // `ensure_columnar_engine_schema` doc comment.
         let engine_preexisted = self.columnar_engines.contains_key(&engine_key);
-        let schema = self.ensure_columnar_engine_schema(
+        let schema = match self.ensure_columnar_engine_schema(
             &engine_key,
             collection,
             bitemporal,
             &ndb_rows[0],
             schema_bytes,
-        );
+        ) {
+            Ok(schema) => schema,
+            Err(e) => return self.response_error(task, ErrorCode::from(e)),
+        };
         // Track engines THIS transaction newly auto-created (never engines
         // that already existed before the txn started) so `MetaOp::DropTxnOverlay`
         // can drop the still-empty ones on rollback without touching engines
@@ -208,19 +211,12 @@ impl CoreLoop {
                         Some(Value::Integer(i)) => Value::Integer(*i),
                         _ => Value::Integer(i64::MAX),
                     }),
-                    _ => ndb_field_to_value(obj.get(&col.name), &col.column_type),
+                    _ => ndb_field_to_value(obj.get(&col.name), col),
                 })
                 .collect::<Result<Vec<Value>, crate::Error>>()
             {
                 Ok(v) => v,
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("columnar insert coercion: {e}"),
-                        },
-                    );
-                }
+                Err(e) => return self.response_error(task, ErrorCode::from(e)),
             };
 
             let surrogate = match surrogates.get(row_idx).copied() {

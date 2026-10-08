@@ -240,6 +240,7 @@ fn authorize_resp_task(
         database_id,
         &mut plan,
         &state.rls,
+        state.credentials.catalog(),
         scope.auth(),
     )?;
 

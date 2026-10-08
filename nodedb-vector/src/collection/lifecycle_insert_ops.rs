@@ -268,6 +268,22 @@ impl VectorCollection {
         }
         false
     }
+
+    /// Un-delete `id` and bind it to `surrogate` again: the reverse of
+    /// [`Self::delete`] on a bound node, which drops the binding.
+    ///
+    /// Returns `false` and changes nothing when `id` carries no tombstone.
+    /// [`Surrogate::ZERO`] binds nothing, as in [`Self::insert_with_surrogate`].
+    pub fn undelete_bound(&mut self, id: u32, surrogate: Surrogate) -> bool {
+        if !self.undelete(id) {
+            return false;
+        }
+        if surrogate != Surrogate::ZERO {
+            self.surrogate_map.insert(id, surrogate);
+            self.surrogate_to_local.insert(surrogate, id);
+        }
+        true
+    }
 }
 
 /// The FP32 vector at `local` in a sealed segment: the mmap tier when the
@@ -323,6 +339,24 @@ mod tests {
         assert_eq!(coll.live_count(), 1);
         assert_eq!(coll.local_for_surrogate(s), Some(second));
         assert!(!coll.delete(first), "the first node is already gone");
+    }
+
+    #[test]
+    fn undelete_bound_restores_the_node_and_its_binding() {
+        let mut coll = collection();
+        let s = Surrogate::new(5);
+        let id = coll.insert_with_surrogate(vec![1.0, 0.0], s).unwrap();
+        assert!(coll.delete(id));
+        assert_eq!(coll.local_for_surrogate(s), None);
+
+        assert!(coll.undelete_bound(id, s));
+        assert_eq!(coll.live_count(), 1);
+        assert_eq!(coll.local_for_surrogate(s), Some(id));
+        assert_eq!(coll.get_surrogate(id), Some(s));
+        assert!(
+            !coll.undelete_bound(id, s),
+            "a live node has no tombstone to clear"
+        );
     }
 
     #[test]

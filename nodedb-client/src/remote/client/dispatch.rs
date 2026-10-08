@@ -32,9 +32,10 @@ impl NodeDb for NodeDbRemote {
         query: &[f32],
         k: usize,
         filter: Option<&MetadataFilter>,
-        _allowed_ids: Option<&std::collections::HashSet<String>>,
+        allowed_ids: Option<&std::collections::HashSet<String>>,
     ) -> NodeDbResult<Vec<SearchResult>> {
-        self.vector_search_impl(collection, query, k, filter).await
+        self.vector_search_impl(collection, query, k, filter, allowed_ids)
+            .await
     }
 
     async fn vector_insert_field(
@@ -81,9 +82,10 @@ impl NodeDb for NodeDbRemote {
         collection: &str,
         start: &NodeId,
         depth: u8,
+        direction: nodedb_types::graph::Direction,
         edge_filter: Option<&EdgeFilter>,
     ) -> NodeDbResult<SubGraph> {
-        self.graph_traverse_impl(collection, start, depth, edge_filter)
+        self.graph_traverse_impl(collection, start, depth, direction, edge_filter)
             .await
     }
 
@@ -230,9 +232,9 @@ impl NodeDb for NodeDbRemote {
         query: &str,
         top_k: usize,
         params: TextSearchParams,
-        _allowed_ids: Option<&std::collections::HashSet<String>>,
+        allowed_ids: Option<&std::collections::HashSet<String>>,
     ) -> NodeDbResult<Vec<SearchResult>> {
-        self.text_search_impl(collection, field, query, top_k, params)
+        self.text_search_impl(collection, field, query, top_k, params, allowed_ids)
             .await
     }
 

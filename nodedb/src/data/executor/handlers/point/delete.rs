@@ -8,6 +8,7 @@ use tracing::debug;
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::redo_image::versioned_point_images;
+use crate::data::executor::enforcement::chain_guard::{AbandonedWrite, abandon_write};
 use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::partial_refusal::refusal_after_partial_apply;
 use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
@@ -88,7 +89,7 @@ impl CoreLoop {
             Ok(txn) => txn,
             Err(e) => return self.response_error(task, e),
         };
-        let outcome = match self.apply_point_delete(
+        let mut outcome = match self.apply_point_delete(
             &txn,
             PointDeleteParams {
                 database_id,
@@ -104,6 +105,11 @@ impl CoreLoop {
             Ok(outcome) => outcome,
             Err(e) => return self.response_error(task, e),
         };
+        // Every abort below drops `txn` uncommitted, which reverses the
+        // durable writes only. `abandon_write` reverses the in-memory
+        // cascades and the target rows' cache and index entries.
+        let storage_key = crate::engine::document::store::StorageKey::for_surrogate(surrogate);
+        let memory_undo = std::mem::take(&mut outcome.memory_undo);
         // Image-folding enforcement, inside the SAME transaction the removal was
         // staged in: a materialized-sum target write is itself a document write,
         // so the debit and the row's removal land or roll back together. A
@@ -125,15 +131,19 @@ impl CoreLoop {
             ) {
                 Ok(enforcement) => enforcement,
                 Err(e) => {
-                    // `apply_point_delete` already invalidated this row's cache
-                    // entry, and dropping `txn` reverses every durable write it
-                    // staged, so nothing else has to be undone here.
+                    let e = abandon_write(
+                        self,
+                        AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                            .undo(memory_undo),
+                        e,
+                    );
                     return self.response_error(task, e);
                 }
             },
             None => Default::default(),
         };
         let target_write_set = write_hook::target_write_set(&enforcement.target_writes);
+        let target_writes = enforcement.target_writes;
 
         // A delete subtracts the removed row's amount, so removing one leg of a
         // balanced journal on its own is a violation. Settled before the commit,
@@ -141,16 +151,27 @@ impl CoreLoop {
         if let Err(e) =
             self.settle_balanced_entries(database_id, tid, collection, enforcement.balanced_entries)
         {
+            let e = abandon_write(
+                self,
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(memory_undo)
+                    .targets(target_writes),
+                e,
+            );
             return self.response_error(task, e);
         }
 
         if let Err(e) = txn.commit() {
-            return self.response_error(
-                task,
-                ErrorCode::Internal {
+            let e = abandon_write(
+                self,
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(memory_undo)
+                    .targets(target_writes),
+                crate::Error::DataPlane(ErrorCode::Internal {
                     detail: format!("commit: {e}"),
-                },
+                }),
             );
+            return self.response_error(task, e);
         }
         let prior = outcome.prior_value;
 
@@ -197,20 +218,15 @@ impl CoreLoop {
         };
         write_set.extend(target_write_set);
         if let Some(prior_bytes) = prior.as_deref() {
-            let old_converted = self.resolve_event_payload(
-                task.request.database_id.as_u64(),
-                tid,
-                collection,
-                prior_bytes,
-            );
             // `document_identity` is read again below for `RETURNING`'s `id`
             // field, so the event-emit boundary gets a clone rather than the
             // move.
             self.emit_document_delete_event(
                 task,
+                tid,
                 collection,
                 document_identity.clone(),
-                Some(old_converted.as_deref().unwrap_or(prior_bytes)),
+                Some(prior_bytes),
             );
         }
 
@@ -221,6 +237,7 @@ impl CoreLoop {
             // document with none of the row's real columns. The schema borrow is
             // scoped so the response build below can take `self` mutably.
             let doc = {
+                let identity_column = self.identity_column(database_id, tid, collection);
                 let strict_schema = self
                     .doc_configs
                     .get(&(
@@ -232,7 +249,12 @@ impl CoreLoop {
                         StorageMode::Strict { schema } => Some(schema),
                         StorageMode::Schemaless => None,
                     });
-                returning_doc::from_stored(prior_bytes, &document_identity, strict_schema)
+                returning_doc::from_stored(
+                    prior_bytes,
+                    &document_identity,
+                    strict_schema,
+                    &identity_column,
+                )
             };
             let doc = match doc {
                 Ok(doc) => doc,
@@ -342,6 +364,7 @@ impl CoreLoop {
             &body,
             &storage_key.to_identity(),
             strict_schema,
+            &self.identity_column(database_id, tid, collection),
             tid,
             collection,
         )
@@ -571,6 +594,242 @@ mod tests {
                 .expect("read back")
                 .is_some(),
             "a refused delete must leave the chained row in place"
+        );
+    }
+
+    /// The in-memory index state of one source row.
+    #[derive(Debug, PartialEq)]
+    struct RowIndexes {
+        rtree: Vec<(u64, nodedb_types::BoundingBox)>,
+        spatial_doc: Option<String>,
+        live_vectors: usize,
+        bound_vector: Option<u32>,
+        recorded_vector: Option<u32>,
+        node_deleted: bool,
+    }
+
+    fn row_indexes(core: &CoreLoop, surrogate: Surrogate, document_id: &str) -> RowIndexes {
+        let storage_key = nodedb_types::StorageKey::for_surrogate(surrogate);
+        let entry_id =
+            crate::data::executor::handlers::point::apply_put::SpatialEntryId::from_storage_key(
+                storage_key,
+            )
+            .as_u64();
+        let db = DatabaseId::DEFAULT;
+        let tenant = TenantId::new(TID);
+        let rtree: Vec<(u64, nodedb_types::BoundingBox)> = core
+            .spatial_indexes
+            .get(&(db, tenant, SOURCE.to_string(), "loc".to_string()))
+            .map(|rt| rt.entries().into_iter().map(|e| (e.id, e.bbox)).collect())
+            .unwrap_or_default();
+        let spatial_doc = core
+            .spatial_doc_map
+            .get(&(db, tenant, SOURCE.to_string(), "loc".to_string(), entry_id))
+            .cloned();
+        let vector_key = CoreLoop::vector_index_key(DB, TID, SOURCE, "embedding");
+        let vectors = core.vector_collections.get(&vector_key);
+        RowIndexes {
+            rtree,
+            spatial_doc,
+            live_vectors: vectors.map(|c| c.live_count()).unwrap_or(0),
+            bound_vector: vectors.and_then(|c| c.local_for_surrogate(surrogate)),
+            recorded_vector: core
+                .vector_doc_map
+                .get(&(
+                    db,
+                    tenant,
+                    SOURCE.to_string(),
+                    "embedding".to_string(),
+                    storage_key,
+                ))
+                .copied(),
+            node_deleted: core.is_node_deleted(DB, TID, SOURCE, document_id),
+        }
+    }
+
+    /// A delete refused after `apply_point_delete` ran leaves the row's
+    /// R-tree entry, vector node, reverse maps and node mark as they were.
+    /// The refusal here is the fold's: the target row it debits is gone.
+    #[test]
+    fn a_delete_refused_after_apply_leaves_every_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut core = seeded_core(dir.path());
+        let task = make_default_task();
+        let targets = resolved();
+        core.vector_params.insert(
+            (DatabaseId::DEFAULT, TenantId::new(TID), SOURCE.to_string()),
+            crate::engine::vector::hnsw::HnswParams::default(),
+        );
+
+        let surrogate = Surrogate(31);
+        let body = doc_format::encode_to_msgpack(&serde_json::json!({
+            "account_id": A1,
+            "amount": 40,
+            "loc": {"type": "Point", "coordinates": [1.0, 2.0]},
+            "embedding": [1.0, 0.0, 0.0],
+        }));
+        assert_eq!(insert(&mut core, &task, surrogate, &body), Status::Ok);
+        let before = row_indexes(&core, surrogate, "e31");
+        assert_eq!(before.rtree.len(), 1, "the insert indexed the geometry");
+        assert!(before.spatial_doc.is_some());
+        assert_eq!(before.live_vectors, 1, "the insert indexed the vector");
+        assert!(before.bound_vector.is_some());
+        assert_eq!(before.recorded_vector, before.bound_vector);
+        assert!(!before.node_deleted);
+
+        let target_key = nodedb_types::StorageKey::for_surrogate(T1);
+        core.sparse
+            .delete(DB, TID, TARGET, &target_key)
+            .expect("drop the target row");
+        core.doc_cache.invalidate(DB, TID, TARGET, &target_key);
+
+        let resp = core.execute_point_delete(
+            &task,
+            PointDeleteExec {
+                tid: TID,
+                collection: SOURCE,
+                document_id: "e31",
+                surrogate: Some(surrogate),
+                returning: None,
+                rls_filters: &[],
+                rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
+                resolved_sum_targets: &targets,
+            },
+        );
+        assert_eq!(
+            resp.status,
+            Status::Error,
+            "the fold must refuse the delete"
+        );
+        assert!(
+            !matches!(
+                resp.error_code.as_deref(),
+                Some(ErrorCode::RollbackFailed { .. })
+            ),
+            "every in-memory entry must reverse, got {:?}",
+            resp.error_code
+        );
+        assert!(
+            core.sparse
+                .get(
+                    DB,
+                    TID,
+                    SOURCE,
+                    &nodedb_types::StorageKey::for_surrogate(surrogate)
+                )
+                .expect("read back")
+                .is_some(),
+            "the refused delete leaves the row"
+        );
+        assert_eq!(
+            row_indexes(&core, surrogate, "e31"),
+            before,
+            "the refused delete leaves every in-memory index as it was"
+        );
+    }
+
+    /// [`seeded_core`] with a strict source that declares a `SparseVector`
+    /// column.
+    fn strict_sparse_core(dir: &std::path::Path) -> CoreLoop {
+        use nodedb_types::columnar::{ColumnDef, ColumnType, StrictSchema};
+        let mut core = seeded_core(dir);
+        let schema = StrictSchema::new(vec![
+            ColumnDef::required("_rowid", ColumnType::Int64),
+            ColumnDef::nullable("account_id", ColumnType::String),
+            ColumnDef::nullable("amount", ColumnType::Int64),
+            ColumnDef::nullable("terms", ColumnType::SparseVector),
+        ])
+        .expect("schema");
+        let mut source = CollectionConfig::new(SOURCE)
+            .with_storage_mode(nodedb_physical::physical_plan::StorageMode::Strict { schema });
+        source.enforcement.materialized_sum_sources = vec![binding()];
+        core.doc_configs.insert(config_key(SOURCE), source);
+        core
+    }
+
+    /// A delete refused after `apply_point_delete` ran leaves the row's
+    /// sparse-vector postings on a strict collection. The refusal here is the
+    /// fold's: the target row it debits is gone.
+    #[test]
+    fn a_delete_refused_after_apply_leaves_the_sparse_postings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut core = strict_sparse_core(dir.path());
+        let task = make_default_task();
+        let targets = resolved();
+
+        let surrogate = Surrogate(32);
+        let body = doc_format::encode_to_msgpack(&serde_json::json!({
+            "account_id": A1,
+            "amount": 40,
+            "terms": "{3:0.5, 7:1.5}",
+        }));
+        assert_eq!(insert(&mut core, &task, surrogate, &body), Status::Ok);
+        let sparse_key = CoreLoop::sparse_index_key(DB, TID, SOURCE, "terms");
+        let row_key = nodedb_types::StorageKey::for_surrogate(surrogate).to_string();
+        let postings = |core: &CoreLoop| {
+            core.sparse_vector_indexes.get(&sparse_key).map(|index| {
+                (
+                    index.doc_count(),
+                    index.doc_image(&row_key),
+                    index.next_internal_id(),
+                )
+            })
+        };
+        let before = postings(&core);
+        let Some((doc_count, image, _)) = &before else {
+            panic!("the insert must create the sparse index");
+        };
+        assert_eq!(*doc_count, 1, "the insert indexed the sparse vector");
+        assert!(image.is_some(), "the row holds sparse postings");
+
+        let target_key = nodedb_types::StorageKey::for_surrogate(T1);
+        core.sparse
+            .delete(DB, TID, TARGET, &target_key)
+            .expect("drop the target row");
+        core.doc_cache.invalidate(DB, TID, TARGET, &target_key);
+
+        let resp = core.execute_point_delete(
+            &task,
+            PointDeleteExec {
+                tid: TID,
+                collection: SOURCE,
+                document_id: "e32",
+                surrogate: Some(surrogate),
+                returning: None,
+                rls_filters: &[],
+                rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
+                resolved_sum_targets: &targets,
+            },
+        );
+        assert_eq!(
+            resp.status,
+            Status::Error,
+            "the fold must refuse the delete"
+        );
+        assert!(
+            !matches!(
+                resp.error_code.as_deref(),
+                Some(ErrorCode::RollbackFailed { .. })
+            ),
+            "every in-memory entry must reverse, got {:?}",
+            resp.error_code
+        );
+        assert!(
+            core.sparse
+                .get(
+                    DB,
+                    TID,
+                    SOURCE,
+                    &nodedb_types::StorageKey::for_surrogate(surrogate)
+                )
+                .expect("read back")
+                .is_some(),
+            "the refused delete leaves the row"
+        );
+        assert_eq!(
+            postings(&core),
+            before,
+            "the refused delete leaves the sparse postings as they were"
         );
     }
 }

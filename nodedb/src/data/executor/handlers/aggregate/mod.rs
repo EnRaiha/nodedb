@@ -12,14 +12,14 @@
 //! `exec` (dispatch + fast paths), `streaming` (the spill-backed group-by
 //! accumulation, itself split into accumulate / finalize / over_docs phases),
 //! `cache_key` (result-cache key derivation), `rows` (post-aggregate alias
-//! renaming and ORDER BY sorting), `state_emit` (the distributed-shuffle
+//! renaming, HAVING and ORDER BY sorting), `state_emit` (the distributed-shuffle
 //! partial-state producer), and `shuffle_merge` (the partial-state consumer).
 
 mod cache_entry;
 mod cache_key;
 pub(in crate::data::executor) mod exec;
 mod invalidate;
-mod rows;
+pub(in crate::data::executor::handlers) mod rows;
 pub(in crate::data::executor) mod shuffle_merge;
 pub(in crate::data::executor) mod state_emit;
 mod streaming;

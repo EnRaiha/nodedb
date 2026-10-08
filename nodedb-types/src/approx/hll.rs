@@ -7,7 +7,7 @@
 /// Uses 2^14 = 16384 registers (12 KB memory). Achieves ~0.8% relative
 /// error at any cardinality. Mergeable: `hll_a.merge(&hll_b)` produces
 /// the union cardinality.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub struct HyperLogLog {
     registers: Vec<u8>,
     precision: u8,
@@ -214,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn hll_serde_roundtrip_merge_semantics() {
+    fn hll_msgpack_roundtrip_merge_semantics() {
         let mut a = HyperLogLog::new();
         let mut b = HyperLogLog::new();
         for i in 0..1000u64 {
@@ -224,9 +224,8 @@ mod tests {
             b.add(i);
         }
 
-        // Serialize and deserialize a via serde_json (serde derive, not zerompk).
-        let json = serde_json::to_vec(&a).expect("serialize HLL");
-        let mut a_prime: HyperLogLog = serde_json::from_slice(&json).expect("deserialize HLL");
+        let bytes = zerompk::to_msgpack_vec(&a).expect("serialize HLL");
+        let mut a_prime: HyperLogLog = zerompk::from_msgpack(&bytes).expect("deserialize HLL");
 
         // Merge b into deserialized a'.
         a_prime.merge(&b);

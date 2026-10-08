@@ -10,7 +10,6 @@ use nodedb_types::id::{EdgeId, NodeId};
 use nodedb_types::protocol::{OpCode, TextFields};
 use nodedb_types::result::SubGraph;
 
-use super::super::response_parse::parse_subgraph_response;
 use super::core::NativeClient;
 use crate::native::connection::check_error;
 use crate::sql_escape::quote_string_literal;
@@ -21,25 +20,35 @@ impl NativeClient {
         collection: &str,
         start: &NodeId,
         depth: u8,
+        direction: nodedb_types::graph::Direction,
         edge_filter: Option<&EdgeFilter>,
     ) -> NodeDbResult<SubGraph> {
-        let mut conn = self.pool.acquire().await?;
-        let resp = conn
-            .send(
-                OpCode::GraphHop,
-                TextFields {
-                    collection: Some(collection.to_string()),
-                    start_node: Some(start.as_str().to_string()),
-                    depth: Some(depth as u32),
-                    edge_label: edge_filter.and_then(|f| f.labels.first().cloned()),
-                    ..Default::default()
-                },
-            )
-            .await?;
-        // An error frame carries no rows; parsed unchecked it would read as
-        // "the traversal found nothing".
-        check_error(&resp)?;
-        parse_subgraph_response(&resp)
+        // `GRAPH TRAVERSE` answers with nodes, their depths and the crossed
+        // edges with their properties, the same result the remote client
+        // decodes. `OpCode::GraphHop` answers only the reachable node set.
+        let sql = crate::graph_dsl::build_graph_traverse_sql(
+            collection,
+            start,
+            depth,
+            direction,
+            edge_filter,
+        )?;
+        let result = self.query(&sql).await?;
+        crate::graph_dsl::decode_traverse_result(&result.columns, &result.rows)
+    }
+
+    pub(super) async fn graph_shortest_path_impl(
+        &self,
+        collection: &str,
+        from: &NodeId,
+        to: &NodeId,
+        max_depth: u8,
+        edge_filter: Option<&EdgeFilter>,
+    ) -> NodeDbResult<Option<Vec<NodeId>>> {
+        let sql =
+            crate::graph_dsl::build_graph_path_sql(collection, from, to, max_depth, edge_filter)?;
+        let result = self.query(&sql).await?;
+        crate::graph_dsl::decode_path_result(&result.columns, &result.rows)
     }
 
     pub(super) async fn graph_insert_edge_impl(

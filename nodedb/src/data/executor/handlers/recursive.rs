@@ -120,15 +120,18 @@ impl CoreLoop {
         };
 
         // Convert raw stored bytes to the msgpack form the CTE steps compare
-        // on. A schemaless row with no declared `id` field carries its
-        // identity only in the storage key, never in the body, so the row
-        // image must inject it before any predicate runs — otherwise
-        // `id IS NULL` and RETURNING rows both lose the identity.
+        // on. A row that lacks its identity column carries its identity only
+        // in the storage key, so the row image injects it under that column
+        // before any predicate runs. A declared-key row already holds its
+        // key and gains no `id`.
+        let identity_column =
+            self.identity_column(task.request.database_id.as_u64(), tid, collection);
         let to_msgpack = |doc_id: &nodedb_types::StorageKey, value: &[u8]| -> Vec<u8> {
             crate::data::executor::scan_normalize::sparse_row_to_doc(
                 doc_id,
                 value,
                 body_format.as_format_ref(),
+                &identity_column,
             )
             .1
         };

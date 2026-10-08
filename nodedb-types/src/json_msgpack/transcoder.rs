@@ -15,6 +15,7 @@ use super::error::MsgpackResult;
 use super::instant_ext::instant_from_ext;
 use super::reader::{Cursor, base64_encode};
 use crate::datetime::NdbDateTime;
+use crate::value::float_text::non_finite_float_text;
 
 /// Transcode raw msgpack bytes to a JSON string without intermediate types.
 ///
@@ -203,9 +204,13 @@ fn write_uint(out: &mut String, v: u64) {
     let _ = write!(out, "{v}");
 }
 
+/// Write a float as JSON. A non-finite float is its PostgreSQL text in a
+/// JSON string, as PostgreSQL `to_json` renders it, never `null`.
 fn write_float(out: &mut String, v: f64) {
-    if v.is_nan() || v.is_infinite() {
-        out.push_str("null");
+    if let Some(text) = non_finite_float_text(v) {
+        out.push('"');
+        out.push_str(text);
+        out.push('"');
     } else if v.fract() == 0.0 && v.abs() < (1i64 << 53) as f64 {
         let _ = write!(out, "{v:.1}");
     } else {
@@ -334,6 +339,21 @@ mod tests {
 
         let unknown = [0xD7, 0x09, 0, 0, 0, 0, 0, 0, 0, 1];
         assert_eq!(msgpack_to_json_string(&unknown).unwrap(), "null");
+    }
+
+    /// A non-finite float transcodes to its PostgreSQL text in a JSON
+    /// string, never `null`. A finite float stays a JSON number.
+    #[test]
+    fn non_finite_floats_render_postgres_text() {
+        let mut mp = vec![0x94];
+        for f in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 2.5] {
+            mp.push(0xCB);
+            mp.extend_from_slice(&f.to_be_bytes());
+        }
+        assert_eq!(
+            msgpack_to_json_string(&mp).unwrap(),
+            "[\"NaN\",\"Infinity\",\"-Infinity\",2.5]"
+        );
     }
 
     #[test]

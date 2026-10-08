@@ -512,12 +512,13 @@ mod tests {
                     surrogate_ceiling: None,
                 })),
             }),
-            PhysicalPlan::Meta(MetaOp::MarkSavepoint { txn_id }),
+            PhysicalPlan::Meta(MetaOp::MarkSavepoint {
+                txn_id,
+                savepoint: 1,
+            }),
             PhysicalPlan::Meta(MetaOp::RollbackToSavepoint {
                 txn_id,
-                value_marker: 0,
-                graph_marker: 0,
-                array_marker: 0,
+                savepoint: 1,
             }),
             PhysicalPlan::Meta(MetaOp::DropTxnOverlay { txn_id }),
             PhysicalPlan::Meta(MetaOp::TransactionBatch {

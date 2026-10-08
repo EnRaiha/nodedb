@@ -17,6 +17,8 @@
 
 use std::collections::HashMap;
 
+use nodedb_types::Value;
+
 use crate::engine::timeseries::columnar_memtable::{ColumnData, ColumnType, ColumnarMemtable};
 use nodedb_query::agg_key::canonical_agg_key;
 
@@ -27,9 +29,10 @@ use super::columnar_agg_support::{
 use super::columnar_filter;
 use super::spill::columnar::ColumnarGroupBySpiller;
 
-/// Result of native columnar aggregation.
+/// Result of native columnar aggregation: one `Value::Object` per group,
+/// keyed by output column name.
 pub(super) struct ColumnarAggResult {
-    pub rows: Vec<serde_json::Value>,
+    pub rows: Vec<nodedb_types::Value>,
 }
 
 /// Parameters for [`try_columnar_aggregate`].
@@ -58,16 +61,46 @@ pub(super) struct ColumnarAggParams<'a> {
 /// `p.spill_dir` and `p.spill_cap` control GROUP BY spill-to-disk: if the
 /// number of distinct groups exceeds `spill_cap`, partial accumulators are
 /// spilled to `spill_dir` and k-way merged at finalize time.
-pub(super) fn try_columnar_aggregate(p: &ColumnarAggParams<'_>) -> Option<ColumnarAggResult> {
+///
+/// Fails with `EvalError::NumericOverflow` when an exact integer SUM total
+/// lies outside the `Decimal` range.
+pub(super) fn try_columnar_aggregate(
+    p: &ColumnarAggParams<'_>,
+) -> Result<Option<ColumnarAggResult>, nodedb_query::EvalError> {
+    let Some(acc) = accumulate_groups(p) else {
+        return Ok(None);
+    };
+    build_results_from_groups(
+        &acc.groups,
+        p.group_by,
+        &acc.group_col_info,
+        p.aggregates,
+        p.mt,
+        p.limit,
+    )
+    .map(Some)
+}
+
+/// Per-group accumulators and the resolved GROUP BY column info.
+struct AccumulatedGroups {
+    groups: HashMap<GroupKey, Vec<AggAccum>>,
+    group_col_info: Vec<(usize, ColumnType)>,
+}
+
+/// Filter, group, and accumulate the memtable rows. `None` when the query
+/// cannot run natively.
+fn accumulate_groups(p: &ColumnarAggParams<'_>) -> Option<AccumulatedGroups> {
     let (mt, group_by, aggregates, filters) = (p.mt, p.group_by, p.aggregates, p.filters);
-    let (limit, scan_limit, spill_dir, spill_cap) =
-        (p.limit, p.scan_limit, p.spill_dir, p.spill_cap);
+    let (scan_limit, spill_dir, spill_cap) = (p.scan_limit, p.spill_dir, p.spill_cap);
     let (db, tenant) = (p.db, p.tenant);
     let schema = mt.schema();
     let row_count = (mt.row_count() as usize).min(scan_limit);
 
     if row_count == 0 {
-        return Some(ColumnarAggResult { rows: Vec::new() });
+        return Some(AccumulatedGroups {
+            groups: HashMap::new(),
+            group_col_info: Vec::new(),
+        });
     }
 
     // --- Phase 1: Resolve column indices for group-by and aggregate fields ---
@@ -221,16 +254,8 @@ pub(super) fn try_columnar_aggregate(p: &ColumnarAggParams<'_>) -> Option<Column
                         match &agg_col_data[agg_idx] {
                             None => accums[agg_idx].feed_count_only(),
                             Some((_, col_data)) => {
-                                let val = match col_data {
-                                    ColumnData::Float64(vals) => vals[row_idx],
-                                    ColumnData::Int64(vals) => vals[row_idx] as f64,
-                                    ColumnData::Timestamp(vals) => vals[row_idx] as f64,
-                                    _ => return,
-                                };
-                                if op == "count" {
-                                    accums[agg_idx].feed_count_only();
-                                } else {
-                                    accums[agg_idx].feed(val);
+                                if !accums[agg_idx].feed_op(op, col_data, row_idx) {
+                                    return;
                                 }
                             }
                         }
@@ -253,14 +278,10 @@ pub(super) fn try_columnar_aggregate(p: &ColumnarAggParams<'_>) -> Option<Column
                         }
                     }
                 }
-                return Some(build_results_from_groups(
-                    &groups,
-                    group_by,
-                    &group_col_info,
-                    aggregates,
-                    mt,
-                    limit,
-                ));
+                return Some(AccumulatedGroups {
+                    groups,
+                    group_col_info,
+                });
             }
         };
 
@@ -291,16 +312,8 @@ pub(super) fn try_columnar_aggregate(p: &ColumnarAggParams<'_>) -> Option<Column
                 match &agg_col_data[agg_idx] {
                     None => accums[agg_idx].feed_count_only(),
                     Some((_, col_data)) => {
-                        let val = match col_data {
-                            ColumnData::Float64(vals) => vals[row_idx],
-                            ColumnData::Int64(vals) => vals[row_idx] as f64,
-                            ColumnData::Timestamp(vals) => vals[row_idx] as f64,
-                            _ => return true,
-                        };
-                        if op == "count" {
-                            accums[agg_idx].feed_count_only();
-                        } else {
-                            accums[agg_idx].feed(val);
+                        if !accums[agg_idx].feed_op(op, col_data, row_idx) {
+                            return true;
                         }
                     }
                 }
@@ -343,44 +356,37 @@ pub(super) fn try_columnar_aggregate(p: &ColumnarAggParams<'_>) -> Option<Column
         }
     };
 
-    // --- Phase 4: Build result rows (resolve symbols only here) ---
-
-    Some(build_results_from_groups(
-        &groups,
-        group_by,
-        &group_col_info,
-        aggregates,
-        mt,
-        limit,
-    ))
+    Some(AccumulatedGroups {
+        groups,
+        group_col_info,
+    })
 }
 
-/// Build `serde_json` result rows from a finalized group accumulator map.
+/// Build `Value` result rows from a finalized group accumulator map
+/// (resolving symbols only here).
 ///
-/// Separated from `try_columnar_aggregate` so that both the spill path and
-/// the fallback no-spill path can reuse it.
+/// SUM is exact per `ExactSum`; AVG divides the exact total. MIN / MAX
+/// return the original cell: an integer column stays an integer. A float
+/// result keeps NaN and ±Infinity, as in PostgreSQL.
 fn build_results_from_groups(
     groups: &HashMap<GroupKey, Vec<AggAccum>>,
     group_by: &[String],
-    group_col_info: &[(
-        usize,
-        crate::engine::timeseries::columnar_memtable::ColumnType,
-    )],
+    group_col_info: &[(usize, ColumnType)],
     aggregates: &[(String, String)],
-    mt: &crate::engine::timeseries::columnar_memtable::ColumnarMemtable,
+    mt: &ColumnarMemtable,
     limit: usize,
-) -> ColumnarAggResult {
-    let mut results: Vec<serde_json::Value> = Vec::with_capacity(groups.len().min(limit));
+) -> Result<ColumnarAggResult, nodedb_query::EvalError> {
+    let mut results: Vec<Value> = Vec::with_capacity(groups.len().min(limit));
 
     for (group_key, accums) in groups {
-        let mut row = serde_json::Map::new();
+        let mut row: HashMap<String, Value> = HashMap::new();
 
         for (i, field) in group_by.iter().enumerate() {
             let (col_idx, _) = group_col_info[i];
             let val = if i < group_key.len() {
                 resolve_key_part(mt, col_idx, &group_key[i])
             } else {
-                serde_json::Value::Null
+                Value::Null
             };
             row.insert(field.clone(), val);
         }
@@ -389,47 +395,23 @@ fn build_results_from_groups(
             let agg_key = canonical_agg_key(op, field);
             let accum = &accums[agg_idx];
             let val = match op.as_str() {
-                "count" => serde_json::json!(accum.count),
-                "sum" => {
-                    if accum.count == 0 {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::json!(accum.sum)
-                    }
-                }
-                "avg" => {
-                    if accum.count == 0 {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::json!(accum.sum / accum.count as f64)
-                    }
-                }
-                "min" => {
-                    if accum.count == 0 {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::json!(accum.min)
-                    }
-                }
-                "max" => {
-                    if accum.count == 0 {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::json!(accum.max)
-                    }
-                }
-                _ => serde_json::Value::Null,
+                "count" => Value::from_u64(accum.count),
+                "sum" => accum.sum.sum()?,
+                "avg" => accum.sum.avg()?,
+                "min" => accum.min.clone().unwrap_or(Value::Null),
+                "max" => accum.max.clone().unwrap_or(Value::Null),
+                _ => Value::Null,
             };
             row.insert(agg_key, val);
         }
 
-        results.push(serde_json::Value::Object(row));
+        results.push(Value::Object(row));
         if results.len() >= limit {
             break;
         }
     }
 
-    ColumnarAggResult { rows: results }
+    Ok(ColumnarAggResult { rows: results })
 }
 
 #[cfg(test)]
@@ -506,11 +488,12 @@ mod tests {
             db: crate::types::DatabaseId::DEFAULT,
             tenant: crate::types::TenantId::new(1),
         })
+        .unwrap()
         .unwrap();
 
         assert_eq!(result.rows.len(), 2); // A and AAAA
         for row in &result.rows {
-            let count = row.get("count(*)").and_then(|v| v.as_u64()).unwrap();
+            let count = row.get("count(*)").and_then(|v| v.as_i64()).unwrap();
             assert_eq!(count, 50); // 100 rows / 2 types
         }
     }
@@ -532,6 +515,7 @@ mod tests {
             db: crate::types::DatabaseId::DEFAULT,
             tenant: crate::types::TenantId::new(1),
         })
+        .unwrap()
         .unwrap();
 
         assert_eq!(result.rows.len(), 5); // 5 unique qnames
@@ -561,6 +545,7 @@ mod tests {
             db: crate::types::DatabaseId::DEFAULT,
             tenant: crate::types::TenantId::new(1),
         })
+        .unwrap()
         .unwrap();
 
         // Only rows with value > 5000 (i >= 51, value >= 5100)
@@ -588,13 +573,193 @@ mod tests {
             db: crate::types::DatabaseId::DEFAULT,
             tenant: crate::types::TenantId::new(1),
         })
+        .unwrap()
         .unwrap();
 
         assert_eq!(result.rows.len(), 1);
         let count = result.rows[0]
             .get("count(*)")
-            .and_then(|v| v.as_u64())
+            .and_then(|v| v.as_i64())
             .unwrap();
         assert_eq!(count, 100);
+    }
+
+    const ABOVE: i64 = 9_007_199_254_740_993;
+    const AT: i64 = 9_007_199_254_740_992;
+
+    /// A memtable with a nanosecond `Int64` column `n`, a `Float64` column
+    /// `f`, and a symbol `g`, one row per `(ts, n, f, g)`.
+    fn int_memtable(rows: &[(i64, i64, f64, &str)]) -> ColumnarMemtable {
+        use crate::engine::timeseries::columnar_memtable::ColumnValue;
+        let schema = ColumnarSchema {
+            columns: vec![
+                ("timestamp".into(), ColumnType::Timestamp(TimeKind::Millis)),
+                ("n".into(), ColumnType::Int64),
+                ("f".into(), ColumnType::Float64),
+                ("g".into(), ColumnType::Symbol),
+            ],
+            timestamp_idx: 0,
+            codecs: vec![],
+        };
+        let mut mt = ColumnarMemtable::new(schema, ColumnarMemtableConfig::default());
+        for (i, &(ts, n, f, g)) in rows.iter().enumerate() {
+            let values = [
+                ColumnValue::Timestamp(ts),
+                ColumnValue::Int64(n),
+                ColumnValue::Float64(f),
+                ColumnValue::Symbol(g.to_string()),
+            ];
+            mt.ingest_row(i as SeriesId, &values).unwrap();
+        }
+        mt
+    }
+
+    /// Aggregate `aggregates` over `mt`, grouped by `group_by`, with a spill
+    /// cap of `spill_cap` groups.
+    fn run(
+        mt: &ColumnarMemtable,
+        group_by: &[String],
+        aggregates: &[(String, String)],
+        spill_cap: usize,
+        suffix: &str,
+    ) -> Result<Vec<Value>, nodedb_query::EvalError> {
+        let sd = test_spill_dir(suffix);
+        let result = try_columnar_aggregate(&ColumnarAggParams {
+            mt,
+            group_by,
+            aggregates,
+            filters: &[],
+            limit: 100,
+            scan_limit: 100_000,
+            spill_dir: &sd,
+            spill_cap,
+            governor: crate::data::executor::core_loop::test_governor(),
+            db: crate::types::DatabaseId::DEFAULT,
+            tenant: crate::types::TenantId::new(1),
+        })?;
+        Ok(result.unwrap().rows)
+    }
+
+    fn aggs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(op, f)| (op.to_string(), f.to_string()))
+            .collect()
+    }
+
+    /// The output value of column `name` in `row`; NULL when absent.
+    fn col(row: &Value, name: &str) -> Value {
+        row.get(name).cloned().unwrap_or(Value::Null)
+    }
+
+    #[test]
+    fn int64_min_max_sum_stay_exact_above_2_pow_53() {
+        let mt = int_memtable(&[(1, ABOVE, 0.0, "a"), (2, AT, 0.0, "a")]);
+        let a = aggs(&[("min", "n"), ("max", "n"), ("sum", "n"), ("avg", "n")]);
+        // Dense-symbol path and the no-GROUP-BY hash path.
+        for group_by in [vec!["g".to_string()], vec![]] {
+            let rows = run(&mt, &group_by, &a, 1_000_000, "exact").unwrap();
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(col(row, "min(n)"), Value::Integer(AT));
+            assert_eq!(col(row, "max(n)"), Value::Integer(ABOVE));
+            assert_eq!(col(row, "sum(n)"), Value::Integer(ABOVE + AT));
+            assert_eq!(col(row, "avg(n)"), Value::Float(AT as f64));
+        }
+    }
+
+    #[test]
+    fn nanosecond_timestamps_min_max_exact() {
+        let t = [
+            1_700_000_000_000_000_002_i64,
+            1_700_000_000_000_000_001,
+            1_700_000_000_000_000_003,
+        ];
+        let mt = int_memtable(&[
+            (t[0], 0, 0.0, "a"),
+            (t[1], 0, 0.0, "a"),
+            (t[2], 0, 0.0, "a"),
+        ]);
+        let a = aggs(&[("min", "timestamp"), ("max", "timestamp")]);
+        let rows = run(&mt, &[], &a, 1_000_000, "nanos").unwrap();
+        assert_eq!(col(&rows[0], "min(timestamp)"), Value::Integer(t[1]));
+        assert_eq!(col(&rows[0], "max(timestamp)"), Value::Integer(t[2]));
+    }
+
+    #[test]
+    fn int64_sum_past_i64_is_decimal_exact() {
+        let mt = int_memtable(&[(1, i64::MAX, 0.0, "a"), (2, i64::MAX, 0.0, "a")]);
+        let rows = run(&mt, &[], &aggs(&[("sum", "n")]), 1_000_000, "dec").unwrap();
+        let want = 2 * i128::from(i64::MAX);
+        assert_eq!(
+            col(&rows[0], "sum(n)"),
+            Value::Decimal(rust_decimal::Decimal::from_i128_with_scale(want, 0))
+        );
+    }
+
+    /// NaN sorts above every number, so MAX is NaN and MIN skips it, and a
+    /// SUM over NaN is NaN, as in PostgreSQL. The float results stay floats.
+    #[test]
+    fn float_min_max_sum_keep_nan() {
+        let mt = int_memtable(&[(1, 0, f64::NAN, "a"), (2, 0, 1.5, "a"), (3, 0, -2.5, "a")]);
+        let a = aggs(&[("min", "f"), ("max", "f"), ("sum", "f")]);
+        let rows = run(&mt, &[], &a, 1_000_000, "nan").unwrap();
+        assert_eq!(col(&rows[0], "min(f)"), Value::Float(-2.5));
+        assert!(matches!(col(&rows[0], "max(f)"), Value::Float(f) if f.is_nan()));
+        assert!(matches!(col(&rows[0], "sum(f)"), Value::Float(f) if f.is_nan()));
+    }
+
+    /// Float overflow is `Infinity` and `Infinity` plus `-Infinity` is NaN;
+    /// both reach the result row as floats, also through spill runs.
+    #[test]
+    fn float_sum_keeps_infinity_through_spill() {
+        let mt = int_memtable(&[
+            (1, 0, 1e308, "a"),
+            (2, 0, 1e308, "a"),
+            (3, 0, f64::INFINITY, "b"),
+            (4, 0, f64::NEG_INFINITY, "b"),
+        ]);
+        let a = aggs(&[("sum", "f"), ("avg", "f"), ("max", "f")]);
+        for spill_cap in [1_000_000, 1] {
+            let rows = run(&mt, &["g".to_string()], &a, spill_cap, "inf").unwrap();
+            assert_eq!(rows.len(), 2);
+            for row in &rows {
+                match col(row, "g") {
+                    Value::String(g) if g == "a" => {
+                        assert_eq!(col(row, "sum(f)"), Value::Float(f64::INFINITY));
+                        assert_eq!(col(row, "avg(f)"), Value::Float(f64::INFINITY));
+                        assert_eq!(col(row, "max(f)"), Value::Float(1e308));
+                    }
+                    Value::String(g) if g == "b" => {
+                        assert!(matches!(col(row, "sum(f)"), Value::Float(f) if f.is_nan()));
+                        assert_eq!(col(row, "max(f)"), Value::Float(f64::INFINITY));
+                    }
+                    other => panic!("unexpected group {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// A spill cap of one group forces every group through spill runs, so
+    /// the partial merge must keep the integer totals exact.
+    #[test]
+    fn spill_merge_keeps_integers_exact() {
+        let mt = int_memtable(&[
+            (1, ABOVE, 0.0, "a"),
+            (2, AT, 0.0, "b"),
+            (3, AT, 0.0, "a"),
+            (4, ABOVE, 0.0, "b"),
+        ]);
+        let a = aggs(&[("min", "n"), ("max", "n"), ("sum", "n")]);
+        let rows = run(&mt, &["timestamp".to_string()], &a, 1, "spill").unwrap();
+        assert_eq!(rows.len(), 4);
+        let rows = run(&mt, &["n".to_string()], &a, 1, "spill_n").unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            let n = col(row, "n").as_i64().unwrap();
+            assert_eq!(col(row, "min(n)"), Value::Integer(n));
+            assert_eq!(col(row, "max(n)"), Value::Integer(n));
+            assert_eq!(col(row, "sum(n)"), Value::Integer(2 * n));
+        }
     }
 }

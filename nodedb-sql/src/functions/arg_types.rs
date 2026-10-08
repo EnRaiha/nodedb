@@ -17,10 +17,7 @@ const ANY: &[ColumnType] = &[];
 const NUMERIC: &[ColumnType] = &[
     ColumnType::Int64,
     ColumnType::Float64,
-    ColumnType::Decimal {
-        precision: 38,
-        scale: 10,
-    },
+    ColumnType::Decimal(None),
 ];
 
 const TEXT: &[ColumnType] = &[ColumnType::String];
@@ -120,7 +117,7 @@ pub static BM25_SCORE_ARGS: &[ArgTypeSpec] = &[any("column"), typed("query", TEX
 
 pub static SEARCH_SCORE_ARGS: &[ArgTypeSpec] = &[any("column"), typed("query", TEXT)];
 
-pub static TEXT_MATCH_ARGS: &[ArgTypeSpec] = &[any("column"), typed("query", TEXT), any("options")];
+pub static TEXT_MATCH_ARGS: &[ArgTypeSpec] = &[any("column"), typed("query", TEXT)];
 
 // ── Hybrid search ─────────────────────────────────────────────────────────────
 
@@ -391,6 +388,9 @@ pub static JSON_CONTAINS_ARGS: &[ArgTypeSpec] = &[any("container"), any("needle"
 
 /// `json_merge(base, overlay)` / `json_patch(base, overlay)`.
 pub static JSON_MERGE_ARGS: &[ArgTypeSpec] = &[any("base"), any("overlay")];
+
+/// `to_jsonb(value)` — any value, or `*` for the whole row.
+pub static TO_JSONB_ARGS: &[ArgTypeSpec] = &[any("value")];
 
 // ── Sequence accessors ───────────────────────────────────────────────────────
 

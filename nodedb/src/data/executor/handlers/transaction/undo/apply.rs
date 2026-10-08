@@ -3,14 +3,14 @@
 //! Per-engine undo entry application logic.
 //!
 //! Each `apply_undo_*` method handles one engine family's undo entries.
-//! All methods return `Err((entry_index, detail))` on fatal failure so the
-//! caller can escalate to a typed `RollbackFailed` response.
+//! All methods return an [`UndoError`] on fatal failure, and the caller
+//! escalates it to a typed `RollbackFailed` response.
 
 use tracing::error;
 
 use crate::data::executor::core_loop::CoreLoop;
 
-use super::{TimeseriesIngestUndo, UndoEntry};
+use super::{TimeseriesIngestUndo, UndoEntry, UndoError};
 
 impl CoreLoop {
     // ── Vector ───────────────────────────────────────────────────────────────
@@ -20,7 +20,7 @@ impl CoreLoop {
         _tid: u64,
         entry_index: usize,
         entry: UndoEntry,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         match entry {
             UndoEntry::InsertVector {
                 index_key,
@@ -50,17 +50,20 @@ impl CoreLoop {
                     Ok(())
                 }
                 None => {
-                    let detail = format!(
-                        "vector index {:?} not found during undo of vector insert {}",
-                        index_key, vector_id
+                    let err = UndoError::mismatch(
+                        entry_index,
+                        format!(
+                            "vector index {index_key:?} not found during undo of vector \
+                             insert {vector_id}"
+                        ),
                     );
                     error!(
                         core = self.core_id,
                         entry_index,
-                        error = %detail,
+                        error = %err,
                         "transaction undo: vector index missing; shard state unknown"
                     );
-                    Err((entry_index, detail))
+                    Err(err)
                 }
             },
             UndoEntry::DeleteVector {
@@ -69,42 +72,83 @@ impl CoreLoop {
                 collection,
                 field,
                 doc_id,
-            } => match self.vector_collections.get_mut(&index_key) {
-                Some(index) => {
-                    index.undelete(vector_id);
-                    // Restore the `vector_doc_map` entry the forward delete
-                    // removed — without this a rolled-back delete leaves the
-                    // doc→vector reverse lookup missing, so a later delete of
-                    // the same document can never find (and soft-delete) its
-                    // vector: a permanent orphan. Mirrors
-                    // `apply_undo_spatial`'s `spatial_doc_map.insert`. `None`
-                    // `doc_id` marks the direct primary-vector write path,
-                    // which never populates `vector_doc_map` — skip it there.
-                    if let Some(doc_id) = doc_id {
-                        self.vector_doc_map.insert(
-                            (index_key.0, index_key.1, collection, field, doc_id),
-                            vector_id,
+                node_deleted,
+            } => {
+                // The forward delete dropped the node's surrogate binding
+                // with its tombstone, so a document node gets both back.
+                // A search hit on an unbound node resolves to no row.
+                // A node the forward delete found dead stays dead.
+                if node_deleted {
+                    let Some(index) = self.vector_collections.get_mut(&index_key) else {
+                        let err = UndoError::mismatch(
+                            entry_index,
+                            format!(
+                                "vector index {index_key:?} not found during undo of vector \
+                                 delete {vector_id}"
+                            ),
                         );
+                        error!(
+                            core = self.core_id,
+                            entry_index,
+                            error = %err,
+                            "transaction undo: vector index missing; shard state unknown"
+                        );
+                        return Err(err);
+                    };
+                    let restored = match doc_id {
+                        Some(doc_id) => index.undelete_bound(vector_id, doc_id.surrogate()),
+                        None => index.undelete(vector_id),
+                    };
+                    if !restored {
+                        return Err(UndoError::mismatch(
+                            entry_index,
+                            format!(
+                                "vector index {index_key:?} holds no tombstone for node \
+                                 {vector_id} during undo of vector delete"
+                            ),
+                        ));
                     }
+                }
+                // Restore the `vector_doc_map` entry the forward delete
+                // removed — without this a rolled-back delete leaves the
+                // doc→vector reverse lookup missing, so a later delete of
+                // the same document can never find (and soft-delete) its
+                // vector: a permanent orphan. Mirrors
+                // `apply_undo_spatial`'s `spatial_doc_map.insert`. `None`
+                // `doc_id` marks the direct primary-vector write path,
+                // which never populates `vector_doc_map` — skip it there.
+                if let Some(doc_id) = doc_id {
+                    self.vector_doc_map.insert(
+                        (index_key.0, index_key.1, collection, field, doc_id),
+                        vector_id,
+                    );
+                }
+                Ok(())
+            }
+            UndoEntry::DisplacedVector {
+                index_key,
+                vector_id,
+                surrogate,
+            } => {
+                let restored = self
+                    .vector_collections
+                    .get_mut(&index_key)
+                    .is_some_and(|index| index.undelete_bound(vector_id, surrogate));
+                if restored {
                     Ok(())
-                }
-                None => {
-                    let detail = format!(
-                        "vector index {:?} not found during undo of vector delete {}",
-                        index_key, vector_id
-                    );
-                    error!(
-                        core = self.core_id,
+                } else {
+                    Err(UndoError::mismatch(
                         entry_index,
-                        error = %detail,
-                        "transaction undo: vector index missing; shard state unknown"
-                    );
-                    Err((entry_index, detail))
+                        format!(
+                            "vector index {index_key:?} cannot restore displaced node \
+                             {vector_id}: index missing or node holds no tombstone"
+                        ),
+                    ))
                 }
-            },
-            _ => Err((
+            }
+            _ => Err(UndoError::mismatch(
                 entry_index,
-                "apply_undo_vector called with non-vector entry".to_string(),
+                "apply_undo_vector called with non-vector entry",
             )),
         }
     }
@@ -115,7 +159,7 @@ impl CoreLoop {
         &mut self,
         entry_index: usize,
         entry: UndoEntry,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         match entry {
             UndoEntry::ColumnarInsert {
                 collection_key,
@@ -165,9 +209,9 @@ impl CoreLoop {
                 // Engine absent: no in-memory state to roll back.
                 Ok(())
             }
-            _ => Err((
+            _ => Err(UndoError::mismatch(
                 entry_index,
-                "apply_undo_columnar called with non-columnar entry".to_string(),
+                "apply_undo_columnar called with non-columnar entry",
             )),
         }
     }
@@ -178,14 +222,14 @@ impl CoreLoop {
         &mut self,
         entry_index: usize,
         entry: UndoEntry,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         match entry {
             UndoEntry::TimeseriesIngest(token) => {
                 self.restore_timeseries_ingest_preimage(entry_index, token)
             }
-            _ => Err((
+            _ => Err(UndoError::mismatch(
                 entry_index,
-                "apply_undo_timeseries called with non-timeseries entry".to_string(),
+                "apply_undo_timeseries called with non-timeseries entry",
             )),
         }
     }
@@ -194,7 +238,7 @@ impl CoreLoop {
         &mut self,
         entry_index: usize,
         token: TimeseriesIngestUndo,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         let TimeseriesIngestUndo {
             collection_key,
             memtable_before,
@@ -214,7 +258,7 @@ impl CoreLoop {
             .get(&collection_key)
             .map(nodedb_mem::ReservationToken::size);
         if reservation_now != reservation_bytes_before {
-            return Err((
+            return Err(UndoError::mismatch(
                 entry_index,
                 format!(
                     "timeseries reservation changed during deferred ingest for {:?}: before {:?}, now {:?}",
@@ -234,9 +278,10 @@ impl CoreLoop {
                         snapshot, config,
                     )
                     .map_err(|error| {
-                        (
+                        UndoError::failed(
                             entry_index,
-                            format!("timeseries memtable snapshot restore failed: {error}"),
+                            "restoring the timeseries memtable snapshot",
+                            error,
                         )
                     })?;
                 restored.restore_memory_bytes_for_undo(memory_bytes);
@@ -247,9 +292,9 @@ impl CoreLoop {
                 self.columnar_memtables.remove(&collection_key);
             }
             _ => {
-                return Err((
+                return Err(UndoError::mismatch(
                     entry_index,
-                    "timeseries undo token has inconsistent memtable pre-image fields".into(),
+                    "timeseries undo token has inconsistent memtable pre-image fields",
                 ));
             }
         }
@@ -654,6 +699,7 @@ mod tests {
             .expect("engine present");
         let mut out: Vec<(i64, i64)> = engine
             .scan_memtable_rows()
+            .map(|row| row.expect("read"))
             .filter_map(|row| match (&row[0], &row[1]) {
                 (Value::Integer(id), Value::Integer(v)) => Some((*id, *v)),
                 _ => None,
@@ -676,7 +722,9 @@ mod tests {
         // COMMIT of `UPDATE m SET v = 999` (empty filter = all rows).
         let updates = vec![(
             "v".to_string(),
-            nodedb_types::value_to_msgpack(&Value::Integer(999)).unwrap(),
+            nodedb_physical::physical_plan::UpdateValue::Literal(
+                nodedb_types::value_to_msgpack(&Value::Integer(999)).unwrap(),
+            ),
         )];
         let plan = PhysicalPlan::Columnar(ColumnarOp::Update {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "m"),
@@ -831,6 +879,7 @@ mod tests {
             collection: "c".to_string(),
             field: "emb".to_string(),
             doc_id: Some(vector_doc_key().4),
+            node_deleted: true,
         };
         core.apply_undo_vector(TID, 0, undo).unwrap();
 
@@ -839,5 +888,120 @@ mod tests {
             Some(vector_id),
             "vector_doc_map entry must be restored so a later delete can find the vector again"
         );
+        let coll = core
+            .vector_collections
+            .get(&vector_index_key())
+            .expect("the index stays");
+        assert_eq!(
+            coll.local_for_surrogate(nodedb_types::Surrogate::new(1)),
+            Some(vector_id),
+            "the restored node must be bound to its row again, or a search hit on it \
+             resolves to no row"
+        );
+    }
+
+    /// A delete that found its recorded node dead already restores only the
+    /// `vector_doc_map` entry. The node stays deleted.
+    #[test]
+    fn vector_delete_undo_leaves_a_node_that_was_dead_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+
+        let index_key = vector_index_key();
+        let coll = core
+            .vector_collections
+            .entry(index_key.clone())
+            .or_insert_with(|| nodedb_vector::VectorCollection::new(2, Default::default()));
+        let vector_id = coll
+            .insert_with_surrogate(vec![3.0, 4.0], nodedb_types::Surrogate::new(1))
+            .unwrap();
+        coll.delete(vector_id);
+
+        let undo = UndoEntry::DeleteVector {
+            index_key,
+            vector_id,
+            collection: "c".to_string(),
+            field: "emb".to_string(),
+            doc_id: Some(vector_doc_key().4),
+            node_deleted: false,
+        };
+        core.apply_undo_vector(TID, 0, undo).unwrap();
+
+        assert_eq!(
+            core.vector_doc_map.get(&vector_doc_key()).copied(),
+            Some(vector_id)
+        );
+        let coll = core
+            .vector_collections
+            .get(&vector_index_key())
+            .expect("the index stays");
+        assert_eq!(
+            coll.live_count(),
+            0,
+            "a node dead before the delete stays dead"
+        );
+        assert_eq!(
+            coll.local_for_surrogate(nodedb_types::Surrogate::new(1)),
+            None
+        );
+    }
+
+    /// Undo of a displaced node un-deletes it and binds it to its surrogate,
+    /// and writes no `vector_doc_map` entry.
+    #[test]
+    fn displaced_vector_undo_restores_the_node_and_its_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+
+        let index_key = vector_index_key();
+        let surrogate = nodedb_types::Surrogate::new(1);
+        let coll = core
+            .vector_collections
+            .entry(index_key.clone())
+            .or_insert_with(|| nodedb_vector::VectorCollection::new(2, Default::default()));
+        let vector_id = coll
+            .insert_with_surrogate(vec![3.0, 4.0], surrogate)
+            .unwrap();
+        assert!(coll.delete(vector_id));
+
+        let undo = UndoEntry::DisplacedVector {
+            index_key,
+            vector_id,
+            surrogate,
+        };
+        core.apply_undo_vector(TID, 0, undo).unwrap();
+
+        let coll = core
+            .vector_collections
+            .get(&vector_index_key())
+            .expect("the index stays");
+        assert_eq!(coll.live_count(), 1);
+        assert_eq!(coll.local_for_surrogate(surrogate), Some(vector_id));
+        assert!(core.vector_doc_map.is_empty());
+    }
+
+    /// A displaced node that carries no tombstone at undo time leaves the
+    /// core's state unknown, so the undo fails.
+    #[test]
+    fn displaced_vector_undo_of_a_live_node_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+
+        let index_key = vector_index_key();
+        let surrogate = nodedb_types::Surrogate::new(1);
+        let coll = core
+            .vector_collections
+            .entry(index_key.clone())
+            .or_insert_with(|| nodedb_vector::VectorCollection::new(2, Default::default()));
+        let vector_id = coll
+            .insert_with_surrogate(vec![3.0, 4.0], surrogate)
+            .unwrap();
+
+        let undo = UndoEntry::DisplacedVector {
+            index_key,
+            vector_id,
+            surrogate,
+        };
+        assert!(core.apply_undo_vector(TID, 3, undo).is_err());
     }
 }

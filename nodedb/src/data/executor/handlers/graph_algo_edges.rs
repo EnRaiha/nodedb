@@ -56,27 +56,16 @@ pub(super) fn csr_from_edges(
 ) -> crate::Result<CsrIndex> {
     let mut csr = CsrIndex::new(memory);
     for edge in edges {
-        csr.add_node(&edge.src)
-            .map_err(|e| crate::Error::Internal {
-                detail: format!("algorithm CSR add src: {e}"),
-            })?;
-        csr.add_node(&edge.dst)
-            .map_err(|e| crate::Error::Internal {
-                detail: format!("algorithm CSR add dst: {e}"),
-            })?;
+        csr.add_node(&edge.src)?;
+        csr.add_node(&edge.dst)?;
     }
     for edge in edges {
-        let res = if edge.weight != 1.0 {
-            csr.add_edge_weighted(&edge.src, &edge.label, &edge.dst, edge.weight)
+        if edge.weight != 1.0 {
+            csr.add_edge_weighted(&edge.src, &edge.label, &edge.dst, edge.weight)?;
         } else {
-            csr.add_edge(&edge.src, &edge.label, &edge.dst)
-        };
-        res.map_err(|e| crate::Error::Internal {
-            detail: format!("algorithm CSR add edge: {e}"),
-        })?;
+            csr.add_edge(&edge.src, &edge.label, &edge.dst)?;
+        }
     }
-    csr.compact().map_err(|e| crate::Error::Internal {
-        detail: format!("algorithm CSR compact: {e}"),
-    })?;
+    csr.compact()?;
     Ok(csr)
 }

@@ -32,9 +32,9 @@ fn resolve_declared_type(
 /// `BINARY` resolves ahead of that call. It is a CONVERT-only spelling for
 /// `ColumnType::Bytes` that the shared parser rejects.
 ///
-/// A spelling the shared parser rejects raises `42601`. The author names the
-/// stored column type, so an unresolvable spelling must never become
-/// `ColumnType::String`.
+/// A spelling the shared parser rejects raises `42601`, and an out-of-range
+/// `DECIMAL(p,s)` typmod raises `22023`. The author names the stored column
+/// type, so an unresolvable spelling must never become `ColumnType::String`.
 pub(super) fn sql_type_to_column_type(
     sql_type: &str,
 ) -> Result<nodedb_types::columnar::ColumnType, DdlError> {
@@ -45,7 +45,7 @@ pub(super) fn sql_type_to_column_type(
         return Ok(ColumnType::Bytes);
     }
     resolve_declared_type(declared)
-        .map_err(|e| err("42601", format!("column type '{declared}': {e}")))
+        .map_err(|e| err(e.sqlstate(), format!("column type '{declared}': {e}")))
 }
 
 /// Map a typeguard type expression string to a `ColumnType`.
@@ -285,10 +285,7 @@ mod tests {
                 SimpleType::Timestamp => ColumnType::Timestamp,
                 SimpleType::Timestamptz => ColumnType::Timestamptz,
                 SimpleType::SystemTimestamp => ColumnType::SystemTimestamp,
-                SimpleType::Decimal { precision, scale } => ColumnType::Decimal {
-                    precision: *precision,
-                    scale: *scale,
-                },
+                SimpleType::Decimal(typmod) => ColumnType::Decimal(*typmod),
                 SimpleType::Uuid => ColumnType::Uuid,
                 SimpleType::Ulid => ColumnType::Ulid,
                 SimpleType::Geometry => ColumnType::Geometry,

@@ -69,12 +69,7 @@ impl CoreLoop {
                     )),
                     Ok(false) => serde_json::Value::Null,
                     Err(e) => {
-                        return self.response_error(
-                            task,
-                            ErrorCode::Internal {
-                                detail: e.to_string(),
-                            },
-                        );
+                        return self.response_error(task, ErrorCode::from(e));
                     }
                 },
                 None => serde_json::Value::Null,
@@ -83,12 +78,7 @@ impl CoreLoop {
         }
         match response_codec::encode_json_vec_as_msgpack(&json_results) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -170,12 +160,7 @@ impl CoreLoop {
         }
         match response_codec::encode_count("inserted", new_count) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }

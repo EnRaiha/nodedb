@@ -18,179 +18,212 @@
 //! targets, unioned with `overlay.out_neighbors`). Each backward frontier
 //! node expands its IN edges symmetrically. Staged edges bypass the frontier
 //! bitmap: the transaction's own writes have no durable surrogate to gate on.
+//!
+//! `partition` is `None` for a tenant with no CSR partition. The search then
+//! follows only staged edges.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use crate::csr::CsrIndex;
+use crate::csr::index::LabelFilter;
 use crate::overlay_delta::GraphOverlayDelta;
 use crate::path_params::ShortestPathParams;
+use crate::traversal_overlay::node_present;
 
-impl CsrIndex {
-    /// String-keyed bidirectional BFS that merges the transaction's staged
-    /// edges/tombstones. Mirrors the durable `shortest_path_dense` loop
-    /// structure (alternating one forward then one backward level per depth
-    /// step) so that, when the overlay contributes nothing, the result and
-    /// path shape match the durable search.
-    pub(crate) fn shortest_path_overlay(
-        &self,
-        params: ShortestPathParams<'_>,
-        overlay: &GraphOverlayDelta,
-    ) -> Option<Vec<String>> {
-        let ShortestPathParams {
-            src,
-            dst,
-            label_filter,
-            max_depth,
-            max_visited,
+/// String-keyed bidirectional BFS that merges the transaction's staged
+/// edges/tombstones. Mirrors the durable `shortest_path_dense` loop
+/// structure (alternating one forward then one backward level per depth
+/// step) so that, when the overlay contributes nothing, the result and
+/// path shape match the durable search.
+///
+/// A path from a node to itself exists only when the node exists: the
+/// partition holds it, or a staged edge names it. The dense search answers
+/// the same.
+pub(crate) fn shortest_path_overlay(
+    partition: Option<&CsrIndex>,
+    params: ShortestPathParams<'_>,
+    overlay: &GraphOverlayDelta,
+) -> Option<Vec<String>> {
+    let ShortestPathParams {
+        src,
+        dst,
+        label_filter,
+        max_depth,
+        max_visited,
+        frontier_bitmap,
+    } = params;
+    if src == dst {
+        return node_present(partition, overlay, src).then(|| vec![src.to_string()]);
+    }
+
+    // parent maps: node -> the neighbour it was reached from. The endpoint
+    // maps to itself, marking the reconstruction terminus.
+    let mut fwd_parent: HashMap<String, String> = HashMap::new();
+    let mut bwd_parent: HashMap<String, String> = HashMap::new();
+    fwd_parent.insert(src.to_string(), src.to_string());
+    bwd_parent.insert(dst.to_string(), dst.to_string());
+
+    let mut fwd_frontier: Vec<String> = vec![src.to_string()];
+    let mut bwd_frontier: Vec<String> = vec![dst.to_string()];
+
+    let gate = PathGate::new(partition, label_filter, frontier_bitmap, [src, dst]);
+    let within_depth =
+        |path: Vec<String>| (path.len().saturating_sub(1) <= max_depth).then_some(path);
+
+    // Round `k` meets on a path of `2k - 1` or `2k` edges, so
+    // `max_depth.div_ceil(2)` rounds reach every path within `max_depth`.
+    for _round in 0..max_depth.div_ceil(2) {
+        if fwd_parent.len() + bwd_parent.len() >= max_visited {
+            break;
+        }
+
+        // Each level's edges are relaxed in (neighbour, frontier node)
+        // name order, as the durable search relaxes them.
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        for node in std::mem::take(&mut fwd_frontier) {
+            for neighbor in forward_neighbors(&node, &gate, overlay) {
+                candidates.push((neighbor, node.clone()));
+            }
+        }
+        candidates.sort();
+        let mut next_fwd = Vec::new();
+        for (neighbor, node) in candidates {
+            if let Some(meeting) = relax(
+                &neighbor,
+                &node,
+                &mut fwd_parent,
+                &bwd_parent,
+                &mut next_fwd,
+            ) {
+                return within_depth(reconstruct(&meeting, &fwd_parent, &bwd_parent));
+            }
+        }
+        fwd_frontier = next_fwd;
+
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        for node in std::mem::take(&mut bwd_frontier) {
+            for neighbor in backward_neighbors(&node, &gate, overlay) {
+                candidates.push((neighbor, node.clone()));
+            }
+        }
+        candidates.sort();
+        let mut next_bwd = Vec::new();
+        for (neighbor, node) in candidates {
+            if let Some(meeting) = relax(
+                &neighbor,
+                &node,
+                &mut bwd_parent,
+                &fwd_parent,
+                &mut next_bwd,
+            ) {
+                return within_depth(reconstruct(&meeting, &fwd_parent, &bwd_parent));
+            }
+        }
+        bwd_frontier = next_bwd;
+
+        if fwd_frontier.is_empty() && bwd_frontier.is_empty() {
+            break;
+        }
+    }
+    None
+}
+
+/// OUT neighbours of `node`: durable CSR out edges (skipping staged
+/// tombstones and gated durable targets) unioned with staged out edges.
+fn forward_neighbors(node: &str, gate: &PathGate<'_>, overlay: &GraphOverlayDelta) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some((csr, durable_labels)) = gate.durable.as_ref()
+        && let Some(&node_id) = csr.node_to_id.get(node)
+    {
+        csr.record_access(node_id);
+        for (lid, dst) in csr.dense_iter_out(node_id) {
+            if !durable_labels.keeps(lid) {
+                continue;
+            }
+            let dst_name = &csr.id_to_node[dst as usize];
+            if overlay.is_tombstoned(node, csr.label_name(lid), dst_name) {
+                continue;
+            }
+            if !gate.admits_durable(csr, dst, dst_name) {
+                continue;
+            }
+            out.push(dst_name.clone());
+        }
+    }
+    out.extend(
+        overlay
+            .out_neighbors(node, gate.labels)
+            .map(|(_, dst)| dst.to_string()),
+    );
+    out
+}
+
+/// IN neighbours of `node`: durable CSR in edges (skipping staged
+/// tombstones and gated durable sources) unioned with staged in edges.
+fn backward_neighbors(node: &str, gate: &PathGate<'_>, overlay: &GraphOverlayDelta) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some((csr, durable_labels)) = gate.durable.as_ref()
+        && let Some(&node_id) = csr.node_to_id.get(node)
+    {
+        csr.record_access(node_id);
+        for (lid, src) in csr.dense_iter_in(node_id) {
+            if !durable_labels.keeps(lid) {
+                continue;
+            }
+            let src_name = &csr.id_to_node[src as usize];
+            if overlay.is_tombstoned(src_name, csr.label_name(lid), node) {
+                continue;
+            }
+            if !gate.admits_durable(csr, src, src_name) {
+                continue;
+            }
+            out.push(src_name.clone());
+        }
+    }
+    out.extend(
+        overlay
+            .in_neighbors(node, gate.labels)
+            .map(|(_, src)| src.to_string()),
+    );
+    out
+}
+
+/// Which edges and nodes one overlay path search may cross.
+struct PathGate<'a> {
+    /// Staged-edge label names. Empty keeps every label.
+    labels: &'a [&'a str],
+    /// The durable partition, and `labels` resolved against it. A label the
+    /// partition has never seen keeps no durable edge, so it never widens
+    /// the filter. `None` when the tenant has no partition.
+    durable: Option<(&'a CsrIndex, LabelFilter)>,
+    frontier_bitmap: Option<&'a nodedb_types::SurrogateBitmap>,
+    /// The source and destination, which the bitmap never gates.
+    endpoints: [&'a str; 2],
+}
+
+impl<'a> PathGate<'a> {
+    fn new(
+        partition: Option<&'a CsrIndex>,
+        label_filter: &'a [&'a str],
+        frontier_bitmap: Option<&'a nodedb_types::SurrogateBitmap>,
+        endpoints: [&'a str; 2],
+    ) -> Self {
+        Self {
+            labels: label_filter,
+            durable: partition.map(|csr| (csr, csr.label_filter(label_filter))),
             frontier_bitmap,
-        } = params;
-        if src == dst {
-            return Some(vec![src.to_string()]);
+            endpoints,
         }
-
-        // parent maps: node -> the neighbour it was reached from. The endpoint
-        // maps to itself, marking the reconstruction terminus.
-        let mut fwd_parent: HashMap<String, String> = HashMap::new();
-        let mut bwd_parent: HashMap<String, String> = HashMap::new();
-        fwd_parent.insert(src.to_string(), src.to_string());
-        bwd_parent.insert(dst.to_string(), dst.to_string());
-
-        let mut fwd_frontier: Vec<String> = vec![src.to_string()];
-        let mut bwd_frontier: Vec<String> = vec![dst.to_string()];
-
-        let labels = self.label_filter(label_filter);
-
-        for _depth in 0..max_depth {
-            if fwd_parent.len() + bwd_parent.len() >= max_visited {
-                break;
-            }
-
-            // Each level's edges are relaxed in (neighbour, frontier node)
-            // name order, as the durable search relaxes them.
-            let mut candidates: Vec<(String, String)> = Vec::new();
-            for node in std::mem::take(&mut fwd_frontier) {
-                for neighbor in
-                    self.forward_neighbors(&node, labels, label_filter, frontier_bitmap, overlay)
-                {
-                    candidates.push((neighbor, node.clone()));
-                }
-            }
-            candidates.sort();
-            let mut next_fwd = Vec::new();
-            for (neighbor, node) in candidates {
-                if let Some(meeting) = relax(
-                    &neighbor,
-                    &node,
-                    &mut fwd_parent,
-                    &bwd_parent,
-                    &mut next_fwd,
-                ) {
-                    return Some(reconstruct(&meeting, &fwd_parent, &bwd_parent));
-                }
-            }
-            fwd_frontier = next_fwd;
-
-            let mut candidates: Vec<(String, String)> = Vec::new();
-            for node in std::mem::take(&mut bwd_frontier) {
-                for neighbor in
-                    self.backward_neighbors(&node, labels, label_filter, frontier_bitmap, overlay)
-                {
-                    candidates.push((neighbor, node.clone()));
-                }
-            }
-            candidates.sort();
-            let mut next_bwd = Vec::new();
-            for (neighbor, node) in candidates {
-                if let Some(meeting) = relax(
-                    &neighbor,
-                    &node,
-                    &mut bwd_parent,
-                    &fwd_parent,
-                    &mut next_bwd,
-                ) {
-                    return Some(reconstruct(&meeting, &fwd_parent, &bwd_parent));
-                }
-            }
-            bwd_frontier = next_bwd;
-
-            if fwd_frontier.is_empty() && bwd_frontier.is_empty() {
-                break;
-            }
-        }
-        None
     }
 
-    /// OUT neighbours of `node`: durable CSR out edges (skipping staged
-    /// tombstones and bitmap-excluded durable targets) unioned with staged
-    /// out edges.
-    fn forward_neighbors(
-        &self,
-        node: &str,
-        labels: crate::csr::index::LabelFilter,
-        label_filter: Option<&str>,
-        frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
-        overlay: &GraphOverlayDelta,
-    ) -> Vec<String> {
-        let mut out = Vec::new();
-        if let Some(&node_id) = self.node_to_id.get(node) {
-            self.record_access(node_id);
-            for (lid, dst) in self.dense_iter_out(node_id) {
-                if !labels.keeps(lid) {
-                    continue;
-                }
-                let dst_name = &self.id_to_node[dst as usize];
-                if overlay.is_tombstoned(node, self.label_name(lid), dst_name) {
-                    continue;
-                }
-                if !frontier_bitmap.is_none_or(|bm| {
-                    bm.contains(nodedb_types::Surrogate::new(self.node_surrogate_raw(dst)))
-                }) {
-                    continue;
-                }
-                out.push(dst_name.clone());
-            }
-        }
-        for (_, dst) in overlay.out_neighbors(node, label_filter) {
-            out.push(dst.to_string());
-        }
-        out
-    }
-
-    /// IN neighbours of `node`: durable CSR in edges (skipping staged
-    /// tombstones and bitmap-excluded durable sources) unioned with staged
-    /// in edges.
-    fn backward_neighbors(
-        &self,
-        node: &str,
-        labels: crate::csr::index::LabelFilter,
-        label_filter: Option<&str>,
-        frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
-        overlay: &GraphOverlayDelta,
-    ) -> Vec<String> {
-        let mut out = Vec::new();
-        if let Some(&node_id) = self.node_to_id.get(node) {
-            self.record_access(node_id);
-            for (lid, src) in self.dense_iter_in(node_id) {
-                if !labels.keeps(lid) {
-                    continue;
-                }
-                let src_name = &self.id_to_node[src as usize];
-                if overlay.is_tombstoned(src_name, self.label_name(lid), node) {
-                    continue;
-                }
-                if !frontier_bitmap.is_none_or(|bm| {
-                    bm.contains(nodedb_types::Surrogate::new(self.node_surrogate_raw(src)))
-                }) {
-                    continue;
-                }
-                out.push(src_name.clone());
-            }
-        }
-        for (_, src) in overlay.in_neighbors(node, label_filter) {
-            out.push(src.to_string());
-        }
-        out
+    /// Staged edges bypass the bitmap: the transaction's own writes have no
+    /// durable surrogate to gate on.
+    fn admits_durable(&self, csr: &CsrIndex, id: u32, name: &str) -> bool {
+        self.endpoints.contains(&name)
+            || self.frontier_bitmap.is_none_or(|bm| {
+                bm.contains(nodedb_types::Surrogate::new(csr.node_surrogate_raw(id)))
+            })
     }
 }
 
@@ -270,7 +303,7 @@ mod tests {
     fn params<'a>(
         src: &'a str,
         dst: &'a str,
-        label_filter: Option<&'a str>,
+        label_filter: &'a [&'a str],
         max_depth: usize,
     ) -> ShortestPathParams<'a> {
         ShortestPathParams {
@@ -283,6 +316,29 @@ mod tests {
         }
     }
 
+    /// A bitmap that holds neither endpoint still admits the durable edge
+    /// between them while a staged edge forces the overlay search.
+    #[test]
+    fn the_frontier_bitmap_never_gates_the_endpoints() {
+        use nodedb_types::{Surrogate, SurrogateBitmap};
+
+        let mut csr = CsrIndex::new(test_memory());
+        csr.add_edge("a", "KNOWS", "c").unwrap();
+        csr.set_node_surrogate("a", Surrogate::new(1));
+        csr.set_node_surrogate("c", Surrogate::new(3));
+        let mut bm = SurrogateBitmap::new();
+        bm.insert(Surrogate::new(99));
+        let mut ov = GraphOverlayDelta::new();
+        ov.stage_edge("x", "KNOWS", "y");
+
+        let mut p = params("a", "c", &["KNOWS"], 1);
+        p.frontier_bitmap = Some(&bm);
+        assert_eq!(
+            csr.shortest_path(p, Some(&ov)),
+            Some(vec!["a".to_string(), "c".to_string()])
+        );
+    }
+
     /// A staged edge completes a path the durable graph lacks: durable A->B,
     /// staged B->C, so A->B->C must be found only with the overlay.
     #[test]
@@ -293,13 +349,13 @@ mod tests {
         ov.stage_edge("b", "KNOWS", "c");
 
         let path = csr
-            .shortest_path(params("a", "c", Some("KNOWS"), 5), Some(&ov))
+            .shortest_path(params("a", "c", &["KNOWS"], 5), Some(&ov))
             .expect("staged edge should complete the path");
         assert_eq!(path, vec!["a", "b", "c"]);
 
         // Without the overlay the path does not exist.
         assert!(
-            csr.shortest_path(params("a", "c", Some("KNOWS"), 5), None)
+            csr.shortest_path(params("a", "c", &["KNOWS"], 5), None)
                 .is_none()
         );
     }
@@ -315,7 +371,7 @@ mod tests {
         ov.stage_edge("x", "KNOWS", "d");
 
         let path = csr
-            .shortest_path(params("a", "d", Some("KNOWS"), 5), Some(&ov))
+            .shortest_path(params("a", "d", &["KNOWS"], 5), Some(&ov))
             .expect("staged-only path should be found");
         assert_eq!(path, vec!["a", "x", "d"]);
     }
@@ -333,7 +389,7 @@ mod tests {
         ov.stage_tombstone("a", "KNOWS", "d");
 
         let path = csr
-            .shortest_path(params("a", "d", Some("KNOWS"), 5), Some(&ov))
+            .shortest_path(params("a", "d", &["KNOWS"], 5), Some(&ov))
             .expect("detour path should be found");
         assert_eq!(path, vec!["a", "b", "d"]);
     }
@@ -347,7 +403,7 @@ mod tests {
         ov.stage_tombstone("a", "KNOWS", "d");
 
         assert!(
-            csr.shortest_path(params("a", "d", Some("KNOWS"), 5), Some(&ov))
+            csr.shortest_path(params("a", "d", &["KNOWS"], 5), Some(&ov))
                 .is_none()
         );
     }
@@ -365,10 +421,31 @@ mod tests {
         // Empty overlay dispatches to dense; force the overlay code path by
         // calling it directly, then compare with dense.
         let dense = csr
-            .shortest_path(params("a", "d", Some("KNOWS"), 10), None)
+            .shortest_path(params("a", "d", &["KNOWS"], 10), None)
             .unwrap();
-        let overlaid = csr.shortest_path_overlay(params("a", "d", Some("KNOWS"), 10), &ov);
+        let overlaid =
+            super::shortest_path_overlay(Some(&csr), params("a", "d", &["KNOWS"], 10), &ov);
         assert_eq!(overlaid, Some(dense));
+    }
+
+    /// Durable `a -FIRST-> b`, staged `b -SECOND-> d` and `b -OTHER-> d`. The
+    /// set follows the staged edge under its second label only.
+    #[test]
+    fn a_staged_edge_under_the_second_label_of_a_set_is_followed() {
+        let mut csr = CsrIndex::new(test_memory());
+        csr.add_edge("a", "FIRST", "b").unwrap();
+        let mut ov = GraphOverlayDelta::new();
+        ov.stage_edge("b", "SECOND", "d");
+        ov.stage_edge("b", "OTHER", "x");
+
+        assert_eq!(
+            csr.shortest_path(params("a", "d", &["FIRST", "SECOND"], 5), Some(&ov)),
+            Some(vec!["a".to_string(), "b".to_string(), "d".to_string()])
+        );
+        assert!(
+            csr.shortest_path(params("a", "x", &["FIRST", "SECOND"], 5), Some(&ov))
+                .is_none()
+        );
     }
 
     #[test]
@@ -378,9 +455,48 @@ mod tests {
         let mut ov = GraphOverlayDelta::new();
         ov.stage_edge("a", "KNOWS", "x");
         let path = csr
-            .shortest_path(params("a", "a", None, 5), Some(&ov))
+            .shortest_path(params("a", "a", &[], 5), Some(&ov))
             .unwrap();
         assert_eq!(path, vec!["a"]);
+    }
+
+    /// A node the partition lacks and no staged edge names has no path to
+    /// itself, as in the dense search. A staged edge naming it makes it
+    /// exist.
+    #[test]
+    fn src_equals_dst_on_an_absent_node_is_none() {
+        let mut csr = CsrIndex::new(test_memory());
+        csr.add_edge("a", "KNOWS", "b").unwrap();
+        let mut ov = GraphOverlayDelta::new();
+        ov.stage_edge("x", "KNOWS", "y");
+        assert!(
+            csr.shortest_path(params("ghost", "ghost", &[], 5), Some(&ov))
+                .is_none()
+        );
+        assert!(
+            csr.shortest_path(params("ghost", "ghost", &[], 5), None)
+                .is_none()
+        );
+        assert_eq!(
+            csr.shortest_path(params("y", "y", &[], 5), Some(&ov)),
+            Some(vec!["y".to_string()])
+        );
+    }
+
+    /// With no partition, the search follows staged edges only.
+    #[test]
+    fn a_missing_partition_walks_staged_edges() {
+        let mut ov = GraphOverlayDelta::new();
+        ov.stage_edge("a", "KNOWS", "x");
+        ov.stage_edge("x", "KNOWS", "d");
+        assert_eq!(
+            CsrIndex::shortest_path_on(None, params("a", "d", &["KNOWS"], 5), Some(&ov)),
+            Some(vec!["a".to_string(), "x".to_string(), "d".to_string()])
+        );
+        assert!(CsrIndex::shortest_path_on(None, params("a", "d", &[], 5), None).is_none());
+        assert!(
+            CsrIndex::shortest_path_on(None, params("ghost", "ghost", &[], 5), Some(&ov)).is_none()
+        );
     }
 
     #[test]
@@ -390,7 +506,7 @@ mod tests {
         let mut ov = GraphOverlayDelta::new();
         ov.stage_edge("m", "KNOWS", "n");
         assert!(
-            csr.shortest_path(params("a", "n", Some("KNOWS"), 5), Some(&ov))
+            csr.shortest_path(params("a", "n", &["KNOWS"], 5), Some(&ov))
                 .is_none()
         );
     }

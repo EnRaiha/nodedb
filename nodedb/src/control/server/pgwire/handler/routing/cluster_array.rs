@@ -8,7 +8,8 @@
 //! the outcome as one pgwire `Response` (surfacing any client-facing notice
 //! via the session) or a `DmlOutcome` the caller folds into the statement tag.
 
-use pgwire::api::results::{FieldFormat, Response};
+use pgwire::api::portal::Format;
+use pgwire::api::results::Response;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::server::response_shape::schema::OutputSchema;
@@ -39,7 +40,7 @@ impl NodeDbPgHandler {
         &self,
         authorized: crate::control::server::shared::authorization::AuthorizedTask,
         projection: Option<&OutputSchema>,
-        result_formats: &[FieldFormat],
+        result_formats: &Format,
         session_id: SessionId,
         auth: &crate::control::security::auth_context::AuthContext,
     ) -> PgWireResult<ClusterArrayResult> {

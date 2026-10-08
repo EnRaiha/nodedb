@@ -29,6 +29,25 @@ pub(in crate::data::executor) struct VectorIndexDelta {
     pub collection: String,
     pub field: String,
     pub doc_id: crate::engine::document::store::StorageKey,
+    /// Whether the removal tombstoned `vector_id`. `false` when the node was
+    /// dead already and only the `vector_doc_map` entry went.
+    pub node_deleted: bool,
+}
+
+impl VectorIndexDelta {
+    /// The undo entry that reverses this removal.
+    pub(in crate::data::executor) fn into_delete_undo(
+        self,
+    ) -> crate::data::executor::handlers::transaction::undo::UndoEntry {
+        crate::data::executor::handlers::transaction::undo::UndoEntry::DeleteVector {
+            index_key: self.index_key,
+            vector_id: self.vector_id,
+            collection: self.collection,
+            field: self.field,
+            doc_id: Some(self.doc_id),
+            node_deleted: self.node_deleted,
+        }
+    }
 }
 
 /// Inputs to `remove_then_insert_vector_field`, the shared per-field

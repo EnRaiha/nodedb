@@ -4,6 +4,7 @@
 
 mod admission;
 pub mod aggregate;
+pub mod cell_read;
 pub mod encode;
 mod events;
 pub mod flush;
@@ -14,9 +15,11 @@ pub mod ingest_formats;
 mod ingest_resolved;
 mod ingest_resolved_fit;
 mod ingest_resolved_outcome;
+mod ingest_resolved_returning;
 mod ingest_schema;
 mod msgpack_decode;
 mod normalize;
+pub mod partition_read;
 pub mod paths;
 pub mod raw_scan;
 mod redo_ingest;

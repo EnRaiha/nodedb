@@ -1,79 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Block-level decode helpers: type inference, null-fill, and compressed-block decoding.
+//! Block-level decode helpers: null-fill and compressed-block decoding by the
+//! column's recorded [`BlockLayout`].
 
 use nodedb_codec::{ColumnCodec, ResolvedColumnCodec};
 
 use crate::error::ColumnarError;
-use crate::format::ColumnMeta;
+use crate::format::BlockLayout;
 
 use super::types::DecodedColumn;
 
-/// Simplified column kind for decode dispatch.
-#[derive(Debug, Clone, Copy)]
-pub(super) enum ColumnKind {
-    Int64,
-    Float64,
-    VarLen,
-    Binary,
-    DictEncoded,
-}
-
-/// Infer a simplified column type from ColumnMeta for decode dispatch.
-///
-/// We use the codec as a strong signal: DeltaFastLanesLz4 = numeric,
-/// FsstLz4 = string, etc. The name is a fallback heuristic.
-pub(super) fn infer_column_type(meta: &ColumnMeta) -> ColumnKind {
-    // Dict-encoded columns store IDs as DeltaFastLanesLz4 but must be decoded
-    // differently — the presence of a dictionary distinguishes them.
-    if meta.dictionary.is_some() {
-        return ColumnKind::DictEncoded;
-    }
-
-    match meta.codec {
-        ResolvedColumnCodec::DeltaFastLanesLz4
-        | ResolvedColumnCodec::DeltaFastLanesRans
-        | ResolvedColumnCodec::FastLanesLz4
-        | ResolvedColumnCodec::Delta
-        | ResolvedColumnCodec::DoubleDelta => ColumnKind::Int64,
-
-        ResolvedColumnCodec::AlpFastLanesLz4
-        | ResolvedColumnCodec::AlpFastLanesRans
-        | ResolvedColumnCodec::AlpRdLz4
-        | ResolvedColumnCodec::PcodecLz4
-        | ResolvedColumnCodec::Gorilla => ColumnKind::Float64,
-
-        ResolvedColumnCodec::FsstLz4 | ResolvedColumnCodec::FsstRans => ColumnKind::VarLen,
-
-        // LZ4/Raw/Zstd could be bool, binary, decimal, uuid, vector — use
-        // block_stats to distinguish: if min/max are NaN → binary-like.
-        ResolvedColumnCodec::Lz4 | ResolvedColumnCodec::Raw | ResolvedColumnCodec::Zstd => {
-            if meta.block_stats.first().is_some_and(|s| !s.min.is_nan()) {
-                ColumnKind::Int64 // Numeric fallback.
-            } else {
-                ColumnKind::Binary
-            }
-        }
-    }
-}
-
-/// Create an empty DecodedColumn for the given kind.
-pub(super) fn empty_decoded(kind: &ColumnKind) -> DecodedColumn {
-    match kind {
-        ColumnKind::Int64 => DecodedColumn::Int64 {
+/// Create an empty DecodedColumn for the given layout.
+pub(super) fn empty_decoded(layout: BlockLayout) -> DecodedColumn {
+    match layout {
+        BlockLayout::Int64 => DecodedColumn::Int64 {
             values: Vec::new(),
             valid: Vec::new(),
         },
-        ColumnKind::Float64 => DecodedColumn::Float64 {
+        BlockLayout::Float64 => DecodedColumn::Float64 {
             values: Vec::new(),
             valid: Vec::new(),
         },
-        ColumnKind::VarLen | ColumnKind::Binary => DecodedColumn::Binary {
+        BlockLayout::PackedBool => DecodedColumn::Bool {
+            values: Vec::new(),
+            valid: Vec::new(),
+        },
+        BlockLayout::VarLen | BlockLayout::FixedWidth => DecodedColumn::Binary {
             data: Vec::new(),
             offsets: Vec::new(),
             valid: Vec::new(),
         },
-        ColumnKind::DictEncoded => DecodedColumn::DictEncoded {
+        BlockLayout::DictIds => DecodedColumn::DictEncoded {
             ids: Vec::new(),
             dictionary: Vec::new(), // Populated during decode_block.
             valid: Vec::new(),
@@ -149,7 +106,7 @@ pub(super) fn result_valid_slice_mut(result: &mut DecodedColumn, offset: usize) 
 pub(super) fn decode_block(
     result: &mut DecodedColumn,
     block_data: &[u8],
-    kind: &ColumnKind,
+    layout: BlockLayout,
     codec: ResolvedColumnCodec,
     row_count: usize,
     dictionary: Option<&[String]>,
@@ -171,8 +128,8 @@ pub(super) fn decode_block(
         .map(|i| bitmap[i / 8] & (1 << (i % 8)) != 0)
         .collect();
 
-    match kind {
-        ColumnKind::Int64 => {
+    match layout {
+        BlockLayout::Int64 => {
             let DecodedColumn::Int64 { values, valid: v } = result else {
                 append_null_fill(result, row_count);
                 return Ok(());
@@ -184,7 +141,7 @@ pub(super) fn decode_block(
             }
             v.extend_from_slice(&valid);
         }
-        ColumnKind::Float64 => {
+        BlockLayout::Float64 => {
             let DecodedColumn::Float64 { values, valid: v } = result else {
                 append_null_fill(result, row_count);
                 return Ok(());
@@ -196,7 +153,22 @@ pub(super) fn decode_block(
             }
             v.extend_from_slice(&valid);
         }
-        ColumnKind::VarLen => {
+        BlockLayout::PackedBool => {
+            let DecodedColumn::Bool { values, valid: v } = result else {
+                append_null_fill(result, row_count);
+                return Ok(());
+            };
+            let packed = nodedb_codec::decode_bytes_pipeline(payload, codec.into_column_codec())?;
+            if packed.len() != bitmap_size {
+                return Err(block_corruption(format!(
+                    "packed bool block holds {} bytes for {row_count} rows",
+                    packed.len()
+                )));
+            }
+            values.extend((0..row_count).map(|i| packed[i / 8] & (1 << (i % 8)) != 0));
+            v.extend_from_slice(&valid);
+        }
+        BlockLayout::VarLen => {
             let DecodedColumn::Binary {
                 data,
                 offsets,
@@ -262,18 +234,27 @@ pub(super) fn decode_block(
             let decoded_bytes =
                 nodedb_codec::decode_bytes_pipeline(string_data, codec.into_column_codec())?;
 
-            // decoded_offsets has row_count + 1 entries (including sentinel).
-            // Map them to absolute positions in the output data buffer.
-            let base = data.len() as u32;
-            let n_offsets = (row_count + 1).min(decoded_offsets.len());
-            for &off in &decoded_offsets[..n_offsets] {
-                offsets.push(base + off as u32);
+            // The block's offsets are relative to its first byte: row_count + 1
+            // entries, the first 0, the last the block's byte length.
+            if decoded_offsets.len() != row_count + 1
+                || decoded_offsets.first() != Some(&0)
+                || decoded_offsets.windows(2).any(|w| w[0] > w[1])
+                || decoded_offsets
+                    .last()
+                    .is_some_and(|&end| usize::try_from(end) != Ok(decoded_bytes.len()))
+            {
+                return Err(block_corruption(format!(
+                    "variable-length offset table of {} entries does not span {} bytes \
+                     for {row_count} rows",
+                    decoded_offsets.len(),
+                    decoded_bytes.len()
+                )));
             }
-
+            append_block_offsets(data, offsets, &decoded_offsets[1..])?;
             data.extend_from_slice(&decoded_bytes);
             v.extend_from_slice(&valid);
         }
-        ColumnKind::Binary => {
+        BlockLayout::FixedWidth => {
             let DecodedColumn::Binary {
                 data,
                 offsets,
@@ -285,23 +266,23 @@ pub(super) fn decode_block(
             };
             let decoded_bytes =
                 nodedb_codec::decode_bytes_pipeline(payload, codec.into_column_codec())?;
-            let base = data.len() as u32;
-
-            if row_count > 0 && !decoded_bytes.is_empty() {
-                let chunk_size = decoded_bytes.len() / row_count;
-                for i in 0..row_count {
-                    offsets.push(base + (i * chunk_size) as u32);
-                }
-                offsets.push(base + decoded_bytes.len() as u32);
-            } else {
-                let last = *offsets.last().unwrap_or(&0);
-                offsets.extend(std::iter::repeat_n(last, row_count + 1));
+            // Every row holds a full cell, so the block divides evenly.
+            let width = decoded_bytes.len().checked_div(row_count).unwrap_or(0);
+            if width * row_count != decoded_bytes.len() {
+                return Err(block_corruption(format!(
+                    "fixed-width block of {} bytes does not divide into {row_count} rows",
+                    decoded_bytes.len()
+                )));
             }
-
+            let ends: Vec<i64> = (1..=row_count)
+                .map(|i| i64::try_from(i * width))
+                .collect::<Result<_, _>>()
+                .map_err(|_| block_corruption("fixed-width cell end exceeds i64".into()))?;
+            append_block_offsets(data, offsets, &ends)?;
             data.extend_from_slice(&decoded_bytes);
             v.extend_from_slice(&valid);
         }
-        ColumnKind::DictEncoded => {
+        BlockLayout::DictIds => {
             let DecodedColumn::DictEncoded {
                 ids,
                 dictionary: col_dict,
@@ -335,6 +316,43 @@ pub(super) fn decode_block(
     Ok(())
 }
 
+/// Append one block's row end offsets, rebased onto the end of `data`.
+///
+/// `ends` holds each row's end relative to the block's first byte. The start
+/// sentinel is pushed once, before the first row of the column, so `offsets`
+/// always holds one more entry than the rows decoded so far.
+fn append_block_offsets(
+    data: &[u8],
+    offsets: &mut Vec<u32>,
+    ends: &[i64],
+) -> Result<(), ColumnarError> {
+    let base = data.len();
+    if offsets.is_empty() {
+        offsets.push(absolute_offset(base, 0)?);
+    }
+    for &end in ends {
+        let relative = usize::try_from(end)
+            .map_err(|_| block_corruption(format!("negative row end offset {end}")))?;
+        offsets.push(absolute_offset(base, relative)?);
+    }
+    Ok(())
+}
+
+/// `base + relative` as a `u32` column offset.
+fn absolute_offset(base: usize, relative: usize) -> Result<u32, ColumnarError> {
+    base.checked_add(relative)
+        .and_then(|offset| u32::try_from(offset).ok())
+        .ok_or_else(|| block_corruption(format!("column offset {base} + {relative} exceeds u32")))
+}
+
+fn block_corruption(reason: String) -> ColumnarError {
+    ColumnarError::Corruption {
+        segment_id: None,
+        reason,
+        offset: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nodedb_types::columnar::{ColumnDef, ColumnType, ColumnarSchema};
@@ -361,7 +379,7 @@ mod tests {
             super::decode_block(
                 &mut result,
                 &block,
-                &super::ColumnKind::VarLen,
+                crate::format::BlockLayout::VarLen,
                 nodedb_codec::ResolvedColumnCodec::FsstLz4,
                 1,
                 None,

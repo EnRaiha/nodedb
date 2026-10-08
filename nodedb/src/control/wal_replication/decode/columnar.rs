@@ -3,7 +3,7 @@
 //! Decode `ReplicatedWrite` variants that produce `PhysicalPlan::Columnar`.
 
 use crate::bridge::envelope::PhysicalPlan;
-use nodedb_physical::physical_plan::{ColumnarOp, TimeseriesOp};
+use nodedb_physical::physical_plan::{ColumnarOp, TimeseriesOp, UpdateValue};
 use nodedb_types::RlsWriteCheck;
 
 /// Reconstruct a `ColumnarOp::Truncate` plan. Same idempotent-replay
@@ -39,7 +39,7 @@ pub(super) fn bulk_dml(
     collection: &str,
     filters: &[u8],
     is_update: bool,
-    updates: &[(String, Vec<u8>)],
+    updates: &[(String, UpdateValue)],
 ) -> PhysicalPlan {
     if is_update {
         PhysicalPlan::Columnar(ColumnarOp::Update {

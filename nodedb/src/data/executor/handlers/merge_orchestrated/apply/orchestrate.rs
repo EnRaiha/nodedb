@@ -70,9 +70,14 @@ impl CoreLoop {
         // Gate every arm on the target's write policy BEFORE the apply
         // transaction opens, so a rejected row leaves nothing written and
         // nothing to unwind.
-        if let Err(e) =
-            gate_merge_arms(&plan, params.rls_write_check, tid, params.target_collection)
-        {
+        let identity_column = self.identity_column(database_id, tid, params.target_collection);
+        if let Err(e) = gate_merge_arms(
+            &plan,
+            params.rls_write_check,
+            &identity_column,
+            tid,
+            params.target_collection,
+        ) {
             return self.response_error(task, e);
         }
 
@@ -288,23 +293,13 @@ impl CoreLoop {
         let mut response = if let Some(spec) = params.returning {
             match returning_rows::build_rows_payload(spec, params.rls_filters, &returned_docs) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("RETURNING encode: {e}"),
-                    },
-                ),
+                Err(e) => self.response_error(task, ErrorCode::from(e)),
             }
         } else {
             let result = serde_json::json!({ "affected": affected });
             match encode_json_as_msgpack(&result) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                ),
+                Err(e) => self.response_error(task, ErrorCode::from(e)),
             }
         };
         response.write_set = write_set;

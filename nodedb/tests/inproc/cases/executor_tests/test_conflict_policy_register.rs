@@ -51,6 +51,9 @@ fn register(ctx: &mut TestCtx, collection: &str, conflict_policy: Option<String>
             conflict_policy,
             timeseries: None,
             vector_primary: None,
+            vector_fields: Vec::new(),
+            declared_columns: Vec::new(),
+            declared_key: None,
         }),
     );
     assert_eq!(resp.status, Status::Ok, "register document collection");

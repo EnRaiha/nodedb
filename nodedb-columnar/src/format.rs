@@ -229,6 +229,32 @@ impl BlockStats {
     }
 }
 
+/// Physical layout of every block of one column.
+///
+/// The writer records the layout it encodes. The reader decodes by it, so a
+/// column's codec never has to stand in for its layout.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToMessagePack, FromMessagePack,
+)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+#[msgpack(c_enum)]
+pub enum BlockLayout {
+    /// `i64` values through the integer codec pipeline.
+    Int64 = 1,
+    /// `f64` values through the float codec pipeline.
+    Float64 = 2,
+    /// One bit per row: row `i` is bit `i % 8` of byte `i / 8`.
+    PackedBool = 3,
+    /// A compressed `i64` offset table, then the variable-length bytes.
+    VarLen = 4,
+    /// Cells of one width: 16-byte decimals and identifiers, or packed `f32`
+    /// vectors. Every row holds a full cell, a null row included.
+    FixedWidth = 5,
+    /// `i64` dictionary IDs. The strings are in [`ColumnMeta::dictionary`].
+    DictIds = 6,
+}
+
 /// Metadata for a single column within the segment footer.
 #[derive(Debug, Clone, Serialize, Deserialize, ToMessagePack, FromMessagePack)]
 pub struct ColumnMeta {
@@ -243,6 +269,8 @@ pub struct ColumnMeta {
     ///
     /// Always a concrete, resolved codec — never `Auto`.
     pub codec: nodedb_codec::ResolvedColumnCodec,
+    /// Physical layout of this column's blocks.
+    pub layout: BlockLayout,
     /// Number of blocks for this column.
     pub block_count: u32,
     /// Per-block statistics (one entry per block).
@@ -401,6 +429,7 @@ mod tests {
                     offset: 7,
                     length: 512,
                     codec: nodedb_codec::ResolvedColumnCodec::DeltaFastLanesLz4,
+                    layout: BlockLayout::Int64,
                     block_count: 2,
                     block_stats: vec![
                         BlockStats::numeric(1.0, 1024.0, 0, 1024),
@@ -413,6 +442,7 @@ mod tests {
                     offset: 519,
                     length: 256,
                     codec: nodedb_codec::ResolvedColumnCodec::FsstLz4,
+                    layout: BlockLayout::VarLen,
                     block_count: 2,
                     block_stats: vec![
                         BlockStats::non_numeric(0, 1024),
@@ -425,6 +455,7 @@ mod tests {
                     offset: 775,
                     length: 128,
                     codec: nodedb_codec::ResolvedColumnCodec::AlpFastLanesLz4,
+                    layout: BlockLayout::Float64,
                     block_count: 2,
                     block_stats: vec![
                         BlockStats::numeric(0.0, 100.0, 10, 1024),
@@ -452,6 +483,7 @@ mod tests {
         assert_eq!(parsed.columns[0].name, "id");
         assert_eq!(parsed.columns[1].name, "name");
         assert_eq!(parsed.columns[2].name, "score");
+        assert_eq!(parsed.columns[1].layout, BlockLayout::VarLen);
     }
 
     #[test]
@@ -520,6 +552,7 @@ mod tests {
                     offset: 0,
                     length: 64,
                     codec: nodedb_codec::ResolvedColumnCodec::Lz4,
+                    layout: BlockLayout::FixedWidth,
                     block_count: 1,
                     block_stats: vec![BlockStats::non_numeric(0, 128)],
                     dictionary: None,

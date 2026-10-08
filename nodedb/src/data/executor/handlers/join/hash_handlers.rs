@@ -134,16 +134,30 @@ impl CoreLoop {
         // Evaluate bitmap sub-plans first. These prefilter the local scan for
         // each side, pushing surrogate exclusion into the document engine before
         // any msgpack decode occurs.
-        let left_bm = left_bitmap.map(|sub_plan| {
-            crate::data::executor::dispatch::bitmap::hashjoin_inline::run_bitmap_subplan(
-                self, join.task, sub_plan,
-            )
-        });
-        let right_bm = right_bitmap.map(|sub_plan| {
-            crate::data::executor::dispatch::bitmap::hashjoin_inline::run_bitmap_subplan(
-                self, join.task, sub_plan,
-            )
-        });
+        // A failing sub-plan fails the join: an empty bitmap would admit no
+        // probe row and silently answer with a zero-row join.
+        let left_bm = match left_bitmap
+            .map(|sub_plan| {
+                crate::data::executor::dispatch::bitmap::hashjoin_inline::run_bitmap_subplan(
+                    self, join.task, sub_plan,
+                )
+            })
+            .transpose()
+        {
+            Ok(bm) => bm,
+            Err(e) => return self.response_error(join.task, e),
+        };
+        let right_bm = match right_bitmap
+            .map(|sub_plan| {
+                crate::data::executor::dispatch::bitmap::hashjoin_inline::run_bitmap_subplan(
+                    self, join.task, sub_plan,
+                )
+            })
+            .transpose()
+        {
+            Ok(bm) => bm,
+            Err(e) => return self.response_error(join.task, e),
+        };
 
         // Memory-bounded completion path. Only when BOTH sides are plain local
         // scans can we stream them. For every both-local, NON-CROSS join this
@@ -231,53 +245,28 @@ impl CoreLoop {
 
             (docs, resolved)
         } else if let Some(bm) = left_bm {
-            let docs = match crate::data::executor::dispatch::bitmap::hashjoin_inline::prefiltered_scan_plan(
-                left_collection,
-                scan_limit,
-                bm,
-            ) {
-                Some(scan_plan) => {
-                    let resp = self.execute_plan(join.task, &scan_plan);
-                    // Forward a failing sub-plan response (e.g. ResourcesExhausted
-                    // from the bitmap scan) instead of swallowing it to an empty
-                    // Vec, which would silently return a zero-row join.
-                    // The prefiltered scan carries no predicate slot of its own,
-                    // so both of this side's filter sets apply to its rows here.
-                    let rows =
-                        match crate::data::executor::response_codec::decode_response_to_docs(&resp) {
-                            Some(d) => d,
-                            None => return resp,
-                        };
-                    match self.retain_join_side_rows(rows, left_rls_filters, left_scan_filters) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            return self.response_error(
-                                join.task,
-                                ErrorCode::Internal {
-                                    detail: e.to_string(),
-                                },
-                            );
-                        }
-                    }
+            // An empty bitmap admits no row: the scan returns none.
+            let scan_plan =
+                crate::data::executor::dispatch::bitmap::hashjoin_inline::prefiltered_scan_plan(
+                    left_collection,
+                    scan_limit,
+                    bm,
+                );
+            let resp = self.execute_plan(join.task, &scan_plan);
+            // Forward a failing sub-plan response (e.g. ResourcesExhausted
+            // from the bitmap scan) instead of swallowing it to an empty
+            // Vec, which would silently return a zero-row join.
+            // The prefiltered scan carries no predicate slot of its own,
+            // so both of this side's filter sets apply to its rows here.
+            let rows = match crate::data::executor::response_codec::decode_response_to_docs(&resp) {
+                Some(d) => d,
+                None => return resp,
+            };
+            let docs = match self.retain_join_side_rows(rows, left_rls_filters, left_scan_filters) {
+                Ok(d) => d,
+                Err(e) => {
+                    return self.response_error(join.task, ErrorCode::from(e));
                 }
-                None => match self.scan_join_side(JoinSideScan {
-                    database_id: join.task.request.database_id.as_u64(),
-                    tenant_id: tid,
-                    collection: left_collection,
-                    limit: scan_limit,
-                    rls_filters: left_rls_filters,
-                    scan_filters: left_scan_filters,
-                }) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        return self.response_error(
-                            join.task,
-                            ErrorCode::Internal {
-                                detail: e.to_string(),
-                            },
-                        );
-                    }
-                },
             };
             let keys = join.on.iter().map(|(l, _)| l.clone()).collect();
             (docs, keys)
@@ -292,12 +281,7 @@ impl CoreLoop {
             }) {
                 Ok(d) => d,
                 Err(e) => {
-                    return self.response_error(
-                        join.task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
+                    return self.response_error(join.task, ErrorCode::from(e));
                 }
             };
             let keys = join.on.iter().map(|(l, _)| l.clone()).collect();
@@ -323,54 +307,28 @@ impl CoreLoop {
                 None => return sub_response,
             }
         } else if let Some(bm) = right_bm {
-            match crate::data::executor::dispatch::bitmap::hashjoin_inline::prefiltered_scan_plan(
-                right_collection,
-                scan_limit,
-                bm,
-            ) {
-                Some(scan_plan) => {
-                    let resp = self.execute_plan(join.task, &scan_plan);
-                    // Forward a failing sub-plan response (e.g. ResourcesExhausted
-                    // from the bitmap scan) instead of swallowing it to an empty
-                    // Vec, which would silently return a zero-row join.
-                    // The prefiltered scan carries no predicate slot of its own,
-                    // so both of this side's filter sets apply to its rows here.
-                    let rows =
-                        match crate::data::executor::response_codec::decode_response_to_docs(&resp)
-                        {
-                            Some(d) => d,
-                            None => return resp,
-                        };
-                    match self.retain_join_side_rows(rows, right_rls_filters, right_scan_filters) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            return self.response_error(
-                                join.task,
-                                ErrorCode::Internal {
-                                    detail: e.to_string(),
-                                },
-                            );
-                        }
-                    }
+            // An empty bitmap admits no row: the scan returns none.
+            let scan_plan =
+                crate::data::executor::dispatch::bitmap::hashjoin_inline::prefiltered_scan_plan(
+                    right_collection,
+                    scan_limit,
+                    bm,
+                );
+            let resp = self.execute_plan(join.task, &scan_plan);
+            // Forward a failing sub-plan response (e.g. ResourcesExhausted
+            // from the bitmap scan) instead of swallowing it to an empty
+            // Vec, which would silently return a zero-row join.
+            // The prefiltered scan carries no predicate slot of its own,
+            // so both of this side's filter sets apply to its rows here.
+            let rows = match crate::data::executor::response_codec::decode_response_to_docs(&resp) {
+                Some(d) => d,
+                None => return resp,
+            };
+            match self.retain_join_side_rows(rows, right_rls_filters, right_scan_filters) {
+                Ok(d) => d,
+                Err(e) => {
+                    return self.response_error(join.task, ErrorCode::from(e));
                 }
-                None => match self.scan_join_side(JoinSideScan {
-                    database_id: join.task.request.database_id.as_u64(),
-                    tenant_id: tid,
-                    collection: right_collection,
-                    limit: scan_limit,
-                    rls_filters: right_rls_filters,
-                    scan_filters: right_scan_filters,
-                }) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        return self.response_error(
-                            join.task,
-                            ErrorCode::Internal {
-                                detail: e.to_string(),
-                            },
-                        );
-                    }
-                },
             }
         } else {
             match self.scan_join_side(JoinSideScan {
@@ -383,12 +341,7 @@ impl CoreLoop {
             }) {
                 Ok(d) => d,
                 Err(e) => {
-                    return self.response_error(
-                        join.task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
+                    return self.response_error(join.task, ErrorCode::from(e));
                 }
             }
         };
@@ -475,12 +428,7 @@ impl CoreLoop {
         }
 
         if let Err(e) = join.filter_and_project(&mut results) {
-            return self.response_error(
-                join.task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            );
+            return self.response_error(join.task, ErrorCode::from(e));
         }
 
         // Deferred user LIMIT: when post-join WHERE filters exist the probe

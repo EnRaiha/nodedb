@@ -377,6 +377,7 @@ pub async fn fetch_old_row(
         database_id,
         &mut plan,
         &state.rls,
+        state.credentials.catalog(),
         auth,
     )?;
     crate::control::planner::redaction_refusal::refuse_unredactable_plan(

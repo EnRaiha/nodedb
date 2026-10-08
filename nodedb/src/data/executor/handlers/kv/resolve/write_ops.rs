@@ -56,10 +56,12 @@ impl CoreLoop {
         let now_ms = self.kv_ttl_now_ms(task);
         let existing_bytes = self.kv_resolve_read(did, tid, collection, key, now_ms);
 
-        let stored_bytes: Vec<u8> = match &existing_bytes {
-            None => value.to_vec(),
-            Some(existing_raw) => merge_kv_conflict_body(existing_raw, value, updates)?,
-        };
+        let stored_bytes = merge_kv_conflict_body(
+            existing_bytes.as_deref(),
+            value,
+            updates,
+            self.declared_columns_of(did, tid, collection),
+        )?;
 
         admit_kv_row(rls_write_check, &stored_bytes, key, tid, collection)?;
 
@@ -241,6 +243,7 @@ impl CoreLoop {
             collection,
             current.as_deref(),
             updates,
+            self.declared_columns_of(did, tid, collection),
         )?;
         admit_kv_row(rls_write_check, &computed.new_value, key, tid, collection)?;
 

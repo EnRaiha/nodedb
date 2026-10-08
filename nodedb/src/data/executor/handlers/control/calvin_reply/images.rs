@@ -125,8 +125,15 @@ impl CoreLoop {
                     .iter()
                     .map(|row| (&row.identity, row.bytes.as_slice()))
                     .collect();
-                build_stored_rows_payload(spec, rls_filters, strict_schema.as_ref(), &stored)
-                    .map_err(ErrorCode::from)
+                let identity_column = self.identity_column(at.database_id, at.tid, at.collection);
+                build_stored_rows_payload(
+                    spec,
+                    rls_filters,
+                    strict_schema.as_ref(),
+                    &identity_column,
+                    &stored,
+                )
+                .map_err(ErrorCode::from)
             }
             RowEngine::Kv => {
                 let keys = rows
@@ -150,7 +157,9 @@ impl CoreLoop {
                     .zip(rows)
                     .map(|(key, row)| (key, row.bytes.as_slice()))
                     .collect();
-                vector_stored_rows_payload(spec, rls_filters, &stored).map_err(ErrorCode::from)
+                let identity_column = self.identity_column(at.database_id, at.tid, at.collection);
+                vector_stored_rows_payload(spec, rls_filters, &identity_column, &stored)
+                    .map_err(ErrorCode::from)
             }
             RowEngine::Columnar | RowEngine::Timeseries => Err(ErrorCode::Internal {
                 detail: format!(

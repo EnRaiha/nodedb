@@ -137,12 +137,7 @@ impl CoreLoop {
 
         match super::super::response_codec::encode_count("compacted", removed) {
             Ok(bytes) => self.response_with_payload(task, bytes),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 

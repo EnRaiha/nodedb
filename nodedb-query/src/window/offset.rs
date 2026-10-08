@@ -2,12 +2,14 @@
 
 //! Offset window functions: lag, lead, nth_value.
 
+use nodedb_types::Value;
+
 use super::arg::{arg_at, const_default_arg, const_usize_arg, eval_arg_values};
 use super::helpers::set_window_col;
 use super::spec::WindowFuncSpec;
 
 pub(super) fn apply_lag(
-    rows: &mut [(String, serde_json::Value)],
+    rows: &mut [(String, Value)],
     indices: &[usize],
     spec: &WindowFuncSpec,
 ) -> Result<(), crate::expr::EvalError> {
@@ -27,7 +29,7 @@ pub(super) fn apply_lag(
 }
 
 pub(super) fn apply_lead(
-    rows: &mut [(String, serde_json::Value)],
+    rows: &mut [(String, Value)],
     indices: &[usize],
     spec: &WindowFuncSpec,
 ) -> Result<(), crate::expr::EvalError> {
@@ -52,7 +54,7 @@ pub(super) fn apply_lead(
 /// rows of each partition return NULL and rows from the n'th onward return
 /// the value of `expr` at the n'th row.
 pub(super) fn apply_nth_value(
-    rows: &mut [(String, serde_json::Value)],
+    rows: &mut [(String, Value)],
     indices: &[usize],
     spec: &WindowFuncSpec,
 ) -> Result<(), crate::expr::EvalError> {
@@ -63,7 +65,7 @@ pub(super) fn apply_nth_value(
         let val = if pos + 1 >= n {
             arg_at(&arg_values, n - 1)
         } else {
-            serde_json::Value::Null
+            Value::Null
         };
         set_window_col(&mut rows[i].1, &spec.alias, val);
     }

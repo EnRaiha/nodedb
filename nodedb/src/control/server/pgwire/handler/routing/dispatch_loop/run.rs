@@ -164,6 +164,7 @@ impl NodeDbPgHandler {
                     session_id,
                     plan_kind: describe_plan(&plan),
                     projection,
+                    result_formats,
                 };
                 match self
                     .route_statement_txn_task(route, task, &mut statement_events)
@@ -316,6 +317,7 @@ impl NodeDbPgHandler {
                         session_id,
                         plan_kind,
                         projection,
+                        result_formats,
                     },
                     task,
                 )

@@ -96,9 +96,9 @@ impl CoreLoop {
         )
     }
 
-    /// RMW + write-back: absent key installs `value`
-    /// verbatim (the live handler's insert branch); present key re-runs
-    /// `merge_kv_conflict_body`, the exact merge the live handler uses. A
+    /// RMW + write-back through `merge_kv_conflict_body`, the exact post-image
+    /// the live handler stores: the incoming `value` for an absent key, the
+    /// merge for a present one. A
     /// merge failure is logged and the record is skipped rather than
     /// fabricating a value.
     fn apply_replayed_insert_on_conflict_update(
@@ -122,27 +122,29 @@ impl CoreLoop {
             .kv_engine
             .get(database_id, tenant_id, collection, key, now_ms);
 
-        let stored_bytes: Vec<u8> = match &existing_bytes {
-            None => value.to_vec(),
-            Some(existing_raw) => match merge_kv_conflict_body(existing_raw, value, updates) {
-                Ok(b) => b,
-                Err(e) => {
-                    // A division/modulo-by-zero here can only come from a
-                    // record logged by a build that did not fail the
-                    // statement at execution time; a shape or decode error
-                    // means the durable bytes no longer hold what the record
-                    // expects. Either way the record is skipped, never
-                    // fabricated, and startup continues.
-                    warn!(
-                        core = self.core_id,
-                        collection = %collection,
-                        key = %String::from_utf8_lossy(key),
-                        ?e,
-                        "WAL kv_insert_on_conflict_update replay: merge failed, skipping record"
-                    );
-                    return 0;
-                }
-            },
+        let stored_bytes = match merge_kv_conflict_body(
+            existing_bytes.as_deref(),
+            value,
+            updates,
+            self.declared_columns_of(database_id, tenant_id, collection),
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                // A division/modulo-by-zero here can only come from a
+                // record logged by a build that did not fail the
+                // statement at execution time; a shape or decode error
+                // means the durable bytes no longer hold what the record
+                // expects. Either way the record is skipped, never
+                // fabricated, and startup continues.
+                warn!(
+                    core = self.core_id,
+                    collection = %collection,
+                    key = %String::from_utf8_lossy(key),
+                    ?e,
+                    "WAL kv_insert_on_conflict_update replay: merge failed, skipping record"
+                );
+                return 0;
+            }
         };
 
         let params = crate::engine::kv::KvPutParams {

@@ -8,7 +8,8 @@
 //! Shaping the forwarded payloads into the statement's one answer lives in
 //! `gateway_fold`.
 
-use pgwire::api::results::{FieldFormat, Response};
+use pgwire::api::portal::Format;
+use pgwire::api::results::Response;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::gateway::GatewayErrorMap;
@@ -63,7 +64,7 @@ pub(super) struct GatewayDispatchParams<'a> {
     /// Receives a shaped row set's NOTICE.
     pub(super) session_id: SessionId,
     pub(super) projection: Option<&'a OutputSchema>,
-    pub(super) result_formats: &'a [FieldFormat],
+    pub(super) result_formats: &'a Format,
     /// The requester's resolved context; its roles drive column-level
     /// redaction of the forwarded rows.
     pub(super) auth: &'a crate::control::security::auth_context::AuthContext,

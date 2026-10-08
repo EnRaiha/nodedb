@@ -24,12 +24,20 @@ pub(super) fn fts_index_err(e: nodedb_fts::FtsIndexError<crate::Error>) -> crate
         FtsIndexError::BudgetExhausted(_) => crate::Error::MemoryExhausted {
             engine: "fts".into(),
         },
-        other @ (FtsIndexError::SurrogateOutOfRange { .. } | FtsIndexError::Segment(_)) => {
-            crate::Error::Storage {
-                engine: "inverted".into(),
-                detail: other.to_string(),
-            }
-        }
+        // On-disk index state that is wrong: a segment that fails
+        // validation, a listed segment that is gone, or a state blob that
+        // does not decode.
+        other @ (FtsIndexError::CorruptSegment { .. }
+        | FtsIndexError::MissingSegment { .. }
+        | FtsIndexError::CorruptState { .. }) => crate::Error::SegmentCorrupted {
+            detail: other.to_string(),
+        },
+        other @ (FtsIndexError::SurrogateOutOfRange { .. }
+        | FtsIndexError::Segment(_)
+        | FtsIndexError::StateEncode { .. }) => crate::Error::Storage {
+            engine: "inverted".into(),
+            detail: other.to_string(),
+        },
         // `FtsIndexError` is `#[non_exhaustive]` and lives in another crate,
         // so the compiler requires this arm. A variant this build cannot name
         // is a storage fault.
@@ -74,6 +82,29 @@ mod tests {
                 value: 70_000,
                 max: 65_535,
             }
+        ));
+    }
+
+    /// A corrupt or missing segment is on-disk corruption, not a generic
+    /// storage fault.
+    #[test]
+    fn a_corrupt_segment_is_segment_corruption() {
+        let corrupt: nodedb_fts::FtsIndexError<crate::Error> =
+            nodedb_fts::FtsIndexError::CorruptSegment {
+                segment_id: "L0:0000000000000001".into(),
+                source: nodedb_fts::lsm::segment::error::SegmentError::Truncated,
+            };
+        assert!(matches!(
+            fts_index_err(corrupt),
+            crate::Error::SegmentCorrupted { ref detail } if detail.contains("L0:0000000000000001")
+        ));
+        let missing: nodedb_fts::FtsIndexError<crate::Error> =
+            nodedb_fts::FtsIndexError::MissingSegment {
+                segment_id: "L0:0000000000000002".into(),
+            };
+        assert!(matches!(
+            fts_index_err(missing),
+            crate::Error::SegmentCorrupted { .. }
         ));
     }
 }

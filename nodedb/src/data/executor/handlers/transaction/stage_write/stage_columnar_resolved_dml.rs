@@ -44,6 +44,7 @@ use nodedb_types::{RowIdentity, value_to_pk_string};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::columnar_write::coerce_columnar_row;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::{TenantId, TxnId};
 
@@ -144,15 +145,24 @@ impl CoreLoop {
         for (surrogate, row) in &matched {
             by_pk.insert(encode_pk(&row[pk_idx]), *surrogate);
         }
-        let mut resolved: Vec<(u32, RowIdentity, &Vec<Value>)> = Vec::with_capacity(rows.len());
+        let mut resolved: Vec<(u32, RowIdentity, Vec<Value>)> = Vec::with_capacity(rows.len());
         for (pk, new_row) in rows {
             let identity = match resolved_pk_identity(collection, pk) {
                 Ok(identity) => identity,
                 Err(e) => return self.response_error(task, e),
             };
             match by_pk.get(&encode_pk(pk)) {
-                Some(surrogate) => resolved.push((*surrogate, identity, new_row)),
+                Some(surrogate) => resolved.push((*surrogate, identity, new_row.clone())),
                 None => return self.response_error(task, ErrorCode::OllpRetryRequired),
+            }
+        }
+
+        // Every shipped post-image meets the declared column rule before the
+        // policy decides it and before the first put stages, as the durable
+        // apply does.
+        for (_, _, new_row) in &mut resolved {
+            if let Err(e) = coerce_columnar_row(&schema, new_row) {
+                return self.response_error(task, e);
             }
         }
 
@@ -176,7 +186,7 @@ impl CoreLoop {
             }
         }
         for (surrogate, identity, new_row) in resolved {
-            let body = match nodedb_types::value_to_msgpack(&Value::Array(new_row.clone())) {
+            let body = match nodedb_types::value_to_msgpack(&Value::Array(new_row)) {
                 Ok(b) => b,
                 Err(e) => {
                     return self.response_error(

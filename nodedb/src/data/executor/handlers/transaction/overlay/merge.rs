@@ -353,11 +353,19 @@ impl CoreLoop {
         // passes finish.
         let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
             std::cell::Cell::new(None);
+        let identity_column =
+            self.identity_column(coll_key.0.as_u64(), coll_key.1.as_u64(), &coll_key.2);
         let residual_matches = |row_key: &StorageKey, body: &[u8]| -> bool {
             if residual.is_empty() {
                 return true;
             }
-            match matches_with_resolved_schema(strict_schema, residual, row_key, body) {
+            match matches_with_resolved_schema(
+                strict_schema,
+                residual,
+                row_key,
+                body,
+                &identity_column,
+            ) {
                 Ok(b) => b,
                 Err(e) => {
                     predicate_err.set(Some(e));

@@ -12,6 +12,7 @@ use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::server::native::sqlstate_code::sqlstate_error;
 use crate::control::server::shared::authorization::authorize_database;
 use crate::control::server::shared::session::TransactionState;
+use crate::control::server::shared::txn_control::{TxnControl, classify as classify_txn_control};
 
 use super::sql_admin::{handle_explain, handle_set_sql, handle_show_sql, is_session_show};
 use super::sql_planned::execute_planned;
@@ -83,32 +84,16 @@ async fn handle_sql_inner(
         return resp(NativeResponse::ok(seq));
     }
 
-    // Transaction control.
-    if upper == "BEGIN" || upper == "BEGIN TRANSACTION" || upper == "START TRANSACTION" {
-        return resp(handle_begin(ctx, seq));
-    }
-    if upper == "COMMIT" || upper == "END" || upper == "END TRANSACTION" {
-        return resp(handle_commit(ctx, seq).await);
-    }
-    if upper == "ROLLBACK" || upper == "ABORT" {
-        return resp(handle_rollback(ctx, seq).await);
-    }
-    if upper.starts_with("SAVEPOINT ") {
-        return resp(handle_savepoint(ctx, seq, sql_trimmed).await);
-    }
-    if upper.starts_with("RELEASE SAVEPOINT ") || upper.starts_with("RELEASE ") {
-        return resp(handle_release_savepoint(ctx, seq, sql_trimmed));
-    }
-    if upper.starts_with("ROLLBACK TO ") {
-        return resp(handle_rollback_to_savepoint(ctx, seq, sql_trimmed).await);
+    // Transaction control. Its session handlers own the aborted-block state,
+    // so it runs before the failed-transaction guard. pgwire classifies with
+    // the same function, so both protocols accept the same spellings.
+    if let Some(control) = classify_txn_control(sql_trimmed) {
+        return resp(handle_txn_control(ctx, seq, control).await);
     }
 
+    // An aborted block refuses every other statement until it ends.
     if ctx.sessions.transaction_state(ctx.peer_addr) == TransactionState::Failed {
-        return resp(sqlstate_error(
-            seq,
-            "25P02",
-            "current transaction is aborted, commands ignored until end of transaction block",
-        ));
+        return resp(aborted_block_error(seq));
     }
 
     // SET / SHOW / RESET.
@@ -188,6 +173,32 @@ async fn handle_sql_inner(
     }
 
     outcome
+}
+
+/// Run one classified transaction-control statement.
+async fn handle_txn_control(
+    ctx: &DispatchCtx<'_>,
+    seq: u64,
+    control: TxnControl,
+) -> NativeResponse {
+    match control {
+        TxnControl::Begin(modes) => handle_begin(ctx, seq, &modes),
+        TxnControl::Commit => handle_commit(ctx, seq).await,
+        TxnControl::Rollback => handle_rollback(ctx, seq).await,
+        TxnControl::Savepoint(name) => handle_savepoint(ctx, seq, &name).await,
+        TxnControl::Release(name) => handle_release_savepoint(ctx, seq, &name),
+        TxnControl::RollbackTo(name) => handle_rollback_to_savepoint(ctx, seq, &name).await,
+    }
+}
+
+/// The SQLSTATE 25P02 frame an aborted transaction block answers to every
+/// statement except transaction control.
+pub(crate) fn aborted_block_error(seq: u64) -> NativeResponse {
+    sqlstate_error(
+        seq,
+        "25P02",
+        "current transaction is aborted, commands ignored until end of transaction block",
+    )
 }
 
 /// Wrap a materialized response as a non-streaming [`SqlOutcome`].

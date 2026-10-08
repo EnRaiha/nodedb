@@ -1,15 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Append operations on `ColumnData`: push owned values and push borrowed values.
+//! Append owned values on `ColumnData`.
+//!
+//! A column accepts every shape the strict document coercion yields for its
+//! declared type, so columnar and strict collections hold the same values.
 
 use nodedb_types::columnar::ColumnType;
 use nodedb_types::value::Value;
-use nodedb_types::value_to_msgpack;
+use nodedb_types::{value_from_msgpack, value_to_msgpack};
 
 use crate::error::ColumnarError;
 
-use super::super::IngestValue;
 use super::types::ColumnData;
+
+/// The 16 stored bytes of an identifier column cell.
+///
+/// A `Ulid` column parses ULID text. Every other column backed by 16-byte
+/// identifier storage parses UUID text. Text that does not parse is refused.
+fn parse_id_bytes(
+    s: &str,
+    col_name: &str,
+    col_type: &ColumnType,
+) -> Result<[u8; 16], ColumnarError> {
+    let parsed = match col_type {
+        ColumnType::Ulid => ulid::Ulid::from_string(s).ok().map(|u| u.to_bytes()),
+        _ => uuid::Uuid::parse_str(s).ok().map(|u| *u.as_bytes()),
+    };
+    parsed.ok_or_else(|| ColumnarError::TypeMismatch {
+        column: col_name.to_string(),
+        expected: col_type.to_string(),
+    })
+}
 
 /// Encode a `Value` as MessagePack bytes for JSON/Array/Set/Record storage.
 ///
@@ -170,11 +191,12 @@ impl ColumnData {
                 values.push(d.serialize());
                 Self::push_valid(valid, true);
             }
-            (Self::Uuid { values, valid }, Value::Uuid(s)) => {
-                let bytes = uuid::Uuid::parse_str(s)
-                    .map(|u| *u.as_bytes())
-                    .unwrap_or([0u8; 16]);
-                values.push(bytes);
+            (Self::Uuid { values, valid }, Value::Uuid(s) | Value::Ulid(s) | Value::String(s)) => {
+                values.push(parse_id_bytes(s, col_name, col_type)?);
+                Self::push_valid(valid, true);
+            }
+            (Self::Timestamp { values, valid }, Value::Duration(d)) => {
+                values.push(d.micros);
                 Self::push_valid(valid, true);
             }
             (
@@ -183,7 +205,7 @@ impl ColumnData {
                     offsets,
                     valid,
                 },
-                Value::String(s),
+                Value::String(s) | Value::Uuid(s) | Value::Ulid(s) | Value::Regex(s),
             ) => {
                 data.extend_from_slice(s.as_bytes());
                 offsets.push(data.len() as u32);
@@ -245,7 +267,12 @@ impl ColumnData {
                 },
                 Value::Bytes(b),
             ) => {
-                // Assume already MessagePack-encoded bytes.
+                // Bytes are stored as an encoded MessagePack cell. Bytes that
+                // do not decode are refused, so every stored JSON cell reads.
+                value_from_msgpack(b).map_err(|e| ColumnarError::MsgpackDeserialize {
+                    column: col_name.to_string(),
+                    source: e,
+                })?;
                 data.extend_from_slice(b);
                 offsets.push(data.len() as u32);
                 Self::push_valid(valid, true);
@@ -307,6 +334,18 @@ impl ColumnData {
                 }
                 Self::push_valid(valid, true);
             }
+            // Packed little-endian `f32`s, the form strict coercion yields.
+            (Self::Vector { data, dim, valid }, Value::Bytes(b))
+                if b.len() == *dim as usize * 4 =>
+            {
+                data.extend(
+                    b.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|chunk| f32::from_le_bytes(*chunk)),
+                );
+                Self::push_valid(valid, true);
+            }
             (Self::DictEncoded { ids, valid, .. }, Value::Null) => {
                 ids.push(0);
                 Self::push_valid(valid, false);
@@ -318,7 +357,7 @@ impl ColumnData {
                     reverse,
                     valid,
                 },
-                Value::String(s),
+                Value::String(s) | Value::Uuid(s) | Value::Ulid(s) | Value::Regex(s),
             ) => {
                 let id = if let Some(&existing) = reverse.get(s.as_str()) {
                     existing
@@ -331,147 +370,118 @@ impl ColumnData {
                 ids.push(id);
                 Self::push_valid(valid, true);
             }
-            (other, val) => {
-                let type_name = match other {
-                    Self::Int64 { .. } => "Int64",
-                    Self::Float64 { .. } => "Float64",
-                    Self::Bool { .. } => "Bool",
-                    Self::Timestamp { .. } => "Timestamp",
-                    Self::Decimal { .. } => "Decimal",
-                    Self::Uuid { .. } => "Uuid",
-                    Self::String { .. } => "String",
-                    Self::Bytes { .. } => "Bytes",
-                    Self::Json { .. } => "Json",
-                    Self::Geometry { .. } => "Geometry",
-                    Self::Vector { .. } => "Vector",
-                    Self::DictEncoded { .. } => "DictEncoded",
-                };
-                let _ = val;
+            (other, _) => {
                 return Err(ColumnarError::TypeMismatch {
                     column: col_name.to_string(),
-                    expected: type_name.to_string(),
+                    expected: other.type_name().to_string(),
                 });
             }
         }
         Ok(())
     }
+}
 
-    /// Append a borrowed value (zero-copy for strings). Used by `ingest_row_refs`.
-    pub(crate) fn push_ref(
-        &mut self,
-        value: &IngestValue<'_>,
-        col_name: &str,
-    ) -> Result<(), ColumnarError> {
-        match (self, value) {
-            (Self::Int64 { values, valid }, IngestValue::Null) => {
-                values.push(0);
-                Self::push_valid(valid, false);
-            }
-            (Self::Float64 { values, valid }, IngestValue::Null) => {
-                values.push(0.0);
-                Self::push_valid(valid, false);
-            }
-            (Self::Bool { values, valid }, IngestValue::Null) => {
-                values.push(false);
-                Self::push_valid(valid, false);
-            }
-            (Self::Timestamp { values, valid }, IngestValue::Null) => {
-                values.push(0);
-                Self::push_valid(valid, false);
-            }
-            (Self::String { offsets, valid, .. }, IngestValue::Null) => {
-                offsets.push(*offsets.last().unwrap_or(&0));
-                Self::push_valid(valid, false);
-            }
-            (Self::Bytes { offsets, valid, .. }, IngestValue::Null) => {
-                offsets.push(*offsets.last().unwrap_or(&0));
-                Self::push_valid(valid, false);
-            }
-            (Self::Json { offsets, valid, .. }, IngestValue::Null) => {
-                offsets.push(*offsets.last().unwrap_or(&0));
-                Self::push_valid(valid, false);
-            }
-            (Self::DictEncoded { ids, valid, .. }, IngestValue::Null) => {
-                ids.push(0);
-                Self::push_valid(valid, false);
-            }
-            (Self::Int64 { values, valid }, IngestValue::Int64(v)) => {
-                values.push(*v);
-                Self::push_valid(valid, true);
-            }
-            (Self::Float64 { values, valid }, IngestValue::Float64(v)) => {
-                values.push(*v);
-                Self::push_valid(valid, true);
-            }
-            (Self::Float64 { values, valid }, IngestValue::Int64(v)) => {
-                values.push(*v as f64);
-                Self::push_valid(valid, true);
-            }
-            (Self::Bool { values, valid }, IngestValue::Bool(v)) => {
-                values.push(*v);
-                Self::push_valid(valid, true);
-            }
-            (Self::Timestamp { values, valid }, IngestValue::Timestamp(v)) => {
-                values.push(*v);
-                Self::push_valid(valid, true);
-            }
-            (Self::Timestamp { values, valid }, IngestValue::Int64(v)) => {
-                values.push(*v);
-                Self::push_valid(valid, true);
-            }
-            (
-                Self::String {
-                    data,
-                    offsets,
-                    valid,
-                },
-                IngestValue::Str(s),
-            ) => {
-                data.extend_from_slice(s.as_bytes());
-                offsets.push(data.len() as u32);
-                Self::push_valid(valid, true);
-            }
-            (
-                Self::DictEncoded {
-                    ids,
-                    dictionary,
-                    reverse,
-                    valid,
-                },
-                IngestValue::Str(s),
-            ) => {
-                let id = if let Some(&existing) = reverse.get(*s) {
-                    existing
-                } else {
-                    let new_id = dictionary.len() as u32;
-                    dictionary.push((*s).to_string());
-                    reverse.insert((*s).to_string(), new_id);
-                    new_id
-                };
-                ids.push(id);
-                Self::push_valid(valid, true);
-            }
-            (other, _) => {
-                let type_name = match other {
-                    Self::Int64 { .. } => "Int64",
-                    Self::Float64 { .. } => "Float64",
-                    Self::Bool { .. } => "Bool",
-                    Self::Timestamp { .. } => "Timestamp",
-                    Self::Decimal { .. } => "Decimal",
-                    Self::Uuid { .. } => "Uuid",
-                    Self::String { .. } => "String",
-                    Self::Bytes { .. } => "Bytes",
-                    Self::Json { .. } => "Json",
-                    Self::Geometry { .. } => "Geometry",
-                    Self::Vector { .. } => "Vector",
-                    Self::DictEncoded { .. } => "DictEncoded",
-                };
-                return Err(ColumnarError::TypeMismatch {
-                    column: col_name.to_string(),
-                    expected: type_name.to_string(),
-                });
-            }
-        }
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use nodedb_types::NdbDuration;
+    use nodedb_types::columnar::{ColumnDef, ColumnarSchema};
+
+    use super::*;
+    use crate::memtable::ColumnarMemtable;
+
+    fn memtable(col_type: ColumnType) -> ColumnarMemtable {
+        let schema =
+            ColumnarSchema::new(vec![ColumnDef::required("c", col_type)]).expect("valid schema");
+        ColumnarMemtable::new(&schema)
+    }
+
+    #[test]
+    fn uuid_column_stores_uuid_text() {
+        let mut mt = memtable(ColumnType::Uuid);
+        let text = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        mt.append_row(&[Value::String(text.into())])
+            .expect("append");
+        assert_eq!(
+            mt.get_row(0).expect("read"),
+            Some(vec![Value::Uuid(text.into())])
+        );
+    }
+
+    #[test]
+    fn uuid_column_refuses_text_that_is_not_a_uuid() {
+        let mut mt = memtable(ColumnType::Uuid);
+        let err = mt
+            .append_row(&[Value::Uuid("not-a-uuid".into())])
+            .unwrap_err();
+        assert!(matches!(err, ColumnarError::TypeMismatch { ref column, .. } if column == "c"));
+        assert_eq!(mt.row_count(), 0);
+    }
+
+    #[test]
+    fn ulid_column_round_trips_ulid_text() {
+        let mut mt = memtable(ColumnType::Ulid);
+        let text = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        mt.append_row(&[Value::String(text.into())])
+            .expect("append");
+        assert_eq!(
+            mt.get_row(0).expect("read"),
+            Some(vec![Value::Ulid(text.into())])
+        );
+    }
+
+    #[test]
+    fn string_column_accepts_identifier_text() {
+        let mut mt = memtable(ColumnType::String);
+        mt.append_row(&[Value::Uuid("u".into())]).expect("append");
+        assert_eq!(
+            mt.get_row(0).expect("read"),
+            Some(vec![Value::String("u".into())])
+        );
+    }
+
+    #[test]
+    fn json_column_refuses_bytes_that_are_not_msgpack() {
+        let mut mt = memtable(ColumnType::Json);
+        let err = mt.append_row(&[Value::Bytes(vec![0xC1])]).unwrap_err();
+        assert!(
+            matches!(err, ColumnarError::MsgpackDeserialize { ref column, .. } if column == "c")
+        );
+        assert_eq!(mt.row_count(), 0);
+
+        let encoded = nodedb_types::value_to_msgpack(&Value::Integer(9)).expect("encode");
+        mt.append_row(&[Value::Bytes(encoded)]).expect("append");
+        assert_eq!(mt.get_row(0).expect("read"), Some(vec![Value::Integer(9)]));
+    }
+
+    #[test]
+    fn duration_column_stores_micros() {
+        let mut mt = memtable(ColumnType::Duration);
+        mt.append_row(&[Value::Duration(NdbDuration::from_micros(1_500))])
+            .expect("append");
+        assert_eq!(
+            mt.get_row(0).expect("read"),
+            Some(vec![Value::Integer(1_500)])
+        );
+    }
+
+    #[test]
+    fn vector_column_accepts_packed_floats() {
+        let mut mt = memtable(ColumnType::Vector(2));
+        let packed: Vec<u8> = [0.5f32, 1.25f32]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        mt.append_row(&[Value::Bytes(packed)]).expect("append");
+        assert_eq!(
+            mt.get_row(0).expect("read"),
+            Some(vec![Value::Array(vec![
+                Value::Float(0.5),
+                Value::Float(1.25)
+            ])])
+        );
+
+        let err = mt.append_row(&[Value::Bytes(vec![0; 3])]).unwrap_err();
+        assert!(matches!(err, ColumnarError::TypeMismatch { .. }));
+        assert_eq!(mt.row_count(), 1);
     }
 }

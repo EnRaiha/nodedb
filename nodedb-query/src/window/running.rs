@@ -11,9 +11,13 @@
 //! computed at the *last* peer in the group (i.e., they all include each
 //! other). This matches PostgreSQL behaviour for RANGE CURRENT ROW.
 
+use nodedb_types::Value;
+
 use super::arg::{ArgValues, arg_at};
-use super::helpers::{as_f64, order_keys_equal, set_window_col};
+use super::extremum::{extremum_direction, value_replaces};
+use super::helpers::{order_keys_equal, set_window_col};
 use super::spec::WindowFuncSpec;
+use crate::numeric_sum::{ExactSum, sum_input};
 
 /// Apply a peer-aware running aggregate over a sorted partition.
 ///
@@ -21,7 +25,7 @@ use super::spec::WindowFuncSpec;
 /// `arg_values` holds the function argument already evaluated once per
 /// partition position; `None` is the no-argument form (`COUNT(*)`).
 pub(super) fn running_aggregate(
-    rows: &mut [(String, serde_json::Value)],
+    rows: &mut [(String, Value)],
     indices: &[usize],
     spec: &WindowFuncSpec,
     arg_values: &ArgValues,
@@ -34,10 +38,12 @@ pub(super) fn running_aggregate(
     // Accumulate state incrementally row-by-row, but defer writing results
     // until the end of each peer group (so all peers see the group's final
     // value). We track where the current peer group started.
-    let mut running_sum = 0.0f64;
+    // SUM / AVG total exactly per `ExactSum`.
+    let mut running_sum = ExactSum::new();
     let mut running_count = 0u64;
-    let mut running_min: Option<f64> = None;
-    let mut running_max: Option<f64> = None;
+    // MIN / MAX hold the original argument value, compared exactly.
+    let extremum_dir = extremum_direction(&spec.func_name);
+    let mut running_extreme: Option<Value> = None;
 
     // Indices of rows belonging to the *current* peer group (deferred write).
     let mut peer_start = 0usize;
@@ -45,11 +51,13 @@ pub(super) fn running_aggregate(
     for pos in 0..len {
         let i = indices[pos];
         let val = arg_at(arg_values, pos);
-        if let Some(n) = as_f64(&val) {
-            running_sum += n;
+        if sum_input(&val).is_some_and(|n| running_sum.add_value(&n)) {
             running_count += 1;
-            running_min = Some(running_min.map_or(n, |m: f64| m.min(n)));
-            running_max = Some(running_max.map_or(n, |m: f64| m.max(n)));
+            if let Some(want_max) = extremum_dir
+                && value_replaces(&val, running_extreme.as_ref(), want_max)
+            {
+                running_extreme = Some(val);
+            }
         } else if spec.func_name == "count" && (arg_values.is_none() || !val.is_null()) {
             // `COUNT(*)` counts every row; `COUNT(expr)` counts rows whose
             // argument is non-NULL, including non-numeric values.
@@ -63,24 +71,13 @@ pub(super) fn running_aggregate(
         if is_last_in_group {
             // Compute the result at the end of this peer group.
             let result = match spec.func_name.as_str() {
-                "sum" => serde_json::json!(running_sum),
-                "count" => serde_json::json!(running_count),
-                "avg" => {
-                    if running_count > 0 {
-                        serde_json::json!(running_sum / running_count as f64)
-                    } else {
-                        serde_json::Value::Null
-                    }
-                }
-                "min" => running_min
-                    .map(|m| serde_json::json!(m))
-                    .unwrap_or(serde_json::Value::Null),
-                "max" => running_max
-                    .map(|m| serde_json::json!(m))
-                    .unwrap_or(serde_json::Value::Null),
+                "sum" => running_sum.sum()?,
+                "count" => Value::from_u64(running_count),
+                "avg" => running_sum.avg()?,
+                "min" | "max" => running_extreme.clone().unwrap_or(Value::Null),
                 "first_value" => arg_at(arg_values, 0),
                 "last_value" => arg_at(arg_values, pos),
-                _ => serde_json::Value::Null,
+                _ => Value::Null,
             };
 
             // Write the *same* result to every row in the peer group.

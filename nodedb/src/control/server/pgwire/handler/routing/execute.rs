@@ -166,6 +166,7 @@ impl NodeDbPgHandler {
                     columns: described.columns.clone(),
                     is_star: described.is_star,
                     cp_computed: output_schema.cp_computed,
+                    declared_key: output_schema.declared_key,
                 },
                 None => output_schema,
             };

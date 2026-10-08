@@ -222,12 +222,14 @@ impl CoreLoop {
             // Don't commit — transaction is dropped (implicit rollback).
             // Send error responses for failed tasks, put successful ones back.
             drop(txn);
+            let fatal = self.abandon_batched_puts(&batch, &mut results);
             let count = batch.len();
             let mut responses = Vec::with_capacity(count);
             for (task, result) in batch.iter().zip(results) {
-                let response = match result {
-                    Err(err_response) => err_response,
-                    Ok(_) => self.response_error(
+                let response = match (&fatal, result) {
+                    (Some(code), _) => self.response_error(task, code.clone()),
+                    (None, Err(err_response)) => err_response,
+                    (None, Ok(_)) => self.response_error(
                         task,
                         ErrorCode::Internal {
                             detail: "batch aborted due to sibling failure".into(),
@@ -244,12 +246,17 @@ impl CoreLoop {
 
         // Commit once for all writes.
         let commit_result = txn.commit();
+        let fatal = match commit_result {
+            Ok(()) => None,
+            Err(_) => self.abandon_batched_puts(&batch, &mut results),
+        };
 
         let count = batch.len();
         let mut responses = Vec::with_capacity(count);
         for (task, result) in batch.iter().zip(results.iter()) {
-            let response = match &commit_result {
-                Ok(()) => {
+            let response = match (&commit_result, &fatal) {
+                (Err(_), Some(code)) => self.response_error(task, code.clone()),
+                (Ok(()), _) => {
                     // Emit write event for each successful batched PointPut.
                     // The Insert vs Update tag is derived from the prior
                     // bytes captured per row above.
@@ -275,7 +282,7 @@ impl CoreLoop {
                     }
                     self.response_ok(task)
                 }
-                Err(e) => self.response_error(
+                (Err(e), None) => self.response_error(
                     task,
                     ErrorCode::Internal {
                         detail: format!("batch commit: {e}"),
@@ -304,6 +311,45 @@ impl CoreLoop {
         }
 
         count
+    }
+
+    /// Reverse the in-memory side effects of batched puts whose shared
+    /// transaction drops uncommitted: the cache entry each put wrote and the
+    /// R-tree, vector and sparse entries of each applied put, last put first.
+    ///
+    /// Returns `Some(RollbackFailed)` when an entry did not reverse. The
+    /// core's state is then unknown, so this fail-stops it, and every task
+    /// of the batch reports that code.
+    fn abandon_batched_puts(
+        &mut self,
+        batch: &[ExecutionTask],
+        results: &mut [Result<PointPutOutcome, Response>],
+    ) -> Option<ErrorCode> {
+        let mut undone: crate::Result<()> = Ok(());
+        for (task, result) in batch.iter().zip(results.iter_mut()).rev() {
+            let PhysicalPlan::Document(DocumentOp::PointPut {
+                collection,
+                surrogate,
+                ..
+            }) = task.plan()
+            else {
+                continue;
+            };
+            let database_id = task.request.database_id.as_u64();
+            let tid = task.request.tenant_id.as_u64();
+            let key = crate::engine::document::store::StorageKey::for_surrogate(*surrogate);
+            // A failed put can have cached its row before it failed.
+            self.doc_cache
+                .invalidate(database_id, tid, collection.as_str(), &key);
+            if let Ok(outcome) = result {
+                let memory_undo = std::mem::take(&mut outcome.memory_undo);
+                let row = self.undo_memory_effects(database_id, tid, memory_undo);
+                undone = undone.and(row);
+            }
+        }
+        let fatal = ErrorCode::from(undone.err()?);
+        self.fail_stop_on_rollback_code(&fatal);
+        Some(fatal)
     }
 
     /// Store the write sets of the journalled tasks of `batch`, finish the

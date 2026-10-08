@@ -2,8 +2,8 @@
 
 //! Rollback driver for the undo log.
 
-use super::UndoEntry;
 use super::graph_node::NodeLabelsUndo;
+use super::{UndoEntry, UndoError};
 use crate::data::executor::core_loop::CoreLoop;
 
 impl CoreLoop {
@@ -11,18 +11,17 @@ impl CoreLoop {
     ///
     /// Returns `Ok(())` if all undo entries were applied successfully.
     ///
-    /// Returns `Err((entry_index, detail))` on the first undo failure —
-    /// the entry index is the original forward-order position of the failed
-    /// entry (before reversal). On failure the caller **must** return a
-    /// `RollbackFailed` error. The core's state is then unknown: the core
-    /// fail-stops when that response leaves it, and a restart rebuilds the
-    /// state through WAL replay.
-    pub(in crate::data::executor::handlers) fn rollback_undo_log(
+    /// Returns the [`UndoError`] of the first entry that does not reverse.
+    /// Its index is the forward-order position of that entry. On error the
+    /// caller **must** answer `RollbackFailed`. The core's state is then
+    /// unknown: the core fail-stops when that response leaves it, and a
+    /// restart rebuilds the state through WAL replay.
+    pub(in crate::data::executor) fn rollback_undo_log(
         &mut self,
         did: u64,
         tid: u64,
         undo_log: Vec<UndoEntry>,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         let total = undo_log.len();
         for (rev_idx, entry) in undo_log.into_iter().rev().enumerate() {
             // Convert reversed index back to original forward-order index for
@@ -34,16 +33,15 @@ impl CoreLoop {
         Ok(())
     }
 
-    /// Apply a single undo entry. Returns `Err((entry_index, detail))` if the
-    /// undo cannot be applied — this is a fatal condition: the shard's in-memory
-    /// state is now partially rolled back and must not serve writes.
+    /// Apply a single undo entry. An error is fatal: the shard's in-memory
+    /// state is partially rolled back and must not serve writes.
     fn apply_undo_entry(
         &mut self,
         did: u64,
         tid: u64,
         entry_index: usize,
         entry: UndoEntry,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         match entry {
             UndoEntry::ChainHead { collection, prior } => {
                 self.undo_chain_hash(did, tid, &collection, entry_index, Some(prior))
@@ -51,8 +49,12 @@ impl CoreLoop {
             UndoEntry::PutDocument { .. } | UndoEntry::DeleteDocument { .. } => {
                 self.apply_undo_document(did, tid, entry_index, entry)
             }
-            UndoEntry::InsertVector { .. } | UndoEntry::DeleteVector { .. } => {
-                self.apply_undo_vector(tid, entry_index, entry)
+            UndoEntry::InsertVector { .. }
+            | UndoEntry::DeleteVector { .. }
+            | UndoEntry::DisplacedVector { .. } => self.apply_undo_vector(tid, entry_index, entry),
+            UndoEntry::VectorCollectionCreated { index_key } => {
+                self.vector_collections.remove(&index_key);
+                Ok(())
             }
             UndoEntry::SpatialInsert { .. } | UndoEntry::SpatialDelete { .. } => {
                 self.apply_undo_spatial(entry_index, entry)
@@ -84,16 +86,15 @@ impl CoreLoop {
             UndoEntry::SpatialRow(undo) => self.apply_undo_spatial_row(entry_index, *undo),
             UndoEntry::VectorWrite(undo) => self.apply_undo_vector_write(entry_index, *undo),
             UndoEntry::CrdtCollection(undo) => self.apply_undo_crdt_collection(entry_index, *undo),
+            UndoEntry::CrdtRow(undo) => self.apply_undo_crdt_row(entry_index, *undo),
             UndoEntry::ArrayTiles { array_id, snapshot } => self
                 .array_engine
                 .restore_tiles(&array_id, snapshot)
                 .map_err(|e| {
-                    (
+                    UndoError::failed(
                         entry_index,
-                        format!(
-                            "restoring the memtable tiles of array '{}': {e}",
-                            array_id.name
-                        ),
+                        format!("restoring the memtable tiles of array '{}'", array_id.name),
+                        e,
                     )
                 }),
             UndoEntry::SparseDoc {
@@ -439,7 +440,7 @@ mod tests {
             .is_some();
         let csr = !core
             .csr_partition_mut(DB, TID)
-            .neighbors(PK, None, Direction::Out)
+            .neighbors(PK, &[], Direction::Out)
             .is_empty();
         store && csr
     }

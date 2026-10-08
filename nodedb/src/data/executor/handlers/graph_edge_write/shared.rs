@@ -2,7 +2,9 @@
 
 //! Shared param structs and helpers for the edge write handlers.
 
+use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::transaction::undo::edge_write::EdgeWriteUndo;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::{RecordHomes, TenantId};
 
@@ -87,6 +89,29 @@ impl CoreLoop {
             .restore_edge_in_collection(src_id, label, dst_id, collection, weight)
     }
 
+    /// Take back an edge write the CSR refused. The edge store already holds
+    /// the write's version, so the version is removed and the CSR is put back
+    /// to the state the write found. The answer is the CSR error. A failed
+    /// reversal leaves the edge store and the CSR apart: the answer is then
+    /// `RollbackFailed`, which fail-stops the core.
+    pub(in crate::data::executor) fn reverse_edge_write(
+        &mut self,
+        undo: EdgeWriteUndo,
+        csr_error: nodedb_graph::GraphError,
+    ) -> ErrorCode {
+        let csr_detail = csr_error.to_string();
+        match self.apply_undo_edge_write(0, undo) {
+            Ok(()) => crate::Error::from(csr_error).into(),
+            Err(mut undo_error) => {
+                undo_error.action = format!(
+                    "{}; while reversing an edge write the CSR refused: {csr_detail}",
+                    undo_error.action
+                );
+                ErrorCode::from(undo_error)
+            }
+        }
+    }
+
     /// Record a committed edge write's version, keyed by the edge's
     /// `(src, label, dst)` identity, if a WAL LSN was threaded onto the task.
     pub(in crate::data::executor) fn note_edge_write_lsn(
@@ -167,7 +192,7 @@ pub(super) mod test_support {
             vshard_id: VShardId::new(0),
             plan: PhysicalPlan::Graph(GraphOp::Neighbors {
                 node_id: "x".to_string(),
-                edge_label: None,
+                edge_labels: Vec::new(),
                 direction: nodedb_graph::Direction::Out,
                 rls_filters: Vec::new(),
                 collection: None,

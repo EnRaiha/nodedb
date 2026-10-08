@@ -44,11 +44,7 @@ impl CoreLoop {
         let mut simulation = match existing {
             Some(memtable) => {
                 ColumnarMemtable::from_snapshot(memtable.export_snapshot(), memtable.config())
-                    .map_err(|error| ErrorCode::Internal {
-                        detail: format!(
-                            "failed to clone timeseries memtable for admission: {error}"
-                        ),
-                    })?
+                    .map_err(ErrorCode::from)?
             }
             None => {
                 let mut schema = self.initial_ts_schema(task, tid, collection, lines);
@@ -251,12 +247,7 @@ impl CoreLoop {
             && let Err(e) =
                 self.flush_ts_collection(tid, task.request.database_id, collection, now_ms)
         {
-            return self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: format!("pre-ingest ts flush failed: {e}"),
-                },
-            );
+            return self.response_error(task, ErrorCode::from(e));
         }
 
         let emits_events = self.ts_ingest_emits_events(task, collection, mode);
@@ -378,12 +369,7 @@ impl CoreLoop {
                 && let Err(e) =
                     self.flush_ts_collection(tid, task.request.database_id, collection, now_ms)
             {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("post-ingest ts flush failed: {e}"),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
 
             if accepted > 0 {
@@ -434,12 +420,7 @@ impl CoreLoop {
         let json = match response_codec::encode_json_as_msgpack(&result) {
             Ok(b) => b,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         Response {

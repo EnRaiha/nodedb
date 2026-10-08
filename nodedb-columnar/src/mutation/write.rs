@@ -17,7 +17,8 @@ impl MutationEngine {
     ///
     /// Validates schema. If the PK already exists, the prior row is
     /// tombstoned via the segment's delete bitmap (a single positional
-    /// delete) before the new row is appended to the memtable. The PK
+    /// delete) after the new row is appended to the memtable. A row that
+    /// fails validation returns an error and leaves the prior row live. The PK
     /// index is rebound to the new row location. This matches the
     /// ClickHouse / Iceberg "sparse PK + positional delete" model and
     /// keeps `SELECT WHERE pk = X` linearizable on one row without a
@@ -28,47 +29,7 @@ impl MutationEngine {
     /// want `ON CONFLICT DO NOTHING` semantics should use
     /// [`Self::insert_if_absent`].
     pub fn insert(&mut self, values: &[Value]) -> Result<MutationResult, ColumnarError> {
-        let pk_bytes = self.extract_pk_bytes(values)?;
-        let mut wal_records = Vec::with_capacity(2);
-
-        // Bitemporal collections preserve every version of a PK: each
-        // write appends a new row with a distinct `_ts_system` stamp and
-        // the prior row stays visible to `AS OF` queries. Skipping the
-        // upsert-tombstone here keeps compaction lossless without
-        // needing a separate "version-aware" delete bitmap. The PK
-        // index is still rebound below so current-state reads see the
-        // latest version.
-        let bitemporal = self.schema.is_bitemporal();
-
-        // If a prior row exists for this PK, tombstone it in place so
-        // subsequent scans skip the stale row. The PK index is rebound
-        // below to the freshly-appended row.
-        if !bitemporal && let Some(prior) = self.pk_index.get(&pk_bytes).copied() {
-            let bitmap = self.delete_bitmaps.entry(prior.segment_id).or_default();
-            bitmap.mark_deleted(prior.row_index);
-            wal_records.push(ColumnarWalRecord::DeleteRows {
-                collection: self.collection.clone(),
-                segment_id: prior.segment_id,
-                row_indices: vec![prior.row_index],
-            });
-        }
-
-        let row_data = encode_row_for_wal(values)?;
-        wal_records.push(ColumnarWalRecord::InsertRow {
-            collection: self.collection.clone(),
-            row_data,
-        });
-
-        self.memtable.append_row(values)?;
-        let location = RowLocation {
-            segment_id: self.memtable_segment_id,
-            row_index: self.memtable_row_counter,
-        };
-        self.pk_index.upsert(pk_bytes, location);
-        self.memtable_surrogates.push(None);
-        self.memtable_row_counter += 1;
-
-        Ok(MutationResult { wal_records })
+        self.upsert_row(values, None)
     }
 
     /// Insert with a stable cross-engine surrogate identity.
@@ -81,36 +42,80 @@ impl MutationEngine {
         values: &[Value],
         surrogate: Surrogate,
     ) -> Result<MutationResult, ColumnarError> {
-        let pk_bytes = self.extract_pk_bytes(values)?;
-        let mut wal_records = Vec::with_capacity(2);
+        self.upsert_row(values, Some(surrogate))
+    }
 
-        let bitemporal = self.schema.is_bitemporal();
-        if !bitemporal && let Some(prior) = self.pk_index.get(&pk_bytes).copied() {
-            let bitmap = self.delete_bitmaps.entry(prior.segment_id).or_default();
-            bitmap.mark_deleted(prior.row_index);
+    /// Shared body of [`Self::insert`] and [`Self::insert_with_surrogate`].
+    ///
+    /// A non-bitemporal write tombstones the prior row for the PK. A
+    /// bitemporal write keeps every version of a PK: the prior row stays
+    /// visible to `AS OF` queries, and the PK index still rebinds so
+    /// current-state reads see the latest version.
+    fn upsert_row(
+        &mut self,
+        values: &[Value],
+        surrogate: Option<Surrogate>,
+    ) -> Result<MutationResult, ColumnarError> {
+        let pk_bytes = self.extract_pk_bytes(values)?;
+        let prior = if self.schema.is_bitemporal() {
+            None
+        } else {
+            self.pk_index.get(&pk_bytes).copied()
+        };
+        let mut wal_records = Vec::with_capacity(2);
+        self.commit_row(
+            values,
+            pk_bytes,
+            surrogate,
+            prior.as_slice(),
+            &mut wal_records,
+        )?;
+        Ok(MutationResult { wal_records })
+    }
+
+    /// Append `values` as a memtable row bound to `pk_bytes`, then
+    /// tombstone each row in `replaced`.
+    ///
+    /// Every fallible step runs before any state changes:
+    /// `encode_row_for_wal` runs first, and `append_row` is all-or-nothing.
+    /// An error leaves the engine and `wal_records` unchanged. Tombstone
+    /// records go into `wal_records` before the insert record, so replay
+    /// applies them in the same order.
+    pub(super) fn commit_row(
+        &mut self,
+        values: &[Value],
+        pk_bytes: Vec<u8>,
+        surrogate: Option<Surrogate>,
+        replaced: &[RowLocation],
+        wal_records: &mut Vec<ColumnarWalRecord>,
+    ) -> Result<(), ColumnarError> {
+        let row_data = encode_row_for_wal(values)?;
+        self.memtable.append_row(values)?;
+
+        for prior in replaced {
+            self.delete_bitmaps
+                .entry(prior.segment_id)
+                .or_default()
+                .mark_deleted(prior.row_index);
             wal_records.push(ColumnarWalRecord::DeleteRows {
                 collection: self.collection.clone(),
                 segment_id: prior.segment_id,
                 row_indices: vec![prior.row_index],
             });
         }
-
-        let row_data = encode_row_for_wal(values)?;
         wal_records.push(ColumnarWalRecord::InsertRow {
             collection: self.collection.clone(),
             row_data,
         });
 
-        self.memtable.append_row(values)?;
         let location = RowLocation {
             segment_id: self.memtable_segment_id,
             row_index: self.memtable_row_counter,
         };
         self.pk_index.upsert(pk_bytes, location);
-        self.memtable_surrogates.push(Some(surrogate));
+        self.memtable_surrogates.push(surrogate);
         self.memtable_row_counter += 1;
-
-        Ok(MutationResult { wal_records })
+        Ok(())
     }
 
     /// `INSERT ... ON CONFLICT DO NOTHING` semantics: append only if the
@@ -126,24 +131,9 @@ impl MutationEngine {
                 wal_records: Vec::new(),
             });
         }
-
-        let row_data = encode_row_for_wal(values)?;
-        let wal = ColumnarWalRecord::InsertRow {
-            collection: self.collection.clone(),
-            row_data,
-        };
-        self.memtable.append_row(values)?;
-        let location = RowLocation {
-            segment_id: self.memtable_segment_id,
-            row_index: self.memtable_row_counter,
-        };
-        self.pk_index.upsert(pk_bytes, location);
-        self.memtable_surrogates.push(None);
-        self.memtable_row_counter += 1;
-
-        Ok(MutationResult {
-            wal_records: vec![wal],
-        })
+        let mut wal_records = Vec::with_capacity(1);
+        self.commit_row(values, pk_bytes, None, &[], &mut wal_records)?;
+        Ok(MutationResult { wal_records })
     }
 
     /// Look up the current row for a PK in the memtable, if present.
@@ -154,12 +144,22 @@ impl MutationEngine {
     /// used by `ON CONFLICT DO UPDATE` to read the would-be-merged row
     /// when the duplicate hits the memtable — the common case under
     /// back-to-back inserts.
-    pub fn lookup_memtable_row_by_pk(&self, pk_bytes: &[u8]) -> Option<Vec<Value>> {
-        let loc = self.pk_index.get(pk_bytes).copied()?;
+    ///
+    /// `Err` when a cell of the bound row is corrupt: a corrupt row is not an
+    /// absent row.
+    pub fn lookup_memtable_row_by_pk(
+        &self,
+        pk_bytes: &[u8],
+    ) -> Result<Option<Vec<Value>>, ColumnarError> {
+        let Some(loc) = self.pk_index.get(pk_bytes).copied() else {
+            return Ok(None);
+        };
         if loc.segment_id != self.memtable_segment_id {
-            return None;
+            return Ok(None);
         }
-        self.memtable.get_row(loc.row_index as usize)
+        self.memtable
+            .get_row(loc.row_index as usize)
+            .map_err(|e| self.memtable_read_fault(e))
     }
 
     /// Delete a row by PK value. Returns WAL record to persist.
@@ -199,7 +199,9 @@ impl MutationEngine {
     /// `updates` maps column names to new values. Columns not in the map
     /// retain their existing values from the old row.
     ///
-    /// Returns WAL records for both the delete and the insert.
+    /// Returns WAL records for both the delete and the insert. The old row
+    /// is tombstoned only after the new row is appended, so an invalid new
+    /// row returns an error and leaves the old row live.
     ///
     /// NOTE: The caller must provide the full old row values for the re-insert.
     /// This method takes the complete new row (already merged with old values).
@@ -215,29 +217,175 @@ impl MutationEngine {
         new_values: &[Value],
         flushed_surrogate: Option<Surrogate>,
     ) -> Result<MutationResult, ColumnarError> {
-        let surrogate = match self.pk_index.get(&encode_pk(old_pk)) {
-            Some(loc) if loc.segment_id == self.memtable_segment_id => self
-                .memtable_surrogates
-                .get(loc.row_index as usize)
+        let old_pk_bytes = encode_pk(old_pk);
+        let old_location = self
+            .pk_index
+            .get(&old_pk_bytes)
+            .copied()
+            .ok_or(ColumnarError::PrimaryKeyNotFound)?;
+        let surrogate = if old_location.segment_id == self.memtable_segment_id {
+            self.memtable_surrogates
+                .get(old_location.row_index as usize)
                 .copied()
-                .flatten(),
-            Some(_) => flushed_surrogate,
-            None => None,
+                .flatten()
+        } else {
+            flushed_surrogate
         };
 
-        // Delete the old row.
-        let delete_result = self.delete(old_pk)?;
+        let new_pk_bytes = self.extract_pk_bytes(new_values)?;
+        let pk_changed = new_pk_bytes != old_pk_bytes;
 
-        // Insert the new row under the old row's surrogate.
-        let insert_result = match surrogate {
-            Some(surrogate) => self.insert_with_surrogate(new_values, surrogate)?,
-            None => self.insert(new_values)?,
-        };
+        // The old row is always tombstoned. When the PK changes, a
+        // non-bitemporal row already bound to the new PK is replaced too,
+        // as an upsert replaces it.
+        let mut replaced = Vec::with_capacity(2);
+        replaced.push(old_location);
+        if pk_changed
+            && !self.schema.is_bitemporal()
+            && let Some(prior) = self.pk_index.get(&new_pk_bytes).copied()
+        {
+            replaced.push(prior);
+        }
 
-        // Combine WAL records.
-        let mut wal_records = delete_result.wal_records;
-        wal_records.extend(insert_result.wal_records);
+        let mut wal_records = Vec::with_capacity(replaced.len() + 1);
+        self.commit_row(
+            new_values,
+            new_pk_bytes,
+            surrogate,
+            &replaced,
+            &mut wal_records,
+        )?;
+        if pk_changed {
+            self.pk_index.remove(&old_pk_bytes);
+        }
 
         Ok(MutationResult { wal_records })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::columnar::{ColumnDef, ColumnType, ColumnarSchema};
+
+    use super::*;
+
+    fn schema() -> ColumnarSchema {
+        ColumnarSchema::new(vec![
+            ColumnDef::required("id", ColumnType::Int64).with_primary_key(),
+            ColumnDef::required("name", ColumnType::String),
+            ColumnDef::nullable("score", ColumnType::Float64),
+        ])
+        .expect("valid")
+    }
+
+    fn row(id: i64, name: &str, score: f64) -> Vec<Value> {
+        vec![
+            Value::Integer(id),
+            Value::String(name.into()),
+            Value::Float(score),
+        ]
+    }
+
+    fn live_rows(engine: &MutationEngine) -> Vec<Vec<Value>> {
+        engine
+            .scan_memtable_rows()
+            .collect::<Result<_, _>>()
+            .expect("read")
+    }
+
+    #[test]
+    fn rejected_upsert_keeps_prior_row() {
+        let mut engine = MutationEngine::new("t".into(), schema());
+        engine.insert(&row(1, "a", 0.5)).expect("insert");
+
+        let err = engine
+            .insert(&[Value::Integer(1), Value::Null, Value::Null])
+            .unwrap_err();
+        assert!(matches!(err, ColumnarError::NullViolation(_)));
+
+        assert_eq!(live_rows(&engine), vec![row(1, "a", 0.5)]);
+        assert_eq!(engine.memtable().row_count(), 1);
+        let loc = engine
+            .pk_index()
+            .get(&encode_pk(&Value::Integer(1)))
+            .copied();
+        assert_eq!(loc.map(|l| l.row_index), Some(0));
+        assert!(
+            engine
+                .delete_bitmap(engine.memtable_segment_id())
+                .is_none_or(|bm| !bm.is_deleted(0))
+        );
+    }
+
+    #[test]
+    fn rejected_upsert_with_surrogate_keeps_prior_row() {
+        let mut engine = MutationEngine::new("t".into(), schema());
+        engine
+            .insert_with_surrogate(&row(1, "a", 0.5), Surrogate(7))
+            .expect("insert");
+
+        let err = engine
+            .insert_with_surrogate(
+                &[
+                    Value::Integer(1),
+                    Value::String("b".into()),
+                    Value::Bool(true),
+                ],
+                Surrogate(8),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ColumnarError::TypeMismatch { .. }));
+
+        assert_eq!(live_rows(&engine), vec![row(1, "a", 0.5)]);
+        assert_eq!(engine.memtable_surrogates(), &[Some(Surrogate(7))]);
+    }
+
+    #[test]
+    fn rejected_insert_if_absent_leaves_engine_unchanged() {
+        let mut engine = MutationEngine::new("t".into(), schema());
+        let err = engine
+            .insert_if_absent(&[Value::Integer(1), Value::Null, Value::Null])
+            .unwrap_err();
+        assert!(matches!(err, ColumnarError::NullViolation(_)));
+        assert!(engine.pk_index().is_empty());
+        assert_eq!(engine.memtable().row_count(), 0);
+
+        engine
+            .insert_if_absent(&row(1, "a", 0.5))
+            .expect("insert after rejected row");
+        assert_eq!(live_rows(&engine), vec![row(1, "a", 0.5)]);
+    }
+
+    #[test]
+    fn rejected_update_keeps_old_row() {
+        let mut engine = MutationEngine::new("t".into(), schema());
+        engine.insert(&row(1, "a", 0.5)).expect("insert");
+
+        let err = engine
+            .update(
+                &Value::Integer(1),
+                &[Value::Integer(1), Value::Null, Value::Null],
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ColumnarError::NullViolation(_)));
+
+        assert_eq!(live_rows(&engine), vec![row(1, "a", 0.5)]);
+        assert!(engine.pk_index().contains(&encode_pk(&Value::Integer(1))));
+    }
+
+    #[test]
+    fn update_to_new_pk_rebinds_index() {
+        let mut engine = MutationEngine::new("t".into(), schema());
+        engine.insert(&row(1, "a", 0.5)).expect("insert");
+
+        let result = engine
+            .update(&Value::Integer(1), &row(2, "b", 0.25), None)
+            .expect("update");
+        assert_eq!(result.wal_records.len(), 2);
+
+        assert_eq!(live_rows(&engine), vec![row(2, "b", 0.25)]);
+        assert!(!engine.pk_index().contains(&encode_pk(&Value::Integer(1))));
+        assert!(engine.pk_index().contains(&encode_pk(&Value::Integer(2))));
     }
 }

@@ -228,6 +228,7 @@ fn with_caller_rls(
         database_id,
         &mut plan,
         &state.rls,
+        state.credentials.catalog(),
         scope.auth(),
     )?;
     crate::control::planner::redaction_refusal::refuse_unredactable_plan(

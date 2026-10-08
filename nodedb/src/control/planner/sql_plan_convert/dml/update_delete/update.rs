@@ -162,24 +162,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
 
     // No document store: route to ColumnarOp::Update regardless of PK-reduced WHERE.
     if matches!(engine, EngineType::Columnar | EngineType::Spatial) {
-        // Literals only: expressions need row-context eval, not wired into the columnar handler.
-        use nodedb_physical::physical_plan::UpdateValue;
-        let mut columnar_updates: Vec<(String, Vec<u8>)> = Vec::with_capacity(updates.len());
-        for (field, update_val) in &updates {
-            match update_val {
-                UpdateValue::Literal(bytes) => {
-                    columnar_updates.push((field.clone(), bytes.clone()))
-                }
-                UpdateValue::Expr(_) => {
-                    return Err(crate::Error::BadRequest {
-                        detail: format!(
-                            "UPDATE with non-literal RHS on columnar/spatial engine \
-                             (field '{field}') is not yet supported; use a literal value"
-                        ),
-                    });
-                }
-            }
-        }
+        // An expression assignment evaluates per matched row on the Data Plane.
         // PK-targeted WHERE: convert target_keys to an Eq filter on the PK column.
         let effective_filter = pk_effective_filter(filter_bytes, target_keys)?;
         return Ok(vec![PhysicalTask {
@@ -189,7 +172,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
             plan: PhysicalPlan::Columnar(ColumnarOp::Update {
                 collection: qualified_collection.clone(),
                 filters: effective_filter,
-                updates: columnar_updates,
+                updates,
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
             }),
             post_set_op: PostSetOp::None,
@@ -209,6 +192,19 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
     }
     // CRDT partial-update payload, built once from the literal SET assignments.
     let crdt_fields_json = if is_crdt {
+        // The partial upsert merges these fields into the row stored under
+        // each target key, so an identity assignment must name that key.
+        let identity_column = declared_primary_key
+            .as_deref()
+            .unwrap_or(nodedb_types::DEFAULT_IDENTITY_COLUMN);
+        for key in target_keys {
+            super::super::key_assignment::check_assignments_keep_key(
+                collection,
+                identity_column,
+                assignments,
+                &sql_value_to_string(key),
+            )?;
+        }
         Some(super::super::crdt_gate::literal_assignments_to_fields_json(
             assignments,
         )?)
@@ -234,7 +230,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
 
     if edge_bearing || multi_key {
         // Reject `Expr` RHS to a reserved edge field: reconciliation diffs against
-        // literal SET values only (mirrors the KV/columnar `Expr`-RHS rejection).
+        // literal SET values only (mirrors the KV `Expr`-RHS rejection).
         if edge_bearing
             && let Some((field, _)) = assignments.iter().find(|(field, expr)| {
                 matches!(field.as_str(), "_from" | "_to" | "_type")

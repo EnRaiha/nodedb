@@ -23,18 +23,17 @@
 //!
 //! A `GraphNodeLabelSet` record can only exist in the WAL because a live
 //! `SetNodeLabels` (`data::executor::dispatch::graph`) already ran and already
-//! called `CsrIndex::add_node_label`, which vivifies its node argument via
+//! ran `CoreLoop::set_node_labels`, which vivifies its node argument via
 //! `ensure_node` — labeling a node with no edges yet is a supported, successful
-//! live operation. Replay therefore calls the exact same `add_node_label` /
+//! live operation. Replay therefore runs the same `set_node_labels` /
 //! `remove_node_label` unconditionally, with no `contains_node` precondition:
 //! reproducing that vivification on restart is not "interning a phantom node",
 //! it is recreating the state that legitimately existed before the crash.
-//! `add_node_label`'s `Err` (node-id space exhausted) is still logged and
-//! skipped rather than propagated as a panic; its `Ok(false)` (64-distinct-label
-//! bitset limit) is treated the same as the live handler treats it — ignored,
-//! since the live handler discards the returned bool on `Ok` and only reacts to
-//! `Err`. `remove_node_label` never vivifies (it no-ops on an unknown node or
-//! unknown label), so it was already identical to live and needs no change.
+//! `set_node_labels` is all-or-none: a set that exhausts the node-id space or
+//! the distinct node-label limit applies nothing, and replay logs and skips
+//! the record with the same error code the live handler answered.
+//! `remove_node_label` never vivifies (it no-ops on an unknown node or unknown
+//! label), so it is identical to live.
 
 use nodedb_wal::WalRecord;
 use nodedb_wal::record::RecordType;
@@ -85,24 +84,14 @@ impl CoreLoop {
         }
 
         if is_set {
-            for label in &labels {
-                // `add_node_label` vivifies `node_id` via `ensure_node` exactly
-                // as the live `SetNodeLabels` handler does. `Ok(false)` (the
-                // 64-distinct-label bitset limit) is discarded here, mirroring
-                // the live handler, which also never inspects the returned
-                // bool on `Ok`.
-                let added = self
-                    .csr_partition_mut(database_id.as_u64(), tenant_id)
-                    .add_node_label(&node_id, label);
-                if let Err(e) = added {
-                    self.replay_record_rejected(
-                        "graph",
-                        record_lsn,
-                        None,
-                        &format!("setting label '{label}' on node '{node_id}' failed: {e}"),
-                    );
-                    return Some(0);
-                }
+            // The same all-or-none set the live `SetNodeLabels` handler runs,
+            // so a record refused live is refused again here.
+            if let Err(code) =
+                self.set_node_labels(database_id.as_u64(), tenant_id, &node_id, &labels)
+            {
+                let detail = format!("setting labels {labels:?} on node '{node_id}' failed");
+                self.replay_record_rejected("graph", record_lsn, Some(Box::new(code)), &detail);
+                return Some(0);
             }
         } else {
             let partition = self.csr_partition_mut(database_id.as_u64(), tenant_id);

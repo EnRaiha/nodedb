@@ -356,31 +356,7 @@ impl CoreLoop {
                 )
             }
 
-            DocumentOp::Register {
-                collection,
-                indexes,
-                crdt_enabled,
-                storage_mode,
-                enforcement,
-                bitemporal,
-                conflict_policy,
-                timeseries,
-                vector_primary,
-            } => self.execute_register_document_collection(
-                task,
-                super::super::handlers::document::write::RegisterDocumentCollectionParams {
-                    tid,
-                    collection: collection.as_str(),
-                    indexes,
-                    crdt_enabled: *crdt_enabled,
-                    storage_mode,
-                    enforcement,
-                    bitemporal: *bitemporal,
-                    conflict_policy: conflict_policy.as_deref(),
-                    timeseries: timeseries.as_deref(),
-                    vector_primary: vector_primary.as_deref(),
-                },
-            ),
+            DocumentOp::Register { .. } => self.dispatch_register(task, tid, op),
 
             DocumentOp::IndexLookup {
                 collection,

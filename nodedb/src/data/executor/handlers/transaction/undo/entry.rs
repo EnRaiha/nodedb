@@ -156,6 +156,12 @@ pub(in crate::data::executor) enum UndoEntry {
         field: String,
         doc_id: Option<nodedb_types::StorageKey>,
     },
+    /// Undo the creation of a vector index by a document write: the index did
+    /// not exist before the write. An index left behind fixes the vector
+    /// width for every later write, so undo removes it.
+    VectorCollectionCreated {
+        index_key: (nodedb_types::DatabaseId, TenantId, String),
+    },
     /// Undo a VectorDelete by un-deleting (clearing tombstone) and restoring
     /// the `vector_doc_map` entry the forward delete removed — mirroring
     /// `SpatialDelete`'s reverse-map restore. Without this, a rolled-back
@@ -172,6 +178,19 @@ pub(in crate::data::executor) enum UndoEntry {
         collection: String,
         field: String,
         doc_id: Option<nodedb_types::StorageKey>,
+        /// Whether the forward delete tombstoned `vector_id`. `false` when
+        /// the node carried a tombstone already: undo then restores only the
+        /// `vector_doc_map` entry and leaves the node deleted.
+        node_deleted: bool,
+    },
+    /// Undo the displacement of a node bound to a document's surrogate that
+    /// no `vector_doc_map` entry recorded, such as a node a direct vector
+    /// write bound. A document put soft-deletes it before it binds its own
+    /// node. Undo un-deletes it and binds it to `surrogate` again.
+    DisplacedVector {
+        index_key: (nodedb_types::DatabaseId, TenantId, String),
+        vector_id: u32,
+        surrogate: nodedb_types::Surrogate,
     },
     /// Undo a spatial R-tree insert by removing the entry from the per-field
     /// R-tree and deleting its reverse `spatial_doc_map` record.
@@ -256,6 +275,9 @@ pub(in crate::data::executor) enum UndoEntry {
     },
     /// Undo a CRDT write by putting the collection's Loro document back.
     CrdtCollection(Box<super::crdt_collection::CrdtCollectionUndo>),
+    /// Undo a CRDT scalar write to one document row by putting the row's
+    /// scalar fields back.
+    CrdtRow(Box<super::crdt_row::CrdtRowUndo>),
     /// Undo an array cell write by putting back the memtable tiles it
     /// touched.
     ArrayTiles {

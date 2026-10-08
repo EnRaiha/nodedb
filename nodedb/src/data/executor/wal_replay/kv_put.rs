@@ -32,8 +32,11 @@
 //! verbatim. Recomputing `now_ms + ttl_ms` at replay time would push every
 //! expiry forward by the crash-to-restart delay.
 
+use std::borrow::Cow;
+
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::write_index::KeyRepr;
+use crate::data::executor::handlers::kv::declared_body::coerce_kv_body;
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use nodedb_types::Surrogate;
 
@@ -74,6 +77,18 @@ impl CoreLoop {
         if self.claim_for_validation() {
             return Some(0);
         }
+        // The record holds the body the write supplied. The live apply
+        // re-typed its declared numeric columns, so replay does too.
+        let declared = self.declared_columns_of(database_id, tenant_id, &collection);
+        let coerced = match coerce_kv_body(&value, declared) {
+            Ok(Cow::Owned(bytes)) => Some(bytes),
+            Ok(Cow::Borrowed(_)) => None,
+            Err(e) => {
+                self.replay_record_unapplied("kv", "put_declared", record_lsn, &e.to_string());
+                return Some(0);
+            }
+        };
+        let value = coerced.unwrap_or(value);
         if self.recording_redo_undo() {
             let prior =
                 self.kv_engine
@@ -206,6 +221,29 @@ impl CoreLoop {
                 ),
             );
             return Some(0);
+        }
+
+        // Each entry holds the body the write supplied. The live apply
+        // re-typed its declared numeric columns, so replay does too.
+        let mut entries = entries;
+        for (_, value) in entries.iter_mut() {
+            let declared = self.declared_columns_of(database_id, tenant_id, &collection);
+            let coerced = match coerce_kv_body(value, declared) {
+                Ok(Cow::Owned(bytes)) => Some(bytes),
+                Ok(Cow::Borrowed(_)) => None,
+                Err(e) => {
+                    self.replay_record_unapplied(
+                        "kv",
+                        "batch_put_declared",
+                        record_lsn,
+                        &e.to_string(),
+                    );
+                    return Some(0);
+                }
+            };
+            if let Some(bytes) = coerced {
+                *value = bytes;
+            }
         }
 
         let params = crate::engine::kv::KvBatchPutParams {

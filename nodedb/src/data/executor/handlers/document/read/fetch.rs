@@ -54,6 +54,8 @@ impl CoreLoop {
         // prefix, not an answer.
         let deadline = crate::data::executor::deadline::DeadlineCheck::for_task(task);
         let stop = || deadline.expired();
+        let identity_column =
+            self.identity_column(task.request.database_id.as_u64(), tid, collection);
 
         match params.mode {
             DocScanMode::Current => self.fetch_current(task, tid, &params, &deadline),
@@ -79,6 +81,7 @@ impl CoreLoop {
                         filter_predicates,
                         doc_id,
                         body,
+                        &identity_column,
                     ) {
                         Ok(b) => b,
                         Err(e) => {
@@ -136,6 +139,7 @@ impl CoreLoop {
                         filter_predicates,
                         doc_id,
                         body,
+                        &identity_column,
                     ) {
                         Ok(b) => b,
                         Err(e) => {
@@ -214,6 +218,7 @@ impl CoreLoop {
             self.effective_fetch_limit(params.limit, params.offset, params.full_fetch);
         let database_id = task.request.database_id.as_u64();
         let bitemporal = self.is_bitemporal(database_id, tid, collection);
+        let identity_column = self.identity_column(database_id, tid, collection);
         // Resolved from the collection's registered kind, never from the bytes:
         // a tagged sidecar and a plain document body are both valid MessagePack
         // maps with the same header, so sniffing necessarily mis-reads one.
@@ -246,7 +251,13 @@ impl CoreLoop {
             } else {
                 value
             };
-            match matches_with_resolved_schema(strict_schema, filter_predicates, key, value) {
+            match matches_with_resolved_schema(
+                strict_schema,
+                filter_predicates,
+                key,
+                value,
+                &identity_column,
+            ) {
                 Ok(b) => b,
                 Err(e) => {
                     predicate_err.set(Some(e));
@@ -327,6 +338,7 @@ impl CoreLoop {
                         &key,
                         &body,
                         SparseBodyFormatRef::VectorSidecar,
+                        &identity_column,
                     );
                     (key, mp)
                 })

@@ -39,10 +39,12 @@
 //! transaction's redo record (`resolve::columnar_image`). The first statement
 //! that stages a base row records that row's primary key
 //! (`stage_columnar_base_key`), so the redo names the base row a key-changing
-//! UPDATE or a DELETE removes. The staged set is resolved from the live
-//! memtable (plus overlay), the scope the autocommit handlers
-//! (`execute_columnar_delete` / `execute_columnar_update`) match against.
+//! UPDATE or a DELETE removes. The staged set is resolved from the current
+//! rows, flushed and in the memtable (plus overlay), the scope the
+//! autocommit handlers (`execute_columnar_delete` / `execute_columnar_update`)
+//! match against.
 
+use nodedb_physical::physical_plan::UpdateValue;
 use nodedb_types::columnar::ColumnarSchema;
 use nodedb_types::value::Value;
 use nodedb_types::{RowIdentity, Surrogate, value_to_pk_string};
@@ -50,8 +52,10 @@ use nodedb_types::{RowIdentity, Surrogate, value_to_pk_string};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::columnar_assignments::ColumnarAssignments;
 use crate::data::executor::handlers::columnar_read::convert::row_to_projected_value;
 use crate::data::executor::handlers::columnar_read::filter::row_matches_filters;
+use crate::data::executor::handlers::columnar_resolve::CurrentColumnarRow;
 use crate::data::executor::handlers::transaction::overlay::{
     ColumnarMatchedRow, ColumnarOverlayMergeParams,
 };
@@ -95,9 +99,9 @@ pub(in crate::data::executor) struct StageColumnarUpdateParams<'a> {
     pub txn_id: TxnId,
     pub collection: &'a str,
     pub filter_bytes: &'a [u8],
-    /// Field assignments: `(column_name, msgpack_value_bytes)`, the same shape
-    /// `execute_columnar_update` applies on the durable path.
-    pub updates: &'a [(String, Vec<u8>)],
+    /// Field assignments, the same shape `execute_columnar_update` applies
+    /// on the durable path.
+    pub updates: &'a [(String, UpdateValue)],
     /// Compiled row-level-security WRITE predicate carried by the plan,
     /// decided against each row's post-image once the assignments are applied.
     pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
@@ -214,15 +218,21 @@ impl CoreLoop {
         // it only exists once the assignments are applied. A refusal partway
         // through would leave the rows ahead of it staged and visible to this
         // transaction's own reads.
+        //
+        // An expression assignment evaluates against each row's pre-image, and
+        // each post-image meets the declared column rule, as on the durable
+        // path.
+        let assignments = match ColumnarAssignments::bind(&schema, updates) {
+            Ok(a) => a,
+            Err(e) => return self.response_error(task, e),
+        };
         let affected = affected_rows.len();
         let mut new_rows: Vec<(u32, Vec<Value>)> = Vec::with_capacity(affected);
         let mut base_rows: Vec<(u32, Vec<Value>)> = Vec::with_capacity(affected);
         for (surrogate, row) in affected_rows {
-            match apply_columnar_updates(&schema, row.clone(), updates) {
+            match assignments.apply(&schema, row.clone()) {
                 Ok(r) => new_rows.push((surrogate, r)),
-                Err(detail) => {
-                    return self.response_error(task, ErrorCode::Internal { detail });
-                }
+                Err(e) => return self.response_error(task, e),
             }
             base_rows.push((surrogate, row));
         }
@@ -270,15 +280,16 @@ impl CoreLoop {
     }
 
     /// Resolve the CURRENT in-transaction matching set for a columnar
-    /// predicate DELETE/UPDATE: committed memtable rows matching the WHERE
+    /// predicate DELETE/UPDATE: committed current rows matching the WHERE
     /// predicate, folded with this transaction's own staged overlay
     /// (tombstones dropped, staged puts/inserts surfaced) via
     /// [`Self::merge_overlay_into_columnar_scan`]. Returns each affected row's
     /// `(surrogate, schema-ordered values)`.
     ///
     /// Mirrors `execute_columnar_delete` / `execute_columnar_update`: the base
-    /// set is the live memtable (the same scope the durable handlers mutate),
-    /// so the staged affected set matches exactly what COMMIT replay applies.
+    /// set is every current row, flushed and in the memtable (the same scope
+    /// the durable handlers mutate), so the staged affected set matches
+    /// exactly what COMMIT replay applies.
     pub(super) fn columnar_txn_matching_rows(
         &self,
         task: &ExecutionTask,
@@ -311,32 +322,30 @@ impl CoreLoop {
             collection.to_string(),
         );
 
-        // BASE: live memtable rows matching the predicate, carried as the
-        // shared `ColumnarMatchedRow` tuple the overlay merge consumes. A
-        // missing engine means the only affected rows are overlay-only staged
-        // inserts, which the merge appends below.
+        // BASE: current rows, flushed and in the memtable, matching the
+        // predicate, carried as the shared `ColumnarMatchedRow` tuple the
+        // overlay merge consumes. A missing engine visits no row, so the only
+        // affected rows are overlay-only staged inserts, which the merge
+        // appends below.
         let mut matched: Vec<ColumnarMatchedRow> = Vec::new();
-        if let Some(engine) = self.columnar_engines.get(&coll_key) {
-            for (surrogate, row) in engine.scan_memtable_rows_with_surrogates() {
-                if !filter_predicates.is_empty() {
-                    match row_matches_filters(&row, &schema, &filter_predicates) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(e) => {
-                            return Err(self.response_error(task, ErrorCode::from(e)));
-                        }
-                    }
+        let base =
+            self.for_each_current_columnar_row(&coll_key, "columnar_txn_dml_resolve", |row| {
+                let CurrentColumnarRow { surrogate, values } = row;
+                if !filter_predicates.is_empty()
+                    && !row_matches_filters(&values, &schema, &filter_predicates)?
+                {
+                    return Ok(());
                 }
-                // No computed columns on this path (`&[]` below), so this
-                // cannot raise an evaluation error today. It is handled like
-                // every other `row_to_projected_value` caller instead of
-                // assuming that invariant with an `unwrap`.
-                let obj = match row_to_projected_value(&row, &schema, &[], &[], false) {
-                    Ok(v) => v,
-                    Err(e) => return Err(self.response_error(task, e)),
-                };
-                matched.push((surrogate, row, obj));
-            }
+                // No computed columns on this path (`&[]` below), so this cannot
+                // raise an evaluation error today. It is handled like every other
+                // `row_to_projected_value` caller instead of assuming that
+                // invariant with an `unwrap`.
+                let obj = row_to_projected_value(&values, &schema, &[], &[], false)?;
+                matched.push((surrogate, values, obj));
+                Ok(())
+            });
+        if let Err(e) = base {
+            return Err(self.response_error(task, e));
         }
 
         // Fold the transaction's own staged writes into the base set: drops
@@ -412,33 +421,7 @@ impl CoreLoop {
     ) -> Response {
         match response_codec::encode_json_as_msgpack(&serde_json::json!({ "affected": affected })) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
-}
-
-/// Apply the columnar UPDATE SET-list to one schema-ordered row, mirroring
-/// `execute_columnar_update`'s per-field application: each `(field, bytes)`
-/// pair overwrites the row's value at the field's schema column index, with
-/// the value decoded from MessagePack. Unknown fields are ignored (same as the
-/// durable path). Returns the new row, or a decode-error detail string.
-fn apply_columnar_updates(
-    schema: &ColumnarSchema,
-    mut row: Vec<Value>,
-    updates: &[(String, Vec<u8>)],
-) -> Result<Vec<Value>, String> {
-    for (field_name, value_bytes) in updates {
-        let Some(col_idx) = schema.columns.iter().position(|c| c.name == *field_name) else {
-            continue;
-        };
-        let typed_val = nodedb_types::value_from_msgpack(value_bytes)
-            .map_err(|e| format!("failed to decode update value for field '{field_name}': {e}"))?;
-        row[col_idx] = typed_val;
-    }
-    Ok(row)
 }

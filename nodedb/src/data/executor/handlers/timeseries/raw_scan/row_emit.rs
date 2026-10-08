@@ -3,12 +3,18 @@
 //! Row emission helpers — build `rmpv::Value` directly.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use nodedb_types::columnar::schema::TS_SYSTEM;
 
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::handlers::columnar_read::filter::value_matches_filters;
 use crate::data::executor::handlers::columnar_read::{emit_column_value, rmpv_time_cell};
+use crate::data::executor::handlers::timeseries::cell_read::{TsCell, read_ts_cell};
+use crate::data::executor::handlers::timeseries::partition_read::partition_corrupt;
+
+/// The read path the corruption report names.
+const SITE: &str = "timeseries_raw_scan";
 use crate::engine::timeseries::columnar_memtable::{ColumnData, ColumnType};
 use crate::util::rmpv_value::{rmpv_to_value, value_to_rmpv};
 
@@ -111,13 +117,21 @@ pub(super) fn emit_memtable_row(
         nodedb_query::msgpack_scan::write_str(&mut buf, col_name);
         emit_column_value(&mut buf, mt, *col_idx, col_type, col_data, idx)?;
     }
-    Ok(crate::util::bounded_msgpack::read_value(&buf).unwrap_or(rmpv::Value::Nil))
+    // The row is built above, so a decode error is a bug in that build, never
+    // a row to answer as NULL.
+    crate::util::bounded_msgpack::read_value(&buf).map_err(|e| crate::Error::Internal {
+        detail: format!("timeseries memtable row {idx} does not decode after it is built: {e}"),
+    })
 }
 
 /// Emit a single row from a disk partition as rmpv::Value::Map.
 ///
 /// `Err` when a stored time cell cannot be read as its column's instant.
+/// A column the partition read did not decode, and a cell that does not
+/// read as its declared type, are corruption: each files one report naming
+/// `part_dir`.
 pub(super) fn emit_partition_row(
+    part_dir: &Path,
     schema: &[(String, ColumnType)],
     col_data: &[Option<ColumnData>],
     sym_dicts: &HashMap<usize, nodedb_types::timeseries::SymbolDictionary>,
@@ -125,47 +139,22 @@ pub(super) fn emit_partition_row(
 ) -> crate::Result<rmpv::Value> {
     let mut fields: Vec<(rmpv::Value, rmpv::Value)> = Vec::with_capacity(schema.len());
     for (col_i, (col_name, col_type)) in schema.iter().enumerate() {
-        // A column whose file could not be read is emitted as NULL, never
-        // skipped. Skipping it changed the row's COLUMN SET rather than one
-        // cell's value, so `SELECT *` on the same row returned different
-        // columns before and after a flush — the memtable path below always
-        // emits every column. A missing value is NULL; it is not a missing
-        // column.
-        let Some(data) = &col_data[col_i] else {
-            fields.push((
-                rmpv::Value::String(col_name.as_str().into()),
-                rmpv::Value::Nil,
+        let Some(data) = col_data.get(col_i).and_then(Option::as_ref) else {
+            return Err(partition_corrupt(
+                part_dir,
+                "column",
+                SITE,
+                format!("column '{col_name}' was not decoded"),
             ));
-            continue;
         };
-        let val = match col_type {
-            ColumnType::Timestamp(kind) => rmpv_time_cell(*kind, data.as_timestamps()[idx])?,
-            ColumnType::Float64 => {
-                let v = data.as_f64()[idx];
-                if v.is_nan() {
-                    rmpv::Value::Nil
-                } else {
-                    rmpv::Value::F64(v)
-                }
-            }
-            ColumnType::Int64 => {
-                if let ColumnData::Int64(vals) = data {
-                    rmpv::Value::Integer(vals[idx].into())
-                } else {
-                    rmpv::Value::Nil
-                }
-            }
-            ColumnType::Symbol => {
-                if let ColumnData::Symbol(ids) = data {
-                    sym_dicts
-                        .get(&col_i)
-                        .and_then(|dict| dict.get(ids[idx]))
-                        .map(|s| rmpv::Value::String(s.into()))
-                        .unwrap_or(rmpv::Value::Nil)
-                } else {
-                    rmpv::Value::Nil
-                }
-            }
+        let cell = read_ts_cell(data, *col_type, col_name, sym_dicts.get(&col_i), idx)
+            .map_err(|e| partition_corrupt(part_dir, "cell", SITE, e))?;
+        let val = match cell {
+            TsCell::Time(kind, millis) => rmpv_time_cell(kind, millis)?,
+            TsCell::Float(v) => rmpv::Value::F64(v),
+            TsCell::Int(n) => rmpv::Value::Integer(n.into()),
+            TsCell::Symbol(s) => rmpv::Value::String(s.into()),
+            TsCell::Null => rmpv::Value::Nil,
         };
         fields.push((rmpv::Value::String(col_name.as_str().into()), val));
     }

@@ -2,87 +2,88 @@
 
 //! Flushed-segment PK lookup for ON CONFLICT DO UPDATE prior-row reads.
 
-use std::mem::size_of;
-
-use nodedb_types::decode_bounds::checked_decode_capacity;
 use nodedb_types::value::Value;
 
 use crate::data::executor::core_loop::CoreLoop;
 
 impl CoreLoop {
     /// Read the live row bound to `pk_bytes`, wherever it lives: the memtable
-    /// first, then a flushed segment. `None` when the PK is unbound.
+    /// first, then a flushed segment. `Ok(None)` when the PK is unbound.
+    ///
+    /// `Err` when the bound row does not read. A corrupt row is never
+    /// reported as an absent one: an upsert would then insert a duplicate
+    /// key, and a write policy would decide against no prior row.
     pub(in crate::data::executor) fn read_columnar_row_by_pk(
         &self,
         engine_key: &(nodedb_types::DatabaseId, crate::types::TenantId, String),
         pk_bytes: &[u8],
-    ) -> Option<Vec<Value>> {
-        self.columnar_engines
-            .get(engine_key)
-            .and_then(|e| e.lookup_memtable_row_by_pk(pk_bytes))
-            .or_else(|| self.read_flushed_row_by_pk(engine_key, pk_bytes))
+    ) -> crate::Result<Option<Vec<Value>>> {
+        let Some(engine) = self.columnar_engines.get(engine_key) else {
+            return Ok(None);
+        };
+        if let Some(row) = engine.lookup_memtable_row_by_pk(pk_bytes)? {
+            return Ok(Some(row));
+        }
+        self.read_flushed_row_by_pk(engine_key, pk_bytes)
     }
 
     /// Read a single row from a flushed columnar segment by PK, if the PK
-    /// index points to one. Returns `None` when the PK lives in the
-    /// memtable, when the segment is not in memory, or when the row was
-    /// tombstoned. Used by the `ON CONFLICT DO UPDATE` path to locate a
-    /// prior row that has already been flushed out of the memtable.
+    /// index points to one. `Ok(None)` when the PK is unbound, lives in the
+    /// memtable, or was tombstoned. Used by the `ON CONFLICT DO UPDATE` and
+    /// write-policy paths to read a prior row already flushed out of the
+    /// memtable.
+    ///
+    /// `Err` when the PK index points at a segment or row this core does not
+    /// hold, or when the segment does not decode. The shared segment reader
+    /// files the corruption report.
     pub(in crate::data::executor) fn read_flushed_row_by_pk(
         &self,
         engine_key: &(nodedb_types::DatabaseId, crate::types::TenantId, String),
         pk_bytes: &[u8],
-    ) -> Option<Vec<Value>> {
-        let engine = self.columnar_engines.get(engine_key)?;
-        let loc = engine.pk_index().get(pk_bytes).copied()?;
+    ) -> crate::Result<Option<Vec<Value>>> {
+        let Some(engine) = self.columnar_engines.get(engine_key) else {
+            return Ok(None);
+        };
+        let Some(loc) = engine.pk_index().get(pk_bytes).copied() else {
+            return Ok(None);
+        };
         // Memtable case is already covered by the engine-side lookup.
         if loc.segment_id == engine.memtable_segment_id() {
-            return None;
+            return Ok(None);
         }
         // Tombstoned — prior row no longer logically present.
         if engine
             .delete_bitmap(loc.segment_id)
             .is_some_and(|bm| bm.is_deleted(loc.row_index))
         {
-            return None;
+            return Ok(None);
         }
-        let segs = self.columnar_flushed_segments.get(engine_key)?;
-        // Segments are pushed in order starting at segment_id=1.
-        let seg_idx = (loc.segment_id as usize).checked_sub(1)?;
-        let seg_bytes = segs.get(seg_idx)?;
-        let seg_id_str = loc.segment_id.to_string();
-        let reader = if let Some(reg) = &self.quarantine_registry {
-            crate::storage::quarantine::engines::open_segment_with_quarantine(
-                reg,
-                seg_bytes,
-                &engine_key.2,
-                &seg_id_str,
-            )
-            .ok()?
-        } else {
-            nodedb_columnar::SegmentReader::open(seg_bytes).ok()?
+        let collection = engine_key.2.as_str();
+        let unheld = || crate::Error::Internal {
+            detail: format!(
+                "columnar '{collection}': the PK index binds a row to flushed segment {} row {}, \
+                 which this core does not hold",
+                loc.segment_id, loc.row_index
+            ),
         };
+        // Segments are pushed in order starting at segment_id=1.
+        let seg_bytes = usize::try_from(loc.segment_id)
+            .ok()
+            .and_then(|id| id.checked_sub(1))
+            .and_then(|seg_idx| self.columnar_flushed_segments.get(engine_key)?.get(seg_idx))
+            .ok_or_else(unheld)?;
         let schema = engine.schema();
-        // Schema cardinality is catalog-owned rather than byte-decoded; bind
-        // it once so the allocation's direct trusted bound is explicit.
-        let column_count = schema.columns.len();
-        let row_capacity = checked_decode_capacity(
-            column_count,
-            size_of::<Value>(),
-            column_count,
-            1,
-            column_count,
-            usize::MAX,
+        let segment = self.decode_flushed_segment(
+            collection,
+            loc.segment_id,
+            seg_bytes,
+            schema.columns.len(),
+            "columnar_prior_row",
         )?;
-        let mut row = Vec::with_capacity(row_capacity);
-        for (col_idx, col_def) in schema.columns.iter().enumerate() {
-            let decoded = reader.read_column(col_idx).ok()?;
-            row.push(crate::data::executor::scan_normalize::decoded_col_to_value(
-                &decoded,
-                loc.row_index as usize,
-                &col_def.column_type,
-            ));
+        let row_idx = loc.row_index as usize;
+        if row_idx >= segment.row_count() {
+            return Err(unheld());
         }
-        Some(row)
+        segment.row(schema, row_idx).map(Some)
     }
 }

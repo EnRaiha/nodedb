@@ -25,9 +25,9 @@ impl CoreLoop {
 
     /// Edge delete with optional transactional compensation.
     ///
-    /// The `UndoEntry::EdgeWrite` is recorded once the tombstone is written,
-    /// never before: it names the tombstone version, and a rollback removes
-    /// exactly that version.
+    /// The `UndoEntry::EdgeWrite` is recorded once the tombstone and its CSR
+    /// change both stand, never before: it names the tombstone version, and a
+    /// rollback removes exactly that version.
     ///
     /// The RLS write policy is decided against that same pre-image and BEFORE
     /// the tombstone: the row a policy governs is the edge that exists now, and
@@ -69,18 +69,19 @@ impl CoreLoop {
         // The pre-image is always read: the RLS write gate needs it for any
         // non-admit-all policy, and the response needs it to report a
         // truthful affected count.
-        let old_properties = self
-            .edge_store
-            .get_edge(
-                database_id,
-                TenantId::new(tid),
-                collection,
-                src_id,
-                label,
-                dst_id,
-            )
-            .ok()
-            .flatten();
+        // A pre-image read error refuses the delete: read as absent, it would
+        // admit the delete without the policy and report nothing removed.
+        let old_properties = match self.edge_store.get_edge(
+            database_id,
+            TenantId::new(tid),
+            collection,
+            src_id,
+            label,
+            dst_id,
+        ) {
+            Ok(properties) => properties,
+            Err(e) => return self.response_error(task, ErrorCode::from(e)),
+        };
         let existed = old_properties.is_some();
 
         if let Err(error) = crate::data::executor::handlers::rls_write_gate::admit_edge_properties(
@@ -105,8 +106,9 @@ impl CoreLoop {
             label,
             dst_id,
         };
-        // The CSR state the undo puts back, read only when an undo is kept.
-        let csr_prior = undo.is_some().then(|| self.capture_edge_csr(&target));
+        // The CSR state a reversal puts back: a transaction rollback, or the
+        // reversal of a tombstone the CSR refuses below.
+        let csr_prior = self.capture_edge_csr(&target);
         use crate::engine::graph::edge_store::EdgeRef;
         match self.edge_store.soft_delete_edge_recorded(
             EdgeRef::new(
@@ -122,14 +124,11 @@ impl CoreLoop {
         ) {
             Ok(tombstone) => {
                 let current = tombstone.current.clone();
-                // The tombstone is written whether or not the edge was live,
-                // so the undo that removes it is recorded either way.
-                if let (Some(undo), Some(csr)) = (undo, csr_prior) {
-                    undo.push(UndoEntry::EdgeWrite(Box::new(target.undo(tombstone, csr))));
-                }
+                let edge_undo = target.undo(tombstone, csr_prior);
                 // The CSR follows what the edge resolves to: a tombstone a
                 // TRUNCATE hides, or one below a newer version, leaves the
-                // edge as it was.
+                // edge as it was. A CSR refusal takes the tombstone back out,
+                // so the edge store and the CSR never disagree.
                 if let Err(e) = self.mirror_edge_csr(
                     database_id,
                     tid,
@@ -137,12 +136,13 @@ impl CoreLoop {
                     collection,
                     current.as_deref(),
                 ) {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
+                    let code = self.reverse_edge_write(edge_undo, e);
+                    return self.response_error(task, code);
+                }
+                // The tombstone is written whether or not the edge was live,
+                // so the undo that removes it is recorded either way.
+                if let Some(undo) = undo {
+                    undo.push(UndoEntry::EdgeWrite(Box::new(edge_undo)));
                 }
                 self.checkpoint_coordinator.mark_dirty("sparse", 1);
                 self.note_edge_write_lsn(task, tid, collection, src_id, label, dst_id);
@@ -178,12 +178,7 @@ impl CoreLoop {
                 ))];
                 response
             }
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }
@@ -211,6 +206,12 @@ mod tests {
         zerompk::to_msgpack_vec(&vec![filter]).expect("encode policy filter")
     }
 
+    /// The stored property map `{"owner": owner}`, as plain MessagePack.
+    fn owner_properties(owner: &str) -> Vec<u8> {
+        nodedb_types::json_msgpack::json_to_msgpack(&serde_json::json!({ "owner": owner }))
+            .expect("encode properties")
+    }
+
     /// The delete is decided against the edge's STORED property object before
     /// the tombstone is written, so a rejected delete leaves the edge in place.
     #[test]
@@ -227,7 +228,7 @@ mod tests {
                         src_id: "a",
                         label: "KNOWS",
                         dst_id: "b",
-                        properties: br#"{"owner":"alice"}"#,
+                        properties: &owner_properties("alice"),
                         src_surrogate: Surrogate::new(1),
                         dst_surrogate: Surrogate::new(2),
                     },
@@ -285,7 +286,7 @@ mod tests {
                         src_id: "a",
                         label: "KNOWS",
                         dst_id: "b",
-                        properties: br#"{"owner":"alice"}"#,
+                        properties: &owner_properties("alice"),
                         src_surrogate: Surrogate::new(1),
                         dst_surrogate: Surrogate::new(2),
                     },

@@ -3,6 +3,7 @@
 //! Core row-ingest path: per-row value coercion, ON CONFLICT DO UPDATE merge
 //! resolution, and the row-level `MutationEngine` insert call.
 
+use nodedb_columnar::{BatchConflict, BatchRow};
 use nodedb_types::columnar::ColumnarSchema;
 use nodedb_types::columnar::schema::{TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL};
 use nodedb_types::surrogate::Surrogate;
@@ -59,8 +60,9 @@ impl CoreLoop {
     /// `InsertUnique` on a PK the index or an earlier row of the batch
     /// already carries).
     ///
-    /// Every row is resolved and checked before any row is written, so a
-    /// refusal applies nothing. Returns the accepted row count (and, on
+    /// Every row is resolved and checked before any row is written. The
+    /// engine then writes the whole batch or none of it, so a refusal at any
+    /// stage applies nothing. Returns the accepted row count (and, on
     /// request, the stored post-images), or `Err(Response)` on the first
     /// error.
     pub(in crate::data::executor) fn insert_columnar_rows(
@@ -75,52 +77,44 @@ impl CoreLoop {
             collect_stored_rows,
             ..
         } = params;
+        let conflict = match intent {
+            ColumnarInsertIntent::InsertIfAbsent => BatchConflict::Skip,
+            ColumnarInsertIntent::InsertUnique
+            | ColumnarInsertIntent::Insert
+            | ColumnarInsertIntent::Put => BatchConflict::Upsert,
+        };
+
+        let Some(engine) = self.columnar_engines.get_mut(engine_key) else {
+            return Err(self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: "columnar engine vanished during insert".into(),
+                },
+            ));
+        };
+        let batch = resolved.iter().map(|row| BatchRow {
+            values: &row.values,
+            surrogate: row.surrogate,
+        });
+        let results = match engine.insert_batch(batch, conflict) {
+            Ok(results) => results,
+            Err(e) => {
+                return Err(self.response_error(task, ErrorCode::from(crate::Error::from(e))));
+            }
+        };
+
+        // A skipped row returns an EMPTY `wal_records`: the engine's no-op
+        // signal, and the only way to tell a skip from a write. A skipped
+        // row is neither counted nor returned, as it was never stored.
         let mut accepted = 0u64;
         let mut stored_rows: Vec<Vec<Value>> = Vec::new();
-
-        for row in resolved {
-            let engine = match self.columnar_engines.get_mut(engine_key) {
-                Some(e) => e,
-                None => {
-                    return Err(self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: "columnar engine vanished during insert".into(),
-                        },
-                    ));
-                }
-            };
-            let result = match intent {
-                ColumnarInsertIntent::InsertIfAbsent => engine.insert_if_absent(&row.values),
-                ColumnarInsertIntent::InsertUnique
-                | ColumnarInsertIntent::Insert
-                | ColumnarInsertIntent::Put => match row.surrogate {
-                    Some(s) => engine.insert_with_surrogate(&row.values, s),
-                    None => engine.insert(&row.values),
-                },
-            };
-
-            match result {
-                // An `insert_if_absent` that hit an existing key returns an
-                // EMPTY `wal_records` — that is the engine's documented no-op
-                // signal, and the only way to tell a skip from a write. Counting
-                // it reported an `INSERT 1` for a row that was never stored, and
-                // returning it would hand back a row that does not exist.
-                Ok(mutation) if mutation.wal_records.is_empty() => {}
-                Ok(_) => {
-                    accepted += 1;
-                    if collect_stored_rows {
-                        stored_rows.push(row.values);
-                    }
-                }
-                Err(e) => {
-                    return Err(self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("columnar insert failed: {e}"),
-                        },
-                    ));
-                }
+        for (row, result) in resolved.into_iter().zip(results) {
+            if result.wal_records.is_empty() {
+                continue;
+            }
+            accepted += 1;
+            if collect_stored_rows {
+                stored_rows.push(row.values);
             }
         }
 
@@ -162,9 +156,18 @@ impl CoreLoop {
             std::collections::HashMap::new();
 
         for (row_idx, row) in ndb_rows.iter().enumerate() {
-            let obj = match row {
-                nodedb_types::Value::Object(m) => m,
-                _ => continue,
+            // A row that is not an object has no fields to write. Skipping it
+            // would report a statement that stored fewer rows than it sent.
+            let nodedb_types::Value::Object(obj) = row else {
+                return Err(self.response_error(
+                    task,
+                    crate::Error::BadRequest {
+                        detail: format!(
+                            "columnar insert into '{}': row {row_idx} is not an object",
+                            engine_key.2
+                        ),
+                    },
+                ));
             };
 
             // Build Value slice in schema order. For bitemporal
@@ -192,19 +195,12 @@ impl CoreLoop {
                         Some(Value::Integer(i)) => Value::Integer(*i),
                         _ => Value::Integer(i64::MAX),
                     }),
-                    _ => ndb_field_to_value(obj.get(&col.name), &col.column_type),
+                    _ => ndb_field_to_value(obj.get(&col.name), col),
                 })
                 .collect::<Result<Vec<Value>, crate::Error>>()
             {
                 Ok(v) => v,
-                Err(e) => {
-                    return Err(self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("columnar insert coercion: {e}"),
-                        },
-                    ));
-                }
+                Err(e) => return Err(self.response_error(task, ErrorCode::from(e))),
             };
 
             let pk_bytes = if merging || unique {
@@ -222,12 +218,9 @@ impl CoreLoop {
                 match engine.encode_pk_from_row(&values) {
                     Ok(b) => b,
                     Err(e) => {
-                        return Err(self.response_error(
-                            task,
-                            ErrorCode::Internal {
-                                detail: format!("columnar insert: pk encode failed: {e}"),
-                            },
-                        ));
+                        return Err(
+                            self.response_error(task, ErrorCode::from(crate::Error::from(e)))
+                        );
                     }
                 }
             } else {
@@ -238,12 +231,16 @@ impl CoreLoop {
             // UPDATE, plain otherwise.
             let final_values: Vec<Value> = match intent {
                 ColumnarInsertIntent::Put if merging => {
-                    let prior_row = batch_rows.get(&pk_bytes).cloned().or_else(|| {
-                        self.columnar_engines
-                            .get(engine_key)
-                            .and_then(|e| e.lookup_memtable_row_by_pk(&pk_bytes))
-                            .or_else(|| self.read_flushed_row_by_pk(engine_key, &pk_bytes))
-                    });
+                    // A prior row that does not read refuses the statement:
+                    // merging against "no prior row" would insert a
+                    // duplicate key.
+                    let prior_row = match batch_rows.get(&pk_bytes) {
+                        Some(row) => Some(row.clone()),
+                        None => match self.read_columnar_row_by_pk(engine_key, &pk_bytes) {
+                            Ok(row) => row,
+                            Err(e) => return Err(self.response_error(task, e)),
+                        },
+                    };
                     match prior_row {
                         None => values,
                         Some(prior) => self.merge_on_conflict(
@@ -350,16 +347,9 @@ impl CoreLoop {
         schema
             .columns
             .iter()
-            .map(|col| ndb_field_to_value(merged_obj.get(&col.name), &col.column_type))
+            .map(|col| ndb_field_to_value(merged_obj.get(&col.name), col))
             .collect::<Result<Vec<Value>, crate::Error>>()
-            .map_err(|e| {
-                self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("columnar ON CONFLICT coercion: {e}"),
-                    },
-                )
-            })
+            .map_err(|e| self.response_error(task, ErrorCode::from(e)))
     }
 }
 
@@ -473,6 +463,82 @@ mod tests {
             live_rows(&core),
             1,
             "the row before the duplicate is not written"
+        );
+    }
+
+    /// An upsert whose prior row lives in a flushed segment that does not
+    /// read is refused. Reading the corrupt row as absent would insert a
+    /// second row under the same key.
+    #[test]
+    fn an_upsert_over_a_corrupt_prior_row_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let seeded = insert(&mut core, ColumnarInsertIntent::Insert, vec![row("a")]);
+        assert_eq!(seeded.status, Status::Ok, "{:?}", seeded.error_code);
+
+        // Flush row "a" out of the memtable, then hold segment bytes that do
+        // not open in its place.
+        let key = (
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            COLLECTION.to_string(),
+        );
+        let engine = core.columnar_engines.get_mut(&key).expect("engine");
+        let segment_id = engine.next_segment_id();
+        let _drained = engine.memtable_mut().drain_optimized();
+        let sidecar = engine.memtable_surrogates().to_vec();
+        engine.on_memtable_flushed(segment_id).expect("flush");
+        core.columnar_flushed_segments
+            .insert(key.clone(), vec![Vec::new()]);
+        core.columnar_flushed_surrogates.insert(key, vec![sidecar]);
+        let before = live_rows(&core);
+
+        let payload =
+            nodedb_types::value_to_msgpack(&Value::Array(vec![row("a")])).expect("encode rows");
+        let schema = schema_bytes();
+        let updates = vec![(
+            "v".to_string(),
+            nodedb_physical::physical_plan::UpdateValue::Literal(
+                nodedb_types::value_to_msgpack(&Value::Integer(2)).expect("encode"),
+            ),
+        )];
+        let refused = core.execute_columnar_insert(
+            &task(),
+            ColumnarInsertParams {
+                collection: COLLECTION,
+                payload: &payload,
+                format: "msgpack",
+                intent: ColumnarInsertIntent::Put,
+                on_conflict_updates: &updates,
+                surrogates: &[],
+                schema_bytes: &schema,
+                provenance: None,
+                rls_write_check: &RlsWriteCheck::already_decided_elsewhere(),
+                returning: None,
+                rls_filters: &[],
+                spatial_undo: None,
+            },
+        );
+
+        assert_ne!(refused.status, Status::Ok, "the upsert is refused");
+        assert_eq!(live_rows(&core), before);
+        let bound = core
+            .columnar_engines
+            .get(&(
+                DatabaseId::DEFAULT,
+                TenantId::new(TID),
+                COLLECTION.to_string(),
+            ))
+            .expect("engine")
+            .pk_index()
+            .get(&nodedb_columnar::pk_index::encode_pk(&Value::String(
+                "a".into(),
+            )))
+            .copied()
+            .expect("key stays bound");
+        assert_eq!(
+            bound.segment_id, segment_id,
+            "the key still names the flushed row: no replacement row was written"
         );
     }
 

@@ -48,18 +48,14 @@ impl CoreLoop {
         let now_ms = self.kv_ttl_now_ms(task);
         let existing_bytes = self.kv_engine.get(did, tid, collection, key, now_ms);
 
-        let stored_bytes: Vec<u8> = match &existing_bytes {
-            None => value.to_vec(),
-            Some(existing_raw) => {
-                match super::super::conflict_merge::merge_kv_conflict_body(
-                    existing_raw,
-                    value,
-                    updates,
-                ) {
-                    Ok(b) => b,
-                    Err(e) => return self.response_error(task, e),
-                }
-            }
+        let stored_bytes: Vec<u8> = match super::super::conflict_merge::merge_kv_conflict_body(
+            existing_bytes.as_deref(),
+            value,
+            updates,
+            self.declared_columns_of(did, tid, collection),
+        ) {
+            Ok(b) => b,
+            Err(e) => return self.response_error(task, e),
         };
 
         // `stored_bytes` is whichever body this op actually persists — the

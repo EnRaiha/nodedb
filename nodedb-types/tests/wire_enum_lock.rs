@@ -162,12 +162,19 @@ fn column_type_wire_forms() {
     }
 
     // Parametric variants.
-    let dec = ColumnType::Decimal {
-        precision: 10,
-        scale: 2,
-    };
+    let dec = ColumnType::Decimal(Some(
+        nodedb_types::columnar::DecimalTypmod::new(10, 2).expect("valid typmod"),
+    ));
     let v = serde_json::to_value(dec).expect("serialize");
     assert_eq!(v["type"], "Decimal", "ColumnType::Decimal wire tag");
+    assert_eq!(
+        v["params"]["precision"], 10,
+        "DecimalTypmod precision field"
+    );
+    assert_eq!(v["params"]["scale"], 2, "DecimalTypmod scale field");
+    let plain = serde_json::to_value(ColumnType::Decimal(None)).expect("serialize");
+    assert_eq!(plain["type"], "Decimal", "plain DECIMAL wire tag");
+    assert!(plain["params"].is_null(), "plain DECIMAL carries no typmod");
 
     let vec = ColumnType::Vector(128);
     let v = serde_json::to_value(vec).expect("serialize");
@@ -454,7 +461,6 @@ fn query_mode_wire_forms() {
         match qm {
             QueryMode::Or => {}
             QueryMode::And => {}
-            _ => panic!("unrecognized QueryMode — update wire_enum_lock.rs"),
         }
         let v = serde_json::to_value(qm).expect("serialize");
         assert_eq!(v, json!(expected), "QueryMode::{expected} wire form");

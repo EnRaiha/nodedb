@@ -109,10 +109,16 @@ pub(super) fn compensation_hint_for_dispatch_error(e: &crate::Error) -> Compensa
         | crate::Error::UndefinedObject { .. }
         | crate::Error::ObjectNotInPrerequisiteState { .. }
         | crate::Error::UndefinedColumn { .. }
+        | crate::Error::TextColumn { .. }
         | crate::Error::AmbiguousColumn { .. }
         | crate::Error::UnknownStrictField { .. }
         | crate::Error::DivisionByZero
         | crate::Error::DataException { .. }
+        | crate::Error::NumericValueOutOfRange { .. }
+        | crate::Error::InvalidTextRepresentation { .. }
+        | crate::Error::DatatypeMismatch { .. }
+        | crate::Error::InvalidDatetimeFormat { .. }
+        | crate::Error::DatetimeFieldOverflow { .. }
         | crate::Error::InvalidLimitValue { .. }
         | crate::Error::ExecutionLimitExceeded { .. }
         | crate::Error::LimitExceeded { .. }
@@ -209,6 +215,7 @@ fn compensation_hint_for_code(code: &ErrorCode) -> CompensationHint {
         | ErrorCode::InsufficientBalance { .. }
         | ErrorCode::RecursionDepthExceeded { .. }
         | ErrorCode::UndefinedColumn { .. }
+        | ErrorCode::TextColumn { .. }
         | ErrorCode::Internal { .. }
         | ErrorCode::Unsupported { .. }
         | ErrorCode::RollbackFailed { .. }
@@ -216,9 +223,15 @@ fn compensation_hint_for_code(code: &ErrorCode) -> CompensationHint {
         | ErrorCode::DivisionByZero
         | ErrorCode::UndefinedFunction { .. }
         | ErrorCode::DataException { .. }
+        | ErrorCode::NumericValueOutOfRange { .. }
+        | ErrorCode::InvalidTextRepresentation { .. }
+        | ErrorCode::DatatypeMismatch { .. }
+        | ErrorCode::InvalidDatetimeFormat { .. }
+        | ErrorCode::DatetimeFieldOverflow { .. }
         | ErrorCode::BadRequest { .. }
         | ErrorCode::ActiveSqlTransaction { .. }
-        | ErrorCode::DependentObjectsExist { .. }) => CompensationHint::Custom {
+        | ErrorCode::DependentObjectsExist { .. }
+        | ErrorCode::NodeLabelLimit { .. }) => CompensationHint::Custom {
             constraint: "apply_failed".into(),
             detail: format!("{other:?}"),
         },

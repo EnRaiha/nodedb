@@ -14,9 +14,7 @@ use nodedb_types::value::Value;
 
 use crate::delete_bitmap::DeleteBitmap;
 use crate::error::ColumnarError;
-use crate::reader::OwnedSegmentReader;
-
-use super::extract::extract_row_value;
+use crate::reader::{OwnedSegmentReader, decoded_cell_value};
 
 /// Decode the live rows of one flushed segment blob into `Value::Object`s,
 /// paired with their per-row cross-engine surrogate.
@@ -62,7 +60,7 @@ pub fn materialize_segment_live_rows(
         let mut map = std::collections::HashMap::with_capacity(col_count);
         for (col_idx, decoded) in decoded_cols.iter().enumerate() {
             let col = &schema.columns[col_idx];
-            let value = extract_row_value(decoded, row_idx, &col.column_type, &col.name)?;
+            let value = decoded_cell_value(decoded, row_idx, &col.column_type)?;
             map.insert(col.name.clone(), value);
         }
         let surrogate = row_surrogates.get(row_idx).copied().flatten();

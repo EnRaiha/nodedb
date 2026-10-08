@@ -6,6 +6,7 @@
 //! shared `txn_route` instead, which fires its triggers and takes its clone
 //! copy-on-write steps inside the transaction.
 
+use pgwire::api::portal::Format;
 use pgwire::api::results::Response;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
@@ -96,6 +97,9 @@ pub(super) struct PreDispatchContext<'a> {
     /// interception) shapes its rows against these, exactly as the normal
     /// dispatch path does — the client holds one RowDescription either way.
     pub(super) projection: Option<&'a OutputSchema>,
+    /// The client's result-format request, which a hook that answers the
+    /// statement itself honours as the normal dispatch path does.
+    pub(super) result_formats: &'a Format,
 }
 
 impl NodeDbPgHandler {
@@ -177,6 +181,7 @@ impl NodeDbPgHandler {
             session_id,
             plan_kind,
             projection,
+            result_formats,
             ..
         } = context;
         // A clone write can carry RETURNING rows, which deliver stored column
@@ -194,12 +199,12 @@ impl NodeDbPgHandler {
         .map_err(|e| shape_error_to_pg(&e))?
         {
             ShapeOutcome::Rows(shaped) => {
-                // Clone write-path DML result (PointUpdate/PointDelete): no
-                // client-requested result formats, so text.
+                // Clone write-path RETURNING rows (PointUpdate/PointDelete),
+                // in the client's requested result formats.
                 let (response, notice) =
                     crate::control::server::pgwire::handler::shape_encode::shaped_query_response(
                         shaped,
-                        &[],
+                        result_formats,
                     );
                 if let Some(n) = notice {
                     self.sessions.push_notice(session_id, n);

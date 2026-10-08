@@ -19,7 +19,7 @@ use nodedb_types::Surrogate;
 use crate::data::executor::handlers::point::apply_put::SpatialEntryId;
 use crate::data::executor::handlers::point::apply_put::VectorIndexDelta;
 use crate::data::executor::handlers::point::apply_put::map_enforcement_error;
-use crate::data::executor::spatial_key::SpatialIndexKey;
+use crate::data::executor::handlers::transaction::undo::UndoEntry;
 
 /// Parameters for [`CoreLoop::apply_point_delete`].
 pub(in crate::data::executor) struct PointDeleteParams<'a> {
@@ -68,28 +68,18 @@ pub(in crate::data::executor) struct PointDeleteOutcome {
     /// where a rolled-back DELETE never restored its secondary-index entries.
     /// Empty on the bitemporal path (which has no plain INDEXES entries).
     pub secondary_index_tuples: Vec<(String, String)>,
-    /// Vector index mutations this delete soft-deleted from HNSW vector
-    /// indexes. Populated unconditionally (autocommit and transactional) so the
-    /// owning document's vectors never orphan; a transactional caller pushes an
-    /// `UndoEntry::DeleteVector` per entry so a rolled-back delete restores
-    /// them, including the paired `vector_doc_map` entry this cascade removed.
-    pub vector_deletes: Vec<VectorIndexDelta>,
-    /// `(spatial_index_key, entry_id, bbox, document_id)` tuples this delete
-    /// removed from per-field spatial R-trees (and the reverse
-    /// `spatial_doc_map`). The bbox is captured BEFORE the R-tree `delete`
-    /// (which does not return it) so a transactional caller can push
-    /// `UndoEntry::SpatialDelete` re-insert reversals. Empty when the document
-    /// had no spatial fields. Autocommit callers ignore it (an aborted redb txn
-    /// does not reverse in-memory spatial writes).
-    pub spatial_deletes: Vec<(SpatialIndexKey, u64, nodedb_types::BoundingBox, String)>,
-    /// The node id this delete NEWLY marked deleted in the in-memory
-    /// `deleted_nodes` edge referential-integrity tracker, if any. `Some(id)`
-    /// only when `mark_node_deleted` newly inserted the node (it was not already
-    /// tombstoned by a prior committed op). A transactional caller pushes an
-    /// `UndoEntry::MarkNodeDeleted` so a rolled-back delete un-marks exactly the
-    /// node it added — never resurrecting a pre-existing tombstone. `None` when
-    /// the node was already marked. Autocommit callers ignore it.
-    pub mark_node_deleted: Option<String>,
+    /// Undo entries for the in-memory cascades, in the order they ran:
+    /// - `SpatialDelete` for each R-tree entry and `spatial_doc_map` record
+    ///   removed
+    /// - `MarkNodeDeleted` when this delete newly marked the row's node
+    ///   deleted. A node a prior write marked is never un-marked.
+    /// - `DeleteVector` for each vector node soft-deleted and each
+    ///   `vector_doc_map` entry removed
+    /// - `SparseDoc` for each sparse-vector document removed
+    ///
+    /// Dropping the caller's transaction does not reverse these. A caller
+    /// that abandons the delete reverses them with `undo_memory_effects`.
+    pub memory_undo: Vec<UndoEntry>,
 }
 
 impl CoreLoop {
@@ -113,7 +103,8 @@ impl CoreLoop {
     /// the spatial / vector / sparse-vector removals are in-memory, so those
     /// cascades are unaffected by the caller's transaction.
     ///
-    /// On `Err` the caller MUST drop `txn` without committing.
+    /// On `Err` the caller MUST drop `txn` without committing. An `Err`
+    /// leaves no in-memory change behind.
     ///
     /// Does NOT emit WriteEvents, mark checkpoints dirty, or build
     /// RETURNING payloads — those stay with the caller.
@@ -121,8 +112,9 @@ impl CoreLoop {
     /// Returns a [`PointDeleteOutcome`] capturing the prior stored bytes
     /// (present when a row was actually removed) plus the bitemporal system
     /// time and versioned index tombstone tuples written, so a transactional
-    /// caller can build a fully-reversible undo entry. Autocommit callers
-    /// read only `prior_value`.
+    /// caller can build a fully-reversible undo entry. A caller that drops
+    /// `txn` uncommitted after `Ok` reverses `memory_undo` with
+    /// `abandon_write`.
     pub(in crate::data::executor) fn apply_point_delete(
         &mut self,
         txn: &WriteTransaction,
@@ -343,26 +335,23 @@ impl CoreLoop {
 
         // Cascade 3: Remove from spatial R-tree indexes + reverse map, and
         // record the node deletion for edge referential integrity. Both are
-        // fully captured (`spatial_deletes` + `mark_node_deleted` in the
-        // outcome) and reversed on rollback, so they run unconditionally for
-        // both the autocommit and transactional delete paths.
+        // captured in `memory_undo` and reversed on rollback or abort, so
+        // they run unconditionally for both the autocommit and transactional
+        // delete paths.
         //
         // `apply_point_put` hashes the substrate row key as the R-tree entry
         // id, so delete must hash the same key to find the entry. Hashing the
         // user PK would leak ghost bbox entries that survive the row's removal.
-        // `(spatial_index_key, entry_id, bbox, document_id)` tuples removed by
-        // the spatial cascade below are captured so a transactional caller can
-        // reverse them.
-        let mut mark_node_deleted_capture: Option<String> = None;
-        // The put path hashes the same storage key via `SpatialEntryId`, so
-        // the shared removal hashes the same key to find and drop every
-        // per-field entry + reverse-map pair for this document. Captures
-        // each removed `(skey, entry_id, bbox, doc)` for reversible undo.
-        let spatial_deletes = self.remove_document_spatial_indexes(
+        //
+        // No step from here on fails, so an `Err` from this function leaves
+        // no in-memory change behind.
+        let mut memory_undo: Vec<UndoEntry> = Vec::new();
+        self.remove_document_spatial_indexes_with_undo(
             database_id,
             tid,
             collection,
             SpatialEntryId::from_storage_key(storage_key),
+            &mut memory_undo,
         );
 
         // Record deletion for edge referential integrity. Capture the id
@@ -370,7 +359,12 @@ impl CoreLoop {
         // a prior committed op already tombstoned would wrongly resurrect
         // it as a valid edge target.
         if self.mark_node_deleted(database_id, tid, collection, document_id) {
-            mark_node_deleted_capture = Some(document_id.to_string());
+            memory_undo.push(UndoEntry::MarkNodeDeleted {
+                database_id,
+                tid,
+                collection: collection.to_string(),
+                node_id: document_id.to_string(),
+            });
         }
 
         // Cascade 4 (CORE, UNCONDITIONAL): soft-delete any HNSW vector entries
@@ -385,14 +379,23 @@ impl CoreLoop {
         // enumeration the put path uses, so each `vector_doc_map` entry is
         // looked up by its exact key rather than scanning the whole map on
         // every delete. Shared with the PointUpdate re-index path.
-        let vector_deletes =
-            self.remove_document_vector_indexes(database_id, tid, collection, storage_key);
+        memory_undo.extend(
+            self.remove_document_vector_indexes(database_id, tid, collection, storage_key)
+                .into_iter()
+                .map(VectorIndexDelta::into_delete_undo),
+        );
 
         // Sparse inverted-index cleanup, mirroring the dense-vector cascade
         // above: drop this document's sparse posting entries under the same hex
         // surrogate row key the put path indexed them by. A no-op unless the
         // strict schema declares a `SparseVector` column.
-        self.remove_document_sparse_indexes(database_id, tid, collection, storage_key);
+        self.remove_document_sparse_indexes(
+            database_id,
+            tid,
+            collection,
+            storage_key,
+            &mut memory_undo,
+        );
 
         // Invalidate document cache.
         self.doc_cache
@@ -409,9 +412,7 @@ impl CoreLoop {
             bitemporal_sys_from_ms,
             bitemporal_index_tuples,
             secondary_index_tuples,
-            vector_deletes,
-            spatial_deletes,
-            mark_node_deleted: mark_node_deleted_capture,
+            memory_undo,
         })
     }
 }

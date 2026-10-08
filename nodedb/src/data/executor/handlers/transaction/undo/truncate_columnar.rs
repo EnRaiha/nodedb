@@ -10,14 +10,14 @@
 
 use crate::data::executor::core_loop::CoreLoop;
 
-use super::ColumnarTruncateUndo;
+use super::{ColumnarTruncateUndo, UndoError};
 
 impl CoreLoop {
     pub(super) fn apply_undo_columnar_truncate(
         &mut self,
         entry_index: usize,
         undo: ColumnarTruncateUndo,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         let ColumnarTruncateUndo {
             collection_key,
             rows,
@@ -27,7 +27,7 @@ impl CoreLoop {
             spatial_doc_map,
         } = undo;
         let Some(engine) = self.columnar_engines.get_mut(&collection_key) else {
-            return Err((
+            return Err(UndoError::mismatch(
                 entry_index,
                 format!(
                     "columnar truncate undo: engine for {:?} vanished before rollback",

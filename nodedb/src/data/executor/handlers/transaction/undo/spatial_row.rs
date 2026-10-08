@@ -14,7 +14,7 @@ use crate::data::executor::spatial_key::SpatialIndexKey;
 use crate::types::{DatabaseId, TenantId};
 use crate::util::fnv1a_hash;
 
-use super::UndoEntry;
+use super::{UndoEntry, UndoError};
 
 /// The pre-image of one spatial row.
 pub(in crate::data::executor) struct SpatialRowUndo {
@@ -79,7 +79,7 @@ impl CoreLoop {
         &mut self,
         entry_index: usize,
         undo: SpatialRowUndo,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         let SpatialRowUndo {
             key,
             storage_key,
@@ -100,9 +100,10 @@ impl CoreLoop {
                 .map(drop),
         };
         restored.map_err(|e| {
-            (
+            UndoError::failed(
                 entry_index,
-                format!("restoring spatial row in '{}': {e}", key.2),
+                format!("restoring spatial row in '{}'", key.2),
+                e,
             )
         })?;
 

@@ -113,10 +113,16 @@ pub fn classify(error: &crate::Error) -> ApplyFailureClass {
         | crate::Error::UndefinedObject { .. }
         | crate::Error::ObjectNotInPrerequisiteState { .. }
         | crate::Error::UndefinedColumn { .. }
+        | crate::Error::TextColumn { .. }
         | crate::Error::AmbiguousColumn { .. }
         | crate::Error::UnknownStrictField { .. }
         | crate::Error::DivisionByZero
         | crate::Error::DataException { .. }
+        | crate::Error::NumericValueOutOfRange { .. }
+        | crate::Error::InvalidTextRepresentation { .. }
+        | crate::Error::DatatypeMismatch { .. }
+        | crate::Error::InvalidDatetimeFormat { .. }
+        | crate::Error::DatetimeFieldOverflow { .. }
         | crate::Error::InvalidLimitValue { .. }
         | crate::Error::RetryableSchemaChanged { .. }
         | crate::Error::RetryableLeaderChange { .. }

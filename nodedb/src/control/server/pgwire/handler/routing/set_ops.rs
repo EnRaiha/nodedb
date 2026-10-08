@@ -3,7 +3,8 @@
 //! Set operation payload merging for pgwire: UNION DISTINCT, INTERSECT,
 //! EXCEPT over collected per-task payloads, shaped into a pgwire response.
 
-use pgwire::api::results::{FieldFormat, Response};
+use pgwire::api::portal::Format;
+use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
 
 use nodedb_physical::physical_task::PostSetOp;
@@ -29,7 +30,7 @@ pub(super) fn apply_set_ops(
     dedup_payloads: &[Vec<u8>],
     dedup_set_op: PostSetOp,
     projection: Option<&OutputSchema>,
-    result_formats: &[FieldFormat],
+    result_formats: &Format,
     redaction: Option<RedactionCtx<'_>>,
     sequences: Option<&dyn SequenceAccess>,
 ) -> PgWireResult<(Response, Option<String>)> {

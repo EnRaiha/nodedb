@@ -19,23 +19,12 @@ pub(super) type MergePutEvent<'a> = (RowIdentity, &'a [u8], Option<Vec<u8>>);
 
 /// Record the in-memory index mutations a successful
 /// [`crate::data::executor::core_loop::CoreLoop::apply_point_put`] performed as
-/// undo entries. The HNSW vector index and the spatial R-tree live OUTSIDE the
+/// undo entries. The vector, sparse and spatial indexes live OUTSIDE the
 /// shared redb transaction, so dropping that transaction on abort does not
-/// reverse them — they must be undone explicitly. Drains the outcome's insert
-/// deltas (leaving `prior_value` for the caller's event emission).
+/// reverse them. Drains the outcome's undo
+/// entries and leaves `prior_value` for the caller's event emission.
 pub(super) fn record_put_index_undo(undo_log: &mut Vec<UndoEntry>, outcome: &mut PointPutOutcome) {
-    for d in std::mem::take(&mut outcome.vector_inserts) {
-        undo_log.push(UndoEntry::InsertVector {
-            index_key: d.index_key,
-            vector_id: d.vector_id,
-            collection: d.collection,
-            field: d.field,
-            doc_id: Some(d.doc_id),
-        });
-    }
-    for (key, entry_id) in std::mem::take(&mut outcome.spatial_inserts) {
-        undo_log.push(UndoEntry::SpatialInsert { key, entry_id });
-    }
+    undo_log.append(&mut outcome.memory_undo);
 }
 
 /// Decide every resolved arm of a MERGE against the target's compiled write
@@ -54,6 +43,7 @@ pub(super) fn record_put_index_undo(undo_log: &mut Vec<UndoEntry>, outcome: &mut
 pub(super) fn gate_merge_arms(
     plan: &MergePlanActions,
     rls_write_check: &nodedb_types::RlsWriteCheck,
+    identity_column: &str,
     tid: u64,
     collection: &str,
 ) -> crate::Result<()> {
@@ -73,7 +63,15 @@ pub(super) fn gate_merge_arms(
         .chain(plan.deletes.iter().map(|d| (d.body.as_slice(), d.key)));
     for (body, key) in doc_arms {
         let identity = key.to_identity();
-        rls_write_gate::admit_stored_row(rls_write_check, body, &identity, None, tid, collection)?;
+        rls_write_gate::admit_stored_row(
+            rls_write_check,
+            body,
+            &identity,
+            None,
+            identity_column,
+            tid,
+            collection,
+        )?;
     }
     for insert in &plan.inserts {
         let identity =
@@ -83,6 +81,7 @@ pub(super) fn gate_merge_arms(
             &insert.body,
             &identity,
             None,
+            identity_column,
             tid,
             collection,
         )?;
@@ -102,7 +101,12 @@ pub(super) fn gate_merge_arms(
 /// bodies are MessagePack for BOTH storage modes (`collect_merge_plan` decodes
 /// a strict target's Binary Tuple and re-encodes the resolved row before the
 /// apply pass ever sees it), so the strict decoder would have nothing to read.
-pub(super) fn returning_doc(body: &[u8], key: &StorageKey) -> crate::Result<nodedb_types::Value> {
+/// `identity_column` is the column the identity renders under.
+pub(super) fn returning_doc(
+    body: &[u8],
+    key: &StorageKey,
+    identity_column: &str,
+) -> crate::Result<nodedb_types::Value> {
     let identity = key.to_identity();
-    super::super::returning_doc::from_stored(body, &identity, None)
+    super::super::returning_doc::from_stored(body, &identity, None, identity_column)
 }

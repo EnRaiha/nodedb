@@ -38,7 +38,8 @@ pub(crate) fn build_kv_collection_type(
             ColumnDef::nullable(name.clone(), column_type)
         } else {
             ColumnDef::required(name.clone(), column_type)
-        };
+        }
+        .with_declared_width(&bare_type);
         if is_pk {
             col = col.with_primary_key();
         }

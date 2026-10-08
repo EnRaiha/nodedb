@@ -13,6 +13,7 @@
 
 use nodedb::control::security::identity::{AuthMethod, AuthenticatedIdentity, DatabaseSet, Role};
 use nodedb::control::server::pgwire::ddl_encode;
+use nodedb::control::server::pgwire::types::wire_type::TEXT_RESULTS;
 use nodedb::control::server::shared::ddl;
 use nodedb::control::server::shared::session::DetachedTxnScope;
 use nodedb::control::state::SharedState;
@@ -89,7 +90,7 @@ pub async fn ddl_ok_in(
     let scope = DetachedTxnScope::new();
     let result = ddl::dispatch(state, identity, sql, database_id, &scope.ctx())
         .await
-        .map(ddl_encode::ddl_results_to_pgwire);
+        .map(|result| ddl_encode::ddl_results_to_pgwire(result, &TEXT_RESULTS));
     assert!(result.is_some(), "DDL not recognized: {sql}");
     result
         .unwrap()
@@ -107,7 +108,7 @@ pub async fn ddl_err(state: &SharedState, identity: &AuthenticatedIdentity, sql:
         &scope.ctx(),
     )
     .await
-    .map(ddl_encode::ddl_results_to_pgwire);
+    .map(|result| ddl_encode::ddl_results_to_pgwire(result, &TEXT_RESULTS));
     assert!(result.is_some(), "DDL not recognized: {sql}");
     let err = result.unwrap().unwrap_err();
     err.to_string()
@@ -131,7 +132,7 @@ pub async fn try_ddl(
         &scope.ctx(),
     )
     .await
-    .map(ddl_encode::ddl_results_to_pgwire);
+    .map(|result| ddl_encode::ddl_results_to_pgwire(result, &TEXT_RESULTS));
     let result = result.expect("DDL not recognized");
     result.map(|_| ()).map_err(|e| e.to_string())
 }

@@ -14,6 +14,7 @@ use nodedb_physical::physical_plan::document::merge_types::{
     MergeActionOp, MergeClauseKind as MergeClauseKindOp,
 };
 
+use super::super::identity_guard::IdentitySnapshot;
 use super::super::merge::MergeParams;
 use super::super::merge_helpers::{
     build_insert_doc, build_merged, build_update_doc, find_arm, json_to_str,
@@ -55,21 +56,22 @@ pub(super) struct MergePlanActions {
     pub(super) inserts: Vec<MergeInsert>,
 }
 
-/// Decode a stored target row into JSON, with `id` injected for a schemaless
-/// row whose body carries none. Fails rather than skipping — a row the
-/// classifier can't read is not "absent", and treating it as absent inserts a
-/// duplicate of a row that already exists.
+/// Decode a stored target row into JSON, with its identity injected under
+/// `identity_column` for a schemaless row whose body lacks that column. Fails
+/// rather than skipping — a row the classifier can't read is not "absent",
+/// and treating it as absent inserts a duplicate of a row that already exists.
 ///
-/// A schemaless collection with no declared `id` field carries its identity
-/// only in the row's storage key, never in the body — so a MERGE arm's
-/// `AND id ...` condition, matched by [`find_arm`], must see the row's
-/// client-visible identity injected here, never the raw storage key. A
-/// strict row already surfaces `id` as a real tuple column, so injection
-/// only runs on the schemaless arm.
+/// A schemaless row that lacks its identity column carries its identity only
+/// in the row's storage key, never in the body — so a MERGE arm's condition
+/// on that column, matched by [`find_arm`], must see the row's client-visible
+/// identity injected here, never the raw storage key. A declared-key row
+/// holds its key and gains no `id`. A strict row surfaces its key as a real
+/// tuple column, so injection only runs on the schemaless arm.
 fn decode_target(
     identity: &RowIdentity,
     bytes: &[u8],
     strict_schema: &Option<nodedb_types::columnar::StrictSchema>,
+    identity_column: &str,
 ) -> crate::Result<serde_json::Value> {
     let mut doc = doc_format::decode_document_or_binary_tuple(
         bytes,
@@ -78,10 +80,10 @@ fn decode_target(
     )?;
     if strict_schema.is_none()
         && let Some(obj) = doc.as_object_mut()
-        && !obj.contains_key("id")
+        && !obj.contains_key(identity_column)
     {
         obj.insert(
-            "id".to_string(),
+            identity_column.to_string(),
             serde_json::Value::String(identity.as_str().to_string()),
         );
     }
@@ -110,6 +112,7 @@ impl CoreLoop {
         let strict_schema = self.merge_strict_schema(database_id, tid, params.target_collection);
         let target_docs =
             self.collect_target_docs(database_id, tid, params.target_collection, txn_id)?;
+        let identity_column = self.identity_column(database_id, tid, params.target_collection);
 
         let mut updates: Vec<MergeUpdate> = Vec::new();
         let mut deletes: Vec<MergeDelete> = Vec::new();
@@ -121,7 +124,7 @@ impl CoreLoop {
         for (key, bytes) in &target_docs {
             let key = *key;
             let identity = key.to_identity();
-            let target_doc = decode_target(&identity, bytes, &strict_schema)?;
+            let target_doc = decode_target(&identity, bytes, &strict_schema, &identity_column)?;
             let join_val = target_doc
                 .get(params.target_join_col)
                 .map(json_to_str)
@@ -162,6 +165,13 @@ impl CoreLoop {
                             upd,
                             pk,
                         )?;
+                        IdentitySnapshot::capture(
+                            strict_schema.as_ref(),
+                            params.declared_primary_key,
+                            upd,
+                            &target_doc,
+                        )
+                        .check_unchanged(params.target_collection, &updated)?;
                         updates.push(MergeUpdate {
                             key,
                             body: encode_doc_body(&updated),

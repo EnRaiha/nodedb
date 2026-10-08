@@ -34,12 +34,19 @@ impl CoreLoop {
         rls_write_check: &nodedb_types::RlsWriteCheck,
     ) -> Response {
         let existing = self.resolve_kv_current(ctx, key);
-        let (stored_bytes, op) = match &existing {
-            None => (value.to_vec(), "insert"),
-            Some(existing_raw) => match merge_kv_conflict_body(existing_raw, value, updates) {
-                Ok(b) => (b, "update"),
-                Err(e) => return self.response_error(ctx.task, e),
-            },
+        let op = if existing.is_some() {
+            "update"
+        } else {
+            "insert"
+        };
+        let stored_bytes = match merge_kv_conflict_body(
+            existing.as_deref(),
+            value,
+            updates,
+            self.declared_columns_of(ctx.database_id, ctx.tid, ctx.collection),
+        ) {
+            Ok(b) => b,
+            Err(e) => return self.response_error(ctx.task, e),
         };
 
         // Staging is where an in-transaction statement's row image is produced,

@@ -3,8 +3,8 @@
 //! Document-engine undo entry application logic.
 //!
 //! `apply_undo_document` handles document-engine undo entries. All methods
-//! return `Err((entry_index, detail))` on fatal failure so the caller can
-//! escalate to a typed `RollbackFailed` response.
+//! return an [`UndoError`] on fatal failure, and the caller escalates it to
+//! a typed `RollbackFailed` response.
 
 use nodedb_types::StorageKey;
 use tracing::error;
@@ -12,7 +12,7 @@ use tracing::error;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::engine::sparse::btree_versioned::VersionedIndexEntry;
 
-use super::UndoEntry;
+use super::{UndoEntry, UndoError};
 
 #[derive(Clone, Copy)]
 pub(super) struct UndoDocumentContext<'a> {
@@ -32,7 +32,7 @@ impl CoreLoop {
         tid: u64,
         entry_index: usize,
         entry: UndoEntry,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         match entry {
             UndoEntry::PutDocument {
                 collection,
@@ -65,26 +65,26 @@ impl CoreLoop {
                         self.sparse
                             .put(database_id, tid, &collection, &storage_key, &old)
                             .map(|_| ())
-                            .map_err(|e| e.to_string())
                     } else {
                         self.sparse
                             .delete(database_id, tid, &collection, &storage_key)
                             .map(|_| ())
-                            .map_err(|e| e.to_string())
                     };
                     result.map_err(|e| {
+                        let err = UndoError::failed(
+                            entry_index,
+                            format!("document restore on {collection}/{document_id}"),
+                            e,
+                        );
                         error!(
                             core = self.core_id,
                             entry_index,
                             collection = %collection,
                             document_id = %document_id,
-                            error = %e,
+                            error = %err,
                             "transaction undo: document restore failed; shard state unknown"
                         );
-                        (
-                            entry_index,
-                            format!("document restore on {collection}/{document_id}: {e}"),
-                        )
+                        err
                     })?;
                 }
                 // Reverse plain secondary-index mutations: undo the inserts and
@@ -104,18 +104,20 @@ impl CoreLoop {
                         surrogate,
                     )
                     .map_err(|e| {
+                        let err = UndoError::failed(
+                            entry_index,
+                            format!("fts posting removal on {collection}/{document_id}"),
+                            e,
+                        );
                         error!(
                             core = self.core_id,
                             entry_index,
                             collection = %collection,
                             document_id = %document_id,
-                            error = %e,
+                            error = %err,
                             "transaction undo: FTS posting removal failed; shard state unknown"
                         );
-                        (
-                            entry_index,
-                            format!("fts posting removal on {collection}/{document_id}: {e}"),
-                        )
+                        err
                     })?;
                 // Evict any cached copy of the reversed document. Always safe:
                 // a stale hit would otherwise resurrect a rolled-back put; the
@@ -150,18 +152,20 @@ impl CoreLoop {
                         .put(database_id, tid, &collection, &storage_key, &old_value)
                         .map(|_| ())
                         .map_err(|e| {
+                            let err = UndoError::failed(
+                                entry_index,
+                                format!("document re-insert on {collection}/{document_id}"),
+                                e,
+                            );
                             error!(
                                 core = self.core_id,
                                 entry_index,
                                 collection = %collection,
                                 document_id = %document_id,
-                                error = %e,
+                                error = %err,
                                 "transaction undo: document re-insert failed; shard state unknown"
                             );
-                            (
-                                entry_index,
-                                format!("document re-insert on {collection}/{document_id}: {e}"),
-                            )
+                            err
                         })?;
                 }
                 // Restore the plain secondary-index entries the forward delete
@@ -196,7 +200,7 @@ impl CoreLoop {
         ctx: UndoDocumentContext<'_>,
         sys_from_ms: i64,
         index_tuples: &[(String, String)],
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         let UndoDocumentContext {
             database_id,
             tid,
@@ -204,28 +208,29 @@ impl CoreLoop {
             collection,
             document_id,
         } = ctx;
-        let map_err = |stage: &str, e: String| {
+        let map_err = |stage: &str, e: crate::Error| {
+            let err = UndoError::failed(
+                entry_index,
+                format!("bitemporal {stage} on {collection}/{document_id}"),
+                e,
+            );
             error!(
                 core = self.core_id,
                 entry_index,
                 collection = %collection,
                 document_id = %document_id,
-                error = %e,
+                error = %err,
                 "transaction undo: bitemporal version removal failed; shard state unknown"
             );
-            (
-                entry_index,
-                format!("bitemporal {stage} on {collection}/{document_id}: {e}"),
-            )
+            err
         };
         let txn = self
             .sparse
-            .db()
             .begin_write()
-            .map_err(|e| map_err("begin_write", e.to_string()))?;
+            .map_err(|e| map_err("begin_write", e))?;
         self.sparse
             .versioned_remove_in_txn(&txn, database_id, tid, collection, document_id, sys_from_ms)
-            .map_err(|e| map_err("version remove", e.to_string()))?;
+            .map_err(|e| map_err("version remove", e))?;
         for (field, value) in index_tuples {
             self.sparse
                 .versioned_index_remove_in_txn(
@@ -240,9 +245,17 @@ impl CoreLoop {
                         sys_from_ms,
                     },
                 )
-                .map_err(|e| map_err("index remove", e.to_string()))?;
+                .map_err(|e| map_err("index remove", e))?;
         }
-        txn.commit().map_err(|e| map_err("commit", e.to_string()))?;
+        txn.commit().map_err(|e| {
+            map_err(
+                "commit",
+                crate::Error::Storage {
+                    engine: "sparse".into(),
+                    detail: e.to_string(),
+                },
+            )
+        })?;
         Ok(())
     }
 
@@ -259,7 +272,7 @@ impl CoreLoop {
         ctx: UndoDocumentContext<'_>,
         to_remove: &[(String, String)],
         to_restore: &[(String, String)],
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         let UndoDocumentContext {
             database_id,
             tid,
@@ -267,29 +280,31 @@ impl CoreLoop {
             collection,
             document_id,
         } = ctx;
-        let map_err = |stage: &str, e: String| {
+        let map_err = |stage: &str, e: crate::Error| {
+            let err = UndoError::failed(
+                entry_index,
+                format!("secondary-index {stage} on {collection}/{document_id}"),
+                e,
+            );
             error!(
                 core = self.core_id,
                 entry_index,
                 collection = %collection,
                 document_id = %document_id,
-                error = %e,
+                error = %err,
                 "transaction undo: secondary-index reversal failed; shard state unknown"
             );
-            (
-                entry_index,
-                format!("secondary-index {stage} on {collection}/{document_id}: {e}"),
-            )
+            err
         };
         for (field, value) in to_remove {
             self.sparse
                 .index_remove(database_id, tid, collection, field, value, document_id)
-                .map_err(|e| map_err("remove", e.to_string()))?;
+                .map_err(|e| map_err("remove", e))?;
         }
         for (field, value) in to_restore {
             self.sparse
                 .index_put(database_id, tid, collection, field, value, document_id)
-                .map_err(|e| map_err("restore", e.to_string()))?;
+                .map_err(|e| map_err("restore", e))?;
         }
         Ok(())
     }
@@ -311,7 +326,7 @@ impl CoreLoop {
         collection: &str,
         entry_index: usize,
         chain_hash_prior: Option<Option<crate::types::hash_chain::ChainHead>>,
-    ) -> Result<(), (usize, String)> {
+    ) -> Result<(), UndoError> {
         let key = (
             crate::types::DatabaseId::new(database_id),
             crate::types::TenantId::new(tid),
@@ -330,17 +345,19 @@ impl CoreLoop {
             }
         };
         persisted.map_err(|e| {
+            let err = UndoError::failed(
+                entry_index,
+                format!("hash-chain head restore on {collection}"),
+                e,
+            );
             error!(
                 core = self.core_id,
                 entry_index,
                 collection = %collection,
-                error = %e,
+                error = %err,
                 "transaction undo: hash-chain head restore failed; shard state unknown"
             );
-            (
-                entry_index,
-                format!("hash-chain head restore on {collection}: {e}"),
-            )
+            err
         })
     }
 }

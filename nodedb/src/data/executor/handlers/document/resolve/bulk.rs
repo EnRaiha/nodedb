@@ -179,6 +179,7 @@ impl CoreLoop {
                 &stored,
                 &identity,
                 ctx.strict_schema.as_ref(),
+                &ctx.identity_column,
                 tid,
                 collection,
             )
@@ -198,12 +199,7 @@ impl CoreLoop {
             .iter()
             .map(|(id, body)| (id, body.as_slice()))
             .collect();
-        let response_payload = resolved_response_payload(
-            returning,
-            rls_filters,
-            ctx.strict_schema.as_ref(),
-            &borrowed,
-        )?;
+        let response_payload = resolved_response_payload(returning, rls_filters, &ctx, &borrowed)?;
         Ok(DocumentResolveOutcome {
             mutations,
             response_payload,

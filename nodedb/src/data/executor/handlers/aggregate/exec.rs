@@ -8,7 +8,7 @@ use tracing::debug;
 
 use super::cache_entry::AggregateCacheEntry;
 use super::cache_key::{AggregateCacheKeyInputs, aggregate_cache_key, legacy_aggregate_pairs};
-use super::rows::{apply_user_aliases_to_rows, sort_aggregated_rows};
+use super::rows::{apply_user_aliases_to_rows, retain_having, sort_aggregated_rows};
 use crate::bridge::envelope::{ErrorCode, Response, Status};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
@@ -204,12 +204,7 @@ impl CoreLoop {
                 }
                 return match Ok::<Vec<u8>, crate::Error>(payload_buf) {
                     Ok(payload) => self.response_with_payload(task, payload),
-                    Err(e) => self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    ),
+                    Err(e) => self.response_error(task, ErrorCode::from(e)),
                 };
             }
         }
@@ -260,23 +255,30 @@ impl CoreLoop {
                 .join("groupby-spill")
                 .join(format!("core-{}-columnar", self.core_id));
             let columnar_spill_cap = self.query_tuning.groupby_max_groups_in_mem;
-            if let Some(mut agg_result) = legacy_aggs.and_then(|pairs| {
-                super::super::columnar_agg::try_columnar_aggregate(
-                    &super::super::columnar_agg::ColumnarAggParams {
-                        mt,
-                        group_by: &group_fields,
-                        aggregates: &pairs,
-                        filters: &filter_predicates,
-                        limit,
-                        scan_limit,
-                        spill_dir: &columnar_spill_dir,
-                        spill_cap: columnar_spill_cap,
-                        governor: self.governor.clone(),
-                        db: task.request.database_id,
-                        tenant: task.request.tenant_id,
-                    },
-                )
-            }) {
+            let columnar = legacy_aggs
+                .map(|pairs| {
+                    super::super::columnar_agg::try_columnar_aggregate(
+                        &super::super::columnar_agg::ColumnarAggParams {
+                            mt,
+                            group_by: &group_fields,
+                            aggregates: &pairs,
+                            filters: &filter_predicates,
+                            limit,
+                            scan_limit,
+                            spill_dir: &columnar_spill_dir,
+                            spill_cap: columnar_spill_cap,
+                            governor: self.governor.clone(),
+                            db: task.request.database_id,
+                            tenant: task.request.tenant_id,
+                        },
+                    )
+                })
+                .transpose();
+            let columnar = match columnar {
+                Ok(result) => result.flatten(),
+                Err(e) => return self.response_error(task, ErrorCode::from(e)),
+            };
+            if let Some(mut agg_result) = columnar {
                 if !having.is_empty() {
                     let having_predicates: Vec<ScanFilter> = match zerompk::from_msgpack(having) {
                         Ok(h) => h,
@@ -285,30 +287,10 @@ impl CoreLoop {
                             Vec::new()
                         }
                     };
-                    if !having_predicates.is_empty() {
-                        // `Vec::retain`'s closure must return `bool`, so an
-                        // evaluation error in a HAVING predicate is captured
-                        // via this side-channel and checked once the retain
-                        // finishes. HAVING is WHERE-shaped, so it gets the
-                        // full error treatment.
-                        let predicate_err: std::cell::RefCell<Option<nodedb_query::EvalError>> =
-                            std::cell::RefCell::new(None);
-                        agg_result.rows.retain(|row| {
-                            if predicate_err.borrow().is_some() {
-                                return true;
-                            }
-                            let mp = nodedb_types::json_to_msgpack_or_empty(row);
-                            match ScanFilter::all_match_binary(&having_predicates, &mp) {
-                                Ok(keep) => keep,
-                                Err(e) => {
-                                    predicate_err.replace(Some(e));
-                                    true
-                                }
-                            }
-                        });
-                        if let Some(e) = predicate_err.take() {
-                            return self.response_error(task, ErrorCode::from(e));
-                        }
+                    // HAVING is WHERE-shaped, so an evaluation error in a
+                    // predicate fails the statement.
+                    if let Err(e) = retain_having(&mut agg_result.rows, &having_predicates) {
+                        return self.response_error(task, ErrorCode::from(e));
                     }
                 }
 
@@ -322,7 +304,7 @@ impl CoreLoop {
                 }
                 agg_result.rows.truncate(limit);
 
-                return match crate::data::executor::response_codec::encode_json_vec_as_msgpack(
+                return match crate::data::executor::response_codec::encode_value_vec(
                     &agg_result.rows,
                 ) {
                     Ok(payload) => {
@@ -355,12 +337,7 @@ impl CoreLoop {
                         }
                         self.response_with_payload(task, payload)
                     }
-                    Err(e) => self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    ),
+                    Err(e) => self.response_error(task, ErrorCode::from(e)),
                 };
             }
         }
@@ -392,12 +369,7 @@ impl CoreLoop {
         let docs = match scan_result {
             Ok(d) => d,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
         self.aggregate_over_docs(super::streaming::over_docs::AggregateOverDocsParams {

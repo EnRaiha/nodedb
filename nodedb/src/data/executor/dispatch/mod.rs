@@ -10,6 +10,7 @@ pub mod crdt;
 pub mod document;
 mod document_admit;
 mod document_dml;
+mod document_register;
 mod execute;
 pub mod graph;
 pub mod kv;

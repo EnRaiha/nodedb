@@ -9,59 +9,34 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pgwire::api::results::{FieldFormat, FieldInfo};
+use pgwire::api::results::FieldInfo;
 use pgwire::api::stmt::QueryParser;
 use pgwire::api::{ClientInfo, Type};
-use pgwire::error::PgWireResult;
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::config::auth::AuthMode;
 use crate::control::security::audit::ArcAuditEmitter;
-use crate::control::server::response_shape::types::DdlColType;
+use crate::control::server::pgwire::types::wire_type::{TEXT_RESULTS, pg_type};
 use crate::control::server::shared::authorization::{authorize_database, authorize_task_set};
 use crate::control::server::shared::returning;
-use crate::control::server::shared::session::{SessionId, SessionStore};
+use crate::control::server::shared::session::{SessionId, SessionStore, TransactionState};
 use crate::control::state::SharedState;
 
 use super::super::auth::{pgwire_authorization_error, resolve_session_identity};
-use super::statement::ParsedStatement;
-use parser_schema::{count_placeholders, is_dsl_statement, substitute_placeholders_with_null};
+use super::statement::{ParsedStatement, ResultColumn};
+use parser_schema::{
+    count_placeholders, is_dsl_statement, is_transaction_control_sql,
+    substitute_placeholders_with_null,
+};
 
 #[path = "parser_schema.rs"]
 mod parser_schema;
-
-/// Maps the response shaper's protocol-neutral wire type to a pgwire `Type`
-/// for RowDescription.
-///
-/// This is the only mapping the extended-query path uses. Every result column
-/// — a `SELECT` projection and a `RETURNING` clause alike — reaches it through
-/// `build_output_schema`, so Describe and the simple-query path answer one
-/// question with one rule. A `DdlColType` with no dedicated wire type resolves
-/// to `Type::TEXT`, the safe default a client can always parse.
-fn ddl_col_type_to_pg(ty: &DdlColType) -> Type {
-    match ty {
-        DdlColType::Int8 => Type::INT8,
-        DdlColType::Int4 => Type::INT4,
-        DdlColType::Int2 => Type::INT2,
-        DdlColType::Float8 => Type::FLOAT8,
-        DdlColType::Float4 => Type::FLOAT4,
-        DdlColType::Text => Type::TEXT,
-        DdlColType::Bool => Type::BOOL,
-        DdlColType::Bytea => Type::BYTEA,
-        DdlColType::Json => Type::JSON,
-        DdlColType::Jsonb => Type::JSONB,
-        DdlColType::Timestamp => Type::TIMESTAMP,
-        DdlColType::Timestamptz => Type::TIMESTAMPTZ,
-        DdlColType::Varchar => Type::VARCHAR,
-        DdlColType::Float4Array => Type::FLOAT4_ARRAY,
-        DdlColType::Float8Array => Type::FLOAT8_ARRAY,
-    }
-}
 
 /// Maps a server-inferred parameter type to the pgwire `Type` to advertise
 /// in `ParameterDescription`, or `None` when no faithful wire type exists.
 ///
 /// Reuses the two established hops — `sql_data_type_to_ddl_col_type_with_width`
-/// then [`ddl_col_type_to_pg`] — rather than introducing a third mapping. The
+/// then [`pg_type`] — rather than introducing a third mapping. The
 /// declared numeric widths travel with the inferred type so a column declared
 /// `INT` is advertised as int4 (oid 23), not int8, and one declared `REAL` as
 /// float4 (oid 700), not float8: the client encodes its bind value at exactly
@@ -71,13 +46,13 @@ fn ddl_col_type_to_pg(ty: &DdlColType) -> Type {
 /// # Why some variants are refused
 ///
 /// Advertising a concrete OID makes the client commit to that type's binary
-/// encoding, so a lossy mapping is worse than saying nothing: an unknown
-/// parameter type is sent as text, which the bind layer already handles.
-/// `Decimal`, `Uuid`, `Vector` and `Geometry` all currently fold into
-/// `DdlColType::Text`, so advertising them will tell a client holding a
-/// `Decimal`/`Uuid` that the server wants TEXT — a client-side `WrongType`
-/// failure where `Unknown` works. They stay unresolved until
-/// each has a real wire type.
+/// encoding. An unknown parameter type is sent as text, which the bind layer
+/// reads for every type. `numeric`, `uuid` and `float4[]` parameters stay
+/// unknown: advertising them makes a client that holds a string, a float or
+/// a list fail with `WrongType`, and the bind layer has no binary decoder
+/// for them. A `json` parameter stays unknown for the same reason: the bind
+/// layer has no binary decoder for it. `Geometry` has no PostgreSQL wire
+/// type.
 fn inferred_param_type(inferred: &nodedb_sql::InferredParamType) -> Option<Type> {
     use crate::control::server::response_shape::schema::sql_data_type_to_ddl_col_type_with_width;
     use nodedb_sql::types_expr::SqlDataType;
@@ -89,17 +64,16 @@ fn inferred_param_type(inferred: &nodedb_sql::InferredParamType) -> Option<Type>
         | SqlDataType::Bool
         | SqlDataType::Bytes
         | SqlDataType::Timestamp
-        | SqlDataType::Timestamptz => Some(ddl_col_type_to_pg(
-            &sql_data_type_to_ddl_col_type_with_width(
-                &inferred.data_type,
-                inferred.int_width,
-                inferred.float_width,
-            ),
-        )),
-        SqlDataType::Decimal
+        | SqlDataType::Timestamptz => Some(pg_type(sql_data_type_to_ddl_col_type_with_width(
+            &inferred.data_type,
+            inferred.int_width,
+            inferred.float_width,
+        ))),
+        SqlDataType::Decimal(_)
         | SqlDataType::Uuid
         | SqlDataType::Vector(_)
         | SqlDataType::Geometry
+        | SqlDataType::Json
         | SqlDataType::Unknown => None,
     }
 }
@@ -281,7 +255,7 @@ impl NodeDbQueryParser {
         catalog: &crate::control::planner::catalog_adapter::OriginCatalog,
         database_id: crate::types::DatabaseId,
         tenant_id: crate::types::TenantId,
-    ) -> (Vec<Option<Type>>, Vec<FieldInfo>) {
+    ) -> (Vec<Option<Type>>, Vec<ResultColumn>) {
         // Placeholder *counting* runs unconditionally so an unplannable SQL
         // string (e.g. `WHERE id = $1` where the planner needs bound params
         // to typecheck) still reports the right number of parameter slots in
@@ -333,31 +307,30 @@ impl NodeDbQueryParser {
         // never disagree on a column's type. Empty `plans` (already handled
         // above) or a plan variant with no resolvable projection yields an
         // empty `OutputSchema`, matching the `Vec::new()` fallback for
-        // DSL/non-SELECT statements.
+        // DSL/non-SELECT statements. A catalog error yields no fields, as a
+        // planning error does above; Execute re-plans and reports it.
         let output_schema =
-            crate::control::planner::sql_plan_convert::output_schema::build_output_schema(
+            match crate::control::planner::sql_plan_convert::output_schema::build_output_schema(
                 &plans,
                 catalog,
                 database_id,
                 returning
                     .as_ref()
                     .map(|clause| clause.projection.as_slice()),
-            );
-        let result_fields: Vec<FieldInfo> = output_schema
+            ) {
+                Ok(schema) => schema,
+                Err(_) => return (param_types, Vec::new()),
+            };
+        let result_columns: Vec<ResultColumn> = output_schema
             .columns
-            .iter()
-            .map(|c| {
-                FieldInfo::new(
-                    c.display_name.clone(),
-                    None,
-                    None,
-                    ddl_col_type_to_pg(&c.ty),
-                    FieldFormat::Text,
-                )
+            .into_iter()
+            .map(|c| ResultColumn {
+                name: c.display_name,
+                ty: c.ty,
             })
             .collect();
 
-        (param_types, result_fields)
+        (param_types, result_columns)
     }
 }
 
@@ -381,12 +354,35 @@ impl QueryParser for NodeDbQueryParser {
             client,
             &self.session_id,
         )?;
+        // An aborted block refuses a Parse before planning or authorization,
+        // as PostgreSQL does. Only transaction control can end the block.
+        if self.sessions.transaction_state(self.session_id) == TransactionState::Failed
+            && !is_transaction_control_sql(sql)
+        {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "25P02".to_owned(),
+                "current transaction is aborted, commands ignored until end of transaction block"
+                    .to_owned(),
+            ))));
+        }
         let database_id = self
             .sessions
             .get_current_database(self.session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
         let emitter = ArcAuditEmitter(Arc::clone(&self.state.audit));
         authorize_database(&identity, database_id, &emitter).map_err(pgwire_authorization_error)?;
+
+        // Transaction control has no plan and no parameters. Execute routes
+        // it to the session handlers in `execute_sql`.
+        if is_transaction_control_sql(sql) {
+            return Ok(Some(ParsedStatement {
+                sql: sql.to_owned(),
+                param_types: Vec::new(),
+                result_columns: Vec::new(),
+                is_dsl: true,
+            }));
+        }
 
         // Wire-streaming COPY shapes for backup/restore: bypass nodedb-sql
         // entirely. Authorization still precedes this early return so a denied
@@ -395,7 +391,7 @@ impl QueryParser for NodeDbQueryParser {
             return Ok(Some(ParsedStatement {
                 sql: sql.to_owned(),
                 param_types: Vec::new(),
-                result_fields: Vec::new(),
+                result_columns: Vec::new(),
                 is_dsl: false,
             }));
         }
@@ -408,7 +404,7 @@ impl QueryParser for NodeDbQueryParser {
         // `WHERE col = $1` from the catalog whether or not the statement as a
         // whole can be planned.
         let catalog = self.build_catalog(identity.tenant_id.as_u64(), database_id);
-        let (param_types, result_fields) = if can_infer_schema {
+        let (param_types, result_columns) = if can_infer_schema {
             self.try_infer_types(sql, types, &catalog, database_id, identity.tenant_id)
         } else {
             (
@@ -421,12 +417,12 @@ impl QueryParser for NodeDbQueryParser {
         // known DSL prefix, mark the statement as a DSL passthrough. The
         // Execute handler will route it through the full DSL dispatcher
         // (same as the simple-query path) instead of `execute_planned_sql_with_params`.
-        let is_dsl = result_fields.is_empty() && is_dsl_statement(sql);
+        let is_dsl = result_columns.is_empty() && is_dsl_statement(sql);
 
         Ok(Some(ParsedStatement {
             sql: sql.to_owned(),
             param_types,
-            result_fields,
+            result_columns,
             is_dsl,
         }))
     }
@@ -442,8 +438,8 @@ impl QueryParser for NodeDbQueryParser {
     fn get_result_schema(
         &self,
         stmt: &Self::Statement,
-        _column_format: Option<&pgwire::api::portal::Format>,
+        column_format: Option<&pgwire::api::portal::Format>,
     ) -> PgWireResult<Vec<FieldInfo>> {
-        Ok(stmt.result_fields.clone())
+        Ok(stmt.result_fields(column_format.unwrap_or(&TEXT_RESULTS)))
     }
 }

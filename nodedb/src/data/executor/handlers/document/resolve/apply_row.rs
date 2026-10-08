@@ -12,10 +12,13 @@ use nodedb_types::Surrogate;
 use crate::bridge::envelope::{ErrorCode, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::redo_image::{removed_row_image, submitted_row_image};
-use crate::data::executor::enforcement::chain_guard::{ChainGuard, abort_after_apply};
+use crate::data::executor::enforcement::chain_guard::{
+    AbandonedWrite, ChainGuard, abandon_write, abort_after_apply,
+};
 use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
-use crate::data::executor::handlers::point::apply_put::PointPutParams;
+use crate::data::executor::handlers::point::apply_put::{PointPutParams, VectorIndexDelta};
+use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::{RowIdentity, StorageKey};
 
@@ -67,12 +70,6 @@ impl CoreLoop {
         let row_identity = RowIdentity::from_user_key(document_id);
         let has_vectors = self.collection_has_vectors(database_id, tid, collection);
 
-        // HNSW insert appends rather than replaces, so the prior embedding
-        // must come out first or KNN keeps scoring both.
-        if has_vectors && precondition.is_some() {
-            self.remove_document_vector_indexes(database_id, tid, collection, storage_key);
-        }
-
         // A row absent before this write is a link of a HASH_CHAIN target.
         let mut chain = ChainGuard::begin(self, database_id, tid, collection);
         if precondition.is_none() {
@@ -87,6 +84,18 @@ impl CoreLoop {
                 return Err(ErrorCode::from(e));
             }
         };
+
+        // HNSW insert appends rather than replaces, so the prior embedding
+        // must come out first or KNN keeps scoring both. The removal is in
+        // memory, so an abort below puts the prior nodes back.
+        let mut memory_undo: Vec<UndoEntry> = Vec::new();
+        if has_vectors && precondition.is_some() {
+            memory_undo.extend(
+                self.remove_document_vector_indexes(database_id, tid, collection, storage_key)
+                    .into_iter()
+                    .map(VectorIndexDelta::into_delete_undo),
+            );
+        }
         let mut outcome = match self.apply_point_put(
             &txn,
             PointPutParams {
@@ -106,16 +115,29 @@ impl CoreLoop {
         ) {
             Ok(outcome) => outcome,
             Err(e) => {
-                // Dropping `txn` reverses the write but not the cache entry.
-                abort_after_apply(self, &mut chain, database_id, tid, collection, &storage_key);
+                // Dropping `txn` reverses the write but not the cache entry
+                // or the prior vector removal.
+                let e = abort_after_apply(
+                    self,
+                    &mut chain,
+                    AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                        .undo(memory_undo),
+                    e,
+                );
                 return Err(ErrorCode::from(e));
             }
         };
+        memory_undo.append(&mut outcome.memory_undo);
         if let Err(e) = chain
             .settle(self, surrogate, &outcome.stored_value)
             .and_then(|()| chain.persist_head(self, &txn))
         {
-            abort_after_apply(self, &mut chain, database_id, tid, collection, &storage_key);
+            let e = abort_after_apply(
+                self,
+                &mut chain,
+                AbandonedWrite::row(database_id, tid, collection, &storage_key).undo(memory_undo),
+                e,
+            );
             return Err(ErrorCode::from(e));
         }
 
@@ -139,24 +161,46 @@ impl CoreLoop {
         let enforcement = match write_hook::run(self, &txn, &hook_ctx, images) {
             Ok(enforcement) => enforcement,
             Err(e) => {
-                abort_after_apply(self, &mut chain, database_id, tid, collection, &storage_key);
+                let e = abort_after_apply(
+                    self,
+                    &mut chain,
+                    AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                        .undo(memory_undo),
+                    e,
+                );
                 return Err(ErrorCode::from(e));
             }
         };
         let target_write_set = write_hook::target_write_set(&enforcement.target_writes);
+        let target_writes = enforcement.target_writes;
 
         if let Err(e) =
             self.settle_balanced_entries(database_id, tid, collection, enforcement.balanced_entries)
         {
-            abort_after_apply(self, &mut chain, database_id, tid, collection, &storage_key);
+            let e = abort_after_apply(
+                self,
+                &mut chain,
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(memory_undo)
+                    .targets(target_writes),
+                e,
+            );
             return Err(ErrorCode::from(e));
         }
 
         if let Err(e) = txn.commit() {
-            abort_after_apply(self, &mut chain, database_id, tid, collection, &storage_key);
-            return Err(ErrorCode::Internal {
-                detail: format!("commit: {e}"),
-            });
+            let e = abort_after_apply(
+                self,
+                &mut chain,
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(memory_undo)
+                    .targets(target_writes),
+                crate::Error::Storage {
+                    engine: "sparse".into(),
+                    detail: format!("commit: {e}"),
+                },
+            );
+            return Err(ErrorCode::from(e));
         }
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
@@ -219,7 +263,7 @@ impl CoreLoop {
         let database_id = task.request.database_id.as_u64();
 
         let txn = self.sparse.begin_write().map_err(ErrorCode::from)?;
-        let outcome = self
+        let mut outcome = self
             .apply_point_delete(
                 &txn,
                 PointDeleteParams {
@@ -234,6 +278,11 @@ impl CoreLoop {
                 },
             )
             .map_err(ErrorCode::from)?;
+        // Every abort below drops `txn` uncommitted, which reverses the
+        // durable writes only. `abandon_write` reverses the in-memory
+        // cascades and the target rows' cache and index entries.
+        let storage_key = StorageKey::for_surrogate(surrogate);
+        let memory_undo = std::mem::take(&mut outcome.memory_undo);
 
         let hook_ctx = HookCtx {
             database_id,
@@ -246,25 +295,55 @@ impl CoreLoop {
         // The pre-image is the ONLY image a delete has, and it is what tells the
         // fold to take the removed row's contribution off the total.
         let enforcement = match outcome.prior_value {
-            Some(ref old) => write_hook::run(
+            Some(ref old) => match write_hook::run(
                 self,
                 &txn,
                 &hook_ctx,
                 WriteImages::Delete {
                     old: ImageBody::Stored(old),
                 },
-            )
-            .map_err(ErrorCode::from)?,
+            ) {
+                Ok(enforcement) => enforcement,
+                Err(e) => {
+                    let e = abandon_write(
+                        self,
+                        AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                            .undo(memory_undo),
+                        e,
+                    );
+                    return Err(ErrorCode::from(e));
+                }
+            },
             None => Default::default(),
         };
         let target_write_set = write_hook::target_write_set(&enforcement.target_writes);
+        let target_writes = enforcement.target_writes;
 
-        self.settle_balanced_entries(database_id, tid, collection, enforcement.balanced_entries)
-            .map_err(ErrorCode::from)?;
+        if let Err(e) =
+            self.settle_balanced_entries(database_id, tid, collection, enforcement.balanced_entries)
+        {
+            let e = abandon_write(
+                self,
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(memory_undo)
+                    .targets(target_writes),
+                e,
+            );
+            return Err(ErrorCode::from(e));
+        }
 
-        txn.commit().map_err(|e| ErrorCode::Internal {
-            detail: format!("commit: {e}"),
-        })?;
+        if let Err(e) = txn.commit() {
+            let e = abandon_write(
+                self,
+                AbandonedWrite::row(database_id, tid, collection, &storage_key)
+                    .undo(memory_undo)
+                    .targets(target_writes),
+                crate::Error::DataPlane(ErrorCode::Internal {
+                    detail: format!("commit: {e}"),
+                }),
+            );
+            return Err(ErrorCode::from(e));
+        }
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
         if let Some(prior_bytes) = outcome.prior_value.as_deref() {
@@ -280,13 +359,12 @@ impl CoreLoop {
                     lsn,
                 );
             }
-            let old_converted =
-                self.resolve_event_payload(database_id, tid, collection, prior_bytes);
             self.emit_document_delete_event(
                 task,
+                tid,
                 collection,
                 RowIdentity::from_user_key(document_id),
-                Some(old_converted.as_deref().unwrap_or(prior_bytes)),
+                Some(prior_bytes),
             );
         }
         // The removal, journalled after apply, naming its own collection,

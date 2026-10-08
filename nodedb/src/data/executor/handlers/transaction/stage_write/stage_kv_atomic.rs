@@ -45,9 +45,11 @@ use super::stage_kv::kv_row_identity;
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::kv::atomic::incr_float_reply;
+use crate::data::executor::handlers::kv::declared_body::fit_kv_image;
 use crate::data::executor::handlers::transaction::overlay::StagedTtl;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
+use crate::engine::kv::fitted_counter_f64;
 use crate::types::TxnId;
 
 /// FNV-1a 32-bit hash, used only to derive a stable, collection-local overlay
@@ -196,7 +198,11 @@ impl CoreLoop {
     ) -> Response {
         let current = self.resolve_kv_current(ctx, key);
         match atomic_compute::incr(current.as_deref(), delta, shape) {
-            Ok((new_i64, new_bytes)) => {
+            Ok((new_i64, computed)) => {
+                let new_bytes = match self.stage_fit_kv_image(ctx, computed) {
+                    Ok(bytes) => bytes,
+                    Err(e) => return self.response_error(ctx.task, e),
+                };
                 if let Err(e) = self.stage_admit_kv_image(ctx, &new_bytes, rls_write_check) {
                     return self.response_error(ctx.task, e);
                 }
@@ -219,7 +225,15 @@ impl CoreLoop {
     ) -> Response {
         let current = self.resolve_kv_current(ctx, key);
         match atomic_compute::incr_float(current.as_deref(), delta, shape) {
-            Ok((new_f64, new_bytes)) => {
+            Ok((computed_f64, computed)) => {
+                let declared = self.declared_columns(&ctx.coll_key);
+                let (new_f64, new_bytes) = match fit_kv_image(&computed, declared) {
+                    Ok(None) => (computed_f64, computed),
+                    Ok(Some(fitted)) => {
+                        (fitted_counter_f64(computed_f64, &computed, &fitted), fitted)
+                    }
+                    Err(e) => return self.response_error(ctx.task, e),
+                };
                 if let Err(e) = self.stage_admit_kv_image(ctx, &new_bytes, rls_write_check) {
                     return self.response_error(ctx.task, e);
                 }
@@ -231,6 +245,15 @@ impl CoreLoop {
             }
             Err(e) => self.response_atomic_error(ctx.task, ctx.collection, e.into()),
         }
+    }
+
+    /// The image a staged KV write stores for the image it computed: fitted
+    /// to the collection's declared numeric columns, the rule the durable
+    /// apply runs. A value past a declared column is refused here, at
+    /// statement time.
+    fn stage_fit_kv_image(&self, ctx: &StageCtx<'_>, image: Vec<u8>) -> crate::Result<Vec<u8>> {
+        let declared = self.declared_columns(&ctx.coll_key);
+        Ok(fit_kv_image(&image, declared)?.unwrap_or(image))
     }
 
     /// Decide one staged KV image against the compiled write policy, naming
@@ -273,6 +296,10 @@ impl CoreLoop {
             };
 
         if matches {
+            let write_bytes = match self.stage_fit_kv_image(ctx, write_bytes) {
+                Ok(bytes) => bytes,
+                Err(e) => return self.response_error(ctx.task, e),
+            };
             if let Err(e) = self.stage_admit_kv_image(ctx, &write_bytes, rls_write_check) {
                 return self.response_error(ctx.task, e);
             }
@@ -307,6 +334,10 @@ impl CoreLoop {
         let write_bytes = match atomic_compute::getset(current.as_deref(), new_value) {
             Ok(bytes) => bytes,
             Err(e) => return self.response_atomic_error(ctx.task, ctx.collection, e.into()),
+        };
+        let write_bytes = match self.stage_fit_kv_image(ctx, write_bytes) {
+            Ok(bytes) => bytes,
+            Err(e) => return self.response_error(ctx.task, e),
         };
         if let Err(e) = self.stage_admit_kv_image(ctx, &write_bytes, rls_write_check) {
             return self.response_error(ctx.task, e);

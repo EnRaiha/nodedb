@@ -13,6 +13,11 @@ use super::ingest_value::IngestValue;
 
 impl ColumnarMemtable {
     /// Append a row of values. Validates types and nullability.
+    ///
+    /// The append is all-or-nothing. On an error, every column is cut back
+    /// to `row_count`, so the memtable holds exactly the rows it held before
+    /// the call. A rolled-back push to a `DictEncoded` column can leave one
+    /// dictionary entry that no row references. Every id stays valid.
     pub fn append_row(&mut self, values: &[Value]) -> Result<(), ColumnarError> {
         if values.len() != self.schema.columns.len() {
             return Err(ColumnarError::SchemaMismatch {
@@ -21,11 +26,21 @@ impl ColumnarMemtable {
             });
         }
 
-        for (i, (col_def, value)) in self.schema.columns.iter().zip(values.iter()).enumerate() {
-            if matches!(value, Value::Null) && !col_def.nullable {
-                return Err(ColumnarError::NullViolation(col_def.name.clone()));
-            }
-            self.columns[i].push(value, &col_def.name, &col_def.column_type)?;
+        let pushed = self
+            .schema
+            .columns
+            .iter()
+            .zip(values.iter())
+            .zip(self.columns.iter_mut())
+            .try_for_each(|((col_def, value), column)| {
+                if matches!(value, Value::Null) && !col_def.nullable {
+                    return Err(ColumnarError::NullViolation(col_def.name.clone()));
+                }
+                column.push(value, &col_def.name, &col_def.column_type)
+            });
+        if let Err(e) = pushed {
+            self.rollback_partial_row();
+            return Err(e);
         }
 
         self.row_count += 1;
@@ -34,6 +49,21 @@ impl ColumnarMemtable {
             "column lengths must stay aligned with row_count"
         );
         Ok(())
+    }
+
+    /// Cut every column back to `row_count` after a failed row push.
+    ///
+    /// The columns before the failed one hold one extra value. The failed
+    /// column and the columns after it hold `row_count` values already.
+    fn rollback_partial_row(&mut self) {
+        let n = self.row_count;
+        for col in &mut self.columns {
+            col.truncate(n);
+        }
+        debug_assert!(
+            self.columns.iter().all(|c| c.len() == self.row_count),
+            "column lengths must stay aligned with row_count after rollback"
+        );
     }
 
     /// Convert low-cardinality `String` columns to `DictEncoded` in-place.
@@ -90,6 +120,7 @@ impl ColumnarMemtable {
     ///
     /// Accepts borrowed values via `IngestValue<'_>`, avoiding string cloning
     /// for tag columns that are already interned in the `DictEncoded` dictionary.
+    /// The ingest is all-or-nothing, as in [`Self::append_row`].
     pub fn ingest_row_refs(&mut self, values: &[IngestValue<'_>]) -> Result<(), ColumnarError> {
         if values.len() != self.schema.columns.len() {
             return Err(ColumnarError::SchemaMismatch {
@@ -98,11 +129,21 @@ impl ColumnarMemtable {
             });
         }
 
-        for (i, (col_def, value)) in self.schema.columns.iter().zip(values.iter()).enumerate() {
-            if matches!(value, IngestValue::Null) && !col_def.nullable {
-                return Err(ColumnarError::NullViolation(col_def.name.clone()));
-            }
-            self.columns[i].push_ref(value, &col_def.name)?;
+        let pushed = self
+            .schema
+            .columns
+            .iter()
+            .zip(values.iter())
+            .zip(self.columns.iter_mut())
+            .try_for_each(|((col_def, value), column)| {
+                if matches!(value, IngestValue::Null) && !col_def.nullable {
+                    return Err(ColumnarError::NullViolation(col_def.name.clone()));
+                }
+                column.push_ref(value, &col_def.name)
+            });
+        if let Err(e) = pushed {
+            self.rollback_partial_row();
+            return Err(e);
         }
 
         self.row_count += 1;
@@ -153,6 +194,87 @@ mod tests {
             .append_row(&[Value::Null, Value::String("x".into()), Value::Null])
             .unwrap_err();
         assert!(matches!(err, ColumnarError::NullViolation(ref s) if s == "id"));
+    }
+
+    #[test]
+    fn null_violation_mid_row_leaves_columns_aligned() {
+        let schema = test_schema();
+        let mut mt = ColumnarMemtable::new(&schema);
+
+        let err = mt
+            .append_row(&[Value::Integer(1), Value::Null, Value::Null])
+            .unwrap_err();
+        assert!(matches!(err, ColumnarError::NullViolation(ref s) if s == "name"));
+        assert_eq!(mt.row_count(), 0);
+        assert!(mt.columns().iter().all(|c| c.len() == 0));
+
+        mt.append_row(&[Value::Integer(2), Value::String("b".into()), Value::Null])
+            .expect("append after rejected row");
+        assert_eq!(mt.row_count(), 1);
+        assert!(mt.columns().iter().all(|c| c.len() == 1));
+        assert_eq!(
+            mt.get_row(0).expect("read"),
+            Some(vec![
+                Value::Integer(2),
+                Value::String("b".into()),
+                Value::Null
+            ])
+        );
+    }
+
+    #[test]
+    fn type_mismatch_mid_row_leaves_columns_aligned() {
+        let schema = test_schema();
+        let mut mt = ColumnarMemtable::new(&schema);
+        mt.append_row(&[
+            Value::Integer(1),
+            Value::String("a".into()),
+            Value::Float(0.5),
+        ])
+        .expect("append");
+
+        let err = mt
+            .append_row(&[
+                Value::Integer(2),
+                Value::String("b".into()),
+                Value::Bool(true),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, ColumnarError::TypeMismatch { ref column, .. } if column == "score"));
+        assert_eq!(mt.row_count(), 1);
+        assert!(mt.columns().iter().all(|c| c.len() == 1));
+
+        mt.append_row(&[
+            Value::Integer(3),
+            Value::String("c".into()),
+            Value::Float(0.25),
+        ])
+        .expect("append after rejected row");
+        assert_eq!(
+            mt.get_row(1).expect("read"),
+            Some(vec![
+                Value::Integer(3),
+                Value::String("c".into()),
+                Value::Float(0.25)
+            ])
+        );
+    }
+
+    #[test]
+    fn rejected_ref_ingest_leaves_columns_aligned() {
+        let schema = test_schema();
+        let mut mt = ColumnarMemtable::new(&schema);
+
+        let err = mt
+            .ingest_row_refs(&[
+                IngestValue::Int64(1),
+                IngestValue::Str("a"),
+                IngestValue::Bool(true),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, ColumnarError::TypeMismatch { .. }));
+        assert_eq!(mt.row_count(), 0);
+        assert!(mt.columns().iter().all(|c| c.len() == 0));
     }
 
     #[test]

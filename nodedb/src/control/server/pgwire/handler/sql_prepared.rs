@@ -13,6 +13,7 @@
 
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 use nodedb_types::strip_prefix_ascii_case_insensitive;
+use pgwire::api::portal::Format;
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
@@ -64,6 +65,7 @@ impl NodeDbPgHandler {
         identity: &'a AuthenticatedIdentity,
         session_id: SessionId,
         sql: &'a str,
+        requested: &'a Format,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PgWireResult<Vec<Response>>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -100,7 +102,8 @@ impl NodeDbPgHandler {
             // Execute through the standard pipeline. The substituted SQL is the
             // PREPARE body (e.g., SELECT/INSERT), never another EXECUTE statement,
             // so this does not recurse further.
-            self.execute_sql(identity, session_id, &final_sql).await
+            self.execute_sql(identity, session_id, &final_sql, requested)
+                .await
         })
     }
 

@@ -17,7 +17,8 @@ impl CoreLoop {
     /// live version per `doc_id` and normalizes each body to standard msgpack
     /// via [`sparse_row_to_doc`], producing rows byte-identical in shape to
     /// [`CoreLoop::scan_collection`] (schemaless normalized from possibly-legacy
-    /// JSON, strict decoded from Binary Tuple, `id` injected).
+    /// JSON, strict decoded from Binary Tuple, identity injected under the
+    /// collection's identity column).
     pub(in crate::data::executor) fn scan_collection_versioned_current(
         &self,
         did: u64,
@@ -39,15 +40,19 @@ impl CoreLoop {
             // own bound (an explicit `limit`), so no deadline cuts it short.
             &crate::engine::sparse::scan_stop::never_stop,
         )?;
-        let format = self.sparse_body_format(
-            crate::types::DatabaseId::new(did),
-            crate::types::TenantId::new(tid),
-            collection,
-        );
+        let database_id = crate::types::DatabaseId::new(did);
+        let tenant_id = crate::types::TenantId::new(tid);
+        let format = self.sparse_body_format(database_id, tenant_id, collection);
+        let identity_column = self.identity_column(did, tid, collection);
 
         let mut normalized = Vec::with_capacity(docs.len());
         for (key, raw) in docs {
-            normalized.push(sparse_row_to_doc(&key, &raw, format.as_format_ref()));
+            normalized.push(sparse_row_to_doc(
+                &key,
+                &raw,
+                format.as_format_ref(),
+                &identity_column,
+            ));
         }
         Ok(normalized)
     }

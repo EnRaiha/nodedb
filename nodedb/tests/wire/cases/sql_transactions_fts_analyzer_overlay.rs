@@ -191,3 +191,57 @@ async fn staged_insert_rollback_removes_match() {
         "ROLLBACK must leave no durable index trace of the staged insert: {after_rollback:?}"
     );
 }
+
+/// The `'indonesian'` analyzer does not stem, so the index holds `running` and
+/// `dogs` as written. A phrase is analyzed once with the collection's
+/// analyzer, so it matches the indexed text and the staged text alike. An
+/// English stemmer would turn the phrase into `run dog`, which no indexed
+/// token holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_phrase_matches_under_a_no_stem_analyzer() {
+    let server = TestServer::start().await;
+    let coll = "fts_an_phrase";
+    server
+        .exec(&format!(
+            "CREATE COLLECTION {coll} WITH (engine='document_schemaless')"
+        ))
+        .await
+        .unwrap();
+    server
+        .exec(&format!(
+            "CREATE SEARCH INDEX idx_{coll}_fts ON {coll} FIELDS body ANALYZER 'indonesian'"
+        ))
+        .await
+        .unwrap();
+    for (id, body) in [("p1", "running dogs bark"), ("p2", "dogs running fast")] {
+        server
+            .exec(&format!(
+                "INSERT INTO {coll} (id, body) VALUES ('{id}', '{body}')"
+            ))
+            .await
+            .unwrap();
+    }
+    let phrase = "\"running dogs\"";
+
+    let committed = matched_ids(&server, coll, phrase).await;
+    assert_eq!(
+        committed,
+        vec!["p1".to_string()],
+        "the phrase matches its words in order, unstemmed: {committed:?}"
+    );
+
+    server.exec("BEGIN").await.unwrap();
+    server
+        .exec(&format!(
+            "INSERT INTO {coll} (id, body) VALUES ('p3', 'two running dogs')"
+        ))
+        .await
+        .unwrap();
+    let in_txn = matched_ids(&server, coll, phrase).await;
+    assert_eq!(
+        in_txn,
+        vec!["p1".to_string(), "p3".to_string()],
+        "the staged row matches the same analyzed phrase: {in_txn:?}"
+    );
+    server.client.simple_query("ROLLBACK").await.unwrap();
+}

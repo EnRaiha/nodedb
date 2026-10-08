@@ -19,7 +19,9 @@ use nodedb_types::Surrogate;
 use redb::WriteTransaction;
 
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::enforcement::chain_guard::{ChainGuard, abort_after_apply};
+use crate::data::executor::enforcement::chain_guard::{
+    AbandonedWrite, ChainGuard, abandon_write, abort_after_apply,
+};
 use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, WriteImages};
 use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
@@ -127,7 +129,7 @@ impl CoreLoop {
                 return Err(error);
             }
         };
-        let outcome = match self.apply_point_put(
+        let mut outcome = match self.apply_point_put(
             &txn,
             PointPutParams {
                 database_id: row.database_id,
@@ -146,16 +148,24 @@ impl CoreLoop {
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
-                self.abort_committed_write(&mut chain, row, &storage_key);
-                return Err(error);
+                return Err(abort_after_apply(
+                    self,
+                    &mut chain,
+                    abandoned(row, &storage_key),
+                    error,
+                ));
             }
         };
         if let Err(error) = chain
             .settle(self, surrogate, &outcome.stored_value)
             .and_then(|()| chain.persist_head(self, &txn))
         {
-            self.abort_committed_write(&mut chain, row, &storage_key);
-            return Err(error);
+            return Err(abort_after_apply(
+                self,
+                &mut chain,
+                abandoned(row, &storage_key).undo(std::mem::take(&mut outcome.memory_undo)),
+                error,
+            ));
         }
 
         // The fold reads the SUBMITTED body: `_chain_hash` wraps the row and no
@@ -169,16 +179,26 @@ impl CoreLoop {
                 new: ImageBody::Submitted(value),
             },
         };
-        let target_writes = match write_hook::run(self, &txn, &hook_ctx, images) {
+        let mut target_writes = match write_hook::run(self, &txn, &hook_ctx, images) {
             Ok(enforcement) => enforcement.target_writes,
             Err(error) => {
-                self.abort_committed_write(&mut chain, row, &storage_key);
-                return Err(error);
+                return Err(abort_after_apply(
+                    self,
+                    &mut chain,
+                    abandoned(row, &storage_key).undo(std::mem::take(&mut outcome.memory_undo)),
+                    error,
+                ));
             }
         };
         if let Err(error) = commit_row(txn) {
-            self.abort_committed_write(&mut chain, row, &storage_key);
-            return Err(error);
+            return Err(abort_after_apply(
+                self,
+                &mut chain,
+                abandoned(row, &storage_key)
+                    .undo(std::mem::take(&mut outcome.memory_undo))
+                    .targets(target_writes),
+                error,
+            ));
         }
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
@@ -201,12 +221,10 @@ impl CoreLoop {
         });
         if self.recording_redo_undo() {
             let mut undo = Vec::new();
-            push_target_undo(&mut undo, &target_writes);
+            push_target_undo(&mut undo, &mut target_writes);
             push_put_undo(
                 &mut undo,
                 DocumentRow {
-                    database_id: row.database_id,
-                    tid: row.tenant_id,
                     collection: row.collection,
                     storage_key,
                 },
@@ -234,7 +252,7 @@ impl CoreLoop {
         };
 
         let txn = self.sparse.begin_write()?;
-        let outcome = self.apply_point_delete(
+        let mut outcome = self.apply_point_delete(
             &txn,
             PointDeleteParams {
                 database_id: row.database_id,
@@ -247,21 +265,39 @@ impl CoreLoop {
                 resolved_targets: &resolved,
             },
         )?;
-        let target_writes = match outcome.prior_value {
-            Some(ref old) => {
-                write_hook::run(
-                    self,
-                    &txn,
-                    &hook_ctx,
-                    WriteImages::Delete {
-                        old: ImageBody::Stored(old),
-                    },
-                )?
-                .target_writes
-            }
+        // An abort below drops `txn` uncommitted, which reverses the durable
+        // writes only. `abandon_write` reverses the in-memory cascades.
+        let mut target_writes = match outcome.prior_value {
+            Some(ref old) => match write_hook::run(
+                self,
+                &txn,
+                &hook_ctx,
+                WriteImages::Delete {
+                    old: ImageBody::Stored(old),
+                },
+            ) {
+                Ok(enforcement) => enforcement.target_writes,
+                Err(error) => {
+                    let undo = std::mem::take(&mut outcome.memory_undo);
+                    return Err(abandon_write(
+                        self,
+                        abandoned(row, &storage_key).undo(undo),
+                        error,
+                    ));
+                }
+            },
             None => Vec::new(),
         };
-        commit_row(txn)?;
+        if let Err(error) = commit_row(txn) {
+            let undo = std::mem::take(&mut outcome.memory_undo);
+            return Err(abandon_write(
+                self,
+                abandoned(row, &storage_key)
+                    .undo(undo)
+                    .targets(target_writes),
+                error,
+            ));
+        }
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
         let removed = outcome.prior_value.clone();
@@ -271,12 +307,10 @@ impl CoreLoop {
         // reverse, so its undo is recorded either way.
         if self.recording_redo_undo() {
             let mut undo = Vec::new();
-            push_target_undo(&mut undo, &target_writes);
+            push_target_undo(&mut undo, &mut target_writes);
             push_delete_undo(
                 &mut undo,
                 DocumentRow {
-                    database_id: row.database_id,
-                    tid: row.tenant_id,
                     collection: row.collection,
                     storage_key,
                 },
@@ -297,24 +331,6 @@ impl CoreLoop {
         });
         self.record_committed_targets(target_writes);
         Ok(true)
-    }
-
-    /// Reverse the in-memory effects of a put abandoned after
-    /// `apply_point_put` ran; the caller drops its transaction uncommitted.
-    fn abort_committed_write(
-        &mut self,
-        chain: &mut ChainGuard,
-        row: &CommittedDocWrite<'_>,
-        storage_key: &StorageKey,
-    ) {
-        abort_after_apply(
-            self,
-            chain,
-            row.database_id,
-            row.tenant_id,
-            row.collection,
-            storage_key,
-        );
     }
 
     /// The sum targets a write to `collection` folds into: the open scope's
@@ -354,6 +370,12 @@ impl CoreLoop {
             }
         }
     }
+}
+
+/// A put of `row` abandoned after `apply_point_put` ran. The caller drops its
+/// transaction uncommitted.
+fn abandoned<'a>(row: &CommittedDocWrite<'a>, storage_key: &'a StorageKey) -> AbandonedWrite<'a> {
+    AbandonedWrite::row(row.database_id, row.tenant_id, row.collection, storage_key)
 }
 
 fn commit_row(txn: WriteTransaction) -> crate::Result<()> {

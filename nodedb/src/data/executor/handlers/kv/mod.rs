@@ -6,6 +6,7 @@ pub(in crate::data::executor) mod atomic;
 pub(in crate::data::executor) mod batch;
 pub(in crate::data::executor) mod conflict_merge;
 pub(in crate::data::executor) mod crud;
+pub(in crate::data::executor) mod declared_body;
 mod dispatch;
 mod dispatch_scan;
 mod dispatch_transfer;

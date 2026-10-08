@@ -8,7 +8,7 @@ use nodedb_types::sync::wire::SyncProvenance;
 use crate::bridge::envelope::{CounterFault, ErrorCode, SyncHold};
 
 /// The number of `ErrorCode` variants [`variant_index`] numbers.
-pub(super) const VARIANT_COUNT: usize = 43;
+pub(super) const VARIANT_COUNT: usize = 50;
 
 /// A dense index per variant. Exhaustive, so a new variant fails to compile
 /// here until it gets an index, and [`every_variant_has_a_sample`] then fails
@@ -58,6 +58,13 @@ pub(super) fn variant_index(code: &ErrorCode) -> usize {
         ErrorCode::TransactionRollback { .. } => 41,
         ErrorCode::ActiveSqlTransaction { .. } => 42,
         ErrorCode::DependentObjectsExist { .. } => 10,
+        ErrorCode::TextColumn { .. } => 43,
+        ErrorCode::NumericValueOutOfRange { .. } => 44,
+        ErrorCode::NodeLabelLimit { .. } => 45,
+        ErrorCode::InvalidTextRepresentation { .. } => 46,
+        ErrorCode::DatatypeMismatch { .. } => 47,
+        ErrorCode::InvalidDatetimeFormat { .. } => 48,
+        ErrorCode::DatetimeFieldOverflow { .. } => 49,
     }
 }
 
@@ -159,17 +166,33 @@ pub(super) fn samples() -> Vec<ErrorCode> {
             max_depth: 100,
         },
         ErrorCode::UndefinedColumn { column: "x".into() },
+        ErrorCode::TextColumn {
+            collection: collection(),
+            column: "x".into(),
+            fault: nodedb_types::text_search::TextColumnFault::NotIndexed,
+        },
+        ErrorCode::TextColumn {
+            collection: collection(),
+            column: "x".into(),
+            fault: nodedb_types::text_search::TextColumnFault::NotAColumn,
+        },
         ErrorCode::Internal { detail: text() },
         ErrorCode::Unsupported { detail: text() },
         ErrorCode::RollbackFailed {
             entry_index: 0,
             detail: text(),
+            cause: Some(Box::new(ErrorCode::Internal { detail: text() })),
         },
         ErrorCode::OllpRetryRequired,
         ErrorCode::TxnOverlayMemoryExceeded { limit: 1 << 20 },
         ErrorCode::DivisionByZero,
         ErrorCode::UndefinedFunction { name: "f".into() },
         ErrorCode::DataException { detail: text() },
+        ErrorCode::NumericValueOutOfRange { detail: text() },
+        ErrorCode::InvalidTextRepresentation { detail: text() },
+        ErrorCode::DatatypeMismatch { detail: text() },
+        ErrorCode::InvalidDatetimeFormat { detail: text() },
+        ErrorCode::DatetimeFieldOverflow { detail: text() },
         ErrorCode::DispatchCapacity { reason: text() },
         ErrorCode::ExpiredBeforeExecution,
         ErrorCode::BadRequest { detail: text() },
@@ -178,6 +201,11 @@ pub(super) fn samples() -> Vec<ErrorCode> {
         ErrorCode::DependentObjectsExist {
             object: "role \"analyst\"".into(),
             detail: text(),
+        },
+        ErrorCode::NodeLabelLimit {
+            node: "alice".into(),
+            label: "Person".into(),
+            limit: 64,
         },
     ];
     for constraint in [

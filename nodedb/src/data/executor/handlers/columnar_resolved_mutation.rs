@@ -31,6 +31,7 @@ use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::columnar_write::coerce_columnar_row;
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
 use crate::data::executor::task::ExecutionTask;
 
@@ -89,10 +90,21 @@ impl CoreLoop {
             }
         }
 
+        // Every shipped post-image meets the declared column rule before the
+        // policy decides it and before the first row changes. The Control
+        // Plane computed these values, so a value past a declared width
+        // refuses the statement whole.
+        let mut rows = rows.to_vec();
+        for (_, new_row) in &mut rows {
+            if let Err(e) = coerce_columnar_row(&schema, new_row) {
+                return self.response_error(task, e);
+            }
+        }
+
         // The gate stays on every write path even though `DecidedEarlierInRequest`
         // makes this a no-op — a single path that skips it entirely is a hole
         // future callers can fall into.
-        for (_pk, new_row) in rows {
+        for (_pk, new_row) in &rows {
             if let Err(error) = crate::data::executor::handlers::rls_write_gate::admit_columnar_row(
                 rls_write_check,
                 new_row,
@@ -106,8 +118,16 @@ impl CoreLoop {
 
         let row_count_before = engine.memtable().row_count();
         let mut undo_log = undo_log;
-        let outcome =
-            self.apply_columnar_update_rows(task, &key, &schema, rows, undo_log.as_deref_mut());
+        let outcome = match self.apply_columnar_update_rows(
+            task,
+            &key,
+            &schema,
+            &rows,
+            undo_log.as_deref_mut(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => return self.response_error(task, e),
+        };
         let affected = outcome.affected;
 
         if let Some(log) = undo_log {
@@ -132,12 +152,7 @@ impl CoreLoop {
         let result = serde_json::json!({ "affected": affected });
         match super::super::response_codec::encode_json_as_msgpack(&result) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -194,7 +209,11 @@ impl CoreLoop {
         }
 
         let mut undo_log = undo_log;
-        let outcome = self.apply_columnar_delete_pks(&key, &schema, pks, undo_log.as_deref_mut());
+        let outcome =
+            match self.apply_columnar_delete_pks(&key, &schema, pks, undo_log.as_deref_mut()) {
+                Ok(outcome) => outcome,
+                Err(e) => return self.response_error(task, e),
+            };
         let affected = outcome.affected;
 
         if let Some(log) = undo_log {
@@ -212,12 +231,7 @@ impl CoreLoop {
         let result = serde_json::json!({ "affected": affected });
         match super::super::response_codec::encode_json_as_msgpack(&result) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }
@@ -349,6 +363,7 @@ mod tests {
         engine
             .scan_memtable_rows()
             .map(|r| {
+                let r = r.expect("read");
                 let id = match &r[id_idx] {
                     Value::Integer(n) => *n,
                     other => panic!("expected integer id, got {other:?}"),
@@ -536,5 +551,133 @@ mod tests {
             vec![(1, 10)],
             "rejected update must not mutate the row"
         );
+    }
+
+    /// Seed rows into a collection whose `v` column is declared `SMALLINT`.
+    fn insert_smallint_rows(core: &mut CoreLoop, task: &ExecutionTask, rows: Vec<Value>) {
+        use nodedb_types::columnar::{ColumnDef, ColumnType, ColumnarSchema};
+        let schema = ColumnarSchema::new(vec![
+            ColumnDef::required("id", ColumnType::Int64).with_primary_key(),
+            ColumnDef::nullable("v", ColumnType::Int64).with_declared_width("SMALLINT"),
+        ])
+        .expect("valid schema");
+        let schema_bytes = zerompk::to_msgpack_vec(&schema).expect("encode schema");
+        let payload =
+            nodedb_types::value_to_msgpack(&Value::Array(rows)).expect("encode insert payload");
+        let resp = core.execute_columnar_insert(
+            task,
+            crate::data::executor::handlers::columnar_write::ColumnarInsertParams {
+                collection: COLLECTION,
+                payload: &payload,
+                format: "msgpack",
+                intent: nodedb_physical::physical_plan::ColumnarInsertIntent::Insert,
+                on_conflict_updates: &[],
+                surrogates: &[],
+                schema_bytes: &schema_bytes,
+                provenance: None,
+                rls_write_check: &RlsWriteCheck::already_decided_elsewhere(),
+                returning: None,
+                rls_filters: &[],
+                spatial_undo: None,
+            },
+        );
+        assert_eq!(
+            resp.status,
+            crate::bridge::envelope::Status::Ok,
+            "seed insert failed: {:?}",
+            resp.error_code
+        );
+    }
+
+    fn is_out_of_range(resp: &crate::bridge::envelope::Response) -> bool {
+        matches!(
+            resp.error_code.as_deref(),
+            Some(ErrorCode::NumericValueOutOfRange { .. })
+        )
+    }
+
+    /// A SMALLINT column refuses a value past its width on INSERT.
+    #[test]
+    fn declared_smallint_refuses_an_insert_past_its_width() {
+        let mut h = make_core();
+        let task = task_for(&h);
+        insert_smallint_rows(&mut h.core, &task, vec![row(1, 1)]);
+
+        let payload =
+            nodedb_types::value_to_msgpack(&Value::Array(vec![row(2, 40000)])).expect("encode");
+        let resp = h.core.execute_columnar_insert(
+            &task,
+            crate::data::executor::handlers::columnar_write::ColumnarInsertParams {
+                collection: COLLECTION,
+                payload: &payload,
+                format: "msgpack",
+                intent: nodedb_physical::physical_plan::ColumnarInsertIntent::Insert,
+                on_conflict_updates: &[],
+                surrogates: &[],
+                schema_bytes: &[],
+                provenance: None,
+                rls_write_check: &RlsWriteCheck::already_decided_elsewhere(),
+                returning: None,
+                rls_filters: &[],
+                spatial_undo: None,
+            },
+        );
+        assert!(is_out_of_range(&resp), "{:?}", resp.error_code);
+        assert_eq!(scan_ids(&mut h.core), vec![(1, 1)]);
+    }
+
+    /// A computed post-image past the declared width, here `v + 39999` over a
+    /// stored `1`, refuses the whole resolved update and changes no row.
+    #[test]
+    fn resolved_update_past_a_declared_width_changes_nothing() {
+        let mut h = make_core();
+        let task = task_for(&h);
+        insert_smallint_rows(&mut h.core, &task, vec![row(1, 1), row(2, 2)]);
+
+        let rows = vec![
+            (Value::Integer(1), resolved_row(&h.core, 1, 40000)),
+            (Value::Integer(2), resolved_row(&h.core, 2, 3)),
+        ];
+        let resp = h.core.execute_columnar_resolved_update(
+            &task,
+            COLLECTION,
+            &rows,
+            &RlsWriteCheck::decided_earlier_in_request(),
+            None,
+        );
+        assert!(is_out_of_range(&resp), "{:?}", resp.error_code);
+
+        let mut ids = scan_ids(&mut h.core);
+        ids.sort();
+        assert_eq!(ids, vec![(1, 1), (2, 2)]);
+    }
+
+    /// A predicate update whose post-image is past the declared width is
+    /// refused before the first row changes.
+    #[test]
+    fn predicate_update_past_a_declared_width_changes_nothing() {
+        let mut h = make_core();
+        let task = task_for(&h);
+        insert_smallint_rows(&mut h.core, &task, vec![row(1, 1), row(2, 2)]);
+
+        let updates = vec![(
+            "v".to_string(),
+            nodedb_physical::physical_plan::UpdateValue::Literal(
+                nodedb_types::value_to_msgpack(&Value::Integer(40000)).expect("encode"),
+            ),
+        )];
+        let resp = h.core.execute_columnar_update(
+            &task,
+            COLLECTION,
+            &[],
+            &updates,
+            &RlsWriteCheck::decided_earlier_in_request(),
+            None,
+        );
+        assert!(is_out_of_range(&resp), "{:?}", resp.error_code);
+
+        let mut ids = scan_ids(&mut h.core);
+        ids.sort();
+        assert_eq!(ids, vec![(1, 1), (2, 2)]);
     }
 }

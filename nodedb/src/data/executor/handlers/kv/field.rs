@@ -72,12 +72,7 @@ impl CoreLoop {
             Ok(true) => {}
             Ok(false) => return self.response_error(task, ErrorCode::NotFound),
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         }
 
@@ -114,12 +109,7 @@ impl CoreLoop {
 
         match response_codec::encode_json_as_msgpack(&serde_json::Value::Object(result)) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -160,12 +150,7 @@ impl CoreLoop {
                 &serde_json::json!({ "affected": 0, "fields_added": 0 }),
             ) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                ),
+                Err(e) => self.response_error(task, ErrorCode::from(e)),
             };
         }
 
@@ -176,6 +161,7 @@ impl CoreLoop {
             collection,
             current.as_deref(),
             updates,
+            self.declared_columns_of(did, tid, collection),
         ) {
             Ok(c) => c,
             Err(e) => return self.response_error(task, e),
@@ -233,12 +219,7 @@ impl CoreLoop {
             &serde_json::json!({ "affected": 1, "fields_added": computed.fields_added }),
         ) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }

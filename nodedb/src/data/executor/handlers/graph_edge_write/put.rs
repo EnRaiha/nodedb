@@ -25,11 +25,12 @@ impl CoreLoop {
 
     /// Edge upsert with optional transactional compensation.
     ///
-    /// When `undo` is `Some`, the `UndoEntry::EdgeWrite` is recorded after
-    /// the edge-store version is written and before the fallible CSR
-    /// mutation. It names the version the put added, so a rollback removes
-    /// exactly that version. An entry recorded before the store write would
-    /// name a version that does not exist.
+    /// When `undo` is `Some`, the `UndoEntry::EdgeWrite` is recorded once the
+    /// edge-store version and its CSR edge both stand. It names the version
+    /// the put added, so a rollback removes exactly that version.
+    ///
+    /// A CSR refusal after the version is stored takes the version back out,
+    /// so the edge store never holds an edge the CSR misses.
     ///
     /// A put writes a new edge-store version and makes the CSR edge live with
     /// the weight in `properties`, so a successful put always reports exactly
@@ -105,8 +106,9 @@ impl CoreLoop {
             label,
             dst_id,
         };
-        // The CSR state the undo puts back, read only when an undo is kept.
-        let csr_prior = undo.is_some().then(|| self.capture_edge_csr(&target));
+        // The CSR state a reversal puts back: a transaction rollback, or the
+        // reversal of a version the CSR refuses below.
+        let csr_prior = self.capture_edge_csr(&target);
         use crate::engine::graph::edge_store::EdgeRef;
         match self.edge_store.put_edge_version_recorded(
             EdgeRef::new(
@@ -126,11 +128,7 @@ impl CoreLoop {
         ) {
             Ok(version) => {
                 let current = version.current.clone();
-                // Edge-store version is now durable; the compensation entry is
-                // valid from here on even if the CSR mutation below fails.
-                if let (Some(undo), Some(csr)) = (undo, csr_prior) {
-                    undo.push(UndoEntry::EdgeWrite(Box::new(target.undo(version, csr))));
-                }
+                let edge_undo = target.undo(version, csr_prior);
                 // The CSR follows what the edge resolves to: a version a
                 // TRUNCATE hides, or one below a newer version, leaves the
                 // edge as it was.
@@ -143,6 +141,11 @@ impl CoreLoop {
                 );
                 match csr_result {
                     Ok(()) => {
+                        // The version and its CSR edge both stand, so a
+                        // transaction rollback reverses them together.
+                        if let Some(undo) = undo {
+                            undo.push(UndoEntry::EdgeWrite(Box::new(edge_undo)));
+                        }
                         let partition = self.csr_partition_mut(database_id, tid);
                         // Populate the per-node surrogates so future bitmap-gated
                         // traversals can check membership without a separate lookup.
@@ -184,20 +187,15 @@ impl CoreLoop {
                         ))];
                         response
                     }
-                    Err(e) => self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    ),
+                    // The CSR never misses a stored edge: the version the CSR
+                    // refused is taken back out of the edge store.
+                    Err(e) => {
+                        let code = self.reverse_edge_write(edge_undo, e);
+                        self.response_error(task, code)
+                    }
                 }
             }
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }
@@ -252,6 +250,60 @@ mod tests {
             "event LSN matches the edge's WAL LSN"
         );
         assert_eq!(event.new_value.as_deref(), Some(b"w=1".as_slice()));
+    }
+
+    /// A CSR refusal after the edge store took the version takes the version
+    /// back out, and the answer keeps the CSR error's typed code.
+    #[test]
+    fn a_reversed_edge_write_leaves_no_version_and_keeps_the_typed_code() {
+        use crate::data::executor::handlers::transaction::undo::edge_write::EdgeTarget;
+        use crate::engine::graph::edge_store::{EdgeRef, VersionStamp};
+
+        let mut h = make_core();
+        let task = make_task_with_lsn(79);
+        let database_id = task.request.database_id;
+        let target = EdgeTarget {
+            database_id: database_id.as_u64(),
+            tid: 1,
+            collection: "knows",
+            src_id: "a",
+            label: "KNOWS",
+            dst_id: "b",
+        };
+        let csr_prior = h.core.capture_edge_csr(&target);
+        let version = h
+            .core
+            .edge_store
+            .put_edge_version_recorded(
+                EdgeRef::new(database_id, TenantId::new(1), "knows", "a", "KNOWS", "b")
+                    .with_surrogates(Surrogate::new(1), Surrogate::new(2)),
+                b"w=1",
+                VersionStamp::at(100),
+                100,
+                i64::MAX,
+                true,
+            )
+            .expect("put edge version");
+
+        let code = h.core.reverse_edge_write(
+            target.undo(version, csr_prior),
+            nodedb_graph::GraphError::RebuildInProgress,
+        );
+
+        assert!(matches!(code, ErrorCode::BadRequest { .. }), "{code:?}");
+        let stored = h
+            .core
+            .edge_store
+            .get_edge(
+                database_id.as_u64(),
+                TenantId::new(1),
+                "knows",
+                "a",
+                "KNOWS",
+                "b",
+            )
+            .expect("edge lookup");
+        assert!(stored.is_none(), "the reversed version is gone");
     }
 
     /// An endpoint under `Surrogate::ZERO` names no node: the put is refused
