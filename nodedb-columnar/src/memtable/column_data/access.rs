@@ -99,8 +99,10 @@ impl ColumnData {
             Self::String { data, offsets, .. } => {
                 let start = offsets[row] as usize;
                 let end = offsets[row + 1] as usize;
-                Value::String(utf8_cell(&data[start..end])
-                    .map_err(|e| corrupt(format!("text cell is not UTF-8: {e}")))?)
+                Value::String(
+                    utf8_cell(&data[start..end])
+                        .map_err(|e| corrupt(format!("text cell is not UTF-8: {e}")))?,
+                )
             }
             Self::Bytes { data, offsets, .. } => {
                 let start = offsets[row] as usize;
@@ -121,8 +123,10 @@ impl ColumnData {
             Self::Geometry { data, offsets, .. } => {
                 let start = offsets[row] as usize;
                 let end = offsets[row + 1] as usize;
-                Value::String(utf8_cell(&data[start..end])
-                    .map_err(|e| corrupt(format!("text cell is not UTF-8: {e}")))?)
+                Value::String(
+                    utf8_cell(&data[start..end])
+                        .map_err(|e| corrupt(format!("text cell is not UTF-8: {e}")))?,
+                )
             }
             Self::Vector { data, dim, .. } => {
                 let d = *dim as usize;
