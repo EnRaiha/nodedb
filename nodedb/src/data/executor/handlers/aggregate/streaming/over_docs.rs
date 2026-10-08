@@ -133,12 +133,7 @@ impl CoreLoop {
                 }
                 self.response_with_payload(task, payload)
             }
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }

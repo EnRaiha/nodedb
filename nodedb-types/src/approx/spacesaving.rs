@@ -9,7 +9,7 @@ use std::collections::HashMap;
 /// Tracks the K most frequent items with bounded memory. Items not in
 /// the top K are approximated — their counts may be over-estimated by
 /// at most the minimum count in the structure.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub struct SpaceSaving {
     items: HashMap<u64, (u64, u64)>,
     max_items: usize,
@@ -135,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn spacesaving_serde_roundtrip_merge_semantics() {
+    fn spacesaving_msgpack_roundtrip_merge_semantics() {
         let mut a = SpaceSaving::new(5);
         let mut b = SpaceSaving::new(5);
         for _ in 0..100u64 {
@@ -148,9 +148,9 @@ mod tests {
             b.add(2);
         }
 
-        let bytes = serde_json::to_vec(&a).expect("serialize SpaceSaving");
+        let bytes = zerompk::to_msgpack_vec(&a).expect("serialize SpaceSaving");
         let mut a_prime: SpaceSaving =
-            serde_json::from_slice(&bytes).expect("deserialize SpaceSaving");
+            zerompk::from_msgpack(&bytes).expect("deserialize SpaceSaving");
 
         a_prime.merge(&b);
         a.merge(&b);

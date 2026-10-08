@@ -10,7 +10,9 @@
 
 use std::collections::HashMap;
 
-use super::super::rows::{apply_user_aliases_to_rows, sort_aggregated_rows};
+use nodedb_types::Value;
+
+use super::super::rows::{apply_user_aliases_to_rows, retain_having, sort_aggregated_rows};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::accum::GroupState;
@@ -78,10 +80,10 @@ impl CoreLoop {
             groups.insert("__all__".to_string(), GroupState::new(aggregates));
         }
 
-        let mut results: Vec<serde_json::Value> = Vec::new();
+        let mut results: Vec<Value> = Vec::new();
 
         for (group_key, state) in groups {
-            let mut row = serde_json::Map::new();
+            let mut row: HashMap<String, Value> = HashMap::new();
 
             if !group_by.is_empty()
                 && let Ok(parts) = sonic_rs::from_str::<Vec<serde_json::Value>>(&group_key)
@@ -98,46 +100,41 @@ impl CoreLoop {
                     let val = parts
                         .get(part_idx)
                         .cloned()
-                        .unwrap_or(serde_json::Value::Null);
+                        .map_or(Value::Null, Value::from);
                     row.insert(spec.output_name.clone(), val);
                     part_idx += 1;
                 }
             }
 
-            for (alias, val) in state.finalize(aggregates) {
-                let json_val: serde_json::Value = val.into();
-                row.insert(alias, json_val);
+            for (alias, val) in state.finalize(aggregates)? {
+                row.insert(alias, val);
             }
 
             if need_sub {
                 let sub_map = sub_groups.remove(&group_key).unwrap_or_default();
-                let mut sub_results: Vec<serde_json::Value> = Vec::new();
+                let mut sub_results: Vec<Value> = Vec::new();
                 for (sub_key, sub_state) in sub_map {
-                    let mut sub_row = serde_json::Map::new();
+                    let mut sub_row: HashMap<String, Value> = HashMap::new();
                     if let Ok(parts) = sonic_rs::from_str::<Vec<serde_json::Value>>(&sub_key) {
                         for (i, field) in sub_group_by.iter().enumerate() {
-                            let val = parts.get(i).cloned().unwrap_or(serde_json::Value::Null);
+                            let val = parts.get(i).cloned().map_or(Value::Null, Value::from);
                             sub_row.insert(field.clone(), val);
                         }
                     }
-                    for (alias, val) in sub_state.finalize(sub_aggregates) {
-                        let json_val: serde_json::Value = val.into();
-                        sub_row.insert(alias, json_val);
+                    for (alias, val) in sub_state.finalize(sub_aggregates)? {
+                        sub_row.insert(alias, val);
                     }
-                    let mut sub_value = serde_json::Value::Object(sub_row);
+                    let mut sub_value = Value::Object(sub_row);
                     apply_user_aliases_to_rows(
                         std::slice::from_mut(&mut sub_value),
                         sub_aggregates,
                     );
                     sub_results.push(sub_value);
                 }
-                row.insert(
-                    "sub_groups".to_string(),
-                    serde_json::Value::Array(sub_results),
-                );
+                row.insert("sub_groups".to_string(), Value::Array(sub_results));
             }
 
-            results.push(serde_json::Value::Object(row));
+            results.push(Value::Object(row));
         }
 
         if !having.is_empty() {
@@ -152,29 +149,7 @@ impl CoreLoop {
                     Vec::new()
                 }
             };
-            if !having_predicates.is_empty() {
-                // `Vec::retain`'s closure must return `bool`, so an evaluation
-                // error in a HAVING predicate is captured via this side-channel
-                // and checked once the retain finishes.
-                let predicate_err: std::cell::RefCell<Option<nodedb_query::EvalError>> =
-                    std::cell::RefCell::new(None);
-                results.retain(|row| {
-                    if predicate_err.borrow().is_some() {
-                        return true;
-                    }
-                    let mp = nodedb_types::json_to_msgpack_or_empty(row);
-                    match ScanFilter::all_match_binary(&having_predicates, &mp) {
-                        Ok(keep) => keep,
-                        Err(e) => {
-                            predicate_err.replace(Some(e));
-                            true
-                        }
-                    }
-                });
-                if let Some(e) = predicate_err.take() {
-                    return Err(crate::Error::from(e));
-                }
-            }
+            retain_having(&mut results, &having_predicates)?;
         }
 
         apply_user_aliases_to_rows(&mut results, aggregates);
@@ -183,6 +158,6 @@ impl CoreLoop {
         sort_aggregated_rows(&mut results, sort_keys)?;
         results.truncate(limit);
 
-        crate::data::executor::response_codec::encode_json_vec_as_msgpack(&results)
+        crate::data::executor::response_codec::encode_value_vec(&results)
     }
 }

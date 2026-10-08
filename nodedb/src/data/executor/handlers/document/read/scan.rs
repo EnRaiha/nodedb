@@ -5,14 +5,14 @@
 use nodedb_types::StorageKey;
 use tracing::{debug, warn};
 
-use super::projection::{apply_projection, apply_projection_msgpack};
+use super::projection::apply_projection_msgpack;
 use super::{DocFetchParams, DocScanMode};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::document::sort;
+use crate::data::executor::handlers::provider_scan_compute::apply_windows_and_computed;
 use crate::data::executor::handlers::transaction::overlay::SidecarRowShape;
-use crate::data::executor::response_codec::DocumentRow;
 use crate::data::executor::scan_normalize::sparse_row_to_doc;
 use crate::data::executor::sparse_body_format::{SparseBodyFormat, SparseBodyFormatRef};
 use crate::data::executor::task::ExecutionTask;
@@ -71,14 +71,34 @@ impl CoreLoop {
             if window_functions_bytes.is_empty() {
                 Vec::new()
             } else {
-                zerompk::from_msgpack(window_functions_bytes).unwrap_or_default()
+                match zerompk::from_msgpack(window_functions_bytes) {
+                    Ok(specs) => specs,
+                    Err(e) => {
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: format!("malformed scan window functions: {e}"),
+                            },
+                        );
+                    }
+                }
             };
 
         let computed_cols: Vec<crate::bridge::expr_eval::ComputedColumn> =
             if computed_columns_bytes.is_empty() {
                 Vec::new()
             } else {
-                zerompk::from_msgpack(computed_columns_bytes).unwrap_or_default()
+                match zerompk::from_msgpack(computed_columns_bytes) {
+                    Ok(specs) => specs,
+                    Err(e) => {
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: format!("malformed scan computed columns: {e}"),
+                            },
+                        );
+                    }
+                }
             };
 
         let scan_budget_bytes = self.query_tuning.max_scan_result_bytes;
@@ -105,6 +125,8 @@ impl CoreLoop {
             crate::types::TenantId::new(tid),
             collection.to_string(),
         );
+        let identity_column =
+            self.identity_column(task.request.database_id.as_u64(), tid, collection);
         let strict_schema = self.doc_configs.get(&config_key).and_then(|c| {
             if let nodedb_physical::physical_plan::StorageMode::Strict { ref schema } =
                 c.storage_mode
@@ -114,6 +136,9 @@ impl CoreLoop {
                 None
             }
         });
+        // A `DECIMAL` sort key orders by value: its cells are text and wide
+        // integers side by side.
+        let decimal_keys = sort::decimal_sort_keys(sort_keys, strict_schema.as_ref());
 
         // Fetch stage: the ONLY part that differs between a current-time read
         // and a bitemporal `AS OF` / all-versions audit read. It returns the
@@ -194,6 +219,7 @@ impl CoreLoop {
                             &filter_predicates,
                             row_key,
                             value,
+                            &identity_column,
                         ) {
                             Ok(b) => b,
                             Err(e) => {
@@ -275,7 +301,9 @@ impl CoreLoop {
                 let filtered: Vec<(String, Vec<u8>)> = if normalizes {
                     filtered
                         .into_iter()
-                        .map(|(key, bytes)| sparse_row_to_doc(&key, &bytes, body_format))
+                        .map(|(key, bytes)| {
+                            sparse_row_to_doc(&key, &bytes, body_format, &identity_column)
+                        })
                         .collect()
                 } else {
                     filtered
@@ -284,21 +312,40 @@ impl CoreLoop {
                         .collect()
                 };
 
-                // With window functions the sort runs after the window pass
-                // (below), so ORDER BY can name a window alias, as the
-                // provider scan orders it.
-                let sorted = if sort_keys.is_empty() || !window_specs.is_empty() {
+                // With window functions the window pass runs first and the
+                // sort after it, so ORDER BY can name a window alias, as the
+                // provider scan orders it. The windowed rows stay msgpack, so
+                // a NaN or ±Infinity window result reaches the client.
+                let sorted = if !window_specs.is_empty() {
+                    let (ids, bodies): (Vec<String>, Vec<Vec<u8>>) = filtered.into_iter().unzip();
+                    let bodies =
+                        match apply_windows_and_computed(bodies, window_functions_bytes, &[]) {
+                            Ok(bodies) => bodies,
+                            Err(e) => return self.response_error(task, e),
+                        };
+                    let mut windowed: Vec<(String, Vec<u8>)> =
+                        ids.into_iter().zip(bodies).collect();
+                    if let Err(e) = sort::sort_rows(&mut windowed, sort_keys, &decimal_keys) {
+                        return self.response_error(task, e);
+                    }
+                    windowed
+                } else if sort_keys.is_empty() {
                     filtered
                 } else if filtered.len() <= self.query_tuning.sort_run_size {
                     let mut v = filtered;
                     // Propagate the typed error: a zero divisor in a sort key
                     // is a `22012` statement failure, not an internal fault.
-                    if let Err(e) = sort::sort_rows(&mut v, sort_keys) {
+                    if let Err(e) = sort::sort_rows(&mut v, sort_keys, &decimal_keys) {
                         return self.response_error(task, e);
                     }
                     v
                 } else {
-                    match self.external_sort(filtered, sort_keys, limit.saturating_add(offset)) {
+                    match self.external_sort(
+                        filtered,
+                        sort_keys,
+                        &decimal_keys,
+                        limit.saturating_add(offset),
+                    ) {
                         Ok(merged) => merged,
                         Err(e) => {
                             warn!(core = self.core_id, error = %e, "external sort failed");
@@ -351,103 +398,49 @@ impl CoreLoop {
                     return self.send_document_rows_raw(task, &result, stream_chunk_size);
                 }
 
-                if !window_specs.is_empty() {
-                    let mut decoded_rows: Vec<(String, serde_json::Value)> = match sorted
+                let needs_transform = !computed_cols.is_empty() || !projection.is_empty();
+
+                if needs_transform {
+                    // Project first so DISTINCT acts on the projected
+                    // row, not the raw document.
+                    let projected_rows: Vec<_> = match sorted
                         .into_iter()
                         .map(|(doc_id, mp)| {
-                            crate::data::executor::doc_format::decode_document(&mp)
-                                .map(|doc| (doc_id, doc))
+                            let projected =
+                                apply_projection_msgpack(&mp, &computed_cols, projection)?;
+                            Ok((doc_id, projected))
                         })
                         .collect::<crate::Result<Vec<_>>>()
                     {
                         Ok(rows) => rows,
                         Err(e) => return self.response_error(task, e),
                     };
-                    if let Err(e) = crate::bridge::window_func::evaluate_window_functions(
-                        &mut decoded_rows,
-                        &window_specs,
-                    ) {
-                        return self.response_error(task, crate::Error::from(e));
-                    }
-                    let decoded_rows = match sort::sort_decoded_rows(decoded_rows, sort_keys) {
-                        Ok(rows) => rows,
-                        Err(e) => return self.response_error(task, e),
-                    };
-
-                    // Project first, then dedupe on the projected JSON value
-                    // so `SELECT DISTINCT col` honours SQL semantics.
-                    let projected_rows: Vec<_> = match decoded_rows
-                        .into_iter()
-                        .map(|(doc_id, data)| {
-                            let projected = apply_projection(data, &computed_cols, projection)?;
-                            Ok(DocumentRow {
-                                id: doc_id,
-                                data: projected,
-                            })
-                        })
-                        .collect::<crate::Result<Vec<_>>>()
-                    {
-                        Ok(rows) => rows,
-                        Err(e) => return self.response_error(task, e),
-                    };
-
-                    let deduped: Vec<_> = if distinct {
+                    let deduped = if distinct {
                         let mut seen = std::collections::HashSet::new();
                         projected_rows
                             .into_iter()
-                            .filter(|row| seen.insert(row.data.to_string()))
+                            .filter(|(_, value)| seen.insert(value.clone()))
                             .collect()
                     } else {
                         projected_rows
                     };
-
                     let result: Vec<_> = deduped.into_iter().skip(offset).take(limit).collect();
-                    self.send_document_rows_transformed(task, &result, stream_chunk_size)
+                    self.send_document_rows_raw(task, &result, stream_chunk_size)
                 } else {
-                    let needs_transform = !computed_cols.is_empty() || !projection.is_empty();
-
-                    if needs_transform {
-                        // Project first so DISTINCT acts on the projected
-                        // row, not the raw document.
-                        let projected_rows: Vec<_> = match sorted
+                    // No projection — `SELECT DISTINCT *` semantics dedupe
+                    // on the entire raw value, which is what the
+                    // pre-existing path does.
+                    let deduped = if distinct {
+                        let mut seen = std::collections::HashSet::new();
+                        sorted
                             .into_iter()
-                            .map(|(doc_id, mp)| {
-                                let projected =
-                                    apply_projection_msgpack(&mp, &computed_cols, projection)?;
-                                Ok((doc_id, projected))
-                            })
-                            .collect::<crate::Result<Vec<_>>>()
-                        {
-                            Ok(rows) => rows,
-                            Err(e) => return self.response_error(task, e),
-                        };
-                        let deduped = if distinct {
-                            let mut seen = std::collections::HashSet::new();
-                            projected_rows
-                                .into_iter()
-                                .filter(|(_, value)| seen.insert(value.clone()))
-                                .collect()
-                        } else {
-                            projected_rows
-                        };
-                        let result: Vec<_> = deduped.into_iter().skip(offset).take(limit).collect();
-                        self.send_document_rows_raw(task, &result, stream_chunk_size)
+                            .filter(|(_, value)| seen.insert(value.clone()))
+                            .collect()
                     } else {
-                        // No projection — `SELECT DISTINCT *` semantics dedupe
-                        // on the entire raw value, which is what the
-                        // pre-existing path does.
-                        let deduped = if distinct {
-                            let mut seen = std::collections::HashSet::new();
-                            sorted
-                                .into_iter()
-                                .filter(|(_, value)| seen.insert(value.clone()))
-                                .collect()
-                        } else {
-                            sorted
-                        };
-                        let rows: Vec<_> = deduped.into_iter().skip(offset).take(limit).collect();
-                        self.send_document_rows_raw(task, &rows, stream_chunk_size)
-                    }
+                        sorted
+                    };
+                    let rows: Vec<_> = deduped.into_iter().skip(offset).take(limit).collect();
+                    self.send_document_rows_raw(task, &rows, stream_chunk_size)
                 }
             }
             Err(e) => self.response_error(task, e),

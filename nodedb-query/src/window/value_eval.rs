@@ -126,10 +126,8 @@ pub(super) fn order_keys_equal_v(
 
 // ── Argument evaluation (pub(super) for value_agg) ────────────────────────────
 
-/// Evaluate a window-function argument expression against one row.
-///
-/// This is the Value-native counterpart of `window::helpers::eval_expr_on_json`.
-/// A division/modulo-by-zero surfaces as
+/// Evaluate a window-function argument expression against one column-major
+/// row. A division/modulo-by-zero surfaces as
 /// `Err(EvalError::DivisionByZero)` — which the value-path callers convert into
 /// `WindowError` via `?` — rather than being folded to `NULL`.
 pub(super) fn eval_arg_for_row(

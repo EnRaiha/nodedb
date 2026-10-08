@@ -9,15 +9,21 @@
 //! - All other frame combinations → per-row frame evaluator that computes the
 //!   concrete `[start_idx, end_idx]` slice for every row and aggregates over
 //!   it.
+//!
+//! A float result keeps NaN and ±Infinity, as in PostgreSQL.
+
+use nodedb_types::Value;
 
 use super::arg::{ArgValues, arg_at, eval_arg_values};
+use super::extremum::value_replaces;
 use super::frame::{build_peer_groups, evaluate_frame_bounds};
 use super::helpers::{as_f64, set_window_col};
 use super::running::running_aggregate;
 use super::spec::{FrameBound, WindowFuncSpec};
+use crate::numeric_sum::{ExactSum, sum_input};
 
 pub(super) fn apply_aggregate_window(
-    rows: &mut [(String, serde_json::Value)],
+    rows: &mut [(String, Value)],
     indices: &[usize],
     spec: &WindowFuncSpec,
 ) -> Result<(), crate::expr::EvalError> {
@@ -49,7 +55,7 @@ pub(super) fn apply_aggregate_window(
 /// 2. Aggregate the evaluated argument over `indices[start_idx..=end_idx]`.
 /// 3. Write the result back under `spec.alias`.
 fn per_row_aggregate(
-    rows: &mut [(String, serde_json::Value)],
+    rows: &mut [(String, Value)],
     indices: &[usize],
     spec: &WindowFuncSpec,
     arg_values: &ArgValues,
@@ -61,11 +67,11 @@ fn per_row_aggregate(
 
     // Extract order-by values for RANGE numeric offsets.
     let order_expr = spec.order_by.first().map(|(expr, _)| expr);
-    let order_values: Vec<serde_json::Value> = indices
+    let order_values: Vec<Value> = indices
         .iter()
         .map(|&i| match order_expr {
-            Some(expr) => super::helpers::eval_expr_on_json(expr, &rows[i].1),
-            None => Ok(serde_json::Value::Null),
+            Some(expr) => expr.eval(&rows[i].1),
+            None => Ok(Value::Null),
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -82,20 +88,33 @@ fn per_row_aggregate(
         .map(|pos| as_f64(&arg_at(arg_values, pos)))
         .collect();
 
-    let results: Vec<serde_json::Value> = (0..len)
+    let results: Vec<Value> = (0..len)
         .map(|pos| {
             let (start_idx, end_idx) =
                 evaluate_frame_bounds(&spec.frame, pos, len, &order_values, &peer_groups);
 
             aggregate_slice(&all_vals, arg_values, spec, start_idx, end_idx)
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     for (pos, result) in results.into_iter().enumerate() {
         let row_idx = indices[pos];
         set_window_col(&mut rows[row_idx].1, &spec.alias, result);
     }
     Ok(())
+}
+
+/// The exact SUM / AVG state of the frame slice `[start_idx, end_idx]`.
+fn frame_sum(arg_values: &ArgValues, start_idx: usize, end_idx: usize) -> ExactSum {
+    let mut acc = ExactSum::new();
+    if let Some(values) = arg_values {
+        for v in values.get(start_idx..=end_idx).unwrap_or(&[]) {
+            if let Some(n) = sum_input(v) {
+                acc.add_value(&n);
+            }
+        }
+    }
+    acc
 }
 
 /// Aggregate the evaluated argument over the frame slice
@@ -106,57 +125,43 @@ fn aggregate_slice(
     spec: &WindowFuncSpec,
     start_idx: usize,
     end_idx: usize,
-) -> serde_json::Value {
-    let slice_vals: Vec<f64> = all_vals[start_idx..=end_idx]
-        .iter()
-        .filter_map(|v| *v)
-        .collect();
-
-    match spec.func_name.as_str() {
-        "sum" => {
-            let rt = crate::simd_agg::ts_runtime();
-            serde_json::json!((rt.sum_f64)(&slice_vals))
-        }
+) -> Result<Value, crate::expr::EvalError> {
+    Ok(match spec.func_name.as_str() {
+        "sum" => frame_sum(arg_values, start_idx, end_idx).sum()?,
         // `COUNT(*)` counts frame rows; `COUNT(expr)` counts the rows whose
         // argument is non-NULL, so a NULL argument is excluded rather than
         // inflating the count.
         "count" => match arg_values {
-            None => serde_json::json!(end_idx - start_idx + 1),
-            Some(values) => serde_json::json!(
+            None => Value::from_u64((end_idx - start_idx + 1) as u64),
+            Some(values) => Value::from_u64(
                 values[start_idx..=end_idx]
                     .iter()
                     .filter(|v| !v.is_null())
-                    .count()
+                    .count() as u64,
             ),
         },
-        "avg" => {
-            if slice_vals.is_empty() {
-                serde_json::Value::Null
-            } else {
-                let rt = crate::simd_agg::ts_runtime();
-                serde_json::json!((rt.sum_f64)(&slice_vals) / slice_vals.len() as f64)
+        "avg" => frame_sum(arg_values, start_idx, end_idx).avg()?,
+        "min" | "max" => {
+            let want_max = spec.func_name == "max";
+            let Some(values) = arg_values else {
+                return Ok(Value::Null);
+            };
+            let frame_values = values.get(start_idx..=end_idx).unwrap_or(&[]);
+            let mut best: Option<&Value> = None;
+            for (numeric, candidate) in all_vals[start_idx..=end_idx].iter().zip(frame_values) {
+                if numeric.is_none() {
+                    continue;
+                }
+                if value_replaces(candidate, best, want_max) {
+                    best = Some(candidate);
+                }
             }
-        }
-        "min" => {
-            if slice_vals.is_empty() {
-                serde_json::Value::Null
-            } else {
-                let rt = crate::simd_agg::ts_runtime();
-                serde_json::json!((rt.min_f64)(&slice_vals))
-            }
-        }
-        "max" => {
-            if slice_vals.is_empty() {
-                serde_json::Value::Null
-            } else {
-                let rt = crate::simd_agg::ts_runtime();
-                serde_json::json!((rt.max_f64)(&slice_vals))
-            }
+            best.cloned().unwrap_or(Value::Null)
         }
         "first_value" => arg_at(arg_values, start_idx),
         "last_value" => arg_at(arg_values, end_idx),
-        _ => serde_json::Value::Null,
-    }
+        _ => Value::Null,
+    })
 }
 
 #[cfg(test)]
@@ -164,11 +169,20 @@ mod tests {
     use super::super::spec::{FrameBound, WindowFrame, WindowFuncSpec};
     use super::apply_aggregate_window;
     use crate::expr::SqlExpr;
+    use nodedb_types::Value;
     use serde_json::json;
 
-    fn numbered(n: usize) -> Vec<(String, serde_json::Value)> {
+    fn v(j: serde_json::Value) -> Value {
+        Value::from(j)
+    }
+
+    fn res(row: &(String, Value)) -> Value {
+        row.1.get("result").cloned().unwrap_or(Value::Null)
+    }
+
+    fn numbered(n: usize) -> Vec<(String, Value)> {
         (1..=n)
-            .map(|i| (i.to_string(), json!({ "n": i as i64 })))
+            .map(|i| (i.to_string(), v(json!({ "n": i as i64 }))))
             .collect()
     }
 
@@ -228,11 +242,11 @@ mod tests {
         // row 2 (n=3): sum of [2,3,4] = 9
         // row 3 (n=4): sum of [3,4,5] = 12
         // row 4 (n=5): sum of [4,5] = 9
-        assert_eq!(rows[0].1["result"], json!(3.0));
-        assert_eq!(rows[1].1["result"], json!(6.0));
-        assert_eq!(rows[2].1["result"], json!(9.0));
-        assert_eq!(rows[3].1["result"], json!(12.0));
-        assert_eq!(rows[4].1["result"], json!(9.0));
+        assert_eq!(res(&rows[0]), Value::Integer(3));
+        assert_eq!(res(&rows[1]), Value::Integer(6));
+        assert_eq!(res(&rows[2]), Value::Integer(9));
+        assert_eq!(res(&rows[3]), Value::Integer(12));
+        assert_eq!(res(&rows[4]), Value::Integer(9));
     }
 
     #[test]
@@ -245,11 +259,11 @@ mod tests {
             rows_frame(FrameBound::UnboundedPreceding, FrameBound::CurrentRow),
         );
         apply_aggregate_window(&mut rows, &indices, &spec).unwrap();
-        assert_eq!(rows[0].1["result"], json!(1.0));
-        assert_eq!(rows[1].1["result"], json!(3.0));
-        assert_eq!(rows[2].1["result"], json!(6.0));
-        assert_eq!(rows[3].1["result"], json!(10.0));
-        assert_eq!(rows[4].1["result"], json!(15.0));
+        assert_eq!(res(&rows[0]), Value::Integer(1));
+        assert_eq!(res(&rows[1]), Value::Integer(3));
+        assert_eq!(res(&rows[2]), Value::Integer(6));
+        assert_eq!(res(&rows[3]), Value::Integer(10));
+        assert_eq!(res(&rows[4]), Value::Integer(15));
     }
 
     #[test]
@@ -265,9 +279,9 @@ mod tests {
         // row 0: sum 1+2+3+4+5=15
         // row 1: sum 2+3+4+5=14
         // ...
-        assert_eq!(rows[0].1["result"], json!(15.0));
-        assert_eq!(rows[1].1["result"], json!(14.0));
-        assert_eq!(rows[4].1["result"], json!(5.0));
+        assert_eq!(res(&rows[0]), Value::Integer(15));
+        assert_eq!(res(&rows[1]), Value::Integer(14));
+        assert_eq!(res(&rows[4]), Value::Integer(5));
     }
 
     // ── RANGE ─────────────────────────────────────────────────────────────────
@@ -276,10 +290,10 @@ mod tests {
     fn range_unbounded_preceding_current_row_with_ties() {
         // Values: n in [1, 1, 2, 3] — two rows with n=1 share same frame.
         let mut rows = vec![
-            ("a".into(), json!({"n": 1i64})),
-            ("b".into(), json!({"n": 1i64})),
-            ("c".into(), json!({"n": 2i64})),
-            ("d".into(), json!({"n": 3i64})),
+            ("a".into(), v(json!({"n": 1i64}))),
+            ("b".into(), v(json!({"n": 1i64}))),
+            ("c".into(), v(json!({"n": 2i64}))),
+            ("d".into(), v(json!({"n": 3i64}))),
         ];
         let indices: Vec<usize> = (0..4).collect();
         // Use the fast running path (RANGE UNBOUNDED PRECEDING TO CURRENT ROW)
@@ -292,13 +306,229 @@ mod tests {
         );
         apply_aggregate_window(&mut rows, &indices, &spec).unwrap();
         // Row a (n=1, pos=0): CURRENT ROW expands to last peer at pos=1, sum=1+1=2
-        assert_eq!(rows[0].1["result"], json!(2.0));
+        assert_eq!(res(&rows[0]), Value::Integer(2));
         // Row b (n=1, pos=1): same
-        assert_eq!(rows[1].1["result"], json!(2.0));
+        assert_eq!(res(&rows[1]), Value::Integer(2));
         // Row c (n=2): sum=1+1+2=4
-        assert_eq!(rows[2].1["result"], json!(4.0));
+        assert_eq!(res(&rows[2]), Value::Integer(4));
         // Row d (n=3): sum=1+1+2+3=7
-        assert_eq!(rows[3].1["result"], json!(7.0));
+        assert_eq!(res(&rows[3]), Value::Integer(7));
+    }
+
+    // ── SUM / AVG exactness ───────────────────────────────────────────────────
+
+    #[test]
+    fn frame_and_running_sum_keep_integers_above_2_pow_53_exact() {
+        let vals = [
+            Value::Integer(9_007_199_254_740_993),
+            Value::Integer(9_007_199_254_740_992),
+        ];
+        let indices: Vec<usize> = (0..2).collect();
+
+        let mut rows = keyed(&vals);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("sum", "v", whole())).unwrap();
+        assert_eq!(res(&rows[0]), Value::Integer(18_014_398_509_481_985));
+
+        let running = range_frame(FrameBound::UnboundedPreceding, FrameBound::CurrentRow);
+        let mut rows = keyed(&vals);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("sum", "v", running)).unwrap();
+        assert_eq!(
+            results(&rows),
+            vec![
+                Value::Integer(9_007_199_254_740_993),
+                Value::Integer(18_014_398_509_481_985)
+            ]
+        );
+
+        let mut rows = keyed(&vals);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("avg", "v", whole())).unwrap();
+        assert_eq!(res(&rows[0]), Value::Float(9_007_199_254_740_992.0));
+    }
+
+    #[test]
+    fn frame_sum_past_i64_and_u64_is_exact() {
+        let vals = [
+            Value::Integer(i64::MAX),
+            Value::from_u64(u64::MAX),
+            Value::from_u64(u64::MAX),
+        ];
+        let indices: Vec<usize> = (0..3).collect();
+        let mut rows = keyed(&vals);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("sum", "v", whole())).unwrap();
+        let want = i128::from(i64::MAX) + 2 * i128::from(u64::MAX);
+        assert_eq!(
+            res(&rows[0]),
+            Value::Decimal(rust_decimal::Decimal::from_i128_with_scale(want, 0))
+        );
+    }
+
+    #[test]
+    fn frame_sum_mixed_int_float_is_float_and_empty_is_null() {
+        let vals = [Value::Integer(2), Value::Float(0.5), Value::Null];
+        let indices: Vec<usize> = (0..3).collect();
+        let mut rows = keyed(&vals);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("sum", "v", whole())).unwrap();
+        assert_eq!(res(&rows[0]), Value::Float(2.5));
+
+        let one_row = rows_frame(FrameBound::CurrentRow, FrameBound::CurrentRow);
+        let mut rows = keyed(&vals);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("sum", "v", one_row)).unwrap();
+        assert_eq!(res(&rows[2]), Value::Null);
+    }
+
+    /// Float overflow is `Infinity` and `Infinity` plus `-Infinity` is NaN;
+    /// both reach the window column as floats, as in PostgreSQL.
+    #[test]
+    fn frame_and_running_sum_keep_non_finite_floats() {
+        let indices: Vec<usize> = (0..2).collect();
+        let overflow = [Value::Float(1e308), Value::Float(1e308)];
+
+        let mut rows = keyed(&overflow);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("sum", "v", whole())).unwrap();
+        assert_eq!(res(&rows[0]), Value::Float(f64::INFINITY));
+
+        let running = range_frame(FrameBound::UnboundedPreceding, FrameBound::CurrentRow);
+        let mut rows = keyed(&overflow);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("sum", "v", running)).unwrap();
+        assert_eq!(
+            results(&rows),
+            vec![Value::Float(1e308), Value::Float(f64::INFINITY)]
+        );
+
+        let cancel = [Value::Float(f64::INFINITY), Value::Float(f64::NEG_INFINITY)];
+        let mut rows = keyed(&cancel);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("avg", "v", whole())).unwrap();
+        assert!(matches!(res(&rows[0]), Value::Float(f) if f.is_nan()));
+    }
+
+    // ── MIN / MAX exactness ───────────────────────────────────────────────────
+
+    /// Rows with order key `n` = 1..; `v` carries the given values.
+    fn keyed(vals: &[Value]) -> Vec<(String, Value)> {
+        vals.iter()
+            .enumerate()
+            .map(|(i, val)| {
+                let doc = std::collections::HashMap::from([
+                    ("n".to_string(), Value::Integer(i as i64 + 1)),
+                    ("v".to_string(), val.clone()),
+                ]);
+                (i.to_string(), Value::Object(doc))
+            })
+            .collect()
+    }
+
+    fn results(rows: &[(String, Value)]) -> Vec<Value> {
+        rows.iter().map(res).collect()
+    }
+
+    fn whole() -> WindowFrame {
+        rows_frame(
+            FrameBound::UnboundedPreceding,
+            FrameBound::UnboundedFollowing,
+        )
+    }
+
+    #[test]
+    fn frame_min_max_keep_integers_above_2_pow_53_exact() {
+        let vals = [
+            Value::Integer(9_007_199_254_740_993),
+            Value::Integer(9_007_199_254_740_992),
+        ];
+        let indices: Vec<usize> = (0..2).collect();
+
+        let mut rows = keyed(&vals);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("min", "v", whole())).unwrap();
+        assert_eq!(res(&rows[0]), Value::Integer(9_007_199_254_740_992));
+
+        let mut rows = keyed(&vals);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("max", "v", whole())).unwrap();
+        assert_eq!(res(&rows[0]), Value::Integer(9_007_199_254_740_993));
+    }
+
+    #[test]
+    fn frame_min_max_over_nanosecond_timestamps() {
+        let vals = [
+            Value::Integer(1_700_000_000_000_000_002),
+            Value::Integer(1_700_000_000_000_000_001),
+            Value::Integer(1_700_000_000_000_000_003),
+        ];
+        let indices: Vec<usize> = (0..3).collect();
+
+        let mut rows = keyed(&vals);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("min", "v", whole())).unwrap();
+        assert_eq!(res(&rows[2]), Value::Integer(1_700_000_000_000_000_001));
+
+        let mut rows = keyed(&vals);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("max", "v", whole())).unwrap();
+        assert_eq!(res(&rows[2]), Value::Integer(1_700_000_000_000_000_003));
+    }
+
+    #[test]
+    fn frame_min_max_mixed_int_float_return_original_type() {
+        let vals = [
+            Value::Integer(9_007_199_254_740_993),
+            Value::Float(9_007_199_254_740_992.0),
+            Value::Float(1.5),
+            Value::Integer(2),
+        ];
+        let indices: Vec<usize> = (0..4).collect();
+
+        let mut rows = keyed(&vals);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("min", "v", whole())).unwrap();
+        assert_eq!(res(&rows[0]), Value::Float(1.5));
+
+        let mut rows = keyed(&vals);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("max", "v", whole())).unwrap();
+        assert_eq!(res(&rows[0]), Value::Integer(9_007_199_254_740_993));
+    }
+
+    /// NaN sorts above every number: MAX over a frame with NaN is NaN, and
+    /// MIN skips it.
+    #[test]
+    fn frame_min_max_place_nan_above_every_number() {
+        let vals = [Value::Float(f64::NAN), Value::Integer(3), Value::Float(1.5)];
+        let indices: Vec<usize> = (0..3).collect();
+
+        let mut rows = keyed(&vals);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("max", "v", whole())).unwrap();
+        assert!(matches!(res(&rows[0]), Value::Float(f) if f.is_nan()));
+
+        let mut rows = keyed(&vals);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("min", "v", whole())).unwrap();
+        assert_eq!(res(&rows[0]), Value::Float(1.5));
+    }
+
+    #[test]
+    fn running_min_max_keep_integers_exact() {
+        let vals = [
+            Value::Integer(9_007_199_254_740_993),
+            Value::Integer(9_007_199_254_740_992),
+            Value::Integer(9_007_199_254_740_995),
+        ];
+        let indices: Vec<usize> = (0..3).collect();
+        let running = || range_frame(FrameBound::UnboundedPreceding, FrameBound::CurrentRow);
+
+        let mut rows = keyed(&vals);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("min", "v", running())).unwrap();
+        assert_eq!(
+            results(&rows),
+            vec![
+                Value::Integer(9_007_199_254_740_993),
+                Value::Integer(9_007_199_254_740_992),
+                Value::Integer(9_007_199_254_740_992),
+            ]
+        );
+
+        let mut rows = keyed(&vals);
+        apply_aggregate_window(&mut rows, &indices, &make_spec("max", "v", running())).unwrap();
+        assert_eq!(
+            results(&rows),
+            vec![
+                Value::Integer(9_007_199_254_740_993),
+                Value::Integer(9_007_199_254_740_993),
+                Value::Integer(9_007_199_254_740_995),
+            ]
+        );
     }
 
     // ── GROUPS ────────────────────────────────────────────────────────────────
@@ -307,11 +537,11 @@ mod tests {
     fn groups_1_preceding_1_following_sum() {
         // Values: [1, 1, 2, 3, 3] — groups [0, 0, 1, 2, 2]
         let mut rows = vec![
-            ("a".into(), json!({"n": 1i64})),
-            ("b".into(), json!({"n": 1i64})),
-            ("c".into(), json!({"n": 2i64})),
-            ("d".into(), json!({"n": 3i64})),
-            ("e".into(), json!({"n": 3i64})),
+            ("a".into(), v(json!({"n": 1i64}))),
+            ("b".into(), v(json!({"n": 1i64}))),
+            ("c".into(), v(json!({"n": 2i64}))),
+            ("d".into(), v(json!({"n": 3i64}))),
+            ("e".into(), v(json!({"n": 3i64}))),
         ];
         let indices: Vec<usize> = (0..5).collect();
         let spec = make_spec(
@@ -321,14 +551,14 @@ mod tests {
         );
         apply_aggregate_window(&mut rows, &indices, &spec).unwrap();
         // pos=0 (group 0): frame → groups 0..=1 → rows 0..=2 → sum=1+1+2=4
-        assert_eq!(rows[0].1["result"], json!(4.0));
+        assert_eq!(res(&rows[0]), Value::Integer(4));
         // pos=1 (group 0): same frame
-        assert_eq!(rows[1].1["result"], json!(4.0));
+        assert_eq!(res(&rows[1]), Value::Integer(4));
         // pos=2 (group 1): frame → groups 0..=2 → rows 0..=4 → sum=1+1+2+3+3=10
-        assert_eq!(rows[2].1["result"], json!(10.0));
+        assert_eq!(res(&rows[2]), Value::Integer(10));
         // pos=3 (group 2): frame → groups 1..=2 → rows 2..=4 → sum=2+3+3=8
-        assert_eq!(rows[3].1["result"], json!(8.0));
+        assert_eq!(res(&rows[3]), Value::Integer(8));
         // pos=4 (group 2): same
-        assert_eq!(rows[4].1["result"], json!(8.0));
+        assert_eq!(res(&rows[4]), Value::Integer(8));
     }
 }

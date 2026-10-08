@@ -84,9 +84,9 @@ pub(in crate::data::executor) fn merge_state_frames(
                 detail: format!("shuffle-aggregate `{AGG_STATE_FIELD}` is not binary"),
             })?;
 
-        // GroupState was serialized via serde (sonic_rs JSON) on the producer.
+        // The producer encodes GroupState as MessagePack.
         let state: GroupState =
-            sonic_rs::from_slice(state_bytes).map_err(|e| crate::Error::Codec {
+            zerompk::from_msgpack(state_bytes).map_err(|e| crate::Error::Codec {
                 detail: format!("shuffle-aggregate partial-state decode: {e}"),
             })?;
 
@@ -136,12 +136,7 @@ impl CoreLoop {
         let merged = match merge_state_frames(Path::new(state_path), group_by, aggregates) {
             Ok(m) => m,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
 
@@ -158,12 +153,7 @@ impl CoreLoop {
             sort_keys,
         }) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }
@@ -238,7 +228,7 @@ mod tests {
                 row.insert(spec.output_name.clone(), Value::from(jv));
                 part_idx += 1;
             }
-            let state_bytes = sonic_rs::to_vec(&state).expect("state json");
+            let state_bytes = zerompk::to_msgpack_vec(&state).expect("state msgpack");
             row.insert(
                 super::AGG_STATE_FIELD.to_string(),
                 Value::Bytes(state_bytes),
@@ -270,7 +260,16 @@ mod tests {
                 .expect("feed");
         }
         map.into_iter()
-            .map(|(k, s)| (k, s.finalize(specs).into_iter().map(|(_, v)| v).collect()))
+            .map(|(k, s)| {
+                (
+                    k,
+                    s.finalize(specs)
+                        .expect("finalize")
+                        .into_iter()
+                        .map(|(_, v)| v)
+                        .collect(),
+                )
+            })
             .collect()
     }
 
@@ -332,7 +331,16 @@ mod tests {
         let merged = merge_state_frames(&combined, &group_by, &specs).expect("merge");
         let got: HashMap<String, Vec<Value>> = merged
             .into_iter()
-            .map(|(k, s)| (k, s.finalize(&specs).into_iter().map(|(_, v)| v).collect()))
+            .map(|(k, s)| {
+                (
+                    k,
+                    s.finalize(&specs)
+                        .expect("finalize")
+                        .into_iter()
+                        .map(|(_, v)| v)
+                        .collect(),
+                )
+            })
             .collect();
 
         // Reference: single pass over the union of both doc sets.

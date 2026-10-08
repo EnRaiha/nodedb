@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared helpers for window-function evaluation.
+//! Shared helpers for window-function evaluation over document rows.
+//!
+//! A row is `(id, Value::Object)`. `Value` holds every result as computed,
+//! NaN and ±Infinity included, which a JSON number cannot.
 
 use std::collections::HashMap;
 
+use nodedb_types::Value;
+
 use crate::expr::types::SqlExpr;
+use crate::value_ops::{compare_sort_values, sort_peers, value_to_display_string};
 
 /// Group row indices by partition key, preserving first-seen partition order,
 /// then sort each partition's indices by the spec's ORDER BY.
@@ -16,7 +22,7 @@ use crate::expr::types::SqlExpr;
 /// propagates as `Err(EvalError::DivisionByZero)` rather than being folded to
 /// NULL.
 pub(super) fn build_partitions(
-    rows: &[(String, serde_json::Value)],
+    rows: &[(String, Value)],
     partition_by: &[SqlExpr],
     order_by: &[(SqlExpr, bool)],
 ) -> Result<Vec<Vec<usize>>, crate::expr::EvalError> {
@@ -29,7 +35,7 @@ pub(super) fn build_partitions(
         for (i, (_id, doc)) in rows.iter().enumerate() {
             let key: String = partition_by
                 .iter()
-                .map(|expr| eval_expr_on_json(expr, doc).map(|v| v.to_string()))
+                .map(|expr| expr.eval(doc).map(|v| partition_key_part(&v)))
                 .collect::<Result<Vec<_>, _>>()?
                 .join("\x00");
             let entry = groups.entry(key.clone()).or_default();
@@ -43,12 +49,12 @@ pub(super) fn build_partitions(
     };
 
     if !order_by.is_empty() {
-        let mut keys: Vec<Vec<serde_json::Value>> = Vec::with_capacity(rows.len());
+        let mut keys: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
         for (_id, doc) in rows.iter() {
             keys.push(
                 order_by
                     .iter()
-                    .map(|(expr, _)| eval_expr_on_json(expr, doc))
+                    .map(|(expr, _)| expr.eval(doc))
                     .collect::<Result<Vec<_>, _>>()?,
             );
         }
@@ -59,6 +65,12 @@ pub(super) fn build_partitions(
     }
 
     Ok(partitions)
+}
+
+/// One PARTITION BY value as a key fragment. The type name keeps the text
+/// `"1"` apart from the integer `1`.
+fn partition_key_part(v: &Value) -> String {
+    format!("{}:{}", v.type_name(), value_to_display_string(v))
 }
 
 /// Decide NULL placement for one ORDER BY column, shared by every window
@@ -94,8 +106,8 @@ pub(super) fn null_order(
 
 /// Compare two rows' pre-evaluated ORDER BY keys.
 fn compare_order_keys(
-    a: &[serde_json::Value],
-    b: &[serde_json::Value],
+    a: &[Value],
+    b: &[Value],
     order_by: &[(SqlExpr, bool)],
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
@@ -104,7 +116,7 @@ fn compare_order_keys(
             continue;
         };
         let ord = null_order(va.is_null(), vb.is_null(), *ascending).unwrap_or_else(|| {
-            let c = crate::json_expr::compare_json(va, vb);
+            let c = compare_sort_values(va, vb);
             if *ascending { c } else { c.reverse() }
         });
         if ord != Ordering::Equal {
@@ -114,46 +126,30 @@ fn compare_order_keys(
     Ordering::Equal
 }
 
-pub(super) fn set_window_col(row: &mut serde_json::Value, alias: &str, val: serde_json::Value) {
-    if let serde_json::Value::Object(map) = row {
+pub(super) fn set_window_col(row: &mut Value, alias: &str, val: Value) {
+    if let Value::Object(map) = row {
         map.insert(alias.to_string(), val);
     }
 }
 
-/// Evaluate a `SqlExpr` against a serde_json document, returning a serde_json value.
-///
-/// A division/modulo-by-zero in a PARTITION BY / ORDER BY expression is
-/// surfaced as `Err(EvalError::DivisionByZero)` — the same
-/// statement-failure treatment WHERE/projection expressions get — rather than
-/// being folded to `NULL`. The `Result` is threaded through every window
-/// function that reaches this evaluator up to `evaluate_window_functions`.
-pub(super) fn eval_expr_on_json(
-    expr: &SqlExpr,
-    doc: &serde_json::Value,
-) -> Result<serde_json::Value, crate::expr::EvalError> {
-    crate::json_expr::eval_expr_on_json(expr, doc)
-}
-
-pub(super) fn as_f64(v: &serde_json::Value) -> Option<f64> {
-    match v {
-        serde_json::Value::Number(n) => n.as_f64(),
-        serde_json::Value::String(s) => s.parse().ok(),
-        _ => None,
-    }
+/// Numeric view of a value for RANGE offsets and MIN / MAX filtering: a
+/// number or numeric text. `None` for any other value.
+pub(super) fn as_f64(v: &Value) -> Option<f64> {
+    crate::value_ops::value_to_f64(v, false)
 }
 
 /// Returns true when row at index `b` has the same ORDER BY key as row at
 /// index `a` (used by peer-aware ranking like RANK and PERCENT_RANK).
 pub(super) fn order_keys_equal(
-    rows: &[(String, serde_json::Value)],
+    rows: &[(String, Value)],
     a: usize,
     b: usize,
     order_by: &[(SqlExpr, bool)],
 ) -> Result<bool, crate::expr::EvalError> {
     for (expr, _) in order_by {
-        let va = eval_expr_on_json(expr, &rows[a].1)?;
-        let vb = eval_expr_on_json(expr, &rows[b].1)?;
-        if va != vb {
+        let va = expr.eval(&rows[a].1)?;
+        let vb = expr.eval(&rows[b].1)?;
+        if !sort_peers(&va, &vb) {
             return Ok(false);
         }
     }

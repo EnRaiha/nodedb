@@ -80,12 +80,7 @@ impl CoreLoop {
             ) {
                 Ok(d) => d,
                 Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
+                    return self.response_error(task, ErrorCode::from(e));
                 }
             }
         };
@@ -104,35 +99,20 @@ impl CoreLoop {
             }) {
                 Ok(g) => g,
                 Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
+                    return self.response_error(task, ErrorCode::from(e));
                 }
             };
 
         let rows = match Self::partial_state_rows(groups, group_by) {
             Ok(r) => r,
             Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
+                return self.response_error(task, ErrorCode::from(e));
             }
         };
 
         match crate::data::executor::response_codec::encode_value_vec(&rows) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 
@@ -175,9 +155,9 @@ impl CoreLoop {
                 }
             }
 
-            // GroupState serializes via serde (sonic_rs JSON) — the same
-            // canonical encoding `GroupBySpiller` already uses to persist it.
-            let state_bytes = sonic_rs::to_vec(&state).map_err(|e| crate::Error::Codec {
+            // GroupState encodes as MessagePack, the same encoding
+            // `GroupBySpiller` uses to persist it. NaN and ±Infinity stay exact.
+            let state_bytes = zerompk::to_msgpack_vec(&state).map_err(|e| crate::Error::Codec {
                 detail: format!("partial-state serialize: {e}"),
             })?;
             map.insert(AGG_STATE_FIELD.to_string(), Value::Bytes(state_bytes));

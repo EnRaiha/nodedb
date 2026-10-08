@@ -13,10 +13,11 @@ use super::spec::WindowFuncSpec;
 
 /// Evaluate window functions over sorted, partitioned rows.
 ///
-/// `rows` is the sorted result set. Each row is a `(doc_id, serde_json::Value)`.
-/// The same rows are mutated in place with window columns appended to each
-/// document. The row array keeps its input order; each spec's partitions are
-/// ordered by that spec's own ORDER BY, independent of the row array order.
+/// `rows` is the result set. Each row is a `(doc_id, Value::Object)`. The
+/// same rows are mutated in place with window columns appended to each
+/// document. A window result keeps NaN and ±Infinity. The row array keeps
+/// its input order; each spec's partitions are ordered by that spec's own
+/// ORDER BY, independent of the row array order.
 ///
 /// Unknown window function names must be rejected by the planner before
 /// reaching this dispatcher; an unrecognised name here is an internal bug
@@ -26,7 +27,7 @@ use super::spec::WindowFuncSpec;
 /// expression propagates as `Err(EvalError::DivisionByZero)` rather than
 /// folding to NULL.
 pub fn evaluate_window_functions(
-    rows: &mut [(String, serde_json::Value)],
+    rows: &mut [(String, nodedb_types::Value)],
     specs: &[WindowFuncSpec],
 ) -> Result<(), crate::expr::EvalError> {
     for spec in specs {
@@ -68,37 +69,54 @@ mod tests {
     use super::super::spec::{WindowFrame, WindowFuncSpec};
     use super::evaluate_window_functions;
     use crate::expr::SqlExpr;
+    use nodedb_types::Value;
     use serde_json::json;
 
-    fn make_rows() -> Vec<(String, serde_json::Value)> {
+    type Row = (String, Value);
+
+    fn row(id: &str, doc: serde_json::Value) -> Row {
+        (id.to_string(), Value::from(doc))
+    }
+
+    /// Column `name` of `row` in its JSON form, NULL when absent.
+    fn col(row: &Row, name: &str) -> serde_json::Value {
+        serde_json::Value::from(row.1.get(name).cloned().unwrap_or(Value::Null))
+    }
+
+    fn make_rows() -> Vec<Row> {
         vec![
-            (
-                "1".into(),
-                json!({"dept": "eng", "salary": 100, "name": "Alice"}),
-            ),
-            (
-                "2".into(),
-                json!({"dept": "eng", "salary": 120, "name": "Bob"}),
-            ),
-            (
-                "3".into(),
-                json!({"dept": "eng", "salary": 90, "name": "Carol"}),
-            ),
-            (
-                "4".into(),
-                json!({"dept": "sales", "salary": 80, "name": "Dave"}),
-            ),
-            (
-                "5".into(),
-                json!({"dept": "sales", "salary": 110, "name": "Eve"}),
-            ),
+            row("1", json!({"dept": "eng", "salary": 100, "name": "Alice"})),
+            row("2", json!({"dept": "eng", "salary": 120, "name": "Bob"})),
+            row("3", json!({"dept": "eng", "salary": 90, "name": "Carol"})),
+            row("4", json!({"dept": "sales", "salary": 80, "name": "Dave"})),
+            row("5", json!({"dept": "sales", "salary": 110, "name": "Eve"})),
         ]
     }
 
-    fn numbered(n: usize) -> Vec<(String, serde_json::Value)> {
+    fn numbered(n: usize) -> Vec<Row> {
         (1..=n)
-            .map(|i| (i.to_string(), json!({ "n": i })))
+            .map(|i| row(&i.to_string(), json!({ "n": i })))
             .collect()
+    }
+
+    fn peers() -> Vec<Row> {
+        vec![
+            row("a", json!({"n": 1})),
+            row("b", json!({"n": 1})),
+            row("c", json!({"n": 2})),
+            row("d", json!({"n": 3})),
+        ]
+    }
+
+    fn ordered_by_n(alias: &str, func: &str) -> WindowFuncSpec {
+        WindowFuncSpec {
+            alias: alias.into(),
+            func_name: func.into(),
+            args: vec![],
+            partition_by: vec![],
+            order_by: vec![(SqlExpr::Column("n".into()), true)],
+            frame: WindowFrame::default(),
+        }
     }
 
     #[test]
@@ -113,8 +131,8 @@ mod tests {
             frame: WindowFrame::default(),
         };
         evaluate_window_functions(&mut rows, &[spec]).unwrap();
-        assert_eq!(rows[0].1["rn"], json!(1));
-        assert_eq!(rows[4].1["rn"], json!(5));
+        assert_eq!(col(&rows[0], "rn"), json!(1));
+        assert_eq!(col(&rows[4], "rn"), json!(5));
     }
 
     #[test]
@@ -129,10 +147,10 @@ mod tests {
             frame: WindowFrame::default(),
         };
         evaluate_window_functions(&mut rows, &[spec]).unwrap();
-        assert_eq!(rows[0].1["rn"], json!(1));
-        assert_eq!(rows[2].1["rn"], json!(3));
-        assert_eq!(rows[3].1["rn"], json!(1));
-        assert_eq!(rows[4].1["rn"], json!(2));
+        assert_eq!(col(&rows[0], "rn"), json!(1));
+        assert_eq!(col(&rows[2], "rn"), json!(3));
+        assert_eq!(col(&rows[3], "rn"), json!(1));
+        assert_eq!(col(&rows[4], "rn"), json!(2));
     }
 
     #[test]
@@ -149,120 +167,122 @@ mod tests {
         evaluate_window_functions(&mut rows, &[spec]).unwrap();
         // The frame runs in salary order within each dept, not in row
         // arrival order: eng = Carol(90) → Alice(100) → Bob(120).
-        assert_eq!(rows[0].1["running_total"], json!(190.0));
-        assert_eq!(rows[1].1["running_total"], json!(310.0));
-        assert_eq!(rows[2].1["running_total"], json!(90.0));
-        assert_eq!(rows[3].1["running_total"], json!(80.0));
-        assert_eq!(rows[4].1["running_total"], json!(190.0));
+        // Integer salaries total exactly as integers.
+        assert_eq!(col(&rows[0], "running_total"), json!(190));
+        assert_eq!(col(&rows[1], "running_total"), json!(310));
+        assert_eq!(col(&rows[2], "running_total"), json!(90));
+        assert_eq!(col(&rows[3], "running_total"), json!(80));
+        assert_eq!(col(&rows[4], "running_total"), json!(190));
+    }
+
+    /// A float overflow reaches the window column as `Infinity`, not NULL.
+    #[test]
+    fn running_sum_keeps_infinity() {
+        let mut rows = vec![
+            (
+                "a".to_string(),
+                Value::Object(
+                    [
+                        ("n".to_string(), Value::Integer(1)),
+                        ("x".to_string(), Value::Float(1e308)),
+                    ]
+                    .into(),
+                ),
+            ),
+            (
+                "b".to_string(),
+                Value::Object(
+                    [
+                        ("n".to_string(), Value::Integer(2)),
+                        ("x".to_string(), Value::Float(1e308)),
+                    ]
+                    .into(),
+                ),
+            ),
+        ];
+        let mut spec = ordered_by_n("total", "sum");
+        spec.args = vec![SqlExpr::Column("x".into())];
+        evaluate_window_functions(&mut rows, &[spec]).unwrap();
+        assert_eq!(rows[0].1.get("total"), Some(&Value::Float(1e308)));
+        assert_eq!(rows[1].1.get("total"), Some(&Value::Float(f64::INFINITY)));
+    }
+
+    /// NaN order keys are peers of each other and sort after every number.
+    #[test]
+    fn nan_order_keys_rank_last_as_peers() {
+        let doc = |n: f64| Value::Object([("n".to_string(), Value::Float(n))].into());
+        let mut rows = vec![
+            ("a".to_string(), doc(f64::NAN)),
+            ("b".to_string(), doc(2.0)),
+            ("c".to_string(), doc(f64::NAN)),
+            ("d".to_string(), doc(f64::INFINITY)),
+        ];
+        evaluate_window_functions(&mut rows, &[ordered_by_n("rnk", "rank")]).unwrap();
+        assert_eq!(col(&rows[1], "rnk"), json!(1));
+        assert_eq!(col(&rows[3], "rnk"), json!(2));
+        assert_eq!(col(&rows[0], "rnk"), json!(3));
+        assert_eq!(col(&rows[2], "rnk"), json!(3));
     }
 
     #[test]
     fn percent_rank_distinct_keys() {
         let mut rows = numbered(5);
-        let spec = WindowFuncSpec {
-            alias: "pr".into(),
-            func_name: "percent_rank".into(),
-            args: vec![],
-            partition_by: vec![],
-            order_by: vec![(SqlExpr::Column("n".into()), true)],
-            frame: WindowFrame::default(),
-        };
-        evaluate_window_functions(&mut rows, &[spec]).unwrap();
-        assert_eq!(rows[0].1["pr"], json!(0.0));
-        assert_eq!(rows[1].1["pr"], json!(0.25));
-        assert_eq!(rows[2].1["pr"], json!(0.5));
-        assert_eq!(rows[3].1["pr"], json!(0.75));
-        assert_eq!(rows[4].1["pr"], json!(1.0));
+        evaluate_window_functions(&mut rows, &[ordered_by_n("pr", "percent_rank")]).unwrap();
+        assert_eq!(col(&rows[0], "pr"), json!(0.0));
+        assert_eq!(col(&rows[1], "pr"), json!(0.25));
+        assert_eq!(col(&rows[2], "pr"), json!(0.5));
+        assert_eq!(col(&rows[3], "pr"), json!(0.75));
+        assert_eq!(col(&rows[4], "pr"), json!(1.0));
     }
 
     #[test]
     fn percent_rank_with_peers() {
         // Peers share the leader's rank, so [1, 1, 2, 3] yields ranks
         // 1, 1, 3, 4 → percent_rank = 0, 0, 2/3, 3/3.
-        let mut rows = vec![
-            ("a".into(), json!({"n": 1})),
-            ("b".into(), json!({"n": 1})),
-            ("c".into(), json!({"n": 2})),
-            ("d".into(), json!({"n": 3})),
-        ];
-        let spec = WindowFuncSpec {
-            alias: "pr".into(),
-            func_name: "percent_rank".into(),
-            args: vec![],
-            partition_by: vec![],
-            order_by: vec![(SqlExpr::Column("n".into()), true)],
-            frame: WindowFrame::default(),
-        };
-        evaluate_window_functions(&mut rows, &[spec]).unwrap();
-        assert_eq!(rows[0].1["pr"], json!(0.0));
-        assert_eq!(rows[1].1["pr"], json!(0.0));
-        assert_eq!(rows[2].1["pr"], json!(2.0 / 3.0));
-        assert_eq!(rows[3].1["pr"], json!(1.0));
+        let mut rows = peers();
+        evaluate_window_functions(&mut rows, &[ordered_by_n("pr", "percent_rank")]).unwrap();
+        assert_eq!(col(&rows[0], "pr"), json!(0.0));
+        assert_eq!(col(&rows[1], "pr"), json!(0.0));
+        assert_eq!(col(&rows[2], "pr"), json!(2.0 / 3.0));
+        assert_eq!(col(&rows[3], "pr"), json!(1.0));
     }
 
     #[test]
     fn cume_dist_distinct_keys() {
         let mut rows = numbered(5);
-        let spec = WindowFuncSpec {
-            alias: "cd".into(),
-            func_name: "cume_dist".into(),
-            args: vec![],
-            partition_by: vec![],
-            order_by: vec![(SqlExpr::Column("n".into()), true)],
-            frame: WindowFrame::default(),
-        };
-        evaluate_window_functions(&mut rows, &[spec]).unwrap();
-        assert_eq!(rows[0].1["cd"], json!(0.2));
-        assert_eq!(rows[1].1["cd"], json!(0.4));
-        assert_eq!(rows[2].1["cd"], json!(0.6));
-        assert_eq!(rows[3].1["cd"], json!(0.8));
-        assert_eq!(rows[4].1["cd"], json!(1.0));
+        evaluate_window_functions(&mut rows, &[ordered_by_n("cd", "cume_dist")]).unwrap();
+        assert_eq!(col(&rows[0], "cd"), json!(0.2));
+        assert_eq!(col(&rows[1], "cd"), json!(0.4));
+        assert_eq!(col(&rows[2], "cd"), json!(0.6));
+        assert_eq!(col(&rows[3], "cd"), json!(0.8));
+        assert_eq!(col(&rows[4], "cd"), json!(1.0));
     }
 
     #[test]
     fn cume_dist_with_peers() {
-        let mut rows = vec![
-            ("a".into(), json!({"n": 1})),
-            ("b".into(), json!({"n": 1})),
-            ("c".into(), json!({"n": 2})),
-            ("d".into(), json!({"n": 3})),
-        ];
-        let spec = WindowFuncSpec {
-            alias: "cd".into(),
-            func_name: "cume_dist".into(),
-            args: vec![],
-            partition_by: vec![],
-            order_by: vec![(SqlExpr::Column("n".into()), true)],
-            frame: WindowFrame::default(),
-        };
-        evaluate_window_functions(&mut rows, &[spec]).unwrap();
+        let mut rows = peers();
+        evaluate_window_functions(&mut rows, &[ordered_by_n("cd", "cume_dist")]).unwrap();
         // Peers share value of last peer's position / N.
-        assert_eq!(rows[0].1["cd"], json!(0.5));
-        assert_eq!(rows[1].1["cd"], json!(0.5));
-        assert_eq!(rows[2].1["cd"], json!(0.75));
-        assert_eq!(rows[3].1["cd"], json!(1.0));
+        assert_eq!(col(&rows[0], "cd"), json!(0.5));
+        assert_eq!(col(&rows[1], "cd"), json!(0.5));
+        assert_eq!(col(&rows[2], "cd"), json!(0.75));
+        assert_eq!(col(&rows[3], "cd"), json!(1.0));
     }
 
     #[test]
     fn nth_value_returns_nth_then_holds() {
         let mut rows = numbered(5);
-        let spec = WindowFuncSpec {
-            alias: "nv".into(),
-            func_name: "nth_value".into(),
-            args: vec![
-                SqlExpr::Column("n".into()),
-                SqlExpr::Literal(nodedb_types::Value::Integer(2)),
-            ],
-            partition_by: vec![],
-            order_by: vec![(SqlExpr::Column("n".into()), true)],
-            frame: WindowFrame::default(),
-        };
+        let mut spec = ordered_by_n("nv", "nth_value");
+        spec.args = vec![
+            SqlExpr::Column("n".into()),
+            SqlExpr::Literal(Value::Integer(2)),
+        ];
         evaluate_window_functions(&mut rows, &[spec]).unwrap();
-        assert_eq!(rows[0].1["nv"], json!(null));
-        assert_eq!(rows[1].1["nv"], json!(2));
-        assert_eq!(rows[2].1["nv"], json!(2));
-        assert_eq!(rows[3].1["nv"], json!(2));
-        assert_eq!(rows[4].1["nv"], json!(2));
+        assert_eq!(col(&rows[0], "nv"), json!(null));
+        assert_eq!(col(&rows[1], "nv"), json!(2));
+        assert_eq!(col(&rows[2], "nv"), json!(2));
+        assert_eq!(col(&rows[3], "nv"), json!(2));
+        assert_eq!(col(&rows[4], "nv"), json!(2));
     }
 
     #[test]
@@ -280,16 +300,16 @@ mod tests {
             frame: WindowFrame::default(),
         };
         evaluate_window_functions(&mut rows, &[spec]).unwrap();
-        assert_eq!(rows[0].1["name"], json!("Alice"));
-        assert_eq!(rows[1].1["name"], json!("Bob"));
-        assert_eq!(rows[2].1["name"], json!("Carol"));
-        assert_eq!(rows[3].1["name"], json!("Dave"));
-        assert_eq!(rows[4].1["name"], json!("Eve"));
-        assert_eq!(rows[0].1["rnk"], json!(2)); // Alice, salary 100
-        assert_eq!(rows[1].1["rnk"], json!(1)); // Bob, salary 120
-        assert_eq!(rows[2].1["rnk"], json!(3)); // Carol, salary 90
-        assert_eq!(rows[3].1["rnk"], json!(2)); // Dave, salary 80
-        assert_eq!(rows[4].1["rnk"], json!(1)); // Eve, salary 110
+        assert_eq!(col(&rows[0], "name"), json!("Alice"));
+        assert_eq!(col(&rows[1], "name"), json!("Bob"));
+        assert_eq!(col(&rows[2], "name"), json!("Carol"));
+        assert_eq!(col(&rows[3], "name"), json!("Dave"));
+        assert_eq!(col(&rows[4], "name"), json!("Eve"));
+        assert_eq!(col(&rows[0], "rnk"), json!(2)); // Alice, salary 100
+        assert_eq!(col(&rows[1], "rnk"), json!(1)); // Bob, salary 120
+        assert_eq!(col(&rows[2], "rnk"), json!(3)); // Carol, salary 90
+        assert_eq!(col(&rows[3], "rnk"), json!(2)); // Dave, salary 80
+        assert_eq!(col(&rows[4], "rnk"), json!(1)); // Eve, salary 110
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! Public helpers for streaming aggregate accumulators.
 //!
 //! These thin wrappers expose field-extraction primitives used by the
-//! `handlers/aggregate.rs` streaming accumulator path in the `nodedb` crate.
+//! streaming aggregate accumulators in the `nodedb` crate.
 //! Each function operates on a single raw MessagePack document byte slice and
 //! returns only the scalar value needed by the calling accumulator — no
 //! document bytes are retained after the call returns.
@@ -12,7 +12,7 @@ use nodedb_types::Value;
 
 use crate::expr::{EvalError, SqlExpr};
 use crate::msgpack_scan::field::extract_field;
-use crate::msgpack_scan::reader::{read_f64, read_str, read_value};
+use crate::msgpack_scan::reader::{read_f64, read_numeric, read_str, read_value};
 use crate::value_ops;
 
 // ── Expression evaluator ───────────────────────────────────────────────────
@@ -54,6 +54,32 @@ pub fn extract_f64(
         return Ok(None);
     };
     Ok(read_f64(doc, start))
+}
+
+/// Extract the SUM / AVG input of `field`, or of `expr` if provided, as the
+/// number it contributes (`Integer`, `Float`, or `Decimal`). A raw field
+/// and an expression result contribute by the same rule,
+/// [`crate::numeric_sum::sum_input`]: a msgpack number read exactly, or a
+/// numeric string read per [`crate::numeric_sum::numeric_text`] (a
+/// `DECIMAL` cell is stored as its text).
+/// Returns `Ok(None)` when nothing contributes, and
+/// `Err(EvalError::DivisionByZero)` when `expr` divides/mods by zero.
+#[inline]
+pub fn extract_sum_value(
+    doc: &[u8],
+    field: &str,
+    expr: Option<&SqlExpr>,
+) -> Result<Option<Value>, EvalError> {
+    if let Some(expr) = expr {
+        return Ok(eval_expr(doc, expr)?.and_then(|v| crate::numeric_sum::sum_input(&v)));
+    }
+    let Some((start, _end)) = extract_field(doc, 0, field) else {
+        return Ok(None);
+    };
+    Ok(match read_numeric(doc, start) {
+        Some(n) => Some(crate::numeric_sum::numeric_to_value(n)),
+        None => read_str(doc, start).and_then(crate::numeric_sum::numeric_text),
+    })
 }
 
 /// Extract a display string from `field`, or evaluate `expr` if provided.

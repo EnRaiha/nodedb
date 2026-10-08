@@ -4,9 +4,8 @@
 //!
 //! The columnar path uses `GroupKey = Vec<GroupKeyPart>` (integer/symbol IDs)
 //! rather than the JSON-encoded string keys used by the schemaless path.
-//! Both `GroupKey` and `Vec<AggAccum>` derive `serde::Serialize +
-//! Deserialize`, so they serialize directly without intermediate string
-//! encoding — no unwrap fallbacks, no double-serialization.
+//! Both `GroupKey` and `Vec<AggAccum>` derive the `zerompk` MessagePack
+//! traits, so they encode directly without intermediate string encoding.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -99,14 +98,7 @@ impl ColumnarGroupBySpiller {
     ) -> crate::Result<HashMap<GroupKey, Vec<AggAccum>>> {
         self.core.merge(&mut self.in_mem, self.cap, |dst, src| {
             for (d, s) in dst.iter_mut().zip(src) {
-                d.count += s.count;
-                d.sum += s.sum;
-                if s.min < d.min {
-                    d.min = s.min;
-                }
-                if s.max > d.max {
-                    d.max = s.max;
-                }
+                d.merge(s);
             }
         })
     }

@@ -10,7 +10,8 @@
 //! projection or WHERE clause, and a non-column argument yields its computed
 //! value rather than a NULL placeholder.
 
-use super::helpers::eval_expr_on_json;
+use nodedb_types::Value;
+
 use super::spec::WindowFuncSpec;
 use crate::expr::{EvalError, SqlExpr};
 
@@ -19,7 +20,7 @@ use crate::expr::{EvalError, SqlExpr};
 ///
 /// `None` means the function was called without that argument — `COUNT(*)`,
 /// `ROW_NUMBER()` — which is distinct from an argument that evaluated to NULL.
-pub(super) type ArgValues = Option<Vec<serde_json::Value>>;
+pub(super) type ArgValues = Option<Vec<Value>>;
 
 /// Evaluate argument `idx` of `spec` once for every row in the partition.
 ///
@@ -27,7 +28,7 @@ pub(super) type ArgValues = Option<Vec<serde_json::Value>>;
 /// when the frame evaluator revisits rows, and gives every aggregate the same
 /// values the frame bounds are computed against.
 pub(super) fn eval_arg_values(
-    rows: &[(String, serde_json::Value)],
+    rows: &[(String, Value)],
     indices: &[usize],
     spec: &WindowFuncSpec,
     idx: usize,
@@ -37,18 +38,18 @@ pub(super) fn eval_arg_values(
     };
     let values = indices
         .iter()
-        .map(|&i| eval_expr_on_json(expr, &rows[i].1))
+        .map(|&i| expr.eval(&rows[i].1))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Some(values))
 }
 
 /// Value of argument `idx` at partition position `pos`, or NULL when the
 /// function was called without that argument.
-pub(super) fn arg_at(values: &ArgValues, pos: usize) -> serde_json::Value {
+pub(super) fn arg_at(values: &ArgValues, pos: usize) -> Value {
     values
         .as_ref()
         .and_then(|v| v.get(pos).cloned())
-        .unwrap_or(serde_json::Value::Null)
+        .unwrap_or(Value::Null)
 }
 
 /// Resolve a constant integer argument — the `LAG`/`LEAD` offset, `NTILE`
@@ -69,12 +70,12 @@ pub(super) fn const_usize_arg(spec: &WindowFuncSpec, idx: usize, default: usize)
 
 /// Resolve the constant `default` argument of `LAG`/`LEAD` — the value
 /// returned when the offset falls outside the partition.
-pub(super) fn const_default_arg(spec: &WindowFuncSpec, idx: usize) -> serde_json::Value {
+pub(super) fn const_default_arg(spec: &WindowFuncSpec, idx: usize) -> Value {
     spec.args
         .get(idx)
         .and_then(|e| match e {
-            SqlExpr::Literal(v) => Some(serde_json::Value::from(v.clone())),
+            SqlExpr::Literal(v) => Some(v.clone()),
             _ => None,
         })
-        .unwrap_or(serde_json::Value::Null)
+        .unwrap_or(Value::Null)
 }
