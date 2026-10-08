@@ -91,8 +91,12 @@ impl CoreLoop {
 
         let mut affected = 0usize;
         for row in matched {
-            let computed = match merge_field_updates(collection, Some(row.body.as_slice()), updates)
-            {
+            let computed = match merge_field_updates(
+                collection,
+                Some(row.body.as_slice()),
+                updates,
+                self.declared_columns(&coll_key),
+            ) {
                 Ok(c) => c,
                 Err(e) => return self.response_error(task, e),
             };

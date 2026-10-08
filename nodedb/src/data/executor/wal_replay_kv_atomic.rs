@@ -22,6 +22,7 @@ use tracing::warn;
 
 use super::core_loop::CoreLoop;
 use crate::data::executor::core_loop::write_index::KeyRepr;
+use crate::data::executor::handlers::kv::declared_body::fit_replayed_kv_image;
 use crate::engine::kv::{AtomicError, AtomicKeyCtx};
 
 impl CoreLoop {
@@ -94,6 +95,12 @@ impl CoreLoop {
         if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
             return Some(0);
         }
+        // Replay re-applies a write the policy already admitted when it was
+        // first accepted. The declared column rule is part of the computation.
+        let declared = self
+            .declared_columns_of(database_id, tenant_id, &collection)
+            .to_vec();
+        let gate = |image: &[u8]| fit_replayed_kv_image(image, &declared);
         let result = self.kv_engine.cas(
             AtomicKeyCtx {
                 database_id,
@@ -105,9 +112,7 @@ impl CoreLoop {
             },
             &expected,
             &new_value,
-            // Replay re-applies a write the policy already admitted when it
-            // was first accepted.
-            &crate::engine::kv::admit_any,
+            &gate,
         );
         let swapped = match result {
             Ok(result) => result.success(),
@@ -153,6 +158,14 @@ impl CoreLoop {
         if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
             return Some(0);
         }
+        // Replay re-applies a write the policy already admitted when it was
+        // first accepted; re-deciding it here would make recovery depend on
+        // the policies of whoever happens to be connected. The declared column
+        // rule is part of the computation, so it runs again.
+        let declared = self
+            .declared_columns_of(database_id, tenant_id, &collection)
+            .to_vec();
+        let gate = |image: &[u8]| fit_replayed_kv_image(image, &declared);
         match self.kv_engine.incr_float(
             AtomicKeyCtx {
                 database_id,
@@ -164,10 +177,7 @@ impl CoreLoop {
             },
             &delta,
             &shape,
-            // Replay re-applies a write the policy already admitted when it was
-            // first accepted; re-deciding it here would make recovery depend on
-            // the policies of whoever happens to be connected.
-            &crate::engine::kv::admit_any,
+            &gate,
         ) {
             Ok(_) => {
                 self.note_replay_write_lsn(
@@ -209,8 +219,21 @@ impl CoreLoop {
                 );
                 Some(0)
             }
-            // Unreachable by construction: replay hands the engine
-            // `admit_any`, so there is no predicate here that could refuse an
+            // The live write refused the same value against the same
+            // pre-state, so the record converges to the same no-op.
+            Err(AtomicError::Declared(error)) => {
+                warn!(
+                    core = self.core_id,
+                    collection = %collection,
+                    key = %String::from_utf8_lossy(&key),
+                    %error,
+                    "WAL kv_incr_float replay: declared column rule refused the value, \
+                     skipping record"
+                );
+                Some(0)
+            }
+            // Unreachable by construction: the replay gate decides no write
+            // policy, so there is no predicate here that could refuse an
             // image. Reaching this arm means a redo path acquired a real
             // write policy, and recovery would then be re-deciding writes that
             // were already admitted when they were accepted — against
@@ -268,6 +291,12 @@ impl CoreLoop {
         if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
             return Some(0);
         }
+        // Replay re-applies a write the policy already admitted when it was
+        // first accepted. The declared column rule is part of the computation.
+        let declared = self
+            .declared_columns_of(database_id, tenant_id, &collection)
+            .to_vec();
+        let gate = |image: &[u8]| fit_replayed_kv_image(image, &declared);
         let result = self.kv_engine.getset(
             AtomicKeyCtx {
                 database_id,
@@ -278,9 +307,7 @@ impl CoreLoop {
                 surrogate: nodedb_types::Surrogate::new(surrogate),
             },
             &new_value,
-            // Replay re-applies a write the policy already admitted when it
-            // was first accepted.
-            &crate::engine::kv::admit_any,
+            &gate,
         );
         if let Err(error) = result {
             self.replay_swap_error("getset", &collection, &key, record_lsn, error);
@@ -299,10 +326,11 @@ impl CoreLoop {
     /// Handle a `cas` or `getset` record whose replay computed no value.
     ///
     /// The live apply of the same record against the same pre-state failed
-    /// the same way and wrote nothing, so replay skips it. A refusal by the
-    /// write gate cannot happen here: replay hands the engine `admit_any`.
-    /// Reaching it means a redo path re-decides writes that were already
-    /// admitted, so replay halts and files a forensic report.
+    /// the same way and wrote nothing, so replay skips it. That covers a
+    /// declared column rule refusal too. A refusal by the write policy cannot
+    /// happen here: the replay gate decides no policy. Reaching it means a
+    /// redo path re-decides writes that were already admitted, so replay
+    /// halts and files a forensic report.
     fn replay_swap_error(
         &mut self,
         op: &'static str,
@@ -314,6 +342,7 @@ impl CoreLoop {
         let detail = match error {
             AtomicError::TypeMismatch { detail } | AtomicError::Encode { detail } => detail,
             AtomicError::Counter(fault) => fault.message().to_string(),
+            AtomicError::Declared(error) => error.to_string(),
             AtomicError::Rejected(error) => {
                 self.replay_record_unapplied(
                     "kv",

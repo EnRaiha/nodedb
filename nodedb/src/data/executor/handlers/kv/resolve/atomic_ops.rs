@@ -14,8 +14,10 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::kv::atomic::{
     KvAtomicCtx, atomic_error_code, incr_float_reply,
 };
+use crate::data::executor::handlers::kv::declared_body::fit_kv_image;
 use crate::data::executor::handlers::kv::rls::admit_kv_row;
 use crate::data::executor::response_codec;
+use crate::engine::kv::fitted_counter_f64;
 
 /// Render a stored body for the `current_value` / `old_value` slot of an
 /// atomic's reply, exactly as the live handlers do.
@@ -47,8 +49,12 @@ impl CoreLoop {
         }
         let now_ms = self.kv_ttl_now_ms(task);
         let current = self.kv_resolve_read(did, tid, collection, key, now_ms);
-        let (new_value, new_bytes) = compute::incr(current.as_deref(), delta, shape)
+        let (new_value, computed) = compute::incr(current.as_deref(), delta, shape)
             .map_err(|e| atomic_error_code(e.into(), collection))?;
+        // The declared column rule fits the computed row, as the live engine
+        // gate does. It never changes an integer it accepts.
+        let declared = self.declared_columns_of(did, tid, collection);
+        let new_bytes = fit_kv_image(&computed, declared)?.unwrap_or(computed);
         admit_kv_row(rls_write_check, &new_bytes, key, tid, collection)?;
 
         let expire_at_ms = if ttl_ms > 0 {
@@ -94,8 +100,18 @@ impl CoreLoop {
         }
         let now_ms = self.kv_read_now_ms();
         let current = self.kv_resolve_read(did, tid, collection, key, now_ms);
-        let (new_value, new_bytes) = compute::incr_float(current.as_deref(), delta, shape)
+        let (computed_value, computed) = compute::incr_float(current.as_deref(), delta, shape)
             .map_err(|e| atomic_error_code(e.into(), collection))?;
+        // The declared column rule fits the computed row, as the live engine
+        // gate does, and the reply carries the value the fitted row stores.
+        let declared = self.declared_columns_of(did, tid, collection);
+        let (new_value, new_bytes) = match fit_kv_image(&computed, declared)? {
+            None => (computed_value, computed),
+            Some(fitted) => (
+                fitted_counter_f64(computed_value, &computed, &fitted),
+                fitted,
+            ),
+        };
         admit_kv_row(rls_write_check, &new_bytes, key, tid, collection)?;
 
         let response_payload =
@@ -137,13 +153,19 @@ impl CoreLoop {
         }
         let now_ms = self.kv_read_now_ms();
         let current = self.kv_resolve_read(did, tid, collection, key, now_ms);
-        let (matches, write_bytes) = compute::cas(current.as_deref(), expected, new_value)
+        let (matches, computed) = compute::cas(current.as_deref(), expected, new_value)
             .map_err(|e| atomic_error_code(e.into(), collection))?;
-        // Decided on the image the swap stores, same as `execute_kv_cas`: a
-        // swap into a typed row stores the row, not `new_value` itself.
-        if matches {
-            admit_kv_row(rls_write_check, &write_bytes, key, tid, collection)?;
-        }
+        // Fitted and decided on the image the swap stores, same as
+        // `execute_kv_cas`: a swap into a typed row stores the row, not
+        // `new_value` itself.
+        let write_bytes = if matches {
+            let declared = self.declared_columns_of(did, tid, collection);
+            let fitted = fit_kv_image(&computed, declared)?.unwrap_or(computed);
+            admit_kv_row(rls_write_check, &fitted, key, tid, collection)?;
+            fitted
+        } else {
+            computed
+        };
 
         let response_payload = response_codec::encode_json_as_msgpack(&serde_json::json!({
             "success": matches,
@@ -192,9 +214,12 @@ impl CoreLoop {
         }
         let now_ms = self.kv_read_now_ms();
         let old = self.kv_resolve_read(did, tid, collection, key, now_ms);
-        let write_bytes = compute::getset(old.as_deref(), new_value)
+        let computed = compute::getset(old.as_deref(), new_value)
             .map_err(|e| atomic_error_code(e.into(), collection))?;
-        // Decided on the image the write stores, same as `execute_kv_getset`.
+        // Fitted and decided on the image the write stores, same as
+        // `execute_kv_getset`.
+        let declared = self.declared_columns_of(did, tid, collection);
+        let write_bytes = fit_kv_image(&computed, declared)?.unwrap_or(computed);
         admit_kv_row(rls_write_check, &write_bytes, key, tid, collection)?;
 
         let disclosable_old = match &old {
@@ -202,9 +227,7 @@ impl CoreLoop {
                 Ok(true) => old.as_deref(),
                 Ok(false) => None,
                 Err(e) => {
-                    return Err(ErrorCode::Internal {
-                        detail: e.to_string(),
-                    });
+                    return Err(ErrorCode::from(e));
                 }
             },
             None => None,

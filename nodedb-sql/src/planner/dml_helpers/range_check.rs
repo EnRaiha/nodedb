@@ -157,10 +157,9 @@ pub(crate) fn check_declared_float_ranges(
 /// [`check_declared_int_ranges`] for `UPDATE ... SET col = <literal>`.
 ///
 /// Only literal assignments are checkable at plan time; a computed assignment
-/// (`SET n = n + 1`) has no value until the Data Plane evaluates it. Those are
-/// caught on the read path instead, where the encoder refuses to transmit a
-/// value that does not fit the column's advertised width — so an out-of-range
-/// value can never reach a client silently by either route.
+/// (`SET n = n + 1`) has no value until the Data Plane evaluates it. The Data
+/// Plane checks the evaluated value against the same declared width before it
+/// stores the row, so a computed value out of range is refused there.
 pub(crate) fn check_declared_int_ranges_in_assignments(
     columns: &[ColumnInfo],
     assignments: &[(String, SqlExpr)],

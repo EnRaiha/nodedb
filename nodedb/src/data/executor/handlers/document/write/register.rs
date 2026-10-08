@@ -6,7 +6,7 @@
 
 use tracing::{debug, warn};
 
-use crate::bridge::envelope::Response;
+use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
@@ -32,6 +32,15 @@ pub(in crate::data::executor) struct RegisterDocumentCollectionParams<'a> {
     /// The read path decodes this collection's sparse rows as `zerompk`
     /// TAGGED sidecars solely on the strength of this marker.
     pub vector_primary: Option<&'a nodedb_types::VectorPrimaryConfig>,
+    /// Declared `VECTOR(n)` columns of a schemaless collection, as
+    /// `(column, n)`. Empty for every other collection.
+    pub vector_fields: &'a [(String, usize)],
+    /// Declared numeric columns of a schemaless or KV collection. Empty for
+    /// every other collection.
+    pub declared_columns: &'a [nodedb_physical::physical_plan::DeclaredColumn],
+    /// The collection's declared key column. `None` when rows key by the
+    /// implicit `id` or `_rowid`.
+    pub declared_key: Option<&'a str>,
 }
 
 impl CoreLoop {
@@ -56,6 +65,9 @@ impl CoreLoop {
             conflict_policy,
             timeseries,
             vector_primary,
+            vector_fields,
+            declared_columns,
+            declared_key,
         } = params;
         let mode_label = match storage_mode {
             nodedb_physical::physical_plan::StorageMode::Schemaless => "document_schemaless",
@@ -90,7 +102,30 @@ impl CoreLoop {
             conflict_policy: conflict_policy.map(str::to_string),
             timeseries: timeseries.map(|ts| Box::new(ts.clone())),
             vector_primary: vector_primary.map(|vp| Box::new(vp.clone())),
+            vector_fields: vector_fields.to_vec(),
+            declared_columns: declared_columns.to_vec(),
+            declared_key: declared_key.map(str::to_string),
         };
+
+        // Rehydrate the durable CRDT conflict-resolution policy (if any) into
+        // this core's `PolicyRegistry`. Runs on every `Register` — live DDL
+        // apply AND boot rehydration replay — so `ALTER COLLECTION ... SET ON
+        // CONFLICT ...` survives a restart. A policy that does not apply
+        // refuses the register before the collection config is installed.
+        if let Some(policy_json) = conflict_policy {
+            let applied = self
+                .get_crdt_engine(task.request.database_id, crate::types::TenantId::new(tid))
+                .and_then(|engine| engine.set_collection_policy(collection, policy_json));
+            if let Err(e) = applied {
+                warn!(
+                    core = self.core_id,
+                    %collection,
+                    error = %e,
+                    "persisted conflict policy did not apply on register"
+                );
+                return self.response_error(task, ErrorCode::from(e));
+            }
+        }
 
         let config_key = (
             task.request.database_id,
@@ -98,34 +133,6 @@ impl CoreLoop {
             collection.to_string(),
         );
         self.doc_configs.insert(config_key, config);
-
-        // Rehydrate the durable CRDT conflict-resolution policy (if any) into
-        // this core's `PolicyRegistry`. Runs on every `Register` — live DDL
-        // apply AND boot rehydration replay — so `ALTER COLLECTION ... SET ON
-        // CONFLICT ...` survives a restart instead of silently reverting to
-        // `CollectionPolicy::ephemeral()`.
-        if let Some(policy_json) = conflict_policy {
-            match self.get_crdt_engine(task.request.database_id, crate::types::TenantId::new(tid)) {
-                Ok(engine) => {
-                    if let Err(e) = engine.set_collection_policy(collection, policy_json) {
-                        warn!(
-                            core = self.core_id,
-                            %collection,
-                            error = %e,
-                            "failed to rehydrate persisted conflict policy on register"
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        core = self.core_id,
-                        %collection,
-                        error = %e,
-                        "failed to create CRDT engine for conflict policy rehydration"
-                    );
-                }
-            }
-        }
 
         self.response_ok(task)
     }

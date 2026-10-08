@@ -42,11 +42,11 @@ pub use cluster_event::{ClusterEventOp, MAX_REMOTE_CDC_COMMITTED_OFFSETS};
 pub use columnar::{ColumnarInsertIntent, ColumnarOp};
 pub use crdt::{CrdtOp, CrdtWriteVerb};
 pub use document::{
-    BalancedDef, DocumentOp, DocumentResolveOutcome, DocumentResolvedMutation, EnforcementOptions,
-    GeneratedColumnSpec, MaterializedSumBinding, OllpPredictedEdge, PeriodLockConfig,
-    RedoSumTargets, RegisteredIndex, RegisteredIndexState, ResolvedSumTarget, ReturningColumns,
-    ReturningItem, ReturningSpec, StorageMode, SumTargetKey, TimeseriesSchema, UpdateValue,
-    resolved_sum_surrogate,
+    BalancedDef, DeclaredColumn, DocumentOp, DocumentResolveOutcome, DocumentResolvedMutation,
+    EnforcementOptions, GeneratedColumnSpec, MaterializedSumBinding, OllpPredictedEdge,
+    PeriodLockConfig, RedoSumTargets, RegisteredIndex, RegisteredIndexState, ResolvedSumTarget,
+    ReturningColumns, ReturningItem, ReturningSpec, StorageMode, SumTargetKey, TimeseriesSchema,
+    UpdateValue, resolved_sum_surrogate,
 };
 pub use exchange::{ExchangeMode, ExchangeOp};
 pub use graph::{
@@ -55,8 +55,9 @@ pub use graph::{
 };
 pub use kv::{
     KvCounterShape, KvOp, KvResolveOutcome, KvResolvedMutation, SortedIndexRead, SortedIndexSpec,
+    TransferAmount,
 };
-pub use meta::{MetaOp, SAVEPOINT_MARKER_BYTES};
+pub use meta::MetaOp;
 pub use meta_home::{HomeAnswer, HomeVersion, HomeVersionProbe};
 pub use meta_restore::{RestoredEdgeVersion, RestoredIdentity, RestoredRedo, RestoredRow};
 pub use meta_snapshot::{CutCaptureRequest, SnapshotClearTarget};
@@ -67,7 +68,7 @@ pub use routing::plan_contains_cluster_partitioned_leaf;
 pub use set_op::SetOpKind;
 pub use sort_key::SortKeySpec;
 pub use spatial::{SpatialOp, SpatialPredicate};
-pub use text::TextOp;
+pub use text::{ScoreScanBound, ScoreScanOrder, TextOp, TextScoreSpec};
 pub use timeseries::{TimeseriesOp, TimeseriesResolve, UNBOUNDED_TIME_RANGE};
 pub use vector::{
     VectorDirectWriteIntent, VectorOp, VectorResolveOutcome, VectorResolvedMutation,

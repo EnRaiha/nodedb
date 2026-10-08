@@ -79,7 +79,8 @@ pub(crate) fn parse_origin_column_def(s: &str) -> crate::Result<nodedb_types::co
         ColumnDef::nullable(name, column_type)
     } else {
         ColumnDef::required(name, column_type)
-    };
+    }
+    .with_declared_width(type_str);
     if is_pk {
         col = col.with_primary_key();
     }

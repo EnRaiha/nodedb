@@ -184,17 +184,22 @@ async fn incr_on_absent_key_in_tx_creates_it_from_zero() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn incr_float_in_tx_ryow() {
     let server = TestServer::start().await;
-    setup(&server).await;
+    // A float increment needs a FLOAT value column: an INT column refuses
+    // the non-whole result.
+    server
+        .exec("CREATE COLLECTION cf (key TEXT PRIMARY KEY, n FLOAT) WITH (engine='kv')")
+        .await
+        .unwrap();
 
     server.exec("BEGIN").await.unwrap();
     let rows = server
-        .query_text("SELECT KV_INCR_FLOAT('c', 'dmg', 2.5)")
+        .query_text("SELECT KV_INCR_FLOAT('cf', 'dmg', 2.5)")
         .await
         .unwrap();
     assert!((json_of(&rows)["value"].as_f64().unwrap() - 2.5).abs() < f64::EPSILON);
 
     let rows2 = server
-        .query_text("SELECT KV_INCR_FLOAT('c', 'dmg', 1.5)")
+        .query_text("SELECT KV_INCR_FLOAT('cf', 'dmg', 1.5)")
         .await
         .unwrap();
     assert!(

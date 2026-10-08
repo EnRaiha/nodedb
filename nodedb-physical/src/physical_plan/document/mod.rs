@@ -2,6 +2,7 @@
 
 //! Document / sparse engine operations dispatched to the Data Plane.
 
+pub mod declared_column;
 pub mod enforcement_types;
 pub mod merge_types;
 pub mod ollp_edge;
@@ -12,6 +13,7 @@ pub mod timeseries_schema;
 pub mod types;
 pub mod update_value;
 
+pub use declared_column::DeclaredColumn;
 pub use enforcement_types::{
     RetentionDuration, RetentionUnit, StateTransitionDef, TransitionCheckDef, TransitionRule,
 };

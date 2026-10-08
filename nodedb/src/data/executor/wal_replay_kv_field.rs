@@ -58,7 +58,12 @@ impl CoreLoop {
         if if_present && current.is_none() {
             return Some(0);
         }
-        let computed = match merge_field_updates(&collection, current.as_deref(), &updates) {
+        let computed = match merge_field_updates(
+            &collection,
+            current.as_deref(),
+            &updates,
+            self.declared_columns_of(database_id, tenant_id, &collection),
+        ) {
             Ok(c) => c,
             Err(e) => {
                 warn!(
@@ -218,6 +223,7 @@ mod tests {
             "players",
             Some(&seed),
             &[("mana".to_string(), json_field_bytes(serde_json::json!(5)))],
+            &[],
         )
         .expect("live merge")
         .new_value;
@@ -252,6 +258,7 @@ mod tests {
             "players",
             None,
             &[("hp".to_string(), json_field_bytes(serde_json::json!(100)))],
+            &[],
         )
         .expect("live merge")
         .new_value;
@@ -298,6 +305,7 @@ mod tests {
             "players",
             Some(b"42"),
             &[("hp".to_string(), json_field_bytes(serde_json::json!(1)))],
+            &[],
         );
         assert!(
             matches!(

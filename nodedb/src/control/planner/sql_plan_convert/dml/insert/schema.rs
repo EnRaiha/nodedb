@@ -34,22 +34,18 @@ pub(crate) fn build_columnar_schema(
     let mut cols = Vec::with_capacity(column_schema.len());
     let mut has_id = false;
     for (name, type_str) in column_schema {
-        // `type_str` may contain SQL modifiers such as `NOT NULL` or `PRIMARY KEY`
-        // (e.g. "BIGINT NOT NULL"). Strip everything after the first token so that
-        // `ColumnType::from_str` receives the bare type name (e.g. "BIGINT").
-        let bare_type = type_str
-            .split_whitespace()
-            .next()
-            .unwrap_or(type_str.as_str());
-        let col_type = bare_type
-            .parse::<ColumnType>()
-            .unwrap_or(ColumnType::String);
-        if name == identity_column {
+        // `type_str` carries SQL modifiers such as `NOT NULL` or `PRIMARY KEY`
+        // ("BIGINT NOT NULL", "DECIMAL(10, 2) NOT NULL"). The declared-type
+        // resolver reads the leading type token and keeps a spaced parameter
+        // list whole.
+        let col_type = ColumnType::from_declared_type(type_str).unwrap_or(ColumnType::String);
+        let col = if name == identity_column {
             has_id = true;
-            cols.push(ColumnDef::required(name.clone(), col_type).with_primary_key());
+            ColumnDef::required(name.clone(), col_type).with_primary_key()
         } else {
-            cols.push(ColumnDef::nullable(name.clone(), col_type));
-        }
+            ColumnDef::nullable(name.clone(), col_type)
+        };
+        cols.push(col.with_declared_width(type_str));
     }
     // No column carries the identity: synthesize it.
     if !has_id {
@@ -75,4 +71,40 @@ pub(in super::super) fn build_schema_bytes(
     build_columnar_schema(column_schema, identity_column)
         .map(|schema| zerompk::to_msgpack_vec(&schema).unwrap_or_default())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::columnar::{DecimalTypmod, FloatWidth, IntWidth};
+
+    use super::*;
+
+    #[test]
+    fn columnar_schema_keeps_declared_widths_and_typmods() {
+        let fields: Vec<(String, String)> = [
+            ("id", "BIGINT PRIMARY KEY"),
+            ("s", "SMALLINT NOT NULL"),
+            ("r", "REAL"),
+            ("d", "DECIMAL(10, 2) NOT NULL"),
+        ]
+        .into_iter()
+        .map(|(name, declared)| (name.to_string(), declared.to_string()))
+        .collect();
+        let schema = build_columnar_schema(&fields, "id").expect("valid schema");
+        let column = |name: &str| {
+            schema
+                .columns
+                .iter()
+                .find(|c| c.name == name)
+                .cloned()
+                .expect("column present")
+        };
+        assert_eq!(column("id").int_width, Some(IntWidth::I64));
+        assert_eq!(column("s").int_width, Some(IntWidth::I16));
+        assert_eq!(column("r").float_width, Some(FloatWidth::F32));
+        assert_eq!(
+            column("d").column_type,
+            ColumnType::Decimal(Some(DecimalTypmod::new(10, 2).expect("valid typmod")))
+        );
+    }
 }

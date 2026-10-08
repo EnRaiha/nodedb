@@ -2,6 +2,7 @@
 
 mod batch_put;
 mod clock;
+mod counter_refit;
 pub mod engine;
 pub mod engine_atomic;
 mod engine_helpers;
@@ -22,11 +23,12 @@ pub(crate) mod test_support;
 
 pub use batch_put::KvBatchPutParams;
 pub use clock::current_ms;
+pub use counter_refit::fitted_counter_f64;
 pub use engine::{
     KvEngine, KvEntryImage, KvKeyRef, RestoreCompositeIndexParams, RestoreFieldIndexParams,
 };
 pub use engine_atomic::{
-    AtomicAdmission, AtomicError, AtomicKeyCtx, CasResult, GetSetResult, IncrStep, Incremented,
+    AtomicError, AtomicImageGate, AtomicKeyCtx, CasResult, GetSetResult, IncrStep, Incremented,
     admit_any,
 };
 pub use engine_index::RegisterIndexParams;

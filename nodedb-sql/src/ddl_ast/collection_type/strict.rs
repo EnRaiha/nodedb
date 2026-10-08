@@ -38,7 +38,8 @@ pub(crate) fn build_strict_schema(
             ColumnDef::nullable(name.clone(), column_type)
         } else {
             ColumnDef::required(name.clone(), column_type)
-        };
+        }
+        .with_declared_width(&bare_type);
         if is_pk {
             col = col.with_primary_key();
         }
@@ -112,5 +113,43 @@ pub(crate) fn build_strict_schema(
         StrictSchema::new(col_defs).map_err(|e| SqlError::Parse {
             detail: e.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::columnar::{FloatWidth, IntWidth};
+
+    use super::*;
+
+    #[test]
+    fn schema_records_each_declared_numeric_width() {
+        let columns: Vec<(String, String)> = [
+            ("id", "TEXT PRIMARY KEY"),
+            ("s", "SMALLINT NOT NULL"),
+            ("i", "INT"),
+            ("b", "BIGINT"),
+            ("r", "REAL"),
+            ("d", "DOUBLE PRECISION"),
+            ("t", "TEXT"),
+        ]
+        .into_iter()
+        .map(|(name, declared)| (name.to_string(), declared.to_string()))
+        .collect();
+        let schema = build_strict_schema(&columns, false).expect("valid schema");
+        let width = |name: &str| {
+            let column = schema
+                .columns
+                .iter()
+                .find(|c| c.name == name)
+                .expect("column present");
+            (column.int_width, column.float_width)
+        };
+        assert_eq!(width("s"), (Some(IntWidth::I16), None));
+        assert_eq!(width("i"), (Some(IntWidth::I32), None));
+        assert_eq!(width("b"), (Some(IntWidth::I64), None));
+        assert_eq!(width("r"), (None, Some(FloatWidth::F32)));
+        assert_eq!(width("d"), (None, Some(FloatWidth::F64)));
+        assert_eq!(width("t"), (None, None));
     }
 }

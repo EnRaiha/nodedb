@@ -9,6 +9,7 @@
 use nodedb_physical::kv_atomic::{AtomicComputeError, compute};
 use nodedb_physical::physical_plan::KvCounterShape;
 
+use super::counter_refit::fitted_counter_f64;
 use super::engine::KvEngine;
 use super::engine_helpers::{expiry_key, table_key};
 use super::engine_write::{UnboundKvWrite, require_bound};
@@ -75,8 +76,13 @@ pub enum AtomicError {
     Counter(crate::bridge::envelope::CounterFault),
     /// The computed new value failed to re-encode as MessagePack.
     Encode { detail: String },
-    /// The [`AtomicAdmission`] gate refused the computed post-image, so nothing
+    /// The computed value breaks a declared column rule of the collection,
+    /// such as a `SMALLINT` range or a `DECIMAL(p,s)` precision, so nothing
     /// was written. Boxed to keep the error small on the success path.
+    Declared(Box<crate::Error>),
+    /// The row-level-security write policy refused the computed post-image,
+    /// so nothing was written. Boxed to keep the error small on the success
+    /// path.
     Rejected(Box<crate::Error>),
     /// The write binds its row to `Surrogate::ZERO`, so nothing was written.
     Unbound(UnboundKvWrite),
@@ -101,21 +107,28 @@ impl From<AtomicComputeError> for AtomicError {
 /// A gate consulted with the computed post-image before an atomic commits.
 ///
 /// Every atomic computes the value it stores from the stored one: INCR runs
-/// arithmetic, and CAS and GETSET swap one column of a typed row. The row a
-/// row-level-security write policy has to decide does not exist until that
-/// computation has run, and it runs here, inside the engine, in the same pass
-/// that persists the result. Passing the decision in keeps the computation in
-/// one place.
-pub type AtomicAdmission<'a> = &'a dyn Fn(&[u8]) -> crate::Result<()>;
-
-/// An admission that accepts every image.
+/// arithmetic, and CAS and GETSET swap one column of a typed row. The image
+/// the collection's declared column rule fits, and the image a row-level
+/// security write policy decides, do not exist until that computation has
+/// run. It runs here, inside the engine, in the same pass that persists the
+/// result. Passing the gate in keeps the computation in one place.
 ///
-/// For replaying a write that was already decided: a WAL redo re-applies a
-/// write whose policy verdict was reached when it was first accepted, and
-/// re-deciding it against the *current* session's policies would make recovery
-/// depend on who happens to be connected.
-pub fn admit_any(_image: &[u8]) -> crate::Result<()> {
-    Ok(())
+/// The gate answers `Ok(None)` to store the computed image as it is,
+/// `Ok(Some(image))` to store the image the declared rule fitted, and `Err`
+/// to store nothing.
+pub type AtomicImageGate<'a> = &'a dyn Fn(&[u8]) -> Result<Option<Vec<u8>>, AtomicError>;
+
+/// A gate that stores every computed image as it is.
+///
+/// For a collection with no declared column and no write policy, and for
+/// tests.
+pub fn admit_any(_image: &[u8]) -> Result<Option<Vec<u8>>, AtomicError> {
+    Ok(None)
+}
+
+/// The image `gate` decides to store for the computed `image`.
+fn gated(gate: AtomicImageGate<'_>, image: Vec<u8>) -> Result<Vec<u8>, AtomicError> {
+    Ok(gate(&image)?.unwrap_or(image))
 }
 
 /// Shared key-identity context for a single-key atomic KV operation
@@ -151,15 +164,15 @@ impl KvEngine {
     /// - On i64 overflow: returns `Counter(IntegerOverflow)`. It never wraps.
     /// - TTL behavior: if `ttl_ms > 0` and key is new, sets TTL.
     ///   If key exists and `ttl_ms > 0`, resets TTL. If `ttl_ms == 0`, preserves.
-    /// - If `admit` refuses the computed value: returns `Rejected` and writes
-    ///   nothing.
+    /// - `admit` fits the computed row to the declared columns and decides
+    ///   it. A refusal returns its error and writes nothing.
     pub fn incr(
         &mut self,
         ctx: AtomicKeyCtx<'_>,
         delta: i64,
         ttl_ms: u64,
         shape: &KvCounterShape,
-        admit: AtomicAdmission<'_>,
+        admit: AtomicImageGate<'_>,
     ) -> Result<Incremented<i64>, AtomicError> {
         self.incr_resolved(
             ctx,
@@ -190,7 +203,7 @@ impl KvEngine {
         ctx: AtomicKeyCtx<'_>,
         step: IncrStep<'_>,
         expire_at_ms: u64,
-        admit: AtomicAdmission<'_>,
+        admit: AtomicImageGate<'_>,
     ) -> Result<Incremented<i64>, AtomicError> {
         self.incr_resolved(ctx, step, Some(expire_at_ms), admit)
     }
@@ -203,7 +216,7 @@ impl KvEngine {
         ctx: AtomicKeyCtx<'_>,
         step: IncrStep<'_>,
         expire_override: Option<u64>,
-        admit: AtomicAdmission<'_>,
+        admit: AtomicImageGate<'_>,
     ) -> Result<Incremented<i64>, AtomicError> {
         let IncrStep {
             delta,
@@ -215,10 +228,11 @@ impl KvEngine {
         let table = self.ensure_table(tkey, ctx.tenant_id, ctx.collection);
 
         let current = table.get(ctx.key, ctx.now_ms).map(|v| v.to_vec());
-        let (value, written) = compute::incr(current.as_deref(), delta, shape)?;
+        let (value, computed) = compute::incr(current.as_deref(), delta, shape)?;
         // Decided before `atomic_put`, so a refused image is never durable and
-        // never reaches the expiry wheel or the secondary indexes.
-        admit(&written).map_err(|error| AtomicError::Rejected(Box::new(error)))?;
+        // never reaches the expiry wheel or the secondary indexes. A declared
+        // rule never changes an integer it accepts, so `value` stands.
+        let written = gated(admit, computed)?;
         self.atomic_put(
             ctx,
             tkey,
@@ -243,23 +257,28 @@ impl KvEngine {
     ///   `Counter(NotAFloat)`. A typed row without a numeric column: returns
     ///   `TypeMismatch`.
     /// - A NaN or infinite result: returns `Counter(NonFinite)`.
-    /// - If `admit` refuses the computed value: returns `Rejected` and writes
-    ///   nothing.
+    /// - `admit` fits the computed row to the declared columns and decides
+    ///   it. A refusal returns its error and writes nothing. The returned
+    ///   value is the one the fitted row stores: a `DECIMAL(p,s)` column
+    ///   rounds it to its scale.
     pub fn incr_float(
         &mut self,
         ctx: AtomicKeyCtx<'_>,
         delta: &str,
         shape: &KvCounterShape,
-        admit: AtomicAdmission<'_>,
+        admit: AtomicImageGate<'_>,
     ) -> Result<Incremented<f64>, AtomicError> {
         require_bound(ctx.collection, ctx.surrogate)?;
         let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
         let table = self.ensure_table(tkey, ctx.tenant_id, ctx.collection);
 
         let current = table.get(ctx.key, ctx.now_ms).map(|v| v.to_vec());
-        let (value, written) = compute::incr_float(current.as_deref(), delta, shape)?;
+        let (value, computed) = compute::incr_float(current.as_deref(), delta, shape)?;
         // Decided before the value is installed — see `incr_resolved`.
-        admit(&written).map_err(|error| AtomicError::Rejected(Box::new(error)))?;
+        let (value, written) = match admit(&computed)? {
+            None => (value, computed),
+            Some(fitted) => (fitted_counter_f64(value, &computed, &fitted), fitted),
+        };
         // incr_float always preserves existing TTL (ttl_ms = 0).
         self.atomic_put(ctx, tkey, &written, 0, current.is_none(), None);
 
@@ -271,14 +290,14 @@ impl KvEngine {
     /// If current value equals `expected`, sets to `new_value` and returns success.
     /// If current value differs, returns the actual current value.
     /// If key doesn't exist and `expected` is empty, creates the key (create-if-not-exists).
-    /// If `admit` refuses the bytes the swap would store: returns `Rejected`
-    /// and writes nothing.
+    /// `admit` fits the bytes the swap would store to the declared columns
+    /// and decides them. A refusal returns its error and writes nothing.
     pub fn cas(
         &mut self,
         ctx: AtomicKeyCtx<'_>,
         expected: &[u8],
         new_value: &[u8],
-        admit: AtomicAdmission<'_>,
+        admit: AtomicImageGate<'_>,
     ) -> Result<CasResult, AtomicError> {
         require_bound(ctx.collection, ctx.surrogate)?;
         let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
@@ -294,7 +313,7 @@ impl KvEngine {
             });
         }
         // Decided before the value is installed — see `incr_resolved`.
-        admit(&write_bytes).map_err(|error| AtomicError::Rejected(Box::new(error)))?;
+        let write_bytes = gated(admit, write_bytes)?;
         self.atomic_put(ctx, tkey, &write_bytes, 0, current.is_none(), None);
         Ok(CasResult {
             written: Some(write_bytes),
@@ -306,13 +325,13 @@ impl KvEngine {
     ///
     /// If key didn't exist, `old` is `None`.
     /// Preserves existing TTL.
-    /// If `admit` refuses the bytes the write would store: returns `Rejected`
-    /// and writes nothing.
+    /// `admit` fits the bytes the write would store to the declared columns
+    /// and decides them. A refusal returns its error and writes nothing.
     pub fn getset(
         &mut self,
         ctx: AtomicKeyCtx<'_>,
         new_value: &[u8],
-        admit: AtomicAdmission<'_>,
+        admit: AtomicImageGate<'_>,
     ) -> Result<GetSetResult, AtomicError> {
         require_bound(ctx.collection, ctx.surrogate)?;
         let tkey = table_key(ctx.database_id, ctx.tenant_id, ctx.collection);
@@ -320,7 +339,7 @@ impl KvEngine {
         let old = table.get(ctx.key, ctx.now_ms).map(|v| v.to_vec());
         let write_bytes = compute::getset(old.as_deref(), new_value)?;
         // Decided before the value is installed — see `incr_resolved`.
-        admit(&write_bytes).map_err(|error| AtomicError::Rejected(Box::new(error)))?;
+        let write_bytes = gated(admit, write_bytes)?;
 
         // GetSet preserves existing TTL (ttl_ms = 0).
         self.atomic_put(ctx, tkey, &write_bytes, 0, old.is_none(), None);
@@ -563,11 +582,13 @@ mod tests {
             .incr(ctx("counters", b"hits"), 7, 0, &RAW, &admit_any)
             .unwrap();
 
-        let deny = |_: &[u8]| {
-            Err(crate::Error::RejectedAuthz {
-                tenant_id: crate::types::TenantId::new(1),
-                resource: "test".into(),
-            })
+        let deny = |_: &[u8]| -> Result<Option<Vec<u8>>, AtomicError> {
+            Err(AtomicError::Rejected(Box::new(
+                crate::Error::RejectedAuthz {
+                    tenant_id: crate::types::TenantId::new(1),
+                    resource: "test".into(),
+                },
+            )))
         };
         let result = engine.incr(ctx("counters", b"hits"), 5, 0, &RAW, &deny);
         assert!(matches!(result, Err(AtomicError::Rejected(_))));
@@ -579,6 +600,60 @@ mod tests {
             stored,
             b"7".to_vec(),
             "a refused increment must not be applied"
+        );
+    }
+
+    /// The gate's fitted image is what the engine stores, and the counter
+    /// value it returns is the fitted one.
+    #[test]
+    fn a_fitted_image_is_stored_and_reported() {
+        let mut engine = make_engine();
+        let round =
+            |_: &[u8]| -> Result<Option<Vec<u8>>, AtomicError> { Ok(Some(b"1.01".to_vec())) };
+        let result = engine
+            .incr_float(ctx("scores", b"price"), "1.005", &RAW, &round)
+            .expect("fitted");
+        assert_eq!(result.written, b"1.01".to_vec());
+        assert_eq!(result.value, 1.01);
+        assert_eq!(
+            engine.get(0, 1, "scores", b"price", 1000).as_deref(),
+            Some(b"1.01".as_slice())
+        );
+    }
+
+    /// A declared-rule refusal stores nothing for every atomic.
+    #[test]
+    fn a_declared_refusal_writes_nothing() {
+        let mut engine = make_engine();
+        engine
+            .incr(ctx("counters", b"hits"), 7, 0, &RAW, &admit_any)
+            .expect("seed");
+        let refuse = |_: &[u8]| -> Result<Option<Vec<u8>>, AtomicError> {
+            Err(AtomicError::Declared(Box::new(
+                crate::Error::NumericValueOutOfRange {
+                    detail: "test".into(),
+                },
+            )))
+        };
+        assert!(matches!(
+            engine.incr(ctx("counters", b"hits"), 1, 0, &RAW, &refuse),
+            Err(AtomicError::Declared(_))
+        ));
+        assert!(matches!(
+            engine.incr_float(ctx("counters", b"hits"), "1", &RAW, &refuse),
+            Err(AtomicError::Declared(_))
+        ));
+        assert!(matches!(
+            engine.cas(ctx("counters", b"hits"), b"7", b"9", &refuse),
+            Err(AtomicError::Declared(_))
+        ));
+        assert!(matches!(
+            engine.getset(ctx("counters", b"hits"), b"9", &refuse),
+            Err(AtomicError::Declared(_))
+        ));
+        assert_eq!(
+            engine.get(0, 1, "counters", b"hits", 1000).as_deref(),
+            Some(b"7".as_slice())
         );
     }
 

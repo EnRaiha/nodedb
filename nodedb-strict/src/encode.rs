@@ -19,10 +19,14 @@ pub const MAGIC: u32 = 0x5453_444E;
 /// Current Binary Tuple format version.
 pub const FORMAT_VERSION: u8 = 1;
 
-use nodedb_types::columnar::{ColumnType, StrictSchema};
+use nodedb_types::columnar::StrictSchema;
 use nodedb_types::value::Value;
 
 use crate::error::StrictError;
+
+#[path = "encode/value.rs"]
+mod value_encode;
+use value_encode::{encode_fixed, encode_variable};
 
 /// Encodes rows into Binary Tuples according to a fixed schema.
 ///
@@ -121,12 +125,7 @@ impl TupleEncoder {
             // Write fixed-size value.
             if let Some(offset) = self.fixed_offsets[i] {
                 let dst = fixed_start + offset;
-                encode_fixed(&mut buf[dst..], &col.column_type, val).map_err(|()| {
-                    StrictError::TypeMismatch {
-                        column: col.name.clone(),
-                        expected: col.column_type,
-                    }
-                })?;
+                encode_fixed(&mut buf[dst..], col, val)?;
             }
             // Variable-length values are handled in the offset table pass below.
         }
@@ -143,15 +142,7 @@ impl TupleEncoder {
 
             let val = &values[col_idx];
             if !matches!(val, Value::Null) {
-                encode_variable(
-                    &mut var_data,
-                    &self.schema.columns[col_idx].column_type,
-                    val,
-                )
-                .map_err(|()| StrictError::TypeMismatch {
-                    column: self.schema.columns[col_idx].name.clone(),
-                    expected: self.schema.columns[col_idx].column_type,
-                })?;
+                encode_variable(&mut var_data, &self.schema.columns[col_idx], val)?;
             }
             // If null: offset stays the same as next entry → zero length.
         }
@@ -207,211 +198,130 @@ impl TupleEncoder {
     }
 }
 
-/// Encode a fixed-size value into the buffer at the given position.
-///
-/// Handles both native Value types and SQL coercion sources.
-fn encode_fixed(dst: &mut [u8], col_type: &ColumnType, value: &Value) -> Result<(), ()> {
-    match (col_type, value) {
-        // Int64: native.
-        (ColumnType::Int64, Value::Integer(v)) => {
-            dst[..8].copy_from_slice(&v.to_le_bytes());
-        }
-        // Float64: native + Int64→Float64 coercion.
-        (ColumnType::Float64, Value::Float(v)) => {
-            dst[..8].copy_from_slice(&v.to_le_bytes());
-        }
-        (ColumnType::Float64, Value::Integer(v)) => {
-            dst[..8].copy_from_slice(&(*v as f64).to_le_bytes());
-        }
-        // Bool: native.
-        (ColumnType::Bool, Value::Bool(v)) => {
-            dst[0] = *v as u8;
-        }
-        // Timestamp (naive): NaiveDateTime + Integer (micros) + String (ISO 8601 parse).
-        (ColumnType::Timestamp, Value::NaiveDateTime(dt)) => {
-            dst[..8].copy_from_slice(&dt.micros.to_le_bytes());
-        }
-        (ColumnType::Timestamp, Value::Integer(micros)) => {
-            dst[..8].copy_from_slice(&micros.to_le_bytes());
-        }
-        (ColumnType::Timestamp, Value::String(s)) => {
-            let micros = nodedb_types::NdbDateTime::parse(s)
-                .map(|dt| dt.micros)
-                .unwrap_or(0);
-            dst[..8].copy_from_slice(&micros.to_le_bytes());
-        }
-        // Timestamptz (TZ-aware): DateTime + Integer (micros) + String (ISO 8601 parse).
-        (ColumnType::Timestamptz, Value::DateTime(dt)) => {
-            dst[..8].copy_from_slice(&dt.micros.to_le_bytes());
-        }
-        (ColumnType::Timestamptz, Value::Integer(micros)) => {
-            dst[..8].copy_from_slice(&micros.to_le_bytes());
-        }
-        (ColumnType::Timestamptz, Value::String(s)) => {
-            let micros = nodedb_types::NdbDateTime::parse(s)
-                .map(|dt| dt.micros)
-                .unwrap_or(0);
-            dst[..8].copy_from_slice(&micros.to_le_bytes());
-        }
-        // System timestamp: UTC micros, decoded canonically as DateTime.
-        (ColumnType::SystemTimestamp, Value::DateTime(dt)) => {
-            dst[..8].copy_from_slice(&dt.micros.to_le_bytes());
-        }
-        (ColumnType::SystemTimestamp, Value::Integer(micros)) => {
-            dst[..8].copy_from_slice(&micros.to_le_bytes());
-        }
-        // ULID: parse its textual representation and retain the canonical 16-byte ID.
-        (ColumnType::Ulid, Value::Ulid(s) | Value::String(s)) => {
-            let id = ulid::Ulid::from_string(s).map_err(|_| ())?;
-            dst[..16].copy_from_slice(&id.to_bytes());
-        }
-        // Duration: native duration, microseconds, or a human-readable literal.
-        (ColumnType::Duration, Value::Duration(duration)) => {
-            dst[..8].copy_from_slice(&duration.micros.to_le_bytes());
-        }
-        (ColumnType::Duration, Value::Integer(micros)) => {
-            dst[..8].copy_from_slice(&micros.to_le_bytes());
-        }
-        (ColumnType::Duration, Value::String(s)) => {
-            let duration = nodedb_types::NdbDuration::parse(s).ok_or(())?;
-            dst[..8].copy_from_slice(&duration.micros.to_le_bytes());
-        }
-        // Decimal: native Decimal + String/Float/Integer coercion.
-        (ColumnType::Decimal { .. }, Value::Decimal(d)) => {
-            dst[..16].copy_from_slice(&d.serialize());
-        }
-        (ColumnType::Decimal { .. }, Value::String(s)) => {
-            let d: rust_decimal::Decimal = s.parse().unwrap_or_default();
-            dst[..16].copy_from_slice(&d.serialize());
-        }
-        (ColumnType::Decimal { .. }, Value::Float(f)) => {
-            let d = rust_decimal::Decimal::try_from(*f).unwrap_or_default();
-            dst[..16].copy_from_slice(&d.serialize());
-        }
-        (ColumnType::Decimal { .. }, Value::Integer(i)) => {
-            let d = rust_decimal::Decimal::from(*i);
-            dst[..16].copy_from_slice(&d.serialize());
-        }
-        // Uuid: native Uuid string + String coercion.
-        (ColumnType::Uuid, Value::Uuid(s) | Value::String(s)) => {
-            if let Ok(parsed) = uuid::Uuid::parse_str(s) {
-                dst[..16].copy_from_slice(parsed.as_bytes());
-            }
-        }
-        // Vector: Array of floats + Bytes (packed f32).
-        (ColumnType::Vector(dim), Value::Array(arr)) => {
-            let d = *dim as usize;
-            for (i, v) in arr.iter().take(d).enumerate() {
-                let f = match v {
-                    Value::Float(f) => *f as f32,
-                    Value::Integer(n) => *n as f32,
-                    _ => 0.0,
-                };
-                dst[i * 4..(i + 1) * 4].copy_from_slice(&f.to_le_bytes());
-            }
-        }
-        (ColumnType::Vector(dim), Value::Bytes(b)) => {
-            let byte_len = (*dim as usize) * 4;
-            let copy_len = b.len().min(byte_len);
-            dst[..copy_len].copy_from_slice(&b[..copy_len]);
-        }
-        _ => {} // Type mismatch caught earlier by accepts().
-    }
-    Ok(())
-}
-
-/// Encode a variable-length value, appending to the data buffer.
-///
-/// Handles both native Value types and SQL coercion sources.
-fn encode_variable(var_data: &mut Vec<u8>, col_type: &ColumnType, value: &Value) -> Result<(), ()> {
-    match (col_type, value) {
-        (ColumnType::String, Value::String(s)) => {
-            var_data.extend_from_slice(s.as_bytes());
-        }
-        (ColumnType::Bytes, Value::Bytes(b)) => {
-            var_data.extend_from_slice(b);
-        }
-        // Geometry: native Geometry (JSON-serialized) + String (WKT/GeoJSON passthrough).
-        (ColumnType::Geometry, Value::Geometry(g)) => {
-            if let Ok(json) = sonic_rs::to_vec(g) {
-                var_data.extend_from_slice(&json);
-            }
-        }
-        (ColumnType::Geometry, Value::String(s)) => {
-            var_data.extend_from_slice(s.as_bytes());
-        }
-        (ColumnType::Json, Value::String(s)) => {
-            // String input for JSON column: parse as JSON, then serialize as MessagePack.
-            // This handles VALUES ('{"key":"val"}') where the SQL planner passes a string literal.
-            let parsed = sonic_rs::from_str::<serde_json::Value>(s)
-                .ok()
-                .map(nodedb_types::Value::from);
-            let to_encode = parsed.as_ref().unwrap_or(value);
-            if let Ok(bytes) = nodedb_types::value_to_msgpack(to_encode) {
-                var_data.extend_from_slice(&bytes);
-            }
-        }
-        (ColumnType::Json, value) => {
-            // Non-string input (Object, Array, etc.): serialize directly as MessagePack.
-            if let Ok(bytes) = nodedb_types::value_to_msgpack(value) {
-                var_data.extend_from_slice(&bytes);
-            }
-        }
-        // SparseVector: a `'{id: weight}'` literal stored as raw UTF-8 bytes,
-        // mirroring the String path (parsed at index-build time). Raw bytes
-        // pass through unchanged.
-        (ColumnType::SparseVector, Value::String(s)) => {
-            var_data.extend_from_slice(s.as_bytes());
-        }
-        (ColumnType::SparseVector, Value::Bytes(b)) => {
-            var_data.extend_from_slice(b);
-        }
-        // Typed variable columns use tagged NodeDB MessagePack so their Value
-        // variant survives storage. Coercion inputs are converted first.
-        (ColumnType::Array, Value::Array(_))
-        | (ColumnType::Set, Value::Set(_))
-        | (ColumnType::Regex, Value::Regex(_))
-        | (ColumnType::Range, Value::Range { .. })
-        | (ColumnType::Record, Value::Record { .. }) => {
-            append_msgpack(var_data, value)?;
-        }
-        (ColumnType::Set, Value::Array(items)) => {
-            append_msgpack(var_data, &Value::Set(items.clone()))?;
-        }
-        (ColumnType::Regex, Value::String(pattern)) => {
-            append_msgpack(var_data, &Value::Regex(pattern.clone()))?;
-        }
-        (ColumnType::Record, Value::String(reference)) => {
-            let (table, id) = reference.split_once(':').ok_or(())?;
-            if table.is_empty() || id.is_empty() {
-                return Err(());
-            }
-            append_msgpack(
-                var_data,
-                &Value::Record {
-                    table: table.to_owned(),
-                    id: id.to_owned(),
-                },
-            )?;
-        }
-        _ => {} // Type mismatch caught earlier by accepts().
-    }
-    Ok(())
-}
-
-/// Append a lossless NodeDB MessagePack representation.
-fn append_msgpack(var_data: &mut Vec<u8>, value: &Value) -> Result<(), ()> {
-    let bytes = zerompk::to_msgpack_vec(value).map_err(|_| ())?;
-    var_data.extend_from_slice(&bytes);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use nodedb_types::columnar::ColumnDef;
+    use nodedb_types::columnar::{ColumnDef, ColumnType};
     use nodedb_types::datetime::NdbDateTime;
 
     use super::*;
+
+    /// Encode one value into a single-column schema of `column_type`.
+    fn encode_one(column_type: ColumnType, value: Value) -> Result<Vec<u8>, StrictError> {
+        let schema = StrictSchema::new(vec![ColumnDef::required("c", column_type)]).unwrap();
+        TupleEncoder::new(&schema).encode(&[value])
+    }
+
+    fn assert_invalid_value(result: Result<Vec<u8>, StrictError>, expected: ColumnType) {
+        match result {
+            Err(StrictError::InvalidValue {
+                column,
+                expected: got,
+                ..
+            }) => {
+                assert_eq!(column, "c");
+                assert_eq!(got, expected);
+            }
+            other => panic!("expected InvalidValue for {expected}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unparsable_uuid_text_errors() {
+        assert_invalid_value(
+            encode_one(ColumnType::Uuid, Value::String("not-a-uuid".into())),
+            ColumnType::Uuid,
+        );
+        assert_invalid_value(
+            encode_one(ColumnType::Uuid, Value::Uuid("zzzz".into())),
+            ColumnType::Uuid,
+        );
+    }
+
+    #[test]
+    fn valid_uuid_text_roundtrips() {
+        let schema = StrictSchema::new(vec![ColumnDef::required("c", ColumnType::Uuid)]).unwrap();
+        let text = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        let tuple = TupleEncoder::new(&schema)
+            .encode(&[Value::String(text.into())])
+            .unwrap();
+        let decoded = crate::decode::TupleDecoder::new(&schema)
+            .extract_value(&tuple, 0)
+            .unwrap();
+        assert_eq!(decoded, Value::Uuid(text.into()));
+    }
+
+    #[test]
+    fn unparsable_ulid_and_duration_text_error() {
+        assert_invalid_value(
+            encode_one(ColumnType::Ulid, Value::String("not-a-ulid".into())),
+            ColumnType::Ulid,
+        );
+        assert_invalid_value(
+            encode_one(ColumnType::Ulid, Value::Ulid("01ARZ3NDEK".into())),
+            ColumnType::Ulid,
+        );
+        assert_invalid_value(
+            encode_one(ColumnType::Duration, Value::String("ten minutes".into())),
+            ColumnType::Duration,
+        );
+    }
+
+    #[test]
+    fn unparsable_timestamp_text_errors() {
+        for column_type in [ColumnType::Timestamp, ColumnType::Timestamptz] {
+            assert_invalid_value(
+                encode_one(column_type, Value::String("yesterday".into())),
+                column_type,
+            );
+        }
+    }
+
+    #[test]
+    fn unconvertible_decimal_sources_error() {
+        let decimal = ColumnType::Decimal(None);
+        assert_invalid_value(encode_one(decimal, Value::String("12.x".into())), decimal);
+        assert_invalid_value(encode_one(decimal, Value::Float(f64::NAN)), decimal);
+        assert_invalid_value(encode_one(decimal, Value::Float(f64::INFINITY)), decimal);
+    }
+
+    #[test]
+    fn vector_with_wrong_shape_errors() {
+        let vector = ColumnType::Vector(3);
+        let short = Value::Array(vec![Value::Float(1.0), Value::Float(2.0)]);
+        assert_invalid_value(encode_one(vector, short), vector);
+        let long = Value::Array(vec![Value::Float(0.5); 4]);
+        assert_invalid_value(encode_one(vector, long), vector);
+        let non_numeric = Value::Array(vec![
+            Value::Float(1.0),
+            Value::String("two".into()),
+            Value::Float(3.0),
+        ]);
+        assert_invalid_value(encode_one(vector, non_numeric), vector);
+        assert_invalid_value(encode_one(vector, Value::Bytes(vec![0; 8])), vector);
+        assert_invalid_value(encode_one(vector, Value::Bytes(vec![0; 13])), vector);
+        assert!(encode_one(vector, Value::Bytes(vec![0; 12])).is_ok());
+    }
+
+    #[test]
+    fn malformed_record_reference_errors() {
+        for text in ["users", ":42", "users:"] {
+            assert_invalid_value(
+                encode_one(ColumnType::Record, Value::String(text.into())),
+                ColumnType::Record,
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_value_error_reaches_encode_bitemporal() {
+        let schema =
+            StrictSchema::new_bitemporal(vec![ColumnDef::required("id", ColumnType::Uuid)])
+                .unwrap();
+        let err = TupleEncoder::new(&schema)
+            .encode_bitemporal(0, 0, 0, &[Value::String("bad".into())])
+            .unwrap_err();
+        assert!(matches!(err, StrictError::InvalidValue { ref column, .. } if column == "id"));
+    }
 
     fn crm_schema() -> StrictSchema {
         StrictSchema::new(vec![
@@ -420,10 +330,9 @@ mod tests {
             ColumnDef::nullable("email", ColumnType::String),
             ColumnDef::required(
                 "balance",
-                ColumnType::Decimal {
-                    precision: 18,
-                    scale: 4,
-                },
+                ColumnType::Decimal(Some(
+                    nodedb_types::columnar::DecimalTypmod::new(18, 4).expect("valid typmod"),
+                )),
             ),
             ColumnDef::nullable("active", ColumnType::Bool),
         ])

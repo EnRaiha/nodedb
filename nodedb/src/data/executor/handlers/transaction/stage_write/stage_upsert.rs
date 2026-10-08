@@ -144,10 +144,15 @@ impl CoreLoop {
                 strict_format::value_to_binary_tuple(&merged, schema, ctx.collection)
             }
         } else {
-            nodedb_types::value_to_msgpack(&merged).map_err(|e| crate::Error::Serialization {
-                format: "msgpack".into(),
-                detail: format!("staged upsert merge: {e}"),
-            })
+            let body = nodedb_types::value_to_msgpack(&merged).map_err(|e| {
+                crate::Error::Serialization {
+                    format: "msgpack".into(),
+                    detail: format!("staged upsert merge: {e}"),
+                }
+            })?;
+            // A declared numeric column holds the value its type stores, as
+            // on the durable path.
+            strict_format::coerce_declared_body(body, self.declared_columns(&config_key))
         }
     }
 

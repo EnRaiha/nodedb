@@ -6,9 +6,15 @@
 //! JSON is only produced at the read boundary (`binary_tuple_to_json`) for pgwire clients.
 
 mod coerce;
+mod declared;
 mod decode;
 mod encode;
+mod render;
 
+pub(crate) use coerce::{coerce_value, float_to_i64};
+pub(crate) use declared::{
+    coerce_declared, coerce_declared_body, coerce_declared_doc, coerce_declared_row,
+};
 pub(crate) use decode::{
     binary_tuple_to_json, binary_tuple_to_msgpack, binary_tuple_to_row_value,
     binary_tuple_to_value, undecodable_strict_row,
@@ -17,3 +23,4 @@ pub(super) use encode::{
     bytes_to_binary_tuple, bytes_to_binary_tuple_bitemporal, value_to_binary_tuple,
     value_to_binary_tuple_bitemporal,
 };
+pub(crate) use render::strict_row_to_msgpack;

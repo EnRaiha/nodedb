@@ -51,6 +51,13 @@ impl CoreLoop {
         {
             return self.response_error(task, refusal);
         }
+        // A staged row body holds its declared numeric columns' values, as an
+        // autocommit write does.
+        let coerced = match self.coerce_kv_op_bodies(task.request.database_id.as_u64(), tid, op) {
+            Ok(coerced) => coerced,
+            Err(e) => return self.response_error(task, e),
+        };
+        let op = coerced.as_ref().unwrap_or(op);
         match op {
             KvOp::Put {
                 collection,

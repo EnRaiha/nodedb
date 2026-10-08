@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Dispatch for KvOp variants: engine pressure check, refusal of an unbound
-//! row write, then delegation to execute_kv.
+//! row write, declared-column re-typing of incoming row bodies, then
+//! delegation to execute_kv.
 
 use crate::bridge::envelope::Response;
 use nodedb_physical::physical_plan::KvOp;
@@ -44,6 +45,12 @@ impl CoreLoop {
         {
             return self.response_error(task, refusal);
         }
-        self.execute_kv(task, did, tid, op)
+        // Every row body the op supplies whole holds its declared numeric
+        // columns' values before any handler sees it.
+        let coerced = match self.coerce_kv_op_bodies(did, tid, op) {
+            Ok(coerced) => coerced,
+            Err(e) => return self.response_error(task, e),
+        };
+        self.execute_kv(task, did, tid, coerced.as_ref().unwrap_or(op))
     }
 }

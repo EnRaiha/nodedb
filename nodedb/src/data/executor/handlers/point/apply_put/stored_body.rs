@@ -91,6 +91,10 @@ impl CoreLoop {
             doc_format::canonicalize_document_for_storage(value)
         };
 
+        // A declared numeric column holds the value its type stores. Runs
+        // after the generated columns, so a generated value is re-typed too.
+        let value = strict_format::coerce_declared_body(value, self.declared_columns(config_key))?;
+
         // Strict (Binary Tuple) pipeline: inject an auto-generated `_rowid`
         // from the surrogate if the schema declares one and the client
         // payload lacks it, then encode into Binary Tuple.
@@ -106,15 +110,19 @@ impl CoreLoop {
             let value = match link_after {
                 Some(head) => {
                     // A chained row carries its identity inside the linked
-                    // contents: a minted row gets `id` from its surrogate here,
-                    // as a strict row gets `_rowid` below. A copy under a new
-                    // surrogate then keeps both its id and its link.
-                    // A body that is not an object is left for the link to
-                    // refuse.
+                    // contents: a minted row gets its identity column from its
+                    // surrogate here, as a strict row gets `_rowid` below. A
+                    // copy under a new surrogate then keeps both its identity
+                    // and its link. A declared-key row holds its key and gains
+                    // no `id`. A body that is not an object is left for the
+                    // link to refuse.
                     let value = if nodedb_query::msgpack_scan::map_header(&value, 0).is_some() {
                         nodedb_query::msgpack_scan::inject_str_field(
                             &value,
-                            nodedb_types::DEFAULT_IDENTITY_COLUMN,
+                            config
+                                .declared_key
+                                .as_deref()
+                                .unwrap_or(nodedb_types::DEFAULT_IDENTITY_COLUMN),
                             &surrogate.as_u32().to_string(),
                         )
                     } else {

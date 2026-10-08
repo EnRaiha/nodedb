@@ -26,6 +26,7 @@ use tracing::warn;
 
 use super::core_loop::CoreLoop;
 use crate::data::executor::core_loop::write_index::KeyRepr;
+use crate::data::executor::handlers::kv::declared_body::fit_replayed_kv_image;
 use crate::engine::kv::{AtomicError, AtomicKeyCtx, IncrStep, Incremented};
 
 /// The decoded `kv_incr` record.
@@ -76,8 +77,13 @@ impl CoreLoop {
         };
         // Replay re-applies a write the policy already admitted when it was
         // first accepted. Re-deciding it here would make recovery depend on
-        // the policies of whoever happens to be connected.
-        let admit = &crate::engine::kv::admit_any;
+        // the policies of whoever happens to be connected. The declared
+        // column rule is part of the computation, so it runs again.
+        let declared = self
+            .declared_columns_of(database_id, tenant_id, &collection)
+            .to_vec();
+        let gate = |image: &[u8]| fit_replayed_kv_image(image, &declared);
+        let admit: crate::engine::kv::AtomicImageGate<'_> = &gate;
         let result = match expire_at_ms {
             Some(expire_at_ms) => self.kv_engine.incr_with_absolute_expiry(
                 ctx,
@@ -105,7 +111,7 @@ impl CoreLoop {
     }
 
     /// Shared result handling for a `kv_incr` replay: `Ok` counts as one
-    /// applied put; `TypeMismatch` / `Counter` / `Encode` are
+    /// applied put; `TypeMismatch` / `Counter` / `Encode` / `Declared` are
     /// correctly-converging no-ops (the live dispatch would have failed
     /// identically), logged and skipped rather than treated as errors.
     ///
@@ -155,8 +161,21 @@ impl CoreLoop {
                 );
                 0
             }
-            // Unreachable by construction: replay hands the engine
-            // `admit_any`, so there is no predicate here that could refuse an
+            // The live write refused the same value against the same
+            // pre-state, so the record converges to the same no-op.
+            Err(AtomicError::Declared(error)) => {
+                warn!(
+                    core = self.core_id,
+                    collection = %collection,
+                    key = %String::from_utf8_lossy(key),
+                    delta,
+                    %error,
+                    "WAL kv_incr replay: declared column rule refused the value, skipping record"
+                );
+                0
+            }
+            // Unreachable by construction: the replay gate decides no write
+            // policy, so there is no predicate here that could refuse an
             // image. Reaching this arm means a redo path acquired a real
             // write policy, and recovery would then be re-deciding writes that
             // were already admitted when they were accepted — against

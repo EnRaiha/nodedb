@@ -46,17 +46,17 @@ pub(super) fn typeguards_to_column_defs(
             ColumnDef::required(guard.field.clone(), ct)
         } else {
             ColumnDef::nullable(guard.field.clone(), ct)
-        };
+        }
+        .with_declared_width(&guard.type_expr);
         // A guard carries either DEFAULT or VALUE, never both. Strict schema
         // has one materialization slot, so both land on the column `DEFAULT`.
         if let Some(expr) = guard.default_expr.clone().or(guard.value_expr.clone()) {
-            // The resolved type's own spelling stands in for the declaration:
-            // a guard names no numeric width, so the canonical name resolves
-            // to the same width-less type the column will carry.
+            // The column's declared name stands in for the declaration. It
+            // resolves to the type and numeric width the column carries.
             validate_column_default(
                 &DeclaredColumn {
                     name: &col.name,
-                    declared_type: &col.column_type.to_string(),
+                    declared_type: &col.declared_type_name(),
                     primary_key: col.primary_key,
                 },
                 &expr,

@@ -480,10 +480,9 @@ mod tests {
             ColumnDef::nullable("email", ColumnType::String),
             ColumnDef::required(
                 "balance",
-                ColumnType::Decimal {
-                    precision: 18,
-                    scale: 4,
-                },
+                ColumnType::Decimal(Some(
+                    nodedb_types::columnar::DecimalTypmod::new(18, 4).expect("valid typmod"),
+                )),
             ),
             ColumnDef::nullable("active", ColumnType::Bool),
         ])
@@ -766,10 +765,9 @@ mod tests {
             ColumnDef::required("tstz", ColumnType::Timestamptz),
             ColumnDef::required(
                 "dec",
-                ColumnType::Decimal {
-                    precision: 18,
-                    scale: 4,
-                },
+                ColumnType::Decimal(Some(
+                    nodedb_types::columnar::DecimalTypmod::new(18, 4).expect("valid typmod"),
+                )),
             ),
             ColumnDef::required("uid", ColumnType::Uuid),
             ColumnDef::required("vec", ColumnType::Vector(2)),
