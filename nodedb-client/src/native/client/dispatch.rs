@@ -15,6 +15,7 @@ use nodedb_types::graph::GraphStats;
 use nodedb_types::id::{EdgeId, NodeId};
 use nodedb_types::protocol::Limits;
 use nodedb_types::result::{QueryResult, SearchResult, SubGraph};
+use nodedb_types::text_search::TextSearchParams;
 use nodedb_types::value::Value;
 
 use crate::traits::NodeDb;
@@ -58,9 +59,10 @@ impl NodeDb for NativeClient {
         query: &[f32],
         k: usize,
         filter: Option<&MetadataFilter>,
-        _allowed_ids: Option<&std::collections::HashSet<String>>,
+        allowed_ids: Option<&std::collections::HashSet<String>>,
     ) -> NodeDbResult<Vec<SearchResult>> {
-        self.vector_search_impl(collection, query, k, filter).await
+        self.vector_search_impl(collection, query, k, filter, allowed_ids)
+            .await
     }
 
     async fn vector_insert(
@@ -83,9 +85,10 @@ impl NodeDb for NativeClient {
         collection: &str,
         start: &NodeId,
         depth: u8,
+        direction: nodedb_types::graph::Direction,
         edge_filter: Option<&EdgeFilter>,
     ) -> NodeDbResult<SubGraph> {
-        self.graph_traverse_impl(collection, start, depth, edge_filter)
+        self.graph_traverse_impl(collection, start, depth, direction, edge_filter)
             .await
     }
 
@@ -127,6 +130,18 @@ impl NodeDb for NativeClient {
             max_iterations,
         )
         .await
+    }
+
+    async fn graph_shortest_path(
+        &self,
+        collection: &str,
+        from: &NodeId,
+        to: &NodeId,
+        max_depth: u8,
+        edge_filter: Option<&EdgeFilter>,
+    ) -> NodeDbResult<Option<Vec<NodeId>>> {
+        self.graph_shortest_path_impl(collection, from, to, max_depth, edge_filter)
+            .await
     }
 
     async fn list_insert(
@@ -174,6 +189,19 @@ impl NodeDb for NativeClient {
 
     async fn document_delete(&self, collection: &str, id: &str) -> NodeDbResult<()> {
         self.document_delete_impl(collection, id).await
+    }
+
+    async fn text_search(
+        &self,
+        collection: &str,
+        field: &str,
+        query: &str,
+        top_k: usize,
+        params: TextSearchParams,
+        allowed_ids: Option<&std::collections::HashSet<String>>,
+    ) -> NodeDbResult<Vec<SearchResult>> {
+        self.text_search_impl(collection, field, query, top_k, params, allowed_ids)
+            .await
     }
 
     async fn execute_sql(&self, query: &str, params: &[Value]) -> NodeDbResult<QueryResult> {

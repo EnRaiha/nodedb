@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `NodeDb` trait: unified query interface for both Origin and Lite.
+//! The `NodeDb` trait: one query interface for Origin and Lite.
 //!
-//! Application code writes against this trait once. The runtime determines
-//! whether queries execute locally (in-memory engines on Lite) or remotely
-//! (pgwire to Origin).
+//! Application code writes against this trait once. Lite runs each call on
+//! in-process engines. The native and pgwire clients send it to Origin. All
+//! methods are `async`: Tokio on native targets, `wasm-bindgen-futures` on
+//! WASM.
 //!
-//! All methods are `async` — on native this runs on Tokio, on WASM this
-//! runs on `wasm-bindgen-futures`.
+//! `NodeDb` is one trait, so an implementation is one `impl` block and one
+//! import. Long provided-method bodies live in `default_impls`.
 //!
-//! This file must remain a single block for object-safety: Rust does not
-//! permit a `trait` body to be split across files. Splitting `NodeDb` into
-//! supertraits would break the `Arc<dyn NodeDb>` pattern all callers depend
-//! on and is therefore out of scope for any mechanical refactor.
+//! Each method states its contract first. The `On Lite` / `On Remote` /
+//! `On Native` lines name what each backend runs. `Remote` is the pgwire
+//! client. `Native` is the MessagePack client, the canonical typed
+//! transport. "Key column" is a collection's declared primary key, else `id`.
 
 use std::collections::HashSet;
 
@@ -35,30 +36,29 @@ use crate::traits::document::CollectionPurgedHandler;
 
 /// Unified database interface for NodeDB.
 ///
-/// Two implementations:
-/// - `NodeDbLite`: executes queries against in-memory HNSW/CSR/Loro engines
-///   on the edge device. Writes produce CRDT deltas synced to Origin in background.
-/// - `NodeDbRemote`: translates trait calls into parameterized SQL and sends
-///   them over pgwire to the Origin cluster.
-///
-/// The developer writes agent logic once. Switching between local and cloud
-/// is a one-line configuration change.
+/// Implementations:
+/// - `NodeDbLite`: in-process HNSW/CSR/Loro engines on the edge device.
+///   Writes produce CRDT deltas synced to Origin in the background.
+/// - `NativeClient`: the MessagePack protocol to Origin.
+/// - `NodeDbRemote`: SQL over pgwire to Origin.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait NodeDb: NodeDbMarker {
-    // ─── Vector Operations ───────────────────────────────────────────
-
     /// Search for the `k` nearest vectors to `query` in `collection`.
     ///
-    /// Returns results ordered by ascending distance. Optional metadata
-    /// filter constrains which vectors are considered. When `allowed_ids`
-    /// is `Some`, only documents whose string ID appears in the set are
-    /// eligible — the filter is pushed into HNSW traversal on Lite so
-    /// the returned top-k is drawn exclusively from the allowed set.
+    /// Results are ordered by ascending distance. `filter` constrains which
+    /// vectors are considered. `Some(allowed_ids)` applies before ranking on
+    /// every implementation: the top-k comes from the allowed set even when
+    /// nearer vectors lie outside it. An empty set returns no result.
     ///
-    /// On Lite: direct in-memory HNSW search with optional ID prefilter. Sub-millisecond.
-    /// On Remote: translated to `SELECT ... ORDER BY embedding <-> $1 LIMIT $2`
-    /// (allowed_ids is ignored on the remote path — pass `None`).
+    /// On Lite: in-memory HNSW search with the id prefilter pushed into
+    /// traversal.
+    /// On Remote: `SELECT id, vector_distance(..) AS distance FROM <collection>
+    /// [WHERE <filter>] [AND <key column> IN (..)] ORDER BY vector_distance(..)
+    /// LIMIT <k>`. The server lowers the key restriction to a candidate bitmap
+    /// the index search honors.
+    /// On Native: the ids travel in the request. The server lowers them to
+    /// the same candidate bitmap.
     async fn vector_search(
         &self,
         collection: &str,
@@ -70,8 +70,8 @@ pub trait NodeDb: NodeDbMarker {
 
     /// Insert a vector with optional metadata into `collection`.
     ///
-    /// On Lite: inserts into in-memory HNSW + emits CRDT delta + persists to SQLite.
-    /// On Remote: translated to `INSERT INTO collection (id, embedding, metadata) VALUES (...)`.
+    /// On Lite: HNSW insert + CRDT delta + persist to local storage.
+    /// On Remote: `INSERT INTO collection (id, embedding, metadata) VALUES (...)`.
     async fn vector_insert(
         &self,
         collection: &str,
@@ -86,34 +86,33 @@ pub trait NodeDb: NodeDbMarker {
     /// On Remote: `DELETE FROM collection WHERE id = $1`.
     async fn vector_delete(&self, collection: &str, id: &str) -> NodeDbResult<()>;
 
-    // ─── Graph Operations ────────────────────────────────────────────
-
-    /// Traverse the graph from `start` up to `depth` hops within
-    /// `collection`.
+    /// Traverse the graph from `start` up to `depth` hops within `collection`.
     ///
-    /// `collection` names the graph collection holding the adjacency
-    /// data. NodeDB's graph overlay scopes edges per collection, so the
-    /// caller picks which graph to walk. Returns the discovered subgraph
-    /// (nodes + edges). Optional edge filter constrains which edges are
-    /// followed.
+    /// Edges are scoped per collection, so the caller picks which graph to
+    /// walk. Returns the discovered subgraph (nodes + edges). `direction`
+    /// selects outgoing, incoming, or both orientations.
     ///
-    /// On Lite: direct CSR pointer-chasing in contiguous memory. Microseconds.
-    /// On Remote: `GRAPH TRAVERSE IN '<collection>' FROM '<start>' DEPTH <n>
-    /// [LABEL '<l>']`.
+    /// Every label of the filter is followed. Every property filter must
+    /// admit an edge before it is crossed. Each returned edge carries its
+    /// properties.
+    ///
+    /// On Lite: CSR pointer-chasing in contiguous memory.
+    /// On Remote and Native: `GRAPH TRAVERSE IN '<collection>' FROM '<start>'
+    /// DEPTH <n> DIRECTION out|in|both [LABEL '<a>', '<b>' …]
+    /// [EDGE WHERE <property filters>]`, one round trip.
     async fn graph_traverse(
         &self,
         collection: &str,
         start: &NodeId,
         depth: u8,
+        direction: nodedb_types::graph::Direction,
         edge_filter: Option<&EdgeFilter>,
     ) -> NodeDbResult<SubGraph>;
 
-    /// Insert a directed edge from `from` to `to` with the given label
-    /// into `collection`.
+    /// Insert a directed edge `from` → `to` with label `edge_type` into
+    /// `collection`. Returns the generated edge ID.
     ///
-    /// Returns the generated edge ID.
-    ///
-    /// On Lite: appends to mutable adjacency buffer + CRDT delta + SQLite.
+    /// On Lite: mutable adjacency buffer + CRDT delta + local storage.
     /// On Remote: `GRAPH INSERT EDGE IN '<collection>' FROM '<from>' TO '<to>' TYPE '<label>'`.
     async fn graph_insert_edge(
         &self,
@@ -130,20 +129,15 @@ pub trait NodeDb: NodeDbMarker {
     /// On Remote: `GRAPH DELETE EDGE IN '<collection>' FROM '<src>' TO '<dst>' TYPE '<label>'`.
     async fn graph_delete_edge(&self, collection: &str, edge_id: &EdgeId) -> NodeDbResult<()>;
 
-    /// Read aggregated graph statistics.
+    /// Read aggregated graph statistics from the persisted edge store.
     ///
-    /// When `collection` is `Some(name)`, returns statistics for that one
-    /// collection — a vec of length 0 (no edges recorded) or 1. When
-    /// `collection` is `None`, returns one `GraphStats` per collection that
-    /// has edges (tenant-wide). Each entry contains the global edge count,
-    /// distinct node count, distinct label count, and per-label edge counts
-    /// (sorted ascending by label name). Reads what was *persisted* in the
-    /// edge store, bypassing any in-memory CSR view.
+    /// `Some(name)` returns zero or one entry for that collection. `None`
+    /// returns one entry per collection that has edges. Each entry holds the
+    /// edge count, distinct node count, distinct label count, and per-label
+    /// edge counts sorted by label.
     ///
-    /// `as_of` pins the read to a past system-time epoch (milliseconds
-    /// since Unix epoch). When `None`, the live (current) state is
-    /// returned. Bitemporal reads are supported on Origin; the Lite backend
-    /// returns an error when `as_of` is `Some`.
+    /// `as_of` pins the read to a past system time (ms since Unix epoch).
+    /// `None` reads the live state. Lite returns an error for `Some`.
     ///
     /// On Lite: direct read of the local edge store.
     /// On Remote: `SHOW GRAPH STATS [<'collection'>] [AS OF SYSTEM TIME <ms>]`.
@@ -155,11 +149,9 @@ pub trait NodeDb: NodeDbMarker {
 
     /// Run PageRank on a graph collection's edges.
     ///
-    /// When `personalization` is `Some`, computes Personalized PageRank — initial
-    /// rank is biased toward the seed nodes in the map (values are normalized).
-    /// When `None`, runs standard uniform-init PageRank.
-    ///
-    /// `damping` defaults to 0.85 when `None`. `max_iterations` defaults to 20.
+    /// `personalization` biases the initial rank toward its seed nodes
+    /// (values are normalized). `None` runs uniform-init PageRank.
+    /// `damping` defaults to 0.85, `max_iterations` to 20.
     ///
     /// Returns `(node_id, rank)` pairs sorted by rank descending. Ranks sum to 1.0.
     async fn graph_pagerank(
@@ -172,44 +164,47 @@ pub trait NodeDb: NodeDbMarker {
         default_impls::graph_pagerank_default(collection, personalization, damping, max_iterations)
     }
 
-    // ─── Document Operations ─────────────────────────────────────────
-
     /// Get a document by ID from `collection`.
     ///
-    /// A document that does not exist is `Ok(None)` — absence is an answer,
-    /// never an error. An error means the read itself failed.
+    /// A missing document is `Ok(None)`. An error means the read failed.
+    /// Every field reads back with its stored type, on every implementation.
     ///
-    /// On Lite: direct Loro state read. Sub-millisecond.
-    /// On Remote: `SELECT * FROM collection WHERE id = $1`.
+    /// On Lite: direct Loro state read.
+    /// On Remote: `SELECT to_jsonb(*) AS document FROM <collection> WHERE
+    /// <key column> = '<id>'` on the simple-query protocol. The row object
+    /// decodes field by field to the values the native client returns.
     async fn document_get(&self, collection: &str, id: &str) -> NodeDbResult<Option<Document>>;
 
-    /// Put (insert or update) a document into `collection`.
+    /// Put (insert or replace) a document into `collection`.
     ///
-    /// The document's `id` field determines the key. If a document with that
-    /// ID already exists, it is overwritten (last-writer-wins locally; CRDT
-    /// merge on sync).
+    /// The document's `id` is the key. An existing document with that id is
+    /// replaced whole (last-writer-wins locally, CRDT merge on sync).
     ///
-    /// On Lite: Loro apply + CRDT delta + SQLite persist.
-    /// On Remote: `INSERT ... ON CONFLICT (id) DO UPDATE SET ...`.
+    /// Each field is a top-level column. The key column holds the document
+    /// id. A field under the key column must equal the document id. A
+    /// declared key column reads back as a field. The implicit `id` does not.
+    ///
+    /// On Lite: Loro apply + CRDT delta + local storage.
+    /// On Remote: `DELETE` then `INSERT INTO <collection> (<key column>,
+    /// <fields>) VALUES (...)`, every value a bound parameter. The pair is
+    /// atomic. Inside the caller's transaction block it runs under a
+    /// savepoint and never ends that block. A failed put rolls back to the
+    /// savepoint and leaves the block usable. Outside a block it runs in its
+    /// own transaction.
     async fn document_put(&self, collection: &str, doc: Document) -> NodeDbResult<()>;
 
     /// Delete a document by ID from `collection`.
     ///
     /// On Lite: Loro delete + CRDT tombstone.
-    /// On Remote: `DELETE FROM collection WHERE id = $1`.
+    /// On Remote: `DELETE FROM <collection> WHERE <key column> = $1`.
     async fn document_delete(&self, collection: &str, id: &str) -> NodeDbResult<()>;
 
-    /// Put a document and insert its embedding vector in a single CRDT lock acquisition.
+    /// Put a document and insert its embedding under one CRDT lock acquisition.
     ///
-    /// Equivalent to calling `document_put` then `vector_insert`, but acquires the
-    /// CRDT lock only once — halving the per-insert oplog-walk cost on Lite. When
-    /// `embedding` is empty this behaves identically to `document_put`.
-    ///
-    /// `vector_collection` names the vector index to insert into (may differ from
-    /// the document `collection`).
-    ///
-    /// The default implementation falls back to two separate calls. Implementations
-    /// that can batch the two operations under one lock should override this method.
+    /// Equivalent to `document_put` then `vector_insert` into
+    /// `vector_collection`. An empty `embedding` makes it `document_put`.
+    /// The default makes the two calls. Implementations that can batch both
+    /// under one lock override it.
     async fn document_put_with_vector(
         &self,
         doc_collection: &str,
@@ -229,18 +224,15 @@ pub trait NodeDb: NodeDbMarker {
         .await
     }
 
-    /// Read a document as-of a system time, optionally filtered by valid_time.
+    /// Read a document as of a system time, optionally at a valid time.
     ///
-    /// Only valid on collections created `WITH (bitemporal=true)` — returns an
-    /// error on plain (non-bitemporal) collections.
-    ///
-    /// When `as_of_ms` is `None`, returns the current LIVE version (equivalent
-    /// to `document_get`). When `as_of_ms` is `Some(t)`, returns the version
-    /// visible at system time `t`. If `valid_time_ms` is `Some(vt)`, the
-    /// returned version must additionally satisfy
+    /// Only valid on collections created `WITH (bitemporal=true)`; a plain
+    /// collection returns an error. `as_of_ms: None` reads the live version.
+    /// `Some(t)` reads the version visible at system time `t`.
+    /// `valid_time_ms: Some(vt)` also requires
     /// `valid_from_ms <= vt < valid_until_ms`.
     ///
-    /// Returns `Err` on implementations that do not support bitemporal reads.
+    /// Implementations without bitemporal reads return `Err`.
     async fn document_get_as_of(
         &self,
         collection: &str,
@@ -254,11 +246,8 @@ pub trait NodeDb: NodeDbMarker {
     /// Put a document with explicit valid-time bounds.
     ///
     /// Only valid on collections created `WITH (bitemporal=true)`.
-    /// `valid_from_ms` and `valid_until_ms` specify the application-time
-    /// interval for which the version is considered current.  Both default
-    /// to system time / open-ended when `None`.
-    ///
-    /// Returns `Err` on implementations that do not support bitemporal writes.
+    /// `valid_from_ms` defaults to the system time, `valid_until_ms` to
+    /// open-ended. Implementations without bitemporal writes return `Err`.
     async fn document_put_with_valid_time(
         &self,
         collection: &str,
@@ -274,21 +263,16 @@ pub trait NodeDb: NodeDbMarker {
         )
     }
 
-    // ─── CRDT List Operations (Movable List) ───────────────────────────
-
-    /// Insert a new block into a document's movable-list container at `index`.
+    /// Insert a new block into a document's movable list at `index`.
     ///
-    /// `list_path` addresses the movable list within the document (dot-path
-    /// for nested containers). `fields` supplies the new block's contents —
-    /// must be `Value::Object(..)`; each key becomes a field on the new
-    /// LoroMap block inserted at `index`. `index` is unconditionally
-    /// required: a missing position is a data-corruption risk, never a
-    /// silent-default insert point.
+    /// `list_path` addresses the list (dot-path for nested containers).
+    /// `fields` must be `Value::Object(..)`. Each key becomes a field of the
+    /// new map block. `index` is required: a defaulted position corrupts
+    /// list order.
     ///
-    /// On Lite: appends to the local Loro movable list via
-    /// `nodedb_crdt::list_ops::list_insert_container` + emits a CRDT delta.
-    /// On Remote: encodes `OpCode::CrdtListInsert` (0x99) over the native
-    /// wire with `list_path` / `list_index` / `list_fields_json` set.
+    /// On Lite: `nodedb_crdt::list_ops::list_insert_container` + CRDT delta.
+    /// On Native: `OpCode::CrdtListInsert` with `list_path` / `list_index` /
+    /// `list_fields_json`.
     async fn list_insert(
         &self,
         collection: &str,
@@ -298,12 +282,10 @@ pub trait NodeDb: NodeDbMarker {
         fields: &Value,
     ) -> NodeDbResult<()>;
 
-    /// Delete the block at `index` from a document's movable-list container.
+    /// Delete the block at `index` from a document's movable list.
     ///
-    /// On Lite: removes the entry from the local Loro movable list + emits
-    /// a CRDT tombstone delta.
-    /// On Remote: encodes `OpCode::CrdtListDelete` (0x9A) over the native
-    /// wire with `list_path` / `list_index` set.
+    /// On Lite: removes the local entry + CRDT tombstone delta.
+    /// On Native: `OpCode::CrdtListDelete` with `list_path` / `list_index`.
     async fn list_delete(
         &self,
         collection: &str,
@@ -312,16 +294,14 @@ pub trait NodeDb: NodeDbMarker {
         index: usize,
     ) -> NodeDbResult<()>;
 
-    /// Move the block at `from_index` to `to_index` within a document's
-    /// movable-list container.
+    /// Move the block at `from_index` to `to_index` in a document's movable list.
     ///
-    /// `from_index` and `to_index` are distinct wire fields — never conflate
-    /// them; swapping them silently reorders the list to the wrong shape.
+    /// The two indexes are distinct wire fields. Swapping them reorders the
+    /// list to the wrong shape.
     ///
-    /// On Lite: repositions the entry in the local Loro movable list + emits
-    /// a CRDT delta.
-    /// On Remote: encodes `OpCode::CrdtListMove` (0x9B) over the native wire
-    /// with `list_path` / `list_from_index` / `list_to_index` set.
+    /// On Lite: repositions the local entry + CRDT delta.
+    /// On Native: `OpCode::CrdtListMove` with `list_path` /
+    /// `list_from_index` / `list_to_index`.
     async fn list_move(
         &self,
         collection: &str,
@@ -331,17 +311,12 @@ pub trait NodeDb: NodeDbMarker {
         to_index: usize,
     ) -> NodeDbResult<()>;
 
-    // ─── Named Vector Fields ──────────────────────────────────────────
-
-    /// Insert a vector into a named field within a collection.
+    /// Insert a vector into the named field `field_name` of `collection`.
     ///
-    /// Enables multiple embeddings per collection (e.g., "title_embedding",
-    /// "body_embedding") with independent HNSW indexes.
-    ///
-    /// Default returns `Err` — silently delegating to `vector_insert` and
-    /// dropping `field_name` would land the vector in the wrong field.
-    /// Implementations that route through to a server with field-aware
-    /// support must override.
+    /// Each named field has its own HNSW index, so a collection holds several
+    /// embeddings (e.g. `title_embedding`, `body_embedding`). The default
+    /// returns `Err`: delegating to `vector_insert` would drop `field_name`
+    /// and land the vector in the wrong field.
     async fn vector_insert_field(
         &self,
         collection: &str,
@@ -353,12 +328,10 @@ pub trait NodeDb: NodeDbMarker {
         default_impls::vector_insert_field_default(collection, field_name, id, embedding, metadata)
     }
 
-    /// Search a named vector field.
+    /// Search the named vector field `field_name`.
     ///
-    /// Default returns `Err` — silently delegating to `vector_search`
-    /// and dropping `field_name` would search the wrong field.
-    /// Implementations that route through to a server with field-aware
-    /// support must override.
+    /// The default returns `Err`: delegating to `vector_search` would drop
+    /// `field_name` and search the wrong field.
     async fn vector_search_field(
         &self,
         collection: &str,
@@ -370,21 +343,17 @@ pub trait NodeDb: NodeDbMarker {
         default_impls::vector_search_field_default(collection, field_name, query, k, filter)
     }
 
-    // ─── Graph Shortest Path ────────────────────────────────────────
-
     /// Find the shortest path between two nodes.
     ///
-    /// Returns the path as a list of node IDs (`from` first, `to` last),
-    /// or `None` if no path exists within `max_depth` hops.
+    /// Returns node IDs from `from` to `to`, or `None` when no path exists
+    /// within `max_depth` hops. The path follows outgoing edges the filter
+    /// admits.
     ///
-    /// Default: forward breadth-first search built on `graph_traverse`.
-    /// Each frontier expansion calls `graph_traverse(node, 1,
-    /// edge_filter)` to discover outgoing neighbors. Inherits the
-    /// underlying impl's edge direction semantics. Implementations with
-    /// a server-side shortest-path operator (e.g. NodeDB's
-    /// `GRAPH PATH IN <collection> FROM <src> TO <dst>` DSL) should override for
-    /// performance — round-tripping per-hop is O(path_length) wire
-    /// hops.
+    /// The default is a breadth-first search, one depth-1 `graph_traverse`
+    /// per expanded node.
+    /// On Remote and Native: `GRAPH PATH IN '<collection>' FROM '<from>'
+    /// TO '<to>' MAX_DEPTH <n> [LABEL '<a>', '<b>' …]
+    /// [EDGE WHERE <property filters>]`, one round trip.
     async fn graph_shortest_path(
         &self,
         collection: &str,
@@ -404,25 +373,26 @@ pub trait NodeDb: NodeDbMarker {
         .await
     }
 
-    // ─── Text Search ────────────────────────────────────────────────
-
-    /// Full-text search with BM25 scoring against the FTS-indexed
-    /// `field` on `collection`.
+    /// Full-text BM25 search of the indexed `field` of `collection`.
     ///
-    /// NodeDB's FTS is per-field — every BM25 index is scoped to one
-    /// declared field, so the caller names which field to search.
-    /// Returns document IDs with relevance scores, ordered by
-    /// descending score. Pass [`TextSearchParams::default()`] for
-    /// standard OR-mode non-fuzzy search.
+    /// Every BM25 index covers one declared field, so the caller names it.
+    /// An empty `field` searches the whole-document index. Returns ids with
+    /// scores, best first, at most `top_k`. `Some(allowed_ids)` returns only
+    /// those ids.
     ///
-    /// Default returns `Err` — `Ok(Vec::new())` is indistinguishable
-    /// from a real "no matches" answer and would silently mask the
-    /// missing implementation. Implementations must override (e.g., a
-    /// `SEARCH IN '<collection>' FIELD '<field>' QUERY '<q>'` round-trip
-    /// via `execute_sql`).
-    /// Full-text BM25 search. When `allowed_ids` is `Some`, only documents
-    /// whose ID is in the set are returned. On Lite, the filter is applied
-    /// after an over-fetch; on Remote, `allowed_ids` is ignored (pass `None`).
+    /// `params` means the same on every implementation. `mode` combines the
+    /// terms (`Or`: any, `And`: all). `fuzzy`, or the collection's fuzzy
+    /// default, lets a term with no exact match fall back to a Levenshtein
+    /// match. [`TextSearchParams::default`] is `{ mode: Or, fuzzy: false }`.
+    ///
+    /// On Lite: honors every `params` value, and applies `allowed_ids` after
+    /// an over-fetch.
+    /// On Remote and Native: one shared statement, `SELECT id, bm25_score(..,
+    /// opts) AS score FROM <collection> WHERE text_match(.., opts) [AND <key
+    /// column> IN (..)] ORDER BY score DESC LIMIT <k>`, with `opts` the
+    /// non-default `mode => '..'` and `fuzzy => ..`. Both return the same ids
+    /// and scores. A double-quoted query is a phrase query, which takes only
+    /// the default `params`.
     async fn text_search(
         &self,
         collection: &str,
@@ -431,11 +401,7 @@ pub trait NodeDb: NodeDbMarker {
         top_k: usize,
         params: TextSearchParams,
         allowed_ids: Option<&HashSet<String>>,
-    ) -> NodeDbResult<Vec<SearchResult>> {
-        default_impls::text_search_default(collection, field, query, top_k, params, allowed_ids)
-    }
-
-    // ─── Batch Operations ───────────────────────────────────────────
+    ) -> NodeDbResult<Vec<SearchResult>>;
 
     /// Batch insert vectors — amortizes CRDT delta export to O(1) per batch.
     async fn batch_vector_insert(
@@ -456,407 +422,73 @@ pub trait NodeDb: NodeDbMarker {
         default_impls::batch_graph_insert_edges_default(self, collection, edges).await
     }
 
-    // ─── Connection Metadata ─────────────────────────────────────────────
-
     /// The protocol version negotiated during the connection handshake.
-    ///
-    /// Returns `0` for implementations that do not maintain a persistent
-    /// connection and therefore never perform a handshake.
+    /// `0` for an implementation that performs no handshake.
     fn proto_version(&self) -> u16 {
         0
     }
 
-    /// The raw capability bitfield advertised by the server.
-    ///
-    /// Returns `0` when no handshake was performed. Use
-    /// `Capabilities::from_raw(self.capabilities())` for named predicates.
+    /// The raw capability bitfield advertised by the server. `0` when no
+    /// handshake ran. `Capabilities::from_raw` gives named predicates.
     fn capabilities(&self) -> u64 {
         0
     }
 
     /// The server version string from `HelloAckFrame` (e.g. `"0.1.0-dev"`).
-    ///
-    /// Returns an empty string when no handshake was performed.
+    /// Empty when no handshake ran.
     fn server_version(&self) -> String {
         String::new()
     }
 
-    /// Per-operation limits announced by the server.
-    ///
-    /// All fields are `None` when no handshake was performed — the caller
-    /// should treat `None` as "no server-side cap" for that dimension.
+    /// Per-operation limits announced by the server. Every field is `None`
+    /// when no handshake ran. `None` means no server-side cap.
     fn limits(&self) -> Limits {
         Limits::default()
     }
 
-    // ─── SQL Escape Hatch ────────────────────────────────────────────
-
     /// Execute a raw SQL query with parameters.
     ///
-    /// On Lite: requires the `sql` feature flag (compiles in DataFusion parser).
-    ///   Returns `NodeDbError::SqlNotEnabled` if the feature is not compiled in.
+    /// On Lite: requires the `sql` feature. Without it, returns
+    /// `NodeDbError::SqlNotEnabled`.
     /// On Remote: pass-through to Origin via pgwire.
     ///
-    /// For most AI agent workloads, the typed methods above are sufficient
-    /// and faster. Use this for BI tools, existing ORMs, or ad-hoc queries.
+    /// The typed methods above cover most agent workloads. Use this for BI
+    /// tools, ORMs, and ad-hoc queries.
     async fn execute_sql(&self, query: &str, params: &[Value]) -> NodeDbResult<QueryResult>;
-
-    // ─── Collection Lifecycle (soft-delete / undrop / hard-delete) ───
 
     /// Restore a soft-deleted collection within its retention window.
     ///
-    /// Equivalent to `UNDROP COLLECTION <name>`. Fails with 42P01 if
-    /// the retention window has elapsed and the row is gone, or with
-    /// 42501 if the caller is neither preserved owner nor admin.
-    ///
-    /// Default impl routes through `execute_sql` so any implementation
-    /// that can execute SQL inherits the correct behavior for free.
+    /// Runs `UNDROP COLLECTION <name>` through `execute_sql`. Fails with
+    /// 42P01 once the retention window has elapsed, or with 42501 when the
+    /// caller is neither the preserved owner nor an admin.
     async fn undrop_collection(&self, name: &str) -> NodeDbResult<()> {
         default_impls::undrop_collection_default(self, name).await
     }
 
     /// Hard-delete a collection, skipping soft-delete and retention.
     ///
-    /// Equivalent to `DROP COLLECTION <name> PURGE`. Admin-only on the
-    /// server; the server rejects non-admin callers with 42501.
-    /// Bypasses the retention safety net — data is unrecoverable.
+    /// Runs `DROP COLLECTION <name> PURGE`. Admin-only: the server rejects
+    /// other callers with 42501. The data is unrecoverable.
     async fn drop_collection_purge(&self, name: &str) -> NodeDbResult<()> {
         default_impls::drop_collection_purge_default(self, name).await
     }
 
-    /// List every soft-deleted collection in the current tenant that
-    /// is still within its retention window.
+    /// List the current tenant's soft-deleted collections still within their
+    /// retention window. Empty when there are none.
     ///
-    /// Equivalent to `SELECT tenant_id, name, owner, deactivated_at_ns,
-    /// retention_expires_at_ns FROM _system.dropped_collections`.
-    /// Returns `Vec<DroppedCollection>` — empty if no soft-deleted rows
-    /// exist for the caller's tenant.
+    /// Reads `tenant_id, name, owner, deactivated_at_ns,
+    /// retention_expires_at_ns` from `_system.dropped_collections`.
     async fn list_dropped_collections(&self) -> NodeDbResult<Vec<DroppedCollection>> {
         default_impls::list_dropped_collections_default(self).await
     }
 
-    /// Register a handler fired when a collection the caller has
-    /// synced is purged on Origin and the local copy is removed.
+    /// Register a handler fired when a collection the caller synced is purged
+    /// on Origin and the local copy is removed.
     ///
-    /// Default impl returns `NodeDbError::storage` with a
-    /// `"not supported"` detail — implementations that maintain a
-    /// sync client (Lite, any future push-capable remote client)
-    /// override with registration into their internal handler list.
-    /// Stateless clients (pgwire-only `NodeDbRemote`) have nothing
-    /// to push, so the default rejection is the correct behavior.
+    /// The default returns `NodeDbError::storage` ("not supported").
+    /// Implementations with a sync client (Lite) override it. A stateless
+    /// pgwire client has nothing to push, so the default is correct there.
     async fn on_collection_purged(&self, _handler: CollectionPurgedHandler) -> NodeDbResult<()> {
         default_impls::on_collection_purged_default()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::capabilities::Capabilities;
-    use async_trait::async_trait;
-    use nodedb_types::document::Document;
-    use nodedb_types::error::{NodeDbError, NodeDbResult};
-    use nodedb_types::filter::{EdgeFilter, MetadataFilter};
-    use nodedb_types::graph::GraphStats;
-    use nodedb_types::id::{EdgeId, NodeId};
-    use nodedb_types::result::{QueryResult, SearchResult, SubGraph};
-    use nodedb_types::value::Value;
-    use std::collections::HashMap;
-
-    /// Mock implementation to verify the trait is object-safe and
-    /// can be used as `Arc<dyn NodeDb>`.
-    struct MockDb;
-
-    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-    impl NodeDb for MockDb {
-        async fn vector_search(
-            &self,
-            _collection: &str,
-            _query: &[f32],
-            _k: usize,
-            _filter: Option<&MetadataFilter>,
-            _allowed_ids: Option<&HashSet<String>>,
-        ) -> NodeDbResult<Vec<SearchResult>> {
-            Ok(vec![SearchResult {
-                id: "vec-1".into(),
-                node_id: None,
-                distance: 0.1,
-                metadata: HashMap::new(),
-            }])
-        }
-
-        async fn vector_insert(
-            &self,
-            _collection: &str,
-            _id: &str,
-            _embedding: &[f32],
-            _metadata: Option<Document>,
-        ) -> NodeDbResult<()> {
-            Ok(())
-        }
-
-        async fn vector_delete(&self, _collection: &str, _id: &str) -> NodeDbResult<()> {
-            Ok(())
-        }
-
-        async fn graph_traverse(
-            &self,
-            _collection: &str,
-            _start: &NodeId,
-            _depth: u8,
-            _edge_filter: Option<&EdgeFilter>,
-        ) -> NodeDbResult<SubGraph> {
-            Ok(SubGraph::empty())
-        }
-
-        async fn graph_insert_edge(
-            &self,
-            _collection: &str,
-            from: &NodeId,
-            to: &NodeId,
-            edge_type: &str,
-            _properties: Option<Document>,
-        ) -> NodeDbResult<EdgeId> {
-            EdgeId::try_first(from.clone(), to.clone(), edge_type)
-                .map_err(|e| NodeDbError::storage(format!("invalid edge label: {e}")))
-        }
-
-        async fn graph_delete_edge(
-            &self,
-            _collection: &str,
-            _edge_id: &EdgeId,
-        ) -> NodeDbResult<()> {
-            Ok(())
-        }
-
-        async fn graph_stats(
-            &self,
-            collection: Option<&str>,
-            _as_of: Option<i64>,
-        ) -> NodeDbResult<Vec<GraphStats>> {
-            Ok(vec![GraphStats::zero(collection.unwrap_or("mock"))])
-        }
-
-        async fn document_get(
-            &self,
-            _collection: &str,
-            id: &str,
-        ) -> NodeDbResult<Option<Document>> {
-            let mut doc = Document::new(id);
-            doc.set("title", Value::String("test".into()));
-            Ok(Some(doc))
-        }
-
-        async fn document_put(&self, _collection: &str, _doc: Document) -> NodeDbResult<()> {
-            Ok(())
-        }
-
-        async fn document_delete(&self, _collection: &str, _id: &str) -> NodeDbResult<()> {
-            Ok(())
-        }
-
-        async fn list_insert(
-            &self,
-            _collection: &str,
-            _document_id: &str,
-            _list_path: &str,
-            _index: usize,
-            _fields: &Value,
-        ) -> NodeDbResult<()> {
-            Ok(())
-        }
-
-        async fn list_delete(
-            &self,
-            _collection: &str,
-            _document_id: &str,
-            _list_path: &str,
-            _index: usize,
-        ) -> NodeDbResult<()> {
-            Ok(())
-        }
-
-        async fn list_move(
-            &self,
-            _collection: &str,
-            _document_id: &str,
-            _list_path: &str,
-            _from_index: usize,
-            _to_index: usize,
-        ) -> NodeDbResult<()> {
-            Ok(())
-        }
-
-        async fn execute_sql(&self, _query: &str, _params: &[Value]) -> NodeDbResult<QueryResult> {
-            Ok(QueryResult::empty())
-        }
-    }
-
-    #[test]
-    fn trait_is_object_safe() {
-        fn _accepts_dyn(_db: &dyn NodeDb) {}
-        let db = MockDb;
-        _accepts_dyn(&db);
-    }
-
-    #[test]
-    fn trait_works_with_arc() {
-        use std::sync::Arc;
-        let db: Arc<dyn NodeDb> = Arc::new(MockDb);
-        let _ = db;
-    }
-
-    #[tokio::test]
-    async fn mock_vector_search() {
-        let db = MockDb;
-        let results = db
-            .vector_search("embeddings", &[0.1, 0.2, 0.3], 5, None, None)
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, "vec-1");
-        assert!(results[0].distance < 1.0);
-    }
-
-    #[tokio::test]
-    async fn mock_vector_insert_and_delete() {
-        let db = MockDb;
-        db.vector_insert("coll", "v1", &[1.0, 2.0], None)
-            .await
-            .unwrap();
-        db.vector_delete("coll", "v1").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn mock_graph_stats_returns_zero() {
-        let db = MockDb;
-        let result = db.graph_stats(Some("social"), None).await.unwrap();
-        assert_eq!(result.len(), 1);
-        let stats = &result[0];
-        assert_eq!(stats.collection, "social");
-        assert_eq!(stats.node_count, 0);
-        assert_eq!(stats.edge_count, 0);
-        assert_eq!(stats.distinct_label_count, 0);
-        assert!(stats.labels.is_empty());
-    }
-
-    #[tokio::test]
-    async fn mock_graph_stats_tenant_wide_uses_mock_key() {
-        let db = MockDb;
-        let result = db.graph_stats(None, None).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].collection, "mock");
-    }
-
-    #[tokio::test]
-    async fn mock_graph_operations() {
-        let db = MockDb;
-        let start = NodeId::try_new("alice").expect("test fixture");
-        let subgraph = db.graph_traverse("social", &start, 2, None).await.unwrap();
-        assert_eq!(subgraph.node_count(), 0);
-
-        let from = NodeId::try_new("alice").expect("test fixture");
-        let to = NodeId::try_new("bob").expect("test fixture");
-        let edge_id = db
-            .graph_insert_edge("social", &from, &to, "KNOWS", None)
-            .await
-            .unwrap();
-        assert_eq!(edge_id.src.as_str(), "alice");
-        assert_eq!(edge_id.dst.as_str(), "bob");
-        assert_eq!(edge_id.label, "KNOWS");
-        assert_eq!(edge_id.seq, 0);
-
-        db.graph_delete_edge("social", &edge_id).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn mock_document_operations() {
-        let db = MockDb;
-        let doc = db.document_get("notes", "n1").await.unwrap().unwrap();
-        assert_eq!(doc.id, "n1");
-        assert_eq!(doc.get_str("title"), Some("test"));
-
-        let mut new_doc = Document::new("n2");
-        new_doc.set("body", Value::String("hello".into()));
-        db.document_put("notes", new_doc).await.unwrap();
-
-        db.document_delete("notes", "n1").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn mock_execute_sql() {
-        let db = MockDb;
-        let result = db.execute_sql("SELECT 1", &[]).await.unwrap();
-        assert_eq!(result.row_count(), 0);
-    }
-
-    /// Verify the full "one API, any runtime" pattern: application
-    /// code switches between `NodeDbLite` and `NodeDbRemote` only at
-    /// the construction site.
-    #[tokio::test]
-    async fn unified_api_pattern() {
-        use std::sync::Arc;
-
-        let db: Arc<dyn NodeDb> = Arc::new(MockDb);
-
-        let results = db
-            .vector_search("knowledge_base", &[0.1, 0.2], 5, None, None)
-            .await
-            .unwrap();
-        assert!(!results.is_empty());
-
-        let start = NodeId::from_validated(results[0].id.clone());
-        let _subgraph = db
-            .graph_traverse("knowledge_base", &start, 2, None)
-            .await
-            .unwrap();
-
-        let doc = Document::new("note-1");
-        db.document_put("notes", doc).await.unwrap();
-    }
-
-    #[test]
-    fn default_proto_version_is_zero() {
-        let db = MockDb;
-        assert_eq!(db.proto_version(), 0);
-    }
-
-    #[test]
-    fn default_capabilities_is_zero() {
-        let db = MockDb;
-        assert_eq!(db.capabilities(), 0);
-        let caps = Capabilities::from_raw(db.capabilities());
-        assert!(!caps.supports_streaming());
-        assert!(!caps.supports_graphrag());
-    }
-
-    #[test]
-    fn default_server_version_is_empty() {
-        let db = MockDb;
-        assert!(db.server_version().is_empty());
-    }
-
-    #[test]
-    fn default_limits_all_none() {
-        let db = MockDb;
-        let limits = db.limits();
-        assert!(limits.max_vector_dim.is_none());
-        assert!(limits.max_top_k.is_none());
-        assert!(limits.max_scan_limit.is_none());
-        assert!(limits.max_batch_size.is_none());
-        assert!(limits.max_crdt_delta_bytes.is_none());
-        assert!(limits.max_query_text_bytes.is_none());
-        assert!(limits.max_graph_depth.is_none());
-    }
-
-    #[test]
-    fn capabilities_newtype_smoke() {
-        use nodedb_types::protocol::{CAP_FTS, CAP_STREAMING};
-        let caps = Capabilities::from_raw(CAP_STREAMING | CAP_FTS);
-        assert!(caps.supports_streaming());
-        assert!(caps.supports_fts());
-        assert!(!caps.supports_graphrag());
-        assert!(!caps.supports_crdt());
     }
 }

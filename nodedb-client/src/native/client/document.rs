@@ -7,6 +7,7 @@ use nodedb_types::error::{NodeDbError, NodeDbResult};
 use nodedb_types::protocol::{NativeResponse, OpCode, TextFields};
 
 use super::core::NativeClient;
+use crate::document_identity::is_identity_cell;
 use crate::native::connection::check_error;
 
 impl NativeClient {
@@ -30,6 +31,10 @@ impl NativeClient {
         point_get_response_to_document(collection, id, resp)
     }
 
+    /// Replace the document's whole field set, creating it when absent.
+    ///
+    /// The server owns the identity column: it writes `doc.id` under the
+    /// collection's key and refuses a field there that names another id.
     pub(super) async fn document_put_impl(
         &self,
         collection: &str,
@@ -128,7 +133,9 @@ fn point_get_response_to_document(
 
     let mut doc = Document::new(id);
     for (name, value) in columns.into_iter().zip(row) {
-        doc.set(name, value);
+        if !is_identity_cell(&name, &value, id) {
+            doc.set(name, value);
+        }
     }
     Ok(Some(doc))
 }
@@ -172,6 +179,20 @@ mod tests {
         assert_eq!(doc.get("name"), Some(&Value::String("alice".into())));
         assert_eq!(doc.get("age"), Some(&Value::Integer(30)));
         assert_eq!(doc.get("active"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn the_stored_identity_cell_is_the_document_id_not_a_field() {
+        let resp = hit(
+            &["id", "name"],
+            vec![Value::String("u-1".into()), Value::String("alice".into())],
+        );
+        let doc = point_get_response_to_document("users", "u-1", resp)
+            .expect("a well-formed hit must parse")
+            .expect("a hit must yield a document");
+        assert_eq!(doc.id, "u-1");
+        assert_eq!(doc.fields.len(), 1);
+        assert_eq!(doc.get("name"), Some(&Value::String("alice".into())));
     }
 
     #[test]

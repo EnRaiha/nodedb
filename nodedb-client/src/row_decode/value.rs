@@ -13,12 +13,16 @@
 use nodedb_types::error::{NodeDbError, NodeDbResult};
 use nodedb_types::value::Value;
 
-/// Decode a row value as `u64`. Accepts both `Value::Integer` (extended-
-/// query / native path) and `Value::String` containing a base-10 integer
-/// (pgwire simple-query path, which returns every column as text).
+/// Decode a row value as `u64`. Accepted shapes:
+/// - `Value::Integer`: extended-query or native path, up to `i64::MAX`.
+/// - `Value::Decimal` with scale 0: a msgpack `uint64` above `i64::MAX`.
+/// - `Value::String` holding a base-10 integer: pgwire simple-query text.
 pub(crate) fn value_as_u64(v: &Value) -> NodeDbResult<u64> {
     match v {
-        Value::Integer(i) => Ok(*i as u64),
+        Value::Integer(i) => u64::try_from(*i)
+            .map_err(|_| NodeDbError::storage(format!("expected u64 column, got negative {i}"))),
+        Value::Decimal(d) => Value::decimal_as_wide_u64(d)
+            .ok_or_else(|| NodeDbError::storage(format!("expected u64 column, got decimal {d}"))),
         Value::String(s) => s
             .parse::<u64>()
             .map_err(|e| NodeDbError::storage(format!("parse u64 from '{s}': {e}"))),
@@ -48,6 +52,26 @@ mod tests {
     #[test]
     fn value_as_u64_accepts_integer() {
         assert_eq!(value_as_u64(&Value::Integer(42)).unwrap(), 42u64);
+    }
+
+    #[test]
+    fn value_as_u64_rejects_a_negative_integer() {
+        let err = value_as_u64(&Value::Integer(-1)).unwrap_err();
+        assert!(err.to_string().contains("negative -1"), "{err}");
+    }
+
+    #[test]
+    fn value_as_u64_accepts_a_wide_uint64_decimal() {
+        let wide = Value::from_u64(u64::MAX);
+        assert!(matches!(wide, Value::Decimal(_)));
+        assert_eq!(value_as_u64(&wide).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn value_as_u64_rejects_a_scaled_decimal() {
+        let scaled = Value::Decimal(rust_decimal::Decimal::new(15, 1));
+        let err = value_as_u64(&scaled).unwrap_err();
+        assert!(err.to_string().contains("decimal 1.5"), "{err}");
     }
 
     #[test]
