@@ -10,6 +10,9 @@
 
 use crate::data::executor::core_loop::CoreLoop;
 
+/// The constraint name a delta outside its frame target violates.
+const ONE_DOCUMENT_PER_DELTA: &str = "one_document_per_delta";
+
 impl CoreLoop {
     /// Enforce the one-document-per-delta contract: every row a validated delta
     /// wrote must be exactly the frame-declared `(collection, document_id)`.
@@ -17,29 +20,34 @@ impl CoreLoop {
     /// A client that coalesced N document upserts into one delta, or tagged the
     /// frame with a synthetic id matching no written row, has no surrogate for
     /// the extra rows; materializing just one would silently drop the rest.
-    /// Returns a human-readable detail naming the offending rows so the caller
-    /// surfaces the violation instead of losing data.
+    /// The error is a CRDT constraint violation whose detail names the
+    /// offending rows, so the caller surfaces it instead of losing data.
     pub(crate) fn single_document_write_set(
         collection: &str,
         document_id: &str,
         write_set: &[(String, String)],
-    ) -> Result<(), String> {
+    ) -> crate::Result<()> {
         let foreign: Vec<String> = write_set
             .iter()
             .filter(|(coll, row)| coll != collection || row != document_id)
             .map(|(coll, row)| format!("{coll}/{row}"))
             .collect();
         if foreign.is_empty() {
-            Ok(())
-        } else {
-            Err(format!(
-                "delta for {collection}/{document_id} wrote {} row(s) outside its frame \
-                 target: [{}]; a delta must carry exactly one document (cross-engine \
-                 identity binds one surrogate per delta)",
-                foreign.len(),
-                foreign.join(", ")
-            ))
+            return Ok(());
         }
+        Err(crate::Error::Crdt(
+            nodedb_crdt::CrdtError::ConstraintViolation {
+                constraint: ONE_DOCUMENT_PER_DELTA.to_owned(),
+                collection: collection.to_owned(),
+                detail: format!(
+                    "delta for {collection}/{document_id} wrote {} row(s) outside its frame \
+                     target: [{}]; a delta must carry exactly one document (cross-engine \
+                     identity binds one surrogate per delta)",
+                    foreign.len(),
+                    foreign.join(", ")
+                ),
+            },
+        ))
     }
 }
 
@@ -77,7 +85,15 @@ mod tests {
         )
         .expect_err("multi-row delta must be rejected");
         assert!(
-            err.contains("users/b"),
+            matches!(
+                &err,
+                crate::Error::Crdt(nodedb_crdt::CrdtError::ConstraintViolation { constraint, .. })
+                    if constraint == ONE_DOCUMENT_PER_DELTA
+            ),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("users/b"),
             "detail names the offending row: {err}"
         );
     }
@@ -93,13 +109,14 @@ mod tests {
             &ws(&[("entries", "u1"), ("entries", "u2")]),
         )
         .expect_err("synthetic frame id must be rejected");
-        assert!(err.contains("entries/u1") && err.contains("entries/u2"));
+        let detail = err.to_string();
+        assert!(detail.contains("entries/u1") && detail.contains("entries/u2"));
     }
 
     #[test]
     fn foreign_collection_is_rejected() {
         let err = CoreLoop::single_document_write_set("users", "a", &ws(&[("orders", "a")]))
             .expect_err("row in a different collection must be rejected");
-        assert!(err.contains("orders/a"));
+        assert!(err.to_string().contains("orders/a"));
     }
 }

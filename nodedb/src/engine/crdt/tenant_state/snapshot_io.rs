@@ -47,6 +47,10 @@ impl TenantCrdtEngine {
     /// fully applied — a restore that left operations causally pending has NOT
     /// restored the collection, and reporting success would leave the caller
     /// unable to tell a complete restore from a partial one.
+    ///
+    /// The bytes are a snapshot this node or its backup exported, so they
+    /// import without the peer byte and operation ceilings
+    /// ([`super::ApplyTarget::Collection`]).
     pub fn import_snapshot_bytes(&mut self, collection: &str, bytes: &[u8]) -> crate::Result<()> {
         match self.apply_committed_delta_validated(
             collection,
@@ -62,6 +66,11 @@ impl TenantCrdtEngine {
                     detail: reason.to_string(),
                 },
             )),
+            // The DLQ refusal is the error: nothing applied and nothing
+            // records the snapshot.
+            super::ValidatedApplyOutcome::DeadLetterRefused { error, .. } => {
+                Err(crate::Error::Crdt(error))
+            }
             super::ValidatedApplyOutcome::Malformed => Err(crate::Error::Crdt(
                 nodedb_crdt::CrdtError::DeltaApplyFailed("malformed snapshot".into()),
             )),
@@ -70,6 +79,12 @@ impl TenantCrdtEngine {
                     "snapshot import left operations causally pending".into(),
                 ),
             )),
+            super::ValidatedApplyOutcome::CandidateUnavailable { error } => Err(
+                crate::Error::Crdt(nodedb_crdt::CrdtError::DeltaApplyFailed(format!(
+                    "no apply candidate for collection {collection}: {error}; nothing was \
+                     imported"
+                ))),
+            ),
         }
     }
 }
@@ -129,6 +144,31 @@ mod tests {
             "snapshot import reported a completed restore while its operations \
              stayed causally pending"
         );
+    }
+
+    /// A checkpoint of a collection past the peer operation ceiling loads:
+    /// a snapshot import runs without the peer ceilings.
+    #[test]
+    fn a_snapshot_past_the_peer_ceilings_imports() {
+        let doc = loro::LoroDoc::new();
+        doc.set_peer_id(7).unwrap();
+        let row = doc
+            .get_map("docs")
+            .insert_container("r", loro::LoroMap::new())
+            .unwrap();
+        row.insert_container("body", loro::LoroText::new())
+            .unwrap()
+            .insert(
+                0,
+                &"x".repeat(nodedb_crdt::state::DEFAULT_MAX_IMPORT_OPS + 1),
+            )
+            .unwrap();
+        doc.commit();
+        let snapshot = doc.export(loro::ExportMode::Snapshot).unwrap();
+
+        let mut engine = TenantCrdtEngine::new(TenantId::new(1), 0, ConstraintSet::new()).unwrap();
+        engine.import_snapshot_bytes("docs", &snapshot).unwrap();
+        assert!(engine.row_exists("docs", "r"));
     }
 
     /// Every collection's document is constructed with the same peer id, so Loro
