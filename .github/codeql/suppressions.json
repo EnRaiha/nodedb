@@ -39,6 +39,24 @@
       "path": "nodedb/src/control/server/shared/ddl/neutral/timeseries/rewrite.rs",
       "sink": "^\\s*let partition_dir = ts_base\\.join\\(dir_name\\);",
       "reason": "dir_name is validated with is_plain_path_component immediately above this join (rejects / \\ : NUL . .. leading/trailing dot-space and control chars); a failing name is skipped with a warning before any path is built, so the join stays one level under ts_base."
+    },
+    {
+      "rule": "rust/cleartext-logging",
+      "path": "nodedb-client/src/pg_cell/text.rs",
+      "sink": "^\\s*Ok\\(v\\) => panic!\\(\"\\{text:\\?\\} as \\{ty\\} must be refused, got \\{v:\\?\\}\"\\),",
+      "reason": "Test-only: a panic inside #[cfg(test)] mod tests prints a decoded test fixture when a decode is wrongly accepted. The value is a hard-coded literal, never user data, and the panic goes to test output, not a log."
+    },
+    {
+      "rule": "rust/cleartext-logging",
+      "path": "nodedb/src/control/server/response_shape/compose/kernel.rs",
+      "sink": "^\\s*panic!\\(\"the whole row is an object: \\{:\\?\\}\", shaped\\.rows\\[0\\]\\);",
+      "reason": "Test-only: a panic inside #[cfg(test)] mod tests prints a row built from hard-coded fixture values when the shape assertion fails. No user data reaches it, and the panic goes to test output, not a log."
+    },
+    {
+      "rule": "rust/cleartext-logging",
+      "path": "nodedb/src/data/executor/strict_format/coerce.rs",
+      "sink": "^\\s*panic!\\(\"(\\{input\\}: expected a decimal|expected an instant), got \\{got:\\?\\}\"\\);",
+      "reason": "Test-only: panics inside #[cfg(test)] mod tests print a coerced fixture value when a coercion returns the wrong variant. The inputs are hard-coded literals, never user data, and the panic goes to test output, not a log."
     }
   ]
 }
