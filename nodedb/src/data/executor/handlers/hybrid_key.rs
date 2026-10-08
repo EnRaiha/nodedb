@@ -42,6 +42,29 @@ impl HybridFusionKey {
     }
 }
 
+/// Keep the hits of one ranked leg whose row `admitted` holds, and renumber
+/// their ranks from 0 in the order kept. A headless hit has no row, so it is
+/// never admitted. `None` admits every hit.
+///
+/// Each leg is restricted before fusion, so the fused top-k counts only
+/// admitted rows and needs no check after fusion.
+pub(in crate::data::executor) fn retain_admitted(
+    ranked: &mut Vec<crate::query::fusion::RankedResult<HybridFusionKey>>,
+    admitted: Option<&nodedb_types::SurrogateBitmap>,
+) {
+    let Some(admitted) = admitted else {
+        return;
+    };
+    ranked.retain(|r| {
+        r.document_id
+            .storage_key()
+            .is_some_and(|key| admitted.contains(key.surrogate()))
+    });
+    for (rank, r) in ranked.iter_mut().enumerate() {
+        r.rank = rank;
+    }
+}
+
 impl fmt::Display for HybridFusionKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

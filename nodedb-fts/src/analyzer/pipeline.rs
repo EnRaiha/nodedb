@@ -48,51 +48,10 @@ pub fn tokenize_no_stem(text: &str) -> Vec<String> {
     tokenize_raw(text, "en", en_stops)
 }
 
-/// Raw tokenization shared by `tokenize_no_stem` and language-specific variants.
-/// Same pipeline as `tokenize_with_stemmer` but skips the stemming step.
+/// Tokenize without stemming: the pipeline of [`tokenize_with_stemmer`]
+/// with the stemming stage left out.
 pub(crate) fn tokenize_raw(text: &str, lang: &str, stop_list: &[&str]) -> Vec<String> {
-    let mut normalized = String::with_capacity(text.len());
-    for c in text.chars() {
-        if script::is_cjk(c) || script::is_hangul_jamo(c) || script::is_thai(c) {
-            for lc in c.to_lowercase() {
-                normalized.push(lc);
-            }
-        } else {
-            for decomposed in c.nfd() {
-                if unicode_normalization::char::is_combining_mark(decomposed) {
-                    continue;
-                }
-                for lc in decomposed.to_lowercase() {
-                    normalized.push(lc);
-                }
-            }
-        }
-    }
-
-    let mut tokens = Vec::new();
-    for word in normalized.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_') {
-        let trimmed = word.trim_matches(|c: char| c == '-' || c == '_');
-        if trimmed.is_empty() || trimmed.len() <= 1 {
-            continue;
-        }
-        if trimmed.chars().any(script::needs_segmentation) {
-            let cjk_tokens = if matches!(lang, "ja" | "zh" | "ko" | "th") {
-                super::language::cjk::segmenter::segment(trimmed, lang)
-            } else {
-                bigram::tokenize_cjk(trimmed)
-            };
-            for token in cjk_tokens {
-                if !token.is_empty() && !is_stop_word_in_list(&token, stop_list) {
-                    tokens.push(token);
-                }
-            }
-            continue;
-        }
-        if !is_stop_word_in_list(trimmed, stop_list) {
-            tokens.push(trimmed.to_string());
-        }
-    }
-    tokens
+    tokenize(text, None, lang, stop_list)
 }
 
 /// Shared tokenization pipeline used by both the standard `analyze()` function
@@ -104,6 +63,12 @@ pub(crate) fn tokenize_with_stemmer(
     lang: &str,
     stop_list: &[&str],
 ) -> Vec<String> {
+    tokenize(text, Some(stemmer), lang, stop_list)
+}
+
+/// The one analysis pipeline. A `None` stemmer keeps each non-CJK token as
+/// the normalized word.
+fn tokenize(text: &str, stemmer: Option<&Stemmer>, lang: &str, stop_list: &[&str]) -> Vec<String> {
     // Stage 1-2: Normalize and lowercase.
     // Process char-by-char: for CJK/Hangul characters, preserve as-is (lowercased).
     // For others, apply NFD + strip combining marks to handle diacritics (café → cafe).
@@ -163,11 +128,7 @@ pub(crate) fn tokenize_with_stemmer(
                         }
                     }
                 } else if run.len() > 1 && !is_stop_word_in_list(&run, stop_list) {
-                    // Non-CJK run → stem.
-                    let stemmed = stemmer.stem(&run);
-                    if !stemmed.is_empty() {
-                        tokens.push(stemmed.into_owned());
-                    }
+                    push_stemmed(&mut tokens, stemmer, &run);
                 }
                 i = run_end;
             }
@@ -185,13 +146,22 @@ pub(crate) fn tokenize_with_stemmer(
         }
 
         // Stage 7: Snowball stemming.
-        let stemmed = stemmer.stem(trimmed);
-        if !stemmed.is_empty() {
-            tokens.push(stemmed.into_owned());
-        }
+        push_stemmed(&mut tokens, stemmer, trimmed);
     }
 
     tokens
+}
+
+/// Append `word` stemmed by `stemmer`, or unchanged when there is none. An
+/// empty stem is dropped.
+fn push_stemmed(tokens: &mut Vec<String>, stemmer: Option<&Stemmer>, word: &str) {
+    let token = match stemmer {
+        Some(stemmer) => stemmer.stem(word).into_owned(),
+        None => word.to_owned(),
+    };
+    if !token.is_empty() {
+        tokens.push(token);
+    }
 }
 
 /// Check if a word is in a sorted stop word list via binary search.

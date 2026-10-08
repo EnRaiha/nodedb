@@ -119,7 +119,9 @@ fn clause_error(clause: &str, owner: &str, error: &SqlError) -> DdlError {
         SqlError::TypeMismatch { .. } => sqlstate::DATATYPE_MISMATCH,
         SqlError::IntegerOutOfRange { .. }
         | SqlError::FloatOutOfRange { .. }
-        | SqlError::ConstantOverflow { .. } => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
+        | SqlError::DecimalOutOfRange { .. }
+        | SqlError::ConstantOverflow { .. }
+        | SqlError::NumericLiteralOutOfRange { .. } => sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,
         SqlError::DivisionByZero => sqlstate::DIVISION_BY_ZERO,
         SqlError::DataException { .. } => sqlstate::DATA_EXCEPTION,
         SqlError::InvalidLimitValue { .. } => sqlstate::INVALID_LIMIT_VALUE,
@@ -128,6 +130,7 @@ fn clause_error(clause: &str, owner: &str, error: &SqlError) -> DdlError {
         }
         SqlError::UnknownColumn { .. } => sqlstate::UNDEFINED_COLUMN,
         SqlError::AmbiguousColumn { .. } => sqlstate::AMBIGUOUS_COLUMN,
+        SqlError::TextColumn { fault, .. } => fault.sqlstate(),
         SqlError::UndefinedObject { .. } => sqlstate::UNDEFINED_OBJECT,
         SqlError::ObjectNotInPrerequisiteState { .. } => sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
         SqlError::SequencePerRowUnsupported { .. }

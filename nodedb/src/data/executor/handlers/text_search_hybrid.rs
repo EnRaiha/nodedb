@@ -10,7 +10,7 @@ use nodedb_fts::posting::QueryMode;
 use crate::bridge::envelope::{ErrorCode, Response};
 
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::scan_normalize::sparse_body_to_msgpack;
+use crate::data::executor::handlers::text_rows::{TextRowGate, combine_eligible};
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
 
@@ -21,10 +21,20 @@ const DEFAULT_VECTOR_WEIGHT: f32 = 0.5;
 pub(in crate::data::executor) struct HybridSearchParams<'a> {
     pub tid: u64,
     pub collection: &'a str,
+    /// Vector column the vector leg searches. Empty names the
+    /// collection-level index.
+    pub vector_field: &'a str,
     pub query_vector: &'a [f32],
+    /// Field index the text leg reads. `None` reads the whole-document index.
+    pub text_field: Option<&'a str>,
     pub query_text: &'a str,
+    /// Residual WHERE predicates (`Vec<ScanFilter>`), applied to both legs
+    /// before fusion.
+    pub filters: &'a [u8],
     pub top_k: usize,
     pub ef_search: usize,
+    /// Boolean combination of the text leg's query terms.
+    pub mode: nodedb_types::text_search::QueryMode,
     pub fuzzy: bool,
     pub vector_weight: f32,
     pub filter_bitmap: Option<&'a nodedb_types::SurrogateBitmap>,
@@ -45,10 +55,14 @@ impl CoreLoop {
         let HybridSearchParams {
             tid,
             collection,
+            vector_field,
             query_vector,
+            text_field,
             query_text,
+            filters,
             top_k,
             ef_search,
+            mode,
             fuzzy,
             vector_weight,
             filter_bitmap,
@@ -83,9 +97,30 @@ impl CoreLoop {
         // enough material to fuse. 3x is a good balance.
         let fetch_k = top_k.saturating_mul(3).max(20);
 
+        // The rows the residual filters and RLS admit restrict both legs
+        // before fusion, so the fused top-k counts only admitted rows.
+        let eligible = match TextRowGate::new(filters, rls_filters)
+            .and_then(|gate| self.text_eligible_rows(task, tid, collection, &gate))
+        {
+            Ok(eligible) => combine_eligible(filter_bitmap, eligible),
+            Err(e) => return self.response_error(task, e),
+        };
+        let filter_bitmap = eligible.as_ref();
+        let text_index = match self.text_index(task, tid, collection, text_field) {
+            Ok(index) => index,
+            Err(e) => return self.response_error(task, e),
+        };
+
         // 1. Vector search.
-        let index_key =
-            CoreLoop::vector_index_key(task.request.database_id.as_u64(), tid, collection, "");
+        let index_key = match self.resolve_vector_index_key(
+            task.request.database_id.as_u64(),
+            tid,
+            collection,
+            vector_field,
+        ) {
+            Ok(key) => key,
+            Err(e) => return self.response_error(task, e),
+        };
         let vector_collection = self.vector_collections.get(&index_key);
         let vector_results = match vector_collection {
             Some(index) => {
@@ -108,17 +143,18 @@ impl CoreLoop {
             None => Vec::new(),
         };
 
-        // 2. Text search (no surrogate prefilter for the text leg of hybrid search).
-        let text_results = match self.inverted.search(
-            task.request.database_id.as_u64(),
-            tenant_id,
-            collection,
+        // 2. Text search over the field's index, restricted to the same rows,
+        //    with the transaction's staged rows ranked in.
+        let text_results = match self.hybrid_text_leg(
+            task,
+            tid,
+            text_index,
             FtsSearchParams {
                 query: query_text,
                 top_k: fetch_k,
                 fuzzy_enabled: fuzzy,
-                mode: QueryMode::And,
-                prefilter: None,
+                mode: QueryMode::from(mode),
+                prefilter: filter_bitmap,
             },
         ) {
             Ok(results) => results,
@@ -151,7 +187,7 @@ impl CoreLoop {
         // in via the shared overlay splice (which reuses the single-source
         // vector/FTS overlay merges). Outside a transaction the committed-only
         // construction below runs unchanged.
-        let (vector_ranked, text_ranked): super::hybrid_overlay::HybridRankedLegs =
+        let (mut vector_ranked, mut text_ranked): super::hybrid_overlay::HybridRankedLegs =
             if let Some(txn_id) = task.request.txn_id {
                 match self.hybrid_ranked_with_overlay(
                     super::hybrid_overlay::HybridOverlayParams {
@@ -159,8 +195,8 @@ impl CoreLoop {
                         database_id: task.request.database_id,
                         tid: tenant_id,
                         collection,
+                        vector_field,
                         query_vector,
-                        query_text,
                         fetch_k,
                         filter_bitmap,
                     },
@@ -196,48 +232,24 @@ impl CoreLoop {
                 (vector_ranked, text_ranked)
             };
 
+        // Each leg keeps only the rows the filters and RLS admit, judged
+        // before ranking on the transaction's view of each row. The fused
+        // top-k then counts only admitted rows. A headless vector hit has no
+        // row, so a gate excludes it.
+        super::hybrid_key::retain_admitted(&mut vector_ranked, filter_bitmap);
+        super::hybrid_key::retain_admitted(&mut text_ranked, filter_bitmap);
+
         let fused = reciprocal_rank_fusion_weighted(
             &[vector_ranked, text_ranked],
             &[k_vector, k_text],
             top_k,
         );
 
-        // Build response with per-engine rank diagnostics.
-        // RLS post-fusion: filter fused results by looking up each document.
-        //
-        // The predicate runs against the NORMALIZED msgpack image, never the
-        // stored bytes: a strict Binary Tuple is not a msgpack map at all and a
-        // vector-primary sidecar is a TAGGED one, so a predicate pushed at the
-        // stored bytes finds no field it recognizes and the row is dropped on a
-        // format mismatch rather than on policy. The encoding is resolved from
-        // the collection's registered kind — a tagged map and a plain document
-        // map share the same map header, so the bytes cannot answer it.
-        let body_format = self.sparse_body_format(task.request.database_id, tenant_id, collection);
-        // The fused key is rendered once per row here, at the response
-        // envelope; it is the only place the key becomes text.
+        // Build response with per-engine rank diagnostics. The fused key is
+        // rendered once per row here, at the response envelope; it is the
+        // only place the key becomes text.
         let rendered: Vec<(String, &crate::query::fusion::FusedResult<HybridFusionKey>)> = fused
             .iter()
-            .filter(|f| {
-                if rls_filters.is_empty() {
-                    return true;
-                }
-                // A headless hit has no stored row to check the policy against,
-                // so it is treated the same as a row the lookup cannot find.
-                let Some(key) = f.document_id.storage_key() else {
-                    return false;
-                };
-                match self
-                    .sparse
-                    .get(task.request.database_id.as_u64(), tid, collection, &key)
-                {
-                    Ok(Some(bytes)) => {
-                        let normalized =
-                            sparse_body_to_msgpack(&bytes, body_format.as_format_ref());
-                        super::rls_eval::rls_check_msgpack_bytes(rls_filters, &normalized)
-                    }
-                    _ => false,
-                }
-            })
             .map(|f| (f.document_id.to_string(), f))
             .collect();
         let results: Vec<_> = rendered
@@ -265,12 +277,7 @@ impl CoreLoop {
         }
         match super::super::response_codec::encode(&results) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
 }

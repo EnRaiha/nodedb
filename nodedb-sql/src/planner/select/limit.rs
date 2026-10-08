@@ -11,6 +11,10 @@ use super::post_process::post_process;
 use super::query_tail::QueryTail;
 use crate::error::{Result, SqlError};
 use crate::types::SqlPlan;
+use crate::types::{
+    ArraySlicePlan, CtePlan, DocumentIndexLookupPlan, HybridSearchPlan, HybridSearchTriplePlan,
+    TextSearchPlan, TextSearchShape, TimeseriesScanPlan,
+};
 
 /// Default `ef_search` multiplier applied when LIMIT is the only signal
 /// available for sizing the HNSW beam (e.g. on a fused VectorSearch that
@@ -32,11 +36,11 @@ pub(in crate::planner::select) fn apply_limit(
     // The LIMIT belongs to the query reading the CTE, not to the CTE body, so
     // it lands on the outer plan — without this a derived table like
     // `FROM (...) s LIMIT n` comes back unbounded.
-    if let SqlPlan::Cte { definitions, outer } = plan {
-        return Ok(SqlPlan::Cte {
+    if let SqlPlan::Cte(CtePlan { definitions, outer }) = plan {
+        return Ok(SqlPlan::Cte(CtePlan {
             definitions,
             outer: Box::new(apply_limit(*outer, tail)?),
-        });
+        }));
     }
 
     // Only these three variants carry an OFFSET of their own. For the rest the
@@ -75,11 +79,11 @@ pub(in crate::planner::select) fn apply_limit(
         // The index-lookup rewrite of a document scan. It carries the same
         // row bound as the scan it replaced — without this the converter
         // substitutes its own default and `LIMIT 1` returns 10,000 rows.
-        SqlPlan::DocumentIndexLookup {
+        SqlPlan::DocumentIndexLookup(DocumentIndexLookupPlan {
             ref mut limit,
             ref mut offset,
             ..
-        } => {
+        }) => {
             *limit = limit_val;
             *offset = offset_val;
         }
@@ -93,9 +97,9 @@ pub(in crate::planner::select) fn apply_limit(
             *limit = limit_val;
             *offset = offset_val;
         }
-        SqlPlan::TimeseriesScan {
+        SqlPlan::TimeseriesScan(TimeseriesScanPlan {
             limit: ref mut l, ..
-        } => {
+        }) => {
             if let Some(lv) = limit_val {
                 *l = lv;
             }
@@ -107,9 +111,9 @@ pub(in crate::planner::select) fn apply_limit(
                 *l = lv;
             }
         }
-        SqlPlan::ArraySlice {
+        SqlPlan::ArraySlice(ArraySlicePlan {
             limit: ref mut l, ..
-        } => {
+        }) => {
             if let Some(lv) = limit_val {
                 // The slice bound is a `u32` (0 = unlimited); a LIMIT that
                 // does not fit would wrap into a smaller bound.
@@ -122,18 +126,34 @@ pub(in crate::planner::select) fn apply_limit(
         // `LIMIT N` *is* the top-k bound. `ef_search` is deliberately left
         // alone on the fused-search variants: a wider beam than the final N
         // costs distance computations, never correctness.
-        SqlPlan::TextSearch {
+        // A text match ranks its hits, so `LIMIT N` is its top-k bound. With
+        // no LIMIT it returns every match.
+        SqlPlan::TextSearch(TextSearchPlan {
+            shape: TextSearchShape::Match {
+                top_k: ref mut k, ..
+            },
+            ..
+        }) => {
+            *k = limit_val;
+        }
+        // A score scan has no ranked cut: its rows are bounded by a tail.
+        SqlPlan::TextSearch(TextSearchPlan {
+            shape: TextSearchShape::ScoreScan,
+            ..
+        }) => {
+            if limit_val.is_some() {
+                return post_process(plan, Vec::new(), limit_val, 0);
+            }
+        }
+        SqlPlan::MultiVectorSearch {
             top_k: ref mut k, ..
         }
-        | SqlPlan::MultiVectorSearch {
+        | SqlPlan::HybridSearch(HybridSearchPlan {
             top_k: ref mut k, ..
-        }
-        | SqlPlan::HybridSearch {
+        })
+        | SqlPlan::HybridSearchTriple(HybridSearchTriplePlan {
             top_k: ref mut k, ..
-        }
-        | SqlPlan::HybridSearchTriple {
-            top_k: ref mut k, ..
-        } => {
+        }) => {
             if let Some(lv) = limit_val {
                 *k = lv;
             }
@@ -200,6 +220,7 @@ mod tests {
 
     use super::*;
     use crate::temporal::TemporalScope;
+    use crate::types::LateralLoopPlan;
     use crate::types::query::{EngineType, JoinType};
 
     fn minimal_scan() -> SqlPlan {
@@ -274,7 +295,7 @@ mod tests {
     }
 
     fn lateral_loop_plan() -> SqlPlan {
-        SqlPlan::LateralLoop {
+        SqlPlan::LateralLoop(LateralLoopPlan {
             outer: Box::new(minimal_scan()),
             outer_alias: None,
             inner: Box::new(minimal_scan()),
@@ -283,7 +304,7 @@ mod tests {
             projection: vec![],
             outer_row_cap: 10,
             left_join: false,
-        }
+        })
     }
 
     #[test]

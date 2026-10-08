@@ -300,3 +300,91 @@ async fn autocommit_hybrid_unchanged() {
         "autocommit hybrid must return a fused row for the committed doc matching its term: {scores:?}"
     );
 }
+
+const RLS_PASSWORD: &str = "hyb-ov-rls-secret-1";
+
+/// The number of rows `sql` returns on `client`.
+async fn row_count(client: &tokio_postgres::Client, sql: &str) -> usize {
+    client
+        .simple_query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+        .count()
+}
+
+/// Under a read policy, a row the reader inserts in its own transaction is
+/// judged on its staged body. The fused result holds it before COMMIT, and a
+/// row the policy hides never appears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staged_insert_is_fused_under_a_read_policy() {
+    let server = TestServer::start().await;
+    let coll = "hyb_ov_rls";
+    let user = "hyb_ov_rls_reader";
+    create_hybrid_collection(&server, coll).await;
+    server
+        .exec(&format!("CREATE USER {user} PASSWORD '{RLS_PASSWORD}'"))
+        .await
+        .unwrap();
+    server
+        .exec(&format!("GRANT ROLE readwrite TO {user}"))
+        .await
+        .unwrap();
+    for (id, owner, content, emb) in [
+        ("a", user, "consensus algorithm", "0.1, 0.2, 0.3, 0.4"),
+        ("b", "other", "elephant herd", "0.15, 0.25, 0.35, 0.45"),
+    ] {
+        server
+            .exec(&format!(
+                "INSERT INTO {coll} (id, owner, content, embedding) \
+                 VALUES ('{id}', '{owner}', '{content}', ARRAY[{emb}])"
+            ))
+            .await
+            .unwrap();
+    }
+    server
+        .exec(&format!(
+            "CREATE RLS POLICY hyb_ov_rls_owner ON {coll} FOR READ \
+             USING (owner = $auth.username)"
+        ))
+        .await
+        .unwrap();
+
+    let (client, handle) = server
+        .connect_as(user, RLS_PASSWORD)
+        .await
+        .unwrap_or_else(|e| panic!("connect as {user}: {e}"));
+    let hybrid = format!(
+        "SELECT id, rrf_score(\
+           vector_distance(embedding, ARRAY[0.15, 0.25, 0.35, 0.45]), \
+           bm25_score(content, 'elephant')\
+         ) AS score FROM {coll} LIMIT 10"
+    );
+
+    // Only 'a' is admitted. The policy hides 'b', the only text match.
+    assert_eq!(row_count(&client, &hybrid).await, 1, "only 'a' is admitted");
+
+    client.simple_query("BEGIN").await.unwrap();
+    client
+        .simple_query(&format!(
+            "INSERT INTO {coll} (id, owner, content, embedding) \
+             VALUES ('c', '{user}', 'elephant calf', ARRAY[0.15, 0.25, 0.35, 0.45])"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        row_count(&client, &hybrid).await,
+        2,
+        "the staged row the policy admits is fused before COMMIT"
+    );
+    client.simple_query("ROLLBACK").await.unwrap();
+    assert_eq!(
+        row_count(&client, &hybrid).await,
+        1,
+        "the rolled-back row is gone"
+    );
+
+    drop(client);
+    handle.abort();
+}

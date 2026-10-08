@@ -4,7 +4,7 @@
 
 use rust_stemmers::{Algorithm, Stemmer};
 
-use crate::analyzer::pipeline::{TextAnalyzer, tokenize_with_stemmer};
+use crate::analyzer::pipeline::{TextAnalyzer, tokenize_raw, tokenize_with_stemmer};
 
 use super::stop_words;
 
@@ -97,10 +97,7 @@ impl NoStemAnalyzer {
 impl TextAnalyzer for NoStemAnalyzer {
     fn analyze(&self, text: &str) -> Vec<String> {
         let stop_list = stop_words::stop_words(&self.lang_code);
-        // Use English stemmer as no-op: it won't affect non-English words meaningfully.
-        // The stop word list does the language-specific work.
-        let stemmer = Stemmer::create(Algorithm::English);
-        tokenize_with_stemmer(text, &stemmer, &self.lang_code, stop_list)
+        tokenize_raw(text, &self.lang_code, stop_list)
     }
 
     fn name(&self) -> &str {
@@ -156,5 +153,11 @@ mod tests {
         let tokens = analyzer.analyze("यह एक परीक्षा है");
         // "यह" and "है" are Hindi stop words.
         assert!(!tokens.iter().any(|t| t == "यह" || t == "है"));
+    }
+
+    #[test]
+    fn no_stem_keeps_latin_words_as_written() {
+        let analyzer = NoStemAnalyzer::new("indonesian").unwrap();
+        assert_eq!(analyzer.analyze("Running dogs"), vec!["running", "dogs"]);
     }
 }

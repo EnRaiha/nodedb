@@ -4,6 +4,12 @@
 //!
 //! Maintains the k best `(score, surrogate)` pairs. The threshold (minimum
 //! score to enter the heap) is the root's score when full, 0.0 when filling.
+//!
+//! Rank order is score descending, then surrogate ascending. The kept set
+//! is the first k documents in that order, so a cut at k is a prefix of the
+//! uncut result, ties included.
+
+use std::cmp::Ordering;
 
 use nodedb_types::Surrogate;
 
@@ -14,20 +20,31 @@ pub struct ScoredDoc {
     pub doc_id: Surrogate,
 }
 
-/// Fixed-capacity min-heap: smallest score is at the root.
+/// `Greater` when `a` ranks above `b`: a higher score, or an equal score and
+/// a lower surrogate.
+fn rank_cmp(a: &ScoredDoc, b: &ScoredDoc) -> Ordering {
+    a.score
+        .total_cmp(&b.score)
+        .then_with(|| b.doc_id.cmp(&a.doc_id))
+}
+
+/// Fixed-capacity min-heap: the lowest-ranked candidate is at the root.
 ///
-/// When full, only candidates exceeding the root's score are admitted
-/// (the root is replaced and the heap is sifted down).
+/// When full, only a candidate that ranks above the root is admitted (the
+/// root is replaced and the heap is sifted down).
 pub struct TopKHeap {
     data: Vec<ScoredDoc>,
     capacity: usize,
 }
 
+/// Initial heap allocation. A larger `k` grows on demand; `usize::MAX` means every match.
+const INITIAL_HEAP_CAPACITY: usize = 1024;
+
 impl TopKHeap {
-    /// Create a new heap with the given capacity (k).
+    /// Create a new heap that keeps the best `k` candidates.
     pub fn new(k: usize) -> Self {
         Self {
-            data: Vec::with_capacity(k),
+            data: Vec::with_capacity(k.min(INITIAL_HEAP_CAPACITY)),
             capacity: k,
         }
     }
@@ -44,28 +61,26 @@ impl TopKHeap {
 
     /// Try to insert a scored document.
     ///
-    /// If the heap is not full, always inserts. If full, only inserts
-    /// if `score > threshold()`, replacing the root.
+    /// If the heap is not full, always inserts. If full, inserts only when
+    /// the candidate ranks above the root, replacing the root.
     pub fn insert(&mut self, score: f32, doc_id: Surrogate) {
+        let candidate = ScoredDoc { score, doc_id };
         if self.data.len() < self.capacity {
-            self.data.push(ScoredDoc { score, doc_id });
+            self.data.push(candidate);
             if self.data.len() == self.capacity {
                 // Build the min-heap once full.
                 self.build_heap();
             }
-        } else if score > self.data[0].score {
-            self.data[0] = ScoredDoc { score, doc_id };
+        } else if rank_cmp(&candidate, &self.data[0]) == Ordering::Greater {
+            self.data[0] = candidate;
             self.sift_down(0);
         }
     }
 
-    /// Drain the heap into a sorted vec (descending by score).
+    /// Drain the heap into a vec in rank order: score descending, then
+    /// surrogate ascending.
     pub fn into_sorted(mut self) -> Vec<ScoredDoc> {
-        self.data.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        self.data.sort_by(|a, b| rank_cmp(b, a));
         self.data
     }
 
@@ -93,10 +108,10 @@ impl TopKHeap {
             let right = 2 * pos + 2;
             let mut smallest = pos;
 
-            if left < n && self.data[left].score < self.data[smallest].score {
+            if left < n && rank_cmp(&self.data[left], &self.data[smallest]) == Ordering::Less {
                 smallest = left;
             }
-            if right < n && self.data[right].score < self.data[smallest].score {
+            if right < n && rank_cmp(&self.data[right], &self.data[smallest]) == Ordering::Less {
                 smallest = right;
             }
 
@@ -159,6 +174,36 @@ mod tests {
         let heap = TopKHeap::new(5);
         assert!(heap.is_empty());
         assert_eq!(heap.threshold(), 0.0);
+    }
+
+    #[test]
+    fn unbounded_k_allocates_at_most_the_initial_capacity() {
+        let mut heap = TopKHeap::new(usize::MAX);
+        assert!(heap.data.capacity() <= INITIAL_HEAP_CAPACITY);
+        for i in 1..=3000u32 {
+            heap.insert(i as f32, Surrogate(i));
+        }
+        assert_eq!(heap.len(), 3000, "an unbounded heap keeps every match");
+        assert_eq!(heap.into_sorted()[0].doc_id, Surrogate(3000));
+    }
+
+    /// A full heap of tied scores evicts the tie with the highest surrogate,
+    /// so the kept set is the first k rows of the uncut order.
+    #[test]
+    fn eviction_among_ties_keeps_the_lowest_surrogates() {
+        let mut heap = TopKHeap::new(2);
+        heap.insert(1.0, Surrogate(1));
+        heap.insert(1.0, Surrogate(2));
+        heap.insert(2.0, Surrogate(3));
+        let kept: Vec<Surrogate> = heap.into_sorted().iter().map(|d| d.doc_id).collect();
+        assert_eq!(kept, vec![Surrogate(3), Surrogate(1)]);
+
+        let mut heap = TopKHeap::new(3);
+        for id in [7, 4, 9, 2] {
+            heap.insert(1.0, Surrogate(id));
+        }
+        let kept: Vec<Surrogate> = heap.into_sorted().iter().map(|d| d.doc_id).collect();
+        assert_eq!(kept, vec![Surrogate(2), Surrogate(4), Surrogate(7)]);
     }
 
     #[test]

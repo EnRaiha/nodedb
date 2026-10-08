@@ -58,9 +58,13 @@ fn fulltext_search_isolated() {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "articles"),
             query: "quantum".into(),
             top_k: 5,
+            mode: nodedb_types::text_search::QueryMode::And,
             fuzzy: false,
             rls_filters: Vec::new(),
             prefilter: None,
+            field: None,
+            filters: Vec::new(),
+            scores: Vec::new(),
         }),
     );
     assert_eq!(resp_a.status, Status::Ok);
@@ -75,9 +79,13 @@ fn fulltext_search_isolated() {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "articles"),
             query: "quantum".into(),
             top_k: 5,
+            mode: nodedb_types::text_search::QueryMode::And,
             fuzzy: false,
             rls_filters: Vec::new(),
             prefilter: None,
+            field: None,
+            filters: Vec::new(),
+            scores: Vec::new(),
         }),
     );
     assert_eq!(resp_b.status, Status::Ok);
