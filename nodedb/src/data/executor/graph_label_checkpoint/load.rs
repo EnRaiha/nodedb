@@ -73,25 +73,33 @@ impl CoreLoop {
             let csr = self.csr_partition_mut(partition.database_id, partition.tenant_id);
             for (node, labels) in &partition.nodes {
                 for label in labels {
-                    // `add_node_label` is the same call the live `SetNodeLabels`
-                    // handler and the WAL replay make, vivifying the node when
-                    // it has no edges. Its `Ok(false)` (the 64-distinct-label
-                    // bitset limit) is discarded here for the same reason they
-                    // discard it: the limit was already enforced when the label
-                    // was first set, so an export can never carry more than 64
-                    // distinct labels per partition to begin with.
-                    if let Err(e) = csr.add_node_label(node, label) {
-                        warn!(
-                            core = core_id,
-                            %node,
-                            %label,
-                            error = %e,
-                            "graph node-label checkpoint restore: could not set label"
-                        );
-                        failed += 1;
-                        continue;
+                    // `add_node_label` vivifies the node when it has no edges,
+                    // as the live `SetNodeLabels` handler does. `Ok(false)` is
+                    // the distinct node-label limit: the label is not set, so
+                    // it counts as a failed restore.
+                    match csr.add_node_label(node, label) {
+                        Ok(true) => restored += 1,
+                        Ok(false) => {
+                            warn!(
+                                core = core_id,
+                                %node,
+                                %label,
+                                "graph node-label checkpoint restore: label exceeds the \
+                                 partition's distinct node-label limit"
+                            );
+                            failed += 1;
+                        }
+                        Err(e) => {
+                            warn!(
+                                core = core_id,
+                                %node,
+                                %label,
+                                error = %e,
+                                "graph node-label checkpoint restore: could not set label"
+                            );
+                            failed += 1;
+                        }
                     }
-                    restored += 1;
                 }
             }
         }

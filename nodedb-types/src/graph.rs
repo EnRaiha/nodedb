@@ -77,14 +77,25 @@ impl std::fmt::Display for Direction {
     }
 }
 
+/// A traversal direction string that names no [`Direction`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown direction '{input}': expected 'out', 'in' or 'both'")]
+pub struct ParseDirectionError {
+    pub input: String,
+}
+
 impl std::str::FromStr for Direction {
-    type Err = String;
+    type Err = ParseDirectionError;
+    /// Case-insensitive. Accepts `out`/`outgoing`, `in`/`incoming` and
+    /// `both`/`any`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
+        match s.to_ascii_lowercase().as_str() {
             "out" | "outgoing" => Ok(Self::Out),
             "in" | "incoming" => Ok(Self::In),
             "both" | "any" => Ok(Self::Both),
-            other => Err(format!("unknown direction: '{other}'")),
+            _ => Err(ParseDirectionError {
+                input: s.to_string(),
+            }),
         }
     }
 }
@@ -171,15 +182,10 @@ impl GraphStats {
                 NodeDbError::storage("wire_shape: SHOW GRAPH STATS: missing collection cell")
             })?
             .to_string();
-        let node_count = row.get(1).and_then(parse_u64_cell).ok_or_else(|| {
-            NodeDbError::storage("wire_shape: SHOW GRAPH STATS: missing node_count")
-        })?;
-        let edge_count = row.get(2).and_then(parse_u64_cell).ok_or_else(|| {
-            NodeDbError::storage("wire_shape: SHOW GRAPH STATS: missing edge_count")
-        })?;
-        let distinct_label_count = row.get(3).and_then(parse_u64_cell).ok_or_else(|| {
-            NodeDbError::storage("wire_shape: SHOW GRAPH STATS: missing distinct_label_count")
-        })?;
+        let [_, node_column, edge_column, label_column, _] = Self::EXPECTED_COLUMNS;
+        let node_count = parse_u64_cell(row, 1, node_column)?;
+        let edge_count = parse_u64_cell(row, 2, edge_column)?;
+        let distinct_label_count = parse_u64_cell(row, 3, label_column)?;
         let labels_json = row.get(4).and_then(|v| v.as_str()).unwrap_or("[]");
         let parsed: Vec<sonic_rs::Value> = sonic_rs::from_str(labels_json)
             .map_err(|e| NodeDbError::storage(format!("wire_shape: labels JSON parse: {e}")))?;
@@ -207,19 +213,51 @@ impl GraphStats {
     }
 }
 
-/// Parse a count cell that may arrive typed (`Value::Integer`) or as
-/// pgwire text (`Value::String`).
-fn parse_u64_cell(v: &crate::value::Value) -> Option<u64> {
-    match v {
-        crate::value::Value::Integer(i) => Some(*i as u64),
-        crate::value::Value::String(s) => s.parse::<u64>().ok(),
+/// Parse the count cell `column` at `index` of a `SHOW GRAPH STATS` row.
+///
+/// The cell arrives typed or as pgwire text:
+/// - `Value::Integer`: a count up to `i64::MAX`. A negative value is an error.
+/// - `Value::Decimal` with scale 0: a msgpack `uint64` above `i64::MAX`.
+/// - `Value::String`: the base-10 text form.
+///
+/// A missing cell or any other shape is an error that names the column.
+fn parse_u64_cell(
+    row: &[crate::value::Value],
+    index: usize,
+    column: &str,
+) -> crate::error::NodeDbResult<u64> {
+    use crate::error::NodeDbError;
+    use crate::value::Value;
+
+    let cell = row.get(index).ok_or_else(|| {
+        NodeDbError::storage(format!("wire_shape: SHOW GRAPH STATS: missing {column}"))
+    })?;
+    let parsed = match cell {
+        Value::Integer(i) => u64::try_from(*i).ok(),
+        Value::Decimal(d) => Value::decimal_as_wide_u64(d),
+        Value::String(s) => s.parse::<u64>().ok(),
         _ => None,
-    }
+    };
+    parsed.ok_or_else(|| {
+        NodeDbError::storage(format!(
+            "wire_shape: SHOW GRAPH STATS: {column} is not a u64 count: {cell:?}"
+        ))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direction_parses_case_insensitively_and_names_an_unknown_value() {
+        assert_eq!("IN".parse::<Direction>(), Ok(Direction::In));
+        assert_eq!("outgoing".parse::<Direction>(), Ok(Direction::Out));
+        assert_eq!("Both".parse::<Direction>(), Ok(Direction::Both));
+        let err = "sideways".parse::<Direction>().unwrap_err();
+        assert_eq!(err.input, "sideways");
+        assert!(err.to_string().contains("'sideways'"), "{err}");
+    }
 
     #[test]
     fn direction_roundtrip() {
@@ -323,6 +361,52 @@ mod tests {
     fn parse_show_stats_no_columns_no_rows_returns_empty_vec() {
         let result = GraphStats::parse_show_stats_response(&[], &[]).unwrap();
         assert!(result.is_empty());
+    }
+
+    fn stats_row(count: crate::value::Value) -> Vec<crate::value::Value> {
+        use crate::value::Value;
+        vec![
+            Value::String("c".into()),
+            count,
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::String("[]".into()),
+        ]
+    }
+
+    #[test]
+    fn parse_u64_cell_accepts_a_count_above_i64_max() {
+        use crate::value::Value;
+        let wide = u64::MAX;
+        let row = stats_row(Value::from_u64(wide));
+        assert!(matches!(row[1], Value::Decimal(_)));
+        assert_eq!(parse_u64_cell(&row, 1, "node_count").unwrap(), wide);
+        let columns: Vec<String> = GraphStats::EXPECTED_COLUMNS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = GraphStats::parse_show_stats_response(&columns, &[row]).unwrap();
+        assert_eq!(parsed[0].node_count, wide);
+    }
+
+    #[test]
+    fn parse_u64_cell_refuses_a_negative_count() {
+        use crate::value::Value;
+        let err = parse_u64_cell(&stats_row(Value::Integer(-1)), 1, "node_count").unwrap_err();
+        assert!(err.to_string().contains("node_count"), "{err}");
+    }
+
+    #[test]
+    fn parse_u64_cell_refuses_a_scaled_decimal() {
+        use crate::value::Value;
+        let scaled = rust_decimal::Decimal::new(15, 1);
+        assert!(parse_u64_cell(&stats_row(Value::Decimal(scaled)), 1, "node_count").is_err());
+    }
+
+    #[test]
+    fn parse_u64_cell_names_a_missing_cell() {
+        let err = parse_u64_cell(&[], 2, "edge_count").unwrap_err();
+        assert!(err.to_string().contains("missing edge_count"), "{err}");
     }
 
     #[test]

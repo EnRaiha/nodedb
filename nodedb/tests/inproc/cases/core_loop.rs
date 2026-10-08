@@ -30,8 +30,14 @@ mod test_generated_columns;
 mod test_graph;
 #[path = "executor_tests/test_graph_bounds.rs"]
 mod test_graph_bounds;
+#[path = "executor_tests/test_graph_edge_predicate.rs"]
+mod test_graph_edge_predicate;
 #[path = "executor_tests/test_graph_savepoint_overlay.rs"]
 mod test_graph_savepoint_overlay;
+#[path = "executor_tests/test_graph_txn_overlay_no_partition.rs"]
+mod test_graph_txn_overlay_no_partition;
+#[path = "executor_tests/test_graph_txn_overlay_reads.rs"]
+mod test_graph_txn_overlay_reads;
 #[path = "executor_tests/test_group_by_alias.rs"]
 mod test_group_by_alias;
 #[path = "executor_tests/test_kv.rs"]

@@ -21,7 +21,9 @@ pub mod engine;
 pub mod error;
 mod error_classify;
 mod error_from;
+mod error_from_columnar;
 mod error_from_data_plane;
+mod error_from_graph;
 pub mod event;
 // The fail-point framework lives in `nodedb-types` so crates below this one
 // (`nodedb-wal` in particular) inject into the same process-wide registry.

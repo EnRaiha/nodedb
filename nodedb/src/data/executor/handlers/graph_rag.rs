@@ -117,7 +117,7 @@ impl CoreLoop {
             database_id: task.request.database_id.as_u64(),
             tid: tenant_id,
             seeds: GraphSeeds::Surrogates(&seeds),
-            label_filter: edge_label.as_deref(),
+            label_filter: edge_label.as_deref().as_slice(),
             direction,
             max_depth: expansion_depth,
             max_visited,
@@ -279,12 +279,7 @@ impl CoreLoop {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => {
                 warn!(core = self.core_id, error = %e, "{} serialization failed", p.op_name);
-                self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                )
+                self.response_error(task, ErrorCode::from(e))
             }
         }
     }
