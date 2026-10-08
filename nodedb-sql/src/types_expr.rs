@@ -5,6 +5,7 @@
 //! Re-exported from `types` so downstream `use crate::types::*` continues
 //! to resolve these symbols without change.
 
+use nodedb_types::columnar::DecimalTypmod;
 use nodedb_types::datetime::NdbDateTime;
 
 use crate::types::SqlPlan;
@@ -146,9 +147,14 @@ pub enum SqlDataType {
     Timestamp,
     /// Timezone-aware timestamp.
     Timestamptz,
-    Decimal,
+    /// Exact decimal. `Some` carries the declared `DECIMAL(p,s)` typmod that
+    /// every written value is fitted to. `None` is a plain `DECIMAL`.
+    Decimal(Option<DecimalTypmod>),
     Uuid,
     Vector(usize),
     Geometry,
+    /// A structured value: a JSON document, or a typed `ARRAY`, `SET`,
+    /// `RANGE` or `RECORD` cell. It reads back as its JSON text.
+    Json,
     Unknown,
 }

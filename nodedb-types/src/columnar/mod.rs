@@ -3,6 +3,7 @@
 pub mod column_def;
 pub mod column_parse;
 pub mod column_type;
+pub mod decimal_typmod;
 pub mod declared_type_keyword;
 pub mod dml_wal_record;
 pub mod float_width;
@@ -17,6 +18,10 @@ pub mod wal_record;
 pub use column_def::{ColumnDef, ColumnModifier};
 pub use column_parse::{ColumnTypeParseError, DECLARED_FLOAT_KEYWORDS, DECLARED_INT_KEYWORDS};
 pub use column_type::ColumnType;
+pub use decimal_typmod::{
+    DecimalOutOfRange, DecimalTypmod, DecimalTypmodError, MAX_DECIMAL_PRECISION,
+    PG_MAX_DECIMAL_PRECISION,
+};
 pub use declared_type_keyword::declared_type_matches;
 pub use dml_wal_record::ColumnarDmlWalRecord;
 pub use float_width::FloatWidth;

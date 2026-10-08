@@ -4,15 +4,15 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::decimal_typmod::DecimalTypmod;
 use crate::InstantKind;
 use crate::value::Value;
 
 /// Typed column definition for strict document and columnar collections.
 ///
-/// `#[non_exhaustive]` — this enum grows with each type system expansion
-/// (e.g. future variants may add `Decimal { precision, scale }` or split
-/// `Timestamp`/`TimestampTz`). External exhaustive `match` arms must handle
-/// future variants via a typed error arm rather than `_ => unreachable!()`.
+/// `#[non_exhaustive]` — this enum grows with each type system expansion.
+/// External exhaustive `match` arms must handle future variants via a typed
+/// error arm rather than `_ => unreachable!()`.
 #[non_exhaustive]
 #[derive(
     Debug,
@@ -42,14 +42,10 @@ pub enum ColumnType {
     /// layer can reject user-supplied values — the column is populated by the
     /// engine from HLC at commit.
     SystemTimestamp,
-    /// Arbitrary-precision decimal with explicit precision and scale.
-    ///
-    /// `precision`: total significant digits, 1–38. `scale`: digits after the
-    /// decimal point, 0–precision. Default when unspecified: `{38, 10}`.
-    Decimal {
-        precision: u8,
-        scale: u8,
-    },
+    /// Exact decimal. `Some` carries the declared `DECIMAL(p,s)` typmod, and
+    /// every value is fitted to it. `None` is a plain `DECIMAL`, and its
+    /// values are stored as given.
+    Decimal(Option<DecimalTypmod>),
     Geometry,
     /// Fixed-dimension float32 vector.
     Vector(u32),
@@ -273,6 +269,12 @@ mod tests {
         crate::datetime::NdbDateTime::from_micros(0)
     }
 
+    fn decimal(precision: i64, scale: i64) -> ColumnType {
+        ColumnType::Decimal(Some(
+            DecimalTypmod::new(precision, scale).expect("test typmod is valid"),
+        ))
+    }
+
     #[test]
     fn instant_kind_names_the_variant_a_time_column_reads_back_as() {
         assert_eq!(
@@ -301,14 +303,8 @@ mod tests {
         assert_eq!(ColumnType::Timestamptz.to_pg_oid(), 1184);
         assert_eq!(ColumnType::SystemTimestamp.to_pg_oid(), 1114);
         assert_eq!(ColumnType::Duration.to_pg_oid(), 1186);
-        assert_eq!(
-            ColumnType::Decimal {
-                precision: 38,
-                scale: 10
-            }
-            .to_pg_oid(),
-            1700
-        );
+        assert_eq!(decimal(28, 10).to_pg_oid(), 1700);
+        assert_eq!(ColumnType::Decimal(None).to_pg_oid(), 1700);
         assert_eq!(ColumnType::Uuid.to_pg_oid(), 2950);
         assert_eq!(ColumnType::Ulid.to_pg_oid(), 2950);
         assert_eq!(ColumnType::Json.to_pg_oid(), 3802);
@@ -458,14 +454,9 @@ mod tests {
             ColumnType::Timestamp,
             ColumnType::Timestamptz,
             ColumnType::Vector(768),
-            ColumnType::Decimal {
-                precision: 10,
-                scale: 2,
-            },
-            ColumnType::Decimal {
-                precision: 38,
-                scale: 10,
-            },
+            decimal(10, 2),
+            decimal(28, 10),
+            ColumnType::Decimal(None),
         ] {
             let s = ct.to_string();
             let parsed: ColumnType = s.parse().unwrap();
@@ -477,63 +468,93 @@ mod tests {
     fn decimal_parse_with_params() {
         assert_eq!(
             "NUMERIC(10,2)".parse::<ColumnType>().unwrap(),
-            ColumnType::Decimal {
-                precision: 10,
-                scale: 2
-            }
+            decimal(10, 2)
         );
         assert_eq!(
-            "DECIMAL(38,10)".parse::<ColumnType>().unwrap(),
-            ColumnType::Decimal {
-                precision: 38,
-                scale: 10
-            }
+            "DECIMAL(28,10)".parse::<ColumnType>().unwrap(),
+            decimal(28, 10)
         );
+        assert_eq!("DECIMAL(7)".parse::<ColumnType>().unwrap(), decimal(7, 0));
         assert_eq!(
             "NUMERIC".parse::<ColumnType>().unwrap(),
-            ColumnType::Decimal {
-                precision: 38,
-                scale: 10
-            }
+            ColumnType::Decimal(None)
         );
         assert_eq!(
             "DECIMAL".parse::<ColumnType>().unwrap(),
-            ColumnType::Decimal {
-                precision: 38,
-                scale: 10
-            }
+            ColumnType::Decimal(None)
         );
+        assert_eq!(ColumnType::Decimal(None).to_string(), "DECIMAL");
+        assert_eq!(decimal(5, 2).to_string(), "DECIMAL(5,2)");
     }
 
     #[test]
     fn decimal_parse_invalid() {
-        assert!("DECIMAL(5,6)".parse::<ColumnType>().is_err());
-        assert!("DECIMAL(0,0)".parse::<ColumnType>().is_err());
-        assert!("DECIMAL(39,0)".parse::<ColumnType>().is_err());
+        use super::super::column_parse::ColumnTypeParseError;
+        use super::super::decimal_typmod::DecimalTypmodError;
+
+        assert_eq!(
+            "DECIMAL(5,6)".parse::<ColumnType>(),
+            Err(ColumnTypeParseError::InvalidDecimalTypmod(
+                DecimalTypmodError::ScaleOutOfRange {
+                    precision: 5,
+                    scale: 6
+                }
+            ))
+        );
+        assert_eq!(
+            "DECIMAL(0,0)".parse::<ColumnType>(),
+            Err(ColumnTypeParseError::InvalidDecimalTypmod(
+                DecimalTypmodError::PrecisionOutOfRange { precision: 0 }
+            ))
+        );
+        assert_eq!(
+            "DECIMAL(1001,0)".parse::<ColumnType>(),
+            Err(ColumnTypeParseError::InvalidDecimalTypmod(
+                DecimalTypmodError::PrecisionOutOfRange { precision: 1001 }
+            ))
+        );
+        assert_eq!(
+            "DECIMAL(39,0)".parse::<ColumnType>(),
+            Err(ColumnTypeParseError::InvalidDecimalTypmod(
+                DecimalTypmodError::PrecisionUnsupported { precision: 39 }
+            ))
+        );
+        for malformed in ["DECIMAL()", "DECIMAL(a,2)", "DECIMAL(5,2,1)", "NUMERIC(5"] {
+            assert!(
+                matches!(
+                    malformed.parse::<ColumnType>(),
+                    Err(ColumnTypeParseError::InvalidDecimalParams(_))
+                ),
+                "{malformed}"
+            );
+        }
+        assert_eq!(
+            "NUMERIC_MONEY".parse::<ColumnType>(),
+            Err(ColumnTypeParseError::Unknown("NUMERIC_MONEY".into()))
+        );
     }
 
     #[test]
     fn decimal_fixed_size() {
-        assert_eq!(
-            ColumnType::Decimal {
-                precision: 10,
-                scale: 2
-            }
-            .fixed_size(),
-            Some(16)
-        );
+        assert_eq!(decimal(10, 2).fixed_size(), Some(16));
+        assert_eq!(ColumnType::Decimal(None).fixed_size(), Some(16));
     }
 
     #[test]
     fn decimal_to_pg_oid_is_1700() {
-        assert_eq!(
-            ColumnType::Decimal {
-                precision: 10,
-                scale: 2
-            }
-            .to_pg_oid(),
-            1700
-        );
+        assert_eq!(decimal(10, 2).to_pg_oid(), 1700);
+    }
+
+    #[test]
+    fn decimal_wire_forms_roundtrip() {
+        for ct in [decimal(10, 2), ColumnType::Decimal(None)] {
+            let bytes = zerompk::to_msgpack_vec(&ct).expect("encode");
+            let back: ColumnType = zerompk::from_msgpack(&bytes).expect("decode");
+            assert_eq!(back, ct);
+            let json = serde_json::to_string(&ct).expect("encode json");
+            let back: ColumnType = serde_json::from_str(&json).expect("decode json");
+            assert_eq!(back, ct);
+        }
     }
 
     #[test]
@@ -547,13 +568,7 @@ mod tests {
         assert!(
             ColumnType::Uuid.accepts(&Value::Uuid("550e8400-e29b-41d4-a716-446655440000".into()))
         );
-        assert!(
-            ColumnType::Decimal {
-                precision: 38,
-                scale: 10
-            }
-            .accepts(&Value::Decimal(rust_decimal::Decimal::ZERO))
-        );
+        assert!(decimal(28, 10).accepts(&Value::Decimal(rust_decimal::Decimal::ZERO)));
 
         let naive = Value::NaiveDateTime(nodedb_types_datetime_epoch());
         let tz = Value::DateTime(nodedb_types_datetime_epoch());
@@ -576,20 +591,8 @@ mod tests {
         assert!(ColumnType::Uuid.accepts(&Value::String(
             "550e8400-e29b-41d4-a716-446655440000".into()
         )));
-        assert!(
-            ColumnType::Decimal {
-                precision: 10,
-                scale: 2
-            }
-            .accepts(&Value::String("99.95".into()))
-        );
-        assert!(
-            ColumnType::Decimal {
-                precision: 10,
-                scale: 2
-            }
-            .accepts(&Value::Float(99.95))
-        );
+        assert!(decimal(10, 2).accepts(&Value::String("99.95".into())));
+        assert!(decimal(10, 2).accepts(&Value::Float(99.95)));
         assert!(ColumnType::Geometry.accepts(&Value::String("POINT(0 0)".into())));
     }
 

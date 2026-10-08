@@ -7,7 +7,7 @@
 //! at write time.
 
 use nodedb_types::Value;
-use nodedb_types::columnar::ColumnType;
+use nodedb_types::columnar::{ColumnType, DecimalTypmod};
 
 use crate::error::SqlError;
 
@@ -43,12 +43,9 @@ pub enum SimpleType {
     /// Engine-assigned instant. Matching mirrors
     /// `ColumnType::SystemTimestamp`: a client writes an instant, never text.
     SystemTimestamp,
-    /// Declared precision and scale carry the spelling the author wrote.
+    /// The declared typmod, `None` for a plain `DECIMAL`.
     /// Matching is variant-level, as it is for [`SimpleType::Vector`].
-    Decimal {
-        precision: u8,
-        scale: u8,
-    },
+    Decimal(Option<DecimalTypmod>),
     Uuid,
     Ulid,
     Geometry,
@@ -285,7 +282,7 @@ fn simple_from_column_type(
         ColumnType::Timestamp => SimpleType::Timestamp,
         ColumnType::Timestamptz => SimpleType::Timestamptz,
         ColumnType::SystemTimestamp => SimpleType::SystemTimestamp,
-        ColumnType::Decimal { precision, scale } => SimpleType::Decimal { precision, scale },
+        ColumnType::Decimal(typmod) => SimpleType::Decimal(typmod),
         ColumnType::Geometry => SimpleType::Geometry,
         ColumnType::Vector(dim) => SimpleType::Vector(dim),
         ColumnType::SparseVector => SimpleType::SparseVector,
@@ -383,7 +380,7 @@ fn value_matches_simple(value: &Value, simple: &SimpleType) -> bool {
         // Mirrors `ColumnType::SystemTimestamp.accepts`: an engine-assigned
         // instant takes no text form.
         SimpleType::SystemTimestamp => matches!(value, Value::DateTime(_) | Value::Integer(_)),
-        SimpleType::Decimal { .. } => matches!(
+        SimpleType::Decimal(_) => matches!(
             value,
             Value::Decimal(_) | Value::Float(_) | Value::Integer(_) | Value::String(_)
         ),
@@ -600,18 +597,15 @@ mod tests {
     fn parse_decimal_carries_declared_params() {
         assert_eq!(
             parse_type_expr("DECIMAL(10, 2)").unwrap(),
-            TypeExpr::Simple(SimpleType::Decimal {
-                precision: 10,
-                scale: 2
-            })
+            TypeExpr::Simple(SimpleType::Decimal(Some(
+                DecimalTypmod::new(10, 2).expect("valid typmod")
+            )))
         );
         assert_eq!(
             parse_type_expr("NUMERIC").unwrap(),
-            TypeExpr::Simple(SimpleType::Decimal {
-                precision: 38,
-                scale: 10
-            })
+            TypeExpr::Simple(SimpleType::Decimal(None))
         );
+        assert!(parse_type_expr("DECIMAL(1001,0)").is_err());
         assert!(parse_type_expr("DECIMAL(0)").is_err());
     }
 

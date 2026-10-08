@@ -160,7 +160,8 @@ fn parse_column_defs(s: &str) -> Result<Vec<nodedb_types::columnar::ColumnDef>, 
             ColumnDef::nullable(col_name, ct)
         } else {
             ColumnDef::required(col_name, ct)
-        };
+        }
+        .with_declared_width(&col_type);
         if primary_key {
             col = col.with_primary_key();
         }
@@ -258,10 +259,9 @@ mod tests {
             );
             assert_eq!(
                 cols[1].column_type,
-                ColumnType::Decimal {
-                    precision: 10,
-                    scale: 2
-                }
+                ColumnType::Decimal(Some(
+                    nodedb_types::columnar::DecimalTypmod::new(10, 2).expect("valid typmod")
+                ))
             );
         }
     }
