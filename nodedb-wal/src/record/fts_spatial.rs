@@ -26,6 +26,7 @@
 //! Field set can be extended when the handler is wired; the length-prefixed
 //! layout is forward-compatible.
 
+use nodedb_types::decode_bounds::checked_decode_capacity;
 use nodedb_types::sync::wire::SyncProvenance;
 
 use crate::error::{Result, WalError};
@@ -223,14 +224,21 @@ impl FtsIndexPayload {
         let count = read_u32_le(buf, off)? as usize;
         off += 4;
         let remaining = buf.len().saturating_sub(off);
-        if count > remaining / MIN_FIELD_PAIR_BYTES {
+        let Some(capacity) = checked_decode_capacity(
+            count,
+            std::mem::size_of::<(String, String)>(),
+            remaining,
+            MIN_FIELD_PAIR_BYTES,
+            u32::MAX as usize,
+            isize::MAX as usize,
+        ) else {
             return Err(WalError::InvalidPayload {
                 detail: format!(
                     "FTS field count {count} exceeds what {remaining} remaining bytes can hold"
                 ),
             });
-        }
-        let mut fields = Vec::with_capacity(count);
+        };
+        let mut fields = Vec::with_capacity(capacity);
         for _ in 0..count {
             let (field, next) = read_utf8_field(buf, off)?;
             let (text, next) = read_utf8_field(buf, next)?;
