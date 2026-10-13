@@ -13,7 +13,9 @@
 //! indistinguishable from a wedge here.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use tokio::time::MissedTickBehavior;
 
 use tracing::{error, info};
 
@@ -54,6 +56,10 @@ pub fn spawn_core_stall_monitor(shared: &Arc<SharedState>) {
         crate::control::shutdown::ShutdownPhase::DrainingControlPlane,
         move |mut shutdown| async move {
             let mut tick = tokio::time::interval(SAMPLE_INTERVAL);
+            // A late wake fires the next tick one full interval later. The
+            // default burst fires every missed tick back to back, and each of
+            // those milliseconds-long windows reads an idle core as stalled.
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
             // Both buffers are allocated once and swapped, so a loop that runs
             // for the life of the process allocates nothing per sample.
             let mut previous: Vec<u64> = Vec::with_capacity(num_cores);
@@ -68,6 +74,7 @@ pub fn spawn_core_stall_monitor(shared: &Arc<SharedState>) {
             // read every core as stalled.
             tick.tick().await;
             metrics.core_heartbeats.sample_into(&mut previous);
+            let mut previous_at = Instant::now();
 
             loop {
                 tokio::select! {
@@ -79,6 +86,16 @@ pub fn spawn_core_stall_monitor(shared: &Arc<SharedState>) {
                 }
 
                 metrics.core_heartbeats.sample_into(&mut current);
+                let current_at = Instant::now();
+
+                // A tick resumed late can land close behind the previous
+                // sample. An idle core moves its counter once per 100ms poll,
+                // so a window shorter than the interval cannot tell idle from
+                // stalled. Judge nothing and keep the older baseline.
+                if current_at.duration_since(previous_at) < SAMPLE_INTERVAL {
+                    continue;
+                }
+                previous_at = current_at;
 
                 // Before the gateway opens, cores are still restoring
                 // checkpoints and replaying the WAL and have not entered their
