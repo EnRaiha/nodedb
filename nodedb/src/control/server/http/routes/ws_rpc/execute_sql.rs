@@ -355,6 +355,12 @@ pub async fn execute_sql(
                 continue;
             }
 
+            // A provider relation's rows are filled here, where the identity
+            // is. The node the gateway runs the task on cannot fill them.
+            let task = crate::control::server::exchange::resolve::materialize_task_providers(
+                shared, identity, task,
+            )
+            .await?;
             // Clone CoW write-path interception, then authorization, run once per
             // task before dispatch — same protocol-neutral gate every transport runs.
             let emitter =

@@ -18,6 +18,7 @@
 //! never enter the plan cache.
 
 use nodedb_physical::physical_plan::{ExchangeOp, PhysicalPlan, QueryOp};
+use nodedb_physical::physical_task::PhysicalTask;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::catalog;
@@ -299,4 +300,19 @@ pub(super) async fn materialize_providers(
         // pass through unchanged.
         other => Ok(other),
     }
+}
+
+/// `task` with the rows of every provider relation it reads filled for
+/// `identity`.
+///
+/// A transport calls this before it sends a task through the gateway. The
+/// node that runs a forwarded task has no identity to fill the rows with,
+/// so a provider scan that leaves here empty answers no rows there.
+pub(crate) async fn materialize_task_providers(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    mut task: PhysicalTask,
+) -> crate::Result<PhysicalTask> {
+    task.plan = materialize_providers(state, identity, task.database_id, task.plan).await?;
+    Ok(task)
 }

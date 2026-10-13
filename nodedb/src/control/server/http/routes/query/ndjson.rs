@@ -10,6 +10,7 @@ use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::sequence::SessionSequenceAccess;
+use crate::control::server::exchange::resolve::materialize_task_providers;
 use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::response_shape::request::MaterializedShapeRequest;
 use crate::control::server::response_shape::types::describe_plan;
@@ -276,6 +277,8 @@ pub async fn query_ndjson(
         let task_is_write =
             crate::control::server::shared::write_admission::plan_is_write(&task.plan);
         let dispatch = async {
+            // A provider relation's rows are filled here, where the identity is.
+            let task = materialize_task_providers(&state.shared, &identity, task).await?;
             let result: crate::Result<Vec<Vec<u8>>> =
                 if crate::control::array_catalog::ddl::is_array_ddl(&task.plan) {
                     match authorize_one_task(&state.shared, &identity, &task) {

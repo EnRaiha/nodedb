@@ -41,3 +41,4 @@ mod shuffle_aggregate;
 
 pub use capture::DistributedReadCapture;
 pub use exchange::{Resolved, resolve_and_materialize, resolve_exchange_in_plan};
+pub(crate) use materialize::materialize_task_providers;
