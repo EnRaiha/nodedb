@@ -580,25 +580,31 @@ mod tests {
             rl.run(shutdown_rx).await;
         });
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        assert!(
-            raft_loop.applier.count() >= 1,
-            "expected at least 1 applied entry (no-op), got {}",
-            raft_loop.applier.count()
-        );
+        // Poll until the leader commits its no-op (election done). The log
+        // fsyncs to disk, so a loaded host can take far longer than one tick.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while raft_loop.applier.count() < 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected at least 1 applied entry (no-op), got {}",
+                raft_loop.applier.count()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         // vshard 0 maps to data group 1 (not metadata group 0).
         let (_gid, idx) = raft_loop.propose(0, b"hello".to_vec()).unwrap();
         assert!(idx >= 2);
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        assert!(
-            raft_loop.applier.count() >= 2,
-            "expected at least 2 applied entries, got {}",
-            raft_loop.applier.count()
-        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while raft_loop.applier.count() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected at least 2 applied entries, got {}",
+                raft_loop.applier.count()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         shutdown_tx.send(true).unwrap();
         run_handle.abort();
