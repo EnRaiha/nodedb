@@ -92,18 +92,18 @@ pub fn parse(sql: &str) -> crate::Result<MatchQuery> {
 fn parse_in_target(section: &str) -> crate::Result<String> {
     let name = match section.chars().next() {
         Some(quote @ ('\'' | '"')) => {
-            let rest = &section[1..];
-            let end = rest.find(quote).ok_or_else(|| {
+            let rest = section.strip_prefix(quote).unwrap_or(section);
+            let (inner, after) = rest.split_once(quote).ok_or_else(|| {
                 bad(format!(
                     "MATCH: unclosed quote in IN collection '{section}'"
                 ))
             })?;
-            if !rest[end + 1..].trim().is_empty() {
+            if !after.trim().is_empty() {
                 return Err(bad(format!(
                     "MATCH: unexpected text after the IN collection: '{section}'"
                 )));
             }
-            &rest[..end]
+            inner
         }
         _ if section.contains(char::is_whitespace) => {
             return Err(bad(format!(

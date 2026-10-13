@@ -34,7 +34,8 @@ pub(crate) fn decode_rows(metric: &str, payload: &[u8]) -> crate::Result<Vec<rmp
     }
     let (count, mut offset) = nodedb_query::msgpack_scan::array_header(payload, 0)
         .ok_or_else(|| codec(metric, "the scan reply is not an array"))?;
-    let mut rows = Vec::with_capacity(count.min(payload.len()));
+    // The header's count is untrusted, so the vector grows as rows decode.
+    let mut rows = Vec::new();
     for _ in 0..count {
         let rest = payload
             .get(offset..)

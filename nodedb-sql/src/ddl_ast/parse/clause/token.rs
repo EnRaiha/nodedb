@@ -118,7 +118,11 @@ fn push_text<'a>(text: &'a str, base: usize, out: &mut Vec<Token<'a>>) {
 /// prefix for strings) ends with its own closing quote.
 fn is_terminated(raw: &str, q: char) -> bool {
     let escape = q == '\'' && raw.starts_with(['E', 'e']);
-    let body = if escape { &raw[1..] } else { raw };
+    let body = if escape {
+        raw.get(1..).unwrap_or(raw)
+    } else {
+        raw
+    };
     let Some(inner) = body.strip_prefix(q) else {
         return false;
     };
