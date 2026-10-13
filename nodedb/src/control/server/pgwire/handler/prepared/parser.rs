@@ -326,6 +326,7 @@ impl NodeDbQueryParser {
             .into_iter()
             .map(|c| ResultColumn {
                 name: c.display_name,
+                lookup_key: c.lookup_key,
                 ty: c.ty,
             })
             .collect();

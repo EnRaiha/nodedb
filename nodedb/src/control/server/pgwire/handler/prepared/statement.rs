@@ -11,10 +11,15 @@ use pgwire::api::results::FieldInfo;
 use crate::control::server::pgwire::types::wire_type::result_fields;
 use crate::control::server::response_shape::types::DdlColType;
 
-/// One result column of a parsed statement: its output name and its type.
+/// One result column of a parsed statement: its output name, the key the
+/// executor emits its value under, and its type.
+///
+/// The key differs from the name for a join column (`d.n` announced as `n`)
+/// and for an aliased column reference (`n AS x` emitted under `n`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultColumn {
     pub name: String,
+    pub lookup_key: String,
     pub ty: DdlColType,
 }
 
