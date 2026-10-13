@@ -43,8 +43,9 @@ pub(super) async fn compensate_finalized(
     lease.release().await;
     let (log_index, constraint_targets) = reversed?;
     // A restored constraint set is live on the collection's data log before
-    // the compensation returns.
-    crate::control::constraint_install::install_constraints(state, &constraint_targets).await?;
+    // the compensation returns. The reversal is committed, so a failed
+    // install never fails it.
+    crate::control::constraint_install::install_constraints(state, &constraint_targets).await;
     // The compensation restores prior authorization state, which binds every
     // node like any other authorization change.
     if super::ddl_authorization::objects_bear_authorization(objects)? {

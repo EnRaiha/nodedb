@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Capture sites for CRDT history work that never reached the Data Plane, and
-//! for dead-letter entries the queue or the store could not hold.
+//! Capture sites for CRDT history work that never reached the Data Plane, for
+//! dead-letter entries the queue or the store could not hold, and for
+//! constraint installs that failed after their DDL committed.
 
 use faultbox::{Capture, EventKind, error_chain_of};
 
@@ -34,6 +35,31 @@ pub fn history_compaction_not_applied(
     .error_chain(error_chain_of(err))
     .domain(&ctx)
     .with_backtrace()
+    .emit();
+}
+
+/// Report a committed DDL whose constraint install failed. Called only from
+/// `constraint_install::install_constraints`, which leaves the set to the
+/// reconcile loop.
+pub fn constraint_install_deferred(
+    err: &crate::Error,
+    database_id: u64,
+    tenant_id: u64,
+    collection: &str,
+) {
+    let class = error_class(err);
+    let ctx = context::ConstraintInstallDeferred {
+        database_id,
+        tenant_id,
+        collection,
+        error_class: &class,
+    };
+    let _ = Capture::new(
+        EventKind::Error,
+        "constraint install: a committed DDL's constraint set did not install on its data group",
+    )
+    .error_chain(error_chain_of(err))
+    .domain(&ctx)
     .emit();
 }
 

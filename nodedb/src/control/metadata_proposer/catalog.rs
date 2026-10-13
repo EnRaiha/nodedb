@@ -33,8 +33,9 @@ use crate::control::server::shared::session::StatementDeadline;
 /// every node: the authorization barrier runs after the local apply, with the
 /// DDL preparation lock and lease already released.
 ///
-/// An entry that changes a collection's CRDT constraint version returns only
-/// once the new set is installed through the collection's data Raft log.
+/// An entry that changes a collection's CRDT constraint version installs the
+/// new set through the collection's data Raft log before it returns. The
+/// entry is committed by then, so a failed install never fails it.
 pub async fn propose_catalog_entry_async(
     shared: &SharedState,
     entry: &CatalogEntry,
@@ -42,7 +43,7 @@ pub async fn propose_catalog_entry_async(
     let (outcome, constraint_targets) = propose_and_apply_locally(shared, entry).await?;
     // A changed constraint set is live on the collection's data log before
     // the DDL returns, so the first CRDT apply after it is not fenced.
-    crate::control::constraint_install::install_constraints(shared, &constraint_targets).await?;
+    crate::control::constraint_install::install_constraints(shared, &constraint_targets).await;
     if let ProposeOutcome::Replicated { log_index } = outcome
         && entry.bears_authorization()
     {

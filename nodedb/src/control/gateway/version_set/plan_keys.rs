@@ -321,7 +321,9 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
 
                 // `ImportSnapshot` is a whole-tenant Loro import and
                 // `SetConstraints` / `DropConstraints` install validator rules —
-                // none produce per-collection versioned read output.
+                // none produce per-collection versioned read output. A
+                // constraint op still homes to its collection's vShard
+                // (`gateway::home_collection`).
                 GetVersionVector { .. }
                 | ReadConstraints { .. }
                 | ExportDelta { .. }

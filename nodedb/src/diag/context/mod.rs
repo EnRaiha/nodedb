@@ -41,7 +41,9 @@ pub(in crate::diag) use columnar::{
 pub(in crate::diag) use continuous_agg::{
     ContinuousAggregateNotApplied, ContinuousAggregateStateFault,
 };
-pub(in crate::diag) use crdt::{CrdtDeadLetterNotEnqueued, HistoryCompactionNotApplied};
+pub(in crate::diag) use crdt::{
+    ConstraintInstallDeferred, CrdtDeadLetterNotEnqueued, HistoryCompactionNotApplied,
+};
 pub(in crate::diag) use crdt_dead_letter_store::{
     CrdtDeadLetterNotRestored, CrdtDeadLetterNotStored,
 };

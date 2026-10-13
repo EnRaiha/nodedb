@@ -81,8 +81,9 @@ pub async fn propose_catalog_batch_async(
         return Ok(CatalogBatch::empty());
     };
     // A changed constraint set is live on the collection's data log before
-    // the batch returns, so the first CRDT apply after it is not fenced.
-    crate::control::constraint_install::install_constraints(shared, &constraint_targets).await?;
+    // the batch returns, so the first CRDT apply after it is not fenced. The
+    // batch is committed, so a failed install never fails it.
+    crate::control::constraint_install::install_constraints(shared, &constraint_targets).await;
     if entries.iter().any(CatalogEntry::bears_authorization) {
         crate::control::security::auth_lease::authorization_barrier(
             shared,

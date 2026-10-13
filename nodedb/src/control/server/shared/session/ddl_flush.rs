@@ -349,8 +349,9 @@ pub(super) async fn finalize_pending(
     lease.release().await;
     let (log_index, bears_authorization) = finalized?;
     // A changed constraint set is live on the collection's data log before
-    // COMMIT returns, so the first CRDT apply after it is not fenced.
-    crate::control::constraint_install::install_constraints(state, &constraint_targets).await?;
+    // COMMIT returns, so the first CRDT apply after it is not fenced. The
+    // finalize is committed, so a failed install never fails COMMIT.
+    crate::control::constraint_install::install_constraints(state, &constraint_targets).await;
     if bears_authorization {
         super::ddl_authorization::barrier_at(state, log_index).await?;
     }

@@ -30,7 +30,10 @@ use tracing::{debug, warn};
 
 use crate::control::security::catalog::{ReadOnlySystemCatalog, StoredCollection, SystemCatalog};
 use crate::control::state::SharedState;
-use crate::control::wal_replication::propose_replicated_entry;
+
+/// A collection the reconcile loop delivers to: the same name in two
+/// databases is two collections.
+pub type DeliveredKey = (DatabaseId, TenantId, String);
 
 /// Maximum number of constraint deliveries proposed in a single reconcile
 /// pass. Remaining changed collections are delivered on subsequent ticks so a
@@ -56,9 +59,10 @@ pub fn spawn_constraint_reconcile(shared: Arc<SharedState>, interval_ms: u64) {
             let shared = task_shared;
             // Task-local delivered-version map, persisted across ticks (NOT in
             // SharedState): records the highest `constraint_version` already
-            // accepted by Raft for each `(tenant, collection)`. Skipping equal
-            // or older versions keeps steady-state ticks proposal-free.
-            let mut delivered: HashMap<(TenantId, String), u64> = HashMap::new();
+            // accepted by Raft for each `(database, tenant, collection)`.
+            // Skipping equal or older versions keeps steady-state ticks
+            // proposal-free.
+            let mut delivered: HashMap<DeliveredKey, u64> = HashMap::new();
             let mut tick = tokio::time::interval(Duration::from_millis(interval_ms));
             loop {
                 tokio::select! {
@@ -79,14 +83,14 @@ pub fn spawn_constraint_reconcile(shared: Arc<SharedState>, interval_ms: u64) {
 /// for each collection whose `constraint_version` exceeds what `delivered`
 /// records. `delivered` is updated in place on each accepted proposal. Returns
 /// the number of proposals accepted this pass. A no-op (returns 0) when this
-/// node is not the one elected to reconcile, the catalog is absent, or the
-/// async Raft proposer is not yet installed.
+/// node is not the one elected to reconcile or the catalog is absent. A
+/// delivery that fails is retried on the next pass.
 ///
 /// Exposed (crate-public) so tests can drive constraint installation
 /// deterministically instead of waiting on the background timer.
 pub async fn reconcile_once(
     shared: &Arc<SharedState>,
-    delivered: &mut HashMap<(TenantId, String), u64>,
+    delivered: &mut HashMap<DeliveredKey, u64>,
 ) -> usize {
     // Only one node reconciles — every replica installing would duplicate
     // proposals onto the data log for no gain. That node is the metadata
@@ -107,22 +111,16 @@ pub async fn reconcile_once(
             return 0;
         }
     };
-    // Boot spawns this loop after `start_raft` installed the proposer.
-    let proposer = match shared.async_raft_proposer() {
-        Ok(proposer) => proposer,
-        Err(error) => {
-            warn!(%error, "constraint reconcile: no raft proposer");
-            return 0;
-        }
-    };
-    let proposer = Arc::clone(proposer);
-
     let mut proposed = 0usize;
     for (database_id, stored) in loaded {
         if proposed >= MAX_RECONCILE_PROPOSALS_PER_PASS {
             break;
         }
-        let key = (TenantId::new(stored.tenant_id), stored.name.clone());
+        let key = (
+            database_id,
+            TenantId::new(stored.tenant_id),
+            stored.name.clone(),
+        );
         // Already delivered this version (or newer) — fence skip.
         if delivered
             .get(&key)
@@ -131,25 +129,12 @@ pub async fn reconcile_once(
             continue;
         }
 
-        let entry =
-            match crate::control::constraint_install::constraint_change_entry(database_id, &stored)
-            {
-                Ok(entry) => entry,
-                Err(e) => {
-                    warn!(
-                        collection = %stored.name,
-                        error = %e,
-                        "constraint reconcile: encode failed; skipping collection"
-                    );
-                    continue;
-                }
-            };
-
-        let deadline =
-            crate::control::server::shared::session::StatementDeadline::of_statement(shared)
-                .tokio_instant();
-        match propose_replicated_entry(shared, &proposer, entry, deadline).await {
-            Ok(_) => {
+        // The delivery routes to the leader of the collection's data group,
+        // which need not be this node.
+        match crate::control::constraint_install::deliver_constraints(shared, database_id, &stored)
+            .await
+        {
+            Ok(()) => {
                 // Record only on commit. A transient / NotLeader error
                 // leaves the map untouched so the next tick retries.
                 delivered.insert(key, stored.constraint_version);

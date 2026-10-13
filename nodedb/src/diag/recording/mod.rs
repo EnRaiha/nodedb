@@ -41,8 +41,8 @@ pub use columnar::{
 };
 pub use continuous_agg::{continuous_aggregate_not_applied, continuous_aggregate_state_fault};
 pub use crdt::{
-    crdt_dead_letter_not_enqueued, crdt_dead_letter_not_restored, crdt_dead_letter_not_stored,
-    history_compaction_not_applied,
+    constraint_install_deferred, crdt_dead_letter_not_enqueued, crdt_dead_letter_not_restored,
+    crdt_dead_letter_not_stored, history_compaction_not_applied,
 };
 pub use cut_barrier::cut_barrier_not_placed;
 pub use data_plane::{
