@@ -326,14 +326,25 @@ pub async fn lookup_surrogates_routed(
         .await
         .into_iter()
         .collect::<crate::Result<_>>()?;
+    // Every answered winner binds first-wins in one catalog transaction.
+    let found: Vec<(&[u8], Surrogate)> = missing
+        .iter()
+        .zip(&answered)
+        .filter_map(|(&pk, answer)| answer.map(|winner| (pk, winner)))
+        .collect();
+    let mut bound = state
+        .surrogate_assigner
+        .bind_many(collection, tenant_id, &found)?
+        .into_iter();
     let mut kept = Vec::with_capacity(answered.len());
-    for (pk, answer) in missing.iter().zip(answered) {
+    for answer in &answered {
         kept.push(match answer {
-            Some(winner) => Some(
-                state
-                    .surrogate_assigner
-                    .bind(collection, tenant_id, pk, winner)?,
-            ),
+            Some(_) => Some(bound.next().ok_or_else(|| crate::Error::Internal {
+                detail: format!(
+                    "a found key of '{}' stayed unbound after bind",
+                    collection.name()
+                ),
+            })?),
             None => None,
         });
     }
@@ -383,23 +394,21 @@ fn local_bindings<'k>(
     tenant_id: TenantId,
     pks: &[&'k [u8]],
 ) -> crate::Result<LocalBindings<'k>> {
-    let mut out = Vec::with_capacity(pks.len());
+    let out = state
+        .surrogate_assigner
+        .lookup_bound_many(collection, tenant_id, pks)?;
     let mut missing: Vec<&[u8]> = Vec::new();
     let mut asked: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
-    for &pk in pks {
-        let hit = state
-            .surrogate_assigner
-            .lookup_bound(collection, tenant_id, pk)?;
+    for (&pk, hit) in pks.iter().zip(&out) {
         if hit.is_none() && asked.insert(pk) {
             missing.push(pk);
         }
-        out.push(hit);
     }
     Ok(LocalBindings { out, missing })
 }
 
-/// Bind each remote winner in this node's catalog first-wins, and return the
-/// kept values in `missing` order.
+/// Bind each remote winner in this node's catalog first-wins, in one catalog
+/// transaction, and return the kept values in `missing` order.
 fn keep_winners(
     state: &SharedState,
     collection: CollectionKey<'_>,
@@ -407,15 +416,14 @@ fn keep_winners(
     missing: &[&[u8]],
     winners: &[Surrogate],
 ) -> crate::Result<Vec<Surrogate>> {
-    missing
+    let rows: Vec<(&[u8], Surrogate)> = missing
         .iter()
-        .zip(winners)
-        .map(|(pk, winner)| {
-            state
-                .surrogate_assigner
-                .bind(collection, tenant_id, pk, *winner)
-        })
-        .collect()
+        .copied()
+        .zip(winners.iter().copied())
+        .collect();
+    state
+        .surrogate_assigner
+        .bind_many(collection, tenant_id, &rows)
 }
 
 /// Write the answers for `missing` (in its order) into every unfilled slot of

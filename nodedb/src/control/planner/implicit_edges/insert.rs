@@ -6,9 +6,13 @@
 use nodedb_physical::physical_plan::{DocumentOp, GraphOp, PhysicalPlan};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
+use std::collections::{HashMap, HashSet};
+
+use nodedb_types::Surrogate;
+
 use super::catalog::mark_collection_edge_bearing;
 use super::extract::{extract_edge, weight_properties};
-use crate::control::server::surrogate_exchange::assign_surrogate_routed;
+use crate::control::server::surrogate_exchange::assign_surrogates_routed;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, RecordHomes, TenantId, TraceId};
 
@@ -78,18 +82,61 @@ pub async fn append_implicit_edge_tasks(
         }
     }
 
-    for edge in edges {
-        // The write routes to the source endpoint's home. Both endpoints'
-        // surrogates come from the collection home, where every key of the
-        // collection is minted.
-        let vsrc = RecordHomes::edge(&edge.src, &edge.dst).owner();
-
+    // Both endpoints' surrogates come from the collection home, where every
+    // key of the collection is minted. Every endpoint of one collection
+    // resolves in one routed batch.
+    let mut resolved: HashMap<String, HashMap<String, Surrogate>> = HashMap::new();
+    for &collection in &marked {
         // `edge.collection` is the plan's database-qualified name.
-        let key = nodedb_types::CollectionKey::from_qualified_str(database_id, &edge.collection)?;
-        let src_surrogate =
-            assign_surrogate_routed(state, key, tenant_id, edge.src.as_bytes(), trace_id).await?;
-        let dst_surrogate =
-            assign_surrogate_routed(state, key, tenant_id, edge.dst.as_bytes(), trace_id).await?;
+        let key = nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?;
+        let mut endpoints: Vec<&str> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for edge in edges.iter().filter(|edge| edge.collection == collection) {
+            for id in [edge.src.as_str(), edge.dst.as_str()] {
+                if seen.insert(id) {
+                    endpoints.push(id);
+                }
+            }
+        }
+        let pks: Vec<&[u8]> = endpoints.iter().map(|id| id.as_bytes()).collect();
+        let bound = assign_surrogates_routed(state, key, tenant_id, &pks, trace_id).await?;
+        if bound.len() != endpoints.len() {
+            return Err(crate::Error::Internal {
+                detail: format!(
+                    "implicit edges of '{collection}': {} of {} endpoints got a surrogate",
+                    bound.len(),
+                    endpoints.len()
+                ),
+            });
+        }
+        resolved.insert(
+            collection.to_string(),
+            endpoints
+                .into_iter()
+                .map(str::to_string)
+                .zip(bound)
+                .collect(),
+        );
+    }
+    drop(marked);
+
+    for edge in edges {
+        // The write routes to the source endpoint's home.
+        let vsrc = RecordHomes::edge(&edge.src, &edge.dst).owner();
+        let endpoint = |id: &str| {
+            resolved
+                .get(&edge.collection)
+                .and_then(|by_id| by_id.get(id))
+                .copied()
+                .ok_or_else(|| crate::Error::Internal {
+                    detail: format!(
+                        "implicit edge endpoint '{id}' of '{}' got no surrogate",
+                        edge.collection
+                    ),
+                })
+        };
+        let src_surrogate = endpoint(&edge.src)?;
+        let dst_surrogate = endpoint(&edge.dst)?;
 
         let properties = match edge.weight {
             Some(w) => weight_properties(w),

@@ -20,18 +20,27 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut ArrayOp) -> crate::Resu
                     format: "msgpack".into(),
                     detail: format!("array cell put decode: {e}"),
                 })?;
-            let mut rewritten = false;
-            for cell in cells.iter_mut() {
-                let pk_bytes = zerompk::to_msgpack_vec(&cell.coord).map_err(|e| {
-                    crate::Error::Serialization {
+            let pks = cells
+                .iter()
+                .map(|cell| {
+                    zerompk::to_msgpack_vec(&cell.coord).map_err(|e| crate::Error::Serialization {
                         format: "msgpack".into(),
                         detail: format!("array coord pk encode: {e}"),
-                    }
-                })?;
-                let bound =
-                    binder.resolve(binder.bare_key(&array_id.name), &pk_bytes, cell.surrogate)?;
-                if bound != cell.surrogate {
-                    cell.surrogate = bound;
+                    })
+                })
+                .collect::<crate::Result<Vec<Vec<u8>>>>()?;
+            let key = binder.bare_key(&array_id.name);
+            let identities: Vec<_> = pks
+                .iter()
+                .zip(&cells)
+                .map(|(pk_bytes, cell)| (key, pk_bytes.as_slice(), cell.surrogate))
+                .collect();
+            // Every cell binds in one catalog transaction.
+            let bound = binder.resolve_many(&identities)?;
+            let mut rewritten = false;
+            for (cell, surrogate) in cells.iter_mut().zip(bound) {
+                if surrogate != cell.surrogate {
+                    cell.surrogate = surrogate;
                     rewritten = true;
                 }
             }

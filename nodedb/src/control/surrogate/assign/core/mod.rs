@@ -18,6 +18,7 @@
 //! this hot path) lives in the sibling [`super::cluster_reserve`] module.
 
 mod assign_ops;
+mod batch_ops;
 mod draw;
 mod flush;
 mod home;

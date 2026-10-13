@@ -50,22 +50,18 @@ impl SurrogateAssigner {
         pks: &[&[u8]],
     ) -> crate::Result<Vec<Surrogate>> {
         if !self.is_cluster()? {
-            let mut bound = Vec::with_capacity(pks.len());
-            for pk in pks {
-                bound.push(self.assign_bound(key, tenant_id, pk).await?);
-            }
-            return Ok(bound);
+            return self.assign_bound_many(key, tenant_id, pks).await;
         }
-        let catalog = self.credential_store.catalog();
-        let mut out: Vec<Option<Surrogate>> = Vec::with_capacity(pks.len());
+        let mut out = self
+            .credential_store
+            .catalog()
+            .get_surrogates_for_pks(key, tenant_id, pks)?;
         let mut missing: Vec<&[u8]> = Vec::new();
         let mut asked: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
-        for &pk in pks {
-            let hit = catalog.get_surrogate_for_pk(key, tenant_id, pk)?;
+        for (&pk, hit) in pks.iter().zip(&out) {
             if hit.is_none() && asked.insert(pk) {
                 missing.push(pk);
             }
-            out.push(hit);
         }
         if !missing.is_empty() {
             let winners = self
@@ -82,13 +78,12 @@ impl SurrogateAssigner {
                     ),
                 });
             }
-            let mut kept: std::collections::HashMap<&[u8], Surrogate> =
-                std::collections::HashMap::with_capacity(missing.len());
-            for (&pk, winner) in missing.iter().zip(winners) {
-                // The winner is final: every replica of the home binds it in
-                // log order, so keeping it here agrees with them.
-                kept.insert(pk, self.bind(key, tenant_id, pk, winner)?);
-            }
+            // The winner is final: every replica of the home binds it in log
+            // order, so keeping it here agrees with them.
+            let rows: Vec<(&[u8], Surrogate)> = missing.iter().copied().zip(winners).collect();
+            let bound = self.bind_many(key, tenant_id, &rows)?;
+            let kept: std::collections::HashMap<&[u8], Surrogate> =
+                missing.iter().copied().zip(bound).collect();
             for (slot, &pk) in out.iter_mut().zip(pks) {
                 if slot.is_none() {
                     *slot = kept.get(pk).copied();
@@ -136,9 +131,10 @@ impl SurrogateAssigner {
     /// - Else: allocate one surrogate, persist the binding, and check
     ///   the registry's flush threshold; flush durably if tripped.
     ///
-    /// Allocation + catalog write happen inside one critical section
-    /// on the registry write-lock so the registry hwm and the
-    /// persisted PK row cannot diverge under concurrent assigners.
+    /// [`Self::assign_bound_many`] for one key: allocation and catalog write
+    /// run in one critical section on the registry write lock, so the
+    /// registry hwm and the persisted PK row cannot diverge under concurrent
+    /// assigners.
     ///
     /// Only a node that is the key's home binds this way: a single node, or
     /// an apply that has no carried value to bind.
@@ -148,70 +144,13 @@ impl SurrogateAssigner {
         tenant_id: TenantId,
         pk_bytes: &[u8],
     ) -> crate::Result<Surrogate> {
-        let catalog = self.credential_store.catalog();
-
-        // Fast-path: existing binding. Done under a read lock — most
-        // production calls land here once the per-collection working
-        // set has been observed.
-        if let Some(s) = catalog.get_surrogate_for_pk(key, tenant_id, pk_bytes)? {
-            return Ok(s);
-        }
-
-        // Slow path: allocate + persist + maybe flush. The write lock
-        // guards the (allocate, write-pk-row) pair so two concurrent
-        // assigners can't both observe "missing", both allocate, and
-        // both write — the second silently overwrites the
-        // first's binding with a different surrogate.
-        //
-        // In cluster mode the allocation source is the node's reserved
-        // batch (`try_alloc_reserved`). An empty batch is awaited from the
-        // background refiller with the registry write lock released: the
-        // applier installs the batch under a read guard, so a wait that held
-        // the write lock deadlocks.
-        loop {
-            if let Some(surrogate) = self.try_assign_bound(catalog, key, tenant_id, pk_bytes)? {
-                return Ok(surrogate);
-            }
-            self.await_reserved_batch().await?;
-        }
-    }
-
-    /// One [`Self::assign_bound`] attempt under the registry write lock.
-    /// `None` when this node's reserved batch is empty, after nudging the
-    /// refill loop.
-    fn try_assign_bound(
-        &self,
-        catalog: &crate::control::security::catalog::SystemCatalog,
-        key: CollectionKey<'_>,
-        tenant_id: TenantId,
-        pk_bytes: &[u8],
-    ) -> crate::Result<Option<Surrogate>> {
-        let registry = self.registry_write()?;
-        // Re-check inside the lock: another assigner can have raced us
-        // between the fast-path read and the lock acquisition.
-        if let Some(s) = catalog.get_surrogate_for_pk(key, tenant_id, pk_bytes)? {
-            return Ok(Some(s));
-        }
-        let Some(surrogate) = self.alloc_locked(&registry)? else {
-            drop(registry);
-            self.refill_notify.notify_one();
-            return Ok(None);
-        };
-        // Proactive top-up: a low batch nudges the background refiller so
-        // the next reservation lands before the pool drains.
-        self.nudge_refill_if_low(&registry);
-        catalog.put_surrogate(key, tenant_id, pk_bytes, surrogate)?;
-        // Emit a durable WAL bind before the lock releases. Order is
-        // load-bearing: a crash between catalog write and bind append
-        // is invisible (the catalog row is already on disk via redb's
-        // own WAL); a crash before the catalog write leaves nothing
-        // to recover; a crash between bind append and lock release is
-        // recovered by replaying the bind into the catalog (idempotent
-        // via the two-table overwrite).
-        self.wal_appender
-            .record_bind_to_wal(key, tenant_id, surrogate.as_u32(), pk_bytes)?;
-        self.maybe_flush(&registry, catalog)?;
-        Ok(Some(surrogate))
+        let mut bound = self.assign_bound_many(key, tenant_id, &[pk_bytes]).await?;
+        bound.pop().ok_or_else(|| crate::Error::Internal {
+            detail: format!(
+                "surrogate assign_bound of a key in '{}' returned no surrogate",
+                key.name()
+            ),
+        })
     }
 
     /// Read-only lookup of many keys of one collection, in `pks` order:
@@ -229,15 +168,16 @@ impl SurrogateAssigner {
         tenant_id: TenantId,
         pks: &[&[u8]],
     ) -> crate::Result<Vec<Option<Surrogate>>> {
-        let mut out: Vec<Option<Surrogate>> = Vec::with_capacity(pks.len());
+        let mut out = self
+            .credential_store
+            .catalog()
+            .get_surrogates_for_pks(key, tenant_id, pks)?;
         let mut missing: Vec<&[u8]> = Vec::new();
         let mut asked: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
-        for &pk in pks {
-            let hit = self.lookup_bound(key, tenant_id, pk)?;
+        for (&pk, hit) in pks.iter().zip(&out) {
             if hit.is_none() && asked.insert(pk) {
                 missing.push(pk);
             }
-            out.push(hit);
         }
         if missing.is_empty() || !self.is_cluster()? {
             return Ok(out);
@@ -256,13 +196,14 @@ impl SurrogateAssigner {
                 ),
             });
         }
-        let mut kept: std::collections::HashMap<&[u8], Surrogate> =
-            std::collections::HashMap::new();
-        for (&pk, answer) in missing.iter().zip(answers) {
-            if let Some(winner) = answer {
-                kept.insert(pk, self.bind(key, tenant_id, pk, winner)?);
-            }
-        }
+        let rows: Vec<(&[u8], Surrogate)> = missing
+            .iter()
+            .zip(answers)
+            .filter_map(|(&pk, answer)| answer.map(|winner| (pk, winner)))
+            .collect();
+        let bound = self.bind_many(key, tenant_id, &rows)?;
+        let kept: std::collections::HashMap<&[u8], Surrogate> =
+            rows.iter().map(|&(pk, _)| pk).zip(bound).collect();
         for (slot, &pk) in out.iter_mut().zip(pks) {
             if slot.is_none() {
                 *slot = kept.get(pk).copied();
@@ -289,6 +230,19 @@ impl SurrogateAssigner {
         catalog.get_surrogate_for_pk(key, tenant_id, pk_bytes)
     }
 
+    /// [`Self::lookup_bound`] for many keys of one collection, in `pks` order,
+    /// read in one catalog read transaction.
+    pub fn lookup_bound_many(
+        &self,
+        key: CollectionKey<'_>,
+        tenant_id: TenantId,
+        pks: &[&[u8]],
+    ) -> crate::Result<Vec<Option<Surrogate>>> {
+        self.credential_store
+            .catalog()
+            .get_surrogates_for_pks(key, tenant_id, pks)
+    }
+
     /// Bind `(collection, pk_bytes)` to a *carried* surrogate without ever
     /// allocating, resolving concurrent carried values **first-wins** and
     /// returning the *authoritative* surrogate the caller must use.
@@ -306,9 +260,6 @@ impl SurrogateAssigner {
     /// otherwise the owner creates duplicate rows under different
     /// surrogates for the same key.
     ///
-    /// - No catalog (in-memory test fixture): returns `Ok(surrogate)` — the
-    ///   carried value is authoritative, nothing to persist (mirrors
-    ///   `assign`'s catalog-less branch).
     /// - Binding already exists: returns `Ok(existing)` — first-wins, never
     ///   overwrites, discards the carried value even if it differs.
     /// - Otherwise: persist the binding + emit the durable WAL bind under the
@@ -322,6 +273,8 @@ impl SurrogateAssigner {
     /// Crucially this never touches `alloc_locked`/`maybe_flush`: the
     /// allocator counter must NOT advance on a bind — that burns a
     /// surrogate and diverge from the coordinator.
+    ///
+    /// [`Self::bind_many`] for one key.
     pub fn bind(
         &self,
         key: CollectionKey<'_>,
@@ -329,42 +282,13 @@ impl SurrogateAssigner {
         pk_bytes: &[u8],
         surrogate: Surrogate,
     ) -> crate::Result<Surrogate> {
-        let catalog = self.credential_store.catalog();
-
-        // First-wins pre-check under a read lock: if any binding is already
-        // installed (replay, retry, or a competing coordinator's carried
-        // value applied first) it is authoritative — return it, never
-        // overwrite, discard the carried value even if it differs.
-        if let Some(existing) = catalog.get_surrogate_for_pk(key, tenant_id, pk_bytes)? {
-            return Ok(existing);
-        }
-
-        // Hold the registry write lock across (re-check, persist binding,
-        // WAL bind, hwm advance) so it is one critical section — same lock
-        // discipline as `assign`, which also serializes on this write lock.
-        // `restore_hwm` itself is atomic on the counter; we call it through
-        // the held guard rather than re-locking (which deadlocks on
-        // this std `RwLock`).
-        let registry = self.registry_write()?;
-        // Re-check under the lock (TOCTOU): a concurrent `assign`/`bind` on
-        // this node can have written between the pre-check and the lock.
-        // First-wins still applies — return the existing value.
-        if let Some(existing) = catalog.get_surrogate_for_pk(key, tenant_id, pk_bytes)? {
-            return Ok(existing);
-        }
-        catalog.put_surrogate(key, tenant_id, pk_bytes, surrogate)?;
-        self.wal_appender
-            .record_bind_to_wal(key, tenant_id, surrogate.as_u32(), pk_bytes)?;
-        // Advance the local watermark past the carried value so a later
-        // LOCAL `assign`/`assign_anonymous` on this node can never re-issue
-        // it. Idempotent and monotonic — never lowers, never advances the
-        // allocator's draw position (only the hwm floor).
-        registry
-            .restore_hwm(surrogate.as_u32())
-            .map_err(|e| crate::Error::Internal {
-                detail: format!("surrogate bind restore_hwm failed: {e}"),
-            })?;
-        Ok(surrogate)
+        let mut bound = self.bind_many(key, tenant_id, &[(pk_bytes, surrogate)])?;
+        bound.pop().ok_or_else(|| crate::Error::Internal {
+            detail: format!(
+                "surrogate bind of a key in '{}' returned no surrogate",
+                key.name()
+            ),
+        })
     }
 }
 

@@ -55,13 +55,20 @@ pub fn bind_carried_identities(
     tenant_id: TenantId,
     identities: &[CarriedIdentity],
 ) -> crate::Result<()> {
-    for identity in identities {
-        let bound = assigner.bind(
-            nodedb_types::CollectionKey::from_bare(database_id, &identity.collection),
-            tenant_id,
-            &identity.pk_bytes,
-            identity.surrogate,
-        )?;
+    let binder = IdentityBinder::new(assigner, database_id, tenant_id);
+    let rows: Vec<_> = identities
+        .iter()
+        .map(|identity| {
+            (
+                nodedb_types::CollectionKey::from_bare(database_id, &identity.collection),
+                identity.pk_bytes.as_slice(),
+                identity.surrogate,
+            )
+        })
+        .collect();
+    // Every identity binds in one catalog transaction per collection.
+    let bound = binder.resolve_many(&rows)?;
+    for (identity, bound) in identities.iter().zip(bound) {
         if bound != identity.surrogate {
             return Err(crate::Error::Internal {
                 detail: format!(

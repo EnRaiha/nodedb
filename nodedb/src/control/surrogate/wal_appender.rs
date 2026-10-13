@@ -8,10 +8,12 @@
 //! [`WalSurrogateAppender`].
 //!
 //! The appender is invoked from [`crate::control::surrogate::assign`]
-//! immediately after the catalog hwm row has been persisted. Order is
-//! load-bearing for crash recovery: post-restart we read the catalog
-//! row first; the WAL record is only consulted if the catalog is
-//! behind (S2 will wire the actual replay path).
+//! immediately after the catalog rows have been persisted. Order is
+//! load-bearing for crash recovery: boot replays every `SurrogateAlloc`
+//! and `SurrogateBind` record into the catalog and registry
+//! (`crate::wal::replay_surrogate_records`). The replay only raises the
+//! watermark and re-writes bindings, so a record the catalog already
+//! holds changes nothing.
 
 use std::sync::Arc;
 
@@ -29,19 +31,18 @@ pub trait SurrogateWalAppender: Send + Sync {
     /// catalog row has been updated.
     fn record_alloc_to_wal(&self, hi: u32) -> crate::Result<()>;
 
-    /// Append a `SurrogateBind` record carrying the
-    /// `(surrogate, collection, pk_bytes)` triple. Called by
-    /// `SurrogateAssigner::assign` after the catalog two-table txn so
-    /// the binding is durable before the write-lock is released. The
-    /// record carries the key's bare name. The `(database_id, tenant_id)`
-    /// scope is stamped into the record header so replay re-keys the
-    /// binding under the same canonical key.
-    fn record_bind_to_wal(
+    /// Append one `SurrogateBind` record per `(surrogate, pk_bytes)` pair
+    /// in `binds`, then force them to disk with one sync. Called by the
+    /// assigner after the catalog transaction commits, so every binding
+    /// is durable before the write-lock is released. Each record carries
+    /// the key's bare name. The `(database_id, tenant_id)` scope is
+    /// stamped into the record header so replay re-keys the binding under
+    /// the same canonical key. An empty `binds` writes and syncs nothing.
+    fn record_binds_to_wal(
         &self,
         key: CollectionKey<'_>,
         tenant_id: TenantId,
-        surrogate: u32,
-        pk_bytes: &[u8],
+        binds: &[(u32, &[u8])],
     ) -> crate::Result<()>;
 }
 
@@ -65,24 +66,29 @@ impl SurrogateWalAppender for WalSurrogateAppender {
             .map(|_| ())
     }
 
-    fn record_bind_to_wal(
+    fn record_binds_to_wal(
         &self,
         key: CollectionKey<'_>,
         tenant_id: TenantId,
-        surrogate: u32,
-        pk_bytes: &[u8],
+        binds: &[(u32, &[u8])],
     ) -> crate::Result<()> {
-        self.wal.appender(NO_APPLY_KEY).append_surrogate_bind(
-            key.database_id(),
-            tenant_id,
-            surrogate,
-            key.name(),
-            pk_bytes,
-        )?;
-        // Force the record to disk before the assigner releases its
-        // write-lock. A crash after `assign` returns must always see
-        // the binding on replay; group-commit batching alone does not
-        // give us that guarantee.
+        if binds.is_empty() {
+            return Ok(());
+        }
+        let appender = self.wal.appender(NO_APPLY_KEY);
+        for &(surrogate, pk_bytes) in binds {
+            appender.append_surrogate_bind(
+                key.database_id(),
+                tenant_id,
+                surrogate,
+                key.name(),
+                pk_bytes,
+            )?;
+        }
+        // One sync covers the whole batch and lands before the assigner
+        // releases its write-lock. A crash after `assign` returns must
+        // always see the bindings on replay. Group-commit batching alone
+        // does not give that guarantee.
         self.wal.sync()
     }
 }
@@ -96,12 +102,11 @@ impl SurrogateWalAppender for NoopWalAppender {
         Ok(())
     }
 
-    fn record_bind_to_wal(
+    fn record_binds_to_wal(
         &self,
         _key: CollectionKey<'_>,
         _tenant_id: TenantId,
-        _surrogate: u32,
-        _pk_bytes: &[u8],
+        _binds: &[(u32, &[u8])],
     ) -> crate::Result<()> {
         Ok(())
     }

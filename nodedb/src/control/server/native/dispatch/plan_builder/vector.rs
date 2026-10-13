@@ -93,17 +93,13 @@ pub(crate) async fn build_batch_insert(
 
     // Headless batch — every vector gets a fresh anonymous surrogate.
     let assigner = &ctx.state.surrogate_assigner;
-    let mut surrogates = Vec::with_capacity(vectors.len());
-    for _ in &vectors {
-        surrogates.push(
-            assigner
-                .assign_anonymous(
-                    nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-                    ctx.tenant_id(),
-                )
-                .await?,
-        );
-    }
+    let surrogates = assigner
+        .assign_anonymous_many(
+            nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
+            ctx.tenant_id(),
+            vectors.len(),
+        )
+        .await?;
 
     Ok(PhysicalPlan::Vector(VectorOp::BatchInsert {
         collection: QualifiedCollection::new(ctx.database_id(), collection),

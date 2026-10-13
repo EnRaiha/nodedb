@@ -43,8 +43,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nodedb_types::Surrogate;
-use nodedb_types::id::{CollectionKey, DatabaseId};
+use nodedb_types::id::DatabaseId;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::cluster::snapshot_install::{
@@ -327,20 +326,13 @@ impl DataPlaneSnapshotApplier {
         // bind here. Without them PK point-lookups (`WHERE id=<pk>`) resolve to
         // nothing on the caught-up follower even though full scans work.
         let catalog = self.shared.credentials.catalog();
-        for e in surrogate_pk {
-            catalog
-                .put_surrogate(
-                    CollectionKey::from_bare(DatabaseId::new(e.database_id), &e.collection),
-                    TenantId::new(e.tenant_id),
-                    &e.pk,
-                    Surrogate::new(e.surrogate),
-                )
-                .map_err(|source| SnapshotInstallError::Settle {
-                    group_id,
-                    step: SettleStep::SurrogateRebind,
-                    source,
-                })?;
-        }
+        catalog
+            .overwrite_surrogate_entries(surrogate_pk)
+            .map_err(|source| SnapshotInstallError::Settle {
+                group_id,
+                step: SettleStep::SurrogateRebind,
+                source,
+            })?;
 
         // Take the group's tenant write marks, durably, before this node
         // reports the group applied through the snapshot.

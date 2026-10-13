@@ -109,25 +109,31 @@ async fn derive_surrogates(
     let mut bound = super::helpers::assign_surrogates(ctx, collection, &keyed)
         .await?
         .into_iter();
+    // Every keyless row draws in one catalog transaction.
+    let keyless_count = pks.len() - keyed.len();
+    let mut keyless = if keyless_count > 0 {
+        ctx.state
+            .surrogate_assigner
+            .assign_anonymous_many(
+                nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
+                ctx.tenant_id(),
+                keyless_count,
+            )
+            .await?
+    } else {
+        Vec::new()
+    }
+    .into_iter();
     let mut out = Vec::with_capacity(pks.len());
     for pk in &pks {
-        if pk.is_empty() {
-            out.push(
-                ctx.state
-                    .surrogate_assigner
-                    .assign_anonymous(
-                        nodedb_types::CollectionKey::from_bare(ctx.database_id(), collection),
-                        ctx.tenant_id(),
-                    )
-                    .await?,
-            );
+        let next = if pk.is_empty() {
+            keyless.next()
         } else {
-            out.push(bound.next().ok_or_else(|| crate::Error::Internal {
-                detail: format!(
-                    "columnar ingest into '{collection}': a keyed row got no surrogate"
-                ),
-            })?);
-        }
+            bound.next()
+        };
+        out.push(next.ok_or_else(|| crate::Error::Internal {
+            detail: format!("columnar ingest into '{collection}': a row got no surrogate"),
+        })?);
     }
     Ok(out)
 }

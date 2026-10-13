@@ -60,18 +60,25 @@ pub(crate) async fn assign_many_at_home(
 ) -> crate::Result<Vec<Surrogate>> {
     let assigner = &state.surrogate_assigner;
     let proposer = state.async_raft_proposer()?;
-    let mut identities: Vec<ReplicatedIdentity> = Vec::new();
+    let local = assigner.lookup_bound_many(collection, tenant_id, pks)?;
+    let mut unbound: Vec<&[u8]> = Vec::new();
     let mut proposed: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
-    for &pk in pks {
-        if assigner.lookup_bound(collection, tenant_id, pk)?.is_none() && proposed.insert(pk) {
-            identities.push(ReplicatedIdentity {
-                collection: collection.name().to_string(),
-                pk_bytes: pk.to_vec(),
-                surrogate: assigner.mint_candidate().await?.as_u32(),
-            });
+    for (&pk, hit) in pks.iter().zip(&local) {
+        if hit.is_none() && proposed.insert(pk) {
+            unbound.push(pk);
         }
     }
-    if !identities.is_empty() {
+    if !unbound.is_empty() {
+        let candidates = assigner.mint_candidates(unbound.len()).await?;
+        let identities: Vec<ReplicatedIdentity> = unbound
+            .iter()
+            .zip(candidates)
+            .map(|(pk, candidate)| ReplicatedIdentity {
+                collection: collection.name().to_string(),
+                pk_bytes: pk.to_vec(),
+                surrogate: candidate.as_u32(),
+            })
+            .collect();
         let entry = ReplicatedEntry::new(
             tenant_id.as_u64(),
             collection.database_id().as_u64(),
@@ -83,18 +90,18 @@ pub(crate) async fn assign_many_at_home(
                 .tokio_instant();
         propose_replicated_entry(state, proposer, entry, deadline).await?;
     }
-    pks.iter()
-        .map(|pk| {
-            assigner
-                .lookup_bound(collection, tenant_id, pk)?
-                .ok_or_else(|| crate::Error::Internal {
-                    detail: format!(
-                        "surrogate bind of a key in '{}' applied on vShard {} but the key is \
+    let bound = assigner.lookup_bound_many(collection, tenant_id, pks)?;
+    bound
+        .into_iter()
+        .map(|hit| {
+            hit.ok_or_else(|| crate::Error::Internal {
+                detail: format!(
+                    "surrogate bind of a key in '{}' applied on vShard {} but the key is \
                          unbound",
-                        collection.name(),
-                        home.as_u32()
-                    ),
-                })
+                    collection.name(),
+                    home.as_u32()
+                ),
+            })
         })
         .collect()
 }

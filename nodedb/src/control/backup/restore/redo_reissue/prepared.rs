@@ -67,14 +67,28 @@ pub(super) fn document_units(
     for collection in prepared {
         let key = nodedb_types::CollectionKey::from_bare(collection.database_id, &collection.bare);
         let mut units = Vec::with_capacity(collection.rows.len());
-        for row in collection.rows {
+        // Every row of the collection binds in one catalog transaction.
+        let carried_rows: Vec<(&[u8], nodedb_types::Surrogate)> = collection
+            .rows
+            .iter()
+            .map(|row| (row.identity.as_str().as_bytes(), row.key.surrogate()))
+            .collect();
+        let bound = state
+            .surrogate_assigner
+            .bind_many(key, collection.tenant, &carried_rows)?;
+        drop(carried_rows);
+        if bound.len() != collection.rows.len() {
+            return Err(crate::Error::Internal {
+                detail: format!(
+                    "restore bind of '{}' answered {} of {} rows",
+                    collection.bare,
+                    bound.len(),
+                    collection.rows.len()
+                ),
+            });
+        }
+        for (row, surrogate) in collection.rows.into_iter().zip(bound) {
             let pk = row.identity.as_str();
-            let surrogate = state.surrogate_assigner.bind(
-                key,
-                collection.tenant,
-                pk.as_bytes(),
-                row.key.surrogate(),
-            )?;
             let carried = CarriedIdentity {
                 collection: collection.bare.clone(),
                 pk_bytes: pk.as_bytes().to_vec(),
