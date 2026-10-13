@@ -766,18 +766,14 @@ SHOW MATERIALIZED VIEWS;
 
 ### Continuous Aggregates
 
-Continuous aggregates are incrementally maintained views over timeseries collections. Unlike `REFRESH MATERIALIZED VIEW` (full re-scan), continuous aggregates update only the new watermark window.
+Continuous aggregates are incrementally maintained views over timeseries collections. Unlike `REFRESH MATERIALIZED VIEW` (full re-scan), continuous aggregates fold only new data into per-bucket state.
 
 ```sql
-CREATE CONTINUOUS AGGREGATE cpu_hourly
-ON cpu_metrics
-AS
-    SELECT time_bucket('1 hour', ts) AS hour,
-           host,
-           AVG(cpu) AS avg_cpu
-    FROM cpu_metrics
-    GROUP BY hour, host
-WITH (refresh_interval = '1m');
+CREATE CONTINUOUS AGGREGATE cpu_hourly ON cpu_metrics
+    BUCKET '1h'
+    AGGREGATE avg(cpu) AS avg_cpu, count(*) AS samples
+    GROUP BY host
+    WITH (refresh_interval = '1m', retention = '365d');
 
 -- Manually trigger a refresh
 REFRESH CONTINUOUS AGGREGATE cpu_hourly;
@@ -786,6 +782,23 @@ SHOW CONTINUOUS AGGREGATES;
 
 DROP CONTINUOUS AGGREGATE cpu_hourly;
 ```
+
+`BUCKET` sets the bucket width. `AGGREGATE` functions: `count`, `sum`, `avg`, `min`, `max`, `first`, `last`, `count_distinct`, `approx_count_distinct`, `percentile(col, q)` (also `ts_percentile`, `approx_percentile`), `topk(col, k)` (also `approx_topk`). `GROUP BY` is optional.
+
+`WITH` options:
+
+| Option | Value |
+| ------ | ----- |
+| `refresh_policy` | `on_flush` (default), `on_seal`, `manual`, or an interval such as `'5m'` (folds periodically) |
+| `refresh_interval` | Interval such as `'1m'`. Folds periodically on the maintenance tick. |
+| `retention` | Interval after which the aggregate drops old buckets |
+
+- `on_flush` and `on_seal` aggregates fold each flushed partition once.
+- An interval `refresh_policy` or `refresh_interval` folds on the maintenance tick at that interval.
+- `manual` aggregates fold only on `REFRESH CONTINUOUS AGGREGATE`. A read serves the last refresh.
+- Aggregate state survives restart and keeps its history after raw retention removes the source rows.
+- `SELECT * FROM cpu_hourly` returns one row per bucket and group: `bucket`, the `GROUP BY` columns, then the outputs.
+- The aggregate is read-only.
 
 ## Engine-Specific SQL
 
@@ -1257,7 +1270,7 @@ SHOW USERS;
 
 `NOW()`, `CURRENT_TIMESTAMP()`, `EXTRACT(field FROM ts)`, `DATE_TRUNC(unit, ts)`, `DATE_FORMAT(ts, fmt)`, `time_bucket(interval, ts)`
 
-`time_bucket(interval, ts)` — truncates `ts` to the nearest `interval` boundary. Registered as a DataFusion ScalarUDF. Accepts interval literals (`'5m'`, `'1h'`, `'1d'`) and ISO 8601 durations (`'PT5M'`, `'PT1H'`). Used in timeseries aggregations and continuous aggregate definitions.
+`time_bucket(interval, ts)` — truncates `ts` to the nearest `interval` boundary. Registered as a DataFusion ScalarUDF. Accepts interval literals (`'5m'`, `'1h'`, `'1d'`) and ISO 8601 durations (`'PT5M'`, `'PT1H'`). Used in timeseries aggregations. Continuous aggregate definitions do not use it. They set the bucket with `BUCKET`.
 
 ### Type
 

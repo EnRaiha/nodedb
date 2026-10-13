@@ -113,7 +113,7 @@ CREATE COLLECTION corpus (
     tenant_id UUID,
     created_at TIMESTAMP DEFAULT now()
 ) WITH (
-    primary='vector',
+    engine='vector',
     vector_field='embedding',
     dim=384,
     metric='cosine',
@@ -125,7 +125,7 @@ CREATE COLLECTION corpus (
 );
 ```
 
-`primary='vector'` is purely an access-path hint — not a different engine. Cross-engine queries, CRDT sync, SQL semantics all keep working. `payload_indexes` are per-field equality / range / boolean indexes over the metadata sidecar for filtered ANN (replaces Pinecone metadata filters).
+`engine='vector'` implies `primary='vector'`. It requires `vector_field` and `dim`; a missing one, or a contradicting `primary`, is refused with SQLSTATE `42601`. A document collection searched through a vector index uses `engine='document_schemaless'`. Cross-engine queries, CRDT sync, SQL semantics all keep working. `payload_indexes` are per-field equality / range / boolean indexes over the metadata sidecar for filtered ANN (replaces Pinecone metadata filters).
 
 `storage_dtype` controls the precision of raw HNSW vector storage (independent of quantization). Accepted values: `F32` (default, 4 bytes/dimension), `F16` (2 bytes/dimension, IEEE half), `BF16` (2 bytes/dimension, bfloat16 — same exponent range as F32, better dynamic range for embeddings, preferred). Using `BF16` or `F16` halves resident vector bytes, reducing memory pressure on large indexes with a small accuracy cost. The HNSW graph structure and search quality remain unaffected.
 
